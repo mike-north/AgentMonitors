@@ -7,26 +7,45 @@ import type { HookState, UrgentItem } from './types.js';
  * Compute hook state from the current inbox contents.
  */
 export function computeHookState(inbox: InboxService): HookState {
-  const queued = inbox.list({ state: 'queued' });
-  const acked = inbox.list({ state: 'acked' });
-  const inProgress = inbox.list({ state: 'in-progress' });
+  // Two queries instead of five: active items + failed items
+  const active = inbox.list({
+    state: ['queued', 'acked', 'in-progress'],
+  });
   const failed = inbox.list({ state: 'failed' });
 
-  const urgentItems = inbox.list({ state: 'queued', urgency: 'high' });
+  let queuedCount = 0;
+  let ackedCount = 0;
+  let inProgressCount = 0;
+  const urgent: UrgentItem[] = [];
 
-  const urgent: UrgentItem[] = urgentItems.map((item) => ({
-    id: item.id,
-    monitorId: item.monitorId,
-    title: item.title,
-    createdAt: item.createdAt.toISOString(),
-  }));
+  for (const item of active) {
+    switch (item.state) {
+      case 'queued':
+        queuedCount++;
+        if (item.urgency === 'high') {
+          urgent.push({
+            id: item.id,
+            monitorId: item.monitorId,
+            title: item.title,
+            createdAt: item.createdAt.toISOString(),
+          });
+        }
+        break;
+      case 'acked':
+        ackedCount++;
+        break;
+      case 'in-progress':
+        inProgressCount++;
+        break;
+    }
+  }
 
   return {
     updatedAt: new Date().toISOString(),
     counts: {
-      queued: queued.length,
-      acked: acked.length,
-      'in-progress': inProgress.length,
+      queued: queuedCount,
+      acked: ackedCount,
+      'in-progress': inProgressCount,
       failed: failed.length,
     },
     urgent,

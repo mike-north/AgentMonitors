@@ -8,6 +8,8 @@ interface AuthConfig {
   type: 'bearer' | 'basic';
   'token-env'?: string;
   token?: string;
+  username?: string;
+  password?: string;
 }
 
 type ChangeStrategy = 'json-diff' | 'text-diff' | 'status-code';
@@ -56,7 +58,10 @@ function resolveAuth(auth: AuthConfig | undefined): Record<string, string> {
     return { Authorization: `Bearer ${token}` };
   }
 
-  return {};
+  const username = auth.username ?? '';
+  const password = auth.password ?? '';
+  const encoded = Buffer.from(`${username}:${password}`).toString('base64');
+  return { Authorization: `Basic ${encoded}` };
 }
 
 interface CachedResponse {
@@ -72,6 +77,19 @@ function cacheKey(config: Record<string, unknown>): string {
   return JSON.stringify(config);
 }
 
+/** Recursively sort object keys for order-insensitive JSON comparison. */
+function sortKeys(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortKeys);
+  if (value !== null && typeof value === 'object') {
+    const sorted: Record<string, unknown> = {};
+    for (const key of Object.keys(value).sort()) {
+      sorted[key] = sortKeys((value as Record<string, unknown>)[key]);
+    }
+    return sorted;
+  }
+  return value;
+}
+
 function hasChanged(
   strategy: ChangeStrategy,
   prev: CachedResponse,
@@ -82,8 +100,8 @@ function hasChanged(
       return prev.status !== curr.status;
     case 'json-diff':
       try {
-        const prevJson = JSON.stringify(JSON.parse(prev.body));
-        const currJson = JSON.stringify(JSON.parse(curr.body));
+        const prevJson = JSON.stringify(sortKeys(JSON.parse(prev.body)));
+        const currJson = JSON.stringify(sortKeys(JSON.parse(curr.body)));
         return prevJson !== currJson;
       } catch {
         // Fall back to text comparison if JSON parsing fails
@@ -105,13 +123,20 @@ const scopeSchema: JsonSchema = {
         type: { type: 'string', enum: ['bearer', 'basic'] },
         'token-env': { type: 'string' },
         token: { type: 'string' },
+        username: { type: 'string' },
+        password: { type: 'string' },
       },
     },
     headers: {
       type: 'object',
       additionalProperties: { type: 'string' },
     },
-    interval: { type: 'string', pattern: '^\\d+[smhd]$' },
+    interval: {
+      type: 'string',
+      pattern: '^\\d+[smhd]$',
+      description:
+        'Polling interval (e.g., "5m"). Used by the scheduling engine, not by this plugin directly.',
+    },
     'change-detection': {
       type: 'object',
       properties: {

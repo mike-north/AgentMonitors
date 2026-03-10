@@ -1,6 +1,7 @@
 import type { Observation } from '../observation/types.js';
+import type { NotifyStrategy } from '../schema/types.js';
 
-export type NotifyStrategy = 'debounce' | 'throttle';
+export type { NotifyStrategy };
 
 export type NotifyCallback = (observation: Observation) => void;
 

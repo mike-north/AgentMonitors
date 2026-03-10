@@ -1,9 +1,7 @@
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { rmSync } from 'node:fs';
 import { scanMonitors } from './scan-monitors.js';
 
 const yaml = String.raw;

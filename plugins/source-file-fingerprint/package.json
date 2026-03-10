@@ -28,7 +28,6 @@
   },
   "dependencies": {
     "@agentmonitors/core": "workspace:*",
-    "chokidar": "^4.0.3",
     "glob": "^11.0.1"
   },
   "license": "UNLICENSED",
