@@ -1,0 +1,40 @@
+{
+  "name": "@agentmonitors/core",
+  "description": "Core library for Agent Monitors — schema, parser, inbox, plugin interface, and notification engine",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup && tsc -p tsconfig.build.json",
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "clean": "rm -rf dist",
+    "check:api-report": "api-extractor run --local --verbose",
+    "ci:api-report": "api-extractor run --verbose"
+  },
+  "license": "UNLICENSED",
+  "dependencies": {
+    "better-sqlite3": "^11.9.1",
+    "drizzle-orm": "^0.45.1",
+    "glob": "^11.0.1",
+    "gray-matter": "^4.0.3",
+    "ulid": "^2.3.0",
+    "zod": "^3.25.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.15.0",
+    "drizzle-kit": "^0.31.3"
+  }
+}
