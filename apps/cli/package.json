@@ -1,0 +1,28 @@
+{
+  "name": "@agentmonitors/cli",
+  "description": "CLI for Agent Monitors — validate, scan, query, and manage observation inboxes",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "bin": {
+    "agentmonitors": "./dist/index.cjs"
+  },
+  "scripts": {
+    "build": "tsup",
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@agentmonitors/core": "workspace:*",
+    "@agentmonitors/source-file-fingerprint": "workspace:*",
+    "@agentmonitors/source-api-poll": "workspace:*",
+    "@agentmonitors/source-schedule": "workspace:*",
+    "commander": "^14.0.3"
+  },
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "@types/node": "^22.15.0"
+  }
+}

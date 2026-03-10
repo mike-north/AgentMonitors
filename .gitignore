@@ -143,6 +143,12 @@ vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
 
+# Nx
+.nx/
+
+# API Extractor temp
+temp/
+
 # Claude
 .claude/*.local.*
 

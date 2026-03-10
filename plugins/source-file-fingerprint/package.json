@@ -1,0 +1,38 @@
+{
+  "name": "@agentmonitors/source-file-fingerprint",
+  "description": "File change detection via SHA-256 fingerprinting for Agent Monitors",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "agentmonitor:observation-source"
+  ],
+  "scripts": {
+    "build": "tsup && tsc -p tsconfig.build.json",
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "clean": "rm -rf dist",
+    "check:api-report": "api-extractor run --local --verbose",
+    "ci:api-report": "api-extractor run --verbose"
+  },
+  "dependencies": {
+    "@agentmonitors/core": "workspace:*",
+    "chokidar": "^4.0.3",
+    "glob": "^11.0.1"
+  },
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "@types/node": "^22.15.0"
+  }
+}
