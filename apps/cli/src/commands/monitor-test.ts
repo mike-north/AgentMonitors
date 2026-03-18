@@ -119,7 +119,15 @@ monitorTestCommand
       return;
     }
 
-    const content = readFileSync(filePath, 'utf-8');
+    let content: string;
+    try {
+      content = readFileSync(filePath, 'utf-8');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      reportError(`Cannot read monitor file: ${msg}`, json);
+      return;
+    }
+
     const result = parseMonitor(content, filePath);
 
     if (!result.ok) {

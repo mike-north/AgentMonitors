@@ -12,11 +12,17 @@ export function requireDirectory(dirPath: string, json: boolean): boolean {
     reportError(`path "${dirPath}" does not exist`, json);
     return false;
   }
-  if (!statSync(dirPath).isDirectory()) {
-    reportError(
-      `"${dirPath}" is a file, not a directory. Pass the directory containing MONITOR.md files.`,
-      json,
-    );
+  try {
+    if (!statSync(dirPath).isDirectory()) {
+      reportError(
+        `"${dirPath}" is a file, not a directory. Pass the directory containing MONITOR.md files.`,
+        json,
+      );
+      return false;
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    reportError(`Cannot access "${dirPath}": ${msg}`, json);
     return false;
   }
   return true;

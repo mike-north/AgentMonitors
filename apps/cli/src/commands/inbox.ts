@@ -2,6 +2,7 @@ import { Command, Option } from 'commander';
 import type { InboxFilter, InboxItemState } from '@agentmonitors/core';
 import { createDb, InboxService } from '@agentmonitors/core';
 import { resolveDbPath } from '../db-path.js';
+import { reportError } from '../output.js';
 
 const STATES = [
   'queued',
@@ -75,8 +76,10 @@ inboxCommand
       if (options.since) {
         const d = new Date(options.since);
         if (isNaN(d.getTime())) {
-          console.error('Error: --since must be a valid ISO 8601 date.');
-          process.exitCode = 1;
+          reportError(
+            '--since must be a valid ISO 8601 date.',
+            options.format === 'json',
+          );
           return;
         }
         filter.since = d;
@@ -84,8 +87,10 @@ inboxCommand
       if (options.until) {
         const d = new Date(options.until);
         if (isNaN(d.getTime())) {
-          console.error('Error: --until must be a valid ISO 8601 date.');
-          process.exitCode = 1;
+          reportError(
+            '--until must be a valid ISO 8601 date.',
+            options.format === 'json',
+          );
           return;
         }
         filter.until = d;
