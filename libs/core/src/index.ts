@@ -13,7 +13,7 @@ export type {
 } from './schema/types.js';
 
 // Parser
-export { parseMonitor } from './parser/parse-monitor.js';
+export { parseMonitor, parseMonitorFile } from './parser/parse-monitor.js';
 export type {
   ParseResult,
   ParseError,

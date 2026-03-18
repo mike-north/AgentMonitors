@@ -2,6 +2,7 @@ import { and, desc, eq, gte, inArray, lte, sql } from 'drizzle-orm';
 import { ulid } from 'ulid';
 import type { InboxDb } from './db.js';
 import { inboxItems } from './schema.js';
+import type { InboxItemState } from './schema.js';
 import type { EnqueuePayload, InboxFilter, InboxItem } from './types.js';
 
 function rowToItem(row: typeof inboxItems.$inferSelect): InboxItem {
@@ -22,6 +23,16 @@ function rowToItem(row: typeof inboxItems.$inferSelect): InboxItem {
   };
 }
 
+/** Valid state transitions: current state → allowed next states. */
+const VALID_TRANSITIONS: Record<InboxItemState, InboxItemState[]> = {
+  queued: ['acked'],
+  acked: ['in-progress'],
+  'in-progress': ['completed', 'failed'],
+  completed: ['archived'],
+  failed: ['archived'],
+  archived: [],
+};
+
 /**
  * Service for managing inbox items with a state-machine lifecycle.
  *
@@ -37,6 +48,24 @@ export class InboxService {
   constructor(db: InboxDb, onMutation?: () => void) {
     this.db = db;
     this.onMutation = onMutation;
+  }
+
+  /** Look up an item and validate the state transition, throwing on invalid transitions or missing IDs. */
+  private requireTransition(
+    id: string,
+    targetState: InboxItemState,
+  ): InboxItem {
+    const item = this.getById(id);
+    if (!item) {
+      throw new Error(`Inbox item not found: ${id}`);
+    }
+    const allowed = VALID_TRANSITIONS[item.state];
+    if (!allowed.includes(targetState)) {
+      throw new Error(
+        `Invalid state transition: cannot move from "${item.state}" to "${targetState}"`,
+      );
+    }
+    return item;
   }
 
   /** Enqueue a new inbox item. Returns the generated ULID. */
@@ -67,6 +96,7 @@ export class InboxService {
 
   /** Mark an item as acknowledged (agent has seen it). */
   ack(id: string): void {
+    this.requireTransition(id, 'acked');
     const now = new Date();
     this.db
       .update(inboxItems)
@@ -78,6 +108,7 @@ export class InboxService {
 
   /** Move an item to in-progress (agent is actively working on it). */
   start(id: string): void {
+    this.requireTransition(id, 'in-progress');
     const now = new Date();
     this.db
       .update(inboxItems)
@@ -89,6 +120,7 @@ export class InboxService {
 
   /** Mark an item as successfully completed. */
   complete(id: string): void {
+    this.requireTransition(id, 'completed');
     const now = new Date();
     this.db
       .update(inboxItems)
@@ -100,10 +132,10 @@ export class InboxService {
 
   /** Mark an item as failed. The error message is appended to the body, preserving the original content. */
   fail(id: string, error?: string): void {
+    const item = this.requireTransition(id, 'failed');
     const now = new Date();
     if (error) {
-      const existing = this.getById(id);
-      const existingBody = existing?.body ?? '';
+      const existingBody = item.body;
       const separator = existingBody ? '\n\n---\n\n' : '';
       this.db
         .update(inboxItems)
@@ -126,6 +158,7 @@ export class InboxService {
 
   /** Archive a completed or failed item. */
   archive(id: string): void {
+    this.requireTransition(id, 'archived');
     const now = new Date();
     this.db
       .update(inboxItems)

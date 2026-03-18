@@ -19,6 +19,7 @@
     "@agentmonitors/source-file-fingerprint": "workspace:*",
     "@agentmonitors/source-api-poll": "workspace:*",
     "@agentmonitors/source-schedule": "workspace:*",
+    "better-sqlite3": "^11.9.1",
     "commander": "^14.0.3"
   },
   "license": "UNLICENSED",

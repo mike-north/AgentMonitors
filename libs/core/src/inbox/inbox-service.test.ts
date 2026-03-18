@@ -127,6 +127,8 @@ describe('InboxService', () => {
     it('fail on item with empty body sets error as body', () => {
       const { body: _, ...payloadWithoutBody } = basePayload;
       const emptyBodyId = service.enqueue(payloadWithoutBody);
+      service.ack(emptyBodyId);
+      service.start(emptyBodyId);
       service.fail(emptyBodyId, 'Something broke');
       const item = service.getById(emptyBodyId);
       expect(item?.body).toBe('Error: Something broke');
@@ -151,6 +153,65 @@ describe('InboxService', () => {
       expect(service.getById(id)?.state).toBe('completed');
       service.archive(id);
       expect(service.getById(id)?.state).toBe('archived');
+    });
+
+    it('full lifecycle: queued → acked → in-progress → failed → archived', () => {
+      service.ack(id);
+      service.start(id);
+      service.fail(id);
+      expect(service.getById(id)?.state).toBe('failed');
+      service.archive(id);
+      expect(service.getById(id)?.state).toBe('archived');
+    });
+
+    it('rejects re-acking an already-acked item', () => {
+      service.ack(id);
+      expect(() => service.ack(id)).toThrow(
+        'Invalid state transition: cannot move from "acked" to "acked"',
+      );
+    });
+
+    it('rejects skipping ack (queued → in-progress)', () => {
+      expect(() => service.start(id)).toThrow(
+        'Invalid state transition: cannot move from "queued" to "in-progress"',
+      );
+    });
+
+    it('rejects backwards transition from archived', () => {
+      service.ack(id);
+      service.start(id);
+      service.complete(id);
+      service.archive(id);
+      expect(() => service.ack(id)).toThrow(
+        'Invalid state transition: cannot move from "archived" to "acked"',
+      );
+    });
+
+    it('rejects completing a queued item', () => {
+      expect(() => service.complete(id)).toThrow(
+        'Invalid state transition: cannot move from "queued" to "completed"',
+      );
+    });
+
+    it('rejects failing an acked item (must be in-progress first)', () => {
+      service.ack(id);
+      expect(() => service.fail(id)).toThrow(
+        'Invalid state transition: cannot move from "acked" to "failed"',
+      );
+    });
+
+    it('rejects archiving an in-progress item', () => {
+      service.ack(id);
+      service.start(id);
+      expect(() => service.archive(id)).toThrow(
+        'Invalid state transition: cannot move from "in-progress" to "archived"',
+      );
+    });
+
+    it('throws on nonexistent item ID', () => {
+      expect(() => service.ack('nonexistent-id')).toThrow(
+        'Inbox item not found: nonexistent-id',
+      );
     });
   });
 
@@ -290,10 +351,22 @@ describe('InboxService', () => {
       const callback = vi.fn();
       const svc = new InboxService(db, callback);
       const id = svc.enqueue(basePayload);
+      svc.ack(id);
+      svc.start(id);
       callback.mockClear();
 
       svc.fail(id, 'error');
       expect(callback).toHaveBeenCalledOnce();
+    });
+
+    it('does not call onMutation when transition is rejected', () => {
+      const callback = vi.fn();
+      const svc = new InboxService(db, callback);
+      const id = svc.enqueue(basePayload);
+      callback.mockClear();
+
+      expect(() => svc.complete(id)).toThrow('Invalid state transition');
+      expect(callback).not.toHaveBeenCalled();
     });
   });
 });

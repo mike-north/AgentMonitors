@@ -21,6 +21,8 @@ export interface ObservationSource {
   readonly name: string;
   /** JSON Schema fragment describing this source's `scope` configuration */
   readonly scopeSchema: JsonSchema;
+  /** Whether this source requires a baseline before detecting changes (default: false) */
+  readonly stateful?: boolean;
   /** One-shot observation: check for changes and return any observations */
   observe(config: Record<string, unknown>): Promise<Observation[]>;
   /** Optional continuous watch mode */

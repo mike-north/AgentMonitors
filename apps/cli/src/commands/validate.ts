@@ -1,7 +1,8 @@
-import { Command } from 'commander';
+import { Command, Option } from 'commander';
 import { scanMonitors, SourceRegistry } from '@agentmonitors/core';
 import type { JsonSchema } from '@agentmonitors/core';
 import { registerCoreSources } from '../sources.js';
+import { requireDirectory } from '../validation.js';
 
 /**
  * Validate a scope object against a source's JSON Schema fragment.
@@ -28,21 +29,32 @@ function validateScope(
 export const validateCommand = new Command('validate')
   .description('Validate MONITOR.md files in a directory')
   .argument('[path]', 'Path to monitors directory', '.claude/monitors')
-  .option('--format <format>', 'Output format', 'text')
+  .addOption(
+    new Option('--format <format>', 'Output format')
+      .choices(['text', 'json'])
+      .default('text'),
+  )
   .action(async (monitorPath: string, options: { format: string }) => {
+    if (!requireDirectory(monitorPath, options.format === 'json')) return;
+
     const result = await scanMonitors(monitorPath);
 
     const registry = new SourceRegistry();
     registerCoreSources(registry);
 
-    // Validate scope against source-specific schemas
+    // Validate source names and scope against source-specific schemas
     const scopeErrors: { id: string; errors: string[] }[] = [];
     const validMonitors = result.monitors.filter((m) => {
       const sourceName = m.monitor.frontmatter.source;
       const source = registry.get(sourceName);
       if (!source) {
-        // Unknown source — not an error here (could be a third-party plugin)
-        return true;
+        scopeErrors.push({
+          id: m.monitor.id,
+          errors: [
+            `Unknown source "${sourceName}". Available sources: ${registry.names().join(', ')}`,
+          ],
+        });
+        return false;
       }
 
       const errors = validateScope(

@@ -31,6 +31,12 @@ Observation sources are plugins that know how to detect changes. Three core sour
 
 Sources implement the `ObservationSource` interface and are distributed as npm packages with the `agentmonitor:observation-source` keyword.
 
+### Baseline-then-detect pattern
+
+The `file-fingerprint` and `api-poll` sources use a **baseline-then-detect** pattern. The first observation establishes a baseline (current file hashes or API response). Subsequent observations compare against the baseline to detect changes. This means a single observation in isolation cannot detect changes — the system needs to see "before" and "after" states.
+
+The `schedule` source is stateless — it simply checks if the current time matches the cron expression and produces an observation immediately.
+
 ## Event Kinds
 
 Every monitor declares what kind of signal it produces:

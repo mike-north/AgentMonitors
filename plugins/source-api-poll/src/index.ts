@@ -52,7 +52,7 @@ function resolveAuth(auth: AuthConfig | undefined): Record<string, string> {
     const token = auth.token ?? (envVar ? process.env[envVar] : undefined);
     if (!token) {
       throw new Error(
-        `Bearer auth requires a token. Set ${envVar ?? 'auth.token'} in scope config.`,
+        `Bearer auth requires a token. ${envVar ? `Set the ${envVar} environment variable or add auth.token to your monitor's scope config.` : "Add auth.token or auth.token-env to your monitor's scope config."}`,
       );
     }
     return { Authorization: `Bearer ${token}` };
@@ -152,6 +152,7 @@ const scopeSchema: JsonSchema = {
 
 const source: ObservationSource = {
   name: 'api-poll',
+  stateful: true,
   scopeSchema,
 
   async observe(config: Record<string, unknown>): Promise<Observation[]> {

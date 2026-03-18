@@ -151,9 +151,13 @@ temp/
 
 # Claude
 .claude/*.local.*
+.claude/monitors/
 
 # Scratch
 scratch
+
+# DX evaluation artifacts
+friction-log.md
 
 # Worktrees
 .worktrees

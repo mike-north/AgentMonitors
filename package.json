@@ -38,5 +38,13 @@
       "esbuild",
       "nx"
     ]
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mike-north/AgentMonitors.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mike-north/AgentMonitors/issues"
+  },
+  "homepage": "https://github.com/mike-north/AgentMonitors#readme"
 }

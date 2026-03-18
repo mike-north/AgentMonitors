@@ -12,6 +12,6 @@ export default defineConfig({
   banner: {
     js: '#!/usr/bin/env node',
   },
-  noExternal: [/(.*)/],
-  external: ['better-sqlite3'],
+  noExternal: [/^(?!better-sqlite3|bindings|file-uri-to-path)/],
+  external: ['better-sqlite3', 'bindings', 'file-uri-to-path'],
 });
