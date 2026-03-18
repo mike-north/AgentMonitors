@@ -78,13 +78,35 @@ Polls an HTTP endpoint and detects response changes.
 ```yaml
 scope:
   url: 'https://api.example.com/status'
-  method: GET # optional, defaults to GET
+  method: GET # optional, defaults to GET (also supports POST)
   auth: # optional
     type: bearer
     token-env: API_TOKEN # reads from environment variable
+    # OR use basic auth:
+    # type: basic
+    # username: myuser
+    # password: mypassword
   headers: # optional
     Accept: application/json
+  interval: '5m' # optional, polling interval (e.g., 5m, 30s, 1h)
+  change-detection: # optional
+    strategy: text-diff # text-diff (default) | json-diff | status-code
 ```
+
+#### Change detection strategies
+
+| Strategy      | Behavior                                                                 |
+| ------------- | ------------------------------------------------------------------------ |
+| `text-diff`   | Compares raw response body text (default)                                |
+| `json-diff`   | Parses JSON and compares semantically (ignores key order and whitespace) |
+| `status-code` | Only detects changes in HTTP status code                                 |
+
+#### Authentication
+
+Two auth types are supported:
+
+- **Bearer token**: Set `type: bearer` with either `token` (inline) or `token-env` (environment variable name)
+- **Basic auth**: Set `type: basic` with `username` and `password` fields
 
 ### schedule
 

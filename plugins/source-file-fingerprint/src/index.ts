@@ -55,6 +55,7 @@ const fingerprints = new Map<string, string>();
 
 const source: ObservationSource = {
   name: 'file-fingerprint',
+  stateful: true,
   scopeSchema,
 
   async observe(config: Record<string, unknown>): Promise<Observation[]> {

@@ -1,4 +1,4 @@
-import { Command } from 'commander';
+import { Command, Option } from 'commander';
 import { SourceRegistry } from '@agentmonitors/core';
 import { registerCoreSources } from '../sources.js';
 
@@ -9,11 +9,34 @@ export const sourceCommand = new Command('source').description(
 sourceCommand
   .command('list')
   .description('List installed observation sources')
-  .action(() => {
+  .addOption(
+    new Option('--format <format>', 'Output format')
+      .choices(['text', 'json'])
+      .default('text'),
+  )
+  .action((options: { format: string }) => {
     const registry = new SourceRegistry();
     registerCoreSources(registry);
 
     const sources = registry.list();
+
+    if (options.format === 'json') {
+      const output = sources.map((source) => {
+        const requiredFields =
+          (source.scopeSchema['required'] as string[] | undefined) ?? [];
+        const properties =
+          (source.scopeSchema['properties'] as
+            | Record<string, unknown>
+            | undefined) ?? {};
+        return {
+          name: source.name,
+          scopeFields: Object.keys(properties),
+          required: requiredFields,
+        };
+      });
+      console.log(JSON.stringify(output, null, 2));
+      return;
+    }
 
     if (sources.length === 0) {
       console.log('No sources installed.');

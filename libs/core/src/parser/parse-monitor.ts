@@ -1,4 +1,5 @@
 import matter from 'gray-matter';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { monitorFrontmatterSchema } from '../schema/monitor-schema.js';
 import type { MonitorDefinition } from '../schema/types.js';
@@ -49,4 +50,19 @@ export function parseMonitor(content: string, filePath: string): ParseOutcome {
       filePath,
     },
   };
+}
+
+/**
+ * Parse a MONITOR.md file from its path on disk.
+ *
+ * @param filePath - Absolute path to the MONITOR.md file
+ */
+export function parseMonitorFile(filePath: string): ParseOutcome {
+  try {
+    const content = readFileSync(filePath, 'utf-8');
+    return parseMonitor(content, filePath);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, filePath, error: `Failed to read file: ${message}` };
+  }
 }
