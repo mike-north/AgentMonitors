@@ -1,6 +1,7 @@
 import type {
   JsonSchema,
-  Observation,
+  ObservationContext,
+  ObservationResult,
   ObservationSource,
 } from '@agentmonitors/core';
 
@@ -67,14 +68,6 @@ function resolveAuth(auth: AuthConfig | undefined): Record<string, string> {
 interface CachedResponse {
   body: string;
   status: number;
-}
-
-/** Track previous responses keyed by full config identity. */
-const previousResponses = new Map<string, CachedResponse>();
-
-/** Derive a stable cache key from the full scope config. */
-function cacheKey(config: Record<string, unknown>): string {
-  return JSON.stringify(config);
 }
 
 /** Recursively sort object keys for order-insensitive JSON comparison. */
@@ -155,7 +148,10 @@ const source: ObservationSource = {
   stateful: true,
   scopeSchema,
 
-  async observe(config: Record<string, unknown>): Promise<Observation[]> {
+  async observe(
+    config: Record<string, unknown>,
+    context: ObservationContext = { now: new Date() },
+  ): Promise<ObservationResult> {
     const { url, auth, headers, method, changeDetection } =
       parseScopeConfig(config);
     const authHeaders = resolveAuth(auth);
@@ -166,27 +162,45 @@ const source: ObservationSource = {
     });
 
     const body = await response.text();
-    const key = cacheKey(config);
     const curr: CachedResponse = { body, status: response.status };
-    const prev = previousResponses.get(key);
+    const prev =
+      context.previousState &&
+      typeof context.previousState === 'object' &&
+      !Array.isArray(context.previousState)
+        ? (context.previousState as CachedResponse)
+        : undefined;
 
     if (prev !== undefined && hasChanged(changeDetection, prev, curr)) {
-      previousResponses.set(key, curr);
-      return [
-        {
-          title: `API response changed: ${url}`,
-          snapshot: {
-            url,
-            status: response.status,
-            bodyLength: body.length,
-            strategy: changeDetection,
+      return {
+        observations: [
+          {
+            title: `API response changed: ${url}`,
+            summary: `API response changed: ${url}`,
+            payload: {
+              url,
+              status: response.status,
+              strategy: changeDetection,
+              body,
+            },
+            snapshotText: body,
+            objectKey: url,
+            queryScope: { url },
+            snapshot: {
+              url,
+              status: response.status,
+              bodyLength: body.length,
+              strategy: changeDetection,
+            },
           },
-        },
-      ];
+        ],
+        nextState: curr,
+      };
     }
 
-    previousResponses.set(key, curr);
-    return [];
+    return {
+      observations: [],
+      nextState: curr,
+    };
   },
 };
 

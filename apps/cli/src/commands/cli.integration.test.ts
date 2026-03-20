@@ -5,9 +5,16 @@
  * stdout, stderr, and exit codes.
  */
 import { execFileSync, type ExecFileSyncOptions } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 
 const CLI_PATH = path.resolve(__dirname, '../../dist/index.cjs');
@@ -16,6 +23,11 @@ interface RunResult {
   stdout: string;
   stderr: string;
   exitCode: number;
+}
+
+interface DaemonHandle {
+  stop: () => void;
+  waitForExit: () => Promise<void>;
 }
 
 function run(args: string[], cwd?: string): RunResult {
@@ -35,6 +47,101 @@ function run(args: string[], cwd?: string): RunResult {
       exitCode: e.status ?? 1,
     };
   }
+}
+
+function runWithEnv(
+  args: string[],
+  env: Record<string, string>,
+  cwd?: string,
+): RunResult {
+  const opts: ExecFileSyncOptions = {
+    encoding: 'utf-8',
+    env: { ...process.env, ...env },
+    cwd,
+  };
+  try {
+    const stdout = execFileSync('node', [CLI_PATH, ...args], opts) as string;
+    return { stdout, stderr: '', exitCode: 0 };
+  } catch (err) {
+    const e = err as { stdout: string; stderr: string; status: number };
+    return {
+      stdout: (e.stdout ?? '') as string,
+      stderr: (e.stderr ?? '') as string,
+      exitCode: e.status ?? 1,
+    };
+  }
+}
+
+async function startDaemon(
+  monitorsDir: string,
+  workspace: string,
+  env: Record<string, string>,
+  socketPath: string,
+): Promise<DaemonHandle> {
+  const child = spawn(
+    'node',
+    [
+      CLI_PATH,
+      'daemon',
+      'run',
+      monitorsDir,
+      '--workspace',
+      workspace,
+      '--poll-ms',
+      '200',
+      '--socket',
+      socketPath,
+    ],
+    {
+      cwd: workspace,
+      env: { ...process.env, ...env },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
+  );
+
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf-8');
+  child.stderr.setEncoding('utf-8');
+  child.stdout.on('data', (chunk) => {
+    stdout += chunk;
+  });
+  child.stderr.on('data', (chunk) => {
+    stderr += chunk;
+  });
+
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    if (
+      existsSync(socketPath) &&
+      stdout.includes('AgentMon daemon listening')
+    ) {
+      return {
+        stop: () => {
+          child.kill('SIGTERM');
+        },
+        waitForExit: () =>
+          new Promise<void>((resolve) => {
+            if (child.exitCode !== null) {
+              resolve();
+              return;
+            }
+            child.once('exit', () => resolve());
+          }),
+      };
+    }
+    if (child.exitCode !== null) {
+      throw new Error(
+        `Daemon exited early with code ${child.exitCode}.\nSTDOUT:\n${stdout}\nSTDERR:\n${stderr}`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+
+  child.kill('SIGTERM');
+  throw new Error(
+    `Timed out waiting for daemon startup.\nSTDOUT:\n${stdout}\nSTDERR:\n${stderr}`,
+  );
 }
 
 let tempDir: string;
@@ -197,6 +304,291 @@ describe('source list', () => {
     expect(names).toContain('api-poll');
     expect(names).toContain('schedule');
   });
+});
+
+describe('runtime flow', () => {
+  it('opens a session, detects file changes through the daemon, claims a hook delivery, and acknowledges events', async () => {
+    const dir = path.join(tempDir, 'runtime-flow');
+    const monitorsDir = path.join(dir, '.claude', 'monitors', 'watch-files');
+    mkdirSync(monitorsDir, { recursive: true });
+    const watchedFile = path.join(dir, 'watched.txt');
+    writeFileSync(watchedFile, 'hello', 'utf-8');
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      `---
+name: Watch files
+source: file-fingerprint
+urgency: normal
+event-kind: mutation
+scope:
+  globs:
+    - watched.txt
+  cwd: ${JSON.stringify(dir)}
+  interval: '1s'
+---
+When files change, review them.
+`,
+      'utf-8',
+    );
+
+    const dbPath = path.join(dir, 'agentmon.db');
+    const socketPath = path.join(
+      '/tmp',
+      `agentmon-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const env = {
+      AGENTMONITORS_DB: dbPath,
+      AGENTMONITORS_SOCKET: socketPath,
+    };
+    const daemon = await startDaemon(
+      path.join(dir, '.claude', 'monitors'),
+      dir,
+      env,
+      socketPath,
+    );
+
+    try {
+      const sessionOpen = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          'claude-runtime-flow',
+          '--workspace',
+          dir,
+          '--format',
+          'json',
+        ],
+        env,
+        dir,
+      );
+      expect(sessionOpen.exitCode).toBe(0);
+      const session = JSON.parse(sessionOpen.stdout) as { id: string };
+
+      const status = runWithEnv(
+        ['daemon', 'status', '--format', 'json'],
+        env,
+        dir,
+      );
+      expect(status.exitCode).toBe(0);
+      expect(JSON.parse(status.stdout).running).toBe(true);
+
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1100);
+      writeFileSync(watchedFile, 'hello world', 'utf-8');
+
+      const unread = () =>
+        runWithEnv(
+          [
+            'events',
+            'list',
+            '--session',
+            session.id,
+            '--unread',
+            '--format',
+            'json',
+          ],
+          env,
+          dir,
+        );
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        const result = unread();
+        if (result.exitCode === 0 && JSON.parse(result.stdout).length === 1) {
+          break;
+        }
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+      }
+      expect(unread().exitCode).toBe(0);
+      const unreadEvents = JSON.parse(unread().stdout) as { id: string }[];
+      expect(unreadEvents).toHaveLength(1);
+
+      const claim = runWithEnv(
+        [
+          'hook',
+          'claim',
+          '--session',
+          session.id,
+          '--lifecycle',
+          'turn-interruptible',
+          '--format',
+          'json',
+        ],
+        env,
+        dir,
+      );
+      expect(claim.exitCode).toBe(0);
+      const claimPayload = JSON.parse(claim.stdout) as {
+        urgency: string;
+        mode: string;
+      };
+      expect(claimPayload.mode).toBe('delivery');
+      expect(claimPayload.urgency).toBe('normal');
+
+      const ack = runWithEnv(
+        ['events', 'ack', '--session', session.id],
+        env,
+        dir,
+      );
+      expect(ack.exitCode).toBe(0);
+
+      const unreadAfterAck = runWithEnv(
+        [
+          'events',
+          'list',
+          '--session',
+          session.id,
+          '--unread',
+          '--format',
+          'json',
+        ],
+        env,
+        dir,
+      );
+      expect(unreadAfterAck.exitCode).toBe(0);
+      expect(JSON.parse(unreadAfterAck.stdout)).toHaveLength(0);
+
+      const stop = runWithEnv(['daemon', 'stop'], env, dir);
+      expect(stop.exitCode).toBe(0);
+      await daemon.waitForExit();
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+    }
+  }, 15_000);
+
+  it('projects events only to the lead session when a subagent session exists', async () => {
+    const dir = path.join(tempDir, 'lead-only-projection');
+    const monitorsDir = path.join(dir, '.claude', 'monitors', 'watch-files');
+    mkdirSync(monitorsDir, { recursive: true });
+    const watchedFile = path.join(dir, 'watched.txt');
+    writeFileSync(watchedFile, 'hello', 'utf-8');
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      `---
+name: Watch files
+source: file-fingerprint
+urgency: normal
+event-kind: mutation
+scope:
+  globs:
+    - watched.txt
+  cwd: ${JSON.stringify(dir)}
+  interval: '1s'
+---
+When files change, review them.
+`,
+      'utf-8',
+    );
+
+    const dbPath = path.join(dir, 'agentmon.db');
+    const socketPath = path.join(
+      '/tmp',
+      `agentmon-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const env = {
+      AGENTMONITORS_DB: dbPath,
+      AGENTMONITORS_SOCKET: socketPath,
+    };
+    const daemon = await startDaemon(
+      path.join(dir, '.claude', 'monitors'),
+      dir,
+      env,
+      socketPath,
+    );
+
+    try {
+      const leadSession = JSON.parse(
+        runWithEnv(
+          [
+            'session',
+            'open',
+            '--host-session-id',
+            'claude-lead',
+            '--workspace',
+            dir,
+            '--format',
+            'json',
+          ],
+          env,
+          dir,
+        ).stdout,
+      ) as { id: string };
+      const subagentSession = JSON.parse(
+        runWithEnv(
+          [
+            'session',
+            'open',
+            '--host-session-id',
+            'claude-subagent',
+            '--workspace',
+            dir,
+            '--role',
+            'subagent',
+            '--format',
+            'json',
+          ],
+          env,
+          dir,
+        ).stdout,
+      ) as { id: string };
+
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1100);
+      writeFileSync(watchedFile, 'hello lead session', 'utf-8');
+
+      const leadUnread = () =>
+        runWithEnv(
+          [
+            'events',
+            'list',
+            '--session',
+            leadSession.id,
+            '--unread',
+            '--format',
+            'json',
+          ],
+          env,
+          dir,
+        );
+      await (async () => {
+        const deadline = Date.now() + 10_000;
+        while (Date.now() < deadline) {
+          const result = leadUnread();
+          if (result.exitCode === 0 && JSON.parse(result.stdout).length === 1) {
+            return;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        throw new Error(
+          'Timed out waiting for the lead session to receive an unread event.',
+        );
+      })();
+
+      expect(JSON.parse(leadUnread().stdout)).toHaveLength(1);
+
+      const subagentUnread = runWithEnv(
+        [
+          'events',
+          'list',
+          '--session',
+          subagentSession.id,
+          '--unread',
+          '--format',
+          'json',
+        ],
+        env,
+        dir,
+      );
+      expect(subagentUnread.exitCode).toBe(0);
+      expect(JSON.parse(subagentUnread.stdout)).toHaveLength(0);
+
+      const stop = runWithEnv(['daemon', 'stop'], env, dir);
+      expect(stop.exitCode).toBe(0);
+      await daemon.waitForExit();
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+    }
+  }, 15_000);
 });
 
 describe('monitor test', () => {

@@ -18,7 +18,7 @@ sourceCommand
     const registry = new SourceRegistry();
     registerCoreSources(registry);
 
-    const sources = registry.list();
+    const sources: ReturnType<SourceRegistry['list']> = registry.list();
 
     if (options.format === 'json') {
       const output = sources.map((source) => {

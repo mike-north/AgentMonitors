@@ -20,10 +20,12 @@
     "@agentmonitors/source-api-poll": "workspace:*",
     "@agentmonitors/source-schedule": "workspace:*",
     "better-sqlite3": "^11.9.1",
-    "commander": "^14.0.3"
+    "commander": "^14.0.3",
+    "zod": "^3.25.76"
   },
   "license": "UNLICENSED",
   "devDependencies": {
-    "@types/node": "^22.15.0"
+    "@types/node": "^22.15.0",
+    "pkg-up": "^5.0.0"
   }
 }

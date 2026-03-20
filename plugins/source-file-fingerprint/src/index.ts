@@ -4,6 +4,8 @@ import { globSync } from 'glob';
 import type {
   JsonSchema,
   Observation,
+  ObservationContext,
+  ObservationResult,
   ObservationSource,
 } from '@agentmonitors/core';
 
@@ -29,11 +31,6 @@ async function hashFile(filePath: string): Promise<string> {
   return createHash('sha256').update(content).digest('hex');
 }
 
-/** Derive a stable cache namespace from the full scope config. */
-function configNamespace(config: Record<string, unknown>): string {
-  return JSON.stringify(config);
-}
-
 const scopeSchema: JsonSchema = {
   type: 'object',
   properties: {
@@ -50,18 +47,43 @@ const scopeSchema: JsonSchema = {
   required: ['globs'],
 };
 
-/** Track previous fingerprints keyed by config namespace + file path. */
-const fingerprints = new Map<string, string>();
+interface FingerprintState {
+  fingerprints: Record<string, string>;
+}
+
+function isUnknownRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isFingerprintState(value: unknown): value is FingerprintState {
+  if (!isUnknownRecord(value)) {
+    return false;
+  }
+
+  const fingerprints = value['fingerprints'];
+  return isUnknownRecord(fingerprints);
+}
+
+function parsePreviousState(previousState: unknown): FingerprintState {
+  if (isFingerprintState(previousState)) {
+    return previousState;
+  }
+  return { fingerprints: {} };
+}
 
 const source: ObservationSource = {
   name: 'file-fingerprint',
   stateful: true,
   scopeSchema,
 
-  async observe(config: Record<string, unknown>): Promise<Observation[]> {
+  async observe(
+    config: Record<string, unknown>,
+    context: ObservationContext = { now: new Date() },
+  ): Promise<ObservationResult> {
     const { globs, cwd } = parseScopeConfig(config);
-    const namespace = configNamespace(config);
+    const previous = parsePreviousState(context.previousState);
     const observations: Observation[] = [];
+    const nextFingerprints: Record<string, string> = {};
 
     for (const pattern of globs) {
       const files = globSync(pattern, {
@@ -71,25 +93,35 @@ const source: ObservationSource = {
 
       for (const filePath of files) {
         const hash = await hashFile(filePath);
-        const key = `${namespace}\0${filePath}`;
-        const previousHash = fingerprints.get(key);
+        const previousHash = previous.fingerprints[filePath];
+        nextFingerprints[filePath] = hash;
 
         if (previousHash !== undefined && previousHash !== hash) {
-          observations.push({
+          const content = await readFile(filePath);
+          const observation: Observation = {
             title: `File changed: ${filePath}`,
+            summary: `File changed: ${filePath}`,
+            payload: { filePath, previousHash, currentHash: hash },
+            objectKey: filePath,
+            queryScope: { filePath },
             snapshot: {
               filePath,
               previousHash,
               currentHash: hash,
             },
-          });
+          };
+          if (!content.includes(0)) {
+            observation.snapshotText = content.toString('utf-8');
+          }
+          observations.push(observation);
         }
-
-        fingerprints.set(key, hash);
       }
     }
 
-    return observations;
+    return {
+      observations,
+      nextState: { fingerprints: nextFingerprints },
+    };
   },
 };
 

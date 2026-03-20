@@ -25,6 +25,7 @@ export type { ScanResult } from './parser/scan-monitors.js';
 // Inbox
 export { createDb } from './inbox/db.js';
 export type { InboxDb } from './inbox/db.js';
+export * as schema from './inbox/schema.js';
 export { InboxService } from './inbox/inbox-service.js';
 export type {
   InboxItem,
@@ -39,6 +40,8 @@ export { generateMonitorSchema } from './observation/schema-generator.js';
 export type {
   JsonSchema,
   Observation,
+  ObservationContext,
+  ObservationResult,
   ObservationSource,
 } from './observation/types.js';
 
@@ -59,3 +62,35 @@ export {
   createBridgeCallback,
 } from './hook-bridge/bridge.js';
 export type { HookState, UrgentItem } from './hook-bridge/types.js';
+
+// Runtime
+export { AgentMonitorRuntime } from './runtime/service.js';
+export { RuntimeStore } from './runtime/store.js';
+export { buildTextDiff, fingerprintText } from './runtime/diff.js';
+export type {
+  AgentLifecycleEvent,
+  AgentSessionRole,
+  AgentSessionStatus,
+  AgentSessionRecord,
+  DeliveryClaim,
+  DeliveryEventSummary,
+  DeliveryLifecycle,
+  DeliveryMode,
+  EventQuery,
+  MonitorEventRecord,
+  MonitorRuntimeState,
+  NotifyRuntimeState,
+  OpenSessionInput,
+  PendingDebounceState,
+  RuntimeStatus,
+  RuntimeTickResult,
+  SessionEventFilter,
+  SessionUnreadCounts,
+  SessionHookState,
+  StoredObservationEnvelope,
+  UrgencyCounts,
+} from './runtime/types.js';
+
+// Adapters
+export { claudeCodeAdapter } from './adapter/claude.js';
+export type { AgentRuntimeAdapter } from './adapter/types.js';

@@ -12,7 +12,7 @@ const STATES = [
   'failed',
   'archived',
 ];
-const URGENCIES = ['high', 'normal'];
+const URGENCIES = ['low', 'normal', 'high'];
 const EVENT_KINDS = ['mutation', 'notification', 'alert'];
 
 export const inboxCommand = new Command('inbox').description(
@@ -59,7 +59,7 @@ inboxCommand
         filter.state = options.state as InboxItemState;
       }
       if (options.urgency) {
-        filter.urgency = options.urgency as 'high' | 'normal';
+        filter.urgency = options.urgency as 'low' | 'normal' | 'high';
       }
       if (options.eventKind) {
         filter.eventKind = options.eventKind as

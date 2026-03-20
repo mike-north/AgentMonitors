@@ -33,7 +33,7 @@ export const monitorFrontmatterSchema = z.object({
     .string()
     .min(1)
     .regex(/^[a-z][a-z0-9-]*$/, 'Source must be kebab-case'),
-  urgency: z.enum(['high', 'normal']),
+  urgency: z.enum(['low', 'normal', 'high']),
   'event-kind': z.enum(['mutation', 'notification', 'alert']),
   scope: z.record(z.string(), z.unknown()),
   notify: notifySchema.optional(),

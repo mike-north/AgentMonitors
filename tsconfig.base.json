@@ -9,6 +9,19 @@
     "verbatimModuleSyntax": true,
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
+    "baseUrl": ".",
+    "paths": {
+      "@agentmonitors/core": ["libs/core/dist/rollup.d.ts"],
+      "@agentmonitors/source-file-fingerprint": [
+        "plugins/source-file-fingerprint/dist/rollup.d.ts"
+      ],
+      "@agentmonitors/source-api-poll": [
+        "plugins/source-api-poll/dist/rollup.d.ts"
+      ],
+      "@agentmonitors/source-schedule": [
+        "plugins/source-schedule/dist/rollup.d.ts"
+      ]
+    },
     "target": "ES2022",
     "lib": ["ES2022"],
     "declaration": true,

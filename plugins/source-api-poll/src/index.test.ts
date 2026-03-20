@@ -22,10 +22,14 @@ describe('source-api-poll', () => {
   });
 
   it('returns no observations on first poll (baseline)', async () => {
-    const result = await source.observe({
-      url: 'https://api.example.com/data',
-    });
-    expect(result).toHaveLength(0);
+    const result = await source.observe(
+      {
+        url: 'https://api.example.com/data',
+      },
+      { now: new Date() },
+    );
+    expect(result.observations).toHaveLength(0);
+    expect(result.nextState).toBeDefined();
   });
 
   it('detects response changes on subsequent polls (text-diff)', async () => {
@@ -38,28 +42,36 @@ describe('source-api-poll', () => {
     });
 
     const url = 'https://api.example.com/text-diff-test';
-    await source.observe({ url });
+    const baseline = await source.observe({ url }, { now: new Date() });
 
     mockFetch.mockResolvedValueOnce({
       text: () => Promise.resolve('response-v2'),
       status: 200,
     });
 
-    const result = await source.observe({ url });
-    expect(result).toHaveLength(1);
-    expect(result[0]?.title).toContain(url);
+    const result = await source.observe(
+      { url },
+      { previousState: baseline.nextState, now: new Date() },
+    );
+    expect(result.observations).toHaveLength(1);
+    expect(result.observations[0]?.title).toContain(url);
   });
 
   it('returns no observations when response is unchanged', async () => {
     const url = 'https://api.example.com/stable-test';
 
-    await source.observe({ url });
-    const result = await source.observe({ url });
-    expect(result).toHaveLength(0);
+    const baseline = await source.observe({ url }, { now: new Date() });
+    const result = await source.observe(
+      { url },
+      { previousState: baseline.nextState, now: new Date() },
+    );
+    expect(result.observations).toHaveLength(0);
   });
 
   it('throws on missing url', async () => {
-    await expect(source.observe({})).rejects.toThrow('url');
+    await expect(source.observe({}, { now: new Date() })).rejects.toThrow(
+      'url',
+    );
   });
 
   describe('change-detection strategies', () => {
@@ -76,23 +88,29 @@ describe('source-api-poll', () => {
         text: () => Promise.resolve('body-v1'),
         status: 200,
       });
-      await source.observe(config);
+      const baseline = await source.observe(config, { now: new Date() });
 
       // Same status, different body — should NOT fire
       mockFetch.mockResolvedValueOnce({
         text: () => Promise.resolve('body-v2'),
         status: 200,
       });
-      const noChange = await source.observe(config);
-      expect(noChange).toHaveLength(0);
+      const noChange = await source.observe(config, {
+        previousState: baseline.nextState,
+        now: new Date(),
+      });
+      expect(noChange.observations).toHaveLength(0);
 
       // Different status — should fire
       mockFetch.mockResolvedValueOnce({
         text: () => Promise.resolve('body-v2'),
         status: 500,
       });
-      const changed = await source.observe(config);
-      expect(changed).toHaveLength(1);
+      const changed = await source.observe(config, {
+        previousState: noChange.nextState,
+        now: new Date(),
+      });
+      expect(changed.observations).toHaveLength(1);
     });
 
     it('json-diff: ignores whitespace differences in JSON', async () => {
@@ -108,23 +126,29 @@ describe('source-api-poll', () => {
         text: () => Promise.resolve('{"a": 1,  "b": 2}'),
         status: 200,
       });
-      await source.observe(config);
+      const baseline = await source.observe(config, { now: new Date() });
 
       // Same JSON with different whitespace — should NOT fire
       mockFetch.mockResolvedValueOnce({
         text: () => Promise.resolve('{"a":1,"b":2}'),
         status: 200,
       });
-      const noChange = await source.observe(config);
-      expect(noChange).toHaveLength(0);
+      const noChange = await source.observe(config, {
+        previousState: baseline.nextState,
+        now: new Date(),
+      });
+      expect(noChange.observations).toHaveLength(0);
 
       // Different JSON value — should fire
       mockFetch.mockResolvedValueOnce({
         text: () => Promise.resolve('{"a":1,"b":3}'),
         status: 200,
       });
-      const changed = await source.observe(config);
-      expect(changed).toHaveLength(1);
+      const changed = await source.observe(config, {
+        previousState: noChange.nextState,
+        now: new Date(),
+      });
+      expect(changed.observations).toHaveLength(1);
     });
   });
 
@@ -142,7 +166,7 @@ describe('source-api-poll', () => {
         text: () => Promise.resolve('response-for-key-1'),
         status: 200,
       });
-      await source.observe(config1);
+      await source.observe(config1, { now: new Date() });
 
       // First poll for config2 should be baseline (no observation), not
       // inherit config1's cached response
@@ -150,8 +174,8 @@ describe('source-api-poll', () => {
         text: () => Promise.resolve('response-for-key-2'),
         status: 200,
       });
-      const result = await source.observe(config2);
-      expect(result).toHaveLength(0);
+      const result = await source.observe(config2, { now: new Date() });
+      expect(result.observations).toHaveLength(0);
     });
   });
 });

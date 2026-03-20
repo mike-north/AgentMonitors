@@ -29,8 +29,12 @@ describe('source-file-fingerprint', () => {
     const dir = makeTempDir();
     writeFileSync(path.join(dir, 'a.txt'), 'hello');
 
-    const result = await source.observe({ globs: ['*.txt'], cwd: dir });
-    expect(result).toHaveLength(0);
+    const result = await source.observe(
+      { globs: ['*.txt'], cwd: dir },
+      { now: new Date() },
+    );
+    expect(result.observations).toHaveLength(0);
+    expect(result.nextState).toBeDefined();
   });
 
   it('detects file changes on subsequent runs', async () => {
@@ -38,14 +42,20 @@ describe('source-file-fingerprint', () => {
     const filePath = path.join(dir, 'a.txt');
     writeFileSync(filePath, 'hello');
 
-    await source.observe({ globs: ['*.txt'], cwd: dir });
+    const baseline = await source.observe(
+      { globs: ['*.txt'], cwd: dir },
+      { now: new Date() },
+    );
 
     writeFileSync(filePath, 'world');
-    const result = await source.observe({ globs: ['*.txt'], cwd: dir });
+    const result = await source.observe(
+      { globs: ['*.txt'], cwd: dir },
+      { previousState: baseline.nextState, now: new Date() },
+    );
 
-    expect(result).toHaveLength(1);
-    expect(result[0]?.title).toContain('a.txt');
-    const snap = result[0]?.snapshot as {
+    expect(result.observations).toHaveLength(1);
+    expect(result.observations[0]?.title).toContain('a.txt');
+    const snap = result.observations[0]?.snapshot as {
       previousHash: string;
       currentHash: string;
     };
@@ -56,14 +66,22 @@ describe('source-file-fingerprint', () => {
     const dir = makeTempDir();
     writeFileSync(path.join(dir, 'stable.txt'), 'same content');
 
-    await source.observe({ globs: ['*.txt'], cwd: dir });
-    const result = await source.observe({ globs: ['*.txt'], cwd: dir });
+    const baseline = await source.observe(
+      { globs: ['*.txt'], cwd: dir },
+      { now: new Date() },
+    );
+    const result = await source.observe(
+      { globs: ['*.txt'], cwd: dir },
+      { previousState: baseline.nextState, now: new Date() },
+    );
 
-    expect(result).toHaveLength(0);
+    expect(result.observations).toHaveLength(0);
   });
 
   it('throws on missing globs config', async () => {
-    await expect(source.observe({})).rejects.toThrow('globs');
+    await expect(source.observe({}, { now: new Date() })).rejects.toThrow(
+      'globs',
+    );
   });
 
   describe('cache isolation', () => {
@@ -76,19 +94,22 @@ describe('source-file-fingerprint', () => {
       const config2 = { globs: ['shared.*'], cwd: dir };
 
       // Baseline for config1
-      await source.observe(config1);
+      const baseline1 = await source.observe(config1, { now: new Date() });
 
       // Modify the file
       writeFileSync(filePath, 'modified');
 
       // Config2's first poll should be baseline (no observation), not
       // inherit config1's fingerprint and falsely report a change
-      const result = await source.observe(config2);
-      expect(result).toHaveLength(0);
+      const result = await source.observe(config2, { now: new Date() });
+      expect(result.observations).toHaveLength(0);
 
       // Config1 should detect the change since it has a previous baseline
-      const result1 = await source.observe(config1);
-      expect(result1).toHaveLength(1);
+      const result1 = await source.observe(config1, {
+        previousState: baseline1.nextState,
+        now: new Date(),
+      });
+      expect(result1.observations).toHaveLength(1);
     });
   });
 });
