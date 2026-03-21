@@ -1,9 +1,19 @@
 import { and, desc, eq, gte, inArray, lte, sql } from 'drizzle-orm';
+import type { Database as BetterSQLiteClient } from 'better-sqlite3';
+import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import { ulid } from 'ulid';
 import type { InboxDb } from './db.js';
 import { inboxItems } from './schema.js';
 import type { InboxItemState } from './schema.js';
 import type { EnqueuePayload, InboxFilter, InboxItem } from './types.js';
+
+type InternalInboxDb = BetterSQLite3Database<typeof import('./schema.js')> & {
+  $client: BetterSQLiteClient;
+};
+
+function asInternalDb(db: InboxDb): InternalInboxDb {
+  return db as unknown as InternalInboxDb;
+}
 
 function rowToItem(row: typeof inboxItems.$inferSelect): InboxItem {
   return {
@@ -72,9 +82,9 @@ export class InboxService {
   enqueue(payload: EnqueuePayload): string {
     const now = new Date();
     const id = ulid();
+    const db = asInternalDb(this.db);
 
-    this.db
-      .insert(inboxItems)
+    db.insert(inboxItems)
       .values({
         id,
         monitorId: payload.monitorId,
@@ -98,7 +108,7 @@ export class InboxService {
   ack(id: string): void {
     this.requireTransition(id, 'acked');
     const now = new Date();
-    this.db
+    asInternalDb(this.db)
       .update(inboxItems)
       .set({ state: 'acked', ackedAt: now, updatedAt: now })
       .where(eq(inboxItems.id, id))
@@ -110,7 +120,7 @@ export class InboxService {
   start(id: string): void {
     this.requireTransition(id, 'in-progress');
     const now = new Date();
-    this.db
+    asInternalDb(this.db)
       .update(inboxItems)
       .set({ state: 'in-progress', updatedAt: now })
       .where(eq(inboxItems.id, id))
@@ -122,7 +132,7 @@ export class InboxService {
   complete(id: string): void {
     this.requireTransition(id, 'completed');
     const now = new Date();
-    this.db
+    asInternalDb(this.db)
       .update(inboxItems)
       .set({ state: 'completed', completedAt: now, updatedAt: now })
       .where(eq(inboxItems.id, id))
@@ -134,11 +144,11 @@ export class InboxService {
   fail(id: string, error?: string): void {
     const item = this.requireTransition(id, 'failed');
     const now = new Date();
+    const db = asInternalDb(this.db);
     if (error) {
       const existingBody = item.body;
       const separator = existingBody ? '\n\n---\n\n' : '';
-      this.db
-        .update(inboxItems)
+      db.update(inboxItems)
         .set({
           state: 'failed',
           body: `${existingBody}${separator}Error: ${error}`,
@@ -147,8 +157,7 @@ export class InboxService {
         .where(eq(inboxItems.id, id))
         .run();
     } else {
-      this.db
-        .update(inboxItems)
+      db.update(inboxItems)
         .set({ state: 'failed', updatedAt: now })
         .where(eq(inboxItems.id, id))
         .run();
@@ -160,7 +169,7 @@ export class InboxService {
   archive(id: string): void {
     this.requireTransition(id, 'archived');
     const now = new Date();
-    this.db
+    asInternalDb(this.db)
       .update(inboxItems)
       .set({ state: 'archived', updatedAt: now })
       .where(eq(inboxItems.id, id))
@@ -170,7 +179,7 @@ export class InboxService {
 
   /** Get a single item by ID, or null if not found. */
   getById(id: string): InboxItem | null {
-    const row = this.db
+    const row = asInternalDb(this.db)
       .select()
       .from(inboxItems)
       .where(eq(inboxItems.id, id))
@@ -182,7 +191,7 @@ export class InboxService {
   list(filter?: InboxFilter): InboxItem[] {
     const conditions = this.buildConditions(filter);
 
-    const rows = this.db
+    const rows = asInternalDb(this.db)
       .select()
       .from(inboxItems)
       .where(conditions.length > 0 ? and(...conditions) : undefined)

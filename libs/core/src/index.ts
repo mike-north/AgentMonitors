@@ -25,7 +25,6 @@ export type { ScanResult } from './parser/scan-monitors.js';
 // Inbox
 export { createDb } from './inbox/db.js';
 export type { InboxDb } from './inbox/db.js';
-export * as schema from './inbox/schema.js';
 export { InboxService } from './inbox/inbox-service.js';
 export type {
   InboxItem,

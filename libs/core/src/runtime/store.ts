@@ -1,4 +1,5 @@
 import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from 'drizzle-orm';
+import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import { ulid } from 'ulid';
 import type { InboxDb } from '../inbox/db.js';
 import {
@@ -17,6 +18,14 @@ import type {
   RuntimeStatus,
   SessionHookState,
 } from './types.js';
+
+type InternalInboxDb = BetterSQLite3Database<
+  typeof import('../inbox/schema.js')
+>;
+
+function asInternalDb(db: InboxDb): InternalInboxDb {
+  return db as unknown as InternalInboxDb;
+}
 
 function parseJson<T>(value: string, fallback: T): T {
   try {
@@ -91,7 +100,8 @@ export class RuntimeStore {
   constructor(private readonly db: InboxDb) {}
 
   openSession(input: OpenSessionInput): AgentSessionRecord {
-    const existing = this.db
+    const db = asInternalDb(this.db);
+    const existing = db
       .select()
       .from(agentSessions)
       .where(
@@ -104,8 +114,7 @@ export class RuntimeStore {
 
     const now = new Date();
     if (existing) {
-      this.db
-        .update(agentSessions)
+      db.update(agentSessions)
         .set({
           agentIdentity: input.agentIdentity,
           role: input.role ?? existing.role,
@@ -122,8 +131,7 @@ export class RuntimeStore {
     }
 
     const id = ulid();
-    this.db
-      .insert(agentSessions)
+    db.insert(agentSessions)
       .values({
         id,
         adapter: input.adapter,
@@ -144,7 +152,7 @@ export class RuntimeStore {
   }
 
   getSessionById(id: string): AgentSessionRecord {
-    const row = this.db
+    const row = asInternalDb(this.db)
       .select()
       .from(agentSessions)
       .where(eq(agentSessions.id, id))
@@ -156,7 +164,7 @@ export class RuntimeStore {
   }
 
   listSessions(): AgentSessionRecord[] {
-    return this.db
+    return asInternalDb(this.db)
       .select()
       .from(agentSessions)
       .orderBy(desc(agentSessions.updatedAt))
@@ -166,7 +174,7 @@ export class RuntimeStore {
 
   closeSession(sessionId: string): AgentSessionRecord {
     const now = new Date();
-    this.db
+    asInternalDb(this.db)
       .update(agentSessions)
       .set({
         status: 'dormant',
@@ -181,7 +189,7 @@ export class RuntimeStore {
 
   touchSession(sessionId: string): void {
     const now = new Date();
-    this.db
+    asInternalDb(this.db)
       .update(agentSessions)
       .set({ lastActiveAt: now, updatedAt: now })
       .where(eq(agentSessions.id, sessionId))
@@ -189,7 +197,7 @@ export class RuntimeStore {
   }
 
   getMonitorState(monitorId: string): MonitorRuntimeState {
-    const row = this.db
+    const row = asInternalDb(this.db)
       .select()
       .from(monitorState)
       .where(eq(monitorState.monitorId, monitorId))
@@ -217,7 +225,8 @@ export class RuntimeStore {
     },
   ): void {
     const now = new Date();
-    const existing = this.db
+    const db = asInternalDb(this.db);
+    const existing = db
       .select()
       .from(monitorState)
       .where(eq(monitorState.monitorId, monitorId))
@@ -232,8 +241,7 @@ export class RuntimeStore {
     };
 
     if (existing) {
-      this.db
-        .update(monitorState)
+      db.update(monitorState)
         .set({
           lastObservationAt: values.lastObservationAt,
           lastFingerprint: values.lastFingerprint,
@@ -246,13 +254,13 @@ export class RuntimeStore {
       return;
     }
 
-    this.db.insert(monitorState).values(values).run();
+    db.insert(monitorState).values(values).run();
   }
 
   insertEvent(input: Omit<MonitorEventRecord, 'id'>): MonitorEventRecord {
+    const db = asInternalDb(this.db);
     const id = ulid();
-    this.db
-      .insert(monitorEvents)
+    db.insert(monitorEvents)
       .values({
         id,
         workspacePath: input.workspacePath,
@@ -278,8 +286,7 @@ export class RuntimeStore {
     for (const session of this.sessionsForWorkspace(event.workspacePath).filter(
       (candidate) => candidate.role === 'lead',
     )) {
-      this.db
-        .insert(sessionEventState)
+      db.insert(sessionEventState)
         .values({
           id: ulid(),
           sessionId: session.id,
@@ -293,7 +300,7 @@ export class RuntimeStore {
   }
 
   getEventById(id: string): MonitorEventRecord {
-    const row = this.db
+    const row = asInternalDb(this.db)
       .select()
       .from(monitorEvents)
       .where(eq(monitorEvents.id, id))
@@ -317,7 +324,7 @@ export class RuntimeStore {
     if (query.since) conditions.push(gt(monitorEvents.createdAt, query.since));
 
     let rows = query.sessionId
-      ? this.db
+      ? asInternalDb(this.db)
           .select({
             event: monitorEvents,
             state: sessionEventState,
@@ -339,7 +346,7 @@ export class RuntimeStore {
           .orderBy(desc(monitorEvents.createdAt))
           .all()
           .map((row) => rowToEvent(row.event))
-      : this.db
+      : asInternalDb(this.db)
           .select()
           .from(monitorEvents)
           .where(conditions.length > 0 ? and(...conditions) : undefined)
@@ -372,7 +379,7 @@ export class RuntimeStore {
     eventId: string;
     content: string;
   }): void {
-    this.db
+    asInternalDb(this.db)
       .insert(monitorSnapshots)
       .values({
         id: ulid(),
@@ -391,7 +398,7 @@ export class RuntimeStore {
     objectKey: string,
     workspacePath?: string | null,
   ): { content: string } | null {
-    const row = this.db
+    const row = asInternalDb(this.db)
       .select()
       .from(monitorSnapshots)
       .where(
@@ -409,7 +416,7 @@ export class RuntimeStore {
   }
 
   sessionsForWorkspace(workspacePath?: string | null): AgentSessionRecord[] {
-    return this.db
+    return asInternalDb(this.db)
       .select()
       .from(agentSessions)
       .where(
@@ -431,7 +438,7 @@ export class RuntimeStore {
   ): MonitorEventRecord[] {
     const conditions = [eq(sessionEventState.sessionId, sessionId)];
     if (urgency) conditions.push(eq(monitorEvents.urgency, urgency));
-    const rows = this.db
+    const rows = asInternalDb(this.db)
       .select({
         event: monitorEvents,
         state: sessionEventState,
@@ -450,7 +457,7 @@ export class RuntimeStore {
   ): MonitorEventRecord[] {
     const conditions = [eq(sessionEventState.sessionId, sessionId)];
     if (urgency) conditions.push(eq(monitorEvents.urgency, urgency));
-    const rows = this.db
+    const rows = asInternalDb(this.db)
       .select({
         event: monitorEvents,
       })
@@ -471,7 +478,7 @@ export class RuntimeStore {
   acknowledgeEvents(sessionId: string, eventIds: string[]): void {
     if (eventIds.length === 0) return;
     const now = new Date();
-    this.db
+    asInternalDb(this.db)
       .update(sessionEventState)
       .set({ acknowledgedAt: now, updatedAt: now })
       .where(
@@ -486,7 +493,7 @@ export class RuntimeStore {
   markClaimed(sessionId: string, eventIds: string[], lifecycle: string): void {
     if (eventIds.length === 0) return;
     const now = new Date();
-    this.db
+    asInternalDb(this.db)
       .update(sessionEventState)
       .set({
         firstNotifiedAt: now,
@@ -505,7 +512,7 @@ export class RuntimeStore {
 
   updateSessionRecap(sessionId: string): void {
     const now = new Date();
-    this.db
+    asInternalDb(this.db)
       .update(agentSessions)
       .set({ lastRecapAt: now, lastActiveAt: now, updatedAt: now })
       .where(eq(agentSessions.id, sessionId))
@@ -545,7 +552,7 @@ export class RuntimeStore {
 
   status(): RuntimeStatus {
     const sessions = this.listSessions();
-    const counts = this.db
+    const counts = asInternalDb(this.db)
       .select({ count: sql<number>`count(*)` })
       .from(monitorEvents)
       .all();
