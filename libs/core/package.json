@@ -1,7 +1,7 @@
 {
   "name": "@agentmonitors/core",
   "description": "Core library for Agent Monitors — schema, parser, inbox, plugin interface, and notification engine",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publishConfig": {
     "registry": "https://npm.pkg.github.com"
   },
