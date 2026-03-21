@@ -1,6 +1,6 @@
 import { Command, Option } from 'commander';
-import { scanMonitors, SourceRegistry } from '@agentmonitors/core';
-import type { JsonSchema } from '@agentmonitors/core';
+import { scanMonitors, SourceRegistry } from '@mike-north/core';
+import type { JsonSchema } from '@mike-north/core';
 import { registerCoreSources } from '../sources.js';
 import { requireDirectory } from '../validation.js';
 

@@ -1,5 +1,5 @@
 {
-  "name": "@agentmonitors/cli",
+  "name": "@mike-north/cli",
   "description": "CLI for Agent Monitors — validate, scan, query, and manage observation inboxes",
   "version": "0.0.0",
   "private": true,
@@ -15,10 +15,10 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
-    "@agentmonitors/core": "workspace:*",
-    "@agentmonitors/source-api-poll": "workspace:*",
-    "@agentmonitors/source-file-fingerprint": "workspace:*",
-    "@agentmonitors/source-schedule": "workspace:*",
+    "@mike-north/core": "workspace:*",
+    "@mike-north/source-api-poll": "workspace:*",
+    "@mike-north/source-file-fingerprint": "workspace:*",
+    "@mike-north/source-schedule": "workspace:*",
     "better-sqlite3": "^11.9.1",
     "commander": "^14.0.3",
     "zod": "^3.25.76"

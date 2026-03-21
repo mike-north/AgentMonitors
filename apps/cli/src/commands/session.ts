@@ -1,5 +1,5 @@
 import { Command, Option } from 'commander';
-import { claudeCodeAdapter } from '@agentmonitors/core';
+import { claudeCodeAdapter } from '@mike-north/core';
 import { reportError } from '../output.js';
 import {
   closeSessionClient,

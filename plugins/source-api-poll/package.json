@@ -1,5 +1,5 @@
 {
-  "name": "@agentmonitors/source-api-poll",
+  "name": "@mike-north/source-api-poll",
   "description": "HTTP endpoint polling and change detection for Agent Monitors",
   "version": "0.0.2",
   "publishConfig": {
@@ -30,7 +30,7 @@
     "ci:api-report": "api-extractor run --verbose"
   },
   "dependencies": {
-    "@agentmonitors/core": "workspace:*"
+    "@mike-north/core": "workspace:*"
   },
   "license": "UNLICENSED",
   "devDependencies": {

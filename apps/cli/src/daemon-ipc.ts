@@ -9,7 +9,7 @@ import type {
   DeliveryLifecycle,
   EventKind,
   Urgency,
-} from '@agentmonitors/core';
+} from '@mike-north/core';
 import { z } from 'zod';
 import { resolveDbPath } from './db-path.js';
 

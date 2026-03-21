@@ -44,7 +44,7 @@ jobs:
           node-version: 24
           cache: pnpm
           registry-url: https://npm.pkg.github.com
-          scope: '@agentmonitors'
+          scope: '@mike-north'
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile

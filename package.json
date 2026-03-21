@@ -4,10 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "NX_TUI=false nx run-many --target=build --exclude=agentmonitors-workspace,@agentmonitors/website",
+    "build": "NX_TUI=false nx run-many --target=build --exclude=agentmonitors-workspace,@mike-north/website",
     "check": "pnpm check:packages && pnpm check:workspace",
     "check:changesets:no-major": "node scripts/check-no-major-changesets.mjs",
-    "check:packages": "NX_TUI=false nx run-many --target=check --exclude=agentmonitors-workspace,@agentmonitors/website",
+    "check:packages": "NX_TUI=false nx run-many --target=check --exclude=agentmonitors-workspace,@mike-north/website",
     "check:lint-ts": "eslint .",
     "check:format": "prettier --check .",
     "check:workspace": "pnpm check:lint-ts && pnpm check:format",
