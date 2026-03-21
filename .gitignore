@@ -155,11 +155,13 @@ temp/
 
 # Scratch
 scratch
+scratch/
 
 # DX evaluation artifacts
 friction-log.md
 
 # Worktrees
 .worktrees
+.worktrees/
 .Codex/
 .codex/
