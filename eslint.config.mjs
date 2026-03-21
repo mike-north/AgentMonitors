@@ -10,6 +10,8 @@ export default tseslint.config(
       '**/temp/**',
       '**/node_modules/**',
       '**/.next/**',
+      '.Codex/**',
+      '.codex/**',
       'apps/website/**',
       '**/*.config.ts',
       '**/*.config.mjs',
