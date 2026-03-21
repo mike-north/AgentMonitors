@@ -10,13 +10,13 @@ description: Set up your first Agent Monitor in minutes
 Install the Agent Monitors CLI globally:
 
 ```bash
-npm install -g @agentmonitors/cli
+npm install -g @mike-north/cli
 ```
 
 Or use it via npx:
 
 ```bash
-npx @agentmonitors/cli --help
+npx @mike-north/cli --help
 ```
 
 ## Your First Monitor

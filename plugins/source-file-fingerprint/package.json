@@ -1,5 +1,5 @@
 {
-  "name": "@agentmonitors/source-file-fingerprint",
+  "name": "@mike-north/source-file-fingerprint",
   "description": "File change detection via SHA-256 fingerprinting for Agent Monitors",
   "version": "0.0.2",
   "publishConfig": {
@@ -30,7 +30,7 @@
     "ci:api-report": "api-extractor run --verbose"
   },
   "dependencies": {
-    "@agentmonitors/core": "workspace:*",
+    "@mike-north/core": "workspace:*",
     "glob": "^11.0.1"
   },
   "license": "UNLICENSED",

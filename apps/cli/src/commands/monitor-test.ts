@@ -7,7 +7,7 @@ import {
   type ObservationContext,
   type ObservationSource,
   type Observation,
-} from '@agentmonitors/core';
+} from '@mike-north/core';
 import { registerCoreSources } from '../sources.js';
 import { reportError } from '../output.js';
 

@@ -3,7 +3,7 @@ import type {
   ObservationContext,
   ObservationResult,
   ObservationSource,
-} from '@agentmonitors/core';
+} from '@mike-north/core';
 
 interface ScopeConfig {
   cron: string;

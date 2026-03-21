@@ -1,6 +1,6 @@
 import { Command, Option } from 'commander';
-import type { InboxFilter, InboxItemState } from '@agentmonitors/core';
-import { createDb, InboxService } from '@agentmonitors/core';
+import type { InboxFilter, InboxItemState } from '@mike-north/core';
+import { createDb, InboxService } from '@mike-north/core';
 import { resolveDbPath } from '../db-path.js';
 import { reportError } from '../output.js';
 

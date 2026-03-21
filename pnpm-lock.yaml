@@ -50,16 +50,16 @@ importers:
 
   apps/cli:
     dependencies:
-      '@agentmonitors/core':
+      '@mike-north/core':
         specifier: workspace:*
         version: link:../../libs/core
-      '@agentmonitors/source-api-poll':
+      '@mike-north/source-api-poll':
         specifier: workspace:*
         version: link:../../plugins/source-api-poll
-      '@agentmonitors/source-file-fingerprint':
+      '@mike-north/source-file-fingerprint':
         specifier: workspace:*
         version: link:../../plugins/source-file-fingerprint
-      '@agentmonitors/source-schedule':
+      '@mike-north/source-schedule':
         specifier: workspace:*
         version: link:../../plugins/source-schedule
       better-sqlite3:
@@ -137,7 +137,7 @@ importers:
 
   plugins/source-api-poll:
     dependencies:
-      '@agentmonitors/core':
+      '@mike-north/core':
         specifier: workspace:*
         version: link:../../libs/core
     devDependencies:
@@ -147,7 +147,7 @@ importers:
 
   plugins/source-file-fingerprint:
     dependencies:
-      '@agentmonitors/core':
+      '@mike-north/core':
         specifier: workspace:*
         version: link:../../libs/core
       glob:
@@ -160,7 +160,7 @@ importers:
 
   plugins/source-schedule:
     dependencies:
-      '@agentmonitors/core':
+      '@mike-north/core':
         specifier: workspace:*
         version: link:../../libs/core
     devDependencies:

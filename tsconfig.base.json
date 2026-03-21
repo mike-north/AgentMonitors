@@ -11,14 +11,14 @@
     "moduleResolution": "NodeNext",
     "baseUrl": ".",
     "paths": {
-      "@agentmonitors/core": ["libs/core/dist/rollup.d.ts"],
-      "@agentmonitors/source-file-fingerprint": [
+      "@mike-north/core": ["libs/core/dist/rollup.d.ts"],
+      "@mike-north/source-file-fingerprint": [
         "plugins/source-file-fingerprint/dist/rollup.d.ts"
       ],
-      "@agentmonitors/source-api-poll": [
+      "@mike-north/source-api-poll": [
         "plugins/source-api-poll/dist/rollup.d.ts"
       ],
-      "@agentmonitors/source-schedule": [
+      "@mike-north/source-schedule": [
         "plugins/source-schedule/dist/rollup.d.ts"
       ]
     },
