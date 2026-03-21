@@ -4,11 +4,10 @@ import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import { ulid } from 'ulid';
 import type { InboxDb } from './db.js';
 import { inboxItems } from './schema.js';
-import * as schema from './schema.js';
 import type { InboxItemState } from './schema.js';
 import type { EnqueuePayload, InboxFilter, InboxItem } from './types.js';
 
-type InternalInboxDb = BetterSQLite3Database<typeof schema> & {
+type InternalInboxDb = BetterSQLite3Database<typeof import('./schema.js')> & {
   $client: BetterSQLiteClient;
 };
 

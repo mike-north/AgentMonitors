@@ -140,8 +140,8 @@ for (const packageName of packageNames) {
   );
   assert.equal(packageJson.name, packageName);
   assert.ok(
-    !JSON.stringify(packageJson).includes('workspace:*'),
-    \`\${packageName} still contains workspace protocol metadata\`,
+    !JSON.stringify(packageJson).includes('workspace:'),
+    \`\${packageName} still contains workspace protocol metadata in package.json\`,
   );
 }
 
@@ -368,9 +368,7 @@ void urgency;
 
 function main() {
   console.log('Building published packages...');
-  for (const pkg of PACKAGE_DEFS) {
-    run(PNPM_BIN, ['--filter', pkg.name, 'build'], REPO_ROOT);
-  }
+  run(PNPM_BIN, ['build'], REPO_ROOT);
 
   const projectDir = mkdtempSync(
     path.join(os.tmpdir(), 'agentmonitors-standalone-consumer-'),

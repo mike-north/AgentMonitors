@@ -9,7 +9,6 @@ import {
   monitorState,
   sessionEventState,
 } from '../inbox/schema.js';
-import * as schema from '../inbox/schema.js';
 import type {
   AgentSessionRecord,
   EventQuery,
@@ -20,7 +19,9 @@ import type {
   SessionHookState,
 } from './types.js';
 
-type InternalInboxDb = BetterSQLite3Database<typeof schema>;
+type InternalInboxDb = BetterSQLite3Database<
+  typeof import('../inbox/schema.js')
+>;
 
 function asInternalDb(db: InboxDb): InternalInboxDb {
   return db as unknown as InternalInboxDb;
