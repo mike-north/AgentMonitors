@@ -44,5 +44,18 @@ export default tseslint.config(
     files: ['**/*.test.ts'],
     ...tseslint.configs.disableTypeChecked,
   },
+  {
+    files: ['scripts/**/*.mjs'],
+    ...tseslint.configs.disableTypeChecked,
+    languageOptions: {
+      parserOptions: {
+        projectService: false,
+      },
+      globals: {
+        console: 'readonly',
+        process: 'readonly',
+      },
+    },
+  },
   eslintConfigPrettier,
 );
