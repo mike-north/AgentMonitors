@@ -11,6 +11,6 @@ export interface MonitorDefinition {
   filePath: string;
 }
 
-export type Urgency = 'high' | 'normal';
+export type Urgency = 'low' | 'normal' | 'high';
 export type EventKind = 'mutation' | 'notification' | 'alert';
 export type NotifyStrategy = 'debounce' | 'throttle';

@@ -29,7 +29,7 @@ export function generateMonitorSchema(
     properties: {
       name: { type: 'string', minLength: 1 },
       source: { type: 'string', enum: sourceNames },
-      urgency: { type: 'string', enum: ['high', 'normal'] },
+      urgency: { type: 'string', enum: ['low', 'normal', 'high'] },
       'event-kind': {
         type: 'string',
         enum: ['mutation', 'notification', 'alert'],

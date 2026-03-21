@@ -7,8 +7,31 @@ export interface Observation {
   title: string;
   /** Optional body/description */
   body?: string;
-  /** Point-in-time snapshot data captured at fire time */
+  /** Optional short summary for lightweight delivery surfaces */
+  summary?: string;
+  /** Raw source payload, preserved for later querying */
+  payload?: unknown;
+  /** Optional textual snapshot for diffing and timeline views */
+  snapshotText?: string;
+  /** Source-defined stable object identity, e.g. a PR number or document id */
+  objectKey?: string;
+  /** Source-defined query metadata used for read-time scoping */
+  queryScope?: Record<string, string | string[]>;
+  /** Point-in-time snapshot metadata captured at fire time */
   snapshot?: unknown;
+}
+
+export interface ObservationContext {
+  /** Persisted state from the previous observation cycle */
+  previousState?: unknown;
+  /** Timestamp supplied by the runtime */
+  now: Date;
+}
+
+export interface ObservationResult {
+  observations: Observation[];
+  /** Persisted state to use during the next observation cycle */
+  nextState?: unknown;
 }
 
 /**
@@ -24,7 +47,13 @@ export interface ObservationSource {
   /** Whether this source requires a baseline before detecting changes (default: false) */
   readonly stateful?: boolean;
   /** One-shot observation: check for changes and return any observations */
-  observe(config: Record<string, unknown>): Promise<Observation[]>;
+  observe(
+    config: Record<string, unknown>,
+    context: ObservationContext,
+  ): Promise<ObservationResult>;
   /** Optional continuous watch mode */
-  watch?(config: Record<string, unknown>): AsyncIterable<Observation>;
+  watch?(
+    config: Record<string, unknown>,
+    context: ObservationContext,
+  ): AsyncIterable<Observation>;
 }

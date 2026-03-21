@@ -4,6 +4,7 @@ import { Command, Option } from 'commander';
 import {
   parseMonitor,
   SourceRegistry,
+  type ObservationContext,
   type ObservationSource,
   type Observation,
 } from '@agentmonitors/core';
@@ -64,12 +65,22 @@ const DEFAULT_TEST_MESSAGES = [
   'This test command verifies that the source is configured correctly.',
 ];
 
+export function createFollowupObservationContext(
+  context: ObservationContext,
+): ObservationContext {
+  return {
+    now: new Date(),
+    previousState: context.previousState,
+  };
+}
+
 /** Handle the baseline-then-detect flow for stateful sources. */
 async function handleStatefulSource(
   source: ObservationSource,
   scope: Record<string, unknown>,
   monitorName: string,
   json: boolean,
+  context: ObservationContext,
 ): Promise<void> {
   if (!json) {
     console.log(
@@ -81,7 +92,11 @@ async function handleStatefulSource(
   }
 
   await setTimeout(100);
-  const secondObservations = await source.observe(scope);
+  const secondResult = await source.observe(
+    scope,
+    createFollowupObservationContext(context),
+  );
+  const secondObservations = secondResult.observations;
 
   if (json) {
     printJsonResult(monitorName, source.name, true, secondObservations);
@@ -156,9 +171,16 @@ monitorTestCommand
     }
 
     try {
-      const observations = await source.observe(
+      let context: ObservationContext = { now: new Date() };
+      const firstResult = await source.observe(
         result.monitor.frontmatter.scope,
+        context,
       );
+      const observations = firstResult.observations;
+      context = {
+        now: new Date(),
+        previousState: firstResult.nextState,
+      };
 
       if (observations.length === 0 && source.stateful) {
         await handleStatefulSource(
@@ -166,6 +188,7 @@ monitorTestCommand
           result.monitor.frontmatter.scope,
           monitorName,
           json,
+          context,
         );
       } else if (json) {
         printJsonResult(monitorName, source.name, false, observations);
