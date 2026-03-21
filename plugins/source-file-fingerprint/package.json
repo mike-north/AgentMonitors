@@ -1,7 +1,7 @@
 {
   "name": "@mike-north/source-file-fingerprint",
   "description": "File change detection via SHA-256 fingerprinting for Agent Monitors",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "publishConfig": {
     "registry": "https://npm.pkg.github.com"
   },
