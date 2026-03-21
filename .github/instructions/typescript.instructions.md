@@ -1,5 +1,5 @@
 ---
-applyTo: "apps/**/*.ts,libs/**/*.ts,plugins/**/*.ts"
+applyTo: 'apps/**/*.ts,libs/**/*.ts,plugins/**/*.ts'
 ---
 
 # TypeScript And Boundary Guidance

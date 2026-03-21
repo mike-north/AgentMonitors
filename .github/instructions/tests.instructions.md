@@ -1,5 +1,5 @@
 ---
-applyTo: "**/*.test.ts"
+applyTo: '**/*.test.ts'
 ---
 
 # Test Guidance

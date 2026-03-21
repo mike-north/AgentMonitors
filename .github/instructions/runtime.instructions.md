@@ -1,5 +1,5 @@
 ---
-applyTo: "libs/core/src/runtime/**/*.ts,libs/core/src/adapter/**/*.ts,libs/core/src/inbox/**/*.ts"
+applyTo: 'libs/core/src/runtime/**/*.ts,libs/core/src/adapter/**/*.ts,libs/core/src/inbox/**/*.ts'
 ---
 
 # Runtime And Adapter Review Guidance
