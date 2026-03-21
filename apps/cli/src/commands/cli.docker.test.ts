@@ -1,7 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { packageUpSync } from 'pkg-up';
 import { describe, expect, it } from 'vitest';
 
 function hasDocker(): boolean {
@@ -14,13 +13,7 @@ function hasDocker(): boolean {
 }
 
 const dockerAvailable = hasDocker();
-const cliPackageJson = packageUpSync({ cwd: __dirname });
-
-if (!cliPackageJson) {
-  throw new Error('Could not locate package.json for the CLI package.');
-}
-
-const repoRoot = path.resolve(path.dirname(cliPackageJson), '../..');
+const repoRoot = path.resolve(__dirname, '../../../..');
 const dockerScriptPath = path.join(
   __dirname,
   'fixtures',
