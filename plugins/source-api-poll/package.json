@@ -1,7 +1,7 @@
 {
   "name": "@agentmonitors/source-api-poll",
   "description": "HTTP endpoint polling and change detection for Agent Monitors",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "publishConfig": {
     "registry": "https://npm.pkg.github.com"
   },
