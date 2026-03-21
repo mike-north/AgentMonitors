@@ -2,6 +2,9 @@
   "name": "@agentmonitors/source-file-fingerprint",
   "description": "File change detection via SHA-256 fingerprinting for Agent Monitors",
   "version": "0.0.0",
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
   "type": "module",
   "main": "./dist/index.cjs",
   "types": "./dist/public.d.ts",
