@@ -17,7 +17,7 @@ import type {
 } from '../observation/types.js';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import { RuntimeStore } from './store.js';
-import { AgentMonitorRuntime } from './service.js';
+import { AgentMonitorRuntime, cronMatchesDate } from './service.js';
 
 function createRuntime(
   dbPath: string,
@@ -69,6 +69,15 @@ afterEach(() => {
 });
 
 describe('AgentMonitorRuntime', () => {
+  it('matches schedule cron expressions in the configured timezone', () => {
+    const when = new Date('2026-03-20T16:00:00.000Z');
+
+    expect(cronMatchesDate('0 9 * * *', when, 'America/Los_Angeles')).toBe(
+      true,
+    );
+    expect(cronMatchesDate('0 9 * * *', when, 'UTC')).toBe(false);
+  });
+
   it('persists source state across runtime restarts and emits changes later', async () => {
     const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
     tempDirs.push(rootDir);

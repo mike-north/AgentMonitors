@@ -70,17 +70,60 @@ function hydrateStoredObservationEnvelope(
   };
 }
 
-function matchesCron(cron: string, now: Date): boolean {
+const WEEKDAY_INDEX: Record<string, number> = {
+  sun: 0,
+  mon: 1,
+  tue: 2,
+  wed: 3,
+  thu: 4,
+  fri: 5,
+  sat: 6,
+};
+
+function cronFieldValuesForDate(
+  now: Date,
+  timeZone = 'UTC',
+): [minute: number, hour: number, day: number, month: number, weekday: number] {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    minute: 'numeric',
+    hour: 'numeric',
+    day: 'numeric',
+    month: 'numeric',
+    weekday: 'short',
+    hourCycle: 'h23',
+  }).formatToParts(now);
+
+  const partMap = new Map(parts.map((part) => [part.type, part.value]));
+  const weekdayText = partMap.get('weekday')?.toLowerCase();
+  const weekday = weekdayText ? WEEKDAY_INDEX[weekdayText] : undefined;
+  const minute = Number(partMap.get('minute'));
+  const hour = Number(partMap.get('hour'));
+  const day = Number(partMap.get('day'));
+  const month = Number(partMap.get('month'));
+
+  if (
+    !Number.isFinite(minute) ||
+    !Number.isFinite(hour) ||
+    !Number.isFinite(day) ||
+    !Number.isFinite(month) ||
+    weekday === undefined
+  ) {
+    throw new Error(`Could not derive cron values for timezone "${timeZone}".`);
+  }
+
+  return [minute, hour, day, month, weekday];
+}
+
+export function cronMatchesDate(
+  cron: string,
+  now: Date,
+  timeZone = 'UTC',
+): boolean {
   const parts = cron.trim().split(/\s+/);
   if (parts.length !== 5) return false;
 
-  const values = [
-    now.getUTCMinutes(),
-    now.getUTCHours(),
-    now.getUTCDate(),
-    now.getUTCMonth() + 1,
-    now.getUTCDay(),
-  ];
+  const values = cronFieldValuesForDate(now, timeZone);
 
   return parts.every((part, index) => {
     const currentValue = values[index];
@@ -412,8 +455,14 @@ export class AgentMonitorRuntime {
     const elapsed = now.getTime() - lastObservationAt;
     if (monitor.frontmatter.source === 'schedule') {
       const cron = monitor.frontmatter.scope['cron'];
+      const timezone = monitor.frontmatter.scope['timezone'];
       if (typeof cron !== 'string') return { due: false, nextPollMs: 60_000 };
-      const due = matchesCron(cron, now) && elapsed >= 60_000;
+      const due =
+        cronMatchesDate(
+          cron,
+          now,
+          typeof timezone === 'string' ? timezone : 'UTC',
+        ) && elapsed >= 60_000;
       return { due, nextPollMs: 60_000 };
     }
 

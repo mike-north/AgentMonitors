@@ -18,6 +18,7 @@ import { spawn } from 'node:child_process';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 
 const CLI_PATH = path.resolve(__dirname, '../../dist/index.cjs');
+const CLI_PACKAGE_DIR = path.resolve(__dirname, '../..');
 
 interface RunResult {
   stdout: string;
@@ -147,6 +148,11 @@ async function startDaemon(
 let tempDir: string;
 
 beforeAll(() => {
+  execFileSync('pnpm', ['build'], {
+    cwd: CLI_PACKAGE_DIR,
+    stdio: 'pipe',
+    env: process.env,
+  });
   tempDir = mkdtempSync(path.join(tmpdir(), 'agentmonitors-test-'));
 });
 
@@ -303,6 +309,34 @@ describe('source list', () => {
     expect(names).toContain('file-fingerprint');
     expect(names).toContain('api-poll');
     expect(names).toContain('schedule');
+  });
+});
+
+describe('daemon status', () => {
+  it('returns a non-running status payload when the daemon is down', () => {
+    const socketPath = path.join(tempDir, 'daemon-status-down.sock');
+    const result = runWithEnv(
+      ['daemon', 'status', '--socket', socketPath, '--format', 'json'],
+      {
+        AGENTMONITORS_DB: ':memory:',
+        AGENTMONITORS_SOCKET: socketPath,
+      },
+    );
+    expect(result.exitCode).toBe(0);
+    const parsed = JSON.parse(result.stdout) as {
+      running: boolean;
+      socketPath: string;
+      sessions: number;
+      activeSessions: number;
+      dormantSessions: number;
+      events: number;
+    };
+    expect(parsed.running).toBe(false);
+    expect(parsed.socketPath).toBe(socketPath);
+    expect(parsed.sessions).toBe(0);
+    expect(parsed.activeSessions).toBe(0);
+    expect(parsed.dormantSessions).toBe(0);
+    expect(parsed.events).toBe(0);
   });
 });
 

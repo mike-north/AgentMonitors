@@ -65,6 +65,15 @@ const DEFAULT_TEST_MESSAGES = [
   'This test command verifies that the source is configured correctly.',
 ];
 
+export function createFollowupObservationContext(
+  context: ObservationContext,
+): ObservationContext {
+  return {
+    now: new Date(),
+    previousState: context.previousState,
+  };
+}
+
 /** Handle the baseline-then-detect flow for stateful sources. */
 async function handleStatefulSource(
   source: ObservationSource,
@@ -83,7 +92,10 @@ async function handleStatefulSource(
   }
 
   await setTimeout(100);
-  const secondResult = await source.observe(scope, context);
+  const secondResult = await source.observe(
+    scope,
+    createFollowupObservationContext(context),
+  );
   const secondObservations = secondResult.observations;
 
   if (json) {

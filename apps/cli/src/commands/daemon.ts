@@ -159,23 +159,30 @@ daemonCommand
       .default('text'),
   )
   .action(async (options: { socket?: string; format: string }) => {
-    const running = await daemonAvailable(options.socket);
-    const status = await daemonStatusClient(options.socket);
-    const payload = {
-      running,
-      socketPath: resolveSocketPath(options.socket),
-      ...status,
-    };
-    if (options.format === 'json') {
-      console.log(JSON.stringify(payload, null, 2));
-      return;
+    try {
+      const running = await daemonAvailable(options.socket);
+      const status = running
+        ? await daemonStatusClient(options.socket)
+        : createRuntime().status();
+      const payload = {
+        running,
+        socketPath: resolveSocketPath(options.socket),
+        ...status,
+      };
+      if (options.format === 'json') {
+        console.log(JSON.stringify(payload, null, 2));
+        return;
+      }
+      console.log(`Daemon running: ${running ? 'yes' : 'no'}`);
+      console.log(`Socket: ${payload.socketPath}`);
+      console.log(`Sessions: ${String(status.sessions)}`);
+      console.log(`Active sessions: ${String(status.activeSessions)}`);
+      console.log(`Dormant sessions: ${String(status.dormantSessions)}`);
+      console.log(`Events: ${String(status.events)}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      reportError(message, options.format === 'json');
     }
-    console.log(`Daemon running: ${running ? 'yes' : 'no'}`);
-    console.log(`Socket: ${payload.socketPath}`);
-    console.log(`Sessions: ${String(status.sessions)}`);
-    console.log(`Active sessions: ${String(status.activeSessions)}`);
-    console.log(`Dormant sessions: ${String(status.dormantSessions)}`);
-    console.log(`Events: ${String(status.events)}`);
   });
 
 daemonCommand

@@ -327,12 +327,28 @@ export async function callDaemon<T = unknown>(
   };
 
   return await new Promise<T>((resolve, reject) => {
-    const socket = net.createConnection(socketPath);
+    const socket = new net.Socket();
     let buffer = '';
+    let settled = false;
+
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      socket.removeAllListeners('data');
+      socket.removeAllListeners('error');
+      socket.removeAllListeners('connect');
+      socket.setTimeout(0);
+      fn();
+    };
 
     const fail = (error: Error) => {
-      socket.destroy();
-      reject(error);
+      settle(() => {
+        socket.once('error', () => {
+          // Swallow late socket errors after we've already settled the promise.
+        });
+        socket.destroy();
+        reject(error);
+      });
     };
 
     socket.setTimeout(timeoutMs, () => {
@@ -341,28 +357,31 @@ export async function callDaemon<T = unknown>(
 
     socket.setEncoding('utf-8');
     socket.on('error', (error) => {
-      reject(error);
+      fail(error);
     });
     socket.on('data', (chunk) => {
       buffer += typeof chunk === 'string' ? chunk : chunk.toString('utf-8');
       const newline = buffer.indexOf('\n');
       if (newline === -1) return;
       const raw = buffer.slice(0, newline);
-      socket.end();
       try {
         const response = daemonResponseSchema.parse(JSON.parse(raw));
         if (response.error) {
-          reject(new Error(response.error));
+          fail(new Error(response.error));
           return;
         }
-        resolve(response.result as T);
+        settle(() => {
+          socket.end();
+          resolve(response.result as T);
+        });
       } catch (error) {
-        reject(error instanceof Error ? error : new Error(String(error)));
+        fail(error instanceof Error ? error : new Error(String(error)));
       }
     });
     socket.on('connect', () => {
       socket.write(`${JSON.stringify(request)}\n`);
     });
+    socket.connect(socketPath);
   });
 }
 

@@ -6,7 +6,7 @@ import {
 } from '@agentmonitors/core';
 import { registerCoreSources } from './sources.js';
 import { resolveDbPath } from './db-path.js';
-import { resolveSocketPath } from './socket-path.js';
+import { resolveSocketPath } from './daemon-ipc.js';
 import { SourceRegistry } from '@agentmonitors/core';
 
 export function createRuntime(dbPath = resolveDbPath()): AgentMonitorRuntime {
