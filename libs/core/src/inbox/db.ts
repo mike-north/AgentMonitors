@@ -5,9 +5,15 @@ import { BetterSQLite3Database, drizzle } from 'drizzle-orm/better-sqlite3';
 import { sql } from 'drizzle-orm';
 import * as schema from './schema.js';
 
-export type InboxDb = BetterSQLite3Database & {
+type InternalInboxDb = BetterSQLite3Database<typeof schema> & {
   $client: BetterSQLiteClient;
 };
+
+declare const inboxDbBrand: unique symbol;
+
+export interface InboxDb {
+  readonly [inboxDbBrand]: true;
+}
 
 /**
  * Create a database connection and ensure tables exist.
@@ -34,12 +40,12 @@ export function createDb(dbPath: string): InboxDb {
    * on the local schema module symbol.
    *
    * We therefore erase the schema generic at the public alias boundary and cast
-   * the concrete Drizzle instance to `InboxDb`. This keeps the runtime type
-   * correct, preserves the methods we use internally, and allows declaration
-   * rollups to succeed. If we later replace `InboxDb` with a narrower hand-written
-   * interface or stop exporting it publicly, this cast should be revisited first.
+   * the concrete Drizzle instance to an opaque `InboxDb`. This keeps the runtime
+   * type correct, preserves the methods we use internally via `asInternalDb()`,
+   * and allows declaration rollups to avoid leaking Drizzle's schema-parameterized
+   * types into consumer-facing `.d.ts` output.
    */
-  const db = drizzle(sqlite, { schema }) as unknown as InboxDb;
+  const db = drizzle(sqlite, { schema }) as unknown as InternalInboxDb;
 
   db.run(sql`
     CREATE TABLE IF NOT EXISTS inbox_items (
@@ -149,5 +155,5 @@ export function createDb(dbPath: string): InboxDb {
     )
   `);
 
-  return db;
+  return db as unknown as InboxDb;
 }
