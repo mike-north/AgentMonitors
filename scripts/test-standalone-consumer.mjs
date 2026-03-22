@@ -40,10 +40,16 @@ function runCapture(command, args, cwd) {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   if (result.status !== 0) {
-    process.stderr.write(result.stderr);
-    throw new Error(
+    if (typeof result.stderr === 'string' && result.stderr.length > 0) {
+      process.stderr.write(result.stderr);
+    }
+    const errorMessageParts = [
       `Command failed (${result.status ?? 'unknown'}): ${command} ${args.join(' ')}`,
-    );
+    ];
+    if (result.error?.message) {
+      errorMessageParts.push(`Spawn error: ${result.error.message}`);
+    }
+    throw new Error(errorMessageParts.join('\n'));
   }
   return (result.stdout ?? '').trim();
 }
