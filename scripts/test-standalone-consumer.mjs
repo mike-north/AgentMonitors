@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { Project } from 'fixturify-project';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(SCRIPT_DIR, '..');
@@ -39,21 +40,18 @@ function runCapture(command, args, cwd) {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   if (result.status !== 0) {
-    process.stderr.write(result.stderr);
-    throw new Error(
+    if (typeof result.stderr === 'string' && result.stderr.length > 0) {
+      process.stderr.write(result.stderr);
+    }
+    const errorMessageParts = [
       `Command failed (${result.status ?? 'unknown'}): ${command} ${args.join(' ')}`,
-    );
+    ];
+    if (result.error?.message) {
+      errorMessageParts.push(`Spawn error: ${result.error.message}`);
+    }
+    throw new Error(errorMessageParts.join('\n'));
   }
   return (result.stdout ?? '').trim();
-}
-
-function writeText(filePath, contents) {
-  mkdirSync(path.dirname(filePath), { recursive: true });
-  writeFileSync(filePath, contents, 'utf8');
-}
-
-function writeJson(filePath, value) {
-  writeText(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 function packPackage(packageDir, packDir) {
@@ -77,36 +75,7 @@ function packPackage(packageDir, packDir) {
   return path.join(packDir, created);
 }
 
-function createPackageJson(projectDir) {
-  writeJson(path.join(projectDir, 'package.json'), {
-    name: 'agentmonitors-standalone-consumer',
-    private: true,
-    type: 'module',
-    scripts: {
-      check: 'tsc --noEmit',
-      smoke: 'node smoke.mjs',
-    },
-  });
-}
-
-function createTsConfig(projectDir) {
-  writeJson(path.join(projectDir, 'tsconfig.json'), {
-    compilerOptions: {
-      target: 'ES2022',
-      module: 'NodeNext',
-      moduleResolution: 'NodeNext',
-      strict: true,
-      noEmit: true,
-      types: ['node'],
-    },
-    include: ['smoke-types.ts'],
-  });
-}
-
-function createSmokeFiles(projectDir) {
-  writeText(
-    path.join(projectDir, 'smoke.mjs'),
-    `import assert from 'node:assert/strict';
+const SMOKE_SCRIPT = `import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
@@ -304,12 +273,9 @@ Tell the agent the local API changed.
     server.close((error) => (error ? reject(error) : resolve())),
   );
 }
-`,
-  );
+`;
 
-  writeText(
-    path.join(projectDir, 'smoke-types.ts'),
-    `import type { ObservationSource, Urgency } from '@mike-north/core';
+const SMOKE_TYPES_SCRIPT = `import type { ObservationSource, Urgency } from '@mike-north/core';
 import {
   AgentMonitorRuntime,
   RuntimeStore,
@@ -362,11 +328,48 @@ const runtime = new AgentMonitorRuntime(
 void schema;
 void runtime;
 void urgency;
-`,
-  );
+`;
+
+async function createStandaloneProject(projectDir) {
+  const project = new Project({
+    files: {
+      'package.json': `${JSON.stringify(
+        {
+          name: 'agentmonitors-standalone-consumer',
+          private: true,
+          type: 'module',
+          scripts: {
+            check: 'tsc --noEmit',
+            smoke: 'node smoke.mjs',
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      'tsconfig.json': `${JSON.stringify(
+        {
+          compilerOptions: {
+            target: 'ES2022',
+            module: 'NodeNext',
+            moduleResolution: 'NodeNext',
+            strict: true,
+            noEmit: true,
+            types: ['node'],
+          },
+          include: ['smoke-types.ts'],
+        },
+        null,
+        2,
+      )}\n`,
+      'smoke.mjs': SMOKE_SCRIPT,
+      'smoke-types.ts': SMOKE_TYPES_SCRIPT,
+    },
+  });
+  project.baseDir = projectDir;
+  await project.write();
 }
 
-function main() {
+async function main() {
   console.log('Building published packages...');
   run(PNPM_BIN, ['build'], REPO_ROOT);
 
@@ -382,9 +385,7 @@ function main() {
     packPackage(path.join(REPO_ROOT, pkg.dir), packDir),
   );
 
-  createPackageJson(projectDir);
-  createTsConfig(projectDir);
-  createSmokeFiles(projectDir);
+  await createStandaloneProject(projectDir);
 
   console.log('Installing packed packages into standalone temp project...');
   run(
@@ -405,4 +406,4 @@ function main() {
   );
 }
 
-main();
+await main();
