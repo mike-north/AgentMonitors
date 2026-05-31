@@ -153,6 +153,9 @@ temp/
 .claude/*.local.*
 .claude/monitors/
 
+# Channel probe findings (experiments/channel-probe)
+agentmon-channel-probe.json
+
 # Scratch
 scratch
 scratch/

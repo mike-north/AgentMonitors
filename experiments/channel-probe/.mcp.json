@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "agentmon-probe": {
+      "command": "node",
+      "args": [
+        "/Users/mnorth/Development/agentmonitors/.claude/worktrees/elated-kirch-12ca3c/experiments/channel-probe/probe.mjs"
+      ]
+    }
+  }
+}
