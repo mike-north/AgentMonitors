@@ -14,6 +14,7 @@ export default tseslint.config(
       '.codex/**',
       '.worktrees/**',
       'scratch/**',
+      'experiments/**',
       'apps/website/**',
       '**/*.config.ts',
       '**/*.config.mjs',

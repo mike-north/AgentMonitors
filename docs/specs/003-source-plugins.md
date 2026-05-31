@@ -1,0 +1,312 @@
+# 003 — Source Plugins
+
+> **Status:** Draft
+> **Depends on:** [000-principles.md](./000-principles.md), [001-monitor-definition.md](./001-monitor-definition.md), [002-runtime-delivery.md](./002-runtime-delivery.md)
+> **Covers:** source contract, bundled sources, current limitations, plugin-discovery notes
+
+## 1. Overview
+
+This document specifies the contract implemented by observation source plugins and the current behavior of the bundled sources: `file-fingerprint`, `api-poll`, `schedule`. The runtime depends on sources to detect change, but the runtime owns scheduling, notify dispatch, and delivery timing (PP3).
+
+### Principles Satisfied
+
+| Section                 | Principles         |
+| ----------------------- | ------------------ |
+| Source contract         | PP3, PP6, AP4, NP4 |
+| Bundled source behavior | PP6, PP7, BP3      |
+| Plugin-management notes | NP3                |
+
+## 2. Source Contract
+
+Every source plugin **MUST** implement the `ObservationSource` interface. The required members are: `name`, `scopeSchema`, and `observe(config, context)`. A source **MAY** also declare `stateful` and `watch(config, context)`. The current runtime calls `observe()` only. `watch()` is defined in the interface but is not part of the active execution model (NP4).
+
+### 2.1 TypeScript types
+
+A third-party plugin author implements the `ObservationSource` interface and uses the supporting types `ObservationContext`, `ObservationResult`, `Observation`, and `JsonSchema`. All five are exported from `@mike-north/core` (verified: `libs/core/src/index.ts` lines 39–45).
+
+```typescript
+import type {
+  JsonSchema,
+  Observation,
+  ObservationContext,
+  ObservationResult,
+  ObservationSource,
+} from '@mike-north/core';
+```
+
+The interface definition (verified: `libs/core/src/observation/types.ts`):
+
+| Member                     | Kind                         | Required | Description                                                                                         |
+| -------------------------- | ---------------------------- | -------- | --------------------------------------------------------------------------------------------------- |
+| `name`                     | `readonly string`            | Yes      | Unique kebab-case plugin name. Matches the `source` field in `MONITOR.md`.                          |
+| `scopeSchema`              | `readonly JsonSchema`        | Yes      | JSON Schema fragment describing this source's `scope` configuration.                                |
+| `stateful`                 | `readonly boolean?`          | No       | If `true`, the first successful call establishes a baseline (PP6). Defaults to `false` when absent. |
+| `observe(config, context)` | `Promise<ObservationResult>` | Yes      | One-shot observation: check for changes and return any observations.                                |
+| `watch?(config, context)`  | `AsyncIterable<Observation>` | No       | Optional continuous watch mode. Not currently used by the runtime (NP4).                            |
+
+`JsonSchema` is typed as `Record<string, unknown>`, making it a plain object describing a JSON Schema fragment.
+
+### 2.2 Observation context
+
+`observe()` receives `config` (the source-specific monitor scope as `Record<string, unknown>`) and `context` of type `ObservationContext`:
+
+- `context.previousState?: unknown` — persisted state from the previous observation cycle, if any.
+- `context.now: Date` — timestamp supplied by the runtime.
+
+### 2.3 Observation result
+
+`observe()` returns an `ObservationResult`:
+
+- `observations: Observation[]` — zero or more source observations.
+- `nextState?: unknown` — optional source-owned persisted state to use in the next cycle.
+
+Each `Observation` **MAY** include the following fields (verified: `libs/core/src/observation/types.ts`):
+
+| Field          | Type                                  | Description                                                                |
+| -------------- | ------------------------------------- | -------------------------------------------------------------------------- |
+| `title`        | `string`                              | **Required.** Human-readable title for the inbox item.                     |
+| `body`         | `string?`                             | Optional body/description.                                                 |
+| `summary`      | `string?`                             | Optional short summary for lightweight delivery surfaces.                  |
+| `payload`      | `unknown?`                            | Raw source payload, preserved for later querying.                          |
+| `snapshotText` | `string?`                             | Optional textual snapshot for diffing and timeline views.                  |
+| `objectKey`    | `string?`                             | Source-defined stable object identity (e.g., a PR number, file path, URL). |
+| `queryScope`   | `Record<string, string \| string[]>?` | Source-defined query metadata used for read-time scoping.                  |
+| `snapshot`     | `unknown?`                            | Point-in-time snapshot metadata captured at fire time.                     |
+
+### 2.4 Stateful sources
+
+If `stateful` is `true`, the first successful `observe()` call **MAY** return an empty `observations` array while storing an initial baseline in `nextState`. That is not an error case — it is how baseline-then-detect sources work (PP6). On subsequent calls, the stored state is available via `context.previousState`.
+
+`file-fingerprint` and `api-poll` both declare `stateful: true`. `schedule` does not declare `stateful` (defaults to `false`).
+
+## 3. Bundled Source: `file-fingerprint`
+
+Source name: `"file-fingerprint"` (verified: `plugins/source-file-fingerprint/src/index.ts` line 75).
+
+### 3.1 Scope
+
+```yaml
+scope:
+  globs:
+    - '**/*.ts'
+  cwd: /optional/base/path
+```
+
+Required field: `globs` (array of strings). Optional field: `cwd` (string). Validated by `parseScopeConfig` — throws if `globs` is missing or not an array of strings.
+
+### 3.2 Behavior
+
+The source expands each glob pattern using `globSync` with `absolute: true`, so matched paths are always absolute. For each matched file, it computes a SHA-256 hash using Node.js `crypto.createHash('sha256')`.
+
+Current fingerprints are stored in `nextState.fingerprints` (a `Record<string, string>` keyed by absolute file path). On each call, the source compares each file's current hash against `context.previousState.fingerprints[filePath]`.
+
+When a previously seen file's hash changes, the source emits one `Observation` per changed file (verified: `plugins/source-file-fingerprint/src/index.ts` lines 99–119):
+
+- `title`: `"File changed: <absolute-file-path>"`
+- `summary`: `"File changed: <absolute-file-path>"`
+- `payload`: `{ filePath, previousHash, currentHash }`
+- `objectKey`: `<absolute-file-path>`
+- `queryScope`: `{ filePath: <absolute-file-path> }`
+- `snapshot`: `{ filePath, previousHash, currentHash }`
+- `snapshotText`: file content as UTF-8 string, **only if the file contains no null bytes** (`!content.includes(0)` where `content` is a `Buffer`)
+
+### 3.3 Current limitations
+
+The current implementation detects changed files only. It does **NOT** emit observations for:
+
+- Files that newly appear with no prior fingerprint (new files added after baseline)
+- Files that are deleted after the baseline run
+- Files that stop matching the configured globs between runs
+
+These are current behavioral limits, not silently supported edge cases (PP7). The `nextState` only records the hashes of files present in the current glob expansion; deleted files are silently dropped from state on the next run.
+
+## 4. Bundled Source: `api-poll`
+
+Source name: `"api-poll"` (verified: `plugins/source-api-poll/src/index.ts` line 147).
+
+### 4.1 Scope
+
+```yaml
+scope:
+  url: 'https://api.example.com/status'
+  method: GET
+  headers:
+    Accept: application/json
+  interval: 5m
+  auth:
+    type: bearer
+    token-env: API_TOKEN
+  change-detection:
+    strategy: json-diff
+```
+
+Required field: `url` (string). Important optional fields: `method`, `headers`, `interval`, `auth`, `change-detection`.
+
+`interval` is declared in the scope schema with pattern `^\d+[smhd]$` but is used by the scheduling engine, not by the plugin directly (verified: scope schema comment at `plugins/source-api-poll/src/index.ts` line 131).
+
+`method` defaults to `GET` in the schema and in the `fetch` call if absent from config.
+
+### 4.2 Change-detection strategies
+
+Supported strategies (verified: `plugins/source-api-poll/src/index.ts`, `ChangeStrategy` type and `hasChanged` function):
+
+| Strategy      | Semantics                                                                                                                                  |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `text-diff`   | Compare raw response body strings. This is the **default** when no strategy is specified or the value is unrecognized.                     |
+| `json-diff`   | Parse both bodies as JSON, recursively sort object keys, then compare serialized strings. Ignores key ordering and whitespace differences. |
+| `status-code` | Compare only HTTP status codes; body changes are ignored.                                                                                  |
+
+If `json-diff` parsing fails for either body, the implementation falls back to raw text comparison (verified: `plugins/source-api-poll/src/index.ts` lines 96–101).
+
+### 4.3 Authentication
+
+Auth is configured via the `auth.type` field.
+
+**Bearer:** resolves the token from `auth.token` first, then from `process.env[auth['token-env']]`. If neither yields a value, `resolveAuth` throws:
+
+> `Bearer auth requires a token. Set the <VAR> environment variable or add auth.token to your monitor's scope config.`
+
+(Verified: `plugins/source-api-poll/src/index.ts` lines 52–59.)
+
+**Basic:** uses `auth.username` and `auth.password` (both default to empty string if absent), Base64-encodes `username:password`, and sets `Authorization: Basic <encoded>`.
+
+### 4.4 Observation identity
+
+When a change is detected, the source emits one observation (verified: `plugins/source-api-poll/src/index.ts` lines 175–196):
+
+- `title`: `"API response changed: <url>"`
+- `summary`: `"API response changed: <url>"`
+- `payload`: `{ url, status, strategy, body }`
+- `snapshotText`: response body as a string (always set; no binary check)
+- `objectKey`: `<url>`
+- `queryScope`: `{ url: <url> }`
+- `snapshot`: `{ url, status, bodyLength, strategy }`
+
+This treats the polled URL as the source-defined object identity (SP3).
+
+**Note:** Unlike `file-fingerprint`, `api-poll` always sets `snapshotText` to the response body without a binary check. The `snapshot` field records `bodyLength` and `strategy` rather than full body content.
+
+### 4.5 Stateful behavior
+
+`api-poll` declares `stateful: true`. The first call fetches the URL, stores `{ body, status }` as `nextState`, and returns an empty `observations` array. Subsequent calls compare against `context.previousState` and emit an observation only when `hasChanged` returns `true`.
+
+## 5. Bundled Source: `schedule`
+
+Source name: `"schedule"` (verified: `plugins/source-schedule/src/index.ts` line 47).
+
+### 5.1 Scope
+
+```yaml
+scope:
+  cron: '0 9 * * 1-5'
+  timezone: America/Los_Angeles
+  label: Daily review
+```
+
+Required field: `cron` (string). Optional fields: `timezone` (string), `label` (string).
+
+### 5.2 Behavior
+
+The `schedule` source does **not** declare `stateful`, so it defaults to stateless.
+
+The source does not decide when it is due — that is the runtime's responsibility. Whenever `observe()` is called, it emits **exactly one observation** (verified: `plugins/source-schedule/src/index.ts` lines 59–77):
+
+- `title` and `summary`: `label` if provided, otherwise `"Scheduled trigger: <cron>"`
+- `payload`: `{ cron, timezone: timezone ?? 'UTC' }`
+- `objectKey`: `<cron>`
+- `queryScope`: `{ cron: <cron>, timezone: <resolved-timezone> }`
+- `snapshot`: `{ cron, timezone: <resolved-timezone>, triggeredAt: context.now.toISOString() }`
+
+`timezone` resolves to `'UTC'` when not provided in config. There is no IANA timezone validation in the plugin itself — the scheduling engine owns timezone interpretation.
+
+## 6. Source Registry, Validation, and Schema Generation
+
+### 6.1 SourceRegistry
+
+`SourceRegistry` (exported from `@mike-north/core`, verified: `libs/core/src/observation/registry.ts`) is an in-memory registry of source plugins. It exposes:
+
+| Method     | Signature                                        | Behavior                                                                                    |
+| ---------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------- |
+| `register` | `(source: ObservationSource): void`              | Adds the source. **Throws** `Error` if a source with the same `name` is already registered. |
+| `get`      | `(name: string): ObservationSource \| undefined` | Returns the source or `undefined` if not found.                                             |
+| `has`      | `(name: string): boolean`                        | Returns whether a source with that name is registered.                                      |
+| `list`     | `(): ObservationSource[]`                        | Returns all registered sources as an array.                                                 |
+| `names`    | `(): string[]`                                   | Returns all registered source names as an array.                                            |
+
+At startup the CLI registers only the bundled sources (via `registerCoreSources`,
+`apps/cli/src/sources.ts`); the registry then holds those resolved plugins. Third-party plugin
+**discovery and installation are not implemented** — the `source install`/`update`/`remove`/`search`
+commands are placeholders that print a manual-install hint (NP3). See §7.
+
+### 6.2 Schema generation
+
+`generateMonitorSchema(sources: ObservationSource[]): JsonSchema` (exported from `@mike-north/core`, verified: `libs/core/src/observation/schema-generator.ts`) composes a full JSON Schema from all registered sources' `scopeSchema` fragments.
+
+The generated schema:
+
+- Uses `$schema: 'http://json-schema.org/draft-07/schema#'`
+- Declares top-level required fields: `name`, `source`, `urgency`, `event-kind`, `scope`
+- Constrains `source` to the enum of registered source names
+- Uses `allOf` with `if/then` conditionals to enforce the correct `scope` shape for each `source` value
+- Validates the `notify` field with a `oneOf` covering `debounce` (requires `settle-for`) and `throttle` (requires `suppress-for`)
+- Accepts an optional `tags` array of strings
+
+### 6.3 Validation gap (current vs. target)
+
+The current CLI validation command checks required source scope fields but does not yet enforce full per-source JSON Schema validation against the generated schema. This gap is documented in [004-validation-testing.md](./004-validation-testing.md).
+
+## 7. Plugin Discovery and Installation Notes
+
+The CLI exposes `source search`, `source install`, `source update`, and `source remove`, but those commands are currently placeholders. Therefore:
+
+- Third-party source plugins remain a supported architectural concept.
+- Plugin discovery and installation are **not yet implemented** CLI workflows.
+
+This is an explicit non-property of the current product (NP3).
+
+## 8. Examples
+
+### 8.1 File watcher example
+
+```yaml
+scope:
+  globs:
+    - 'src/**/*.ts'
+  cwd: /workspace
+```
+
+**What this example proves:** `file-fingerprint` scope is file-system oriented; `cwd` changes where glob patterns are resolved (passed as the `cwd` option to `globSync`), while `objectKey` and `queryScope.filePath` always use the absolute file path regardless of `cwd`.
+
+### 8.2 Status-code-only API watcher
+
+```yaml
+scope:
+  url: 'https://api.example.com/health'
+  change-detection:
+    strategy: status-code
+```
+
+**What this example proves:** Body changes alone do not trigger this monitor when `strategy: status-code` is set. Object identity is still the URL even when change detection narrows what counts as a change.
+
+### 8.3 Schedule source with label
+
+```yaml
+scope:
+  cron: '0 9 * * 1-5'
+  timezone: America/New_York
+  label: Morning standup reminder
+```
+
+**What this example proves:** When `label` is provided, the observation `title` and `summary` use the label rather than the cron expression. `objectKey` is always the cron string, not the label.
+
+## 9. Validation Implications
+
+Source-level tests SHOULD verify:
+
+- Stateful sources (`file-fingerprint`, `api-poll`) return no observations on the first baseline run and return observations on subsequent runs when changes occur.
+- Different source configurations do not share baseline state accidentally (state is keyed per monitor instance, not per source name).
+- `json-diff` ignores irrelevant JSON key ordering and whitespace differences between responses.
+- `status-code` ignores body-only changes.
+- Schedule observations are emitted whenever the runtime calls `observe()`, regardless of whether the cron expression would have fired at `context.now`.
+- Source errors are surfaced clearly for invalid required config: missing `globs`, missing `url`, or unresolved bearer token (see §4.3 for the exact error message format).
+- `file-fingerprint` includes `snapshotText` for text files and omits it for binary files (files containing null bytes).

@@ -1,0 +1,13 @@
+{
+  "name": "agentmon-channel-probe",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "description": "Throwaway probe: what environment / cwd / roots does Claude Code give a spawned channel MCP server?",
+  "scripts": {
+    "start": "node probe.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  }
+}
