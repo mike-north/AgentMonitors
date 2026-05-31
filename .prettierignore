@@ -5,3 +5,6 @@ node_modules
 .next
 pnpm-lock.yaml
 api-report
+
+# Cursor rule files use an .mdc extension Prettier has no parser for
+**/*.mdc

@@ -13,6 +13,27 @@ The product direction is:
 
 Review behavior and architecture before style.
 
+## Specifications
+
+This repository has a canonical, code-verified specification set in `docs/specs/` (index:
+`docs/specs/README.md`). It is the source of truth for _intended_ behavior and marks each rule as
+_current_ vs _target_.
+
+Consult the single doc that matches the change under review — you do not need to read the set for
+unrelated work. Relevance map:
+
+- `docs/specs/001-monitor-definition.md` — `MONITOR.md` files, frontmatter schema, monitor identity
+- `docs/specs/002-runtime-delivery.md` — runtime tick & scheduling, notify dispatch, persistence,
+  session projection, hook delivery, daemon/IPC, host adapters
+- `docs/specs/003-source-plugins.md` — the source-plugin contract and the bundled sources
+- `docs/specs/004-validation-testing.md` — validation surfaces and required test scenarios
+- `docs/specs/005-cli-reference.md` — the `agentmonitors` CLI
+- `docs/specs/000-principles.md` — the invariants the rest cite; `docs/specs/roadmap.md` —
+  current→target gaps
+
+When a change alters behavior, expect the matching numbered doc to be updated and a
+`docs/specs/spec-changelog.md` entry added.
+
 ## Architectural Rules
 
 - Keep the runtime core host-agnostic. Host-specific hook names, task tools,
