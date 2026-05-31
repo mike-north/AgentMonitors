@@ -145,31 +145,41 @@ the bound session/workspace before acking. (Permission relay is **out of scope**
 
 ### 4.4 Workspace/session binding
 
-A spawned MCP server **cannot** learn its host session id today: there is no `CLAUDE_SESSION_ID`, and
-nothing session-identifying in the MCP `initialize` handshake. It **can** learn its **workspace**:
-Claude Code sets `CLAUDE_PROJECT_DIR` in the spawned server's environment (and the server may call
-MCP `roots/list`). Reference: <https://code.claude.com/docs/en/mcp.md>.
+Two identity signals are relevant, and the binding strategy is chosen by which is available to a
+process **spawned as an MCP server**:
 
-Therefore the channel transport binds at **workspace granularity**:
+- **Workspace** identity is documented as available: Claude Code sets `CLAUDE_PROJECT_DIR` in the
+  spawned server's environment, and the server may call MCP `roots/list`. Reference:
+  <https://code.claude.com/docs/en/mcp.md>.
+- **Session** identity is the open question. There is no `CLAUDE_SESSION_ID`, but Claude Code
+  populates **`CLAUDE_CODE_SESSION_ID`** in its process environment (observed empirically — see
+  [roadmap.md](./roadmap.md) G7). Whether that variable is **inherited by MCP-server subprocesses**
+  (as opposed to shell subprocesses, where it is confirmed present) is not yet verified.
 
-- the server reads `CLAUDE_PROJECT_DIR` (fallback: `roots/list`) to determine its workspace `W`;
-- it asks the daemon for the **lead** session(s) projected for `W`
-  ([002 §6](./002-runtime-delivery.md)) and surfaces their unread deliveries;
-- this composes with the existing session-open flow: a `SessionStart` hook still calls
-  `session open --host-session-id …`, so a real session record for `W` already exists for the
-  channel server to find by workspace.
+Binding strategy, in preference order:
 
-**Single-lead-session assumption.** When `W` has exactly one active lead session (the common case),
-workspace binding is equivalent to session binding and unread/claimed accounting is exact. When `W`
-has multiple concurrent lead sessions, the channel server **MUST** degrade rather than guess: it
-surfaces the workspace's unread but **MUST NOT** claim on behalf of an ambiguous session; the
-per-session hook-state transport (§3) remains the accurate surface in that case. The runtime can
-detect the multi-lead condition because it tracks all sessions.
+1. **Session binding (preferred, if available):** if the MCP server inherits `CLAUDE_CODE_SESSION_ID`,
+   bind directly to that host session. Unread/claimed accounting is then exact, matching the
+   hook-state transport's precision, and the multi-lead ambiguity below does not arise.
+2. **Workspace binding (fallback):** otherwise read `CLAUDE_PROJECT_DIR` (or `roots/list`) for the
+   workspace `W` and surface the lead session(s) projected for `W`
+   ([002 §6](./002-runtime-delivery.md)). This composes with the existing session-open flow: a
+   `SessionStart` hook still calls `session open --host-session-id …`, so a real session record for
+   `W` already exists for the channel server to find.
 
-> **Open question (prototype).** `CLAUDE_PROJECT_DIR` availability and the spawned server's cwd are
-> documented but not yet empirically confirmed for this host version, and the reference channels do
-> not read them. The one-way prototype (G7) **MUST** verify both before this section is promoted from
-> target to current.
+**Single-lead-session assumption (workspace-binding fallback only).** When `W` has exactly one active
+lead session (the common case), workspace binding is equivalent to session binding and unread/claimed
+accounting is exact. When `W` has multiple concurrent lead sessions, the channel server **MUST**
+degrade rather than guess: it surfaces the workspace's unread but **MUST NOT** claim on behalf of an
+ambiguous session; the per-session hook-state transport (§3) remains the accurate surface in that
+case. The runtime can detect the multi-lead condition because it tracks all sessions.
+
+> **Open question (prototype).** For a server spawned **as an MCP server** (not via a shell), the
+> one-way prototype (G7) **MUST** determine: (a) whether `CLAUDE_PROJECT_DIR` is set and its value;
+> (b) the server's cwd; (c) whether `CLAUDE_CODE_SESSION_ID` is inherited — if so, the preferred
+> session binding (1) applies; and (d) whether `roots/list` is answered. Promote this section from
+> target to current only once these are verified. (`CLAUDE_CODE_SESSION_ID` is confirmed present in
+> Claude Code's own process environment; MCP-subprocess inheritance is the specific unknown.)
 
 ### 4.5 Cross-transport deduplication
 

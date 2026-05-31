@@ -98,15 +98,19 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
 - **Files:** new channel-server package/command; `libs/core/src/adapter/` (transport seam);
   `libs/core/src/runtime/` (claim rendering); reuses the daemon IPC (`apps/cli/src/daemon-ipc.ts`).
 - **Proof (staged):**
-  1. **One-way prototype** that empirically confirms `CLAUDE_PROJECT_DIR` is populated and records
-     the spawned server's cwd (resolves [006 §4.4 open question](./006-agent-integration.md)), then
-     pushes a high-urgency claim as a `<channel>` event.
+  1. **One-way prototype** (`experiments/channel-probe/`) that, for a process spawned **as an MCP
+     server**, records `CLAUDE_PROJECT_DIR`, cwd, whether `CLAUDE_CODE_SESSION_ID` is inherited, and
+     whether `roots/list` is answered (resolves the [006 §4.4 open question](./006-agent-integration.md)),
+     then pushes a high-urgency claim as a `<channel>` event.
   2. Cross-transport dedup test: a channel push marks rows claimed so the hook path suppresses the
      duplicate reminder ([006 §4.5](./006-agent-integration.md)).
   3. Fallback test: with the channel disabled/blocked, delivery still completes via the hook path
      with no error ([006 §5](./006-agent-integration.md)).
-- **Decision captured:** workspace-scoped binding (not session) because Claude Code exposes no
-  session id to spawned MCP servers; single-active-lead-session assumption, degrade on multi-lead.
+- **Decision captured:** binding prefers **session** scope if the MCP server inherits
+  `CLAUDE_CODE_SESSION_ID` (confirmed present in Claude Code's process env; MCP-subprocess
+  inheritance is what the prototype must verify), and falls back to **workspace** scope via
+  `CLAUDE_PROJECT_DIR`/`roots/list` with a single-active-lead-session assumption (degrade on
+  multi-lead). There is no `CLAUDE_SESSION_ID`.
 
 ## Test gaps
 
