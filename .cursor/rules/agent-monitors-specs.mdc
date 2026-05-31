@@ -1,5 +1,5 @@
 ---
-description: Canonical Agent Monitors specification set in docs/specs/ — the source of truth for intended behavior. Fetch and read the single relevant numbered doc when a task touches monitor definitions / MONITOR.md frontmatter, the runtime tick / scheduling / notify dispatch / event delivery / persistence pipeline, the daemon or its IPC layer, host adapters, source plugins, the agentmonitors CLI, or validation/testing. Not needed for changes unrelated to those areas.
+description: Canonical Agent Monitors specification set in docs/specs/ — the source of truth for intended behavior. Fetch and read the single relevant numbered doc when a task touches monitor definitions / MONITOR.md frontmatter, the runtime tick / scheduling / notify dispatch / event delivery / persistence pipeline, the daemon or its IPC layer, host adapters, delivery transports / Claude Code channels, source plugins, the agentmonitors CLI, or validation/testing. Not needed for changes unrelated to those areas.
 globs:
 alwaysApply: false
 ---
@@ -18,6 +18,8 @@ rule as *current* vs *target*.
 - `docs/specs/003-source-plugins.md` — the source-plugin contract and the bundled sources
 - `docs/specs/004-validation-testing.md` — validation surfaces and required test scenarios
 - `docs/specs/005-cli-reference.md` — the `agentmonitors` command surface
+- `docs/specs/006-agent-integration.md` — delivery transports & agent integration: the adapter seam,
+  the hook-state transport, the Claude Code channel transport (target), availability/fallback
 - `docs/specs/000-principles.md` — the invariants (PP/SP/AP/BP/NP) the rest cite
 - `docs/specs/roadmap.md` — known current→target gaps; `docs/specs/glossary.md` — terminology
 

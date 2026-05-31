@@ -28,6 +28,8 @@ unrelated work. Relevance map:
 - `docs/specs/003-source-plugins.md` — the source-plugin contract and the bundled sources
 - `docs/specs/004-validation-testing.md` — validation surfaces and required test scenarios
 - `docs/specs/005-cli-reference.md` — the `agentmonitors` CLI
+- `docs/specs/006-agent-integration.md` — delivery transports: adapter seam, hook-state transport,
+  the Claude Code channel transport (target)
 - `docs/specs/000-principles.md` — the invariants the rest cite; `docs/specs/roadmap.md` —
   current→target gaps
 

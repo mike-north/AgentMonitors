@@ -9,9 +9,23 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
-## 2026-05-31
+## 2026-05-31 — Agent integration & delivery transports
 
-In-repo authoring pass: the numbered draft set was promoted into `docs/specs/` as the
+- Added normative [006-agent-integration.md](./006-agent-integration.md): a delivery-**transport**
+  abstraction behind the adapter seam, covering the current hook-state transport and a **target**
+  Claude Code **channel** transport. Recorded as roadmap item G7.
+- Resolved the channel transport's binding model from evidence: a spawned MCP server can recover its
+  **workspace** (`CLAUDE_PROJECT_DIR` / MCP `roots/list`) but **not** a session id (no
+  `CLAUDE_SESSION_ID`, nothing session-identifying in the MCP `initialize` handshake). The transport
+  therefore binds at **workspace granularity** with a single-active-lead-session assumption and
+  graceful degradation; the hook-state transport remains the per-session-accurate surface.
+- Established that channels are **optional and additive** (NP-CH): research-preview, version- and
+  org-gated, so they must never become a delivery dependency. The hook-state transport stays the
+  always-available default.
+
+## 2026-05-31 — In-repo authoring pass
+
+The numbered draft set was promoted into `docs/specs/` as the
 canonical contract, verified against the code, and enriched. See
 [maintainer-migration-notes.md](./maintainer-migration-notes.md) for the source mapping.
 

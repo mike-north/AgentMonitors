@@ -30,6 +30,8 @@ Use this map to decide relevance:
 - [`004-validation-testing.md`](docs/specs/004-validation-testing.md) — validation surfaces and
   required test scenarios
 - [`005-cli-reference.md`](docs/specs/005-cli-reference.md) — the `agentmonitors` command surface
+- [`006-agent-integration.md`](docs/specs/006-agent-integration.md) — how deliveries reach an agent:
+  the adapter/transport seam, hook-state transport, the Claude Code channel transport (target)
 - [`000-principles.md`](docs/specs/000-principles.md) — the invariants (PP/SP/AP/BP/NP) the rest cite
 - [`roadmap.md`](docs/specs/roadmap.md) — known current→target gaps ·
   [`glossary.md`](docs/specs/glossary.md) — terminology

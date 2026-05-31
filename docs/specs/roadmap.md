@@ -85,6 +85,29 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
 - **Proof:** a runtime test asserting rows are recorded per tick outcome (or a migration
   removing the table).
 
+### G7 — Claude Code channel delivery transport (P2)
+
+- **Current:** delivery has a single surface — per-session `hook-state.json` consumed by hooks
+  ([002 §8/§11](./002-runtime-delivery.md)). There is no transport abstraction.
+- **Target:** a `DeliveryTransport` seam plus an AgentMon **channel** MCP server that pushes settled
+  `DeliveryClaim`s into a session as `<channel>` events, and (two-way) an `agentmon_ack` tool. Binds
+  at workspace granularity via `CLAUDE_PROJECT_DIR`/`roots/list` (no session id is available);
+  additive and never required (NP-CH).
+- **Governs:** [006-agent-integration.md](./006-agent-integration.md), PP4/BP2/AP6
+  ([000](./000-principles.md)).
+- **Files:** new channel-server package/command; `libs/core/src/adapter/` (transport seam);
+  `libs/core/src/runtime/` (claim rendering); reuses the daemon IPC (`apps/cli/src/daemon-ipc.ts`).
+- **Proof (staged):**
+  1. **One-way prototype** that empirically confirms `CLAUDE_PROJECT_DIR` is populated and records
+     the spawned server's cwd (resolves [006 §4.4 open question](./006-agent-integration.md)), then
+     pushes a high-urgency claim as a `<channel>` event.
+  2. Cross-transport dedup test: a channel push marks rows claimed so the hook path suppresses the
+     duplicate reminder ([006 §4.5](./006-agent-integration.md)).
+  3. Fallback test: with the channel disabled/blocked, delivery still completes via the hook path
+     with no error ([006 §5](./006-agent-integration.md)).
+- **Decision captured:** workspace-scoped binding (not session) because Claude Code exposes no
+  session id to spawned MCP servers; single-active-lead-session assumption, degrade on multi-lead.
+
 ## Test gaps
 
 These are required scenarios from [004 §3](./004-validation-testing.md) with no current
