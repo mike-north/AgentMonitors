@@ -217,4 +217,4 @@ At minimum, monitor authoring validation should be able to prove:
 - the selected source exists in the source registry
 - required source-specific scope fields are present
 
-The current `agentmonitors validate` command only partially enforces the final item above: it checks required source scope fields, but it does not yet perform full JSON Schema validation against each source's schema. That limitation is documented further in [004-validation-testing.md](./004-validation-testing.md).
+The `agentmonitors validate` command enforces all of the above, including full per-source JSON Schema validation of `scope` against each source's `scopeSchema` (via the exported core helper `validateScope`). See [004-validation-testing.md](./004-validation-testing.md) §2.2.

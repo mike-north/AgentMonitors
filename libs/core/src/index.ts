@@ -3,6 +3,7 @@ export {
   monitorFrontmatterSchema,
   notifySchema,
 } from './schema/monitor-schema.js';
+export { validateScope } from './schema/validate-scope.js';
 export type {
   MonitorFrontmatter,
   NotifyConfig,

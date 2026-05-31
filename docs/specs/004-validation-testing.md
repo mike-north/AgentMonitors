@@ -28,11 +28,11 @@ The repository currently exposes several different validation surfaces. They do 
 
 ### 2.2 `agentmonitors validate`
 
-The `validate` command proves: the monitor directory exists; monitor files parse; the selected source name is known; required source-specific scope fields are present.
+The `validate` command proves: the monitor directory exists; monitor files parse; monitor IDs are unique within the tree (see [001 §4](./001-monitor-definition.md)); the selected source name is known; and each monitor's `scope` is **fully valid** against its source's `scopeSchema`.
 
-**Verified implementation detail:** `apps/cli/src/commands/validate.ts` `validateScope()` (lines 11–27) only checks `schema['required']` — it iterates the array of required field names and checks for presence using `field in scope`. It does **not** validate field types, formats, enum values, `minimum`/`maximum` constraints, nested object shapes, or any other JSON Schema keywords. This means a monitor with `scope: { globs: 42 }` passes the `validate` command even though `globs` must be an array of strings.
+**Verified implementation detail (current):** scope validation runs full JSON Schema (draft-07) checks — types, enums, `required`, `items`, and other keywords — via the exported core helper `validateScope(scope, scopeSchema)` (`libs/core/src/schema/validate-scope.ts`), which `apps/cli/src/commands/validate.ts` calls. A monitor with `scope: { globs: 42 }` is now **rejected** (validate exits non-zero) because `globs` must be an array of strings.
 
-This limitation MUST be noted explicitly. It is current behavior and MUST be preserved as a documented constraint until the implementation is extended to run full JSON Schema validation against each source's `scopeSchema`.
+The validator is `@cfworker/json-schema`, which walks the schema at runtime rather than compiling with the `Function` constructor, so validation is safe under restrictive CSP / Workers-style environments.
 
 ### 2.3 `agentmonitors schema generate`
 

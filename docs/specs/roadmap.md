@@ -16,19 +16,10 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
 > G1 (reject duplicate monitor IDs) shipped — now current behavior, see
 > [001 §4](./001-monitor-definition.md) and [spec-changelog.md](./spec-changelog.md).
 
-### G2 — Full per-source JSON Schema validation in `validate` (P1)
-
-- **Current:** `validateScope()` only checks that each `required` scope field is _present_
-  (`field in scope`); types, enums, formats, and patterns are not validated. `scope: { globs: 42 }`
-  passes.
-- **Target:** `validate` evaluates each monitor's `scope` against the source's full
-  `scopeSchema` fragment (the same schema `schema generate` emits).
-- **Governs:** [004 §2.2](./004-validation-testing.md), AP4 ([000](./000-principles.md)),
-  BP3 ([000](./000-principles.md)).
-- **Files:** `apps/cli/src/commands/validate.ts`, `libs/core/src/observation/schema-generator.ts`.
-- **Proof:** `validate` rejects a monitor whose required field has the wrong type/enum; an
-  integration test covers both the unknown-source and wrong-type paths (both currently
-  untested per [004 §3](./004-validation-testing.md)).
+> G2 (full per-source JSON Schema validation in `validate`) shipped — now current
+> behavior via the exported core `validateScope` helper (backed by `@cfworker/json-schema`).
+> See [004 §2.2](./004-validation-testing.md) and [spec-changelog.md](./spec-changelog.md).
+> This also closed test gap T3 (`validate` failure paths).
 
 ### G3 — `file-fingerprint` create/delete events (P2)
 
@@ -120,10 +111,8 @@ coverage. They are cheap to close and reduce regression risk on the items above.
   `(workspacePath, monitorId, objectKey)`. Governed by SP5,
   [002 §5.2 / §14](./002-runtime-delivery.md).
 
-### T3 — `validate` failure paths (P2)
-
-- The unknown-source and missing-required-field branches of
-  `apps/cli/src/commands/validate.ts` have no integration test. Pairs naturally with G2.
+> T3 (`validate` failure paths) closed alongside G2 — integration tests now cover the
+> unknown-source and schema-violation branches of `validate`.
 
 ### T4 — `schema generate` / `session list|close` CLI wiring (P3)
 
