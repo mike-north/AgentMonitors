@@ -106,4 +106,37 @@ describe('scanMonitors', () => {
     const [monitor] = result.monitors;
     expect(monitor?.monitor.id).toBe('my-custom-name');
   });
+
+  // Regression for G1 / SP2: two folders with the same basename derive the same
+  // monitor id, which would alias persisted monitor state. The scan must surface
+  // the collision (it does not silently dedupe or drop either monitor).
+  it('flags monitors whose folder-derived id collides', async () => {
+    const base = makeTempDir();
+    createTempMonitor(base, 'dup', validContent);
+    createTempMonitor(base, path.join('nested', 'dup'), validContent);
+
+    const result = await scanMonitors(base);
+
+    // Both still parse successfully — duplicates are a tree-level concern,
+    // not a per-file parse failure.
+    expect(result.monitors).toHaveLength(2);
+    expect(result.errors).toHaveLength(0);
+
+    expect(result.duplicateIds).toHaveLength(1);
+    const [dup] = result.duplicateIds;
+    expect(dup?.id).toBe('dup');
+    expect(dup?.filePaths).toHaveLength(2);
+    expect(
+      dup?.filePaths.every((p) => path.basename(path.dirname(p)) === 'dup'),
+    ).toBe(true);
+  });
+
+  it('reports no duplicateIds when all ids are unique', async () => {
+    const base = makeTempDir();
+    createTempMonitor(base, 'monitor-a', validContent);
+    createTempMonitor(base, 'monitor-b', validContent);
+
+    const result = await scanMonitors(base);
+    expect(result.duplicateIds).toEqual([]);
+  });
 });

@@ -4,9 +4,29 @@ import { globSync } from 'glob';
 import type { ParseError, ParseOutcome, ParseResult } from './parse-monitor.js';
 import { parseMonitor } from './parse-monitor.js';
 
+/**
+ * A folder-derived monitor id that more than one parsed `MONITOR.md` resolves to.
+ *
+ * Duplicate ids are a correctness hazard, not a cosmetic one: runtime state is keyed
+ * by `monitorId`, so two monitors sharing an id would alias each other's persisted
+ * source and notify state (SP2).
+ */
+export interface DuplicateMonitorId {
+  /** The colliding monitor id (a parent-directory basename). */
+  id: string;
+  /** Absolute paths of the `MONITOR.md` files that derive this id (at least two). */
+  filePaths: string[];
+}
+
 export interface ScanResult {
   monitors: ParseResult[];
   errors: ParseError[];
+  /**
+   * Monitor ids that more than one successfully-parsed monitor derives. Empty when
+   * all ids are unique. Callers MUST treat a non-empty list as an error (SP2); the
+   * runtime refuses to tick and the CLI surfaces it.
+   */
+  duplicateIds: DuplicateMonitorId[];
 }
 
 /**
@@ -45,5 +65,24 @@ export async function scanMonitors(baseDir: string): Promise<ScanResult> {
     }
   }
 
-  return { monitors, errors };
+  // Group parsed monitors by their folder-derived id; any id claimed by more than
+  // one file is a collision (SP2). Insertion order is preserved for determinism.
+  const filePathsById = new Map<string, string[]>();
+  for (const { monitor } of monitors) {
+    const existing = filePathsById.get(monitor.id);
+    if (existing) {
+      existing.push(monitor.filePath);
+    } else {
+      filePathsById.set(monitor.id, [monitor.filePath]);
+    }
+  }
+
+  const duplicateIds: DuplicateMonitorId[] = [];
+  for (const [id, filePaths] of filePathsById) {
+    if (filePaths.length > 1) {
+      duplicateIds.push({ id, filePaths });
+    }
+  }
+
+  return { monitors, errors, duplicateIds };
 }

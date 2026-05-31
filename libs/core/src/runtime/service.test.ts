@@ -157,6 +157,41 @@ describe('AgentMonitorRuntime', () => {
     expect(unread[0]?.summary).toContain('Watched file changed');
   });
 
+  // Regression for G1 / SP2: monitor state is keyed by monitorId, so a tick over a
+  // tree with two folders deriving the same id must be refused, not processed.
+  it('refuses to tick when two monitors derive the same id', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const monitorsDir = path.join(rootDir, '.claude', 'monitors');
+
+    const monitorBody = `---
+name: Dup monitor
+source: file-fingerprint
+urgency: normal
+event-kind: mutation
+scope:
+  globs: ["*.ts"]
+---
+Handle it.
+`;
+    for (const rel of ['dup', path.join('nested', 'dup')]) {
+      const dir = path.join(monitorsDir, rel);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(path.join(dir, 'MONITOR.md'), monitorBody, 'utf-8');
+    }
+
+    const db = createDb(':memory:');
+    const runtime = new AgentMonitorRuntime(
+      new RuntimeStore(db),
+      new SourceRegistry(),
+      [claudeCodeAdapter],
+    );
+
+    await expect(runtime.tick(monitorsDir, rootDir)).rejects.toThrow(
+      /Duplicate monitor ids/,
+    );
+  });
+
   it('claims high-urgency deliveries after the debounce window and updates hook state', () => {
     const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
     tempDirs.push(rootDir);
