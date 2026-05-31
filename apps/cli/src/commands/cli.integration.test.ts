@@ -267,6 +267,42 @@ describe('validate', () => {
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("'xml'");
   });
+
+  // Regression for G1 / SP2: two folders with the same basename derive the same
+  // monitor id; validate must fail (exit 1) and name the collision.
+  it('rejects duplicate monitor ids', () => {
+    const dir = path.join(tempDir, 'validate-dup-test');
+    const monitorsDir = path.join(dir, 'monitors');
+    const body = [
+      '---',
+      'name: Dup',
+      'source: file-fingerprint',
+      'urgency: normal',
+      'event-kind: mutation',
+      'scope:',
+      '  globs: ["*.ts"]',
+      '---',
+      'Handle it.',
+      '',
+    ].join('\n');
+    for (const rel of ['dup', path.join('nested', 'dup')]) {
+      const d = path.join(monitorsDir, rel);
+      mkdirSync(d, { recursive: true });
+      writeFileSync(path.join(d, 'MONITOR.md'), body, 'utf-8');
+    }
+
+    const result = run(['validate', monitorsDir]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain('Duplicate monitor id "dup"');
+
+    const json = run(['validate', monitorsDir, '--format', 'json']);
+    const parsed = JSON.parse(json.stdout) as {
+      duplicateIds: { id: string; filePaths: string[] }[];
+    };
+    expect(parsed.duplicateIds).toHaveLength(1);
+    expect(parsed.duplicateIds[0]?.id).toBe('dup');
+    expect(parsed.duplicateIds[0]?.filePaths).toHaveLength(2);
+  });
 });
 
 describe('scan', () => {

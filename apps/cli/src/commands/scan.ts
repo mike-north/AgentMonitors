@@ -30,6 +30,7 @@ export const scanCommand = new Command('scan')
           filePath: e.filePath,
           error: e.error,
         })),
+        duplicateIds: result.duplicateIds,
       };
       console.log(JSON.stringify(output, null, 2));
       return;
@@ -62,5 +63,14 @@ export const scanCommand = new Command('scan')
 
     if (result.errors.length > 0) {
       console.log(`\n${String(result.errors.length)} file(s) failed to parse.`);
+    }
+
+    if (result.duplicateIds.length > 0) {
+      console.log(
+        `\nDuplicate monitor id(s) — ids must be unique within a tree:`,
+      );
+      for (const dup of result.duplicateIds) {
+        console.log(`  ${dup.id}: ${dup.filePaths.join(', ')}`);
+      }
     }
   });

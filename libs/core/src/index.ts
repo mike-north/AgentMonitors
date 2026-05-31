@@ -20,7 +20,7 @@ export type {
   ParseOutcome,
 } from './parser/parse-monitor.js';
 export { scanMonitors } from './parser/scan-monitors.js';
-export type { ScanResult } from './parser/scan-monitors.js';
+export type { ScanResult, DuplicateMonitorId } from './parser/scan-monitors.js';
 
 // Inbox
 export { createDb } from './inbox/db.js';

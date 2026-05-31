@@ -13,18 +13,8 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
 
 ## Behavioral gaps
 
-### G1 — Reject duplicate monitor IDs (P1)
-
-- **Current:** `scanMonitors()` discovers every `**/MONITOR.md` and parses them with no
-  uniqueness check; duplicate directory basenames silently alias persisted monitor state.
-- **Target:** A scanned tree with two monitors resolving to the same ID is a hard error
-  surfaced by `scan`/`validate` and refused by the runtime tick.
-- **Governs:** SP2 ([000](./000-principles.md)), [001 §4](./001-monitor-definition.md).
-- **Files:** `libs/core/src/parser/scan-monitors.ts`; surfaced via
-  `apps/cli/src/commands/scan.ts`, `validate.ts`; enforced in `libs/core/src/runtime/service.ts`.
-- **Proof:** a scan/validate test with two `MONITOR.md` files whose parent dirs share a
-  basename fails clearly; a runtime test asserts the tick refuses the tree.
-- **Why P1:** silent state aliasing is a correctness hazard, not cosmetic.
+> G1 (reject duplicate monitor IDs) shipped — now current behavior, see
+> [001 §4](./001-monitor-definition.md) and [spec-changelog.md](./spec-changelog.md).
 
 ### G2 — Full per-source JSON Schema validation in `validate` (P1)
 

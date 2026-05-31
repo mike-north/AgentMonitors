@@ -360,6 +360,19 @@ export class AgentMonitorRuntime {
     workspacePath = monitorsDir,
   ): Promise<RuntimeTickResult> {
     const result = await scanMonitors(monitorsDir);
+
+    // Refuse the tick on duplicate monitor ids: state is keyed by monitorId, so
+    // processing aliased monitors would corrupt persisted source/notify state (SP2).
+    if (result.duplicateIds.length > 0) {
+      const details = result.duplicateIds
+        .map((dup) => `"${dup.id}" (${dup.filePaths.join(', ')})`)
+        .join('; ');
+      throw new Error(
+        `Duplicate monitor ids in ${monitorsDir}: ${details}. ` +
+          'Monitor ids are derived from folder names and must be unique within a tree.',
+      );
+    }
+
     const now = new Date();
     const emittedEventIds: string[] = [];
     const evaluated: string[] = [];

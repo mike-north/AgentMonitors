@@ -68,6 +68,13 @@ export const validateCommand = new Command('validate')
       return true;
     });
 
+    // Duplicate folder-derived ids are a tree-level correctness error (SP2),
+    // independent of whether each file parses.
+    const duplicateErrors = result.duplicateIds.map((dup) => ({
+      filePath: dup.filePaths.join(', '),
+      error: `Duplicate monitor id "${dup.id}" — ids are derived from folder names and must be unique within a tree`,
+    }));
+
     const allErrors = [
       ...result.errors.map((e) => ({
         filePath: e.filePath,
@@ -77,6 +84,7 @@ export const validateCommand = new Command('validate')
         filePath: e.id,
         error: e.errors.join('; '),
       })),
+      ...duplicateErrors,
     ];
 
     if (options.format === 'json') {
@@ -88,6 +96,7 @@ export const validateCommand = new Command('validate')
           name: m.monitor.frontmatter.name,
           source: m.monitor.frontmatter.source,
         })),
+        duplicateIds: result.duplicateIds,
         errors: allErrors,
       };
       console.log(JSON.stringify(output, null, 2));

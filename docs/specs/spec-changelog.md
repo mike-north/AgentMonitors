@@ -9,6 +9,15 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-05-31 — Duplicate monitor IDs are now rejected (G1)
+
+- Promoted [001 §4](./001-monitor-definition.md) from target to **current**: duplicate
+  folder-derived monitor IDs are now a hard error, closing roadmap item G1.
+- `scanMonitors` surfaces collisions via a new `ScanResult.duplicateIds`
+  (`DuplicateMonitorId[]`) field; the runtime tick refuses to run on duplicates; `validate`
+  exits non-zero and `scan` reports them. Enforces SP2. Regression tests added at the scanner,
+  runtime, and CLI layers; minor `@mike-north/core` changeset included.
+
 ## 2026-05-31 — Agent integration & delivery transports
 
 - Added normative [006-agent-integration.md](./006-agent-integration.md): a delivery-**transport**

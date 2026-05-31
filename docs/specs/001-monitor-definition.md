@@ -127,13 +127,13 @@ If present, `tags` **MUST** be an array of strings. Tags have no runtime semanti
 
 ## 4. Monitor Identity and Uniqueness
 
-Monitor IDs **MUST** be unique within a scanned monitor tree (SP2).
+Monitor IDs **MUST** be unique within a scanned monitor tree (SP2). The runtime stores monitor state by `monitorId`, so two monitors deriving the same ID would alias each other's persisted source and notify state — a durable-state correctness hazard, not a cosmetic one.
 
-**Current vs. target framing:** This uniqueness requirement is stronger than what the current implementation enforces. The scanner (`scan-monitors.ts`) does not reject duplicate directory basenames. It collects all parse outcomes into separate `monitors` and `errors` arrays without deduplication. However, the runtime stores monitor state by `monitorId`, so duplicate IDs alias persisted source state and notify state. That makes uniqueness a correctness requirement now, not a future enhancement.
+This is enforced (current behavior): `scanMonitors` reports folder-name collisions in `ScanResult.duplicateIds` (a `DuplicateMonitorId[]` of `{ id, filePaths }`). The runtime tick **MUST** refuse to run when any duplicate is present, and `agentmonitors validate` **MUST** fail (non-zero exit) while `scan` reports the collisions.
 
-> Verified: `libs/core/src/parser/scan-monitors.ts` lines 37–48 — the accumulation loop has no duplicate-ID check. Uniqueness is not currently enforced by the scanner.
+> Verified: `libs/core/src/parser/scan-monitors.ts` — the scan groups parsed monitors by `id` and populates `duplicateIds`; `libs/core/src/runtime/service.ts` `tick()` throws when `duplicateIds` is non-empty; `apps/cli/src/commands/validate.ts` adds duplicates to its error set and exits non-zero.
 
-Integrators **MUST NOT** create two monitor directories with the same basename under the same monitored tree. Future versions of the scanner are expected to enforce this constraint explicitly.
+Integrators **MUST NOT** create two monitor directories with the same basename under the same monitored tree; doing so is now a hard error rather than a silent hazard.
 
 ## 5. Monitor Body Semantics
 
