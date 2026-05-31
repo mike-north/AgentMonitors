@@ -33,10 +33,18 @@ Three observation sources ship in the box:
 
 ## Quick start
 
-Install the CLI (published to the GitHub npm registry):
+The `agentmonitors` CLI ships from this monorepo (`@mike-north/cli`). It is not yet published to a
+package registry, so build it from source:
 
 ```bash
-npm install -g @mike-north/cli
+pnpm install
+pnpm build
+```
+
+The CLI binary is then `apps/cli/dist/index.cjs`; alias it for convenience:
+
+```bash
+alias agentmonitors="node \"$(pwd)/apps/cli/dist/index.cjs\""
 ```
 
 Scaffold and run your first monitor:

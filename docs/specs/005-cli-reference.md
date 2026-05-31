@@ -87,7 +87,7 @@ Each source produces a distinct starter frontmatter block:
 ## §3 `validate` — Validate monitor files
 
 **Source:** `apps/cli/src/commands/validate.ts`
-**Status:** Partial — validates required scope fields only; full JSON Schema validation is not yet implemented. See [004-validation-testing.md](./004-validation-testing.md) (not yet authored) for the target validation contract.
+**Status:** Partial — validates required scope fields only; full JSON Schema validation is not yet implemented. See [004-validation-testing.md](./004-validation-testing.md) for the target validation contract.
 
 ### Purpose
 

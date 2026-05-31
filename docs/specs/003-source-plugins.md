@@ -233,7 +233,10 @@ The source does not decide when it is due — that is the runtime's responsibili
 | `list`     | `(): ObservationSource[]`                        | Returns all registered sources as an array.                                                 |
 | `names`    | `(): string[]`                                   | Returns all registered source names as an array.                                            |
 
-Plugin discovery from `~/.config/agentmonitors/node_modules/` is handled by the CLI at startup; the registry holds the resolved plugins.
+At startup the CLI registers only the bundled sources (via `registerCoreSources`,
+`apps/cli/src/sources.ts`); the registry then holds those resolved plugins. Third-party plugin
+**discovery and installation are not implemented** — the `source install`/`update`/`remove`/`search`
+commands are placeholders that print a manual-install hint (NP3). See §7.
 
 ### 6.2 Schema generation
 
