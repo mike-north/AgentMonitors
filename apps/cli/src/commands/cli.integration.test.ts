@@ -303,6 +303,55 @@ describe('validate', () => {
     expect(parsed.duplicateIds[0]?.id).toBe('dup');
     expect(parsed.duplicateIds[0]?.filePaths).toHaveLength(2);
   });
+
+  // Full per-source JSON Schema validation: a present-but-wrong-typed scope field
+  // (globs must be an array of strings) is rejected, where the old required-fields
+  // -only check silently accepted it.
+  it('rejects a scope that violates the source schema', () => {
+    const dir = path.join(tempDir, 'validate-badscope-test');
+    const monitorDir = path.join(dir, 'monitors', 'bad-scope');
+    mkdirSync(monitorDir, { recursive: true });
+    const body = [
+      '---',
+      'name: Bad scope',
+      'source: file-fingerprint',
+      'urgency: normal',
+      'event-kind: mutation',
+      'scope:',
+      '  globs: 42',
+      '---',
+      'Handle it.',
+      '',
+    ].join('\n');
+    writeFileSync(path.join(monitorDir, 'MONITOR.md'), body, 'utf-8');
+
+    const result = run(['validate', path.join(dir, 'monitors')]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout.toLowerCase()).toMatch(/scope|array|type/);
+  });
+
+  it('rejects an unknown source name', () => {
+    const dir = path.join(tempDir, 'validate-unknownsource-test');
+    const monitorDir = path.join(dir, 'monitors', 'mystery');
+    mkdirSync(monitorDir, { recursive: true });
+    const body = [
+      '---',
+      'name: Mystery',
+      'source: not-a-real-source',
+      'urgency: normal',
+      'event-kind: mutation',
+      'scope:',
+      '  foo: bar',
+      '---',
+      'Handle it.',
+      '',
+    ].join('\n');
+    writeFileSync(path.join(monitorDir, 'MONITOR.md'), body, 'utf-8');
+
+    const result = run(['validate', path.join(dir, 'monitors')]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain('Unknown source');
+  });
 });
 
 describe('scan', () => {

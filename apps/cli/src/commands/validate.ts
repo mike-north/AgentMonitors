@@ -1,30 +1,7 @@
 import { Command, Option } from 'commander';
-import { scanMonitors, SourceRegistry } from '@mike-north/core';
-import type { JsonSchema } from '@mike-north/core';
+import { scanMonitors, SourceRegistry, validateScope } from '@mike-north/core';
 import { registerCoreSources } from '../sources.js';
 import { requireDirectory } from '../validation.js';
-
-/**
- * Validate a scope object against a source's JSON Schema fragment.
- * Checks that all required fields are present.
- */
-function validateScope(
-  scope: Record<string, unknown>,
-  schema: JsonSchema,
-): string[] {
-  const errors: string[] = [];
-
-  const required = schema['required'];
-  if (Array.isArray(required)) {
-    for (const field of required) {
-      if (typeof field === 'string' && !(field in scope)) {
-        errors.push(`Missing required scope field: "${field}"`);
-      }
-    }
-  }
-
-  return errors;
-}
 
 export const validateCommand = new Command('validate')
   .description('Validate MONITOR.md files in a directory')
