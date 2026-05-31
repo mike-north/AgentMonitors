@@ -62,12 +62,16 @@ describe('monitorFrontmatterSchema', () => {
     });
 
     it('accepts all urgency values', () => {
-      for (const urgency of ['high', 'normal']) {
+      // `low` is first-class (PP5, 001 §3.2) and must be accepted, not just
+      // `normal`/`high`; this guards against the schema narrowing it away.
+      for (const urgency of ['low', 'normal', 'high']) {
         const result = monitorFrontmatterSchema.safeParse({
           ...validMinimal,
           urgency,
         });
-        expect(result.success).toBe(true);
+        expect(result.success, `urgency "${urgency}" should be accepted`).toBe(
+          true,
+        );
       }
     });
 
