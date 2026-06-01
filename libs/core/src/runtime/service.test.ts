@@ -630,4 +630,82 @@ Handle it.
     });
     expect(deletedOnly).toHaveLength(1);
   });
+
+  // T2: snapshot history is keyed by (workspace, monitor, objectKey) — SP5.
+  it('stores and retrieves snapshots isolated by workspace, monitor, and object key', () => {
+    const db = createDb(':memory:');
+    const store = new RuntimeStore(db);
+    store.saveSnapshot({
+      workspacePath: '/ws',
+      monitorId: 'm1',
+      objectKey: 'obj',
+      eventId: 'e1',
+      content: 'v1',
+    });
+
+    expect(store.latestSnapshot('m1', 'obj', '/ws')?.content).toBe('v1');
+    // None of these share the (workspace, monitor, objectKey) tuple, so each is
+    // its own isolated history.
+    expect(store.latestSnapshot('m1', 'other-obj', '/ws')).toBeNull();
+    expect(store.latestSnapshot('other-m', 'obj', '/ws')).toBeNull();
+    expect(store.latestSnapshot('m1', 'obj', '/other-ws')).toBeNull();
+    expect(store.latestSnapshot('m1', 'obj', null)).toBeNull();
+
+    // The null-workspace (global) bucket is its own key: it round-trips
+    // independently and does not disturb the '/ws' bucket.
+    store.saveSnapshot({
+      workspacePath: null,
+      monitorId: 'm1',
+      objectKey: 'obj',
+      eventId: 'e2',
+      content: 'global-v1',
+    });
+    expect(store.latestSnapshot('m1', 'obj', null)?.content).toBe('global-v1');
+    expect(store.latestSnapshot('m1', 'obj', '/ws')?.content).toBe('v1');
+  });
+
+  // T2: a prior snapshot for the same object produces a diff on the next change.
+  it('computes a diff against the prior snapshot when an object changes', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'snap-source',
+      'normal',
+      'Handle it.',
+      "  interval: '1s'\n",
+    );
+
+    let content = 'alpha\nbeta\n';
+    const source: ObservationSource = {
+      name: 'snap-source',
+      scopeSchema: { type: 'object' },
+      observe: () =>
+        Promise.resolve({
+          observations: [
+            { title: 'snapshot', objectKey: 'obj-1', snapshotText: content },
+          ],
+        }),
+    };
+
+    const runtime = createRuntime(dbPath, source);
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-snap',
+        workspacePath: rootDir,
+      }),
+    );
+
+    await runtime.tick(monitorsDir, rootDir); // v1 — no prior snapshot, no diff
+    content = 'alpha\nbeta changed\n';
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    await runtime.tick(monitorsDir, rootDir); // v2 — diffs against v1
+
+    const events = runtime.listEvents({ sessionId: session.id });
+    expect(events).toHaveLength(2);
+    const withDiff = events.filter((event) => event.diffText);
+    expect(withDiff).toHaveLength(1);
+    expect(withDiff[0]?.diffText).toContain('changed');
+  });
 });
