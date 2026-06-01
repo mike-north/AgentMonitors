@@ -21,16 +21,11 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
 > See [004 §2.2](./004-validation-testing.md) and [spec-changelog.md](./spec-changelog.md).
 > This also closed test gap T3 (`validate` failure paths).
 
-### G3 — `file-fingerprint` create/delete events (P2)
-
-- **Current:** the source emits only _change_ observations (`previousHash !== hash`). Newly
-  appearing files, deleted files, and files that stop matching the globs produce nothing.
-- **Target:** baseline-relative create and delete observations (with appropriate
-  `event-kind`/payload), without regressing change detection.
-- **Governs:** [003 §3.3](./003-source-plugins.md), PP7 ([000](./000-principles.md)).
-- **Files:** `plugins/source-file-fingerprint/src/index.ts`.
-- **Proof:** source tests asserting a create event on first-appearance-after-baseline and a
-  delete event on disappearance; existing change/no-change tests still pass.
+> G3 (`file-fingerprint` create/delete events) shipped — and was generalized into a first-class,
+> source-agnostic `changeKind` (`created`/`modified`/`deleted`/`descoped`) on the core `Observation`
+> contract, persisted into the event `queryScope` by the runtime. See
+> [003 §2.3 / §3.3](./003-source-plugins.md), [002 §5.1](./002-runtime-delivery.md), and
+> [spec-changelog.md](./spec-changelog.md).
 
 ### G4 — Third-party source discovery & installation (P3)
 
