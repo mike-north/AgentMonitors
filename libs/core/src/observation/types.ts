@@ -1,6 +1,23 @@
 /** JSON Schema type — a plain object describing a JSON Schema fragment. */
 export type JsonSchema = Record<string, unknown>;
 
+/**
+ * The lifecycle transition an observed object underwent — a source-agnostic
+ * vocabulary every source can speak, so consumers reason about change uniformly:
+ *
+ * - `created` — the object newly appeared / entered the monitor's scope.
+ * - `modified` — the object changed while remaining in scope.
+ * - `deleted` — the object was destroyed upstream; **its information is lost**
+ *   (a file removed from disk, a pull request deleted from the host).
+ * - `descoped` — the object still exists upstream but has **left the monitor's
+ *   scope**, so it is no longer observed; no information is lost (a file that no
+ *   longer matches the globs, a pull request that closed while watching open PRs).
+ *
+ * `deleted` and `descoped` are deliberately distinct: an agent reacts differently
+ * to lost information than to an object merely leaving the observed set.
+ */
+export type ChangeKind = 'created' | 'modified' | 'deleted' | 'descoped';
+
 /** Data returned by an observation source when it detects a change or event. */
 export interface Observation {
   /** Human-readable title for the inbox item */
@@ -17,6 +34,12 @@ export interface Observation {
   objectKey?: string;
   /** Source-defined query metadata used for read-time scoping */
   queryScope?: Record<string, string | string[]>;
+  /**
+   * The lifecycle transition this observation reports, if the source tracks one.
+   * The runtime copies it into the materialized event's `queryScope.changeKind`,
+   * so it is filterable without each source populating `queryScope` itself.
+   */
+  changeKind?: ChangeKind;
   /** Point-in-time snapshot metadata captured at fire time */
   snapshot?: unknown;
 }

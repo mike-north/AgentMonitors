@@ -110,10 +110,12 @@ If an emitted observation omits fields, the runtime **MUST** derive them as foll
 - `body`: observation body, otherwise monitor instructions
 - `summary`: observation summary, otherwise observation body, otherwise title
 - `objectKey`: observation `objectKey`, otherwise the monitor ID
-- `queryScope`: observation `queryScope`, otherwise `{}`
+- `queryScope`: observation `queryScope`, otherwise `{}` — and if the observation sets `changeKind`
+  (see [003 §2.3](./003-source-plugins.md)), the runtime adds `changeKind` to the stored
+  `queryScope` so the source-agnostic lifecycle is filterable without each source duplicating it.
 - `snapshotMetadata`: observation `snapshot`, otherwise `{}`
 
-Verified: `libs/core/src/runtime/service.ts` — `processObservation()` lines 584–602.
+Verified: `libs/core/src/runtime/service.ts` — `processObservation()`.
 
 ### 5.2 Snapshots and diffs
 

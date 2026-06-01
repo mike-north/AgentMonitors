@@ -576,4 +576,58 @@ Handle it.
     expect(workspaceAUnread[0]?.objectKey).toBe('doc-a');
     expect(workspaceBUnread).toHaveLength(0);
   });
+
+  // The source-agnostic changeKind primitive must be persisted into the event's
+  // queryScope by the runtime, so any source gets it filterable for free.
+  it('persists observation.changeKind into the event queryScope for filtering', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'change-kind-source',
+      'normal',
+    );
+
+    const db = createDb(':memory:');
+    const registry = new SourceRegistry();
+    registry.register({
+      name: 'change-kind-source',
+      scopeSchema: { type: 'object' },
+      observe: () =>
+        Promise.resolve({
+          observations: [
+            {
+              title: 'Thing removed upstream',
+              objectKey: 'thing-1',
+              changeKind: 'deleted',
+              queryScope: { objectId: 'thing-1' },
+            },
+          ],
+        }),
+    });
+    const runtime = new AgentMonitorRuntime(new RuntimeStore(db), registry, [
+      claudeCodeAdapter,
+    ]);
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-session-ck',
+        workspacePath: rootDir,
+      }),
+    );
+
+    await runtime.tick(monitorsDir, rootDir);
+
+    const all = runtime.listEvents({ sessionId: session.id });
+    expect(all).toHaveLength(1);
+    expect(all[0]?.queryScope.changeKind).toBe('deleted');
+    // the source's own queryScope entries are preserved alongside it
+    expect(all[0]?.queryScope.objectId).toBe('thing-1');
+
+    // and the event is filterable by changeKind
+    const deletedOnly = runtime.listEvents({
+      sessionId: session.id,
+      scope: { changeKind: 'deleted' },
+    });
+    expect(deletedOnly).toHaveLength(1);
+  });
 });

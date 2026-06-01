@@ -38,6 +38,7 @@ export type {
 export { SourceRegistry } from './observation/registry.js';
 export { generateMonitorSchema } from './observation/schema-generator.js';
 export type {
+  ChangeKind,
   JsonSchema,
   Observation,
   ObservationContext,

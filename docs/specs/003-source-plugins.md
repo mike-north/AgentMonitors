@@ -71,7 +71,17 @@ Each `Observation` **MAY** include the following fields (verified: `libs/core/sr
 | `snapshotText` | `string?`                             | Optional textual snapshot for diffing and timeline views.                  |
 | `objectKey`    | `string?`                             | Source-defined stable object identity (e.g., a PR number, file path, URL). |
 | `queryScope`   | `Record<string, string \| string[]>?` | Source-defined query metadata used for read-time scoping.                  |
+| `changeKind`   | `ChangeKind?`                         | The lifecycle transition this observation reports (see below).             |
 | `snapshot`     | `unknown?`                            | Point-in-time snapshot metadata captured at fire time.                     |
+
+`ChangeKind` is a **source-agnostic** vocabulary so consumers reason about change uniformly across
+sources: `created` (object entered scope), `modified` (changed while in scope), `deleted` (destroyed
+upstream — **information lost**), `descoped` (still exists upstream but **left the monitor's scope** —
+no information lost). `deleted` and `descoped` are deliberately distinct (e.g., a pull request
+_deleted_ vs _closed_ while watching open PRs). When an observation sets `changeKind`, the runtime
+copies it into the materialized event's `queryScope.changeKind` so it is filterable without each
+source populating `queryScope` itself (see [002 §5.1](./002-runtime-delivery.md)). Verified:
+`libs/core/src/observation/types.ts`, `libs/core/src/runtime/service.ts`.
 
 ### 2.4 Stateful sources
 
@@ -110,15 +120,25 @@ When a previously seen file's hash changes, the source emits one `Observation` p
 - `snapshot`: `{ filePath, previousHash, currentHash }`
 - `snapshotText`: file content as UTF-8 string, **only if the file contains no null bytes** (`!content.includes(0)` where `content` is a `Buffer`)
 
-### 3.3 Current limitations
+### 3.3 Change kinds
 
-The current implementation detects changed files only. It does **NOT** emit observations for:
+After the baseline run, the source classifies every observed transition and sets the observation's
+`changeKind` (see §2.3):
 
-- Files that newly appear with no prior fingerprint (new files added after baseline)
-- Files that are deleted after the baseline run
-- Files that stop matching the configured globs between runs
+- **`created`** — a glob-matched path with no prior fingerprint (a new file after baseline).
+- **`modified`** — a matched path whose hash changed (the original behavior).
+- **`deleted`** — a previously-tracked path that is **gone from disk** (a `stat` of the absolute
+  path fails). Information is lost.
+- **`descoped`** — a previously-tracked path that **still exists on disk** but is no longer matched
+  by the globs (only reachable when the monitor's `globs` are edited). No information is lost; the
+  file is simply no longer observed.
 
-These are current behavioral limits, not silently supported edge cases (PP7). The `nextState` only records the hashes of files present in the current glob expansion; deleted files are silently dropped from state on the next run.
+`deleted` vs `descoped` is decided by stat-ing the absolute path. `created`/`modified` observations
+carry `snapshotText` (when the file is not binary); `deleted`/`descoped` do not, as there is no
+current content. The **baseline run emits nothing** — it only records fingerprints — so a first run
+never reports its matched files as `created`. The baseline is detected by the absence of a valid
+prior `FingerprintState` in `context.previousState`. Verified:
+`plugins/source-file-fingerprint/src/index.ts`.
 
 ## 4. Bundled Source: `api-poll`
 

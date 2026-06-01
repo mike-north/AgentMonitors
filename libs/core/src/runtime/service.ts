@@ -611,7 +611,14 @@ export class AgentMonitorRuntime {
       snapshotText: input.observation.snapshotText ?? null,
       diffText,
       objectKey,
-      queryScope: input.observation.queryScope ?? {},
+      // Make the source-agnostic changeKind queryable without each source having
+      // to duplicate it into its own queryScope.
+      queryScope: {
+        ...(input.observation.queryScope ?? {}),
+        ...(input.observation.changeKind
+          ? { changeKind: input.observation.changeKind }
+          : {}),
+      },
       tags: input.monitor.frontmatter.tags ?? [],
       createdAt: input.observedAt,
     });
