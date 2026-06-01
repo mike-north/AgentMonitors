@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { globSync } from 'glob';
 import type {
+  ChangeKind,
   JsonSchema,
   Observation,
   ObservationContext,
@@ -29,6 +30,75 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
 async function hashFile(filePath: string): Promise<string> {
   const content = await readFile(filePath);
   return createHash('sha256').update(content).digest('hex');
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await stat(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const CHANGE_TITLES: Record<ChangeKind, string> = {
+  created: 'File created',
+  modified: 'File changed',
+  deleted: 'File deleted',
+  descoped: 'File no longer matched by globs',
+};
+
+/**
+ * Build an observation for a file that is present now (created or modified).
+ * Reads the file for a textual snapshot when it is not binary.
+ */
+async function buildPresentObservation(
+  filePath: string,
+  changeKind: 'created' | 'modified',
+  currentHash: string,
+  previousHash?: string,
+): Promise<Observation> {
+  const content = await readFile(filePath);
+  const summary = `${CHANGE_TITLES[changeKind]}: ${filePath}`;
+  const hashes =
+    previousHash !== undefined
+      ? { filePath, previousHash, currentHash }
+      : { filePath, currentHash };
+  const observation: Observation = {
+    title: summary,
+    summary,
+    changeKind,
+    payload: hashes,
+    objectKey: filePath,
+    queryScope: { filePath },
+    snapshot: hashes,
+  };
+  if (!content.includes(0)) {
+    observation.snapshotText = content.toString('utf-8');
+  }
+  return observation;
+}
+
+/**
+ * Build an observation for a file that has left the matched set: `deleted`
+ * (gone from disk — information lost) or `descoped` (still on disk, no longer
+ * matched by the globs). No snapshot text: there is no current content to record.
+ */
+function buildAbsentObservation(
+  filePath: string,
+  changeKind: 'deleted' | 'descoped',
+  previousHash: string,
+): Observation {
+  const summary = `${CHANGE_TITLES[changeKind]}: ${filePath}`;
+  return {
+    title: summary,
+    summary,
+    changeKind,
+    payload: { filePath, previousHash },
+    objectKey: filePath,
+    queryScope: { filePath },
+    snapshot: { filePath, previousHash },
+  };
 }
 
 const scopeSchema: JsonSchema = {
@@ -81,40 +151,62 @@ const source: ObservationSource = {
     context: ObservationContext = { now: new Date() },
   ): Promise<ObservationResult> {
     const { globs, cwd } = parseScopeConfig(config);
+    // A first run (no valid prior state) only establishes the baseline; it must
+    // not report every matched file as `created`.
+    const isBaseline = !isFingerprintState(context.previousState);
     const previous = parsePreviousState(context.previousState);
     const observations: Observation[] = [];
     const nextFingerprints: Record<string, string> = {};
 
+    // Collect the current matches once (a path matched by multiple globs is
+    // hashed and reported a single time).
+    const currentHashes = new Map<string, string>();
     for (const pattern of globs) {
       const files = globSync(pattern, {
         ...(cwd !== undefined ? { cwd } : {}),
         absolute: true,
       });
-
       for (const filePath of files) {
-        const hash = await hashFile(filePath);
-        const previousHash = previous.fingerprints[filePath];
-        nextFingerprints[filePath] = hash;
-
-        if (previousHash !== undefined && previousHash !== hash) {
-          const content = await readFile(filePath);
-          const observation: Observation = {
-            title: `File changed: ${filePath}`,
-            summary: `File changed: ${filePath}`,
-            payload: { filePath, previousHash, currentHash: hash },
-            objectKey: filePath,
-            queryScope: { filePath },
-            snapshot: {
-              filePath,
-              previousHash,
-              currentHash: hash,
-            },
-          };
-          if (!content.includes(0)) {
-            observation.snapshotText = content.toString('utf-8');
-          }
-          observations.push(observation);
+        if (!currentHashes.has(filePath)) {
+          currentHashes.set(filePath, await hashFile(filePath));
         }
+      }
+    }
+
+    // Present files: created (new since baseline) or modified (hash changed).
+    for (const [filePath, hash] of currentHashes) {
+      nextFingerprints[filePath] = hash;
+      if (isBaseline) continue;
+      const previousHash = previous.fingerprints[filePath];
+      if (previousHash === undefined) {
+        observations.push(
+          await buildPresentObservation(filePath, 'created', hash),
+        );
+      } else if (previousHash !== hash) {
+        observations.push(
+          await buildPresentObservation(
+            filePath,
+            'modified',
+            hash,
+            previousHash,
+          ),
+        );
+      }
+    }
+
+    // Previously-tracked files no longer matched: deleted (gone from disk) vs
+    // descoped (still on disk, but the globs no longer match it).
+    if (!isBaseline) {
+      for (const [filePath, previousHash] of Object.entries(
+        previous.fingerprints,
+      )) {
+        if (currentHashes.has(filePath)) continue;
+        const changeKind: 'deleted' | 'descoped' = (await fileExists(filePath))
+          ? 'descoped'
+          : 'deleted';
+        observations.push(
+          buildAbsentObservation(filePath, changeKind, previousHash),
+        );
       }
     }
 
