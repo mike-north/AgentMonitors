@@ -56,6 +56,19 @@ Once the session is up, three independent readouts are available — check which
 
 Report the findings JSON back and we promote 006 §4.4 from *target* to *current* (or revise it).
 
+## Result (Claude Code 2.1.157, 2026-05-31)
+
+Run via `claude -p … --mcp-config .mcp.json --strict-mcp-config --dangerously-skip-permissions`,
+which spawned the probe **as an MCP server**. Confirmed:
+
+- `CLAUDE_PROJECT_DIR` = the workspace path; the server's `cwd` was the same path.
+- **`CLAUDE_CODE_SESSION_ID` is inherited** by the MCP-server subprocess (the host session id).
+- `roots/list` is answered, returning the workspace as a single `file://` root.
+
+Conclusion: **session-level binding is available** (006 §4.4 preferred path), with workspace binding
+as fallback. The diagnostic is worth re-running when targeting a newer Claude Code, since the env
+contract is host-version-dependent.
+
 ## Teardown
 
 Throwaway. Delete `experiments/channel-probe/` (and the `agentmon-channel-probe.json` findings
