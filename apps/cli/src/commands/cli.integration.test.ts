@@ -9,6 +9,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -708,6 +709,110 @@ When files change, review them.
       await daemon.waitForExit();
     }
   }, 15_000);
+});
+
+describe('schema generate', () => {
+  it('emits a source-discriminated monitor JSON schema', () => {
+    const result = run(['schema', 'generate']);
+    expect(result.exitCode).toBe(0);
+    const schema = JSON.parse(result.stdout) as {
+      properties?: {
+        source?: { enum?: string[] };
+        urgency?: { enum?: string[] };
+      };
+    };
+    expect(schema.properties?.source?.enum).toEqual(
+      expect.arrayContaining(['file-fingerprint', 'api-poll', 'schedule']),
+    );
+    // `low` is first-class (PP5)
+    expect(schema.properties?.urgency?.enum).toEqual(
+      expect.arrayContaining(['low', 'normal', 'high']),
+    );
+  });
+
+  it('writes the schema to a file with -o', () => {
+    const out = path.join(tempDir, 'generated-schema.json');
+    const result = run(['schema', 'generate', '-o', out]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('Schema written to');
+    const written = JSON.parse(readFileSync(out, 'utf-8')) as {
+      properties?: unknown;
+    };
+    expect(written.properties).toBeDefined();
+  });
+});
+
+describe('session list and close', () => {
+  it('lists an open session and marks it dormant on close', async () => {
+    const dir = path.join(tempDir, 'session-lifecycle');
+    const monitorsDir = path.join(dir, '.claude', 'monitors');
+    mkdirSync(monitorsDir, { recursive: true });
+    const dbPath = path.join(dir, 'agentmon.db');
+    const socketPath = path.join(
+      '/tmp',
+      `agentmon-sess-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const env = {
+      AGENTMONITORS_DB: dbPath,
+      AGENTMONITORS_SOCKET: socketPath,
+    };
+    const daemon = await startDaemon(monitorsDir, dir, env, socketPath);
+
+    try {
+      const open = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          'sess-lifecycle',
+          '--workspace',
+          dir,
+          '--format',
+          'json',
+        ],
+        env,
+        dir,
+      );
+      expect(open.exitCode).toBe(0);
+      const session = JSON.parse(open.stdout) as { id: string };
+
+      const list = runWithEnv(
+        ['session', 'list', '--format', 'json'],
+        env,
+        dir,
+      );
+      expect(list.exitCode).toBe(0);
+      const sessions = JSON.parse(list.stdout) as {
+        id: string;
+        status: string;
+      }[];
+      expect(sessions.find((s) => s.id === session.id)?.status).toBe('active');
+
+      const close = runWithEnv(
+        ['session', 'close', session.id, '--format', 'json'],
+        env,
+        dir,
+      );
+      expect(close.exitCode).toBe(0);
+      expect((JSON.parse(close.stdout) as { status: string }).status).toBe(
+        'dormant',
+      );
+
+      const listAfter = runWithEnv(
+        ['session', 'list', '--format', 'json'],
+        env,
+        dir,
+      );
+      const after = JSON.parse(listAfter.stdout) as {
+        id: string;
+        status: string;
+      }[];
+      expect(after.find((s) => s.id === session.id)?.status).toBe('dormant');
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+    }
+  }, 30_000);
 });
 
 describe('monitor test', () => {

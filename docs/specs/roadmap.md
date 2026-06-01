@@ -91,30 +91,15 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
 
 ## Test gaps
 
-These are required scenarios from [004 §3](./004-validation-testing.md) with no current
-coverage. They are cheap to close and reduce regression risk on the items above.
+All test gaps tracked from [004 §3](./004-validation-testing.md) are now closed:
 
-### T1 — `low` urgency acceptance (P2)
-
-- The schema test loop in `libs/core/src/schema/monitor-schema.test.ts` only iterates
-  `['high', 'normal']`. `low` is first-class (PP5, [001 §3.2](./001-monitor-definition.md))
-  but unasserted. Add `low` to the loop.
-
-### T2 — Snapshot persistence & isolation (P2)
-
-- No test exercises `RuntimeStore.saveSnapshot()` / `latestSnapshot()`: storing a
-  `snapshotText`, producing `diffText` on a later change, and isolation by
-  `(workspacePath, monitorId, objectKey)`. Governed by SP5,
-  [002 §5.2 / §14](./002-runtime-delivery.md).
-
-> T3 (`validate` failure paths) closed alongside G2 — integration tests now cover the
-> unknown-source and schema-violation branches of `validate`.
-
-### T4 — `schema generate` / `session list|close` CLI wiring (P3)
-
-- `generateMonitorSchema` is unit-tested but the `schema generate` command wiring is not;
-  `session list` and `session close` are only exercised inside a larger flow, never
-  asserted standalone. [004 §3.5](./004-validation-testing.md).
+- **T1** — `low` urgency acceptance: added to the schema test loop
+  (`libs/core/src/schema/monitor-schema.test.ts`).
+- **T2** — snapshot persistence & isolation: `RuntimeStore` save/retrieve/isolation tests plus a
+  runtime diff-on-change test (SP5, [002 §5.2](./002-runtime-delivery.md)).
+- **T3** — `validate` failure paths: closed alongside G2 (unknown-source + schema-violation
+  integration tests).
+- **T4** — `schema generate` / `session list|close` CLI wiring: standalone CLI integration tests.
 
 ## How to retire an item
 
