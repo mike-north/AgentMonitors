@@ -650,6 +650,18 @@ Handle it.
     expect(store.latestSnapshot('other-m', 'obj', '/ws')).toBeNull();
     expect(store.latestSnapshot('m1', 'obj', '/other-ws')).toBeNull();
     expect(store.latestSnapshot('m1', 'obj', null)).toBeNull();
+
+    // The null-workspace (global) bucket is its own key: it round-trips
+    // independently and does not disturb the '/ws' bucket.
+    store.saveSnapshot({
+      workspacePath: null,
+      monitorId: 'm1',
+      objectKey: 'obj',
+      eventId: 'e2',
+      content: 'global-v1',
+    });
+    expect(store.latestSnapshot('m1', 'obj', null)?.content).toBe('global-v1');
+    expect(store.latestSnapshot('m1', 'obj', '/ws')?.content).toBe('v1');
   });
 
   // T2: a prior snapshot for the same object produces a diff on the next change.

@@ -803,6 +803,7 @@ describe('session list and close', () => {
         env,
         dir,
       );
+      expect(listAfter.exitCode).toBe(0);
       const after = JSON.parse(listAfter.stdout) as {
         id: string;
         status: string;
