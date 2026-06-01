@@ -32,12 +32,33 @@ async function hashFile(filePath: string): Promise<string> {
   return createHash('sha256').update(content).digest('hex');
 }
 
+/**
+ * Whether an error from `stat` means the path genuinely does not exist
+ * (`ENOENT`/`ENOTDIR`). Other errors — `EACCES`, `EPERM`, transient IO — must
+ * NOT be read as absence, or a file would be misclassified as `deleted`.
+ */
+export function isNotFoundError(err: unknown): boolean {
+  const code =
+    typeof err === 'object' && err !== null && 'code' in err
+      ? (err as { code?: unknown }).code
+      : undefined;
+  return code === 'ENOENT' || code === 'ENOTDIR';
+}
+
+/**
+ * True if the path exists, false if it is confirmed gone. Rethrows on any other
+ * `stat` failure so an ambiguous error surfaces rather than silently becoming a
+ * spurious `deleted` observation.
+ */
 async function fileExists(filePath: string): Promise<boolean> {
   try {
     await stat(filePath);
     return true;
-  } catch {
-    return false;
+  } catch (err) {
+    if (isNotFoundError(err)) {
+      return false;
+    }
+    throw err;
   }
 }
 

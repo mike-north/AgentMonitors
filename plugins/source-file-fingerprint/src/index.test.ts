@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import source from './index.js';
+import source, { isNotFoundError } from './index.js';
 
 const dirs: string[] = [];
 
@@ -187,6 +187,23 @@ describe('source-file-fingerprint', () => {
         { now: new Date() },
       );
       expect(result.observations).toHaveLength(0);
+    });
+  });
+
+  // Regression: only a genuine "not found" may be read as a deletion. Other stat
+  // errors (EACCES, transient IO) must not be misclassified as `deleted`.
+  describe('isNotFoundError', () => {
+    it('treats ENOENT and ENOTDIR as not-found', () => {
+      expect(isNotFoundError({ code: 'ENOENT' })).toBe(true);
+      expect(isNotFoundError({ code: 'ENOTDIR' })).toBe(true);
+    });
+
+    it('does not treat other errors as not-found', () => {
+      expect(isNotFoundError({ code: 'EACCES' })).toBe(false);
+      expect(isNotFoundError({ code: 'EPERM' })).toBe(false);
+      expect(isNotFoundError(new Error('boom'))).toBe(false);
+      expect(isNotFoundError(undefined)).toBe(false);
+      expect(isNotFoundError(null)).toBe(false);
     });
   });
 
