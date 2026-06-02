@@ -16,10 +16,10 @@ Per AP6, all public CLI behaviour must be derivable from core contracts. The CLI
 
 Commands divide into two transport modes:
 
-| Mode                                   | Commands                                                                                                 | Mechanism                                                                                      |
-| -------------------------------------- | -------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| **In-process** (no socket)             | `init`, `validate`, `scan`, `monitor test`, `source list`, `schema generate`, `inbox *`, `daemon once`   | Operates directly on the filesystem and/or SQLite database. No daemon socket required.         |
-| **Daemon socket** (Unix domain socket) | `daemon run`, `daemon status`, `daemon stop`, `session open/close/list`, `events list/ack`, `hook claim` | Sends JSON-RPC-style messages over a Unix domain socket via `callDaemon()` in `daemon-ipc.ts`. |
+| Mode                                   | Commands                                                                                                                    | Mechanism                                                                                      |
+| -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| **In-process** (no socket)             | `init`, `validate`, `scan`, `monitor test`, `source list`, `schema generate`, `inbox *`, `daemon once`                      | Operates directly on the filesystem and/or SQLite database. No daemon socket required.         |
+| **Daemon socket** (Unix domain socket) | `daemon run`, `daemon status`, `daemon stop`, `session open/close/list`, `events list/ack`, `hook claim`, `monitor history` | Sends JSON-RPC-style messages over a Unix domain socket via `callDaemon()` in `daemon-ipc.ts`. |
 
 **`daemon once` is notable:** although it lives under the `daemon` command group, its implementation in `runtime-client.ts` (`daemonTickClient`) calls `createRuntime()` and `runtime.tick()` directly without using the socket. It is a single-tick in-process run, not a socket call. This is consistent with [002-runtime-delivery.md](./002-runtime-delivery.md).
 
@@ -87,11 +87,11 @@ Each source produces a distinct starter frontmatter block:
 ## §3 `validate` — Validate monitor files
 
 **Source:** `apps/cli/src/commands/validate.ts`
-**Status:** Partial — validates required scope fields only; full JSON Schema validation is not yet implemented. See [004-validation-testing.md](./004-validation-testing.md) for the target validation contract.
+**Status:** Fully implemented — validates each monitor's `scope` against the source's full JSON Schema (via the core `validateScope` helper). See [004-validation-testing.md](./004-validation-testing.md) §2.2.
 
 ### Purpose
 
-Validates all `MONITOR.md` files found in a directory: checks that each monitor references a known source and that the `scope` block contains all fields declared `required` in the source's `scopeSchema`.
+Validates all `MONITOR.md` files found in a directory: checks that each monitor references a known source and that the `scope` block is fully valid against the source's `scopeSchema` (types, enums, `required`, `items`, …), and that monitor IDs are unique within the tree.
 
 ### Usage
 
@@ -139,9 +139,8 @@ If no monitors are found: prints `No monitors found.`
 
 1. Parses all `MONITOR.md` files via `scanMonitors()` from `@mike-north/core` (parse errors are included in `errors`).
 2. Checks each monitor's `source` field against the built-in `SourceRegistry`; unknown sources produce an error listing available sources.
-3. Checks that every field listed in `source.scopeSchema.required[]` is present in the monitor's `scope` block.
-
-**What is NOT validated:** field types, additional constraints from the JSON Schema (minimum, maximum, enum values, etc.).
+3. Validates each monitor's `scope` against the source's full `scopeSchema` (draft-07) via the exported core `validateScope` helper — types, enums, `required`, `items`, and other keywords, not just field presence.
+4. Rejects duplicate monitor IDs within the scanned tree (see [001 §4](./001-monitor-definition.md)).
 
 ### Exit codes
 
@@ -332,6 +331,28 @@ agentmonitors monitor test <path> [options]
 ### Exit codes
 
 Exits 1 on: file not found, parse error, unknown source, observation exception. Exits 0 on successful dry-run (even with zero observations).
+
+### `monitor history` — Observation audit trail
+
+**Status:** Fully implemented (socket).
+
+Lists the per-tick outcomes the runtime records for each due monitor
+([002 §"Persistence Schema"](./002-runtime-delivery.md)) — useful for answering "why didn't my
+monitor fire?". Round-trips through the daemon socket (`history.list`).
+
+```
+agentmonitors monitor history [monitorId] [--socket <path>] [--limit <n>] [--format <text|json>]
+```
+
+| Argument / Flag | Default | Description                         |
+| --------------- | ------- | ----------------------------------- |
+| `[monitorId]`   | —       | Filter to a single monitor id       |
+| `--limit <n>`   | `50`    | Maximum rows (newest first)         |
+| `--format`      | `text`  | `text` (one row per line) or `json` |
+
+Each row reports `result` — `triggered` (≥1 observation became an event), `suppressed` (observations
+returned but none emitted this tick), or `no-change` (the source returned nothing) — plus the
+monitor id, source name, and timestamp.
 
 ---
 
@@ -794,6 +815,7 @@ All commands set `process.exitCode = 1` rather than calling `process.exit(1)`. T
 | `inbox`    | `fail`     | in-process                        | Fully implemented                   |
 | `inbox`    | `archive`  | in-process                        | Fully implemented                   |
 | `monitor`  | `test`     | in-process                        | Fully implemented                   |
+| `monitor`  | `history`  | socket                            | Fully implemented                   |
 | `source`   | `list`     | in-process                        | Fully implemented                   |
 | `source`   | `search`   | —                                 | Placeholder / not implemented (NP3) |
 | `source`   | `install`  | —                                 | Placeholder / not implemented (NP3) |
