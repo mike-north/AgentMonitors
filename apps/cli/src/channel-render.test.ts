@@ -42,6 +42,8 @@ describe('renderChannelEvent', () => {
       expect(typeof value).toBe('string');
       // keys must be identifiers (no hyphens — the host drops them silently)
       expect(key).toMatch(/^[a-z0-9_]+$/);
+      // every value must be free of tag-breakout characters (006 §4.6)
+      expect(value).not.toMatch(/[<>[\]\r\n;]/);
     }
   });
 

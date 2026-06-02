@@ -721,9 +721,10 @@ target work; see [006 §4](./006-agent-integration.md).
 
 ### `channel serve`
 
-Runs AgentMon as a Claude Code **channel**: an MCP server (stdio) that pushes pending high-urgency
-deliveries into the session as `<channel source="agentmonitors" …>` events. Intended to be spawned
-by Claude Code via a channel plugin, not run by hand.
+Runs AgentMon as a Claude Code **channel**: an MCP server (stdio) that pushes pending
+turn-interruptible deliveries (settled high-urgency events, and coalesced normal reminders) into the
+session as `<channel source="agentmonitors" …>` events. Intended to be spawned by Claude Code via a
+channel plugin, not run by hand.
 
 **Usage:** `agentmonitors channel serve [--socket <path>] [--poll-ms <ms>] [--host-session-id <id>] [--workspace <path>]`
 

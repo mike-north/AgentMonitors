@@ -22,7 +22,7 @@ export const channelCommand = new Command('channel').description(
 channelCommand
   .command('serve')
   .description(
-    'Run the AgentMon channel: push pending high-urgency deliveries into the Claude Code session',
+    'Run the AgentMon channel: push pending turn-interruptible deliveries into the Claude Code session as channel events',
   )
   .option('--socket <path>', 'Daemon Unix domain socket path')
   .option(
@@ -115,12 +115,27 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
     }
   };
 
-  const timer = setInterval(() => void poll(), pollMs);
-  timer.unref();
-  void poll();
+  // Self-scheduling loop: the next poll is only armed after the current one
+  // settles, so a slow daemon call can never overlap with the next poll.
+  let stopped = false;
+  let timer: NodeJS.Timeout | undefined;
+  const loop = async (): Promise<void> => {
+    await poll();
+    if (!stopped) {
+      timer = setTimeout(() => void loop(), pollMs);
+      timer.unref();
+    }
+  };
+  void loop();
 
+  // MCP disconnect (stdin EOF): stop polling and close the transport, then let
+  // the event loop drain naturally — no process.exit, so in-flight work and any
+  // cleanup can complete first.
   process.stdin.on('end', () => {
-    clearInterval(timer);
-    process.exit(0);
+    stopped = true;
+    if (timer) {
+      clearTimeout(timer);
+    }
+    void mcp.close();
   });
 }

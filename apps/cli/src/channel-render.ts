@@ -39,8 +39,17 @@ export function renderChannelEvent(claim: DeliveryClaim): {
   if (claim.events.length === 1) {
     const event = claim.events[0];
     if (event) {
-      meta['monitor_id'] = metaValue(event.monitorId);
-      meta['event_id'] = metaValue(event.eventId);
+      meta['monitor_id'] = event.monitorId;
+      meta['event_id'] = event.eventId;
+    }
+  }
+
+  // 006 §4.6: ALL meta values must be tag-breakout-sanitized — defense in depth,
+  // even for fields that are currently constrained enums/counts.
+  for (const key of Object.keys(meta)) {
+    const value = meta[key];
+    if (value !== undefined) {
+      meta[key] = metaValue(value);
     }
   }
 
