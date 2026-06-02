@@ -105,13 +105,39 @@ When files change, review them.
     } catch {
       /* ignore */
     }
+    // SIGTERM the daemon and *wait* for it to actually exit, escalating to SIGKILL,
+    // so it can't outlive this harness as an orphan holding the socket.
+    if (daemon && daemon.exitCode === null) {
+      await new Promise((resolve) => {
+        const kill9 = setTimeout(() => {
+          try {
+            daemon.kill('SIGKILL');
+          } catch {
+            /* ignore */
+          }
+        }, 2_000);
+        kill9.unref?.();
+        daemon.once('exit', () => {
+          clearTimeout(kill9);
+          resolve();
+        });
+        try {
+          daemon.kill('SIGTERM');
+        } catch {
+          clearTimeout(kill9);
+          resolve();
+        }
+      });
+    }
+    // Remove the workspace and the Unix socket file (the daemon may leave it behind,
+    // and a stale socket can interfere with a subsequent run).
     try {
-      if (daemon) daemon.kill('SIGTERM');
+      rmSync(work, { recursive: true, force: true });
     } catch {
       /* ignore */
     }
     try {
-      rmSync(work, { recursive: true, force: true });
+      rmSync(sock, { force: true });
     } catch {
       /* ignore */
     }
