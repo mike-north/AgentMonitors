@@ -61,6 +61,18 @@ For schedule monitors: `scope.cron` is interpreted as a five-field cron expressi
 
 Verified: `libs/core/src/runtime/service.ts` — `cronMatchesDate()` (lines 118–132), `scheduleForMonitor()` schedule branch (lines 456–467).
 
+### 2.3 Watch-mode execution
+
+In addition to the one-shot `observe()` tick loop, the runtime drives continuous `watch()` for sources that implement it (NP4). `AgentMonitorRuntime.watchMonitors(monitorsDir, workspacePath)` scans the tree and, for each monitor whose source exposes `watch()`, consumes its `AsyncIterable<Observation>`, funnelling each yielded observation through the **same** notify dispatch → event materialization → session projection pipeline as `observe()` (the shared `ingest()` path). It returns a `WatchHandle` whose `stop()` aborts (via `context.signal`) and awaits every watcher. `daemon run` starts watchers at startup and stops them on shutdown.
+
+While a monitor has an active watcher, the tick loop **MUST** skip its `observe()`, so it is never driven twice. A watcher that throws (other than from the runtime's own abort) is reported via the `onError` callback and released, after which the tick loop resumes driving that monitor via `observe()`. A `watch()` source owns its change-detection state in memory; the runtime does not persist it, so watchers re-establish fresh on restart.
+
+> **Example:** a source that opens an OS file-system watcher yields a `modified` observation the instant a file changes, rather than waiting for the next poll interval; `stop()` closes the OS watcher via the aborted signal.
+>
+> **Test implication:** a `watch()`-based source whose iterator yields one observation then idles until aborted produces exactly one materialized, session-projected event, and `stop()` resolves with the source's abort handler having fired (`libs/core/src/runtime/service.test.ts`).
+
+Verified: `libs/core/src/runtime/service.ts` — `watchMonitors()`, `consumeWatch()`, the `activeWatchers` skip in `tick()`, and the shared `ingest()` helper; `apps/cli/src/commands/daemon.ts` — watcher start/stop in `runLoop()`.
+
 ## 3. Persisted Monitor State
 
 Each monitor has persisted runtime state containing: `lastObservationAt`, `sourceState`, `notifyState`. `sourceState` is owned by the source plugin and returned via `nextState`. `notifyState` is owned by the runtime and records delivery timing state such as active suppression windows for throttle and pending observation batches for debounce.
