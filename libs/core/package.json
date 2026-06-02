@@ -1,7 +1,7 @@
 {
   "name": "@mike-north/core",
   "description": "Core library for Agent Monitors — schema, parser, inbox, plugin interface, and notification engine",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publishConfig": {
     "registry": "https://npm.pkg.github.com"
   },
