@@ -92,6 +92,7 @@ export type {
   SessionUnreadCounts,
   SessionHookState,
   StoredObservationEnvelope,
+  WatchHandle,
   UrgencyCounts,
 } from './runtime/types.js';
 

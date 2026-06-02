@@ -20,6 +20,7 @@ import type {
   ProcessObservationInput,
   RuntimeTickResult,
   StoredObservationEnvelope,
+  WatchHandle,
 } from './types.js';
 import {
   defaultNotifyConfigForUrgency,
@@ -168,6 +169,9 @@ function summarizeEvents(events: { title: string; summary: string }[]): string {
 }
 
 export class AgentMonitorRuntime {
+  /** Monitor ids currently driven by a continuous `watch()` (see `watchMonitors`). */
+  private readonly activeWatchers = new Set<string>();
+
   constructor(
     private readonly store: RuntimeStore,
     private readonly registry: SourceRegistry,
@@ -368,18 +372,7 @@ export class AgentMonitorRuntime {
     workspacePath = monitorsDir,
   ): Promise<RuntimeTickResult> {
     const result = await scanMonitors(monitorsDir);
-
-    // Refuse the tick on duplicate monitor ids: state is keyed by monitorId, so
-    // processing aliased monitors would corrupt persisted source/notify state (SP2).
-    if (result.duplicateIds.length > 0) {
-      const details = result.duplicateIds
-        .map((dup) => `"${dup.id}" (${dup.filePaths.join(', ')})`)
-        .join('; ');
-      throw new Error(
-        `Duplicate monitor ids in ${monitorsDir}: ${details}. ` +
-          'Monitor ids are derived from folder names and must be unique within a tree.',
-      );
-    }
+    this.assertNoDuplicateIds(result, monitorsDir);
 
     const now = new Date();
     const emittedEventIds: string[] = [];
@@ -393,6 +386,10 @@ export class AgentMonitorRuntime {
           `Monitor "${monitor.id}" references unknown source "${monitor.frontmatter.source}".`,
         );
       }
+
+      // A monitor with an active continuous watcher is driven by that watcher;
+      // skip its one-shot observe() so it is not processed twice (G5).
+      if (this.activeWatchers.has(monitor.id)) continue;
 
       const schedule = this.scheduleForMonitor(monitor, now);
       if (!schedule.due) continue;
@@ -408,56 +405,221 @@ export class AgentMonitorRuntime {
         },
       );
 
-      const dispatch = this.dispatchNotify(
-        monitor,
-        observationResult.observations,
-        now,
-        monitorState.notifyState,
-      );
-
-      this.store.setMonitorState(monitor.id, {
-        sourceState: observationResult.nextState,
-        notifyState: dispatch.nextState,
-        lastObservationAt: now,
-      });
-
-      // Audit trail: record this monitor's outcome for the tick (G6).
-      // Classify by what was *emitted*, not by new observations: a tick can emit
-      // a previously-debounced batch with zero new observations (e.g. the default
-      // high-urgency settle flushing), which is still a `triggered` outcome. Only
-      // `suppressed` (observations seen but held/throttled this tick) and
-      // `no-change` (nothing seen) depend on the observation count.
-      const observed = observationResult.observations.length;
-      const emittedCount = dispatch.emitted.length;
-      this.store.recordObservationHistory({
-        monitorId: monitor.id,
-        sourceName: monitor.frontmatter.source,
-        result:
-          emittedCount > 0
-            ? 'triggered'
-            : observed > 0
-              ? 'suppressed'
-              : 'no-change',
-        observationData: { observed, emitted: emittedCount },
-      });
-
-      for (const emitted of dispatch.emitted) {
-        const event = this.processObservation({
-          monitor: emitted.monitor,
-          sourceName: emitted.monitor.frontmatter.source,
-          observation: emitted.observation,
-          observedAt: emitted.observedAt,
+      emittedEventIds.push(
+        ...this.ingest(monitor, observationResult.observations, now, {
           workspacePath,
-        });
-        emittedEventIds.push(event.id);
-      }
+          nextSourceState: { value: observationResult.nextState },
+        }),
+      );
     }
 
+    this.refreshWorkspaceSessions(workspacePath);
+
+    return { evaluatedMonitors: evaluated, emittedEventIds };
+  }
+
+  /**
+   * Funnel a batch of observations through notify dispatch, persist the updated
+   * monitor state, and materialize the emitted observations into durable events.
+   * Shared by the tick loop (one-shot `observe()`) and the continuous watcher
+   * (`watch()`), so both paths apply identical notify/throttle/debounce semantics
+   * and event materialization.
+   *
+   * `nextSourceState` is provided only by `observe()` (which returns the next
+   * source state); the watcher omits it, since a long-lived `watch()` owns its
+   * own in-memory state and the runtime leaves the persisted `sourceState`
+   * untouched. Synchronous start-to-finish, so concurrent watchers on the
+   * single-threaded event loop never interleave a monitor's state mutation.
+   */
+  private ingest(
+    monitor: MonitorDefinition,
+    observations: Observation[],
+    now: Date,
+    options: {
+      workspacePath: string;
+      nextSourceState?: { value: unknown };
+    },
+  ): string[] {
+    const monitorState = this.store.getMonitorState(monitor.id);
+    const dispatch = this.dispatchNotify(
+      monitor,
+      observations,
+      now,
+      monitorState.notifyState,
+    );
+
+    this.store.setMonitorState(monitor.id, {
+      sourceState: options.nextSourceState
+        ? options.nextSourceState.value
+        : monitorState.sourceState,
+      notifyState: dispatch.nextState,
+      lastObservationAt: now,
+    });
+
+    // Audit trail: record this monitor's outcome (G6). Shared by the tick loop
+    // and the watcher, so watch-mode observations are audited identically.
+    // Classify by what was *emitted*, not by new observations: a batch can emit
+    // a previously-debounced observation with zero new observations (e.g. the
+    // default high-urgency settle flushing), which is still a `triggered`
+    // outcome. Only `suppressed` (observations seen but held/throttled) and
+    // `no-change` (nothing seen) depend on the observation count.
+    const observed = observations.length;
+    const emittedCount = dispatch.emitted.length;
+    this.store.recordObservationHistory({
+      monitorId: monitor.id,
+      sourceName: monitor.frontmatter.source,
+      result:
+        emittedCount > 0
+          ? 'triggered'
+          : observed > 0
+            ? 'suppressed'
+            : 'no-change',
+      observationData: { observed, emitted: emittedCount },
+    });
+
+    const emittedEventIds: string[] = [];
+    for (const emitted of dispatch.emitted) {
+      const event = this.processObservation({
+        monitor: emitted.monitor,
+        sourceName: emitted.monitor.frontmatter.source,
+        observation: emitted.observation,
+        observedAt: emitted.observedAt,
+        workspacePath: options.workspacePath,
+      });
+      emittedEventIds.push(event.id);
+    }
+    return emittedEventIds;
+  }
+
+  private refreshWorkspaceSessions(workspacePath: string): void {
     for (const session of this.store.sessionsForWorkspace(workspacePath)) {
       this.refreshHookState(session.id);
     }
+  }
 
-    return { evaluatedMonitors: evaluated, emittedEventIds };
+  /**
+   * Refuse to run on duplicate monitor ids: state is keyed by monitorId, so
+   * processing aliased monitors would corrupt persisted source/notify state (SP2).
+   */
+  private assertNoDuplicateIds(
+    result: Awaited<ReturnType<typeof scanMonitors>>,
+    monitorsDir: string,
+  ): void {
+    if (result.duplicateIds.length === 0) return;
+    const details = result.duplicateIds
+      .map((dup) => `"${dup.id}" (${dup.filePaths.join(', ')})`)
+      .join('; ');
+    throw new Error(
+      `Duplicate monitor ids in ${monitorsDir}: ${details}. ` +
+        'Monitor ids are derived from folder names and must be unique within a tree.',
+    );
+  }
+
+  /**
+   * Start continuous watchers for every scanned monitor whose source implements
+   * `watch()` (G5). Each yielded observation is funnelled through the same
+   * pipeline as a ticked `observe()` (notify dispatch → materialization →
+   * projection). Returns a handle whose `stop()` aborts and awaits every watcher.
+   * While a watcher is active, the tick loop skips that monitor's `observe()`, so
+   * it is never driven twice. Sources without `watch()` are untouched and keep
+   * running on the tick loop.
+   *
+   * Restart-safety: watchers are re-established on restart; a `watch()` source's
+   * own change-detection state is in-memory (the runtime does not persist it).
+   */
+  async watchMonitors(
+    monitorsDir: string,
+    workspacePath = monitorsDir,
+    options: { onError?: (monitorId: string, error: Error) => void } = {},
+  ): Promise<WatchHandle> {
+    const result = await scanMonitors(monitorsDir);
+    this.assertNoDuplicateIds(result, monitorsDir);
+
+    const controllers = new Map<string, AbortController>();
+    const tasks: Promise<void>[] = [];
+
+    for (const parsed of result.monitors) {
+      const monitor = parsed.monitor;
+      const source = this.registry.get(monitor.frontmatter.source);
+      if (!source) {
+        throw new Error(
+          `Monitor "${monitor.id}" references unknown source "${monitor.frontmatter.source}".`,
+        );
+      }
+      if (!source.watch) continue;
+      if (this.activeWatchers.has(monitor.id)) continue;
+
+      const controller = new AbortController();
+      controllers.set(monitor.id, controller);
+      this.activeWatchers.add(monitor.id);
+
+      const watch = source.watch.bind(source);
+      tasks.push(
+        this.consumeWatch(
+          monitor,
+          watch,
+          workspacePath,
+          controller.signal,
+          options.onError,
+        ),
+      );
+    }
+
+    const monitorIds = [...controllers.keys()];
+    let stopped = false;
+    return {
+      monitorIds,
+      stop: async () => {
+        if (stopped) return;
+        stopped = true;
+        for (const controller of controllers.values()) controller.abort();
+        await Promise.allSettled(tasks);
+        for (const id of monitorIds) this.activeWatchers.delete(id);
+      },
+    };
+  }
+
+  /**
+   * Drive a single monitor's `watch()` iterable to completion (or abort),
+   * ingesting each yielded observation. Never rejects: an error that is not the
+   * result of our own abort is reported via `onError` and the monitor is released
+   * from the active-watcher set so the tick loop resumes driving it via
+   * `observe()`.
+   */
+  private async consumeWatch(
+    monitor: MonitorDefinition,
+    watch: (
+      config: Record<string, unknown>,
+      context: {
+        previousState?: unknown;
+        now: Date;
+        signal: AbortSignal;
+      },
+    ) => AsyncIterable<Observation>,
+    workspacePath: string,
+    signal: AbortSignal,
+    onError?: (monitorId: string, error: Error) => void,
+  ): Promise<void> {
+    const monitorState = this.store.getMonitorState(monitor.id);
+    const iterable = watch(monitor.frontmatter.scope, {
+      previousState: monitorState.sourceState,
+      now: new Date(),
+      signal,
+    });
+    try {
+      for await (const observation of iterable) {
+        if (signal.aborted) break;
+        this.ingest(monitor, [observation], new Date(), { workspacePath });
+        this.refreshWorkspaceSessions(workspacePath);
+      }
+    } catch (error) {
+      if (signal.aborted) return;
+      this.activeWatchers.delete(monitor.id);
+      onError?.(
+        monitor.id,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    }
   }
 
   status() {

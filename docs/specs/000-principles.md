@@ -69,7 +69,7 @@ The current repository contains both public-facing docs and implementation code.
 
 **NP3: The current CLI does not implement third-party source discovery or installation.** Placeholder commands do not count as a supported plugin manager.
 
-**NP4: The runtime does not currently define watch-mode source execution.** Sources may expose `watch()`, but the implemented runtime uses `observe()`.
+**NP4: Watch-mode source execution is opt-in and additive, not the default.** The runtime drives continuous `watch()` for sources that implement it (via `AgentMonitorRuntime.watchMonitors()`, started by `daemon run`); sources without `watch()` run on the one-shot `observe()` tick loop. `observe()` remains required on every source — it is the fallback for one-shot ticks (e.g. `daemon once`) and for any monitor not currently watched. A watched monitor is driven only by its watcher; the tick loop skips its `observe()` so it is never processed twice.
 
 ## 7. Cross-Reference Index
 

@@ -828,4 +828,112 @@ Handle it.
     expect(history[1]?.result).toBe('suppressed');
     expect(history[1]?.observationData).toEqual({ observed: 1, emitted: 0 });
   });
+
+  // G5: a source that implements watch() is driven continuously by the runtime;
+  // each yielded observation flows through the same notify/materialize/project
+  // pipeline as observe(), and stop() aborts the watcher cleanly.
+  it('drives a watch()-based source end-to-end and stops cleanly', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    // normal urgency => immediate emit (no debounce), so the yielded observation
+    // materializes without waiting for a settle window.
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'watch-source',
+      'normal',
+      'Handle it.',
+    );
+
+    let watchAborted = false;
+    const source: ObservationSource = {
+      name: 'watch-source',
+      scopeSchema: { type: 'object' },
+      observe: () => Promise.resolve({ observations: [] }),
+      async *watch(_config, context: ObservationContext) {
+        yield {
+          title: 'live event',
+          summary: 'live event',
+          objectKey: 'obj-live',
+        };
+        // then idle until the runtime aborts us.
+        await new Promise<void>((resolve) => {
+          context.signal?.addEventListener(
+            'abort',
+            () => {
+              watchAborted = true;
+              resolve();
+            },
+            { once: true },
+          );
+        });
+      },
+    };
+
+    const runtime = createRuntime(dbPath, source);
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-watch',
+        workspacePath: rootDir,
+      }),
+    );
+
+    const handle = await runtime.watchMonitors(monitorsDir, rootDir);
+    expect(handle.monitorIds).toEqual(['test-monitor']);
+
+    // let the watcher consume the yielded observation.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const unread = runtime.listEvents({
+      sessionId: session.id,
+      unreadOnly: true,
+    });
+    expect(unread).toHaveLength(1);
+    expect(unread[0]?.summary).toContain('live event');
+
+    await handle.stop();
+    expect(watchAborted).toBe(true);
+  });
+
+  // G5: while a monitor is watched, the tick loop must not also observe() it
+  // (no double-processing); once the watcher stops, the tick loop resumes it.
+  it('skips a watched monitor in the tick loop and resumes it after stop', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'watch-source',
+      'normal',
+      'Handle it.',
+      "  interval: '1s'\n",
+    );
+
+    const source: ObservationSource = {
+      name: 'watch-source',
+      scopeSchema: { type: 'object' },
+      observe: () => Promise.resolve({ observations: [] }),
+      // eslint-disable-next-line require-yield
+      async *watch(_config, context: ObservationContext) {
+        await new Promise<void>((resolve) => {
+          context.signal?.addEventListener('abort', () => resolve(), {
+            once: true,
+          });
+        });
+      },
+    };
+
+    const runtime = createRuntime(dbPath, source);
+    const handle = await runtime.watchMonitors(monitorsDir, rootDir);
+
+    const duringWatch = await runtime.tick(monitorsDir, rootDir);
+    expect(duringWatch.evaluatedMonitors).not.toContain('test-monitor');
+
+    await handle.stop();
+
+    // after stop, the monitor is due again (1s interval) and the tick observes it.
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    const afterStop = await runtime.tick(monitorsDir, rootDir);
+    expect(afterStop.evaluatedMonitors).toContain('test-monitor');
+  });
 });

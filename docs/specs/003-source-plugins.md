@@ -18,7 +18,7 @@ This document specifies the contract implemented by observation source plugins a
 
 ## 2. Source Contract
 
-Every source plugin **MUST** implement the `ObservationSource` interface. The required members are: `name`, `scopeSchema`, and `observe(config, context)`. A source **MAY** also declare `stateful` and `watch(config, context)`. The current runtime calls `observe()` only. `watch()` is defined in the interface but is not part of the active execution model (NP4).
+Every source plugin **MUST** implement the `ObservationSource` interface. The required members are: `name`, `scopeSchema`, and `observe(config, context)`. A source **MAY** also declare `stateful` and `watch(config, context)`. The runtime drives `observe()` on the tick loop for every source, and additionally drives `watch()` continuously for sources that implement it (NP4); a watched monitor is driven only by its watcher (the tick loop skips its `observe()`). No bundled source opts into `watch()` today, but the execution path exists and is exercised end-to-end.
 
 ### 2.1 TypeScript types
 
@@ -36,13 +36,13 @@ import type {
 
 The interface definition (verified: `libs/core/src/observation/types.ts`):
 
-| Member                     | Kind                         | Required | Description                                                                                         |
-| -------------------------- | ---------------------------- | -------- | --------------------------------------------------------------------------------------------------- |
-| `name`                     | `readonly string`            | Yes      | Unique kebab-case plugin name. Matches the `source` field in `MONITOR.md`.                          |
-| `scopeSchema`              | `readonly JsonSchema`        | Yes      | JSON Schema fragment describing this source's `scope` configuration.                                |
-| `stateful`                 | `readonly boolean?`          | No       | If `true`, the first successful call establishes a baseline (PP6). Defaults to `false` when absent. |
-| `observe(config, context)` | `Promise<ObservationResult>` | Yes      | One-shot observation: check for changes and return any observations.                                |
-| `watch?(config, context)`  | `AsyncIterable<Observation>` | No       | Optional continuous watch mode. Not currently used by the runtime (NP4).                            |
+| Member                     | Kind                         | Required | Description                                                                                                                 |
+| -------------------------- | ---------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `name`                     | `readonly string`            | Yes      | Unique kebab-case plugin name. Matches the `source` field in `MONITOR.md`.                                                  |
+| `scopeSchema`              | `readonly JsonSchema`        | Yes      | JSON Schema fragment describing this source's `scope` configuration.                                                        |
+| `stateful`                 | `readonly boolean?`          | No       | If `true`, the first successful call establishes a baseline (PP6). Defaults to `false` when absent.                         |
+| `observe(config, context)` | `Promise<ObservationResult>` | Yes      | One-shot observation: check for changes and return any observations.                                                        |
+| `watch?(config, context)`  | `AsyncIterable<Observation>` | No       | Optional continuous watch mode, driven by the runtime for sources that implement it (NP4). Stops on `context.signal` abort. |
 
 `JsonSchema` is typed as `Record<string, unknown>`, making it a plain object describing a JSON Schema fragment.
 
@@ -52,6 +52,7 @@ The interface definition (verified: `libs/core/src/observation/types.ts`):
 
 - `context.previousState?: unknown` — persisted state from the previous observation cycle, if any.
 - `context.now: Date` — timestamp supplied by the runtime.
+- `context.signal?: AbortSignal` — supplied to `watch()` only; the runtime aborts it to tear the watcher down (daemon shutdown, monitor removal). A `watch()` implementation **SHOULD** stop yielding and release resources when it fires. Unused by `observe()`.
 
 ### 2.3 Observation result
 

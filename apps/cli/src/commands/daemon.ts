@@ -1,4 +1,5 @@
 import { Command, Option } from 'commander';
+import type { WatchHandle } from '@mike-north/core';
 import { createRuntime } from '../runtime.js';
 import { reportError } from '../output.js';
 import {
@@ -37,6 +38,28 @@ async function runLoop(
   await server.listen();
   console.log(`AgentMon daemon listening on ${socketPath}`);
 
+  // Start continuous watchers for any watch-capable sources (G5). Watched
+  // monitors are driven by their watcher; the tick loop below skips them. New
+  // monitors added after startup are picked up on the next daemon restart.
+  let watchHandle: WatchHandle | undefined;
+  try {
+    watchHandle = await runtime.watchMonitors(monitorsDir, workspacePath, {
+      onError: (monitorId, error) => {
+        console.error(
+          `AgentMon watcher for "${monitorId}" failed: ${error.message}`,
+        );
+      },
+    });
+    if (watchHandle.monitorIds.length > 0) {
+      console.log(
+        `Watching ${String(watchHandle.monitorIds.length)} monitor(s) continuously: ${watchHandle.monitorIds.join(', ')}.`,
+      );
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`AgentMon watch setup failed: ${message}`);
+  }
+
   try {
     while (!isStoppingRequested()) {
       try {
@@ -65,6 +88,7 @@ async function runLoop(
   } finally {
     process.off('SIGINT', stop);
     process.off('SIGTERM', stop);
+    if (watchHandle) await watchHandle.stop();
     await server.close();
   }
 }

@@ -39,16 +39,13 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
 - **Files:** `apps/cli/src/commands/source.ts`.
 - **Proof:** integration tests for the chosen workflow; until then NP3 stays normative.
 
-### G5 — Watch-mode source execution (P3)
-
-- **Current:** `ObservationSource.watch()` is defined but no bundled source implements it and
-  the runtime never calls it; execution is `observe()`-only.
-- **Target:** either a runtime execution path that drives `watch()` for sources that opt in,
-  or removal of the unused interface member.
-- **Governs:** NP4 ([000](./000-principles.md)), [003 §2](./003-source-plugins.md).
-- **Files:** `libs/core/src/observation/types.ts`, `libs/core/src/runtime/service.ts`.
-- **Proof:** a runtime test exercising a `watch()`-based source end-to-end (or a PR that
-  deletes the member and updates NP4).
+> G5 (watch-mode source execution) **shipped** — the runtime now drives continuous `watch()` for
+> opt-in sources via `AgentMonitorRuntime.watchMonitors()` (started by `daemon run`), funnelling each
+> yielded observation through the same notify/materialize/project pipeline as `observe()`; a watched
+> monitor is skipped by the tick loop so it is never driven twice, and `stop()` aborts watchers via
+> `context.signal`. No bundled source opts in yet, but the path is exercised end-to-end. See
+> [NP4](./000-principles.md), [002 §2.3](./002-runtime-delivery.md), [003 §2](./003-source-plugins.md),
+> and [spec-changelog.md](./spec-changelog.md).
 
 > G6 (`observation_history`) **shipped** — the runtime now writes a per-tick audit row for each due
 > monitor (`triggered` / `suppressed` / `no-change`) via `RuntimeStore.recordObservationHistory`, read
