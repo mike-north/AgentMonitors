@@ -76,9 +76,9 @@ the baseline every environment can use.
 
 ## 4. Channel Transport (Target)
 
-> **Status: partially implemented.** The one-way push (§4.1) ships as `agentmonitors channel serve`;
-> the two-way ack tool (§4.3), full meta coverage (§4.2), and packaging are still target. Tracked in
-> [roadmap.md](./roadmap.md) (G7).
+> **Status: partially implemented.** The one-way push (§4.1) and the two-way `agentmon_ack` tool
+> (§4.3) ship as `agentmonitors channel serve`; full meta coverage (§4.2) and plugin packaging are
+> still target. Tracked in [roadmap.md](./roadmap.md) (G7).
 
 A channel is an MCP server Claude Code spawns over stdio that pushes events into the session as
 `<channel …>` tags. AgentMon ships a channel server that bridges the daemon's deliveries onto that
@@ -134,6 +134,10 @@ The `source` attribute on the rendered `<channel>` tag is set by the host from t
 > the claim summary; they are not yet emitted.
 
 ### 4.3 Two-way: acknowledgement tool
+
+> **Status: implemented.** `agentmonitors channel serve` declares `capabilities.tools` and exposes
+> the `agentmon_ack` tool (`apps/cli/src/channel-ack.ts`), routing it through `events.ack`. Arguments
+> are validated defensively at the MCP boundary (`parseAckArgs`).
 
 To close the unread→acknowledged loop in-session, the channel server **MAY** be two-way
 (`capabilities.tools = {}`) and expose an acknowledgement tool, e.g.:

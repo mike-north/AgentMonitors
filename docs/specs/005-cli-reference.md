@@ -716,7 +716,7 @@ Claims a pending delivery payload for a session at the specified lifecycle point
 ## §13 `channel` — Claude Code channel server
 
 **Source:** `apps/cli/src/commands/channel.ts`
-**Status:** One-way push implemented (stage 1). The two-way ack tool and plugin packaging are
+**Status:** Two-way (push + `agentmon_ack` tool) implemented. Plugin packaging is the remaining
 target work; see [006 §4](./006-agent-integration.md).
 
 ### `channel serve`
@@ -733,13 +733,15 @@ channel plugin, not run by hand.
 - `--host-session-id` — host session id (default: `$CLAUDE_CODE_SESSION_ID`).
 - `--workspace` — workspace path (default: `$CLAUDE_PROJECT_DIR`).
 
-**Behavior:** declares the `claude/channel` capability and connects over stdio. If a host session id
-is available, it resolves the AgentMon session via `session.open` (idempotent) and, every
-`--poll-ms`, calls `claimDelivery('turn-interruptible')`; each returned `DeliveryClaim` is rendered
-into a `<channel>` event (006 §4.2). It reuses the claim path, so claimed-state and cross-transport
-dedup with the hook-state surface are automatic. A missing/unreachable daemon is handled quietly
-(the hook-state path still delivers durably); the server shuts down when stdin closes (MCP
-disconnect). With no host session id it stays connected but does not poll.
+**Behavior:** declares the `claude/channel` capability **and `tools`**, and connects over stdio. If a
+host session id is available, it resolves the AgentMon session via `session.open` (idempotent) and,
+every `--poll-ms`, calls `claimDelivery('turn-interruptible')`; each returned `DeliveryClaim` is
+rendered into a `<channel>` event (006 §4.2). It also exposes the **`agentmon_ack`** tool: the agent
+calls it with `event_ids` (or none, to ack all unread) and it routes through `events.ack` for the
+bound session (006 §4.3). It reuses the claim path, so claimed-state and cross-transport dedup with
+the hook-state surface are automatic. A missing/unreachable daemon is handled quietly (the hook-state
+path still delivers durably); the server shuts down when stdin closes (MCP disconnect). With no host
+session id it stays connected (the ack tool reports an error if called) but does not poll.
 
 **Output:** none on stdout (the stdio channel is the MCP transport). Errors are quiet by design.
 
@@ -808,4 +810,4 @@ All commands set `process.exitCode = 1` rather than calling `process.exit(1)`. T
 | `events`   | `list`     | socket                            | Fully implemented                   |
 | `events`   | `ack`      | socket                            | Fully implemented                   |
 | `hook`     | `claim`    | socket                            | Fully implemented                   |
-| `channel`  | `serve`    | stdio MCP server + socket         | One-way push (stage 1)              |
+| `channel`  | `serve`    | stdio MCP server + socket         | Two-way (push + `agentmon_ack`)     |

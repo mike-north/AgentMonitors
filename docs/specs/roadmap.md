@@ -84,9 +84,12 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
      [006 §4.1](./006-agent-integration.md)). Reusing `claimDelivery` gives cross-transport dedup
      ([006 §4.5](./006-agent-integration.md)) and the durable hook-path fallback
      ([006 §5](./006-agent-integration.md)) for free.
-  3. Remaining: the two-way `agentmon_ack` tool (`events.ack`), plugin packaging
-     (`.claude-plugin` + `.mcp.json`), and an end-to-end manual UAT (channels are research-preview,
-     so not CI-able).
+  3. ✅ **Two-way ack shipped.** `agentmonitors channel serve` declares `tools` and exposes
+     `agentmon_ack`, routing through `events.ack` with defensively-validated arguments
+     ([006 §4.3](./006-agent-integration.md)); the arg parser is unit-tested.
+  4. Remaining: plugin packaging (`.claude-plugin` + `.mcp.json`), an end-to-end manual UAT (channels
+     are research-preview, so not CI-able), and optional `event_kind`/`object_key` meta (needs
+     `DeliveryEventSummary` enrichment, [006 §4.2](./006-agent-integration.md)).
 - **Decision captured:** binds by **session** via the inherited `CLAUDE_CODE_SESSION_ID` (no
   `CLAUDE_SESSION_ID`); the channel server lives as `agentmonitors channel serve` and polls
   `claimDelivery('turn-interruptible')`.

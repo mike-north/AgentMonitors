@@ -1,10 +1,19 @@
 import { Command } from 'commander';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+} from '@modelcontextprotocol/sdk/types.js';
 import { claudeCodeAdapter } from '@mike-north/core';
-import { claimDeliveryClient, openSessionClient } from '../runtime-client.js';
+import {
+  acknowledgeEventsClient,
+  claimDeliveryClient,
+  openSessionClient,
+} from '../runtime-client.js';
 import { resolveSocketPath } from '../daemon-ipc.js';
 import { renderChannelEvent } from '../channel-render.js';
+import { ACK_TOOL, parseAckArgs } from '../channel-ack.js';
 
 const DEFAULT_POLL_MS = 3000;
 
@@ -40,10 +49,11 @@ channelCommand
   });
 
 /**
- * Run the channel as a one-way MCP server: resolve the host session, then poll
- * the daemon for settled `turn-interruptible` deliveries and push each into the
- * session as a `<channel>` event. It reuses `claimDelivery`, so claimed-state and
- * cross-transport dedup with the hook-state path come for free (006 §4).
+ * Run the channel as a two-way MCP server. Outbound: poll the daemon for settled
+ * `turn-interruptible` deliveries and push each into the session as a `<channel>`
+ * event (reusing `claimDelivery`, so claimed-state and cross-transport dedup come
+ * for free, 006 §4). Inbound: expose an `agentmon_ack` tool that routes through
+ * `events.ack` so the agent can acknowledge what it has handled (006 §4.3).
  */
 async function runChannelServe(options: ChannelServeOptions): Promise<void> {
   const hostSessionId =
@@ -60,19 +70,78 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
   const mcp = new Server(
     { name: 'agentmonitors', version: '0.0.0' },
     {
-      capabilities: { experimental: { 'claude/channel': {} } },
+      capabilities: { experimental: { 'claude/channel': {} }, tools: {} },
       instructions:
         'AgentMon delivers monitor events here as <channel source="agentmonitors" ...>. ' +
         'Read each one and act on the work it describes. The tag meta carries urgency, ' +
-        'event_count, and (for a single event) monitor_id and event_id. One-way for now — ' +
-        'no reply is expected.',
+        'event_count, and (for a single event) monitor_id and event_id. When you have ' +
+        'handled events, call the agentmon_ack tool with their event_id values (or no ' +
+        'arguments to acknowledge all unread).',
     },
   );
 
+  let sessionId: string | undefined;
+  // session.open is idempotent: it resumes the session a SessionStart hook already
+  // opened for this (adapter, hostSessionId), or opens a new one. Shared by the
+  // poll loop and the ack tool.
+  const resolveSession = async (): Promise<string> => {
+    if (!hostSessionId) {
+      throw new Error('no host session id available');
+    }
+    sessionId ??= (
+      await openSessionClient(
+        claudeCodeAdapter.createSessionInput({
+          hostSessionId,
+          ...(workspace ? { workspacePath: workspace } : {}),
+        }),
+        socketPath,
+      )
+    ).id;
+    return sessionId;
+  };
+
+  // Inbound: advertise the agentmon_ack tool and route it through events.ack.
+  mcp.setRequestHandler(ListToolsRequestSchema, () => ({ tools: [ACK_TOOL] }));
+  mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
+    if (request.params.name !== ACK_TOOL.name) {
+      throw new Error(`unknown tool: ${request.params.name}`);
+    }
+    const parsed = parseAckArgs(request.params.arguments);
+    if (!parsed.ok) {
+      return {
+        content: [{ type: 'text', text: `Invalid arguments: ${parsed.error}` }],
+        isError: true,
+      };
+    }
+    try {
+      const boundSession = await resolveSession();
+      // events.ack only touches rows projected to this session, so passing the
+      // bound session id is the "outbound gate" that re-authorizes the ids (006 §4.3).
+      await acknowledgeEventsClient(
+        boundSession,
+        parsed.args.eventIds,
+        socketPath,
+      );
+      // events.ack silently ignores ids not projected to this session and does
+      // not report a count, so for explicit ids we frame the result as a request
+      // (some ids may be unknown/stale); the all-unread path is unambiguous.
+      const text = parsed.args.eventIds
+        ? `Requested acknowledgement of ${String(parsed.args.eventIds.length)} event(s); ids not projected to this session are ignored.`
+        : 'Acknowledged all unread events for this session.';
+      return { content: [{ type: 'text', text }] };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: 'text', text: `Acknowledge failed: ${message}` }],
+        isError: true,
+      };
+    }
+  });
+
   await mcp.connect(new StdioServerTransport());
 
-  // Without a host session id we cannot bind to a session. Stay connected so the
-  // host is satisfied, but do not poll. (Workspace-only fallback is a later step.)
+  // Without a host session id we cannot bind to a session. Stay connected (the
+  // ack tool reports an error if called), but do not poll.
   if (!hostSessionId) {
     process.stderr.write(
       'agentmonitors channel: no CLAUDE_CODE_SESSION_ID available; not binding to a session.\n',
@@ -80,24 +149,11 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
     return;
   }
 
-  let sessionId: string | undefined;
-
   const poll = async (): Promise<void> => {
     try {
-      // session.open is idempotent: it resumes the session a SessionStart hook
-      // already opened for this (adapter, hostSessionId), or opens a new one.
-      sessionId ??= (
-        await openSessionClient(
-          claudeCodeAdapter.createSessionInput({
-            hostSessionId,
-            ...(workspace ? { workspacePath: workspace } : {}),
-          }),
-          socketPath,
-        )
-      ).id;
-
+      const boundSession = await resolveSession();
       const claim = await claimDeliveryClient(
-        sessionId,
+        boundSession,
         'turn-interruptible',
         socketPath,
       );
