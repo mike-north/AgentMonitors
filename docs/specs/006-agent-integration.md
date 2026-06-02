@@ -56,9 +56,12 @@ A **delivery transport** is the generalization. Every transport **MUST**:
 - respect projection — only **lead** sessions receive deliveries
   ([002 §6](./002-runtime-delivery.md)).
 
-> **Design note.** This is a target refactor. The current code has no `DeliveryTransport` type; the
-> hook-state behavior lives directly in the runtime + adapter. The transport seam is introduced so a
-> second transport can be added without changing what the runtime decides.
+> **Design note (realization).** The seam does **not** require an in-process `DeliveryTransport`
+> abstraction. The hook-state behavior stays in the runtime + adapter, and the channel transport is
+> realized **out-of-process**: an MCP server that consumes the daemon's existing IPC
+> (`session.open`, `hook.claim`/`claimDelivery`, `events.ack`). So the transport boundary is the
+> **daemon IPC surface** ([002 §10](./002-runtime-delivery.md)), not a new core type — a transport is
+> anything that drives that IPC to surface `DeliveryClaim`s while honoring the rules above.
 
 ## 3. Hook-State Transport (Current)
 
@@ -73,8 +76,9 @@ the baseline every environment can use.
 
 ## 4. Channel Transport (Target)
 
-> **Status: target.** Not implemented. This section specifies the intended contract so it can drive
-> a prototype and is tracked in [roadmap.md](./roadmap.md) (G7).
+> **Status: partially implemented.** The one-way push (§4.1) ships as `agentmonitors channel serve`;
+> the two-way ack tool (§4.3), full meta coverage (§4.2), and packaging are still target. Tracked in
+> [roadmap.md](./roadmap.md) (G7).
 
 A channel is an MCP server Claude Code spawns over stdio that pushes events into the session as
 `<channel …>` tags. AgentMon ships a channel server that bridges the daemon's deliveries onto that
@@ -82,6 +86,12 @@ surface. (Channel mechanism reference:
 <https://code.claude.com/docs/en/channels-reference.md>.)
 
 ### 4.1 Mechanism
+
+> **Status: one-way push implemented** as the `agentmonitors channel serve` command
+> (`apps/cli/src/commands/channel.ts`, [005 §13](./005-cli-reference.md)). It resolves its session
+> via `CLAUDE_CODE_SESSION_ID` (§4.4), polls `claimDelivery('turn-interruptible')` over the daemon
+> socket, and pushes each returned claim. The two-way ack tool (§4.3) and plugin packaging are the
+> remaining target work.
 
 The AgentMon channel server:
 
@@ -116,6 +126,12 @@ multi-values flattened):
 
 The `source` attribute on the rendered `<channel>` tag is set by the host from the MCP server name
 (e.g. `agentmonitors`), not by `meta`.
+
+> **Stage-1 coverage.** The one-way server renders from a `DeliveryClaim`, whose
+> `DeliveryEventSummary` carries `eventId`, `monitorId`, `urgency`, etc. but **not** `eventKind` or
+> `objectKey`. So stage 1 emits `lifecycle`, `mode`, `event_count`, `urgency`, and (for a single
+> event) `monitor_id` and `event_id`. `event_kind` / `object_key` are target and require enriching
+> the claim summary; they are not yet emitted.
 
 ### 4.3 Two-way: acknowledgement tool
 
