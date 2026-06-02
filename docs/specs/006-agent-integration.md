@@ -56,9 +56,12 @@ A **delivery transport** is the generalization. Every transport **MUST**:
 - respect projection — only **lead** sessions receive deliveries
   ([002 §6](./002-runtime-delivery.md)).
 
-> **Design note.** This is a target refactor. The current code has no `DeliveryTransport` type; the
-> hook-state behavior lives directly in the runtime + adapter. The transport seam is introduced so a
-> second transport can be added without changing what the runtime decides.
+> **Design note (realization).** The seam does **not** require an in-process `DeliveryTransport`
+> abstraction. The hook-state behavior stays in the runtime + adapter, and the channel transport is
+> realized **out-of-process**: an MCP server that consumes the daemon's existing IPC
+> (`session.open`, `hook.claim`/`claimDelivery`, `events.ack`). So the transport boundary is the
+> **daemon IPC surface** ([002 §10](./002-runtime-delivery.md)), not a new core type — a transport is
+> anything that drives that IPC to surface `DeliveryClaim`s while honoring the rules above.
 
 ## 3. Hook-State Transport (Current)
 
@@ -82,6 +85,12 @@ surface. (Channel mechanism reference:
 <https://code.claude.com/docs/en/channels-reference.md>.)
 
 ### 4.1 Mechanism
+
+> **Status: one-way push implemented** as the `agentmonitors channel serve` command
+> (`apps/cli/src/commands/channel.ts`, [005 §13](./005-cli-reference.md)). It resolves its session
+> via `CLAUDE_CODE_SESSION_ID` (§4.4), polls `claimDelivery('turn-interruptible')` over the daemon
+> socket, and pushes each returned claim. The two-way ack tool (§4.3) and plugin packaging are the
+> remaining target work.
 
 The AgentMon channel server:
 

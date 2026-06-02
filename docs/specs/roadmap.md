@@ -65,29 +65,31 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
 
 - **Current:** delivery has a single surface — per-session `hook-state.json` consumed by hooks
   ([002 §8/§11](./002-runtime-delivery.md)). There is no transport abstraction.
-- **Target:** a `DeliveryTransport` seam plus an AgentMon **channel** MCP server that pushes settled
-  `DeliveryClaim`s into a session as `<channel>` events, and (two-way) an `agentmon_ack` tool.
-  Binds by **session** via the inherited `CLAUDE_CODE_SESSION_ID` (workspace via
-  `CLAUDE_PROJECT_DIR`/`roots/list` as fallback); additive and never required (NP-CH).
+- **Target:** an AgentMon **channel** MCP server that pushes settled `DeliveryClaim`s into a session
+  as `<channel>` events, and (two-way) an `agentmon_ack` tool. Binds by **session** via the inherited
+  `CLAUDE_CODE_SESSION_ID`; additive and never required (NP-CH). The transport is realized
+  out-of-process over the daemon IPC — no in-process core refactor (see
+  [006 §2](./006-agent-integration.md)).
 - **Governs:** [006-agent-integration.md](./006-agent-integration.md), PP4/BP2/AP6
   ([000](./000-principles.md)).
-- **Files:** new channel-server package/command; `libs/core/src/adapter/` (transport seam);
-  `libs/core/src/runtime/` (claim rendering); reuses the daemon IPC (`apps/cli/src/daemon-ipc.ts`).
+- **Files:** `apps/cli/src/commands/channel.ts`, `apps/cli/src/channel-render.ts`; reuses the daemon
+  IPC client (`apps/cli/src/runtime-client.ts`).
 - **Proof (staged):**
-  1. ✅ **Done — binding question resolved.** The `experiments/channel-probe` run (Claude Code
-     2.1.157) confirmed a spawned MCP server gets `CLAUDE_PROJECT_DIR` (= workspace) and cwd =
-     workspace, **inherits `CLAUDE_CODE_SESSION_ID`**, and can call `roots/list`. Session binding is
-     therefore available (see [006 §4.4](./006-agent-integration.md)).
-  2. Cross-transport dedup test: a channel push marks rows claimed so the hook path suppresses the
-     duplicate reminder ([006 §4.5](./006-agent-integration.md)).
-  3. Fallback test: with the channel disabled/blocked, delivery still completes via the hook path
-     with no error ([006 §5](./006-agent-integration.md)).
-  4. Remaining build work: the `DeliveryTransport` seam, the channel MCP server (one-way push, then
-     the `agentmon_ack` tool), and packaging.
-- **Decision captured:** binding prefers **session** scope via the inherited `CLAUDE_CODE_SESSION_ID`
-  (confirmed available to MCP-server subprocesses), falling back to **workspace** scope via
-  `CLAUDE_PROJECT_DIR`/`roots/list` (single-active-lead-session assumption, degrade on multi-lead).
-  There is no `CLAUDE_SESSION_ID`.
+  1. ✅ **Binding resolved.** The `experiments/channel-probe` run (Claude Code 2.1.157) confirmed a
+     spawned MCP server gets `CLAUDE_PROJECT_DIR` (= workspace) and cwd = workspace, **inherits
+     `CLAUDE_CODE_SESSION_ID`**, and can call `roots/list` ([006 §4.4](./006-agent-integration.md)).
+  2. ✅ **One-way push shipped.** `agentmonitors channel serve` resolves its session and pushes
+     settled `claimDelivery('turn-interruptible')` results as `<channel>` events; the claim→event
+     renderer is unit-tested and the command is wired ([005 §13](./005-cli-reference.md),
+     [006 §4.1](./006-agent-integration.md)). Reusing `claimDelivery` gives cross-transport dedup
+     ([006 §4.5](./006-agent-integration.md)) and the durable hook-path fallback
+     ([006 §5](./006-agent-integration.md)) for free.
+  3. Remaining: the two-way `agentmon_ack` tool (`events.ack`), plugin packaging
+     (`.claude-plugin` + `.mcp.json`), and an end-to-end manual UAT (channels are research-preview,
+     so not CI-able).
+- **Decision captured:** binds by **session** via the inherited `CLAUDE_CODE_SESSION_ID` (no
+  `CLAUDE_SESSION_ID`); the channel server lives as `agentmonitors channel serve` and polls
+  `claimDelivery('turn-interruptible')`.
 
 ## Test gaps
 

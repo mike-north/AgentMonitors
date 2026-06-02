@@ -713,7 +713,38 @@ Claims a pending delivery payload for a session at the specified lifecycle point
 
 ---
 
-## §13 Exit codes & diagnostics
+## §13 `channel` — Claude Code channel server
+
+**Source:** `apps/cli/src/commands/channel.ts`
+**Status:** One-way push implemented (stage 1). The two-way ack tool and plugin packaging are
+target work; see [006 §4](./006-agent-integration.md).
+
+### `channel serve`
+
+Runs AgentMon as a Claude Code **channel**: an MCP server (stdio) that pushes pending high-urgency
+deliveries into the session as `<channel source="agentmonitors" …>` events. Intended to be spawned
+by Claude Code via a channel plugin, not run by hand.
+
+**Usage:** `agentmonitors channel serve [--socket <path>] [--poll-ms <ms>] [--host-session-id <id>] [--workspace <path>]`
+
+- `--socket` — daemon Unix socket path (default: `$AGENTMONITORS_SOCKET` or the standard path).
+- `--poll-ms` — delivery poll interval in milliseconds (default: `3000`).
+- `--host-session-id` — host session id (default: `$CLAUDE_CODE_SESSION_ID`).
+- `--workspace` — workspace path (default: `$CLAUDE_PROJECT_DIR`).
+
+**Behavior:** declares the `claude/channel` capability and connects over stdio. If a host session id
+is available, it resolves the AgentMon session via `session.open` (idempotent) and, every
+`--poll-ms`, calls `claimDelivery('turn-interruptible')`; each returned `DeliveryClaim` is rendered
+into a `<channel>` event (006 §4.2). It reuses the claim path, so claimed-state and cross-transport
+dedup with the hook-state surface are automatic. A missing/unreachable daemon is handled quietly
+(the hook-state path still delivers durably); the server shuts down when stdin closes (MCP
+disconnect). With no host session id it stays connected but does not poll.
+
+**Output:** none on stdout (the stdio channel is the MCP transport). Errors are quiet by design.
+
+---
+
+## §14 Exit codes & diagnostics
 
 ### General conventions
 
@@ -751,7 +782,7 @@ All commands set `process.exitCode = 1` rather than calling `process.exit(1)`. T
 | Command    | Subcommand | Transport                         | Status                              |
 | ---------- | ---------- | --------------------------------- | ----------------------------------- |
 | `init`     | —          | in-process                        | Fully implemented                   |
-| `validate` | —          | in-process                        | Partial (required fields only)      |
+| `validate` | —          | in-process                        | Fully implemented (full schema)     |
 | `scan`     | —          | in-process                        | Fully implemented                   |
 | `inbox`    | `list`     | in-process                        | Fully implemented                   |
 | `inbox`    | `ack`      | in-process                        | Fully implemented                   |
@@ -776,3 +807,4 @@ All commands set `process.exitCode = 1` rather than calling `process.exit(1)`. T
 | `events`   | `list`     | socket                            | Fully implemented                   |
 | `events`   | `ack`      | socket                            | Fully implemented                   |
 | `hook`     | `claim`    | socket                            | Fully implemented                   |
+| `channel`  | `serve`    | stdio MCP server + socket         | One-way push (stage 1)              |
