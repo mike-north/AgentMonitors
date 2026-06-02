@@ -825,6 +825,74 @@ describe('session list and close', () => {
   }, 30_000);
 });
 
+describe('monitor history', () => {
+  it('records observation outcomes and lists them through the daemon', async () => {
+    const dir = path.join(tempDir, 'history-flow');
+    const monitorsDir = path.join(dir, '.claude', 'monitors', 'watch-files');
+    mkdirSync(monitorsDir, { recursive: true });
+    const watchedFile = path.join(dir, 'watched.txt');
+    writeFileSync(watchedFile, 'hello', 'utf-8');
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      `---
+name: Watch files
+source: file-fingerprint
+urgency: normal
+event-kind: mutation
+scope:
+  globs:
+    - watched.txt
+  cwd: ${JSON.stringify(dir)}
+  interval: '1s'
+---
+When files change, review them.
+`,
+      'utf-8',
+    );
+
+    const dbPath = path.join(dir, 'agentmon.db');
+    const socketPath = path.join(
+      '/tmp',
+      `agentmon-hist-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const env = { AGENTMONITORS_DB: dbPath, AGENTMONITORS_SOCKET: socketPath };
+    const daemon = await startDaemon(
+      path.join(dir, '.claude', 'monitors'),
+      dir,
+      env,
+      socketPath,
+    );
+
+    try {
+      // Let the daemon establish a baseline tick, then change the watched file.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
+      writeFileSync(watchedFile, 'changed', 'utf-8');
+
+      let records: { result: string; monitorId: string }[] = [];
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        const result = runWithEnv(
+          ['monitor', 'history', '--format', 'json'],
+          env,
+          dir,
+        );
+        if (result.exitCode === 0) {
+          records = JSON.parse(result.stdout) as typeof records;
+          if (records.some((r) => r.result === 'triggered')) break;
+        }
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+      }
+
+      expect(records.length).toBeGreaterThan(0);
+      expect(records.some((r) => r.result === 'triggered')).toBe(true);
+      expect(records.every((r) => r.monitorId === 'watch-files')).toBe(true);
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+    }
+  }, 30_000);
+});
+
 describe('monitor test', () => {
   it('errors on missing file', () => {
     const result = run(['monitor', 'test', '/tmp/nonexistent-monitor.md']);

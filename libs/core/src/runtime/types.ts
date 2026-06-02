@@ -180,6 +180,28 @@ export interface RuntimeStatus {
   events: number;
 }
 
+/**
+ * The outcome of evaluating a due monitor on a tick: `triggered` (≥1 observation
+ * became an event), `suppressed` (observations were returned but none emitted —
+ * throttled or held in a debounce batch), or `no-change` (the source returned
+ * nothing).
+ */
+export type ObservationOutcome = 'triggered' | 'suppressed' | 'no-change';
+
+export interface ObservationHistoryRecord {
+  id: string;
+  monitorId: string;
+  sourceName: string;
+  observationData: Record<string, unknown>;
+  result: ObservationOutcome;
+  createdAt: Date;
+}
+
+export interface ObservationHistoryQuery {
+  monitorId?: string;
+  limit?: number;
+}
+
 export interface ObservationCycleResult {
   observations: Observation[];
   nextState?: unknown;

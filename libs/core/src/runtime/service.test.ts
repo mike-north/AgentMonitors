@@ -708,4 +708,124 @@ Handle it.
     expect(withDiff).toHaveLength(1);
     expect(withDiff[0]?.diffText).toContain('changed');
   });
+
+  // G6: each due monitor's outcome is recorded to observation_history per tick.
+  it('records observation history (triggered, then no-change) per tick', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'history-source',
+      'normal',
+      'Handle it.',
+      "  interval: '1s'\n",
+    );
+
+    let emit = true;
+    const source: ObservationSource = {
+      name: 'history-source',
+      scopeSchema: { type: 'object' },
+      observe: () =>
+        Promise.resolve({
+          observations: emit ? [{ title: 'thing', objectKey: 'obj-1' }] : [],
+        }),
+    };
+
+    const runtime = createRuntime(dbPath, source);
+    runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-history',
+        workspacePath: rootDir,
+      }),
+    );
+
+    await runtime.tick(monitorsDir, rootDir); // observation emitted -> triggered
+    emit = false;
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    await runtime.tick(monitorsDir, rootDir); // nothing observed -> no-change
+
+    const history = runtime.listObservationHistory({
+      monitorId: 'test-monitor',
+    });
+    expect(history).toHaveLength(2);
+    // newest first
+    expect(history[0]?.result).toBe('no-change');
+    expect(history[1]?.result).toBe('triggered');
+    expect(history[1]?.sourceName).toBe('history-source');
+    expect(history[1]?.observationData).toEqual({ observed: 1, emitted: 1 });
+  });
+
+  it('classifies a debounced-flush tick (emit with zero new observations) as triggered, not no-change', async () => {
+    // Regression for PR #30: a tick that flushes a previously-debounced batch has
+    // zero *new* observations yet still emits events. It must be recorded as
+    // `triggered`, not `no-change`. The pre-fix ternary keyed off `observed === 0`
+    // first and misclassified this (common) case — e.g. the default high-urgency
+    // settle flushing. See https://github.com/mike-north/AgentMonitors/pull/30
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    const monitorsDir = path.join(rootDir, '.claude', 'monitors');
+    const monitorDir = path.join(monitorsDir, 'debounce-monitor');
+    mkdirSync(monitorDir, { recursive: true });
+    // High urgency with an explicit, minimal (1s) debounce: tick 1 holds the
+    // observation (suppressed); after the settle elapses, tick 2 flushes it with
+    // no new observation (the bug scenario).
+    writeFileSync(
+      path.join(monitorDir, 'MONITOR.md'),
+      `---
+name: Debounce flush
+source: debounce-source
+urgency: high
+event-kind: mutation
+notify:
+  strategy: debounce
+  settle-for: 1s
+scope:
+  filePath: ${JSON.stringify(path.join(rootDir, 'watched.txt'))}
+  interval: '1s'
+---
+Handle it.
+`,
+      'utf-8',
+    );
+
+    let emit = true;
+    const source: ObservationSource = {
+      name: 'debounce-source',
+      scopeSchema: { type: 'object' },
+      stateful: true,
+      observe: () =>
+        Promise.resolve({
+          observations: emit ? [{ title: 'thing', objectKey: 'obj-1' }] : [],
+          nextState: { sent: true },
+        }),
+    };
+
+    const runtime = createRuntime(dbPath, source);
+    runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-debounce',
+        workspacePath: rootDir,
+      }),
+    );
+
+    const first = await runtime.tick(monitorsDir, rootDir); // held in debounce
+    expect(first.emittedEventIds).toHaveLength(0);
+    emit = false;
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    const second = await runtime.tick(monitorsDir, rootDir); // flush, no new obs
+    expect(second.emittedEventIds).toHaveLength(1);
+
+    const history = runtime.listObservationHistory({
+      monitorId: 'debounce-monitor',
+    });
+    expect(history).toHaveLength(2);
+    // newest first: the flush tick emitted with zero new observations
+    expect(history[0]?.result).toBe('triggered');
+    expect(history[0]?.observationData).toEqual({ observed: 0, emitted: 1 });
+    // the earlier tick held the observation without emitting
+    expect(history[1]?.result).toBe('suppressed');
+    expect(history[1]?.observationData).toEqual({ observed: 1, emitted: 0 });
+  });
 });

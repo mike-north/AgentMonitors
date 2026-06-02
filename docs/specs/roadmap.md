@@ -50,16 +50,10 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
 - **Proof:** a runtime test exercising a `watch()`-based source end-to-end (or a PR that
   deletes the member and updates NP4).
 
-### G6 — `observation_history` has no write path (P3)
-
-- **Current:** the `observation_history` table exists in the Drizzle schema and DDL, but
-  `RuntimeStore` never writes to it.
-- **Target:** either populate it during the tick (triggered / suppressed / no-change audit
-  trail) or remove the dead table.
-- **Governs:** [002 §"Persistence Schema" appendix](./002-runtime-delivery.md).
-- **Files:** `libs/core/src/inbox/schema.ts`, `libs/core/src/runtime/store.ts`.
-- **Proof:** a runtime test asserting rows are recorded per tick outcome (or a migration
-  removing the table).
+> G6 (`observation_history`) **shipped** — the runtime now writes a per-tick audit row for each due
+> monitor (`triggered` / `suppressed` / `no-change`) via `RuntimeStore.recordObservationHistory`, read
+> back through `agentmonitors monitor history` ([002 §"Persistence Schema"](./002-runtime-delivery.md),
+> [005 §6](./005-cli-reference.md)).
 
 > G7 (Claude Code channel delivery transport) **shipped** — built out-of-process over the daemon IPC
 > (no in-process core refactor), binding by the inherited `CLAUDE_CODE_SESSION_ID`:
