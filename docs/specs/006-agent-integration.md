@@ -76,9 +76,11 @@ the baseline every environment can use.
 
 ## 4. Channel Transport (Target)
 
-> **Status: partially implemented.** The one-way push (§4.1) and the two-way `agentmon_ack` tool
-> (§4.3) ship as `agentmonitors channel serve`; full meta coverage (§4.2) and plugin packaging are
-> still target. Tracked in [roadmap.md](./roadmap.md) (G7).
+> **Status: implemented.** The one-way push (§4.1), the two-way `agentmon_ack` tool (§4.3), and
+> plugin packaging (`channel-plugin/` — a `.claude-plugin/plugin.json` + `.mcp.json` that runs
+> `agentmonitors channel serve`) all ship. Remaining is an end-to-end **manual UAT** (channels are
+> research-preview, so not CI-able) and optional fuller meta (§4.2 `event_kind`/`object_key`, which
+> need `DeliveryEventSummary` enrichment). Tracked in [roadmap.md](./roadmap.md) (G7).
 
 A channel is an MCP server Claude Code spawns over stdio that pushes events into the session as
 `<channel …>` tags. AgentMon ships a channel server that bridges the daemon's deliveries onto that
