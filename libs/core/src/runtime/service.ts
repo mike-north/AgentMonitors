@@ -13,6 +13,8 @@ import type {
   AgentSessionRecord,
   DeliveryClaim,
   EventQuery,
+  ObservationHistoryQuery,
+  ObservationHistoryRecord,
   OpenSessionInput,
   PollingDecision,
   ProcessObservationInput,
@@ -198,6 +200,12 @@ export class AgentMonitorRuntime {
 
   listEvents(query: EventQuery = {}) {
     return this.store.listEvents(query);
+  }
+
+  listObservationHistory(
+    query: ObservationHistoryQuery = {},
+  ): ObservationHistoryRecord[] {
+    return this.store.listObservationHistory(query);
   }
 
   acknowledgeSession(sessionId: string, eventIds?: string[]): void {
@@ -411,6 +419,21 @@ export class AgentMonitorRuntime {
         sourceState: observationResult.nextState,
         notifyState: dispatch.nextState,
         lastObservationAt: now,
+      });
+
+      // Audit trail: record this monitor's outcome for the tick (G6).
+      const observed = observationResult.observations.length;
+      const emittedCount = dispatch.emitted.length;
+      this.store.recordObservationHistory({
+        monitorId: monitor.id,
+        sourceName: monitor.frontmatter.source,
+        result:
+          observed === 0
+            ? 'no-change'
+            : emittedCount > 0
+              ? 'triggered'
+              : 'suppressed',
+        observationData: { observed, emitted: emittedCount },
       });
 
       for (const emitted of dispatch.emitted) {

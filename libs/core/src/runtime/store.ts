@@ -7,6 +7,7 @@ import {
   monitorEvents,
   monitorSnapshots,
   monitorState,
+  observationHistory,
   sessionEventState,
 } from '../inbox/schema.js';
 import type {
@@ -14,6 +15,9 @@ import type {
   EventQuery,
   MonitorEventRecord,
   MonitorRuntimeState,
+  ObservationHistoryQuery,
+  ObservationHistoryRecord,
+  ObservationOutcome,
   OpenSessionInput,
   RuntimeStatus,
   SessionHookState,
@@ -413,6 +417,52 @@ export class RuntimeStore {
       .orderBy(desc(monitorSnapshots.createdAt))
       .get();
     return row ? { content: row.content } : null;
+  }
+
+  recordObservationHistory(input: {
+    monitorId: string;
+    sourceName: string;
+    result: ObservationOutcome;
+    observationData: Record<string, unknown>;
+  }): void {
+    asInternalDb(this.db)
+      .insert(observationHistory)
+      .values({
+        id: ulid(),
+        monitorId: input.monitorId,
+        sourceName: input.sourceName,
+        observationData: JSON.stringify(input.observationData),
+        result: input.result,
+        createdAt: new Date(),
+      })
+      .run();
+  }
+
+  listObservationHistory(
+    query: ObservationHistoryQuery = {},
+  ): ObservationHistoryRecord[] {
+    const rows = asInternalDb(this.db)
+      .select()
+      .from(observationHistory)
+      .where(
+        query.monitorId
+          ? eq(observationHistory.monitorId, query.monitorId)
+          : undefined,
+      )
+      .orderBy(desc(observationHistory.createdAt))
+      .limit(query.limit ?? 50)
+      .all();
+    return rows.map((row) => ({
+      id: row.id,
+      monitorId: row.monitorId,
+      sourceName: row.sourceName,
+      observationData: parseJson<Record<string, unknown>>(
+        row.observationData,
+        {},
+      ),
+      result: row.result,
+      createdAt: row.createdAt,
+    }));
   }
 
   sessionsForWorkspace(workspacePath?: string | null): AgentSessionRecord[] {

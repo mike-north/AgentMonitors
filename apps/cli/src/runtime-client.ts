@@ -4,6 +4,8 @@ import type {
   DeliveryLifecycle,
   EventQuery,
   MonitorEventRecord,
+  ObservationHistoryQuery,
+  ObservationHistoryRecord,
   OpenSessionInput,
   RuntimeStatus,
   RuntimeTickResult,
@@ -77,6 +79,17 @@ export async function claimDeliveryClient(
   return await callDaemon<DeliveryClaim | null>(
     'hook.claim',
     { sessionId, lifecycle },
+    socketPath ? { socketPath } : {},
+  );
+}
+
+export async function listObservationHistoryClient(
+  query: ObservationHistoryQuery,
+  socketPath?: string,
+): Promise<ObservationHistoryRecord[]> {
+  return await callDaemon<ObservationHistoryRecord[]>(
+    'history.list',
+    query as unknown as Record<string, unknown>,
     socketPath ? { socketPath } : {},
   );
 }

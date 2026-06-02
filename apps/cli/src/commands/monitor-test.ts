@@ -10,6 +10,7 @@ import {
 } from '@mike-north/core';
 import { registerCoreSources } from '../sources.js';
 import { reportError } from '../output.js';
+import { listObservationHistoryClient } from '../runtime-client.js';
 
 export const monitorTestCommand = new Command('monitor').description(
   'Monitor utilities',
@@ -202,3 +203,52 @@ monitorTestCommand
       reportError(`Observation failed: ${message}`, json);
     }
   });
+
+monitorTestCommand
+  .command('history')
+  .description(
+    'Show recent observation outcomes per tick (triggered / suppressed / no-change)',
+  )
+  .argument('[monitorId]', 'Filter to a single monitor id')
+  .option('--socket <path>', 'Unix domain socket path for the daemon')
+  .option('--limit <n>', 'Maximum rows to return', '50')
+  .addOption(
+    new Option('--format <format>', 'Output format')
+      .choices(['text', 'json'])
+      .default('text'),
+  )
+  .action(
+    async (
+      monitorId: string | undefined,
+      options: { socket?: string; limit: string; format: string },
+    ) => {
+      const json = options.format === 'json';
+      try {
+        const limit = Number.parseInt(options.limit, 10);
+        const records = await listObservationHistoryClient(
+          {
+            ...(monitorId ? { monitorId } : {}),
+            ...(Number.isFinite(limit) && limit > 0 ? { limit } : {}),
+          },
+          options.socket,
+        );
+
+        if (json) {
+          console.log(JSON.stringify(records, null, 2));
+          return;
+        }
+        if (records.length === 0) {
+          console.log('No observation history.');
+          return;
+        }
+        for (const record of records) {
+          console.log(
+            `${String(record.createdAt)}  ${record.result.padEnd(10)}  ${record.monitorId}  (${record.sourceName})`,
+          );
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        reportError(`History failed: ${message}`, json);
+      }
+    },
+  );

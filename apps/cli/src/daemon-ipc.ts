@@ -33,6 +33,7 @@ const daemonMethodSchema = z.enum([
   'events.list',
   'events.ack',
   'hook.claim',
+  'history.list',
   'daemon.tick',
 ]);
 const daemonResponseSchema = z.object({
@@ -78,6 +79,10 @@ const eventsAckParamsSchema = z.object({
 const hookClaimParamsSchema = z.object({
   sessionId: z.string(),
   lifecycle: deliveryLifecycleSchema,
+});
+const historyListParamsSchema = z.object({
+  monitorId: z.string().optional(),
+  limit: z.number().int().positive().optional(),
 });
 const daemonTickParamsSchema = z.object({
   monitorsDir: z.string(),
@@ -212,6 +217,15 @@ function handleRequest(
       const params = hookClaimParamsSchema.parse(request.params);
       return Promise.resolve(
         runtime.claimDelivery(params.sessionId, params.lifecycle),
+      );
+    }
+    case 'history.list': {
+      const params = historyListParamsSchema.parse(request.params);
+      return Promise.resolve(
+        runtime.listObservationHistory({
+          ...(params.monitorId ? { monitorId: params.monitorId } : {}),
+          ...(params.limit ? { limit: params.limit } : {}),
+        }),
       );
     }
     case 'daemon.tick': {
