@@ -15,6 +15,7 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@mike-north/core": "workspace:*",
     "@mike-north/source-api-poll": "workspace:*",
     "@mike-north/source-file-fingerprint": "workspace:*",

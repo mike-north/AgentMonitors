@@ -173,6 +173,15 @@ describe('CLI --help', () => {
   });
 });
 
+describe('channel serve', () => {
+  it('registers the channel serve command and its flags', () => {
+    const result = run(['channel', 'serve', '--help']);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('--poll-ms');
+    expect(result.stdout).toContain('--host-session-id');
+  });
+});
+
 describe('init', () => {
   it('scaffolds a file-fingerprint monitor by default', () => {
     const dir = path.join(tempDir, 'init-test-1');

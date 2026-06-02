@@ -10,6 +10,7 @@ import { daemonCommand } from './commands/daemon.js';
 import { sessionCommand } from './commands/session.js';
 import { eventsCommand } from './commands/events.js';
 import { hookCommand } from './commands/hook.js';
+import { channelCommand } from './commands/channel.js';
 
 const program = new Command();
 
@@ -29,5 +30,6 @@ program.addCommand(daemonCommand);
 program.addCommand(sessionCommand);
 program.addCommand(eventsCommand);
 program.addCommand(hookCommand);
+program.addCommand(channelCommand);
 
 program.parse();
