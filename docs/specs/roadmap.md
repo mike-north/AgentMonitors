@@ -61,38 +61,18 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
 - **Proof:** a runtime test asserting rows are recorded per tick outcome (or a migration
   removing the table).
 
-### G7 — Claude Code channel delivery transport (P2)
-
-- **Current:** delivery has a single surface — per-session `hook-state.json` consumed by hooks
-  ([002 §8/§11](./002-runtime-delivery.md)). There is no transport abstraction.
-- **Target:** an AgentMon **channel** MCP server that pushes settled `DeliveryClaim`s into a session
-  as `<channel>` events, and (two-way) an `agentmon_ack` tool. Binds by **session** via the inherited
-  `CLAUDE_CODE_SESSION_ID`; additive and never required (NP-CH). The transport is realized
-  out-of-process over the daemon IPC — no in-process core refactor (see
-  [006 §2](./006-agent-integration.md)).
-- **Governs:** [006-agent-integration.md](./006-agent-integration.md), PP4/BP2/AP6
-  ([000](./000-principles.md)).
-- **Files:** `apps/cli/src/commands/channel.ts`, `apps/cli/src/channel-render.ts`; reuses the daemon
-  IPC client (`apps/cli/src/runtime-client.ts`).
-- **Proof (staged):**
-  1. ✅ **Binding resolved.** The `experiments/channel-probe` run (Claude Code 2.1.157) confirmed a
-     spawned MCP server gets `CLAUDE_PROJECT_DIR` (= workspace) and cwd = workspace, **inherits
-     `CLAUDE_CODE_SESSION_ID`**, and can call `roots/list` ([006 §4.4](./006-agent-integration.md)).
-  2. ✅ **One-way push shipped.** `agentmonitors channel serve` resolves its session and pushes
-     settled `claimDelivery('turn-interruptible')` results as `<channel>` events; the claim→event
-     renderer is unit-tested and the command is wired ([005 §13](./005-cli-reference.md),
-     [006 §4.1](./006-agent-integration.md)). Reusing `claimDelivery` gives cross-transport dedup
-     ([006 §4.5](./006-agent-integration.md)) and the durable hook-path fallback
-     ([006 §5](./006-agent-integration.md)) for free.
-  3. ✅ **Two-way ack shipped.** `agentmonitors channel serve` declares `tools` and exposes
-     `agentmon_ack`, routing through `events.ack` with defensively-validated arguments
-     ([006 §4.3](./006-agent-integration.md)); the arg parser is unit-tested.
-  4. Remaining: plugin packaging (`.claude-plugin` + `.mcp.json`), an end-to-end manual UAT (channels
-     are research-preview, so not CI-able), and optional `event_kind`/`object_key` meta (needs
-     `DeliveryEventSummary` enrichment, [006 §4.2](./006-agent-integration.md)).
-- **Decision captured:** binds by **session** via the inherited `CLAUDE_CODE_SESSION_ID` (no
-  `CLAUDE_SESSION_ID`); the channel server lives as `agentmonitors channel serve` and polls
-  `claimDelivery('turn-interruptible')`.
+> G7 (Claude Code channel delivery transport) **shipped** — built out-of-process over the daemon IPC
+> (no in-process core refactor), binding by the inherited `CLAUDE_CODE_SESSION_ID`:
+>
+> - One-way push **and** the two-way `agentmon_ack` tool via `agentmonitors channel serve`
+>   ([005 §13](./005-cli-reference.md), [006 §4](./006-agent-integration.md)); reusing `claimDelivery`
+>   gives cross-transport dedup and the durable hook-path fallback for free.
+> - An installable channel plugin in `channel-plugin/` (`.claude-plugin/plugin.json` + `.mcp.json`).
+> - Binding confirmed empirically by `experiments/channel-probe` (006 §4.4).
+>
+> Non-blocking follow-ups: an end-to-end **manual UAT** (channels are research-preview, not CI-able),
+> and optional `event_kind`/`object_key` meta (needs `DeliveryEventSummary` enrichment,
+> [006 §4.2](./006-agent-integration.md)).
 
 ## Test gaps
 

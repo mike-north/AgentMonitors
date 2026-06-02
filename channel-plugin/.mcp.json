@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "agentmonitors": {
+      "command": "agentmonitors",
+      "args": ["channel", "serve"]
+    }
+  }
+}

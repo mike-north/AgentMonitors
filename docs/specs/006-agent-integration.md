@@ -76,9 +76,11 @@ the baseline every environment can use.
 
 ## 4. Channel Transport (Target)
 
-> **Status: partially implemented.** The one-way push (§4.1) and the two-way `agentmon_ack` tool
-> (§4.3) ship as `agentmonitors channel serve`; full meta coverage (§4.2) and plugin packaging are
-> still target. Tracked in [roadmap.md](./roadmap.md) (G7).
+> **Status: implemented.** The one-way push (§4.1), the two-way `agentmon_ack` tool (§4.3), and
+> plugin packaging (`channel-plugin/` — a `.claude-plugin/plugin.json` + `.mcp.json` that runs
+> `agentmonitors channel serve`) all ship. Remaining is an end-to-end **manual UAT** (channels are
+> research-preview, so not CI-able) and optional fuller meta (§4.2 `event_kind`/`object_key`, which
+> need `DeliveryEventSummary` enrichment). See [roadmap.md](./roadmap.md) (G7, shipped).
 
 A channel is an MCP server Claude Code spawns over stdio that pushes events into the session as
 `<channel …>` tags. AgentMon ships a channel server that bridges the daemon's deliveries onto that
@@ -87,11 +89,11 @@ surface. (Channel mechanism reference:
 
 ### 4.1 Mechanism
 
-> **Status: one-way push implemented** as the `agentmonitors channel serve` command
+> **Status: implemented** as the `agentmonitors channel serve` command
 > (`apps/cli/src/commands/channel.ts`, [005 §13](./005-cli-reference.md)). It resolves its session
 > via `CLAUDE_CODE_SESSION_ID` (§4.4), polls `claimDelivery('turn-interruptible')` over the daemon
-> socket, and pushes each returned claim. The two-way ack tool (§4.3) and plugin packaging are the
-> remaining target work.
+> socket, and pushes each returned claim. (The two-way ack tool is §4.3; packaging is
+> `channel-plugin/`.)
 
 The AgentMon channel server:
 
