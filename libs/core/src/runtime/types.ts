@@ -168,6 +168,18 @@ export interface RuntimeTickResult {
   emittedEventIds: string[];
 }
 
+/**
+ * A live handle over the continuous watchers started by
+ * `AgentMonitorRuntime.watchMonitors()`. While a monitor is being watched, the
+ * tick loop skips its one-shot `observe()` so it is not driven twice.
+ */
+export interface WatchHandle {
+  /** The ids of the monitors with an active watcher under this handle. */
+  readonly monitorIds: string[];
+  /** Abort every watcher this handle started and wait for them to settle. */
+  stop(): Promise<void>;
+}
+
 export interface NotifyDispatchResult {
   emitted: StoredObservationEnvelope[];
   nextState: NotifyRuntimeState;

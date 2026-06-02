@@ -49,6 +49,13 @@ export interface ObservationContext {
   previousState?: unknown;
   /** Timestamp supplied by the runtime */
   now: Date;
+  /**
+   * Abort signal for continuous `watch()` execution. The runtime aborts it to
+   * tear a watcher down (daemon shutdown, monitor removal). A `watch()`
+   * implementation **SHOULD** stop yielding and release resources when it fires.
+   * Unused by one-shot `observe()`.
+   */
+  signal?: AbortSignal;
 }
 
 export interface ObservationResult {
@@ -74,7 +81,14 @@ export interface ObservationSource {
     config: Record<string, unknown>,
     context: ObservationContext,
   ): Promise<ObservationResult>;
-  /** Optional continuous watch mode */
+  /**
+   * Optional continuous watch mode. A source that opts in yields observations as
+   * they happen; the runtime drives it via `AgentMonitorRuntime.watchMonitors()`,
+   * funnelling each yielded observation through the same notify dispatch, event
+   * materialization, and session projection pipeline as `observe()`. The source
+   * **SHOULD** stop yielding when `context.signal` aborts. `observe()` remains
+   * required (it is the fallback for one-shot ticks, e.g. `daemon once`).
+   */
   watch?(
     config: Record<string, unknown>,
     context: ObservationContext,
