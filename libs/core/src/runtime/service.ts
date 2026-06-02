@@ -422,17 +422,22 @@ export class AgentMonitorRuntime {
       });
 
       // Audit trail: record this monitor's outcome for the tick (G6).
+      // Classify by what was *emitted*, not by new observations: a tick can emit
+      // a previously-debounced batch with zero new observations (e.g. the default
+      // high-urgency settle flushing), which is still a `triggered` outcome. Only
+      // `suppressed` (observations seen but held/throttled this tick) and
+      // `no-change` (nothing seen) depend on the observation count.
       const observed = observationResult.observations.length;
       const emittedCount = dispatch.emitted.length;
       this.store.recordObservationHistory({
         monitorId: monitor.id,
         sourceName: monitor.frontmatter.source,
         result:
-          observed === 0
-            ? 'no-change'
-            : emittedCount > 0
-              ? 'triggered'
-              : 'suppressed',
+          emittedCount > 0
+            ? 'triggered'
+            : observed > 0
+              ? 'suppressed'
+              : 'no-change',
         observationData: { observed, emitted: emittedCount },
       });
 

@@ -483,7 +483,7 @@ Stores the per-monitor polling and notification state. One row per monitor ID.
 
 ### `observation_history`
 
-An audit trail of each due monitor's outcome per tick. For every evaluated monitor the runtime writes a row with `monitorId`, `sourceName`, `observationData` (a `{ observed, emitted }` summary), and `result` — one of `triggered` (≥1 observation became an event), `suppressed` (observations were returned but none emitted this tick — throttled or held in a debounce batch), or `no-change` (the source returned nothing). Verified: `RuntimeStore.recordObservationHistory` / `listObservationHistory`, written from `service.ts` `tick()`. Read via `agentmonitors monitor history` ([005 §6](./005-cli-reference.md)).
+An audit trail of each due monitor's outcome per tick. For every evaluated monitor the runtime writes a row with `monitorId`, `sourceName`, `observationData` (a `{ observed, emitted }` summary), and `result`. The result is classified by what was **emitted** this tick, not by the new-observation count: `triggered` (≥1 event was emitted — including a tick that flushes a previously-held debounce batch even though it returned no new observations), else `suppressed` (observations were returned but none emitted this tick — throttled or held in a debounce batch), else `no-change` (the source returned nothing). Verified: `RuntimeStore.recordObservationHistory` / `listObservationHistory`, written from `service.ts` `tick()`. Read via `agentmonitors monitor history` ([005 §6](./005-cli-reference.md)).
 
 | Column             | Type             | Notes                                  |
 | ------------------ | ---------------- | -------------------------------------- |
