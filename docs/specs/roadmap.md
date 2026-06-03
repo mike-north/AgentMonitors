@@ -60,10 +60,13 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
 >   gives cross-transport dedup and the durable hook-path fallback for free.
 > - An installable channel plugin in `channel-plugin/` (`.claude-plugin/plugin.json` + `.mcp.json`).
 > - Binding confirmed empirically by `experiments/channel-probe` (006 §4.4).
+> - End-to-end **push** verified by `experiments/channel-uat` — an MCP-client harness that drives a
+>   real `channel serve` against a live daemon and asserts the `<channel>` push for both the
+>   coalesced-reminder (normal) and concrete-event (high) paths, without needing a live Claude
+>   session or a channels-enabled org.
 >
-> Non-blocking follow-ups: an end-to-end **manual UAT** (channels are research-preview, not CI-able),
-> and optional `event_kind`/`object_key` meta (needs `DeliveryEventSummary` enrichment,
-> [006 §4.2](./006-agent-integration.md)).
+> Non-blocking follow-ups: optional `event_kind`/`object_key` meta (needs `DeliveryEventSummary`
+> enrichment, [006 §4.2](./006-agent-integration.md)).
 
 ## Test gaps
 

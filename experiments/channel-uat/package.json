@@ -1,0 +1,13 @@
+{
+  "name": "agentmon-channel-uat",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "description": "Automated end-to-end UAT for the AgentMon channel: drives `channel serve` as an MCP client against a live daemon and asserts a <channel> push.",
+  "scripts": {
+    "uat": "node uat.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  }
+}
