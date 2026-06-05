@@ -207,3 +207,22 @@ it('derives the id from the parent directory for a folder monitor (MONITOR.md)',
   expect(outcome.ok).toBe(true);
   if (outcome.ok) expect(outcome.monitor.id).toBe('pr-watch');
 });
+
+it('derives the id correctly for an extension-less flat path', () => {
+  const outcome = parseMonitor(FRONTMATTER, '/x/.claude/monitors/noext');
+  expect(outcome.ok).toBe(true);
+  if (outcome.ok) expect(outcome.monitor.id).toBe('noext');
+});
+
+it('derives the id correctly for a multi-dot flat filename', () => {
+  const outcome = parseMonitor(FRONTMATTER, '/x/.claude/monitors/foo.bar.md');
+  expect(outcome.ok).toBe(true);
+  if (outcome.ok) expect(outcome.monitor.id).toBe('foo.bar');
+});
+
+it('rejects a path whose basename is .md (empty derived id)', () => {
+  const outcome = parseMonitor(FRONTMATTER, '/x/.claude/monitors/.md');
+  expect(outcome.ok).toBe(false);
+  if (!outcome.ok)
+    expect(outcome.error).toContain('Could not derive a monitor id');
+});

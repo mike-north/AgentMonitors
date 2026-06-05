@@ -47,7 +47,8 @@ export async function scanMonitors(baseDir: string): Promise<ScanResult> {
     cwd: baseDir,
     absolute: true,
   }).filter((filePath) => path.basename(filePath) !== 'MONITOR.md');
-  const matches = [...folderMatches, ...flatMatches];
+  // Sort for deterministic output regardless of filesystem order.
+  const matches = [...folderMatches, ...flatMatches].sort();
 
   const outcomes: ParseOutcome[] = await Promise.all(
     matches.map(async (filePath) => {
@@ -76,8 +77,8 @@ export async function scanMonitors(baseDir: string): Promise<ScanResult> {
     }
   }
 
-  // Group parsed monitors by their folder-derived id; any id claimed by more than
-  // one file is a collision (SP2). Insertion order is preserved for determinism.
+  // Group parsed monitors by their id; any id claimed by more than one file is a
+  // collision (SP2). The sorted input order is preserved by Map insertion order.
   const filePathsById = new Map<string, string[]>();
   for (const { monitor } of monitors) {
     const existing = filePathsById.get(monitor.id);
