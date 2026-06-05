@@ -87,9 +87,24 @@ describe('monitorFrontmatterSchema', () => {
   });
 
   describe('missing required fields', () => {
-    it('rejects missing name', () => {
-      const { name: _, ...rest } = validMinimal;
-      const result = monitorFrontmatterSchema.safeParse(rest);
+    it('accepts frontmatter that omits name (name is optional)', () => {
+      const result = monitorFrontmatterSchema.safeParse({
+        source: 'file-fingerprint',
+        urgency: 'normal',
+        'event-kind': 'mutation',
+        scope: { globs: ['src/**/*.ts'] },
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it('still rejects an empty-string name', () => {
+      const result = monitorFrontmatterSchema.safeParse({
+        name: '',
+        source: 'file-fingerprint',
+        urgency: 'normal',
+        'event-kind': 'mutation',
+        scope: { globs: ['x'] },
+      });
       expect(result.success).toBe(false);
     });
 

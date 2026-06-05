@@ -140,3 +140,84 @@ describe('scanMonitors', () => {
     expect(result.duplicateIds).toEqual([]);
   });
 });
+
+const BODY = yaml`---
+source: file-fingerprint
+urgency: normal
+event-kind: mutation
+scope:
+  globs:
+    - 'x'
+---
+Body.
+`;
+
+it('discovers both flat monitor files and folder MONITOR.md files', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'agentmon-scan-'));
+  try {
+    // flat monitor
+    writeFileSync(path.join(root, 'watch-src.md'), BODY, 'utf-8');
+    // folder monitor + a markdown ASSET that must NOT be treated as a monitor
+    mkdirSync(path.join(root, 'pr-watch'), { recursive: true });
+    writeFileSync(path.join(root, 'pr-watch', 'MONITOR.md'), BODY, 'utf-8');
+    writeFileSync(
+      path.join(root, 'pr-watch', 'notes.md'),
+      'just notes',
+      'utf-8',
+    );
+
+    const result = await scanMonitors(root);
+    const ids = result.monitors.map((m) => m.monitor.id).sort();
+
+    expect(ids).toEqual(['pr-watch', 'watch-src']);
+    expect(result.duplicateIds).toEqual([]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+it('flags a flat file and a folder that derive the same id as a duplicate', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'agentmon-scan-'));
+  try {
+    writeFileSync(path.join(root, 'dup.md'), BODY, 'utf-8');
+    mkdirSync(path.join(root, 'dup'), { recursive: true });
+    writeFileSync(path.join(root, 'dup', 'MONITOR.md'), BODY, 'utf-8');
+
+    const result = await scanMonitors(root);
+    expect(result.duplicateIds.map((d) => d.id)).toEqual(['dup']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+it('does not discover a dot-prefixed flat file (.hidden.md) in the scanned root', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'agentmon-scan-'));
+  try {
+    writeFileSync(path.join(root, '.hidden.md'), BODY, 'utf-8');
+    writeFileSync(path.join(root, 'visible.md'), BODY, 'utf-8');
+
+    const result = await scanMonitors(root);
+    const ids = result.monitors.map((m) => m.monitor.id);
+    expect(ids).toEqual(['visible']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// A folder monitor is `<id>/MONITOR.md` (≥1 dir deep). A bare MONITOR.md sitting
+// directly in the monitors root is not a valid monitor and must not be discovered
+// (it would otherwise derive its id from the monitors-root directory name).
+it('ignores a depth-0 MONITOR.md directly in the scanned root', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'agentmon-scan-'));
+  try {
+    writeFileSync(path.join(root, 'MONITOR.md'), BODY, 'utf-8');
+    mkdirSync(path.join(root, 'real'), { recursive: true });
+    writeFileSync(path.join(root, 'real', 'MONITOR.md'), BODY, 'utf-8');
+
+    const result = await scanMonitors(root);
+    const ids = result.monitors.map((m) => m.monitor.id);
+    expect(ids).toEqual(['real']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

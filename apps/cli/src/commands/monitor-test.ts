@@ -163,7 +163,7 @@ monitorTestCommand
       return;
     }
 
-    const monitorName = result.monitor.frontmatter.name;
+    const monitorName = result.monitor.displayName;
 
     if (!json) {
       console.log(

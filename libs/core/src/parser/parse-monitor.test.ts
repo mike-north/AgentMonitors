@@ -113,7 +113,8 @@ scope:
     const result = parseMonitor(content, '/monitors/no-fm/MONITOR.md');
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error).toContain('name');
+    // `name` is now optional; the error surfaces the other missing required fields
+    expect(result.error).toContain('source');
   });
 
   it('returns error for invalid frontmatter values', () => {
@@ -176,4 +177,80 @@ Instructions.
     if (result.ok) return;
     expect(result.filePath).toBe('/some/path/MONITOR.md');
   });
+});
+
+const FRONTMATTER = yaml`---
+source: file-fingerprint
+urgency: normal
+event-kind: mutation
+scope:
+  globs:
+    - 'src/**/*.ts'
+---
+Body instructions.
+`;
+
+it('derives the id from the filename for a flat monitor file', () => {
+  const outcome = parseMonitor(
+    FRONTMATTER,
+    '/repo/.claude/monitors/watch-src.md',
+  );
+  expect(outcome.ok).toBe(true);
+  if (outcome.ok) expect(outcome.monitor.id).toBe('watch-src');
+});
+
+it('derives the id from the parent directory for a folder monitor (MONITOR.md)', () => {
+  const outcome = parseMonitor(
+    FRONTMATTER,
+    '/repo/.claude/monitors/pr-watch/MONITOR.md',
+  );
+  expect(outcome.ok).toBe(true);
+  if (outcome.ok) expect(outcome.monitor.id).toBe('pr-watch');
+});
+
+it('derives the id correctly for an extension-less flat path', () => {
+  const outcome = parseMonitor(FRONTMATTER, '/x/.claude/monitors/noext');
+  expect(outcome.ok).toBe(true);
+  if (outcome.ok) expect(outcome.monitor.id).toBe('noext');
+});
+
+it('derives the id correctly for a multi-dot flat filename', () => {
+  const outcome = parseMonitor(FRONTMATTER, '/x/.claude/monitors/foo.bar.md');
+  expect(outcome.ok).toBe(true);
+  if (outcome.ok) expect(outcome.monitor.id).toBe('foo.bar');
+});
+
+it('rejects a path whose basename is .md (empty derived id)', () => {
+  const outcome = parseMonitor(FRONTMATTER, '/x/.claude/monitors/.md');
+  expect(outcome.ok).toBe(false);
+  if (!outcome.ok)
+    expect(outcome.error).toContain('Could not derive a monitor id');
+});
+
+it('rejects a dotfile path like .foo.md (non-empty but dot-prefixed id)', () => {
+  const outcome = parseMonitor(FRONTMATTER, '/x/.claude/monitors/.foo.md');
+  expect(outcome.ok).toBe(false);
+  if (!outcome.ok)
+    expect(outcome.error).toContain('Could not derive a monitor id');
+});
+
+it('sets displayName to the frontmatter name when present', () => {
+  const outcome = parseMonitor(
+    validContent,
+    '/monitors/github-pr-review/MONITOR.md',
+  );
+  expect(outcome.ok).toBe(true);
+  if (!outcome.ok) return;
+  expect(outcome.monitor.displayName).toBe('GitHub PR review monitor');
+});
+
+it('sets displayName to the id when name is omitted', () => {
+  const outcome = parseMonitor(
+    FRONTMATTER,
+    '/repo/.claude/monitors/watch-src.md',
+  );
+  expect(outcome.ok).toBe(true);
+  if (!outcome.ok) return;
+  expect(outcome.monitor.frontmatter.name).toBeUndefined();
+  expect(outcome.monitor.displayName).toBe(outcome.monitor.id);
 });

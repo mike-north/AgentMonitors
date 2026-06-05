@@ -5,16 +5,17 @@ import type { ParseError, ParseOutcome, ParseResult } from './parse-monitor.js';
 import { parseMonitor } from './parse-monitor.js';
 
 /**
- * A folder-derived monitor id that more than one parsed `MONITOR.md` resolves to.
+ * A monitor id derived from a directory name or a flat filename that more than one
+ * parsed monitor resolves to.
  *
  * Duplicate ids are a correctness hazard, not a cosmetic one: runtime state is keyed
  * by `monitorId`, so two monitors sharing an id would alias each other's persisted
  * source and notify state (SP2).
  */
 export interface DuplicateMonitorId {
-  /** The colliding monitor id (a parent-directory basename). */
+  /** The colliding monitor id (derived from a directory name or a flat filename). */
   id: string;
-  /** Absolute paths of the `MONITOR.md` files that derive this id (at least two). */
+  /** Absolute paths of the monitor files that derive this id (at least two). */
   filePaths: string[];
 }
 
@@ -35,8 +36,27 @@ export interface ScanResult {
  * @param baseDir - Directory to scan (e.g., `~/.claude/monitors` or `<project>/.claude/monitors`)
  */
 export async function scanMonitors(baseDir: string): Promise<ScanResult> {
-  const pattern = '**/MONITOR.md';
-  const matches = globSync(pattern, { cwd: baseDir, absolute: true });
+  // Folder monitors live at `<id>/MONITOR.md` (at least one directory deep — the
+  // folder name is the id). A bare `<monitors-root>/MONITOR.md` at depth-0 is NOT
+  // a valid monitor (it would derive its id from the monitors-root name), so it is
+  // excluded. Flat monitors are `<id>.md` files directly in the monitors dir;
+  // markdown assets nested inside a folder monitor are intentionally NOT discovered
+  // (only depth-1 `*.md`, minus any stray MONITOR.md the flat glob would pick up).
+  const resolvedBase = path.resolve(baseDir);
+  const folderMatches = globSync('**/MONITOR.md', {
+    cwd: baseDir,
+    absolute: true,
+  }).filter(
+    (filePath) => path.dirname(path.resolve(filePath)) !== resolvedBase,
+  );
+  // Dot-prefixed files and directories (e.g. `.hidden.md`) are intentionally
+  // ignored — `*.md` does not match dotfiles under glob default options.
+  const flatMatches = globSync('*.md', {
+    cwd: baseDir,
+    absolute: true,
+  }).filter((filePath) => path.basename(filePath) !== 'MONITOR.md');
+  // Sort for deterministic output regardless of filesystem order.
+  const matches = [...folderMatches, ...flatMatches].sort();
 
   const outcomes: ParseOutcome[] = await Promise.all(
     matches.map(async (filePath) => {
@@ -65,8 +85,8 @@ export async function scanMonitors(baseDir: string): Promise<ScanResult> {
     }
   }
 
-  // Group parsed monitors by their folder-derived id; any id claimed by more than
-  // one file is a collision (SP2). Insertion order is preserved for determinism.
+  // Group parsed monitors by their id; any id claimed by more than one file is a
+  // collision (SP2). The sorted input order is preserved by Map insertion order.
   const filePathsById = new Map<string, string[]>();
   for (const { monitor } of monitors) {
     const existing = filePathsById.get(monitor.id);

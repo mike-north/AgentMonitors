@@ -19,7 +19,7 @@ export const scanCommand = new Command('scan')
       const output = {
         monitors: result.monitors.map((m) => ({
           id: m.monitor.id,
-          name: m.monitor.frontmatter.name,
+          name: m.monitor.displayName,
           source: m.monitor.frontmatter.source,
           urgency: m.monitor.frontmatter.urgency,
           'event-kind': m.monitor.frontmatter['event-kind'],
@@ -54,7 +54,7 @@ export const scanCommand = new Command('scan')
       console.log(
         [
           id.padEnd(30),
-          frontmatter.name.padEnd(40),
+          m.monitor.displayName.padEnd(40),
           frontmatter.source.padEnd(20),
           frontmatter.urgency,
         ].join('  '),

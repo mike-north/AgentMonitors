@@ -24,7 +24,21 @@ export type ParseOutcome = ParseResult | ParseError;
  * @param filePath - Absolute path to the MONITOR.md file
  */
 export function parseMonitor(content: string, filePath: string): ParseOutcome {
-  const dirName = path.basename(path.dirname(filePath));
+  // Folder monitor: `<id>/MONITOR.md` (id = parent dir). Flat monitor: `<id>.md`
+  // (id = path.parse stem). Guard empty/dot-prefixed ids (e.g. `.md`, `.foo.md`).
+  const base = path.basename(filePath);
+  const id =
+    base === 'MONITOR.md'
+      ? path.basename(path.dirname(filePath))
+      : path.parse(filePath).name;
+
+  if (!id || id.startsWith('.')) {
+    return {
+      ok: false,
+      filePath,
+      error: 'Could not derive a monitor id from the file path',
+    };
+  }
 
   let parsed: matter.GrayMatterFile<string>;
   try {
@@ -44,7 +58,8 @@ export function parseMonitor(content: string, filePath: string): ParseOutcome {
   return {
     ok: true,
     monitor: {
-      id: dirName,
+      id,
+      displayName: result.data.name ?? id,
       frontmatter: result.data,
       instructions: parsed.content.trim(),
       filePath,
