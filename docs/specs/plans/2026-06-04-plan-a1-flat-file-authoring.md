@@ -414,7 +414,7 @@ git commit --author="Mike North <michael.l.north@gmail.com>" -m "Document flat-f
 
 ## Final verification (before opening the PR)
 
-- [ ] Run `/clean_blt` (clean build + lint + test). All pass.
+- [ ] Run `pnpm build && pnpm test && pnpm check` (clean build + lint + test). All pass.
 - [ ] Manually sanity-check the new path: in a temp dir, `node apps/cli/dist/index.cjs validate <dir>` against a dir holding a flat `watch-src.md` lists it as a valid monitor with id `watch-src` and (since it omits `name`) display name `watch-src`.
 
 ## Self-review notes (author)

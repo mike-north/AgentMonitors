@@ -22,9 +22,11 @@
 | `apps/cli/src/local-state.ts`      | Read/write `.claude/agentmonitors.local.md`                               | Create                                           |
 | `apps/cli/src/detached-spawn.ts`   | Spawn `daemon run` detached so it outlives a hook                         | Create                                           |
 | `apps/cli/src/commands/session.ts` | Add `session start` + `session end` subcommands                           | Modify                                           |
-| `apps/cli/src/commands/daemon.ts`  | Idle-reaping in `runLoop`                                                 | Modify                                           |
-| `libs/core/src/runtime/service.ts` | Expose an open-lead-session count for the reaper                          | Modify (small)                                   |
+| `apps/cli/src/commands/daemon.ts`  | Idle-reaping in `runLoop` (reuses the existing `runtime.listSessions()`)  | Modify                                           |
 | Tests                              | `apps/cli/src/*.test.ts`, `apps/cli/src/commands/cli.integration.test.ts` | Add: derivation, local-state, lifecycle, reaping |
+
+> **No `@mike-north/core` change needed:** the reaper counts open sessions via the existing,
+> already-exported `AgentMonitorRuntime.listSessions()`. This plan is CLI-only (changeset-exempt).
 
 ---
 
@@ -37,7 +39,6 @@
 ```ts
 import { describe, it, expect } from 'vitest';
 import path from 'node:path';
-import os from 'node:os';
 import { workspacePaths } from './workspace-paths.js';
 
 describe('workspacePaths', () => {
@@ -50,7 +51,10 @@ describe('workspacePaths', () => {
     expect(a.socket).not.toBe(c.socket); // distinct per workspace
     expect(a.db.endsWith(path.join('inbox.db'))).toBe(true);
     expect(a.socket.endsWith('.sock')).toBe(true);
-    expect(a.dir.startsWith(path.join(os.homedir()))).toBe(true);
+    // Assert the structural shape, not a homedir prefix — the data root honors
+    // XDG_DATA_HOME, which is set in many CI environments and would break a
+    // `startsWith(os.homedir())` assertion.
+    expect(a.dir).toContain(path.join('agentmonitors', 'workspaces'));
   });
 });
 ```
@@ -125,7 +129,7 @@ git commit --author="Mike North <michael.l.north@gmail.com>" -m "Derive a stable
 
 ```ts
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { readLocalState, writeLocalState } from './local-state.js';
@@ -164,15 +168,10 @@ describe('local-state', () => {
   it('treats a present-but-enabled:false file as disabled', () => {
     const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-ls-'));
     try {
-      writeFileSync(
-        path.join(ws, '.claude', 'agentmonitors.local.md'),
-        '---\nenabled: false\n---\n',
-        { encoding: 'utf-8', flag: 'w' },
-      );
-      // note: dir may not exist; writeLocalState creates it — see impl
+      // Use writeLocalState (which creates `.claude/`) so the test reliably
+      // exercises the enabled:false parse path — never throwing on a missing dir.
+      writeLocalState(ws, { enabled: false });
       expect(readLocalState(ws).enabled).toBe(false);
-    } catch {
-      // acceptable if the dir wasn't created by this raw write
     } finally {
       rmSync(ws, { recursive: true, force: true });
     }
@@ -584,7 +583,7 @@ spec-changelog entry "2026-06-04 — Lazy project-scoped daemon (B)" summarizing
 - [ ] **Step 3: Format + clean verification**
 
 Run: `npx --no-install prettier --write "docs/specs/*.md" ".changeset/*.md"`
-Run: `/clean_blt`
+Run: `pnpm build && pnpm test && pnpm check`
 Expected: green.
 
 - [ ] **Step 4: Commit**
@@ -600,7 +599,7 @@ git commit --author="Mike North <michael.l.north@gmail.com>" -m "Document the la
 
 - [ ] Two different temp workspaces booted via `session start` get **different** sockets/dbs (`session list --socket <each>` shows only that workspace's session).
 - [ ] After `session end`, `pgrep -fl "daemon run"` shows the reaped daemon gone within `reap-after-ms`.
-- [ ] `/clean_blt` green; no orphan daemons or stale sockets left by the test suite.
+- [ ] `pnpm build && pnpm test && pnpm check` green; no orphan daemons or stale sockets left by the test suite.
 
 ## Self-review notes (author)
 

@@ -288,7 +288,7 @@ Remove the `event-kind` frontmatter field, the `event_kind` persistence column (
 - [ ] **Step 4: Format, link-check, clean verification**
 
 Run: `npx --no-install prettier --write "docs/specs/*.md" ".changeset/*.md"`
-Run: `/clean_blt`
+Run: `pnpm build && pnpm test && pnpm check`
 Expected: clean build + lint + test all pass.
 
 - [ ] **Step 5: Commit**
@@ -304,7 +304,7 @@ git commit --author="Mike North <michael.l.north@gmail.com>" -m "Document the re
 
 - [ ] `grep -rn "event.kind\|eventKind" libs/core/src apps/cli/src` returns **nothing** (excluding dist/node_modules).
 - [ ] `node apps/cli/dist/index.cjs init demo --source file-fingerprint` produces a MONITOR.md with **no** `event-kind` line, and `validate` accepts it.
-- [ ] `/clean_blt` green.
+- [ ] `pnpm build && pnpm test && pnpm check` green.
 
 ## Self-review notes (author)
 

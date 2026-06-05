@@ -352,7 +352,7 @@ Carry the monitor body in `DeliveryEventSummary`, so turn-boundary delivery can 
 - [ ] **Step 3: Format + clean verification**
 
 Run: `npx --no-install prettier --write "docs/specs/*.md" ".changeset/*.md"`
-Run: `/clean_blt`
+Run: `pnpm build && pnpm test && pnpm check`
 Expected: green.
 
 - [ ] **Step 4: Commit**
@@ -368,7 +368,7 @@ git commit --author="Mike North <michael.l.north@gmail.com>" -m "Document body-b
 
 - [ ] `node experiments/steel-thread-uat/uat.mjs` exits 0 — the dropped flat monitor's body reaches the agent context after a file change. **This is the campaign's "done" gate.**
 - [ ] Manual: install the plugin (Plan C) in a real repo, drop `.claude/monitors/watch-src.md`, change a matching file, and confirm the next turn surfaces the monitor's instructions.
-- [ ] `/clean_blt` green.
+- [ ] `pnpm build && pnpm test && pnpm check` green.
 
 ## Self-review notes (author)
 

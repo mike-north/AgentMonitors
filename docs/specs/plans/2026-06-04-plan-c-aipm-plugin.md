@@ -105,7 +105,7 @@ import { defineConfig } from '@ai-plugin-marketplace/core';
 
 export default defineConfig({
   version: '0.0.1',
-  targets: ['claude', 'codex', 'cursor', 'gemini', 'kiro'],
+  targets: ['claude', 'codex', 'cursor', 'gemini', 'kiro', 'vercel'],
   description:
     'Drop-in monitors: a one-time install that watches .claude/monitors and surfaces changes into your session.',
   keywords: ['agentmonitors', 'monitoring', 'hooks', 'drop-in', 'channel'],
@@ -227,7 +227,7 @@ git commit --author="Mike North <michael.l.north@gmail.com>" -m "Fold channel-pl
 - [ ] **Step 2: Format + clean verification**
 
 Run: `npx --no-install prettier --write "docs/specs/*.md" "README.md"`
-Run: `/clean_blt` (and `pnpm exec aipm validate`)
+Run: `pnpm build && pnpm test && pnpm check` (and `pnpm exec aipm validate`)
 Expected: green.
 
 - [ ] **Step 3: Commit**
