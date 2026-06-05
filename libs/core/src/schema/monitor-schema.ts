@@ -28,7 +28,10 @@ const notifySchema = z.discriminatedUnion('strategy', [
 ]);
 
 export const monitorFrontmatterSchema = z.object({
-  name: z.string().min(1, 'Monitor name is required'),
+  name: z
+    .string()
+    .min(1, 'Monitor name must be non-empty when present')
+    .optional(),
   source: z
     .string()
     .min(1)
