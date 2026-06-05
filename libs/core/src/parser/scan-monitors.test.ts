@@ -203,3 +203,21 @@ it('does not discover a dot-prefixed flat file (.hidden.md) in the scanned root'
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+// A folder monitor is `<id>/MONITOR.md` (≥1 dir deep). A bare MONITOR.md sitting
+// directly in the monitors root is not a valid monitor and must not be discovered
+// (it would otherwise derive its id from the monitors-root directory name).
+it('ignores a depth-0 MONITOR.md directly in the scanned root', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'agentmon-scan-'));
+  try {
+    writeFileSync(path.join(root, 'MONITOR.md'), BODY, 'utf-8');
+    mkdirSync(path.join(root, 'real'), { recursive: true });
+    writeFileSync(path.join(root, 'real', 'MONITOR.md'), BODY, 'utf-8');
+
+    const result = await scanMonitors(root);
+    const ids = result.monitors.map((m) => m.monitor.id);
+    expect(ids).toEqual(['real']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

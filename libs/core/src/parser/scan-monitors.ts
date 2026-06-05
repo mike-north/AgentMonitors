@@ -36,14 +36,19 @@ export interface ScanResult {
  * @param baseDir - Directory to scan (e.g., `~/.claude/monitors` or `<project>/.claude/monitors`)
  */
 export async function scanMonitors(baseDir: string): Promise<ScanResult> {
-  // Folder monitors live at `<id>/MONITOR.md` (any depth). Flat monitors are
-  // `<id>.md` files directly in the monitors dir; markdown assets nested inside a
-  // folder monitor are intentionally NOT discovered (only depth-1 `*.md`, minus
-  // any stray MONITOR.md that the folder glob already covers).
+  // Folder monitors live at `<id>/MONITOR.md` (at least one directory deep — the
+  // folder name is the id). A bare `<monitors-root>/MONITOR.md` at depth-0 is NOT
+  // a valid monitor (it would derive its id from the monitors-root name), so it is
+  // excluded. Flat monitors are `<id>.md` files directly in the monitors dir;
+  // markdown assets nested inside a folder monitor are intentionally NOT discovered
+  // (only depth-1 `*.md`, minus any stray MONITOR.md the flat glob would pick up).
+  const resolvedBase = path.resolve(baseDir);
   const folderMatches = globSync('**/MONITOR.md', {
     cwd: baseDir,
     absolute: true,
-  });
+  }).filter(
+    (filePath) => path.dirname(path.resolve(filePath)) !== resolvedBase,
+  );
   // Dot-prefixed files and directories (e.g. `.hidden.md`) are intentionally
   // ignored — `*.md` does not match dotfiles under glob default options.
   const flatMatches = globSync('*.md', {

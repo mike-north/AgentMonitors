@@ -42,7 +42,8 @@ The parser **MUST** derive the monitor's stable machine ID using form-aware logi
   extension.
 
 > Verified: `libs/core/src/parser/parse-monitor.ts` — `const base = path.basename(filePath)`, then
-> `base === 'MONITOR.md' ? path.basename(path.dirname(filePath)) : base.slice(0, -path.extname(base).length)`.
+> `base === 'MONITOR.md' ? path.basename(path.dirname(filePath)) : path.parse(filePath).name`. A
+> derived id that is empty or begins with `.` is rejected as a parse error.
 
 The file **MUST** contain:
 
@@ -59,15 +60,18 @@ The parser **MUST**:
 
 The scanner discovers monitors using two glob passes relative to the supplied base directory:
 
-1. **Folder monitors**: `**/MONITOR.md` (any depth) — resolves to folder-form monitors.
+1. **Folder monitors**: `**/MONITOR.md`, then excluding any match at depth-0 — a folder monitor is
+   `<id>/MONITOR.md` (at least one directory deep, the folder name being the id). A bare
+   `<monitors-root>/MONITOR.md` is **not** a valid monitor and is ignored.
 2. **Flat monitors**: `*.md` at depth-1 only, excluding any file named `MONITOR.md` — resolves to
    flat-form monitors. Markdown assets nested inside a folder monitor's directory are intentionally
    **not** treated as monitors.
 
 All discovered paths are resolved to absolute paths before parsing.
 
-> Verified: `libs/core/src/parser/scan-monitors.ts` — `globSync('**/MONITOR.md', ...)` for folder
-> monitors and `globSync('*.md', ...).filter(f => basename(f) !== 'MONITOR.md')` for flat monitors.
+> Verified: `libs/core/src/parser/scan-monitors.ts` — `globSync('**/MONITOR.md', ...)` filtered to
+> exclude matches whose directory is the monitors root (depth-0), and
+> `globSync('*.md', ...).filter(f => basename(f) !== 'MONITOR.md')` for flat monitors.
 
 ## 3. Monitor Frontmatter Schema
 
