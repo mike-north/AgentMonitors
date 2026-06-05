@@ -5,16 +5,17 @@ import type { ParseError, ParseOutcome, ParseResult } from './parse-monitor.js';
 import { parseMonitor } from './parse-monitor.js';
 
 /**
- * A folder-derived monitor id that more than one parsed `MONITOR.md` resolves to.
+ * A monitor id derived from a directory name or a flat filename that more than one
+ * parsed monitor resolves to.
  *
  * Duplicate ids are a correctness hazard, not a cosmetic one: runtime state is keyed
  * by `monitorId`, so two monitors sharing an id would alias each other's persisted
  * source and notify state (SP2).
  */
 export interface DuplicateMonitorId {
-  /** The colliding monitor id (a parent-directory basename). */
+  /** The colliding monitor id (derived from a directory name or a flat filename). */
   id: string;
-  /** Absolute paths of the `MONITOR.md` files that derive this id (at least two). */
+  /** Absolute paths of the monitor files that derive this id (at least two). */
   filePaths: string[];
 }
 
@@ -43,6 +44,8 @@ export async function scanMonitors(baseDir: string): Promise<ScanResult> {
     cwd: baseDir,
     absolute: true,
   });
+  // Dot-prefixed files and directories (e.g. `.hidden.md`) are intentionally
+  // ignored — `*.md` does not match dotfiles under glob default options.
   const flatMatches = globSync('*.md', {
     cwd: baseDir,
     absolute: true,

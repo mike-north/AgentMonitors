@@ -24,15 +24,13 @@ export type ParseOutcome = ParseResult | ParseError;
  * @param filePath - Absolute path to the MONITOR.md file
  */
 export function parseMonitor(content: string, filePath: string): ParseOutcome {
-  // A folder monitor is `<id>/MONITOR.md` (id = parent dir). A flat monitor is
-  // `<id>.md` directly in the monitors dir (id = filename without extension).
-  // `path.extname` returns '' for extension-less names AND for bare dotfiles like
-  // `.md`, so guard both: empty stem and dotfile stems (e.g. `.md` -> stem `.md`).
+  // Folder monitor: `<id>/MONITOR.md` (id = parent dir). Flat monitor: `<id>.md`
+  // (id = path.parse stem). Guard empty/dot-prefixed ids (e.g. `.md`, `.foo.md`).
   const base = path.basename(filePath);
-  const ext = path.extname(base);
-  const stem = ext ? base.slice(0, -ext.length) : base; // 'noext' -> 'noext', 'foo.bar.md' -> 'foo.bar'
   const id =
-    base === 'MONITOR.md' ? path.basename(path.dirname(filePath)) : stem;
+    base === 'MONITOR.md'
+      ? path.basename(path.dirname(filePath))
+      : path.parse(filePath).name;
 
   if (!id || id.startsWith('.')) {
     return {
@@ -61,6 +59,7 @@ export function parseMonitor(content: string, filePath: string): ParseOutcome {
     ok: true,
     monitor: {
       id,
+      displayName: result.data.name ?? id,
       frontmatter: result.data,
       instructions: parsed.content.trim(),
       filePath,

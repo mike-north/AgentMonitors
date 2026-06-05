@@ -70,7 +70,7 @@ export const validateCommand = new Command('validate')
         invalid: allErrors.length,
         monitors: validMonitors.map((m) => ({
           id: m.monitor.id,
-          name: m.monitor.frontmatter.name ?? m.monitor.id,
+          name: m.monitor.displayName,
           source: m.monitor.frontmatter.source,
         })),
         duplicateIds: result.duplicateIds,
@@ -81,9 +81,7 @@ export const validateCommand = new Command('validate')
       if (validMonitors.length > 0) {
         console.log(`Valid monitors: ${String(validMonitors.length)}`);
         for (const m of validMonitors) {
-          console.log(
-            `  ${m.monitor.id}: ${m.monitor.frontmatter.name ?? m.monitor.id}`,
-          );
+          console.log(`  ${m.monitor.id}: ${m.monitor.displayName}`);
         }
       }
 

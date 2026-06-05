@@ -189,3 +189,17 @@ it('flags a flat file and a folder that derive the same id as a duplicate', asyn
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+it('does not discover a dot-prefixed flat file (.hidden.md) in the scanned root', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'agentmon-scan-'));
+  try {
+    writeFileSync(path.join(root, '.hidden.md'), BODY, 'utf-8');
+    writeFileSync(path.join(root, 'visible.md'), BODY, 'utf-8');
+
+    const result = await scanMonitors(root);
+    const ids = result.monitors.map((m) => m.monitor.id);
+    expect(ids).toEqual(['visible']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -226,3 +226,31 @@ it('rejects a path whose basename is .md (empty derived id)', () => {
   if (!outcome.ok)
     expect(outcome.error).toContain('Could not derive a monitor id');
 });
+
+it('rejects a dotfile path like .foo.md (non-empty but dot-prefixed id)', () => {
+  const outcome = parseMonitor(FRONTMATTER, '/x/.claude/monitors/.foo.md');
+  expect(outcome.ok).toBe(false);
+  if (!outcome.ok)
+    expect(outcome.error).toContain('Could not derive a monitor id');
+});
+
+it('sets displayName to the frontmatter name when present', () => {
+  const outcome = parseMonitor(
+    validContent,
+    '/monitors/github-pr-review/MONITOR.md',
+  );
+  expect(outcome.ok).toBe(true);
+  if (!outcome.ok) return;
+  expect(outcome.monitor.displayName).toBe('GitHub PR review monitor');
+});
+
+it('sets displayName to the id when name is omitted', () => {
+  const outcome = parseMonitor(
+    FRONTMATTER,
+    '/repo/.claude/monitors/watch-src.md',
+  );
+  expect(outcome.ok).toBe(true);
+  if (!outcome.ok) return;
+  expect(outcome.monitor.frontmatter.name).toBeUndefined();
+  expect(outcome.monitor.displayName).toBe(outcome.monitor.id);
+});
