@@ -35,8 +35,19 @@ export interface ScanResult {
  * @param baseDir - Directory to scan (e.g., `~/.claude/monitors` or `<project>/.claude/monitors`)
  */
 export async function scanMonitors(baseDir: string): Promise<ScanResult> {
-  const pattern = '**/MONITOR.md';
-  const matches = globSync(pattern, { cwd: baseDir, absolute: true });
+  // Folder monitors live at `<id>/MONITOR.md` (any depth). Flat monitors are
+  // `<id>.md` files directly in the monitors dir; markdown assets nested inside a
+  // folder monitor are intentionally NOT discovered (only depth-1 `*.md`, minus
+  // any stray MONITOR.md that the folder glob already covers).
+  const folderMatches = globSync('**/MONITOR.md', {
+    cwd: baseDir,
+    absolute: true,
+  });
+  const flatMatches = globSync('*.md', {
+    cwd: baseDir,
+    absolute: true,
+  }).filter((filePath) => path.basename(filePath) !== 'MONITOR.md');
+  const matches = [...folderMatches, ...flatMatches];
 
   const outcomes: ParseOutcome[] = await Promise.all(
     matches.map(async (filePath) => {

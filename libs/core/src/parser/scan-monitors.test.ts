@@ -140,3 +140,52 @@ describe('scanMonitors', () => {
     expect(result.duplicateIds).toEqual([]);
   });
 });
+
+const BODY = yaml`---
+source: file-fingerprint
+urgency: normal
+event-kind: mutation
+scope:
+  globs:
+    - 'x'
+---
+Body.
+`;
+
+it('discovers both flat monitor files and folder MONITOR.md files', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'agentmon-scan-'));
+  try {
+    // flat monitor
+    writeFileSync(path.join(root, 'watch-src.md'), BODY, 'utf-8');
+    // folder monitor + a markdown ASSET that must NOT be treated as a monitor
+    mkdirSync(path.join(root, 'pr-watch'), { recursive: true });
+    writeFileSync(path.join(root, 'pr-watch', 'MONITOR.md'), BODY, 'utf-8');
+    writeFileSync(
+      path.join(root, 'pr-watch', 'notes.md'),
+      'just notes',
+      'utf-8',
+    );
+
+    const result = await scanMonitors(root);
+    const ids = result.monitors.map((m) => m.monitor.id).sort();
+
+    expect(ids).toEqual(['pr-watch', 'watch-src']);
+    expect(result.duplicateIds).toEqual([]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+it('flags a flat file and a folder that derive the same id as a duplicate', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'agentmon-scan-'));
+  try {
+    writeFileSync(path.join(root, 'dup.md'), BODY, 'utf-8');
+    mkdirSync(path.join(root, 'dup'), { recursive: true });
+    writeFileSync(path.join(root, 'dup', 'MONITOR.md'), BODY, 'utf-8');
+
+    const result = await scanMonitors(root);
+    expect(result.duplicateIds.map((d) => d.id)).toEqual(['dup']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
