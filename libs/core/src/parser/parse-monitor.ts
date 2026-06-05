@@ -24,7 +24,13 @@ export type ParseOutcome = ParseResult | ParseError;
  * @param filePath - Absolute path to the MONITOR.md file
  */
 export function parseMonitor(content: string, filePath: string): ParseOutcome {
-  const dirName = path.basename(path.dirname(filePath));
+  // A folder monitor is `<id>/MONITOR.md` (id = parent dir). A flat monitor is
+  // `<id>.md` directly in the monitors dir (id = filename without extension).
+  const base = path.basename(filePath);
+  const id =
+    base === 'MONITOR.md'
+      ? path.basename(path.dirname(filePath))
+      : base.slice(0, -path.extname(base).length);
 
   let parsed: matter.GrayMatterFile<string>;
   try {
@@ -44,7 +50,7 @@ export function parseMonitor(content: string, filePath: string): ParseOutcome {
   return {
     ok: true,
     monitor: {
-      id: dirName,
+      id,
       frontmatter: result.data,
       instructions: parsed.content.trim(),
       filePath,

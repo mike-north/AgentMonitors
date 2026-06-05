@@ -113,7 +113,8 @@ scope:
     const result = parseMonitor(content, '/monitors/no-fm/MONITOR.md');
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error).toContain('name');
+    // `name` is now optional; the error surfaces the other missing required fields
+    expect(result.error).toContain('source');
   });
 
   it('returns error for invalid frontmatter values', () => {
@@ -176,4 +177,33 @@ Instructions.
     if (result.ok) return;
     expect(result.filePath).toBe('/some/path/MONITOR.md');
   });
+});
+
+const FRONTMATTER = yaml`---
+source: file-fingerprint
+urgency: normal
+event-kind: mutation
+scope:
+  globs:
+    - 'src/**/*.ts'
+---
+Body instructions.
+`;
+
+it('derives the id from the filename for a flat monitor file', () => {
+  const outcome = parseMonitor(
+    FRONTMATTER,
+    '/repo/.claude/monitors/watch-src.md',
+  );
+  expect(outcome.ok).toBe(true);
+  if (outcome.ok) expect(outcome.monitor.id).toBe('watch-src');
+});
+
+it('derives the id from the parent directory for a folder monitor (MONITOR.md)', () => {
+  const outcome = parseMonitor(
+    FRONTMATTER,
+    '/repo/.claude/monitors/pr-watch/MONITOR.md',
+  );
+  expect(outcome.ok).toBe(true);
+  if (outcome.ok) expect(outcome.monitor.id).toBe('pr-watch');
 });
