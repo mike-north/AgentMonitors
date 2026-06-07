@@ -87,13 +87,11 @@ describe('bridge', () => {
       inbox.enqueue({
         monitorId: 'mon-1',
         urgency: 'normal',
-        eventKind: 'notification',
         title: 'Normal item',
       });
       inbox.enqueue({
         monitorId: 'mon-2',
         urgency: 'high',
-        eventKind: 'alert',
         title: 'Urgent item',
       });
 
@@ -112,13 +110,11 @@ describe('bridge', () => {
       inbox.enqueue({
         monitorId: 'mon-1',
         urgency: 'normal',
-        eventKind: 'notification',
         title: 'Normal item',
       });
       const urgentId = inbox.enqueue({
         monitorId: 'mon-2',
         urgency: 'high',
-        eventKind: 'alert',
         title: 'Urgent item',
       });
 
@@ -136,7 +132,6 @@ describe('bridge', () => {
       const id = inbox.enqueue({
         monitorId: 'mon-1',
         urgency: 'high',
-        eventKind: 'alert',
         title: 'Urgent item',
       });
       inbox.ack(id);

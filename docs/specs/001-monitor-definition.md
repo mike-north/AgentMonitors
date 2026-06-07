@@ -77,17 +77,16 @@ All discovered paths are resolved to absolute paths before parsing.
 
 Each monitor frontmatter object **MUST** contain:
 
-| Field        | Type     | Required | Meaning                                                                                           |
-| ------------ | -------- | -------- | ------------------------------------------------------------------------------------------------- |
-| `name`       | string   | no       | Human-readable display name; defaults to the monitor id (filename or directory name) when omitted |
-| `source`     | string   | yes      | Source plugin name, kebab-case                                                                    |
-| `urgency`    | enum     | yes      | `low`, `normal`, or `high`                                                                        |
-| `event-kind` | enum     | yes      | `mutation`, `notification`, or `alert`                                                            |
-| `scope`      | object   | yes      | Source-specific configuration                                                                     |
-| `notify`     | object   | no       | Explicit debounce/throttle policy                                                                 |
-| `tags`       | string[] | no       | Tags for later filtering                                                                          |
+| Field     | Type     | Required | Meaning                                                                                           |
+| --------- | -------- | -------- | ------------------------------------------------------------------------------------------------- |
+| `name`    | string   | no       | Human-readable display name; defaults to the monitor id (filename or directory name) when omitted |
+| `source`  | string   | yes      | Source plugin name, kebab-case                                                                    |
+| `urgency` | enum     | yes      | `low`, `normal`, or `high`                                                                        |
+| `scope`   | object   | yes      | Source-specific configuration                                                                     |
+| `notify`  | object   | no       | Explicit debounce/throttle policy                                                                 |
+| `tags`    | string[] | no       | Tags for later filtering                                                                          |
 
-> Verified: `libs/core/src/schema/monitor-schema.ts` lines 30–41 — all fields above match the `monitorFrontmatterSchema` Zod object definition.
+> Verified: `libs/core/src/schema/monitor-schema.ts` lines 30–44 — all fields above match the `monitorFrontmatterSchema` Zod object definition.
 
 ### 3.1 `source`
 
@@ -103,13 +102,7 @@ The `urgency` field **MUST** accept exactly: `low`, `normal`, `high`. Even thoug
 
 > Verified: `libs/core/src/schema/monitor-schema.ts` line 36 — `z.enum(['low', 'normal', 'high'])`. Also confirmed in `libs/core/src/schema/types.ts` line 14 — `export type Urgency = 'low' | 'normal' | 'high'`.
 
-### 3.3 `event-kind`
-
-The `event-kind` field **MUST** accept exactly: `mutation`, `notification`, `alert`. The event kind describes the semantic nature of the signal; it does not itself change runtime scheduling or hook timing.
-
-> Verified: `libs/core/src/schema/monitor-schema.ts` line 37 — `z.enum(['mutation', 'notification', 'alert'])`. Also confirmed in `libs/core/src/schema/types.ts` line 15 — `export type EventKind = 'mutation' | 'notification' | 'alert'`.
-
-### 3.4 `scope`
+### 3.3 `scope`
 
 The `scope` field **MUST** be a plain object with string keys. The value types of individual keys are unconstrained at the core schema level and are delegated to source-specific validation.
 
@@ -179,7 +172,6 @@ This means scope precedence, override order, and multi-root composition are outs
 name: Build Config Drift
 source: file-fingerprint
 urgency: high
-event-kind: mutation
 scope:
   globs:
     - 'package.json'
@@ -207,7 +199,6 @@ When these files change, determine whether build behavior, dependency state, or 
 name: Weekly Maintenance Reminder
 source: schedule
 urgency: low
-event-kind: notification
 scope:
   cron: '0 9 * * 1'
   timezone: America/Los_Angeles
@@ -230,7 +221,7 @@ At minimum, monitor authoring validation should be able to prove:
 
 - the frontmatter parses successfully
 - required top-level fields are present
-- `urgency`, `event-kind`, and `notify.strategy` values are in-range
+- `urgency` and `notify.strategy` values are in-range
 - duration strings are syntactically valid
 - the selected source exists in the source registry
 - required source-specific scope fields are present

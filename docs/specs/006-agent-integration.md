@@ -79,8 +79,8 @@ the baseline every environment can use.
 > **Status: implemented.** The one-way push (§4.1), the two-way `agentmon_ack` tool (§4.3), and
 > plugin packaging (`channel-plugin/` — a `.claude-plugin/plugin.json` + `.mcp.json` that runs
 > `agentmonitors channel serve`) all ship. Remaining is an end-to-end **manual UAT** (channels are
-> research-preview, so not CI-able) and optional fuller meta (§4.2 `event_kind`/`object_key`, which
-> need `DeliveryEventSummary` enrichment). See [roadmap.md](./roadmap.md) (G7, shipped).
+> research-preview, so not CI-able) and optional fuller meta (§4.2 `object_key`, which
+> needs `DeliveryEventSummary` enrichment). See [roadmap.md](./roadmap.md) (G7, shipped).
 
 A channel is an MCP server Claude Code spawns over stdio that pushes events into the session as
 `<channel …>` tags. AgentMon ships a channel server that bridges the daemon's deliveries onto that
@@ -120,7 +120,6 @@ multi-values flattened):
   | ------------- | ----------------------------------------------------- | ---------------------------------- |
   | `monitor_id`  | the monitor's ID                                      |                                    |
   | `urgency`     | `low` \| `normal` \| `high`                           |                                    |
-  | `event_kind`  | `mutation` \| `notification` \| `alert`               | NOT `event-kind` (hyphen dropped)  |
   | `object_key`  | the event `objectKey`                                 | sanitized (§4.6)                   |
   | `event_id`    | the durable event ID                                  | passed back by the ack tool (§4.3) |
   | `event_count` | number of coalesced events, stringified               |                                    |
@@ -130,10 +129,10 @@ The `source` attribute on the rendered `<channel>` tag is set by the host from t
 (e.g. `agentmonitors`), not by `meta`.
 
 > **Stage-1 coverage.** The one-way server renders from a `DeliveryClaim`, whose
-> `DeliveryEventSummary` carries `eventId`, `monitorId`, `urgency`, etc. but **not** `eventKind` or
-> `objectKey`. So stage 1 emits `lifecycle`, `mode`, `event_count`, `urgency`, and (for a single
-> event) `monitor_id` and `event_id`. `event_kind` / `object_key` are target and require enriching
-> the claim summary; they are not yet emitted.
+> `DeliveryEventSummary` carries `eventId`, `monitorId`, `urgency`, etc. but **not** `objectKey`.
+> So stage 1 emits `lifecycle`, `mode`, `event_count`, `urgency`, and (for a single event)
+> `monitor_id` and `event_id`. `object_key` is target and requires enriching the claim summary; it
+> is not yet emitted.
 
 ### 4.3 Two-way: acknowledgement tool
 
@@ -256,15 +255,14 @@ A settled high-urgency `file-fingerprint` claim surfaces as:
 
 ```text
 <channel source="agentmonitors" monitor_id="build-config-drift" urgency="high"
-         event_kind="mutation" object_key="/repo/package.json" event_id="01J…"
+         object_key="/repo/package.json" event_id="01J…"
          event_count="1" lifecycle="turn-interruptible">
 package.json changed — review whether build behavior or dependency state needs updating.
 </channel>
 ```
 
 **What this proves:** the same `DeliveryClaim` the hook path would surface is rendered into the
-channel field schema; `event-kind` is carried as `event_kind`; `event_id` is available for the ack
-tool.
+channel field schema; `event_id` is available for the ack tool.
 
 ### 9.2 Acknowledgement round-trip
 
