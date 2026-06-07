@@ -10,7 +10,6 @@ const TEMPLATES: Record<string, string> = {
 name: My monitor
 source: file-fingerprint
 urgency: normal
-event-kind: mutation
 scope:
   globs:
     - '**/*.ts'
@@ -24,7 +23,6 @@ When changes are detected, review and take appropriate action.
 name: My API monitor
 source: api-poll
 urgency: normal
-event-kind: notification
 scope:
   url: 'https://api.example.com/endpoint'
   method: GET
@@ -41,7 +39,6 @@ When the API response changes, review the differences and take appropriate actio
 name: My scheduled monitor
 source: schedule
 urgency: normal
-event-kind: notification
 scope:
   cron: '0 9 * * 1-5'
   timezone: UTC

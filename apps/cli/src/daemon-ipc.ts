@@ -7,7 +7,6 @@ import type {
   AgentMonitorRuntime,
   AgentSessionRole,
   DeliveryLifecycle,
-  EventKind,
   Urgency,
 } from '@mike-north/core';
 import { z } from 'zod';
@@ -17,7 +16,6 @@ type JsonRecord = Record<string, unknown>;
 const MAX_UNIX_SOCKET_PATH_LENGTH = 100;
 const sessionRoleValues = ['lead', 'subagent'] as const;
 const urgencyValues = ['low', 'normal', 'high'] as const;
-const eventKindValues = ['mutation', 'notification', 'alert'] as const;
 const deliveryLifecycleValues = [
   'turn-interruptible',
   'turn-idle',
@@ -45,7 +43,6 @@ const sessionRoleSchema = z.enum(
   sessionRoleValues satisfies readonly AgentSessionRole[],
 );
 const urgencySchema = z.enum(urgencyValues satisfies readonly Urgency[]);
-const eventKindSchema = z.enum(eventKindValues satisfies readonly EventKind[]);
 const deliveryLifecycleSchema = z.enum(
   deliveryLifecycleValues satisfies readonly DeliveryLifecycle[],
 );
@@ -64,7 +61,6 @@ const eventsListParamsSchema = z.object({
   sessionId: z.string().optional(),
   monitorId: z.string().optional(),
   urgency: urgencySchema.optional(),
-  eventKind: eventKindSchema.optional(),
   tags: z.array(z.string()).optional(),
   scope: z.record(z.string(), z.string()).optional(),
   objectKey: z.string().optional(),
@@ -195,7 +191,6 @@ function handleRequest(
           ...(params.sessionId ? { sessionId: params.sessionId } : {}),
           ...(params.monitorId ? { monitorId: params.monitorId } : {}),
           ...(params.urgency ? { urgency: params.urgency } : {}),
-          ...(params.eventKind ? { eventKind: params.eventKind } : {}),
           ...(params.tags ? { tags: params.tags } : {}),
           ...(params.scope ? { scope: params.scope } : {}),
           ...(params.objectKey ? { objectKey: params.objectKey } : {}),

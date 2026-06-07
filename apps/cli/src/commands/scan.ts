@@ -22,7 +22,6 @@ export const scanCommand = new Command('scan')
           name: m.monitor.displayName,
           source: m.monitor.frontmatter.source,
           urgency: m.monitor.frontmatter.urgency,
-          'event-kind': m.monitor.frontmatter['event-kind'],
           tags: m.monitor.frontmatter.tags ?? [],
           notify: m.monitor.frontmatter.notify ?? null,
         })),
