@@ -111,7 +111,7 @@ Verified: `libs/core/src/runtime/types.ts` — `PendingDebounceState` (lines 137
 
 ## 5. Event Materialization
 
-Each emitted observation becomes one row in the `monitor_events` table. The runtime **MUST** persist at least: `id`, `workspacePath`, `monitorId`, `sourceName`, `urgency`, `eventKind`, `title`, `body`, `summary`, `payload`, `snapshotMetadata`, `snapshotText`, `diffText`, `objectKey`, `queryScope`, `tags`, `createdAt`.
+Each emitted observation becomes one row in the `monitor_events` table. The runtime **MUST** persist at least: `id`, `workspacePath`, `monitorId`, `sourceName`, `urgency`, `title`, `body`, `summary`, `payload`, `snapshotMetadata`, `snapshotText`, `diffText`, `objectKey`, `queryScope`, `tags`, `createdAt`.
 
 Verified: `libs/core/src/runtime/service.ts` — `processObservation()` (lines 566–617); `libs/core/src/runtime/store.ts` — `insertEvent()` (lines 260–299).
 
@@ -413,7 +413,6 @@ Corresponds to the `monitorEvents` Drizzle table. One row per materialized obser
 | `workspace_path`    | TEXT nullable    | Path to the workspace; `NULL` for global events |
 | `monitor_id`        | TEXT NOT NULL    | Stable monitor identifier                       |
 | `source_name`       | TEXT NOT NULL    | Source plugin name                              |
-| `event_kind`        | TEXT NOT NULL    | `mutation \| notification \| alert`             |
 | `urgency`           | TEXT NOT NULL    | `low \| normal \| high`                         |
 | `title`             | TEXT NOT NULL    |                                                 |
 | `body`              | TEXT NOT NULL    | Defaults to `''`                                |
@@ -519,7 +518,6 @@ Legacy inbox table. Driven by `InboxService`, not by the runtime tick loop (§12
 | `monitor_id`   | TEXT NOT NULL    |                                                                     |
 | `state`        | TEXT NOT NULL    | `queued \| acked \| in-progress \| completed \| failed \| archived` |
 | `urgency`      | TEXT NOT NULL    | `low \| normal \| high`                                             |
-| `event_kind`   | TEXT NOT NULL    | `mutation \| notification \| alert`                                 |
 | `title`        | TEXT NOT NULL    |                                                                     |
 | `body`         | TEXT NOT NULL    |                                                                     |
 | `snapshot`     | TEXT NOT NULL    | JSON                                                                |

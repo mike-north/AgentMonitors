@@ -9,7 +9,6 @@ export type {
   NotifyConfig,
   MonitorDefinition,
   Urgency,
-  EventKind,
   NotifyStrategy,
 } from './schema/types.js';
 

@@ -25,15 +25,11 @@ export function generateMonitorSchema(
     $schema: 'http://json-schema.org/draft-07/schema#',
     title: 'Agent Monitor Definition',
     type: 'object',
-    required: ['name', 'source', 'urgency', 'event-kind', 'scope'],
+    required: ['source', 'urgency', 'scope'],
     properties: {
       name: { type: 'string', minLength: 1 },
       source: { type: 'string', enum: sourceNames },
       urgency: { type: 'string', enum: ['low', 'normal', 'high'] },
-      'event-kind': {
-        type: 'string',
-        enum: ['mutation', 'notification', 'alert'],
-      },
       scope: { type: 'object' },
       notify: {
         type: 'object',

@@ -21,7 +21,6 @@ function rowToItem(row: typeof inboxItems.$inferSelect): InboxItem {
     monitorId: row.monitorId,
     state: row.state,
     urgency: row.urgency,
-    eventKind: row.eventKind,
     title: row.title,
     body: row.body,
     snapshot: JSON.parse(row.snapshot) as unknown,
@@ -90,7 +89,6 @@ export class InboxService {
         monitorId: payload.monitorId,
         state: 'queued',
         urgency: payload.urgency,
-        eventKind: payload.eventKind,
         title: payload.title,
         body: payload.body ?? '',
         snapshot: JSON.stringify(payload.snapshot ?? {}),
@@ -213,9 +211,6 @@ export class InboxService {
     }
     if (filter?.urgency) {
       conditions.push(eq(inboxItems.urgency, filter.urgency));
-    }
-    if (filter?.eventKind) {
-      conditions.push(eq(inboxItems.eventKind, filter.eventKind));
     }
     if (filter?.monitorId) {
       conditions.push(eq(inboxItems.monitorId, filter.monitorId));

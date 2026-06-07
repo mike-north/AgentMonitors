@@ -266,7 +266,7 @@ commands are placeholders that print a manual-install hint (NP3). See §7.
 The generated schema:
 
 - Uses `$schema: 'http://json-schema.org/draft-07/schema#'`
-- Declares top-level required fields: `name`, `source`, `urgency`, `event-kind`, `scope`
+- Declares top-level required fields: `source`, `urgency`, `scope`
 - Constrains `source` to the enum of registered source names
 - Uses `allOf` with `if/then` conditionals to enforce the correct `scope` shape for each `source` value
 - Validates the `notify` field with a `oneOf` covering `debounce` (requires `settle-for`) and `throttle` (requires `suppress-for`)

@@ -7,7 +7,6 @@ const validContent = yaml`---
 name: GitHub PR review monitor
 source: api-poll
 urgency: normal
-event-kind: notification
 scope:
   url: "https://api.github.com/repos/my-org/my-repo/pulls"
   interval: 5m
@@ -24,7 +23,6 @@ const minimalContent = yaml`---
 name: File watcher
 source: file-fingerprint
 urgency: high
-event-kind: mutation
 scope:
   globs:
     - "**/*.ts"
@@ -46,7 +44,6 @@ describe('parseMonitor', () => {
     expect(result.monitor.frontmatter.name).toBe('GitHub PR review monitor');
     expect(result.monitor.frontmatter.source).toBe('api-poll');
     expect(result.monitor.frontmatter.urgency).toBe('normal');
-    expect(result.monitor.frontmatter['event-kind']).toBe('notification');
     expect(result.monitor.frontmatter.notify).toEqual({
       strategy: 'debounce',
       'settle-for': '5m',
@@ -70,7 +67,6 @@ describe('parseMonitor', () => {
 
     expect(result.monitor.id).toBe('file-watcher');
     expect(result.monitor.frontmatter.urgency).toBe('high');
-    expect(result.monitor.frontmatter['event-kind']).toBe('mutation');
     expect(result.monitor.frontmatter.notify).toBeUndefined();
     expect(result.monitor.frontmatter.tags).toBeUndefined();
   });
@@ -90,7 +86,6 @@ describe('parseMonitor', () => {
 name: Test
 source: file-fingerprint
 urgency: normal
-event-kind: mutation
 scope:
   globs: ["*.ts"]
 ---
@@ -122,7 +117,6 @@ scope:
 name: Test
 source: file-fingerprint
 urgency: critical
-event-kind: mutation
 scope:
   globs: ["*.ts"]
 ---
@@ -140,7 +134,6 @@ Instructions.
 name: Test
 source: file-fingerprint
 urgency: normal
-event-kind: mutation
 ---
 
 Instructions.
@@ -156,7 +149,6 @@ Instructions.
 name: Test
 source: file-fingerprint
 urgency: normal
-event-kind: mutation
 scope:
   globs: ["*.ts"]
 notify:
@@ -182,7 +174,6 @@ Instructions.
 const FRONTMATTER = yaml`---
 source: file-fingerprint
 urgency: normal
-event-kind: mutation
 scope:
   globs:
     - 'src/**/*.ts'

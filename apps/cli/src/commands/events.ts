@@ -40,13 +40,6 @@ eventsCommand
       'high',
     ]),
   )
-  .addOption(
-    new Option('--event-kind <kind>', 'Filter by event kind').choices([
-      'mutation',
-      'notification',
-      'alert',
-    ]),
-  )
   .option('--tag <tag>', 'Filter by tag (repeatable)', collectTag, [])
   .option('--scope <pairs>', 'Scope filters like key=value,key2=value2')
   .option('--unread', 'Only unread events')
@@ -62,7 +55,6 @@ eventsCommand
       socket?: string;
       monitor?: string;
       urgency?: 'low' | 'normal' | 'high';
-      eventKind?: 'mutation' | 'notification' | 'alert';
       tag: string[];
       scope?: string;
       unread?: boolean;
@@ -76,7 +68,6 @@ eventsCommand
             sessionId: options.session,
             ...(options.monitor ? { monitorId: options.monitor } : {}),
             ...(options.urgency ? { urgency: options.urgency } : {}),
-            ...(options.eventKind ? { eventKind: options.eventKind } : {}),
             ...(options.tag.length > 0 ? { tags: options.tag } : {}),
             ...(scope ? { scope } : {}),
             ...(options.unread ? { unreadOnly: true } : {}),

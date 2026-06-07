@@ -20,7 +20,6 @@ const validContent = yaml`---
 name: Test monitor
 source: file-fingerprint
 urgency: normal
-event-kind: mutation
 scope:
   globs: ["*.ts"]
 ---
@@ -32,7 +31,6 @@ const invalidContent = yaml`---
 name: Bad monitor
 source: file-fingerprint
 urgency: invalid-value
-event-kind: mutation
 scope:
   globs: ["*.ts"]
 ---
@@ -144,7 +142,6 @@ describe('scanMonitors', () => {
 const BODY = yaml`---
 source: file-fingerprint
 urgency: normal
-event-kind: mutation
 scope:
   globs:
     - 'x'

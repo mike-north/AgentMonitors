@@ -21,8 +21,7 @@ The folder name becomes the monitor's machine identifier. Choose a descriptive k
 ---
 name: GitHub PR review monitor # required, human-readable display name
 source: api-poll # required, observation source plugin
-urgency: normal # required: high | normal
-event-kind: notification # required: mutation | notification | alert
+urgency: normal # required: high | normal | low
 scope: # required, source-specific configuration
   url: 'https://api.github.com/...'
   auth:
@@ -44,7 +43,6 @@ The markdown body after the frontmatter is injected into the agent's context whe
 name: Config drift detector
 source: file-fingerprint
 urgency: normal
-event-kind: mutation
 scope:
   globs: ['tsconfig.json', 'package.json']
 ---

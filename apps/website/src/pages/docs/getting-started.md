@@ -34,7 +34,6 @@ This creates `.claude/monitors/my-first-monitor/MONITOR.md` with a starter templ
 name: Config file watcher
 source: file-fingerprint
 urgency: normal
-event-kind: mutation
 scope:
   globs:
     - '*.config.js'

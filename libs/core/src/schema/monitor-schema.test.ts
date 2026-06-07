@@ -5,7 +5,6 @@ const validMinimal = {
   name: 'Test monitor',
   source: 'file-fingerprint',
   urgency: 'normal' as const,
-  'event-kind': 'mutation' as const,
   scope: { globs: ['**/*.ts'] },
 };
 
@@ -14,7 +13,6 @@ const validFull = {
   name: 'GitHub PR review monitor',
   source: 'api-poll',
   urgency: 'high' as const,
-  'event-kind': 'notification' as const,
   scope: {
     url: 'https://api.github.com/repos/my-org/my-repo/pulls?state=open',
     auth: { type: 'bearer', 'token-env': 'GITHUB_TOKEN' },
@@ -75,14 +73,25 @@ describe('monitorFrontmatterSchema', () => {
       }
     });
 
-    it('accepts all event-kind values', () => {
-      for (const kind of ['mutation', 'notification', 'alert']) {
-        const result = monitorFrontmatterSchema.safeParse({
-          ...validMinimal,
-          'event-kind': kind,
-        });
-        expect(result.success).toBe(true);
-      }
+    it('parses a minimal monitor without event-kind', () => {
+      const result = monitorFrontmatterSchema.safeParse({
+        source: 'file-fingerprint',
+        urgency: 'normal',
+        scope: { globs: ['x'] },
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it('ignores an event-kind field if present (no longer part of the schema)', () => {
+      const result = monitorFrontmatterSchema.safeParse({
+        source: 'file-fingerprint',
+        urgency: 'normal',
+        'event-kind': 'mutation',
+        scope: { globs: ['x'] },
+      });
+      // schema is non-strict, so an extra key is dropped, not an error
+      expect(result.success).toBe(true);
+      if (result.success) expect('event-kind' in result.data).toBe(false);
     });
   });
 
@@ -91,7 +100,6 @@ describe('monitorFrontmatterSchema', () => {
       const result = monitorFrontmatterSchema.safeParse({
         source: 'file-fingerprint',
         urgency: 'normal',
-        'event-kind': 'mutation',
         scope: { globs: ['src/**/*.ts'] },
       });
       expect(result.success).toBe(true);
@@ -102,7 +110,6 @@ describe('monitorFrontmatterSchema', () => {
         name: '',
         source: 'file-fingerprint',
         urgency: 'normal',
-        'event-kind': 'mutation',
         scope: { globs: ['x'] },
       });
       expect(result.success).toBe(false);
@@ -116,12 +123,6 @@ describe('monitorFrontmatterSchema', () => {
 
     it('rejects missing urgency', () => {
       const { urgency: _, ...rest } = validMinimal;
-      const result = monitorFrontmatterSchema.safeParse(rest);
-      expect(result.success).toBe(false);
-    });
-
-    it('rejects missing event-kind', () => {
-      const { 'event-kind': _, ...rest } = validMinimal;
       const result = monitorFrontmatterSchema.safeParse(rest);
       expect(result.success).toBe(false);
     });
@@ -146,14 +147,6 @@ describe('monitorFrontmatterSchema', () => {
       const result = monitorFrontmatterSchema.safeParse({
         ...validMinimal,
         urgency: 'critical',
-      });
-      expect(result.success).toBe(false);
-    });
-
-    it('rejects invalid event-kind', () => {
-      const result = monitorFrontmatterSchema.safeParse({
-        ...validMinimal,
-        'event-kind': 'webhook',
       });
       expect(result.success).toBe(false);
     });

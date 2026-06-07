@@ -13,7 +13,6 @@ const STATES = [
   'archived',
 ];
 const URGENCIES = ['low', 'normal', 'high'];
-const EVENT_KINDS = ['mutation', 'notification', 'alert'];
 
 export const inboxCommand = new Command('inbox').description(
   'Manage inbox items',
@@ -25,11 +24,6 @@ inboxCommand
   .addOption(new Option('--state <state>', 'Filter by state').choices(STATES))
   .addOption(
     new Option('--urgency <urgency>', 'Filter by urgency').choices(URGENCIES),
-  )
-  .addOption(
-    new Option('--event-kind <kind>', 'Filter by event kind').choices(
-      EVENT_KINDS,
-    ),
   )
   .option('--tags <tags>', 'Filter by tags (comma-separated)')
   .option('--monitor <id>', 'Filter by monitor ID')
@@ -44,7 +38,6 @@ inboxCommand
     (options: {
       state?: string;
       urgency?: string;
-      eventKind?: string;
       tags?: string;
       monitor?: string;
       since?: string;
@@ -60,12 +53,6 @@ inboxCommand
       }
       if (options.urgency) {
         filter.urgency = options.urgency as 'low' | 'normal' | 'high';
-      }
-      if (options.eventKind) {
-        filter.eventKind = options.eventKind as
-          | 'mutation'
-          | 'notification'
-          | 'alert';
       }
       if (options.tags) {
         filter.tags = options.tags.split(',').map((t) => t.trim());
@@ -110,7 +97,7 @@ inboxCommand
 
       for (const item of items) {
         console.log(
-          `[${item.state}] ${item.id}  ${item.title}  (${item.urgency}, ${item.eventKind})`,
+          `[${item.state}] ${item.id}  ${item.title}  (${item.urgency})`,
         );
       }
     },

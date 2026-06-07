@@ -70,7 +70,6 @@ A monitor looks like this:
 name: Config file watcher
 source: file-fingerprint
 urgency: normal
-event-kind: mutation
 scope:
   globs:
     - '*.config.ts'

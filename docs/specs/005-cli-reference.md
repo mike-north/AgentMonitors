@@ -184,7 +184,6 @@ If no monitors and no errors: prints `No monitors found.`
       "name": "<string>",
       "source": "<string>",
       "urgency": "<string>",
-      "event-kind": "<string>",
       "tags": ["<string>"],
       "notify": "<string | null>"
     }
@@ -220,14 +219,13 @@ agentmonitors inbox list [options]
 | --------------------- | -------- | ------- | --------------------------------------------------------------------------- |
 | `--state <state>`     | choices  | —       | Filter: `queued`, `acked`, `in-progress`, `completed`, `failed`, `archived` |
 | `--urgency <urgency>` | choices  | —       | Filter: `low`, `normal`, `high`                                             |
-| `--event-kind <kind>` | choices  | —       | Filter: `mutation`, `notification`, `alert`                                 |
 | `--tags <tags>`       | string   | —       | Comma-separated tag filter                                                  |
 | `--monitor <id>`      | string   | —       | Filter by monitor ID                                                        |
 | `--since <date>`      | ISO 8601 | —       | Items created after this date                                               |
 | `--until <date>`      | ISO 8601 | —       | Items created before this date                                              |
 | `--format <format>`   | choices  | `text`  | `text`, `json`                                                              |
 
-**Text output:** one line per item: `[<state>] <id>  <title>  (<urgency>, <eventKind>)`
+**Text output:** one line per item: `[<state>] <id>  <title>  (<urgency>)`
 
 **JSON output:** raw `InboxItem[]` array serialised via `JSON.stringify`.
 
@@ -670,7 +668,6 @@ agentmonitors events list --session <id> [options]
 | `--socket <path>`     | string              | resolved default | Unix domain socket path                        |
 | `--monitor <id>`      | string              | —                | Filter by monitor id                           |
 | `--urgency <urgency>` | choices             | —                | `low`, `normal`, `high`                        |
-| `--event-kind <kind>` | choices             | —                | `mutation`, `notification`, `alert`            |
 | `--tag <tag>`         | string (repeatable) | `[]`             | Filter by tag; may be specified multiple times |
 | `--scope <pairs>`     | string              | —                | Scope filters as `key=value,key2=value2`       |
 | `--unread`            | boolean flag        | —                | Only unread events                             |

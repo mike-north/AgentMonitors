@@ -288,7 +288,6 @@ describe('validate', () => {
       'name: Dup',
       'source: file-fingerprint',
       'urgency: normal',
-      'event-kind: mutation',
       'scope:',
       '  globs: ["*.ts"]',
       '---',
@@ -326,7 +325,6 @@ describe('validate', () => {
       'name: Bad scope',
       'source: file-fingerprint',
       'urgency: normal',
-      'event-kind: mutation',
       'scope:',
       '  globs: 42',
       '---',
@@ -349,7 +347,6 @@ describe('validate', () => {
       'name: Mystery',
       'source: not-a-real-source',
       'urgency: normal',
-      'event-kind: mutation',
       'scope:',
       '  foo: bar',
       '---',
@@ -374,7 +371,7 @@ describe('scan', () => {
     expect(result.exitCode).toBe(0);
     const parsed = JSON.parse(result.stdout);
     expect(parsed.monitors).toHaveLength(1);
-    expect(parsed.monitors[0]).toHaveProperty('event-kind');
+    expect(parsed.monitors[0]).not.toHaveProperty('event-kind');
     expect(parsed.monitors[0]).toHaveProperty('tags');
     expect(parsed.monitors[0]).toHaveProperty('notify');
   });
@@ -448,7 +445,6 @@ describe('runtime flow', () => {
 name: Watch files
 source: file-fingerprint
 urgency: normal
-event-kind: mutation
 scope:
   globs:
     - watched.txt
@@ -597,7 +593,6 @@ When files change, review them.
 name: Watch files
 source: file-fingerprint
 urgency: normal
-event-kind: mutation
 scope:
   globs:
     - watched.txt
@@ -838,7 +833,6 @@ describe('monitor history', () => {
 name: Watch files
 source: file-fingerprint
 urgency: normal
-event-kind: mutation
 scope:
   globs:
     - watched.txt
