@@ -32,7 +32,6 @@ cat > /tmp/workspace/.claude/monitors/watch-files/MONITOR.md <<'EOF'
 name: Watch files
 source: file-fingerprint
 urgency: normal
-event-kind: mutation
 scope:
   globs:
     - watched.txt
