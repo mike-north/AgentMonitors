@@ -22,9 +22,6 @@ is authoritative; this page is a quick index, not the contract.
 - **Urgency** — One of `low`, `normal`, `high`. All three are first-class and affect default
   notify timing and delivery lifecycle. [001 §3.2](./001-monitor-definition.md),
   [002 §4.1, §9](./002-runtime-delivery.md). (PP5)
-- **Event kind** — One of `mutation`, `notification`, `alert`. Describes the semantic nature
-  of a signal; does **not** itself change scheduling or delivery timing.
-  [001 §3.3](./001-monitor-definition.md).
 - **Notify policy** — A monitor's optional `debounce` (`settle-for`) or `throttle`
   (`suppress-for`) configuration. Omitted ⇒ urgency-based defaults.
   [001 §3.4](./001-monitor-definition.md), [002 §4](./002-runtime-delivery.md).

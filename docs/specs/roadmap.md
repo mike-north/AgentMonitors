@@ -65,7 +65,7 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
 >   coalesced-reminder (normal) and concrete-event (high) paths, without needing a live Claude
 >   session or a channels-enabled org.
 >
-> Non-blocking follow-ups: optional `event_kind`/`object_key` meta (needs `DeliveryEventSummary`
+> Non-blocking follow-ups: optional `object_key` meta (needs `DeliveryEventSummary`
 > enrichment, [006 §4.2](./006-agent-integration.md)).
 
 ## Test gaps

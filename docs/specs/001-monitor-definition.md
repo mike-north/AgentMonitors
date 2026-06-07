@@ -108,7 +108,7 @@ The `scope` field **MUST** be a plain object with string keys. The value types o
 
 > Verified: `libs/core/src/schema/monitor-schema.ts` line 38 — `scope: z.record(z.string(), z.unknown())`.
 
-### 3.5 `notify`
+### 3.4 `notify`
 
 If present, `notify` **MUST** be one of these shapes:
 
@@ -130,7 +130,7 @@ If `notify` is omitted, default delivery behavior is defined in [002-runtime-del
 
 > Verified: `libs/core/src/schema/monitor-schema.ts` — `debounceNotifySchema` at lines 5–13 (requires `strategy: 'debounce'` and `settle-for` matching `durationPattern`); `throttleNotifySchema` at lines 15–23 (requires `strategy: 'throttle'` and `suppress-for` matching `durationPattern`); `durationPattern` at line 3 is `/^\d+[smhd]$/`; `notifySchema` is a discriminated union on `strategy` at lines 25–28.
 
-### 3.6 `tags`
+### 3.5 `tags`
 
 If present, `tags` **MUST** be an array of strings. Tags have no runtime semantics in the current implementation and are intended for future filtering.
 
