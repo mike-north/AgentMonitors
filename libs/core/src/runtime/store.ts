@@ -69,7 +69,6 @@ function rowToEvent(
     monitorId: row.monitorId,
     sourceName: row.sourceName,
     urgency: row.urgency,
-    eventKind: row.eventKind,
     title: row.title,
     body: row.body,
     summary: row.summary,
@@ -270,7 +269,6 @@ export class RuntimeStore {
         workspacePath: input.workspacePath,
         monitorId: input.monitorId,
         sourceName: input.sourceName,
-        eventKind: input.eventKind,
         urgency: input.urgency,
         title: input.title,
         body: input.body,
@@ -321,8 +319,6 @@ export class RuntimeStore {
       conditions.push(eq(monitorEvents.monitorId, query.monitorId));
     if (query.urgency)
       conditions.push(eq(monitorEvents.urgency, query.urgency));
-    if (query.eventKind)
-      conditions.push(eq(monitorEvents.eventKind, query.eventKind));
     if (query.objectKey)
       conditions.push(eq(monitorEvents.objectKey, query.objectKey));
     if (query.since) conditions.push(gt(monitorEvents.createdAt, query.since));

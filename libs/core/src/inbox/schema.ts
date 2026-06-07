@@ -11,7 +11,6 @@ export const inboxItemState = [
 export type InboxItemState = (typeof inboxItemState)[number];
 
 export const urgencyValues = ['low', 'normal', 'high'] as const;
-export const eventKindValues = ['mutation', 'notification', 'alert'] as const;
 
 export const inboxItems = sqliteTable('inbox_items', {
   id: text('id').primaryKey(),
@@ -19,7 +18,6 @@ export const inboxItems = sqliteTable('inbox_items', {
   monitorId: text('monitor_id').notNull(),
   state: text('state', { enum: inboxItemState }).notNull().default('queued'),
   urgency: text('urgency', { enum: urgencyValues }).notNull(),
-  eventKind: text('event_kind', { enum: eventKindValues }).notNull(),
   title: text('title').notNull(),
   body: text('body').notNull().default(''),
   snapshot: text('snapshot').notNull().default('{}'),
@@ -58,7 +56,6 @@ export const monitorEvents = sqliteTable('monitor_events', {
   workspacePath: text('workspace_path'),
   monitorId: text('monitor_id').notNull(),
   sourceName: text('source_name').notNull(),
-  eventKind: text('event_kind', { enum: eventKindValues }).notNull(),
   urgency: text('urgency', { enum: urgencyValues }).notNull(),
   title: text('title').notNull(),
   body: text('body').notNull().default(''),

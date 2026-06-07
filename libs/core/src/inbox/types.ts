@@ -7,7 +7,6 @@ export interface InboxItem {
   monitorId: string;
   state: InboxItemState;
   urgency: 'low' | 'normal' | 'high';
-  eventKind: 'mutation' | 'notification' | 'alert';
   title: string;
   body: string;
   snapshot: unknown;
@@ -21,7 +20,6 @@ export interface InboxItem {
 export interface EnqueuePayload {
   monitorId: string;
   urgency: 'low' | 'normal' | 'high';
-  eventKind: 'mutation' | 'notification' | 'alert';
   title: string;
   body?: string;
   snapshot?: unknown;
@@ -31,7 +29,6 @@ export interface EnqueuePayload {
 export interface InboxFilter {
   state?: InboxItemState | InboxItemState[];
   urgency?: 'low' | 'normal' | 'high';
-  eventKind?: 'mutation' | 'notification' | 'alert';
   tags?: string[];
   monitorId?: string;
   since?: Date;

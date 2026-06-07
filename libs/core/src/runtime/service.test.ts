@@ -47,7 +47,6 @@ function createMonitorFile(
 name: Test monitor
 source: ${sourceName}
 urgency: ${urgency}
-event-kind: mutation
 scope:
   filePath: ${JSON.stringify(path.join(rootDir, 'watched.txt'))}
 ${extraScope}
@@ -168,7 +167,6 @@ describe('AgentMonitorRuntime', () => {
 name: Dup monitor
 source: file-fingerprint
 urgency: normal
-event-kind: mutation
 scope:
   globs: ["*.ts"]
 ---
@@ -214,7 +212,6 @@ Handle it.
       monitorId: 'urgent-monitor',
       sourceName: 'manual',
       urgency: 'high',
-      eventKind: 'alert',
       title: 'CI failed',
       body: 'CI failed on the default branch',
       summary: 'CI failed on the default branch',
@@ -260,7 +257,6 @@ Handle it.
       monitorId: 'doc-monitor',
       sourceName: 'manual',
       urgency: 'normal',
-      eventKind: 'notification',
       title: 'Doc comments',
       body: 'New comments landed',
       summary: 'New comments landed',
@@ -303,7 +299,6 @@ Handle it.
       monitorId: 'slack-monitor',
       sourceName: 'manual',
       urgency: 'low',
-      eventKind: 'notification',
       title: 'Background chatter',
       body: 'A low-urgency Slack update arrived',
       summary: 'A low-urgency Slack update arrived',
@@ -347,7 +342,6 @@ Handle it.
       monitorId: 'docs-monitor',
       sourceName: 'manual',
       urgency: 'normal',
-      eventKind: 'notification',
       title: 'Doc update',
       body: 'A document changed',
       summary: 'A document changed',
@@ -369,7 +363,6 @@ Handle it.
       monitorId: 'docs-monitor',
       sourceName: 'manual',
       urgency: 'normal',
-      eventKind: 'notification',
       title: 'Second doc update',
       body: 'Another document changed',
       summary: 'Another document changed',
@@ -418,7 +411,6 @@ Handle it.
       monitorId: 'docs-monitor',
       sourceName: 'manual',
       urgency: 'normal',
-      eventKind: 'notification',
       title: 'Doc A comments',
       body: 'Doc A received comments',
       summary: 'Doc A received comments',
@@ -530,7 +522,6 @@ Handle it.
       monitorId: 'docs-monitor',
       sourceName: 'manual',
       urgency: 'normal',
-      eventKind: 'notification',
       title: 'Doc A comments',
       body: 'Doc A received comments',
       summary: 'Doc A received comments',
@@ -548,7 +539,6 @@ Handle it.
       monitorId: 'docs-monitor',
       sourceName: 'manual',
       urgency: 'normal',
-      eventKind: 'notification',
       title: 'Doc B comments',
       body: 'Doc B received comments',
       summary: 'Doc B received comments',
@@ -777,7 +767,6 @@ Handle it.
 name: Debounce flush
 source: debounce-source
 urgency: high
-event-kind: mutation
 notify:
   strategy: debounce
   settle-for: 1s

@@ -789,7 +789,6 @@ export class AgentMonitorRuntime {
       monitorId: input.monitor.id,
       sourceName: input.sourceName,
       urgency: input.monitor.frontmatter.urgency,
-      eventKind: input.monitor.frontmatter['event-kind'],
       title: input.observation.title,
       body: input.observation.body ?? input.monitor.instructions,
       summary:

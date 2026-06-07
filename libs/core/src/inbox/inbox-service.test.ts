@@ -8,7 +8,6 @@ const CREATED_AT = new Date('2024-01-15T10:30:00.000Z');
 const basePayload: EnqueuePayload = {
   monitorId: 'github-pr-review',
   urgency: 'normal',
-  eventKind: 'notification',
   title: 'New PR review on my-repo#42',
   body: 'Review comments from @reviewer',
   snapshot: { pr: 42, comments: 3 },
@@ -39,7 +38,6 @@ describe('InboxService', () => {
       expect(item?.state).toBe('queued');
       expect(item?.monitorId).toBe('github-pr-review');
       expect(item?.urgency).toBe('normal');
-      expect(item?.eventKind).toBe('notification');
       expect(item?.title).toBe('New PR review on my-repo#42');
       expect(item?.body).toBe('Review comments from @reviewer');
       expect(item?.snapshot).toEqual({ pr: 42, comments: 3 });
@@ -227,11 +225,7 @@ describe('InboxService', () => {
     beforeEach(() => {
       ids = [
         service.enqueue({ ...basePayload, title: 'Item 1', urgency: 'high' }),
-        service.enqueue({
-          ...basePayload,
-          title: 'Item 2',
-          eventKind: 'mutation',
-        }),
+        service.enqueue({ ...basePayload, title: 'Item 2' }),
         service.enqueue({
           ...basePayload,
           title: 'Item 3',
@@ -265,12 +259,6 @@ describe('InboxService', () => {
       const items = service.list({ urgency: 'high' });
       expect(items).toHaveLength(1);
       expect(items[0]?.title).toBe('Item 1');
-    });
-
-    it('filters by eventKind', () => {
-      const items = service.list({ eventKind: 'mutation' });
-      expect(items).toHaveLength(1);
-      expect(items[0]?.title).toBe('Item 2');
     });
 
     it('filters by monitorId', () => {

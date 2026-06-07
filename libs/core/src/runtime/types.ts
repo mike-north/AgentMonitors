@@ -1,5 +1,4 @@
 import type {
-  EventKind,
   MonitorDefinition,
   NotifyConfig,
   Urgency,
@@ -57,7 +56,6 @@ export interface MonitorEventRecord {
   monitorId: string;
   sourceName: string;
   urgency: Urgency;
-  eventKind: EventKind;
   title: string;
   body: string;
   summary: string;
@@ -94,7 +92,6 @@ export interface SessionEventFilter {
   sessionId: string;
   monitorId?: string;
   urgency?: Urgency;
-  eventKind?: EventKind;
   tags?: string[];
   scope?: Record<string, string>;
   unreadOnly?: boolean;
@@ -107,7 +104,6 @@ export interface EventQuery {
   sessionId?: string;
   monitorId?: string;
   urgency?: Urgency;
-  eventKind?: EventKind;
   tags?: string[];
   scope?: Record<string, string>;
   objectKey?: string;
