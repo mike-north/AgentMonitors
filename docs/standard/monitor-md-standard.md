@@ -37,21 +37,30 @@ directory name** — a stable machine identifier, not a frontmatter field.
 
 ```yaml
 ---
-watch: git-commits          # intent: names WHAT to watch, never HOW it is detected
-where:
-  touches: "src/payments/**"
-when: appeared              # change filter (§2); optional, default = any
-urgency: normal             # low | normal | high
+name: Watch auth-module commits   # optional; identity comes from the parent directory
+watch:
+  type: git-commits               # the source type — an explicit, validated tag
+  branch: main
+  touches: "src/auth/**"
 ---
-New commits touched the payments code. Summarize what changed and flag anything
-that affects the API contract in the file I am currently editing.
+New commits touched the auth code. Summarize what changed and whether it
+affects what I am working on.
 ```
 
-**Authoring is intent-first.** `watch:` names a thing (`files`, `url`, `feed`,
-`git-commits`, `webhook`, `schedule`, …), never a mechanism (`fingerprint`, `poll`). This
-is deliberate: the most common failure of mature event systems is "which event do I
-subscribe to for _my_ goal?" Declaring intent and letting the runtime map it to a
-mechanism removes that question.
+This is the minimal complete monitor: a `watch:` block and a body. No change filter, no
+formatting, no urgency — every other field is optional with a sensible default, so the
+simple case carries no knobs (see §7).
+
+**Authoring is intent-first.** `watch.type` names a thing (`files`, `url`, `feed`,
+`git-commits`, `webhook`, `schedule`, …), never a mechanism (`fingerprint`, `poll`); the
+remaining keys in the `watch:` block are that type's configuration. This is deliberate: the
+most common failure of mature event systems is "which event do I subscribe to for _my_
+goal?" Declaring intent and letting the runtime map it to a mechanism removes that question.
+
+**`type` is an explicit, validated tag — a discriminated union — never inferred from which
+keys happen to be present.** The cost is one line; the return is precise validation errors,
+a discoverable catalog of types, and the freedom for new types to share configuration keys
+(two types may both take a `url:`) without the format becoming ambiguous.
 
 ## 2. The change vocabulary (`changeKind`)
 
@@ -147,8 +156,9 @@ post-condition:
 
 ```yaml
 until: # presence promotes the monitor to the reliable tier
-  watch: dependency
-  where: { name: lodash }
+  watch:
+    type: dependency
+    name: lodash
   satisfied-when: "version >= 4.17.21"
 ```
 
@@ -197,11 +207,14 @@ best-delivering runtime wins on merit rather than lock-in.
 
 These are unresolved and invite proposals:
 
-1. **Frontmatter key names.** `watch` / `where` / `when` / `until` are intent-first but
-   provisional. This surface _is_ the authoring experience and deserves careful design.
-2. **Filters over `appeared`.** "A new member of a collection matching a predicate" is shown
-   here as a thin `where` predicate in the spine. Whether filtering belongs in the standard
-   or entirely inside sources is open.
+1. **Frontmatter key names.** The `watch:` block carrying an explicit `type` tag is locked
+   (a discriminated union, not shape inference). The remaining key names — `when`, `deliver`,
+   `until`, and each type's configuration keys — are still provisional. This surface _is_ the
+   authoring experience and deserves careful design.
+2. **Filters over `appeared`.** Narrowing "a new member of a collection matching a predicate"
+   can live in `when:` (a change filter) or as per-type configuration inside `watch:` (e.g.
+   `touches:`). Whether richer, source-agnostic filtering belongs in the standard as a
+   first-class predicate, or stays entirely inside sources, is open.
 3. **The post-condition language (§6).** Expressing a _re-observable_ predicate generically,
    without it growing into a full query language, is the deepest unsolved problem in the
    standard. `satisfied-when` as a string expression is a placeholder.
