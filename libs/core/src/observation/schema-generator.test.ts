@@ -27,6 +27,10 @@ describe('generateMonitorSchema', () => {
     expect(schema.type).toBe('object');
     expect(schema.required).toContain('source');
     expect(schema.required).toContain('scope');
+    expect(schema.required).not.toContain('event-kind');
+    const properties = schema.properties as Record<string, unknown>;
+    expect(properties).not.toHaveProperty('event-kind');
+    expect(schema.required).toEqual(['source', 'urgency', 'scope']);
   });
 
   it('enumerates source names in the source property', () => {
