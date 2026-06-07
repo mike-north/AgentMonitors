@@ -81,7 +81,7 @@ Agent Monitors spec set in `docs/specs/`.
   manifest, not an npm package).
 - Marks the channel transport ([006 §4](./006-agent-integration.md)) implemented and retires roadmap
   **G7**. Non-blocking follow-ups remain: the end-to-end manual UAT (channels are research-preview)
-  and optional `event_kind`/`object_key` meta (needs `DeliveryEventSummary` enrichment).
+  and optional `object_key` meta (needs `DeliveryEventSummary` enrichment).
 
 ## 2026-06-01 — Channel transport, stage 2 (two-way ack)
 
