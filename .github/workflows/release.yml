@@ -69,6 +69,7 @@ jobs:
               libs/core/package.json \
               plugins/source-api-poll/package.json \
               plugins/source-file-fingerprint/package.json \
+              plugins/source-incoming-changes/package.json \
               plugins/source-schedule/package.json | \
             grep -Eq '^[+-][[:space:]]+"version":'; then
             echo "should-run=true" >> "$GITHUB_OUTPUT"

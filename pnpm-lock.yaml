@@ -62,6 +62,9 @@ importers:
       '@mike-north/source-file-fingerprint':
         specifier: workspace:*
         version: link:../../plugins/source-file-fingerprint
+      '@mike-north/source-incoming-changes':
+        specifier: workspace:*
+        version: link:../../plugins/source-incoming-changes
       '@mike-north/source-schedule':
         specifier: workspace:*
         version: link:../../plugins/source-schedule

@@ -212,6 +212,38 @@ describe('init', () => {
     expect(result.stdout).toContain('Created monitor');
   });
 
+  it('scaffolds an incoming-changes monitor that passes validate', () => {
+    const dir = path.join(tempDir, 'init-incoming');
+    mkdirSync(dir, { recursive: true });
+    const monitorsDir = path.join(dir, 'monitors');
+    const created = run(
+      [
+        'init',
+        'spec-watch',
+        '--dir',
+        monitorsDir,
+        '--source',
+        'incoming-changes',
+      ],
+      dir,
+    );
+    expect(created.exitCode).toBe(0);
+    expect(created.stdout).toContain('Created monitor');
+
+    // The scaffolded scope must validate against the registered source's
+    // scopeSchema (paths required) — proves both registration and the template.
+    const validated = run(['validate', monitorsDir, '--format', 'json'], dir);
+    expect(validated.exitCode).toBe(0);
+    const parsed = JSON.parse(validated.stdout) as {
+      valid: number;
+      invalid: number;
+      monitors: { source: string }[];
+    };
+    expect(parsed.valid).toBe(1);
+    expect(parsed.invalid).toBe(0);
+    expect(parsed.monitors[0]?.source).toBe('incoming-changes');
+  });
+
   it('rejects invalid --source value', () => {
     const dir = path.join(tempDir, 'init-test-3');
     mkdirSync(dir, { recursive: true });
@@ -390,17 +422,19 @@ describe('source list', () => {
     expect(result.stdout).toContain('file-fingerprint');
     expect(result.stdout).toContain('api-poll');
     expect(result.stdout).toContain('schedule');
+    expect(result.stdout).toContain('incoming-changes');
   });
 
   it('lists sources in JSON format', () => {
     const result = run(['source', 'list', '--format', 'json']);
     expect(result.exitCode).toBe(0);
     const parsed = JSON.parse(result.stdout);
-    expect(parsed).toHaveLength(3);
+    expect(parsed).toHaveLength(4);
     const names = parsed.map((s: { name: string }) => s.name);
     expect(names).toContain('file-fingerprint');
     expect(names).toContain('api-poll');
     expect(names).toContain('schedule');
+    expect(names).toContain('incoming-changes');
   });
 });
 
