@@ -37,11 +37,11 @@ directory name** — a stable machine identifier, not a frontmatter field.
 
 ```yaml
 ---
-name: Watch auth-module commits   # optional; identity comes from the parent directory
+name: Watch auth-module commits # optional; identity comes from the parent directory
 watch:
-  type: git-commits               # the source type — an explicit, validated tag
+  type: git-commits # the source type — an explicit, validated tag
   branch: main
-  touches: "src/auth/**"
+  touches: 'src/auth/**'
 ---
 New commits touched the auth code. Summarize what changed and whether it
 affects what I am working on.
@@ -69,13 +69,22 @@ Two tiers.
 The **platform tier** is the stable, universal spine. Every conformant signal carries
 exactly one of:
 
-| `changeKind` | Meaning                                                              |
-| ------------ | -------------------------------------------------------------------- |
+| `changeKind` | Meaning                                                             |
+| ------------ | ------------------------------------------------------------------- |
 | `created`    | the object came into existence                                      |
 | `modified`   | the observed object mutated                                         |
 | `deleted`    | the object ceased to exist                                          |
 | `appeared`   | a new member entered a watched collection/feed (optional predicate) |
 | `elapsed`    | a time condition fired (no object change)                           |
+
+> **This vocabulary is the standard's target, not necessarily this repository's current
+> internal contract.** The internal specs (`../specs/`) presently use
+> `created | modified | deleted | descoped`, where `created` / `descoped` are _scope
+> transitions_ (an object entering or leaving a monitor's scope). This standard reframes the
+> platform tier around observable change shapes and adds `appeared` and `elapsed`. The two
+> are being reconciled; where they differ, treat the internal specs as the current
+> implementation and this document as the intended direction. Do not assume the vocabularies
+> match merely because the field name is shared.
 
 The **semantic tier** (`action-item.detected`, `release.shipped`, …) is **not enumerated
 by this standard**. Semantic meaning is manufactured per-monitor by the body instruction
@@ -89,25 +98,29 @@ never a stream fragment that requires global ordering to interpret. An event log
 state-reconstruction primitive; a conformant runtime does not ask the consumer to rebuild
 state from a sequence of fragments.
 
-```jsonc
+```json
 {
-  // --- stable spine (versioned conservatively; required) ---
-  "monitor": "payments-commits",                   // monitor id (= parent directory name)
-  "object": "git:src/payments/api.ts@a1b2c3",      // source-defined object identity
+  "monitor": "payments-commits",
+  "object": "git:src/payments/api.ts@a1b2c3",
   "changeKind": "appeared",
-  "observedAt": "2026-06-07T18:04:11Z",            // freshness is MANDATORY
-  "resumeToken": "<opaque, source-owned>",         // see §4
-
-  // --- loose, self-describing body (NOT lockstep-versioned) ---
-  "state": {
-    /* current observed state */
-  },
-  "changed": {
-    /* optional: how state differs from the prior observation */
-  },
-  "body": "...handling instruction (markdown)...",
+  "observedAt": "2026-06-07T18:04:11Z",
+  "resumeToken": "<opaque, source-owned>",
+  "state": {},
+  "changed": {},
+  "body": "...handling instruction (markdown)..."
 }
 ```
+
+The example is strict, copy-pasteable JSON. The fields split into two groups:
+
+- **Stable spine (required, versioned conservatively):** `monitor` (the monitor id — the
+  parent directory name), `object` (source-defined object identity), `changeKind` (§2),
+  `observedAt` (the freshness timestamp — **mandatory**), and `resumeToken` (opaque,
+  source-owned — §4).
+- **Loose body (NOT lockstep-versioned):** `state` (the current observed state), `changed`
+  (optional: how `state` differs from the prior observation), and `body` (the handling
+  instruction, markdown). The example leaves `state` / `changed` empty because their shape
+  is source-defined.
 
 - **Stable thin spine + loose body.** The consumer is a language model, not a typed
   deserializer. Keep the spine small and stable for cross-host and cross-tool
@@ -124,11 +137,11 @@ state from a sequence of fragments.
 Every source persists a **resumption token** per object and reconciles on (re)connect. This
 single mechanism underpins both restart-safety and survival across an offline window:
 
-| Source archetype | Resumption token       | On (re)connect          |
-| ---------------- | ---------------------- | ----------------------- |
-| pull (file/url)  | content hash / snapshot | diff current vs. token  |
-| poll with cursor | cursor                  | fetch since cursor      |
-| stream (ws/SSE)  | last event id           | replay from id          |
+| Source archetype | Resumption token        | On (re)connect         |
+| ---------------- | ----------------------- | ---------------------- |
+| pull (file/url)  | content hash / snapshot | diff current vs. token |
+| poll with cursor | cursor                  | fetch since cursor     |
+| stream (ws/SSE)  | last event id           | replay from id         |
 
 Reconnection always **dials outbound** — the device is never required to be internet
 addressable. A relay is a _reachability shim_ used **only** for origins that cannot be
@@ -159,7 +172,7 @@ until: # presence promotes the monitor to the reliable tier
   watch:
     type: dependency
     name: lodash
-  satisfied-when: "version >= 4.17.21"
+  satisfied-when: 'version >= 4.17.21'
 ```
 
 Then:
@@ -186,11 +199,11 @@ and not rewound away").
 
 ## 7. Conformance, and the line between standard and implementation
 
-| Level                  | A runtime must…                                                                                                  |
-| ---------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| **L0 — Author**        | parse `MONITOR.md`, derive identity from the parent directory, validate frontmatter.                             |
+| Level                      | A runtime must…                                                                                                 |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| **L0 — Author**            | parse `MONITOR.md`, derive identity from the parent directory, validate frontmatter.                            |
 | **L1 — Observe & deliver** | evaluate a source into §3 signals with a valid spine and `observedAt`, and deliver over at least one transport. |
-| **L2 — Reliable**      | honor §4 resumption and §6 reaction obligations.                                                                 |
+| **L2 — Reliable**          | honor §4 resumption and §6 reaction obligations.                                                                |
 
 A minimal "fire the hook on every change" runtime is fully **L1-conformant**.
 
