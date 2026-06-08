@@ -769,6 +769,66 @@ describe('source-incoming-changes', () => {
       });
     });
 
+    // -------------------------------------------------------------------------
+    // Pathspec: recursive glob matching with 'docs/specs/**'
+    // -------------------------------------------------------------------------
+
+    describe('pathspec: recursive glob matching', () => {
+      // Verifies that a glob pathspec like 'docs/specs/**' matches files nested
+      // arbitrarily deep under that prefix.  This is the canonical use-case for
+      // watching a specific subtree of a repository (e.g. a generated spec file
+      // that lives in a deep subdirectory).
+      it('detects a change to a deeply nested file when its subtree is in paths', async () => {
+        const dir = makeTempRepo();
+        // Seed with an unrelated top-level file so HEAD exists before baselines.
+        writeAndCommit(dir, { 'README.md': 'root readme' }, 'init');
+
+        const baseline = await source.observe(
+          { paths: ['docs/specs/**'], cwd: dir },
+          { now: NOW },
+        );
+
+        // Add a deeply nested file under docs/specs/
+        writeAndCommit(
+          dir,
+          { 'docs/specs/a/b.md': '# nested spec' },
+          'add nested spec',
+        );
+
+        const result = await source.observe(
+          { paths: ['docs/specs/**'], cwd: dir },
+          { previousState: baseline.nextState, now: NOW },
+        );
+
+        // The nested file must be detected — it falls under docs/specs/**
+        expect(result.observations).toHaveLength(1);
+        const obs = result.observations[0];
+        expect(obs?.objectKey).toBe('docs/specs/a/b.md');
+        expect(obs?.changeKind).toBe('created');
+      });
+
+      it('does NOT detect a change outside the pathspec subtree', async () => {
+        const dir = makeTempRepo();
+        writeAndCommit(dir, { 'README.md': 'root' }, 'init');
+
+        const baseline = await source.observe(
+          { paths: ['docs/specs/**'], cwd: dir },
+          { now: NOW },
+        );
+
+        // Only modify a file outside the watched subtree
+        writeAndCommit(dir, { 'src/app.ts': 'const x = 1;' }, 'add src');
+
+        const result = await source.observe(
+          { paths: ['docs/specs/**'], cwd: dir },
+          { previousState: baseline.nextState, now: NOW },
+        );
+
+        // The out-of-scope file must not appear in observations
+        expect(result.observations).toHaveLength(0);
+      });
+    });
+
     // Integration test for rename: git detects renames by default when
     // similarity is high, so this exercises the real R-record code path.
     it('rename: payload.status is R and changeKind is modified', async () => {

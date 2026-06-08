@@ -408,7 +408,9 @@ export class AgentMonitorRuntime {
       emittedEventIds.push(
         ...this.ingest(monitor, observationResult.observations, now, {
           workspacePath,
-          nextSourceState: { value: observationResult.nextState },
+          ...(observationResult.nextState !== undefined
+            ? { nextSourceState: { value: observationResult.nextState } }
+            : {}),
         }),
       );
     }

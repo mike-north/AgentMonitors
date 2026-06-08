@@ -2,7 +2,7 @@
  * Incoming-changes observation source for Agent Monitors.
  *
  * Reports per-file diffs when a `git pull` / ref-advance brings in changes
- * touching configured path prefixes or globs.
+ * touching configured git pathspecs.
  *
  * **Resumption token**: the last-seen commit SHA, persisted as `nextState`
  * (`{ ref: '<sha>' }`). The runtime hands it back as `context.previousState`.
@@ -317,7 +317,8 @@ const scopeSchema: JsonSchema = {
     paths: {
       type: 'array',
       items: { type: 'string' },
-      description: 'Path prefixes or globs to filter the diff',
+      minItems: 1,
+      description: 'Git pathspecs to filter the diff',
     },
     branch: {
       type: 'string',
