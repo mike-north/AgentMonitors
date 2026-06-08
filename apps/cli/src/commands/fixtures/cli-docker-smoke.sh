@@ -24,6 +24,7 @@ pnpm --filter @mike-north/core build >/dev/null
 pnpm --filter @mike-north/source-file-fingerprint build >/dev/null
 pnpm --filter @mike-north/source-api-poll build >/dev/null
 pnpm --filter @mike-north/source-schedule build >/dev/null
+pnpm --filter @mike-north/source-incoming-changes build >/dev/null
 pnpm --filter @mike-north/cli build >/dev/null
 
 mkdir -p /tmp/workspace/.claude/monitors/watch-files
