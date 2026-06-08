@@ -396,23 +396,50 @@ export class AgentMonitorRuntime {
 
       evaluated.push(monitor.id);
 
-      const monitorState = this.store.getMonitorState(monitor.id);
-      const observationResult = await source.observe(
-        monitor.frontmatter.scope,
-        {
-          previousState: monitorState.sourceState,
-          now,
-        },
-      );
+      try {
+        const monitorState = this.store.getMonitorState(monitor.id);
+        const observationResult = await source.observe(
+          monitor.frontmatter.scope,
+          {
+            previousState: monitorState.sourceState,
+            now,
+          },
+        );
 
-      emittedEventIds.push(
-        ...this.ingest(monitor, observationResult.observations, now, {
-          workspacePath,
-          ...(observationResult.nextState !== undefined
-            ? { nextSourceState: { value: observationResult.nextState } }
-            : {}),
-        }),
-      );
+        // ingest() calls setMonitorState(), which persists the new sourceState.
+        // We only call it on success — skipping it on failure (when observe()
+        // throws, before ingest runs) is what preserves the previously-persisted
+        // sourceState so the next tick's diff spans from the last good baseline
+        // rather than an empty state. If ingest() itself throws internally after
+        // setMonitorState(), state preservation is best-effort.
+        emittedEventIds.push(
+          ...this.ingest(monitor, observationResult.observations, now, {
+            workspacePath,
+            ...(observationResult.nextState !== undefined
+              ? { nextSourceState: { value: observationResult.nextState } }
+              : {}),
+          }),
+        );
+      } catch (error) {
+        // Per-monitor isolation (issue #46): a source whose observe() throws or
+        // rejects must not abort the tick. Record the failure in the
+        // observation-history audit trail (G6) and continue to the next monitor.
+        // The audit write is best-effort — if recordObservationHistory itself
+        // throws (e.g. DB locked/full) we swallow it so one failed audit row
+        // can never re-introduce the "one failure aborts the tick" problem.
+        try {
+          this.store.recordObservationHistory({
+            monitorId: monitor.id,
+            sourceName: monitor.frontmatter.source,
+            result: 'errored',
+            observationData: {
+              error: error instanceof Error ? error.message : String(error),
+            },
+          });
+        } catch {
+          // best-effort audit — ignore write failures
+        }
+      }
     }
 
     this.refreshWorkspaceSessions(workspacePath);
@@ -611,8 +638,33 @@ export class AgentMonitorRuntime {
     try {
       for await (const observation of iterable) {
         if (signal.aborted) break;
-        this.ingest(monitor, [observation], new Date(), { workspacePath });
-        this.refreshWorkspaceSessions(workspacePath);
+        // Per-observation isolation (issue #46): an ingest() failure on one
+        // yielded observation must not kill the entire watcher. Record an
+        // 'errored' history row and continue consuming subsequent observations.
+        // The outer try/catch (below) still handles errors from the async
+        // iterator itself (the watch() generator rejecting).
+        // The audit write is best-effort — if recordObservationHistory itself
+        // throws we swallow it so a failed audit row never kills the watcher.
+        try {
+          this.ingest(monitor, [observation], new Date(), { workspacePath });
+          this.refreshWorkspaceSessions(workspacePath);
+        } catch (ingestError) {
+          try {
+            this.store.recordObservationHistory({
+              monitorId: monitor.id,
+              sourceName: monitor.frontmatter.source,
+              result: 'errored',
+              observationData: {
+                error:
+                  ingestError instanceof Error
+                    ? ingestError.message
+                    : String(ingestError),
+              },
+            });
+          } catch {
+            // best-effort audit — ignore write failures
+          }
+        }
       }
     } catch (error) {
       if (signal.aborted) return;

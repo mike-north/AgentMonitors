@@ -17,6 +17,7 @@ import type {
 } from '../observation/types.js';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import { RuntimeStore } from './store.js';
+import type { MonitorEventRecord } from './types.js';
 import { AgentMonitorRuntime, cronMatchesDate } from './service.js';
 
 function createRuntime(
@@ -980,5 +981,523 @@ Handle it.
     await new Promise((resolve) => setTimeout(resolve, 1_100));
     const afterStop = await runtime.tick(monitorsDir, rootDir);
     expect(afterStop.evaluatedMonitors).toContain('test-monitor');
+  });
+
+  // Issue #46: per-monitor observe() failure isolation in tick().
+  // https://github.com/mike-north/AgentMonitors/issues/46
+  //
+  // A single source whose observe() throws must not abort the tick — all other
+  // due monitors must still run. The failing monitor's history row must be
+  // `errored`; the succeeding monitor's history row must be `triggered`.
+
+  // Helper: write a two-source monitor directory (avoids repeating boilerplate
+  // for the throw-first and throw-last direction tests).
+  function createTwoMonitorDir(
+    rootDir: string,
+    firstMonitorName: string,
+    firstSourceName: string,
+    secondMonitorName: string,
+    secondSourceName: string,
+  ): string {
+    const monitorsDir = path.join(rootDir, '.claude', 'monitors');
+    for (const [monitorName, sourceName] of [
+      [firstMonitorName, firstSourceName],
+      [secondMonitorName, secondSourceName],
+    ] as const) {
+      const dir = path.join(monitorsDir, monitorName);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        path.join(dir, 'MONITOR.md'),
+        `---
+name: ${monitorName}
+source: ${sourceName}
+urgency: normal
+scope:
+  filePath: ${JSON.stringify(path.join(rootDir, 'watched.txt'))}
+  interval: '1s'
+---
+Handle it.
+`,
+        'utf-8',
+      );
+    }
+    return monitorsDir;
+  }
+
+  it('isolates a failing observe() so other monitors still run and records errored history (thrower sorts first)', async () => {
+    // aaa-throws (sorts first, observe throws) then zzz-works (sorts last).
+    // Proves that a failure in the FIRST monitor does not abort the tick.
+    // H2: also asserts observationData shape and covers the non-Error throw branch.
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+
+    const throwingSource: ObservationSource = {
+      name: 'throwing-source-a',
+      scopeSchema: { type: 'object' },
+      observe: (): Promise<ObservationResult> => {
+        throw new Error('simulated source failure');
+      },
+    };
+    const workingSource: ObservationSource = {
+      name: 'working-source-z',
+      scopeSchema: { type: 'object' },
+      observe: (): Promise<ObservationResult> =>
+        Promise.resolve({
+          observations: [
+            {
+              title: 'Working monitor fired',
+              summary: 'Working monitor fired',
+              objectKey: 'obj-1',
+            },
+          ],
+        }),
+    };
+
+    const monitorsDir = createTwoMonitorDir(
+      rootDir,
+      'aaa-throws',
+      'throwing-source-a',
+      'zzz-works',
+      'working-source-z',
+    );
+
+    const db = createDb(dbPath);
+    const registry = new SourceRegistry();
+    registry.register(throwingSource);
+    registry.register(workingSource);
+    const runtime = new AgentMonitorRuntime(new RuntimeStore(db), registry, [
+      claudeCodeAdapter,
+    ]);
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-session-isolation-a',
+        workspacePath: rootDir,
+      }),
+    );
+
+    // (a) tick must not reject even though aaa-throws' source throws
+    const result = await runtime.tick(monitorsDir, rootDir);
+
+    // M1: both monitors appear in evaluatedMonitors
+    expect(result.evaluatedMonitors).toContain('aaa-throws');
+    expect(result.evaluatedMonitors).toContain('zzz-works');
+
+    // (b) the working monitor emitted an event
+    expect(result.emittedEventIds.length).toBeGreaterThan(0);
+    const events = runtime.listEvents({ sessionId: session.id });
+    expect(events.some((e) => e.monitorId === 'zzz-works')).toBe(true);
+
+    // (c) the failing monitor's history row records 'errored' with the right shape
+    const throwingHistory = runtime.listObservationHistory({
+      monitorId: 'aaa-throws',
+    });
+    expect(throwingHistory).toHaveLength(1);
+    expect(throwingHistory[0]?.result).toBe('errored');
+    // H2: assert observationData shape (spec 002 §observation_history)
+    expect(throwingHistory[0]?.observationData).toEqual({
+      error: 'simulated source failure',
+    });
+
+    // (d) the working monitor's history row records 'triggered'
+    const workingHistory = runtime.listObservationHistory({
+      monitorId: 'zzz-works',
+    });
+    expect(workingHistory).toHaveLength(1);
+    expect(workingHistory[0]?.result).toBe('triggered');
+  });
+
+  // M3: also cover the reverse ordering — thrower sorts LAST — to prove a failure
+  // in a later monitor does not corrupt an earlier monitor's result.
+  // https://github.com/mike-north/AgentMonitors/issues/46
+  it('isolates a failing observe() so earlier monitors are unaffected (thrower sorts last)', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+
+    const workingSource: ObservationSource = {
+      name: 'working-source-a',
+      scopeSchema: { type: 'object' },
+      observe: (): Promise<ObservationResult> =>
+        Promise.resolve({
+          observations: [
+            {
+              title: 'Early monitor fired',
+              summary: 'Early monitor fired',
+              objectKey: 'obj-early',
+            },
+          ],
+        }),
+    };
+    const throwingSource: ObservationSource = {
+      name: 'throwing-source-z',
+      scopeSchema: { type: 'object' },
+      observe: (): Promise<ObservationResult> => {
+        throw new Error('late source failure');
+      },
+    };
+
+    const monitorsDir = createTwoMonitorDir(
+      rootDir,
+      'aaa-works',
+      'working-source-a',
+      'zzz-throws',
+      'throwing-source-z',
+    );
+
+    const db = createDb(dbPath);
+    const registry = new SourceRegistry();
+    registry.register(workingSource);
+    registry.register(throwingSource);
+    const runtime = new AgentMonitorRuntime(new RuntimeStore(db), registry, [
+      claudeCodeAdapter,
+    ]);
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-session-isolation-z',
+        workspacePath: rootDir,
+      }),
+    );
+
+    // tick must not reject even though zzz-throws' source throws
+    const result = await runtime.tick(monitorsDir, rootDir);
+
+    // M1: both monitors appear in evaluatedMonitors
+    expect(result.evaluatedMonitors).toContain('aaa-works');
+    expect(result.evaluatedMonitors).toContain('zzz-throws');
+
+    // the working monitor (which ran FIRST) still emitted its event
+    expect(result.emittedEventIds.length).toBeGreaterThan(0);
+    const events = runtime.listEvents({ sessionId: session.id });
+    expect(events.some((e) => e.monitorId === 'aaa-works')).toBe(true);
+
+    expect(
+      runtime.listObservationHistory({ monitorId: 'aaa-works' })[0]?.result,
+    ).toBe('triggered');
+    expect(
+      runtime.listObservationHistory({ monitorId: 'zzz-throws' })[0]?.result,
+    ).toBe('errored');
+  });
+
+  // H2: covers the non-Error throw branch — a source that throws a plain string
+  // rather than an Error must still produce result:'errored' with a stringified
+  // observationData.error.
+  // https://github.com/mike-north/AgentMonitors/issues/46
+  it('records errored history with String() fallback when source throws a non-Error value', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'non-error-throw-source',
+      'normal',
+      'Handle it.',
+      "  interval: '1s'\n",
+    );
+
+    const source: ObservationSource = {
+      name: 'non-error-throw-source',
+      scopeSchema: { type: 'object' },
+      observe: (): Promise<ObservationResult> => {
+        throw 'string failure value'; // intentional non-Error throw for coverage
+      },
+    };
+
+    const runtime = createRuntime(path.join(rootDir, 'agentmon.db'), source);
+    runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-non-error-throw',
+        workspacePath: rootDir,
+      }),
+    );
+
+    await runtime.tick(monitorsDir, rootDir);
+
+    const history = runtime.listObservationHistory({
+      monitorId: 'test-monitor',
+    });
+    expect(history).toHaveLength(1);
+    expect(history[0]?.result).toBe('errored');
+    // String(error) of a plain string is the string itself
+    expect(history[0]?.observationData).toEqual({
+      error: 'string failure value',
+    });
+  });
+
+  // Issue #46: when a monitor's observe() throws the tick must NOT call ingest()
+  // for that monitor. Because ingest() is what calls setMonitorState(), skipping
+  // it preserves the previously-persisted sourceState so no subsequent delta is
+  // dropped.
+  // https://github.com/mike-north/AgentMonitors/issues/46
+  it('preserves persisted sourceState when observe() throws on tick 2 (no baseline loss)', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'state-preserve-throw-source',
+      'normal',
+      'Handle it.',
+      "  interval: '1s'\n",
+    );
+
+    // Track what previousState each tick receives so we can assert tick 3 still
+    // sees the tick-1 baseline.
+    const receivedPreviousStates: unknown[] = [];
+
+    let tickCount = 0;
+    const source: ObservationSource = {
+      name: 'state-preserve-throw-source',
+      scopeSchema: { type: 'object' },
+      stateful: true,
+      observe: (_config, context): Promise<ObservationResult> => {
+        tickCount++;
+        receivedPreviousStates.push(context.previousState);
+        if (tickCount === 1) {
+          // Tick 1: emit something and establish the baseline state.
+          return Promise.resolve({
+            observations: [
+              { title: 'Initial event', summary: 'Initial event' },
+            ],
+            nextState: { baseline: 'tick-1' },
+          });
+        }
+        if (tickCount === 2) {
+          // Tick 2: throw — simulating a transient source failure.
+          throw new Error('transient failure on tick 2');
+        }
+        // Tick 3+: succeed with no new observations. The previousState we
+        // receive must still be the tick-1 baseline, not an empty object.
+        return Promise.resolve({
+          observations: [],
+          nextState: { baseline: 'tick-3' },
+        });
+      },
+    };
+
+    const runtime = createRuntime(dbPath, source);
+    runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-state-preserve-throw',
+        workspacePath: rootDir,
+      }),
+    );
+
+    // Tick 1: establishes baseline { baseline: 'tick-1' }.
+    await runtime.tick(monitorsDir, rootDir);
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+
+    // Tick 2: source throws; ingest() must be skipped (preserving tick-1 state).
+    await runtime.tick(monitorsDir, rootDir);
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+
+    // Tick 3: source recovers. Assert it received the tick-1 baseline, not {}/undefined.
+    await runtime.tick(monitorsDir, rootDir);
+
+    // previousState on tick 3 (index 2) must equal the tick-1 baseline.
+    expect(receivedPreviousStates[2]).toEqual({ baseline: 'tick-1' });
+
+    // Observation history: tick 1 = triggered, tick 2 = errored, tick 3 = no-change.
+    const history = runtime.listObservationHistory({
+      monitorId: 'test-monitor',
+    });
+    expect(history).toHaveLength(3);
+    // newest first
+    expect(history[0]?.result).toBe('no-change');
+    expect(history[1]?.result).toBe('errored');
+    expect(history[2]?.result).toBe('triggered');
+  });
+
+  // M2: Throwing-monitor + debounce-flush interaction.
+  // A tick where monitor A's observe() throws must not prevent monitor B from
+  // flushing a previously-held debounce batch in the same tick.
+  // https://github.com/mike-north/AgentMonitors/issues/46
+  it('does not prevent a debounce flush on a later monitor when an earlier monitor throws', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    const monitorsDir = path.join(rootDir, '.claude', 'monitors');
+
+    // Monitor aaa-throws: always errors
+    const throwingMonitorDir = path.join(monitorsDir, 'aaa-throws-debounce');
+    mkdirSync(throwingMonitorDir, { recursive: true });
+    writeFileSync(
+      path.join(throwingMonitorDir, 'MONITOR.md'),
+      `---
+name: Throwing monitor debounce
+source: debounce-test-throwing-source
+urgency: normal
+scope:
+  filePath: ${JSON.stringify(path.join(rootDir, 'watched.txt'))}
+  interval: '1s'
+---
+Handle it.
+`,
+      'utf-8',
+    );
+
+    // Monitor zzz-debounce: high urgency with a short 1s settle so we can
+    // observe the flush in a reasonable time window.
+    const debounceMonitorDir = path.join(monitorsDir, 'zzz-debounce-flush');
+    mkdirSync(debounceMonitorDir, { recursive: true });
+    writeFileSync(
+      path.join(debounceMonitorDir, 'MONITOR.md'),
+      `---
+name: Debounce flush monitor
+source: debounce-test-working-source
+urgency: high
+notify:
+  strategy: debounce
+  settle-for: 1s
+scope:
+  filePath: ${JSON.stringify(path.join(rootDir, 'watched.txt'))}
+  interval: '1s'
+---
+Handle it.
+`,
+      'utf-8',
+    );
+
+    let debounceEmit = true;
+    const throwingSource: ObservationSource = {
+      name: 'debounce-test-throwing-source',
+      scopeSchema: { type: 'object' },
+      observe: (): Promise<ObservationResult> => {
+        throw new Error('always fails');
+      },
+    };
+    const debounceSource: ObservationSource = {
+      name: 'debounce-test-working-source',
+      scopeSchema: { type: 'object' },
+      stateful: true,
+      observe: (): Promise<ObservationResult> =>
+        Promise.resolve({
+          observations: debounceEmit
+            ? [{ title: 'debounce event', objectKey: 'obj-debounce' }]
+            : [],
+          nextState: { sent: true },
+        }),
+    };
+
+    const db = createDb(dbPath);
+    const registry = new SourceRegistry();
+    registry.register(throwingSource);
+    registry.register(debounceSource);
+    const runtime = new AgentMonitorRuntime(new RuntimeStore(db), registry, [
+      claudeCodeAdapter,
+    ]);
+    runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-debounce-isolation',
+        workspacePath: rootDir,
+      }),
+    );
+
+    // Tick 1: thrower errors; debounce monitor holds its observation (settle pending).
+    const firstTick = await runtime.tick(monitorsDir, rootDir);
+    expect(firstTick.emittedEventIds).toHaveLength(0);
+
+    debounceEmit = false;
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+
+    // Tick 2: thrower errors again; debounce settle has elapsed so flush should fire.
+    const secondTick = await runtime.tick(monitorsDir, rootDir);
+    // The debounce flush must have emitted despite the co-running thrower.
+    expect(secondTick.emittedEventIds).toHaveLength(1);
+
+    expect(
+      runtime.listObservationHistory({ monitorId: 'aaa-throws-debounce' })[0]
+        ?.result,
+    ).toBe('errored');
+    expect(
+      runtime.listObservationHistory({ monitorId: 'zzz-debounce-flush' })[0]
+        ?.result,
+    ).toBe('triggered');
+  });
+
+  // Issue #46: watch-path per-observation isolation.
+  // A FlakyStore subclass that throws on a sentinel observation title provides
+  // a clean public seam to trigger ingest() failure without private mocking.
+  // https://github.com/mike-north/AgentMonitors/issues/46
+  it('isolates an ingest() failure in consumeWatch() so the watcher survives and subsequent observations still flow', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    // normal urgency => immediate emit (no debounce settle needed).
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'watch-ingest-source',
+      'normal',
+      'Handle it.',
+    );
+
+    // Subclass RuntimeStore to throw on the sentinel observation so ingest()
+    // fails for that specific observation without patching private methods.
+    class FlakyStore extends RuntimeStore {
+      override insertEvent(
+        input: Omit<MonitorEventRecord, 'id'>,
+      ): MonitorEventRecord {
+        if (input.title === 'boom') {
+          throw new Error('simulated insert failure');
+        }
+        return super.insertEvent(input);
+      }
+    }
+
+    const db = createDb(dbPath);
+    const registry = new SourceRegistry();
+
+    // Watch source: yields 'boom' (ingest will fail), then 'ok' (ingest succeeds),
+    // then idles until aborted.
+    registry.register({
+      name: 'watch-ingest-source',
+      scopeSchema: { type: 'object' },
+      observe: () => Promise.resolve({ observations: [] }),
+      async *watch(_config, context: ObservationContext) {
+        yield { title: 'boom', summary: 'boom', objectKey: 'obj-boom' };
+        yield { title: 'ok', summary: 'ok', objectKey: 'obj-ok' };
+        // idle until aborted
+        await new Promise<void>((resolve) => {
+          context.signal?.addEventListener('abort', () => resolve(), {
+            once: true,
+          });
+        });
+      },
+    });
+
+    const runtime = new AgentMonitorRuntime(new FlakyStore(db), registry, [
+      claudeCodeAdapter,
+    ]);
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-watch-ingest-isolation',
+        workspacePath: rootDir,
+      }),
+    );
+
+    const handle = await runtime.watchMonitors(monitorsDir, rootDir);
+    expect(handle.monitorIds).toEqual(['test-monitor']);
+
+    // give the watcher enough time to consume both observations
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    // (a) watcher survived 'boom' — handle still active and 'ok' produced an event
+    const events = runtime.listEvents({ sessionId: session.id });
+    expect(events.some((e) => e.title === 'ok')).toBe(true);
+
+    // (b) 'ok' produced a triggered history row
+    const history = runtime.listObservationHistory({
+      monitorId: 'test-monitor',
+    });
+    const triggered = history.filter((h) => h.result === 'triggered');
+    expect(triggered.length).toBeGreaterThan(0);
+
+    // (c) 'boom' produced an errored history row
+    const errored = history.filter((h) => h.result === 'errored');
+    expect(errored).toHaveLength(1);
+    expect(errored[0]?.observationData).toEqual({
+      error: 'simulated insert failure',
+    });
+
+    await handle.stop();
   });
 });

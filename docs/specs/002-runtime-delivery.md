@@ -494,18 +494,25 @@ Stores the per-monitor polling and notification state. One row per monitor ID.
 
 ### `observation_history`
 
-An audit trail of each due monitor's outcome per tick. For every evaluated monitor the runtime writes a row with `monitorId`, `sourceName`, `observationData` (a `{ observed, emitted }` summary), and `result`. The result is classified by what was **emitted** this tick, not by the new-observation count: `triggered` (≥1 event was emitted — including a tick that flushes a previously-held debounce batch even though it returned no new observations), else `suppressed` (observations were returned but none emitted this tick — throttled or held in a debounce batch), else `no-change` (the source returned nothing). Verified: `RuntimeStore.recordObservationHistory` / `listObservationHistory`, written from `service.ts` `tick()`. Read via `agentmonitors monitor history` ([005 §6](./005-cli-reference.md)).
+An audit trail of each due monitor's outcome per tick. For every evaluated monitor the runtime writes a row with `monitorId`, `sourceName`, `observationData`, and `result`. The `result` values are:
 
-| Column             | Type             | Notes                                  |
-| ------------------ | ---------------- | -------------------------------------- |
-| `id`               | TEXT PK          | ULID                                   |
-| `monitor_id`       | TEXT NOT NULL    |                                        |
-| `source_name`      | TEXT NOT NULL    |                                        |
-| `observation_data` | TEXT NOT NULL    | JSON                                   |
-| `result`           | TEXT NOT NULL    | `triggered \| suppressed \| no-change` |
-| `created_at`       | INTEGER NOT NULL |                                        |
+- `triggered` — ≥1 event was emitted (including a tick that flushes a previously-held debounce batch even when it returned no new observations). `observationData` is `{ observed, emitted }`.
+- `suppressed` — observations were returned but none emitted this tick (throttled or held in a debounce batch). `observationData` is `{ observed, emitted }`.
+- `no-change` — the source returned no observations. `observationData` is `{ observed: 0, emitted: 0 }`.
+- `errored` — the monitor's `observe()` threw or rejected. The failure is **isolated**: all other due monitors still ran this tick. `observationData` is `{ error: "<message>" }`. State-preservation guarantee: when `observe()` throws (before `ingest()` runs), the persisted `sourceState` is left exactly as it was — no delta is dropped. If a throw occurs inside `ingest()` after `setMonitorState()` already ran, state preservation is best-effort. The audit-history write on an errored observation is also best-effort: if `recordObservationHistory` itself throws (e.g. DB locked/full), that write failure is swallowed so a failing audit row can never re-introduce the tick-abort problem this isolation was designed to fix.
 
-Verified: `libs/core/src/inbox/schema.ts` lines 107–116; `libs/core/src/inbox/db.ts` lines 99–108; no insert path found in `libs/core/src/runtime/store.ts`.
+_current_. Per-monitor isolation and the `errored` outcome are guaranteed by the runtime for both the tick loop and the watch path (issue #46). Verified: `RuntimeStore.recordObservationHistory` / `listObservationHistory`, written from `service.ts` `tick()` and `consumeWatch()`. Read via `agentmonitors monitor history` ([005 §6](./005-cli-reference.md)).
+
+| Column             | Type             | Notes                                             |
+| ------------------ | ---------------- | ------------------------------------------------- |
+| `id`               | TEXT PK          | ULID                                              |
+| `monitor_id`       | TEXT NOT NULL    |                                                   |
+| `source_name`      | TEXT NOT NULL    |                                                   |
+| `observation_data` | TEXT NOT NULL    | JSON                                              |
+| `result`           | TEXT NOT NULL    | `triggered \| suppressed \| no-change \| errored` |
+| `created_at`       | INTEGER NOT NULL |                                                   |
+
+Verified: `libs/core/src/inbox/schema.ts` lines 107–116; `libs/core/src/inbox/db.ts` lines 99–108; `libs/core/src/runtime/service.ts` `tick()` catch block and `consumeWatch()` inner catch block.
 
 ### `inbox_items`
 
