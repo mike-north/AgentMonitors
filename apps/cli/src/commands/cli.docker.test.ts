@@ -5,7 +5,10 @@ import { describe, expect, it } from 'vitest';
 
 function hasDocker(): boolean {
   try {
-    execFileSync('docker', ['--version'], { stdio: 'ignore' });
+    // `docker info` reaches the daemon, unlike `docker --version` which only
+    // confirms the CLI is installed. This keeps the smoke test skipped (not
+    // failed) when the CLI exists but the daemon is stopped.
+    execFileSync('docker', ['info'], { stdio: 'ignore' });
     return true;
   } catch {
     return false;
