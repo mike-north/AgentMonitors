@@ -203,7 +203,9 @@ function tryGetDiffEntries(
       // tokens[i+1] = old path, tokens[i+2] = new path
       const newPath = tokens[i + 2] ?? '';
       if (newPath !== '') {
-        entries.push({ status: 'R', path: newPath });
+        // Preserve the real first letter ('R' or 'C') so payload.status is
+        // accurate — the old code hard-coded 'R' for both, misreporting copies.
+        entries.push({ status: token[0] ?? token, path: newPath });
       }
       i += 3;
     } else {
@@ -248,12 +250,21 @@ function getFileContent(
 // changeKind mapping
 // ---------------------------------------------------------------------------
 
-type MappedChangeKind = 'created' | 'modified' | 'deleted';
-
-function mapStatusToChangeKind(status: GitStatusLetter): MappedChangeKind {
+/**
+ * Map a git diff `--name-status` status letter to a `ChangeKind`.
+ *
+ * Exported for direct unit-testing of the C-vs-R distinction (copy detection
+ * requires specific git conditions that are hard to reproduce deterministically
+ * in a temp repo, so unit coverage of the mapper is the primary safety net).
+ */
+export function mapStatusToChangeKind(
+  status: string,
+): 'created' | 'modified' | 'deleted' {
   if (status === 'A') return 'created';
   if (status === 'D') return 'deleted';
-  // M, R, C, T (type change), X (unknown) — treat as modified
+  // C (copy) → a new path appeared; report as created.
+  if (status === 'C') return 'created';
+  // R (rename), M (modify), T (type change), X (unknown) — treat as modified.
   return 'modified';
 }
 

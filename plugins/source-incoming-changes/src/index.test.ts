@@ -18,7 +18,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import source from './index.js';
+import source, { mapStatusToChangeKind } from './index.js';
 
 // ---------------------------------------------------------------------------
 // Fixed test constants (no dynamic Date/now usage)
@@ -727,6 +727,89 @@ describe('source-incoming-changes', () => {
       expect(result.observations).toHaveLength(0);
       // nextState should be absent (can't establish a baseline without a valid repo)
       expect(result.nextState).toBeUndefined();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Fix 1 (code): copy vs rename status — mapper + integration (rename)
+  // -------------------------------------------------------------------------
+
+  describe('copy vs rename status (Fix 1 code)', () => {
+    // Unit-test the mapper directly.  Git copy detection requires the source
+    // file to also be modified in the same commit, which is hard to force
+    // deterministically in a temp repo; direct mapper coverage is the primary
+    // safety net for the 'C' → 'created' mapping.
+    describe('mapStatusToChangeKind (unit)', () => {
+      it("maps 'A' → 'created'", () => {
+        expect(mapStatusToChangeKind('A')).toBe('created');
+      });
+
+      it("maps 'M' → 'modified'", () => {
+        expect(mapStatusToChangeKind('M')).toBe('modified');
+      });
+
+      it("maps 'D' → 'deleted'", () => {
+        expect(mapStatusToChangeKind('D')).toBe('deleted');
+      });
+
+      it("maps 'R' → 'modified' (rename: new path takes the old content)", () => {
+        expect(mapStatusToChangeKind('R')).toBe('modified');
+      });
+
+      it("maps 'C' → 'created' (copy: a new path appeared — not 'modified')", () => {
+        // Before the fix, 'C' fell through to the default 'modified' branch
+        // because status was hard-coded to 'R' in the parser, masking the bug.
+        // Now the real letter is preserved and 'C' maps to 'created'.
+        expect(mapStatusToChangeKind('C')).toBe('created');
+      });
+
+      it("maps unknown letters → 'modified' (safe fallback)", () => {
+        expect(mapStatusToChangeKind('T')).toBe('modified');
+        expect(mapStatusToChangeKind('X')).toBe('modified');
+      });
+    });
+
+    // Integration test for rename: git detects renames by default when
+    // similarity is high, so this exercises the real R-record code path.
+    it('rename: payload.status is R and changeKind is modified', async () => {
+      const dir = makeTempRepo();
+      // Use enough content that git detects the rename (similarity threshold)
+      const content = Array.from({ length: 10 }, (_, i) => `line${i}`).join(
+        '\n',
+      );
+      writeAndCommit(dir, { 'original.txt': content }, 'init');
+
+      const baseline = await source.observe(
+        { paths: ['.'], cwd: dir },
+        { now: NOW },
+      );
+
+      // git mv is detected as a rename by git diff
+      git(dir, ['mv', 'original.txt', 'renamed.txt']);
+      git(dir, [
+        '-c',
+        'user.name=Test',
+        '-c',
+        'user.email=test@example.com',
+        'commit',
+        '--message',
+        'rename original.txt → renamed.txt',
+      ]);
+
+      const result = await source.observe(
+        { paths: ['.'], cwd: dir },
+        { previousState: baseline.nextState, now: NOW },
+      );
+
+      // git diff emits one R-record; the new path is the objectKey
+      expect(result.observations).toHaveLength(1);
+      const obs = result.observations[0];
+      expect(obs?.objectKey).toBe('renamed.txt');
+      expect(obs?.changeKind).toBe('modified');
+      const payload = obs?.payload as { status: string; path: string };
+      // Before the fix this would have been 'R' even for copies (hard-coded).
+      // For a genuine rename it must still be 'R'.
+      expect(payload.status).toBe('R');
     });
   });
 });
