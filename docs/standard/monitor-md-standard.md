@@ -35,6 +35,13 @@ directory name** — a stable machine identifier, not a frontmatter field.
 > Frontmatter is the event you would subscribe to. The body is the per-reader meaning that
 > no central event bus can know on your behalf.
 
+This split is also a boundary: **frontmatter states facts, the body states judgments.** A
+conformant runtime reasons about neither — it observes the mechanical change the frontmatter
+declares and delivers it with the body verbatim; all semantic judgment is the agent's, run
+from the body. The format makes this structural: the runtime **interprets** only the
+frontmatter (config) — it carries the body through to the agent verbatim, never acting on it
+itself — so reasoning has nowhere to leak into the runtime.
+
 ```yaml
 ---
 name: Watch auth-module commits # optional; identity comes from the parent directory
