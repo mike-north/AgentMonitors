@@ -1,0 +1,39 @@
+{
+  "name": "@mike-north/source-incoming-changes",
+  "description": "Git incoming-changes detection for Agent Monitors",
+  "version": "0.1.0",
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "types": "./dist/public.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/public.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "agentmonitor:observation-source"
+  ],
+  "scripts": {
+    "build": "tsup && tsc -p tsconfig.build.json && api-extractor run --local --verbose",
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "clean": "rm -rf dist",
+    "check:api-report": "api-extractor run --local --verbose",
+    "ci:api-report": "api-extractor run --verbose"
+  },
+  "dependencies": {
+    "@mike-north/core": "workspace:*"
+  },
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "@types/node": "^22.15.0"
+  }
+}

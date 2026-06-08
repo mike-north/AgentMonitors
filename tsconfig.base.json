@@ -20,6 +20,9 @@
       ],
       "@mike-north/source-schedule": [
         "plugins/source-schedule/dist/rollup.d.ts"
+      ],
+      "@mike-north/source-incoming-changes": [
+        "plugins/source-incoming-changes/dist/rollup.d.ts"
       ]
     },
     "target": "ES2022",
