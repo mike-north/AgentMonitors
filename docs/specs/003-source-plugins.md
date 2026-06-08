@@ -244,7 +244,7 @@ The source does not decide when it is due — that is the runtime's responsibili
 
 Source name: `"incoming-changes"` (verified: `plugins/source-incoming-changes/src/index.ts`).
 
-Package: `@mike-north/source-incoming-changes`. CLI registration and `init` scaffolding land with issue #39.
+Package: `@mike-north/source-incoming-changes`. Registered via `registerCoreSources` and available as an `agentmonitors init --source incoming-changes` template (issue #39).
 
 ### 6.1 Scope
 

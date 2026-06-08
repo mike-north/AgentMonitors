@@ -10,7 +10,7 @@
 
 The binary is named **`agentmonitors`** and is described as _"Durable observation and inbox delivery for AI agents"_ (version `0.0.0` in the current codebase).
 
-Per AP6, all public CLI behaviour must be derivable from core contracts. The CLI wraps `@mike-north/core` and three bundled source packages (`@mike-north/source-file-fingerprint`, `@mike-north/source-api-poll`, `@mike-north/source-schedule`).
+Per AP6, all public CLI behaviour must be derivable from core contracts. The CLI wraps `@mike-north/core` and four bundled source packages (`@mike-north/source-file-fingerprint`, `@mike-north/source-api-poll`, `@mike-north/source-schedule`, `@mike-north/source-incoming-changes`).
 
 ### In-process vs. socket commands
 
@@ -59,11 +59,11 @@ Creates a new monitor directory under a base directory and writes a template `MO
 agentmonitors init <name> [options]
 ```
 
-| Argument / Flag     | Type                  | Default            | Description                                                    |
-| ------------------- | --------------------- | ------------------ | -------------------------------------------------------------- |
-| `<name>`            | positional (required) | —                  | Monitor name, becomes the subdirectory name                    |
-| `--dir <dir>`       | option                | `.claude/monitors` | Base directory for monitors                                    |
-| `--source <source>` | option (choices)      | `file-fingerprint` | Observation source: `file-fingerprint`, `api-poll`, `schedule` |
+| Argument / Flag     | Type                  | Default            | Description                                                                        |
+| ------------------- | --------------------- | ------------------ | ---------------------------------------------------------------------------------- |
+| `<name>`            | positional (required) | —                  | Monitor name, becomes the subdirectory name                                        |
+| `--dir <dir>`       | option                | `.claude/monitors` | Base directory for monitors                                                        |
+| `--source <source>` | option (choices)      | `file-fingerprint` | Observation source: `file-fingerprint`, `api-poll`, `schedule`, `incoming-changes` |
 
 ### Output
 
@@ -81,6 +81,7 @@ Each source produces a distinct starter frontmatter block:
 | `file-fingerprint` | `globs: ['**/*.ts']`                                                         |
 | `api-poll`         | `url`, `method: GET`, `interval: 5m`, `change-detection.strategy: json-diff` |
 | `schedule`         | `cron: '0 9 * * 1-5'`, `timezone: UTC`                                       |
+| `incoming-changes` | `paths: ['docs/specs/**']`, `branch: main`                                   |
 
 ---
 
@@ -369,7 +370,7 @@ agentmonitors source list [--format <format>]
 | ------------------- | ------- | ------- | -------------- |
 | `--format <format>` | choices | `text`  | `text`, `json` |
 
-Lists all sources registered via `registerCoreSources()` (currently: `file-fingerprint`, `api-poll`, `schedule`).
+Lists all sources registered via `registerCoreSources()` (currently: `file-fingerprint`, `api-poll`, `schedule`, `incoming-changes`).
 
 **Text output:**
 

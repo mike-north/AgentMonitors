@@ -46,6 +46,21 @@ scope:
 
 This monitor fires on a schedule. Review and take appropriate action.
 `.trimStart(),
+
+  'incoming-changes': yaml`
+---
+name: Spec changes from upstream
+source: incoming-changes
+urgency: normal
+scope:
+  paths:
+    - 'docs/specs/**'
+  branch: main
+---
+
+The spec documents changed in the latest pull. Summarize what changed and
+whether it affects what I'm currently working on.
+`.trimStart(),
 };
 
 const VALID_SOURCES = Object.keys(TEMPLATES);
