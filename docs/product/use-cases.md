@@ -128,6 +128,7 @@ the file's shape, not by discipline:
 > _mechanical_ facts (declared in frontmatter); all _semantic_ judgment is authored in the
 > body and executed by the agent.
 
-You cannot accidentally put reasoning into the monitor, because the monitor only reads
-frontmatter, and frontmatter is config — it cannot carry a judgment. See the matching
-non-goal in [vision & positioning](./vision-and-positioning.md).
+You cannot accidentally put reasoning into the monitor, because the runtime only
+_interprets_ the frontmatter — the body is carried through to the agent verbatim, never
+acted on by the runtime itself. See the matching non-goal in
+[vision & positioning](./vision-and-positioning.md).
