@@ -71,6 +71,12 @@ So our positioning is deliberate:
   problems and keep signals self-contained.
 - **Not a replacement for host-native scheduling or push.** We complement them: they are
   the clock and the conduit; we are what decides _what is worth surfacing, and when_.
+- **Not a reasoner.** Monitors observe and deliver _facts_; they do not interpret meaning.
+  All semantic judgment — is this relevant, are these edits in tension, what should be done —
+  is authored in the monitor body and executed by the agent. The monitor is the sensory
+  organ, not the cognition. Keeping reasoning out of the core is what makes it deterministic,
+  testable, portable, and trustworthy as a reliability layer; any agent-powered enrichment
+  is an explicitly separate, opt-in tier that sits _adjacent to_ the monitor, never inside it.
 
 ## Who we build for first
 
