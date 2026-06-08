@@ -88,6 +88,30 @@ function writeAndCommit(
   return git(dir, ['rev-parse', 'HEAD']).trim();
 }
 
+/** Write binary content into a file and commit it, returning the new SHA. */
+function writeBinaryAndCommit(
+  dir: string,
+  relPath: string,
+  message: string,
+): string {
+  const abs = path.join(dir, relPath);
+  mkdirSync(path.dirname(abs), { recursive: true });
+  // Write a buffer with embedded NUL bytes — git treats this as binary
+  const buf = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x0d, 0x0a, 0x1a]);
+  writeFileSync(abs, buf);
+  git(dir, ['add', '.']);
+  git(dir, [
+    '-c',
+    'user.name=Test',
+    '-c',
+    'user.email=test@example.com',
+    'commit',
+    '--message',
+    message,
+  ]);
+  return git(dir, ['rev-parse', 'HEAD']).trim();
+}
+
 /** Delete a file in `dir` and commit the deletion, returning the new SHA. */
 function deleteAndCommit(
   dir: string,
@@ -521,6 +545,188 @@ describe('source-incoming-changes', () => {
       expect(typeof (result.nextState as { ref: string }).ref).toBe('string');
       // nextState should record the orphan SHA (current HEAD on orphan branch)
       expect((result.nextState as { ref: string }).ref).toBe(orphanSha);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Fix 3: Unicode paths and paths with spaces
+  // -------------------------------------------------------------------------
+
+  describe('non-ASCII and special-character paths (Fix 3)', () => {
+    it('handles a unicode filename correctly: objectKey is the real path, snapshotText is present', async () => {
+      const dir = makeTempRepo();
+      // 'café.txt' contains a non-ASCII byte (é = U+00E9).
+      // Without -z + core.quotePath=false the git output would be C-quoted:
+      // "caf\303\251.txt" — the old parser would use that literal string as
+      // the objectKey and the subsequent git-show would fail.
+      writeAndCommit(dir, { 'a.txt': 'seed' }, 'init');
+
+      const baseline = await source.observe(
+        { paths: ['.'], cwd: dir },
+        { now: NOW },
+      );
+
+      writeAndCommit(dir, { 'café.txt': 'coffee' }, 'add café.txt');
+
+      const result = await source.observe(
+        { paths: ['.'], cwd: dir },
+        { previousState: baseline.nextState, now: NOW },
+      );
+
+      expect(result.observations).toHaveLength(1);
+      const obs = result.observations[0];
+      // objectKey must be the real UTF-8 path, not a C-quoted escape sequence
+      expect(obs?.objectKey).toBe('café.txt');
+      expect(obs?.changeKind).toBe('created');
+      // snapshotText must be present (file is text, not binary)
+      expect(obs?.snapshotText).toBe('coffee');
+      // queryScope must also use the real path
+      expect(obs?.queryScope).toEqual({ path: 'café.txt' });
+    });
+
+    it('handles a filename with spaces correctly', async () => {
+      const dir = makeTempRepo();
+      writeAndCommit(dir, { 'seed.txt': 'seed' }, 'init');
+
+      const baseline = await source.observe(
+        { paths: ['.'], cwd: dir },
+        { now: NOW },
+      );
+
+      // A space in the filename trips up naive tab/newline parsing
+      writeAndCommit(dir, { 'my file.txt': 'content' }, 'add spaced filename');
+
+      const result = await source.observe(
+        { paths: ['.'], cwd: dir },
+        { previousState: baseline.nextState, now: NOW },
+      );
+
+      expect(result.observations).toHaveLength(1);
+      const obs = result.observations[0];
+      expect(obs?.objectKey).toBe('my file.txt');
+      expect(obs?.changeKind).toBe('created');
+      expect(obs?.snapshotText).toBe('content');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Fix 2 + binary: binary files — snapshot omitted, no throw
+  // -------------------------------------------------------------------------
+
+  describe('binary file handling', () => {
+    it('emits a created observation for a binary file but omits snapshotText', async () => {
+      const dir = makeTempRepo();
+      writeAndCommit(dir, { 'seed.txt': 'seed' }, 'init');
+
+      const baseline = await source.observe(
+        { paths: ['.'], cwd: dir },
+        { now: NOW },
+      );
+
+      writeBinaryAndCommit(dir, 'image.png', 'add binary image');
+
+      const result = await source.observe(
+        { paths: ['.'], cwd: dir },
+        { previousState: baseline.nextState, now: NOW },
+      );
+
+      expect(result.observations).toHaveLength(1);
+      const obs = result.observations[0];
+      expect(obs?.objectKey).toBe('image.png');
+      expect(obs?.changeKind).toBe('created');
+      // Binary content must NOT produce a snapshotText
+      expect(obs?.snapshotText).toBeUndefined();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Fix 1: option-injection guard — branch values starting with '--'
+  // -------------------------------------------------------------------------
+
+  describe('option-injection guard (Fix 1)', () => {
+    it('returns a safe result (re-baseline or empty) when branch looks like a git flag', async () => {
+      // A branch value of '--help' would cause `git rev-parse --help` to exit
+      // immediately (or hang/print usage) without --end-of-options.
+      // With --end-of-options it becomes a ref lookup which fails → resilience
+      // path returns { observations: [], nextState: undefined }.
+      const dir = makeTempRepo();
+      writeAndCommit(dir, { 'a.txt': 'seed' }, 'init');
+
+      // Must not throw, must not hang
+      const result = await source.observe(
+        { paths: ['.'], cwd: dir, branch: '--help' },
+        { now: NOW },
+      );
+
+      // Whether it re-baselines or returns empty doesn't matter — it must not crash
+      expect(Array.isArray(result.observations)).toBe(true);
+      expect(result.observations).toHaveLength(0);
+    });
+
+    it('returns a safe result when branch is a double-dash flag with an argument', async () => {
+      const dir = makeTempRepo();
+      writeAndCommit(dir, { 'a.txt': 'seed' }, 'init');
+
+      const result = await source.observe(
+        { paths: ['.'], cwd: dir, branch: '--git-dir=/etc/passwd' },
+        { now: NOW },
+      );
+
+      expect(Array.isArray(result.observations)).toBe(true);
+      expect(result.observations).toHaveLength(0);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Fix 4: resilience — gc'd/invalid prev SHA → graceful re-baseline
+  // -------------------------------------------------------------------------
+
+  describe('resilience: invalid previousState SHA (Fix 4)', () => {
+    it('re-baselines gracefully when previousState.ref is a non-existent SHA', async () => {
+      // Simulates a gc'd commit or history-rewritten force-push where the
+      // previously stored SHA no longer exists in the repo. The diff command
+      // will fail with "fatal: Invalid revision range" — we must not throw.
+      const dir = makeTempRepo();
+      writeAndCommit(dir, { 'a.txt': 'v0' }, 'init');
+
+      const gcedSha = 'deadbeef'.repeat(5); // 40-char plausible SHA that doesn't exist
+
+      const result = await source.observe(
+        { paths: ['.'], cwd: dir },
+        { previousState: { ref: gcedSha }, now: NOW },
+      );
+
+      // Must not throw; must re-baseline (record current ref, emit nothing)
+      expect(Array.isArray(result.observations)).toBe(true);
+      expect(result.observations).toHaveLength(0);
+      // nextState must be set to the current HEAD ref (not the bogus SHA)
+      const state = result.nextState as { ref: string };
+      expect(typeof state.ref).toBe('string');
+      expect(state.ref).toHaveLength(40);
+      expect(state.ref).not.toBe(gcedSha);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Fix 4: resilience — non-git cwd → graceful empty result
+  // -------------------------------------------------------------------------
+
+  describe('resilience: non-git cwd (Fix 4)', () => {
+    it('returns empty observations without throwing when cwd is not a git repo', async () => {
+      // A directory that is not a git repo will cause git rev-parse to fail.
+      // The source should catch this and return an empty result with no nextState.
+      const nonGitDir = mkdtempSync(path.join(tmpdir(), 'ic-nongit-'));
+      dirs.push(nonGitDir);
+
+      const result = await source.observe(
+        { paths: ['.'], cwd: nonGitDir },
+        { now: NOW },
+      );
+
+      expect(Array.isArray(result.observations)).toBe(true);
+      expect(result.observations).toHaveLength(0);
+      // nextState should be absent (can't establish a baseline without a valid repo)
+      expect(result.nextState).toBeUndefined();
     });
   });
 });

@@ -71,17 +71,49 @@ function isIncomingChangesState(value: unknown): value is IncomingChangesState {
 // Git helpers — all use execFileSync with an args array (no shell injection)
 // ---------------------------------------------------------------------------
 
+/** 64 MiB — large enough for monorepo diffs and large text files. */
+const MAX_BUFFER = 64 * 1024 * 1024;
+
 /**
  * Resolve the current commit SHA for the given branch (or HEAD).
- * Scopes every git call to `cwd`.
+ *
+ * Fix 1 (option injection): `--end-of-options` terminates git option parsing
+ * before the user-supplied `branch` value so a value like `--help` or
+ * `--git-dir=...` is treated as a ref name rather than a flag.
+ *
+ * Note on output format: `git rev-parse --end-of-options <ref>` echoes the
+ * literal string `--end-of-options` as its first output line, followed by the
+ * resolved SHA.  We therefore take the LAST non-empty line of stdout.
+ *
+ * Returns `undefined` if the resolution fails (not a git repo, unknown ref).
+ * The caller is responsible for deciding how to handle the absence.
  */
-function resolveCurrentRef(cwd: string, branch: string | undefined): string {
+function tryResolveCurrentRef(
+  cwd: string,
+  branch: string | undefined,
+): string | undefined {
   const ref = branch ?? 'HEAD';
-  const sha = execFileSync('git', ['rev-parse', ref], {
-    cwd,
-    encoding: 'utf-8',
-  }).trim();
-  return sha;
+  try {
+    // Fix 1: --end-of-options prevents a branch value like "--help" from being
+    //        interpreted as a git flag.
+    // Fix 2: maxBuffer prevents ENOBUFS on pathologically large output.
+    const raw = execFileSync('git', ['rev-parse', '--end-of-options', ref], {
+      cwd,
+      encoding: 'utf-8',
+      maxBuffer: MAX_BUFFER,
+    });
+    // Take only the last non-empty line — the echoed --end-of-options token
+    // appears as an earlier line in some git versions.
+    const sha = raw
+      .trim()
+      .split('\n')
+      .filter((l) => l !== '--end-of-options')
+      .at(-1)
+      ?.trim();
+    return sha !== undefined && sha.length > 0 ? sha : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 // git diff --name-status status codes: A=added, M=modified, D=deleted,
@@ -95,48 +127,103 @@ interface DiffEntry {
 
 /**
  * Return the list of changed files between two refs, filtered to `paths`.
- * Uses `--name-status` so we get the change type alongside each path.
+ *
+ * Fix 2 (maxBuffer): explicit 64 MiB limit on all execFileSync calls.
+ * Fix 3 (non-ASCII paths / spaces): use `-z` (NUL-delimited output) and
+ *   `-c core.quotePath=false` so paths with non-ASCII characters, spaces, or
+ *   tabs are transmitted literally rather than C-quoted. With `-z`:
+ *   - Fields within a record are NUL-separated.
+ *   - Records are NUL-terminated.
+ *   - A rename record is:  `R<score>\0<old-path>\0<new-path>\0`
+ *   - A regular record is: `<status>\0<path>\0`
+ *
+ * Fix 1 (option injection): `--end-of-options` before the range prevents a
+ *   pathological `fromRef`/`toRef` value from acting as a git flag (in
+ *   practice these are SHA values from `rev-parse`, but belt-and-suspenders).
+ *
+ * Returns `undefined` if the diff command fails (e.g. a gc'd prev SHA).
  */
-function getDiffEntries(
+function tryGetDiffEntries(
   cwd: string,
   fromRef: string,
   toRef: string,
   paths: string[],
-): DiffEntry[] {
-  // git diff --name-status <from>..<to> -- <path1> <path2> ...
+): DiffEntry[] | undefined {
+  // Fix 3: `-c core.quotePath=false` is a top-level git option and must come
+  //   BEFORE the subcommand (`diff`).  Passing it after `diff` would make git
+  //   try to parse it as a revision range and fail with "bad revision".
+  // Fix 3: `-z` makes output NUL-delimited so paths with spaces, tabs, or
+  //   non-ASCII characters are transmitted literally (no C-quoting).
+  // Fix 1: `--end-of-options` before the range prevents a pathological SHA
+  //   value from being treated as a flag (belt-and-suspenders; SHAs come from
+  //   rev-parse so are safe, but defence-in-depth is cheap here).
   const args = [
+    '-c',
+    'core.quotePath=false',
     'diff',
+    '-z',
     '--name-status',
+    '--end-of-options',
     `${fromRef}..${toRef}`,
     '--',
     ...paths,
   ];
-  const output = execFileSync('git', args, {
-    cwd,
-    encoding: 'utf-8',
-  });
+  let output: Buffer;
+  try {
+    // Fix 2: maxBuffer; encoding: 'buffer' so NUL bytes are preserved for
+    //   the NUL-delimited parser below.
+    output = execFileSync('git', args, {
+      cwd,
+      encoding: 'buffer',
+      maxBuffer: MAX_BUFFER,
+    });
+  } catch {
+    // Fix 4: a gc'd prev SHA, a history-rewritten range, or any other git
+    //   error causes a graceful re-baseline rather than a throw that would
+    //   propagate up and halt the runtime tick loop.
+    return undefined;
+  }
+
+  // Parse NUL-delimited output.  Each record ends with a NUL; within a
+  // rename/copy record the old path and new path are also NUL-separated.
+  const text = output.toString('utf-8');
   const entries: DiffEntry[] = [];
-  for (const line of output.split('\n')) {
-    const trimmed = line.trim();
-    if (trimmed === '') continue;
-    // Lines are tab-separated: "<status>\t<path>" or "<R100>\t<old>\t<new>"
-    const parts = trimmed.split('\t');
-    const rawStatus = parts[0] ?? '';
-    // Rename/copy: status is like "R100" or "C95"; the new path is in column 2
-    if (rawStatus.startsWith('R') || rawStatus.startsWith('C')) {
-      const newPath = parts[2] ?? parts[1] ?? '';
-      if (newPath) entries.push({ status: 'R', path: newPath });
+
+  // Split on NUL and walk the token stream.
+  const tokens = text.split('\0');
+  let i = 0;
+  while (i < tokens.length) {
+    const token = tokens[i] ?? '';
+    if (token === '') {
+      i++;
+      continue;
+    }
+    // Rename / copy: status starts with R or C and is followed by two paths
+    if (token.startsWith('R') || token.startsWith('C')) {
+      // tokens[i+1] = old path, tokens[i+2] = new path
+      const newPath = tokens[i + 2] ?? '';
+      if (newPath !== '') {
+        entries.push({ status: 'R', path: newPath });
+      }
+      i += 3;
     } else {
-      const filePath = parts[1] ?? '';
-      if (filePath) entries.push({ status: rawStatus, path: filePath });
+      // Regular entry: status token, then path token
+      const filePath = tokens[i + 1] ?? '';
+      if (filePath !== '') {
+        entries.push({ status: token, path: filePath });
+      }
+      i += 2;
     }
   }
+
   return entries;
 }
 
 /**
  * Fetch the current file content at the given ref via `git show`.
  * Returns `undefined` for binary files (contains a NUL byte) or on error.
+ *
+ * Fix 2 (maxBuffer): explicit 64 MiB limit prevents ENOBUFS on large files.
  */
 function getFileContent(
   cwd: string,
@@ -147,6 +234,7 @@ function getFileContent(
     const content = execFileSync('git', ['show', `${ref}:${filePath}`], {
       cwd,
       encoding: 'buffer',
+      maxBuffer: MAX_BUFFER,
     });
     // Omit snapshot text for binary files
     if (content.includes(0)) return undefined;
@@ -250,7 +338,12 @@ const source: ObservationSource = {
     try {
       const { paths, branch, cwd } = parseScopeConfig(config);
 
-      const currentRef = resolveCurrentRef(cwd, branch);
+      // Fix 4: if current-ref resolution fails (not a repo, unknown branch),
+      // return an empty result without nextState rather than throwing.
+      const currentRef = tryResolveCurrentRef(cwd, branch);
+      if (currentRef === undefined) {
+        return Promise.resolve({ observations: [] });
+      }
 
       // Baseline run: no valid prior state — record the current SHA and return
       // no observations. We do NOT report the whole tree as changed.
@@ -271,7 +364,16 @@ const source: ObservationSource = {
         });
       }
 
-      const entries = getDiffEntries(cwd, previousRef, currentRef, paths);
+      // Fix 4: if the diff fails (gc'd prev SHA, force-pushed history),
+      // re-baseline: record the current ref and emit nothing.
+      const entries = tryGetDiffEntries(cwd, previousRef, currentRef, paths);
+      if (entries === undefined) {
+        return Promise.resolve({
+          observations: [],
+          nextState: { ref: currentRef },
+        });
+      }
+
       const observations: Observation[] = entries.map((entry) =>
         buildObservation(entry, previousRef, currentRef, cwd),
       );
