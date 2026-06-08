@@ -167,6 +167,16 @@ importers:
         specifier: ^22.15.0
         version: 22.19.15
 
+  plugins/source-incoming-changes:
+    dependencies:
+      '@mike-north/core':
+        specifier: workspace:*
+        version: link:../../libs/core
+    devDependencies:
+      '@types/node':
+        specifier: ^22.15.0
+        version: 22.19.15
+
   plugins/source-schedule:
     dependencies:
       '@mike-north/core':

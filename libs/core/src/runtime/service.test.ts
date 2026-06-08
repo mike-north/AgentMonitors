@@ -884,6 +884,62 @@ Handle it.
     expect(watchAborted).toBe(true);
   });
 
+  // Regression: when a source returns no nextState (e.g. transient rev-parse
+  // failure), the previously-persisted sourceState must be left intact rather
+  // than overwritten with an empty/undefined value. The pre-fix code always
+  // passed nextSourceState: { value: undefined }, which caused ingest() to write
+  // undefined, zeroing the stored SHA and causing event loss on the next tick.
+  it('preserves persisted sourceState when a tick returns no nextState', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'preserve-state-source',
+      'normal',
+      'Handle it.',
+      "  interval: '1s'\n",
+    );
+
+    let tick = 0;
+    const source: ObservationSource = {
+      name: 'preserve-state-source',
+      scopeSchema: { type: 'object' },
+      stateful: true,
+      observe: (): Promise<ObservationResult> => {
+        tick++;
+        if (tick === 1) {
+          // First tick: establish baseline, record the initial state token.
+          return Promise.resolve({ observations: [], nextState: { v: 1 } });
+        }
+        // Second tick: source had a transient failure — returns observations
+        // but deliberately omits nextState.
+        return Promise.resolve({ observations: [] });
+      },
+    };
+
+    const runtime = createRuntime(dbPath, source);
+    runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-preserve-state',
+        workspacePath: rootDir,
+      }),
+    );
+
+    // First tick establishes the state token { v: 1 }.
+    await runtime.tick(monitorsDir, rootDir);
+
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+
+    // Second tick: source returns no nextState (transient failure path).
+    await runtime.tick(monitorsDir, rootDir);
+
+    // The persisted sourceState must still be { v: 1 } — not wiped to {}.
+    const store = new RuntimeStore(createDb(dbPath));
+    const state = store.getMonitorState('test-monitor');
+    expect(state.sourceState).toEqual({ v: 1 });
+  });
+
   // G5: while a monitor is watched, the tick loop must not also observe() it
   // (no double-processing); once the watcher stops, the tick loop resumes it.
   it('skips a watched monitor in the tick loop and resumes it after stop', async () => {

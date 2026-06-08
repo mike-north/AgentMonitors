@@ -6,7 +6,7 @@
 
 ## 1. Overview
 
-This document specifies the contract implemented by observation source plugins and the current behavior of the bundled sources: `file-fingerprint`, `api-poll`, `schedule`. The runtime depends on sources to detect change, but the runtime owns scheduling, notify dispatch, and delivery timing (PP3).
+This document specifies the contract implemented by observation source plugins and the current behavior of the bundled sources: `file-fingerprint`, `api-poll`, `schedule`, `incoming-changes`. The runtime depends on sources to detect change, but the runtime owns scheduling, notify dispatch, and delivery timing (PP3).
 
 ### Principles Satisfied
 
@@ -88,7 +88,7 @@ source populating `queryScope` itself (see [002 §5.1](./002-runtime-delivery.md
 
 If `stateful` is `true`, the first successful `observe()` call **MAY** return an empty `observations` array while storing an initial baseline in `nextState`. That is not an error case — it is how baseline-then-detect sources work (PP6). On subsequent calls, the stored state is available via `context.previousState`.
 
-`file-fingerprint` and `api-poll` both declare `stateful: true`. `schedule` does not declare `stateful` (defaults to `false`).
+`file-fingerprint`, `api-poll`, and `incoming-changes` all declare `stateful: true`. `schedule` does not declare `stateful` (defaults to `false`).
 
 ## 3. Bundled Source: `file-fingerprint`
 
@@ -240,9 +240,61 @@ The source does not decide when it is due — that is the runtime's responsibili
 
 `timezone` resolves to `'UTC'` when not provided in config. There is no IANA timezone validation in the plugin itself — the scheduling engine owns timezone interpretation.
 
-## 6. Source Registry, Validation, and Schema Generation
+## 6. Bundled Source: `incoming-changes`
 
-### 6.1 SourceRegistry
+Source name: `"incoming-changes"` (verified: `plugins/source-incoming-changes/src/index.ts`).
+
+Package: `@mike-north/source-incoming-changes`. CLI registration and `init` scaffolding land with issue #39.
+
+### 6.1 Scope
+
+```yaml
+scope:
+  paths:
+    - 'src/'
+    - 'lib/'
+  branch: main # optional — defaults to HEAD
+  cwd: /repo/root # optional — defaults to process.cwd()
+```
+
+Required field: `paths` (array of strings — path prefixes or globs passed to `git diff -- <paths>`). Optional fields: `branch` (string, git ref to resolve; defaults to `HEAD`), `cwd` (string, repository working directory for all git calls).
+
+### 6.2 Behavior
+
+`incoming-changes` is `stateful: true`. The first call resolves the current commit SHA via `git rev-parse`, stores it as `nextState: { ref: '<sha>' }`, and returns an empty `observations` array — this is the baseline run; it does **not** report the existing tree as changed.
+
+On subsequent calls, the source:
+
+1. Resolves the current commit SHA.
+2. Diffs `<previousRef>..<currentRef>` with `git diff -z --name-status -c core.quotePath=false -- <paths>` (NUL-delimited, no C-quoting of non-ASCII paths).
+3. Emits one `Observation` per changed file:
+   - `objectKey`: the file path (relative, as reported by git)
+   - `changeKind`: `created` (status `A` or `C`), `modified` (status `M`, `R`, `T`), or `deleted` (status `D`)
+   - `title`/`summary`: `"Incoming change: <path> (<changeKind>)"`
+   - `payload`: `{ path, status, fromRef, toRef }`
+   - `queryScope`: `{ path: <file-path> }`
+   - `snapshotText`: new file content (via `git show <toRef>:<path>`) for `created`/`modified` when the file is text (not binary); absent for `deleted` and binary files
+4. Returns `nextState: { ref: currentRef }`.
+
+### 6.3 Resumption token and restart-safety
+
+The resumption token is the last-seen commit SHA. If the daemon is offline across multiple commits, the next `observe()` call diffs from the stored SHA to the current HEAD — the net diff across all missed commits is reported in a single batch. This is deliberate (PP6).
+
+### 6.4 v1 scope boundary
+
+`incoming-changes` v1 fires on **any** ref advance touching `paths` — a pull, merge, fast-forward, or a local commit. Filtering to "only others' changes / only on fetch-merge" is a planned later refinement, not v1. A non-fast-forward advance (rebase, force-push) yields a meaningful net `git diff <prev>..<current>` and will not crash.
+
+### 6.5 Error resilience
+
+- If `git rev-parse` fails (not a git repo, unknown branch, option-injection guard triggered), `observe()` returns `{ observations: [] }` with no `nextState` — it silently waits for the repo/branch to become valid.
+- If `git diff` fails (e.g., the stored SHA was gc'd or history-rewritten), `observe()` re-baselines: it returns `{ observations: [], nextState: { ref: currentRef } }` and starts fresh from the current ref.
+- `git show` failures (per-file snapshot fetch) are silenced and result in `snapshotText` being absent; the observation is still emitted.
+
+These guards ensure a source error does not propagate to the runtime tick loop.
+
+## 7. Source Registry, Validation, and Schema Generation
+
+### 7.1 SourceRegistry
 
 `SourceRegistry` (exported from `@mike-north/core`, verified: `libs/core/src/observation/registry.ts`) is an in-memory registry of source plugins. It exposes:
 
@@ -257,9 +309,9 @@ The source does not decide when it is due — that is the runtime's responsibili
 At startup the CLI registers only the bundled sources (via `registerCoreSources`,
 `apps/cli/src/sources.ts`); the registry then holds those resolved plugins. Third-party plugin
 **discovery and installation are not implemented** — the `source install`/`update`/`remove`/`search`
-commands are placeholders that print a manual-install hint (NP3). See §7.
+commands are placeholders that print a manual-install hint (NP3). See §8.
 
-### 6.2 Schema generation
+### 7.2 Schema generation
 
 `generateMonitorSchema(sources: ObservationSource[]): JsonSchema` (exported from `@mike-north/core`, verified: `libs/core/src/observation/schema-generator.ts`) composes a full JSON Schema from all registered sources' `scopeSchema` fragments.
 
@@ -272,11 +324,11 @@ The generated schema:
 - Validates the `notify` field with a `oneOf` covering `debounce` (requires `settle-for`) and `throttle` (requires `suppress-for`)
 - Accepts an optional `tags` array of strings
 
-### 6.3 Validation gap (current vs. target)
+### 7.3 Validation gap (current vs. target)
 
 The current CLI validation command checks required source scope fields but does not yet enforce full per-source JSON Schema validation against the generated schema. This gap is documented in [004-validation-testing.md](./004-validation-testing.md).
 
-## 7. Plugin Discovery and Installation Notes
+## 8. Plugin Discovery and Installation Notes
 
 The CLI exposes `source search`, `source install`, `source update`, and `source remove`, but those commands are currently placeholders. Therefore:
 
@@ -285,9 +337,9 @@ The CLI exposes `source search`, `source install`, `source update`, and `source 
 
 This is an explicit non-property of the current product (NP3).
 
-## 8. Examples
+## 9. Examples
 
-### 8.1 File watcher example
+### 9.1 File watcher example
 
 ```yaml
 scope:
@@ -298,7 +350,7 @@ scope:
 
 **What this example proves:** `file-fingerprint` scope is file-system oriented; `cwd` changes where glob patterns are resolved (passed as the `cwd` option to `globSync`), while `objectKey` and `queryScope.filePath` always use the absolute file path regardless of `cwd`.
 
-### 8.2 Status-code-only API watcher
+### 9.2 Status-code-only API watcher
 
 ```yaml
 scope:
@@ -309,7 +361,7 @@ scope:
 
 **What this example proves:** Body changes alone do not trigger this monitor when `strategy: status-code` is set. Object identity is still the URL even when change detection narrows what counts as a change.
 
-### 8.3 Schedule source with label
+### 9.3 Schedule source with label
 
 ```yaml
 scope:
@@ -320,14 +372,15 @@ scope:
 
 **What this example proves:** When `label` is provided, the observation `title` and `summary` use the label rather than the cron expression. `objectKey` is always the cron string, not the label.
 
-## 9. Validation Implications
+## 10. Validation Implications
 
 Source-level tests SHOULD verify:
 
-- Stateful sources (`file-fingerprint`, `api-poll`) return no observations on the first baseline run and return observations on subsequent runs when changes occur.
+- Stateful sources (`file-fingerprint`, `api-poll`, `incoming-changes`) return no observations on the first baseline run and return observations on subsequent runs when changes occur.
 - Different source configurations do not share baseline state accidentally (state is keyed per monitor instance, not per source name).
 - `json-diff` ignores irrelevant JSON key ordering and whitespace differences between responses.
 - `status-code` ignores body-only changes.
 - Schedule observations are emitted whenever the runtime calls `observe()`, regardless of whether the cron expression would have fired at `context.now`.
-- Source errors are surfaced clearly for invalid required config: missing `globs`, missing `url`, or unresolved bearer token (see §4.3 for the exact error message format).
+- Source errors are surfaced clearly for invalid required config: missing `globs`, missing `url`, or unresolved bearer token (see §4.3 for the exact error message format); missing `paths` for `incoming-changes`.
+- `incoming-changes` emits no observations on the baseline run; subsequent runs report net changes since the stored ref; a gc'd or force-pushed ref triggers a silent re-baseline.
 - `file-fingerprint` includes `snapshotText` for text files and omits it for binary files (files containing null bytes).

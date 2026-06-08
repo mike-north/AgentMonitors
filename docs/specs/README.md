@@ -17,7 +17,7 @@ Read top to bottom the first time; after that, jump to the doc that owns your co
 | [000 — Principles & Properties](./000-principles.md)                        | The invariants (PP/SP/AP/BP/NP) every other doc cites                                                                                               | Always first — the rest reference these by ID                                |
 | [001 — Monitor Definition & Authoring](./001-monitor-definition.md)         | `MONITOR.md` layout, frontmatter schema, identity, notify shapes                                                                                    | Authoring monitors; changing the frontmatter schema                          |
 | [002 — Runtime, Delivery & Persistence](./002-runtime-delivery.md)          | Tick loop, scheduling, notify dispatch, event materialization, session projection, hook state, delivery lifecycles, daemon/IPC, adapters, DB schema | Anything about _when_ a signal becomes durable and _how_ it reaches an agent |
-| [003 — Source Plugins](./003-source-plugins.md)                             | The source contract and the bundled `file-fingerprint` / `api-poll` / `schedule` sources                                                            | Writing a source; changing observation behavior                              |
+| [003 — Source Plugins](./003-source-plugins.md)                             | The source contract and the bundled `file-fingerprint` / `api-poll` / `schedule` / `incoming-changes` sources                                       | Writing a source; changing observation behavior                              |
 | [004 — Validation & Testing](./004-validation-testing.md)                   | Validation surfaces, required test scenarios, ambiguity/drift handling                                                                              | Adding tests; resolving a contradiction                                      |
 | [005 — CLI Reference](./005-cli-reference.md)                               | The `agentmonitors` command surface                                                                                                                 | Using or changing a CLI command                                              |
 | [006 — Agent Integration & Delivery Transports](./006-agent-integration.md) | The adapter/transport seam, the hook-state transport, the Claude Code channel transport (target), availability/fallback                             | Adding/changing how deliveries reach an agent (hooks, channels, new hosts)   |
@@ -53,5 +53,5 @@ The contract is implemented across a pnpm + Nx monorepo:
 - `libs/core` (`@mike-north/core`) — parser, schema, source registry, runtime, hook bridge,
   adapters, persistence. The published library and the home of most normative behavior.
 - `apps/cli` (`agentmonitors`) — the command surface and the daemon/IPC layer.
-- `plugins/source-*` — the three bundled observation sources.
+- `plugins/source-*` — the four bundled observation sources (`file-fingerprint`, `api-poll`, `schedule`, `incoming-changes`).
 - `apps/website` — public docs (out of scope for this spec set).

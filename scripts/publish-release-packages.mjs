@@ -7,6 +7,7 @@ const PACKAGE_DIRS = [
   'libs/core',
   'plugins/source-api-poll',
   'plugins/source-file-fingerprint',
+  'plugins/source-incoming-changes',
   'plugins/source-schedule',
 ];
 const DRY_RUN = process.argv.includes('--dry-run');
