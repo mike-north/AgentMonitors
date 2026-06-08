@@ -499,9 +499,13 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
 - `triggered` — ≥1 event was emitted (including a tick that flushes a previously-held debounce batch even when it returned no new observations). `observationData` is `{ observed, emitted }`.
 - `suppressed` — observations were returned but none emitted this tick (throttled or held in a debounce batch). `observationData` is `{ observed, emitted }`.
 - `no-change` — the source returned no observations. `observationData` is `{ observed: 0, emitted: 0 }`.
-- `errored` — the monitor's `observe()` threw or rejected. The failure is **isolated**: all other due monitors still ran this tick. `observationData` is `{ error: "<message>" }`. State-preservation guarantee: when `observe()` throws (before `ingest()` runs), the persisted `sourceState` is left exactly as it was — no delta is dropped. If a throw occurs inside `ingest()` after `setMonitorState()` already ran, state preservation is best-effort. The audit-history write on an errored observation is also best-effort: if `recordObservationHistory` itself throws (e.g. DB locked/full), that write failure is swallowed so a failing audit row can never re-introduce the tick-abort problem this isolation was designed to fix.
+- `errored` — a failure occurred and was **isolated** so the tick (or watcher) continued. Two sub-cases:
+  - `observe()` threw or rejected in the tick loop: `ingest()` was never called, so the monitor's persisted `sourceState` is left exactly as it was and no subsequent delta is dropped.
+  - A single dispatched observation failed to materialize inside `ingest()` (tick or watch path, e.g. a DB insert error): the batch's other observations are unaffected and `emittedEventIds` reflects only what was durably written. Note: `insertEvent` and `saveSnapshot` are two separate writes; a `saveSnapshot` failure after a successful `insertEvent` is best-effort — the event row exists but has no snapshot (see TODO in `service.ts processObservation`).
 
-_current_. Per-monitor isolation and the `errored` outcome are guaranteed by the runtime for both the tick loop and the watch path (issue #46). Verified: `RuntimeStore.recordObservationHistory` / `listObservationHistory`, written from `service.ts` `tick()` and `consumeWatch()`. Read via `agentmonitors monitor history` ([005 §6](./005-cli-reference.md)).
+  In both cases `observationData` is `{ error: "<message>" }`. The audit write itself is best-effort: a `recordObservationHistory` failure is swallowed so a failing audit row can never re-abort the tick.
+
+_current_. Per-monitor isolation and the `errored` outcome are guaranteed by the runtime for both the tick loop and the watch path (issue #46). Verified: `RuntimeStore.recordObservationHistory` / `listObservationHistory`, written from `service.ts` `tick()` (observe-error and ingest-error catches), `ingest()` per-observation materialization catch, and `consumeWatch()` inner catch. Read via `agentmonitors monitor history` ([005 §6](./005-cli-reference.md)).
 
 | Column             | Type             | Notes                                             |
 | ------------------ | ---------------- | ------------------------------------------------- |
@@ -512,7 +516,7 @@ _current_. Per-monitor isolation and the `errored` outcome are guaranteed by the
 | `result`           | TEXT NOT NULL    | `triggered \| suppressed \| no-change \| errored` |
 | `created_at`       | INTEGER NOT NULL |                                                   |
 
-Verified: `libs/core/src/inbox/schema.ts` lines 107–116; `libs/core/src/inbox/db.ts` lines 99–108; `libs/core/src/runtime/service.ts` `tick()` catch block and `consumeWatch()` inner catch block.
+Verified: `libs/core/src/inbox/schema.ts` lines 104–113; `libs/core/src/inbox/db.ts` lines 98–107; `libs/core/src/runtime/service.ts` `tick()` catch blocks, `ingest()` per-observation catch, and `consumeWatch()` inner catch block.
 
 ### `inbox_items`
 

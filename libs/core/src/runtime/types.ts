@@ -202,10 +202,18 @@ export interface RuntimeStatus {
  * - `suppressed`: observations were returned but none emitted this tick —
  *   throttled or held in a debounce batch.
  * - `no-change`: the source returned no observations.
- * - `errored`: the monitor's `observe()` threw or rejected; the failure was
- *   isolated so all other due monitors still ran this tick. The failing monitor's
- *   `sourceState` is preserved (ingest() was NOT called) so no subsequent delta
- *   is dropped.
+ * - `errored`: a failure occurred and was isolated so the tick (or watcher)
+ *   continued. Two cases produce this outcome:
+ *   (1) The monitor's `observe()` threw or rejected in the tick loop. In this
+ *       case `ingest()` was never called, so the monitor's persisted
+ *       `sourceState` is left exactly as it was — no subsequent delta is
+ *       dropped.
+ *   (2) A single dispatched observation failed to materialize inside `ingest()`
+ *       (tick or watch path), e.g. a DB insert error. The batch's other
+ *       observations are unaffected; `emittedEventIds` reflects only the
+ *       observations that were durably written.
+ *   In both cases the audit write itself is best-effort: a `recordObservationHistory`
+ *   failure is swallowed so a failing audit row can never re-abort the tick.
  */
 export type ObservationOutcome =
   | 'triggered'

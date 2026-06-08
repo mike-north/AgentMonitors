@@ -1500,4 +1500,91 @@ Handle it.
 
     await handle.stop();
   });
+
+  // Issue #46 / Copilot comment 1: per-observation materialization isolation in
+  // ingest(). When a batch of ≥2 dispatched observations is being materialized
+  // and the FIRST processObservation() call succeeds but a LATER one fails,
+  // the successful observation's event id must still appear in emittedEventIds
+  // and in the DB — the tick must not reject and already-written ids must not
+  // be lost.
+  // https://github.com/mike-north/AgentMonitors/issues/46
+  it('preserves already-emitted event ids when a later observation in the same batch fails to materialize', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    // normal urgency → immediate emit (no debounce settle needed).
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'partial-batch-source',
+      'normal',
+      'Handle it.',
+      "  interval: '1s'\n",
+    );
+
+    // FlakyStore: throw on insertEvent for the sentinel title so the second
+    // observation in the batch fails to materialize.
+    class FlakyStore extends RuntimeStore {
+      override insertEvent(
+        input: Omit<MonitorEventRecord, 'id'>,
+      ): MonitorEventRecord {
+        if (input.title === 'bad-obs') {
+          throw new Error('insert failure for bad-obs');
+        }
+        return super.insertEvent(input);
+      }
+    }
+
+    const db = createDb(dbPath);
+    const registry = new SourceRegistry();
+    registry.register({
+      name: 'partial-batch-source',
+      scopeSchema: { type: 'object' },
+      observe: (): Promise<ObservationResult> =>
+        Promise.resolve({
+          observations: [
+            // First observation: succeeds
+            { title: 'good-obs', summary: 'good-obs', objectKey: 'obj-good' },
+            // Second observation: insertEvent will throw
+            { title: 'bad-obs', summary: 'bad-obs', objectKey: 'obj-bad' },
+          ],
+        }),
+    });
+
+    const runtime = new AgentMonitorRuntime(new FlakyStore(db), registry, [
+      claudeCodeAdapter,
+    ]);
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-partial-batch',
+        workspacePath: rootDir,
+      }),
+    );
+
+    // (i) tick must not reject
+    const result = await runtime.tick(monitorsDir, rootDir);
+
+    // (ii) the successful observation's event IS in emittedEventIds AND in
+    //      listEvents — the id must not be lost due to the later failure
+    expect(result.emittedEventIds).toHaveLength(1);
+    const events = runtime.listEvents({ sessionId: session.id });
+    expect(events).toHaveLength(1);
+    expect(events[0]?.title).toBe('good-obs');
+    expect(result.emittedEventIds[0]).toBe(events[0]?.id);
+
+    // (iii) an errored history row exists for the failing observation
+    const history = runtime.listObservationHistory({
+      monitorId: 'test-monitor',
+    });
+    const errored = history.filter((h) => h.result === 'errored');
+    expect(errored).toHaveLength(1);
+    expect(errored[0]?.observationData).toEqual({
+      error: 'insert failure for bad-obs',
+    });
+
+    // (iv) the batch-level triggered row was still recorded (the batch had
+    //      dispatched observations, so the outcome is triggered regardless of
+    //      materialization failures)
+    const triggered = history.filter((h) => h.result === 'triggered');
+    expect(triggered).toHaveLength(1);
+  });
 });

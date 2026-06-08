@@ -396,22 +396,48 @@ export class AgentMonitorRuntime {
 
       evaluated.push(monitor.id);
 
+      // Two separate try/catch blocks so observe() failures and ingest()
+      // failures are handled independently (issue #46):
+      //
+      // Block 1 — observe(): if observe() throws, we skip ingest() entirely.
+      // Skipping ingest() means setMonitorState() is never called, which is
+      // what preserves the previously-persisted sourceState so the next tick's
+      // diff spans from the last good baseline rather than an empty state.
+      let observationResult;
       try {
         const monitorState = this.store.getMonitorState(monitor.id);
-        const observationResult = await source.observe(
-          monitor.frontmatter.scope,
-          {
-            previousState: monitorState.sourceState,
-            now,
-          },
-        );
+        observationResult = await source.observe(monitor.frontmatter.scope, {
+          previousState: monitorState.sourceState,
+          now,
+        });
+      } catch (observeError) {
+        // observe() failed: record errored outcome (best-effort) and skip
+        // this monitor entirely for this tick. ingest() is NOT called, which
+        // preserves sourceState as described above.
+        try {
+          this.store.recordObservationHistory({
+            monitorId: monitor.id,
+            sourceName: monitor.frontmatter.source,
+            result: 'errored',
+            observationData: {
+              error:
+                observeError instanceof Error
+                  ? observeError.message
+                  : String(observeError),
+            },
+          });
+        } catch {
+          // best-effort audit — ignore write failures
+        }
+        continue;
+      }
 
-        // ingest() calls setMonitorState(), which persists the new sourceState.
-        // We only call it on success — skipping it on failure (when observe()
-        // throws, before ingest runs) is what preserves the previously-persisted
-        // sourceState so the next tick's diff spans from the last good baseline
-        // rather than an empty state. If ingest() itself throws internally after
-        // setMonitorState(), state preservation is best-effort.
+      // Block 2 — ingest(): ingest() now isolates per-observation materialization
+      // failures internally (see ingest()), so it should not normally throw.
+      // This outer catch is a defence-in-depth safety net: if ingest() itself
+      // throws (e.g. setMonitorState fails), record errored best-effort and
+      // continue so the tick is not aborted.
+      try {
         emittedEventIds.push(
           ...this.ingest(monitor, observationResult.observations, now, {
             workspacePath,
@@ -420,20 +446,17 @@ export class AgentMonitorRuntime {
               : {}),
           }),
         );
-      } catch (error) {
-        // Per-monitor isolation (issue #46): a source whose observe() throws or
-        // rejects must not abort the tick. Record the failure in the
-        // observation-history audit trail (G6) and continue to the next monitor.
-        // The audit write is best-effort — if recordObservationHistory itself
-        // throws (e.g. DB locked/full) we swallow it so one failed audit row
-        // can never re-introduce the "one failure aborts the tick" problem.
+      } catch (ingestError) {
         try {
           this.store.recordObservationHistory({
             monitorId: monitor.id,
             sourceName: monitor.frontmatter.source,
             result: 'errored',
             observationData: {
-              error: error instanceof Error ? error.message : String(error),
+              error:
+                ingestError instanceof Error
+                  ? ingestError.message
+                  : String(ingestError),
             },
           });
         } catch {
@@ -506,16 +529,41 @@ export class AgentMonitorRuntime {
       observationData: { observed, emitted: emittedCount },
     });
 
+    // Per-observation materialization isolation (issue #46): a single failing
+    // observation must not drop the already-durably-written ids of its
+    // batch-mates, and must not cause emittedEventIds to disagree with what is
+    // actually in the DB. On failure we record a best-effort errored history row
+    // for the individual observation and continue to the next in the batch.
+    // The batch-level triggered/suppressed/no-change row recorded above is
+    // unaffected — it reflects what was *dispatched*, not what materialized.
     const emittedEventIds: string[] = [];
     for (const emitted of dispatch.emitted) {
-      const event = this.processObservation({
-        monitor: emitted.monitor,
-        sourceName: emitted.monitor.frontmatter.source,
-        observation: emitted.observation,
-        observedAt: emitted.observedAt,
-        workspacePath: options.workspacePath,
-      });
-      emittedEventIds.push(event.id);
+      try {
+        const event = this.processObservation({
+          monitor: emitted.monitor,
+          sourceName: emitted.monitor.frontmatter.source,
+          observation: emitted.observation,
+          observedAt: emitted.observedAt,
+          workspacePath: options.workspacePath,
+        });
+        emittedEventIds.push(event.id);
+      } catch (materializeError) {
+        try {
+          this.store.recordObservationHistory({
+            monitorId: monitor.id,
+            sourceName: monitor.frontmatter.source,
+            result: 'errored',
+            observationData: {
+              error:
+                materializeError instanceof Error
+                  ? materializeError.message
+                  : String(materializeError),
+            },
+          });
+        } catch {
+          // best-effort audit — ignore write failures
+        }
+      }
     }
     return emittedEventIds;
   }
@@ -866,6 +914,10 @@ export class AgentMonitorRuntime {
       createdAt: input.observedAt,
     });
 
+    // TODO(#46 follow-up): make insertEvent+saveSnapshot atomic via a
+    // transaction. Currently a saveSnapshot failure after a successful insertEvent
+    // leaves an event row without its snapshot — best-effort: the ingest() caller
+    // catches this and records an errored history row for the observation.
     if (input.observation.snapshotText) {
       this.store.saveSnapshot({
         workspacePath: input.workspacePath ?? null,
