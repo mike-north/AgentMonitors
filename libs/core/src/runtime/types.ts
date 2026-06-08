@@ -191,10 +191,16 @@ export interface RuntimeStatus {
 /**
  * The outcome of evaluating a due monitor on a tick: `triggered` (≥1 observation
  * became an event), `suppressed` (observations were returned but none emitted —
- * throttled or held in a debounce batch), or `no-change` (the source returned
- * nothing).
+ * throttled or held in a debounce batch), `no-change` (the source returned
+ * nothing), or `error` (the source's `observe()` threw — the failure was
+ * contained so other monitors still ran, and this monitor's persisted state was
+ * left untouched so it retries cleanly next tick).
  */
-export type ObservationOutcome = 'triggered' | 'suppressed' | 'no-change';
+export type ObservationOutcome =
+  | 'triggered'
+  | 'suppressed'
+  | 'no-change'
+  | 'error';
 
 export interface ObservationHistoryRecord {
   id: string;

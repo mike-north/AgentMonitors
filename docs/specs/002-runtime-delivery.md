@@ -39,7 +39,24 @@ For each runtime tick, the implementation **MUST**:
 9. materialize emitted observations as durable events
 10. refresh hook state for sessions in the affected workspace
 
-Verified: `libs/core/src/runtime/service.ts` — `AgentMonitorRuntime.tick()` (lines 358–420).
+Steps 6–9 run inside a **per-monitor failure boundary**: each due monitor's `observe()` and the
+ingest pipeline it feeds are wrapped so that an operational error thrown by one source (e.g. the
+`incoming-changes` source shelling out to git and hitting a gc'd object or a transient git failure)
+**MUST NOT** abort the tick or starve the remaining due monitors. On such a failure the runtime:
+
+- records a single `observation_history` row with `result = error` and an `observationData` of
+  `{ error: <message> }` (visible via `agentmonitors monitor history`),
+- logs the failure to stderr with the monitor id and source name,
+- leaves the failing monitor's persisted source state, notify state, and `lastObservationAt`
+  **untouched** — so the monitor stays due and retries cleanly on the next tick rather than losing a
+  polling window — and
+- continues to the next due monitor.
+
+A monitor referencing an **unknown source** (step 4) is a different class of fault — an authoring/
+configuration error, not an operational one — and still fails the whole tick loudly.
+
+Verified: `libs/core/src/runtime/service.ts` — `AgentMonitorRuntime.tick()` per-monitor `try/catch`
+and `recordMonitorFailure()`.
 
 ### 2.1 Due scheduling
 
@@ -494,16 +511,16 @@ Stores the per-monitor polling and notification state. One row per monitor ID.
 
 ### `observation_history`
 
-An audit trail of each due monitor's outcome per tick. For every evaluated monitor the runtime writes a row with `monitorId`, `sourceName`, `observationData` (a `{ observed, emitted }` summary), and `result`. The result is classified by what was **emitted** this tick, not by the new-observation count: `triggered` (≥1 event was emitted — including a tick that flushes a previously-held debounce batch even though it returned no new observations), else `suppressed` (observations were returned but none emitted this tick — throttled or held in a debounce batch), else `no-change` (the source returned nothing). Verified: `RuntimeStore.recordObservationHistory` / `listObservationHistory`, written from `service.ts` `tick()`. Read via `agentmonitors monitor history` ([005 §6](./005-cli-reference.md)).
+An audit trail of each due monitor's outcome per tick. For every evaluated monitor the runtime writes a row with `monitorId`, `sourceName`, `observationData`, and `result`. The result is classified by what was **emitted** this tick, not by the new-observation count: `triggered` (≥1 event was emitted — including a tick that flushes a previously-held debounce batch even though it returned no new observations), else `suppressed` (observations were returned but none emitted this tick — throttled or held in a debounce batch), else `no-change` (the source returned nothing). A fourth outcome, `error`, is written when the source's `observe()` throws (see §2 "per-monitor failure boundary"); its `observationData` is `{ error: <message> }` rather than the `{ observed, emitted }` summary the other three carry, and the failing monitor's persisted state is left untouched. Verified: `RuntimeStore.recordObservationHistory` / `listObservationHistory`, written from `service.ts` `tick()` and `recordMonitorFailure()`. Read via `agentmonitors monitor history` ([005 §6](./005-cli-reference.md)).
 
-| Column             | Type             | Notes                                  |
-| ------------------ | ---------------- | -------------------------------------- |
-| `id`               | TEXT PK          | ULID                                   |
-| `monitor_id`       | TEXT NOT NULL    |                                        |
-| `source_name`      | TEXT NOT NULL    |                                        |
-| `observation_data` | TEXT NOT NULL    | JSON                                   |
-| `result`           | TEXT NOT NULL    | `triggered \| suppressed \| no-change` |
-| `created_at`       | INTEGER NOT NULL |                                        |
+| Column             | Type             | Notes                                           |
+| ------------------ | ---------------- | ----------------------------------------------- |
+| `id`               | TEXT PK          | ULID                                            |
+| `monitor_id`       | TEXT NOT NULL    |                                                 |
+| `source_name`      | TEXT NOT NULL    |                                                 |
+| `observation_data` | TEXT NOT NULL    | JSON                                            |
+| `result`           | TEXT NOT NULL    | `triggered \| suppressed \| no-change \| error` |
+| `created_at`       | INTEGER NOT NULL |                                                 |
 
 Verified: `libs/core/src/inbox/schema.ts` lines 107–116; `libs/core/src/inbox/db.ts` lines 99–108; no insert path found in `libs/core/src/runtime/store.ts`.
 

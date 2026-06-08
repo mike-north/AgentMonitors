@@ -396,23 +396,34 @@ export class AgentMonitorRuntime {
 
       evaluated.push(monitor.id);
 
-      const monitorState = this.store.getMonitorState(monitor.id);
-      const observationResult = await source.observe(
-        monitor.frontmatter.scope,
-        {
-          previousState: monitorState.sourceState,
-          now,
-        },
-      );
+      // Contain per-monitor failures (G6 hardening): a single source's
+      // operational error (e.g. `incoming-changes` shelling out to git and
+      // hitting a transient failure) must not abort the whole tick and starve
+      // every other due monitor. On failure we record an `error` outcome and
+      // continue; crucially we do NOT persist any state for this monitor, so its
+      // `lastObservationAt` stays put and it is still due — and retries cleanly —
+      // on the next tick.
+      try {
+        const monitorState = this.store.getMonitorState(monitor.id);
+        const observationResult = await source.observe(
+          monitor.frontmatter.scope,
+          {
+            previousState: monitorState.sourceState,
+            now,
+          },
+        );
 
-      emittedEventIds.push(
-        ...this.ingest(monitor, observationResult.observations, now, {
-          workspacePath,
-          ...(observationResult.nextState !== undefined
-            ? { nextSourceState: { value: observationResult.nextState } }
-            : {}),
-        }),
-      );
+        emittedEventIds.push(
+          ...this.ingest(monitor, observationResult.observations, now, {
+            workspacePath,
+            ...(observationResult.nextState !== undefined
+              ? { nextSourceState: { value: observationResult.nextState } }
+              : {}),
+          }),
+        );
+      } catch (error) {
+        this.recordMonitorFailure(monitor, error);
+      }
     }
 
     this.refreshWorkspaceSessions(workspacePath);
@@ -491,6 +502,31 @@ export class AgentMonitorRuntime {
       emittedEventIds.push(event.id);
     }
     return emittedEventIds;
+  }
+
+  /**
+   * Record a contained per-monitor failure (G6). Writes a single `error` row to
+   * the `observation_history` audit trail (surfaced by `agentmonitors monitor
+   * history`) and logs it, but deliberately does **not** touch this monitor's
+   * persisted source/notify/`lastObservationAt` state: leaving it untouched
+   * means the monitor stays due and retries cleanly on the next tick rather than
+   * losing a polling window to a transient source error.
+   */
+  private recordMonitorFailure(
+    monitor: MonitorDefinition,
+    error: unknown,
+  ): void {
+    const message = error instanceof Error ? error.message : String(error);
+    this.store.recordObservationHistory({
+      monitorId: monitor.id,
+      sourceName: monitor.frontmatter.source,
+      result: 'error',
+      observationData: { error: message },
+    });
+    console.error(
+      `[agentmonitors] monitor "${monitor.id}" (source "${monitor.frontmatter.source}") observe() failed; ` +
+        `skipping it this tick and retrying next tick: ${message}`,
+    );
   }
 
   private refreshWorkspaceSessions(workspacePath: string): void {

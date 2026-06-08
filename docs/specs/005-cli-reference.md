@@ -350,8 +350,9 @@ agentmonitors monitor history [monitorId] [--socket <path>] [--limit <n>] [--for
 | `--format`      | `text`  | `text` (one row per line) or `json` |
 
 Each row reports `result` — `triggered` (≥1 observation became an event), `suppressed` (observations
-returned but none emitted this tick), or `no-change` (the source returned nothing) — plus the
-monitor id, source name, and timestamp.
+returned but none emitted this tick), `no-change` (the source returned nothing), or `error` (the
+source's `observe()` threw; the failure was contained so other monitors still ran — see
+[002 §2](./002-runtime-delivery.md)) — plus the monitor id, source name, and timestamp.
 
 ---
 

@@ -9,6 +9,23 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-06-08 — Per-monitor failure boundary in the tick loop
+
+- The runtime tick loop ([002 §2](./002-runtime-delivery.md)) now wraps each due monitor's
+  `observe()` + ingest in a failure boundary: an operational error thrown by one source no longer
+  aborts the tick or starves the other due monitors. Motivated by the `incoming-changes` source
+  shelling out to git — the runtime must not depend on every source being perfectly defensive.
+- On failure the runtime records an `observation_history` row with the new **`error`** outcome
+  (`observationData: { error: <message> }`), logs to stderr, and **leaves the failing monitor's
+  persisted source/notify/`lastObservationAt` state untouched** so it stays due and retries cleanly
+  next tick. `ObservationOutcome` gains `error`; the `observation_history.result` column documents
+  the fourth value ([002 "Persistence Schema"](./002-runtime-delivery.md)). No DB migration — the
+  raw `CREATE TABLE` has no `CHECK` constraint on `result`.
+- A monitor referencing an **unknown source** remains a hard tick failure: that is an authoring/
+  configuration error, not an operational one.
+- `agentmonitors monitor history` ([005 §6](./005-cli-reference.md)) now surfaces `error` rows.
+- Minor `@mike-north/core` changeset.
+
 ## 2026-06-08 — New bundled source `incoming-changes`
 
 - Added `@mike-north/source-incoming-changes` as the fourth bundled observation source

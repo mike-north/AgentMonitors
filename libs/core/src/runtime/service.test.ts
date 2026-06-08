@@ -58,6 +58,35 @@ ${body}
   return path.join(rootDir, '.claude', 'monitors');
 }
 
+/**
+ * Write a folder monitor at `.claude/monitors/<id>/MONITOR.md` with an explicit
+ * id (folder name) and source, so a single tree can hold several monitors with
+ * distinct sources. Returns the shared `.claude/monitors` dir to tick against.
+ */
+function writeNamedMonitor(
+  rootDir: string,
+  id: string,
+  sourceName: string,
+): string {
+  const monitorsDir = path.join(rootDir, '.claude', 'monitors');
+  const dir = path.join(monitorsDir, id);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    path.join(dir, 'MONITOR.md'),
+    `---
+name: ${id}
+source: ${sourceName}
+urgency: normal
+scope:
+  filePath: ${JSON.stringify(path.join(rootDir, `${id}.txt`))}
+---
+Handle it.
+`,
+    'utf-8',
+  );
+  return monitorsDir;
+}
+
 const tempDirs: string[] = [];
 
 afterEach(() => {
@@ -619,6 +648,70 @@ Handle it.
       scope: { changeKind: 'deleted' },
     });
     expect(deletedOnly).toHaveLength(1);
+  });
+
+  // A single source's operational failure must be contained: one monitor's
+  // throwing observe() must not abort the tick or starve other due monitors.
+  it('contains a single source failure and records an error outcome without aborting the tick', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+
+    // Two due monitors: the first source throws operationally, the second emits.
+    const monitorsDir = writeNamedMonitor(rootDir, 'failing', 'boom-source');
+    writeNamedMonitor(rootDir, 'healthy', 'ok-source');
+
+    const db = createDb(dbPath);
+    const registry = new SourceRegistry();
+    registry.register({
+      name: 'boom-source',
+      scopeSchema: { type: 'object' },
+      observe: (): Promise<ObservationResult> =>
+        Promise.reject(new Error('git exploded')),
+    });
+    registry.register({
+      name: 'ok-source',
+      scopeSchema: { type: 'object' },
+      observe: (): Promise<ObservationResult> =>
+        Promise.resolve({ observations: [{ title: 'all good' }] }),
+    });
+    const runtime = new AgentMonitorRuntime(new RuntimeStore(db), registry, [
+      claudeCodeAdapter,
+    ]);
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-fail',
+        workspacePath: rootDir,
+      }),
+    );
+
+    // The tick must resolve, not reject, despite the throwing source.
+    const tickResult = await runtime.tick(monitorsDir, rootDir);
+
+    // Both monitors were attempted; the healthy one still emitted its event.
+    expect(tickResult.evaluatedMonitors).toContain('failing');
+    expect(tickResult.evaluatedMonitors).toContain('healthy');
+    const events = runtime.listEvents({ sessionId: session.id });
+    expect(events).toHaveLength(1);
+    expect(events[0]?.monitorId).toBe('healthy');
+
+    // The failure is visible to operators as an `error` audit-trail outcome.
+    const failingHistory = runtime.listObservationHistory({
+      monitorId: 'failing',
+    });
+    expect(failingHistory).toHaveLength(1);
+    expect(failingHistory[0]?.result).toBe('error');
+    expect(String(failingHistory[0]?.observationData['error'])).toContain(
+      'git exploded',
+    );
+
+    // A failing monitor must not advance its persisted state, so it stays due
+    // and retries cleanly on the next tick.
+    const store = new RuntimeStore(db);
+    expect(store.getMonitorState('failing').lastObservationAt).toBeUndefined();
+    expect(store.getMonitorState('healthy').lastObservationAt).toBeInstanceOf(
+      Date,
+    );
   });
 
   // T2: snapshot history is keyed by (workspace, monitor, objectKey) — SP5.
