@@ -39,10 +39,10 @@ For each runtime tick, the implementation **MUST**:
 9. materialize emitted observations as durable events
 10. refresh hook state for sessions in the affected workspace
 
-Steps 6–9 run inside a **per-monitor failure boundary**: each due monitor's `observe()` and the
-ingest pipeline it feeds are wrapped so that an operational error thrown by one source (e.g. the
-`incoming-changes` source shelling out to git and hitting a gc'd object or a transient git failure)
-**MUST NOT** abort the tick or starve the remaining due monitors. On such a failure the runtime:
+Step 6 (the source's `observe()`) runs inside a **per-monitor failure boundary** so that an
+operational error thrown by one source (e.g. the `incoming-changes` source shelling out to git and
+hitting a gc'd object or a transient git failure) **MUST NOT** abort the tick or starve the
+remaining due monitors. On such a failure the runtime:
 
 - records a single `observation_history` row with `result = error` and an `observationData` of
   `{ error: <message> }` (visible via `agentmonitors monitor history`),
@@ -52,11 +52,17 @@ ingest pipeline it feeds are wrapped so that an operational error thrown by one 
   polling window — and
 - continues to the next due monitor.
 
-A monitor referencing an **unknown source** (step 4) is a different class of fault — an authoring/
-configuration error, not an operational one — and still fails the whole tick loudly.
+The boundary is scoped to `observe()` only. Steps 7–9 (`ingest()` — notify dispatch, state
+persistence, event materialization) are runtime-owned and advance persisted state as they run, so a
+throw there is a runtime/persistence bug, not a source error; it is **not** contained and surfaces
+as a tick failure rather than being recorded as an `error` outcome. Containing it would violate the
+"leave state untouched" guarantee above (state may already have advanced) and mislabel the failure.
 
-Verified: `libs/core/src/runtime/service.ts` — `AgentMonitorRuntime.tick()` per-monitor `try/catch`
-and `recordMonitorFailure()`.
+A monitor referencing an **unknown source** (step 4) is likewise a different class of fault — an
+authoring/configuration error, not an operational one — and still fails the whole tick loudly.
+
+Verified: `libs/core/src/runtime/service.ts` — `AgentMonitorRuntime.tick()` (the `observe()`
+`try/catch`) and `recordMonitorFailure()`.
 
 ### 2.1 Due scheduling
 

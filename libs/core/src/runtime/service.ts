@@ -3,7 +3,7 @@ import path from 'node:path';
 import { scanMonitors } from '../parser/scan-monitors.js';
 import type { MonitorDefinition } from '../schema/types.js';
 import { parseDuration } from '../notify/notifier.js';
-import type { Observation } from '../observation/types.js';
+import type { Observation, ObservationResult } from '../observation/types.js';
 import type { SourceRegistry } from '../observation/registry.js';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import type { AgentRuntimeAdapter } from '../adapter/types.js';
@@ -396,34 +396,41 @@ export class AgentMonitorRuntime {
 
       evaluated.push(monitor.id);
 
-      // Contain per-monitor failures (G6 hardening): a single source's
-      // operational error (e.g. `incoming-changes` shelling out to git and
-      // hitting a transient failure) must not abort the whole tick and starve
-      // every other due monitor. On failure we record an `error` outcome and
-      // continue; crucially we do NOT persist any state for this monitor, so its
-      // `lastObservationAt` stays put and it is still due — and retries cleanly —
-      // on the next tick.
+      // Contain per-monitor *source* failures (G6 hardening): only `observe()`
+      // is inside this boundary. A source's operational error (e.g. the
+      // `incoming-changes` source shelling out to git and hitting a transient
+      // failure) must not abort the whole tick and starve every other due
+      // monitor. On such a failure we record an `error` outcome and continue,
+      // without persisting anything for this monitor — so its `lastObservationAt`
+      // stays put and it is still due, and retries cleanly, on the next tick.
+      //
+      // `ingest()` is deliberately OUTSIDE the boundary: it is runtime-owned
+      // (notify dispatch, persistence, event materialization) and advances
+      // persisted state as it goes, so a throw there is a runtime/persistence
+      // bug, not a source error. Containing it would both violate the
+      // "leave state untouched on failure" invariant (state may already have
+      // advanced) and mislabel the failure as an `observe()` error — so we let
+      // it surface as a tick failure instead of masking it.
+      let observationResult: ObservationResult;
       try {
         const monitorState = this.store.getMonitorState(monitor.id);
-        const observationResult = await source.observe(
-          monitor.frontmatter.scope,
-          {
-            previousState: monitorState.sourceState,
-            now,
-          },
-        );
-
-        emittedEventIds.push(
-          ...this.ingest(monitor, observationResult.observations, now, {
-            workspacePath,
-            ...(observationResult.nextState !== undefined
-              ? { nextSourceState: { value: observationResult.nextState } }
-              : {}),
-          }),
-        );
+        observationResult = await source.observe(monitor.frontmatter.scope, {
+          previousState: monitorState.sourceState,
+          now,
+        });
       } catch (error) {
         this.recordMonitorFailure(monitor, error);
+        continue;
       }
+
+      emittedEventIds.push(
+        ...this.ingest(monitor, observationResult.observations, now, {
+          workspacePath,
+          ...(observationResult.nextState !== undefined
+            ? { nextSourceState: { value: observationResult.nextState } }
+            : {}),
+        }),
+      );
     }
 
     this.refreshWorkspaceSessions(workspacePath);
@@ -505,12 +512,15 @@ export class AgentMonitorRuntime {
   }
 
   /**
-   * Record a contained per-monitor failure (G6). Writes a single `error` row to
-   * the `observation_history` audit trail (surfaced by `agentmonitors monitor
-   * history`) and logs it, but deliberately does **not** touch this monitor's
-   * persisted source/notify/`lastObservationAt` state: leaving it untouched
-   * means the monitor stays due and retries cleanly on the next tick rather than
-   * losing a polling window to a transient source error.
+   * Record a contained per-monitor source failure (G6) — a throw from
+   * `source.observe()`. Writes a single `error` row to the `observation_history`
+   * audit trail (surfaced by `agentmonitors monitor history`) and logs it, but
+   * deliberately does **not** touch this monitor's persisted
+   * source/notify/`lastObservationAt` state: leaving it untouched means the
+   * monitor stays due and retries cleanly on the next tick rather than losing a
+   * polling window to a transient source error. Only the tick loop's
+   * `observe()` boundary calls this; `ingest()` failures are not routed here
+   * (they surface as tick failures — see `tick()`).
    */
   private recordMonitorFailure(
     monitor: MonitorDefinition,

@@ -12,9 +12,12 @@ Agent Monitors spec set in `docs/specs/`.
 ## 2026-06-08 — Per-monitor failure boundary in the tick loop
 
 - The runtime tick loop ([002 §2](./002-runtime-delivery.md)) now wraps each due monitor's
-  `observe()` + ingest in a failure boundary: an operational error thrown by one source no longer
+  `observe()` call in a failure boundary: an operational error thrown by one source no longer
   aborts the tick or starves the other due monitors. Motivated by the `incoming-changes` source
-  shelling out to git — the runtime must not depend on every source being perfectly defensive.
+  shelling out to git — the runtime must not depend on every source being perfectly defensive. The
+  boundary is scoped to `observe()` only; an `ingest()` throw (runtime-owned notify dispatch,
+  persistence, materialization) surfaces as a tick failure rather than being masked, since it would
+  otherwise advance persisted state and violate the retry-clean guarantee below.
 - On failure the runtime records an `observation_history` row with the new **`error`** outcome
   (`observationData: { error: <message> }`), logs to stderr, and **leaves the failing monitor's
   persisted source/notify/`lastObservationAt` state untouched** so it stays due and retries cleanly
