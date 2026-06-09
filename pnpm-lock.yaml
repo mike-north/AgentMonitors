@@ -112,6 +112,9 @@ importers:
       '@types/react-dom':
         specifier: ^19.1.6
         version: 19.2.3(@types/react@19.2.14)
+      typescript:
+        specifier: ^5.9.0
+        version: 5.9.3
 
   libs/core:
     dependencies:
