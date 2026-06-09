@@ -31,13 +31,13 @@ mkdir -p /tmp/workspace/.claude/monitors/watch-files
 cat > /tmp/workspace/.claude/monitors/watch-files/MONITOR.md <<'EOF'
 ---
 name: Watch files
-source: file-fingerprint
-urgency: normal
-scope:
+watch:
+  type: file-fingerprint
   globs:
     - watched.txt
   cwd: "/tmp/workspace"
   interval: "1s"
+urgency: normal
 ---
 When files change, review them.
 EOF
