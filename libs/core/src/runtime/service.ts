@@ -458,6 +458,9 @@ export class AgentMonitorRuntime {
             ...(observationResult.nextState !== undefined
               ? { nextSourceState: { value: observationResult.nextState } }
               : {}),
+            ...(observationResult.outcome
+              ? { sourceOutcome: observationResult.outcome }
+              : {}),
           }),
         );
       } catch (ingestError) {
@@ -504,6 +507,7 @@ export class AgentMonitorRuntime {
     options: {
       workspacePath: string;
       nextSourceState?: { value: unknown };
+      sourceOutcome?: 'rebaselined';
     },
   ): string[] {
     const monitorState = this.store.getMonitorState(monitor.id);
@@ -537,9 +541,11 @@ export class AgentMonitorRuntime {
       result:
         emittedCount > 0
           ? 'triggered'
-          : observed > 0
-            ? 'suppressed'
-            : 'no-change',
+          : options.sourceOutcome === 'rebaselined'
+            ? 'rebaselined'
+            : observed > 0
+              ? 'suppressed'
+              : 'no-change',
       observationData: { observed, emitted: emittedCount },
     });
 

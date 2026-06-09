@@ -1501,6 +1501,142 @@ Handle it.
     await handle.stop();
   });
 
+  // Issue #56: a source that signals outcome:'rebaselined' must produce a
+  // 'rebaselined' row in observation_history, not 'no-change'.
+  // A source that returns no observations with no outcome still produces 'no-change'
+  // (regression guard: sources that don't set the diagnostic are unaffected).
+  // https://github.com/mike-north/AgentMonitors/issues/56
+  it('records rebaselined history when source sets outcome:rebaselined (not no-change)', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'rebaselined-source',
+      'normal',
+      'Handle it.',
+      "  interval: '1s'\n",
+    );
+
+    const source: ObservationSource = {
+      name: 'rebaselined-source',
+      scopeSchema: { type: 'object' },
+      stateful: true,
+      observe: (): Promise<ObservationResult> =>
+        Promise.resolve({
+          observations: [],
+          nextState: { ref: 'abc123' },
+          outcome: 'rebaselined',
+        }),
+    };
+
+    const runtime = createRuntime(dbPath, source);
+    runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-rebaselined',
+        workspacePath: rootDir,
+      }),
+    );
+
+    await runtime.tick(monitorsDir, rootDir);
+
+    const history = runtime.listObservationHistory({
+      monitorId: 'test-monitor',
+    });
+    expect(history).toHaveLength(1);
+    // Must be 'rebaselined', not 'no-change'
+    expect(history[0]?.result).toBe('rebaselined');
+    expect(history[0]?.observationData).toEqual({ observed: 0, emitted: 0 });
+  });
+
+  it('records no-change history when source returns no observations with no outcome (unaffected by #56)', async () => {
+    // Regression guard: sources that do not set outcome are unaffected by #56.
+    // A genuinely quiet tick (zero observations, no outcome field) must still record no-change.
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'quiet-source',
+      'normal',
+      'Handle it.',
+      "  interval: '1s'\n",
+    );
+
+    const source: ObservationSource = {
+      name: 'quiet-source',
+      scopeSchema: { type: 'object' },
+      observe: (): Promise<ObservationResult> =>
+        Promise.resolve({ observations: [] }),
+    };
+
+    const runtime = createRuntime(dbPath, source);
+    runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-quiet',
+        workspacePath: rootDir,
+      }),
+    );
+
+    await runtime.tick(monitorsDir, rootDir);
+
+    const history = runtime.listObservationHistory({
+      monitorId: 'test-monitor',
+    });
+    expect(history).toHaveLength(1);
+    expect(history[0]?.result).toBe('no-change');
+  });
+
+  // Issue #56 (precedence invariant): the classification orders
+  // emitted>0 → 'triggered' ABOVE the rebaselined check. A source that both
+  // emits an observation AND signals outcome:'rebaselined' must record
+  // 'triggered' — an emitted event always wins. incoming-changes never does
+  // this today (its re-baseline return is always empty), so this guards the
+  // core invariant against a future source.
+  // https://github.com/mike-north/AgentMonitors/issues/56
+  it('classifies triggered over rebaselined when an observation is emitted (issue #56 precedence)', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'emit-and-rebaseline-source',
+      'normal',
+      'Handle it.',
+      "  interval: '1s'\n",
+    );
+
+    const source: ObservationSource = {
+      name: 'emit-and-rebaseline-source',
+      scopeSchema: { type: 'object' },
+      stateful: true,
+      observe: (): Promise<ObservationResult> =>
+        Promise.resolve({
+          observations: [{ title: 'change', objectKey: 'obj-1' }],
+          nextState: { ref: 'abc123' },
+          outcome: 'rebaselined',
+        }),
+    };
+
+    const runtime = createRuntime(dbPath, source);
+    runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-emit-rebaseline',
+        workspacePath: rootDir,
+      }),
+    );
+
+    await runtime.tick(monitorsDir, rootDir);
+
+    const history = runtime.listObservationHistory({
+      monitorId: 'test-monitor',
+    });
+    expect(history).toHaveLength(1);
+    // Emitted event wins over the rebaselined diagnostic.
+    expect(history[0]?.result).toBe('triggered');
+    expect(history[0]?.observationData).toEqual({ observed: 1, emitted: 1 });
+  });
+
   // Issue #46 / Copilot comment 1: per-observation materialization isolation in
   // ingest(). When a batch of ≥2 dispatched observations is being materialized
   // and the FIRST processObservation() call succeeds but a LATER one fails,

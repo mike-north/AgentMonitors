@@ -69,6 +69,15 @@ export interface ObservationResult {
   observations: Observation[];
   /** Persisted state to use during the next observation cycle */
   nextState?: unknown;
+  /**
+   * Optional diagnostic: a source sets this to signal that this cycle was a
+   * graceful re-baseline (it advanced its persisted state to the current point
+   * but could not compute a delta — e.g. a gc'd/force-pushed prior ref), as
+   * opposed to a genuine "nothing changed". The runtime records it as a
+   * `rebaselined` observation-history outcome instead of `no-change`. Omitted by
+   * sources that don't distinguish this case.
+   */
+  outcome?: 'rebaselined';
 }
 
 /**
