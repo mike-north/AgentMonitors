@@ -1148,13 +1148,42 @@ Summarize what changed in the spec/standard docs and whether it affects current 
       const session = JSON.parse(sessionOpen.stdout) as { id: string };
 
       // -----------------------------------------------------------------------
-      // 5. Wait for the first tick to establish the baseline (no event yet).
-      //    The source records the current HEAD SHA on the first observe() call
-      //    and emits no observations.
+      // 5. Wait DETERMINISTICALLY for the first tick to establish the baseline.
+      //    incoming-changes records the current HEAD SHA on its first observe()
+      //    and emits nothing. We must not commit the change until that baseline
+      //    observe has run — otherwise the source would record the POST-commit
+      //    HEAD as its baseline and emit no event (a race a fixed sleep can lose
+      //    under slow/loaded CI). Poll the observation-history audit: the first
+      //    tick writes a `no-change` row for `spec-changes`, which is proof the
+      //    baseline observe() completed.
       // -----------------------------------------------------------------------
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500);
+      const historyRows = () =>
+        runWithEnv(
+          ['monitor', 'history', 'spec-changes', '--format', 'json'],
+          env,
+          repo,
+        );
+      const baselineDeadline = Date.now() + 10_000;
+      while (Date.now() < baselineDeadline) {
+        const result = historyRows();
+        if (
+          result.exitCode === 0 &&
+          (JSON.parse(result.stdout) as unknown[]).length >= 1
+        ) {
+          break;
+        }
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+      }
+      const baseline = historyRows();
+      expect(baseline.exitCode).toBe(0);
+      const baselineHistory = JSON.parse(baseline.stdout) as {
+        result: string;
+      }[];
+      // The baseline observe ran and emitted nothing.
+      expect(baselineHistory.length).toBeGreaterThanOrEqual(1);
+      expect(baselineHistory.every((r) => r.result === 'no-change')).toBe(true);
 
-      // Confirm no events yet (baseline tick only)
+      // And no events have been delivered yet (baseline only).
       const noEvents = runWithEnv(
         [
           'events',
