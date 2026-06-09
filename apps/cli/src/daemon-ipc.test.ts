@@ -1,6 +1,12 @@
 import net from 'node:net';
 import path from 'node:path';
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+  existsSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
@@ -95,6 +101,109 @@ describe('callDaemon', () => {
         resolve();
       });
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// createDaemonServer: startup lock (stale-lock recovery, live-lock rejection) (#68)
+// ---------------------------------------------------------------------------
+
+/**
+ * The lock directory path mirrors the private lockPath() helper in daemon-ipc.ts.
+ * Keeping this in sync here is intentional: the test exercises the observable
+ * file-system contract, not an internal detail.
+ */
+function startupLockDir(socketPath: string): string {
+  return `${socketPath}.lock.d`;
+}
+
+describe('createDaemonServer listen() — startup lock', () => {
+  it('recovers from a stale lock left by a dead process', async () => {
+    const socketPath = tempSocketPath('stale-lock');
+    const lockDir = startupLockDir(socketPath);
+
+    // Plant a stale lock: directory exists, pid inside refers to a dead process.
+    mkdirSync(lockDir, { recursive: true });
+    // PID 0 is never a valid live process.
+    writeFileSync(path.join(lockDir, 'pid'), '0', 'utf-8');
+
+    const server = createDaemonServer({
+      runtime: createRuntime(':memory:'),
+      socketPath,
+    });
+
+    try {
+      // listen() must recover the stale lock and proceed.
+      await expect(server.listen()).resolves.toBeUndefined();
+      await expect(daemonAvailable(socketPath)).resolves.toBe(true);
+    } finally {
+      await server.close().catch(() => undefined);
+    }
+  });
+
+  it('treats an EADDRINUSE from a live-lock holder as "already running"', async () => {
+    const socketPath = tempSocketPath('live-lock');
+    const lockDir = startupLockDir(socketPath);
+
+    // Plant a "live" lock that belongs to our own process.
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(path.join(lockDir, 'pid'), String(process.pid), 'utf-8');
+
+    const challenger = createDaemonServer({
+      runtime: createRuntime(':memory:'),
+      socketPath,
+    });
+
+    // Must fail because the lock is held by a live pid.
+    await expect(challenger.listen()).rejects.toMatchObject({
+      code: 'EADDRINUSE',
+    });
+
+    // Clean up the lock we planted.
+    rmSync(lockDir, { recursive: true, force: true });
+  });
+
+  it('releases the startup lock after a successful bind', async () => {
+    const socketPath = tempSocketPath('lock-released');
+    const lockDir = startupLockDir(socketPath);
+
+    const server = createDaemonServer({
+      runtime: createRuntime(':memory:'),
+      socketPath,
+    });
+
+    try {
+      await server.listen();
+      // After listen() completes the lock directory must be gone.
+      expect(existsSync(lockDir)).toBe(false);
+    } finally {
+      await server.close().catch(() => undefined);
+    }
+  });
+
+  it('releases the startup lock even when bind fails', async () => {
+    const socketPath = tempSocketPath('lock-released-on-fail');
+    const lockDir = startupLockDir(socketPath);
+
+    // Stand up a live daemon to force EADDRINUSE.
+    const liveServer = createDaemonServer({
+      runtime: createRuntime(':memory:'),
+      socketPath,
+    });
+    await liveServer.listen();
+
+    const challenger = createDaemonServer({
+      runtime: createRuntime(':memory:'),
+      socketPath,
+    });
+
+    try {
+      await expect(challenger.listen()).rejects.toThrow();
+      // Lock must be gone even though listen() failed.
+      expect(existsSync(lockDir)).toBe(false);
+    } finally {
+      await liveServer.close().catch(() => undefined);
+    }
   });
 });
 

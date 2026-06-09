@@ -1,5 +1,12 @@
 import { createHash } from 'node:crypto';
-import { mkdirSync, rmSync, unlinkSync } from 'node:fs';
+import {
+  mkdirSync,
+  rmdirSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+  readFileSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
@@ -184,6 +191,120 @@ function probeSocket(socketPath: string, timeoutMs = 500): Promise<boolean> {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Startup lock — serialises the probe→unlink→bind critical section
+// ---------------------------------------------------------------------------
+
+/**
+ * Path of the startup lock directory for a given socket path.
+ *
+ * We use a directory (not a file) because mkdir is atomic on all POSIX
+ * filesystems: exactly one process gets EEXIST, all others succeed.  A file
+ * created with O_EXCL would work too, but the dir approach lets us recover
+ * the holder PID without a separate read step.
+ */
+function lockPath(socketPath: string): string {
+  return `${socketPath}.lock.d`;
+}
+
+/**
+ * Attempt to acquire the startup lock for `socketPath`.
+ *
+ * The lock is a directory `<socketPath>.lock.d` that contains a `pid` file.
+ * mkdir is atomic: the first caller succeeds, all others receive EEXIST.
+ *
+ * Stale-lock recovery: if the lock directory exists but the PID written inside
+ * is dead (`process.kill(pid, 0)` throws ESRCH), the lock is stale — remove it
+ * and try once more.  If the pid is alive, another daemon is starting right now
+ * → return false so the caller can treat this as "already running".
+ *
+ * Returns true when the lock is held, false if a live peer holds it.
+ */
+function acquireStartupLock(socketPath: string): boolean {
+  const lock = lockPath(socketPath);
+  const pidFile = path.join(lock, 'pid');
+
+  const tryMkdir = (): boolean => {
+    try {
+      mkdirSync(lock);
+      // We own it — write our pid so a future caller can detect us as dead.
+      writeFileSync(pidFile, String(process.pid), 'utf-8');
+      return true;
+    } catch (err) {
+      if (!isErrnoException(err) || err.code !== 'EEXIST') throw err;
+      return false;
+    }
+  };
+
+  if (tryMkdir()) return true;
+
+  // Lock exists. Read the holder pid and decide whether it's stale.
+  let holderPid: number | undefined;
+  try {
+    holderPid = parseInt(readFileSync(pidFile, 'utf-8'), 10);
+  } catch {
+    // The pid file was removed between our mkdir and now — concurrent startup;
+    // treat as live to be safe.
+    return false;
+  }
+
+  if (!Number.isFinite(holderPid) || holderPid <= 0) {
+    // Unreadable/corrupt pid — treat as stale.
+    holderPid = undefined;
+  }
+
+  const holderIsAlive = (() => {
+    if (holderPid === undefined) return false;
+    try {
+      process.kill(holderPid, 0);
+      return true;
+    } catch (err) {
+      // ESRCH → process is dead; EPERM → alive but no permission (treated live)
+      if (isErrnoException(err) && err.code === 'ESRCH') return false;
+      return true;
+    }
+  })();
+
+  if (holderIsAlive) {
+    // Another process is actively starting up (or running) — yield.
+    return false;
+  }
+
+  // Stale lock — remove it and try to acquire once.
+  try {
+    unlinkSync(pidFile);
+  } catch {
+    /* already gone — that's fine */
+  }
+  try {
+    rmdirSync(lock);
+  } catch {
+    /* lost the removal race — another peer cleaned it up; just try mkdir */
+  }
+
+  return tryMkdir();
+}
+
+/**
+ * Release the startup lock acquired by {@link acquireStartupLock}.
+ * Called immediately after `server.listen()` resolves (or rejects); from that
+ * point on the bound socket itself is the liveness signal.
+ */
+function releaseStartupLock(socketPath: string): void {
+  const lock = lockPath(socketPath);
+  const pidFile = path.join(lock, 'pid');
+  try {
+    unlinkSync(pidFile);
+  } catch {
+    /* ignore */
+  }
+  try {
+    rmdirSync(lock);
+  } catch {
+    /* ignore */
+  }
+}
+
 function handleRequest(
   runtime: AgentMonitorRuntime,
   request: DaemonRequest,
@@ -329,34 +450,56 @@ export function createDaemonServer({
 
   return {
     async listen() {
-      // Before attempting to bind, check whether the socket file already exists.
-      // If it does, probe it: a live daemon answers → keep it (caller's "already
-      // running" guard handles this). A stale file (no listener) → safe to unlink.
-      // This is the only place we unlink — never unconditionally — so a live
-      // socket is never removed (no-clobber invariant).
-      const live = await probeSocket(socketPath);
-      if (!live) {
-        // Nothing is listening; any leftover file is stale — remove it so our
-        // bind does not hit EADDRINUSE.
-        try {
-          unlinkSync(socketPath);
-        } catch (unlinkErr) {
-          const code = isErrnoException(unlinkErr)
-            ? String(unlinkErr.code)
-            : '';
-          if (code !== 'ENOENT') throw unlinkErr;
-        }
+      // Acquire the per-workspace startup lock before entering the
+      // probe→unlink→bind critical section.  This prevents the TOCTOU race
+      // where two daemons both see "stale socket", both unlink, and the second
+      // removes the first's just-bound socket — leaving two daemons running on
+      // the same workspace (issue #68).
+      //
+      // The lock is a directory (<socketPath>.lock.d); mkdir is atomic on POSIX.
+      // We write our pid inside so a future caller can detect us as dead (stale-
+      // lock recovery).  We release the lock immediately after bind() completes —
+      // from that point the bound socket itself is the liveness signal.
+      const locked = acquireStartupLock(socketPath);
+      if (!locked) {
+        // A live peer is in the middle of (or just completed) its own startup.
+        // Behave as if we hit EADDRINUSE so the caller's "already running" guard
+        // takes over.
+        throw Object.assign(
+          new Error('EADDRINUSE: startup lock held by peer'),
+          {
+            code: 'EADDRINUSE',
+          },
+        );
       }
-      // Now attempt the actual bind.  If `live` is true we leave the socket
-      // alone and let the bind fail with EADDRINUSE so the caller can detect
-      // "already running" in the normal way.
-      return new Promise<void>((resolve, reject) => {
-        server.once('error', reject);
-        server.listen(socketPath, () => {
-          server.off('error', reject);
-          resolve();
+
+      try {
+        // Probe the socket: a live daemon answers → keep it (no-clobber).
+        // A stale file (no listener) → safe to unlink so our bind succeeds.
+        const live = await probeSocket(socketPath);
+        if (!live) {
+          try {
+            unlinkSync(socketPath);
+          } catch (unlinkErr) {
+            const code = isErrnoException(unlinkErr)
+              ? String(unlinkErr.code)
+              : '';
+            if (code !== 'ENOENT') throw unlinkErr;
+          }
+        }
+        // Attempt the actual bind.  If `live` is true we leave the socket alone
+        // and let bind fail with EADDRINUSE so the caller detects "already running".
+        await new Promise<void>((resolve, reject) => {
+          server.once('error', reject);
+          server.listen(socketPath, () => {
+            server.off('error', reject);
+            resolve();
+          });
         });
-      });
+      } finally {
+        // Release immediately — the bound socket is the liveness signal now.
+        releaseStartupLock(socketPath);
+      }
     },
     close() {
       return new Promise((resolve, reject) => {
