@@ -77,6 +77,25 @@ describe('generateMonitorSchema', () => {
     expect(conditional?.then.properties.watch).toEqual(fpSchema);
   });
 
+  it('requires watch.type inside each conditional if (typeless watch must not match every branch)', () => {
+    // Regression: without `required: ['type']` on the inner `watch`, JSON
+    // Schema `properties` is vacuously satisfied when `watch.type` is absent,
+    // so `watch: {}` would match every `if` and apply every `then` — yielding
+    // noisy, conflicting per-source errors instead of a clean "type required".
+    const schema = generateMonitorSchema([
+      makeSource('file-fingerprint', { type: 'object' }),
+      makeSource('api-poll', { type: 'object' }),
+    ]);
+
+    const allOf = schema.allOf as {
+      if: { properties: { watch: { required?: string[] } } };
+    }[];
+    expect(allOf).toHaveLength(2);
+    for (const conditional of allOf) {
+      expect(conditional.if.properties.watch.required).toContain('type');
+    }
+  });
+
   it('includes notify schema with debounce and throttle', () => {
     const schema = generateMonitorSchema([]);
 

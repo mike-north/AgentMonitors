@@ -15,7 +15,17 @@ export function generateMonitorSchema(
 
   const conditionals = sources.map((source) => ({
     if: {
-      properties: { watch: { properties: { type: { const: source.name } } } },
+      // `required: ['type']` on the inner `watch` is essential: JSON Schema
+      // `properties` constraints are vacuously satisfied when the property is
+      // absent, so without it a typeless `watch: {}` would match every `if` and
+      // apply every `then` — producing noisy, conflicting per-source errors
+      // instead of a clean "watch.type is required".
+      properties: {
+        watch: {
+          properties: { type: { const: source.name } },
+          required: ['type'],
+        },
+      },
       required: ['watch'],
     },
     then: {
