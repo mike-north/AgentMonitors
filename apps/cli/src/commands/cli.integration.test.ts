@@ -1013,3 +1013,368 @@ describe('inbox list', () => {
     expect(result.stderr).toContain('valid ISO 8601 date');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Dogfood UAT: incoming-changes runtime flow
+// Acceptance proof for https://github.com/mike-north/AgentMonitors/issues/40
+//
+// This test proves end-to-end that a commit advancing `main` under the watched
+// paths (`docs/specs/**`, `docs/standard/**`) surfaces a delivered signal in a
+// session via the hook claim path — with no manual polling or diffing.
+// ---------------------------------------------------------------------------
+
+function hasGit(): boolean {
+  try {
+    execFileSync('git', ['--version'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const gitAvailable = hasGit();
+
+/** Run a git command in the given directory with deterministic identity config. */
+function gitIn(cwd: string, args: string[]): void {
+  execFileSync('git', args, {
+    cwd,
+    stdio: 'pipe',
+    env: {
+      ...process.env,
+      GIT_AUTHOR_DATE: '2024-01-15T10:30:00+0000',
+      GIT_COMMITTER_DATE: '2024-01-15T10:30:00+0000',
+    },
+  });
+}
+
+describe.skipIf(!gitAvailable)('incoming-changes runtime flow', () => {
+  // Acceptance proof for https://github.com/mike-north/AgentMonitors/issues/40
+  // Proves the daemon → observe → deliver → claim path is wired and a claim is
+  // available; literal in-session rendering of the prompt is covered by the
+  // channel/hook transport tests, not here.
+  it('detects a spec-file commit on main and delivers a hook claim to the session', async () => {
+    // -----------------------------------------------------------------------
+    // 1. Create a temp git repo seeded with docs/specs/001.md on branch main.
+    // -----------------------------------------------------------------------
+    const repo = path.join(tempDir, 'incoming-changes-flow');
+    mkdirSync(repo, { recursive: true });
+
+    // git init with -b main; fall back to init + checkout if git is older
+    try {
+      gitIn(repo, ['init', '-b', 'main']);
+    } catch {
+      gitIn(repo, ['init']);
+      gitIn(repo, ['checkout', '-b', 'main']);
+    }
+    gitIn(repo, ['config', 'user.email', 'test@example.com']);
+    gitIn(repo, ['config', 'user.name', 'Test']);
+
+    // Seed the watched spec file (baseline commit on main)
+    const specFile = path.join(repo, 'docs', 'specs', '001.md');
+    mkdirSync(path.dirname(specFile), { recursive: true });
+    writeFileSync(specFile, '# Spec 001\n\nInitial content.\n', 'utf-8');
+    gitIn(repo, ['add', '.']);
+    gitIn(repo, [
+      '-c',
+      'user.name=Test',
+      '-c',
+      'user.email=test@example.com',
+      'commit',
+      '--message',
+      'chore: seed docs/specs/001.md',
+    ]);
+
+    // -----------------------------------------------------------------------
+    // 2. Write the test monitor into the repo's monitors dir.
+    //    cwd is set explicitly to the temp repo so the daemon's process.cwd()
+    //    doesn't affect git resolution.
+    // -----------------------------------------------------------------------
+    const monitorsDir = path.join(repo, '.claude', 'monitors', 'spec-changes');
+    mkdirSync(monitorsDir, { recursive: true });
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      `---
+name: Spec & standard changes from upstream
+source: incoming-changes
+urgency: normal
+scope:
+  paths:
+    - 'docs/specs/**'
+    - 'docs/standard/**'
+  branch: main
+  cwd: ${JSON.stringify(repo)}
+  interval: '1s'
+---
+Summarize what changed in the spec/standard docs and whether it affects current work.
+`,
+      'utf-8',
+    );
+
+    // -----------------------------------------------------------------------
+    // 3. Start the daemon with a dedicated DB and socket path.
+    // -----------------------------------------------------------------------
+    const dbPath = path.join(repo, 'agentmon.db');
+    const socketPath = path.join(
+      '/tmp',
+      `agentmon-ic-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const env = {
+      AGENTMONITORS_DB: dbPath,
+      AGENTMONITORS_SOCKET: socketPath,
+    };
+    const daemon = await startDaemon(
+      path.join(repo, '.claude', 'monitors'),
+      repo,
+      env,
+      socketPath,
+    );
+
+    try {
+      // -----------------------------------------------------------------------
+      // 4. Open a session for this workspace.
+      // -----------------------------------------------------------------------
+      const sessionOpen = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          'claude-incoming-changes-uat',
+          '--workspace',
+          repo,
+          '--format',
+          'json',
+        ],
+        env,
+        repo,
+      );
+      expect(sessionOpen.exitCode).toBe(0);
+      const session = JSON.parse(sessionOpen.stdout) as { id: string };
+
+      // -----------------------------------------------------------------------
+      // 5. Wait DETERMINISTICALLY for the first tick to establish the baseline.
+      //    incoming-changes records the current HEAD SHA on its first observe()
+      //    and emits nothing. We must not commit the change until that baseline
+      //    observe has run — otherwise the source would record the POST-commit
+      //    HEAD as its baseline and emit no event (a race a fixed sleep can lose
+      //    under slow/loaded CI). Poll the observation-history audit: the first
+      //    tick writes a `no-change` row for `spec-changes`, which is proof the
+      //    baseline observe() completed.
+      // -----------------------------------------------------------------------
+      const historyRows = () =>
+        runWithEnv(
+          ['monitor', 'history', 'spec-changes', '--format', 'json'],
+          env,
+          repo,
+        );
+      const baselineDeadline = Date.now() + 10_000;
+      while (Date.now() < baselineDeadline) {
+        const result = historyRows();
+        if (
+          result.exitCode === 0 &&
+          (JSON.parse(result.stdout) as unknown[]).length >= 1
+        ) {
+          break;
+        }
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+      }
+      const baseline = historyRows();
+      expect(baseline.exitCode).toBe(0);
+      const baselineHistory = JSON.parse(baseline.stdout) as {
+        result: string;
+      }[];
+      // The baseline observe ran and emitted nothing.
+      expect(baselineHistory.length).toBeGreaterThanOrEqual(1);
+      expect(baselineHistory.every((r) => r.result === 'no-change')).toBe(true);
+
+      // And no events have been delivered yet (baseline only).
+      const noEvents = runWithEnv(
+        [
+          'events',
+          'list',
+          '--session',
+          session.id,
+          '--unread',
+          '--format',
+          'json',
+        ],
+        env,
+        repo,
+      );
+      expect(noEvents.exitCode).toBe(0);
+      expect(JSON.parse(noEvents.stdout)).toHaveLength(0);
+
+      // -----------------------------------------------------------------------
+      // 6. Advance main: commit a change to docs/specs/001.md.
+      //    This simulates a `git pull` bringing in upstream spec changes.
+      // -----------------------------------------------------------------------
+      writeFileSync(
+        specFile,
+        '# Spec 001\n\nUpdated content — new invariant added.\n',
+        'utf-8',
+      );
+      gitIn(repo, ['add', '.']);
+      gitIn(repo, [
+        '-c',
+        'user.name=Test',
+        '-c',
+        'user.email=test@example.com',
+        'commit',
+        '--message',
+        'spec: add new invariant to 001',
+      ]);
+
+      // -----------------------------------------------------------------------
+      // 7. Poll events until exactly 1 unread event appears (deadline: 10s).
+      // -----------------------------------------------------------------------
+      const unread = () =>
+        runWithEnv(
+          [
+            'events',
+            'list',
+            '--session',
+            session.id,
+            '--unread',
+            '--format',
+            'json',
+          ],
+          env,
+          repo,
+        );
+
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        const result = unread();
+        if (result.exitCode === 0 && JSON.parse(result.stdout).length === 1) {
+          break;
+        }
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+      }
+
+      // -----------------------------------------------------------------------
+      // 8. Assert: 1 unread event, claim returns delivery with urgency normal.
+      // -----------------------------------------------------------------------
+      const unreadResult = unread();
+      expect(unreadResult.exitCode).toBe(0);
+      const unreadEvents = JSON.parse(unreadResult.stdout) as {
+        id: string;
+        title: string;
+        monitorId: string;
+      }[];
+      expect(unreadEvents).toHaveLength(1);
+
+      // Acceptance: the delivered signal must be concrete and actionable —
+      // it names the changed spec file and the nature of the change, not just
+      // "something changed". incoming-changes emits a per-path observation
+      // titled `Incoming change: <path> (<changeKind>)`.
+      const [event] = unreadEvents;
+      expect(event?.monitorId).toBe('spec-changes');
+      expect(event?.title).toContain('docs/specs/001.md');
+      expect(event?.title).toContain('modified');
+
+      const claim = runWithEnv(
+        [
+          'hook',
+          'claim',
+          '--session',
+          session.id,
+          '--lifecycle',
+          'turn-interruptible',
+          '--format',
+          'json',
+        ],
+        env,
+        repo,
+      );
+      expect(claim.exitCode).toBe(0);
+      const claimPayload = JSON.parse(claim.stdout) as {
+        mode: string;
+        urgency: string;
+      };
+      // A commit advancing the watched paths must produce a delivered signal.
+      expect(claimPayload.mode).toBe('delivery');
+      expect(claimPayload.urgency).toBe('normal');
+
+      // Acknowledge all events, confirm the queue is drained.
+      const ack = runWithEnv(
+        ['events', 'ack', '--session', session.id],
+        env,
+        repo,
+      );
+      expect(ack.exitCode).toBe(0);
+
+      const unreadAfterAck = unread();
+      expect(unreadAfterAck.exitCode).toBe(0);
+      expect(JSON.parse(unreadAfterAck.stdout)).toHaveLength(0);
+
+      // -----------------------------------------------------------------------
+      // Phase 2 — Regression guard: `**` in a git pathspec crosses `/` and
+      // matches files nested arbitrarily deep.  The dogfood monitor relies on
+      // `docs/specs/**` catching new files under ANY subdirectory (e.g. a newly
+      // created `docs/specs/design/nested.md`).  This second phase commits such
+      // a file and asserts it surfaces a delivered event, locking in the
+      // git-pathspec recursion semantics permanently.
+      // -----------------------------------------------------------------------
+      const nestedSpecFile = path.join(
+        repo,
+        'docs',
+        'specs',
+        'design',
+        'nested.md',
+      );
+      mkdirSync(path.dirname(nestedSpecFile), { recursive: true });
+      writeFileSync(
+        nestedSpecFile,
+        '# Nested design doc\n\nNew content.\n',
+        'utf-8',
+      );
+      gitIn(repo, ['add', '.']);
+      gitIn(repo, [
+        '-c',
+        'user.name=Test',
+        '-c',
+        'user.email=test@example.com',
+        'commit',
+        '--message',
+        'spec: add nested design doc',
+      ]);
+
+      const deadline2 = Date.now() + 10_000;
+      while (Date.now() < deadline2) {
+        const result = unread();
+        if (result.exitCode === 0 && JSON.parse(result.stdout).length === 1) {
+          break;
+        }
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+      }
+
+      const nestedUnreadResult = unread();
+      expect(nestedUnreadResult.exitCode).toBe(0);
+      const nestedEvents = JSON.parse(nestedUnreadResult.stdout) as {
+        id: string;
+        title: string;
+        monitorId: string;
+      }[];
+      expect(nestedEvents).toHaveLength(1);
+      // The event must name the deeply-nested path, not just a top-level file.
+      // incoming-changes titles: `Incoming change: <path> (<changeKind>)`
+      expect(nestedEvents[0]?.title).toContain('docs/specs/design/nested.md');
+      expect(nestedEvents[0]?.title).toContain('created');
+      expect(nestedEvents[0]?.monitorId).toBe('spec-changes');
+
+      // Leave the session clean.
+      const ack2 = runWithEnv(
+        ['events', 'ack', '--session', session.id],
+        env,
+        repo,
+      );
+      expect(ack2.exitCode).toBe(0);
+
+      const stop = runWithEnv(['daemon', 'stop'], env, repo);
+      expect(stop.exitCode).toBe(0);
+      await daemon.waitForExit();
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+    }
+  }, 30_000);
+});
