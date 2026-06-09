@@ -18,6 +18,10 @@ const PACKAGE_DEFS = [
     dir: 'plugins/source-file-fingerprint',
   },
   { name: '@mike-north/source-schedule', dir: 'plugins/source-schedule' },
+  {
+    name: '@mike-north/source-incoming-changes',
+    dir: 'plugins/source-incoming-changes',
+  },
 ];
 
 function run(command, args, cwd) {
@@ -76,6 +80,7 @@ function packPackage(packageDir, packDir) {
 }
 
 const SMOKE_SCRIPT = `import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
@@ -91,6 +96,7 @@ import {
 import apiPollSource from '@mike-north/source-api-poll';
 import fileFingerprintSource from '@mike-north/source-file-fingerprint';
 import scheduleSource from '@mike-north/source-schedule';
+import incomingChangesSource from '@mike-north/source-incoming-changes';
 
 const projectDir = path.dirname(fileURLToPath(import.meta.url));
 const packageNames = [
@@ -98,6 +104,7 @@ const packageNames = [
   '@mike-north/source-api-poll',
   '@mike-north/source-file-fingerprint',
   '@mike-north/source-schedule',
+  '@mike-north/source-incoming-changes',
 ];
 
 for (const packageName of packageNames) {
@@ -118,9 +125,11 @@ const registry = new SourceRegistry();
 registry.register(apiPollSource);
 registry.register(fileFingerprintSource);
 registry.register(scheduleSource);
+registry.register(incomingChangesSource);
 assert.deepEqual(registry.names().sort(), [
   'api-poll',
   'file-fingerprint',
+  'incoming-changes',
   'schedule',
 ]);
 
@@ -155,7 +164,6 @@ try {
 name: Watch file
 source: file-fingerprint
 urgency: normal
-event-kind: mutation
 scope:
   globs:
     - watched.txt
@@ -175,7 +183,6 @@ Tell the agent the watched file changed.
 name: Watch api
 source: api-poll
 urgency: normal
-event-kind: notification
 scope:
   url: http://127.0.0.1:\${port}/state
   interval: 0s
@@ -259,6 +266,106 @@ Tell the agent the local API changed.
   assert.equal(scheduled.observations.length, 1);
   assert.equal(scheduled.observations[0]?.title, 'Five minute timer');
 
+  // ---- incoming-changes source: git-backed smoke ----
+  // The incoming-changes source shells out to git, so exercise it against a
+  // real temp repo: create a branch with an initial commit, baseline it, then
+  // advance it with a second commit touching the tracked path and assert the
+  // next tick emits exactly one event for the changed file (spec 003 §6.2).
+  const gitRepoDir = path.join(projectDir, 'incoming-repo');
+  const trackedDir = path.join(gitRepoDir, 'tracked');
+  const trackedFile = path.join(trackedDir, 'file.txt');
+  mkdirSync(trackedDir, { recursive: true });
+
+  // Keep the success path quiet, but surface git's stderr on failure so a
+  // pre-publish break (missing git, config/commit failure) is diagnosable.
+  const git = (args) => {
+    try {
+      return execFileSync('git', args, {
+        cwd: gitRepoDir,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      if (typeof error.stderr === 'string' && error.stderr.length > 0) {
+        process.stderr.write(error.stderr);
+      }
+      throw error;
+    }
+  };
+
+  git(['init']);
+  git(['config', 'user.email', 'smoke@example.com']);
+  git(['config', 'user.name', 'Standalone Smoke']);
+  git(['config', 'commit.gpgsign', 'false']);
+  writeFileSync(trackedFile, 'one\\n', 'utf8');
+  git(['add', '-A']);
+  git(['commit', '-m', 'first commit']);
+  // Rename whatever the default branch is to a deterministic name.
+  git(['branch', '-m', 'work']);
+
+  const incomingMonitorsDir = path.join(projectDir, 'incoming-monitors');
+  const incomingMonitorDir = path.join(incomingMonitorsDir, 'watch-incoming');
+  mkdirSync(incomingMonitorDir, { recursive: true });
+  writeFileSync(
+    path.join(incomingMonitorDir, 'MONITOR.md'),
+    \`---
+name: Watch incoming
+source: incoming-changes
+urgency: normal
+scope:
+  paths:
+    - tracked/file.txt
+  branch: work
+  cwd: \${gitRepoDir}
+  interval: 0s
+---
+Tell the agent an incoming change landed.
+\`,
+    'utf8',
+  );
+
+  // A workspace with no open session: incoming-changes events materialize but
+  // project into nothing, so the main-session assertions above stay intact.
+  const incomingWorkspaceDir = path.join(projectDir, 'incoming-workspace');
+  mkdirSync(incomingWorkspaceDir, { recursive: true });
+
+  // Baseline run: records the current SHA and emits nothing (spec 003 §6.2).
+  const incomingBaselineTick = await runtime.tick(
+    incomingMonitorsDir,
+    incomingWorkspaceDir,
+  );
+  assert.equal(incomingBaselineTick.emittedEventIds.length, 0);
+
+  // Advance the branch with a commit touching the tracked path.
+  writeFileSync(trackedFile, 'two\\n', 'utf8');
+  git(['add', '-A']);
+  git(['commit', '-m', 'second commit']);
+
+  const incomingAdvanceTick = await runtime.tick(
+    incomingMonitorsDir,
+    incomingWorkspaceDir,
+  );
+  assert.equal(incomingAdvanceTick.emittedEventIds.length, 1);
+
+  const incomingEvents = runtime.listEvents({ monitorId: 'watch-incoming' });
+  assert.equal(incomingEvents.length, 1);
+  const incomingEvent = incomingEvents[0];
+  assert.ok(incomingEvent);
+  // spec 003 §6.2: title is "Incoming change: <path> (<changeKind>)"
+  assert.equal(
+    incomingEvent.title,
+    'Incoming change: tracked/file.txt (modified)',
+  );
+  // spec 003 §2.3 + §6.2: runtime copies changeKind into queryScope.changeKind
+  assert.equal(incomingEvent.queryScope.changeKind, 'modified');
+  // spec 003 §6.2: objectKey is the file path as reported by git
+  assert.equal(incomingEvent.objectKey, 'tracked/file.txt');
+  // spec 003 §6.2: snapshotText is the new file content for modified files
+  assert.equal(incomingEvent.snapshotText, 'two\\n');
+  // spec 003 §6.2: payload is { path, status, fromRef, toRef }
+  assert.equal(incomingEvent.payload.path, 'tracked/file.txt');
+  assert.equal(incomingEvent.payload.status, 'M');
+
   console.log(JSON.stringify({
     projectDir,
     workspaceDir,
@@ -287,11 +394,13 @@ import {
 import apiPollSource from '@mike-north/source-api-poll';
 import fileFingerprintSource from '@mike-north/source-file-fingerprint';
 import scheduleSource from '@mike-north/source-schedule';
+import incomingChangesSource from '@mike-north/source-incoming-changes';
 
 const sources: ObservationSource[] = [
   apiPollSource,
   fileFingerprintSource,
   scheduleSource,
+  incomingChangesSource,
 ];
 
 const registry = new SourceRegistry();
@@ -305,7 +414,6 @@ const parsed = parseMonitor(
 name: Typed monitor
 source: file-fingerprint
 urgency: normal
-event-kind: mutation
 scope:
   globs:
     - package.json
