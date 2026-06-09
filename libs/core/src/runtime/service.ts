@@ -282,6 +282,7 @@ export class AgentMonitorRuntime {
             summary: event.summary || event.body || event.title,
             urgency: event.urgency,
             createdAt: event.createdAt.toISOString(),
+            body: event.body,
           })),
         };
       }
@@ -370,6 +371,7 @@ export class AgentMonitorRuntime {
           summary: event.summary || event.body || event.title,
           urgency: event.urgency,
           createdAt: event.createdAt.toISOString(),
+          body: event.body,
         })),
       };
     }

@@ -76,6 +76,13 @@ export interface DeliveryEventSummary {
   summary: string;
   urgency: Urgency;
   createdAt: string;
+  /**
+   * The monitor's body-instructions for this event (from `MonitorEventRecord.body`,
+   * which is the monitor's markdown body / `observation.body`). Carries what the
+   * agent should DO when the monitor fires, so a delivery transport can surface the
+   * instructions, not just the title/summary.
+   */
+  body: string;
 }
 
 export interface DeliveryClaim {
