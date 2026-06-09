@@ -159,6 +159,13 @@ export interface PollingDecision {
   nextPollMs: number;
 }
 
+/**
+ * Summary returned by a single `AgentMonitorRuntime.tick()` call.
+ *
+ * Note: errored monitors (whose `observe()` threw) are still included in
+ * `evaluatedMonitors` — they were attempted even though their outcome is
+ * `errored` rather than `triggered`/`suppressed`/`no-change`.
+ */
 export interface RuntimeTickResult {
   evaluatedMonitors: string[];
   emittedEventIds: string[];
@@ -189,12 +196,30 @@ export interface RuntimeStatus {
 }
 
 /**
- * The outcome of evaluating a due monitor on a tick: `triggered` (≥1 observation
- * became an event), `suppressed` (observations were returned but none emitted —
- * throttled or held in a debounce batch), or `no-change` (the source returned
- * nothing).
+ * The outcome of evaluating a due monitor on a tick:
+ * - `triggered`: ≥1 observation became an event (including a tick that flushes a
+ *   previously-held debounce batch even when no new observations were returned).
+ * - `suppressed`: observations were returned but none emitted this tick —
+ *   throttled or held in a debounce batch.
+ * - `no-change`: the source returned no observations.
+ * - `errored`: a failure occurred and was isolated so the tick (or watcher)
+ *   continued. Two cases produce this outcome:
+ *   (1) The monitor's `observe()` threw or rejected in the tick loop. In this
+ *       case `ingest()` was never called, so the monitor's persisted
+ *       `sourceState` is left exactly as it was — no subsequent delta is
+ *       dropped.
+ *   (2) A single dispatched observation failed to materialize inside `ingest()`
+ *       (tick or watch path), e.g. a DB insert error. The batch's other
+ *       observations are unaffected; `emittedEventIds` reflects only the
+ *       observations that were durably written.
+ *   In both cases the audit write itself is best-effort: a `recordObservationHistory`
+ *   failure is swallowed so a failing audit row can never re-abort the tick.
  */
-export type ObservationOutcome = 'triggered' | 'suppressed' | 'no-change';
+export type ObservationOutcome =
+  | 'triggered'
+  | 'suppressed'
+  | 'no-change'
+  | 'errored';
 
 export interface ObservationHistoryRecord {
   id: string;
