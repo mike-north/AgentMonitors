@@ -276,8 +276,22 @@ Tell the agent the local API changed.
   const trackedFile = path.join(trackedDir, 'file.txt');
   mkdirSync(trackedDir, { recursive: true });
 
-  const git = (args) =>
-    execFileSync('git', args, { cwd: gitRepoDir, stdio: 'ignore' });
+  // Keep the success path quiet, but surface git's stderr on failure so a
+  // pre-publish break (missing git, config/commit failure) is diagnosable.
+  const git = (args) => {
+    try {
+      return execFileSync('git', args, {
+        cwd: gitRepoDir,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      if (typeof error.stderr === 'string' && error.stderr.length > 0) {
+        process.stderr.write(error.stderr);
+      }
+      throw error;
+    }
+  };
 
   git(['init']);
   git(['config', 'user.email', 'smoke@example.com']);
