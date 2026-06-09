@@ -44,13 +44,22 @@ When config files change, review the changes and update any dependent
 configuration or documentation that may be affected.
 ```
 
-Or create the directory structure manually:
+Or create a monitor manually. The simplest form is a single flat markdown file — just drop it into your monitors directory, and the filename (without the `.md` extension) becomes the monitor id:
+
+```
+.claude/monitors/
+  my-first-monitor.md
+```
+
+You can also use the folder form, where the folder name becomes the id:
 
 ```
 .claude/monitors/
   my-first-monitor/
     MONITOR.md
 ```
+
+The folder form is what `agentmonitors init` scaffolds, and it's the form the `monitor test` examples below reference.
 
 ## Validate Your Monitor
 

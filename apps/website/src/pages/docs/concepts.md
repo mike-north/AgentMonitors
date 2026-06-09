@@ -7,17 +7,16 @@ description: Understanding the Agent Monitors architecture
 
 ## Monitors
 
-A monitor is a declarative configuration that watches for external changes and produces durable inbox items for AI agents. Each monitor is a folder containing a `MONITOR.md` file:
+A monitor is a declarative configuration that watches for external changes and produces durable inbox items for AI agents. Each monitor is a markdown file — either a flat `<id>.md` file or an `<id>/MONITOR.md` file inside its own folder:
 
 ```
 .claude/monitors/
-  github-pr-review/
-    MONITOR.md
+  github-pr-review.md      # flat form — id is the filename without .md
   config-drift/
-    MONITOR.md
+    MONITOR.md             # folder form — id is the folder name
 ```
 
-The folder name is the monitor's machine identifier. The `MONITOR.md` file contains YAML frontmatter (policy) and a markdown body (handling instructions).
+The filename without its `.md` extension (flat form), or the folder name (folder form), is the monitor's machine identifier. The file contains YAML frontmatter (policy) and a markdown body (handling instructions).
 
 ## Observation Sources
 
@@ -37,22 +36,13 @@ The `file-fingerprint` and `api-poll` sources use a **baseline-then-detect** pat
 
 The `schedule` source is stateless — it simply checks if the current time matches the cron expression and produces an observation immediately.
 
-## Event Kinds
-
-Every monitor declares what kind of signal it produces:
-
-| Kind           | Meaning                  | Example                                 |
-| -------------- | ------------------------ | --------------------------------------- |
-| `mutation`     | Something changed        | File modified, API response changed     |
-| `notification` | New information arrived  | New code review, webhook event          |
-| `alert`        | A condition was detected | Memory pressure, rate limit approaching |
-
 ## Urgency
 
 Urgency drives delivery behavior:
 
 - **`high`** — Inline context injection via hook (interrupt the agent immediately)
 - **`normal`** — Hook tells the agent "you have inbox items, add a todo to check"
+- **`low`** — Surfaced at idle, without interrupting in-progress work
 
 ## Inbox
 

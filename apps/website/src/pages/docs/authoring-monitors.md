@@ -7,19 +7,29 @@ description: How to write effective monitor definitions
 
 ## File Structure
 
-Each monitor lives in its own folder with a `MONITOR.md` file:
+A monitor can be authored in either of two forms. The simplest is a flat markdown file — just drop a file into your monitors directory:
+
+```
+.claude/monitors/<monitor-id>.md
+```
+
+Here the filename (without the `.md` extension) becomes the monitor's machine identifier.
+
+Alternatively, a monitor can live in its own folder with a `MONITOR.md` file:
 
 ```
 .claude/monitors/<monitor-id>/MONITOR.md
 ```
 
-The folder name becomes the monitor's machine identifier. Choose a descriptive kebab-case name.
+In the folder form, the folder name becomes the identifier. Use this when you want to keep related assets alongside the monitor.
+
+Either way, choose a descriptive kebab-case identifier.
 
 ## Frontmatter Reference
 
 ```yaml
 ---
-name: GitHub PR review monitor # required, human-readable display name
+name: GitHub PR review monitor # optional, human-readable display name (defaults to the monitor id)
 source: api-poll # required, observation source plugin
 urgency: normal # required: high | normal | low
 scope: # required, source-specific configuration
