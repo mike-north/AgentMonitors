@@ -151,6 +151,8 @@ temp/
 
 # Claude
 .claude/*.local.*
+.claude/*.lock
+.claude/scheduled_tasks.lock
 .claude/monitors/*
 !.claude/monitors/spec-changes/
 !.claude/monitors/spec-changes/MONITOR.md

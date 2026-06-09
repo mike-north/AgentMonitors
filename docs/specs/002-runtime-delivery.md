@@ -197,7 +197,9 @@ Verified: `libs/core/src/runtime/types.ts` — `AgentLifecycleEvent` (lines 9–
 
 At `turn-interruptible`, the runtime **MUST** deliver all pending high-urgency events that have aged past the 15-second settle window (`DEFAULT_HIGH_URGENCY_SETTLE_MS`). The delivery payload **MUST** summarize the concrete events (titles and summaries), not just emit a generic reminder. The `DeliveryClaim` will have `mode: 'delivery'` and include a populated `events` array.
 
-Verified: `libs/core/src/runtime/service.ts` — `claimDelivery()` turn-interruptible high branch (lines 231–265): `settledHigh` filters by age, payload includes `summarizeEvents(...)` and a full `events` array.
+Each element of the `events` array is a `DeliveryEventSummary` which carries: `eventId`, `monitorId`, `title`, `summary`, `urgency`, `createdAt` (ISO-8601 string), and `body`. The `body` field is the raw monitor body-instructions (`MonitorEventRecord.body`, set from `observation.body ?? monitor.instructions`). It carries what the agent should **do** when the monitor fires, so a delivery transport (e.g. hook, MCP channel) can surface the instructions, not just the title/summary.
+
+Verified: `libs/core/src/runtime/service.ts` — `claimDelivery()` turn-interruptible high branch: `settledHigh` filters by age, payload includes `summarizeEvents(...)` and a full `events` array with `body: event.body`.
 
 ### 9.2 Normal urgency
 
@@ -219,9 +221,9 @@ At `post-compact`, if unread events remain, the runtime **MUST** emit a recap pa
 - appends two commands: one for full session history and one for unread details
 - updates `lastRecapAt` on the session record
 
-The `DeliveryClaim` in this case has `mode: 'recap'`. Claiming any delivery **MUST** mark the underlying session-event rows as claimed (`firstNotifiedAt` set). Claiming **MUST NOT** acknowledge them (`acknowledgedAt` remains null) (BP2).
+The `DeliveryClaim` in this case has `mode: 'recap'`. The `events` array contains up to 10 `DeliveryEventSummary` entries, each including `body` (the raw monitor instructions — see §9.1 for the `DeliveryEventSummary` shape). Claiming any delivery **MUST** mark the underlying session-event rows as claimed (`firstNotifiedAt` set). Claiming **MUST NOT** acknowledge them (`acknowledgedAt` remains null) (BP2).
 
-Verified: `libs/core/src/runtime/service.ts` — `claimDelivery()` post-compact branch (lines 318–355); `MAX_RECAP_EVENTS = 10` (line 33); `store.markClaimed()` does not set `acknowledgedAt` (see `libs/core/src/runtime/store.ts` lines 493–511: only sets `firstNotifiedAt`, `lastClaimAt`, `lastClaimLifecycle`).
+Verified: `libs/core/src/runtime/service.ts` — `claimDelivery()` post-compact branch; `MAX_RECAP_EVENTS = 10`; `store.markClaimed()` does not set `acknowledgedAt` (see `libs/core/src/runtime/store.ts`: only sets `firstNotifiedAt`, `lastClaimAt`, `lastClaimLifecycle`). Each mapped event includes `body: event.body`.
 
 ## 10. Daemon and IPC
 

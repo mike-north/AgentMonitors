@@ -278,6 +278,99 @@ Handle it.
     expect(claim?.events).toHaveLength(1);
   });
 
+  // Plan D Task 1: delivery claims must carry the raw monitor body (instructions) so
+  // a downstream delivery transport can surface what the agent should DO, not just
+  // the title/summary. Covers both the settled-high path and the recap path.
+  it('includes the raw monitor body in each DeliveryEventSummary for a high-urgency delivery claim', () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const db = createDb(':memory:');
+    const registry = new SourceRegistry();
+    const runtime = new AgentMonitorRuntime(new RuntimeStore(db), registry, [
+      claudeCodeAdapter,
+    ]);
+
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-session-body-high',
+        workspacePath: rootDir,
+      }),
+    );
+
+    const store = new RuntimeStore(db);
+    const distinctBody =
+      'When CI fails: immediately check the failing test suite and fix the root cause before continuing.';
+    store.insertEvent({
+      workspacePath: rootDir,
+      monitorId: 'ci-monitor',
+      sourceName: 'manual',
+      urgency: 'high',
+      title: 'CI failed',
+      body: distinctBody,
+      summary: 'CI failed on the default branch',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey: 'ci/default',
+      queryScope: { pipeline: 'default' },
+      tags: ['ci'],
+      // Aged past the 15s settle window — mirrors the existing high-urgency test idiom
+      createdAt: new Date(Date.now() - 20_000),
+    });
+
+    const claim = runtime.claimDelivery(session.id, 'turn-interruptible');
+    expect(claim?.mode).toBe('delivery');
+    expect(claim?.urgency).toBe('high');
+    expect(claim?.events).toHaveLength(1);
+    // The raw body (monitor instructions) must be present and unmodified
+    expect(claim?.events[0]?.body).toBe(distinctBody);
+  });
+
+  it('includes the raw monitor body in each DeliveryEventSummary for a recap delivery claim', () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const db = createDb(':memory:');
+    const registry = new SourceRegistry();
+    const runtime = new AgentMonitorRuntime(new RuntimeStore(db), registry, [
+      claudeCodeAdapter,
+    ]);
+
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-session-body-recap',
+        workspacePath: rootDir,
+      }),
+    );
+
+    const store = new RuntimeStore(db);
+    const distinctBody =
+      'When a doc comment arrives: review the linked PR and leave feedback within 24 hours.';
+    store.insertEvent({
+      workspacePath: rootDir,
+      monitorId: 'doc-monitor',
+      sourceName: 'manual',
+      urgency: 'normal',
+      title: 'Doc comments',
+      body: distinctBody,
+      summary: 'New comments landed',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey: 'doc-1',
+      queryScope: { doc: 'doc-1' },
+      tags: ['docs'],
+      createdAt: new Date(),
+    });
+
+    const claim = runtime.claimDelivery(session.id, 'post-compact');
+    expect(claim?.mode).toBe('recap');
+    expect(claim?.events).toHaveLength(1);
+    // The raw body (monitor instructions) must be present and unmodified
+    expect(claim?.events[0]?.body).toBe(distinctBody);
+  });
+
   it('defers low-urgency delivery until idle lifecycle points', () => {
     const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
     tempDirs.push(rootDir);
