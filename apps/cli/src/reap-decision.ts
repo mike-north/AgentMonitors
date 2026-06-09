@@ -8,7 +8,9 @@
  *     idle window is `max(reapAfterMs, bootGraceMs)`.
  *   - Once at least one session has been seen and all are closed again, the
  *     normal `reapAfterMs` applies.
- *   - Orphan daemons (never registered a session) still reap after `bootGraceMs`.
+ *   - Orphan daemons (never registered a session) still reap after that same
+ *     `max(reapAfterMs, bootGraceMs)` window — so a daemon that boots but whose
+ *     session never registers does not linger forever.
  */
 
 export interface ShouldReapInput {

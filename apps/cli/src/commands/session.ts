@@ -7,7 +7,7 @@ import {
   listSessionsClient,
   openSessionClient,
 } from '../runtime-client.js';
-import { daemonAvailable } from '../daemon-ipc.js';
+import { daemonAvailable, resolveSocketPath } from '../daemon-ipc.js';
 import { readLocalState, writeLocalState } from '../local-state.js';
 import { workspacePaths } from '../workspace-paths.js';
 import { spawnDetachedDaemon } from '../detached-spawn.js';
@@ -142,7 +142,13 @@ sessionCommand
     if (!state.enabled) return; // quick-exit: monitoring not enabled here
 
     const paths = workspacePaths(workspacePath);
-    const socket = state.socket ?? paths.socket;
+    // Resolve the socket up-front through the SAME transform `daemon run` applies
+    // when it binds (resolveSocketPath falls back to a short /tmp socket when the
+    // derived path exceeds the ~100-char Unix limit). Resolving here keeps the
+    // spawner, the daemonAvailable poll, openSessionClient, and the persisted
+    // `.local.md` socket all pointing at the actual bound socket — and stores the
+    // REAL path so sibling hooks (end, deliver) read a socket that exists.
+    const socket = resolveSocketPath(state.socket ?? paths.socket);
     const db = state.db ?? paths.db;
     const monitorsDir = path.join(workspacePath, '.claude', 'monitors');
 
@@ -202,16 +208,18 @@ sessionCommand
     if (!hostSessionId) return;
     const state = readLocalState(workspacePath);
     if (!state.enabled || !state.socket) return;
-    if (!(await daemonAvailable(state.socket))) return;
-    // resolve this host session's runtime id, then close it
-    const sessions = await listSessionsClient(state.socket);
-    const match = sessions.find((s) => s.hostSessionId === hostSessionId);
-    if (match) {
-      try {
-        await closeSessionClient(match.id, state.socket);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        reportError(message, false);
-      }
+    const socket = resolveSocketPath(state.socket);
+    if (!(await daemonAvailable(socket))) return;
+    // `session end` runs from a SessionEnd hook and must be a quiet no-op even if
+    // the daemon disappears between the availability check and the list/close
+    // (a TOCTOU race, or a self-reap firing concurrently). Wrap the whole
+    // resolve-id-then-close in try/catch so a vanished daemon never surfaces as
+    // an unhandled hook error.
+    try {
+      const sessions = await listSessionsClient(socket);
+      const match = sessions.find((s) => s.hostSessionId === hostSessionId);
+      if (match) await closeSessionClient(match.id, socket);
+    } catch {
+      // daemon went away mid-deregister — the idle reaper is the backstop; no-op.
     }
   });
