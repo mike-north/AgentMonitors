@@ -71,7 +71,8 @@ node apps/cli/dist/index.cjs events list \
 
 The `incoming-changes runtime flow` describe block in
 `apps/cli/src/commands/cli.integration.test.ts` is the automated proof of this end-to-end
-path. It:
+path (daemon → observe → deliver → claim); literal in-session rendering of the prompt is
+covered by the channel/hook transport tests, not this UAT. It:
 
 1. Creates a temp git repo with an initial `docs/specs/001.md` commit on `main`.
 2. Starts the daemon pointing at an `incoming-changes` monitor scoped to

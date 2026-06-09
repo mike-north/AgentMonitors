@@ -147,6 +147,31 @@ describe('source-incoming-changes', () => {
     expect(source.scopeSchema['required']).toContain('paths');
   });
 
+  it('declares interval in scopeSchema.properties (type string, not required)', () => {
+    // interval is handled by the scheduling engine, not the source itself.
+    // It must be declared in scopeSchema so authored monitors using it (e.g. the
+    // dogfood spec-changes monitor with `interval: 5m`) are schema-valid.
+    const props = source.scopeSchema['properties'] as Record<
+      string,
+      { type?: string; description?: string }
+    >;
+    expect(props).toHaveProperty('interval');
+    expect(props['interval']?.type).toBe('string');
+    // interval must NOT be required — it is optional scheduling metadata
+    expect(source.scopeSchema['required']).not.toContain('interval');
+  });
+
+  it('accepts a scope that includes an interval field', async () => {
+    const dir = makeTempRepo();
+    writeAndCommit(dir, { 'a.txt': 'init' }, 'init');
+
+    // A scope with interval must not throw — the source ignores it (scheduling
+    // engine owns it) but must not reject the config as unknown.
+    await expect(
+      source.observe({ paths: ['.'], cwd: dir, interval: '5m' }, { now: NOW }),
+    ).resolves.toBeDefined();
+  });
+
   it('throws on missing paths config', async () => {
     const dir = makeTempRepo();
     writeAndCommit(dir, { 'a.txt': 'init' }, 'init');

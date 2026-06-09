@@ -328,6 +328,11 @@ const scopeSchema: JsonSchema = {
       type: 'string',
       description: 'Repository working directory for git resolution',
     },
+    interval: {
+      type: 'string',
+      description:
+        'Polling interval (e.g., "5m"). Used by the scheduling engine, not by this plugin directly.',
+    },
   },
   required: ['paths'],
 };

@@ -1049,6 +1049,9 @@ function gitIn(cwd: string, args: string[]): void {
 
 describe.skipIf(!gitAvailable)('incoming-changes runtime flow', () => {
   // Acceptance proof for https://github.com/mike-north/AgentMonitors/issues/40
+  // Proves the daemon → observe → deliver → claim path is wired and a claim is
+  // available; literal in-session rendering of the prompt is covered by the
+  // channel/hook transport tests, not here.
   it('detects a spec-file commit on main and delivers a hook claim to the session', async () => {
     // -----------------------------------------------------------------------
     // 1. Create a temp git repo seeded with docs/specs/001.md on branch main.
@@ -1303,6 +1306,69 @@ Summarize what changed in the spec/standard docs and whether it affects current 
       expect(unreadAfterAck.exitCode).toBe(0);
       expect(JSON.parse(unreadAfterAck.stdout)).toHaveLength(0);
 
+      // -----------------------------------------------------------------------
+      // Phase 2 — Regression guard: `**` in a git pathspec crosses `/` and
+      // matches files nested arbitrarily deep.  The dogfood monitor relies on
+      // `docs/specs/**` catching new files under ANY subdirectory (e.g. a newly
+      // created `docs/specs/design/nested.md`).  This second phase commits such
+      // a file and asserts it surfaces a delivered event, locking in the
+      // git-pathspec recursion semantics permanently.
+      // -----------------------------------------------------------------------
+      const nestedSpecFile = path.join(
+        repo,
+        'docs',
+        'specs',
+        'design',
+        'nested.md',
+      );
+      mkdirSync(path.dirname(nestedSpecFile), { recursive: true });
+      writeFileSync(
+        nestedSpecFile,
+        '# Nested design doc\n\nNew content.\n',
+        'utf-8',
+      );
+      gitIn(repo, ['add', '.']);
+      gitIn(repo, [
+        '-c',
+        'user.name=Test',
+        '-c',
+        'user.email=test@example.com',
+        'commit',
+        '--message',
+        'spec: add nested design doc',
+      ]);
+
+      const deadline2 = Date.now() + 10_000;
+      while (Date.now() < deadline2) {
+        const result = unread();
+        if (result.exitCode === 0 && JSON.parse(result.stdout).length === 1) {
+          break;
+        }
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+      }
+
+      const nestedUnreadResult = unread();
+      expect(nestedUnreadResult.exitCode).toBe(0);
+      const nestedEvents = JSON.parse(nestedUnreadResult.stdout) as {
+        id: string;
+        title: string;
+        monitorId: string;
+      }[];
+      expect(nestedEvents).toHaveLength(1);
+      // The event must name the deeply-nested path, not just a top-level file.
+      // incoming-changes titles: `Incoming change: <path> (<changeKind>)`
+      expect(nestedEvents[0]?.title).toContain('docs/specs/design/nested.md');
+      expect(nestedEvents[0]?.title).toContain('created');
+      expect(nestedEvents[0]?.monitorId).toBe('spec-changes');
+
+      // Leave the session clean.
+      const ack2 = runWithEnv(
+        ['events', 'ack', '--session', session.id],
+        env,
+        repo,
+      );
+      expect(ack2.exitCode).toBe(0);
+
       const stop = runWithEnv(['daemon', 'stop'], env, repo);
       expect(stop.exitCode).toBe(0);
       await daemon.waitForExit();
@@ -1310,5 +1376,5 @@ Summarize what changed in the spec/standard docs and whether it affects current 
       daemon.stop();
       await daemon.waitForExit();
     }
-  }, 20_000);
+  }, 30_000);
 });
