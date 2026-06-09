@@ -1,144 +1,131 @@
 ---
 title: Getting Started
-description: Set up your first Agent Monitor in minutes
+description: Install Agent Monitors, author your first monitor, and see a signal in minutes.
 ---
 
 # Getting Started
 
-## Installation
+## Install
 
-Install the Agent Monitors CLI globally:
-
-```bash
-npm install -g @mike-north/cli
-```
-
-Or use it via npx:
+The `agentmonitors` CLI is not yet published to a package registry. Build it from the
+monorepo:
 
 ```bash
-npx @mike-north/cli --help
+git clone https://github.com/mike-north/AgentMonitors.git
+cd AgentMonitors
+pnpm install
+pnpm build
 ```
 
-## Your First Monitor
+The binary is then `apps/cli/dist/index.cjs`. Alias it for convenience:
 
-Scaffold a new monitor using the `init` command:
+```bash
+alias agentmonitors="node \"$(pwd)/apps/cli/dist/index.cjs\""
+```
+
+## Scaffold your first monitor
+
+The `init` command creates a ready-to-edit `MONITOR.md` in your project's monitors folder:
 
 ```bash
 agentmonitors init my-first-monitor
 ```
 
-This creates `.claude/monitors/my-first-monitor/MONITOR.md` with a starter template. Edit it to configure your monitor:
+This creates `.claude/monitors/my-first-monitor/MONITOR.md`. By default it scaffolds a
+`file-fingerprint` monitor:
+
+```yaml
+---
+name: My monitor
+watch:
+  type: file-fingerprint
+  globs:
+    - '**/*.ts'
+urgency: normal
+---
+
+When changes are detected, review and take appropriate action.
+```
+
+You can scaffold other source types with `--type`:
+
+```bash
+agentmonitors init api-watcher --type api-poll
+agentmonitors init daily-standup --type schedule
+agentmonitors init spec-watcher --type incoming-changes
+```
+
+## Edit the monitor body
+
+The markdown body after the frontmatter is the handling instruction the agent receives when
+the monitor fires. Write it as a prompt fragment:
 
 ```yaml
 ---
 name: Config file watcher
-source: file-fingerprint
-urgency: normal
-scope:
+watch:
+  type: file-fingerprint
   globs:
-    - '*.config.js'
     - '*.config.ts'
     - 'tsconfig.json'
+urgency: normal
 ---
-When config files change, review the changes and update any dependent
-configuration or documentation that may be affected.
+Config files changed. Review the diff, check whether the change affects
+build output or dependencies, and update any documentation that references
+the changed configuration.
 ```
 
-Or create a monitor manually. The simplest form is a single flat markdown file — just drop it into your monitors directory, and the filename (without the `.md` extension) becomes the monitor id:
+## Validate
 
-```
-.claude/monitors/
-  my-first-monitor.md
-```
-
-You can also use the folder form, where the folder name becomes the id:
-
-```
-.claude/monitors/
-  my-first-monitor/
-    MONITOR.md
-```
-
-The folder form is what `agentmonitors init` scaffolds, and it's the form the `monitor test` examples below reference.
-
-## Validate Your Monitor
+Check that your monitor parses correctly and its source configuration is valid:
 
 ```bash
 agentmonitors validate .claude/monitors
 ```
 
-## Test the Observation Source
+## Test the observation source
+
+Dry-run the source against your filesystem to confirm it can observe:
 
 ```bash
 agentmonitors monitor test .claude/monitors/my-first-monitor/MONITOR.md
 ```
 
-> **Note:** The `file-fingerprint` and `api-poll` sources use a baseline-then-detect pattern. The first run establishes a baseline of current state. The `monitor test` command runs a second observation automatically to verify the source can read your files. In production, the agent process keeps running between observations, so changes are detected across polls.
+> **Note:** `file-fingerprint` and `api-poll` use a baseline-then-detect pattern. The first
+> run establishes the baseline; `monitor test` runs a second observation automatically so
+> you can see the change-detection in action.
 
-## Scan Your Monitors
+## Scan all monitors
 
-Get an overview of all monitors in a directory:
+Get an overview of every monitor under a root — useful to verify discovery:
 
 ```bash
 agentmonitors scan .claude/monitors
 ```
 
-## View Your Inbox
+## Start the daemon
+
+The daemon ticks on an interval, observes each source, and materialises durable events:
 
 ```bash
-agentmonitors inbox list
+agentmonitors daemon run
 ```
 
-## Manage Inbox Items
-
-Walk items through the lifecycle using inbox subcommands:
+For a single tick (useful in CI or scripts):
 
 ```bash
-# Acknowledge an item (you've seen it)
-agentmonitors inbox ack <id>
-
-# Mark as in-progress (you're working on it)
-agentmonitors inbox start <id>
-
-# Mark as completed or failed
-agentmonitors inbox complete <id>
-agentmonitors inbox fail <id> --error "reason for failure"
-
-# Archive when done
-agentmonitors inbox archive <id>
+agentmonitors daemon once
 ```
 
-The state machine enforces valid transitions: `queued → acked → in-progress → completed|failed → archived`. Invalid transitions produce a clear error message.
+## See events
 
-## Filter Inbox Items
-
-Use `inbox list` with filters and date ranges:
+After the daemon has run at least one tick:
 
 ```bash
-# Filter by state, urgency, tags, or date range
-agentmonitors inbox list --state in-progress --urgency high
-agentmonitors inbox list --since 2024-01-01 --until 2024-02-01
-agentmonitors inbox list --tags github,review --format json
+agentmonitors events list
 ```
 
-## View Installed Sources
+## Next steps
 
-```bash
-agentmonitors source list
-```
-
-This shows all available observation sources with their required and optional scope fields.
-
-## Generate JSON Schema
-
-Generate a JSON Schema for editor autocompletion and validation:
-
-```bash
-agentmonitors schema generate
-agentmonitors schema generate -o monitor-schema.json
-```
-
-## Next Steps
-
-- Read about [core concepts](/docs/concepts) to understand the architecture
-- Learn how to [author monitors](/docs/authoring-monitors) for different use cases
+- [Authoring monitors](/docs/authoring-monitors) — all sources, urgency levels, notify strategies
+- [Use cases](/docs/use-cases) — patterns from simple file-watching to fleet supervision

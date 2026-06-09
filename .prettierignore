@@ -11,3 +11,8 @@ api-report
 
 # Throwaway experiments are not held to the production format gate
 experiments/
+
+# The website app has its own Next.js/Markdoc toolchain (Markdoc's {% %} tags
+# have no Prettier parser); excluded from the root format gate, matching its
+# exclusion from build/check (nx) and eslint (eslint.config.mjs).
+apps/website/
