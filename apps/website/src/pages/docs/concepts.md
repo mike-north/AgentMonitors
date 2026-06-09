@@ -11,12 +11,12 @@ A monitor is a declarative configuration that watches for external changes and p
 
 ```
 .claude/monitors/
-  github-pr-review.md      # flat form — id is the filename
+  github-pr-review.md      # flat form — id is the filename without .md
   config-drift/
     MONITOR.md             # folder form — id is the folder name
 ```
 
-The filename (flat form) or folder name (folder form) is the monitor's machine identifier. The file contains YAML frontmatter (policy) and a markdown body (handling instructions).
+The filename without its `.md` extension (flat form), or the folder name (folder form), is the monitor's machine identifier. The file contains YAML frontmatter (policy) and a markdown body (handling instructions).
 
 ## Observation Sources
 
