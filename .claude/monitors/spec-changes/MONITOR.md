@@ -1,13 +1,13 @@
 ---
 name: Spec & standard changes from upstream
-source: incoming-changes
-urgency: normal
-scope:
+watch:
+  type: incoming-changes
   paths:
     - 'docs/specs/**'
     - 'docs/standard/**'
   branch: main
   interval: 5m
+urgency: normal
 ---
 
 When this monitor fires, a `git pull` (or local commit) has advanced `main` in a way that

@@ -5,16 +5,23 @@ export type JsonSchema = Record<string, unknown>;
  * The lifecycle transition an observed object underwent — a source-agnostic
  * vocabulary every source can speak, so consumers reason about change uniformly:
  *
- * - `created` — the object newly appeared / entered the monitor's scope.
- * - `modified` — the object changed while remaining in scope.
- * - `deleted` — the object was destroyed upstream; **its information is lost**
- *   (a file removed from disk, a pull request deleted from the host).
- * - `descoped` — the object still exists upstream but has **left the monitor's
- *   scope**, so it is no longer observed; no information is lost (a file that no
- *   longer matches the globs, a pull request that closed while watching open PRs).
+ * - `created` — a new object or member entered the monitor's scope. This covers
+ *   both first-time discovery of an object and a new item appearing in a watched
+ *   collection or feed. The object did not previously exist within the monitored
+ *   set, regardless of whether it existed somewhere upstream.
+ * - `modified` — the object changed while remaining in scope; it existed before
+ *   and still exists, but its observed state differs.
+ * - `deleted` — the object was **destroyed upstream**; its information is
+ *   permanently lost (a file removed from disk, a pull request deleted from the
+ *   host). The agent should react as if the data is gone.
+ * - `descoped` — the object **still exists upstream** but has left the monitor's
+ *   scope, so it is no longer observed; no information is lost. Examples: a file
+ *   that no longer matches the monitored globs; a pull request that closed while
+ *   the monitor watched only open PRs.
  *
- * `deleted` and `descoped` are deliberately distinct: an agent reacts differently
- * to lost information than to an object merely leaving the observed set.
+ * `deleted` and `descoped` are deliberately distinct: a `deleted` object is gone;
+ * a `descoped` object merely left the observed window. An agent reacts differently
+ * to lost information than to an object that moved out of the watched set.
  */
 export type ChangeKind = 'created' | 'modified' | 'deleted' | 'descoped';
 

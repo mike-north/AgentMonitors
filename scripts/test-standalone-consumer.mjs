@@ -134,7 +134,7 @@ assert.deepEqual(registry.names().sort(), [
 ]);
 
 const schema = generateMonitorSchema(registry.list());
-assert.deepEqual(schema.properties.source.enum.sort(), registry.names().sort());
+assert.deepEqual(schema.properties.watch.properties.type.enum.sort(), registry.names().sort());
 
 const workspaceDir = path.join(projectDir, 'workspace');
 const monitorsDir = path.join(workspaceDir, '.claude', 'monitors');
@@ -162,13 +162,13 @@ try {
     path.join(fileMonitorDir, 'MONITOR.md'),
     \`---
 name: Watch file
-source: file-fingerprint
-urgency: normal
-scope:
+watch:
+  type: file-fingerprint
   globs:
     - watched.txt
   cwd: \${workspaceDir}
   interval: 0s
+urgency: normal
 ---
 Tell the agent the watched file changed.
 \`,
@@ -181,13 +181,13 @@ Tell the agent the watched file changed.
     path.join(apiMonitorDir, 'MONITOR.md'),
     \`---
 name: Watch api
-source: api-poll
-urgency: normal
-scope:
+watch:
+  type: api-poll
   url: http://127.0.0.1:\${port}/state
   interval: 0s
   change-detection:
     strategy: json-diff
+urgency: normal
 ---
 Tell the agent the local API changed.
 \`,
@@ -310,14 +310,14 @@ Tell the agent the local API changed.
     path.join(incomingMonitorDir, 'MONITOR.md'),
     \`---
 name: Watch incoming
-source: incoming-changes
-urgency: normal
-scope:
+watch:
+  type: incoming-changes
   paths:
     - tracked/file.txt
   branch: work
   cwd: \${gitRepoDir}
   interval: 0s
+urgency: normal
 ---
 Tell the agent an incoming change landed.
 \`,
@@ -412,11 +412,11 @@ const schema = generateMonitorSchema(registry.list());
 const parsed = parseMonitor(
   \`---
 name: Typed monitor
-source: file-fingerprint
-urgency: normal
-scope:
+watch:
+  type: file-fingerprint
   globs:
     - package.json
+urgency: normal
 ---
 Type smoke
 \`,

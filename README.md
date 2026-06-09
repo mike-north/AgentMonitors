@@ -68,12 +68,12 @@ A monitor looks like this:
 ```yaml
 ---
 name: Config file watcher
-source: file-fingerprint
-urgency: normal
-scope:
+watch:
+  type: file-fingerprint
   globs:
     - '*.config.ts'
     - 'tsconfig.json'
+urgency: normal
 ---
 When config files change, review the changes and update any dependent
 configuration or documentation that may be affected.

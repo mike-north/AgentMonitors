@@ -34,6 +34,16 @@ const DEFAULT_FILE_FINGERPRINT_POLL_MS = 30_000;
 const DEFAULT_API_POLL_MS = 300_000;
 const DEFAULT_HIGH_URGENCY_SETTLE_MS = 15_000;
 const MAX_RECAP_EVENTS = 10;
+
+/**
+ * Extract the per-source configuration from a monitor's `watch` block. This is
+ * the `watch` object minus the `type` key, which is passed to source plugins as
+ * their config (matching the old `scope` contract).
+ */
+function watchConfig(watch: Record<string, unknown>): Record<string, unknown> {
+  const { type: _type, ...config } = watch;
+  return config;
+}
 const NORMAL_INBOX_PROMPT = 'AgentMon messages are available. Read the inbox.';
 const IDLE_INBOX_PROMPT = 'AgentMon has inbox updates ready for review.';
 
@@ -380,10 +390,11 @@ export class AgentMonitorRuntime {
 
     for (const parsed of result.monitors) {
       const monitor = parsed.monitor;
-      const source = this.registry.get(monitor.frontmatter.source);
+      const sourceName = monitor.frontmatter.watch.type;
+      const source = this.registry.get(sourceName);
       if (!source) {
         throw new Error(
-          `Monitor "${monitor.id}" references unknown source "${monitor.frontmatter.source}".`,
+          `Monitor "${monitor.id}" references unknown source "${sourceName}".`,
         );
       }
 
@@ -406,10 +417,13 @@ export class AgentMonitorRuntime {
       let observationResult;
       try {
         const monitorState = this.store.getMonitorState(monitor.id);
-        observationResult = await source.observe(monitor.frontmatter.scope, {
-          previousState: monitorState.sourceState,
-          now,
-        });
+        observationResult = await source.observe(
+          watchConfig(monitor.frontmatter.watch),
+          {
+            previousState: monitorState.sourceState,
+            now,
+          },
+        );
       } catch (observeError) {
         // observe() failed: record errored outcome (best-effort) and skip
         // this monitor entirely for this tick. ingest() is NOT called, which
@@ -417,7 +431,7 @@ export class AgentMonitorRuntime {
         try {
           this.store.recordObservationHistory({
             monitorId: monitor.id,
-            sourceName: monitor.frontmatter.source,
+            sourceName,
             result: 'errored',
             observationData: {
               error:
@@ -450,7 +464,7 @@ export class AgentMonitorRuntime {
         try {
           this.store.recordObservationHistory({
             monitorId: monitor.id,
-            sourceName: monitor.frontmatter.source,
+            sourceName,
             result: 'errored',
             observationData: {
               error:
@@ -519,7 +533,7 @@ export class AgentMonitorRuntime {
     const emittedCount = dispatch.emitted.length;
     this.store.recordObservationHistory({
       monitorId: monitor.id,
-      sourceName: monitor.frontmatter.source,
+      sourceName: monitor.frontmatter.watch.type,
       result:
         emittedCount > 0
           ? 'triggered'
@@ -541,7 +555,7 @@ export class AgentMonitorRuntime {
       try {
         const event = this.processObservation({
           monitor: emitted.monitor,
-          sourceName: emitted.monitor.frontmatter.source,
+          sourceName: emitted.monitor.frontmatter.watch.type,
           observation: emitted.observation,
           observedAt: emitted.observedAt,
           workspacePath: options.workspacePath,
@@ -551,7 +565,7 @@ export class AgentMonitorRuntime {
         try {
           this.store.recordObservationHistory({
             monitorId: monitor.id,
-            sourceName: monitor.frontmatter.source,
+            sourceName: monitor.frontmatter.watch.type,
             result: 'errored',
             observationData: {
               error:
@@ -617,10 +631,11 @@ export class AgentMonitorRuntime {
 
     for (const parsed of result.monitors) {
       const monitor = parsed.monitor;
-      const source = this.registry.get(monitor.frontmatter.source);
+      const sourceName = monitor.frontmatter.watch.type;
+      const source = this.registry.get(sourceName);
       if (!source) {
         throw new Error(
-          `Monitor "${monitor.id}" references unknown source "${monitor.frontmatter.source}".`,
+          `Monitor "${monitor.id}" references unknown source "${sourceName}".`,
         );
       }
       if (!source.watch) continue;
@@ -678,7 +693,7 @@ export class AgentMonitorRuntime {
     onError?: (monitorId: string, error: Error) => void,
   ): Promise<void> {
     const monitorState = this.store.getMonitorState(monitor.id);
-    const iterable = watch(monitor.frontmatter.scope, {
+    const iterable = watch(watchConfig(monitor.frontmatter.watch), {
       previousState: monitorState.sourceState,
       now: new Date(),
       signal,
@@ -700,7 +715,7 @@ export class AgentMonitorRuntime {
           try {
             this.store.recordObservationHistory({
               monitorId: monitor.id,
-              sourceName: monitor.frontmatter.source,
+              sourceName: monitor.frontmatter.watch.type,
               result: 'errored',
               observationData: {
                 error:
@@ -758,9 +773,10 @@ export class AgentMonitorRuntime {
     const state = this.store.getMonitorState(monitor.id);
     const lastObservationAt = state.lastObservationAt?.getTime() ?? 0;
     const elapsed = now.getTime() - lastObservationAt;
-    if (monitor.frontmatter.source === 'schedule') {
-      const cron = monitor.frontmatter.scope['cron'];
-      const timezone = monitor.frontmatter.scope['timezone'];
+    const config = watchConfig(monitor.frontmatter.watch);
+    if (monitor.frontmatter.watch.type === 'schedule') {
+      const cron = config['cron'];
+      const timezone = config['timezone'];
       if (typeof cron !== 'string') return { due: false, nextPollMs: 60_000 };
       const due =
         cronMatchesDate(
@@ -771,8 +787,8 @@ export class AgentMonitorRuntime {
       return { due, nextPollMs: 60_000 };
     }
 
-    if (monitor.frontmatter.source === 'api-poll') {
-      const interval = monitor.frontmatter.scope['interval'];
+    if (monitor.frontmatter.watch.type === 'api-poll') {
+      const interval = config['interval'];
       const ms =
         typeof interval === 'string'
           ? parseDuration(interval)
@@ -780,7 +796,7 @@ export class AgentMonitorRuntime {
       return { due: elapsed >= ms, nextPollMs: ms };
     }
 
-    const genericInterval = monitor.frontmatter.scope['interval'];
+    const genericInterval = config['interval'];
     if (typeof genericInterval === 'string') {
       const ms = parseDuration(genericInterval);
       return { due: elapsed >= ms, nextPollMs: ms };

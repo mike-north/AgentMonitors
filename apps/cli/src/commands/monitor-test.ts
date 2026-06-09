@@ -154,16 +154,20 @@ monitorTestCommand
     const registry = new SourceRegistry();
     registerCoreSources(registry);
 
-    const source = registry.get(result.monitor.frontmatter.source);
+    const source = registry.get(result.monitor.frontmatter.watch.type);
     if (!source) {
       reportError(
-        `Unknown source: "${result.monitor.frontmatter.source}". Available: ${registry.names().join(', ')}`,
+        `Unknown source: "${result.monitor.frontmatter.watch.type}". Available: ${registry.names().join(', ')}`,
         json,
       );
       return;
     }
 
     const monitorName = result.monitor.displayName;
+
+    // Extract per-source config (watch block minus `type`)
+    const { type: _type, ...monitorWatchConfig } =
+      result.monitor.frontmatter.watch;
 
     if (!json) {
       console.log(
@@ -173,10 +177,7 @@ monitorTestCommand
 
     try {
       let context: ObservationContext = { now: new Date() };
-      const firstResult = await source.observe(
-        result.monitor.frontmatter.scope,
-        context,
-      );
+      const firstResult = await source.observe(monitorWatchConfig, context);
       const observations = firstResult.observations;
       context = {
         now: new Date(),
@@ -186,7 +187,7 @@ monitorTestCommand
       if (observations.length === 0 && source.stateful) {
         await handleStatefulSource(
           source,
-          result.monitor.frontmatter.scope,
+          monitorWatchConfig,
           monitorName,
           json,
           context,

@@ -76,22 +76,16 @@ Two tiers.
 The **platform tier** is the stable, universal spine. Every conformant signal carries
 exactly one of:
 
-| `changeKind` | Meaning                                                             |
-| ------------ | ------------------------------------------------------------------- |
-| `created`    | the object came into existence                                      |
-| `modified`   | the observed object mutated                                         |
-| `deleted`    | the object ceased to exist                                          |
-| `appeared`   | a new member entered a watched collection/feed (optional predicate) |
-| `elapsed`    | a time condition fired (no object change)                           |
+| `changeKind` | Meaning                                                                                                                                    |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `created`    | a new object or member entered the monitor's scope — first-time discovery or a new item in a watched collection/feed                       |
+| `modified`   | the object changed while remaining in scope; it existed before and still exists, but its observed state differs                            |
+| `deleted`    | the object was destroyed upstream; its information is permanently lost (e.g. a file removed from disk, a PR deleted from the host)         |
+| `descoped`   | the object still exists upstream but left the monitor's scope; no information is lost (e.g. a file no longer matching the monitored globs) |
 
-> **This vocabulary is the standard's target, not necessarily this repository's current
-> internal contract.** The internal specs (`../specs/`) presently use
-> `created | modified | deleted | descoped`, where `created` / `descoped` are _scope
-> transitions_ (an object entering or leaving a monitor's scope). This standard reframes the
-> platform tier around observable change shapes and adds `appeared` and `elapsed`. The two
-> are being reconciled; where they differ, treat the internal specs as the current
-> implementation and this document as the intended direction. Do not assume the vocabularies
-> match merely because the field name is shared.
+`deleted` and `descoped` are deliberately distinct: a `deleted` object is gone; a
+`descoped` object merely moved out of the observed window. An agent should react
+differently to lost information than to an object that left the watched set intact.
 
 The **semantic tier** (`action-item.detected`, `release.shipped`, …) is **not enumerated
 by this standard**. Semantic meaning is manufactured per-monitor by the body instruction
@@ -109,7 +103,7 @@ state from a sequence of fragments.
 {
   "monitor": "payments-commits",
   "object": "git:src/payments/api.ts@a1b2c3",
-  "changeKind": "appeared",
+  "changeKind": "modified",
   "observedAt": "2026-06-07T18:04:11Z",
   "resumeToken": "<opaque, source-owned>",
   "state": {},
