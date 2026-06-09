@@ -76,12 +76,12 @@ Two tiers.
 The **platform tier** is the stable, universal spine. Every conformant signal carries
 exactly one of:
 
-| `changeKind` | Meaning                                                                                                                                     |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `created`    | a new object or member entered the monitor's scope — first-time discovery or a new item in a watched collection/feed                        |
-| `modified`   | the object changed while remaining in scope; it existed before and still exists, but its observed state differs                             |
-| `deleted`    | the object was destroyed upstream; its information is permanently lost (e.g. a file removed from disk, a PR deleted from the host)          |
-| `descoped`   | the object still exists upstream but left the monitor's scope; no information is lost (e.g. a file no longer matching the monitored globs)  |
+| `changeKind` | Meaning                                                                                                                                    |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `created`    | a new object or member entered the monitor's scope — first-time discovery or a new item in a watched collection/feed                       |
+| `modified`   | the object changed while remaining in scope; it existed before and still exists, but its observed state differs                            |
+| `deleted`    | the object was destroyed upstream; its information is permanently lost (e.g. a file removed from disk, a PR deleted from the host)         |
+| `descoped`   | the object still exists upstream but left the monitor's scope; no information is lost (e.g. a file no longer matching the monitored globs) |
 
 `deleted` and `descoped` are deliberately distinct: a `deleted` object is gone; a
 `descoped` object merely moved out of the observed window. An agent should react

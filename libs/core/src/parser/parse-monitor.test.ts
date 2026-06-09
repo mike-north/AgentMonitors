@@ -5,11 +5,11 @@ const yaml = String.raw;
 
 const validContent = yaml`---
 name: GitHub PR review monitor
-source: api-poll
-urgency: normal
-scope:
+watch:
+  type: api-poll
   url: "https://api.github.com/repos/my-org/my-repo/pulls"
   interval: 5m
+urgency: normal
 notify:
   strategy: debounce
   settle-for: 5m
@@ -21,11 +21,11 @@ When new PR reviews are detected, summarize them and add a todo item to address 
 
 const minimalContent = yaml`---
 name: File watcher
-source: file-fingerprint
-urgency: high
-scope:
+watch:
+  type: file-fingerprint
   globs:
     - "**/*.ts"
+urgency: high
 ---
 
 Check the modified files and report changes.
@@ -42,7 +42,7 @@ describe('parseMonitor', () => {
 
     expect(result.monitor.id).toBe('github-pr-review');
     expect(result.monitor.frontmatter.name).toBe('GitHub PR review monitor');
-    expect(result.monitor.frontmatter.source).toBe('api-poll');
+    expect(result.monitor.frontmatter.watch.type).toBe('api-poll');
     expect(result.monitor.frontmatter.urgency).toBe('normal');
     expect(result.monitor.frontmatter.notify).toEqual({
       strategy: 'debounce',
@@ -84,10 +84,10 @@ describe('parseMonitor', () => {
   it('returns body content as instructions (trimmed)', () => {
     const content = yaml`---
 name: Test
-source: file-fingerprint
-urgency: normal
-scope:
+watch:
+  type: file-fingerprint
   globs: ["*.ts"]
+urgency: normal
 ---
 
   Some instructions with leading whitespace.
@@ -108,17 +108,17 @@ scope:
     const result = parseMonitor(content, '/monitors/no-fm/MONITOR.md');
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    // `name` is now optional; the error surfaces the other missing required fields
-    expect(result.error).toContain('source');
+    // `watch` is required; the error surfaces it
+    expect(result.error).toContain('watch');
   });
 
   it('returns error for invalid frontmatter values', () => {
     const content = yaml`---
 name: Test
-source: file-fingerprint
-urgency: critical
-scope:
+watch:
+  type: file-fingerprint
   globs: ["*.ts"]
+urgency: critical
 ---
 
 Instructions.
@@ -129,28 +129,43 @@ Instructions.
     expect(result.error).toContain('urgency');
   });
 
-  it('returns error for missing required scope', () => {
+  it('returns error for missing required watch block', () => {
     const content = yaml`---
 name: Test
-source: file-fingerprint
 urgency: normal
 ---
 
 Instructions.
 `;
-    const result = parseMonitor(content, '/monitors/no-scope/MONITOR.md');
+    const result = parseMonitor(content, '/monitors/no-watch/MONITOR.md');
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error).toContain('scope');
+    expect(result.error).toContain('watch');
+  });
+
+  it('returns error for watch block missing type', () => {
+    const content = yaml`---
+name: Test
+watch:
+  globs: ["*.ts"]
+urgency: normal
+---
+
+Instructions.
+`;
+    const result = parseMonitor(content, '/monitors/no-type/MONITOR.md');
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toContain('type');
   });
 
   it('returns error for invalid notify config', () => {
     const content = yaml`---
 name: Test
-source: file-fingerprint
-urgency: normal
-scope:
+watch:
+  type: file-fingerprint
   globs: ["*.ts"]
+urgency: normal
 notify:
   strategy: debounce
 ---
@@ -169,14 +184,28 @@ Instructions.
     if (result.ok) return;
     expect(result.filePath).toBe('/some/path/MONITOR.md');
   });
-});
 
-const FRONTMATTER = yaml`---
+  it('rejects old source/scope shape (hard cut — no back-compat)', () => {
+    const content = yaml`---
 source: file-fingerprint
 urgency: normal
 scope:
   globs:
+    - '**/*.ts'
+---
+Instructions.
+`;
+    const result = parseMonitor(content, '/monitors/old-shape/MONITOR.md');
+    expect(result.ok).toBe(false);
+  });
+});
+
+const FRONTMATTER = yaml`---
+watch:
+  type: file-fingerprint
+  globs:
     - 'src/**/*.ts'
+urgency: normal
 ---
 Body instructions.
 `;

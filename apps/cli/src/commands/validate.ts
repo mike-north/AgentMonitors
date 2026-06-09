@@ -19,10 +19,10 @@ export const validateCommand = new Command('validate')
     const registry = new SourceRegistry();
     registerCoreSources(registry);
 
-    // Validate source names and scope against source-specific schemas
+    // Validate watch.type names and per-source config against source-specific schemas
     const scopeErrors: { id: string; errors: string[] }[] = [];
     const validMonitors = result.monitors.filter((m) => {
-      const sourceName = m.monitor.frontmatter.source;
+      const sourceName = m.monitor.frontmatter.watch.type;
       const source = registry.get(sourceName);
       if (!source) {
         scopeErrors.push({
@@ -34,10 +34,9 @@ export const validateCommand = new Command('validate')
         return false;
       }
 
-      const errors = validateScope(
-        m.monitor.frontmatter.scope,
-        source.scopeSchema,
-      );
+      // Extract per-source config (watch block minus `type`) for schema validation
+      const { type: _type, ...watchConfig } = m.monitor.frontmatter.watch;
+      const errors = validateScope(watchConfig, source.scopeSchema);
       if (errors.length > 0) {
         scopeErrors.push({ id: m.monitor.id, errors });
         return false;
@@ -71,7 +70,7 @@ export const validateCommand = new Command('validate')
         monitors: validMonitors.map((m) => ({
           id: m.monitor.id,
           name: m.monitor.displayName,
-          source: m.monitor.frontmatter.source,
+          source: m.monitor.frontmatter.watch.type,
         })),
         duplicateIds: result.duplicateIds,
         errors: allErrors,

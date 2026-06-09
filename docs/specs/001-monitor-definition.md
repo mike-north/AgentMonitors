@@ -80,33 +80,40 @@ Each monitor frontmatter object **MUST** contain:
 | Field     | Type     | Required | Meaning                                                                                           |
 | --------- | -------- | -------- | ------------------------------------------------------------------------------------------------- |
 | `name`    | string   | no       | Human-readable display name; defaults to the monitor id (filename or directory name) when omitted |
-| `source`  | string   | yes      | Source plugin name, kebab-case                                                                    |
+| `watch`   | object   | yes      | Intent-first observation config: `type` names the source; remaining keys are per-source config    |
 | `urgency` | enum     | yes      | `low`, `normal`, or `high`                                                                        |
-| `scope`   | object   | yes      | Source-specific configuration                                                                     |
 | `notify`  | object   | no       | Explicit debounce/throttle policy                                                                 |
 | `tags`    | string[] | no       | Tags for later filtering                                                                          |
 
-> Verified: `libs/core/src/schema/monitor-schema.ts` lines 30–44 — all fields above match the `monitorFrontmatterSchema` Zod object definition.
+> Verified: `libs/core/src/schema/monitor-schema.ts` — the `monitorFrontmatterSchema` Zod object requires `watch` and `urgency`; `name`, `notify`, and `tags` are optional.
 
-### 3.1 `source`
+### 3.1 `watch`
 
-The `source` field identifies the observation source plugin. It **MUST** match the pattern `/^[a-z][a-z0-9-]*$/`: it must start with a lowercase letter, and subsequent characters may be lowercase letters, digits, or hyphens. The source name is the key used to resolve the plugin in the source registry, select the correct `scope` schema, and determine runtime behavior for due scheduling defaults in some cases.
+The `watch` block is the authoring surface for _what to observe_. It **MUST** be an object with a `type` key; all remaining keys are per-source configuration carried flat alongside `type`.
 
-> Verified: `libs/core/src/schema/monitor-schema.ts` lines 33–35 — `z.string().min(1).regex(/^[a-z][a-z0-9-]*$/, 'Source must be kebab-case')`.
+```yaml
+watch:
+  type: file-fingerprint # source plugin name, kebab-case
+  globs:
+    - 'src/**/*.ts' # per-source config flat inside watch:
+  interval: 5m # scheduling hint (also inside watch:)
+```
 
-> **Note on drift:** The draft described `source` as "kebab-case" without further qualification. The actual regex `/^[a-z][a-z0-9-]*$/` is slightly more restrictive: the first character must be a lowercase ASCII letter (not a digit or hyphen). This spec uses the code as the authoritative definition.
+**`watch.type`** identifies the observation source plugin. It **MUST** match the pattern `/^[a-z][a-z0-9-]*$/`: it must start with a lowercase letter, and subsequent characters may be lowercase letters, digits, or hyphens. The type value is the key used to resolve the plugin in the source registry and determine runtime scheduling defaults.
+
+> Verified: `libs/core/src/schema/monitor-schema.ts` — `watch.type` is validated via `z.string().min(1).regex(/^[a-z][a-z0-9-]*$/, 'watch.type must be kebab-case')`.
+
+**Per-source config** is everything in the `watch` block except `type`. These keys are passed directly to the source plugin's `observe()` / `watch()` methods. The core schema imposes no constraints on these keys beyond their container being an object; full validation is delegated to each source's `scopeSchema`.
+
+**`interval`** (used by the scheduling engine to determine poll frequency) lives inside the `watch:` block as a sibling of `type`, not at the top level.
+
+> Authoring principle: `watch.type` names the _intent_ (`file-fingerprint`, `api-poll`, `schedule`, `incoming-changes`, …), never a mechanism. This removes the "which event do I subscribe to?" question from the authoring surface.
 
 ### 3.2 `urgency`
 
 The `urgency` field **MUST** accept exactly: `low`, `normal`, `high`. Even though earlier public docs emphasized only `normal` and `high`, the implemented schema, runtime, and CLI all support `low` (PP5).
 
-> Verified: `libs/core/src/schema/monitor-schema.ts` line 36 — `z.enum(['low', 'normal', 'high'])`. Also confirmed in `libs/core/src/schema/types.ts` line 14 — `export type Urgency = 'low' | 'normal' | 'high'`.
-
-### 3.3 `scope`
-
-The `scope` field **MUST** be a plain object with string keys. The value types of individual keys are unconstrained at the core schema level and are delegated to source-specific validation.
-
-> Verified: `libs/core/src/schema/monitor-schema.ts` line 38 — `scope: z.record(z.string(), z.unknown())`.
+> Verified: `libs/core/src/schema/monitor-schema.ts` — `z.enum(['low', 'normal', 'high'])`. Also confirmed in `libs/core/src/schema/types.ts` — `export type Urgency = 'low' | 'normal' | 'high'`.
 
 ### 3.4 `notify`
 
@@ -170,12 +177,12 @@ This means scope precedence, override order, and multi-root composition are outs
 ```md
 ---
 name: Build Config Drift
-source: file-fingerprint
-urgency: high
-scope:
+watch:
+  type: file-fingerprint
   globs:
     - 'package.json'
     - 'tsconfig.json'
+urgency: high
 notify:
   strategy: debounce
   settle-for: 30s
@@ -188,6 +195,7 @@ When these files change, determine whether build behavior, dependency state, or 
 **What this example proves:**
 
 - monitor ID is folder-derived rather than declared in frontmatter
+- `watch.type` names the source; per-source config (`globs`) lives flat alongside it
 - `high` urgency is valid and can still be combined with explicit notify timing
 - `settle-for: 30s` is a valid duration string matching `^\d+[smhd]$`
 - the Markdown body is intended to become the fallback event body
@@ -197,12 +205,12 @@ When these files change, determine whether build behavior, dependency state, or 
 ```md
 ---
 name: Weekly Maintenance Reminder
-source: schedule
-urgency: low
-scope:
+watch:
+  type: schedule
   cron: '0 9 * * 1'
   timezone: America/Los_Angeles
   label: Weekly maintenance review
+urgency: low
 tags: [maintenance]
 ---
 
@@ -212,8 +220,8 @@ Review stale monitors, old failed items, and event volume trends.
 **What this example proves:**
 
 - `low` urgency is a valid authoring value
-- the schedule source uses source-specific `scope` fields (`cron`, `timezone`, `label`) that are not constrained by the core schema
-- human-readable labels belong in source-specific scope where appropriate
+- the schedule source uses per-source config (`cron`, `timezone`, `label`) flat inside `watch:`
+- human-readable labels belong in source-specific config where appropriate
 
 ## 8. Validation Implications
 
@@ -226,4 +234,4 @@ At minimum, monitor authoring validation should be able to prove:
 - the selected source exists in the source registry
 - required source-specific scope fields are present
 
-The `agentmonitors validate` command enforces all of the above, including full per-source JSON Schema validation of `scope` against each source's `scopeSchema` (via the exported core helper `validateScope`). See [004-validation-testing.md](./004-validation-testing.md) §2.2.
+The `agentmonitors validate` command enforces all of the above, including full per-source JSON Schema validation of the `watch` config (the `watch` block minus `type`) against each source's `scopeSchema` (via the exported core helper `validateScope`). See [004-validation-testing.md](./004-validation-testing.md) §2.2.

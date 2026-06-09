@@ -37,7 +37,7 @@ function createMonitorFile(
   sourceName: string,
   urgency: 'low' | 'normal' | 'high' = 'normal',
   body = 'Handle it.',
-  extraScope = '',
+  extraWatchConfig = '',
 ): string {
   const monitorsDir = path.join(rootDir, '.claude', 'monitors', 'test-monitor');
   const monitorFile = path.join(monitorsDir, 'MONITOR.md');
@@ -46,11 +46,11 @@ function createMonitorFile(
     monitorFile,
     `---
 name: Test monitor
-source: ${sourceName}
-urgency: ${urgency}
-scope:
+watch:
+  type: ${sourceName}
   filePath: ${JSON.stringify(path.join(rootDir, 'watched.txt'))}
-${extraScope}
+${extraWatchConfig}
+urgency: ${urgency}
 ---
 ${body}
 `,
@@ -166,10 +166,10 @@ describe('AgentMonitorRuntime', () => {
 
     const monitorBody = `---
 name: Dup monitor
-source: file-fingerprint
-urgency: normal
-scope:
+watch:
+  type: file-fingerprint
   globs: ["*.ts"]
+urgency: normal
 ---
 Handle it.
 `;
@@ -766,14 +766,14 @@ Handle it.
       path.join(monitorDir, 'MONITOR.md'),
       `---
 name: Debounce flush
-source: debounce-source
+watch:
+  type: debounce-source
+  filePath: ${JSON.stringify(path.join(rootDir, 'watched.txt'))}
+  interval: '1s'
 urgency: high
 notify:
   strategy: debounce
   settle-for: 1s
-scope:
-  filePath: ${JSON.stringify(path.join(rootDir, 'watched.txt'))}
-  interval: '1s'
 ---
 Handle it.
 `,
@@ -1010,11 +1010,11 @@ Handle it.
         path.join(dir, 'MONITOR.md'),
         `---
 name: ${monitorName}
-source: ${sourceName}
-urgency: normal
-scope:
+watch:
+  type: ${sourceName}
   filePath: ${JSON.stringify(path.join(rootDir, 'watched.txt'))}
   interval: '1s'
+urgency: normal
 ---
 Handle it.
 `,
@@ -1324,11 +1324,11 @@ Handle it.
       path.join(throwingMonitorDir, 'MONITOR.md'),
       `---
 name: Throwing monitor debounce
-source: debounce-test-throwing-source
-urgency: normal
-scope:
+watch:
+  type: debounce-test-throwing-source
   filePath: ${JSON.stringify(path.join(rootDir, 'watched.txt'))}
   interval: '1s'
+urgency: normal
 ---
 Handle it.
 `,
@@ -1343,14 +1343,14 @@ Handle it.
       path.join(debounceMonitorDir, 'MONITOR.md'),
       `---
 name: Debounce flush monitor
-source: debounce-test-working-source
+watch:
+  type: debounce-test-working-source
+  filePath: ${JSON.stringify(path.join(rootDir, 'watched.txt'))}
+  interval: '1s'
 urgency: high
 notify:
   strategy: debounce
   settle-for: 1s
-scope:
-  filePath: ${JSON.stringify(path.join(rootDir, 'watched.txt'))}
-  interval: '1s'
 ---
 Handle it.
 `,

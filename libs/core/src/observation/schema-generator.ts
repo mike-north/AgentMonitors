@@ -3,8 +3,10 @@ import type { JsonSchema, ObservationSource } from './types.js';
 /**
  * Compose a full JSON Schema from installed plugins' scopeSchema fragments.
  *
- * Produces a schema where the top-level `source` field discriminates
- * which `scope` shape is valid via `if/then` conditional schemas.
+ * Produces a schema where the top-level `watch.type` field discriminates
+ * which per-source config keys are valid via `if/then` conditional schemas.
+ * Each source's `scopeSchema` describes the per-source config keys that live
+ * flat inside the `watch:` block alongside `type`.
  */
 export function generateMonitorSchema(
   sources: ObservationSource[],
@@ -13,11 +15,11 @@ export function generateMonitorSchema(
 
   const conditionals = sources.map((source) => ({
     if: {
-      properties: { source: { const: source.name } },
-      required: ['source'],
+      properties: { watch: { properties: { type: { const: source.name } } } },
+      required: ['watch'],
     },
     then: {
-      properties: { scope: source.scopeSchema },
+      properties: { watch: source.scopeSchema },
     },
   }));
 
@@ -25,12 +27,17 @@ export function generateMonitorSchema(
     $schema: 'http://json-schema.org/draft-07/schema#',
     title: 'Agent Monitor Definition',
     type: 'object',
-    required: ['source', 'urgency', 'scope'],
+    required: ['watch', 'urgency'],
     properties: {
       name: { type: 'string', minLength: 1 },
-      source: { type: 'string', enum: sourceNames },
+      watch: {
+        type: 'object',
+        required: ['type'],
+        properties: {
+          type: { type: 'string', enum: sourceNames },
+        },
+      },
       urgency: { type: 'string', enum: ['low', 'normal', 'high'] },
-      scope: { type: 'object' },
       notify: {
         type: 'object',
         required: ['strategy'],

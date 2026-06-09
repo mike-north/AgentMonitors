@@ -25,15 +25,20 @@ describe('generateMonitorSchema', () => {
 
     expect(schema.$schema).toBe('http://json-schema.org/draft-07/schema#');
     expect(schema.type).toBe('object');
-    expect(schema.required).toContain('source');
-    expect(schema.required).toContain('scope');
+    expect(schema.required).toContain('watch');
+    expect(schema.required).toContain('urgency');
+    expect(schema.required).not.toContain('source');
+    expect(schema.required).not.toContain('scope');
     expect(schema.required).not.toContain('event-kind');
     const properties = schema.properties as Record<string, unknown>;
     expect(properties).not.toHaveProperty('event-kind');
-    expect(schema.required).toEqual(['source', 'urgency', 'scope']);
+    expect(properties).not.toHaveProperty('source');
+    expect(properties).not.toHaveProperty('scope');
+    expect(properties).toHaveProperty('watch');
+    expect(schema.required).toEqual(['watch', 'urgency']);
   });
 
-  it('enumerates source names in the source property', () => {
+  it('enumerates source names in watch.type property', () => {
     const schema = generateMonitorSchema([
       makeSource('file-fingerprint', { type: 'object' }),
       makeSource('api-poll', { type: 'object' }),
@@ -41,15 +46,13 @@ describe('generateMonitorSchema', () => {
     ]);
 
     const properties = schema.properties as Record<string, unknown>;
-    const sourceProp = properties.source as Record<string, unknown>;
-    expect(sourceProp.enum).toEqual([
-      'file-fingerprint',
-      'api-poll',
-      'schedule',
-    ]);
+    const watchProp = properties.watch as Record<string, unknown>;
+    const watchProperties = watchProp.properties as Record<string, unknown>;
+    const typeProp = watchProperties.type as Record<string, unknown>;
+    expect(typeProp.enum).toEqual(['file-fingerprint', 'api-poll', 'schedule']);
   });
 
-  it('generates if/then conditionals for each source', () => {
+  it('generates if/then conditionals for each source keyed on watch.type', () => {
     const fpSchema = {
       type: 'object',
       properties: { globs: { type: 'array' } },
@@ -60,14 +63,18 @@ describe('generateMonitorSchema', () => {
     ]);
 
     const allOf = schema.allOf as {
-      if: { properties: { source: { const: string } } };
-      then: { properties: { scope: Record<string, unknown> } };
+      if: {
+        properties: { watch: { properties: { type: { const: string } } } };
+      };
+      then: { properties: { watch: Record<string, unknown> } };
     }[];
     expect(allOf).toHaveLength(1);
 
     const conditional = allOf[0];
-    expect(conditional?.if.properties.source.const).toBe('file-fingerprint');
-    expect(conditional?.then.properties.scope).toEqual(fpSchema);
+    expect(conditional?.if.properties.watch.properties.type.const).toBe(
+      'file-fingerprint',
+    );
+    expect(conditional?.then.properties.watch).toEqual(fpSchema);
   });
 
   it('includes notify schema with debounce and throttle', () => {
@@ -83,8 +90,10 @@ describe('generateMonitorSchema', () => {
     const schema = generateMonitorSchema([]);
 
     const properties = schema.properties as Record<string, unknown>;
-    const sourceProp = properties.source as Record<string, unknown>;
-    expect(sourceProp.enum).toEqual([]);
+    const watchProp = properties.watch as Record<string, unknown>;
+    const watchProperties = watchProp.properties as Record<string, unknown>;
+    const typeProp = watchProperties.type as Record<string, unknown>;
+    expect(typeProp.enum).toEqual([]);
     expect(schema.allOf).toEqual([]);
   });
 });

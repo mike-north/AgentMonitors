@@ -20,7 +20,7 @@ export const scanCommand = new Command('scan')
         monitors: result.monitors.map((m) => ({
           id: m.monitor.id,
           name: m.monitor.displayName,
-          source: m.monitor.frontmatter.source,
+          source: m.monitor.frontmatter.watch.type,
           urgency: m.monitor.frontmatter.urgency,
           tags: m.monitor.frontmatter.tags ?? [],
           notify: m.monitor.frontmatter.notify ?? null,
@@ -54,7 +54,7 @@ export const scanCommand = new Command('scan')
         [
           id.padEnd(30),
           m.monitor.displayName.padEnd(40),
-          frontmatter.source.padEnd(20),
+          frontmatter.watch.type.padEnd(20),
           frontmatter.urgency,
         ].join('  '),
       );

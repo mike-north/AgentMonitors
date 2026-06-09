@@ -3,21 +3,20 @@ import { monitorFrontmatterSchema } from './monitor-schema.js';
 
 const validMinimal = {
   name: 'Test monitor',
-  source: 'file-fingerprint',
+  watch: { type: 'file-fingerprint', globs: ['**/*.ts'] },
   urgency: 'normal' as const,
-  scope: { globs: ['**/*.ts'] },
 };
 
 const validFull = {
   ...validMinimal,
   name: 'GitHub PR review monitor',
-  source: 'api-poll',
-  urgency: 'high' as const,
-  scope: {
+  watch: {
+    type: 'api-poll',
     url: 'https://api.github.com/repos/my-org/my-repo/pulls?state=open',
     auth: { type: 'bearer', 'token-env': 'GITHUB_TOKEN' },
     interval: '5m',
   },
+  urgency: 'high' as const,
   notify: { strategy: 'debounce' as const, 'settle-for': '5m' },
   tags: ['github', 'review', 'code-review'],
 };
@@ -75,32 +74,47 @@ describe('monitorFrontmatterSchema', () => {
 
     it('parses a minimal monitor without event-kind', () => {
       const result = monitorFrontmatterSchema.safeParse({
-        source: 'file-fingerprint',
+        watch: { type: 'file-fingerprint', globs: ['x'] },
         urgency: 'normal',
-        scope: { globs: ['x'] },
       });
       expect(result.success).toBe(true);
     });
 
     it('ignores an event-kind field if present (no longer part of the schema)', () => {
       const result = monitorFrontmatterSchema.safeParse({
-        source: 'file-fingerprint',
+        watch: { type: 'file-fingerprint', globs: ['x'] },
         urgency: 'normal',
         'event-kind': 'mutation',
-        scope: { globs: ['x'] },
       });
       // schema is non-strict, so an extra key is dropped, not an error
       expect(result.success).toBe(true);
       if (result.success) expect('event-kind' in result.data).toBe(false);
+    });
+
+    it('carries arbitrary per-source config keys flat inside watch', () => {
+      const result = monitorFrontmatterSchema.safeParse({
+        watch: {
+          type: 'api-poll',
+          url: 'https://example.com/api',
+          method: 'GET',
+          interval: '5m',
+        },
+        urgency: 'normal',
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.watch.type).toBe('api-poll');
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        expect((result.data.watch as any).url).toBe('https://example.com/api');
+      }
     });
   });
 
   describe('missing required fields', () => {
     it('accepts frontmatter that omits name (name is optional)', () => {
       const result = monitorFrontmatterSchema.safeParse({
-        source: 'file-fingerprint',
+        watch: { type: 'file-fingerprint', globs: ['src/**/*.ts'] },
         urgency: 'normal',
-        scope: { globs: ['src/**/*.ts'] },
       });
       expect(result.success).toBe(true);
     });
@@ -108,16 +122,23 @@ describe('monitorFrontmatterSchema', () => {
     it('still rejects an empty-string name', () => {
       const result = monitorFrontmatterSchema.safeParse({
         name: '',
-        source: 'file-fingerprint',
+        watch: { type: 'file-fingerprint', globs: ['x'] },
         urgency: 'normal',
-        scope: { globs: ['x'] },
       });
       expect(result.success).toBe(false);
     });
 
-    it('rejects missing source', () => {
-      const { source: _, ...rest } = validMinimal;
+    it('rejects missing watch', () => {
+      const { watch: _, ...rest } = validMinimal;
       const result = monitorFrontmatterSchema.safeParse(rest);
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects watch block without type', () => {
+      const result = monitorFrontmatterSchema.safeParse({
+        watch: { globs: ['**/*.ts'] },
+        urgency: 'normal',
+      });
       expect(result.success).toBe(false);
     });
 
@@ -127,9 +148,13 @@ describe('monitorFrontmatterSchema', () => {
       expect(result.success).toBe(false);
     });
 
-    it('rejects missing scope', () => {
-      const { scope: _, ...rest } = validMinimal;
-      const result = monitorFrontmatterSchema.safeParse(rest);
+    it('rejects old source/scope shape (hard cut — no back-compat)', () => {
+      const result = monitorFrontmatterSchema.safeParse({
+        source: 'file-fingerprint',
+        urgency: 'normal',
+        scope: { globs: ['**/*.ts'] },
+      });
+      // `watch` is required, so this must fail
       expect(result.success).toBe(false);
     });
   });
@@ -151,18 +176,18 @@ describe('monitorFrontmatterSchema', () => {
       expect(result.success).toBe(false);
     });
 
-    it('rejects non-kebab-case source', () => {
+    it('rejects non-kebab-case watch.type', () => {
       const result = monitorFrontmatterSchema.safeParse({
         ...validMinimal,
-        source: 'FileFingerprint',
+        watch: { type: 'FileFingerprint' },
       });
       expect(result.success).toBe(false);
     });
 
-    it('rejects source starting with a digit', () => {
+    it('rejects watch.type starting with a digit', () => {
       const result = monitorFrontmatterSchema.safeParse({
         ...validMinimal,
-        source: '1source',
+        watch: { type: '1source' },
       });
       expect(result.success).toBe(false);
     });

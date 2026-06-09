@@ -18,10 +18,10 @@ function createTempMonitor(
 
 const validContent = yaml`---
 name: Test monitor
-source: file-fingerprint
-urgency: normal
-scope:
+watch:
+  type: file-fingerprint
   globs: ["*.ts"]
+urgency: normal
 ---
 
 Handle file changes.
@@ -29,10 +29,10 @@ Handle file changes.
 
 const invalidContent = yaml`---
 name: Bad monitor
-source: file-fingerprint
-urgency: invalid-value
-scope:
+watch:
+  type: file-fingerprint
   globs: ["*.ts"]
+urgency: invalid-value
 ---
 
 Instructions.
@@ -140,11 +140,11 @@ describe('scanMonitors', () => {
 });
 
 const BODY = yaml`---
-source: file-fingerprint
-urgency: normal
-scope:
+watch:
+  type: file-fingerprint
   globs:
     - 'x'
+urgency: normal
 ---
 Body.
 `;

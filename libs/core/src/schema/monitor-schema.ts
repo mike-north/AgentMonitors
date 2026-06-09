@@ -27,17 +27,28 @@ const notifySchema = z.discriminatedUnion('strategy', [
   throttleNotifySchema,
 ]);
 
+/**
+ * The `watch` block — an intent-first, discriminated description of what to
+ * observe. `type` names the observation source (kebab-case, matches a source
+ * plugin name); the remaining keys are per-source configuration carried flat
+ * alongside `type`.
+ */
+const watchSchema = z
+  .object({
+    type: z
+      .string()
+      .min(1)
+      .regex(/^[a-z][a-z0-9-]*$/, 'watch.type must be kebab-case'),
+  })
+  .catchall(z.unknown());
+
 export const monitorFrontmatterSchema = z.object({
   name: z
     .string()
     .min(1, 'Monitor name must be non-empty when present')
     .optional(),
-  source: z
-    .string()
-    .min(1)
-    .regex(/^[a-z][a-z0-9-]*$/, 'Source must be kebab-case'),
+  watch: watchSchema,
   urgency: z.enum(['low', 'normal', 'high']),
-  scope: z.record(z.string(), z.unknown()),
   notify: notifySchema.optional(),
   tags: z.array(z.string()).optional(),
 });

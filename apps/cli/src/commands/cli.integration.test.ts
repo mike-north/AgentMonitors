@@ -194,7 +194,7 @@ describe('init', () => {
     expect(result.stdout).toContain('Created monitor');
   });
 
-  it('scaffolds an api-poll monitor with --source', () => {
+  it('scaffolds an api-poll monitor with --type', () => {
     const dir = path.join(tempDir, 'init-test-2');
     mkdirSync(dir, { recursive: true });
     const result = run(
@@ -203,7 +203,7 @@ describe('init', () => {
         'api-watcher',
         '--dir',
         path.join(dir, 'monitors'),
-        '--source',
+        '--type',
         'api-poll',
       ],
       dir,
@@ -222,7 +222,7 @@ describe('init', () => {
         'spec-watch',
         '--dir',
         monitorsDir,
-        '--source',
+        '--type',
         'incoming-changes',
       ],
       dir,
@@ -244,7 +244,7 @@ describe('init', () => {
     expect(parsed.monitors[0]?.source).toBe('incoming-changes');
   });
 
-  it('rejects invalid --source value', () => {
+  it('rejects invalid --type value', () => {
     const dir = path.join(tempDir, 'init-test-3');
     mkdirSync(dir, { recursive: true });
     const result = run(
@@ -253,7 +253,7 @@ describe('init', () => {
         'bad',
         '--dir',
         path.join(dir, 'monitors'),
-        '--source',
+        '--type',
         'nonexistent',
       ],
       dir,
@@ -318,10 +318,10 @@ describe('validate', () => {
     const body = [
       '---',
       'name: Dup',
-      'source: file-fingerprint',
-      'urgency: normal',
-      'scope:',
+      'watch:',
+      '  type: file-fingerprint',
       '  globs: ["*.ts"]',
+      'urgency: normal',
       '---',
       'Handle it.',
       '',
@@ -355,10 +355,10 @@ describe('validate', () => {
     const body = [
       '---',
       'name: Bad scope',
-      'source: file-fingerprint',
-      'urgency: normal',
-      'scope:',
+      'watch:',
+      '  type: file-fingerprint',
       '  globs: 42',
+      'urgency: normal',
       '---',
       'Handle it.',
       '',
@@ -377,10 +377,10 @@ describe('validate', () => {
     const body = [
       '---',
       'name: Mystery',
-      'source: not-a-real-source',
-      'urgency: normal',
-      'scope:',
+      'watch:',
+      '  type: not-a-real-source',
       '  foo: bar',
+      'urgency: normal',
       '---',
       'Handle it.',
       '',
@@ -477,13 +477,13 @@ describe('runtime flow', () => {
       path.join(monitorsDir, 'MONITOR.md'),
       `---
 name: Watch files
-source: file-fingerprint
-urgency: normal
-scope:
+watch:
+  type: file-fingerprint
   globs:
     - watched.txt
   cwd: ${JSON.stringify(dir)}
   interval: '1s'
+urgency: normal
 ---
 When files change, review them.
 `,
@@ -625,13 +625,13 @@ When files change, review them.
       path.join(monitorsDir, 'MONITOR.md'),
       `---
 name: Watch files
-source: file-fingerprint
-urgency: normal
-scope:
+watch:
+  type: file-fingerprint
   globs:
     - watched.txt
   cwd: ${JSON.stringify(dir)}
   interval: '1s'
+urgency: normal
 ---
 When files change, review them.
 `,
@@ -750,16 +750,18 @@ When files change, review them.
 });
 
 describe('schema generate', () => {
-  it('emits a source-discriminated monitor JSON schema', () => {
+  it('emits a watch.type-discriminated monitor JSON schema', () => {
     const result = run(['schema', 'generate']);
     expect(result.exitCode).toBe(0);
     const schema = JSON.parse(result.stdout) as {
       properties?: {
-        source?: { enum?: string[] };
+        watch?: {
+          properties?: { type?: { enum?: string[] } };
+        };
         urgency?: { enum?: string[] };
       };
     };
-    expect(schema.properties?.source?.enum).toEqual(
+    expect(schema.properties?.watch?.properties?.type?.enum).toEqual(
       expect.arrayContaining(['file-fingerprint', 'api-poll', 'schedule']),
     );
     // `low` is first-class (PP5)
@@ -865,13 +867,13 @@ describe('monitor history', () => {
       path.join(monitorsDir, 'MONITOR.md'),
       `---
 name: Watch files
-source: file-fingerprint
-urgency: normal
-scope:
+watch:
+  type: file-fingerprint
   globs:
     - watched.txt
   cwd: ${JSON.stringify(dir)}
   interval: '1s'
+urgency: normal
 ---
 When files change, review them.
 `,
@@ -1095,15 +1097,15 @@ describe.skipIf(!gitAvailable)('incoming-changes runtime flow', () => {
       path.join(monitorsDir, 'MONITOR.md'),
       `---
 name: Spec & standard changes from upstream
-source: incoming-changes
-urgency: normal
-scope:
+watch:
+  type: incoming-changes
   paths:
     - 'docs/specs/**'
     - 'docs/standard/**'
   branch: main
   cwd: ${JSON.stringify(repo)}
   interval: '1s'
+urgency: normal
 ---
 Summarize what changed in the spec/standard docs and whether it affects current work.
 `,
