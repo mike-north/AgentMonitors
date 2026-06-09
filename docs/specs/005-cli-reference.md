@@ -519,18 +519,21 @@ agentmonitors daemon once [monitorsDir] [options]
 agentmonitors daemon run [monitorsDir] [options]
 ```
 
-| Argument / Flag      | Type                  | Default            | Description                             |
-| -------------------- | --------------------- | ------------------ | --------------------------------------- |
-| `[monitorsDir]`      | positional (optional) | `.claude/monitors` | Directory containing `MONITOR.md` files |
-| `--workspace <path>` | string                | `process.cwd()`    | Workspace path for session projection   |
-| `--poll-ms <ms>`     | number (string)       | `30000`            | Polling interval in milliseconds        |
-| `--socket <path>`    | string                | resolved default   | Unix domain socket path for the daemon  |
+| Argument / Flag        | Type                  | Default            | Description                                                                |
+| ---------------------- | --------------------- | ------------------ | -------------------------------------------------------------------------- |
+| `[monitorsDir]`        | positional (optional) | `.claude/monitors` | Directory containing `MONITOR.md` files                                    |
+| `--workspace <path>`   | string                | `process.cwd()`    | Workspace path for session projection                                      |
+| `--poll-ms <ms>`       | number (string)       | `30000`            | Polling interval in milliseconds                                           |
+| `--socket <path>`      | string                | resolved default   | Unix domain socket path for the daemon                                     |
+| `--reap-after-ms <ms>` | number (string)       | `300000`           | Stop after this many ms with no active sessions; `0` disables idle reaping |
 
 Starts the daemon loop: creates a Unix domain socket server, listens for IPC commands, then polls `runtime.tick()` at `--poll-ms` intervals.
 
 **Startup check:** refuses to start if another daemon is already listening at the resolved socket path (exits with error message and code 1).
 
 **Signal handling:** `SIGINT` and `SIGTERM` trigger a graceful stop (closes the socket, exits the loop).
+
+**Idle reaping:** after each tick, counts active sessions for the workspace. If none have been active continuously for `--reap-after-ms` ms, the daemon stops itself. Disabled when `--reap-after-ms 0`.
 
 **Stdout per tick (when events emitted):** `Emitted <n> event(s) from <n> monitor(s).`
 
@@ -652,6 +655,49 @@ agentmonitors session list [options]
 **Text output:** one line per session: `<id>  <status>  <agentIdentity>  <workspacePath | "(global)">`
 
 **JSON output:** `AgentSessionRecord[]` array.
+
+### §10.4 `session start` — Lazy-boot daemon and register session
+
+```
+agentmonitors session start
+```
+
+No flags. Reads workspace and session context from environment variables:
+
+| Environment variable     | Description                                    |
+| ------------------------ | ---------------------------------------------- |
+| `CLAUDE_CODE_SESSION_ID` | Host session id (required; no-op if absent)    |
+| `CLAUDE_PROJECT_DIR`     | Workspace path (falls back to `process.cwd()`) |
+
+**Behavior:**
+
+1. Reads `.claude/agentmonitors.local.md` in the workspace. If absent or `enabled: false`, exits silently (quick-exit).
+2. Derives per-workspace socket/db paths via `workspacePaths()` (overridden by `socket`/`db` fields in the local state file if present).
+3. If no daemon is listening at the socket, spawns `daemon run` as a **detached background process** (`stdio: 'ignore'`, `.unref()`), passing the derived socket/db paths, the monitors dir, and `reap-after-ms` from the local state. Waits up to 8 seconds for the socket to appear.
+4. Persists the resolved socket/db paths back to `.claude/agentmonitors.local.md` (so sibling hooks can use them without re-deriving).
+5. Opens a session via the `session.open` IPC method (`claudeCodeAdapter.createSessionInput()` with `hostSessionId` and `workspacePath`).
+
+**No output on success.** Errors are printed to stderr and set exit code 1.
+
+**Designed for use as a `PreToolUse` / `PostToolUse` hook** (or any Claude Code lifecycle hook that runs at session start). Claude Code does not need the daemon to be pre-started.
+
+### §10.5 `session end` — Deregister session
+
+```
+agentmonitors session end
+```
+
+No flags. Reads the same environment variables as `session start`.
+
+**Behavior:**
+
+1. Reads `.claude/agentmonitors.local.md`. If absent, `enabled: false`, or no `socket` field, exits silently.
+2. If the daemon is unreachable, exits silently.
+3. Calls `session.list` to find the runtime session whose `hostSessionId` matches `CLAUDE_CODE_SESSION_ID`, then calls `session.close` on it.
+
+After all sessions for a workspace are closed, the daemon's idle reaper will stop it within `reap-after-ms`.
+
+**Designed for use as a `Stop` hook** in Claude Code.
 
 ---
 
@@ -804,33 +850,35 @@ All commands set `process.exitCode = 1` rather than calling `process.exit(1)`. T
 
 ## Appendix A — Command inventory
 
-| Command    | Subcommand | Transport                         | Status                              |
-| ---------- | ---------- | --------------------------------- | ----------------------------------- |
-| `init`     | —          | in-process                        | Fully implemented                   |
-| `validate` | —          | in-process                        | Fully implemented (full schema)     |
-| `scan`     | —          | in-process                        | Fully implemented                   |
-| `inbox`    | `list`     | in-process                        | Fully implemented                   |
-| `inbox`    | `ack`      | in-process                        | Fully implemented                   |
-| `inbox`    | `start`    | in-process                        | Fully implemented                   |
-| `inbox`    | `complete` | in-process                        | Fully implemented                   |
-| `inbox`    | `fail`     | in-process                        | Fully implemented                   |
-| `inbox`    | `archive`  | in-process                        | Fully implemented                   |
-| `monitor`  | `test`     | in-process                        | Fully implemented                   |
-| `monitor`  | `history`  | socket                            | Fully implemented                   |
-| `source`   | `list`     | in-process                        | Fully implemented                   |
-| `source`   | `search`   | —                                 | Placeholder / not implemented (NP3) |
-| `source`   | `install`  | —                                 | Placeholder / not implemented (NP3) |
-| `source`   | `update`   | —                                 | Placeholder / not implemented (NP3) |
-| `source`   | `remove`   | —                                 | Placeholder / not implemented (NP3) |
-| `schema`   | `generate` | in-process                        | Fully implemented                   |
-| `daemon`   | `once`     | in-process                        | Fully implemented                   |
-| `daemon`   | `run`      | creates socket server             | Fully implemented                   |
-| `daemon`   | `status`   | socket (with in-process fallback) | Fully implemented                   |
-| `daemon`   | `stop`     | socket                            | Fully implemented                   |
-| `session`  | `open`     | socket                            | Fully implemented                   |
-| `session`  | `close`    | socket                            | Fully implemented                   |
-| `session`  | `list`     | socket                            | Fully implemented                   |
-| `events`   | `list`     | socket                            | Fully implemented                   |
-| `events`   | `ack`      | socket                            | Fully implemented                   |
-| `hook`     | `claim`    | socket                            | Fully implemented                   |
-| `channel`  | `serve`    | stdio MCP server + socket         | Two-way (push + `agentmon_ack`)     |
+| Command    | Subcommand | Transport                         | Status                                      |
+| ---------- | ---------- | --------------------------------- | ------------------------------------------- |
+| `init`     | —          | in-process                        | Fully implemented                           |
+| `validate` | —          | in-process                        | Fully implemented (full schema)             |
+| `scan`     | —          | in-process                        | Fully implemented                           |
+| `inbox`    | `list`     | in-process                        | Fully implemented                           |
+| `inbox`    | `ack`      | in-process                        | Fully implemented                           |
+| `inbox`    | `start`    | in-process                        | Fully implemented                           |
+| `inbox`    | `complete` | in-process                        | Fully implemented                           |
+| `inbox`    | `fail`     | in-process                        | Fully implemented                           |
+| `inbox`    | `archive`  | in-process                        | Fully implemented                           |
+| `monitor`  | `test`     | in-process                        | Fully implemented                           |
+| `monitor`  | `history`  | socket                            | Fully implemented                           |
+| `source`   | `list`     | in-process                        | Fully implemented                           |
+| `source`   | `search`   | —                                 | Placeholder / not implemented (NP3)         |
+| `source`   | `install`  | —                                 | Placeholder / not implemented (NP3)         |
+| `source`   | `update`   | —                                 | Placeholder / not implemented (NP3)         |
+| `source`   | `remove`   | —                                 | Placeholder / not implemented (NP3)         |
+| `schema`   | `generate` | in-process                        | Fully implemented                           |
+| `daemon`   | `once`     | in-process                        | Fully implemented                           |
+| `daemon`   | `run`      | creates socket server             | Fully implemented (`--reap-after-ms` added) |
+| `daemon`   | `status`   | socket (with in-process fallback) | Fully implemented                           |
+| `daemon`   | `stop`     | socket                            | Fully implemented                           |
+| `session`  | `open`     | socket                            | Fully implemented                           |
+| `session`  | `close`    | socket                            | Fully implemented                           |
+| `session`  | `list`     | socket                            | Fully implemented                           |
+| `session`  | `start`    | in-process + socket (lazy boot)   | Fully implemented                           |
+| `session`  | `end`      | socket                            | Fully implemented                           |
+| `events`   | `list`     | socket                            | Fully implemented                           |
+| `events`   | `ack`      | socket                            | Fully implemented                           |
+| `hook`     | `claim`    | socket                            | Fully implemented                           |
+| `channel`  | `serve`    | stdio MCP server + socket         | Two-way (push + `agentmon_ack`)             |

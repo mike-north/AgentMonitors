@@ -17,6 +17,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { writeLocalState } from '../local-state.js';
+import { daemonAvailable, callDaemon } from '../daemon-ipc.js';
 
 const CLI_PATH = path.resolve(__dirname, '../../dist/index.cjs');
 const CLI_PACKAGE_DIR = path.resolve(__dirname, '../..');
@@ -1377,6 +1379,271 @@ Summarize what changed in the spec/standard docs and whether it affects current 
     } finally {
       daemon.stop();
       await daemon.waitForExit();
+    }
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// Lazy-daemon lifecycle: session start / session end
+// ---------------------------------------------------------------------------
+
+// The daemon spawned by `session start` uses pollMs=1000 (hardcoded in session.ts).
+// This constant drives the reap-deadline formula so it matches the actual timer.
+const LAZY_DAEMON_POLL_MS = 1000;
+
+/**
+ * Scaffold a temp workspace with a file-fingerprint monitor and a
+ * `.claude/agentmonitors.local.md` coordination file. Returns everything
+ * the tests need to call `session start` / `session end`.
+ *
+ * Pass a short `reapAfterMs` (a few seconds) so any escaped daemon
+ * self-cleans quickly even if the `finally` stop fails — defence in depth.
+ */
+function bootLazyWorkspace(reapAfterMs: number): {
+  ws: string;
+  socket: string;
+  db: string;
+  env: Record<string, string>;
+  hostSessionId: string;
+} {
+  const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-lazy-'));
+  const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-files');
+  mkdirSync(monitorsDir, { recursive: true });
+
+  writeFileSync(
+    path.join(monitorsDir, 'MONITOR.md'),
+    [
+      '---',
+      'name: Watch files',
+      'watch:',
+      '  type: file-fingerprint',
+      '  globs:',
+      '    - "*.txt"',
+      `  cwd: ${JSON.stringify(ws)}`,
+      'urgency: normal',
+      '---',
+      'When files change, review them.',
+      '',
+    ].join('\n'),
+    'utf-8',
+  );
+
+  const socket = path.join(
+    '/tmp',
+    `agentmon-lazy-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+  );
+  const db = path.join(ws, 'lazy.db');
+
+  writeLocalState(ws, { enabled: true, socket, db, reapAfterMs });
+
+  const hostSessionId = `lazy-test-${Date.now()}`;
+  const env = {
+    CLAUDE_CODE_SESSION_ID: hostSessionId,
+    CLAUDE_PROJECT_DIR: ws,
+    AGENTMONITORS_DB: db,
+    AGENTMONITORS_SOCKET: socket,
+  };
+
+  return { ws, socket, db, env, hostSessionId };
+}
+
+describe('lazy daemon lifecycle', () => {
+  it('session start boots a per-workspace daemon and registers the session', async () => {
+    // Use a short reapAfterMs so an escaped daemon self-cleans (defence-in-depth).
+    const { ws, socket, env, hostSessionId } = bootLazyWorkspace(5_000);
+
+    try {
+      // session start should lazy-boot the daemon and open the session
+      const start = runWithEnv(['session', 'start'], env, ws);
+      expect(start.exitCode).toBe(0);
+
+      // daemon is up on the per-workspace socket
+      expect(await daemonAvailable(socket)).toBe(true);
+
+      // the session is registered
+      const list = runWithEnv(
+        ['session', 'list', '--socket', socket, '--format', 'json'],
+        env,
+        ws,
+      );
+      expect(list.exitCode).toBe(0);
+      const sessions = JSON.parse(list.stdout) as {
+        hostSessionId: string;
+        workspacePath?: string;
+      }[];
+      expect(sessions.some((s) => s.hostSessionId === hostSessionId)).toBe(
+        true,
+      );
+
+      // session end deregisters the session
+      const end = runWithEnv(['session', 'end'], env, ws);
+      expect(end.exitCode).toBe(0);
+    } finally {
+      try {
+        await callDaemon('stop', {}, { socketPath: socket });
+      } catch {
+        // already stopped or never started — ignore
+      }
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('the daemon idle-reaps itself after the last session ends', async () => {
+    // reapAfterMs = 1500 ms, daemon pollMs = 1000 ms (hardcoded in session.ts)
+    // latest reap fires at: reapAfterMs + 1 poll = 1500 + 1000 = 2500 ms
+    // deadline = reapAfterMs + 4 * daemonPollMs + 2000 ms headroom = 7500 ms
+    const reapAfterMs = 1500;
+    const { ws, socket, env } = bootLazyWorkspace(reapAfterMs);
+
+    // bootLazyWorkspace already wrote local state with the explicit socket/db.
+    // No overwrite needed — the reapAfterMs is already in the state.
+
+    try {
+      // Boot + register
+      const start = runWithEnv(['session', 'start'], env, ws);
+      expect(start.exitCode).toBe(0);
+      expect(await daemonAvailable(socket)).toBe(true);
+
+      // End the session — daemon should become idle
+      const end = runWithEnv(['session', 'end'], env, ws);
+      expect(end.exitCode).toBe(0);
+
+      // Poll until unavailable — deadline = reapAfterMs + 4 * daemon_pollMs + headroom
+      const deadline =
+        Date.now() + reapAfterMs + 4 * LAZY_DAEMON_POLL_MS + 2_000;
+      let down = false;
+      while (Date.now() < deadline) {
+        if (!(await daemonAvailable(socket))) {
+          down = true;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      expect(down).toBe(true);
+      // Stronger assertion: the server cleanup unlinks the socket file.
+      expect(existsSync(socket)).toBe(false);
+    } finally {
+      try {
+        await callDaemon('stop', {}, { socketPath: socket });
+      } catch {
+        // already stopped — ignore
+      }
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it('two workspaces get distinct daemons and isolated session lists', async () => {
+    // Use workspacePaths() derivation — do NOT pass explicit sockets — so this
+    // test exercises the real hash-based path derivation path.
+    // We create two real temp dirs and let workspacePaths() compute their sockets.
+    const { workspacePaths } = await import('../workspace-paths.js');
+
+    const wsA = mkdtempSync(path.join(tmpdir(), 'agentmon-wsA-'));
+    const wsB = mkdtempSync(path.join(tmpdir(), 'agentmon-wsB-'));
+
+    const pathsA = workspacePaths(wsA);
+    const pathsB = workspacePaths(wsB);
+
+    // Confirm the derivation yields distinct sockets (the acceptance criterion).
+    expect(pathsA.socket).not.toBe(pathsB.socket);
+
+    // Scaffold monitors in both workspaces
+    for (const ws of [wsA, wsB]) {
+      const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-files');
+      mkdirSync(monitorsDir, { recursive: true });
+      writeFileSync(
+        path.join(monitorsDir, 'MONITOR.md'),
+        [
+          '---',
+          'name: Watch files',
+          'watch:',
+          '  type: file-fingerprint',
+          '  globs:',
+          '    - "*.txt"',
+          `  cwd: ${JSON.stringify(ws)}`,
+          'urgency: normal',
+          '---',
+          'When files change, review them.',
+          '',
+        ].join('\n'),
+        'utf-8',
+      );
+    }
+
+    // Write local state using the DERIVED paths (no explicit socket override).
+    // Short reapAfterMs for fast self-cleanup of any escaped daemon.
+    const reapAfterMs = 5_000;
+    writeLocalState(wsA, {
+      enabled: true,
+      reapAfterMs,
+      // omit socket/db — let session start derive them via workspacePaths()
+    });
+    writeLocalState(wsB, {
+      enabled: true,
+      reapAfterMs,
+    });
+
+    const hostIdA = `cross-ws-A-${Date.now()}`;
+    const hostIdB = `cross-ws-B-${Date.now()}`;
+    const envA = {
+      CLAUDE_CODE_SESSION_ID: hostIdA,
+      CLAUDE_PROJECT_DIR: wsA,
+    };
+    const envB = {
+      CLAUDE_CODE_SESSION_ID: hostIdB,
+      CLAUDE_PROJECT_DIR: wsB,
+    };
+
+    try {
+      // Start both sessions — each gets its own daemon
+      const startA = runWithEnv(['session', 'start'], envA, wsA);
+      expect(startA.exitCode).toBe(0);
+      const startB = runWithEnv(['session', 'start'], envB, wsB);
+      expect(startB.exitCode).toBe(0);
+
+      // Both daemons must be simultaneously reachable on their derived sockets
+      expect(await daemonAvailable(pathsA.socket)).toBe(true);
+      expect(await daemonAvailable(pathsB.socket)).toBe(true);
+
+      // A's session list contains A's session, NOT B's
+      const listA = runWithEnv(
+        ['session', 'list', '--socket', pathsA.socket, '--format', 'json'],
+        envA,
+        wsA,
+      );
+      expect(listA.exitCode).toBe(0);
+      const sessionsA = JSON.parse(listA.stdout) as {
+        hostSessionId: string;
+      }[];
+      expect(sessionsA.some((s) => s.hostSessionId === hostIdA)).toBe(true);
+      expect(sessionsA.some((s) => s.hostSessionId === hostIdB)).toBe(false);
+
+      // B's session list contains B's session, NOT A's
+      const listB = runWithEnv(
+        ['session', 'list', '--socket', pathsB.socket, '--format', 'json'],
+        envB,
+        wsB,
+      );
+      expect(listB.exitCode).toBe(0);
+      const sessionsB = JSON.parse(listB.stdout) as {
+        hostSessionId: string;
+      }[];
+      expect(sessionsB.some((s) => s.hostSessionId === hostIdB)).toBe(true);
+      expect(sessionsB.some((s) => s.hostSessionId === hostIdA)).toBe(false);
+
+      // Clean up both sessions
+      runWithEnv(['session', 'end'], envA, wsA);
+      runWithEnv(['session', 'end'], envB, wsB);
+    } finally {
+      for (const socket of [pathsA.socket, pathsB.socket]) {
+        try {
+          await callDaemon('stop', {}, { socketPath: socket });
+        } catch {
+          // already stopped — ignore
+        }
+      }
+      rmSync(wsA, { recursive: true, force: true });
+      rmSync(wsB, { recursive: true, force: true });
     }
   }, 30_000);
 });
