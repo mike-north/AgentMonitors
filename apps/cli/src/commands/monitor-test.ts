@@ -207,7 +207,7 @@ monitorTestCommand
 monitorTestCommand
   .command('history')
   .description(
-    'Show recent observation outcomes per tick (triggered / suppressed / no-change)',
+    'Show recent observation outcomes per tick (triggered / suppressed / no-change / errored)',
   )
   .argument('[monitorId]', 'Filter to a single monitor id')
   .option('--socket <path>', 'Unix domain socket path for the daemon')
