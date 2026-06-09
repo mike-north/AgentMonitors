@@ -11,6 +11,9 @@
  *     requires them so the tests never depend on global git config.
  *
  * Rule: no `new Date()` / `Date.now()` in test data (fixed-dates-in-tests rule).
+ *
+ * @see ../../../docs/specs/003-source-plugins.md — source contract & scope schema
+ * @see ../../../docs/specs/002-runtime-delivery.md — `observation_history` outcomes (incl. `rebaselined`, issue #56)
  */
 
 import { execFileSync } from 'node:child_process';
@@ -729,6 +732,86 @@ describe('source-incoming-changes', () => {
       expect(typeof state.ref).toBe('string');
       expect(state.ref).toHaveLength(40);
       expect(state.ref).not.toBe(gcedSha);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Issue #56: rebaselined outcome — graceful re-baseline sets outcome field
+  // https://github.com/mike-north/AgentMonitors/issues/56
+  // -------------------------------------------------------------------------
+
+  describe('rebaselined outcome (issue #56)', () => {
+    it("sets outcome: rebaselined on the diff-failure re-baseline path (gc'd prev SHA)", async () => {
+      // The diff-failure path (tryGetDiffEntries returns undefined) is a graceful
+      // re-baseline: it advances nextState but cannot compute a delta. This is
+      // distinct from no-change (genuinely quiet tick) and must carry
+      // outcome: 'rebaselined' so the runtime records it accordingly.
+      const dir = makeTempRepo();
+      writeAndCommit(dir, { 'a.txt': 'v0' }, 'init');
+
+      const gcedSha = 'deadbeef'.repeat(5); // 40-char SHA that doesn't exist
+
+      const result = await source.observe(
+        { paths: ['.'], cwd: dir },
+        { previousState: { ref: gcedSha }, now: NOW },
+      );
+
+      expect(result.observations).toHaveLength(0);
+      // nextState is advanced (re-baseline with state advance)
+      expect((result.nextState as { ref: string }).ref).toHaveLength(40);
+      // The diagnostic outcome field must be set to 'rebaselined'
+      expect(result.outcome).toBe('rebaselined');
+    });
+
+    it('does NOT set outcome on the first-observe baseline path (normal initial baseline)', async () => {
+      // The initial baseline (no previousState) is a normal quiet tick, not a
+      // graceful re-baseline caused by a diff failure. outcome must be absent.
+      const dir = makeTempRepo();
+      writeAndCommit(dir, { 'a.txt': 'v0' }, 'init');
+
+      const result = await source.observe(
+        { paths: ['.'], cwd: dir },
+        { now: NOW }, // no previousState
+      );
+
+      expect(result.observations).toHaveLength(0);
+      expect(result.nextState).toBeDefined();
+      expect(result.outcome).toBeUndefined();
+    });
+
+    it('does NOT set outcome when ref has not advanced (genuine no-change)', async () => {
+      // currentRef === previousRef: genuinely nothing changed. outcome must be absent.
+      const dir = makeTempRepo();
+      writeAndCommit(dir, { 'a.txt': 'v0' }, 'init');
+
+      const baseline = await source.observe(
+        { paths: ['.'], cwd: dir },
+        { now: NOW },
+      );
+
+      const result = await source.observe(
+        { paths: ['.'], cwd: dir },
+        { previousState: baseline.nextState, now: NOW },
+      );
+
+      expect(result.observations).toHaveLength(0);
+      expect(result.outcome).toBeUndefined();
+    });
+
+    it("does NOT set outcome when cwd is not a git repo (transient can't-observe, no state advance)", async () => {
+      // The not-a-repo path returns no nextState at all — it's a transient failure,
+      // not a graceful re-baseline with state advance. outcome must be absent.
+      const nonGitDir = mkdtempSync(path.join(tmpdir(), 'ic-nongit-rebase-'));
+      dirs.push(nonGitDir);
+
+      const result = await source.observe(
+        { paths: ['.'], cwd: nonGitDir },
+        { now: NOW },
+      );
+
+      expect(result.observations).toHaveLength(0);
+      expect(result.nextState).toBeUndefined();
+      expect(result.outcome).toBeUndefined();
     });
   });
 

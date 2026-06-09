@@ -383,11 +383,14 @@ const source: ObservationSource = {
 
       // Fix 4: if the diff fails (gc'd prev SHA, force-pushed history),
       // re-baseline: record the current ref and emit nothing.
+      // Issue #56: set outcome:'rebaselined' so the runtime records this as a
+      // graceful re-baseline rather than a genuine no-change tick.
       const entries = tryGetDiffEntries(cwd, previousRef, currentRef, paths);
       if (entries === undefined) {
         return Promise.resolve({
           observations: [],
           nextState: { ref: currentRef },
+          outcome: 'rebaselined',
         });
       }
 

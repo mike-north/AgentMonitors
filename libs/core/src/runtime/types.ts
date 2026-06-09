@@ -214,12 +214,17 @@ export interface RuntimeStatus {
  *       observations that were durably written.
  *   In both cases the audit write itself is best-effort: a `recordObservationHistory`
  *   failure is swallowed so a failing audit row can never re-abort the tick.
+ * - `rebaselined`: the source advanced its baseline without computing a delta
+ *   (a graceful re-baseline after it could not diff against the prior point,
+ *   e.g. a force-pushed/gc'd ref); distinct from `no-change` (genuinely nothing
+ *   changed) and from `errored` (the source threw).
  */
 export type ObservationOutcome =
   | 'triggered'
   | 'suppressed'
   | 'no-change'
-  | 'errored';
+  | 'errored'
+  | 'rebaselined';
 
 export interface ObservationHistoryRecord {
   id: string;
