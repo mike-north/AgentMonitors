@@ -1,13 +1,15 @@
 ---
 title: Core Concepts
-description: Understanding the Agent Monitors architecture
+description: The core concepts behind Agent Monitors — monitors, sources, urgency, and the delivery pipeline.
 ---
 
 # Core Concepts
 
 ## Monitors
 
-A monitor is a declarative configuration that watches for external changes and produces durable inbox items for AI agents. Each monitor is a markdown file — either a flat `<id>.md` file or an `<id>/MONITOR.md` file inside its own folder:
+A monitor is a declarative configuration that watches for external changes and delivers
+durable signals to AI agents. Each monitor is a `MONITOR.md` file — either a flat
+`<id>.md` or an `<id>/MONITOR.md` inside its own folder:
 
 ```
 .claude/monitors/
@@ -16,63 +18,76 @@ A monitor is a declarative configuration that watches for external changes and p
     MONITOR.md             # folder form — id is the folder name
 ```
 
-The filename without its `.md` extension (flat form), or the folder name (folder form), is the monitor's machine identifier. The file contains YAML frontmatter (policy) and a markdown body (handling instructions).
+The **identity is the name** (filename without `.md`, or folder name) — a stable machine
+identifier, not a frontmatter field.
 
-## Observation Sources
+## The `watch:` block
 
-Observation sources are plugins that know how to detect changes. Three core sources ship with Agent Monitors:
+Every monitor has a `watch:` block that declares what to observe. The `type` field is an
+explicit discriminated union tag:
 
-| Source             | Purpose                                          |
-| ------------------ | ------------------------------------------------ |
-| `file-fingerprint` | Hash local files and detect changes via SHA-256  |
-| `api-poll`         | Poll HTTP endpoints and detect response changes  |
-| `schedule`         | Cron-based triggers for time-driven observations |
+```yaml
+watch:
+  type: file-fingerprint   # explicit type tag — never inferred from key shape
+  globs:
+    - 'src/**/*.ts'
+```
 
-Sources implement the `ObservationSource` interface and are distributed as npm packages with the `agentmonitor:observation-source` keyword.
+Current bundled source types:
 
-### Baseline-then-detect pattern
-
-The `file-fingerprint` and `api-poll` sources use a **baseline-then-detect** pattern. The first observation establishes a baseline (current file hashes or API response). Subsequent observations compare against the baseline to detect changes. This means a single observation in isolation cannot detect changes — the system needs to see "before" and "after" states.
-
-The `schedule` source is stateless — it simply checks if the current time matches the cron expression and produces an observation immediately.
+| Type | Observes |
+|---|---|
+| `file-fingerprint` | Local file changes via SHA-256 hashing |
+| `api-poll` | HTTP endpoint response changes |
+| `schedule` | Cron-based time triggers |
+| `incoming-changes` | Files changed by an incoming `git pull` |
 
 ## Urgency
 
-Urgency drives delivery behavior:
+`urgency` controls how urgently the runtime surfaces the signal:
 
-- **`high`** — Inline context injection via hook (interrupt the agent immediately)
-- **`normal`** — Hook tells the agent "you have inbox items, add a todo to check"
-- **`low`** — Surfaced at idle, without interrupting in-progress work
+| Value | Delivery |
+|---|---|
+| `high` | Interrupt the agent at the earliest interruptible point (15 s debounce) |
+| `normal` | Surface at turn-idle — after the current agent turn completes |
+| `low` | Surface at idle or post-compact — lowest priority |
 
-## Inbox
-
-The inbox is a SQLite database that provides durable storage for observations. Items follow a state machine:
+## The delivery pipeline
 
 ```
-queued → acked → in-progress → completed → archived
-                             → failed    → archived
+MONITOR.md  ──parse──▶  runtime tick  ──observe()──▶  source plugin
+                              │                              │
+                       notify dispatch  ◀──observations──────┘
+                       (debounce/throttle)
+                              │
+                       durable monitor_events  ──project──▶  sessions  ──▶  hook
 ```
 
-The inbox persists across agent restarts, so no observations are lost.
-
-## Notification Strategies
-
-The `notify` block in a monitor controls when observations become inbox items:
-
-| Strategy   | Behavior                                    | Good for                                  |
-| ---------- | ------------------------------------------- | ----------------------------------------- |
-| (default)  | Every signal fires immediately              | Rare, high-value events                   |
-| `debounce` | Wait for signals to stop, then fire         | Rapid-fire mutations (file saves)         |
-| `throttle` | Fire on first signal, suppress for cooldown | "Tell me right away, then leave me alone" |
+1. **Parse** — `MONITOR.md` is read and validated; frontmatter configures the source.
+2. **Observe** — the source plugin runs and returns observations (what changed and how).
+3. **Notify dispatch** — the runtime applies debounce/throttle policy.
+4. **Persist** — observations become durable `monitor_events` rows in SQLite.
+5. **Project** — events are projected into matching active agent sessions.
+6. **Deliver** — the host adapter surfaces pending events at the right lifecycle point.
 
 ## Scoping
 
-Monitors inherit their activation scope from the hook hierarchy:
+Monitors are discovered by the runtime in standard locations:
 
-- **Enterprise-level** — Always active org-wide (managed config)
-- **User-level** (`~/.claude/monitors/`) — Always active on the user's machine
-- **Project-level** (`.claude/monitors/`) — Active only in that project
+| Scope | Location | When active |
+|---|---|---|
+| User | `~/.claude/monitors/` | Always, on this machine |
+| Project | `.claude/monitors/` | When working in that project |
 
-## Hook Bridge
+## The facts/judgments split
 
-The hook bridge writes inbox state to a JSON file that AI coding tool hooks can read. This enables real-time integration — when the inbox changes, the hook can inject context or create todos for the agent.
+**Frontmatter states facts; the body states judgments.** The monitor observes and delivers
+mechanical facts (declared in frontmatter); all semantic judgment is authored in the body
+and executed by the agent. The runtime carries the body through verbatim — it never acts on
+it. This structural split makes monitors deterministic, testable, and portable.
+
+## Learn more
+
+- [Authoring monitors](/docs/authoring-monitors) — the complete frontmatter reference
+- [Use cases](/docs/use-cases) — patterns from simple to advanced
+- [The Monitor Standard](/docs/monitor-standard) — the open format specification
