@@ -103,7 +103,7 @@ state from a sequence of fragments.
 {
   "monitor": "payments-commits",
   "object": "git:src/payments/api.ts@a1b2c3",
-  "changeKind": "appeared",
+  "changeKind": "modified",
   "observedAt": "2026-06-07T18:04:11Z",
   "resumeToken": "<opaque, source-owned>",
   "state": {},
