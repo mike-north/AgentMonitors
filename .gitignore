@@ -151,7 +151,10 @@ temp/
 
 # Claude
 .claude/*.local.*
-.claude/monitors/
+.claude/monitors/*
+!.claude/monitors/spec-changes/
+!.claude/monitors/spec-changes/MONITOR.md
+
 
 # Channel probe findings (experiments/channel-probe)
 agentmon-channel-probe.json

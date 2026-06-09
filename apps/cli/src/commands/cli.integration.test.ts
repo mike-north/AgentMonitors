@@ -1013,3 +1013,273 @@ describe('inbox list', () => {
     expect(result.stderr).toContain('valid ISO 8601 date');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Dogfood UAT: incoming-changes runtime flow
+// Acceptance proof for https://github.com/mike-north/AgentMonitors/issues/40
+//
+// This test proves end-to-end that a commit advancing `main` under the watched
+// paths (`docs/specs/**`, `docs/standard/**`) surfaces a delivered signal in a
+// session via the hook claim path — with no manual polling or diffing.
+// ---------------------------------------------------------------------------
+
+function hasGit(): boolean {
+  try {
+    execFileSync('git', ['--version'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const gitAvailable = hasGit();
+
+/** Run a git command in the given directory with deterministic identity config. */
+function gitIn(cwd: string, args: string[]): void {
+  execFileSync('git', args, {
+    cwd,
+    stdio: 'pipe',
+    env: {
+      ...process.env,
+      GIT_AUTHOR_DATE: '2024-01-15T10:30:00+0000',
+      GIT_COMMITTER_DATE: '2024-01-15T10:30:00+0000',
+    },
+  });
+}
+
+describe.skipIf(!gitAvailable)('incoming-changes runtime flow', () => {
+  // Acceptance proof for https://github.com/mike-north/AgentMonitors/issues/40
+  it('detects a spec-file commit on main and delivers a hook claim to the session', async () => {
+    // -----------------------------------------------------------------------
+    // 1. Create a temp git repo seeded with docs/specs/001.md on branch main.
+    // -----------------------------------------------------------------------
+    const repo = path.join(tempDir, 'incoming-changes-flow');
+    mkdirSync(repo, { recursive: true });
+
+    // git init with -b main; fall back to init + checkout if git is older
+    try {
+      gitIn(repo, ['init', '-b', 'main']);
+    } catch {
+      gitIn(repo, ['init']);
+      gitIn(repo, ['checkout', '-b', 'main']);
+    }
+    gitIn(repo, ['config', 'user.email', 'test@example.com']);
+    gitIn(repo, ['config', 'user.name', 'Test']);
+
+    // Seed the watched spec file (baseline commit on main)
+    const specFile = path.join(repo, 'docs', 'specs', '001.md');
+    mkdirSync(path.dirname(specFile), { recursive: true });
+    writeFileSync(specFile, '# Spec 001\n\nInitial content.\n', 'utf-8');
+    gitIn(repo, ['add', '.']);
+    gitIn(repo, [
+      '-c',
+      'user.name=Test',
+      '-c',
+      'user.email=test@example.com',
+      'commit',
+      '--message',
+      'chore: seed docs/specs/001.md',
+    ]);
+
+    // -----------------------------------------------------------------------
+    // 2. Write the test monitor into the repo's monitors dir.
+    //    cwd is set explicitly to the temp repo so the daemon's process.cwd()
+    //    doesn't affect git resolution.
+    // -----------------------------------------------------------------------
+    const monitorsDir = path.join(repo, '.claude', 'monitors', 'spec-changes');
+    mkdirSync(monitorsDir, { recursive: true });
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      `---
+name: Spec & standard changes from upstream
+source: incoming-changes
+urgency: normal
+scope:
+  paths:
+    - 'docs/specs/**'
+    - 'docs/standard/**'
+  branch: main
+  cwd: ${JSON.stringify(repo)}
+  interval: '1s'
+---
+Summarize what changed in the spec/standard docs and whether it affects current work.
+`,
+      'utf-8',
+    );
+
+    // -----------------------------------------------------------------------
+    // 3. Start the daemon with a dedicated DB and socket path.
+    // -----------------------------------------------------------------------
+    const dbPath = path.join(repo, 'agentmon.db');
+    const socketPath = path.join(
+      '/tmp',
+      `agentmon-ic-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const env = {
+      AGENTMONITORS_DB: dbPath,
+      AGENTMONITORS_SOCKET: socketPath,
+    };
+    const daemon = await startDaemon(
+      path.join(repo, '.claude', 'monitors'),
+      repo,
+      env,
+      socketPath,
+    );
+
+    try {
+      // -----------------------------------------------------------------------
+      // 4. Open a session for this workspace.
+      // -----------------------------------------------------------------------
+      const sessionOpen = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          'claude-incoming-changes-uat',
+          '--workspace',
+          repo,
+          '--format',
+          'json',
+        ],
+        env,
+        repo,
+      );
+      expect(sessionOpen.exitCode).toBe(0);
+      const session = JSON.parse(sessionOpen.stdout) as { id: string };
+
+      // -----------------------------------------------------------------------
+      // 5. Wait for the first tick to establish the baseline (no event yet).
+      //    The source records the current HEAD SHA on the first observe() call
+      //    and emits no observations.
+      // -----------------------------------------------------------------------
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500);
+
+      // Confirm no events yet (baseline tick only)
+      const noEvents = runWithEnv(
+        [
+          'events',
+          'list',
+          '--session',
+          session.id,
+          '--unread',
+          '--format',
+          'json',
+        ],
+        env,
+        repo,
+      );
+      expect(noEvents.exitCode).toBe(0);
+      expect(JSON.parse(noEvents.stdout)).toHaveLength(0);
+
+      // -----------------------------------------------------------------------
+      // 6. Advance main: commit a change to docs/specs/001.md.
+      //    This simulates a `git pull` bringing in upstream spec changes.
+      // -----------------------------------------------------------------------
+      writeFileSync(
+        specFile,
+        '# Spec 001\n\nUpdated content — new invariant added.\n',
+        'utf-8',
+      );
+      gitIn(repo, ['add', '.']);
+      gitIn(repo, [
+        '-c',
+        'user.name=Test',
+        '-c',
+        'user.email=test@example.com',
+        'commit',
+        '--message',
+        'spec: add new invariant to 001',
+      ]);
+
+      // -----------------------------------------------------------------------
+      // 7. Poll events until exactly 1 unread event appears (deadline: 10s).
+      // -----------------------------------------------------------------------
+      const unread = () =>
+        runWithEnv(
+          [
+            'events',
+            'list',
+            '--session',
+            session.id,
+            '--unread',
+            '--format',
+            'json',
+          ],
+          env,
+          repo,
+        );
+
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        const result = unread();
+        if (result.exitCode === 0 && JSON.parse(result.stdout).length === 1) {
+          break;
+        }
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+      }
+
+      // -----------------------------------------------------------------------
+      // 8. Assert: 1 unread event, claim returns delivery with urgency normal.
+      // -----------------------------------------------------------------------
+      const unreadResult = unread();
+      expect(unreadResult.exitCode).toBe(0);
+      const unreadEvents = JSON.parse(unreadResult.stdout) as {
+        id: string;
+        title: string;
+        monitorId: string;
+      }[];
+      expect(unreadEvents).toHaveLength(1);
+
+      // Acceptance: the delivered signal must be concrete and actionable —
+      // it names the changed spec file and the nature of the change, not just
+      // "something changed". incoming-changes emits a per-path observation
+      // titled `Incoming change: <path> (<changeKind>)`.
+      const [event] = unreadEvents;
+      expect(event?.monitorId).toBe('spec-changes');
+      expect(event?.title).toContain('docs/specs/001.md');
+      expect(event?.title).toContain('modified');
+
+      const claim = runWithEnv(
+        [
+          'hook',
+          'claim',
+          '--session',
+          session.id,
+          '--lifecycle',
+          'turn-interruptible',
+          '--format',
+          'json',
+        ],
+        env,
+        repo,
+      );
+      expect(claim.exitCode).toBe(0);
+      const claimPayload = JSON.parse(claim.stdout) as {
+        mode: string;
+        urgency: string;
+      };
+      // A commit advancing the watched paths must produce a delivered signal.
+      expect(claimPayload.mode).toBe('delivery');
+      expect(claimPayload.urgency).toBe('normal');
+
+      // Acknowledge all events, confirm the queue is drained.
+      const ack = runWithEnv(
+        ['events', 'ack', '--session', session.id],
+        env,
+        repo,
+      );
+      expect(ack.exitCode).toBe(0);
+
+      const unreadAfterAck = unread();
+      expect(unreadAfterAck.exitCode).toBe(0);
+      expect(JSON.parse(unreadAfterAck.stdout)).toHaveLength(0);
+
+      const stop = runWithEnv(['daemon', 'stop'], env, repo);
+      expect(stop.exitCode).toBe(0);
+      await daemon.waitForExit();
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+    }
+  }, 20_000);
+});
