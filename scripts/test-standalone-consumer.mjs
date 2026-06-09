@@ -162,13 +162,13 @@ try {
     path.join(fileMonitorDir, 'MONITOR.md'),
     \`---
 name: Watch file
-source: file-fingerprint
-urgency: normal
-scope:
+watch:
+  type: file-fingerprint
   globs:
     - watched.txt
   cwd: \${workspaceDir}
   interval: 0s
+urgency: normal
 ---
 Tell the agent the watched file changed.
 \`,
@@ -181,13 +181,13 @@ Tell the agent the watched file changed.
     path.join(apiMonitorDir, 'MONITOR.md'),
     \`---
 name: Watch api
-source: api-poll
-urgency: normal
-scope:
+watch:
+  type: api-poll
   url: http://127.0.0.1:\${port}/state
   interval: 0s
   change-detection:
     strategy: json-diff
+urgency: normal
 ---
 Tell the agent the local API changed.
 \`,

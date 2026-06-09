@@ -77,14 +77,13 @@ async function main() {
     path.join(monitorDir, 'MONITOR.md'),
     `---
 name: Watch files
-source: file-fingerprint
-urgency: ${urgency}
-event-kind: mutation
-scope:
+watch:
+  type: file-fingerprint
   globs:
     - watched.txt
   cwd: ${JSON.stringify(work)}
   interval: '1s'
+urgency: ${urgency}
 ---
 When files change, review them.
 `,
