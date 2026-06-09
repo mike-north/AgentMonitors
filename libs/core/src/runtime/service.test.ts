@@ -1637,6 +1637,60 @@ Handle it.
     expect(history[0]?.observationData).toEqual({ observed: 1, emitted: 1 });
   });
 
+  // Issue #56 (PR review): `rebaselined` is, by contract (002 §observation_history),
+  // a tick that returned ZERO observations. If a source returns observations that
+  // get suppressed (emitted=0, observed>0) AND mistakenly sets outcome:'rebaselined',
+  // the runtime must record `suppressed`, not `rebaselined` — the observed===0 guard
+  // enforces the invariant at the boundary so a misbehaving source can't mask a
+  // genuine suppressed tick.
+  // https://github.com/mike-north/AgentMonitors/issues/56
+  it('records suppressed (not rebaselined) when a held observation accompanies the rebaselined diagnostic', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    // High urgency → default 15s debounce: the observation is held (emitted=0,
+    // observed=1) on this tick, exercising the observed>0 + rebaselined case.
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'suppress-and-rebaseline-source',
+      'high',
+      'Handle it.',
+      "  interval: '1s'\n",
+    );
+
+    const source: ObservationSource = {
+      name: 'suppress-and-rebaseline-source',
+      scopeSchema: { type: 'object' },
+      stateful: true,
+      observe: (): Promise<ObservationResult> =>
+        Promise.resolve({
+          observations: [{ title: 'held', objectKey: 'obj-1' }],
+          nextState: { ref: 'abc123' },
+          outcome: 'rebaselined',
+        }),
+    };
+
+    const runtime = createRuntime(dbPath, source);
+    runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-suppress-rebaseline',
+        workspacePath: rootDir,
+      }),
+    );
+
+    const tick = await runtime.tick(monitorsDir, rootDir);
+    // Held by debounce — nothing emitted this tick.
+    expect(tick.emittedEventIds).toHaveLength(0);
+
+    const history = runtime.listObservationHistory({
+      monitorId: 'test-monitor',
+    });
+    expect(history).toHaveLength(1);
+    // observed>0 wins: a held observation is `suppressed`, never `rebaselined`.
+    expect(history[0]?.result).toBe('suppressed');
+    expect(history[0]?.observationData).toEqual({ observed: 1, emitted: 0 });
+  });
+
   // Issue #46 / Copilot comment 1: per-observation materialization isolation in
   // ingest(). When a batch of ≥2 dispatched observations is being materialized
   // and the FIRST processObservation() call succeeds but a LATER one fails,

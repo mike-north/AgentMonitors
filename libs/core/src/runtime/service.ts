@@ -541,7 +541,13 @@ export class AgentMonitorRuntime {
       result:
         emittedCount > 0
           ? 'triggered'
-          : options.sourceOutcome === 'rebaselined'
+          : // `rebaselined` is, by contract (002 §observation_history), a tick
+            // that returned ZERO observations and advanced its baseline. Guard
+            // on observed === 0 so a source that mistakenly sets the diagnostic
+            // while also returning (suppressed) observations can't mask a
+            // genuine `suppressed` tick — the invariant is enforced here at the
+            // runtime boundary, not left to source authors.
+            observed === 0 && options.sourceOutcome === 'rebaselined'
             ? 'rebaselined'
             : observed > 0
               ? 'suppressed'
