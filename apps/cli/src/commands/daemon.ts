@@ -9,12 +9,16 @@ import {
   resolveSocketPath,
 } from '../daemon-ipc.js';
 import { daemonStatusClient, daemonTickClient } from '../runtime-client.js';
+import { shouldReap, BOOT_GRACE_MS } from '../reap-decision.js';
+
+const DEFAULT_REAP_AFTER_MS = 5 * 60 * 1000;
 
 async function runLoop(
   monitorsDir: string,
   workspacePath: string,
   pollMs: number,
   socketPath: string,
+  reapAfterMs: number,
 ): Promise<void> {
   const runtime = createRuntime();
   let stopping = false;
@@ -32,6 +36,9 @@ async function runLoop(
     wakeLoop?.();
   };
   const isStoppingRequested = () => stopping;
+
+  let idleSince: number | null = null;
+  let hasSeenSession = false;
 
   process.on('SIGINT', stop);
   process.on('SIGTERM', stop);
@@ -73,6 +80,39 @@ async function runLoop(
         const message = error instanceof Error ? error.message : String(error);
         console.error(`AgentMon runtime tick failed: ${message}`);
       }
+
+      // Idle reaping: stop the daemon when no active sessions have been open
+      // for this workspace continuously for the required idle window.
+      // Uses shouldReap() which applies a boot-grace period to prevent the
+      // reaper from firing before `session start` finishes registration.
+      //
+      // hasSeenSession is also set if any dormant session exists — this handles
+      // the case where a session is registered and closed between tick intervals
+      // (tick only observes the closed/dormant state but must not apply the
+      // boot-grace period as if no session was ever registered).
+      {
+        const workspaceSessions = runtime
+          .listSessions()
+          .filter((s) => s.workspacePath === workspacePath);
+        const openCount = workspaceSessions.filter(
+          (s) => s.status === 'active',
+        ).length;
+        const anySession = workspaceSessions.length > 0;
+        const decision = shouldReap({
+          openCount,
+          hasSeenSession: hasSeenSession || anySession,
+          idleSince,
+          now: Date.now(),
+          reapAfterMs,
+          bootGraceMs: BOOT_GRACE_MS,
+        });
+        idleSince = decision.nextIdleSince;
+        hasSeenSession = decision.nextHasSeenSession;
+        if (decision.reap) {
+          stop();
+        }
+      }
+
       await new Promise<void>((resolve) => {
         const timeout = setTimeout(() => {
           wakeLoop = undefined;
@@ -151,14 +191,32 @@ daemonCommand
   )
   .option('--poll-ms <ms>', 'Polling interval in milliseconds', '30000')
   .option('--socket <path>', 'Unix domain socket path for the daemon')
+  .option(
+    '--reap-after-ms <ms>',
+    'Stop the daemon after this many ms of idle (no active sessions). Set 0 to disable.',
+    String(DEFAULT_REAP_AFTER_MS),
+  )
   .action(
     async (
       monitorsDir: string,
-      options: { workspace: string; pollMs: string; socket?: string },
+      options: {
+        workspace: string;
+        pollMs: string;
+        socket?: string;
+        reapAfterMs: string;
+      },
     ) => {
       const pollMs = Number(options.pollMs);
       if (!Number.isFinite(pollMs) || pollMs <= 0) {
         reportError('--poll-ms must be a positive number.', false);
+        return;
+      }
+      const reapAfterMs = Number(options.reapAfterMs);
+      if (!Number.isFinite(reapAfterMs) || reapAfterMs < 0) {
+        reportError(
+          '--reap-after-ms must be a non-negative number (0 disables).',
+          false,
+        );
         return;
       }
       const socketPath = resolveSocketPath(options.socket);
@@ -169,7 +227,13 @@ daemonCommand
         );
         return;
       }
-      await runLoop(monitorsDir, options.workspace, pollMs, socketPath);
+      await runLoop(
+        monitorsDir,
+        options.workspace,
+        pollMs,
+        socketPath,
+        reapAfterMs,
+      );
     },
   );
 

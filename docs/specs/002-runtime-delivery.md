@@ -244,7 +244,13 @@ Verified: `apps/cli/src/runtime-client.ts` — `daemonTickClient()` (lines 94–
 5. Handles `SIGINT` and `SIGTERM` to stop cleanly
 6. Refuses to start if the socket is already in use (another daemon is running)
 
-Verified: `apps/cli/src/commands/daemon.ts` — `runLoop()` (lines 17–70); `run` subcommand (lines 115–150).
+**Idle reaping:** the daemon monitors active sessions for the workspace. After each tick it counts sessions with `status === 'active'` and `workspacePath === workspacePath`. If this count stays zero continuously for `--reap-after-ms` milliseconds (default `300000`; `0` disables), the daemon stops itself cleanly. This is the primary self-termination mechanism for daemons booted by `session start`.
+
+**Per-workspace isolation:** socket and db paths are derived from the workspace path via `workspacePaths()` in `apps/cli/src/workspace-paths.ts`, which hashes `resolve(workspacePath)` (SHA-256, first 16 hex chars) under `XDG_DATA_HOME ?? ~/.local/share/agentmonitors/workspaces/<hash>/`. Two sessions in the same repo share one daemon; two distinct repos get isolated daemons.
+
+**Lazy boot:** `session start` spawns `daemon run` as a detached background process when no daemon is already listening at the per-workspace socket path, waits up to 8 seconds for the socket to appear, then opens the session. The spawner unref's the child, so the parent (the hook process) can exit while the daemon continues running. The coordination file `.claude/agentmonitors.local.md` holds `enabled`, `socket`, `db`, and `reap-after-ms` fields so sibling hooks can locate the per-workspace daemon without re-deriving paths.
+
+Verified: `apps/cli/src/commands/daemon.ts` — `runLoop()`; `run` subcommand; `apps/cli/src/detached-spawn.ts` — `spawnDetachedDaemon()`; `apps/cli/src/workspace-paths.ts` — `workspacePaths()`; `apps/cli/src/local-state.ts` — `readLocalState()`/`writeLocalState()`.
 
 ### 10.3 Socket path resolution
 

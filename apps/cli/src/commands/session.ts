@@ -1,4 +1,5 @@
 import { Command, Option } from 'commander';
+import path from 'node:path';
 import { claudeCodeAdapter } from '@mike-north/core';
 import { reportError } from '../output.js';
 import {
@@ -6,6 +7,10 @@ import {
   listSessionsClient,
   openSessionClient,
 } from '../runtime-client.js';
+import { daemonAvailable } from '../daemon-ipc.js';
+import { readLocalState, writeLocalState } from '../local-state.js';
+import { workspacePaths } from '../workspace-paths.js';
+import { spawnDetachedDaemon } from '../detached-spawn.js';
 
 export const sessionCommand = new Command('session').description(
   'Manage agent sessions tracked by AgentMon',
@@ -120,5 +125,93 @@ sessionCommand
       console.log(
         `${session.id}  ${session.status}  ${session.agentIdentity}  ${session.workspacePath ?? '(global)'}`,
       );
+    }
+  });
+
+sessionCommand
+  .command('start')
+  .description(
+    'Lazy-boot the project daemon (if needed) and register this session',
+  )
+  .action(async () => {
+    const workspacePath = process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
+    const hostSessionId = process.env['CLAUDE_CODE_SESSION_ID'];
+    if (!hostSessionId) return; // not a Claude session; nothing to do
+
+    const state = readLocalState(workspacePath);
+    if (!state.enabled) return; // quick-exit: monitoring not enabled here
+
+    const paths = workspacePaths(workspacePath);
+    const socket = state.socket ?? paths.socket;
+    const db = state.db ?? paths.db;
+    const monitorsDir = path.join(workspacePath, '.claude', 'monitors');
+
+    const BOOT_TIMEOUT_MS = 8_000;
+    if (!(await daemonAvailable(socket))) {
+      spawnDetachedDaemon({
+        monitorsDir,
+        workspacePath,
+        socket,
+        db,
+        pollMs: 1000,
+        ...(state.reapAfterMs !== undefined
+          ? { reapAfterMs: state.reapAfterMs }
+          : {}),
+      });
+      // wait for the socket to come up
+      const bootStart = Date.now();
+      while (
+        Date.now() - bootStart < BOOT_TIMEOUT_MS &&
+        !(await daemonAvailable(socket))
+      ) {
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      // Guard: if the daemon never came up, report and bail — don't fall through
+      // to writeLocalState/openSessionClient pointing at a non-existent socket.
+      if (!(await daemonAvailable(socket))) {
+        reportError(
+          `Daemon failed to start within ${String(BOOT_TIMEOUT_MS / 1000)}s`,
+          false,
+        );
+        return;
+      }
+    }
+    // persist the resolved paths for sibling hooks (deliver/end)
+    writeLocalState(workspacePath, { ...state, socket, db });
+
+    try {
+      await openSessionClient(
+        claudeCodeAdapter.createSessionInput({
+          hostSessionId,
+          workspacePath,
+        }),
+        socket,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      reportError(message, false);
+    }
+  });
+
+sessionCommand
+  .command('end')
+  .description('Deregister this session (lets the idle daemon reap itself)')
+  .action(async () => {
+    const workspacePath = process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
+    const hostSessionId = process.env['CLAUDE_CODE_SESSION_ID'];
+    if (!hostSessionId) return;
+    const state = readLocalState(workspacePath);
+    if (!state.enabled || !state.socket) return;
+    if (!(await daemonAvailable(state.socket))) return;
+    // resolve this host session's runtime id, then close it
+    const sessions = await listSessionsClient(state.socket);
+    const match = sessions.find((s) => s.hostSessionId === hostSessionId);
+    if (match) {
+      try {
+        await closeSessionClient(match.id, state.socket);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        reportError(message, false);
+      }
     }
   });
