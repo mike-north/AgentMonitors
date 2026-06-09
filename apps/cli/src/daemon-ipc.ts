@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdirSync, rmSync } from 'node:fs';
+import { mkdirSync, rmSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
@@ -148,6 +148,42 @@ function cleanupSocket(socketPath: string): void {
   }
 }
 
+/**
+ * Attempt a short-lived connect to socketPath. Returns true if something
+ * answered (a real daemon is running), false if the socket is stale / absent.
+ *
+ * Used by listen() to distinguish a live EADDRINUSE from a stale one so we
+ * only unlink when nothing is actually listening (no-clobber invariant).
+ */
+function probeSocket(socketPath: string, timeoutMs = 500): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = new net.Socket();
+    let settled = false;
+    const done = (result: boolean) => {
+      if (settled) return;
+      settled = true;
+      sock.removeAllListeners();
+      sock.setTimeout(0);
+      try {
+        sock.destroy();
+      } catch {
+        /* ignore */
+      }
+      resolve(result);
+    };
+    sock.setTimeout(timeoutMs, () => {
+      done(false);
+    });
+    sock.on('connect', () => {
+      done(true);
+    });
+    sock.on('error', () => {
+      done(false);
+    });
+    sock.connect(socketPath);
+  });
+}
+
 function handleRequest(
   runtime: AgentMonitorRuntime,
   request: DaemonRequest,
@@ -239,7 +275,6 @@ export function createDaemonServer({
   close(): Promise<void>;
 } {
   mkdirSync(path.dirname(socketPath), { recursive: true });
-  cleanupSocket(socketPath);
 
   let serverClosed = false;
   const server = net.createServer((socket) => {
@@ -293,8 +328,29 @@ export function createDaemonServer({
   });
 
   return {
-    listen() {
-      return new Promise((resolve, reject) => {
+    async listen() {
+      // Before attempting to bind, check whether the socket file already exists.
+      // If it does, probe it: a live daemon answers → keep it (caller's "already
+      // running" guard handles this). A stale file (no listener) → safe to unlink.
+      // This is the only place we unlink — never unconditionally — so a live
+      // socket is never removed (no-clobber invariant).
+      const live = await probeSocket(socketPath);
+      if (!live) {
+        // Nothing is listening; any leftover file is stale — remove it so our
+        // bind does not hit EADDRINUSE.
+        try {
+          unlinkSync(socketPath);
+        } catch (unlinkErr) {
+          const code = isErrnoException(unlinkErr)
+            ? String(unlinkErr.code)
+            : '';
+          if (code !== 'ENOENT') throw unlinkErr;
+        }
+      }
+      // Now attempt the actual bind.  If `live` is true we leave the socket
+      // alone and let the bind fail with EADDRINUSE so the caller can detect
+      // "already running" in the normal way.
+      return new Promise<void>((resolve, reject) => {
         server.once('error', reject);
         server.listen(socketPath, () => {
           server.off('error', reject);
