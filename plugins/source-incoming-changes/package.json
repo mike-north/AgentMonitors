@@ -1,7 +1,7 @@
 {
   "name": "@agentmonitors/source-incoming-changes",
   "description": "Git incoming-changes detection for Agent Monitors",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publishConfig": {
     "registry": "https://registry.npmjs.org",
     "access": "public"
