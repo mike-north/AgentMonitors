@@ -53,7 +53,7 @@ Scaffold and run your first monitor:
 # Create .claude/monitors/my-first-monitor/MONITOR.md from a template
 agentmonitors init my-first-monitor
 
-# Check it parses and its source/scope are valid
+# Check it parses and its watch config is valid
 agentmonitors validate .claude/monitors
 
 # See all monitors discovered under a root (plus any parse failures)
