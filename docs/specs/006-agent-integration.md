@@ -222,7 +222,111 @@ transport that injects content:
 This concern is not new to channels — the hook-state path surfaces the same content — but channels
 make injection more direct, so it is stated here as a transport-level requirement.
 
-## 5. Availability & Fallback
+## 5. Hook-Deliver Transport (Current — Plan D)
+
+> **Status: implemented.** `agentmonitors hook deliver` (`apps/cli/src/commands/hook.ts`).
+
+The **hook-deliver transport** is a CLI command designed to run directly inside a Claude Code
+lifecycle hook (`PreToolUse`, `Stop`, `SessionStart`, etc.). When invoked it claims any pending
+deliveries for the session and emits them as **advisory, non-blocking `additionalContext`** injected
+into the agent at the turn boundary — the same format any hook can use to surface information
+without blocking the tool call.
+
+This transport is fully self-contained (no MCP server, no channel capability requirement) and works
+in any environment that can run Claude Code hooks.
+
+### 5.1 Wire Contract
+
+The hook prints a JSON object to stdout and **MUST exit 0** — non-zero exit or a missing
+`continue` field causes Claude Code to ignore the output. The shape:
+
+```json
+{
+  "continue": true,
+  "hookSpecificOutput": {
+    "hookEventName": "<EventName>",
+    "additionalContext": "<rendered text>"
+  }
+}
+```
+
+- **`continue: true`** — advisory delivery never blocks the agent (BP2).
+- **`hookEventName`** — echoes the event that fired the hook (e.g. `"PreToolUse"`, `"Stop"`).
+  Must match the firing event; passed via `--hook-event-name`.
+- **`additionalContext`** — the rendered delivery: a lead line followed by one block per event
+  with the monitor id, urgency, title, and the monitor's **body-instructions** (`DeliveryEventSummary.body`).
+  Capped at 4000 characters. Unlike the channel transport (§4.6), this is a plain JSON string
+  (`JSON.stringify` escapes it) and is **not** tag-delimited, so `<`, `>`, `[`, `]`, `;`, and
+  newlines are preserved verbatim — a monitor body is trusted, user-authored markdown that
+  legitimately contains code and links. Only raw C0/C1 control characters (except tab/newline) are
+  stripped.
+- **No `permissionDecision` field** — advisory; the agent decides what to do.
+
+When there is nothing pending, the command **MUST** print nothing and exit 0 — an empty stdout is
+the signal to Claude Code to proceed silently.
+
+### 5.2 Behavior
+
+1. Read `CLAUDE_CODE_SESSION_ID` from env. If absent → exit 0, print nothing (not a Claude session).
+2. Read `.claude/agentmonitors.local.md` via `readLocalState(CLAUDE_PROJECT_DIR ?? cwd)`.
+   If `!enabled` or no socket → exit 0, print nothing.
+3. Resolve the socket path via `resolveSocketPath` (flag → `.local.md` socket → env default).
+   If the daemon is unreachable → exit 0, print nothing.
+4. Call `listSessionsClient(socket)`, find the session whose `hostSessionId` matches
+   `CLAUDE_CODE_SESSION_ID`. If not found → exit 0, print nothing.
+5. Call `claimDeliveryClient(sessionId, lifecycle, socket)`. If null → exit 0, print nothing.
+6. Render via `renderHookDelivery(claim, hookEventName)`. If null (empty events) → exit 0, print nothing.
+7. `process.stdout.write(JSON.stringify(output))` → exit 0.
+
+**Any internal error MUST be swallowed.** The command is invoked by a Claude Code hook; an
+unhandled error would interrupt the user's session. The wrapping try/catch ensures the command
+always exits 0 regardless of IPC failures, missing state, or unexpected errors.
+
+### 5.3 Usage
+
+Typical hook registration (in `.claude/settings.json`):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "agentmonitors hook deliver --lifecycle turn-interruptible --hook-event-name PreToolUse"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "agentmonitors hook deliver --lifecycle turn-idle --hook-event-name Stop"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+### 5.4 Lifecycle-to-delivery mapping
+
+| Hook event    | `--lifecycle`        | What is surfaced                                                |
+| ------------- | -------------------- | --------------------------------------------------------------- |
+| `PreToolUse`  | `turn-interruptible` | Settled high-urgency events (≥15 s old); normal/low as reminder |
+| `Stop`        | `turn-idle`          | Low-urgency events (pending but not yet surfaced)               |
+| `PostCompact` | `post-compact`       | All unread events as a recap with bodies                        |
+
+Note: for `turn-interruptible`, `normal` urgency returns `events: []` (reminder text only, no body
+injection). The body is surfaced only for **high-urgency settled events** and **post-compact recap**.
+
+## 6. Availability & Fallback
 
 The channel transport is **optional and additive**. It depends on conditions a restricted environment
 may deny:
@@ -241,7 +345,7 @@ Accordingly (NP-CH):
   AgentMon **MUST** treat this as an expected condition (the durable event was already delivered via
   the hook path) and **MUST NOT** surface an error.
 
-## 6. Out of Scope
+## 7. Out of Scope
 
 - **Permission relay** (`claude/channel/permission`, `notifications/claude/channel/permission_request`
   / `permission`): AgentMon is a work-signal system, not a tool-approval bridge. Not implemented, not
@@ -249,7 +353,7 @@ Accordingly (NP-CH):
 - **AgentMon as a consumer of inbound channel messages** (a "channel" source): channels push into a
   session, not into the daemon; this is not the integration's shape.
 
-## 7. Examples
+## 8. Examples
 
 ### 9.1 A high-urgency delivery rendered as a channel event
 
@@ -278,7 +382,7 @@ channel field schema; `event_id` is available for the ack tool.
 **What this proves:** the two-way reply mechanism maps cleanly onto AgentMon's distinct
 claimed-vs-acknowledged states.
 
-## 8. Validation Implications
+## 9. Validation Implications
 
 Transport and integration tests should be able to prove:
 
@@ -292,7 +396,7 @@ Transport and integration tests should be able to prove:
 - workspace binding resolves the correct lead session when `W` has one lead, and degrades (no
   ambiguous claim) when `W` has multiple leads (§4.4).
 
-## 9. Open Questions
+## 10. Open Questions
 
 - **Resolved (Claude Code 2.1.157):** a stdio MCP server receives `CLAUDE_PROJECT_DIR` (= workspace),
   has its cwd set to the workspace, inherits `CLAUDE_CODE_SESSION_ID`, and can call `roots/list`. The

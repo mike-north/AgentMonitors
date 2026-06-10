@@ -1647,3 +1647,272 @@ describe('lazy daemon lifecycle', () => {
     }
   }, 30_000);
 });
+
+// ---------------------------------------------------------------------------
+// hook deliver: advisory turn-boundary delivery
+// ---------------------------------------------------------------------------
+
+describe('hook deliver', () => {
+  it('hook deliver emits the pending monitor body as advisory context', async () => {
+    // Scaffold a workspace with a file-fingerprint monitor that has a
+    // distinctive body text we can assert on.
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-hook-deliver-'));
+    const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-files');
+    mkdirSync(monitorsDir, { recursive: true });
+
+    const watchedFile = path.join(ws, 'watched.txt');
+    writeFileSync(watchedFile, 'initial content', 'utf-8');
+
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      [
+        '---',
+        'name: Watch files',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs:',
+        '    - "watched.txt"',
+        `  cwd: ${JSON.stringify(ws)}`,
+        '  interval: "1s"',
+        // Use high urgency: `turn-interruptible` surfaces high events after
+        // the 15s settle window (DEFAULT_HIGH_URGENCY_SETTLE_MS).  The body
+        // is included in the claim's events[] array only for high urgency at
+        // this lifecycle; normal returns events:[] (reminder only).
+        'urgency: high',
+        '---',
+        'When files change, review the diff and flag risky changes.',
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+
+    const socket = path.join(
+      '/tmp',
+      `agentmon-hd-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const db = path.join(ws, 'hook-deliver.db');
+    const hostSessionId = `hook-deliver-${Date.now()}`;
+
+    writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 30_000 });
+
+    const env: Record<string, string> = {
+      CLAUDE_CODE_SESSION_ID: hostSessionId,
+      CLAUDE_PROJECT_DIR: ws,
+      AGENTMONITORS_DB: db,
+      AGENTMONITORS_SOCKET: socket,
+    };
+
+    const daemon = await startDaemon(
+      path.join(ws, '.claude', 'monitors'),
+      ws,
+      env,
+      socket,
+    );
+
+    try {
+      // Open a session via the daemon (the low-level session open, not lazy start).
+      const sessionOpen = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          hostSessionId,
+          '--workspace',
+          ws,
+          '--format',
+          'json',
+        ],
+        env,
+        ws,
+      );
+      expect(sessionOpen.exitCode).toBe(0);
+
+      // Wait for the first baseline tick to complete (so the next file change
+      // will be detected as a delta rather than silently ignored).
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
+
+      // Trigger a file change so a monitor event is generated.
+      writeFileSync(watchedFile, 'changed content', 'utf-8');
+
+      // Poll until an unread event appears (deadline: 10 s).
+      const session = JSON.parse(sessionOpen.stdout) as { id: string };
+      const unread = () =>
+        runWithEnv(
+          [
+            'events',
+            'list',
+            '--session',
+            session.id,
+            '--unread',
+            '--format',
+            'json',
+          ],
+          env,
+          ws,
+        );
+
+      // For high-urgency events the runtime holds observations in a 15 s
+      // debounce window before materializing them into monitor_events rows.
+      // Poll for the unread event with a deadline that covers the settle
+      // window (15 s) plus two tick intervals (2 s) plus headroom (3 s = 20 s).
+      const eventDeadline = Date.now() + 20_000;
+      while (Date.now() < eventDeadline) {
+        const result = unread();
+        if (result.exitCode === 0 && JSON.parse(result.stdout).length >= 1) {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      expect(JSON.parse(unread().stdout)).toHaveLength(1);
+
+      // Once the event is materialized (after the debounce expires), hook
+      // deliver can claim it immediately — the settle check in claimDelivery
+      // compares event.createdAt against now, and the event's createdAt is
+      // set at materialization time (after the debounce), so the settle
+      // window is already satisfied when the event first becomes visible.
+      const deliverResult = runWithEnv(
+        [
+          'hook',
+          'deliver',
+          '--lifecycle',
+          'turn-interruptible',
+          '--hook-event-name',
+          'PreToolUse',
+        ],
+        env,
+        ws,
+      );
+
+      expect(deliverResult.exitCode).toBe(0);
+      expect(deliverResult.stdout.trim()).not.toBe('');
+
+      const output = JSON.parse(deliverResult.stdout) as {
+        continue: boolean;
+        hookSpecificOutput: {
+          hookEventName: string;
+          additionalContext: string;
+        };
+      };
+      expect(output.continue).toBe(true);
+      expect(output.hookSpecificOutput.hookEventName).toBe('PreToolUse');
+      // The monitor body must appear in the injected context.
+      expect(output.hookSpecificOutput.additionalContext).toContain(
+        'watch-files',
+      );
+      expect(output.hookSpecificOutput.additionalContext).toContain(
+        'When files change, review the diff and flag risky changes.',
+      );
+      // Advisory only — no permissionDecision
+      expect(output).not.toHaveProperty('permissionDecision');
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 40_000); // high-urgency settle = 15s + baseline + detection + headroom
+
+  it('hook deliver exits 0 and prints nothing when there is nothing pending', async () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-hd-empty-'));
+    const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-files');
+    mkdirSync(monitorsDir, { recursive: true });
+
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      [
+        '---',
+        'name: Watch files',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs:',
+        '    - "*.txt"',
+        `  cwd: ${JSON.stringify(ws)}`,
+        '  interval: "1s"',
+        'urgency: normal',
+        '---',
+        'When files change, review them.',
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+
+    const socket = path.join(
+      '/tmp',
+      `agentmon-hd2-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const db = path.join(ws, 'hd-empty.db');
+    const hostSessionId = `hd-empty-${Date.now()}`;
+
+    writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 10_000 });
+
+    const env: Record<string, string> = {
+      CLAUDE_CODE_SESSION_ID: hostSessionId,
+      CLAUDE_PROJECT_DIR: ws,
+      AGENTMONITORS_DB: db,
+      AGENTMONITORS_SOCKET: socket,
+    };
+
+    const daemon = await startDaemon(
+      path.join(ws, '.claude', 'monitors'),
+      ws,
+      env,
+      socket,
+    );
+
+    try {
+      // Open a session — no events yet
+      const sessionOpen = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          hostSessionId,
+          '--workspace',
+          ws,
+          '--format',
+          'json',
+        ],
+        env,
+        ws,
+      );
+      expect(sessionOpen.exitCode).toBe(0);
+
+      // No file change — nothing is pending.
+      const deliverResult = runWithEnv(
+        [
+          'hook',
+          'deliver',
+          '--lifecycle',
+          'turn-interruptible',
+          '--hook-event-name',
+          'PreToolUse',
+        ],
+        env,
+        ws,
+      );
+
+      expect(deliverResult.exitCode).toBe(0);
+      expect(deliverResult.stdout.trim()).toBe('');
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('hook deliver exits 0 and prints nothing when CLAUDE_CODE_SESSION_ID is absent', () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-hd-nosess-'));
+
+    try {
+      // No CLAUDE_CODE_SESSION_ID in env — must be a clean no-op.
+      const result = runWithEnv(
+        ['hook', 'deliver', '--lifecycle', 'turn-interruptible'],
+        { CLAUDE_PROJECT_DIR: ws },
+        ws,
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe('');
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+});

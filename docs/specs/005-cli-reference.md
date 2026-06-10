@@ -16,10 +16,10 @@ Per AP6, all public CLI behaviour must be derivable from core contracts. The CLI
 
 Commands divide into two transport modes:
 
-| Mode                                   | Commands                                                                                                                    | Mechanism                                                                                      |
-| -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| **In-process** (no socket)             | `init`, `validate`, `scan`, `monitor test`, `source list`, `schema generate`, `inbox *`, `daemon once`                      | Operates directly on the filesystem and/or SQLite database. No daemon socket required.         |
-| **Daemon socket** (Unix domain socket) | `daemon run`, `daemon status`, `daemon stop`, `session open/close/list`, `events list/ack`, `hook claim`, `monitor history` | Sends JSON-RPC-style messages over a Unix domain socket via `callDaemon()` in `daemon-ipc.ts`. |
+| Mode                                   | Commands                                                                                                                                    | Mechanism                                                                                      |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| **In-process** (no socket)             | `init`, `validate`, `scan`, `monitor test`, `source list`, `schema generate`, `inbox *`, `daemon once`                                      | Operates directly on the filesystem and/or SQLite database. No daemon socket required.         |
+| **Daemon socket** (Unix domain socket) | `daemon run`, `daemon status`, `daemon stop`, `session open/close/list`, `events list/ack`, `hook claim`, `hook deliver`, `monitor history` | Sends JSON-RPC-style messages over a Unix domain socket via `callDaemon()` in `daemon-ipc.ts`. |
 
 **`daemon once` is notable:** although it lives under the `daemon` command group, its implementation in `runtime-client.ts` (`daemonTickClient`) calls `createRuntime()` and `runtime.tick()` directly without using the socket. It is a single-tick in-process run, not a socket call. This is consistent with [002-runtime-delivery.md](./002-runtime-delivery.md).
 
@@ -781,6 +781,57 @@ Claims a pending delivery payload for a session at the specified lifecycle point
 
 ---
 
+### §12.2 `hook deliver`
+
+```
+agentmonitors hook deliver --lifecycle <lifecycle> [--hook-event-name <name>] [--socket <path>]
+```
+
+| Flag                       | Type               | Default          | Description                                       |
+| -------------------------- | ------------------ | ---------------- | ------------------------------------------------- |
+| `--lifecycle <lifecycle>`  | choices (required) | —                | `turn-interruptible`, `turn-idle`, `post-compact` |
+| `--hook-event-name <name>` | string             | `PreToolUse`     | Claude Code hook event name echoed in the output  |
+| `--socket <path>`          | string             | from `.local.md` | Override daemon socket path                       |
+
+**Designed to run as a Claude Code lifecycle hook** (`PreToolUse`, `Stop`, `PostCompact`, etc.).
+Claims pending deliveries for the session identified by `CLAUDE_CODE_SESSION_ID` and emits them
+as **advisory, non-blocking `additionalContext`** injected at the turn boundary.
+
+**Behavior:**
+
+1. If `CLAUDE_CODE_SESSION_ID` is absent → exit 0, print nothing.
+2. Read `.claude/agentmonitors.local.md` via `CLAUDE_PROJECT_DIR ?? cwd`. If `!enabled` or no socket → exit 0, print nothing.
+3. Check daemon availability. If unreachable → exit 0, print nothing.
+4. List sessions, find the one matching `CLAUDE_CODE_SESSION_ID`. If not found → exit 0, print nothing.
+5. Call `claimDelivery(sessionId, lifecycle)`. If null → exit 0, print nothing.
+6. Render via `renderHookDelivery(claim, hookEventName)`. If null (empty events) → exit 0, print nothing.
+7. Print the wire JSON to stdout and exit 0.
+
+**ALWAYS exits 0.** Any internal error is swallowed to avoid interrupting the user's session. A hook
+that exits non-zero can block tool calls.
+
+**Wire output (when there is something pending):**
+
+```json
+{
+  "continue": true,
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "additionalContext": "AgentMon: monitored changes are pending — consider handling them before continuing.\n\n### watch-src (high)\n..."
+  }
+}
+```
+
+**No output** when nothing is pending (empty stdout + exit 0).
+
+Note: for `--lifecycle turn-interruptible`, `normal` urgency produces `events: []` (reminder only —
+no body injection). Body text is surfaced for **high-urgency settled events** and **`post-compact`
+recap**.
+
+See [006 §5](./006-agent-integration.md) for the full transport spec and hook registration examples.
+
+---
+
 ## §13 `channel` — Claude Code channel server
 
 **Source:** `apps/cli/src/commands/channel.ts`
@@ -881,4 +932,5 @@ All commands set `process.exitCode = 1` rather than calling `process.exit(1)`. T
 | `events`   | `list`     | socket                            | Fully implemented                           |
 | `events`   | `ack`      | socket                            | Fully implemented                           |
 | `hook`     | `claim`    | socket                            | Fully implemented                           |
+| `hook`     | `deliver`  | socket (always exits 0)           | Fully implemented                           |
 | `channel`  | `serve`    | stdio MCP server + socket         | Two-way (push + `agentmon_ack`)             |
