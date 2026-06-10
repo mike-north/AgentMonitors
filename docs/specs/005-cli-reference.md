@@ -784,28 +784,31 @@ Claims a pending delivery payload for a session at the specified lifecycle point
 ### §12.2 `hook deliver`
 
 ```
-agentmonitors hook deliver --lifecycle <lifecycle> [--hook-event-name <name>] [--socket <path>]
+agentmonitors hook deliver [--lifecycle <lifecycle>] [--socket <path>]
 ```
 
-| Flag                       | Type               | Default          | Description                                       |
-| -------------------------- | ------------------ | ---------------- | ------------------------------------------------- |
-| `--lifecycle <lifecycle>`  | choices (required) | —                | `turn-interruptible`, `turn-idle`, `post-compact` |
-| `--hook-event-name <name>` | string             | `PreToolUse`     | Claude Code hook event name echoed in the output  |
-| `--socket <path>`          | string             | from `.local.md` | Override daemon socket path                       |
+| Flag                      | Type    | Default          | Description                                                                                                   |
+| ------------------------- | ------- | ---------------- | ------------------------------------------------------------------------------------------------------------- |
+| `--lifecycle <lifecycle>` | choices | derived          | Optional override (`turn-interruptible`, `turn-idle`, `post-compact`); normally derived from the firing event |
+| `--socket <path>`         | string  | from `.local.md` | Override daemon socket path                                                                                   |
 
-**Designed to run as a Claude Code lifecycle hook** (`PreToolUse`, `Stop`, `PostCompact`, etc.).
-Claims pending deliveries for the session identified by `CLAUDE_CODE_SESSION_ID` and emits them
-as **advisory, non-blocking `additionalContext`** injected at the turn boundary.
+**Designed to run as a Claude Code lifecycle hook.** Reads the hook payload as **JSON on stdin**
+(Claude Code delivers hook input via stdin, **not** env vars — there is no `CLAUDE_CODE_SESSION_ID`
+env var). It uses `session_id`, `hook_event_name`, and `cwd` from the payload, claims pending
+deliveries for that session, and emits them as **advisory, non-blocking `additionalContext`** at the
+turn boundary. The lifecycle is derived from `hook_event_name`; the same command line works on every
+event.
 
 **Behavior:**
 
-1. If `CLAUDE_CODE_SESSION_ID` is absent → exit 0, print nothing.
-2. Read `.claude/agentmonitors.local.md` via `CLAUDE_PROJECT_DIR ?? cwd`. If `!enabled` or no socket → exit 0, print nothing.
-3. Check daemon availability. If unreachable → exit 0, print nothing.
-4. List sessions, find the one matching `CLAUDE_CODE_SESSION_ID`. If not found → exit 0, print nothing.
-5. Call `claimDelivery(sessionId, lifecycle)`. If null → exit 0, print nothing.
-6. Render via `renderHookDelivery(claim, hookEventName)`. If null (empty events) → exit 0, print nothing.
-7. Print the wire JSON to stdout and exit 0.
+1. Read stdin as a JSON hook payload (TTY/empty/unparseable → `{}`; never hangs). If `session_id` is absent → exit 0, print nothing.
+2. Derive the lifecycle from `hook_event_name` (unless `--lifecycle` is passed). Non-context events (`PreToolUse`, `Stop`) → exit 0, print nothing.
+3. Read `.claude/agentmonitors.local.md` via `payload.cwd ?? CLAUDE_PROJECT_DIR ?? cwd`. If `!enabled` or no explicit socket → exit 0, print nothing.
+4. Check daemon availability. If unreachable → exit 0, print nothing.
+5. List sessions, find the one matching `session_id`. If not found → exit 0, print nothing.
+6. Call `claimDelivery(sessionId, lifecycle)`. If null → exit 0, print nothing.
+7. Render via `renderHookDelivery(claim, hookEventName)`. If null (empty events) → exit 0, print nothing.
+8. Print the wire JSON to stdout and exit 0.
 
 **ALWAYS exits 0.** Any internal error is swallowed to avoid interrupting the user's session. A hook
 that exits non-zero can block tool calls.
@@ -816,7 +819,7 @@ that exits non-zero can block tool calls.
 {
   "continue": true,
   "hookSpecificOutput": {
-    "hookEventName": "PreToolUse",
+    "hookEventName": "PostToolUse",
     "additionalContext": "AgentMon: monitored changes are pending — consider handling them before continuing.\n\n### watch-src (high)\n..."
   }
 }
@@ -824,9 +827,11 @@ that exits non-zero can block tool calls.
 
 **No output** when nothing is pending (empty stdout + exit 0).
 
-Note: for `--lifecycle turn-interruptible`, `normal` urgency produces `events: []` (reminder only —
-no body injection). Body text is surfaced for **high-urgency settled events** and **`post-compact`
-recap**.
+Note: for a derived `turn-interruptible` lifecycle, `normal` urgency produces `events: []` (reminder
+only — no body injection). Body text is surfaced for **high-urgency settled events** and
+**`post-compact`** (`SessionStart`) recap. Over-cap context is truncated at a code-point boundary
+with an explicit `[truncated …]` marker; the truncated-away events stay unread (claiming ≠ acking)
+and are re-discoverable via `events list --unread`.
 
 See [006 §5](./006-agent-integration.md) for the full transport spec and hook registration examples.
 

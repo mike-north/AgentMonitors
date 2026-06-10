@@ -76,6 +76,38 @@ function runWithEnv(
   }
 }
 
+/**
+ * Like {@link runWithEnv} but pipes `input` to the child's STDIN. Claude Code
+ * hooks receive their payload as JSON on stdin (not env vars), so the
+ * `hook deliver` tests must feed the payload this way. `execFileSync`'s `input`
+ * option writes the string to the child's stdin and closes it, so the command's
+ * stdin read sees `end` immediately — no hang.
+ */
+function runWithStdin(
+  args: string[],
+  env: Record<string, string>,
+  input: string,
+  cwd?: string,
+): RunResult {
+  const opts: ExecFileSyncOptions = {
+    encoding: 'utf-8',
+    env: { ...process.env, ...env },
+    cwd,
+    input,
+  };
+  try {
+    const stdout = execFileSync('node', [CLI_PATH, ...args], opts) as string;
+    return { stdout, stderr: '', exitCode: 0 };
+  } catch (err) {
+    const e = err as { stdout: string; stderr: string; status: number };
+    return {
+      stdout: (e.stdout ?? '') as string,
+      stderr: (e.stderr ?? '') as string,
+      exitCode: e.status ?? 1,
+    };
+  }
+}
+
 async function startDaemon(
   monitorsDir: string,
   workspace: string,
@@ -1770,16 +1802,18 @@ describe('hook deliver', () => {
       // compares event.createdAt against now, and the event's createdAt is
       // set at materialization time (after the debounce), so the settle
       // window is already satisfied when the event first becomes visible.
-      const deliverResult = runWithEnv(
-        [
-          'hook',
-          'deliver',
-          '--lifecycle',
-          'turn-interruptible',
-          '--hook-event-name',
-          'PreToolUse',
-        ],
+      //
+      // The hook payload is fed via STDIN (as Claude Code does); the lifecycle
+      // is DERIVED from the `hook_event_name` (PostToolUse → turn-interruptible),
+      // proving the command no longer depends on an env var or a flag.
+      const deliverResult = runWithStdin(
+        ['hook', 'deliver'],
         env,
+        JSON.stringify({
+          session_id: hostSessionId,
+          hook_event_name: 'PostToolUse',
+          cwd: ws,
+        }),
         ws,
       );
 
@@ -1794,7 +1828,8 @@ describe('hook deliver', () => {
         };
       };
       expect(output.continue).toBe(true);
-      expect(output.hookSpecificOutput.hookEventName).toBe('PreToolUse');
+      // The echoed event name matches the firing event from the stdin payload.
+      expect(output.hookSpecificOutput.hookEventName).toBe('PostToolUse');
       // The monitor body must appear in the injected context.
       expect(output.hookSpecificOutput.additionalContext).toContain(
         'watch-files',
@@ -1876,17 +1911,16 @@ describe('hook deliver', () => {
       );
       expect(sessionOpen.exitCode).toBe(0);
 
-      // No file change — nothing is pending.
-      const deliverResult = runWithEnv(
-        [
-          'hook',
-          'deliver',
-          '--lifecycle',
-          'turn-interruptible',
-          '--hook-event-name',
-          'PreToolUse',
-        ],
+      // No file change — nothing is pending. Feed the payload via STDIN; the
+      // lifecycle is derived from the event name.
+      const deliverResult = runWithStdin(
+        ['hook', 'deliver'],
         env,
+        JSON.stringify({
+          session_id: hostSessionId,
+          hook_event_name: 'PostToolUse',
+          cwd: ws,
+        }),
         ws,
       );
 
@@ -1899,14 +1933,15 @@ describe('hook deliver', () => {
     }
   }, 30_000);
 
-  it('hook deliver exits 0 and prints nothing when CLAUDE_CODE_SESSION_ID is absent', () => {
+  it('hook deliver exits 0 and prints nothing when the stdin payload has no session_id', () => {
     const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-hd-nosess-'));
 
     try {
-      // No CLAUDE_CODE_SESSION_ID in env — must be a clean no-op.
-      const result = runWithEnv(
-        ['hook', 'deliver', '--lifecycle', 'turn-interruptible'],
+      // A payload missing session_id → not a tracked Claude session → no-op.
+      const result = runWithStdin(
+        ['hook', 'deliver'],
         { CLAUDE_PROJECT_DIR: ws },
+        JSON.stringify({ hook_event_name: 'PostToolUse', cwd: ws }),
         ws,
       );
       expect(result.exitCode).toBe(0);
@@ -1915,4 +1950,254 @@ describe('hook deliver', () => {
       rmSync(ws, { recursive: true, force: true });
     }
   });
+
+  it('hook deliver exits 0 and prints nothing with an empty stdin payload (does not hang)', () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-hd-empty-stdin-'));
+
+    try {
+      // Empty stdin (no JSON at all) → treated as {} → no session_id → no-op.
+      // This also proves the stdin read does not block when nothing is piped.
+      const result = runWithStdin(
+        ['hook', 'deliver'],
+        { CLAUDE_PROJECT_DIR: ws },
+        '',
+        ws,
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe('');
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it('hook deliver emits nothing for an event that does not honor additionalContext (PreToolUse)', async () => {
+    // Even with pending high-urgency events, PreToolUse (uses permissionDecision,
+    // not additionalContext) must map to NO lifecycle → quiet no-op. This proves
+    // the event→lifecycle mapping suppresses useless injection.
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-hd-pretool-'));
+    const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-files');
+    mkdirSync(monitorsDir, { recursive: true });
+
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      [
+        '---',
+        'name: Watch files',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs:',
+        '    - "*.txt"',
+        `  cwd: ${JSON.stringify(ws)}`,
+        '  interval: "1s"',
+        'urgency: normal',
+        '---',
+        'When files change, review them.',
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+
+    const socket = path.join(
+      '/tmp',
+      `agentmon-hd-pt-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const db = path.join(ws, 'hd-pretool.db');
+    const hostSessionId = `hd-pretool-${Date.now()}`;
+
+    writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 10_000 });
+
+    const env: Record<string, string> = {
+      AGENTMONITORS_DB: db,
+      AGENTMONITORS_SOCKET: socket,
+    };
+
+    const daemon = await startDaemon(
+      path.join(ws, '.claude', 'monitors'),
+      ws,
+      env,
+      socket,
+    );
+
+    try {
+      runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          hostSessionId,
+          '--workspace',
+          ws,
+          '--format',
+          'json',
+        ],
+        env,
+        ws,
+      );
+
+      // PreToolUse is NOT a context event → no lifecycle → quiet no-op,
+      // regardless of whether anything is pending.
+      const result = runWithStdin(
+        ['hook', 'deliver'],
+        env,
+        JSON.stringify({
+          session_id: hostSessionId,
+          hook_event_name: 'PreToolUse',
+          cwd: ws,
+        }),
+        ws,
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe('');
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  // No-event-loss proof: with two settled high-urgency events whose combined
+  // rendered body exceeds the 4000-char cap, `hook deliver` truncates the visible
+  // additionalContext (claiming all the events) but — because claiming ≠ acking
+  // (unreadEventsForSession filters on acknowledgedAt IS NULL only) — the
+  // truncated-away event(s) MUST still be re-discoverable via
+  // `events list --unread`. This proves truncation never drops a durable event.
+  it('hook deliver truncates over-cap context but the truncated-away events stay unread', async () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-hd-trunc-'));
+
+    // Two monitors, each with a >4000-char body and watching a distinct file,
+    // so two distinct high-urgency events materialize. The first block alone
+    // overruns the 4000-char cap, so the second event's body is truncated away
+    // from the rendered context — but the event row remains unread.
+    const bigBody = 'BODYCONTENT '.repeat(450); // ~5400 chars per monitor body
+    for (const [name, file] of [
+      ['mon-a', 'a.txt'],
+      ['mon-b', 'b.txt'],
+    ] as const) {
+      const dir = path.join(ws, '.claude', 'monitors', name);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(path.join(ws, file), 'initial', 'utf-8');
+      writeFileSync(
+        path.join(dir, 'MONITOR.md'),
+        [
+          '---',
+          `name: ${name}`,
+          'watch:',
+          '  type: file-fingerprint',
+          '  globs:',
+          `    - "${file}"`,
+          `  cwd: ${JSON.stringify(ws)}`,
+          '  interval: "1s"',
+          'urgency: high',
+          '---',
+          bigBody,
+          '',
+        ].join('\n'),
+        'utf-8',
+      );
+    }
+
+    const socket = path.join(
+      '/tmp',
+      `agentmon-hd-tr-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const db = path.join(ws, 'hd-trunc.db');
+    const hostSessionId = `hd-trunc-${Date.now()}`;
+
+    writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 30_000 });
+
+    const env: Record<string, string> = {
+      AGENTMONITORS_DB: db,
+      AGENTMONITORS_SOCKET: socket,
+    };
+
+    const daemon = await startDaemon(
+      path.join(ws, '.claude', 'monitors'),
+      ws,
+      env,
+      socket,
+    );
+
+    try {
+      const sessionOpen = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          hostSessionId,
+          '--workspace',
+          ws,
+          '--format',
+          'json',
+        ],
+        env,
+        ws,
+      );
+      expect(sessionOpen.exitCode).toBe(0);
+      const session = JSON.parse(sessionOpen.stdout) as { id: string };
+
+      // Let the baseline tick run, then change both watched files.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
+      writeFileSync(path.join(ws, 'a.txt'), 'changed a', 'utf-8');
+      writeFileSync(path.join(ws, 'b.txt'), 'changed b', 'utf-8');
+
+      const unread = () =>
+        runWithEnv(
+          [
+            'events',
+            'list',
+            '--session',
+            session.id,
+            '--unread',
+            '--format',
+            'json',
+          ],
+          env,
+          ws,
+        );
+
+      // Wait for BOTH high-urgency events to materialize past the 15s settle.
+      const eventDeadline = Date.now() + 25_000;
+      while (Date.now() < eventDeadline) {
+        const r = unread();
+        if (r.exitCode === 0 && JSON.parse(r.stdout).length >= 2) break;
+        await new Promise((res) => setTimeout(res, 500));
+      }
+      const beforeDeliver = JSON.parse(unread().stdout) as { id: string }[];
+      expect(beforeDeliver.length).toBe(2);
+
+      // Deliver: this claims BOTH events and renders a truncated context.
+      const deliverResult = runWithStdin(
+        ['hook', 'deliver'],
+        env,
+        JSON.stringify({
+          session_id: hostSessionId,
+          hook_event_name: 'PostToolUse',
+          cwd: ws,
+        }),
+        ws,
+      );
+      expect(deliverResult.exitCode).toBe(0);
+      const output = JSON.parse(deliverResult.stdout) as {
+        hookSpecificOutput: { additionalContext: string };
+      };
+      const ctx = output.hookSpecificOutput.additionalContext;
+      // The visible context is capped and signposted as truncated.
+      expect(ctx.length).toBeLessThanOrEqual(4000);
+      expect(ctx).toContain('[truncated');
+
+      // No-event-loss: BOTH events remain unread after the claim (claiming ≠
+      // acking). The truncated-away event is still re-discoverable here, so it
+      // will re-deliver via the next context event.
+      const afterDeliver = JSON.parse(unread().stdout) as { id: string }[];
+      expect(afterDeliver.length).toBe(2);
+      // The exact same durable event ids are still present (nothing dropped).
+      expect(new Set(afterDeliver.map((e) => e.id))).toEqual(
+        new Set(beforeDeliver.map((e) => e.id)),
+      );
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 40_000);
 });

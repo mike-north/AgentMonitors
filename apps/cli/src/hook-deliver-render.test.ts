@@ -7,6 +7,27 @@ import { describe, it, expect } from 'vitest';
 import type { DeliveryClaim } from '@agentmonitors/core';
 import { renderHookDelivery } from './hook-deliver-render.js';
 
+/**
+ * True if `s` contains a lone (unpaired) UTF-16 surrogate code unit — the
+ * corruption a UTF-16-unit-boundary truncation would introduce by cutting an
+ * astral code point (e.g. an emoji) in half.
+ */
+function hasLoneSurrogate(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      // high surrogate: must be followed by a low surrogate
+      const next = i + 1 < s.length ? s.charCodeAt(i + 1) : 0;
+      if (next < 0xdc00 || next > 0xdfff) return true;
+      i++; // consume the valid pair
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      // low surrogate without a preceding high surrogate
+      return true;
+    }
+  }
+  return false;
+}
+
 function makeClaim(overrides: Partial<DeliveryClaim> = {}): DeliveryClaim {
   return {
     sessionId: 's1',
@@ -151,6 +172,85 @@ describe('renderHookDelivery', () => {
     expect(
       (out?.hookSpecificOutput.additionalContext ?? '').length,
     ).toBeLessThanOrEqual(4000);
+  });
+
+  // (e.2) truncation marker: an over-cap body yields output that is (a) ≤ cap
+  // and (b) ends with the explicit truncation marker pointing at the still-
+  // unread events. The marker proves the truncation is signposted, not silent.
+  const TRUNCATION_TAIL =
+    'run `agentmonitors events list --unread` to see the rest]';
+  it('appends an explicit truncation marker when over the cap', () => {
+    const largeBody = 'x'.repeat(10_000);
+    const out = renderHookDelivery(
+      makeClaim({
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'watch-src',
+            title: 'Files changed',
+            summary: 'Files changed',
+            body: largeBody,
+            urgency: 'high',
+            createdAt: '2026-06-04T00:00:00.000Z',
+          },
+        ],
+      }),
+      'PreToolUse',
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    // (a) still ≤ cap INCLUDING the marker
+    expect(ctx.length).toBeLessThanOrEqual(4000);
+    // (b) ends with the truncation marker
+    expect(ctx.endsWith(TRUNCATION_TAIL)).toBe(true);
+    expect(ctx).toContain('[truncated');
+  });
+
+  // (e.3) when the content fits under the cap, NO marker is appended.
+  it('does not append a truncation marker when under the cap', () => {
+    const out = renderHookDelivery(makeClaim(), 'PreToolUse');
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).not.toContain('[truncated');
+  });
+
+  // (e.4) surrogate-pair safety: when an astral character (emoji, a UTF-16
+  // surrogate pair) sits exactly at the truncation boundary, it must be dropped
+  // WHOLESALE — never split into a lone surrogate, which would corrupt the JSON
+  // wire output. We pad the body so the cut lands on the emoji, then assert the
+  // result contains no lone surrogate and round-trips as valid JSON.
+  it('truncates at a code-point boundary and never splits a surrogate pair', () => {
+    // Build a body of emoji (each '😀' is a surrogate pair, .length === 2) long
+    // enough to force truncation. With every character occupying 2 UTF-16 units,
+    // a naive .slice() at an odd budget would split one in half.
+    const emoji = '😀';
+    const body = emoji.repeat(5_000); // 10_000 UTF-16 units → forces truncation
+    const out = renderHookDelivery(
+      makeClaim({
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'm',
+            title: 't',
+            summary: 's',
+            body,
+            urgency: 'high',
+            createdAt: '2026-06-04T00:00:00.000Z',
+          },
+        ],
+      }),
+      'PreToolUse',
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx.length).toBeLessThanOrEqual(4000);
+    // No lone surrogate: every UTF-16 code unit in the high-surrogate range
+    // [0xD800, 0xDBFF] must be immediately followed by a low surrogate
+    // [0xDC00, 0xDFFF], and no low surrogate may appear without a preceding
+    // high surrogate. A naive .slice() at an odd boundary would leave a lone
+    // half here.
+    expect(hasLoneSurrogate(ctx)).toBe(false);
+    // The wire output round-trips as valid JSON (the wire requirement).
+    expect(() => JSON.parse(JSON.stringify(out))).not.toThrow();
+    // And it still ends with the truncation marker.
+    expect(ctx.endsWith(TRUNCATION_TAIL)).toBe(true);
   });
 
   // multi-event claim: both monitorIds appear

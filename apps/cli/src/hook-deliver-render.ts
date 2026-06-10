@@ -3,6 +3,18 @@ import type { DeliveryClaim } from '@agentmonitors/core';
 const MAX_ADDITIONAL_CONTEXT = 4000;
 
 /**
+ * Appended verbatim when the assembled context is truncated. It tells the agent
+ * the visible context is incomplete and points at the durable, re-discoverable
+ * source of the rest. Claiming a delivery does NOT acknowledge it (BP2 / SP4):
+ * `unreadEventsForSession` filters on `acknowledgedAt IS NULL` only, so an event
+ * whose body was truncated away here remains UNREAD and is still listed by
+ * `agentmonitors events list --unread` (and re-delivered by the next context
+ * event). No event is lost by truncation.
+ */
+const TRUNCATION_MARKER =
+  '\n\n[truncated — more monitor updates are pending; run `agentmonitors events list --unread` to see the rest]';
+
+/**
  * `additionalContext` is a plain JSON string — `JSON.stringify` escapes quotes,
  * backslashes, and control characters when the command serializes the output, so
  * no character is a "JSON injection" vector here. Unlike the channel transport
@@ -48,6 +60,33 @@ export interface HookDeliveryOutput {
 }
 
 /**
+ * Truncate `value` so the returned string is at most `cap` UTF-16 code units,
+ * cutting only at a Unicode CODE-POINT boundary (never splitting a surrogate
+ * pair) and, when truncation occurs, appending {@link TRUNCATION_MARKER} so the
+ * final string — marker included — is still ≤ `cap`.
+ *
+ * Iterating with `for…of` / `Array.from` walks code points, so an astral
+ * character (emoji) at the boundary is dropped wholesale rather than leaving a
+ * lone surrogate (which would corrupt the JSON the hook prints).
+ */
+function truncateForCap(value: string, cap: number): string {
+  if (value.length <= cap) return value;
+
+  // Budget for the body so that body + marker ≤ cap. The marker is plain ASCII,
+  // so its UTF-16 length equals its code-point count.
+  const budget = Math.max(0, cap - TRUNCATION_MARKER.length);
+
+  let out = '';
+  for (const ch of value) {
+    // ch is a full code point (1 or 2 UTF-16 units); only append if it fits
+    // wholly within the budget, so a surrogate pair is never split.
+    if (out.length + ch.length > budget) break;
+    out += ch;
+  }
+  return out + TRUNCATION_MARKER;
+}
+
+/**
  * Render a {@link DeliveryClaim} into the advisory hook-output payload that a
  * turn-boundary hook prints to stdout. Returns `null` when there is nothing to
  * inject (null claim or zero events), so the caller can skip stdout entirely.
@@ -56,6 +95,9 @@ export interface HookDeliveryOutput {
  * preserved faithfully (a monitor body is trusted, user-authored markdown) with
  * only raw control characters removed (see {@link sanitize}); the total
  * `additionalContext` is capped so a large diff cannot blow the context window.
+ * When the cap is exceeded the text is truncated at a code-point boundary and an
+ * explicit {@link TRUNCATION_MARKER} is appended pointing at the still-unread,
+ * re-discoverable events (claiming ≠ acking, so nothing is lost).
  *
  * @param claim - The delivery claim from `claimDeliveryClient`, or null.
  * @param hookEventName - The Claude Code event name to echo (e.g. `"PreToolUse"`).
@@ -78,7 +120,7 @@ export function renderHookDelivery(
   });
 
   const full = [leadLine, '', ...blocks].join('\n');
-  const additionalContext = full.slice(0, MAX_ADDITIONAL_CONTEXT);
+  const additionalContext = truncateForCap(full, MAX_ADDITIONAL_CONTEXT);
 
   return {
     continue: true,
