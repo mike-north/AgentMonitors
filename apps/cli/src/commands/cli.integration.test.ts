@@ -207,6 +207,26 @@ describe('CLI --help', () => {
   });
 });
 
+describe('CLI --version', () => {
+  // Regression: index.ts shipped with a hardcoded `.version('0.0.0')`, so the
+  // published 0.3.0 CLI reported 0.0.0 — making it impossible to tell which
+  // version a user actually has installed. The version must come from
+  // package.json, and this test must compare against the manifest (never a
+  // literal) so re-hardcoding or a bundle-layout change fails it. Runs against
+  // the built dist/index.cjs, so it also proves the path resolution survives
+  // bundling.
+  it('reports the version from package.json (never a hardcoded literal)', () => {
+    const manifest = JSON.parse(
+      readFileSync(path.join(CLI_PACKAGE_DIR, 'package.json'), 'utf-8'),
+    ) as { version: string };
+    expect(manifest.version).not.toBe('0.0.0');
+
+    const result = run(['--version']);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe(manifest.version);
+  });
+});
+
 describe('channel serve', () => {
   it('registers the channel serve command and its flags', () => {
     const result = run(['channel', 'serve', '--help']);
