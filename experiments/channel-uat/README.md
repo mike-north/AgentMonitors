@@ -56,6 +56,7 @@ received notification is printed to stdout.
 
 ## Running against a real Claude session (optional)
 
-To drive the *actual* Claude Code host instead of this harness, use the installable plugin in
-[`../../channel-plugin`](../../channel-plugin) and its README — that path is gated on a
-channels-enabled org.
+To drive the *actual* Claude Code host instead of this harness, install the `agentmonitors`
+activation plugin (which bundles the channel MCP at
+[`../../agent-plugins/agentmonitors/.mcp.json`](../../agent-plugins/agentmonitors/.mcp.json)) — that
+path is gated on a channels-enabled org.

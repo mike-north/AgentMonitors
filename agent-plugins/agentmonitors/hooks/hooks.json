@@ -1,0 +1,38 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "agentmonitors session start"
+          },
+          {
+            "type": "command",
+            "command": "agentmonitors hook deliver"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "agentmonitors hook deliver"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "agentmonitors session end"
+          }
+        ]
+      }
+    ]
+  }
+}

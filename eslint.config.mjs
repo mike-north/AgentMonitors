@@ -19,6 +19,9 @@ export default tseslint.config(
       '**/*.config.ts',
       '**/*.config.mjs',
       '**/*.workspace.ts',
+      // aipm repo-config (`aipm.repo.ts`): a root meta-config file outside any
+      // package tsconfig, alongside the already-ignored *.config.ts/*.workspace.ts.
+      '**/*.repo.ts',
       'eslint.config.mjs',
     ],
   },

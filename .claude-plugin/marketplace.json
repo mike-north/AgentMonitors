@@ -1,0 +1,23 @@
+{
+  "name": "agentmonitors",
+  "owner": {
+    "name": "Mike North"
+  },
+  "metadata": {
+    "description": "Drop-in monitoring for agentic coding — author a MONITOR.md and get told when watched things change."
+  },
+  "plugins": [
+    {
+      "name": "agentmonitors",
+      "source": "./agent-plugins/agentmonitors",
+      "description": "Drop-in monitoring for agentic coding — author a MONITOR.md and get told when watched things change. Wires the AgentMon lifecycle hooks and the channel MCP into Claude Code.",
+      "tags": [
+        "agentmonitors",
+        "monitoring",
+        "channel",
+        "mcp",
+        "hooks"
+      ]
+    }
+  ]
+}

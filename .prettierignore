@@ -16,3 +16,9 @@ experiments/
 # have no Prettier parser); excluded from the root format gate, matching its
 # exclusion from build/check (nx) and eslint (eslint.config.mjs).
 apps/website/
+
+# aipm marketplace: plugin sources and the generated registries are governed by
+# `aipm validate`'s freshness/byte-parity check, not Prettier. Formatting them
+# would fight that check (and the bundled LICENSE has no Prettier parser).
+agent-plugins/
+.claude-plugin/

@@ -1,0 +1,12 @@
+{
+  "schemaVersion": "0.1.0",
+  "name": "agentmonitors",
+  "version": "0.0.1",
+  "description": "Drop-in monitoring for agentic coding — author a MONITOR.md and get told when watched things change. Wires the AgentMon lifecycle hooks and the channel MCP into Claude Code.",
+  "author": {
+    "name": "Mike North"
+  },
+  "keywords": ["agentmonitors", "monitoring", "channel", "mcp", "hooks"],
+  "skills": ["./skills/setup-monitors"],
+  "hooks": "./hooks/hooks.json"
+}

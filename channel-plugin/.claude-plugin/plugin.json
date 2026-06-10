@@ -1,6 +1,0 @@
-{
-  "name": "agentmonitors",
-  "description": "AgentMon Claude Code channel — pushes monitor deliveries into your session as <channel> events and exposes an agentmon_ack tool to acknowledge them.",
-  "version": "0.0.1",
-  "keywords": ["agentmonitors", "channel", "mcp", "monitoring"]
-}
