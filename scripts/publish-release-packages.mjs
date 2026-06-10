@@ -35,24 +35,23 @@ function packageInfo(packageDir) {
   };
 }
 
+// Registry-driven candidate selection: every publishable package whose
+// current version is not yet on its registry. Deliberately NOT based on a
+// git diff of the head commit — that made a failed publish unretryable
+// (once any other commit landed on main, the version-bump commit was no
+// longer HEAD and the missed packages could never publish). The registry is
+// the source of truth for "needs publishing"; alreadyPublished() makes the
+// whole run idempotent.
 function releaseCandidates() {
-  let baseSha;
-  try {
-    baseSha = run('git', ['rev-parse', 'HEAD^']);
-  } catch {
-    return [];
-  }
-
-  return PACKAGE_DIRS.filter((packageDir) => {
-    const diff = run('git', [
-      'diff',
-      baseSha,
-      'HEAD',
-      '--',
-      `${packageDir}/package.json`,
-    ]);
-    return /^[+-]\s*"version":/m.test(diff);
-  }).map(packageInfo);
+  return PACKAGE_DIRS.map(packageInfo).filter((pkg) => {
+    if (alreadyPublished(pkg)) {
+      console.log(
+        `Skipping ${pkg.name}@${pkg.version}; version already exists.`,
+      );
+      return false;
+    }
+    return true;
+  });
 }
 
 function alreadyPublished(pkg) {
@@ -92,25 +91,18 @@ function publishPackage(pkg) {
 function main() {
   const candidates = releaseCandidates();
   if (candidates.length === 0) {
-    console.log('No version-bumped packages found on this commit.');
+    console.log('All package versions are already published.');
     return;
   }
 
   if (DRY_RUN) {
     for (const pkg of candidates) {
-      console.log(`Would process ${pkg.name}@${pkg.version}`);
+      console.log(`Would publish ${pkg.name}@${pkg.version}`);
     }
     return;
   }
 
   for (const pkg of candidates) {
-    if (alreadyPublished(pkg)) {
-      console.log(
-        `Skipping ${pkg.name}@${pkg.version}; version already exists.`,
-      );
-      continue;
-    }
-
     publishPackage(pkg);
   }
 }
