@@ -8,9 +8,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const nextConfig = {
   pageExtensions: ['md', 'mdoc', 'js', 'jsx', 'ts', 'tsx'],
 
-  // Suppress workspace-root detection warning caused by multiple pnpm lockfiles
-  // in the monorepo worktree setup.
-  outputFileTracingRoot: path.join(__dirname, '../../'),
+  // Pin file-tracing to THIS app's directory. It must NOT point at the monorepo
+  // root (`../../`): Vercel builds apps/website standalone (root directory = the
+  // app), where `../../` resolves above the deploy root and produces a doubled
+  // output path (`/vercel/path0/vercel/path0/.next/...`), failing the deploy.
+  outputFileTracingRoot: __dirname,
 
   // Rewrite <path>.md → the raw markdown API route so LLMs and curl
   // can fetch the plain .md source of any page.
