@@ -9,6 +9,39 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-06-10 — Correction: `hook deliver` reads stdin JSON; corrected event support; truncation marker
+
+Supersedes the input/event-support details of the Plan D entry below after verifying against the
+current Claude Code hooks docs (<https://code.claude.com/docs/en/hooks.md>). Three corrections:
+
+- **Input is stdin JSON, not env vars.** Claude Code delivers hook input as a JSON object on stdin
+  (`session_id`, `cwd`, `hook_event_name`, …). There is **no `CLAUDE_CODE_SESSION_ID` environment
+  variable** — the prior `hook deliver` relied on one and would silently no-op in real sessions. The
+  command now reads stdin (robust against a TTY/empty/unparseable stream — it never hangs), derives
+  `sessionId = payload.session_id` (no env fallback), `hookEventName = payload.hook_event_name`, and
+  `workspacePath = payload.cwd ?? CLAUDE_PROJECT_DIR ?? cwd`.
+- **`additionalContext` is honored only by context events.** Per the docs, only `UserPromptSubmit`,
+  `SessionStart`, and `PostToolUse` honor `hookSpecificOutput.additionalContext`; `PreToolUse` (uses
+  `permissionDecision`) and `Stop` (uses a top-level `decision`) do **not**. The old default
+  `--hook-event-name PreToolUse` therefore targeted an event that ignores the context. The
+  `--hook-event-name` flag is **removed**; the lifecycle is now **derived** from `hook_event_name`
+  (`UserPromptSubmit`/`PostToolUse` → `turn-interruptible`, `SessionStart` → `post-compact`; any
+  other event → emit nothing). `--lifecycle` remains as an optional override (mainly for tests). One
+  command line — `agentmonitors hook deliver` — now works for every registered event.
+- **Code-point-safe truncation with an explicit marker.** When the rendered context exceeds the
+  4000-char cap it is truncated at a Unicode code-point boundary (never splitting a surrogate pair)
+  and an explicit `[truncated — … run "agentmonitors events list --unread" …]` marker is appended
+  (final string still ≤ cap). Truncation does **not** lose events: claiming marks rows claimed, not
+  acknowledged (`unreadEventsForSession` filters on `acknowledgedAt IS NULL` only), so a
+  truncated-away event stays **unread** and re-delivers via the next context event.
+
+Docs updated: [006 §5.0/§5.1/§5.2/§5.3/§5.4/§5.5](./006-agent-integration.md),
+[005 §12.2](./005-cli-reference.md). Tests: stdin-driven `hook deliver` integration tests, a
+truncation-recoverability integration test (truncated-away events still in `events list --unread`),
+and renderer truncation-marker + surrogate-pair unit tests.
+
+---
+
 ## 2026-06-09 — Package scope rename: `@mike-north/*` → `@agentmonitors/*`; public npm publish
 
 All published packages now use the `@agentmonitors` npm scope published to public npm
@@ -30,6 +63,31 @@ Release pipeline: `release.yml` now uses `NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN
 owner must add the `NPM_TOKEN` secret). Changeset `access` set to `"public"`.
 
 No spec behavior changes. All package references in docs, source files, and tooling updated.
+
+---
+
+## 2026-06-10 — Plan D Tasks 2–3: hook-deliver renderer + `hook deliver` command
+
+- Added `apps/cli/src/hook-deliver-render.ts` — a **pure, side-effect-free renderer** that maps a
+  `DeliveryClaim` to the Claude Code hook wire shape
+  `{ continue: true, hookSpecificOutput: { hookEventName, additionalContext } }`. Returns `null`
+  when the claim is null or has no events. `additionalContext` is capped at 4000 characters; unlike
+  the channel transport (§4.6), it is a plain JSON string that is **not** tag-delimited, so
+  markdown/code punctuation (`<>`, `[]`, `;`) and newlines are preserved verbatim (a monitor body is
+  trusted, user-authored markdown) — only raw C0/C1 control characters (except tab/newline) are
+  stripped. The rendered context includes a lead line and one block per event: monitorId, urgency,
+  title, and the monitor's `body`-instructions from `DeliveryEventSummary.body`.
+- Added `hook deliver` subcommand to `apps/cli/src/commands/hook.ts`. Designed to run as a Claude
+  Code lifecycle hook (`PreToolUse`, `Stop`, `PostCompact`). Reads `CLAUDE_CODE_SESSION_ID` +
+  `CLAUDE_PROJECT_DIR` from env, resolves the daemon socket via `.local.md`, looks up the session,
+  claims pending deliveries at the given `--lifecycle`, renders, and writes the wire JSON to stdout.
+  **Always exits 0** — any internal error is swallowed (a hook that exits non-zero would interrupt
+  the user's session). Prints nothing when there is nothing pending.
+- [005 §12.2](./005-cli-reference.md) added (`hook deliver` command reference, flags, wire output,
+  always-exit-0 contract).
+- [006 §5](./006-agent-integration.md) added (hook-deliver transport spec: wire contract, behavior
+  steps, lifecycle-to-delivery mapping, and hook registration examples).
+- `.changeset/hook-deliver-command.md`: `@agentmonitors/cli` minor (new `hook deliver` command).
 
 ---
 

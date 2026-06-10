@@ -222,7 +222,182 @@ transport that injects content:
 This concern is not new to channels — the hook-state path surfaces the same content — but channels
 make injection more direct, so it is stated here as a transport-level requirement.
 
-## 5. Availability & Fallback
+## 5. Hook-Deliver Transport (Current — Plan D)
+
+> **Status: implemented.** `agentmonitors hook deliver` (`apps/cli/src/commands/hook.ts`).
+
+The **hook-deliver transport** is a CLI command designed to run directly inside a Claude Code
+lifecycle hook. When invoked it reads the hook payload from **stdin**, claims any pending deliveries
+for the session, and emits them as **advisory, non-blocking `additionalContext`** injected into the
+agent at the turn boundary — the same format any hook can use to surface information without blocking
+the tool call.
+
+Because only some events honor `additionalContext` (see §5.4), the command derives the delivery
+lifecycle from the firing event and **emits nothing** for events that would ignore the context. The
+hook config is therefore the same single command line for every event: `agentmonitors hook deliver`.
+
+This transport is fully self-contained (no MCP server, no channel capability requirement) and works
+in any environment that can run Claude Code hooks.
+
+### 5.0 Input contract (stdin JSON)
+
+Claude Code delivers hook input as a **JSON object on stdin**, not as environment variables. There
+is **no `CLAUDE_CODE_SESSION_ID` environment variable** in a hook invocation — relying on one would
+silently no-op in real sessions. The command reads all of stdin, parses it as JSON, and uses:
+
+| Payload field     | Used for                                                                         |
+| ----------------- | -------------------------------------------------------------------------------- |
+| `session_id`      | the host session id, matched against tracked AgentMon sessions (no env fallback) |
+| `hook_event_name` | the firing event, mapped to a delivery lifecycle (§5.4) and echoed in the output |
+| `cwd`             | the workspace path (then `CLAUDE_PROJECT_DIR`, then the process cwd)             |
+
+The read is robust: if stdin is a TTY or empty/unparseable, the payload is treated as `{}` (the
+command never hangs waiting for input). The only relevant documented hook environment variable is
+`CLAUDE_PROJECT_DIR`, used as a workspace fallback when the payload omits `cwd`.
+
+> **Input contract reference:** <https://code.claude.com/docs/en/hooks.md> (Hook Input — "Hooks
+> receive data via stdin as JSON" with `session_id`, `cwd`, `hook_event_name`, `transcript_path`,
+> `permission_mode`, plus event-specific fields).
+
+### 5.1 Wire Contract
+
+The hook reads its payload from stdin (§5.0), then prints a JSON object to stdout and **MUST exit 0**
+— non-zero exit or a missing `continue` field causes Claude Code to ignore the output. The shape:
+
+```json
+{
+  "continue": true,
+  "hookSpecificOutput": {
+    "hookEventName": "<EventName>",
+    "additionalContext": "<rendered text>"
+  }
+}
+```
+
+- **`continue: true`** — advisory delivery never blocks the agent (BP2).
+- **`hookEventName`** — echoes the event that fired the hook (e.g. `"PostToolUse"`,
+  `"UserPromptSubmit"`). Taken from the stdin payload's `hook_event_name`; it must match the firing
+  event or the host ignores the `additionalContext`.
+- **`additionalContext`** — the rendered delivery: a lead line followed by one block per event
+  with the monitor id, urgency, title, and the monitor's **body-instructions** (`DeliveryEventSummary.body`).
+  Capped at 4000 characters. Unlike the channel transport (§4.6), this is a plain JSON string
+  (`JSON.stringify` escapes it) and is **not** tag-delimited, so `<`, `>`, `[`, `]`, `;`, and
+  newlines are preserved verbatim — a monitor body is trusted, user-authored markdown that
+  legitimately contains code and links. Only raw C0/C1 control characters (except tab/newline) are
+  stripped. **Truncation:** when the assembled context exceeds the 4000-char cap, it is truncated at
+  a Unicode **code-point** boundary (never splitting a surrogate pair, which would corrupt the JSON)
+  and an explicit marker is appended:
+
+  ```text
+  [truncated — more monitor updates are pending; run `agentmonitors events list --unread` to see the rest]
+  ```
+
+  The final string including the marker is still ≤ 4000 chars. Truncation never drops a durable
+  event: see §5.5 (unread-recoverability).
+
+- **No `permissionDecision` field** — advisory; the agent decides what to do.
+
+When there is nothing pending, the command **MUST** print nothing and exit 0 — an empty stdout is
+the signal to Claude Code to proceed silently.
+
+### 5.2 Behavior
+
+1. Read all of stdin and parse it as a JSON hook payload (§5.0). A TTY/empty/unparseable stream → `{}`.
+2. `sessionId = payload.session_id`. If absent → exit 0, print nothing (not a tracked Claude session).
+   There is **no** env-var fallback.
+3. Derive the lifecycle from `payload.hook_event_name` (§5.4) unless `--lifecycle` is explicitly
+   passed. If the event is not a context event (no mapping) → exit 0, print nothing.
+4. Read `.claude/agentmonitors.local.md` via `readLocalState(payload.cwd ?? CLAUDE_PROJECT_DIR ?? cwd)`.
+   If `!enabled` or no socket → exit 0, print nothing.
+5. Resolve the socket path via `resolveSocketPath` (flag → `.local.md` socket). Require an explicit
+   per-workspace socket — do **not** fall back to the global default (that could cross workspaces).
+   If the daemon is unreachable → exit 0, print nothing.
+6. Call `listSessionsClient(socket)`, find the session whose `hostSessionId` matches `sessionId`.
+   If not found → exit 0, print nothing.
+7. Call `claimDeliveryClient(sessionId, lifecycle, socket)`. If null → exit 0, print nothing.
+8. Render via `renderHookDelivery(claim, hookEventName)`. If null (empty events) → exit 0, print nothing.
+9. `process.stdout.write(JSON.stringify(output))` → exit 0.
+
+**Any internal error MUST be swallowed.** The command is invoked by a Claude Code hook; an
+unhandled error would interrupt the user's session. The wrapping try/catch ensures the command
+always exits 0 regardless of IPC failures, missing state, or unexpected errors.
+
+### 5.3 Usage
+
+The same single command line is registered on every event AgentMon cares about — the command derives
+the lifecycle from the firing event and stays silent on events it should not inject into (§5.4).
+Register it only on **context events** (the events that honor `additionalContext`):
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "agentmonitors hook deliver" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "agentmonitors hook deliver" }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "agentmonitors hook deliver" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`--lifecycle` remains available as an **optional override** (primarily for tests); when omitted, the
+lifecycle is derived from the event per §5.4.
+
+### 5.4 Event → lifecycle mapping & `additionalContext` support
+
+`hookSpecificOutput.additionalContext` is honored only by **context events**: `UserPromptSubmit`,
+`SessionStart`, and `PostToolUse`. It is **not** honored by `PreToolUse` (which uses
+`permissionDecision`) or `Stop` (which uses a top-level `decision`). Emitting `additionalContext` on
+a non-context event is useless — the host ignores it — so the command maps only context events to a
+lifecycle and emits nothing otherwise.
+
+> **Reference:** <https://code.claude.com/docs/en/hooks.md> — JSON Output Format → "Context events
+> (SessionStart, PostToolUse): use `hookSpecificOutput.additionalContext`"; and the hooks guide:
+> "For `UserPromptSubmit` hooks, use `additionalContext` to inject text."
+
+| Hook event         | Honors `additionalContext`? | Derived `lifecycle`  | What is surfaced                                                |
+| ------------------ | --------------------------- | -------------------- | --------------------------------------------------------------- |
+| `UserPromptSubmit` | yes                         | `turn-interruptible` | Settled high-urgency events (≥15 s old); normal/low as reminder |
+| `PostToolUse`      | yes                         | `turn-interruptible` | Settled high-urgency events (≥15 s old); normal/low as reminder |
+| `SessionStart`     | yes                         | `post-compact`       | All unread events as a recap with bodies                        |
+| `PreToolUse`       | **no** (permissionDecision) | — (emit nothing)     | nothing — additionalContext would be ignored                    |
+| `Stop`             | **no** (top-level decision) | — (emit nothing)     | nothing — additionalContext would be ignored                    |
+
+Note: for `turn-interruptible`, `normal` urgency returns `events: []` (reminder text only, no body
+injection). The body is surfaced only for **high-urgency settled events** and **post-compact recap**.
+
+### 5.5 Unread-recoverability (truncation never loses an event)
+
+When the rendered context exceeds the 4000-char cap (§5.1) it is truncated and marked. Truncation
+operates only on the **visible text**, not on the durable delivery state. Claiming a delivery marks
+the underlying rows **claimed**, which is **not** acknowledgement (BP2 / SP4): `unreadEventsForSession`
+filters on `acknowledgedAt IS NULL` only. Therefore an event whose body was truncated away:
+
+- **remains unread** and is still listed by `agentmonitors events list --unread`; and
+- **re-delivers** via the next context event (the truncation marker tells the agent to look there).
+
+No durable event is lost by truncation; the cap only bounds how much is injected into a single turn.
+
+## 6. Availability & Fallback
 
 The channel transport is **optional and additive**. It depends on conditions a restricted environment
 may deny:
@@ -241,7 +416,7 @@ Accordingly (NP-CH):
   AgentMon **MUST** treat this as an expected condition (the durable event was already delivered via
   the hook path) and **MUST NOT** surface an error.
 
-## 6. Out of Scope
+## 7. Out of Scope
 
 - **Permission relay** (`claude/channel/permission`, `notifications/claude/channel/permission_request`
   / `permission`): AgentMon is a work-signal system, not a tool-approval bridge. Not implemented, not
@@ -249,7 +424,7 @@ Accordingly (NP-CH):
 - **AgentMon as a consumer of inbound channel messages** (a "channel" source): channels push into a
   session, not into the daemon; this is not the integration's shape.
 
-## 7. Examples
+## 8. Examples
 
 ### 9.1 A high-urgency delivery rendered as a channel event
 
@@ -278,7 +453,7 @@ channel field schema; `event_id` is available for the ack tool.
 **What this proves:** the two-way reply mechanism maps cleanly onto AgentMon's distinct
 claimed-vs-acknowledged states.
 
-## 8. Validation Implications
+## 9. Validation Implications
 
 Transport and integration tests should be able to prove:
 
@@ -292,7 +467,7 @@ Transport and integration tests should be able to prove:
 - workspace binding resolves the correct lead session when `W` has one lead, and degrades (no
   ambiguous claim) when `W` has multiple leads (§4.4).
 
-## 9. Open Questions
+## 10. Open Questions
 
 - **Resolved (Claude Code 2.1.157):** a stdio MCP server receives `CLAUDE_PROJECT_DIR` (= workspace),
   has its cwd set to the workspace, inherits `CLAUDE_CODE_SESSION_ID`, and can call `roots/list`. The
