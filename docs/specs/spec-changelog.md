@@ -38,10 +38,12 @@ No spec behavior changes. All package references in docs, source files, and tool
 - Added `apps/cli/src/hook-deliver-render.ts` — a **pure, side-effect-free renderer** that maps a
   `DeliveryClaim` to the Claude Code hook wire shape
   `{ continue: true, hookSpecificOutput: { hookEventName, additionalContext } }`. Returns `null`
-  when the claim is null or has no events. Source-derived text is sanitized (strip `[<>\[\]\r]` and
-  control chars) and `additionalContext` is capped at 4000 characters (§4.6 rules). The rendered
-  context includes a lead line and one block per event: monitorId, urgency, title, and the monitor's
-  `body`-instructions from `DeliveryEventSummary.body`.
+  when the claim is null or has no events. `additionalContext` is capped at 4000 characters; unlike
+  the channel transport (§4.6), it is a plain JSON string that is **not** tag-delimited, so
+  markdown/code punctuation (`<>`, `[]`, `;`) and newlines are preserved verbatim (a monitor body is
+  trusted, user-authored markdown) — only raw C0/C1 control characters (except tab/newline) are
+  stripped. The rendered context includes a lead line and one block per event: monitorId, urgency,
+  title, and the monitor's `body`-instructions from `DeliveryEventSummary.body`.
 - Added `hook deliver` subcommand to `apps/cli/src/commands/hook.ts`. Designed to run as a Claude
   Code lifecycle hook (`PreToolUse`, `Stop`, `PostCompact`). Reads `CLAUDE_CODE_SESSION_ID` +
   `CLAUDE_PROJECT_DIR` from env, resolves the daemon socket via `.local.md`, looks up the session,

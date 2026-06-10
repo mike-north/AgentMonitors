@@ -15,6 +15,9 @@ const MAX_ADDITIONAL_CONTEXT = 4000;
  * preserve everything else faithfully. Length is capped by the caller.
  */
 function sanitize(value: string): string {
+  // No trim: leading indentation and deliberate surrounding whitespace are part
+  // of a markdown body (e.g. an indented code block), and the transport contract
+  // is to preserve structure verbatim.
   let out = '';
   for (const ch of value) {
     const code = ch.codePointAt(0) ?? 0;
@@ -23,7 +26,7 @@ function sanitize(value: string): string {
       (code >= 0x7f && code <= 0x9f);
     if (!isControl) out += ch;
   }
-  return out.trim();
+  return out;
 }
 
 /**

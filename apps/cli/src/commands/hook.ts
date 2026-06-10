@@ -95,9 +95,14 @@ hookCommand
         const state = readLocalState(workspacePath);
         if (!state.enabled) return;
 
-        const socketPath = resolveSocketPath(
-          options.socket ?? state.socket ?? undefined,
-        );
+        // Require an EXPLICIT per-workspace socket (flag or `.local.md`). If
+        // neither is present, bail rather than letting resolveSocketPath fall
+        // back to AGENTMONITORS_SOCKET / the global default — that could connect
+        // this workspace's hook to a different workspace's daemon, breaking
+        // per-workspace isolation.
+        const explicitSocket = options.socket ?? state.socket;
+        if (!explicitSocket) return;
+        const socketPath = resolveSocketPath(explicitSocket);
 
         if (!(await daemonAvailable(socketPath))) return;
 

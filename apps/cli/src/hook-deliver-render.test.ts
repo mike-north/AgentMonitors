@@ -103,6 +103,31 @@ describe('renderHookDelivery', () => {
     expect(() => JSON.parse(JSON.stringify(out))).not.toThrow();
   });
 
+  // (d.2) whitespace structure is preserved verbatim — no trim. A body that
+  // starts with an indented code block must keep its indentation/newlines.
+  it('preserves leading indentation and newlines in the body (no trim)', () => {
+    const body = '    const x = 1;\n    return x;\n';
+    const out = renderHookDelivery(
+      makeClaim({
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'watch-src',
+            title: 'Code changed',
+            summary: 's',
+            body,
+            urgency: 'high',
+            createdAt: '2026-06-04T00:00:00.000Z',
+          },
+        ],
+      }),
+      'PreToolUse',
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    // the indented code block survives intact
+    expect(ctx).toContain('    const x = 1;\n    return x;');
+  });
+
   // (e) length cap: a very large body is capped at the configured limit
   it('caps total additionalContext length at 4000 chars', () => {
     const largeBody = 'x'.repeat(10_000);
