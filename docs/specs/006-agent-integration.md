@@ -427,6 +427,22 @@ events (`SessionStart`/`SessionEnd`) are authored as a host-native
 [`hooks/hooks.json`](../../agent-plugins/agentmonitors/hooks/hooks.json) referenced from the plugin
 manifest, rather than via aipm's YAML→JSON hook generation.
 
+**Hardened command form.** The hook commands are not bare `agentmonitors …` invocations; each is
+shell-guarded for the "installed plugin, missing CLI" case (a user who hasn't yet run
+`npm i -g @agentmonitors/cli`, or whose PATH differs in the hook environment):
+
+- **CLI-absent guard (all hooks).** Each command is wrapped `command -v agentmonitors >/dev/null 2>&1
+&& … || true`, so an uninstalled CLI produces a silent exit 0 rather than a `command not found`
+  (exit 127) surfaced to the user on every prompt in every project. The `SessionStart` hook goes
+  further and turns the miss into onboarding: when the CLI is absent it emits a one-shot
+  `additionalContext` hint pointing at `npm i -g @agentmonitors/cli`.
+- **`SessionStart` sequencing (no race).** Claude Code runs the hooks matched to one event **in
+  parallel**, so `session start` (which boots the daemon, writes `.local.md`, and registers the
+  session) and the recap `hook deliver` must not be two separate hook entries — the recap could run
+  before registration completes and silently no-op (worst after compaction, where the recap matters
+  most). They are composed in a **single** entry as `agentmonitors session start && agentmonitors
+hook deliver`, guaranteeing order.
+
 The channel MCP (§4) ships in the same plugin via
 [`.mcp.json`](../../agent-plugins/agentmonitors/.mcp.json) (server key `agentmonitors`, preserving
 the `<channel source="agentmonitors">` tag). A bundled `setup-monitors` skill walks the user through
