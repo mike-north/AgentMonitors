@@ -1,8 +1,8 @@
-import type { SourceRegistry } from '@mike-north/core';
-import fileFingerprint from '@mike-north/source-file-fingerprint';
-import apiPoll from '@mike-north/source-api-poll';
-import schedule from '@mike-north/source-schedule';
-import incomingChanges from '@mike-north/source-incoming-changes';
+import type { SourceRegistry } from '@agentmonitors/core';
+import fileFingerprint from '@agentmonitors/source-file-fingerprint';
+import apiPoll from '@agentmonitors/source-api-poll';
+import schedule from '@agentmonitors/source-schedule';
+import incomingChanges from '@agentmonitors/source-incoming-changes';
 
 /**
  * Register all bundled core observation sources.

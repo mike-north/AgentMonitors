@@ -7,19 +7,25 @@ description: Install Agent Monitors, author your first monitor, and see a signal
 
 ## Install
 
-The `agentmonitors` CLI is not yet published to a package registry. Build it from the
-monorepo:
+Install the CLI globally from npm:
+
+```bash
+npm install -g @agentmonitors/cli
+```
+
+Or use it without a global install:
+
+```bash
+npx @agentmonitors/cli --help
+```
+
+### From source (development)
 
 ```bash
 git clone https://github.com/mike-north/AgentMonitors.git
 cd AgentMonitors
 pnpm install
 pnpm build
-```
-
-The binary is then `apps/cli/dist/index.cjs`. Alias it for convenience:
-
-```bash
 alias agentmonitors="node \"$(pwd)/apps/cli/dist/index.cjs\""
 ```
 

@@ -9,6 +9,7 @@ const PACKAGE_DIRS = [
   'plugins/source-file-fingerprint',
   'plugins/source-incoming-changes',
   'plugins/source-schedule',
+  'apps/cli',
 ];
 const DRY_RUN = process.argv.includes('--dry-run');
 

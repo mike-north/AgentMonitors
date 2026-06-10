@@ -9,7 +9,7 @@ import type {
   OpenSessionInput,
   RuntimeStatus,
   RuntimeTickResult,
-} from '@mike-north/core';
+} from '@agentmonitors/core';
 import { createRuntime } from './runtime.js';
 import { callDaemon } from './daemon-ipc.js';
 

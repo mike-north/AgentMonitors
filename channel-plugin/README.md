@@ -18,7 +18,7 @@ The MCP server name in [`.mcp.json`](./.mcp.json) (`agentmonitors`) is what beco
 2. **The `agentmonitors` CLI on `PATH`.** It is not yet published, so build and link it from this repo:
    ```bash
    pnpm install && pnpm build
-   pnpm --filter @mike-north/cli exec npm link   # or add apps/cli/dist to PATH
+   pnpm --filter @agentmonitors/cli exec npm link   # or add apps/cli/dist to PATH
    ```
    (For local testing without a global link, point the `.mcp.json` `command`/`args` at the built
    binary instead — `"command": "node", "args": ["<repo>/apps/cli/dist/index.cjs", "channel", "serve"]`.)

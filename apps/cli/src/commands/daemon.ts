@@ -1,5 +1,5 @@
 import { Command, Option } from 'commander';
-import type { WatchHandle } from '@mike-north/core';
+import type { WatchHandle } from '@agentmonitors/core';
 import { createRuntime } from '../runtime.js';
 import { reportError } from '../output.js';
 import {

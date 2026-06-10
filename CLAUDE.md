@@ -42,31 +42,31 @@ pnpm clean          # remove all dist/ dirs
 Per-package / single-test:
 
 ```bash
-pnpm nx test @mike-north/core          # one project's full suite
-pnpm --filter @mike-north/core exec vitest run src/runtime/service.test.ts   # one file
-pnpm --filter @mike-north/core exec vitest run -t "high urgency"             # one test by name
-pnpm nx build @mike-north/core         # build a single project (and its deps)
+pnpm nx test @agentmonitors/core          # one project's full suite
+pnpm --filter @agentmonitors/core exec vitest run src/runtime/service.test.ts   # one file
+pnpm --filter @agentmonitors/core exec vitest run -t "high urgency"             # one test by name
+pnpm nx build @agentmonitors/core         # build a single project (and its deps)
 ```
 
-The CLI binary is `agentmonitors` (from `@mike-north/cli`). Build, then run `node apps/cli/dist/index.cjs <cmd>`.
+The CLI binary is `agentmonitors` (from `@agentmonitors/cli`). Build, then run `node apps/cli/dist/index.cjs <cmd>`.
 
 ### Important build ordering
 
-`@mike-north/core`'s build is **three sequential steps**: `tsup` (bundle) → `tsc -p tsconfig.build.json`
+`@agentmonitors/core`'s build is **three sequential steps**: `tsup` (bundle) → `tsc -p tsconfig.build.json`
 (emit `.d.ts`) → `api-extractor run` (roll up `dist/public.d.ts`, the file `package.json#types` points
-at). If you change `@mike-north/core`'s **public** API surface, the api-extractor report must be
-regenerated (`pnpm --filter @mike-north/core run check:api-report` with `--local`) or CI `check:api-report`
+at). If you change `@agentmonitors/core`'s **public** API surface, the api-extractor report must be
+regenerated (`pnpm --filter @agentmonitors/core run check:api-report` with `--local`) or CI `check:api-report`
 fails. Downstream packages (`apps/cli`, `plugins/*`) depend on `^build`, so build core first.
 
 ## Architecture
 
 ### Packages
 
-- `libs/core` (`@mike-north/core`) — host-agnostic engine. Owns parsing, schema, the source
+- `libs/core` (`@agentmonitors/core`) — host-agnostic engine. Owns parsing, schema, the source
   registry, the runtime tick loop, persistence, notify policy, session projection, hook-state, and
   adapters. This is where nearly all behavior lives; it is the only published library with a curated
   public API (api-extractor rollup).
-- `apps/cli` (`@mike-north/cli`, bin `agentmonitors`) — command surface + the daemon and its
+- `apps/cli` (`@agentmonitors/cli`, bin `agentmonitors`) — command surface + the daemon and its
   Unix-socket IPC layer. Thin wrapper over core (per AP6: CLI must not invent behavior the core
   doesn't define). See [`docs/specs/005-cli-reference.md`](docs/specs/005-cli-reference.md).
 - `plugins/source-*` — the three bundled observation sources (`file-fingerprint`, `api-poll`,

@@ -1,5 +1,5 @@
 import { Command } from 'commander';
-import { generateMonitorSchema, SourceRegistry } from '@mike-north/core';
+import { generateMonitorSchema, SourceRegistry } from '@agentmonitors/core';
 import { registerCoreSources } from '../sources.js';
 
 export const schemaCommand = new Command('schema').description(

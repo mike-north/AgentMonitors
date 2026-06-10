@@ -1,5 +1,9 @@
 import { Command, Option } from 'commander';
-import { scanMonitors, SourceRegistry, validateScope } from '@mike-north/core';
+import {
+  scanMonitors,
+  SourceRegistry,
+  validateScope,
+} from '@agentmonitors/core';
 import { registerCoreSources } from '../sources.js';
 import { requireDirectory } from '../validation.js';
 

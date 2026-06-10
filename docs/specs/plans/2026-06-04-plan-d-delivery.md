@@ -81,7 +81,7 @@ it('includes the monitor body in the delivery claim events', () => {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `pnpm --filter @mike-north/core exec vitest run src/runtime/service.test.ts -t "includes the monitor body"`
+Run: `pnpm --filter @agentmonitors/core exec vitest run src/runtime/service.test.ts -t "includes the monitor body"`
 Expected: FAIL — `DeliveryEventSummary` has no `body` field (compile error or `undefined`).
 
 - [ ] **Step 3: Add `body` to the type and populate it**
@@ -97,7 +97,7 @@ body: string;
 
 - [ ] **Step 4: Run to verify it passes + typecheck**
 
-Run: `pnpm --filter @mike-north/core exec vitest run src/runtime/service.test.ts`
+Run: `pnpm --filter @agentmonitors/core exec vitest run src/runtime/service.test.ts`
 Run: `pnpm check`
 Expected: PASS. Update the existing claim tests if they assert exact `events[]` object shape (add the `body` field to their expected objects).
 
@@ -157,7 +157,7 @@ describe('renderHookDelivery', () => {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `pnpm --filter @mike-north/cli exec vitest run src/hook-deliver-render.test.ts`
+Run: `pnpm --filter @agentmonitors/cli exec vitest run src/hook-deliver-render.test.ts`
 Expected: FAIL — module does not exist.
 
 - [ ] **Step 3: Implement the renderer**
@@ -165,7 +165,7 @@ Expected: FAIL — module does not exist.
 `apps/cli/src/hook-deliver-render.ts`:
 
 ```ts
-import type { DeliveryClaim } from '@mike-north/core';
+import type { DeliveryClaim } from '@agentmonitors/core';
 
 export interface HookDeliveryOutput {
   /** Advisory only — never 'block' in v1 (BP2: hook delivery is not completion). */
@@ -199,7 +199,7 @@ export function renderHookDelivery(
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `pnpm --filter @mike-north/cli exec vitest run src/hook-deliver-render.test.ts`
+Run: `pnpm --filter @agentmonitors/cli exec vitest run src/hook-deliver-render.test.ts`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -236,7 +236,7 @@ it('hook deliver emits the pending monitor body as advisory context', async () =
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `pnpm --filter @mike-north/cli exec vitest run src/commands/cli.integration.test.ts -t "hook deliver emits"`
+Run: `pnpm --filter @agentmonitors/cli exec vitest run src/commands/cli.integration.test.ts -t "hook deliver emits"`
 Expected: FAIL — `hook deliver` does not exist.
 
 - [ ] **Step 3: Implement `hook deliver`**
@@ -278,8 +278,8 @@ Add `toClaudeHookOutput(rendered)` — a tiny mapper to the confirmed Claude Cod
 
 - [ ] **Step 4: Build + run the integration test**
 
-Run: `pnpm --filter @mike-north/cli build`
-Run: `pnpm --filter @mike-north/cli exec vitest run src/commands/cli.integration.test.ts -t "hook deliver emits"`
+Run: `pnpm --filter @agentmonitors/cli build`
+Run: `pnpm --filter @agentmonitors/cli exec vitest run src/commands/cli.integration.test.ts -t "hook deliver emits"`
 Expected: PASS.
 
 - [ ] **Step 5: Wire the plugin hooks (Plan C) to `hook deliver`**
@@ -315,7 +315,7 @@ Exit 0 on assertion success, 1 otherwise.
 - [ ] **Step 2: Install harness deps + run**
 
 Run: `cd experiments/steel-thread-uat && npm install --no-audit --no-fund`
-Run (from repo root, CLI built): `pnpm --filter @mike-north/cli build && node experiments/steel-thread-uat/uat.mjs`
+Run (from repo root, CLI built): `pnpm --filter @agentmonitors/cli build && node experiments/steel-thread-uat/uat.mjs`
 Expected: prints PASS and exits 0; the injected context contains the monitor body. No orphan daemon / stale socket afterward.
 
 - [ ] **Step 3: README + commit**
@@ -343,7 +343,7 @@ git commit --author="Mike North <michael.l.north@gmail.com>" -m "Add the end-to-
 
 ```markdown
 ---
-'@mike-north/core': minor
+'@agentmonitors/core': minor
 ---
 
 Carry the monitor body in `DeliveryEventSummary`, so turn-boundary delivery can surface a monitor's handling instructions (not just its title/summary) to the agent.

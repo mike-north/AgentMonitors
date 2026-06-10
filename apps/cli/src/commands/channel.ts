@@ -5,7 +5,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { claudeCodeAdapter } from '@mike-north/core';
+import { claudeCodeAdapter } from '@agentmonitors/core';
 import {
   acknowledgeEventsClient,
   claimDeliveryClient,

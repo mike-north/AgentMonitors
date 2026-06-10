@@ -53,19 +53,19 @@ importers:
 
   apps/cli:
     dependencies:
-      '@mike-north/core':
+      '@agentmonitors/core':
         specifier: workspace:*
         version: link:../../libs/core
-      '@mike-north/source-api-poll':
+      '@agentmonitors/source-api-poll':
         specifier: workspace:*
         version: link:../../plugins/source-api-poll
-      '@mike-north/source-file-fingerprint':
+      '@agentmonitors/source-file-fingerprint':
         specifier: workspace:*
         version: link:../../plugins/source-file-fingerprint
-      '@mike-north/source-incoming-changes':
+      '@agentmonitors/source-incoming-changes':
         specifier: workspace:*
         version: link:../../plugins/source-incoming-changes
-      '@mike-north/source-schedule':
+      '@agentmonitors/source-schedule':
         specifier: workspace:*
         version: link:../../plugins/source-schedule
       '@modelcontextprotocol/sdk':
@@ -152,7 +152,7 @@ importers:
 
   plugins/source-api-poll:
     dependencies:
-      '@mike-north/core':
+      '@agentmonitors/core':
         specifier: workspace:*
         version: link:../../libs/core
     devDependencies:
@@ -162,7 +162,7 @@ importers:
 
   plugins/source-file-fingerprint:
     dependencies:
-      '@mike-north/core':
+      '@agentmonitors/core':
         specifier: workspace:*
         version: link:../../libs/core
       glob:
@@ -175,7 +175,7 @@ importers:
 
   plugins/source-incoming-changes:
     dependencies:
-      '@mike-north/core':
+      '@agentmonitors/core':
         specifier: workspace:*
         version: link:../../libs/core
     devDependencies:
@@ -185,7 +185,7 @@ importers:
 
   plugins/source-schedule:
     dependencies:
-      '@mike-north/core':
+      '@agentmonitors/core':
         specifier: workspace:*
         version: link:../../libs/core
     devDependencies:

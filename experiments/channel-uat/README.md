@@ -28,7 +28,7 @@ This is a UAT harness, not product code.
 ```bash
 cd experiments/channel-uat
 npm install                      # @modelcontextprotocol/sdk only
-pnpm --filter @mike-north/cli build   # (from repo root) build the CLI the harness drives
+pnpm --filter @agentmonitors/cli build   # (from repo root) build the CLI the harness drives
 
 node uat.mjs                     # normal urgency → coalesced reminder push (fast)
 node uat.mjs high                # high urgency → concrete-event push (after the ~15s settle)

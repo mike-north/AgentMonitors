@@ -11,7 +11,6 @@ permissions:
   actions: write
   contents: write
   pull-requests: write
-  packages: write
 
 jobs:
   release:
@@ -43,8 +42,8 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-          registry-url: https://npm.pkg.github.com
-          scope: '@mike-north'
+          registry-url: https://registry.npmjs.org
+          scope: '@agentmonitors'
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -70,7 +69,8 @@ jobs:
               plugins/source-api-poll/package.json \
               plugins/source-file-fingerprint/package.json \
               plugins/source-incoming-changes/package.json \
-              plugins/source-schedule/package.json | \
+              plugins/source-schedule/package.json \
+              apps/cli/package.json | \
             grep -Eq '^[+-][[:space:]]+"version":'; then
             echo "should-run=true" >> "$GITHUB_OUTPUT"
             exit 0
@@ -89,7 +89,7 @@ jobs:
           title: Release packages
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Trigger CI For Release Pull Request
         if: |

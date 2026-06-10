@@ -1,5 +1,5 @@
 import { Command, Option } from 'commander';
-import { SourceRegistry } from '@mike-north/core';
+import { SourceRegistry } from '@agentmonitors/core';
 import { registerCoreSources } from '../sources.js';
 
 export const sourceCommand = new Command('source').description(

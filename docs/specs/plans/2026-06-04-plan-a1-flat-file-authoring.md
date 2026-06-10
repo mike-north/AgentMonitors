@@ -4,9 +4,9 @@
 
 **Goal:** Let a monitor be authored as a flat `.claude/monitors/<name>.md` file (not only `<name>/MONITOR.md`), derive its id from the filename, and make frontmatter `name` optional (defaulting to the id).
 
-**Architecture:** Pure `@mike-north/core` change in the parser/scanner + a one-line schema relaxation, plus updating the five display sites that read `frontmatter.name` to fall back to the monitor id. No runtime, daemon, DB, or delivery changes. No migration (the product has no users yet).
+**Architecture:** Pure `@agentmonitors/core` change in the parser/scanner + a one-line schema relaxation, plus updating the five display sites that read `frontmatter.name` to fall back to the monitor id. No runtime, daemon, DB, or delivery changes. No migration (the product has no users yet).
 
-**Tech Stack:** TypeScript, Zod, `glob`, `gray-matter`, vitest. Single-test command: `pnpm --filter @mike-north/core exec vitest run <file>`.
+**Tech Stack:** TypeScript, Zod, `glob`, `gray-matter`, vitest. Single-test command: `pnpm --filter @agentmonitors/core exec vitest run <file>`.
 
 **Design source:** [docs/specs/design/2026-06-04-drop-in-monitors-steel-thread.md](../design/2026-06-04-drop-in-monitors-steel-thread.md) §3.1 (flat file, promote to folder) and §3.2 (`name` optional).
 
@@ -29,7 +29,7 @@
 | `libs/core/src/schema/monitor-schema.test.ts` | Schema unit tests                                       | Add: optional-name case                                         |
 | `docs/specs/001-monitor-definition.md`        | Authoring spec                                          | Modify: identity + scanning + name-required rows                |
 | `docs/specs/spec-changelog.md`                | Spec changelog                                          | Add: entry                                                      |
-| `.changeset/*.md`                             | Release note                                            | Add: minor `@mike-north/core`                                   |
+| `.changeset/*.md`                             | Release note                                            | Add: minor `@agentmonitors/core`                                |
 
 ---
 
@@ -74,7 +74,7 @@ it('still rejects an empty-string name', () => {
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `pnpm --filter @mike-north/core exec vitest run src/schema/monitor-schema.test.ts -t "omits name"`
+Run: `pnpm --filter @agentmonitors/core exec vitest run src/schema/monitor-schema.test.ts -t "omits name"`
 Expected: FAIL — the schema currently requires `name`, so `safeParse` returns `success: false`.
 
 - [ ] **Step 3: Make `name` optional in the schema**
@@ -129,7 +129,7 @@ const monitorName = result.monitor.frontmatter.name ?? result.monitor.id;
 
 - [ ] **Step 5: Run the schema test + typecheck to verify everything passes**
 
-Run: `pnpm --filter @mike-north/core exec vitest run src/schema/monitor-schema.test.ts`
+Run: `pnpm --filter @agentmonitors/core exec vitest run src/schema/monitor-schema.test.ts`
 Expected: PASS (both new cases).
 
 Run: `pnpm check`
@@ -188,7 +188,7 @@ it('derives the id from the parent directory for a folder monitor (MONITOR.md)',
 
 - [ ] **Step 2: Run the test to verify the flat case fails**
 
-Run: `pnpm --filter @mike-north/core exec vitest run src/parser/parse-monitor.test.ts -t "from the filename"`
+Run: `pnpm --filter @agentmonitors/core exec vitest run src/parser/parse-monitor.test.ts -t "from the filename"`
 Expected: FAIL — current code derives id from `path.dirname`, so a flat file at `.../monitors/watch-src.md` yields id `monitors`, not `watch-src`.
 
 - [ ] **Step 3: Implement form-aware id derivation**
@@ -224,7 +224,7 @@ Then update the returned object (line ~47) to use `id` instead of `dirName`:
 
 - [ ] **Step 4: Run the tests to verify both pass**
 
-Run: `pnpm --filter @mike-north/core exec vitest run src/parser/parse-monitor.test.ts`
+Run: `pnpm --filter @agentmonitors/core exec vitest run src/parser/parse-monitor.test.ts`
 Expected: PASS (both new cases and the existing folder cases).
 
 - [ ] **Step 5: Commit**
@@ -304,7 +304,7 @@ it('flags a flat file and a folder that derive the same id as a duplicate', asyn
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `pnpm --filter @mike-north/core exec vitest run src/parser/scan-monitors.test.ts -t "discovers both"`
+Run: `pnpm --filter @agentmonitors/core exec vitest run src/parser/scan-monitors.test.ts -t "discovers both"`
 Expected: FAIL — the current `**/MONITOR.md` pattern misses `watch-src.md`, so only `pr-watch` is discovered.
 
 - [ ] **Step 3: Implement combined discovery**
@@ -336,12 +336,12 @@ const matches = [...folderMatches, ...flatMatches];
 
 - [ ] **Step 4: Run the scanner tests to verify they pass**
 
-Run: `pnpm --filter @mike-north/core exec vitest run src/parser/scan-monitors.test.ts`
+Run: `pnpm --filter @agentmonitors/core exec vitest run src/parser/scan-monitors.test.ts`
 Expected: PASS (new cases + existing folder/duplicate cases).
 
 - [ ] **Step 5: Run the full core suite to catch regressions**
 
-Run: `pnpm --filter @mike-north/core exec vitest run`
+Run: `pnpm --filter @agentmonitors/core exec vitest run`
 Expected: PASS (all suites).
 
 - [ ] **Step 6: Commit**
@@ -382,7 +382,7 @@ Prepend under the `## Usage` block in `docs/specs/spec-changelog.md`:
   ([001 §scanning](./001-monitor-definition.md)). Verified: `parse-monitor.ts` id derivation and
   `scan-monitors.ts` combined glob.
 - `name` is now **optional** in frontmatter and defaults to the monitor id. Minor
-  `@mike-north/core` changeset.
+  `@agentmonitors/core` changeset.
 ```
 
 - [ ] **Step 3: Create the changeset**
@@ -391,7 +391,7 @@ Create `.changeset/flat-file-monitors.md`:
 
 ```markdown
 ---
-'@mike-north/core': minor
+'@agentmonitors/core': minor
 ---
 
 Author monitors as flat `.claude/monitors/<id>.md` files (id derived from the filename), in addition to the folder form `<id>/MONITOR.md`. The scanner discovers both forms (markdown assets nested inside a folder monitor are ignored), and frontmatter `name` is now optional, defaulting to the monitor id.

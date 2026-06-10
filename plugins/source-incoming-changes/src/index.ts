@@ -24,7 +24,7 @@ import type {
   ObservationContext,
   ObservationResult,
   ObservationSource,
-} from '@mike-north/core';
+} from '@agentmonitors/core';
 
 // ---------------------------------------------------------------------------
 // Scope config parsing

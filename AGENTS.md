@@ -8,8 +8,8 @@ depth.
 
 Agent Monitors is a **local-first monitoring system for agentic coding tools**: a local daemon turns
 external changes (file edits, API responses, schedules) into durable, queryable work signals and
-delivers them into tracked agent sessions. A pnpm + Nx monorepo: `libs/core` (`@mike-north/core`,
-the host-agnostic engine), `apps/cli` (`@mike-north/cli`, bin `agentmonitors`, + the daemon/IPC
+delivers them into tracked agent sessions. A pnpm + Nx monorepo: `libs/core` (`@agentmonitors/core`,
+the host-agnostic engine), `apps/cli` (`@agentmonitors/cli`, bin `agentmonitors`, + the daemon/IPC
 layer), and `plugins/source-*` (the three bundled observation sources).
 
 ## Specifications — consult, don't eagerly read
@@ -46,12 +46,12 @@ When you change behavior, update the matching numbered doc and add a
 pnpm build      # build publishable packages (Nx; build deps first)
 pnpm test       # run all suites (vitest)
 pnpm check      # type-check every package + eslint + prettier
-pnpm nx test @mike-north/core                                            # one package
-pnpm --filter @mike-north/core exec vitest run src/runtime/service.test.ts   # one test file
+pnpm nx test @agentmonitors/core                                            # one package
+pnpm --filter @agentmonitors/core exec vitest run src/runtime/service.test.ts   # one test file
 ```
 
-Note: changing `@mike-north/core`'s **public** API requires regenerating its api-extractor report
-(`pnpm --filter @mike-north/core run check:api-report` with `--local`) or CI fails.
+Note: changing `@agentmonitors/core`'s **public** API requires regenerating its api-extractor report
+(`pnpm --filter @agentmonitors/core run check:api-report` with `--local`) or CI fails.
 
 ## Invariants to respect
 

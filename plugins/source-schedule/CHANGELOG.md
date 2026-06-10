@@ -1,4 +1,4 @@
-# @mike-north/source-schedule
+# @agentmonitors/source-schedule
 
 ## 0.0.0
 
