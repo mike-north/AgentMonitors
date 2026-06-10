@@ -9,6 +9,30 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-06-09 — Package scope rename: `@mike-north/*` → `@agentmonitors/*`; public npm publish
+
+All published packages now use the `@agentmonitors` npm scope published to public npm
+(`https://registry.npmjs.org`), replacing the previous `@mike-north` GitHub Packages scope.
+The CLI (`@agentmonitors/cli`) is now a publishable package (no longer `private: true`); the
+canonical install is `npm install -g @agentmonitors/cli`.
+
+Packages renamed:
+
+- `@mike-north/core` → `@agentmonitors/core`
+- `@mike-north/source-file-fingerprint` → `@agentmonitors/source-file-fingerprint`
+- `@mike-north/source-api-poll` → `@agentmonitors/source-api-poll`
+- `@mike-north/source-schedule` → `@agentmonitors/source-schedule`
+- `@mike-north/source-incoming-changes` → `@agentmonitors/source-incoming-changes`
+- `@mike-north/cli` → `@agentmonitors/cli`
+- `@mike-north/website` → `@agentmonitors/website`
+
+Release pipeline: `release.yml` now uses `NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}` (repo
+owner must add the `NPM_TOKEN` secret). Changeset `access` set to `"public"`.
+
+No spec behavior changes. All package references in docs, source files, and tooling updated.
+
+---
+
 ## 2026-06-09 — Plan D Task 1: `DeliveryEventSummary` carries the monitor `body`
 
 - A new required field `body: string` is added to `DeliveryEventSummary`
@@ -26,7 +50,7 @@ Agent Monitors spec set in `docs/specs/`.
 
 ## 2026-06-09 — Lazy project-scoped daemon (Plan B)
 
-CLI-only change (no `@mike-north/core` public API change; no changeset needed).
+CLI-only change (no `@agentmonitors/core` public API change; no changeset needed).
 
 **New files:**
 
@@ -153,12 +177,12 @@ update to the outward standard.
   `ObservationOutcome` union (`libs/core/src/runtime/types.ts`) and the drizzle enum in
   `libs/core/src/inbox/schema.ts`. The raw SQL in `libs/core/src/inbox/db.ts` uses `result TEXT NOT
 NULL` with no CHECK constraint and needed no change.
-- Minor `@mike-north/core` changeset (new public `ObservationOutcome` member + runtime guarantee).
+- Minor `@agentmonitors/core` changeset (new public `ObservationOutcome` member + runtime guarantee).
 - Issue: [#46](https://github.com/mike-north/AgentMonitors/issues/46).
 
 ## 2026-06-08 — New bundled source `incoming-changes`
 
-- Added `@mike-north/source-incoming-changes` as the fourth bundled observation source
+- Added `@agentmonitors/source-incoming-changes` as the fourth bundled observation source
   ([003 §6](./003-source-plugins.md)). The source detects per-file changes when a git ref advances
   (pull, merge, fast-forward, or local commit) and reports them as `Observation` records with a
   `changeKind` (`created`/`modified`/`deleted`), `objectKey` (file path), `snapshotText` (new text
@@ -172,7 +196,7 @@ NULL` with no CHECK constraint and needed no change.
   failures (gc'd SHA, history-rewritten range) trigger a silent re-baseline. Neither propagates to
   the tick loop.
 - CLI registration and `init` scaffolding land with issue #39.
-- Minor `@mike-north/source-incoming-changes` changeset (initial `minor`).
+- Minor `@agentmonitors/source-incoming-changes` changeset (initial `minor`).
 
 ## 2026-06-07 — Remove `event-kind` frontmatter field
 
@@ -183,7 +207,7 @@ NULL` with no CHECK constraint and needed no change.
   `inbox_items` DB columns ([002 §5/§12](./002-runtime-delivery.md)), delivery meta key table
   ([006 §4.2](./006-agent-integration.md)), CLI scan output and filter options
   ([005 §5/§9](./005-cli-reference.md)). No DB migration — a local no-users project. Minor
-  `@mike-north/core` changeset.
+  `@agentmonitors/core` changeset.
 
 ## 2026-06-04 — Flat-file monitor authoring; `name` optional
 
@@ -193,7 +217,7 @@ NULL` with no CHECK constraint and needed no change.
   ([001 §scanning](./001-monitor-definition.md)). Verified: `parse-monitor.ts` id derivation and
   `scan-monitors.ts` combined glob.
 - `name` is now **optional** in frontmatter and defaults to the monitor id. Minor
-  `@mike-north/core` changeset.
+  `@agentmonitors/core` changeset.
 
 ## 2026-06-02 — Channel transport, automated end-to-end UAT
 
@@ -223,7 +247,7 @@ NULL` with no CHECK constraint and needed no change.
   `WatchHandle` type. Promoted **NP4** from "the runtime does not define watch-mode" to
   "watch-mode is opt-in and additive" ([000](./000-principles.md), [003 §2](./003-source-plugins.md)).
 - Closes roadmap **G5**. No bundled source opts into `watch()` yet, but the path is exercised
-  end-to-end (`libs/core/src/runtime/service.test.ts`). Minor `@mike-north/core` changeset
+  end-to-end (`libs/core/src/runtime/service.test.ts`). Minor `@agentmonitors/core` changeset
   (new `watchMonitors` method, `WatchHandle` type, `ObservationContext.signal` field).
 
 ## 2026-06-01 — Observation history audit trail (G6)
@@ -235,7 +259,7 @@ NULL` with no CHECK constraint and needed no change.
 - Added a daemon IPC method `history.list` and the `agentmonitors monitor history [monitorId]`
   command to read it ([005 §6](./005-cli-reference.md)) — a "why didn't my monitor fire?" diagnostic.
 - Closes roadmap **G6** (the dead table now has a write path **and** a reader). Runtime + CLI
-  integration tests added; minor `@mike-north/core` changeset (new `RuntimeStore` methods, exported
+  integration tests added; minor `@agentmonitors/core` changeset (new `RuntimeStore` methods, exported
   `ObservationHistoryRecord` / `ObservationHistoryQuery` / `ObservationOutcome` types, runtime write).
 
 ## 2026-06-01 — Channel transport, stage 3 (plugin packaging); G7 shipped
@@ -293,7 +317,7 @@ NULL` with no CHECK constraint and needed no change.
 - `file-fingerprint` is the first emitter: it now reports `created` / `modified` / `deleted` /
   `descoped` (stat-ing the path to distinguish a true disk deletion from a glob/config change),
   closing roadmap G3 — promoted [003 §3.3](./003-source-plugins.md) from limitation to current
-  behavior. Minor changesets for `@mike-north/core` and `@mike-north/source-file-fingerprint`.
+  behavior. Minor changesets for `@agentmonitors/core` and `@agentmonitors/source-file-fingerprint`.
 
 ## 2026-05-31 — Channel transport binding confirmed (006 §4.4)
 
@@ -317,7 +341,7 @@ NULL` with no CHECK constraint and needed no change.
   (`libs/core/src/schema/validate-scope.ts`); the CLI calls it (AP4/AP6).
 - Validator is **`@cfworker/json-schema`**, chosen over ajv specifically because it validates by
   walking the schema at runtime rather than compiling with the `Function` constructor — safe under
-  restrictive CSP / Workers-style environments. Minor `@mike-north/core` changeset.
+  restrictive CSP / Workers-style environments. Minor `@agentmonitors/core` changeset.
 
 ## 2026-05-31 — Duplicate monitor IDs are now rejected (G1)
 
@@ -326,7 +350,7 @@ NULL` with no CHECK constraint and needed no change.
 - `scanMonitors` surfaces collisions via a new `ScanResult.duplicateIds`
   (`DuplicateMonitorId[]`) field; the runtime tick refuses to run on duplicates; `validate`
   exits non-zero and `scan` reports them. Enforces SP2. Regression tests added at the scanner,
-  runtime, and CLI layers; minor `@mike-north/core` changeset included.
+  runtime, and CLI layers; minor `@agentmonitors/core` changeset included.
 
 ## 2026-05-31 — Agent integration & delivery transports
 

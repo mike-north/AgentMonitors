@@ -9,7 +9,7 @@ Next.js + Markdoc documentation site for [agentmonitors.io](https://agentmonitor
 pnpm install
 
 # Start the dev server (hot-reload)
-pnpm --filter @mike-north/website dev
+pnpm --filter @agentmonitors/website dev
 # or from inside apps/website/
 pnpm dev
 ```
@@ -19,7 +19,7 @@ The site is available at [http://localhost:3000](http://localhost:3000).
 ## Build
 
 ```bash
-pnpm --filter @mike-north/website build
+pnpm --filter @agentmonitors/website build
 # or from inside apps/website/
 pnpm build
 ```

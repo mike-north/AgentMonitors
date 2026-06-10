@@ -62,7 +62,7 @@ it('ignores an event-kind field if present (no longer part of the schema)', () =
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `pnpm --filter @mike-north/core exec vitest run src/schema/monitor-schema.test.ts -t "without event-kind"`
+Run: `pnpm --filter @agentmonitors/core exec vitest run src/schema/monitor-schema.test.ts -t "without event-kind"`
 Expected: FAIL — `event-kind` is still a required field, so omitting it currently fails. (Confirms the field is real before removing.)
 
 - [ ] **Step 3: Delete the field, the type, and the export**
@@ -83,7 +83,7 @@ export type EventKind = 'mutation' | 'notification' | 'alert';
 
 - [ ] **Step 4: Run the schema test to verify it passes**
 
-Run: `pnpm --filter @mike-north/core exec vitest run src/schema/monitor-schema.test.ts`
+Run: `pnpm --filter @agentmonitors/core exec vitest run src/schema/monitor-schema.test.ts`
 Expected: PASS. (Typecheck of the whole repo will still fail until later tasks — that's expected; this step only gates the schema tests.)
 
 - [ ] **Step 5: Commit**
@@ -113,7 +113,7 @@ expect(schema.required).toEqual(['name', 'source', 'urgency', 'scope']);
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `pnpm --filter @mike-north/core exec vitest run src/observation/schema-generator.test.ts`
+Run: `pnpm --filter @agentmonitors/core exec vitest run src/observation/schema-generator.test.ts`
 Expected: FAIL — generator still emits `event-kind`.
 
 - [ ] **Step 3: Delete the generator entries**
@@ -122,7 +122,7 @@ In `libs/core/src/observation/schema-generator.ts`: remove `'event-kind'` from t
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `pnpm --filter @mike-north/core exec vitest run src/observation/schema-generator.test.ts`
+Run: `pnpm --filter @agentmonitors/core exec vitest run src/observation/schema-generator.test.ts`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -183,10 +183,10 @@ Apply this pattern to every test fixture: **remove `event-kind: mutation` (YAML 
 
 - [ ] **Step 4: Run the core suite + typecheck**
 
-Run: `pnpm --filter @mike-north/core exec vitest run`
+Run: `pnpm --filter @agentmonitors/core exec vitest run`
 Expected: PASS.
 
-Run: `pnpm --filter @mike-north/core exec tsc -p tsconfig.build.json --noEmit`
+Run: `pnpm --filter @agentmonitors/core exec tsc -p tsconfig.build.json --noEmit`
 Expected: no errors (warnings about missing release tags are pre-existing and fine).
 
 - [ ] **Step 5: Commit (Tasks 3 + 4 together — first compiling state)**
@@ -231,7 +231,7 @@ expect(parsed.monitors[0]).not.toHaveProperty('event-kind');
 Run: `pnpm build`
 Expected: build succeeds.
 
-Run: `pnpm --filter @mike-north/cli exec vitest run --exclude "**/*.docker.test.ts"`
+Run: `pnpm --filter @agentmonitors/cli exec vitest run --exclude "**/*.docker.test.ts"`
 Expected: PASS.
 
 Run: `pnpm check`
@@ -270,7 +270,7 @@ Prepend under `## Usage` in `docs/specs/spec-changelog.md`:
   and `inbox_items`, plus the `--event-kind` CLI filters, the generated-schema entry, and the
   exported `EventKind` type. It was behaviorally inert; `tags` (categorization), `changeKind`
   (change-nature), and `urgency` (importance) cover its uses. No migration (no users; local DBs are
-  disposable). Minor `@mike-north/core` changeset.
+  disposable). Minor `@agentmonitors/core` changeset.
 ```
 
 - [ ] **Step 3: Changeset**
@@ -279,7 +279,7 @@ Create `.changeset/remove-event-kind.md`:
 
 ```markdown
 ---
-'@mike-north/core': minor
+'@agentmonitors/core': minor
 ---
 
 Remove the `event-kind` frontmatter field, the `event_kind` persistence column (on both `monitor_events` and `inbox_items`), the `--event-kind` CLI filters, the generated-schema `event-kind` entry, and the exported `EventKind` type. It carried no behavior; categorization is covered by `tags`, change-nature by `changeKind`, and importance by `urgency`.

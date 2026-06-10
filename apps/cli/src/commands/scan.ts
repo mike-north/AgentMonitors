@@ -1,5 +1,5 @@
 import { Command, Option } from 'commander';
-import { scanMonitors } from '@mike-north/core';
+import { scanMonitors } from '@agentmonitors/core';
 import { requireDirectory } from '../validation.js';
 
 export const scanCommand = new Command('scan')

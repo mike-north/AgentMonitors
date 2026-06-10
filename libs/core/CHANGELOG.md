@@ -1,4 +1,4 @@
-# @mike-north/core
+# @agentmonitors/core
 
 ## 0.0.0
 

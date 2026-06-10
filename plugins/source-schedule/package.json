@@ -1,9 +1,10 @@
 {
-  "name": "@mike-north/source-schedule",
+  "name": "@agentmonitors/source-schedule",
   "description": "Cron-based schedule triggers for Agent Monitors",
   "version": "0.0.6",
   "publishConfig": {
-    "registry": "https://npm.pkg.github.com"
+    "registry": "https://registry.npmjs.org",
+    "access": "public"
   },
   "type": "module",
   "main": "./dist/index.cjs",
@@ -30,7 +31,7 @@
     "ci:api-report": "api-extractor run --verbose"
   },
   "dependencies": {
-    "@mike-north/core": "workspace:*"
+    "@agentmonitors/core": "workspace:*"
   },
   "license": "UNLICENSED",
   "devDependencies": {

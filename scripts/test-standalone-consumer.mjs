@@ -11,15 +11,15 @@ const REPO_ROOT = path.resolve(SCRIPT_DIR, '..');
 const PNPM_BIN = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
 const NPM_BIN = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 const PACKAGE_DEFS = [
-  { name: '@mike-north/core', dir: 'libs/core' },
-  { name: '@mike-north/source-api-poll', dir: 'plugins/source-api-poll' },
+  { name: '@agentmonitors/core', dir: 'libs/core' },
+  { name: '@agentmonitors/source-api-poll', dir: 'plugins/source-api-poll' },
   {
-    name: '@mike-north/source-file-fingerprint',
+    name: '@agentmonitors/source-file-fingerprint',
     dir: 'plugins/source-file-fingerprint',
   },
-  { name: '@mike-north/source-schedule', dir: 'plugins/source-schedule' },
+  { name: '@agentmonitors/source-schedule', dir: 'plugins/source-schedule' },
   {
-    name: '@mike-north/source-incoming-changes',
+    name: '@agentmonitors/source-incoming-changes',
     dir: 'plugins/source-incoming-changes',
   },
 ];
@@ -92,19 +92,19 @@ import {
   createDb,
   generateMonitorSchema,
   parseMonitorFile,
-} from '@mike-north/core';
-import apiPollSource from '@mike-north/source-api-poll';
-import fileFingerprintSource from '@mike-north/source-file-fingerprint';
-import scheduleSource from '@mike-north/source-schedule';
-import incomingChangesSource from '@mike-north/source-incoming-changes';
+} from '@agentmonitors/core';
+import apiPollSource from '@agentmonitors/source-api-poll';
+import fileFingerprintSource from '@agentmonitors/source-file-fingerprint';
+import scheduleSource from '@agentmonitors/source-schedule';
+import incomingChangesSource from '@agentmonitors/source-incoming-changes';
 
 const projectDir = path.dirname(fileURLToPath(import.meta.url));
 const packageNames = [
-  '@mike-north/core',
-  '@mike-north/source-api-poll',
-  '@mike-north/source-file-fingerprint',
-  '@mike-north/source-schedule',
-  '@mike-north/source-incoming-changes',
+  '@agentmonitors/core',
+  '@agentmonitors/source-api-poll',
+  '@agentmonitors/source-file-fingerprint',
+  '@agentmonitors/source-schedule',
+  '@agentmonitors/source-incoming-changes',
 ];
 
 for (const packageName of packageNames) {
@@ -382,7 +382,7 @@ Tell the agent an incoming change landed.
 }
 `;
 
-const SMOKE_TYPES_SCRIPT = `import type { ObservationSource, Urgency } from '@mike-north/core';
+const SMOKE_TYPES_SCRIPT = `import type { ObservationSource, Urgency } from '@agentmonitors/core';
 import {
   AgentMonitorRuntime,
   RuntimeStore,
@@ -390,11 +390,11 @@ import {
   createDb,
   generateMonitorSchema,
   parseMonitor,
-} from '@mike-north/core';
-import apiPollSource from '@mike-north/source-api-poll';
-import fileFingerprintSource from '@mike-north/source-file-fingerprint';
-import scheduleSource from '@mike-north/source-schedule';
-import incomingChangesSource from '@mike-north/source-incoming-changes';
+} from '@agentmonitors/core';
+import apiPollSource from '@agentmonitors/source-api-poll';
+import fileFingerprintSource from '@agentmonitors/source-file-fingerprint';
+import scheduleSource from '@agentmonitors/source-schedule';
+import incomingChangesSource from '@agentmonitors/source-incoming-changes';
 
 const sources: ObservationSource[] = [
   apiPollSource,

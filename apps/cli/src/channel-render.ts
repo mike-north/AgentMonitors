@@ -1,4 +1,4 @@
-import type { DeliveryClaim } from '@mike-north/core';
+import type { DeliveryClaim } from '@agentmonitors/core';
 
 // Channel `meta` values become tag attributes, so strip anything that could
 // break out of the tag (matching the bundled reference channels). Newlines and

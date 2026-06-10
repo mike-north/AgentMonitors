@@ -1,4 +1,4 @@
-# @mike-north/source-file-fingerprint
+# @agentmonitors/source-file-fingerprint
 
 ## 0.0.0
 

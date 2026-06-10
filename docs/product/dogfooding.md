@@ -85,7 +85,7 @@ covered by the channel/hook transport tests, not this UAT. It:
 Run it with:
 
 ```sh
-pnpm --filter @mike-north/cli exec vitest run \
+pnpm --filter @agentmonitors/cli exec vitest run \
   src/commands/cli.integration.test.ts \
   -t "incoming-changes runtime flow"
 ```

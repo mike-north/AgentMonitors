@@ -1,5 +1,5 @@
 import { Command, Option } from 'commander';
-import type { DeliveryLifecycle } from '@mike-north/core';
+import type { DeliveryLifecycle } from '@agentmonitors/core';
 import { reportError } from '../output.js';
 import { claimDeliveryClient } from '../runtime-client.js';
 

@@ -1,6 +1,6 @@
 import { Command, Option } from 'commander';
 import path from 'node:path';
-import { claudeCodeAdapter } from '@mike-north/core';
+import { claudeCodeAdapter } from '@agentmonitors/core';
 import { reportError } from '../output.js';
 import {
   closeSessionClient,

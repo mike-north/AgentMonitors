@@ -25,7 +25,7 @@
 | `apps/cli/src/commands/daemon.ts`  | Idle-reaping in `runLoop` (reuses the existing `runtime.listSessions()`)  | Modify                                           |
 | Tests                              | `apps/cli/src/*.test.ts`, `apps/cli/src/commands/cli.integration.test.ts` | Add: derivation, local-state, lifecycle, reaping |
 
-> **No `@mike-north/core` change needed:** the reaper counts open sessions via the existing,
+> **No `@agentmonitors/core` change needed:** the reaper counts open sessions via the existing,
 > already-exported `AgentMonitorRuntime.listSessions()`. This plan is CLI-only (changeset-exempt).
 
 ---
@@ -61,7 +61,7 @@ describe('workspacePaths', () => {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `pnpm --filter @mike-north/cli exec vitest run src/workspace-paths.test.ts`
+Run: `pnpm --filter @agentmonitors/cli exec vitest run src/workspace-paths.test.ts`
 Expected: FAIL — module does not exist.
 
 - [ ] **Step 3: Implement**
@@ -109,7 +109,7 @@ export function workspacePaths(workspacePath: string): WorkspacePaths {
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `pnpm --filter @mike-north/cli exec vitest run src/workspace-paths.test.ts`
+Run: `pnpm --filter @agentmonitors/cli exec vitest run src/workspace-paths.test.ts`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -181,7 +181,7 @@ describe('local-state', () => {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `pnpm --filter @mike-north/cli exec vitest run src/local-state.test.ts`
+Run: `pnpm --filter @agentmonitors/cli exec vitest run src/local-state.test.ts`
 Expected: FAIL — module does not exist.
 
 - [ ] **Step 3: Implement**
@@ -253,7 +253,7 @@ export function writeLocalState(
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `pnpm --filter @mike-north/cli exec vitest run src/local-state.test.ts`
+Run: `pnpm --filter @agentmonitors/cli exec vitest run src/local-state.test.ts`
 Expected: PASS (first two cases; the third is best-effort and tolerant).
 
 - [ ] **Step 5: Commit**
@@ -317,8 +317,8 @@ describe('spawnDetachedDaemon', () => {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `pnpm --filter @mike-north/cli exec vitest run src/detached-spawn.test.ts`
-Expected: FAIL — module does not exist. (Requires the CLI to be built: `pnpm --filter @mike-north/cli build` first, since the helper spawns the built binary.)
+Run: `pnpm --filter @agentmonitors/cli exec vitest run src/detached-spawn.test.ts`
+Expected: FAIL — module does not exist. (Requires the CLI to be built: `pnpm --filter @agentmonitors/cli build` first, since the helper spawns the built binary.)
 
 - [ ] **Step 3: Implement**
 
@@ -382,8 +382,8 @@ export function spawnDetachedDaemon(options: SpawnDaemonOptions): void {
 
 - [ ] **Step 4: Build, then run to verify it passes**
 
-Run: `pnpm --filter @mike-north/cli build`
-Run: `pnpm --filter @mike-north/cli exec vitest run src/detached-spawn.test.ts`
+Run: `pnpm --filter @agentmonitors/cli build`
+Run: `pnpm --filter @agentmonitors/cli exec vitest run src/detached-spawn.test.ts`
 Expected: PASS — daemon comes up on the socket and is stopped in cleanup. Confirm no orphan: `pgrep -fl "daemon run"` shows nothing afterward.
 
 - [ ] **Step 5: Commit**
@@ -428,7 +428,7 @@ it('session start boots a per-workspace daemon and registers the session', async
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `pnpm --filter @mike-north/cli exec vitest run src/commands/cli.integration.test.ts -t "session start boots"`
+Run: `pnpm --filter @agentmonitors/cli exec vitest run src/commands/cli.integration.test.ts -t "session start boots"`
 Expected: FAIL — `session start` is not a command yet.
 
 - [ ] **Step 3: Implement `session start` / `session end`**
@@ -496,8 +496,8 @@ Add the necessary imports (`readLocalState`/`writeLocalState`, `workspacePaths`,
 
 - [ ] **Step 4: Build + run the integration test**
 
-Run: `pnpm --filter @mike-north/cli build`
-Run: `pnpm --filter @mike-north/cli exec vitest run src/commands/cli.integration.test.ts -t "session start boots"`
+Run: `pnpm --filter @agentmonitors/cli build`
+Run: `pnpm --filter @agentmonitors/cli exec vitest run src/commands/cli.integration.test.ts -t "session start boots"`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -527,7 +527,7 @@ it('the daemon idle-reaps itself after the last session ends', async () => {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `pnpm --filter @mike-north/cli exec vitest run src/commands/cli.integration.test.ts -t "idle-reaps"`
+Run: `pnpm --filter @agentmonitors/cli exec vitest run src/commands/cli.integration.test.ts -t "idle-reaps"`
 Expected: FAIL — the daemon runs forever today.
 
 - [ ] **Step 3: Implement reaping in `runLoop`**
@@ -555,8 +555,8 @@ If `listSessions()` is not exposed on the runtime used here, add a thin pass-thr
 
 - [ ] **Step 4: Build + run the reaping test + full suite**
 
-Run: `pnpm --filter @mike-north/cli build`
-Run: `pnpm --filter @mike-north/cli exec vitest run --exclude "**/*.docker.test.ts"`
+Run: `pnpm --filter @agentmonitors/cli build`
+Run: `pnpm --filter @agentmonitors/cli exec vitest run --exclude "**/*.docker.test.ts"`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -578,7 +578,7 @@ git commit --author="Mike North <michael.l.north@gmail.com>" -m "Idle-reap the d
 
 - [ ] **Step 2: Changelog + changeset**
 
-spec-changelog entry "2026-06-04 — Lazy project-scoped daemon (B)" summarizing the above. `.changeset/lazy-daemon.md`: `@mike-north/cli` is changeset-exempt; if `service.ts` gained a public accessor, add a minor `@mike-north/core` changeset, otherwise note "CLI-only, no changeset" in the changelog.
+spec-changelog entry "2026-06-04 — Lazy project-scoped daemon (B)" summarizing the above. `.changeset/lazy-daemon.md`: `@agentmonitors/cli` is changeset-exempt; if `service.ts` gained a public accessor, add a minor `@agentmonitors/core` changeset, otherwise note "CLI-only, no changeset" in the changelog.
 
 - [ ] **Step 3: Format + clean verification**
 

@@ -20,12 +20,12 @@ npm install -g @anthropic-ai/claude-code@2.1.80 >/dev/null
 CLAUDE_VERSION="$(claude --version | head -n 1)"
 
 pnpm install >/dev/null
-pnpm --filter @mike-north/core build >/dev/null
-pnpm --filter @mike-north/source-file-fingerprint build >/dev/null
-pnpm --filter @mike-north/source-api-poll build >/dev/null
-pnpm --filter @mike-north/source-schedule build >/dev/null
-pnpm --filter @mike-north/source-incoming-changes build >/dev/null
-pnpm --filter @mike-north/cli build >/dev/null
+pnpm --filter @agentmonitors/core build >/dev/null
+pnpm --filter @agentmonitors/source-file-fingerprint build >/dev/null
+pnpm --filter @agentmonitors/source-api-poll build >/dev/null
+pnpm --filter @agentmonitors/source-schedule build >/dev/null
+pnpm --filter @agentmonitors/source-incoming-changes build >/dev/null
+pnpm --filter @agentmonitors/cli build >/dev/null
 
 mkdir -p /tmp/workspace/.claude/monitors/watch-files
 cat > /tmp/workspace/.claude/monitors/watch-files/MONITOR.md <<'EOF'

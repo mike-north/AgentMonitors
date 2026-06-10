@@ -50,7 +50,7 @@ questions in [004 §6](./004-validation-testing.md). If any answer is "no", it i
 
 The contract is implemented across a pnpm + Nx monorepo:
 
-- `libs/core` (`@mike-north/core`) — parser, schema, source registry, runtime, hook bridge,
+- `libs/core` (`@agentmonitors/core`) — parser, schema, source registry, runtime, hook bridge,
   adapters, persistence. The published library and the home of most normative behavior.
 - `apps/cli` (`agentmonitors`) — the command surface and the daemon/IPC layer.
 - `plugins/source-*` — the four bundled observation sources (`file-fingerprint`, `api-poll`, `schedule`, `incoming-changes`).

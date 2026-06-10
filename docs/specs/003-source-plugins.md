@@ -22,7 +22,7 @@ Every source plugin **MUST** implement the `ObservationSource` interface. The re
 
 ### 2.1 TypeScript types
 
-A third-party plugin author implements the `ObservationSource` interface and uses the supporting types `ObservationContext`, `ObservationResult`, `Observation`, and `JsonSchema`. All five are exported from `@mike-north/core` (verified: `libs/core/src/index.ts` lines 39–45).
+A third-party plugin author implements the `ObservationSource` interface and uses the supporting types `ObservationContext`, `ObservationResult`, `Observation`, and `JsonSchema`. All five are exported from `@agentmonitors/core` (verified: `libs/core/src/index.ts` lines 39–45).
 
 ```typescript
 import type {
@@ -31,7 +31,7 @@ import type {
   ObservationContext,
   ObservationResult,
   ObservationSource,
-} from '@mike-north/core';
+} from '@agentmonitors/core';
 ```
 
 The interface definition (verified: `libs/core/src/observation/types.ts`):
@@ -244,7 +244,7 @@ The source does not decide when it is due — that is the runtime's responsibili
 
 Source name: `"incoming-changes"` (verified: `plugins/source-incoming-changes/src/index.ts`).
 
-Package: `@mike-north/source-incoming-changes`. Registered via `registerCoreSources` and available as an `agentmonitors init --source incoming-changes` template (issue #39).
+Package: `@agentmonitors/source-incoming-changes`. Registered via `registerCoreSources` and available as an `agentmonitors init --source incoming-changes` template (issue #39).
 
 ### 6.1 Scope
 
@@ -296,7 +296,7 @@ These guards ensure a source error does not propagate to the runtime tick loop.
 
 ### 7.1 SourceRegistry
 
-`SourceRegistry` (exported from `@mike-north/core`, verified: `libs/core/src/observation/registry.ts`) is an in-memory registry of source plugins. It exposes:
+`SourceRegistry` (exported from `@agentmonitors/core`, verified: `libs/core/src/observation/registry.ts`) is an in-memory registry of source plugins. It exposes:
 
 | Method     | Signature                                        | Behavior                                                                                    |
 | ---------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------- |
@@ -313,7 +313,7 @@ commands are placeholders that print a manual-install hint (NP3). See §8.
 
 ### 7.2 Schema generation
 
-`generateMonitorSchema(sources: ObservationSource[]): JsonSchema` (exported from `@mike-north/core`, verified: `libs/core/src/observation/schema-generator.ts`) composes a full JSON Schema from all registered sources' `scopeSchema` fragments.
+`generateMonitorSchema(sources: ObservationSource[]): JsonSchema` (exported from `@agentmonitors/core`, verified: `libs/core/src/observation/schema-generator.ts`) composes a full JSON Schema from all registered sources' `scopeSchema` fragments.
 
 The generated schema:
 

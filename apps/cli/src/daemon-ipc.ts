@@ -15,7 +15,7 @@ import type {
   AgentSessionRole,
   DeliveryLifecycle,
   Urgency,
-} from '@mike-north/core';
+} from '@agentmonitors/core';
 import { z } from 'zod';
 import { resolveDbPath } from './db-path.js';
 

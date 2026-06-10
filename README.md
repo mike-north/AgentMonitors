@@ -33,18 +33,12 @@ Three observation sources ship in the box:
 
 ## Quick start
 
-The `agentmonitors` CLI ships from this monorepo (`@mike-north/cli`). It is not yet published to a
-package registry, so build it from source:
+Install the CLI globally from npm:
 
 ```bash
-pnpm install
-pnpm build
-```
-
-The CLI binary is then `apps/cli/dist/index.cjs`; alias it for convenience:
-
-```bash
-alias agentmonitors="node \"$(pwd)/apps/cli/dist/index.cjs\""
+npm install -g @agentmonitors/cli
+# or with npx (no global install):
+npx @agentmonitors/cli --help
 ```
 
 Scaffold and run your first monitor:
@@ -83,6 +77,16 @@ The monitor's **ID is its parent directory name** (`my-first-monitor`), not a fr
 Run `agentmonitors --help` for the full command surface, or see the
 [CLI reference](docs/specs/005-cli-reference.md).
 
+### From source (development)
+
+```bash
+git clone https://github.com/mike-north/AgentMonitors.git
+cd AgentMonitors
+pnpm install
+pnpm build
+alias agentmonitors="node \"$(pwd)/apps/cli/dist/index.cjs\""
+```
+
 ## Documentation
 
 The **canonical specification** lives in [`docs/specs/`](docs/specs/) — start with the
@@ -103,14 +107,14 @@ about which behaviors are _current_ vs _target_:
 
 A pnpm + Nx monorepo:
 
-| Package                           | Name                                  | Purpose                                                                               |
-| --------------------------------- | ------------------------------------- | ------------------------------------------------------------------------------------- |
-| `libs/core`                       | `@mike-north/core`                    | Host-agnostic engine: parser, schema, source registry, runtime, persistence, adapters |
-| `apps/cli`                        | `@mike-north/cli` (`agentmonitors`)   | Command surface + the daemon and its Unix-socket IPC                                  |
-| `plugins/source-file-fingerprint` | `@mike-north/source-file-fingerprint` | File change-detection source                                                          |
-| `plugins/source-api-poll`         | `@mike-north/source-api-poll`         | HTTP polling source                                                                   |
-| `plugins/source-schedule`         | `@mike-north/source-schedule`         | Cron schedule source                                                                  |
-| `apps/website`                    | —                                     | Public docs site                                                                      |
+| Package                           | Name                                     | Purpose                                                                               |
+| --------------------------------- | ---------------------------------------- | ------------------------------------------------------------------------------------- |
+| `libs/core`                       | `@agentmonitors/core`                    | Host-agnostic engine: parser, schema, source registry, runtime, persistence, adapters |
+| `apps/cli`                        | `@agentmonitors/cli` (`agentmonitors`)   | Command surface + the daemon and its Unix-socket IPC                                  |
+| `plugins/source-file-fingerprint` | `@agentmonitors/source-file-fingerprint` | File change-detection source                                                          |
+| `plugins/source-api-poll`         | `@agentmonitors/source-api-poll`         | HTTP polling source                                                                   |
+| `plugins/source-schedule`         | `@agentmonitors/source-schedule`         | Cron schedule source                                                                  |
+| `apps/website`                    | —                                        | Public docs site                                                                      |
 
 ## Development
 
@@ -126,8 +130,8 @@ pnpm check      # type-check every package + eslint + prettier
 Work on a single package or test:
 
 ```bash
-pnpm nx test @mike-north/core
-pnpm --filter @mike-north/core exec vitest run src/runtime/service.test.ts
+pnpm nx test @agentmonitors/core
+pnpm --filter @agentmonitors/core exec vitest run src/runtime/service.test.ts
 ```
 
 Changes that affect a published package's behavior or public types should include a

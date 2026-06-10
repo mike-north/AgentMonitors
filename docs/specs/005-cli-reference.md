@@ -10,7 +10,7 @@
 
 The binary is named **`agentmonitors`** and is described as _"Durable observation and inbox delivery for AI agents"_ (version `0.0.0` in the current codebase).
 
-Per AP6, all public CLI behaviour must be derivable from core contracts. The CLI wraps `@mike-north/core` and four bundled source packages (`@mike-north/source-file-fingerprint`, `@mike-north/source-api-poll`, `@mike-north/source-schedule`, `@mike-north/source-incoming-changes`).
+Per AP6, all public CLI behaviour must be derivable from core contracts. The CLI wraps `@agentmonitors/core` and four bundled source packages (`@agentmonitors/source-file-fingerprint`, `@agentmonitors/source-api-poll`, `@agentmonitors/source-schedule`, `@agentmonitors/source-incoming-changes`).
 
 ### In-process vs. socket commands
 
@@ -138,7 +138,7 @@ If no monitors are found: prints `No monitors found.`
 
 ### Validation logic (current)
 
-1. Parses all `MONITOR.md` files via `scanMonitors()` from `@mike-north/core` (parse errors are included in `errors`).
+1. Parses all `MONITOR.md` files via `scanMonitors()` from `@agentmonitors/core` (parse errors are included in `errors`).
 2. Checks each monitor's `source` field against the built-in `SourceRegistry`; unknown sources produce an error listing available sources.
 3. Validates each monitor's `scope` against the source's full `scopeSchema` (draft-07) via the exported core `validateScope` helper — types, enums, `required`, `items`, and other keywords, not just field presence.
 4. Rejects duplicate monitor IDs within the scanned tree (see [001 §4](./001-monitor-definition.md)).
@@ -472,7 +472,7 @@ agentmonitors schema generate [-o <file>]
 | --------------------- | ------ | ------- | --------------------------------------------- |
 | `-o, --output <file>` | string | —       | Write schema to file; omit to print to stdout |
 
-Calls `generateMonitorSchema(registry.list())` from `@mike-north/core` and outputs the resulting JSON schema (pretty-printed with 2-space indent).
+Calls `generateMonitorSchema(registry.list())` from `@agentmonitors/core` and outputs the resulting JSON schema (pretty-printed with 2-space indent).
 
 - **Without `--output`:** prints schema JSON to stdout.
 - **With `--output <file>`:** writes to file and prints `Schema written to <file>`.

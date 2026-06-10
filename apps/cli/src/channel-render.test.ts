@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { DeliveryClaim } from '@mike-north/core';
+import type { DeliveryClaim } from '@agentmonitors/core';
 import { renderChannelEvent } from './channel-render.js';
 
 function makeClaim(overrides: Partial<DeliveryClaim> = {}): DeliveryClaim {
