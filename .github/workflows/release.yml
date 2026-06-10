@@ -11,7 +11,6 @@ permissions:
   actions: write
   contents: write
   pull-requests: write
-  id-token: write # npm provenance (OIDC attestation for published packages)
 
 jobs:
   release:
@@ -91,7 +90,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_CONFIG_PROVENANCE: 'true' # pnpm publish attaches a provenance attestation in CI
+          # NOTE: npm provenance (NPM_CONFIG_PROVENANCE + id-token: write) requires a
+          # PUBLIC source repository — the registry rejects private-repo attestations
+          # with E422. Re-enable both if/when this repo goes public.
 
       - name: Trigger CI For Release Pull Request
         if: |
