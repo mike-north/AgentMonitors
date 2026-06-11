@@ -548,7 +548,11 @@ Transport and integration tests should be able to prove:
   lists only `CLAUDE_PROJECT_DIR` + `roots/list`), so its inheritance is observed-not-contracted and
   host-version-dependent — re-run the `experiments/channel-probe` diagnostic when targeting a new
   host, and keep the workspace-binding fallback (§4.4 #2) as the documented-safe path.
-- Confirm `CLAUDE_CODE_SESSION_ID` equals the `hostSessionId` the `SessionStart` hook passes to
-  `session open` (expected, but the channel transport's session binding depends on it).
+- **Resolved (Claude Code 2.1.160):** `CLAUDE_CODE_SESSION_ID` equals the `hostSessionId` the
+  `SessionStart` hook passes to `session open`. The 2.1.160 re-verification above established that
+  the env var's value exactly equals the live session id, and the hook (post stdin-input fix, §5.0)
+  passes the stdin `session_id` — by the hooks contract, that same live session id. Both transports
+  therefore resolve the same identifier. Same caveat as above: the env-var side is
+  observed-not-contracted, so re-verify alongside the channel-probe diagnostic on new host versions.
 - Decide whether the channel server should open a synthetic workspace-lead session when channels are
   used **without** the hook-driven `session open` flow, or require the hook flow as a precondition.
