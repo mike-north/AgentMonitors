@@ -436,11 +436,11 @@ No durable event is lost by truncation; the cap only bounds how much is injected
 The plugin wires the host lifecycle to the already-built CLI verbs (the user installs the
 `agentmonitors` bin globally — e.g. `npm i -g @agentmonitors/cli`):
 
-| Hook event         | Command(s)                                                   | Purpose                                                                                                                                                      |
-| ------------------ | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `SessionStart`     | `agentmonitors session start`                                | Lazy-boot the per-workspace daemon + register the session, then surface the post-compact recap **in the same process** (a no-op when nothing is pending). NOT a chained `&& hook deliver` — see "single-process SessionStart" below |
-| `UserPromptSubmit` | `agentmonitors hook deliver`                                 | Primary turn-boundary delivery (`turn-interruptible` per §5.4)                                                                                               |
-| `SessionEnd`       | `agentmonitors session end`                                  | Deregister the session so the idle daemon reaps itself                                                                                                       |
+| Hook event         | Command(s)                    | Purpose                                                                                                                                                                                                                             |
+| ------------------ | ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SessionStart`     | `agentmonitors session start` | Lazy-boot the per-workspace daemon + register the session, then surface the post-compact recap **in the same process** (a no-op when nothing is pending). NOT a chained `&& hook deliver` — see "single-process SessionStart" below |
+| `UserPromptSubmit` | `agentmonitors hook deliver`  | Primary turn-boundary delivery (`turn-interruptible` per §5.4)                                                                                                                                                                      |
+| `SessionEnd`       | `agentmonitors session end`   | Deregister the session so the idle daemon reaps itself                                                                                                                                                                              |
 
 `hook deliver` reads the hook payload from **stdin** and derives the firing event from
 `hook_event_name` (§5.0/§5.4) — it takes no `--hook-event-name` flag. `session start`/`session end`

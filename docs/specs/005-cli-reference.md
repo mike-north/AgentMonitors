@@ -679,8 +679,14 @@ Code hook payload on stdin** (a JSON object — there is **no `CLAUDE_CODE_SESSI
 3. If no daemon is listening at the socket, spawns `daemon run` as a **detached background process** (`stdio: 'ignore'`, `.unref()`), passing the derived socket/db paths, the monitors dir, and `reap-after-ms` from the local state. Waits up to 8 seconds for the socket to appear.
 4. Persists the resolved socket/db paths back to `.claude/agentmonitors.local.md` (so sibling hooks can use them without re-deriving).
 5. Opens a session via the `session.open` IPC method (`claudeCodeAdapter.createSessionInput()` with `hostSessionId` and `workspacePath`).
+6. **Surfaces the post-compact recap in the same process.** `SessionStart` is a context event, and a Claude Code hook invocation provides only **one** stdin stream — so the recap cannot be a separately chained `hook deliver` (it would see an already-consumed stdin and no-op; see 006 §5.6). Reusing the payload it already read, `session start` claims `post-compact` for the session and, if there are unread events, prints the rendered `SessionStart` hook JSON (`{ "continue": true, "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": "…" } }`) to stdout.
 
-**No output on success.** Errors are printed to stderr and set exit code 1.
+**Output:**
+
+- **Nothing pending** (a fresh start with no unread events) → **no output**.
+- **Compact-resume with unread events** → the `SessionStart` recap JSON on stdout (the `additionalContext` carries the unread events' bodies). This is the only `session …` subcommand that emits hook-wire JSON, so its stdout MUST stay clean (wire JSON only).
+
+Errors are swallowed (best-effort) so a failing hook never disrupts the user's session; the command exits 0.
 
 **Designed for use as a `SessionStart` hook** (see 006 §5.6). Claude Code does not need the daemon to be pre-started.
 

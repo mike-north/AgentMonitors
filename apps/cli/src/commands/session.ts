@@ -212,9 +212,16 @@ sessionCommand
       // silently no-op. Reading once and delivering here is the fix. On a
       // fresh start nothing is pending → renderHookDelivery returns null →
       // nothing is printed; on a compact-resume the unread events are recapped.
-      const claim = await claimDeliveryClient(opened.id, 'post-compact', socket);
+      const claim = await claimDeliveryClient(
+        opened.id,
+        'post-compact',
+        socket,
+      );
       const delivery = renderHookDelivery(claim, 'SessionStart');
       if (delivery !== null) {
+        // stdout is the SessionStart hook's wire channel: it MUST contain only
+        // this JSON. Do NOT add `console.log`/diagnostics to stdout in this
+        // command — anything else here corrupts the hook output Claude reads.
         process.stdout.write(JSON.stringify(delivery));
       }
     } catch (error) {

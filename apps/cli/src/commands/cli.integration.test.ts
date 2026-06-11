@@ -1874,7 +1874,10 @@ describe('lazy daemon lifecycle', () => {
           env,
           ws,
         );
-        if (r.exitCode === 0 && (JSON.parse(r.stdout) as unknown[]).length >= 1) {
+        if (
+          r.exitCode === 0 &&
+          (JSON.parse(r.stdout) as unknown[]).length >= 1
+        ) {
           break;
         }
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
@@ -1887,7 +1890,10 @@ describe('lazy daemon lifecycle', () => {
       expect(resume.exitCode).toBe(0);
       const out = JSON.parse(resume.stdout) as {
         continue: boolean;
-        hookSpecificOutput: { hookEventName: string; additionalContext: string };
+        hookSpecificOutput: {
+          hookEventName: string;
+          additionalContext: string;
+        };
       };
       expect(out.hookSpecificOutput.hookEventName).toBe('SessionStart');
       expect(out.hookSpecificOutput.additionalContext).toContain(RECAP_BODY);
