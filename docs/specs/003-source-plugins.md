@@ -48,6 +48,14 @@ The interface definition (verified: `libs/core/src/observation/types.ts`):
 
 `JsonSchema` is typed as `Record<string, unknown>`, making it a plain object describing a JSON Schema fragment.
 
+> **Naming note ("scope" vs `watch:`).** The TypeScript contract and core helpers retain the
+> historical **scope** wording — `scopeSchema`, `validateScope` — from before the authoring surface
+> migrated to `watch: { type, … }`. The two describe the same thing: "scope" in code refers to the
+> per-source configuration that authors now write flat inside the `watch:` block alongside `type`,
+> and `name` is the value authors reference as `watch.type`. Plugin authors reading the `verified:`
+> sources should translate accordingly; renaming the code identifiers is deliberately out of scope
+> here (it would be a breaking public-API change for plugin authors).
+
 ### 2.2 Observation context
 
 `observe()` receives `config` (the source-specific monitor scope as `Record<string, unknown>`) and `context` of type `ObservationContext`:
@@ -249,7 +257,7 @@ The source does not decide when it is due — that is the runtime's responsibili
 
 Source name: `"incoming-changes"` (verified: `plugins/source-incoming-changes/src/index.ts`).
 
-Package: `@agentmonitors/source-incoming-changes`. Registered via `registerCoreSources` and available as an `agentmonitors init --source incoming-changes` template (issue #39).
+Package: `@agentmonitors/source-incoming-changes`. Registered via `registerCoreSources` and available as an `agentmonitors init --type incoming-changes` template (issue #39).
 
 ### 6.1 Scope
 
