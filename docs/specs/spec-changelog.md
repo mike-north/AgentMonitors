@@ -94,7 +94,7 @@ imported by `hook deliver`, `session start`, and `session end`. Documented in
   `CLAUDE_CODE_SESSION_ID` to stdin payloads so they fail against the old env-reading code.
 - **Follow-up — now resolved (see the channel-binding entry above):** the question of whether
   `channel serve` (`apps/cli/src/commands/channel.ts`) shares the same "no session-id env var" trap was
-  verified separately and answered **no** — an MCP-server subprocess *does* receive
+  verified separately and answered **no** — an MCP-server subprocess _does_ receive
   `CLAUDE_CODE_SESSION_ID` (re-confirmed against 2.1.160), so the channel server's
   `process.env['CLAUDE_CODE_SESSION_ID']` resolution is correct and needs no change. The hooks/stdin
   trap does not transfer (hook = short-lived per-event command with the id on stdin; channel = long-lived

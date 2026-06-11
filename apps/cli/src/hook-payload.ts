@@ -53,10 +53,25 @@ export async function readHookPayload(): Promise<HookPayload> {
   if (trimmed === '') return {};
   try {
     const parsed: unknown = JSON.parse(trimmed);
-    if (typeof parsed === 'object' && parsed !== null) {
-      return parsed as HookPayload;
-    }
-    return {};
+    if (typeof parsed !== 'object' || parsed === null) return {};
+    // stdin is a process trust boundary: pick ONLY the expected string fields and
+    // ignore everything else. A non-string `session_id` (e.g. `123`) must NOT
+    // pass through — it would be truthy yet collapse hook-state paths and risk
+    // session collisions. Coercing a non-string field to absent makes the caller
+    // treat it as "not a Claude session" and quietly exit.
+    const record = parsed as Record<string, unknown>;
+    const pickString = (key: string): string | undefined => {
+      const value = record[key];
+      return typeof value === 'string' ? value : undefined;
+    };
+    const payload: HookPayload = {};
+    const sessionId = pickString('session_id');
+    if (sessionId !== undefined) payload.session_id = sessionId;
+    const eventName = pickString('hook_event_name');
+    if (eventName !== undefined) payload.hook_event_name = eventName;
+    const cwd = pickString('cwd');
+    if (cwd !== undefined) payload.cwd = cwd;
+    return payload;
   } catch {
     return {};
   }
