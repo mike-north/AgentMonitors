@@ -3,6 +3,7 @@ import path from 'node:path';
 import { claudeCodeAdapter } from '@agentmonitors/core';
 import { reportError } from '../output.js';
 import {
+  claimDeliveryClient,
   closeSessionClient,
   listSessionsClient,
   openSessionClient,
@@ -11,6 +12,8 @@ import { daemonAvailable, resolveSocketPath } from '../daemon-ipc.js';
 import { readLocalState, writeLocalState } from '../local-state.js';
 import { workspacePaths } from '../workspace-paths.js';
 import { spawnDetachedDaemon } from '../detached-spawn.js';
+import { readHookPayload } from '../hook-payload.js';
+import { renderHookDelivery } from '../hook-deliver-render.js';
 
 export const sessionCommand = new Command('session').description(
   'Manage agent sessions tracked by AgentMon',
@@ -134,9 +137,16 @@ sessionCommand
     'Lazy-boot the project daemon (if needed) and register this session',
   )
   .action(async () => {
-    const workspacePath = process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
-    const hostSessionId = process.env['CLAUDE_CODE_SESSION_ID'];
+    // Claude Code delivers hook input as JSON on STDIN (not env vars). The host
+    // session id comes from the payload's `session_id`; there is NO
+    // `CLAUDE_CODE_SESSION_ID` env var in a real hook invocation. This is the
+    // same contract `hook deliver` reads.
+    const payload = await readHookPayload();
+    const hostSessionId = payload.session_id;
     if (!hostSessionId) return; // not a Claude session; nothing to do
+
+    const workspacePath =
+      payload.cwd ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
 
     const state = readLocalState(workspacePath);
     if (!state.enabled) return; // quick-exit: monitoring not enabled here
@@ -186,13 +196,34 @@ sessionCommand
     writeLocalState(workspacePath, { ...state, socket, db });
 
     try {
-      await openSessionClient(
+      const opened = await openSessionClient(
         claudeCodeAdapter.createSessionInput({
           hostSessionId,
           workspacePath,
         }),
         socket,
       );
+
+      // SessionStart is a context event, so this command ALSO surfaces the
+      // post-compact recap — from the SAME stdin payload we already read.
+      // The plugin runs `session start` as ONE hook command; a separately
+      // chained `agentmonitors hook deliver` would see an already-consumed
+      // stdin (one hook invocation = one stdin stream), parse `{}`, and
+      // silently no-op. Reading once and delivering here is the fix. On a
+      // fresh start nothing is pending → renderHookDelivery returns null →
+      // nothing is printed; on a compact-resume the unread events are recapped.
+      const claim = await claimDeliveryClient(
+        opened.id,
+        'post-compact',
+        socket,
+      );
+      const delivery = renderHookDelivery(claim, 'SessionStart');
+      if (delivery !== null) {
+        // stdout is the SessionStart hook's wire channel: it MUST contain only
+        // this JSON. Do NOT add `console.log`/diagnostics to stdout in this
+        // command — anything else here corrupts the hook output Claude reads.
+        process.stdout.write(JSON.stringify(delivery));
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       reportError(message, false);
@@ -203,9 +234,13 @@ sessionCommand
   .command('end')
   .description('Deregister this session (lets the idle daemon reap itself)')
   .action(async () => {
-    const workspacePath = process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
-    const hostSessionId = process.env['CLAUDE_CODE_SESSION_ID'];
+    // Same stdin contract as `session start` / `hook deliver`: the host session
+    // id is the payload's `session_id`, not an env var.
+    const payload = await readHookPayload();
+    const hostSessionId = payload.session_id;
     if (!hostSessionId) return;
+    const workspacePath =
+      payload.cwd ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
     const state = readLocalState(workspacePath);
     if (!state.enabled || !state.socket) return;
     const socket = resolveSocketPath(state.socket);
