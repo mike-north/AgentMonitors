@@ -170,17 +170,37 @@ the bound session/workspace before acking. (Permission relay is **out of scope**
 
 ### 4.4 Workspace/session binding
 
-Both identity signals a channel server needs are available to a process **spawned as an MCP server**,
-confirmed empirically by the `experiments/channel-probe` run (Claude Code 2.1.157; see
-[roadmap.md](./roadmap.md) G7). A probe registered via `--mcp-config` and spawned as an MCP server
-observed all of:
+Both identity signals a channel server needs are available to a process **spawned as an MCP server**.
+The two **workspace** signals are **documented**; the **session-id** signal is **empirically observed
+but undocumented**, so it is treated as observed behavior backed by a documented fallback:
 
-- **`CLAUDE_PROJECT_DIR`** set to the workspace path (and the server's cwd was the same path);
-- **`CLAUDE_CODE_SESSION_ID`** inherited by the MCP-server subprocess (the host session id — note the
-  variable is `CLAUDE_CODE_SESSION_ID`, **not** `CLAUDE_SESSION_ID`);
-- **`roots/list`** answered, returning the workspace as a single `file://` root.
+- **`CLAUDE_PROJECT_DIR`** (documented) — set to the workspace path, and the server's cwd is the same
+  path. <https://code.claude.com/docs/en/mcp.md>: "Claude Code sets `CLAUDE_PROJECT_DIR` in the
+  spawned server's environment to the project root."
+- **`roots/list`** (documented) — answered, returning the workspace as a single `file://` root (same
+  reference: "Your server can also call the MCP `roots/list` request, which returns the directory
+  Claude Code was launched from").
+- **`CLAUDE_CODE_SESSION_ID`** (undocumented; empirically present) — inherited by the MCP-server
+  subprocess and equal to the host session id (note the variable is `CLAUDE_CODE_SESSION_ID`, **not**
+  `CLAUDE_SESSION_ID`). The current MCP reference documents only the two workspace signals above; it
+  does **not** list `CLAUDE_CODE_SESSION_ID`. Its presence is confirmed empirically by the
+  `experiments/channel-probe` run (Claude Code 2.1.157; see [roadmap.md](./roadmap.md) G7) and
+  **re-confirmed against Claude Code 2.1.160** — in a live session the variable is present in
+  MCP/child-process environments and its value exactly equals the live session id. Because this is
+  observed-not-contracted, the workspace-binding fallback below is the robustness hedge if a future
+  host stops setting it.
 
-Reference: <https://code.claude.com/docs/en/mcp.md>.
+> **Contrast with hooks — different transport, different mechanism (and a real trap).** A Claude Code
+> **hook** does **not** read its session id from `CLAUDE_CODE_SESSION_ID`: per
+> <https://code.claude.com/docs/en/hooks.md> a hook receives `session_id` in its **stdin payload**,
+> and the documented hook environment variables are `CLAUDE_PROJECT_DIR` / `CLAUDE_PLUGIN_ROOT` /
+> `CLAUDE_PLUGIN_DATA` / `CLAUDE_EFFORT` / `CLAUDE_ENV_FILE` / `CLAUDE_CODE_REMOTE` — the session id is
+> **not** among them. That is why the hook-deliver transport (§5.0) reads `session_id` from stdin
+> while the channel server reads `CLAUDE_CODE_SESSION_ID` from its environment: a hook is a short-lived
+> per-event command whose session context arrives as the event payload, whereas the channel server is
+> a long-lived MCP subprocess with no per-event stdin (its stdin is the JSON-RPC channel), so it
+> relies on the inherited process environment. Both resolve the **same** host session id; do not
+> "unify" them onto one mechanism — each uses the channel its runtime actually provides.
 
 Binding strategy, in preference order:
 
@@ -521,11 +541,13 @@ Transport and integration tests should be able to prove:
 
 ## 10. Open Questions
 
-- **Resolved (Claude Code 2.1.157):** a stdio MCP server receives `CLAUDE_PROJECT_DIR` (= workspace),
-  has its cwd set to the workspace, inherits `CLAUDE_CODE_SESSION_ID`, and can call `roots/list`. The
-  binding strategy in §4.4 is therefore confirmed; the host-version dependence means a future host
-  may differ, so the `experiments/channel-probe` diagnostic should be re-run when targeting a new
-  host.
+- **Resolved (Claude Code 2.1.157; re-confirmed 2.1.160):** a stdio MCP server receives
+  `CLAUDE_PROJECT_DIR` (= workspace), has its cwd set to the workspace, inherits
+  `CLAUDE_CODE_SESSION_ID`, and can call `roots/list`. The binding strategy in §4.4 is therefore
+  confirmed. **Caveat:** `CLAUDE_CODE_SESSION_ID` is _not_ in the documented MCP env contract (mcp.md
+  lists only `CLAUDE_PROJECT_DIR` + `roots/list`), so its inheritance is observed-not-contracted and
+  host-version-dependent — re-run the `experiments/channel-probe` diagnostic when targeting a new
+  host, and keep the workspace-binding fallback (§4.4 #2) as the documented-safe path.
 - Confirm `CLAUDE_CODE_SESSION_ID` equals the `hostSessionId` the `SessionStart` hook passes to
   `session open` (expected, but the channel transport's session binding depends on it).
 - Decide whether the channel server should open a synthetic workspace-lead session when channels are
