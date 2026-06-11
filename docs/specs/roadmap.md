@@ -58,7 +58,8 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
 > - One-way push **and** the two-way `agentmon_ack` tool via `agentmonitors channel serve`
 >   ([005 §13](./005-cli-reference.md), [006 §4](./006-agent-integration.md)); reusing `claimDelivery`
 >   gives cross-transport dedup and the durable hook-path fallback for free.
-> - An installable channel plugin in `channel-plugin/` (`.claude-plugin/plugin.json` + `.mcp.json`).
+> - An installable plugin: the channel MCP now ships inside the `agentmonitors` activation plugin at
+>   `agent-plugins/agentmonitors/.mcp.json` (a colocated aipm marketplace; see [006 §5.6](./006-agent-integration.md)).
 > - Binding confirmed empirically by `experiments/channel-probe` (006 §4.4).
 > - End-to-end **push** verified by `experiments/channel-uat` — an MCP-client harness that drives a
 >   real `channel serve` against a live daemon and asserts the `<channel>` push for both the

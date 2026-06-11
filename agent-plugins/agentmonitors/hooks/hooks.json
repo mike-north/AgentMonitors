@@ -1,0 +1,37 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if command -v agentmonitors >/dev/null 2>&1; then agentmonitors session start && agentmonitors hook deliver || true; else printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"The agentmonitors plugin is installed, but its CLI is not on your PATH. Install it with: npm i -g @agentmonitors/cli\"}}'; fi"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v agentmonitors >/dev/null 2>&1 && agentmonitors hook deliver || true"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v agentmonitors >/dev/null 2>&1 && agentmonitors session end || true"
+          }
+        ]
+      }
+    ]
+  }
+}

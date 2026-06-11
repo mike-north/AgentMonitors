@@ -77,8 +77,10 @@ the baseline every environment can use.
 ## 4. Channel Transport (Target)
 
 > **Status: implemented.** The one-way push (§4.1), the two-way `agentmon_ack` tool (§4.3), and
-> plugin packaging (`channel-plugin/` — a `.claude-plugin/plugin.json` + `.mcp.json` that runs
-> `agentmonitors channel serve`) all ship. `DeliveryEventSummary` now also carries `body` (the raw
+> plugin packaging (the channel MCP now ships inside the `agentmonitors` activation plugin at
+> [`agent-plugins/agentmonitors/.mcp.json`](../../agent-plugins/agentmonitors/.mcp.json) — a
+> `.mcp.json` that runs `agentmonitors channel serve`, alongside the lifecycle hooks; see §5.6) all
+> ship. `DeliveryEventSummary` now also carries `body` (the raw
 > monitor instructions — see [002 §9.1](./002-runtime-delivery.md)), available to transports that
 > want to surface the body alongside the title/summary. Remaining is an end-to-end **manual UAT**
 > (channels are research-preview, so not CI-able) and optional fuller meta (§4.2 `object_key`).
@@ -94,8 +96,8 @@ surface. (Channel mechanism reference:
 > **Status: implemented** as the `agentmonitors channel serve` command
 > (`apps/cli/src/commands/channel.ts`, [005 §13](./005-cli-reference.md)). It resolves its session
 > via `CLAUDE_CODE_SESSION_ID` (§4.4), polls `claimDelivery('turn-interruptible')` over the daemon
-> socket, and pushes each returned claim. (The two-way ack tool is §4.3; packaging is
-> `channel-plugin/`.)
+> socket, and pushes each returned claim. (The two-way ack tool is §4.3; packaging is the
+> `agentmonitors` activation plugin — §5.6.)
 
 The AgentMon channel server:
 
@@ -396,6 +398,56 @@ filters on `acknowledgedAt IS NULL` only. Therefore an event whose body was trun
 - **re-delivers** via the next context event (the truncation marker tells the agent to look there).
 
 No durable event is lost by truncation; the cap only bounds how much is injected into a single turn.
+
+### 5.6 Activation packaging (the `agentmonitors` plugin)
+
+> **Status: implemented.** Activation ships as a **colocated [aipm](https://www.npmjs.com/package/@ai-plugin-marketplace/cli)
+> marketplace** embedded in this repo: the single `agentmonitors` plugin under
+> [`agent-plugins/`](../../agent-plugins/) is installed once into Claude Code, after which a project
+> opts in with project-local state (no plugin reinstall per monitor). Generated marketplace
+> registries (`.claude-plugin/marketplace.json`) are committed and freshness-checked by
+> `aipm validate` in CI.
+
+The plugin wires the host lifecycle to the already-built CLI verbs (the user installs the
+`agentmonitors` bin globally — e.g. `npm i -g @agentmonitors/cli`):
+
+| Hook event         | Command(s)                                                   | Purpose                                                                                                                                                      |
+| ------------------ | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `SessionStart`     | `agentmonitors session start` → `agentmonitors hook deliver` | Lazy-boot the per-workspace daemon + register the session, then surface a recap (the `SessionStart`→`post-compact` mapping; a no-op when nothing is pending) |
+| `UserPromptSubmit` | `agentmonitors hook deliver`                                 | Primary turn-boundary delivery (`turn-interruptible` per §5.4)                                                                                               |
+| `SessionEnd`       | `agentmonitors session end`                                  | Deregister the session so the idle daemon reaps itself                                                                                                       |
+
+`hook deliver` reads the hook payload from **stdin** and derives the firing event from
+`hook_event_name` (§5.0/§5.4) — it takes no `--hook-event-name` flag. `session start`/`session end`
+read `CLAUDE_PROJECT_DIR`/cwd and need no flags. `PreToolUse`/`Stop` are intentionally **not** wired
+(they ignore `additionalContext` — §5.4); `PostToolUse` is left as a documented future tunable (it
+fires per-tool, so a daemon round-trip per tool is too costly for v1). Because the aipm v0.3.0 Claude
+hooks transform only covers `PreToolUse`/`PostToolUse`/`Stop`/`UserPromptSubmit`, the lifecycle
+events (`SessionStart`/`SessionEnd`) are authored as a host-native
+[`hooks/hooks.json`](../../agent-plugins/agentmonitors/hooks/hooks.json) referenced from the plugin
+manifest, rather than via aipm's YAML→JSON hook generation.
+
+**Hardened command form.** The hook commands are not bare `agentmonitors …` invocations; each is
+shell-guarded for the "installed plugin, missing CLI" case (a user who hasn't yet run
+`npm i -g @agentmonitors/cli`, or whose PATH differs in the hook environment):
+
+- **CLI-absent guard (all hooks).** Each command is wrapped `command -v agentmonitors >/dev/null 2>&1
+&& … || true`, so an uninstalled CLI produces a silent exit 0 rather than a `command not found`
+  (exit 127) surfaced to the user on every prompt in every project. The `SessionStart` hook goes
+  further and turns the miss into onboarding: when the CLI is absent it emits a one-shot
+  `additionalContext` hint pointing at `npm i -g @agentmonitors/cli`.
+- **`SessionStart` sequencing (no race).** Claude Code runs the hooks matched to one event **in
+  parallel**, so `session start` (which boots the daemon, writes `.local.md`, and registers the
+  session) and the recap `hook deliver` must not be two separate hook entries — the recap could run
+  before registration completes and silently no-op (worst after compaction, where the recap matters
+  most). They are composed in a **single** entry as `agentmonitors session start && agentmonitors
+hook deliver`, guaranteeing order.
+
+The channel MCP (§4) ships in the same plugin via
+[`.mcp.json`](../../agent-plugins/agentmonitors/.mcp.json) (server key `agentmonitors`, preserving
+the `<channel source="agentmonitors">` tag). A bundled `setup-monitors` skill walks the user through
+enabling a project (the gitignored `.claude/agentmonitors.local.md` with `enabled: true`) and
+authoring `.claude/monitors/<id>/MONITOR.md` files.
 
 ## 6. Availability & Fallback
 
