@@ -3,6 +3,7 @@ import path from 'node:path';
 import { claudeCodeAdapter } from '@agentmonitors/core';
 import { reportError } from '../output.js';
 import {
+  claimDeliveryClient,
   closeSessionClient,
   listSessionsClient,
   openSessionClient,
@@ -12,6 +13,7 @@ import { readLocalState, writeLocalState } from '../local-state.js';
 import { workspacePaths } from '../workspace-paths.js';
 import { spawnDetachedDaemon } from '../detached-spawn.js';
 import { readHookPayload } from '../hook-payload.js';
+import { renderHookDelivery } from '../hook-deliver-render.js';
 
 export const sessionCommand = new Command('session').description(
   'Manage agent sessions tracked by AgentMon',
@@ -194,13 +196,27 @@ sessionCommand
     writeLocalState(workspacePath, { ...state, socket, db });
 
     try {
-      await openSessionClient(
+      const opened = await openSessionClient(
         claudeCodeAdapter.createSessionInput({
           hostSessionId,
           workspacePath,
         }),
         socket,
       );
+
+      // SessionStart is a context event, so this command ALSO surfaces the
+      // post-compact recap — from the SAME stdin payload we already read.
+      // The plugin runs `session start` as ONE hook command; a separately
+      // chained `agentmonitors hook deliver` would see an already-consumed
+      // stdin (one hook invocation = one stdin stream), parse `{}`, and
+      // silently no-op. Reading once and delivering here is the fix. On a
+      // fresh start nothing is pending → renderHookDelivery returns null →
+      // nothing is printed; on a compact-resume the unread events are recapped.
+      const claim = await claimDeliveryClient(opened.id, 'post-compact', socket);
+      const delivery = renderHookDelivery(claim, 'SessionStart');
+      if (delivery !== null) {
+        process.stdout.write(JSON.stringify(delivery));
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       reportError(message, false);

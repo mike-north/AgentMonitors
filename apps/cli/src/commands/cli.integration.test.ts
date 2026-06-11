@@ -1777,6 +1777,134 @@ describe('lazy daemon lifecycle', () => {
   // The price is the ~15s high-urgency settle window before the event
   // materializes — accepted here exactly like the `hook deliver` test above.
   // -------------------------------------------------------------------------
+  // Regression for the PR #83 blocking review: the plugin runs SessionStart as a
+  // SINGLE shell command (`agentmonitors session start`). `session start` reads
+  // the hook payload from stdin; a separately chained `agentmonitors hook deliver`
+  // would see an already-consumed stdin (one hook invocation = one stdin stream),
+  // parse `{}`, and silently no-op — killing the post-compact recap. So
+  // `session start` MUST register AND surface the recap itself, from the one
+  // payload it reads. This test drives the ACTUAL shipped command form: one
+  // subprocess, one stdin stream, and asserts the recap reaches additionalContext.
+  it('SessionStart delivers the post-compact recap from a single stdin payload (the real shipped hook form)', async () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-ss-recap-'));
+    const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-src');
+    mkdirSync(monitorsDir, { recursive: true });
+
+    const RECAP_BODY = 'Recap: the watched file changed since you were away.';
+    const watchedFile = path.join(ws, 'watched.txt');
+    writeFileSync(watchedFile, 'initial', 'utf-8');
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      [
+        '---',
+        'name: Watch src',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs:',
+        '    - "watched.txt"',
+        `  cwd: ${JSON.stringify(ws)}`,
+        '  interval: "1s"',
+        // Normal urgency emits immediately (no 15s high-urgency debounce), so the
+        // event materializes fast. The post-compact recap delivers ANY unread
+        // event (not just settled-high), so normal urgency exercises this path.
+        'urgency: normal',
+        '---',
+        RECAP_BODY,
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+
+    const socket = path.join(
+      '/tmp',
+      `agentmon-ssrecap-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const db = path.join(ws, 'ssrecap.db');
+    const hostSessionId = 'ss-recap-session';
+    writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 60_000 });
+    const env: Record<string, string> = {
+      CLAUDE_PROJECT_DIR: ws,
+      AGENTMONITORS_DB: db,
+      AGENTMONITORS_SOCKET: socket,
+    };
+    const ssPayload = JSON.stringify({
+      session_id: hostSessionId,
+      hook_event_name: 'SessionStart',
+      cwd: ws,
+    });
+
+    try {
+      // 1. First SessionStart: lazy-boot + register. Nothing pending yet, so the
+      //    single command prints no recap.
+      const first = runWithStdin(['session', 'start'], env, ssPayload, ws);
+      expect(first.exitCode).toBe(0);
+      expect(first.stdout.trim()).toBe('');
+      expect(await daemonAvailable(socket)).toBe(true);
+
+      const registered = (
+        JSON.parse(
+          runWithEnv(
+            ['session', 'list', '--socket', socket, '--format', 'json'],
+            env,
+            ws,
+          ).stdout,
+        ) as { id: string; hostSessionId: string }[]
+      ).find((s) => s.hostSessionId === hostSessionId);
+      expect(registered).toBeDefined();
+      const sessionId = registered?.id ?? '';
+
+      // 2. The watched file changes; poll until the daemon materializes + projects
+      //    the unread event (post-compact recap needs only unread, not the settle).
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
+      writeFileSync(watchedFile, 'changed: added eval()', 'utf-8');
+      const deadline = Date.now() + 12_000;
+      while (Date.now() < deadline) {
+        const r = runWithEnv(
+          [
+            'events',
+            'list',
+            '--session',
+            sessionId,
+            '--unread',
+            '--format',
+            'json',
+            '--socket',
+            socket,
+          ],
+          env,
+          ws,
+        );
+        if (r.exitCode === 0 && (JSON.parse(r.stdout) as unknown[]).length >= 1) {
+          break;
+        }
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+      }
+
+      // 3. Second SessionStart (a compact-resume) with ONE stdin payload: the
+      //    single `session start` command must itself emit the recap — proving
+      //    start-then-deliver works from a single stdin stream.
+      const resume = runWithStdin(['session', 'start'], env, ssPayload, ws);
+      expect(resume.exitCode).toBe(0);
+      const out = JSON.parse(resume.stdout) as {
+        continue: boolean;
+        hookSpecificOutput: { hookEventName: string; additionalContext: string };
+      };
+      expect(out.hookSpecificOutput.hookEventName).toBe('SessionStart');
+      expect(out.hookSpecificOutput.additionalContext).toContain(RECAP_BODY);
+
+      runWithStdin(
+        ['session', 'end'],
+        env,
+        sessionEndPayload(hostSessionId, ws),
+        ws,
+      );
+    } finally {
+      runWithEnv(['daemon', 'stop', '--socket', socket], env, ws);
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  // -------------------------------------------------------------------------
   it('steel thread: drop a monitor, session start boots the daemon, a watched-file change is delivered as the monitor body at the next turn', async () => {
     const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-steel-thread-'));
     const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-src');

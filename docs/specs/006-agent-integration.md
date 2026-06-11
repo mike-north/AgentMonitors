@@ -438,7 +438,7 @@ The plugin wires the host lifecycle to the already-built CLI verbs (the user ins
 
 | Hook event         | Command(s)                                                   | Purpose                                                                                                                                                      |
 | ------------------ | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `SessionStart`     | `agentmonitors session start` → `agentmonitors hook deliver` | Lazy-boot the per-workspace daemon + register the session, then surface a recap (the `SessionStart`→`post-compact` mapping; a no-op when nothing is pending) |
+| `SessionStart`     | `agentmonitors session start`                                | Lazy-boot the per-workspace daemon + register the session, then surface the post-compact recap **in the same process** (a no-op when nothing is pending). NOT a chained `&& hook deliver` — see "single-process SessionStart" below |
 | `UserPromptSubmit` | `agentmonitors hook deliver`                                 | Primary turn-boundary delivery (`turn-interruptible` per §5.4)                                                                                               |
 | `SessionEnd`       | `agentmonitors session end`                                  | Deregister the session so the idle daemon reaps itself                                                                                                       |
 
@@ -464,12 +464,18 @@ shell-guarded for the "installed plugin, missing CLI" case (a user who hasn't ye
   (exit 127) surfaced to the user on every prompt in every project. The `SessionStart` hook goes
   further and turns the miss into onboarding: when the CLI is absent it emits a one-shot
   `additionalContext` hint pointing at `npm i -g @agentmonitors/cli`.
-- **`SessionStart` sequencing (no race).** Claude Code runs the hooks matched to one event **in
-  parallel**, so `session start` (which boots the daemon, writes `.local.md`, and registers the
-  session) and the recap `hook deliver` must not be two separate hook entries — the recap could run
-  before registration completes and silently no-op (worst after compaction, where the recap matters
-  most). They are composed in a **single** entry as `agentmonitors session start && agentmonitors
-hook deliver`, guaranteeing order.
+- **Single-process `SessionStart` (one stdin stream).** A Claude Code hook invocation provides
+  **one** stdin stream for the whole command. Both `session start` and `hook deliver` read the hook
+  payload with `readHookPayload()` (which consumes all of stdin), so a chained
+  `agentmonitors session start && agentmonitors hook deliver` is broken: `session start` consumes the
+  payload, and the subsequent `hook deliver` sees EOF, parses `{}`, finds no `session_id`, and
+  silently no-ops — killing the recap. Therefore `agentmonitors session start` reads the payload
+  **once** and, after registering, performs the post-compact recap **itself** (claims
+  `post-compact` and prints the rendered `additionalContext` when there are unread events). The
+  SessionStart hook runs the single command `agentmonitors session start`; there is no chained
+  delivery. (This also avoids the parallel-execution race a two-entry form would have had.) The
+  `UserPromptSubmit` and `SessionEnd` hooks are each their own invocation with their own stdin, so
+  they remain single commands.
 
 The channel MCP (§4) ships in the same plugin via
 [`.mcp.json`](../../agent-plugins/agentmonitors/.mcp.json) (server key `agentmonitors`, preserving
