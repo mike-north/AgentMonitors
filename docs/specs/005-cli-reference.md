@@ -662,15 +662,18 @@ agentmonitors session list [options]
 agentmonitors session start
 ```
 
-No flags. Reads workspace and session context from environment variables:
+No flags. Like `hook deliver`, this command is hook-invoked and reads its context from the **Claude
+Code hook payload on stdin** (a JSON object — there is **no `CLAUDE_CODE_SESSION_ID` env var**; see
+006 §5.0). If stdin is a TTY or empty/unparseable, the payload is `{}`.
 
-| Environment variable     | Description                                    |
-| ------------------------ | ---------------------------------------------- |
-| `CLAUDE_CODE_SESSION_ID` | Host session id (required; no-op if absent)    |
-| `CLAUDE_PROJECT_DIR`     | Workspace path (falls back to `process.cwd()`) |
+| Payload field | Description                                                               |
+| ------------- | ------------------------------------------------------------------------- |
+| `session_id`  | Host session id (required; quiet no-op if absent — not a Claude session)  |
+| `cwd`         | Workspace path (falls back to `CLAUDE_PROJECT_DIR`, then `process.cwd()`) |
 
 **Behavior:**
 
+0. Reads the hook payload from stdin. `hostSessionId = session_id`; if absent, exits silently (not a Claude session).
 1. Reads `.claude/agentmonitors.local.md` in the workspace. If absent or `enabled: false`, exits silently (quick-exit).
 2. Derives per-workspace socket/db paths via `workspacePaths()` (overridden by `socket`/`db` fields in the local state file if present).
 3. If no daemon is listening at the socket, spawns `daemon run` as a **detached background process** (`stdio: 'ignore'`, `.unref()`), passing the derived socket/db paths, the monitors dir, and `reap-after-ms` from the local state. Waits up to 8 seconds for the socket to appear.
@@ -679,7 +682,7 @@ No flags. Reads workspace and session context from environment variables:
 
 **No output on success.** Errors are printed to stderr and set exit code 1.
 
-**Designed for use as a `PreToolUse` / `PostToolUse` hook** (or any Claude Code lifecycle hook that runs at session start). Claude Code does not need the daemon to be pre-started.
+**Designed for use as a `SessionStart` hook** (see 006 §5.6). Claude Code does not need the daemon to be pre-started.
 
 ### §10.5 `session end` — Deregister session
 
@@ -687,13 +690,15 @@ No flags. Reads workspace and session context from environment variables:
 agentmonitors session end
 ```
 
-No flags. Reads the same environment variables as `session start`.
+No flags. Reads the same stdin hook payload as `session start` (`session_id` + `cwd`; **not** env
+vars).
 
 **Behavior:**
 
+0. Reads the hook payload from stdin. `hostSessionId = session_id`; if absent, exits silently.
 1. Reads `.claude/agentmonitors.local.md`. If absent, `enabled: false`, or no `socket` field, exits silently.
 2. If the daemon is unreachable, exits silently.
-3. Calls `session.list` to find the runtime session whose `hostSessionId` matches `CLAUDE_CODE_SESSION_ID`, then calls `session.close` on it.
+3. Calls `session.list` to find the runtime session whose `hostSessionId` matches the payload's `session_id`, then calls `session.close` on it.
 
 After all sessions for a workspace are closed, the daemon's idle reaper will stop it within `reap-after-ms`.
 

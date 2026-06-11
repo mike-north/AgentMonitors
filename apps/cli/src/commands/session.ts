@@ -11,6 +11,7 @@ import { daemonAvailable, resolveSocketPath } from '../daemon-ipc.js';
 import { readLocalState, writeLocalState } from '../local-state.js';
 import { workspacePaths } from '../workspace-paths.js';
 import { spawnDetachedDaemon } from '../detached-spawn.js';
+import { readHookPayload } from '../hook-payload.js';
 
 export const sessionCommand = new Command('session').description(
   'Manage agent sessions tracked by AgentMon',
@@ -134,9 +135,16 @@ sessionCommand
     'Lazy-boot the project daemon (if needed) and register this session',
   )
   .action(async () => {
-    const workspacePath = process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
-    const hostSessionId = process.env['CLAUDE_CODE_SESSION_ID'];
+    // Claude Code delivers hook input as JSON on STDIN (not env vars). The host
+    // session id comes from the payload's `session_id`; there is NO
+    // `CLAUDE_CODE_SESSION_ID` env var in a real hook invocation. This is the
+    // same contract `hook deliver` reads.
+    const payload = await readHookPayload();
+    const hostSessionId = payload.session_id;
     if (!hostSessionId) return; // not a Claude session; nothing to do
+
+    const workspacePath =
+      payload.cwd ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
 
     const state = readLocalState(workspacePath);
     if (!state.enabled) return; // quick-exit: monitoring not enabled here
@@ -203,9 +211,13 @@ sessionCommand
   .command('end')
   .description('Deregister this session (lets the idle daemon reap itself)')
   .action(async () => {
-    const workspacePath = process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
-    const hostSessionId = process.env['CLAUDE_CODE_SESSION_ID'];
+    // Same stdin contract as `session start` / `hook deliver`: the host session
+    // id is the payload's `session_id`, not an env var.
+    const payload = await readHookPayload();
+    const hostSessionId = payload.session_id;
     if (!hostSessionId) return;
+    const workspacePath =
+      payload.cwd ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
     const state = readLocalState(workspacePath);
     if (!state.enabled || !state.socket) return;
     const socket = resolveSocketPath(state.socket);

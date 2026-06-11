@@ -1489,8 +1489,10 @@ function bootLazyWorkspace(reapAfterMs: number): {
   writeLocalState(ws, { enabled: true, socket, db, reapAfterMs });
 
   const hostSessionId = `lazy-test-${Date.now()}`;
+  // NOTE: no CLAUDE_CODE_SESSION_ID — that env var does not exist in a real
+  // Claude Code hook. `session start` / `session end` read the host session id
+  // from the hook stdin payload (`session_id`), so these tests feed it that way.
   const env = {
-    CLAUDE_CODE_SESSION_ID: hostSessionId,
     CLAUDE_PROJECT_DIR: ws,
     AGENTMONITORS_DB: db,
     AGENTMONITORS_SOCKET: socket,
@@ -1499,14 +1501,40 @@ function bootLazyWorkspace(reapAfterMs: number): {
   return { ws, socket, db, env, hostSessionId };
 }
 
+/** A Claude-Code-style SessionStart hook payload (delivered on stdin). */
+function sessionStartPayload(hostSessionId: string, ws: string): string {
+  return JSON.stringify({
+    session_id: hostSessionId,
+    hook_event_name: 'SessionStart',
+    cwd: ws,
+  });
+}
+
+/** A Claude-Code-style SessionEnd hook payload (delivered on stdin). */
+function sessionEndPayload(hostSessionId: string, ws: string): string {
+  return JSON.stringify({
+    session_id: hostSessionId,
+    hook_event_name: 'SessionEnd',
+    cwd: ws,
+  });
+}
+
 describe('lazy daemon lifecycle', () => {
   it('session start boots a per-workspace daemon and registers the session', async () => {
     // Use a short reapAfterMs so an escaped daemon self-cleans (defence-in-depth).
     const { ws, socket, env, hostSessionId } = bootLazyWorkspace(5_000);
 
     try {
-      // session start should lazy-boot the daemon and open the session
-      const start = runWithEnv(['session', 'start'], env, ws);
+      // session start should lazy-boot the daemon and open the session. The
+      // host session id arrives ONLY via the stdin payload (`session_id`) — the
+      // production code no longer reads CLAUDE_CODE_SESSION_ID, so this would
+      // fail against the old env-reading implementation.
+      const start = runWithStdin(
+        ['session', 'start'],
+        env,
+        sessionStartPayload(hostSessionId, ws),
+        ws,
+      );
       expect(start.exitCode).toBe(0);
 
       // daemon is up on the per-workspace socket
@@ -1528,7 +1556,12 @@ describe('lazy daemon lifecycle', () => {
       );
 
       // session end deregisters the session
-      const end = runWithEnv(['session', 'end'], env, ws);
+      const end = runWithStdin(
+        ['session', 'end'],
+        env,
+        sessionEndPayload(hostSessionId, ws),
+        ws,
+      );
       expect(end.exitCode).toBe(0);
     } finally {
       try {
@@ -1545,19 +1578,29 @@ describe('lazy daemon lifecycle', () => {
     // latest reap fires at: reapAfterMs + 1 poll = 1500 + 1000 = 2500 ms
     // deadline = reapAfterMs + 4 * daemonPollMs + 2000 ms headroom = 7500 ms
     const reapAfterMs = 1500;
-    const { ws, socket, env } = bootLazyWorkspace(reapAfterMs);
+    const { ws, socket, env, hostSessionId } = bootLazyWorkspace(reapAfterMs);
 
     // bootLazyWorkspace already wrote local state with the explicit socket/db.
     // No overwrite needed — the reapAfterMs is already in the state.
 
     try {
-      // Boot + register
-      const start = runWithEnv(['session', 'start'], env, ws);
+      // Boot + register (host session id via the stdin hook payload).
+      const start = runWithStdin(
+        ['session', 'start'],
+        env,
+        sessionStartPayload(hostSessionId, ws),
+        ws,
+      );
       expect(start.exitCode).toBe(0);
       expect(await daemonAvailable(socket)).toBe(true);
 
       // End the session — daemon should become idle
-      const end = runWithEnv(['session', 'end'], env, ws);
+      const end = runWithStdin(
+        ['session', 'end'],
+        env,
+        sessionEndPayload(hostSessionId, ws),
+        ws,
+      );
       expect(end.exitCode).toBe(0);
 
       // Poll until unavailable — deadline = reapAfterMs + 4 * daemon_pollMs + headroom
@@ -1637,20 +1680,29 @@ describe('lazy daemon lifecycle', () => {
 
     const hostIdA = `cross-ws-A-${Date.now()}`;
     const hostIdB = `cross-ws-B-${Date.now()}`;
+    // No CLAUDE_CODE_SESSION_ID — the host id is fed via the stdin payload.
     const envA = {
-      CLAUDE_CODE_SESSION_ID: hostIdA,
       CLAUDE_PROJECT_DIR: wsA,
     };
     const envB = {
-      CLAUDE_CODE_SESSION_ID: hostIdB,
       CLAUDE_PROJECT_DIR: wsB,
     };
 
     try {
-      // Start both sessions — each gets its own daemon
-      const startA = runWithEnv(['session', 'start'], envA, wsA);
+      // Start both sessions — each gets its own daemon. Host id via stdin.
+      const startA = runWithStdin(
+        ['session', 'start'],
+        envA,
+        sessionStartPayload(hostIdA, wsA),
+        wsA,
+      );
       expect(startA.exitCode).toBe(0);
-      const startB = runWithEnv(['session', 'start'], envB, wsB);
+      const startB = runWithStdin(
+        ['session', 'start'],
+        envB,
+        sessionStartPayload(hostIdB, wsB),
+        wsB,
+      );
       expect(startB.exitCode).toBe(0);
 
       // Both daemons must be simultaneously reachable on their derived sockets
@@ -1684,8 +1736,18 @@ describe('lazy daemon lifecycle', () => {
       expect(sessionsB.some((s) => s.hostSessionId === hostIdA)).toBe(false);
 
       // Clean up both sessions
-      runWithEnv(['session', 'end'], envA, wsA);
-      runWithEnv(['session', 'end'], envB, wsB);
+      runWithStdin(
+        ['session', 'end'],
+        envA,
+        sessionEndPayload(hostIdA, wsA),
+        wsA,
+      );
+      runWithStdin(
+        ['session', 'end'],
+        envB,
+        sessionEndPayload(hostIdB, wsB),
+        wsB,
+      );
     } finally {
       for (const socket of [pathsA.socket, pathsB.socket]) {
         try {
@@ -1698,6 +1760,200 @@ describe('lazy daemon lifecycle', () => {
       rmSync(wsB, { recursive: true, force: true });
     }
   }, 30_000);
+
+  // -------------------------------------------------------------------------
+  // Steel-thread UAT (Plan D Task 4) — the campaign's "done" gate.
+  //
+  // This is the end-to-end proof of the whole activation loop, driven EXACTLY
+  // as the plugin's hooks drive it in a real Claude Code session: every host
+  // interaction (session start, hook deliver, session end) feeds a CC-style
+  // JSON payload on STDIN — the real contract — NOT env vars. A dropped monitor
+  // + a watched-file change must end with the agent being handed THAT monitor's
+  // own body-instruction as additionalContext at the next turn boundary.
+  //
+  // We use HIGH urgency so the monitor body is included in the claim's events[]
+  // (and thus the rendered additionalContext). At `turn-interruptible`, normal
+  // urgency returns events:[] (reminder only), which would not carry the body.
+  // The price is the ~15s high-urgency settle window before the event
+  // materializes — accepted here exactly like the `hook deliver` test above.
+  // -------------------------------------------------------------------------
+  it('steel thread: drop a monitor, session start boots the daemon, a watched-file change is delivered as the monitor body at the next turn', async () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-steel-thread-'));
+    const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-src');
+    mkdirSync(monitorsDir, { recursive: true });
+
+    // The distinctive body-instruction that MUST reach the agent verbatim.
+    const BODY_INSTRUCTION =
+      'Review the changed file and flag risky edits before continuing.';
+
+    // 1. Scaffold the workspace: a watched file + a file-fingerprint monitor.
+    const watchedFile = path.join(ws, 'watched.txt');
+    writeFileSync(watchedFile, 'initial content', 'utf-8');
+
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      [
+        '---',
+        'name: Watch src',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs:',
+        '    - "watched.txt"',
+        `  cwd: ${JSON.stringify(ws)}`,
+        '  interval: "1s"',
+        'urgency: high',
+        '---',
+        BODY_INSTRUCTION,
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+
+    // Per-workspace socket + db; enable monitoring via .claude/agentmonitors.local.md.
+    const socket = path.join(
+      '/tmp',
+      `agentmon-steel-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const db = path.join(ws, 'steel-thread.db');
+    const hostSessionId = 'steel-thread-session';
+    // Short reap window so any escaped daemon self-cleans (defence-in-depth);
+    // long enough not to reap mid-test before session end.
+    writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 60_000 });
+
+    const env: Record<string, string> = {
+      CLAUDE_PROJECT_DIR: ws,
+      AGENTMONITORS_DB: db,
+      AGENTMONITORS_SOCKET: socket,
+    };
+
+    try {
+      // 2. `session start` with a SessionStart payload on STDIN — lazy-boots the
+      //    daemon and registers the session. No CLAUDE_CODE_SESSION_ID.
+      const start = runWithStdin(
+        ['session', 'start'],
+        env,
+        JSON.stringify({
+          session_id: hostSessionId,
+          hook_event_name: 'SessionStart',
+          cwd: ws,
+        }),
+        ws,
+      );
+      expect(start.exitCode).toBe(0);
+
+      // The daemon lazy-booted on the per-workspace socket...
+      expect(await daemonAvailable(socket)).toBe(true);
+
+      // ...and the session is registered.
+      const list = runWithEnv(
+        ['session', 'list', '--socket', socket, '--format', 'json'],
+        env,
+        ws,
+      );
+      expect(list.exitCode).toBe(0);
+      const sessions = JSON.parse(list.stdout) as {
+        id: string;
+        hostSessionId: string;
+      }[];
+      const registered = sessions.find(
+        (s) => s.hostSessionId === hostSessionId,
+      );
+      expect(registered).toBeDefined();
+      const sessionId = registered?.id ?? '';
+
+      // 3. Let the baseline tick run, then mutate the watched file.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
+      writeFileSync(watchedFile, 'changed content', 'utf-8');
+
+      // Poll until the high-urgency event materializes past the 15s settle.
+      const unread = () =>
+        runWithEnv(
+          [
+            'events',
+            'list',
+            '--session',
+            sessionId,
+            '--unread',
+            '--format',
+            'json',
+          ],
+          env,
+          ws,
+        );
+      const eventDeadline = Date.now() + 20_000;
+      while (Date.now() < eventDeadline) {
+        const r = unread();
+        if (r.exitCode === 0 && JSON.parse(r.stdout).length >= 1) break;
+        await new Promise((res) => setTimeout(res, 500));
+      }
+      expect(JSON.parse(unread().stdout)).toHaveLength(1);
+
+      // 4. `hook deliver` with a UserPromptSubmit payload on STDIN. THIS is the
+      //    steel-thread assertion: the dropped monitor's own body-instruction is
+      //    handed to the agent as additionalContext at the turn boundary.
+      const deliver = runWithStdin(
+        ['hook', 'deliver'],
+        env,
+        JSON.stringify({
+          session_id: hostSessionId,
+          hook_event_name: 'UserPromptSubmit',
+          cwd: ws,
+        }),
+        ws,
+      );
+      expect(deliver.exitCode).toBe(0);
+      expect(deliver.stdout.trim()).not.toBe('');
+      const output = JSON.parse(deliver.stdout) as {
+        continue: boolean;
+        hookSpecificOutput: {
+          hookEventName: string;
+          additionalContext: string;
+        };
+      };
+      expect(output.hookSpecificOutput.hookEventName).toBe('UserPromptSubmit');
+      // The monitor id and its distinctive body must both appear in the context.
+      expect(output.hookSpecificOutput.additionalContext).toContain(
+        'watch-src',
+      );
+      expect(output.hookSpecificOutput.additionalContext).toContain(
+        BODY_INSTRUCTION,
+      );
+
+      // 5. `session end` with a SessionEnd payload on STDIN — deregisters.
+      const end = runWithStdin(
+        ['session', 'end'],
+        env,
+        JSON.stringify({
+          session_id: hostSessionId,
+          hook_event_name: 'SessionEnd',
+          cwd: ws,
+        }),
+        ws,
+      );
+      expect(end.exitCode).toBe(0);
+
+      // The session is deregistered (marked dormant).
+      const listAfter = runWithEnv(
+        ['session', 'list', '--socket', socket, '--format', 'json'],
+        env,
+        ws,
+      );
+      expect(listAfter.exitCode).toBe(0);
+      const after = JSON.parse(listAfter.stdout) as {
+        id: string;
+        status: string;
+      }[];
+      expect(after.find((s) => s.id === sessionId)?.status).toBe('dormant');
+    } finally {
+      // No orphan daemons: stop the per-workspace daemon explicitly.
+      try {
+        await callDaemon('stop', {}, { socketPath: socket });
+      } catch {
+        // already stopped — ignore
+      }
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 40_000); // high-urgency settle = 15s + baseline + detection + headroom
 });
 
 // ---------------------------------------------------------------------------

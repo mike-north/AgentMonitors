@@ -277,6 +277,11 @@ The read is robust: if stdin is a TTY or empty/unparseable, the payload is treat
 command never hangs waiting for input). The only relevant documented hook environment variable is
 `CLAUDE_PROJECT_DIR`, used as a workspace fallback when the payload omits `cwd`.
 
+This stdin contract is shared by **all hook-invoked commands** — `hook deliver` **and** the lifecycle
+commands `session start` / `session end` (§5.6). All three derive the host session id from
+`session_id` and the workspace from `cwd` → `CLAUDE_PROJECT_DIR` → process cwd; none of them read a
+session id from the environment.
+
 > **Input contract reference:** <https://code.claude.com/docs/en/hooks.md> (Hook Input — "Hooks
 > receive data via stdin as JSON" with `session_id`, `cwd`, `hook_event_name`, `transcript_path`,
 > `permission_mode`, plus event-specific fields).
@@ -439,7 +444,10 @@ The plugin wires the host lifecycle to the already-built CLI verbs (the user ins
 
 `hook deliver` reads the hook payload from **stdin** and derives the firing event from
 `hook_event_name` (§5.0/§5.4) — it takes no `--hook-event-name` flag. `session start`/`session end`
-read `CLAUDE_PROJECT_DIR`/cwd and need no flags. `PreToolUse`/`Stop` are intentionally **not** wired
+read the **same stdin payload** (§5.0): the host session id is the payload's `session_id` (there is
+**no `CLAUDE_CODE_SESSION_ID` env var** — reading one would silently no-op in a real session, so the
+daemon would never boot and the session would never register), and the workspace is `cwd` →
+`CLAUDE_PROJECT_DIR` → process cwd. They take no `--host-session-id` flag. `PreToolUse`/`Stop` are intentionally **not** wired
 (they ignore `additionalContext` — §5.4); `PostToolUse` is left as a documented future tunable (it
 fires per-tool, so a daemon round-trip per tool is too costly for v1). Because the aipm v0.3.0 Claude
 hooks transform only covers `PreToolUse`/`PostToolUse`/`Stop`/`UserPromptSubmit`, the lifecycle
