@@ -2,11 +2,13 @@
 
 > **Status:** Draft
 > **Depends on:** [000-principles.md](./000-principles.md), [001-monitor-definition.md](./001-monitor-definition.md), [002-runtime-delivery.md](./002-runtime-delivery.md)
-> **Covers:** source contract, bundled sources, current limitations, plugin-discovery notes
+> **Covers:** source contract, bundled sources, current limitations, plugin-discovery notes, target sources (`command-poll`) and target change-detection capabilities
 
 ## 1. Overview
 
 This document specifies the contract implemented by observation source plugins and the current behavior of the bundled sources: `file-fingerprint`, `api-poll`, `schedule`, `incoming-changes`. The runtime depends on sources to detect change, but the runtime owns scheduling, notify dispatch, and delivery timing (PP3).
+
+Sections marked **target** (§11–§13: the `command-poll` source, keyed-collection change detection, and the cursor protocol) are normative designs that are **not yet implemented** (PP7); they move to current status, with `verified:` references, when they ship.
 
 ### Principles Satisfied
 
@@ -38,13 +40,21 @@ The interface definition (verified: `libs/core/src/observation/types.ts`):
 
 | Member                     | Kind                         | Required | Description                                                                                                                 |
 | -------------------------- | ---------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `name`                     | `readonly string`            | Yes      | Unique kebab-case plugin name. Matches the `source` field in `MONITOR.md`.                                                  |
-| `scopeSchema`              | `readonly JsonSchema`        | Yes      | JSON Schema fragment describing this source's `scope` configuration.                                                        |
+| `name`                     | `readonly string`            | Yes      | Unique kebab-case plugin name. Matches `watch.type` in `MONITOR.md`.                                                        |
+| `scopeSchema`              | `readonly JsonSchema`        | Yes      | JSON Schema fragment describing this source's per-source config (the `watch:` block minus `type`).                          |
 | `stateful`                 | `readonly boolean?`          | No       | If `true`, the first successful call establishes a baseline (PP6). Defaults to `false` when absent.                         |
 | `observe(config, context)` | `Promise<ObservationResult>` | Yes      | One-shot observation: check for changes and return any observations.                                                        |
 | `watch?(config, context)`  | `AsyncIterable<Observation>` | No       | Optional continuous watch mode, driven by the runtime for sources that implement it (NP4). Stops on `context.signal` abort. |
 
 `JsonSchema` is typed as `Record<string, unknown>`, making it a plain object describing a JSON Schema fragment.
+
+> **Naming note ("scope" vs `watch:`).** The TypeScript contract and core helpers retain the
+> historical **scope** wording — `scopeSchema`, `validateScope` — from before the authoring surface
+> migrated to `watch: { type, … }`. The two describe the same thing: "scope" in code refers to the
+> per-source configuration that authors now write flat inside the `watch:` block alongside `type`,
+> and `name` is the value authors reference as `watch.type`. Plugin authors reading the `verified:`
+> sources should translate accordingly; renaming the code identifiers is deliberately out of scope
+> here (it would be a breaking public-API change for plugin authors).
 
 ### 2.2 Observation context
 
@@ -97,7 +107,8 @@ Source name: `"file-fingerprint"` (verified: `plugins/source-file-fingerprint/sr
 ### 3.1 Scope
 
 ```yaml
-scope:
+watch:
+  type: file-fingerprint
   globs:
     - '**/*.ts'
   cwd: /optional/base/path
@@ -148,7 +159,8 @@ Source name: `"api-poll"` (verified: `plugins/source-api-poll/src/index.ts` line
 ### 4.1 Scope
 
 ```yaml
-scope:
+watch:
+  type: api-poll
   url: 'https://api.example.com/status'
   method: GET
   headers:
@@ -218,7 +230,8 @@ Source name: `"schedule"` (verified: `plugins/source-schedule/src/index.ts` line
 ### 5.1 Scope
 
 ```yaml
-scope:
+watch:
+  type: schedule
   cron: '0 9 * * 1-5'
   timezone: America/Los_Angeles
   label: Daily review
@@ -244,12 +257,13 @@ The source does not decide when it is due — that is the runtime's responsibili
 
 Source name: `"incoming-changes"` (verified: `plugins/source-incoming-changes/src/index.ts`).
 
-Package: `@agentmonitors/source-incoming-changes`. Registered via `registerCoreSources` and available as an `agentmonitors init --source incoming-changes` template (issue #39).
+Package: `@agentmonitors/source-incoming-changes`. Registered via `registerCoreSources` and available as an `agentmonitors init --type incoming-changes` template (issue #39).
 
 ### 6.1 Scope
 
 ```yaml
-scope:
+watch:
+  type: incoming-changes
   paths:
     - 'src/'
     - 'lib/'
@@ -318,9 +332,9 @@ commands are placeholders that print a manual-install hint (NP3). See §8.
 The generated schema:
 
 - Uses `$schema: 'http://json-schema.org/draft-07/schema#'`
-- Declares top-level required fields: `source`, `urgency`, `scope`
-- Constrains `source` to the enum of registered source names
-- Uses `allOf` with `if/then` conditionals to enforce the correct `scope` shape for each `source` value
+- Declares top-level required fields: `watch`, `urgency`
+- Requires `watch.type` and constrains it to the enum of registered source names
+- Uses `allOf` with `if/then` conditionals (each `if` requiring `watch.type`) to enforce the correct per-source config shape inside `watch:` for each `type` value
 - Validates the `notify` field with a `oneOf` covering `debounce` (requires `settle-for`) and `throttle` (requires `suppress-for`)
 - Accepts an optional `tags` array of strings
 
@@ -342,7 +356,8 @@ This is an explicit non-property of the current product (NP3).
 ### 9.1 File watcher example
 
 ```yaml
-scope:
+watch:
+  type: file-fingerprint
   globs:
     - 'src/**/*.ts'
   cwd: /workspace
@@ -353,7 +368,8 @@ scope:
 ### 9.2 Status-code-only API watcher
 
 ```yaml
-scope:
+watch:
+  type: api-poll
   url: 'https://api.example.com/health'
   change-detection:
     strategy: status-code
@@ -364,7 +380,8 @@ scope:
 ### 9.3 Schedule source with label
 
 ```yaml
-scope:
+watch:
+  type: schedule
   cron: '0 9 * * 1-5'
   timezone: America/New_York
   label: Morning standup reminder
@@ -384,3 +401,241 @@ Source-level tests SHOULD verify:
 - Source errors are surfaced clearly for invalid required config: missing `globs`, missing `url`, or unresolved bearer token (see §4.3 for the exact error message format); missing `paths` for `incoming-changes`.
 - `incoming-changes` emits no observations on the baseline run; subsequent runs report net changes since the stored ref; a gc'd or force-pushed ref triggers a silent re-baseline.
 - `file-fingerprint` includes `snapshotText` for text files and omits it for binary files (files containing null bytes).
+
+## 11. Target Source: `command-poll`
+
+> **Status: target — not yet implemented** (PP7). This section is the normative design for the
+> source proposed in issue [#81](https://github.com/mike-north/AgentMonitors/issues/81): the
+> local-process sibling of `api-poll`. It runs a configured command on the tick loop, captures the
+> result, and reports change using snapshot-diff strategies. When implemented, the "target" framing
+> here moves to "current" with `verified:` references, per the retirement process in
+> [roadmap.md](./roadmap.md).
+
+`command-poll` exists so that any CLI-backed system (`git`, `gh`, `kubectl`, build tools, task
+managers) can be monitored purely through `MONITOR.md` config, with **zero domain-specific source
+code in this repo** (non-goal reaffirmed from #81). The driving example is a local productivity CLI
+(`ofocus today --json`), but nothing below is specific to it.
+
+### 11.1 Scope
+
+```yaml
+watch:
+  type: command-poll
+  command: ['ofocus', 'today', '--json'] # argv array — REQUIRED
+  interval: 5m
+  cwd: /optional/working/dir
+  env: # optional literal additions/overrides
+    NO_COLOR: '1'
+  timeout: 30s
+  key: ofocus-today # optional objectKey override
+  change-detection:
+    strategy: json-diff
+```
+
+| Field                       | Type             | Required | Default                  | Description                                                                      |
+| --------------------------- | ---------------- | -------- | ------------------------ | -------------------------------------------------------------------------------- |
+| `command`                   | `string[]`       | Yes      | —                        | Argv array; `command[0]` is the executable (resolved via `PATH`). `minItems: 1`. |
+| `interval`                  | duration string  | No       | runtime default          | Poll cadence hint; owned by the scheduling engine, same as `api-poll`.           |
+| `cwd`                       | `string`         | No       | daemon working directory | Working directory for the child process.                                         |
+| `env`                       | `object<string>` | No       | `{}`                     | Literal env vars merged over the inherited daemon environment.                   |
+| `timeout`                   | duration string  | No       | `30s`                    | Wall-clock limit; expiry is an **execution failure** (§11.5).                    |
+| `key`                       | `string`         | No       | joined argv              | Overrides the observation `objectKey` (§11.4).                                   |
+| `change-detection.strategy` | enum             | No       | `text-diff`              | `text-diff` \| `json-diff` \| `exit-code` (§11.3).                               |
+
+**`command` MUST be an argv array; a shell string form MUST NOT be accepted.** The child is spawned
+directly (`execFile` semantics, `shell: false`): there is no word-splitting, globbing, quoting, or
+injection surface, and what executes is exactly what the author wrote, token for token. This is the
+decision for #81's first open question; a `sh -c` convenience form is rejected — an author who needs
+shell features writes them into a script and polls the script.
+
+**`env` is merged over the inherited daemon environment** (decision for #81's second open
+question). Restricting the inherited environment adds hygiene, not security — the command runs as
+the same user the daemon does, and an author who can write `MONITOR.md` can already run anything
+that user can — so v1 does not pay the usability cost of an allow-list. Secrets reach the command
+the same way `api-poll`'s `auth.token-env` does: via the daemon's environment, never inline in
+`MONITOR.md`. `env` **values MUST NOT be persisted** in any observation `payload`, `snapshot`, or
+runtime state row.
+
+### 11.2 Execution model
+
+One execution per due tick (`observe()` only — no `watch()` in v1, per #81): spawn `command` with
+`cwd`/`env`, capture `stdout`, `stderr`, and the exit code, enforcing `timeout` (SIGTERM at expiry,
+SIGKILL after a 5s grace). `stdout` capture is capped at **1 MiB**; output beyond the cap is
+discarded and the result is marked `truncated: true` (a truncated result still diffs — but see the
+validation note in §11.7).
+
+The **result** of an execution is `(exitCode, stdout)`. A **nonzero exit code with output is a
+valid result, not a failure** — many CLIs exit nonzero meaningfully (`grep`, linters, a task CLI
+whose backing app is closed). The failure category is reserved for executions that produce no
+result at all (§11.5).
+
+### 11.3 Change-detection strategies
+
+Mirrors `api-poll` (§4.2), substituting the local-process equivalents:
+
+| Strategy    | Compares                                                                                 | Default |
+| ----------- | ---------------------------------------------------------------------------------------- | ------- |
+| `text-diff` | Raw `stdout` strings                                                                     | Yes     |
+| `json-diff` | `stdout` parsed as JSON, key-order/whitespace-insensitive (same algorithm as `api-poll`) |         |
+| `exit-code` | Exit codes only; `stdout` changes are ignored                                            |         |
+
+`json-diff` falls back to raw text comparison when either side fails to parse, identical to
+`api-poll`. `exit-code` is first-class in v1 (decision for #81's fourth open question); the broader
+"predicate over the result" generalization is explicitly deferred — if it lands later, `exit-code`
+becomes sugar for one such predicate, which is a compatible evolution.
+
+`stderr` is never diffed; it is captured solely for failure diagnostics (§11.5).
+
+### 11.4 Observation identity and stateful behavior
+
+Mirrors `api-poll` (§4.4–4.5):
+
+- `title` / `summary`: `"Command output changed: <objectKey>"`
+- `objectKey`: the `key` field if set, otherwise the argv joined with single spaces
+  (`ofocus today --json`)
+- `payload`: `{ command, exitCode, strategy, stdout, truncated }` — **never `env`**
+- `snapshotText`: captured `stdout`
+- `queryScope`: `{ command: <objectKey> }`
+- `snapshot`: `{ command, exitCode, stdoutLength, strategy }`
+- `changeKind`: `modified` (the observed object is the command's result; it is never created or
+  destroyed in v1 — per-item lifecycle arrives with keyed collections, §12)
+
+`command-poll` declares `stateful: true` (PP6). The first successful execution stores
+`{ stdout, exitCode }` as `nextState` and emits nothing; subsequent executions diff against
+`context.previousState` under the configured strategy.
+
+### 11.5 Failure semantics (fail-open as a health signal)
+
+An **execution failure** is: spawn failure (`ENOENT`, `EACCES`, …) or `timeout` expiry. Per #81's
+framing, a failure is information, not something to silently swallow — but it must not spam.
+
+- On failure, prior state is **kept** (no re-baseline, no state loss) — identical in spirit to how
+  `api-poll` treats an unreachable endpoint and `incoming-changes` treats a broken repo (§6.5).
+- The source tracks `health: 'ok' | 'failing'` in its state and emits an observation only on the
+  **transition edge**, not on every failing tick:
+  - `ok → failing` (or first-ever run fails): one observation, `title:
+"Command failing: <objectKey>"`, `payload: { command, error, stderrTail }`.
+  - `failing → ok`: one observation, `title: "Command recovered: <objectKey>"`. If the recovery
+    result also differs from the pre-failure baseline under the configured strategy, the ordinary
+    output-changed observation is emitted **as well** (two observations on that tick).
+- A failing first run establishes **no baseline**; the first successful run after it baselines
+  silently as usual.
+
+**What this rule buys:** a tool that is closed for three hours produces exactly two signals
+(failing, recovered) rather than 36 failure events at a 5-minute interval — and cannot mask the
+output change that happened while it was down.
+
+### 11.6 Trust model for local execution
+
+Running an arbitrary local command is a higher-trust action than an HTTP GET (#81's third open
+question). The decision is in two parts:
+
+**v1 (normative):** `command-poll` executes without an interactive acknowledgment step. A
+`MONITOR.md` is workspace-resident configuration in the same trust class as `package.json` scripts,
+git hooks, or `.claude` hooks: anyone who can write it into the workspace can already achieve
+arbitrary execution through those channels, and the daemon already scopes evaluation to the
+workspace it was started for. Adding a prompt here would be security theater that taxes the
+legitimate path.
+
+**Target (designed, deferred):** a **command-acknowledgment ledger** for hosts that want explicit
+gating. Sketch: the runtime computes `commandFingerprint = hash(argv ‖ cwd ‖ env-keys)`; a monitor
+whose fingerprint is not in the persisted ledger does not execute — it surfaces as `blocked:
+awaiting-acknowledgment` in `scan`/`status` output, and an explicit CLI act
+(`agentmonitors monitor approve <id>`) records the fingerprint. Any edit that changes the
+fingerprint re-blocks. This composes with v1 (an empty-ledger-means-allow default preserves v1
+behavior) and is the right shape **if** multi-tenant or untrusted-workspace hosting ever matters.
+It is not scheduled; it exists here so the v1 decision is visibly a decision, not an omission.
+
+### 11.7 Validation implications
+
+When implemented, source-level tests MUST verify, beyond the §10 generic items:
+
+- A shell-metacharacter argv element (`['echo', '$(whoami); rm -rf /tmp/x']`) is passed through as a
+  **literal argument** — the output contains the metacharacters verbatim, proving no shell is involved.
+- Baseline run emits nothing; an output change under each strategy emits exactly one observation;
+  `exit-code` ignores stdout-only changes; `json-diff` ignores key reordering.
+- A nonzero-exit result with changed output **is** diffed and reported (nonzero ≠ failure).
+- Spawn failure and timeout each: keep prior state, emit exactly one `ok → failing` observation, stay
+  silent on subsequent failing ticks, and emit `failing → ok` on recovery.
+- `env` values appear in the child's environment and in **no** persisted artifact (payload, snapshot,
+  state row).
+- Output exceeding the 1 MiB cap sets `truncated: true` and still produces stable diffs (two
+  truncated captures of identical leading content do not report change).
+- `timeout` kills a hung child within the grace period and leaves no orphan process (mirror the
+  daemon-test discipline used for CLI integration tests).
+
+### 11.8 Non-goals (v1)
+
+- No domain-specific source code (OmniFocus, git, gh, …) in this repo — those are `MONITOR.md`
+  consumers of `command-poll`.
+- No `watch()` (long-lived `--watch`-style child); `observe()` per tick only.
+- No mtime/file-based "did anything change?" pre-gate, and no monitor chaining as a polling
+  optimization — both rejected in #81 with reasoning this spec adopts: the gate signal is over-broad
+  (backing files are touched by sync/housekeeping, not just relevant edits), the content diff still
+  does the real suppression work, and dependency edges between monitors contradict the
+  independent-monitors model (PP3). The principled cost optimization, if poll cost ever bites, is
+  the cursor protocol (§13).
+
+## 12. Target: Keyed-Collection Change Detection
+
+> **Status: target — not yet implemented** (PP7). Generic companion to §11, applying equally to
+> `api-poll` and `command-poll`; separable and independently shippable.
+
+A third `change-detection` mode treating output as a **collection of keyed objects** rather than
+one blob:
+
+```yaml
+change-detection:
+  strategy: json-diff
+  collection:
+    path: '$.tasks' # where the array lives in the parsed output
+    key: 'id' # field whose value is the per-object identity
+    ignore-paths: ['$.fetchedAt'] # optional: paths excluded before comparison
+```
+
+Semantics:
+
+- The output is parsed (JSON in v1; the `collection` block is invalid under `text-diff`/`exit-code`
+  and MUST be rejected by scope validation).
+- Each element of the array at `path` becomes a tracked object with
+  `objectKey = <monitor-objectKey>#<key-value>`.
+- Per-object observations are emitted with the existing `ChangeKind` vocabulary (§2.3): `created`
+  (key appears), `modified` (key present in both, content differs after `ignore-paths` removal),
+  `descoped` (key disappears from the output — the upstream object may well still exist; the
+  collection no longer contains it, which is precisely `descoped`, not `deleted`).
+- The baseline rule is unchanged: the first run records the keyed snapshot and emits nothing.
+- Reordering of elements and whitespace are inherently ignored (comparison is per-key, not
+  positional).
+
+**What this buys (the #81 motivating case):** "three tasks became overdue" lands as three precise
+`modified` observations with stable per-task `objectKey`s — instead of one opaque "output changed"
+blob — and a re-sorted list produces zero observations.
+
+Open design point (deliberately unresolved here): whether `path` uses a JSONPath subset or a
+simpler dotted-segments syntax. The spec constraint is only that it selects **one array** and is
+validated at authoring time (BP3).
+
+## 13. Target: Caller-Held Cursor Protocol
+
+> **Status: target — sketch only.** Adopted from #81 as the principled optimization **if** poll
+> cost ever measurably bites; explicitly not v1, and not a prerequisite for §11 or §12.
+
+Rather than caching output or gating on file mtimes, a poll source threads a **caller-held cursor**
+through the command: a `{{state}}` placeholder is templated into the argv, and a `next-state` value
+is extracted from the output:
+
+```yaml
+watch:
+  type: command-poll
+  command: ['ofocus', 'changes', '--since', '{{state}}', '--json']
+  cursor:
+    initial: '0'
+    next-state: '$.cursor' # extracted from the parsed output after each run
+```
+
+This generalizes the stateful baseline the sources already keep (PP6): the cursor lives in the same
+per-monitor `nextState` slot, the polled tool stays stateless (it merely answers "what changed since
+`<cursor>`?" — `git <cursor>..HEAD`, `kubectl --resource-version`, a task CLI's change generation),
+and change detection stays where the data lives **without** hidden cross-invocation state inside the
+tool. Sequencing (from #81): ship §11 first, measure, and design this fully only against observed
+poll cost.

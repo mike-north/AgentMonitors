@@ -69,6 +69,39 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
 > Non-blocking follow-ups: optional `object_key` meta (needs `DeliveryEventSummary`
 > enrichment, [006 §4.2](./006-agent-integration.md)).
 
+### G8 — `command-poll` source (P2)
+
+- **Current:** no local-command observation source; `api-poll` is the only "poll and diff" source.
+  The design is fully specified in [003 §11](./003-source-plugins.md) (from issue #81): argv-only
+  execution, `text-diff`/`json-diff`/`exit-code` strategies, transition-edge failure signals, and
+  the v1 trust decision (execute without acknowledgment; ack-ledger designed as target in 003
+  §11.6).
+- **Target:** a bundled `@agentmonitors/source-command-poll` package implementing 003 §11 verbatim,
+  registered via `registerCoreSources`, with an `init --type command-poll` template.
+- **Governs:** PP3, PP6, BP3 ([000](./000-principles.md)), [003 §11](./003-source-plugins.md).
+- **Files:** new `plugins/source-command-poll/`; `apps/cli/src/sources.ts`;
+  `apps/cli/src/commands/init.ts` (template).
+- **Proof:** the validation list in [003 §11.7](./003-source-plugins.md) — most critically the
+  no-shell metacharacter test, the nonzero-exit-is-a-result test, and the transition-edge failure
+  tests.
+
+### G9 — Keyed-collection change detection (P3)
+
+- **Current:** `api-poll` (and the target `command-poll`) report one output-level observation per
+  change; collection outputs produce opaque "something changed" signals.
+- **Target:** the `change-detection.collection` mode of [003 §12](./003-source-plugins.md):
+  per-object observations with stable `objectKey`s and `created`/`modified`/`descoped` change kinds.
+  Applies to both poll sources; separable from G8.
+- **Governs:** SP3 ([000](./000-principles.md)), [003 §2.3 / §12](./003-source-plugins.md).
+- **Files:** shared change-detection helper (location at implementer's discretion — candidates:
+  `libs/core` or a shared plugin utility), `plugins/source-api-poll/`, `plugins/source-command-poll/`.
+- **Proof:** re-sorted collection produces zero observations; one element changing produces exactly
+  one `modified` with the keyed `objectKey`; element removal produces `descoped` (not `deleted`).
+
+> The cursor protocol ([003 §13](./003-source-plugins.md)) is deliberately **not** a roadmap item:
+> per #81 it is designed only as far as a sketch, to be fully specified if measured poll cost ever
+> justifies it.
+
 ## Test gaps
 
 All test gaps tracked from [004 §3](./004-validation-testing.md) are now closed:
