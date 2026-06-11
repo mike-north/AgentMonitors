@@ -6,6 +6,7 @@
  */
 import { execFileSync, type ExecFileSyncOptions } from 'node:child_process';
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -22,6 +23,17 @@ import { daemonAvailable, callDaemon } from '../daemon-ipc.js';
 
 const CLI_PATH = path.resolve(__dirname, '../../dist/index.cjs');
 const CLI_PACKAGE_DIR = path.resolve(__dirname, '../..');
+// Repo root holds the activation plugin. The config-drift UAT below reads the
+// plugin's REAL hooks.json from here (no copies) so it breaks when that file
+// drifts. apps/cli → ../../ is the monorepo root.
+const REPO_ROOT = path.resolve(CLI_PACKAGE_DIR, '..', '..');
+const PLUGIN_HOOKS_JSON_PATH = path.join(
+  REPO_ROOT,
+  'agent-plugins',
+  'agentmonitors',
+  'hooks',
+  'hooks.json',
+);
 
 interface RunResult {
   stdout: string;
@@ -2088,6 +2100,313 @@ describe('lazy daemon lifecycle', () => {
       rmSync(ws, { recursive: true, force: true });
     }
   }, 40_000); // high-urgency settle = 15s + baseline + detection + headroom
+});
+
+// ---------------------------------------------------------------------------
+// Plugin hooks.json config-drift UAT (issue #89)
+//
+// The steel-thread UAT above drives ['session','start'] / ['hook','deliver']
+// as ARGV directly with hand-built stdin. That proves the CLI's stdin contract
+// but skips the exact layer the #83 bug lived in: the seam between the plugin's
+// hooks.json command STRINGS and that contract (the now-removed vestigial
+// `&& agentmonitors hook deliver` chain was dead precisely because the first
+// command had already consumed stdin — invisible to an argv-level test).
+//
+// This suite parses the REAL agent-plugins/agentmonitors/hooks/hooks.json at
+// test time (no copies) and runs each configured command VERBATIM through
+// `/bin/sh -c`, with an `agentmonitors` shim on PATH satisfying the commands'
+// own `command -v agentmonitors` guard. It therefore fails if a command string
+// drifts incompatibly (a flag re-added, the binary renamed, the chain broken),
+// if the stdin contract regresses, or if the missing-CLI fallback emits invalid
+// JSON.
+// ---------------------------------------------------------------------------
+
+interface PluginHooksJson {
+  hooks: Record<
+    string,
+    { matcher: string; hooks: { type: string; command: string }[] }[]
+  >;
+}
+
+/**
+ * Read the literal command string the plugin wires for `eventName` from the
+ * real hooks.json. Throws if absent so a renamed/removed event surfaces as a
+ * test failure rather than a silently skipped assertion.
+ */
+function pluginHookCommand(eventName: string): string {
+  const config = JSON.parse(
+    readFileSync(PLUGIN_HOOKS_JSON_PATH, 'utf-8'),
+  ) as PluginHooksJson;
+  const command = config.hooks[eventName]?.[0]?.hooks?.[0]?.command;
+  if (typeof command !== 'string' || command.length === 0) {
+    throw new Error(`hooks.json has no command for ${eventName}`);
+  }
+  return command;
+}
+
+/**
+ * Run a plugin hook command string exactly as Claude Code does: `/bin/sh -c
+ * '<command>'` with the CC-style JSON payload on stdin. `/bin/sh` is invoked by
+ * absolute path so the command resolves even when `env.PATH` is restricted (the
+ * fallback test deliberately empties PATH); `agentmonitors` itself is resolved
+ * via `env.PATH` by the command's own `command -v` guard.
+ */
+function runPluginHookCommand(
+  command: string,
+  env: Record<string, string>,
+  input: string,
+  cwd: string,
+): RunResult {
+  const opts: ExecFileSyncOptions = {
+    encoding: 'utf-8',
+    env: { ...process.env, ...env },
+    cwd,
+    input,
+  };
+  try {
+    const stdout = execFileSync('/bin/sh', ['-c', command], opts) as string;
+    return { stdout, stderr: '', exitCode: 0 };
+  } catch (err) {
+    const e = err as { stdout: string; stderr: string; status: number };
+    return {
+      stdout: (e.stdout ?? '') as string,
+      stderr: (e.stderr ?? '') as string,
+      exitCode: e.status ?? 1,
+    };
+  }
+}
+
+/**
+ * Create a temp dir holding an executable `agentmonitors` that execs the built
+ * CLI. Prepending this dir to PATH satisfies the hooks' `command -v
+ * agentmonitors` guard and routes the literal command to dist/index.cjs — the
+ * same indirection a real `npm i -g @agentmonitors/cli` install provides.
+ */
+function makeAgentmonitorsShimDir(): string {
+  const shimDir = mkdtempSync(path.join(tmpdir(), 'agentmon-shim-'));
+  const shim = path.join(shimDir, 'agentmonitors');
+  writeFileSync(
+    shim,
+    `#!/bin/sh\nexec node ${JSON.stringify(CLI_PATH)} "$@"\n`,
+    'utf-8',
+  );
+  chmodSync(shim, 0o755);
+  return shimDir;
+}
+
+describe('plugin hooks.json config-drift UAT', () => {
+  it("drives the plugin's literal hooks.json command strings end to end (boot, deliver body, deregister)", async () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-hooksjson-'));
+    const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-src');
+    mkdirSync(monitorsDir, { recursive: true });
+
+    // The distinctive body-instruction that MUST reach the agent verbatim.
+    const BODY_INSTRUCTION =
+      'Review the changed file and flag risky edits before continuing.';
+    const watchedFile = path.join(ws, 'watched.txt');
+    writeFileSync(watchedFile, 'initial content', 'utf-8');
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      [
+        '---',
+        'name: Watch src',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs:',
+        '    - "watched.txt"',
+        `  cwd: ${JSON.stringify(ws)}`,
+        '  interval: "1s"',
+        // High urgency so the body is carried in the claim's events[] at the
+        // UserPromptSubmit lifecycle (normal urgency is reminder-only there).
+        // Price: the ~15s high-urgency settle before the event materializes.
+        'urgency: high',
+        '---',
+        BODY_INSTRUCTION,
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+
+    const socket = path.join(
+      '/tmp',
+      `agentmon-hj-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const db = path.join(ws, 'hooksjson.db');
+    const hostSessionId = 'hooksjson-session';
+    writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 60_000 });
+
+    const shimDir = makeAgentmonitorsShimDir();
+    const env: Record<string, string> = {
+      CLAUDE_PROJECT_DIR: ws,
+      AGENTMONITORS_DB: db,
+      AGENTMONITORS_SOCKET: socket,
+      // Shim first so `command -v agentmonitors` resolves to the built CLI;
+      // the system PATH tail keeps `node` (and the shell's tools) reachable.
+      PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ''}`,
+    };
+
+    // Read the literal command strings ONCE, up front — drift in hooks.json is
+    // what this test is here to catch.
+    const startCmd = pluginHookCommand('SessionStart');
+    const deliverCmd = pluginHookCommand('UserPromptSubmit');
+    const endCmd = pluginHookCommand('SessionEnd');
+
+    try {
+      // 1. SessionStart command string → lazy-boot the daemon + register.
+      const start = runPluginHookCommand(
+        startCmd,
+        env,
+        JSON.stringify({
+          session_id: hostSessionId,
+          hook_event_name: 'SessionStart',
+          cwd: ws,
+        }),
+        ws,
+      );
+      expect(start.exitCode).toBe(0);
+      expect(await daemonAvailable(socket)).toBe(true);
+
+      const sessions = JSON.parse(
+        runWithEnv(
+          ['session', 'list', '--socket', socket, '--format', 'json'],
+          env,
+          ws,
+        ).stdout,
+      ) as { id: string; hostSessionId: string }[];
+      const registered = sessions.find(
+        (s) => s.hostSessionId === hostSessionId,
+      );
+      expect(registered).toBeDefined();
+      const sessionId = registered?.id ?? '';
+
+      // 2. Mutate the watched file; wait for the high-urgency event to settle.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
+      writeFileSync(watchedFile, 'changed content', 'utf-8');
+      const unread = () =>
+        runWithEnv(
+          [
+            'events',
+            'list',
+            '--session',
+            sessionId,
+            '--unread',
+            '--format',
+            'json',
+            '--socket',
+            socket,
+          ],
+          env,
+          ws,
+        );
+      const eventDeadline = Date.now() + 20_000;
+      while (Date.now() < eventDeadline) {
+        const r = unread();
+        if (r.exitCode === 0 && (JSON.parse(r.stdout) as unknown[]).length >= 1)
+          break;
+        await new Promise((res) => setTimeout(res, 500));
+      }
+      expect(JSON.parse(unread().stdout)).toHaveLength(1);
+
+      // 3. UserPromptSubmit command string → the monitor body reaches the agent
+      //    as additionalContext. THIS is the config-drift assertion: if the
+      //    command were changed to drop/rename `agentmonitors hook deliver`, the
+      //    body would not arrive and this fails.
+      const deliver = runPluginHookCommand(
+        deliverCmd,
+        env,
+        JSON.stringify({
+          session_id: hostSessionId,
+          hook_event_name: 'UserPromptSubmit',
+          cwd: ws,
+        }),
+        ws,
+      );
+      expect(deliver.exitCode).toBe(0);
+      expect(deliver.stdout.trim()).not.toBe('');
+      const output = JSON.parse(deliver.stdout) as {
+        hookSpecificOutput: {
+          hookEventName: string;
+          additionalContext: string;
+        };
+      };
+      expect(output.hookSpecificOutput.hookEventName).toBe('UserPromptSubmit');
+      expect(output.hookSpecificOutput.additionalContext).toContain(
+        'watch-src',
+      );
+      expect(output.hookSpecificOutput.additionalContext).toContain(
+        BODY_INSTRUCTION,
+      );
+
+      // 4. SessionEnd command string → deregister (session marked dormant).
+      const end = runPluginHookCommand(
+        endCmd,
+        env,
+        JSON.stringify({
+          session_id: hostSessionId,
+          hook_event_name: 'SessionEnd',
+          cwd: ws,
+        }),
+        ws,
+      );
+      expect(end.exitCode).toBe(0);
+      const after = JSON.parse(
+        runWithEnv(
+          ['session', 'list', '--socket', socket, '--format', 'json'],
+          env,
+          ws,
+        ).stdout,
+      ) as { id: string; status: string }[];
+      expect(after.find((s) => s.id === sessionId)?.status).toBe('dormant');
+    } finally {
+      // No orphan daemons: stop the per-workspace daemon explicitly.
+      try {
+        await callDaemon('stop', {}, { socketPath: socket });
+      } catch {
+        // already stopped — ignore
+      }
+      rmSync(shimDir, { recursive: true, force: true });
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 40_000); // high-urgency settle = 15s + baseline + detection + headroom
+
+  it('SessionStart command falls back to the install-hint JSON when agentmonitors is not on PATH', () => {
+    // The missing-CLI branch: `command -v agentmonitors` fails, so the command
+    // must print VALID fallback JSON carrying the install hint. `command` and
+    // `printf` are POSIX shell builtins, so they still run with an empty PATH.
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-hooksjson-nocli-'));
+    const emptyPathDir = mkdtempSync(
+      path.join(tmpdir(), 'agentmon-empty-path-'),
+    );
+    try {
+      const startCmd = pluginHookCommand('SessionStart');
+      const result = runPluginHookCommand(
+        startCmd,
+        { PATH: emptyPathDir },
+        JSON.stringify({
+          session_id: 'no-cli-session',
+          hook_event_name: 'SessionStart',
+          cwd: ws,
+        }),
+        ws,
+      );
+      expect(result.exitCode).toBe(0);
+      // Must be parseable JSON of the SessionStart additionalContext shape...
+      const parsed = JSON.parse(result.stdout) as {
+        hookSpecificOutput: {
+          hookEventName: string;
+          additionalContext: string;
+        };
+      };
+      expect(parsed.hookSpecificOutput.hookEventName).toBe('SessionStart');
+      // ...and carry the actionable install hint.
+      expect(parsed.hookSpecificOutput.additionalContext).toContain(
+        'npm i -g @agentmonitors/cli',
+      );
+    } finally {
+      rmSync(emptyPathDir, { recursive: true, force: true });
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
