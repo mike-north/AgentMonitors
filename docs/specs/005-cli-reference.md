@@ -686,7 +686,10 @@ Code hook payload on stdin** (a JSON object — there is **no `CLAUDE_CODE_SESSI
 - **Nothing pending** (a fresh start with no unread events) → **no output**.
 - **Compact-resume with unread events** → the `SessionStart` recap JSON on stdout (the `additionalContext` carries the unread events' bodies). This is the only `session …` subcommand that emits hook-wire JSON, so its stdout MUST stay clean (wire JSON only).
 
-Errors are swallowed (best-effort) so a failing hook never disrupts the user's session; the command exits 0.
+**Exit code (two layers):**
+
+- The **CLI command** exits **0** on a quick-exit (no `session_id`, or monitoring not enabled) and on success (with or without recap output). A genuine failure — the daemon not starting within the boot timeout, or a `session.open`/`claimDelivery` error — is reported to **stderr** and exits **non-zero** (`reportError(…, false)` sets `process.exitCode = 1`).
+- The **plugin hook wrapper** (`agent-plugins/agentmonitors/hooks/hooks.json`) runs the command as `agentmonitors session start || true`, so the **hook invocation** is best-effort from Claude Code's perspective — a CLI failure never disrupts the session. The best-effort property is the wrapper's, not the command's.
 
 **Designed for use as a `SessionStart` hook** (see 006 §5.6). Claude Code does not need the daemon to be pre-started.
 
