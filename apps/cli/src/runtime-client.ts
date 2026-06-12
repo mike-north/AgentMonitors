@@ -3,6 +3,8 @@ import type {
   DeliveryClaim,
   DeliveryLifecycle,
   EventQuery,
+  MonitorExplainInput,
+  MonitorExplainReport,
   MonitorEventRecord,
   ObservationHistoryQuery,
   ObservationHistoryRecord,
@@ -90,6 +92,17 @@ export async function listObservationHistoryClient(
   return await callDaemon<ObservationHistoryRecord[]>(
     'history.list',
     query as unknown as Record<string, unknown>,
+    socketPath ? { socketPath } : {},
+  );
+}
+
+export async function explainMonitorClient(
+  input: MonitorExplainInput,
+  socketPath?: string,
+): Promise<MonitorExplainReport> {
+  return await callDaemon<MonitorExplainReport>(
+    'monitor.explain',
+    input as unknown as Record<string, unknown>,
     socketPath ? { socketPath } : {},
   );
 }

@@ -1,20 +1,178 @@
+import path from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 import { setTimeout } from 'node:timers/promises';
 import { Command, Option } from 'commander';
 import {
   parseMonitor,
+  scanMonitors,
   SourceRegistry,
+  validateScope,
+  type MonitorExplainReport,
+  type MonitorExplainStage,
+  type MonitorExplainStageId,
+  type MonitorExplainStageStatus,
   type ObservationContext,
   type ObservationSource,
   type Observation,
 } from '@agentmonitors/core';
 import { registerCoreSources } from '../sources.js';
 import { reportError } from '../output.js';
-import { listObservationHistoryClient } from '../runtime-client.js';
+import {
+  explainMonitorClient,
+  listObservationHistoryClient,
+} from '../runtime-client.js';
 
 export const monitorTestCommand = new Command('monitor').description(
   'Monitor utilities',
 );
+
+const EXPLAIN_STAGE_LABELS: Record<MonitorExplainStageId, string> = {
+  definition: 'Definition',
+  scheduling: 'Scheduling',
+  observation: 'Observation',
+  notify: 'Notify state',
+  materialization: 'Materialization',
+  delivery: 'Projection and delivery',
+};
+
+function monitorIdFromFilePath(filePath: string): string {
+  const base = path.basename(filePath);
+  return base === 'MONITOR.md'
+    ? path.basename(path.dirname(filePath))
+    : path.parse(filePath).name;
+}
+
+function explainStage(
+  id: MonitorExplainStageId,
+  status: MonitorExplainStageStatus,
+  reason: string,
+  details?: Record<string, unknown>,
+): MonitorExplainStage {
+  return {
+    id,
+    label: EXPLAIN_STAGE_LABELS[id],
+    status,
+    reason,
+    ...(details ? { details } : {}),
+  };
+}
+
+function explainVerdict(stages: MonitorExplainStage[]) {
+  const stopped = stages.find((stage) => stage.status !== 'ok');
+  const stage = stopped ?? stages[stages.length - 1];
+  return {
+    status: stage?.status ?? 'ok',
+    stage: stage?.id ?? 'delivery',
+    reason: stage?.reason ?? 'Monitor delivered successfully.',
+  };
+}
+
+function statusGlyph(status: MonitorExplainStageStatus): string {
+  if (status === 'ok') return '✓';
+  if (status === 'pending') return '⏳';
+  return '✗';
+}
+
+function printExplainText(report: MonitorExplainReport): void {
+  console.log(`Monitor ${report.monitorId}`);
+  for (const stage of report.stages) {
+    console.log(`${statusGlyph(stage.status)} ${stage.label}: ${stage.reason}`);
+  }
+  console.log(
+    `Verdict: ${report.verdict.status} at ${EXPLAIN_STAGE_LABELS[report.verdict.stage]} - ${report.verdict.reason}`,
+  );
+}
+
+async function buildDaemonUnavailableReport(input: {
+  monitorId: string;
+  monitorsDir: string;
+  workspacePath?: string;
+  errorMessage: string;
+}): Promise<MonitorExplainReport> {
+  const generatedAt = new Date();
+  const stages: MonitorExplainStage[] = [];
+  const scan = await scanMonitors(input.monitorsDir);
+  const parseError = scan.errors.find(
+    (error) => monitorIdFromFilePath(error.filePath) === input.monitorId,
+  );
+  const monitor = scan.monitors.find(
+    (candidate) => candidate.monitor.id === input.monitorId,
+  )?.monitor;
+
+  if (parseError) {
+    stages.push(
+      explainStage(
+        'definition',
+        'failure',
+        `MONITOR.md failed to parse or validate: ${parseError.error}`,
+        { filePath: parseError.filePath },
+      ),
+    );
+  } else if (!monitor) {
+    stages.push(
+      explainStage(
+        'definition',
+        'failure',
+        `Monitor "${input.monitorId}" was not found in ${input.monitorsDir}.`,
+      ),
+    );
+  } else {
+    const registry = new SourceRegistry();
+    registerCoreSources(registry);
+    const sourceName = monitor.frontmatter.watch.type;
+    const source = registry.get(sourceName);
+    const { type: _type, ...monitorWatchConfig } = monitor.frontmatter.watch;
+    const scopeErrors = source
+      ? validateScope(monitorWatchConfig, source.scopeSchema)
+      : [`Unknown source "${sourceName}".`];
+    stages.push(
+      scopeErrors.length === 0
+        ? explainStage('definition', 'ok', 'Monitor definition is valid.', {
+            filePath: monitor.filePath,
+            sourceName,
+          })
+        : explainStage(
+            'definition',
+            'failure',
+            `Monitor definition is invalid: ${scopeErrors.join('; ')}`,
+            { filePath: monitor.filePath, sourceName },
+          ),
+    );
+  }
+
+  if (stages[0]?.status === 'ok') {
+    stages.push(
+      explainStage(
+        'scheduling',
+        'failure',
+        `The daemon is not running or unreachable: ${input.errorMessage}`,
+        { workspacePath: input.workspacePath },
+      ),
+    );
+  }
+
+  return {
+    monitorId: input.monitorId,
+    generatedAt,
+    ...(monitor
+      ? {
+          monitor: {
+            id: monitor.id,
+            displayName: monitor.displayName,
+            filePath: monitor.filePath,
+            sourceName: monitor.frontmatter.watch.type,
+            urgency: monitor.frontmatter.urgency,
+          },
+        }
+      : {}),
+    stages,
+    verdict: explainVerdict(stages),
+    observations: [],
+    events: [],
+    projections: [],
+    leadSessions: [],
+  };
+}
 
 /** Format observations as JSON output. */
 function printJsonResult(
@@ -204,6 +362,79 @@ monitorTestCommand
       reportError(`Observation failed: ${message}`, json);
     }
   });
+
+monitorTestCommand
+  .command('explain')
+  .description("Explain where a monitor's signal currently stops")
+  .argument('<monitorId>', 'Monitor id to diagnose')
+  .option(
+    '--dir <path>',
+    'Directory containing monitor definitions',
+    '.claude/monitors',
+  )
+  .option('--workspace <path>', 'Workspace path used by the daemon')
+  .option('--socket <path>', 'Unix domain socket path for the daemon')
+  .option('--history-limit <n>', 'Observation history rows to include', '10')
+  .option('--event-limit <n>', 'Materialized event rows to include', '10')
+  .addOption(
+    new Option('--format <format>', 'Output format')
+      .choices(['text', 'json'])
+      .default('text'),
+  )
+  .action(
+    async (
+      monitorId: string,
+      options: {
+        dir: string;
+        workspace?: string;
+        socket?: string;
+        historyLimit: string;
+        eventLimit: string;
+        format: string;
+      },
+    ) => {
+      const json = options.format === 'json';
+      const monitorsDir = path.resolve(options.dir);
+      const workspacePath = path.resolve(options.workspace ?? process.cwd());
+      const historyLimit = Number.parseInt(options.historyLimit, 10);
+      const eventLimit = Number.parseInt(options.eventLimit, 10);
+      try {
+        const report = await explainMonitorClient(
+          {
+            monitorId,
+            monitorsDir,
+            workspacePath,
+            ...(Number.isFinite(historyLimit) && historyLimit > 0
+              ? { historyLimit }
+              : {}),
+            ...(Number.isFinite(eventLimit) && eventLimit > 0
+              ? { eventLimit }
+              : {}),
+          },
+          options.socket,
+        );
+
+        if (json) {
+          console.log(JSON.stringify(report, null, 2));
+          return;
+        }
+        printExplainText(report);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const report = await buildDaemonUnavailableReport({
+          monitorId,
+          monitorsDir,
+          workspacePath,
+          errorMessage: message,
+        });
+        if (json) {
+          console.log(JSON.stringify(report, null, 2));
+          return;
+        }
+        printExplainText(report);
+      }
+    },
+  );
 
 monitorTestCommand
   .command('history')

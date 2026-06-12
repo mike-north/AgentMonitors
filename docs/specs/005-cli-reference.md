@@ -16,10 +16,10 @@ Per AP6, all public CLI behaviour must be derivable from core contracts. The CLI
 
 Commands divide into two transport modes:
 
-| Mode                                   | Commands                                                                                                                                    | Mechanism                                                                                      |
-| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| **In-process** (no socket)             | `init`, `validate`, `scan`, `monitor test`, `source list`, `schema generate`, `inbox *`, `daemon once`                                      | Operates directly on the filesystem and/or SQLite database. No daemon socket required.         |
-| **Daemon socket** (Unix domain socket) | `daemon run`, `daemon status`, `daemon stop`, `session open/close/list`, `events list/ack`, `hook claim`, `hook deliver`, `monitor history` | Sends JSON-RPC-style messages over a Unix domain socket via `callDaemon()` in `daemon-ipc.ts`. |
+| Mode                                   | Commands                                                                                                                                                       | Mechanism                                                                                      |
+| -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| **In-process** (no socket)             | `init`, `validate`, `scan`, `monitor test`, `source list`, `schema generate`, `inbox *`, `daemon once`                                                         | Operates directly on the filesystem and/or SQLite database. No daemon socket required.         |
+| **Daemon socket** (Unix domain socket) | `daemon run`, `daemon status`, `daemon stop`, `session open/close/list`, `events list/ack`, `hook claim`, `hook deliver`, `monitor history`, `monitor explain` | Sends JSON-RPC-style messages over a Unix domain socket via `callDaemon()` in `daemon-ipc.ts`. |
 
 **`daemon once` is notable:** although it lives under the `daemon` command group, its implementation in `runtime-client.ts` (`daemonTickClient`) calls `createRuntime()` and `runtime.tick()` directly without using the socket. It is a single-tick in-process run, not a socket call. This is consistent with [002-runtime-delivery.md](./002-runtime-delivery.md).
 
@@ -355,6 +355,68 @@ source's `observe()` or its `ingest()` threw; the failure was isolated so other 
 [002 §`observation_history`](./002-runtime-delivery.md)), or `rebaselined` (the source advanced its
 baseline without computing a delta, e.g. after a force-pushed/gc'd ref; distinct from `no-change`) —
 plus the monitor id, source name, and timestamp.
+
+### `monitor explain` — Pipeline diagnosis
+
+**Status:** Fully implemented (socket with daemon-unavailable fallback).
+
+Diagnoses where a single monitor's signal currently stops. The command asks the daemon for a
+read-only staged report (`monitor.explain`) built from the monitor definition, scheduling state,
+recent `observation_history`, `monitor_state.notify_state`, `monitor_events`, and
+`session_event_state` projection rows.
+
+```
+agentmonitors monitor explain <monitorId> [--dir <path>] [--workspace <path>] [--socket <path>] [--history-limit <n>] [--event-limit <n>] [--format <text|json>]
+```
+
+| Argument / Flag       | Default             | Description                                    |
+| --------------------- | ------------------- | ---------------------------------------------- |
+| `<monitorId>`         | —                   | Monitor id to diagnose                         |
+| `--dir <path>`        | `.claude/monitors`  | Directory containing monitor definitions       |
+| `--workspace <path>`  | current working dir | Workspace path used for session projection     |
+| `--socket <path>`     | resolved default    | Unix domain socket path for the daemon         |
+| `--history-limit <n>` | `10`                | Observation history rows included in JSON      |
+| `--event-limit <n>`   | `10`                | Materialized event rows included in JSON       |
+| `--format`            | `text`              | `text` (stage summary) or `json` (full report) |
+
+Text output prints one line per stage with `✓`, `✗`, or `⏳`, followed by a verdict. JSON output
+returns:
+
+```json
+{
+  "monitorId": "<id>",
+  "generatedAt": "<iso timestamp>",
+  "monitor": {
+    "id": "<id>",
+    "displayName": "<name>",
+    "filePath": "<path>",
+    "sourceName": "<source>",
+    "urgency": "low|normal|high"
+  },
+  "stages": [
+    {
+      "id": "definition|scheduling|observation|notify|materialization|delivery",
+      "label": "<display label>",
+      "status": "ok|pending|failure",
+      "reason": "<one-line reason>",
+      "details": {}
+    }
+  ],
+  "verdict": {
+    "status": "ok|pending|failure",
+    "stage": "definition|scheduling|observation|notify|materialization|delivery",
+    "reason": "<one-line reason>"
+  },
+  "observations": [],
+  "events": [],
+  "projections": [],
+  "leadSessions": []
+}
+```
+
+If the daemon is not reachable, the command still validates the local definition and returns a stage
+2 scheduling failure that says the daemon is not running or unreachable. It exits 0 when it can
+produce a diagnostic report; malformed command arguments remain normal CLI errors.
 
 ---
 

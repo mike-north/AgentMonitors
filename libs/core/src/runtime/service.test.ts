@@ -840,6 +840,232 @@ Handle it.
     expect(history[1]?.observationData).toEqual({ observed: 1, emitted: 1 });
   });
 
+  it('explains invalid monitor frontmatter at the definition stage', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    const monitorsDir = path.join(rootDir, '.claude', 'monitors');
+    const monitorDir = path.join(monitorsDir, 'bad-monitor');
+    mkdirSync(monitorDir, { recursive: true });
+    writeFileSync(
+      path.join(monitorDir, 'MONITOR.md'),
+      `---
+name: Bad monitor
+---
+Handle it.
+`,
+      'utf-8',
+    );
+
+    const source: ObservationSource = {
+      name: 'unused-source',
+      scopeSchema: { type: 'object' },
+      observe: () => Promise.resolve({ observations: [] }),
+    };
+    const runtime = createRuntime(dbPath, source);
+
+    const report = await runtime.explainMonitor({
+      monitorId: 'bad-monitor',
+      monitorsDir,
+      workspacePath: rootDir,
+    });
+
+    expect(report.verdict).toMatchObject({
+      stage: 'definition',
+      status: 'failure',
+    });
+    expect(report.stages[0]?.reason).toContain('failed to parse or validate');
+  });
+
+  it('explains errored and unchanged source outcomes at the observation stage', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    const monitorsDir = path.join(rootDir, '.claude', 'monitors');
+    const errorMonitorDir = path.join(monitorsDir, 'aaa-error-monitor');
+    const unchangedMonitorDir = path.join(monitorsDir, 'zzz-unchanged-monitor');
+    mkdirSync(errorMonitorDir, { recursive: true });
+    mkdirSync(unchangedMonitorDir, { recursive: true });
+    writeFileSync(
+      path.join(errorMonitorDir, 'MONITOR.md'),
+      `---
+name: Error monitor
+watch:
+  type: error-source
+  interval: '1s'
+urgency: normal
+---
+Handle errors.
+`,
+      'utf-8',
+    );
+    writeFileSync(
+      path.join(unchangedMonitorDir, 'MONITOR.md'),
+      `---
+name: Unchanged monitor
+watch:
+  type: unchanged-source
+  interval: '1s'
+urgency: normal
+---
+Handle unchanged.
+`,
+      'utf-8',
+    );
+
+    const registry = new SourceRegistry();
+    registry.register({
+      name: 'error-source',
+      scopeSchema: { type: 'object' },
+      observe: (): Promise<ObservationResult> => {
+        throw new Error('source failed');
+      },
+    });
+    registry.register({
+      name: 'unchanged-source',
+      scopeSchema: { type: 'object' },
+      observe: () => Promise.resolve({ observations: [] }),
+    });
+    const runtime = new AgentMonitorRuntime(
+      new RuntimeStore(createDb(dbPath)),
+      registry,
+      [claudeCodeAdapter],
+    );
+    await runtime.tick(monitorsDir, rootDir);
+
+    const errored = await runtime.explainMonitor({
+      monitorId: 'aaa-error-monitor',
+      monitorsDir,
+      workspacePath: rootDir,
+    });
+    expect(errored.verdict).toMatchObject({
+      stage: 'observation',
+      status: 'failure',
+    });
+    expect(errored.stages.find((stage) => stage.id === 'observation')).toEqual(
+      expect.objectContaining({
+        reason: expect.stringContaining('errored'),
+      }),
+    );
+
+    const unchanged = await runtime.explainMonitor({
+      monitorId: 'zzz-unchanged-monitor',
+      monitorsDir,
+      workspacePath: rootDir,
+    });
+    expect(unchanged.verdict).toMatchObject({
+      stage: 'observation',
+      status: 'failure',
+    });
+    expect(
+      unchanged.stages.find((stage) => stage.id === 'observation')?.reason,
+    ).toContain('observed 0 changes');
+  });
+
+  it('explains a monitor stopped by pending debounce notify state', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'explain-debounce-source',
+      'high',
+      'Handle it.',
+      "  interval: '1s'\nnotify:\n  strategy: debounce\n  settle-for: 30s\n",
+    );
+
+    const source: ObservationSource = {
+      name: 'explain-debounce-source',
+      scopeSchema: { type: 'object' },
+      observe: () =>
+        Promise.resolve({
+          observations: [{ title: 'held observation', objectKey: 'obj-held' }],
+        }),
+    };
+
+    const runtime = createRuntime(dbPath, source);
+    await runtime.tick(monitorsDir, rootDir);
+
+    const report = await runtime.explainMonitor({
+      monitorId: 'test-monitor',
+      monitorsDir,
+      workspacePath: rootDir,
+    });
+
+    expect(report.verdict.stage).toBe('notify');
+    expect(report.verdict.status).toBe('pending');
+    expect(report.stages.find((stage) => stage.id === 'notify')).toMatchObject({
+      status: 'pending',
+    });
+    expect(
+      report.stages.find((stage) => stage.id === 'notify')?.reason,
+    ).toContain('debounce');
+  });
+
+  it('explains materialized events with no lead session and claimed delivery state', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'explain-delivery-source',
+      'normal',
+      'Handle it.',
+      "  interval: '1s'\n",
+    );
+
+    const source: ObservationSource = {
+      name: 'explain-delivery-source',
+      scopeSchema: { type: 'object' },
+      observe: () =>
+        Promise.resolve({
+          observations: [
+            { title: 'delivery observation', objectKey: 'obj-delivery' },
+          ],
+        }),
+    };
+
+    const runtime = createRuntime(dbPath, source);
+    await runtime.tick(monitorsDir, rootDir);
+
+    const withoutSession = await runtime.explainMonitor({
+      monitorId: 'test-monitor',
+      monitorsDir,
+      workspacePath: rootDir,
+    });
+    expect(withoutSession.verdict.stage).toBe('delivery');
+    expect(withoutSession.verdict.status).toBe('failure');
+    expect(
+      withoutSession.stages.find((stage) => stage.id === 'delivery')?.reason,
+    ).toContain('No lead session');
+
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-explain',
+        workspacePath: rootDir,
+      }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    await runtime.tick(monitorsDir, rootDir);
+    runtime.claimDelivery(session.id, 'turn-interruptible');
+
+    const delivered = await runtime.explainMonitor({
+      monitorId: 'test-monitor',
+      monitorsDir,
+      workspacePath: rootDir,
+    });
+
+    expect(delivered.verdict.status).toBe('ok');
+    expect(delivered.projections).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          sessionId: session.id,
+          deliveryState: 'claimed',
+        }),
+      ]),
+    );
+  });
+
   it('classifies a debounced-flush tick (emit with zero new observations) as triggered, not no-change', async () => {
     // Regression for PR #30: a tick that flushes a previously-debounced batch has
     // zero *new* observations yet still emits events. It must be recorded as

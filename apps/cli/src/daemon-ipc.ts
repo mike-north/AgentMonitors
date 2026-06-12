@@ -39,6 +39,7 @@ const daemonMethodSchema = z.enum([
   'events.ack',
   'hook.claim',
   'history.list',
+  'monitor.explain',
   'daemon.tick',
 ]);
 const daemonResponseSchema = z.object({
@@ -86,6 +87,13 @@ const hookClaimParamsSchema = z.object({
 const historyListParamsSchema = z.object({
   monitorId: z.string().optional(),
   limit: z.number().int().positive().optional(),
+});
+const monitorExplainParamsSchema = z.object({
+  monitorId: z.string(),
+  monitorsDir: z.string(),
+  workspacePath: z.string().optional(),
+  historyLimit: z.number().int().positive().optional(),
+  eventLimit: z.number().int().positive().optional(),
 });
 const daemonTickParamsSchema = z.object({
   monitorsDir: z.string(),
@@ -379,6 +387,18 @@ function handleRequest(
           ...(params.limit ? { limit: params.limit } : {}),
         }),
       );
+    }
+    case 'monitor.explain': {
+      const params = monitorExplainParamsSchema.parse(request.params);
+      return runtime.explainMonitor({
+        monitorId: params.monitorId,
+        monitorsDir: params.monitorsDir,
+        ...(params.workspacePath
+          ? { workspacePath: params.workspacePath }
+          : {}),
+        ...(params.historyLimit ? { historyLimit: params.historyLimit } : {}),
+        ...(params.eventLimit ? { eventLimit: params.eventLimit } : {}),
+      });
     }
     case 'daemon.tick': {
       const params = daemonTickParamsSchema.parse(request.params);
