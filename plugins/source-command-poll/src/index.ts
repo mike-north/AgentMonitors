@@ -1,12 +1,18 @@
 import { execFile } from 'node:child_process';
 import type {
   JsonSchema,
+  KeyedCollectionConfig,
+  KeyedSnapshot,
   Observation,
   ObservationContext,
   ObservationResult,
   ObservationSource,
 } from '@agentmonitors/core';
-import { parseDuration } from '@agentmonitors/core';
+import {
+  diffKeyedCollection,
+  parseDuration,
+  parseKeyedCollectionConfig,
+} from '@agentmonitors/core';
 
 /**
  * Change-detection strategies (003 §11.3). `text-diff` is the default; `exit-code`
@@ -33,6 +39,8 @@ interface ScopeConfig {
   timeoutMs: number;
   objectKey: string;
   strategy: ChangeStrategy;
+  /** Keyed-collection config (003 §12), present only under `strategy: json-diff`. */
+  collection: KeyedCollectionConfig | undefined;
 }
 
 /**
@@ -52,6 +60,13 @@ interface CommandState {
   truncated: boolean;
   health: 'ok' | 'failing';
   baselined: boolean;
+  /**
+   * The keyed-collection snapshot from the previous successful cycle (003 §12),
+   * present only when the monitor uses `change-detection.collection`. Carried
+   * forward untouched across failing ticks so a recovery diffs against the
+   * pre-failure keyed baseline.
+   */
+  keyedSnapshot?: KeyedSnapshot;
 }
 
 interface ExecResult {
@@ -84,6 +99,14 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
       ? rawStrategy
       : 'text-diff';
 
+  // Keyed-collection mode (003 §12) is only valid under `json-diff`. The generated
+  // schema rejects `collection` under other strategies at authoring time (BP3); this
+  // is the defence-in-depth guard for the observe path.
+  const collection = parseKeyedCollectionConfig(config['change-detection']);
+  if (collection && strategy !== 'json-diff') {
+    throw new Error('change-detection.collection requires strategy: json-diff');
+  }
+
   const cwd = typeof config['cwd'] === 'string' ? config['cwd'] : undefined;
 
   const rawEnv = config['env'];
@@ -105,7 +128,7 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
   const objectKey =
     typeof key === 'string' && key.length > 0 ? key : command.join(' ');
 
-  return { command, cwd, env, timeoutMs, objectKey, strategy };
+  return { command, cwd, env, timeoutMs, objectKey, strategy, collection };
 }
 
 /**
@@ -352,6 +375,39 @@ const scopeSchema: JsonSchema = {
           type: 'string',
           enum: ['text-diff', 'json-diff', 'exit-code'],
         },
+        // Keyed-collection mode (003 §12). The `collection` block is only valid
+        // under `strategy: json-diff`; the `if/then` below enforces that at
+        // authoring time (BP3).
+        collection: {
+          type: 'object',
+          properties: {
+            path: {
+              type: 'string',
+              description:
+                'Dotted $.-path to the array within the parsed JSON (e.g. "$.tasks")',
+            },
+            key: {
+              type: 'string',
+              description:
+                'Field on each element used as the per-object identity',
+            },
+            'ignore-paths': {
+              type: 'array',
+              items: { type: 'string' },
+              description:
+                'Dotted $.-paths (relative to each element) removed before comparison',
+            },
+          },
+          required: ['path', 'key'],
+        },
+      },
+      // BP3: change-detection.collection requires strategy: json-diff. Under any
+      // other strategy (or the defaulted text-diff), presence of `collection` is an
+      // authoring-time error.
+      if: { required: ['collection'] },
+      then: {
+        properties: { strategy: { const: 'json-diff' } },
+        required: ['strategy'],
       },
     },
   },
@@ -386,6 +442,8 @@ const source: ObservationSource = {
         truncated: prev?.truncated ?? false,
         health: 'failing',
         baselined: prev?.baselined ?? false,
+        // Carry the keyed baseline forward untouched so recovery diffs against it.
+        ...(prev?.keyedSnapshot ? { keyedSnapshot: prev.keyedSnapshot } : {}),
       };
       return {
         observations: wasFailing ? [] : [failingObservation(scope, outcome)],
@@ -398,6 +456,40 @@ const source: ObservationSource = {
     const recovered = prev?.health === 'failing';
     const hadBaseline = prev?.baselined ?? false;
 
+    const observations: Observation[] = [];
+    // A failing → ok edge always emits the recovery health observation (003 §11.5).
+    if (recovered) {
+      observations.push(recoveredObservation(scope));
+    }
+
+    // ---- Keyed-collection mode (003 §12) ----------------------------------------
+    // Parse stdout as JSON and diff per keyed object. The keyed snapshot lives in the
+    // same per-monitor state slot; the baseline rule is unchanged (first successful
+    // run records the snapshot, emits nothing). A failing-first-run leaves no keyed
+    // baseline, so the first success after it baselines silently too.
+    if (scope.collection) {
+      const result2 = diffKeyedCollection(
+        JSON.parse(result.stdout),
+        scope.collection,
+        scope.objectKey,
+        hadBaseline ? prev?.keyedSnapshot : undefined,
+        {
+          payload: { command: scope.command },
+          queryScope: { command: scope.objectKey },
+        },
+      );
+      observations.push(...result2.observations);
+      const nextState: CommandState = {
+        stdout: result.stdout,
+        exitCode: result.exitCode,
+        truncated: result.truncated,
+        health: 'ok',
+        baselined: true,
+        keyedSnapshot: result2.snapshot,
+      };
+      return { observations, nextState };
+    }
+
     const nextState: CommandState = {
       stdout: result.stdout,
       exitCode: result.exitCode,
@@ -406,11 +498,6 @@ const source: ObservationSource = {
       baselined: true,
     };
 
-    const observations: Observation[] = [];
-    // A failing → ok edge always emits the recovery health observation (003 §11.5).
-    if (recovered) {
-      observations.push(recoveredObservation(scope));
-    }
     // The output-changed observation requires a real pre-failure/prior baseline to
     // diff against. The first-ever success — and the first success after a failing
     // first run — baselines silently (003 §11.4/§11.5).
