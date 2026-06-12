@@ -192,9 +192,7 @@ function removeDottedPath(value: unknown, path: string): void {
   }
   const last = segments[segments.length - 1];
   if (last === undefined || last.length === 0) {
-    throw new Error(
-      `Invalid ignore-paths entry "${path}": empty path segment`,
-    );
+    throw new Error(`Invalid ignore-paths entry "${path}": empty path segment`);
   }
   assertValidSegment(path, last);
   if (
