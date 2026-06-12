@@ -1,4 +1,5 @@
 import { Command, Option } from 'commander';
+import { readFileSync } from 'node:fs';
 import {
   scanMonitors,
   SourceRegistry,
@@ -23,6 +24,31 @@ function changeDetectionCollectionError(
   const strategy = cdObj['strategy'];
   if (strategy === 'json-diff') return undefined;
   return 'change-detection.collection requires strategy: json-diff';
+}
+
+// Old public docs used top-level `source:` + `scope:` before the current
+// `watch: { type, ... }` authoring shape. Detect only that exact parse failure
+// pattern so unrelated schema errors are not polluted with migration advice.
+function oldSourceScopeShapeHint(filePath: string): string | null {
+  let content: string;
+  try {
+    content = readFileSync(filePath, 'utf-8');
+  } catch {
+    return null;
+  }
+
+  const frontmatter = /^---\n(?<frontmatter>[\s\S]*?)\n---/.exec(content)
+    ?.groups?.['frontmatter'];
+  if (!frontmatter) return null;
+
+  const rawSource = /^source:\s*(?<source>[^\n#]+)/m.exec(frontmatter)
+    ?.groups?.['source'];
+  const source = rawSource?.trim().replace(/^['"]|['"]$/g, '');
+  const hasScope = /^scope:\s*($|#)/m.test(frontmatter);
+  const hasWatch = /^watch:\s*($|#)/m.test(frontmatter);
+  if (!source || !hasScope || hasWatch) return null;
+
+  return `did you mean to use the current watch shape? Move source/scope into watch:, for example: watch: { type: ${source}, ... }`;
 }
 
 export const validateCommand = new Command('validate')
@@ -88,7 +114,9 @@ export const validateCommand = new Command('validate')
     const allErrors = [
       ...result.errors.map((e) => ({
         filePath: e.filePath,
-        error: e.error,
+        error: [e.error, oldSourceScopeShapeHint(e.filePath)]
+          .filter(Boolean)
+          .join('; '),
       })),
       ...scopeErrors.map((e) => ({
         filePath: e.id,

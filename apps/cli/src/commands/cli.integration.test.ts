@@ -461,6 +461,30 @@ describe('validate', () => {
     expect(result.stdout.toLowerCase()).toMatch(/scope|array|type/);
   });
 
+  it('hints when a monitor uses the old top-level source/scope shape', () => {
+    const dir = path.join(tempDir, 'validate-old-shape-test');
+    const monitorDir = path.join(dir, 'monitors', 'old-shape');
+    mkdirSync(monitorDir, { recursive: true });
+    const body = [
+      '---',
+      'name: Old shape',
+      'source: file-fingerprint',
+      'scope:',
+      '  globs: ["*.ts"]',
+      'urgency: normal',
+      '---',
+      'Handle it.',
+      '',
+    ].join('\n');
+    writeFileSync(path.join(monitorDir, 'MONITOR.md'), body, 'utf-8');
+
+    const result = run(['validate', path.join(dir, 'monitors')]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain('did you mean');
+    expect(result.stdout).toContain('watch:');
+    expect(result.stdout).toContain('type: file-fingerprint');
+  });
+
   it('rejects an unknown source name', () => {
     const dir = path.join(tempDir, 'validate-unknownsource-test');
     const monitorDir = path.join(dir, 'monitors', 'mystery');
@@ -705,6 +729,8 @@ describe('source list', () => {
   it('lists sources in text format', () => {
     const result = run(['source', 'list']);
     expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('Config fields:');
+    expect(result.stdout).not.toContain('Scope fields:');
     expect(result.stdout).toContain('file-fingerprint');
     expect(result.stdout).toContain('api-poll');
     expect(result.stdout).toContain('command-poll');
@@ -723,6 +749,7 @@ describe('source list', () => {
     expect(names).toContain('command-poll');
     expect(names).toContain('schedule');
     expect(names).toContain('incoming-changes');
+    expect(parsed[0]).toHaveProperty('configFields');
   });
 });
 

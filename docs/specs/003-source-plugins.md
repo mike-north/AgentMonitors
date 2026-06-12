@@ -338,9 +338,12 @@ The generated schema:
 - Validates the `notify` field with a `oneOf` covering `debounce` (requires `settle-for`) and `throttle` (requires `suppress-for`)
 - Accepts an optional `tags` array of strings
 
-### 7.3 Validation gap (current vs. target)
+### 7.3 Validation behavior
 
-The current CLI validation command checks required source scope fields but does not yet enforce full per-source JSON Schema validation against the generated schema. This gap is documented in [004-validation-testing.md](./004-validation-testing.md).
+The current CLI validation command extracts the source config from `watch:` minus `type` and enforces
+the selected source's full `scopeSchema` with the core `validateScope` helper. The `scopeSchema` name
+is a plugin API term; monitor authors write those fields flat inside `watch:`. Validation coverage is
+documented in [004-validation-testing.md](./004-validation-testing.md).
 
 ## 8. Plugin Discovery and Installation Notes
 

@@ -28,9 +28,11 @@ sourceCommand
           (source.scopeSchema['properties'] as
             | Record<string, unknown>
             | undefined) ?? {};
+        const configFields = Object.keys(properties);
         return {
           name: source.name,
-          scopeFields: Object.keys(properties),
+          configFields,
+          scopeFields: configFields,
           required: requiredFields,
         };
       });
@@ -52,7 +54,7 @@ sourceCommand
           | Record<string, unknown>
           | undefined) ?? {};
       console.log(`  ${source.name}`);
-      console.log(`    Scope fields: ${Object.keys(properties).join(', ')}`);
+      console.log(`    Config fields: ${Object.keys(properties).join(', ')}`);
       console.log(`    Required: ${requiredFields.join(', ') || '(none)'}`);
       console.log('');
     }
