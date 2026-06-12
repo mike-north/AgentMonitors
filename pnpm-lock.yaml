@@ -65,6 +65,9 @@ importers:
       '@agentmonitors/source-api-poll':
         specifier: workspace:*
         version: link:../../plugins/source-api-poll
+      '@agentmonitors/source-command-poll':
+        specifier: workspace:*
+        version: link:../../plugins/source-command-poll
       '@agentmonitors/source-file-fingerprint':
         specifier: workspace:*
         version: link:../../plugins/source-file-fingerprint
@@ -157,6 +160,16 @@ importers:
         version: 0.31.9
 
   plugins/source-api-poll:
+    dependencies:
+      '@agentmonitors/core':
+        specifier: workspace:*
+        version: link:../../libs/core
+    devDependencies:
+      '@types/node':
+        specifier: ^22.15.0
+        version: 22.19.15
+
+  plugins/source-command-poll:
     dependencies:
       '@agentmonitors/core':
         specifier: workspace:*
