@@ -1,6 +1,6 @@
 # Engineering Team Instructions
 
-Conventions for the engineering fleet working this repo. The PM agent maintains this file;
+Conventions for the engineering fleet working on this repo. The PM agent maintains this file;
 `CLAUDE.md` covers the codebase itself — this covers how we work together. Keep both.
 
 ## Picking up work
@@ -33,9 +33,9 @@ Conventions for the engineering fleet working this repo. The PM agent maintains 
    pattern — including the no-orphan-daemon discipline). "Tests pass" with the production
    contract untested is this repo's signature bug class — test the real input contract
    (stdin payloads, hooks.json command strings), not a hand-built approximation.
-8. **Quality gate before opening a PR:** `pnpm check` and the affected test suites green;
-   api-extractor report regenerated if core's public surface changed; `pnpm check:aipm` if
-   you touched `agent-plugins/`.
+8. **Quality gate before opening a PR:** `pnpm check` (which includes per-package tsc,
+   workspace lint/format, and aipm freshness validation) and the affected test suites
+   green; api-extractor report regenerated if core's public surface changed.
 
 ## PRs, review, and merging
 
