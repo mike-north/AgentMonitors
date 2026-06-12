@@ -52,7 +52,7 @@ sourceCommand
           | Record<string, unknown>
           | undefined) ?? {};
       console.log(`  ${source.name}`);
-      console.log(`    Scope fields: ${Object.keys(properties).join(', ')}`);
+      console.log(`    Config fields: ${Object.keys(properties).join(', ')}`);
       console.log(`    Required: ${requiredFields.join(', ') || '(none)'}`);
       console.log('');
     }

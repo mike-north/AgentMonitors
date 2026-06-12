@@ -30,8 +30,8 @@ export function validateScope(
   const messages = result.errors.map((unit) => {
     const location =
       unit.instanceLocation && unit.instanceLocation !== '#'
-        ? unit.instanceLocation.replace(/^#/, 'scope')
-        : 'scope';
+        ? unit.instanceLocation.replace(/^#/, 'watch')
+        : 'watch';
     return `${location}: ${unit.error}`;
   });
 

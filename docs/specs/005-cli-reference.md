@@ -381,7 +381,7 @@ Lists all sources registered via `registerCoreSources()` (currently: `file-finge
 Installed sources:
 
   <name>
-    Scope fields: <field1>, <field2>, ...
+    Config fields: <field1>, <field2>, ...
     Required: <field1>, ... (or "(none)")
 ```
 
