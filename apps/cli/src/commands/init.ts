@@ -34,6 +34,24 @@ urgency: normal
 When the API response changes, review the differences and take appropriate action.
 `.trimStart(),
 
+  'command-poll': yaml`
+---
+name: My command monitor
+watch:
+  type: command-poll
+  command:
+    - git
+    - status
+    - --porcelain
+  interval: 5m
+  change-detection:
+    strategy: text-diff
+urgency: normal
+---
+
+When the command output changes, review the differences and take appropriate action.
+`.trimStart(),
+
   schedule: yaml`
 ---
 name: My scheduled monitor

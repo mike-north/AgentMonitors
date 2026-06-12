@@ -25,6 +25,7 @@ pnpm --filter @agentmonitors/source-file-fingerprint build >/dev/null
 pnpm --filter @agentmonitors/source-api-poll build >/dev/null
 pnpm --filter @agentmonitors/source-schedule build >/dev/null
 pnpm --filter @agentmonitors/source-incoming-changes build >/dev/null
+pnpm --filter @agentmonitors/source-command-poll build >/dev/null
 pnpm --filter @agentmonitors/cli build >/dev/null
 
 mkdir -p /tmp/workspace/.claude/monitors/watch-files

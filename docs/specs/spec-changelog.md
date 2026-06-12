@@ -9,6 +9,44 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-06-12 — `command-poll` source shipped (003 §11 target→current; G8 retired)
+
+The local-process sibling of `api-poll` is now a bundled source, promoting
+[003 §11](./003-source-plugins.md) from **target** to **current** with `verified:` references.
+
+- **New package `@agentmonitors/source-command-poll`** implements §11.1–§11.6 verbatim: argv-only
+  `command` spawned directly (`execFile`, `shell: false` — never a shell, so metacharacters pass
+  through as literal arguments); `cwd`/`env`/`timeout`/`key`/`interval` scope; `text-diff` (default) /
+  `json-diff` / `exit-code` strategies; a 1 MiB stdout cap marking `truncated: true` and diffing
+  stably on the capped leading slice; SIGTERM→SIGKILL-after-5s timeout handling that leaves no orphan
+  process; `stateful` baseline (first successful run records `{ stdout, exitCode }` and emits
+  nothing); and transition-edge failure health (`ok ↔ failing` observations only on the edge — a
+  nonzero exit **with** output is a result that gets diffed, while spawn failure and timeout are
+  failures that keep prior state). `env` values are never written to any payload, snapshot, or state
+  row.
+- **Registered** via `registerCoreSources` (`apps/cli/src/sources.ts`) and scaffolded by
+  `agentmonitors init --type command-poll` (`apps/cli/src/commands/init.ts`).
+- **Proof:** `plugins/source-command-poll/src/index.test.ts` covers the §11.7 list (no-shell
+  metacharacter pass-through, per-strategy detection, nonzero-exit-is-a-result, spawn/timeout
+  transition edges, env-not-persisted, 1 MiB stable truncation, no-orphan-on-timeout);
+  `apps/cli/src/commands/cli.integration.test.ts` covers registration, the init template, and
+  `validate` accepting/rejecting a `command-poll` monitor. Roadmap **G8** retired.
+- Keyed-collection (§12) and the cursor protocol (§13) remain unbuilt targets (roadmap G9).
+- Minor changesets: `@agentmonitors/source-command-poll` (new package) and `@agentmonitors/cli` (new
+  source registered + init template).
+
+## 2026-06-12 — `command-poll` implementation correction: `snapshot.command` is the argv array (003 §11.4)
+
+Corrected `changedObservation()` in `plugins/source-command-poll/src/index.ts`: `snapshot.command`
+was incorrectly set to `scope.objectKey` (the joined-argv string or `key` override) instead of the
+argv array (`scope.command`). §11.4 specifies `snapshot: { command, exitCode, stdoutLength,
+strategy }` where `command` is the argv array — matching `payload.command`. This was a behavioral
+deviation from the spec; the spec wording is unchanged (it was always correct).
+
+Also tightened `isCommandState()` to require `typeof truncated === 'boolean'`, preventing a
+malformed `previousState` (e.g. `truncated: "yes"`) from being accepted and re-persisted through
+the failure-path state carry-forward.
+
 ## 2026-06-11 — Steel-thread UAT now drives the plugin's literal `hooks.json` command strings (004 §3.5 config-drift coverage)
 
 Follow-up to the steel-thread entry below (issue #89, review point 2 of #83, deferred at merge). The

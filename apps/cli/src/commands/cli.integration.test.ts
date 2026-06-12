@@ -310,6 +310,31 @@ describe('init', () => {
     expect(parsed.monitors[0]?.source).toBe('incoming-changes');
   });
 
+  // AC7 — the scaffolded command-poll template validates against the registered
+  // source's scopeSchema (`command` required), proving registration + the template.
+  it('scaffolds a command-poll monitor that passes validate', () => {
+    const dir = path.join(tempDir, 'init-command-poll');
+    mkdirSync(dir, { recursive: true });
+    const monitorsDir = path.join(dir, 'monitors');
+    const created = run(
+      ['init', 'cmd-watch', '--dir', monitorsDir, '--type', 'command-poll'],
+      dir,
+    );
+    expect(created.exitCode).toBe(0);
+    expect(created.stdout).toContain('Created monitor');
+
+    const validated = run(['validate', monitorsDir, '--format', 'json'], dir);
+    expect(validated.exitCode).toBe(0);
+    const parsed = JSON.parse(validated.stdout) as {
+      valid: number;
+      invalid: number;
+      monitors: { source: string }[];
+    };
+    expect(parsed.valid).toBe(1);
+    expect(parsed.invalid).toBe(0);
+    expect(parsed.monitors[0]?.source).toBe('command-poll');
+  });
+
   it('rejects invalid --type value', () => {
     const dir = path.join(tempDir, 'init-test-3');
     mkdirSync(dir, { recursive: true });
@@ -457,6 +482,57 @@ describe('validate', () => {
     expect(result.exitCode).toBe(1);
     expect(result.stdout).toContain('Unknown source');
   });
+
+  // AC7 — a command-poll monitor missing the required `command` field is rejected
+  // with a clear, field-naming message (full per-source JSON Schema validation).
+  it('rejects a command-poll monitor missing `command`', () => {
+    const dir = path.join(tempDir, 'validate-command-poll-missing');
+    const monitorDir = path.join(dir, 'monitors', 'cmd-bad');
+    mkdirSync(monitorDir, { recursive: true });
+    const body = [
+      '---',
+      'name: Missing command',
+      'watch:',
+      '  type: command-poll',
+      '  interval: 5m',
+      'urgency: normal',
+      '---',
+      'Handle it.',
+      '',
+    ].join('\n');
+    writeFileSync(path.join(monitorDir, 'MONITOR.md'), body, 'utf-8');
+
+    const result = run(['validate', path.join(dir, 'monitors')]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain('command');
+  });
+
+  // AC7 — a well-formed command-poll monitor (argv `command`) validates.
+  it('accepts a well-formed command-poll monitor', () => {
+    const dir = path.join(tempDir, 'validate-command-poll-ok');
+    const monitorDir = path.join(dir, 'monitors', 'cmd-ok');
+    mkdirSync(monitorDir, { recursive: true });
+    const body = [
+      '---',
+      'name: Git status',
+      'watch:',
+      '  type: command-poll',
+      '  command:',
+      '    - git',
+      '    - status',
+      '    - --porcelain',
+      '  interval: 5m',
+      'urgency: normal',
+      '---',
+      'Review the working-tree changes.',
+      '',
+    ].join('\n');
+    writeFileSync(path.join(monitorDir, 'MONITOR.md'), body, 'utf-8');
+
+    const result = run(['validate', path.join(dir, 'monitors')]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('Valid monitors: 1');
+  });
 });
 
 describe('scan', () => {
@@ -487,6 +563,7 @@ describe('source list', () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain('file-fingerprint');
     expect(result.stdout).toContain('api-poll');
+    expect(result.stdout).toContain('command-poll');
     expect(result.stdout).toContain('schedule');
     expect(result.stdout).toContain('incoming-changes');
   });
@@ -495,10 +572,11 @@ describe('source list', () => {
     const result = run(['source', 'list', '--format', 'json']);
     expect(result.exitCode).toBe(0);
     const parsed = JSON.parse(result.stdout);
-    expect(parsed).toHaveLength(4);
+    expect(parsed).toHaveLength(5);
     const names = parsed.map((s: { name: string }) => s.name);
     expect(names).toContain('file-fingerprint');
     expect(names).toContain('api-poll');
+    expect(names).toContain('command-poll');
     expect(names).toContain('schedule');
     expect(names).toContain('incoming-changes');
   });

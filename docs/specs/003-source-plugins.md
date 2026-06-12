@@ -2,13 +2,13 @@
 
 > **Status:** Draft
 > **Depends on:** [000-principles.md](./000-principles.md), [001-monitor-definition.md](./001-monitor-definition.md), [002-runtime-delivery.md](./002-runtime-delivery.md)
-> **Covers:** source contract, bundled sources, current limitations, plugin-discovery notes, target sources (`command-poll`) and target change-detection capabilities
+> **Covers:** source contract, bundled sources, current limitations, plugin-discovery notes, and target change-detection capabilities
 
 ## 1. Overview
 
-This document specifies the contract implemented by observation source plugins and the current behavior of the bundled sources: `file-fingerprint`, `api-poll`, `schedule`, `incoming-changes`. The runtime depends on sources to detect change, but the runtime owns scheduling, notify dispatch, and delivery timing (PP3).
+This document specifies the contract implemented by observation source plugins and the current behavior of the bundled sources: `file-fingerprint`, `api-poll`, `command-poll`, `schedule`, `incoming-changes`. The runtime depends on sources to detect change, but the runtime owns scheduling, notify dispatch, and delivery timing (PP3).
 
-Sections marked **target** (§11–§13: the `command-poll` source, keyed-collection change detection, and the cursor protocol) are normative designs that are **not yet implemented** (PP7); they move to current status, with `verified:` references, when they ship.
+Sections marked **target** (§12–§13: keyed-collection change detection and the cursor protocol) are normative designs that are **not yet implemented** (PP7); they move to current status, with `verified:` references, when they ship. §11 (`command-poll`) has shipped and is now **current** behavior (verified: `plugins/source-command-poll/src/index.ts`, `plugins/source-command-poll/src/index.test.ts`).
 
 ### Principles Satisfied
 
@@ -98,7 +98,7 @@ source populating `queryScope` itself (see [002 §5.1](./002-runtime-delivery.md
 
 If `stateful` is `true`, the first successful `observe()` call **MAY** return an empty `observations` array while storing an initial baseline in `nextState`. That is not an error case — it is how baseline-then-detect sources work (PP6). On subsequent calls, the stored state is available via `context.previousState`.
 
-`file-fingerprint`, `api-poll`, and `incoming-changes` all declare `stateful: true`. `schedule` does not declare `stateful` (defaults to `false`).
+`file-fingerprint`, `api-poll`, `command-poll`, and `incoming-changes` all declare `stateful: true`. `schedule` does not declare `stateful` (defaults to `false`).
 
 ## 3. Bundled Source: `file-fingerprint`
 
@@ -402,14 +402,16 @@ Source-level tests SHOULD verify:
 - `incoming-changes` emits no observations on the baseline run; subsequent runs report net changes since the stored ref; a gc'd or force-pushed ref triggers a silent re-baseline.
 - `file-fingerprint` includes `snapshotText` for text files and omits it for binary files (files containing null bytes).
 
-## 11. Target Source: `command-poll`
+## 11. Bundled Source: `command-poll`
 
-> **Status: target — not yet implemented** (PP7). This section is the normative design for the
-> source proposed in issue [#81](https://github.com/mike-north/AgentMonitors/issues/81): the
-> local-process sibling of `api-poll`. It runs a configured command on the tick loop, captures the
-> result, and reports change using snapshot-diff strategies. When implemented, the "target" framing
-> here moves to "current" with `verified:` references, per the retirement process in
-> [roadmap.md](./roadmap.md).
+> **Status: current — shipped** (PP7). The source proposed in issue
+> [#81](https://github.com/mike-north/AgentMonitors/issues/81) — the local-process sibling of
+> `api-poll` — is implemented as the bundled package `@agentmonitors/source-command-poll`. It runs a
+> configured command on the tick loop, captures the result, and reports change using snapshot-diff
+> strategies. Verified: `plugins/source-command-poll/src/index.ts` (source) and
+> `plugins/source-command-poll/src/index.test.ts` (the §11.7 validation list); registered via
+> `registerCoreSources` (`apps/cli/src/sources.ts`) with an `init --type command-poll` template
+> (`apps/cli/src/commands/init.ts`), covered by `apps/cli/src/commands/cli.integration.test.ts`.
 
 `command-poll` exists so that any CLI-backed system (`git`, `gh`, `kubectl`, build tools, task
 managers) can be monitored purely through `MONITOR.md` config, with **zero domain-specific source
@@ -548,21 +550,35 @@ It is not scheduled; it exists here so the v1 decision is visibly a decision, no
 
 ### 11.7 Validation implications
 
-When implemented, source-level tests MUST verify, beyond the §10 generic items:
+Source-level tests verify, beyond the §10 generic items (verified:
+`plugins/source-command-poll/src/index.test.ts` unless noted; the acceptance-criterion labels are
+issue #86's AC1–AC7):
 
 - A shell-metacharacter argv element (`['echo', '$(whoami); rm -rf /tmp/x']`) is passed through as a
-  **literal argument** — the output contains the metacharacters verbatim, proving no shell is involved.
+  **literal argument** — the output contains the metacharacters verbatim, proving no shell is
+  involved (AC1: _"passes shell metacharacters through as a literal argument"_).
 - Baseline run emits nothing; an output change under each strategy emits exactly one observation;
-  `exit-code` ignores stdout-only changes; `json-diff` ignores key reordering.
-- A nonzero-exit result with changed output **is** diffed and reported (nonzero ≠ failure).
+  `exit-code` ignores stdout-only changes; `json-diff` ignores key reordering (AC2: the
+  _"baseline and change-detection strategies"_ describe block).
+- A nonzero-exit result with changed output **is** diffed and reported (nonzero ≠ failure) (AC3:
+  _"reports a changed nonzero-exit output as an observation"_).
 - Spawn failure and timeout each: keep prior state, emit exactly one `ok → failing` observation, stay
-  silent on subsequent failing ticks, and emit `failing → ok` on recovery.
+  silent on subsequent failing ticks, and emit `failing → ok` on recovery (AC4: the
+  _"transition-edge failure semantics"_ describe block).
 - `env` values appear in the child's environment and in **no** persisted artifact (payload, snapshot,
-  state row).
+  state row) (AC5: _"passes env to the child but excludes the env config from all persisted
+  artifacts"_).
 - Output exceeding the 1 MiB cap sets `truncated: true` and still produces stable diffs (two
-  truncated captures of identical leading content do not report change).
-- `timeout` kills a hung child within the grace period and leaves no orphan process (mirror the
-  daemon-test discipline used for CLI integration tests).
+  truncated captures of identical leading content do not report change) (AC6: _"marks truncated and
+  produces stable diffs across identical leading content"_).
+- `timeout` kills a hung child within the grace period and leaves no orphan process (AC6: _"a
+  timed-out child leaves no orphan (killed within the grace window)"_, mirroring the daemon-test
+  no-orphan discipline).
+- Registration + the `init --type command-poll` template + `validate` accepting/rejecting a
+  `command-poll` monitor are covered at the CLI layer (AC7: verified:
+  `apps/cli/src/commands/cli.integration.test.ts` — _"scaffolds a command-poll monitor that passes
+  validate"_, _"rejects a command-poll monitor missing `command`"_, _"accepts a well-formed
+  command-poll monitor"_).
 
 ### 11.8 Non-goals (v1)
 

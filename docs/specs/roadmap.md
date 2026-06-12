@@ -69,26 +69,24 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
 > Non-blocking follow-ups: optional `object_key` meta (needs `DeliveryEventSummary`
 > enrichment, [006 §4.2](./006-agent-integration.md)).
 
-### G8 — `command-poll` source (P2)
-
-- **Current:** no local-command observation source; `api-poll` is the only "poll and diff" source.
-  The design is fully specified in [003 §11](./003-source-plugins.md) (from issue #81): argv-only
-  execution, `text-diff`/`json-diff`/`exit-code` strategies, transition-edge failure signals, and
-  the v1 trust decision (execute without acknowledgment; ack-ledger designed as target in 003
-  §11.6).
-- **Target:** a bundled `@agentmonitors/source-command-poll` package implementing 003 §11 verbatim,
-  registered via `registerCoreSources`, with an `init --type command-poll` template.
-- **Governs:** PP3, PP6, BP3 ([000](./000-principles.md)), [003 §11](./003-source-plugins.md).
-- **Files:** new `plugins/source-command-poll/`; `apps/cli/src/sources.ts`;
-  `apps/cli/src/commands/init.ts` (template).
-- **Proof:** the validation list in [003 §11.7](./003-source-plugins.md) — most critically the
-  no-shell metacharacter test, the nonzero-exit-is-a-result test, and the transition-edge failure
-  tests.
+> G8 (`command-poll` source) **shipped** — the bundled package
+> `@agentmonitors/source-command-poll` implements [003 §11](./003-source-plugins.md) verbatim:
+> argv-only execution (never a shell), `text-diff`/`json-diff`/`exit-code` strategies, a 1 MiB stdout
+> cap with stable truncated diffs, SIGTERM→SIGKILL timeout handling with no orphan processes,
+> transition-edge `ok ↔ failing` health signals (nonzero exit with output is a result, not a
+> failure), and `env` never persisted. Registered via `registerCoreSources`
+> (`apps/cli/src/sources.ts`) with an `init --type command-poll` template
+> (`apps/cli/src/commands/init.ts`). Proven by `plugins/source-command-poll/src/index.test.ts` (the
+> §11.7 validation list, incl. the no-shell metacharacter test, the nonzero-exit-is-a-result test,
+> the transition-edge failure tests, and the no-orphan-on-timeout guard) and CLI integration tests
+> (`apps/cli/src/commands/cli.integration.test.ts`). See [003 §11](./003-source-plugins.md) and
+> [spec-changelog.md](./spec-changelog.md). The keyed-collection (§12) and cursor (§13) targets
+> remain unbuilt (G9 below).
 
 ### G9 — Keyed-collection change detection (P3)
 
-- **Current:** `api-poll` (and the target `command-poll`) report one output-level observation per
-  change; collection outputs produce opaque "something changed" signals.
+- **Current:** `api-poll` and `command-poll` report one output-level observation per change;
+  collection outputs produce opaque "something changed" signals.
 - **Target:** the `change-detection.collection` mode of [003 §12](./003-source-plugins.md):
   per-object observations with stable `objectKey`s and `created`/`modified`/`descoped` change kinds.
   Applies to both poll sources; separable from G8.
