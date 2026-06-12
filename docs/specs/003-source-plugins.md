@@ -8,7 +8,7 @@
 
 This document specifies the contract implemented by observation source plugins and the current behavior of the bundled sources: `file-fingerprint`, `api-poll`, `command-poll`, `schedule`, `incoming-changes`. The runtime depends on sources to detect change, but the runtime owns scheduling, notify dispatch, and delivery timing (PP3).
 
-Sections marked **target** (§12–§13: keyed-collection change detection and the cursor protocol) are normative designs that are **not yet implemented** (PP7); they move to current status, with `verified:` references, when they ship. §11 (`command-poll`) has shipped and is now **current** behavior (verified: `plugins/source-command-poll/src/index.ts`, `plugins/source-command-poll/src/index.test.ts`).
+Section §13 (the cursor protocol) is a normative design that is **not yet implemented** (PP7); it moves to current status, with `verified:` references, when it ships. §11 (`command-poll`) and §12 (keyed-collection change detection) have shipped and are now **current** behavior (verified: `plugins/source-command-poll/src/index.ts`, `plugins/source-command-poll/src/index.test.ts`; the shared helper `libs/core/src/observation/keyed-collection.ts` with `libs/core/src/observation/keyed-collection.test.ts`, consumed by both `plugins/source-api-poll/src/index.ts` and `plugins/source-command-poll/src/index.ts`).
 
 ### Principles Satisfied
 
@@ -592,10 +592,17 @@ issue #86's AC1–AC7):
   independent-monitors model (PP3). The principled cost optimization, if poll cost ever bites, is
   the cursor protocol (§13).
 
-## 12. Target: Keyed-Collection Change Detection
+## 12. Keyed-Collection Change Detection
 
-> **Status: target — not yet implemented** (PP7). Generic companion to §11, applying equally to
-> `api-poll` and `command-poll`; separable and independently shippable.
+> **Status: current — shipped** (PP7). The generic companion to §11 applies equally to `api-poll`
+> and `command-poll`. The per-object diff is implemented **once** as a shared, exported core helper
+> (verified: `libs/core/src/observation/keyed-collection.ts`, exported from
+> `libs/core/src/index.ts`) and consumed by **both** sources (verified:
+> `plugins/source-api-poll/src/index.ts`, `plugins/source-command-poll/src/index.ts`) — the
+> create/modified/descoped semantics are identical across the two, so sharing avoids divergence.
+> Proven by `libs/core/src/observation/keyed-collection.test.ts` (the §12 semantics), per-source
+> integration tests in each plugin's `index.test.ts`, and the `validate` BP3-rejection tests in
+> `apps/cli/src/commands/cli.integration.test.ts`.
 
 A third `change-detection` mode treating output as a **collection of keyed objects** rather than
 one blob:
@@ -627,9 +634,19 @@ Semantics:
 `modified` observations with stable per-task `objectKey`s — instead of one opaque "output changed"
 blob — and a re-sorted list produces zero observations.
 
-Open design point (deliberately unresolved here): whether `path` uses a JSONPath subset or a
-simpler dotted-segments syntax. The spec constraint is only that it selects **one array** and is
-validated at authoring time (BP3).
+**`path` syntax (resolved).** `path` is a **minimal `$.`-prefixed dotted path**: a root `$`
+followed by `.field` segments (`$.tasks`, `$.data.items`). There are no wildcards, array indices,
+filters, or recursive descent — deliberately the smallest grammar that keeps the §12 examples valid.
+`path` MUST select exactly **one array**; a path that resolves to a non-array (or to nothing) is an
+error (surfaced at observe time with a precise message naming the path). `ignore-paths` entries use
+the same dotted syntax and address fields **within each element** (relative to the element root,
+e.g. `$.fetchedAt`). The keyed-collection `collection` block is only valid under `strategy:
+json-diff`; under `text-diff`/`exit-code` (or a defaulted/absent strategy) it is rejected by
+`agentmonitors validate` with `change-detection.collection requires strategy: json-diff` (BP3 —
+authoring-time error).
+
+Validation note: each element's `key` value must be a scalar (string/number/boolean) and unique
+within the collection; a missing or non-scalar key, or a duplicate key value, is an error.
 
 ## 13. Target: Caller-Held Cursor Protocol
 
