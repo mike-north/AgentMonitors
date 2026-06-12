@@ -9,6 +9,19 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-06-12 — 003: migrate `scope:` examples to `watch:` + `type:`; clarify "scope" as concept name; rename CLI label
+
+### 003-source-plugins.md
+
+- **Migrated all per-source YAML examples** (§3.1, §4.1, §5.1, §6.1, §9.1–§9.3) from the stale `scope:` top-level key to the correct `watch:` + `type:` authoring form matching 001 §3.1 and the shipped schema. The `scope:` key was never valid — an author copying any of those examples would receive a `watch: Required` validation failure.
+- **Defined "scope" as a concept name, not a YAML key.** Added a callout in §2.1 clarifying that throughout this document, _scope_ means "the per-source configuration carried flat under `watch:` alongside `type:`". The TypeScript contract (`scopeSchema`, `validateScope`) retains historical names as internal identifiers; authors always write per-source config inside `watch:`.
+- **No behavior change.** The spec corrects documentation to match the already-shipped schema and CLI behavior.
+
+### CLI / core
+
+- **`agentmonitors source list` text output** now prints `Config fields:` instead of `Scope fields:` — the label now names the field class without implying a `scope:` YAML key.
+- **Validation error paths** now use the `watch` prefix (e.g. `watch/globs: …`) instead of the historical `scope` prefix, matching the real YAML key authors see.
+
 ## 2026-06-10 — Activation plugin via a colocated aipm marketplace; `channel-plugin/` folded in
 
 Activation now ships as a single installable Claude Code plugin (`agentmonitors`) in a colocated

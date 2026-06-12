@@ -46,6 +46,8 @@ The interface definition (verified: `libs/core/src/observation/types.ts`):
 
 `JsonSchema` is typed as `Record<string, unknown>`, making it a plain object describing a JSON Schema fragment.
 
+> **Terminology — "scope":** Throughout this document, _scope_ refers to a source's per-source configuration — the keys carried flat under `watch:` alongside `type:` (per [001 §3.1](./001-monitor-definition.md)). It is a concept name, not a YAML key; there is no `scope:` key in `MONITOR.md`. The TypeScript contract retains historical names (`scopeSchema`, `validateScope`) as internal identifiers, but authors always write the per-source config flat inside the `watch:` block.
+
 ### 2.2 Observation context
 
 `observe()` receives `config` (the source-specific monitor scope as `Record<string, unknown>`) and `context` of type `ObservationContext`:
@@ -97,7 +99,8 @@ Source name: `"file-fingerprint"` (verified: `plugins/source-file-fingerprint/sr
 ### 3.1 Scope
 
 ```yaml
-scope:
+watch:
+  type: file-fingerprint
   globs:
     - '**/*.ts'
   cwd: /optional/base/path
@@ -148,7 +151,8 @@ Source name: `"api-poll"` (verified: `plugins/source-api-poll/src/index.ts` line
 ### 4.1 Scope
 
 ```yaml
-scope:
+watch:
+  type: api-poll
   url: 'https://api.example.com/status'
   method: GET
   headers:
@@ -218,7 +222,8 @@ Source name: `"schedule"` (verified: `plugins/source-schedule/src/index.ts` line
 ### 5.1 Scope
 
 ```yaml
-scope:
+watch:
+  type: schedule
   cron: '0 9 * * 1-5'
   timezone: America/Los_Angeles
   label: Daily review
@@ -249,7 +254,8 @@ Package: `@agentmonitors/source-incoming-changes`. Registered via `registerCoreS
 ### 6.1 Scope
 
 ```yaml
-scope:
+watch:
+  type: incoming-changes
   paths:
     - 'src/'
     - 'lib/'
@@ -342,7 +348,8 @@ This is an explicit non-property of the current product (NP3).
 ### 9.1 File watcher example
 
 ```yaml
-scope:
+watch:
+  type: file-fingerprint
   globs:
     - 'src/**/*.ts'
   cwd: /workspace
@@ -353,7 +360,8 @@ scope:
 ### 9.2 Status-code-only API watcher
 
 ```yaml
-scope:
+watch:
+  type: api-poll
   url: 'https://api.example.com/health'
   change-detection:
     strategy: status-code
@@ -364,7 +372,8 @@ scope:
 ### 9.3 Schedule source with label
 
 ```yaml
-scope:
+watch:
+  type: schedule
   cron: '0 9 * * 1-5'
   timezone: America/New_York
   label: Morning standup reminder
