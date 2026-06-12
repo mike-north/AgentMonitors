@@ -94,6 +94,18 @@ describe('resolveDottedPath', () => {
   it('rejects an empty path segment', () => {
     expect(() => resolveDottedPath({}, '$.a..b')).toThrow(/empty path segment/);
   });
+
+  it('rejects index-access syntax (e.g. $.tasks[0])', () => {
+    expect(() => resolveDottedPath({}, '$.tasks[0]')).toThrow(
+      /unsupported syntax/,
+    );
+  });
+
+  it('rejects wildcard syntax (e.g. $.tasks.*)', () => {
+    expect(() => resolveDottedPath({}, '$.tasks.*')).toThrow(
+      /unsupported syntax/,
+    );
+  });
 });
 
 describe('diffKeyedCollection — baseline (003 §12)', () => {

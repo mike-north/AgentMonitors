@@ -108,6 +108,24 @@ export function parseKeyedCollectionConfig(
 }
 
 /**
+ * Validate that a path segment contains no JSONPath-special characters that the
+ * minimal `$.field.field` grammar does not support. Throws an author-facing error
+ * with the offending segment named explicitly so the mistake is easy to diagnose.
+ *
+ * Rejected characters: `[`, `]`, `*`, `?`, and whitespace — the characters that
+ * JSONPath uses for index access, wildcards, filters, and recursive-descent
+ * operators. All of these are outside the declared grammar (§12).
+ */
+function assertValidSegment(path: string, segment: string): void {
+  if (/[[\]*?\s]/.test(segment)) {
+    throw new Error(
+      `Invalid collection path "${path}": segment "${segment}" contains unsupported ` +
+        `syntax (only plain field names are allowed — no "[index]", wildcards, or filters)`,
+    );
+  }
+}
+
+/**
  * Resolve a minimal `$.`-prefixed dotted path against a parsed value, returning the
  * value at that path (or `undefined` if any segment is missing). Accepts exactly the
  * form §12's examples use: a root `$`, then `.field` segments. Rejects any other
@@ -127,6 +145,7 @@ export function resolveDottedPath(root: unknown, path: string): unknown {
     if (segment.length === 0) {
       throw new Error(`Invalid collection path "${path}": empty path segment`);
     }
+    assertValidSegment(path, segment);
     if (
       current === null ||
       typeof current !== 'object' ||
@@ -142,7 +161,8 @@ export function resolveDottedPath(root: unknown, path: string): unknown {
 /**
  * Remove a single `$.`-dotted path from within an element (mutating a clone). Used
  * to strip `ignore-paths` fields before content comparison. A path that does not
- * resolve is a no-op.
+ * resolve is a no-op (missing intermediate key). Rejects unsupported segment syntax
+ * (same grammar as {@link resolveDottedPath}) with a precise author-facing error.
  */
 function removeDottedPath(value: unknown, path: string): void {
   if (path === '$') return;
@@ -155,9 +175,13 @@ function removeDottedPath(value: unknown, path: string): void {
   let current: unknown = value;
   for (let i = 0; i < segments.length - 1; i++) {
     const segment = segments[i];
+    if (segment === undefined || segment.length === 0) {
+      throw new Error(
+        `Invalid ignore-paths entry "${path}": empty path segment`,
+      );
+    }
+    assertValidSegment(path, segment);
     if (
-      segment === undefined ||
-      segment.length === 0 ||
       current === null ||
       typeof current !== 'object' ||
       Array.isArray(current)
@@ -167,9 +191,13 @@ function removeDottedPath(value: unknown, path: string): void {
     current = (current as Record<string, unknown>)[segment];
   }
   const last = segments[segments.length - 1];
+  if (last === undefined || last.length === 0) {
+    throw new Error(
+      `Invalid ignore-paths entry "${path}": empty path segment`,
+    );
+  }
+  assertValidSegment(path, last);
   if (
-    last !== undefined &&
-    last.length > 0 &&
     current !== null &&
     typeof current === 'object' &&
     !Array.isArray(current)
