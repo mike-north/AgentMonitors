@@ -39,6 +39,11 @@ interface ScopeConfig {
   timeoutMs: number;
   objectKey: string;
   strategy: ChangeStrategy;
+  /**
+   * Top-level `change-detection.ignore-paths` entries for plain `json-diff`
+   * output comparison. Collection-specific ignores remain inside `collection`.
+   */
+  ignorePaths: string[];
   /** Keyed-collection config (003 §12), present only under `strategy: json-diff`. */
   collection: KeyedCollectionConfig | undefined;
 }
@@ -92,12 +97,20 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
     );
   }
 
-  const cd = config['change-detection'] as { strategy?: string } | undefined;
+  const cd = config['change-detection'] as
+    | { strategy?: string; 'ignore-paths'?: unknown }
+    | undefined;
   const rawStrategy = cd?.strategy;
   const strategy: ChangeStrategy =
     rawStrategy === 'json-diff' || rawStrategy === 'exit-code'
       ? rawStrategy
       : 'text-diff';
+  const ignorePaths = parseTopLevelIgnorePaths(cd);
+  if (ignorePaths.length > 0 && strategy !== 'json-diff') {
+    throw new Error(
+      'change-detection.ignore-paths requires strategy: json-diff',
+    );
+  }
 
   // Keyed-collection mode (003 §12) is only valid under `json-diff`. The generated
   // schema rejects `collection` under other strategies at authoring time (BP3); this
@@ -128,7 +141,16 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
   const objectKey =
     typeof key === 'string' && key.length > 0 ? key : command.join(' ');
 
-  return { command, cwd, env, timeoutMs, objectKey, strategy, collection };
+  return {
+    command,
+    cwd,
+    env,
+    timeoutMs,
+    objectKey,
+    strategy,
+    ignorePaths,
+    collection,
+  };
 }
 
 /**
@@ -260,6 +282,73 @@ function sortKeys(value: unknown): unknown {
   return value;
 }
 
+function parseTopLevelIgnorePaths(
+  changeDetection: { 'ignore-paths'?: unknown } | undefined,
+): string[] {
+  const rawIgnorePaths = changeDetection?.['ignore-paths'];
+  if (rawIgnorePaths === undefined) return [];
+  if (
+    !Array.isArray(rawIgnorePaths) ||
+    !rawIgnorePaths.every((entry): entry is string => typeof entry === 'string')
+  ) {
+    throw new Error(
+      'change-detection.ignore-paths must be an array of strings',
+    );
+  }
+  return rawIgnorePaths;
+}
+
+function normalizeJsonPath(path: string): string {
+  if (path === '$' || path.startsWith('$.')) return path;
+  return `$.${path}`;
+}
+
+function assertValidJsonPathSegment(path: string, segment: string): void {
+  if (segment.length === 0) {
+    throw new Error(
+      `Invalid change-detection.ignore-paths entry "${path}": empty path segment`,
+    );
+  }
+  if (/[.[\]*?]/.test(segment)) {
+    throw new Error(
+      `Invalid change-detection.ignore-paths entry "${path}": unsupported path segment "${segment}"`,
+    );
+  }
+}
+
+/**
+ * Clone parsed JSON and remove author-requested paths before canonical sorting.
+ * Paths are intentionally the same minimal dotted grammar used by keyed
+ * collections: `$.duration` and bare `duration` both address a root field.
+ */
+function stripIgnoredJsonPaths(value: unknown, ignorePaths: string[]): unknown {
+  if (ignorePaths.length === 0) return value;
+  const cloned = structuredClone(value);
+  for (const path of ignorePaths) {
+    removeJsonPath(cloned, path);
+  }
+  return cloned;
+}
+
+function removeJsonPath(value: unknown, path: string): void {
+  const normalizedPath = normalizeJsonPath(path);
+  if (normalizedPath === '$') return;
+  const segments = normalizedPath.slice(2).split('.');
+  let current: unknown = value;
+  for (let i = 0; i < segments.length - 1; i++) {
+    const segment = segments[i];
+    assertValidJsonPathSegment(path, segment ?? '');
+    if (current === null || typeof current !== 'object') return;
+    if (!Object.hasOwn(current, segment ?? '')) return;
+    current = (current as Record<string, unknown>)[segment ?? ''];
+  }
+  const last = segments.at(-1) ?? '';
+  assertValidJsonPathSegment(path, last);
+  if (current !== null && typeof current === 'object') {
+    Reflect.deleteProperty(current, last);
+  }
+}
+
 /**
  * Whether the result changed versus the prior baseline under `strategy` (003 §11.3).
  * `json-diff` falls back to raw text comparison when either side fails to parse,
@@ -267,20 +356,29 @@ function sortKeys(value: unknown): unknown {
  */
 function hasChanged(
   strategy: ChangeStrategy,
+  ignorePaths: string[],
   prev: { stdout: string; exitCode: number },
   curr: { stdout: string; exitCode: number },
 ): boolean {
   switch (strategy) {
     case 'exit-code':
       return prev.exitCode !== curr.exitCode;
-    case 'json-diff':
+    case 'json-diff': {
+      let prevParsed: unknown;
+      let currParsed: unknown;
       try {
-        const prevJson = JSON.stringify(sortKeys(JSON.parse(prev.stdout)));
-        const currJson = JSON.stringify(sortKeys(JSON.parse(curr.stdout)));
-        return prevJson !== currJson;
+        prevParsed = JSON.parse(prev.stdout);
+        currParsed = JSON.parse(curr.stdout);
       } catch {
         return prev.stdout !== curr.stdout;
       }
+      return (
+        JSON.stringify(
+          sortKeys(stripIgnoredJsonPaths(prevParsed, ignorePaths)),
+        ) !==
+        JSON.stringify(sortKeys(stripIgnoredJsonPaths(currParsed, ignorePaths)))
+      );
+    }
     case 'text-diff':
       return prev.stdout !== curr.stdout;
   }
@@ -399,16 +497,35 @@ const scopeSchema: JsonSchema = {
             },
           },
           required: ['path', 'key'],
+          additionalProperties: false,
+        },
+        'ignore-paths': {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Dotted paths removed from parsed JSON before plain json-diff comparison',
         },
       },
+      additionalProperties: false,
       // BP3: change-detection.collection requires strategy: json-diff. Under any
       // other strategy (or the defaulted text-diff), presence of `collection` is an
       // authoring-time error.
-      if: { required: ['collection'] },
-      then: {
-        properties: { strategy: { const: 'json-diff' } },
-        required: ['strategy'],
-      },
+      allOf: [
+        {
+          if: { required: ['collection'] },
+          then: {
+            properties: { strategy: { const: 'json-diff' } },
+            required: ['strategy'],
+          },
+        },
+        {
+          if: { required: ['ignore-paths'] },
+          then: {
+            properties: { strategy: { const: 'json-diff' } },
+            required: ['strategy'],
+          },
+        },
+      ],
     },
   },
   required: ['command'],
@@ -504,7 +621,7 @@ const source: ObservationSource = {
     if (
       prev !== undefined &&
       hadBaseline &&
-      hasChanged(scope.strategy, prev, result)
+      hasChanged(scope.strategy, scope.ignorePaths, prev, result)
     ) {
       observations.push(changedObservation(scope, result));
     }
