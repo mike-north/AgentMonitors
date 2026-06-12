@@ -27,6 +27,11 @@ Conventions for the engineering fleet working this repo. The PM agent maintains 
 6. **Changesets:** required for any published-package behavior or public-type change
    (`@agentmonitors/*`); not for docs, specs, CI, or plugin-marketplace content. Never a
    `major` bump without an issue explicitly authorizing it.
+   **New publishable package checklist:** it MUST ship with a `CHANGELOG.md` (minimal:
+   `# <name>` / `## 0.0.0` / `- Initial release.`) — the changesets action crashes the
+   release pipeline with ENOENT without one (this has broken releases twice) — plus an
+   entry in `scripts/publish-release-packages.mjs` `PACKAGE_DIRS` and standard
+   `publishConfig`.
 7. **Tests at the right layer.** Bug fixes ship a regression test that fails pre-fix.
    Anything touching the daemon, CLI surface, or plugin wiring gets integration coverage
    (the existing harnesses in `apps/cli/src/commands/cli.integration.test.ts` are the
