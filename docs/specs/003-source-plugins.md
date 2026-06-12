@@ -645,14 +645,15 @@ Semantics:
 `modified` observations with stable per-task `objectKey`s — instead of one opaque "output changed"
 blob — and a re-sorted list produces zero observations.
 
-**`path` syntax (resolved).** `path` is a **minimal `$.`-prefixed dotted path**: a root `$`
-followed by `.field` segments (`$.tasks`, `$.data.items`). There are no wildcards, array indices,
-filters, or recursive descent — deliberately the smallest grammar that keeps the §12 examples valid.
-`path` MUST select exactly **one array**; a path that resolves to a non-array (or to nothing) is an
-error (surfaced at observe time with a precise message naming the path). `ignore-paths` entries use
-the same dotted syntax and address fields **within each element** (relative to the element root,
-e.g. `$.fetchedAt`). The keyed-collection `collection` block is only valid under `strategy:
-json-diff`; under `text-diff`/`exit-code` (or a defaulted/absent strategy) it is rejected by
+**`path` syntax (resolved).** `path` is a **minimal dotted path**. Authors may use either explicit
+root form (`$.tasks`, `$.data.items`) or bare root-relative form (`tasks`, `data.items`). There are
+no wildcards, array indices, filters, or recursive descent — deliberately the smallest grammar that
+keeps the §12 examples valid while allowing the common monitor-author shorthand. `path` MUST select
+exactly **one array**; a path that resolves to a non-array (or to nothing) is an error (surfaced at
+observe time with a precise message naming the path). `ignore-paths` entries use the same dotted
+syntax and address fields **within each element** (relative to the element root, e.g. `$.fetchedAt`
+or `fetchedAt`). The keyed-collection `collection` block is only valid under `strategy: json-diff`;
+under `text-diff`/`exit-code` (or a defaulted/absent strategy) it is rejected by
 `agentmonitors validate` with `change-detection.collection requires strategy: json-diff` (BP3 —
 authoring-time error).
 
