@@ -1324,6 +1324,67 @@ When files change, review them.
   }, 30_000);
 });
 
+describe('monitor explain', () => {
+  it('returns JSON stage diagnostics when the daemon is not running', () => {
+    const dir = path.join(tempDir, 'explain-daemon-down');
+    const monitorsDir = path.join(dir, '.claude', 'monitors', 'watch-files');
+    mkdirSync(monitorsDir, { recursive: true });
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      `---
+name: Watch files
+watch:
+  type: file-fingerprint
+  globs:
+    - watched.txt
+urgency: normal
+---
+When files change, review them.
+`,
+      'utf-8',
+    );
+
+    const socketPath = path.join(
+      '/tmp',
+      `agentmon-explain-missing-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const result = runWithEnv(
+      [
+        'monitor',
+        'explain',
+        'watch-files',
+        '--dir',
+        path.join(dir, '.claude', 'monitors'),
+        '--socket',
+        socketPath,
+        '--format',
+        'json',
+      ],
+      { AGENTMONITORS_SOCKET: socketPath },
+      dir,
+    );
+
+    expect(result.exitCode).toBe(0);
+    const report = JSON.parse(result.stdout) as {
+      verdict: { stage: string; status: string };
+      stages: { id: string; status: string; reason: string }[];
+    };
+    expect(report.verdict).toMatchObject({
+      stage: 'scheduling',
+      status: 'failure',
+    });
+    expect(report.stages.find((stage) => stage.id === 'definition')).toEqual(
+      expect.objectContaining({ status: 'ok' }),
+    );
+    expect(report.stages.find((stage) => stage.id === 'scheduling')).toEqual(
+      expect.objectContaining({
+        status: 'failure',
+        reason: expect.stringContaining('daemon is not running'),
+      }),
+    );
+  });
+});
+
 describe('monitor test', () => {
   it('errors on missing file', () => {
     const result = run(['monitor', 'test', '/tmp/nonexistent-monitor.md']);

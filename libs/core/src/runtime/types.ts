@@ -119,6 +119,71 @@ export interface EventQuery {
   since?: Date;
 }
 
+export type MonitorExplainStageId =
+  | 'definition'
+  | 'scheduling'
+  | 'observation'
+  | 'notify'
+  | 'materialization'
+  | 'delivery';
+
+export type MonitorExplainStageStatus = 'ok' | 'pending' | 'failure';
+
+export interface MonitorExplainStage {
+  id: MonitorExplainStageId;
+  label: string;
+  status: MonitorExplainStageStatus;
+  reason: string;
+  details?: Record<string, unknown>;
+}
+
+export type MonitorDeliveryState = 'unread' | 'claimed' | 'acknowledged';
+
+export interface MonitorDeliveryProjection {
+  eventId: string;
+  sessionId: string;
+  sessionRole: AgentSessionRole;
+  sessionStatus: AgentSessionStatus;
+  deliveryState: MonitorDeliveryState;
+  workspacePath: string | null;
+  createdAt: Date;
+  firstNotifiedAt?: Date;
+  lastClaimAt?: Date;
+  lastClaimLifecycle?: string;
+  acknowledgedAt?: Date;
+}
+
+export interface MonitorExplainInput {
+  monitorId: string;
+  monitorsDir: string;
+  workspacePath?: string;
+  historyLimit?: number;
+  eventLimit?: number;
+  now?: Date;
+}
+
+export interface MonitorExplainReport {
+  monitorId: string;
+  generatedAt: Date;
+  monitor?: {
+    id: string;
+    displayName: string;
+    filePath: string;
+    sourceName: string;
+    urgency: Urgency;
+  };
+  stages: MonitorExplainStage[];
+  verdict: {
+    status: MonitorExplainStageStatus;
+    stage: MonitorExplainStageId;
+    reason: string;
+  };
+  observations: ObservationHistoryRecord[];
+  events: MonitorEventRecord[];
+  projections: MonitorDeliveryProjection[];
+  leadSessions: AgentSessionRecord[];
+}
+
 export type SessionUnreadCounts = UrgencyCounts & { total: number };
 
 export interface SessionHookState {

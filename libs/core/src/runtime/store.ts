@@ -14,6 +14,8 @@ import type {
   AgentSessionRecord,
   EventQuery,
   MonitorEventRecord,
+  MonitorDeliveryProjection,
+  MonitorDeliveryState,
   MonitorRuntimeState,
   ObservationHistoryQuery,
   ObservationHistoryRecord,
@@ -81,6 +83,15 @@ function rowToEvent(
     tags: parseJson(row.tags, []),
     createdAt: row.createdAt,
   };
+}
+
+function deliveryStateForRow(row: {
+  firstNotifiedAt: Date | null;
+  acknowledgedAt: Date | null;
+}): MonitorDeliveryState {
+  if (row.acknowledgedAt) return 'acknowledged';
+  if (row.firstNotifiedAt) return 'claimed';
+  return 'unread';
 }
 
 function scopeMatches(
@@ -458,6 +469,44 @@ export class RuntimeStore {
       ),
       result: row.result,
       createdAt: row.createdAt,
+    }));
+  }
+
+  listDeliveryProjectionsForMonitor(
+    monitorId: string,
+  ): MonitorDeliveryProjection[] {
+    const rows = asInternalDb(this.db)
+      .select({
+        event: monitorEvents,
+        state: sessionEventState,
+        session: agentSessions,
+      })
+      .from(sessionEventState)
+      .innerJoin(monitorEvents, eq(sessionEventState.eventId, monitorEvents.id))
+      .innerJoin(
+        agentSessions,
+        eq(sessionEventState.sessionId, agentSessions.id),
+      )
+      .where(eq(monitorEvents.monitorId, monitorId))
+      .orderBy(desc(monitorEvents.createdAt))
+      .all();
+
+    return rows.map(({ event, state, session }) => ({
+      eventId: event.id,
+      sessionId: session.id,
+      sessionRole: session.role,
+      sessionStatus: session.status,
+      deliveryState: deliveryStateForRow(state),
+      workspacePath: session.workspacePath ?? null,
+      createdAt: state.createdAt,
+      ...(state.firstNotifiedAt
+        ? { firstNotifiedAt: state.firstNotifiedAt }
+        : {}),
+      ...(state.lastClaimAt ? { lastClaimAt: state.lastClaimAt } : {}),
+      ...(state.lastClaimLifecycle
+        ? { lastClaimLifecycle: state.lastClaimLifecycle }
+        : {}),
+      ...(state.acknowledgedAt ? { acknowledgedAt: state.acknowledgedAt } : {}),
     }));
   }
 

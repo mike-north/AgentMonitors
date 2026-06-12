@@ -276,18 +276,20 @@ Verified: `apps/cli/src/daemon-ipc.ts` — server `socket.on('data', ...)` handl
 
 The daemon socket exposes the following commands (the `DaemonMethod` enum):
 
-| Method          | Description                                                                                   |
-| --------------- | --------------------------------------------------------------------------------------------- |
-| `ping`          | Health check; returns `{ ok: true }`                                                          |
-| `status`        | Returns `RuntimeStatus` (session counts, event count)                                         |
-| `stop`          | Requests graceful daemon shutdown                                                             |
-| `session.open`  | Opens or resumes a session; returns `AgentSessionRecord`                                      |
-| `session.close` | Marks a session dormant; returns `AgentSessionRecord`                                         |
-| `session.list`  | Returns all `AgentSessionRecord[]`                                                            |
-| `events.list`   | Lists events, with optional filters; returns `MonitorEventRecord[]`                           |
-| `events.ack`    | Acknowledges events for a session                                                             |
-| `hook.claim`    | Claims a delivery payload for a session at a lifecycle point; returns `DeliveryClaim \| null` |
-| `daemon.tick`   | Runs one tick on the specified monitors directory                                             |
+| Method            | Description                                                                                   |
+| ----------------- | --------------------------------------------------------------------------------------------- |
+| `ping`            | Health check; returns `{ ok: true }`                                                          |
+| `status`          | Returns `RuntimeStatus` (session counts, event count)                                         |
+| `stop`            | Requests graceful daemon shutdown                                                             |
+| `session.open`    | Opens or resumes a session; returns `AgentSessionRecord`                                      |
+| `session.close`   | Marks a session dormant; returns `AgentSessionRecord`                                         |
+| `session.list`    | Returns all `AgentSessionRecord[]`                                                            |
+| `events.list`     | Lists events, with optional filters; returns `MonitorEventRecord[]`                           |
+| `events.ack`      | Acknowledges events for a session                                                             |
+| `hook.claim`      | Claims a delivery payload for a session at a lifecycle point; returns `DeliveryClaim \| null` |
+| `history.list`    | Lists recent observation-history rows, optionally filtered by monitor id                      |
+| `monitor.explain` | Returns a read-only staged diagnosis for one monitor's current pipeline state                 |
+| `daemon.tick`     | Runs one tick on the specified monitors directory                                             |
 
 Verified: `apps/cli/src/daemon-ipc.ts` — `daemonMethodSchema` (lines 26–37); `handleRequest()` (lines 150–222).
 
@@ -298,8 +300,29 @@ The `session`, `events`, and `hook` CLI subcommands call the daemon socket via t
 - `agentmonitors session open/close/list` → `session.open` / `session.close` / `session.list`
 - `agentmonitors events list` / `events.ack` → `events.list` / `events.ack`
 - `agentmonitors hook claim` → `hook.claim`
+- `agentmonitors monitor history` → `history.list`
+- `agentmonitors monitor explain` → `monitor.explain`
 
 Verified: `apps/cli/src/runtime-client.ts` — `openSessionClient`, `closeSessionClient`, `listSessionsClient`, `listEventsClient`, `acknowledgeEventsClient`, `claimDeliveryClient` (lines 14–82); `apps/cli/src/commands/session.ts`, `hook.ts`.
+
+### 10.7 Monitor pipeline diagnosis
+
+`monitor.explain` is a read-only daemon IPC method used by
+`agentmonitors monitor explain <monitorId>` ([005 §6](./005-cli-reference.md)). It walks one
+monitor through the persisted pipeline state and returns stages for:
+
+1. Definition: scanned `MONITOR.md`, source resolution, and source scope validation
+2. Scheduling: persisted `monitor_state.last_observation_at`, due state, and next due time
+3. Observation: recent `observation_history` rows and latest outcome
+4. Notify state: active debounce or throttle state in `monitor_state.notify_state`
+5. Materialization: recent `monitor_events`
+6. Projection and delivery: `session_event_state` joined to `agent_sessions`, reported as
+   `unread`, `claimed`, or `acknowledged`
+
+The method MUST NOT mutate runtime state. If events exist but there is no lead session matching the
+workspace (including global sessions), the delivery stage reports that no lead session is registered.
+If the daemon socket is unavailable, the CLI fallback may still validate the local definition and
+then report scheduling as failed because the daemon is not running.
 
 ## 11. Agent Integration (Adapters)
 
