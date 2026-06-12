@@ -533,6 +533,86 @@ describe('validate', () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain('Valid monitors: 1');
   });
+
+  // 003 §12 BP3 — a `change-detection.collection` block is only valid under
+  // `strategy: json-diff`. Under text-diff/exit-code it must be rejected with a
+  // clear message, for both poll sources.
+  function collectionMonitorBody(
+    sourceType: string,
+    strategy: string,
+    watchLines: string[],
+  ): string {
+    return [
+      '---',
+      'name: Tasks',
+      'watch:',
+      `  type: ${sourceType}`,
+      ...watchLines,
+      '  change-detection:',
+      `    strategy: ${strategy}`,
+      '    collection:',
+      "      path: '$.tasks'",
+      "      key: 'id'",
+      'urgency: normal',
+      '---',
+      'Handle it.',
+      '',
+    ].join('\n');
+  }
+
+  it('rejects a collection under text-diff (api-poll) with a clear message', () => {
+    const dir = path.join(tempDir, 'validate-collection-textdiff');
+    const monitorDir = path.join(dir, 'monitors', 'coll-text');
+    mkdirSync(monitorDir, { recursive: true });
+    writeFileSync(
+      path.join(monitorDir, 'MONITOR.md'),
+      collectionMonitorBody('api-poll', 'text-diff', [
+        "  url: 'https://api.example.com/tasks'",
+      ]),
+      'utf-8',
+    );
+    const result = run(['validate', path.join(dir, 'monitors')]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain(
+      'change-detection.collection requires strategy: json-diff',
+    );
+  });
+
+  it('rejects a collection under exit-code (command-poll) with a clear message', () => {
+    const dir = path.join(tempDir, 'validate-collection-exitcode');
+    const monitorDir = path.join(dir, 'monitors', 'coll-exit');
+    mkdirSync(monitorDir, { recursive: true });
+    writeFileSync(
+      path.join(monitorDir, 'MONITOR.md'),
+      collectionMonitorBody('command-poll', 'exit-code', [
+        '  command:',
+        '    - git',
+        '    - status',
+      ]),
+      'utf-8',
+    );
+    const result = run(['validate', path.join(dir, 'monitors')]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain(
+      'change-detection.collection requires strategy: json-diff',
+    );
+  });
+
+  it('accepts a json-diff + collection monitor (api-poll)', () => {
+    const dir = path.join(tempDir, 'validate-collection-ok');
+    const monitorDir = path.join(dir, 'monitors', 'coll-ok');
+    mkdirSync(monitorDir, { recursive: true });
+    writeFileSync(
+      path.join(monitorDir, 'MONITOR.md'),
+      collectionMonitorBody('api-poll', 'json-diff', [
+        "  url: 'https://api.example.com/tasks'",
+      ]),
+      'utf-8',
+    );
+    const result = run(['validate', path.join(dir, 'monitors')]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('Valid monitors: 1');
+  });
 });
 
 describe('scan', () => {

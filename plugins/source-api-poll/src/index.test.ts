@@ -152,6 +152,139 @@ describe('source-api-poll', () => {
     });
   });
 
+  // Keyed-collection change detection (003 §12) wired through api-poll. The shared
+  // diff lives in @agentmonitors/core; these verify api-poll consumes it correctly.
+  describe('keyed-collection (003 §12)', () => {
+    function mockBody(body: string): void {
+      (
+        globalThis.fetch as unknown as ReturnType<typeof vi.fn>
+      ).mockResolvedValueOnce({
+        text: () => Promise.resolve(body),
+        status: 200,
+      });
+    }
+
+    const collectionConfig = {
+      url: 'https://api.example.com/tasks',
+      'change-detection': {
+        strategy: 'json-diff',
+        collection: { path: '$.tasks', key: 'id' },
+      },
+    };
+
+    it('baseline run emits nothing', async () => {
+      const mockFetch = vi.fn();
+      vi.stubGlobal('fetch', mockFetch);
+      mockBody('{"tasks":[{"id":"a","v":1}]}');
+      const result = await source.observe(collectionConfig, {
+        now: new Date(),
+      });
+      expect(result.observations).toHaveLength(0);
+    });
+
+    it('a re-sorted collection produces zero observations', async () => {
+      const mockFetch = vi.fn();
+      vi.stubGlobal('fetch', mockFetch);
+      mockBody('{"tasks":[{"id":"a","v":1},{"id":"b","v":2}]}');
+      const baseline = await source.observe(collectionConfig, {
+        now: new Date(),
+      });
+      mockBody('{"tasks":[{"id":"b","v":2},{"id":"a","v":1}]}');
+      const next = await source.observe(collectionConfig, {
+        previousState: baseline.nextState,
+        now: new Date(),
+      });
+      expect(next.observations).toHaveLength(0);
+    });
+
+    it('one element changing → exactly one modified with keyed objectKey', async () => {
+      const mockFetch = vi.fn();
+      vi.stubGlobal('fetch', mockFetch);
+      mockBody('{"tasks":[{"id":"a","v":1},{"id":"b","v":2}]}');
+      const baseline = await source.observe(collectionConfig, {
+        now: new Date(),
+      });
+      mockBody('{"tasks":[{"id":"a","v":1},{"id":"b","v":99}]}');
+      const next = await source.observe(collectionConfig, {
+        previousState: baseline.nextState,
+        now: new Date(),
+      });
+      expect(next.observations).toHaveLength(1);
+      expect(next.observations[0]?.changeKind).toBe('modified');
+      expect(next.observations[0]?.objectKey).toBe(
+        'https://api.example.com/tasks#b',
+      );
+    });
+
+    it('element addition → created; removal → descoped (not deleted)', async () => {
+      const mockFetch = vi.fn();
+      vi.stubGlobal('fetch', mockFetch);
+      mockBody('{"tasks":[{"id":"a","v":1}]}');
+      const baseline = await source.observe(collectionConfig, {
+        now: new Date(),
+      });
+      mockBody('{"tasks":[{"id":"a","v":1},{"id":"b","v":2}]}');
+      const added = await source.observe(collectionConfig, {
+        previousState: baseline.nextState,
+        now: new Date(),
+      });
+      expect(added.observations).toHaveLength(1);
+      expect(added.observations[0]?.changeKind).toBe('created');
+
+      mockBody('{"tasks":[{"id":"a","v":1}]}');
+      const removed = await source.observe(collectionConfig, {
+        previousState: added.nextState,
+        now: new Date(),
+      });
+      expect(removed.observations).toHaveLength(1);
+      expect(removed.observations[0]?.changeKind).toBe('descoped');
+      expect(removed.observations[0]?.changeKind).not.toBe('deleted');
+      expect(removed.observations[0]?.objectKey).toBe(
+        'https://api.example.com/tasks#b',
+      );
+    });
+
+    it('ignore-paths removes churn fields before comparison', async () => {
+      const mockFetch = vi.fn();
+      vi.stubGlobal('fetch', mockFetch);
+      const ignoreConfig = {
+        url: 'https://api.example.com/tasks',
+        'change-detection': {
+          strategy: 'json-diff',
+          collection: {
+            path: '$.tasks',
+            key: 'id',
+            'ignore-paths': ['$.fetchedAt'],
+          },
+        },
+      };
+      mockBody('{"tasks":[{"id":"a","v":1,"fetchedAt":"t0"}]}');
+      const baseline = await source.observe(ignoreConfig, { now: new Date() });
+      // Only fetchedAt differs — must NOT fire.
+      mockBody('{"tasks":[{"id":"a","v":1,"fetchedAt":"t1"}]}');
+      const next = await source.observe(ignoreConfig, {
+        previousState: baseline.nextState,
+        now: new Date(),
+      });
+      expect(next.observations).toHaveLength(0);
+    });
+
+    it('rejects collection under a non-json-diff strategy at observe time', async () => {
+      await expect(
+        source.observe(
+          {
+            url: 'https://api.example.com/tasks',
+            'change-detection': {
+              strategy: 'text-diff',
+              collection: { path: '$.tasks', key: 'id' },
+            },
+          },
+          { now: new Date() },
+        ),
+      ).rejects.toThrow(/requires strategy: json-diff/);
+    });
+  });
+
   describe('cache isolation', () => {
     it('different configs for same URL maintain separate baselines', async () => {
       const mockFetch = vi.fn();

@@ -1,8 +1,14 @@
 import type {
   JsonSchema,
+  KeyedCollectionConfig,
+  KeyedSnapshot,
   ObservationContext,
   ObservationResult,
   ObservationSource,
+} from '@agentmonitors/core';
+import {
+  diffKeyedCollection,
+  parseKeyedCollectionConfig,
 } from '@agentmonitors/core';
 
 interface AuthConfig {
@@ -21,6 +27,8 @@ interface ScopeConfig {
   headers: Record<string, string> | undefined;
   method: string | undefined;
   changeDetection: ChangeStrategy;
+  /** Keyed-collection config (003 §12), present only under `strategy: json-diff`. */
+  collection: KeyedCollectionConfig | undefined;
 }
 
 function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
@@ -36,12 +44,21 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
       ? strategy
       : 'text-diff';
 
+  // Keyed-collection mode (003 §12) is only valid under `json-diff`. The generated
+  // schema rejects `collection` under other strategies at authoring time (BP3); this
+  // is the defence-in-depth guard for the observe path.
+  const collection = parseKeyedCollectionConfig(config['change-detection']);
+  if (collection && changeDetection !== 'json-diff') {
+    throw new Error('change-detection.collection requires strategy: json-diff');
+  }
+
   return {
     url,
     auth: config['auth'] as AuthConfig | undefined,
     headers: config['headers'] as Record<string, string> | undefined,
     method: typeof config['method'] === 'string' ? config['method'] : undefined,
     changeDetection,
+    collection,
   };
 }
 
@@ -68,6 +85,12 @@ function resolveAuth(auth: AuthConfig | undefined): Record<string, string> {
 interface CachedResponse {
   body: string;
   status: number;
+  /**
+   * The keyed-collection snapshot from the previous cycle (003 §12), present only
+   * when the monitor uses `change-detection.collection`. Held alongside the raw body
+   * so the per-object diff has a baseline to compare against.
+   */
+  keyedSnapshot?: KeyedSnapshot;
 }
 
 /** Recursively sort object keys for order-insensitive JSON comparison. */
@@ -137,6 +160,39 @@ const scopeSchema: JsonSchema = {
           type: 'string',
           enum: ['json-diff', 'text-diff', 'status-code'],
         },
+        // Keyed-collection mode (003 §12). The `collection` block is only valid
+        // under `strategy: json-diff`; the `if/then` below enforces that at
+        // authoring time (BP3).
+        collection: {
+          type: 'object',
+          properties: {
+            path: {
+              type: 'string',
+              description:
+                'Dotted $.-path to the array within the parsed JSON (e.g. "$.tasks")',
+            },
+            key: {
+              type: 'string',
+              description:
+                'Field on each element used as the per-object identity',
+            },
+            'ignore-paths': {
+              type: 'array',
+              items: { type: 'string' },
+              description:
+                'Dotted $.-paths (relative to each element) removed before comparison',
+            },
+          },
+          required: ['path', 'key'],
+        },
+      },
+      // BP3: change-detection.collection requires strategy: json-diff. Under any
+      // other strategy (or the defaulted text-diff), presence of `collection` is an
+      // authoring-time error.
+      if: { required: ['collection'] },
+      then: {
+        properties: { strategy: { const: 'json-diff' } },
+        required: ['strategy'],
       },
     },
   },
@@ -152,7 +208,7 @@ const source: ObservationSource = {
     config: Record<string, unknown>,
     context: ObservationContext = { now: new Date() },
   ): Promise<ObservationResult> {
-    const { url, auth, headers, method, changeDetection } =
+    const { url, auth, headers, method, changeDetection, collection } =
       parseScopeConfig(config);
     const authHeaders = resolveAuth(auth);
 
@@ -162,13 +218,33 @@ const source: ObservationSource = {
     });
 
     const body = await response.text();
-    const curr: CachedResponse = { body, status: response.status };
     const prev =
       context.previousState &&
       typeof context.previousState === 'object' &&
       !Array.isArray(context.previousState)
         ? (context.previousState as CachedResponse)
         : undefined;
+
+    // ---- Keyed-collection mode (003 §12) ----------------------------------------
+    // Parse the body as JSON and diff per keyed object, instead of treating the
+    // whole body as one blob. Per-object observations carry `<url>#<key>` ids.
+    if (collection) {
+      const result = diffKeyedCollection(
+        JSON.parse(body),
+        collection,
+        url,
+        prev?.keyedSnapshot,
+        { payload: { url }, queryScope: { url } },
+      );
+      const curr: CachedResponse = {
+        body,
+        status: response.status,
+        keyedSnapshot: result.snapshot,
+      };
+      return { observations: result.observations, nextState: curr };
+    }
+
+    const curr: CachedResponse = { body, status: response.status };
 
     if (prev !== undefined && hasChanged(changeDetection, prev, curr)) {
       return {

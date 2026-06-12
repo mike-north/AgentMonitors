@@ -205,6 +205,160 @@ describe('source-command-poll', () => {
     });
   });
 
+  // Keyed-collection change detection (003 §12) wired through command-poll. The
+  // shared diff lives in @agentmonitors/core; these verify command-poll consumes it.
+  describe('keyed-collection (003 §12)', () => {
+    /** argv that prints a fixed JSON document. */
+    function jsonArgv(doc: unknown): string[] {
+      return nodeArgv(
+        `process.stdout.write(${JSON.stringify(JSON.stringify(doc))})`,
+      );
+    }
+    const collection = { path: '$.tasks', key: 'id' };
+
+    it('baseline run emits nothing', async () => {
+      const result = await source.observe(
+        {
+          command: jsonArgv({ tasks: [{ id: 'a', v: 1 }] }),
+          'change-detection': { strategy: 'json-diff', collection },
+        },
+        ctx(),
+      );
+      expect(result.observations).toHaveLength(0);
+    });
+
+    it('a re-sorted collection produces zero observations', async () => {
+      const baseline = await source.observe(
+        {
+          command: jsonArgv({
+            tasks: [
+              { id: 'a', v: 1 },
+              { id: 'b', v: 2 },
+            ],
+          }),
+          'change-detection': { strategy: 'json-diff', collection },
+        },
+        ctx(),
+      );
+      const next = await source.observe(
+        {
+          command: jsonArgv({
+            tasks: [
+              { id: 'b', v: 2 },
+              { id: 'a', v: 1 },
+            ],
+          }),
+          'change-detection': { strategy: 'json-diff', collection },
+        },
+        ctx(baseline.nextState),
+      );
+      expect(next.observations).toHaveLength(0);
+    });
+
+    it('one element changing → exactly one modified with keyed objectKey', async () => {
+      const key = 'tasks';
+      const baseline = await source.observe(
+        {
+          command: jsonArgv({
+            tasks: [
+              { id: 'a', v: 1 },
+              { id: 'b', v: 2 },
+            ],
+          }),
+          key,
+          'change-detection': { strategy: 'json-diff', collection },
+        },
+        ctx(),
+      );
+      const next = await source.observe(
+        {
+          command: jsonArgv({
+            tasks: [
+              { id: 'a', v: 1 },
+              { id: 'b', v: 99 },
+            ],
+          }),
+          key,
+          'change-detection': { strategy: 'json-diff', collection },
+        },
+        ctx(baseline.nextState),
+      );
+      expect(next.observations).toHaveLength(1);
+      expect(next.observations[0]?.changeKind).toBe('modified');
+      expect(next.observations[0]?.objectKey).toBe('tasks#b');
+    });
+
+    it('element addition → created; removal → descoped (not deleted)', async () => {
+      const baseline = await source.observe(
+        {
+          command: jsonArgv({ tasks: [{ id: 'a', v: 1 }] }),
+          'change-detection': { strategy: 'json-diff', collection },
+        },
+        ctx(),
+      );
+      const added = await source.observe(
+        {
+          command: jsonArgv({
+            tasks: [
+              { id: 'a', v: 1 },
+              { id: 'b', v: 2 },
+            ],
+          }),
+          'change-detection': { strategy: 'json-diff', collection },
+        },
+        ctx(baseline.nextState),
+      );
+      expect(added.observations).toHaveLength(1);
+      expect(added.observations[0]?.changeKind).toBe('created');
+
+      const removed = await source.observe(
+        {
+          command: jsonArgv({ tasks: [{ id: 'a', v: 1 }] }),
+          'change-detection': { strategy: 'json-diff', collection },
+        },
+        ctx(added.nextState),
+      );
+      expect(removed.observations).toHaveLength(1);
+      expect(removed.observations[0]?.changeKind).toBe('descoped');
+      expect(removed.observations[0]?.changeKind).not.toBe('deleted');
+    });
+
+    it('ignore-paths removes churn fields before comparison', async () => {
+      const cfg = {
+        path: '$.tasks',
+        key: 'id',
+        'ignore-paths': ['$.fetchedAt'],
+      };
+      const baseline = await source.observe(
+        {
+          command: jsonArgv({ tasks: [{ id: 'a', v: 1, fetchedAt: 't0' }] }),
+          'change-detection': { strategy: 'json-diff', collection: cfg },
+        },
+        ctx(),
+      );
+      const next = await source.observe(
+        {
+          command: jsonArgv({ tasks: [{ id: 'a', v: 1, fetchedAt: 't1' }] }),
+          'change-detection': { strategy: 'json-diff', collection: cfg },
+        },
+        ctx(baseline.nextState),
+      );
+      expect(next.observations).toHaveLength(0);
+    });
+
+    it('rejects collection under a non-json-diff strategy at observe time', async () => {
+      await expect(
+        source.observe(
+          {
+            command: jsonArgv({ tasks: [] }),
+            'change-detection': { strategy: 'text-diff', collection },
+          },
+          ctx(),
+        ),
+      ).rejects.toThrow(/requires strategy: json-diff/);
+    });
+  });
+
   // AC3 — nonzero exit WITH changed output is a result, diffed and reported.
   describe('AC3: nonzero-exit result is diffed, not swallowed (003 §11.2/§11.7)', () => {
     it('reports a changed nonzero-exit output as an observation', async () => {

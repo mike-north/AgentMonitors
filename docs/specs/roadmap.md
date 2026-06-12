@@ -80,21 +80,22 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
 > §11.7 validation list, incl. the no-shell metacharacter test, the nonzero-exit-is-a-result test,
 > the transition-edge failure tests, and the no-orphan-on-timeout guard) and CLI integration tests
 > (`apps/cli/src/commands/cli.integration.test.ts`). See [003 §11](./003-source-plugins.md) and
-> [spec-changelog.md](./spec-changelog.md). The keyed-collection (§12) and cursor (§13) targets
-> remain unbuilt (G9 below).
+> [spec-changelog.md](./spec-changelog.md). The cursor (§13) target remains unbuilt.
 
-### G9 — Keyed-collection change detection (P3)
-
-- **Current:** `api-poll` and `command-poll` report one output-level observation per change;
-  collection outputs produce opaque "something changed" signals.
-- **Target:** the `change-detection.collection` mode of [003 §12](./003-source-plugins.md):
-  per-object observations with stable `objectKey`s and `created`/`modified`/`descoped` change kinds.
-  Applies to both poll sources; separable from G8.
-- **Governs:** SP3 ([000](./000-principles.md)), [003 §2.3 / §12](./003-source-plugins.md).
-- **Files:** shared change-detection helper (location at implementer's discretion — candidates:
-  `libs/core` or a shared plugin utility), `plugins/source-api-poll/`, `plugins/source-command-poll/`.
-- **Proof:** re-sorted collection produces zero observations; one element changing produces exactly
-  one `modified` with the keyed `objectKey`; element removal produces `descoped` (not `deleted`).
+> G9 (keyed-collection change detection) **shipped** — the `change-detection.collection` mode of
+> [003 §12](./003-source-plugins.md) is now current. The per-object diff (`created`/`modified`/
+> `descoped` with stable `<monitor-objectKey>#<key>` ids) is implemented once as the shared core
+> helper `diffKeyedCollection` (`libs/core/src/observation/keyed-collection.ts`, exported from
+> `libs/core/src/index.ts`) and consumed by **both** `api-poll` and `command-poll`. `path` is a
+> minimal `$.`-dotted path selecting exactly one array; `ignore-paths` strips churn fields before
+> comparison; reordering/whitespace are inherently ignored; the baseline run emits nothing. The
+> `collection` block requires `strategy: json-diff` and is rejected by `validate` under
+> `text-diff`/`exit-code` (BP3). Proven by `libs/core/src/observation/keyed-collection.test.ts`
+> (re-sorted → zero observations; one element changing → one `modified`; addition → `created`;
+> removal → `descoped`, not `deleted`; `ignore-paths` suppression), per-source integration tests in
+> each plugin's `index.test.ts`, and the `validate` rejection tests in
+> `apps/cli/src/commands/cli.integration.test.ts`. See [003 §12](./003-source-plugins.md) and
+> [spec-changelog.md](./spec-changelog.md).
 
 > The cursor protocol ([003 §13](./003-source-plugins.md)) is deliberately **not** a roadmap item:
 > per #81 it is designed only as far as a sketch, to be fully specified if measured poll cost ever

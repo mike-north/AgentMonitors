@@ -44,6 +44,16 @@ export type {
   ObservationResult,
   ObservationSource,
 } from './observation/types.js';
+export {
+  diffKeyedCollection,
+  parseKeyedCollectionConfig,
+  resolveDottedPath,
+} from './observation/keyed-collection.js';
+export type {
+  KeyedCollectionConfig,
+  KeyedCollectionResult,
+  KeyedSnapshot,
+} from './observation/keyed-collection.js';
 
 // Notification
 export {
