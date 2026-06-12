@@ -8,12 +8,32 @@
  * The tests spawn tiny real subprocesses (`node -e …`) so the no-shell spawn path is
  * genuinely exercised — not a hand-built approximation. Dates are fixed; no network.
  */
+import { execFileSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import type {
   ObservationContext,
   ObservationResult,
 } from '@agentmonitors/core';
 import source from './index.js';
+
+/**
+ * Probe pgrep availability once at module load so `describe.skipIf` has a
+ * synchronous boolean — it cannot await a promise. pgrep exits 1 when there
+ * are no matches (normal); ENOENT means it's not installed at all.
+ */
+function probePgrep(): boolean {
+  try {
+    execFileSync('pgrep', ['-P', '0'], { stdio: 'pipe' });
+    return true;
+  } catch (e) {
+    const err = e as { code?: string | number };
+    // exit code 1 = no matches — pgrep IS available, just found nothing
+    // ENOENT = binary not found — pgrep is NOT available
+    return err.code !== 'ENOENT';
+  }
+}
+
+const PGREP_AVAILABLE = probePgrep();
 
 const NOW = new Date('2026-06-12T00:00:00.000Z');
 
@@ -436,45 +456,123 @@ describe('source-command-poll', () => {
         'Command output changed: my-key',
       );
     });
-  });
-});
 
-/** Process-leak guard: assert the spawned-children count returns to baseline. */
-describe('source-command-poll: no orphan processes (003 §11.7)', () => {
-  let baselineChildCount = 0;
-
-  afterEach(async () => {
-    // Allow any lingering teardown to settle, then confirm no extra children leaked.
-    await new Promise((r) => setTimeout(r, 50));
-  });
-
-  it('a timed-out child leaves no orphan (killed within the grace window)', async () => {
-    baselineChildCount = await childProcessCount();
-
-    const hung = {
-      command: nodeArgv('setTimeout(() => {}, 60000)'),
-      timeout: '1s',
-    };
-    const result: ObservationResult = await source.observe(hung, {
-      now: NOW,
+    // 003 §11.4: snapshot.command is the argv array, not the objectKey string.
+    it('snapshot.command is the argv array, not objectKey (003 §11.4)', async () => {
+      const argv = nodeArgv('process.stdout.write("snap-test")');
+      const baseline = await source.observe({ command: argv }, ctx());
+      const changed = await source.observe(
+        { command: nodeArgv('process.stdout.write("snap-test-2")') },
+        ctx(baseline.nextState),
+      );
+      const obs = changed.observations[0];
+      const snapshot = obs?.snapshot as {
+        command: unknown;
+        exitCode: number;
+        stdoutLength: number;
+        strategy: string;
+      };
+      // snapshot.command must be the argv array, not the objectKey string.
+      expect(snapshot.command).toEqual(
+        nodeArgv('process.stdout.write("snap-test-2")'),
+      );
+      expect(Array.isArray(snapshot.command)).toBe(true);
+      // snapshot.command and payload.command refer to the same data.
+      const payload = obs?.payload as { command: string[] };
+      expect(snapshot.command).toEqual(payload.command);
     });
-    expect(result.observations).toHaveLength(1);
+  });
 
-    // Give SIGTERM time to land (timeout 1s already elapsed; the child exits on TERM).
-    await new Promise((r) => setTimeout(r, 200));
-    const after = await childProcessCount();
-    expect(after).toBeLessThanOrEqual(baselineChildCount);
+  describe('isCommandState guard (003 §11.4)', () => {
+    // Regression test: a malformed previousState with non-boolean `truncated`
+    // must be rejected by the guard and re-baselined, not re-persisted.
+    it('re-baselines when previousState has non-boolean truncated', async () => {
+      // Inject a state where truncated is a string instead of boolean.
+      const malformedState = {
+        stdout: 'old-output',
+        exitCode: 0,
+        truncated: 'yes', // invalid — should be boolean
+        health: 'ok',
+        baselined: true,
+      };
+      // With a valid prior baseline accepted, a changed output would emit an observation.
+      // With the malformed state rejected, the source re-baselines silently (no observation).
+      const result = await source.observe(
+        { command: nodeArgv('process.stdout.write("new-output")') },
+        ctx(malformedState),
+      );
+      // Re-baselined: no observation emitted (same behavior as first-ever run).
+      expect(result.observations).toHaveLength(0);
+      expect(result.nextState).toMatchObject({
+        stdout: 'new-output',
+        health: 'ok',
+        baselined: true,
+        truncated: false,
+      });
+    });
   });
 });
 
-/** Count direct child processes of this test process (best-effort, POSIX `pgrep`). */
+/**
+ * Process-leak guard: assert the spawned-children count returns to baseline.
+ * Skipped on platforms where `pgrep` is unavailable — without it the helper
+ * always returns 0 and the test would pass vacuously (003 §11.7).
+ */
+describe.skipIf(!PGREP_AVAILABLE)(
+  'source-command-poll: no orphan processes (003 §11.7)',
+  () => {
+    let baselineChildCount = 0;
+
+    afterEach(async () => {
+      // Allow any lingering teardown to settle, then confirm no extra children leaked.
+      await new Promise((r) => setTimeout(r, 50));
+    });
+
+    it('a timed-out child leaves no orphan (killed within the grace window)', async () => {
+      baselineChildCount = await childProcessCount();
+
+      const hung = {
+        command: nodeArgv('setTimeout(() => {}, 60000)'),
+        timeout: '1s',
+      };
+      const result: ObservationResult = await source.observe(hung, {
+        now: NOW,
+      });
+      expect(result.observations).toHaveLength(1);
+
+      // Give SIGTERM time to land (timeout 1s already elapsed; the child exits on TERM).
+      await new Promise((r) => setTimeout(r, 200));
+      const after = await childProcessCount();
+      expect(after).toBeLessThanOrEqual(baselineChildCount);
+    });
+  },
+);
+
+/**
+ * Count direct child processes of this test process via POSIX `pgrep`.
+ *
+ * Exit code 1 means "no matches" → 0 children (normal, not an error).
+ * Any other error (ENOENT, unexpected exit code) is thrown so the test fails
+ * loudly rather than passing blind — a masked leak is worse than a test failure.
+ */
 async function childProcessCount(): Promise<number> {
   const { execFile } = await import('node:child_process');
-  return new Promise<number>((resolve) => {
+  return new Promise<number>((resolve, reject) => {
     execFile('pgrep', ['-P', String(process.pid)], (err, stdout) => {
       if (err) {
-        // pgrep exits 1 when there are no matches — that means zero children.
-        resolve(0);
+        const errWithCode = err as Error & { code?: string | number };
+        // pgrep exits 1 when there are no matches — that is "zero children", not an error.
+        if (errWithCode.code === 1) {
+          resolve(0);
+          return;
+        }
+        // Any other failure (ENOENT, unexpected exit code, etc.) means we can't
+        // measure — reject so the test fails loudly rather than passing vacuously.
+        reject(
+          new Error(
+            `pgrep failed unexpectedly (code=${String(errWithCode.code)}): ${err.message}`,
+          ),
+        );
         return;
       }
       const lines = stdout.split('\n').filter((l) => l.trim().length > 0);

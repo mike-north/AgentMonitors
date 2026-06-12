@@ -6,6 +6,7 @@ const REPO_ROOT = process.cwd();
 const PACKAGE_DIRS = [
   'libs/core',
   'plugins/source-api-poll',
+  'plugins/source-command-poll',
   'plugins/source-file-fingerprint',
   'plugins/source-incoming-changes',
   'plugins/source-schedule',

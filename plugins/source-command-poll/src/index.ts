@@ -271,6 +271,7 @@ function isCommandState(value: unknown): value is CommandState {
   return (
     typeof v['stdout'] === 'string' &&
     typeof v['exitCode'] === 'number' &&
+    typeof v['truncated'] === 'boolean' &&
     (v['health'] === 'ok' || v['health'] === 'failing') &&
     typeof v['baselined'] === 'boolean'
   );
@@ -298,7 +299,7 @@ function changedObservation(
     objectKey: scope.objectKey,
     queryScope: { command: scope.objectKey },
     snapshot: {
-      command: scope.objectKey,
+      command: scope.command,
       exitCode: result.exitCode,
       stdoutLength: result.stdout.length,
       strategy: scope.strategy,
