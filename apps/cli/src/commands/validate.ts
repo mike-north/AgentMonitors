@@ -7,6 +7,24 @@ import {
 import { registerCoreSources } from '../sources.js';
 import { requireDirectory } from '../validation.js';
 
+/**
+ * Returns the actionable BP3 error when a `change-detection.collection` block is
+ * present without `strategy: json-diff` (003 §12), or `undefined` otherwise. Mirrors
+ * the schema's `if/then` rule with a clearer, author-facing message.
+ */
+function changeDetectionCollectionError(
+  watchConfig: Record<string, unknown>,
+): string | undefined {
+  const cd = watchConfig['change-detection'];
+  if (cd === null || typeof cd !== 'object' || Array.isArray(cd))
+    return undefined;
+  const cdObj = cd as Record<string, unknown>;
+  if (cdObj['collection'] === undefined) return undefined;
+  const strategy = cdObj['strategy'];
+  if (strategy === 'json-diff') return undefined;
+  return 'change-detection.collection requires strategy: json-diff';
+}
+
 export const validateCommand = new Command('validate')
   .description('Validate MONITOR.md files in a directory')
   .argument('[path]', 'Path to monitors directory', '.claude/monitors')
@@ -41,8 +59,20 @@ export const validateCommand = new Command('validate')
       // Extract per-source config (watch block minus `type`) for schema validation
       const { type: _type, ...watchConfig } = m.monitor.frontmatter.watch;
       const errors = validateScope(watchConfig, source.scopeSchema);
-      if (errors.length > 0) {
-        scopeErrors.push({ id: m.monitor.id, errors });
+
+      // BP3 (003 §12): a keyed-collection block is only valid under json-diff. The
+      // generated schema already rejects it, but cfworker's generic message
+      // ("Instance does not match json-diff") is opaque — surface the actionable
+      // wording instead. This rule is source-agnostic (any source exposing
+      // `change-detection`), so it lives in the shared validate path rather than a
+      // per-source schema.
+      const collectionError = changeDetectionCollectionError(watchConfig);
+      const allScopeErrors = collectionError
+        ? [collectionError, ...errors.filter((e) => !e.includes('then'))]
+        : errors;
+
+      if (allScopeErrors.length > 0) {
+        scopeErrors.push({ id: m.monitor.id, errors: allScopeErrors });
         return false;
       }
       return true;
