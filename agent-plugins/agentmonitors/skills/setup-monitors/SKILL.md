@@ -1,30 +1,31 @@
 ---
 name: setup-monitors
-description: Enable AgentMon monitoring for this project — create the gitignored activation file, scaffold a MONITOR.md, and verify the daemon picks it up. Use when the user asks to "set up agent monitors", "enable monitoring in this repo", "watch files/an API/a schedule and tell me when it changes", or "turn on agentmonitors here".
+description: Enable AgentMon monitoring and author verified-firing monitors from plain-language intent. Use when the user asks to "set up agent monitors", "enable monitoring in this repo", "set up a monitor", "watch this file", "watch these files", "tell me when X changes", "notify me when X happens", "watch an API", "watch a schedule", or "turn on agentmonitors here".
 ---
 
-# Set up AgentMon monitoring for a project
+# Set Up AgentMon Monitoring
 
-This plugin installs the lifecycle hooks and the channel MCP once. After that, monitoring
-for a given project is turned on by **two pieces of project-local state**:
+Help the user go from intent to a working monitor. Do not make the user edit YAML. Ask concise
+questions, write the project-local files yourself, validate them, and verify the monitor fires.
 
-1. A gitignored activation file (`.claude/agentmonitors.local.md`) with `enabled: true`.
+Monitoring needs two project-local pieces:
+
+1. `.claude/agentmonitors.local.md` with `enabled: true` so hooks boot/register the daemon.
 2. One or more monitor definitions under `.claude/monitors/`.
 
-Without step 1, the `SessionStart` hook's `agentmonitors session start` quick-exits and **nothing
-runs** — no daemon boots, no monitors tick. Walk the user through both.
+Without the activation file, `agentmonitors session start` quick-exits and no monitor ticks.
 
 ## Prerequisites
 
-The `agentmonitors` CLI must be on `PATH`. If `agentmonitors --help` fails, install it globally:
+Run `agentmonitors --help`. If it fails, tell the user to install the CLI:
 
 ```bash
 npm i -g @agentmonitors/cli
 ```
 
-## Step 1 — Enable monitoring (the activation file)
+## Enable The Project
 
-Create `.claude/agentmonitors.local.md` with `enabled: true` in its frontmatter:
+Create `.claude/agentmonitors.local.md`:
 
 ```markdown
 ---
@@ -34,70 +35,90 @@ enabled: true
 > Local AgentMon coordination state. Gitignored; safe to delete (it is regenerated).
 ```
 
-This file is per-developer, local, and **must be gitignored** — `agentmonitors session start`
-rewrites it at runtime to record the resolved daemon socket/db paths. The repo's `.gitignore`
-should already ignore it via `.claude/*.local.*`; if not, add that line (see Step 3).
+Ensure `.gitignore` contains:
 
-The change takes effect on the next session: the `SessionStart` hook lazy-boots a per-workspace
-daemon and registers the session; `SessionEnd` deregisters it so the idle daemon reaps itself.
-
-## Step 2 — Add a monitor
-
-Scaffold a monitor with the CLI (creates `.claude/monitors/<name>/MONITOR.md`):
-
-```bash
-agentmonitors init my-monitor --type file-fingerprint
+```gitignore
+.claude/*.local.*
 ```
 
-`--type` accepts `file-fingerprint` (default), `api-poll`, `schedule`, or `incoming-changes`.
-A file-fingerprint monitor looks like this — note the `watch: { type }` frontmatter shape:
+Only add `.claude/monitors/*` to `.gitignore` if the user wants monitors to remain personal. Commit
+monitor definitions when they should be shared by the team.
+
+## Author A Monitor
+
+1. Restate the user's intent as a monitor outcome: what changed, and what should the agent do?
+2. Choose the smallest shipped `watch.type` that matches the intent:
+
+| Intent | Use `watch.type` | Ask for |
+| --- | --- | --- |
+| Local files changed, created, deleted, or descoped | `file-fingerprint` | `globs`; optional `cwd` |
+| HTTP response/status changed | `api-poll` | `url`; optional `method`, `headers`, `auth`, `change-detection`, `interval` |
+| Time-based reminder or recurring check | `schedule` | `cron`; optional `timezone`, `label` |
+| Git ref advances touching paths | `incoming-changes` | `paths`; optional `cwd`, `branch`, `interval` |
+
+If no shipped source fits, say it is not monitorable yet. Do not use `command-poll` until the CLI
+actually lists it.
+
+3. Ask only for fields required by the chosen source. Prefer defaults for everything else:
+   - `urgency: normal` unless the user needs idle-only (`low`) or interrupting (`high`) delivery.
+   - Add `notify:` only when the user asks for batching/throttling behavior.
+4. Write `.claude/monitors/<id>/MONITOR.md` (or a flat `.claude/monitors/<id>.md`). Use the monitor
+   body for the user's judgment and instructions, not facts already captured in `watch:`.
+
+Example body style:
 
 ```markdown
----
-name: My monitor
-watch:
-  type: file-fingerprint
-  globs:
-    - '**/*.ts'
-urgency: normal
----
-
-When changes are detected, review and take appropriate action.
+When this fires, inspect the change and decide whether implementation or docs need follow-up.
 ```
 
-You can also drop a flat `.claude/monitors/<id>.md` instead of a `<id>/MONITOR.md` directory;
-the monitor ID is the directory (or file) name. Edit the frontmatter for your case, then validate:
+## Validate
+
+Run validation after every edit and fix all reported problems:
 
 ```bash
 agentmonitors validate .claude/monitors
 ```
 
-`urgency` is one of `low` / `normal` / `high`. `high` settles on a short debounce (~15s) before
-delivering — it is not instant.
+## Verify It Fires
 
-## Step 3 — Gitignore the right things
+Verification is mandatory. The monitor is not done until it has fired once or until you clearly tell
+the user what external condition is still needed to make it fire.
 
-Add these to `.gitignore` (the activation entry is required; the monitors entry is optional):
+Use the cheapest real verification:
 
-```gitignore
-# AgentMon local coordination state (per-developer; never commit)
-.claude/*.local.*
+- `file-fingerprint`: create or modify a scratch file matched by the monitor, run the monitor through
+  a baseline tick, then a changed tick.
+- `api-poll`: use `agentmonitors monitor test <path/to/MONITOR.md>` if the endpoint can be polled
+  safely; for status/body-change verification, point at a controllable scratch endpoint when possible.
+- `schedule`: choose a near-future cron while testing, or use `agentmonitors monitor test` to verify
+  source configuration before restoring the intended cron.
+- `incoming-changes`: use a scratch git repo or harmless pathspec; advance the ref with a small commit
+  touching a matched path.
 
-# Optional: keep monitor definitions out of version control
-.claude/monitors/*
-```
-
-Commit monitor files only if you want them shared across the team. The `.local.*` activation file
-is always per-developer and must stay ignored.
-
-## Verify
-
-Open a new session (or run a tick by hand) and confirm the daemon is up:
+Useful commands:
 
 ```bash
-agentmonitors session list      # should show this session once enabled
-agentmonitors daemon once .claude/monitors --workspace "$PWD"   # single in-process tick
+agentmonitors monitor test .claude/monitors/<id>/MONITOR.md
+agentmonitors monitor history <id>
+agentmonitors monitor explain <id> --dir .claude/monitors
 ```
 
-If `session list` is empty, re-check that `.claude/agentmonitors.local.md` exists and has
-`enabled: true` — that is the most common reason monitoring appears to do nothing.
+If a daemon-backed check is needed, use the project daemon started by the hooks or start a temporary
+daemon, then stop it when done. Confirm the final report with `monitor history` or `monitor explain`.
+
+## Debug Loop
+
+When the user says "it did not fire", do not guess. Run:
+
+```bash
+agentmonitors monitor explain <id> --dir .claude/monitors
+```
+
+Use the stopped stage to fix the monitor:
+
+- `definition`: parse/schema/source config problem; edit `MONITOR.md`, then run `validate`.
+- `scheduling`: daemon not running or not due; enable the project, start a session, or adjust interval/cron.
+- `observation`: source errored, rebaselined, or saw no change; inspect source-specific config and state.
+- `notify`: debounce/throttle is holding observations; wait or adjust `notify`.
+- `materialization`: source observed but no event was written; inspect runtime error details.
+- `delivery`: event exists but no lead session is available, or events are unread/claimed/acknowledged.
