@@ -1324,6 +1324,186 @@ When files change, review them.
   }, 30_000);
 });
 
+describe('monitor explain', () => {
+  it('returns JSON stage diagnostics when the daemon is not running', () => {
+    const dir = path.join(tempDir, 'explain-daemon-down');
+    const monitorsDir = path.join(dir, '.claude', 'monitors', 'watch-files');
+    mkdirSync(monitorsDir, { recursive: true });
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      `---
+name: Watch files
+watch:
+  type: file-fingerprint
+  globs:
+    - watched.txt
+urgency: normal
+---
+When files change, review them.
+`,
+      'utf-8',
+    );
+
+    const socketPath = path.join(
+      '/tmp',
+      `agentmon-explain-missing-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const result = runWithEnv(
+      [
+        'monitor',
+        'explain',
+        'watch-files',
+        '--dir',
+        path.join(dir, '.claude', 'monitors'),
+        '--socket',
+        socketPath,
+        '--format',
+        'json',
+      ],
+      { AGENTMONITORS_SOCKET: socketPath },
+      dir,
+    );
+
+    expect(result.exitCode).toBe(0);
+    const report = JSON.parse(result.stdout) as {
+      verdict: { stage: string; status: string };
+      stages: { id: string; status: string; reason: string }[];
+    };
+    expect(report.verdict).toMatchObject({
+      stage: 'scheduling',
+      status: 'failure',
+    });
+    expect(report.stages.find((stage) => stage.id === 'definition')).toEqual(
+      expect.objectContaining({ status: 'ok' }),
+    );
+    expect(report.stages.find((stage) => stage.id === 'scheduling')).toEqual(
+      expect.objectContaining({
+        status: 'failure',
+        reason: expect.stringContaining('daemon is not running'),
+      }),
+    );
+  });
+
+  it('surfaces a daemon-side application error instead of masking it as "daemon not running" (issue #94 review)', async () => {
+    // Regression for comment 3408123745: when the daemon answers `monitor.explain`
+    // with an application error (the daemon IS running and reachable), the CLI must
+    // surface that error — NOT fall back to the "daemon unavailable / scheduling
+    // failed" diagnosis, which would hide the real failure.
+    const dir = path.join(tempDir, 'explain-app-error');
+    const monitorsDir = path.join(dir, '.claude', 'monitors', 'watch-files');
+    mkdirSync(monitorsDir, { recursive: true });
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      `---
+name: Watch files
+watch:
+  type: file-fingerprint
+  globs:
+    - watched.txt
+urgency: normal
+---
+When files change, review them.
+`,
+      'utf-8',
+    );
+
+    const socketPath = path.join(
+      '/tmp',
+      `agentmon-explain-apperr-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+
+    // A fake daemon that is reachable but answers every request with an
+    // application error (the `error` field of the daemon response protocol). It
+    // MUST run in a separate process: the CLI is driven via the synchronous
+    // `execFileSync` (runWithEnv), which blocks this process's event loop — an
+    // in-process server could never respond while the CLI is connecting.
+    const fakeDaemonScript = path.join(dir, 'fake-daemon.cjs');
+    writeFileSync(
+      fakeDaemonScript,
+      `const net = require('node:net');
+const socketPath = process.argv[2];
+const server = net.createServer((socket) => {
+  let buffer = '';
+  socket.setEncoding('utf-8');
+  socket.on('data', (chunk) => {
+    buffer += chunk;
+    const nl = buffer.indexOf('\\n');
+    if (nl === -1) return;
+    const id = (JSON.parse(buffer.slice(0, nl)).id) || 'unknown';
+    socket.end(JSON.stringify({ id, error: 'explain blew up inside the daemon' }) + '\\n');
+  });
+});
+server.listen(socketPath, () => { process.stdout.write('FAKE_DAEMON_LISTENING\\n'); });
+`,
+      'utf-8',
+    );
+
+    const fakeDaemon = spawn('node', [fakeDaemonScript, socketPath], {
+      cwd: dir,
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let fakeStdout = '';
+    fakeDaemon.stdout.setEncoding('utf-8');
+    fakeDaemon.stdout.on('data', (chunk: string) => {
+      fakeStdout += chunk;
+    });
+
+    // Wait for the fake daemon to be listening on the socket.
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      if (
+        existsSync(socketPath) &&
+        fakeStdout.includes('FAKE_DAEMON_LISTENING')
+      ) {
+        break;
+      }
+      if (fakeDaemon.exitCode !== null) {
+        throw new Error(
+          `Fake daemon exited early (code ${fakeDaemon.exitCode}).`,
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    try {
+      const result = runWithEnv(
+        [
+          'monitor',
+          'explain',
+          'watch-files',
+          '--dir',
+          path.join(dir, '.claude', 'monitors'),
+          '--socket',
+          socketPath,
+          '--format',
+          'json',
+        ],
+        { AGENTMONITORS_SOCKET: socketPath },
+        dir,
+      );
+
+      // The real application error must be surfaced (exit 1), not masked.
+      expect(result.exitCode).toBe(1);
+      const payload = JSON.parse(result.stdout) as { error: string };
+      expect(payload.error).toContain('explain blew up inside the daemon');
+      // It must NOT have produced the daemon-unavailable diagnosis.
+      expect(result.stdout).not.toContain('daemon is not running');
+    } finally {
+      fakeDaemon.kill('SIGTERM');
+      await new Promise<void>((resolve) => {
+        if (fakeDaemon.exitCode !== null) {
+          resolve();
+          return;
+        }
+        fakeDaemon.once('exit', () => {
+          resolve();
+        });
+      });
+    }
+  });
+});
+
 describe('monitor test', () => {
   it('errors on missing file', () => {
     const result = run(['monitor', 'test', '/tmp/nonexistent-monitor.md']);

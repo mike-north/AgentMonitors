@@ -117,6 +117,96 @@ export interface EventQuery {
   unreadOnly?: boolean;
   sinceBaseline?: boolean;
   since?: Date;
+  /**
+   * Restrict results to events materialized for this workspace, plus
+   * workspace-agnostic (`workspacePath === null`) events. The inbox DB is global
+   * and the same `monitorId` may exist in multiple workspaces, so callers that
+   * reason about a single workspace (e.g. `monitor explain`) MUST scope by this
+   * to avoid leaking other workspaces' events (issue #94 review).
+   */
+  workspacePath?: string;
+}
+
+export type MonitorExplainStageId =
+  | 'definition'
+  | 'scheduling'
+  | 'observation'
+  | 'notify'
+  | 'materialization'
+  | 'delivery';
+
+/**
+ * The status of a single monitor-explain pipeline stage.
+ *
+ * - `ok` — the stage completed and produced the signal the next stage needs.
+ * - `pending` — the stage is intentionally holding (e.g. debounce/throttle), or
+ *   has not run yet because an upstream stage has not produced its input.
+ * - `healthy` — the stage ran successfully and the *correct* outcome was "no
+ *   work to do" (the watched target genuinely did not change). This is an
+ *   affirmative, not-a-bug outcome (issue #94) and is rendered distinctly from
+ *   both `ok` (signal delivered) and `failure` (a real fault).
+ * - `failure` — a real fault: the source errored, the definition is invalid, the
+ *   daemon is down, or an expected projection is missing.
+ */
+export type MonitorExplainStageStatus =
+  | 'ok'
+  | 'pending'
+  | 'healthy'
+  | 'failure';
+
+export interface MonitorExplainStage {
+  id: MonitorExplainStageId;
+  label: string;
+  status: MonitorExplainStageStatus;
+  reason: string;
+  details?: Record<string, unknown>;
+}
+
+export type MonitorDeliveryState = 'unread' | 'claimed' | 'acknowledged';
+
+export interface MonitorDeliveryProjection {
+  eventId: string;
+  sessionId: string;
+  sessionRole: AgentSessionRole;
+  sessionStatus: AgentSessionStatus;
+  deliveryState: MonitorDeliveryState;
+  workspacePath: string | null;
+  createdAt: Date;
+  firstNotifiedAt?: Date;
+  lastClaimAt?: Date;
+  lastClaimLifecycle?: string;
+  acknowledgedAt?: Date;
+}
+
+export interface MonitorExplainInput {
+  monitorId: string;
+  monitorsDir: string;
+  workspacePath?: string;
+  historyLimit?: number;
+  eventLimit?: number;
+  now?: Date;
+}
+
+export interface MonitorExplainReport {
+  monitorId: string;
+  generatedAt: Date;
+  monitor?: {
+    id: string;
+    displayName: string;
+    filePath: string;
+    sourceName: string;
+    urgency: Urgency;
+  };
+  stages: MonitorExplainStage[];
+  verdict: {
+    status: MonitorExplainStageStatus;
+    stage: MonitorExplainStageId;
+    reason: string;
+  };
+  observations: ObservationHistoryRecord[];
+  events: MonitorEventRecord[];
+  projections: MonitorDeliveryProjection[];
+  leadSessions: AgentSessionRecord[];
 }
 
 export type SessionUnreadCounts = UrgencyCounts & { total: number };

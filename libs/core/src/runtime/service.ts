@@ -2,6 +2,7 @@ import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { scanMonitors } from '../parser/scan-monitors.js';
 import type { MonitorDefinition } from '../schema/types.js';
+import { validateScope } from '../schema/validate-scope.js';
 import { parseDuration } from '../notify/notifier.js';
 import type { Observation } from '../observation/types.js';
 import type { SourceRegistry } from '../observation/registry.js';
@@ -13,6 +14,11 @@ import type {
   AgentSessionRecord,
   DeliveryClaim,
   EventQuery,
+  MonitorExplainInput,
+  MonitorExplainReport,
+  MonitorExplainStage,
+  MonitorExplainStageId,
+  MonitorExplainStageStatus,
   ObservationHistoryQuery,
   ObservationHistoryRecord,
   OpenSessionInput,
@@ -34,6 +40,14 @@ const DEFAULT_FILE_FINGERPRINT_POLL_MS = 30_000;
 const DEFAULT_API_POLL_MS = 300_000;
 const DEFAULT_HIGH_URGENCY_SETTLE_MS = 15_000;
 const MAX_RECAP_EVENTS = 10;
+const EXPLAIN_STAGE_LABELS: Record<MonitorExplainStageId, string> = {
+  definition: 'Definition',
+  scheduling: 'Scheduling',
+  observation: 'Observation',
+  notify: 'Notify state',
+  materialization: 'Materialization',
+  delivery: 'Projection and delivery',
+};
 
 /**
  * Extract the per-source configuration from a monitor's `watch` block. This is
@@ -60,6 +74,42 @@ function writeJsonAtomic(filePath: string, payload: unknown): void {
   const tmpPath = `${filePath}.tmp`;
   writeFileSync(tmpPath, JSON.stringify(payload, null, 2), 'utf-8');
   renameSync(tmpPath, filePath);
+}
+
+function monitorIdFromFilePath(filePath: string): string {
+  const base = path.basename(filePath);
+  return base === 'MONITOR.md'
+    ? path.basename(path.dirname(filePath))
+    : path.parse(filePath).name;
+}
+
+function explainStage(
+  id: MonitorExplainStageId,
+  status: MonitorExplainStageStatus,
+  reason: string,
+  details?: Record<string, unknown>,
+): MonitorExplainStage {
+  return {
+    id,
+    label: EXPLAIN_STAGE_LABELS[id],
+    status,
+    reason,
+    ...(details ? { details } : {}),
+  };
+}
+
+function explainVerdict(stages: MonitorExplainStage[]): {
+  status: MonitorExplainStageStatus;
+  stage: MonitorExplainStageId;
+  reason: string;
+} {
+  const stopped = stages.find((stage) => stage.status !== 'ok');
+  const stage = stopped ?? stages[stages.length - 1];
+  return {
+    status: stage?.status ?? 'ok',
+    stage: stage?.id ?? 'delivery',
+    reason: stage?.reason ?? 'Monitor delivered successfully.',
+  };
 }
 
 function serializeObservation(
@@ -220,6 +270,370 @@ export class AgentMonitorRuntime {
     query: ObservationHistoryQuery = {},
   ): ObservationHistoryRecord[] {
     return this.store.listObservationHistory(query);
+  }
+
+  async explainMonitor(
+    input: MonitorExplainInput,
+  ): Promise<MonitorExplainReport> {
+    const now = input.now ?? new Date();
+    const historyLimit = input.historyLimit ?? 10;
+    const eventLimit = input.eventLimit ?? 10;
+    const stages: MonitorExplainStage[] = [];
+    const scan = await scanMonitors(input.monitorsDir);
+    const parseError = scan.errors.find(
+      (error) => monitorIdFromFilePath(error.filePath) === input.monitorId,
+    );
+    const monitor = scan.monitors.find(
+      (candidate) => candidate.monitor.id === input.monitorId,
+    )?.monitor;
+    const duplicate = scan.duplicateIds.find(
+      (candidate) => candidate.id === input.monitorId,
+    );
+
+    if (parseError) {
+      stages.push(
+        explainStage(
+          'definition',
+          'failure',
+          `MONITOR.md failed to parse or validate: ${parseError.error}`,
+          { filePath: parseError.filePath },
+        ),
+      );
+      return {
+        monitorId: input.monitorId,
+        generatedAt: now,
+        stages,
+        verdict: explainVerdict(stages),
+        observations: [],
+        events: [],
+        projections: [],
+        leadSessions: [],
+      };
+    }
+
+    if (!monitor) {
+      stages.push(
+        explainStage(
+          'definition',
+          'failure',
+          `Monitor "${input.monitorId}" was not found in ${input.monitorsDir}.`,
+        ),
+      );
+      return {
+        monitorId: input.monitorId,
+        generatedAt: now,
+        stages,
+        verdict: explainVerdict(stages),
+        observations: [],
+        events: [],
+        projections: [],
+        leadSessions: [],
+      };
+    }
+
+    if (duplicate) {
+      stages.push(
+        explainStage(
+          'definition',
+          'failure',
+          `Monitor id "${input.monitorId}" is duplicated across ${String(duplicate.filePaths.length)} files.`,
+          { filePaths: duplicate.filePaths },
+        ),
+      );
+      return {
+        monitorId: input.monitorId,
+        generatedAt: now,
+        monitor: {
+          id: monitor.id,
+          displayName: monitor.displayName,
+          filePath: monitor.filePath,
+          sourceName: monitor.frontmatter.watch.type,
+          urgency: monitor.frontmatter.urgency,
+        },
+        stages,
+        verdict: explainVerdict(stages),
+        observations: [],
+        events: [],
+        projections: [],
+        leadSessions: [],
+      };
+    }
+
+    const sourceName = monitor.frontmatter.watch.type;
+    const source = this.registry.get(sourceName);
+    const scopeErrors = source
+      ? validateScope(
+          watchConfig(monitor.frontmatter.watch),
+          source.scopeSchema,
+        )
+      : [`Unknown source "${sourceName}".`];
+    if (scopeErrors.length > 0) {
+      stages.push(
+        explainStage(
+          'definition',
+          'failure',
+          `Monitor definition is invalid: ${scopeErrors.join('; ')}`,
+          { filePath: monitor.filePath, sourceName },
+        ),
+      );
+      return {
+        monitorId: input.monitorId,
+        generatedAt: now,
+        monitor: {
+          id: monitor.id,
+          displayName: monitor.displayName,
+          filePath: monitor.filePath,
+          sourceName,
+          urgency: monitor.frontmatter.urgency,
+        },
+        stages,
+        verdict: explainVerdict(stages),
+        observations: [],
+        events: [],
+        projections: [],
+        leadSessions: [],
+      };
+    }
+
+    stages.push(
+      explainStage('definition', 'ok', 'Monitor definition is valid.', {
+        filePath: monitor.filePath,
+        sourceName,
+      }),
+    );
+
+    const runtimeState = this.store.getMonitorState(input.monitorId);
+    const schedule = this.scheduleForMonitor(monitor, now);
+    const lastObservationAt = runtimeState.lastObservationAt;
+    const nextDueAt = schedule.due
+      ? now
+      : new Date(
+          (lastObservationAt?.getTime() ?? now.getTime()) + schedule.nextPollMs,
+        );
+    stages.push(
+      explainStage(
+        'scheduling',
+        'ok',
+        lastObservationAt
+          ? `Last tick completed at ${lastObservationAt.toISOString()}; next due ${schedule.due ? 'now' : nextDueAt.toISOString()}.`
+          : 'No completed tick is recorded yet; the monitor is due on the next daemon tick.',
+        {
+          due: schedule.due,
+          nextPollMs: schedule.nextPollMs,
+          nextDueAt: nextDueAt.toISOString(),
+          ...(lastObservationAt
+            ? { lastObservationAt: lastObservationAt.toISOString() }
+            : {}),
+        },
+      ),
+    );
+
+    const observations = this.store.listObservationHistory({
+      monitorId: input.monitorId,
+      limit: historyLimit,
+    });
+    const latestObservation = observations[0];
+    if (!latestObservation) {
+      stages.push(
+        explainStage(
+          'observation',
+          'failure',
+          'No observation history has been recorded for this monitor.',
+        ),
+      );
+    } else if (latestObservation.result === 'errored') {
+      stages.push(
+        explainStage(
+          'observation',
+          'failure',
+          'The most recent source observation errored.',
+          latestObservation.observationData,
+        ),
+      );
+    } else if (latestObservation.result === 'no-change') {
+      // A genuinely quiet tick is healthy, not a fault (issue #94): the watched
+      // target simply hasn't changed. Render distinctly from a real failure.
+      stages.push(
+        explainStage(
+          'observation',
+          'healthy',
+          'Source ran, observed 0 changes — your watched target genuinely hasn’t changed (not a bug).',
+          latestObservation.observationData,
+        ),
+      );
+    } else if (latestObservation.result === 'rebaselined') {
+      // The source advanced its baseline without computing a delta (e.g. a
+      // force-pushed/gc'd ref). No change was emitted, which is healthy — not a
+      // fault (issue #94).
+      stages.push(
+        explainStage(
+          'observation',
+          'healthy',
+          'Source rebaselined and emitted no change — your watched target is being tracked, nothing to report (not a bug).',
+          latestObservation.observationData,
+        ),
+      );
+    } else {
+      stages.push(
+        explainStage(
+          'observation',
+          'ok',
+          `The latest observation outcome was ${latestObservation.result}.`,
+          latestObservation.observationData,
+        ),
+      );
+    }
+
+    // A healthy/idle observation means the watched target genuinely hasn't
+    // changed (issue #94): the absence of downstream events/projections is the
+    // *expected* outcome, not a fault, so the later stages must not render ✗.
+    const observationHealthy =
+      latestObservation?.result === 'no-change' ||
+      latestObservation?.result === 'rebaselined';
+
+    const notifyState = runtimeState.notifyState;
+    const pendingDebounce = notifyState.pendingDebounce;
+    const suppressedUntil = notifyState.suppressedUntil
+      ? new Date(notifyState.suppressedUntil)
+      : null;
+    if (pendingDebounce && new Date(pendingDebounce.dueAt) > now) {
+      stages.push(
+        explainStage(
+          'notify',
+          'pending',
+          `debounce is holding ${String(pendingDebounce.observations.length)} observation(s) until ${pendingDebounce.dueAt}.`,
+          {
+            dueAt: pendingDebounce.dueAt,
+            observations: pendingDebounce.observations.length,
+          },
+        ),
+      );
+    } else if (suppressedUntil && suppressedUntil > now) {
+      stages.push(
+        explainStage(
+          'notify',
+          'pending',
+          `throttle is suppressing new notifications until ${suppressedUntil.toISOString()}.`,
+          { suppressedUntil: suppressedUntil.toISOString() },
+        ),
+      );
+    } else {
+      stages.push(
+        explainStage(
+          'notify',
+          'ok',
+          'No debounce or throttle hold is currently active.',
+        ),
+      );
+    }
+
+    const events = this.store
+      .listEvents({
+        monitorId: input.monitorId,
+        // Scope to the explained workspace so a same-id monitor in another
+        // workspace cannot leak its events into this report (issue #94 review).
+        ...(input.workspacePath !== undefined
+          ? { workspacePath: input.workspacePath }
+          : {}),
+      })
+      .slice(0, eventLimit);
+    if (events.length === 0) {
+      stages.push(
+        observationHealthy
+          ? explainStage(
+              'materialization',
+              'healthy',
+              'No events materialized — expected, because the source observed no changes (not a bug).',
+            )
+          : explainStage(
+              'materialization',
+              'failure',
+              'No monitor_events rows exist for this monitor.',
+            ),
+      );
+    } else {
+      stages.push(
+        explainStage(
+          'materialization',
+          'ok',
+          `${String(events.length)} recent monitor_events row(s) found.`,
+          { eventIds: events.map((event) => event.id) },
+        ),
+      );
+    }
+
+    const projections = this.store.listDeliveryProjectionsForMonitor(
+      input.monitorId,
+      // Scope to the explained workspace's sessions (plus global sessions) so
+      // projections from other workspaces are not overcounted (issue #94 review).
+      input.workspacePath,
+    );
+    const leadSessions = this.store
+      .sessionsForWorkspace(input.workspacePath)
+      .filter((session) => session.role === 'lead');
+    if (events.length > 0 && projections.length === 0) {
+      stages.push(
+        explainStage(
+          'delivery',
+          'failure',
+          leadSessions.length === 0
+            ? 'No lead session is registered for this workspace, so events were not projected.'
+            : 'No session_event_state projections exist for the materialized events.',
+          { leadSessions: leadSessions.map((session) => session.id) },
+        ),
+      );
+    } else if (events.length > 0) {
+      const counts = projections.reduce<Record<string, number>>(
+        (acc, projection) => {
+          acc[projection.deliveryState] =
+            (acc[projection.deliveryState] ?? 0) + 1;
+          return acc;
+        },
+        {},
+      );
+      stages.push(
+        explainStage(
+          'delivery',
+          'ok',
+          `Events are projected to lead sessions (${Object.entries(counts)
+            .map(([state, count]) => `${state}: ${String(count)}`)
+            .join(', ')}).`,
+          counts,
+        ),
+      );
+    } else {
+      stages.push(
+        observationHealthy
+          ? explainStage(
+              'delivery',
+              'healthy',
+              'Nothing to deliver — the source observed no changes, so there is no signal to project (not a bug).',
+            )
+          : explainStage(
+              'delivery',
+              'pending',
+              'Delivery has not started because no event has materialized yet.',
+            ),
+      );
+    }
+
+    return {
+      monitorId: input.monitorId,
+      generatedAt: now,
+      monitor: {
+        id: monitor.id,
+        displayName: monitor.displayName,
+        filePath: monitor.filePath,
+        sourceName,
+        urgency: monitor.frontmatter.urgency,
+      },
+      stages,
+      verdict: explainVerdict(stages),
+      observations,
+      events,
+      projections,
+      leadSessions,
+    };
   }
 
   acknowledgeSession(sessionId: string, eventIds?: string[]): void {

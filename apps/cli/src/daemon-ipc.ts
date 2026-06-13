@@ -39,6 +39,7 @@ const daemonMethodSchema = z.enum([
   'events.ack',
   'hook.claim',
   'history.list',
+  'monitor.explain',
   'daemon.tick',
 ]);
 const daemonResponseSchema = z.object({
@@ -87,6 +88,13 @@ const historyListParamsSchema = z.object({
   monitorId: z.string().optional(),
   limit: z.number().int().positive().optional(),
 });
+const monitorExplainParamsSchema = z.object({
+  monitorId: z.string(),
+  monitorsDir: z.string(),
+  workspacePath: z.string().optional(),
+  historyLimit: z.number().int().positive().optional(),
+  eventLimit: z.number().int().positive().optional(),
+});
 const daemonTickParamsSchema = z.object({
   monitorsDir: z.string(),
   workspacePath: z.string().optional(),
@@ -115,6 +123,27 @@ export interface DaemonServerOptions {
   runtime: AgentMonitorRuntime;
   socketPath: string;
   onStop?: () => void;
+}
+
+/**
+ * Thrown by {@link callDaemon} when the daemon could not be *reached* — the
+ * socket was absent/refused, the connection dropped, or the request timed out.
+ *
+ * This is deliberately distinct from a plain `Error` carrying a daemon-side
+ * application error (one the daemon answered with via `response.error`). Callers
+ * that have a "daemon unavailable" fallback (e.g. `monitor explain`) must only
+ * fall back on this class — falling back on an application error would mask the
+ * real failure and misreport it as "daemon not running" (issue #94 review,
+ * comment 3408123745).
+ */
+export class DaemonConnectionError extends Error {
+  override readonly name = 'DaemonConnectionError';
+  constructor(
+    message: string,
+    readonly cause?: unknown,
+  ) {
+    super(message);
+  }
 }
 
 function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
@@ -380,6 +409,18 @@ function handleRequest(
         }),
       );
     }
+    case 'monitor.explain': {
+      const params = monitorExplainParamsSchema.parse(request.params);
+      return runtime.explainMonitor({
+        monitorId: params.monitorId,
+        monitorsDir: params.monitorsDir,
+        ...(params.workspacePath
+          ? { workspacePath: params.workspacePath }
+          : {}),
+        ...(params.historyLimit ? { historyLimit: params.historyLimit } : {}),
+        ...(params.eventLimit ? { eventLimit: params.eventLimit } : {}),
+      });
+    }
     case 'daemon.tick': {
       const params = daemonTickParamsSchema.parse(request.params);
       return runtime.tick(params.monitorsDir, params.workspacePath);
@@ -560,12 +601,27 @@ export async function callDaemon<T = unknown>(
     };
 
     socket.setTimeout(timeoutMs, () => {
-      fail(new Error(`Timed out waiting for AgentMon daemon at ${socketPath}`));
+      // A timeout means the daemon could not be reached in time — a connection
+      // failure, not a daemon-side application error.
+      fail(
+        new DaemonConnectionError(
+          `Timed out waiting for AgentMon daemon at ${socketPath}`,
+        ),
+      );
     });
 
     socket.setEncoding('utf-8');
     socket.on('error', (error) => {
-      fail(error);
+      // Socket-level errors (ECONNREFUSED, ENOENT, dropped connection, …) mean
+      // the daemon was unreachable — classify them as connection failures so a
+      // caller's "daemon unavailable" fallback can distinguish them from a real
+      // daemon-side application error.
+      fail(
+        new DaemonConnectionError(
+          error instanceof Error ? error.message : String(error),
+          error,
+        ),
+      );
     });
     socket.on('data', (chunk) => {
       buffer += typeof chunk === 'string' ? chunk : chunk.toString('utf-8');

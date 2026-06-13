@@ -14,6 +14,8 @@ import type {
   AgentSessionRecord,
   EventQuery,
   MonitorEventRecord,
+  MonitorDeliveryProjection,
+  MonitorDeliveryState,
   MonitorRuntimeState,
   ObservationHistoryQuery,
   ObservationHistoryRecord,
@@ -81,6 +83,15 @@ function rowToEvent(
     tags: parseJson(row.tags, []),
     createdAt: row.createdAt,
   };
+}
+
+function deliveryStateForRow(row: {
+  firstNotifiedAt: Date | null;
+  acknowledgedAt: Date | null;
+}): MonitorDeliveryState {
+  if (row.acknowledgedAt) return 'acknowledged';
+  if (row.firstNotifiedAt) return 'claimed';
+  return 'unread';
 }
 
 function scopeMatches(
@@ -322,6 +333,17 @@ export class RuntimeStore {
     if (query.objectKey)
       conditions.push(eq(monitorEvents.objectKey, query.objectKey));
     if (query.since) conditions.push(gt(monitorEvents.createdAt, query.since));
+    // Scope to the requested workspace plus workspace-agnostic events. The inbox
+    // DB is global; the same monitorId can exist in multiple workspaces, so a
+    // workspace-scoped caller (e.g. `monitor explain`) must not see another
+    // workspace's events (issue #94 review, comment 3408123729).
+    if (query.workspacePath !== undefined) {
+      const workspaceCondition = or(
+        eq(monitorEvents.workspacePath, query.workspacePath),
+        isNull(monitorEvents.workspacePath),
+      );
+      if (workspaceCondition) conditions.push(workspaceCondition);
+    }
 
     let rows = query.sessionId
       ? asInternalDb(this.db)
@@ -458,6 +480,57 @@ export class RuntimeStore {
       ),
       result: row.result,
       createdAt: row.createdAt,
+    }));
+  }
+
+  listDeliveryProjectionsForMonitor(
+    monitorId: string,
+    workspacePath?: string,
+  ): MonitorDeliveryProjection[] {
+    const conditions = [eq(monitorEvents.monitorId, monitorId)];
+    // Scope to the requested workspace's sessions plus workspace-agnostic
+    // (global) sessions. The inbox DB is global and the same monitorId can exist
+    // in multiple workspaces, so an unscoped query overcounts projections from
+    // other workspaces' sessions (issue #94 review, comment 3408123736).
+    if (workspacePath !== undefined) {
+      const workspaceCondition = or(
+        eq(agentSessions.workspacePath, workspacePath),
+        isNull(agentSessions.workspacePath),
+      );
+      if (workspaceCondition) conditions.push(workspaceCondition);
+    }
+    const rows = asInternalDb(this.db)
+      .select({
+        event: monitorEvents,
+        state: sessionEventState,
+        session: agentSessions,
+      })
+      .from(sessionEventState)
+      .innerJoin(monitorEvents, eq(sessionEventState.eventId, monitorEvents.id))
+      .innerJoin(
+        agentSessions,
+        eq(sessionEventState.sessionId, agentSessions.id),
+      )
+      .where(and(...conditions))
+      .orderBy(desc(monitorEvents.createdAt))
+      .all();
+
+    return rows.map(({ event, state, session }) => ({
+      eventId: event.id,
+      sessionId: session.id,
+      sessionRole: session.role,
+      sessionStatus: session.status,
+      deliveryState: deliveryStateForRow(state),
+      workspacePath: session.workspacePath ?? null,
+      createdAt: state.createdAt,
+      ...(state.firstNotifiedAt
+        ? { firstNotifiedAt: state.firstNotifiedAt }
+        : {}),
+      ...(state.lastClaimAt ? { lastClaimAt: state.lastClaimAt } : {}),
+      ...(state.lastClaimLifecycle
+        ? { lastClaimLifecycle: state.lastClaimLifecycle }
+        : {}),
+      ...(state.acknowledgedAt ? { acknowledgedAt: state.acknowledgedAt } : {}),
     }));
   }
 
