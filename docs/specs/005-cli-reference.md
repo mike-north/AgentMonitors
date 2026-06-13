@@ -76,7 +76,7 @@ Human-readable only (no `--format` flag).
 
 Each source produces a distinct starter frontmatter block:
 
-| Source             | Key scope fields in template                                                 |
+| Source             | Key config fields in template                                                |
 | ------------------ | ---------------------------------------------------------------------------- |
 | `file-fingerprint` | `globs: ['**/*.ts']`                                                         |
 | `api-poll`         | `url`, `method: GET`, `interval: 5m`, `change-detection.strategy: json-diff` |
@@ -88,11 +88,11 @@ Each source produces a distinct starter frontmatter block:
 ## §3 `validate` — Validate monitor files
 
 **Source:** `apps/cli/src/commands/validate.ts`
-**Status:** Fully implemented — validates each monitor's `scope` against the source's full JSON Schema (via the core `validateScope` helper). See [004-validation-testing.md](./004-validation-testing.md) §2.2.
+**Status:** Fully implemented — validates each monitor's watch config (the `watch` block minus `type`) against the source's full JSON Schema (via the core `validateScope` helper). See [004-validation-testing.md](./004-validation-testing.md) §2.2.
 
 ### Purpose
 
-Validates all `MONITOR.md` files found in a directory: checks that each monitor references a known source and that the `scope` block is fully valid against the source's `scopeSchema` (types, enums, `required`, `items`, …), and that monitor IDs are unique within the tree.
+Validates all `MONITOR.md` files found in a directory: checks that each monitor references a known source and that the source config inside `watch:` is fully valid against the source's `scopeSchema` (types, enums, `required`, `items`, …), and that monitor IDs are unique within the tree.
 
 ### Usage
 
@@ -139,9 +139,10 @@ If no monitors are found: prints `No monitors found.`
 ### Validation logic (current)
 
 1. Parses all `MONITOR.md` files via `scanMonitors()` from `@agentmonitors/core` (parse errors are included in `errors`).
-2. Checks each monitor's `source` field against the built-in `SourceRegistry`; unknown sources produce an error listing available sources.
-3. Validates each monitor's `scope` against the source's full `scopeSchema` (draft-07) via the exported core `validateScope` helper — types, enums, `required`, `items`, and other keywords, not just field presence.
+2. Checks each monitor's `watch.type` field against the built-in `SourceRegistry`; unknown sources produce an error listing available sources.
+3. Validates each monitor's `watch` config (minus `type`) against the source's full `scopeSchema` (draft-07) via the exported core `validateScope` helper — types, enums, `required`, `items`, and other keywords, not just field presence.
 4. Rejects duplicate monitor IDs within the scanned tree (see [001 §4](./001-monitor-definition.md)).
+5. If a parse failure appears to use the pre-migration top-level `source:` + `scope:` shape, appends a hint to rewrite it as `watch: { type, ... }`.
 
 ### Exit codes
 
@@ -381,7 +382,7 @@ Lists all sources registered via `registerCoreSources()` (currently: `file-finge
 Installed sources:
 
   <name>
-    Scope fields: <field1>, <field2>, ...
+    Config fields: <field1>, <field2>, ...
     Required: <field1>, ... (or "(none)")
 ```
 
@@ -391,11 +392,14 @@ Installed sources:
 [
   {
     "name": "<string>",
+    "configFields": ["<string>"],
     "scopeFields": ["<string>"],
     "required": ["<string>"]
   }
 ]
 ```
+
+`scopeFields` remains as a backwards-compatible JSON alias for existing consumers. New users should read `configFields`; these are fields written flat inside `watch:` alongside `type`, not under a `scope:` key.
 
 ### §7.2 `source search` — placeholder
 

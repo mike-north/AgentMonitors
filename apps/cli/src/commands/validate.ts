@@ -1,4 +1,5 @@
 import { Command, Option } from 'commander';
+import { readFileSync } from 'node:fs';
 import {
   scanMonitors,
   SourceRegistry,
@@ -23,6 +24,43 @@ function changeDetectionCollectionError(
   const strategy = cdObj['strategy'];
   if (strategy === 'json-diff') return undefined;
   return 'change-detection.collection requires strategy: json-diff';
+}
+
+// Old public docs used top-level `source:` + `scope:` before the current
+// `watch: { type, ... }` authoring shape. Detect only that exact parse failure
+// pattern so unrelated schema errors are not polluted with migration advice.
+function oldSourceScopeShapeHint(filePath: string): string | null {
+  let content: string;
+  try {
+    content = readFileSync(filePath, 'utf-8');
+  } catch {
+    return null;
+  }
+
+  // Strip an optional UTF-8 BOM (U+FEFF) so Windows-saved files are not silently
+  // skipped. Normalise CRLF -> LF so both line-ending styles are handled by a single
+  // set of regexes.
+  const normalised = content.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n');
+
+  const frontmatter = /^---\n(?<frontmatter>[\s\S]*?)\n---/.exec(normalised)
+    ?.groups?.['frontmatter'];
+  if (!frontmatter) return null;
+
+  // Match `source: <value>` regardless of trailing whitespace or inline content.
+  // The value itself may contain whitespace before a `#` comment.
+  const rawSource = /^source:\s*(?<source>[^\n#]+)/m.exec(frontmatter)
+    ?.groups?.['source'];
+  const source = rawSource?.trim().replace(/^['"]|['"]$/g, '');
+  // Match `scope:` whether the value is empty, inline (`scope: { ... }`), or a
+  // nested block (next line is indented). Any non-whitespace/comment after the colon
+  // counts as content -- we only care that the key is present.
+  const hasScope = /^scope\s*:/m.test(frontmatter);
+  // Same broadening for `watch:` -- present in any form means the author already
+  // migrated, so we suppress the hint.
+  const hasWatch = /^watch\s*:/m.test(frontmatter);
+  if (!source || !hasScope || hasWatch) return null;
+
+  return `did you mean to use the current watch shape? Move source/scope into watch:, for example: watch: { type: ${source}, ... }`;
 }
 
 export const validateCommand = new Command('validate')
@@ -62,7 +100,7 @@ export const validateCommand = new Command('validate')
 
       // BP3 (003 §12): a keyed-collection block is only valid under json-diff. The
       // generated schema already rejects it, but cfworker's generic message
-      // ("Instance does not match json-diff") is opaque — surface the actionable
+      // ("Instance does not match json-diff") is opaque -- surface the actionable
       // wording instead. This rule is source-agnostic (any source exposing
       // `change-detection`), so it lives in the shared validate path rather than a
       // per-source schema.
@@ -82,13 +120,15 @@ export const validateCommand = new Command('validate')
     // independent of whether each file parses.
     const duplicateErrors = result.duplicateIds.map((dup) => ({
       filePath: dup.filePaths.join(', '),
-      error: `Duplicate monitor id "${dup.id}" — ids are derived from folder names and must be unique within a tree`,
+      error: `Duplicate monitor id "${dup.id}" -- ids are derived from folder names and must be unique within a tree`,
     }));
 
     const allErrors = [
       ...result.errors.map((e) => ({
         filePath: e.filePath,
-        error: e.error,
+        error: [e.error, oldSourceScopeShapeHint(e.filePath)]
+          .filter(Boolean)
+          .join('; '),
       })),
       ...scopeErrors.map((e) => ({
         filePath: e.id,
