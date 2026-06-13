@@ -20,16 +20,20 @@ Conventions for the engineering fleet working this repo. The PM agent maintains 
    The queue is for decided work. If you believe a `needs-decision` issue is actually ready, comment
    asking the PM to resolve and unlabel it; don't build around it. (This is distinct from a normal
    open issue, which is greenlit.)
-5. **Blocked or descoping?** Comment on the issue with what/why and remove the `in progress`
+5. **Do not implement issues labeled `backlog`.** These are filed for a later cycle; the PM
+   schedules them by removing the label. A `backlog` issue is decided-but-deprioritized (unlike
+   `needs-decision`, which is design-unresolved) — in both cases, not for pickup until the label
+   is gone.
+6. **Blocked or descoping?** Comment on the issue with what/why and remove the `in progress`
    label so the queue reflects reality. Never go silent on a claimed issue.
 
 ## Building
 
-6. **Specs govern.** Consult the `docs/specs/` doc matching your task (map in `CLAUDE.md`).
+7. **Specs govern.** Consult the `docs/specs/` doc matching your task (map in `CLAUDE.md`).
    Behavior changes update the matching spec **in the same PR**, plus a
    `docs/specs/spec-changelog.md` entry. If a spec section moves from _target_ to _current_,
    add `verified:` references and retire the roadmap item per `docs/specs/roadmap.md`.
-7. **Changesets:** required for any published-package behavior or public-type change
+8. **Changesets:** required for any published-package behavior or public-type change
    (`@agentmonitors/*`); not for docs, specs, CI, or plugin-marketplace content. Never a
    `major` bump without an issue explicitly authorizing it.
    **New publishable package checklist:** it MUST ship with a `CHANGELOG.md` (minimal:
@@ -37,37 +41,37 @@ Conventions for the engineering fleet working this repo. The PM agent maintains 
    release pipeline with ENOENT without one (this has broken releases twice) — plus an
    entry in `scripts/publish-release-packages.mjs` `PACKAGE_DIRS` and standard
    `publishConfig`.
-8. **Tests at the right layer.** Bug fixes ship a regression test that fails pre-fix.
+9. **Tests at the right layer.** Bug fixes ship a regression test that fails pre-fix.
    Anything touching the daemon, CLI surface, or plugin wiring gets integration coverage
    (the existing harnesses in `apps/cli/src/commands/cli.integration.test.ts` are the
    pattern — including the no-orphan-daemon discipline). "Tests pass" with the production
    contract untested is this repo's signature bug class — test the real input contract
    (stdin payloads, hooks.json command strings), not a hand-built approximation.
-9. **Quality gate before opening a PR:** `pnpm check` and the affected test suites green;
-   api-extractor report regenerated if core's public surface changed; `pnpm check:aipm` if
-   you touched `agent-plugins/`.
+10. **Quality gate before opening a PR:** `pnpm check` and the affected test suites green;
+    api-extractor report regenerated if core's public surface changed; `pnpm check:aipm` if
+    you touched `agent-plugins/`.
 
 ## PRs, review, and merging
 
-10. **Reference issues with `Refs #N`, never `Closes #N`/`Fixes #N`** — unless the PR
+11. **Reference issues with `Refs #N`, never `Closes #N`/`Fixes #N`** — unless the PR
     genuinely completes the issue's full acceptance criteria. GitHub parses closing keywords
     anywhere in the body and will close tracking issues out from under the queue.
-11. **The PM agent reviews PRs.** Auto-merge on green CI is fine **unless a review with
+12. **The PM agent reviews PRs.** Auto-merge on green CI is fine **unless a review with
     comments has landed** — then every comment gets a reply before merge: what you changed,
     or why you respectfully didn't (disagreement is fine; silence is not). Resolve threads
     you've addressed. A PR merged past unanswered review feedback creates follow-up debt
     someone else pays.
-12. **Comment the PR link on the issue** when you open it; close the issue only when the
+13. **Comment the PR link on the issue** when you open it; close the issue only when the
     change is merged and the acceptance criteria are demonstrably met.
 
 ## Hard rules
 
-13. **Never touch Version PRs** (branch `changeset-release/main`, title "Release packages"):
+14. **Never touch Version PRs** (branch `changeset-release/main`, title "Release packages"):
     no CI kicks, no auto-merge, no "fixing" their blocked status. The blocked state is
     Mike's deliberate release gate — he merges them personally.
-14. **Never flip repo visibility, publish packages locally, or add/modify repo secrets.**
+15. **Never flip repo visibility, publish packages locally, or add/modify repo secrets.**
     Releases happen only through the CI pipeline via Mike's Version-PR merge.
-15. **No internal codenames/wave numbers in public-facing content** (published packages,
+16. **No internal codenames/wave numbers in public-facing content** (published packages,
     the docs site, npm READMEs). Repo-internal docs and issues may reference them freely.
 
 ## Context that helps
