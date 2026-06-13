@@ -203,6 +203,47 @@ describe('source-command-poll', () => {
       );
       expect(valueChanged.observations).toHaveLength(1);
     });
+
+    it('json-diff: top-level ignore-paths removes noisy fields before comparison', async () => {
+      const config = {
+        command: nodeArgv(
+          'process.stdout.write(JSON.stringify({stable:"same",duration:"1m"}))',
+        ),
+        'change-detection': {
+          strategy: 'json-diff',
+          'ignore-paths': ['duration'],
+        },
+      };
+      const baseline = await source.observe(config, ctx());
+
+      const noisyOnly = await source.observe(
+        {
+          command: nodeArgv(
+            'process.stdout.write(JSON.stringify({stable:"same",duration:"2m"}))',
+          ),
+          'change-detection': {
+            strategy: 'json-diff',
+            'ignore-paths': ['duration'],
+          },
+        },
+        ctx(baseline.nextState),
+      );
+      expect(noisyOnly.observations).toHaveLength(0);
+
+      const stableChanged = await source.observe(
+        {
+          command: nodeArgv(
+            'process.stdout.write(JSON.stringify({stable:"changed",duration:"3m"}))',
+          ),
+          'change-detection': {
+            strategy: 'json-diff',
+            'ignore-paths': ['duration'],
+          },
+        },
+        ctx(noisyOnly.nextState),
+      );
+      expect(stableChanged.observations).toHaveLength(1);
+    });
   });
 
   // Keyed-collection change detection (003 §12) wired through command-poll. The

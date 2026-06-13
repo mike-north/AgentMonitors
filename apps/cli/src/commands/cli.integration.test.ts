@@ -534,6 +534,33 @@ describe('validate', () => {
     expect(result.stdout).toContain('Valid monitors: 1');
   });
 
+  it('rejects unknown command-poll change-detection keys', () => {
+    const dir = path.join(tempDir, 'validate-command-poll-bogus-cd-key');
+    const monitorDir = path.join(dir, 'monitors', 'cmd-bogus-cd');
+    mkdirSync(monitorDir, { recursive: true });
+    const body = [
+      '---',
+      'name: Git status',
+      'watch:',
+      '  type: command-poll',
+      '  command:',
+      '    - git',
+      '    - status',
+      '  change-detection:',
+      '    strategy: json-diff',
+      '    bogus-nonsense-key: 123',
+      'urgency: normal',
+      '---',
+      'Review the working-tree changes.',
+      '',
+    ].join('\n');
+    writeFileSync(path.join(monitorDir, 'MONITOR.md'), body, 'utf-8');
+
+    const result = run(['validate', path.join(dir, 'monitors')]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain('bogus-nonsense-key');
+  });
+
   // 003 §12 BP3 — a `change-detection.collection` block is only valid under
   // `strategy: json-diff`. Under text-diff/exit-code it must be rejected with a
   // clear message, for both poll sources.

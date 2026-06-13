@@ -434,15 +434,16 @@ watch:
     strategy: json-diff
 ```
 
-| Field                       | Type             | Required | Default                  | Description                                                                      |
-| --------------------------- | ---------------- | -------- | ------------------------ | -------------------------------------------------------------------------------- |
-| `command`                   | `string[]`       | Yes      | —                        | Argv array; `command[0]` is the executable (resolved via `PATH`). `minItems: 1`. |
-| `interval`                  | duration string  | No       | runtime default          | Poll cadence hint; owned by the scheduling engine, same as `api-poll`.           |
-| `cwd`                       | `string`         | No       | daemon working directory | Working directory for the child process.                                         |
-| `env`                       | `object<string>` | No       | `{}`                     | Literal env vars merged over the inherited daemon environment.                   |
-| `timeout`                   | duration string  | No       | `30s`                    | Wall-clock limit; expiry is an **execution failure** (§11.5).                    |
-| `key`                       | `string`         | No       | joined argv              | Overrides the observation `objectKey` (§11.4).                                   |
-| `change-detection.strategy` | enum             | No       | `text-diff`              | `text-diff` \| `json-diff` \| `exit-code` (§11.3).                               |
+| Field                           | Type             | Required | Default                  | Description                                                                      |
+| ------------------------------- | ---------------- | -------- | ------------------------ | -------------------------------------------------------------------------------- |
+| `command`                       | `string[]`       | Yes      | —                        | Argv array; `command[0]` is the executable (resolved via `PATH`). `minItems: 1`. |
+| `interval`                      | duration string  | No       | runtime default          | Poll cadence hint; owned by the scheduling engine, same as `api-poll`.           |
+| `cwd`                           | `string`         | No       | daemon working directory | Working directory for the child process.                                         |
+| `env`                           | `object<string>` | No       | `{}`                     | Literal env vars merged over the inherited daemon environment.                   |
+| `timeout`                       | duration string  | No       | `30s`                    | Wall-clock limit; expiry is an **execution failure** (§11.5).                    |
+| `key`                           | `string`         | No       | joined argv              | Overrides the observation `objectKey` (§11.4).                                   |
+| `change-detection.strategy`     | enum             | No       | `text-diff`              | `text-diff` \| `json-diff` \| `exit-code` (§11.3).                               |
+| `change-detection.ignore-paths` | `string[]`       | No       | `[]`                     | Plain `json-diff` paths removed before comparison (§11.3).                       |
 
 **`command` MUST be an argv array; a shell string form MUST NOT be accepted.** The child is spawned
 directly (`execFile` semantics, `shell: false`): there is no word-splitting, globbing, quoting, or
@@ -485,6 +486,13 @@ Mirrors `api-poll` (§4.2), substituting the local-process equivalents:
 `api-poll`. `exit-code` is first-class in v1 (decision for #81's fourth open question); the broader
 "predicate over the result" generalization is explicitly deferred — if it lands later, `exit-code`
 becomes sugar for one such predicate, which is a compatible evolution.
+
+Plain `json-diff` MAY set top-level `change-detection.ignore-paths` to remove noisy fields before
+comparison, e.g. `ignore-paths: ['duration']` or `ignore-paths: ['$.duration']`. Paths use the same
+minimal dotted grammar as §12 keyed-collection ignore paths: an explicit root (`$.field`) or bare
+root-relative form (`field`), with no wildcards, array indices, filters, or recursive descent.
+Top-level `ignore-paths` is valid only with `strategy: json-diff`; unknown `change-detection` keys
+are validation errors so misplaced or misspelled options do not silently no-op.
 
 `stderr` is never diffed; it is captured solely for failure diagnostics (§11.5).
 
@@ -560,6 +568,9 @@ issue #86's AC1–AC7):
 - Baseline run emits nothing; an output change under each strategy emits exactly one observation;
   `exit-code` ignores stdout-only changes; `json-diff` ignores key reordering (AC2: the
   _"baseline and change-detection strategies"_ describe block).
+- Top-level `change-detection.ignore-paths` removes noisy fields before plain `json-diff`
+  comparison, and unrelated stable-field changes still fire (AC2: _"json-diff: top-level
+  ignore-paths removes noisy fields before comparison"_).
 - A nonzero-exit result with changed output **is** diffed and reported (nonzero ≠ failure) (AC3:
   _"reports a changed nonzero-exit output as an observation"_).
 - Spawn failure and timeout each: keep prior state, emit exactly one `ok → failing` observation, stay
@@ -578,7 +589,7 @@ issue #86's AC1–AC7):
   `command-poll` monitor are covered at the CLI layer (AC7: verified:
   `apps/cli/src/commands/cli.integration.test.ts` — _"scaffolds a command-poll monitor that passes
   validate"_, _"rejects a command-poll monitor missing `command`"_, _"accepts a well-formed
-  command-poll monitor"_).
+  command-poll monitor"_, _"rejects unknown command-poll change-detection keys"_).
 
 ### 11.8 Non-goals (v1)
 
