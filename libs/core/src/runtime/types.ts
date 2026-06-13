@@ -257,15 +257,29 @@ export interface PollingDecision {
 }
 
 /**
+ * A monitor whose observation failed on a tick, surfaced so callers can
+ * distinguish a genuine no-change from a broken source without re-querying
+ * `observation_history`.
+ */
+export interface ErroredObservation {
+  monitorId: string;
+  message: string;
+}
+
+/**
  * Summary returned by a single `AgentMonitorRuntime.tick()` call.
  *
- * Note: errored monitors (whose `observe()` threw) are still included in
- * `evaluatedMonitors` — they were attempted even though their outcome is
- * `errored` rather than `triggered`/`suppressed`/`no-change`.
+ * Note: errored monitors (whose `observe()` threw, or whose `ingest()` failed)
+ * are still included in `evaluatedMonitors` — they were attempted even though
+ * their outcome is `errored` rather than `triggered`/`suppressed`/`no-change`.
+ * They are additionally listed in `erroredObservations`, populated from the
+ * same path that writes an `errored` row to `observation_history`, so the tick
+ * itself can report the failure rather than silently print `emitted 0`.
  */
 export interface RuntimeTickResult {
   evaluatedMonitors: string[];
   emittedEventIds: string[];
+  erroredObservations: ErroredObservation[];
 }
 
 /**

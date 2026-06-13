@@ -141,6 +141,9 @@ describe('AgentMonitorRuntime', () => {
 
     const firstTick = await firstRuntime.tick(monitorsDir, rootDir);
     expect(firstTick.emittedEventIds).toHaveLength(0);
+    // Issue #117: a genuine no-change tick has no errored observations — the
+    // not-a-bug case stays clean (the CLI must not "cry wolf").
+    expect(firstTick.erroredObservations).toEqual([]);
 
     writeFileSync(watchedFile, 'hello world', 'utf-8');
     await new Promise((resolve) => setTimeout(resolve, 1_100));
@@ -1597,6 +1600,13 @@ Handle it.
     });
     expect(workingHistory).toHaveLength(1);
     expect(workingHistory[0]?.result).toBe('triggered');
+
+    // Issue #117: the errored monitor is surfaced on the tick result (same
+    // source as the 'errored' history row), so a tick can report the failure
+    // rather than print a bare `emitted 0`. The working monitor must NOT appear.
+    expect(result.erroredObservations).toEqual([
+      { monitorId: 'aaa-throws', message: 'simulated source failure' },
+    ]);
   });
 
   // M3: also cover the reverse ordering — thrower sorts LAST — to prove a failure
@@ -1669,6 +1679,11 @@ Handle it.
     expect(
       runtime.listObservationHistory({ monitorId: 'zzz-throws' })[0]?.result,
     ).toBe('errored');
+
+    // Issue #117: only the errored monitor is surfaced, with its message.
+    expect(result.erroredObservations).toEqual([
+      { monitorId: 'zzz-throws', message: 'late source failure' },
+    ]);
   });
 
   // H2: covers the non-Error throw branch — a source that throws a plain string
@@ -1702,7 +1717,7 @@ Handle it.
       }),
     );
 
-    await runtime.tick(monitorsDir, rootDir);
+    const result = await runtime.tick(monitorsDir, rootDir);
 
     const history = runtime.listObservationHistory({
       monitorId: 'test-monitor',
@@ -1713,6 +1728,12 @@ Handle it.
     expect(history[0]?.observationData).toEqual({
       error: 'string failure value',
     });
+
+    // Issue #117: a non-Error throw is surfaced on the tick result with the
+    // same String()-fallback message that lands in the history row.
+    expect(result.erroredObservations).toEqual([
+      { monitorId: 'test-monitor', message: 'string failure value' },
+    ]);
   });
 
   // Issue #46: when a monitor's observe() throws the tick must NOT call ingest()
