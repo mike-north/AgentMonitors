@@ -480,8 +480,10 @@ shell-guarded for the "installed plugin, missing CLI" case (a user who hasn't ye
 The channel MCP (§4) ships in the same plugin via
 [`.mcp.json`](../../agent-plugins/agentmonitors/.mcp.json) (server key `agentmonitors`, preserving
 the `<channel source="agentmonitors">` tag). A bundled `setup-monitors` skill walks the user through
-enabling a project (the gitignored `.claude/agentmonitors.local.md` with `enabled: true`) and
-authoring `.claude/monitors/<id>/MONITOR.md` files.
+enabling a project (the gitignored `.claude/agentmonitors.local.md` with `enabled: true`) and carries
+plain-language monitoring intent through source selection, minimal config elicitation,
+`.claude/monitors/<id>/MONITOR.md` authoring, `agentmonitors validate`, mandatory firing
+verification, and `monitor explain`-based debugging.
 
 ## 6. Availability & Fallback
 
