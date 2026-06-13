@@ -1,2 +1,1 @@
 # @agentmonitors/source-file-fingerprint
-
