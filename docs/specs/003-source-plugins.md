@@ -8,7 +8,13 @@
 
 This document specifies the contract implemented by observation source plugins and the current behavior of the bundled sources: `file-fingerprint`, `api-poll`, `command-poll`, `schedule`, `incoming-changes`. The runtime depends on sources to detect change, but the runtime owns scheduling, notify dispatch, and delivery timing (PP3).
 
-Section §13 (the cursor protocol) is a normative design that is **not yet implemented** (PP7); it moves to current status, with `verified:` references, when it ships. §11 (`command-poll`) and §12 (keyed-collection change detection) have shipped and are now **current** behavior (verified: `plugins/source-command-poll/src/index.ts`, `plugins/source-command-poll/src/index.test.ts`; the shared helper `libs/core/src/observation/keyed-collection.ts` with `libs/core/src/observation/keyed-collection.test.ts`, consumed by both `plugins/source-api-poll/src/index.ts` and `plugins/source-command-poll/src/index.ts`).
+Section §13 (cursor threading for poll sources), §11 (`command-poll`), and §12 (keyed-collection
+change detection) have shipped and are now **current** behavior (verified:
+`plugins/source-command-poll/src/index.ts`, `plugins/source-command-poll/src/index.test.ts`,
+`plugins/source-api-poll/src/index.ts`, `plugins/source-api-poll/src/index.test.ts`; the shared
+keyed-collection helper `libs/core/src/observation/keyed-collection.ts` with
+`libs/core/src/observation/keyed-collection.test.ts`, consumed by both poll sources). Direct
+observation emission from a delta payload remains a target schema decision in §13.
 
 ### Principles Satisfied
 
@@ -173,7 +179,8 @@ watch:
     strategy: json-diff
 ```
 
-Required field: `url` (string). Important optional fields: `method`, `headers`, `interval`, `auth`, `change-detection`.
+Required field: `url` (string). Important optional fields: `method`, `headers`, `interval`, `auth`,
+`change-detection`, and `cursor` (§13).
 
 `interval` is declared in the scope schema with pattern `^\d+[smhd]$` but is used by the scheduling engine, not by the plugin directly (verified: scope schema comment at `plugins/source-api-poll/src/index.ts` line 131).
 
@@ -222,6 +229,11 @@ This treats the polled URL as the source-defined object identity (SP3).
 ### 4.5 Stateful behavior
 
 `api-poll` declares `stateful: true`. The first call fetches the URL, stores `{ body, status }` as `nextState`, and returns an empty `observations` array. Subsequent calls compare against `context.previousState` and emit an observation only when `hasChanged` returns `true`.
+
+When `cursor` is configured (§13), `api-poll` also persists `cursor` in `nextState`, templates the
+cursor value into the next request URL and header values, extracts the next cursor from the parsed
+JSON response body, and ignores the `cursor.next-state` path during `json-diff` comparison so a
+cursor-only response does not emit an observation.
 
 ## 5. Bundled Source: `schedule`
 
@@ -442,6 +454,7 @@ watch:
 | `env`                       | `object<string>` | No       | `{}`                     | Literal env vars merged over the inherited daemon environment.                   |
 | `timeout`                   | duration string  | No       | `30s`                    | Wall-clock limit; expiry is an **execution failure** (§11.5).                    |
 | `key`                       | `string`         | No       | joined argv              | Overrides the observation `objectKey` (§11.4).                                   |
+| `cursor`                    | object           | No       | —                        | Caller-held cursor threading (§13).                                              |
 | `change-detection.strategy` | enum             | No       | `text-diff`              | `text-diff` \| `json-diff` \| `exit-code` (§11.3).                               |
 
 **`command` MUST be an argv array; a shell string form MUST NOT be accepted.** The child is spawned
@@ -648,14 +661,15 @@ authoring-time error).
 Validation note: each element's `key` value must be a scalar (string/number/boolean) and unique
 within the collection; a missing or non-scalar key, or a duplicate key value, is an error.
 
-## 13. Target: Caller-Held Cursor Protocol
+## 13. Caller-Held Cursor Protocol
 
-> **Status: target — sketch only.** Adopted from #81 as the principled optimization **if** poll
-> cost ever measurably bites; explicitly not v1, and not a prerequisite for §11 or §12.
+> **Status: current for cursor threading in `api-poll` and `command-poll`; target for direct
+> delta-payload observation emission.** Adopted from #81 as the principled optimization when a poll
+> source can answer "what changed since cursor X?" directly.
 
-Rather than caching output or gating on file mtimes, a poll source threads a **caller-held cursor**
-through the command: a `{{state}}` placeholder is templated into the argv, and a `next-state` value
-is extracted from the output:
+Rather than gating on file mtimes or forcing every tool through full snapshot diffing, a poll source
+can thread a **caller-held cursor** through each observation. The source templates the prior cursor
+into the outgoing request/command and extracts the next cursor from the response/output.
 
 ```yaml
 watch:
@@ -663,12 +677,35 @@ watch:
   command: ['ofocus', 'changes', '--since', '{{state}}', '--json']
   cursor:
     initial: '0'
+    placeholder: '{{state}}' # optional; this is the default
     next-state: '$.cursor' # extracted from the parsed output after each run
 ```
 
-This generalizes the stateful baseline the sources already keep (PP6): the cursor lives in the same
-per-monitor `nextState` slot, the polled tool stays stateless (it merely answers "what changed since
-`<cursor>`?" — `git <cursor>..HEAD`, `kubectl --resource-version`, a task CLI's change generation),
-and change detection stays where the data lives **without** hidden cross-invocation state inside the
-tool. Sequencing (from #81): ship §11 first, measure, and design this fully only against observed
-poll cost.
+Cursor config:
+
+| Field         | Type   | Required | Default     | Description                                                            |
+| ------------- | ------ | -------- | ----------- | ---------------------------------------------------------------------- |
+| `initial`     | string | No       | `''`        | Cursor rendered on the first run when no persisted cursor exists.      |
+| `placeholder` | string | No       | `{{state}}` | Literal token replaced with the current cursor value.                  |
+| `next-state`  | string | Yes      | —           | Minimal dotted path to a scalar cursor in the parsed JSON output/body. |
+
+`command-poll` replaces the placeholder in each argv entry before spawning the child. The default
+`objectKey` remains based on the unrendered argv, so cursor advancement does not change identity.
+`api-poll` replaces the placeholder in the URL and header values before fetching. Its `objectKey`
+and `queryScope.url` remain based on the unrendered URL for the same stability reason.
+
+On every successful run, the source parses the output/body as JSON, resolves `next-state`, coerces a
+string/number/boolean cursor to string, and persists it as `nextState.cursor` for the next cycle. If
+the path is missing or does not resolve to a scalar, observation fails rather than silently losing
+the cursor. On execution/fetch failure, prior state is kept by the source's normal failure rules.
+
+For `json-diff`, the source removes the `next-state` path before comparing parsed JSON. This means a
+response whose only change is cursor advancement emits zero observations. Existing
+`text-diff`/`exit-code`/`status-code`, whole-output `json-diff`, and keyed-collection behavior
+remain the observation semantics; cursor threading only changes how the request/command is formed
+and which state is carried forward.
+
+**Target still open:** a schema for "observations come straight from the delta payload" is not
+specified yet. That future mode needs an explicit payload contract for `title`, `objectKey`,
+`changeKind`, `payload`, and any per-item snapshot fields before sources can safely bypass the
+existing diff/keyed-collection observation paths.

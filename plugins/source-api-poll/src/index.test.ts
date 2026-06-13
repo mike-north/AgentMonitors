@@ -152,6 +152,57 @@ describe('source-api-poll', () => {
     });
   });
 
+  describe('cursor protocol (003 §13)', () => {
+    it('templates the persisted cursor into the URL and extracts the next cursor', async () => {
+      const mockFetch = vi.fn(async (input: string) => {
+        const since = new URL(input).searchParams.get('since');
+        const cursor = String(Number(since) + 1);
+        const changes = since === '2' ? [{ id: 'a', value: 1 }] : [];
+        return {
+          text: () => Promise.resolve(JSON.stringify({ cursor, changes })),
+          status: 200,
+        };
+      });
+      vi.stubGlobal('fetch', mockFetch);
+
+      const config = {
+        url: 'https://api.example.com/changes?since={{state}}',
+        'change-detection': { strategy: 'json-diff' },
+        cursor: { initial: '0', 'next-state': '$.cursor' },
+      };
+
+      const baseline = await source.observe(config, { now: new Date() });
+      expect(mockFetch).toHaveBeenLastCalledWith(
+        'https://api.example.com/changes?since=0',
+        expect.any(Object),
+      );
+      expect(baseline.observations).toHaveLength(0);
+      expect(baseline.nextState).toMatchObject({ cursor: '1' });
+
+      const cursorOnly = await source.observe(config, {
+        previousState: baseline.nextState,
+        now: new Date(),
+      });
+      expect(mockFetch).toHaveBeenLastCalledWith(
+        'https://api.example.com/changes?since=1',
+        expect.any(Object),
+      );
+      expect(cursorOnly.observations).toHaveLength(0);
+      expect(cursorOnly.nextState).toMatchObject({ cursor: '2' });
+
+      const changed = await source.observe(config, {
+        previousState: cursorOnly.nextState,
+        now: new Date(),
+      });
+      expect(mockFetch).toHaveBeenLastCalledWith(
+        'https://api.example.com/changes?since=2',
+        expect.any(Object),
+      );
+      expect(changed.observations).toHaveLength(1);
+      expect(changed.nextState).toMatchObject({ cursor: '3' });
+    });
+  });
+
   // Keyed-collection change detection (003 §12) wired through api-poll. The shared
   // diff lives in @agentmonitors/core; these verify api-poll consumes it correctly.
   describe('keyed-collection (003 §12)', () => {

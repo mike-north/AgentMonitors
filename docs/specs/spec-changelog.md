@@ -9,6 +9,23 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-06-12 — Poll-source cursor threading shipped (003 §13)
+
+Implemented the current portion of [003 §13](./003-source-plugins.md): `api-poll` and
+`command-poll` now support top-level `cursor` config with `initial`, optional `placeholder`, and
+required `next-state`.
+
+- **Behavior:** `command-poll` templates the cursor into argv entries; `api-poll` templates it into
+  the URL and header values. Both extract the next cursor from a scalar JSON path and persist it as
+  `nextState.cursor`.
+- **Diffing:** `json-diff` removes the `cursor.next-state` path before comparison, so cursor-only
+  advancement does not emit an observation.
+- **Deferred:** Direct observation emission from a delta payload remains target behavior until a
+  concrete payload schema is specified.
+- **Proof:** `plugins/source-command-poll/src/index.test.ts` and
+  `plugins/source-api-poll/src/index.test.ts` cover placeholder templating, cursor persistence, and
+  cursor-only suppression.
+
 ## 2026-06-12 — Keyed-collection change detection shipped (003 §12 target→current; G9 retired)
 
 The `change-detection.collection` mode now turns a poll source's parsed JSON output into a

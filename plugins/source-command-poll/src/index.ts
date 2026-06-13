@@ -20,6 +20,12 @@ import {
  */
 type ChangeStrategy = 'text-diff' | 'json-diff' | 'exit-code';
 
+interface CursorConfig {
+  initial: string | undefined;
+  nextStatePath: string;
+  placeholder: string;
+}
+
 /** Default wall-clock execution limit when `timeout` is not configured (003 §11.1). */
 const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -39,6 +45,8 @@ interface ScopeConfig {
   timeoutMs: number;
   objectKey: string;
   strategy: ChangeStrategy;
+  /** Caller-held cursor config (003 §13), if this poll source is delta-native. */
+  cursor: CursorConfig | undefined;
   /** Keyed-collection config (003 §12), present only under `strategy: json-diff`. */
   collection: KeyedCollectionConfig | undefined;
 }
@@ -60,6 +68,8 @@ interface CommandState {
   truncated: boolean;
   health: 'ok' | 'failing';
   baselined: boolean;
+  /** Persisted caller-held cursor rendered into the next command invocation (003 §13). */
+  cursor?: string;
   /**
    * The keyed-collection snapshot from the previous successful cycle (003 §12),
    * present only when the monitor uses `change-detection.collection`. Carried
@@ -80,17 +90,29 @@ type ExecOutcome =
   | { kind: 'result'; result: ExecResult }
   | { kind: 'failure'; error: string; stderrTail: string };
 
-function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
-  const command = config['command'];
+function parseScopeConfig(
+  config: Record<string, unknown>,
+  previousCursor: string | undefined,
+): ScopeConfig {
+  const rawCommand = config['command'];
   if (
-    !Array.isArray(command) ||
-    command.length === 0 ||
-    !command.every((c): c is string => typeof c === 'string')
+    !Array.isArray(rawCommand) ||
+    rawCommand.length === 0 ||
+    !rawCommand.every((c): c is string => typeof c === 'string')
   ) {
     throw new Error(
       'scope.command must be a non-empty array of strings (argv form, e.g. ["git", "status"])',
     );
   }
+  const cursor = parseCursorConfig(config['cursor']);
+  const cursorValue =
+    cursor === undefined ? undefined : (previousCursor ?? cursor.initial ?? '');
+  const command =
+    cursor === undefined
+      ? rawCommand
+      : rawCommand.map((part) =>
+          part.replaceAll(cursor.placeholder, cursorValue ?? ''),
+        );
 
   const cd = config['change-detection'] as { strategy?: string } | undefined;
   const rawStrategy = cd?.strategy;
@@ -126,9 +148,18 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
 
   const key = config['key'];
   const objectKey =
-    typeof key === 'string' && key.length > 0 ? key : command.join(' ');
+    typeof key === 'string' && key.length > 0 ? key : rawCommand.join(' ');
 
-  return { command, cwd, env, timeoutMs, objectKey, strategy, collection };
+  return {
+    command,
+    cwd,
+    env,
+    timeoutMs,
+    objectKey,
+    strategy,
+    cursor,
+    collection,
+  };
 }
 
 /**
@@ -260,6 +291,95 @@ function sortKeys(value: unknown): unknown {
   return value;
 }
 
+function parseCursorConfig(value: unknown): CursorConfig | undefined {
+  if (value === undefined) return undefined;
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('cursor must be an object');
+  }
+  const cursor = value as Record<string, unknown>;
+  const nextStatePath = cursor['next-state'];
+  if (typeof nextStatePath !== 'string' || nextStatePath.length === 0) {
+    throw new Error('cursor.next-state must be a non-empty string');
+  }
+  const initial = cursor['initial'];
+  const placeholder = cursor['placeholder'];
+  return {
+    initial: typeof initial === 'string' ? initial : undefined,
+    nextStatePath,
+    placeholder: typeof placeholder === 'string' ? placeholder : '{{state}}',
+  };
+}
+
+function normalizeCursorPath(path: string): string {
+  if (path === '$' || path.startsWith('$.')) return path;
+  return `$.${path}`;
+}
+
+function assertValidCursorPathSegment(path: string, segment: string): void {
+  if (segment.length === 0) {
+    throw new Error(`Invalid cursor path "${path}": empty path segment`);
+  }
+  if (/[.[\]*?]/.test(segment)) {
+    throw new Error(
+      `Invalid cursor path "${path}": unsupported path segment "${segment}"`,
+    );
+  }
+}
+
+function resolveCursorPath(root: unknown, path: string): unknown {
+  const normalizedPath = normalizeCursorPath(path);
+  if (normalizedPath === '$') return root;
+  const segments = normalizedPath.slice(2).split('.');
+  let current: unknown = root;
+  for (const segment of segments) {
+    assertValidCursorPathSegment(path, segment);
+    if (current === null || typeof current !== 'object') return undefined;
+    if (!Object.hasOwn(current, segment)) return undefined;
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return current;
+}
+
+function extractNextCursor(
+  stdout: string,
+  cursor: CursorConfig | undefined,
+): string | undefined {
+  if (cursor === undefined) return undefined;
+  const value = resolveCursorPath(JSON.parse(stdout), cursor.nextStatePath);
+  if (
+    typeof value === 'string' ||
+    typeof value === 'number' ||
+    typeof value === 'boolean'
+  ) {
+    return String(value);
+  }
+  throw new Error(
+    `cursor.next-state path "${cursor.nextStatePath}" must resolve to a scalar value`,
+  );
+}
+
+function removeCursorPath(value: unknown, path: string | undefined): unknown {
+  if (path === undefined) return value;
+  const cloned = structuredClone(value);
+  const normalizedPath = normalizeCursorPath(path);
+  if (normalizedPath === '$') return undefined;
+  const segments = normalizedPath.slice(2).split('.');
+  let current: unknown = cloned;
+  for (let i = 0; i < segments.length - 1; i++) {
+    const segment = segments[i] ?? '';
+    assertValidCursorPathSegment(path, segment);
+    if (current === null || typeof current !== 'object') return cloned;
+    if (!Object.hasOwn(current, segment)) return cloned;
+    current = (current as Record<string, unknown>)[segment];
+  }
+  const last = segments.at(-1) ?? '';
+  assertValidCursorPathSegment(path, last);
+  if (current !== null && typeof current === 'object') {
+    Reflect.deleteProperty(current, last);
+  }
+  return cloned;
+}
+
 /**
  * Whether the result changed versus the prior baseline under `strategy` (003 §11.3).
  * `json-diff` falls back to raw text comparison when either side fails to parse,
@@ -267,20 +387,29 @@ function sortKeys(value: unknown): unknown {
  */
 function hasChanged(
   strategy: ChangeStrategy,
+  ignoredJsonPath: string | undefined,
   prev: { stdout: string; exitCode: number },
   curr: { stdout: string; exitCode: number },
 ): boolean {
   switch (strategy) {
     case 'exit-code':
       return prev.exitCode !== curr.exitCode;
-    case 'json-diff':
+    case 'json-diff': {
+      let prevParsed: unknown;
+      let currParsed: unknown;
       try {
-        const prevJson = JSON.stringify(sortKeys(JSON.parse(prev.stdout)));
-        const currJson = JSON.stringify(sortKeys(JSON.parse(curr.stdout)));
-        return prevJson !== currJson;
+        prevParsed = JSON.parse(prev.stdout);
+        currParsed = JSON.parse(curr.stdout);
       } catch {
         return prev.stdout !== curr.stdout;
       }
+      return (
+        JSON.stringify(
+          sortKeys(removeCursorPath(prevParsed, ignoredJsonPath)),
+        ) !==
+        JSON.stringify(sortKeys(removeCursorPath(currParsed, ignoredJsonPath)))
+      );
+    }
     case 'text-diff':
       return prev.stdout !== curr.stdout;
   }
@@ -368,6 +497,19 @@ const scopeSchema: JsonSchema = {
       description:
         'Polling interval (e.g., "5m"). Used by the scheduling engine, not by this plugin directly.',
     },
+    cursor: {
+      type: 'object',
+      properties: {
+        initial: { type: 'string' },
+        placeholder: { type: 'string', default: '{{state}}' },
+        'next-state': {
+          type: 'string',
+          description:
+            'Dotted path to the scalar cursor value in the parsed JSON output',
+        },
+      },
+      required: ['next-state'],
+    },
     'change-detection': {
       type: 'object',
       properties: {
@@ -423,10 +565,10 @@ const source: ObservationSource = {
     config: Record<string, unknown>,
     context: ObservationContext = { now: new Date() },
   ): Promise<ObservationResult> {
-    const scope = parseScopeConfig(config);
     const prev = isCommandState(context.previousState)
       ? context.previousState
       : undefined;
+    const scope = parseScopeConfig(config, prev?.cursor);
 
     const outcome = await runCommand(scope);
 
@@ -442,6 +584,7 @@ const source: ObservationSource = {
         truncated: prev?.truncated ?? false,
         health: 'failing',
         baselined: prev?.baselined ?? false,
+        ...(prev?.cursor !== undefined ? { cursor: prev.cursor } : {}),
         // Carry the keyed baseline forward untouched so recovery diffs against it.
         ...(prev?.keyedSnapshot ? { keyedSnapshot: prev.keyedSnapshot } : {}),
       };
@@ -453,6 +596,7 @@ const source: ObservationSource = {
 
     // ---- Successful execution path ----------------------------------------------
     const result = outcome.result;
+    const nextCursor = extractNextCursor(result.stdout, scope.cursor);
     const recovered = prev?.health === 'failing';
     const hadBaseline = prev?.baselined ?? false;
 
@@ -485,6 +629,7 @@ const source: ObservationSource = {
         truncated: result.truncated,
         health: 'ok',
         baselined: true,
+        ...(nextCursor !== undefined ? { cursor: nextCursor } : {}),
         keyedSnapshot: result2.snapshot,
       };
       return { observations, nextState };
@@ -496,6 +641,7 @@ const source: ObservationSource = {
       truncated: result.truncated,
       health: 'ok',
       baselined: true,
+      ...(nextCursor !== undefined ? { cursor: nextCursor } : {}),
     };
 
     // The output-changed observation requires a real pre-failure/prior baseline to
@@ -504,7 +650,7 @@ const source: ObservationSource = {
     if (
       prev !== undefined &&
       hadBaseline &&
-      hasChanged(scope.strategy, prev, result)
+      hasChanged(scope.strategy, scope.cursor?.nextStatePath, prev, result)
     ) {
       observations.push(changedObservation(scope, result));
     }

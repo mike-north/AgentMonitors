@@ -205,6 +205,37 @@ describe('source-command-poll', () => {
     });
   });
 
+  describe('cursor protocol (003 §13)', () => {
+    it('templates the persisted cursor into argv and extracts the next cursor', async () => {
+      const config = {
+        command: [
+          ...nodeArgv(`
+            const state = process.argv[1];
+            const cursor = String(Number(state) + 1);
+            const changes = state === "2" ? [{ id: "a", value: 1 }] : [];
+            process.stdout.write(JSON.stringify({ cursor, changes }));
+          `),
+          '{{state}}',
+        ],
+        key: 'delta-command',
+        'change-detection': { strategy: 'json-diff' },
+        cursor: { initial: '0', 'next-state': '$.cursor' },
+      };
+
+      const baseline = await source.observe(config, ctx());
+      expect(baseline.observations).toHaveLength(0);
+      expect(baseline.nextState).toMatchObject({ cursor: '1' });
+
+      const cursorOnly = await source.observe(config, ctx(baseline.nextState));
+      expect(cursorOnly.observations).toHaveLength(0);
+      expect(cursorOnly.nextState).toMatchObject({ cursor: '2' });
+
+      const changed = await source.observe(config, ctx(cursorOnly.nextState));
+      expect(changed.observations).toHaveLength(1);
+      expect(changed.nextState).toMatchObject({ cursor: '3' });
+    });
+  });
+
   // Keyed-collection change detection (003 §12) wired through command-poll. The
   // shared diff lives in @agentmonitors/core; these verify command-poll consumes it.
   describe('keyed-collection (003 §12)', () => {
