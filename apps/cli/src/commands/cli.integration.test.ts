@@ -485,6 +485,92 @@ describe('validate', () => {
     expect(result.stdout).toContain('type: file-fingerprint');
   });
 
+  // Regression for nit id=3408121150 — CRLF line endings (Windows) must not
+  // silently suppress the migration hint. The frontmatter extractor must tolerate
+  // \r\n and still surface the old-shape suggestion.
+  it('hints when the old source/scope shape is in a CRLF-encoded file', () => {
+    const dir = path.join(tempDir, 'validate-old-shape-crlf-test');
+    const monitorDir = path.join(dir, 'monitors', 'old-shape-crlf');
+    mkdirSync(monitorDir, { recursive: true });
+    // Construct the body with explicit CRLF (\r\n) line endings throughout.
+    const lf = [
+      '---',
+      'name: Old shape CRLF',
+      'source: file-fingerprint',
+      'scope:',
+      '  globs: ["*.ts"]',
+      'urgency: normal',
+      '---',
+      'Handle it.',
+      '',
+    ].join('\r\n');
+    writeFileSync(path.join(monitorDir, 'MONITOR.md'), lf, 'utf-8');
+
+    const result = run(['validate', path.join(dir, 'monitors')]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain('did you mean');
+    expect(result.stdout).toContain('watch:');
+    expect(result.stdout).toContain('type: file-fingerprint');
+  });
+
+  // Regression for nit id=3408121150 — a UTF-8 BOM at the start of the file must
+  // not prevent frontmatter extraction.
+  it('hints when the old source/scope shape is in a file with a UTF-8 BOM', () => {
+    const dir = path.join(tempDir, 'validate-old-shape-bom-test');
+    const monitorDir = path.join(dir, 'monitors', 'old-shape-bom');
+    mkdirSync(monitorDir, { recursive: true });
+    const body = [
+      '---',
+      'name: Old shape BOM',
+      'source: file-fingerprint',
+      'scope:',
+      '  globs: ["*.ts"]',
+      'urgency: normal',
+      '---',
+      'Handle it.',
+      '',
+    ].join('\n');
+    // Prepend the UTF-8 BOM byte-sequence (U+FEFF).
+    writeFileSync(
+      path.join(monitorDir, 'MONITOR.md'),
+      '\uFEFF' + body,
+      'utf-8',
+    );
+
+    const result = run(['validate', path.join(dir, 'monitors')]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain('did you mean');
+    expect(result.stdout).toContain('watch:');
+    expect(result.stdout).toContain('type: file-fingerprint');
+  });
+
+  // Regression for nit id=3408121155 — `scope:` with inline content (e.g. `scope: { ... }`)
+  // must still be recognised so the hint fires. Previously only `scope:` with an
+  // empty value matched; a key with inline content was silently ignored.
+  it('hints when scope: has inline content (not just a bare key)', () => {
+    const dir = path.join(tempDir, 'validate-old-shape-scope-inline-test');
+    const monitorDir = path.join(dir, 'monitors', 'old-shape-scope-inline');
+    mkdirSync(monitorDir, { recursive: true });
+    // `scope:` here has an inline YAML mapping value, not just a bare key.
+    const body = [
+      '---',
+      'name: Old shape inline scope',
+      'source: file-fingerprint',
+      'scope: { globs: ["*.ts"] }',
+      'urgency: normal',
+      '---',
+      'Handle it.',
+      '',
+    ].join('\n');
+    writeFileSync(path.join(monitorDir, 'MONITOR.md'), body, 'utf-8');
+
+    const result = run(['validate', path.join(dir, 'monitors')]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain('did you mean');
+    expect(result.stdout).toContain('watch:');
+    expect(result.stdout).toContain('type: file-fingerprint');
+  });
+
   it('rejects an unknown source name', () => {
     const dir = path.join(tempDir, 'validate-unknownsource-test');
     const monitorDir = path.join(dir, 'monitors', 'mystery');
