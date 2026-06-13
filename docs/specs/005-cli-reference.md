@@ -380,8 +380,18 @@ agentmonitors monitor explain <monitorId> [--dir <path>] [--workspace <path>] [-
 | `--event-limit <n>`   | `10`                | Materialized event rows included in JSON       |
 | `--format`            | `text`              | `text` (stage summary) or `json` (full report) |
 
-Text output prints one line per stage with `✓`, `✗`, or `⏳`, followed by a verdict. JSON output
-returns:
+Text output prints one line per stage with a status glyph, followed by a verdict:
+
+- `✓` — `ok` (stage produced its signal)
+- `○` — `healthy` (the stage ran and the correct outcome was "nothing to do" — e.g. the watched
+  target genuinely hasn't changed; an idle monitor is not a bug)
+- `⏳` — `pending` (intentionally holding, e.g. debounce/throttle, or upstream hasn't produced input)
+- `✗` — `failure` (a real fault: invalid definition, errored observe, missing projection, daemon
+  down)
+
+A genuinely idle monitor therefore renders `○` at the observation stage with an affirmative verdict
+(e.g. "Source ran, observed 0 changes — your watched target genuinely hasn't changed (not a bug)."),
+never `✗`. JSON output returns:
 
 ```json
 {
@@ -398,7 +408,7 @@ returns:
     {
       "id": "definition|scheduling|observation|notify|materialization|delivery",
       "label": "<display label>",
-      "status": "ok|pending|failure",
+      "status": "ok|pending|healthy|failure",
       "reason": "<one-line reason>",
       "details": {}
     }
@@ -415,9 +425,12 @@ returns:
 }
 ```
 
-If the daemon is not reachable, the command still validates the local definition and returns a stage
-2 scheduling failure that says the daemon is not running or unreachable. It exits 0 when it can
-produce a diagnostic report; malformed command arguments remain normal CLI errors.
+If the daemon is not reachable (a genuine connection failure — socket refused/absent or request
+timeout), the command still validates the local definition and returns a stage 2 scheduling failure
+that says the daemon is not running or unreachable, exiting 0. A daemon-side **application** error
+(the daemon answered with an error) is **not** masked as "daemon not running": it is surfaced
+verbatim as `Explain failed: <message>` with exit code 1. Malformed command arguments remain normal
+CLI errors.
 
 ---
 
