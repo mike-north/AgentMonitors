@@ -867,6 +867,134 @@ describe('daemon status', () => {
   });
 });
 
+/**
+ * Issue #117: `daemon once` (and the `daemon run` periodic log) must stop
+ * printing a clean `emitted 0 event(s)` when a monitor's `observe()` errored on
+ * the tick — an author cannot otherwise distinguish a genuine no-change (not a
+ * bug) from a broken source (the disease behind #105).
+ *
+ * `daemon once` runs the tick in-process (no socket, no daemon), so these
+ * assertions drive the real CLI subprocess with `:memory:` storage — no orphan
+ * daemon to reap, fully deterministic, no network.
+ *
+ * @see https://github.com/mike-north/AgentMonitors/issues/117
+ */
+describe('daemon once error visibility (issue #117)', () => {
+  // A command-poll monitor whose command emits JSON where the keyed-collection
+  // `path` resolves to a NON-array. Static `validate` cannot catch this — the
+  // failure is data-dependent (the command's runtime output), so it surfaces
+  // only when `observe()` runs. This is exactly #105's class of bug.
+  const erroringMonitorBody = `---
+name: Errors on observe
+watch:
+  type: command-poll
+  command:
+    - node
+    - '-e'
+    - 'process.stdout.write(JSON.stringify({ tasks: 42 }))'
+  interval: 5m
+  change-detection:
+    strategy: json-diff
+    collection:
+      path: tasks
+      key: id
+urgency: normal
+---
+When the command output changes, review it.
+`;
+
+  // file-fingerprint baselines silently on its first tick: a genuine no-change.
+  const noChangeMonitorBody = `---
+name: Genuine no-change
+watch:
+  type: file-fingerprint
+  globs:
+    - watched.txt
+urgency: normal
+---
+When files change, review them.
+`;
+
+  // schedule fires on every observe(); cron '* * * * *' is due every tick, so a
+  // single `daemon once` emits exactly one event from it.
+  const emittingMonitorBody = `---
+name: Emits every tick
+watch:
+  type: schedule
+  cron: '* * * * *'
+  timezone: UTC
+urgency: normal
+---
+This monitor fires on a schedule.
+`;
+
+  function writeMonitor(
+    monitorsRoot: string,
+    monitorId: string,
+    body: string,
+  ): void {
+    const monitorDir = path.join(monitorsRoot, monitorId);
+    mkdirSync(monitorDir, { recursive: true });
+    writeFileSync(path.join(monitorDir, 'MONITOR.md'), body, 'utf-8');
+  }
+
+  // Acceptance criterion 1: a monitor whose observe() throws → `daemon once`
+  // names the errored monitor + message, NOT a bare `emitted 0`.
+  // Regression: pre-fix `daemon once` printed only `…emitted 0 event(s).`,
+  // so the `errored:` line and the monitor id below are absent → this fails.
+  it('names the errored monitor and its message instead of a bare "emitted 0"', () => {
+    const dir = path.join(tempDir, 'once-error-only');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    writeMonitor(monitorsRoot, 'breaks-on-observe', erroringMonitorBody);
+
+    const result = run(['daemon', 'once', monitorsRoot, '--workspace', dir]);
+    expect(result.exitCode).toBe(0);
+
+    // It must report exactly 1 errored, name the monitor, and include the
+    // collection-path error message — the not-a-bug `emitted 0` alone is a lie.
+    expect(result.stdout).toContain('1 errored:');
+    expect(result.stdout).toContain('breaks-on-observe:');
+    expect(result.stdout).toContain('must select an array');
+    expect(result.stdout).toContain('emitted 0 event(s)');
+  });
+
+  // Acceptance criterion 2: a genuine no-change still reports `emitted 0` with
+  // NO error line (don't cry wolf).
+  it('keeps a genuine no-change clean (emitted 0, no errored line)', () => {
+    const dir = path.join(tempDir, 'once-no-change');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, 'watched.txt'), 'hello', 'utf-8');
+    writeMonitor(monitorsRoot, 'quiet', noChangeMonitorBody);
+
+    const result = run(['daemon', 'once', monitorsRoot, '--workspace', dir]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('emitted 0 event(s).');
+    expect(result.stdout).not.toContain('errored');
+  });
+
+  // Acceptance criterion 3: a mix (one errors, one emits, one no-change) is
+  // reported truthfully in one summary.
+  it('reports a mix of errored, emitted, and no-change truthfully', () => {
+    const dir = path.join(tempDir, 'once-mixed');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, 'watched.txt'), 'hello', 'utf-8');
+    writeMonitor(monitorsRoot, 'breaks-on-observe', erroringMonitorBody);
+    writeMonitor(monitorsRoot, 'quiet', noChangeMonitorBody);
+    writeMonitor(monitorsRoot, 'fires', emittingMonitorBody);
+
+    const result = run(['daemon', 'once', monitorsRoot, '--workspace', dir]);
+    expect(result.exitCode).toBe(0);
+    // emitted exactly 1 (the schedule monitor), 1 errored (command-poll), and
+    // the no-change monitor contributes nothing to either count.
+    expect(result.stdout).toContain('emitted 1 event(s)');
+    expect(result.stdout).toContain('1 errored:');
+    expect(result.stdout).toContain('breaks-on-observe:');
+    expect(result.stdout).not.toContain('quiet:');
+  });
+});
+
 describe('runtime flow', () => {
   it('opens a session, detects file changes through the daemon, claims a hook delivery, and acknowledges events', async () => {
     const dir = path.join(tempDir, 'runtime-flow');

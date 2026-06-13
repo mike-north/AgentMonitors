@@ -86,6 +86,7 @@ export type {
   DeliveryEventSummary,
   DeliveryLifecycle,
   DeliveryMode,
+  ErroredObservation,
   EventQuery,
   MonitorDeliveryProjection,
   MonitorDeliveryState,

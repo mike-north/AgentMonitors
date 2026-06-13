@@ -1,5 +1,5 @@
 import { Command, Option } from 'commander';
-import type { WatchHandle } from '@agentmonitors/core';
+import type { RuntimeTickResult, WatchHandle } from '@agentmonitors/core';
 import { createRuntime } from '../runtime.js';
 import { reportError } from '../output.js';
 import {
@@ -12,6 +12,20 @@ import { daemonStatusClient, daemonTickClient } from '../runtime-client.js';
 import { shouldReap, BOOT_GRACE_MS } from '../reap-decision.js';
 
 const DEFAULT_REAP_AFTER_MS = 5 * 60 * 1000;
+
+/**
+ * Append per-monitor errored lines to a tick summary so a non-zero errored
+ * count is visible without a verbose flag (issue #117). Returns the summary
+ * unchanged when nothing errored, so the genuine no-change case stays clean.
+ */
+function appendErroredLines(
+  summary: string,
+  errored: RuntimeTickResult['erroredObservations'],
+): string {
+  if (errored.length === 0) return summary;
+  const lines = errored.map((e) => `  ${e.monitorId}: ${e.message}`);
+  return [summary, ...lines].join('\n');
+}
 
 async function runLoop(
   monitorsDir: string,
@@ -71,10 +85,22 @@ async function runLoop(
     while (!isStoppingRequested()) {
       try {
         const result = await runtime.tick(monitorsDir, workspacePath);
-        if (result.emittedEventIds.length > 0) {
-          console.log(
-            `Emitted ${String(result.emittedEventIds.length)} event(s) from ${String(result.evaluatedMonitors.length)} monitor(s).`,
+        // Log when the tick emitted events OR when one or more monitors
+        // errored — a silent `emitted 0` must not hide a broken source
+        // (issue #117). A clean no-change tick still logs nothing.
+        if (
+          result.emittedEventIds.length > 0 ||
+          result.erroredObservations.length > 0
+        ) {
+          const summary = appendErroredLines(
+            `Emitted ${String(result.emittedEventIds.length)} event(s) from ${String(result.evaluatedMonitors.length)} monitor(s)${
+              result.erroredObservations.length > 0
+                ? `, ${String(result.erroredObservations.length)} errored:`
+                : '.'
+            }`,
+            result.erroredObservations,
           );
+          console.log(summary);
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -166,9 +192,14 @@ daemonCommand
           console.log(JSON.stringify(result, null, 2));
           return;
         }
-        console.log(
-          `Evaluated ${String(result.evaluatedMonitors.length)} monitor(s), emitted ${String(result.emittedEventIds.length)} event(s).`,
-        );
+        // Surface a non-zero errored count without a verbose flag so an author
+        // can tell a broken source from a genuine no-change (issue #117). The
+        // clean case ends with a period and no extra lines (don't cry wolf).
+        const erroredCount = result.erroredObservations.length;
+        const base = `Evaluated ${String(result.evaluatedMonitors.length)} monitor(s), emitted ${String(result.emittedEventIds.length)} event(s)${
+          erroredCount > 0 ? `, ${String(erroredCount)} errored:` : '.'
+        }`;
+        console.log(appendErroredLines(base, result.erroredObservations));
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         reportError(message, options.format === 'json');

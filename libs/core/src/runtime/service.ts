@@ -17,6 +17,7 @@ import type {
   MonitorExplainInput,
   MonitorExplainReport,
   MonitorExplainStage,
+  ErroredObservation,
   MonitorExplainStageId,
   MonitorExplainStageStatus,
   ObservationHistoryQuery,
@@ -803,6 +804,7 @@ export class AgentMonitorRuntime {
     const now = new Date();
     const emittedEventIds: string[] = [];
     const evaluated: string[] = [];
+    const erroredObservations: ErroredObservation[] = [];
 
     for (const parsed of result.monitors) {
       const monitor = parsed.monitor;
@@ -844,16 +846,21 @@ export class AgentMonitorRuntime {
         // observe() failed: record errored outcome (best-effort) and skip
         // this monitor entirely for this tick. ingest() is NOT called, which
         // preserves sourceState as described above.
+        const message =
+          observeError instanceof Error
+            ? observeError.message
+            : String(observeError);
+        // Same source as the audit row below: surface it on the tick result so
+        // `daemon once`/`daemon run` can report the failure instead of a bare
+        // `emitted 0`.
+        erroredObservations.push({ monitorId: monitor.id, message });
         try {
           this.store.recordObservationHistory({
             monitorId: monitor.id,
             sourceName,
             result: 'errored',
             observationData: {
-              error:
-                observeError instanceof Error
-                  ? observeError.message
-                  : String(observeError),
+              error: message,
             },
           });
         } catch {
@@ -880,16 +887,18 @@ export class AgentMonitorRuntime {
           }),
         );
       } catch (ingestError) {
+        const message =
+          ingestError instanceof Error
+            ? ingestError.message
+            : String(ingestError);
+        erroredObservations.push({ monitorId: monitor.id, message });
         try {
           this.store.recordObservationHistory({
             monitorId: monitor.id,
             sourceName,
             result: 'errored',
             observationData: {
-              error:
-                ingestError instanceof Error
-                  ? ingestError.message
-                  : String(ingestError),
+              error: message,
             },
           });
         } catch {
@@ -900,7 +909,11 @@ export class AgentMonitorRuntime {
 
     this.refreshWorkspaceSessions(workspacePath);
 
-    return { evaluatedMonitors: evaluated, emittedEventIds };
+    return {
+      evaluatedMonitors: evaluated,
+      emittedEventIds,
+      erroredObservations,
+    };
   }
 
   /**
