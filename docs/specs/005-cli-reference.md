@@ -581,14 +581,19 @@ agentmonitors daemon once [monitorsDir] [options]
 
 **Transport: in-process.** `daemonTickClient` calls `createRuntime().tick()` directly — no daemon socket is contacted.
 
-**Text output:** `Evaluated <n> monitor(s), emitted <n> event(s).`
+**Text output:** `Evaluated <n> monitor(s), emitted <n> event(s).` — when one or more monitors'
+`observe()` errored on the tick, the summary instead ends with `, <k> errored:` followed by one
+indented `  <monitorId>: <message>` line per errored monitor (so a silently-swallowed source error
+is not hidden behind a clean `emitted 0`). When nothing errored the line is unchanged, ending with
+`.`, so a genuine no-change tick stays clean.
 
 **JSON output (`--format json`):** the raw `RuntimeTickResult` object:
 
 ```json
 {
   "evaluatedMonitors": ["<monitorId>", ...],
-  "emittedEventIds": ["<eventId>", ...]
+  "emittedEventIds": ["<eventId>", ...],
+  "erroredObservations": [{ "monitorId": "<monitorId>", "message": "<error>" }, ...]
 }
 ```
 
@@ -614,9 +619,13 @@ Starts the daemon loop: creates a Unix domain socket server, listens for IPC com
 
 **Idle reaping:** after each tick, counts active sessions for the workspace. If none have been active continuously for `--reap-after-ms` ms, the daemon stops itself. Disabled when `--reap-after-ms 0`.
 
-**Stdout per tick (when events emitted):** `Emitted <n> event(s) from <n> monitor(s).`
+**Stdout per tick (when events emitted _or_ one or more monitors errored):**
+`Emitted <n> event(s) from <n> monitor(s).` — when one or more monitors' `observe()` errored, the
+line ends with `, <k> errored:` followed by one indented `  <monitorId>: <message>` line per errored
+monitor. A tick that neither emits nor errors logs nothing (no per-tick noise), but an errored
+monitor is never silent.
 
-**Tick errors** are logged to stderr as `AgentMon runtime tick failed: <message>` but do not stop the loop.
+**Tick errors** that fail the whole tick (not a single monitor's `observe()`) are logged to stderr as `AgentMon runtime tick failed: <message>` but do not stop the loop.
 
 ### §9.3 `daemon status`
 
