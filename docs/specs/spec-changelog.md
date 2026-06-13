@@ -9,6 +9,24 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-06-12 — Cross-source correlation keys shipped (002 §5, 003 §2.3, 005 §11.1)
+
+Events now have a first-class cross-source join surface: observations may provide
+`correlationKeys`, the runtime persists them on `monitor_events.correlation_keys`, and event listing
+can filter by a shared key.
+
+- **Source contract:** `Observation.correlationKeys?: string[]` carries stable external identities
+  such as PR URLs, issue IDs, provider-native object URIs, or task IDs.
+- **Runtime contract:** `MonitorEventRecord.correlationKeys` is always present, defaults to `[]`,
+  and `EventQuery.correlationKey` returns events whose key array contains the requested key.
+- **CLI/IPC:** `events.list` accepts `correlationKey`; `agentmonitors events list` exposes
+  `--correlation-key <key>`.
+- **Schema:** existing local DBs are upgraded in `createDb()` by adding the JSON text column if it is
+  missing.
+- **Proof:** `libs/core/src/runtime/service.test.ts` covers materialization and filtering related
+  events across multiple sources.
+- Minor changeset: `@agentmonitors/core`; patch changeset: `@agentmonitors/cli`.
+
 ## 2026-06-12 — Keyed-collection change detection shipped (003 §12 target→current; G9 retired)
 
 The `change-detection.collection` mode now turns a poll source's parsed JSON output into a

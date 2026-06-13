@@ -111,7 +111,7 @@ Verified: `libs/core/src/runtime/types.ts` — `PendingDebounceState` (lines 137
 
 ## 5. Event Materialization
 
-Each emitted observation becomes one row in the `monitor_events` table. The runtime **MUST** persist at least: `id`, `workspacePath`, `monitorId`, `sourceName`, `urgency`, `title`, `body`, `summary`, `payload`, `snapshotMetadata`, `snapshotText`, `diffText`, `objectKey`, `queryScope`, `tags`, `createdAt`.
+Each emitted observation becomes one row in the `monitor_events` table. The runtime **MUST** persist at least: `id`, `workspacePath`, `monitorId`, `sourceName`, `urgency`, `title`, `body`, `summary`, `payload`, `snapshotMetadata`, `snapshotText`, `diffText`, `objectKey`, `correlationKeys`, `queryScope`, `tags`, `createdAt`.
 
 Verified: `libs/core/src/runtime/service.ts` — `processObservation()` (lines 566–617); `libs/core/src/runtime/store.ts` — `insertEvent()` (lines 260–299).
 
@@ -122,6 +122,7 @@ If an emitted observation omits fields, the runtime **MUST** derive them as foll
 - `body`: observation body, otherwise monitor instructions
 - `summary`: observation summary, otherwise observation body, otherwise title
 - `objectKey`: observation `objectKey`, otherwise the monitor ID
+- `correlationKeys`: observation `correlationKeys`, otherwise `[]`
 - `queryScope`: observation `queryScope`, otherwise `{}` — and if the observation sets `changeKind`
   (see [003 §2.3](./003-source-plugins.md)), the runtime adds `changeKind` to the stored
   `queryScope` so the source-agnostic lifecycle is filterable without each source duplicating it.
@@ -430,6 +431,7 @@ Corresponds to the `monitorEvents` Drizzle table. One row per materialized obser
 | `snapshot_text`     | TEXT nullable    | Full snapshot content if provided               |
 | `diff_text`         | TEXT nullable    | Line-level diff vs. previous snapshot           |
 | `object_key`        | TEXT nullable    | Snapshot and diff keying                        |
+| `correlation_keys`  | TEXT NOT NULL    | JSON array; defaults to `[]`                    |
 | `query_scope`       | TEXT NOT NULL    | JSON; defaults to `{}`                          |
 | `tags`              | TEXT NOT NULL    | JSON array; defaults to `[]`                    |
 | `created_at`        | INTEGER NOT NULL | Observation timestamp                           |

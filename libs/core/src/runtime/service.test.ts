@@ -715,6 +715,145 @@ Handle it.
     expect(deletedOnly).toHaveLength(1);
   });
 
+  it('persists observation correlation keys and filters related events across sources', async () => {
+    const workspace = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(workspace);
+    const db = createDb(':memory:');
+    const runtime = new AgentMonitorRuntime(
+      new RuntimeStore(db),
+      new SourceRegistry(),
+      [claudeCodeAdapter],
+    );
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-session-correlation',
+        workspacePath: workspace,
+      }),
+    );
+
+    const store = new RuntimeStore(db);
+    store.insertEvent({
+      workspacePath: workspace,
+      monitorId: 'git-monitor',
+      sourceName: 'incoming-changes',
+      urgency: 'normal',
+      title: 'PR merged',
+      body: 'PR merged',
+      summary: 'PR merged',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey: 'pr-123',
+      queryScope: { pr: '123' },
+      correlationKeys: [
+        'github:pr:https://github.com/acme/repo/pull/123',
+        'github:issue:456',
+      ],
+      tags: ['git'],
+      createdAt: new Date('2026-06-12T00:00:00.000Z'),
+    });
+    store.insertEvent({
+      workspacePath: workspace,
+      monitorId: 'task-monitor',
+      sourceName: 'ofocus',
+      urgency: 'normal',
+      title: 'Ship task ready',
+      body: 'Ship task ready',
+      summary: 'Ship task ready',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey: 'task-ship',
+      queryScope: { task: 'ship' },
+      correlationKeys: ['github:issue:456', 'ofocus:task:abc'],
+      tags: ['task'],
+      createdAt: new Date('2026-06-12T00:01:00.000Z'),
+    });
+    store.insertEvent({
+      workspacePath: workspace,
+      monitorId: 'unrelated-monitor',
+      sourceName: 'calendar',
+      urgency: 'normal',
+      title: 'Unrelated event',
+      body: 'Unrelated event',
+      summary: 'Unrelated event',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey: 'event-1',
+      queryScope: { event: '1' },
+      correlationKeys: ['calendar:event:1'],
+      tags: ['calendar'],
+      createdAt: new Date('2026-06-12T00:02:00.000Z'),
+    });
+
+    const related = runtime.listEvents({
+      sessionId: session.id,
+      correlationKey: 'github:issue:456',
+    });
+
+    expect(related.map((event) => event.sourceName)).toEqual([
+      'ofocus',
+      'incoming-changes',
+    ]);
+    expect(related.map((event) => event.correlationKeys)).toEqual([
+      ['github:issue:456', 'ofocus:task:abc'],
+      ['github:pr:https://github.com/acme/repo/pull/123', 'github:issue:456'],
+    ]);
+  });
+
+  it('materializes observation correlation keys into durable events', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'correlated-source',
+      'normal',
+    );
+
+    const db = createDb(':memory:');
+    const registry = new SourceRegistry();
+    registry.register({
+      name: 'correlated-source',
+      scopeSchema: { type: 'object' },
+      observe: () =>
+        Promise.resolve({
+          observations: [
+            {
+              title: 'Task references PR',
+              objectKey: 'task-ship',
+              correlationKeys: [
+                'github:pr:https://github.com/acme/repo/pull/123',
+              ],
+            },
+          ],
+        }),
+    });
+    const runtime = new AgentMonitorRuntime(new RuntimeStore(db), registry, [
+      claudeCodeAdapter,
+    ]);
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-session-observation-correlation',
+        workspacePath: rootDir,
+      }),
+    );
+
+    await runtime.tick(monitorsDir, rootDir);
+
+    const events = runtime.listEvents({
+      sessionId: session.id,
+      correlationKey: 'github:pr:https://github.com/acme/repo/pull/123',
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]?.correlationKeys).toEqual([
+      'github:pr:https://github.com/acme/repo/pull/123',
+    ]);
+  });
+
   // T2: snapshot history is keyed by (workspace, monitor, objectKey) — SP5.
   it('stores and retrieves snapshots isolated by workspace, monitor, and object key', () => {
     const db = createDb(':memory:');

@@ -65,6 +65,7 @@ export const monitorEvents = sqliteTable('monitor_events', {
   snapshotText: text('snapshot_text'),
   diffText: text('diff_text'),
   objectKey: text('object_key'),
+  correlationKeys: text('correlation_keys').notNull().default('[]'),
   queryScope: text('query_scope').notNull().default('{}'),
   tags: text('tags').notNull().default('[]'),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),

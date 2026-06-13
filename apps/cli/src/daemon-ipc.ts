@@ -71,6 +71,7 @@ const eventsListParamsSchema = z.object({
   tags: z.array(z.string()).optional(),
   scope: z.record(z.string(), z.string()).optional(),
   objectKey: z.string().optional(),
+  correlationKey: z.string().optional(),
   unreadOnly: z.boolean().optional(),
   sinceBaseline: z.boolean().optional(),
   since: z.coerce.date().optional(),
@@ -351,6 +352,9 @@ function handleRequest(
           ...(params.tags ? { tags: params.tags } : {}),
           ...(params.scope ? { scope: params.scope } : {}),
           ...(params.objectKey ? { objectKey: params.objectKey } : {}),
+          ...(params.correlationKey
+            ? { correlationKey: params.correlationKey }
+            : {}),
           ...(params.unreadOnly ? { unreadOnly: params.unreadOnly } : {}),
           ...(params.sinceBaseline
             ? { sinceBaseline: params.sinceBaseline }

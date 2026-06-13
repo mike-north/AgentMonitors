@@ -726,17 +726,18 @@ After all sessions for a workspace are closed, the daemon's idle reaper will sto
 agentmonitors events list --session <id> [options]
 ```
 
-| Flag                  | Type                | Default          | Description                                    |
-| --------------------- | ------------------- | ---------------- | ---------------------------------------------- |
-| `--session <id>`      | string (required)   | —                | AgentMon session id                            |
-| `--socket <path>`     | string              | resolved default | Unix domain socket path                        |
-| `--monitor <id>`      | string              | —                | Filter by monitor id                           |
-| `--urgency <urgency>` | choices             | —                | `low`, `normal`, `high`                        |
-| `--tag <tag>`         | string (repeatable) | `[]`             | Filter by tag; may be specified multiple times |
-| `--scope <pairs>`     | string              | —                | Scope filters as `key=value,key2=value2`       |
-| `--unread`            | boolean flag        | —                | Only unread events                             |
-| `--since-baseline`    | boolean flag        | —                | Only events since the session baseline         |
-| `--format <format>`   | choices             | `text`           | `text`, `json`                                 |
+| Flag                      | Type                | Default          | Description                                    |
+| ------------------------- | ------------------- | ---------------- | ---------------------------------------------- |
+| `--session <id>`          | string (required)   | —                | AgentMon session id                            |
+| `--socket <path>`         | string              | resolved default | Unix domain socket path                        |
+| `--monitor <id>`          | string              | —                | Filter by monitor id                           |
+| `--urgency <urgency>`     | choices             | —                | `low`, `normal`, `high`                        |
+| `--tag <tag>`             | string (repeatable) | `[]`             | Filter by tag; may be specified multiple times |
+| `--scope <pairs>`         | string              | —                | Scope filters as `key=value,key2=value2`       |
+| `--correlation-key <key>` | string              | —                | Filter by shared external correlation key      |
+| `--unread`                | boolean flag        | —                | Only unread events                             |
+| `--since-baseline`        | boolean flag        | —                | Only events since the session baseline         |
+| `--format <format>`       | choices             | `text`           | `text`, `json`                                 |
 
 **Text output:** one line per event: `<id>  <monitorId>  <urgency>  <title>`
 

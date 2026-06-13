@@ -39,6 +39,12 @@ function parseJson<T>(value: string, fallback: T): T {
   }
 }
 
+function normalizeStringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string')
+    : [];
+}
+
 function rowToSession(
   row: typeof agentSessions.$inferSelect,
 ): AgentSessionRecord {
@@ -77,6 +83,7 @@ function rowToEvent(
     snapshotText: row.snapshotText ?? null,
     diffText: row.diffText ?? null,
     objectKey: row.objectKey ?? null,
+    correlationKeys: normalizeStringArray(parseJson(row.correlationKeys, [])),
     queryScope: parseJson(row.queryScope, {}),
     tags: parseJson(row.tags, []),
     createdAt: row.createdAt,
@@ -260,7 +267,11 @@ export class RuntimeStore {
     db.insert(monitorState).values(values).run();
   }
 
-  insertEvent(input: Omit<MonitorEventRecord, 'id'>): MonitorEventRecord {
+  insertEvent(
+    input: Omit<MonitorEventRecord, 'id' | 'correlationKeys'> & {
+      correlationKeys?: string[];
+    },
+  ): MonitorEventRecord {
     const db = asInternalDb(this.db);
     const id = ulid();
     db.insert(monitorEvents)
@@ -278,6 +289,7 @@ export class RuntimeStore {
         snapshotText: input.snapshotText,
         diffText: input.diffText,
         objectKey: input.objectKey,
+        correlationKeys: JSON.stringify(input.correlationKeys ?? []),
         queryScope: JSON.stringify(input.queryScope),
         tags: JSON.stringify(input.tags),
         createdAt: input.createdAt,
@@ -362,6 +374,11 @@ export class RuntimeStore {
 
     if (query.scope) {
       rows = rows.filter((row) => scopeMatches(row.queryScope, query.scope));
+    }
+
+    if (query.correlationKey) {
+      const correlationKey = query.correlationKey;
+      rows = rows.filter((row) => row.correlationKeys.includes(correlationKey));
     }
 
     if (query.sessionId && query.sinceBaseline) {

@@ -121,11 +121,23 @@ export function createDb(dbPath: string): InboxDb {
       snapshot_text TEXT,
       diff_text TEXT,
       object_key TEXT,
+      correlation_keys TEXT NOT NULL DEFAULT '[]',
       query_scope TEXT NOT NULL DEFAULT '{}',
       tags TEXT NOT NULL DEFAULT '[]',
       created_at INTEGER NOT NULL
     )
   `);
+
+  const monitorEventColumns = sqlite
+    .prepare('PRAGMA table_info(monitor_events)')
+    .all() as { name: string }[];
+  if (
+    !monitorEventColumns.some((column) => column.name === 'correlation_keys')
+  ) {
+    sqlite.exec(
+      "ALTER TABLE monitor_events ADD COLUMN correlation_keys TEXT NOT NULL DEFAULT '[]'",
+    );
+  }
 
   db.run(sql`
     CREATE TABLE IF NOT EXISTS monitor_snapshots (

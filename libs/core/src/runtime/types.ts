@@ -64,6 +64,7 @@ export interface MonitorEventRecord {
   snapshotText: string | null;
   diffText: string | null;
   objectKey: string | null;
+  correlationKeys: string[];
   queryScope: Record<string, string | string[]>;
   tags: string[];
   createdAt: Date;
@@ -114,6 +115,7 @@ export interface EventQuery {
   tags?: string[];
   scope?: Record<string, string>;
   objectKey?: string;
+  correlationKey?: string;
   unreadOnly?: boolean;
   sinceBaseline?: boolean;
   since?: Date;

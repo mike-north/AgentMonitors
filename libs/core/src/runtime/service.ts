@@ -932,6 +932,7 @@ export class AgentMonitorRuntime {
       snapshotText: input.observation.snapshotText ?? null,
       diffText,
       objectKey,
+      correlationKeys: input.observation.correlationKeys ?? [],
       // Make the source-agnostic changeKind queryable without each source having
       // to duplicate it into its own queryScope.
       queryScope: {

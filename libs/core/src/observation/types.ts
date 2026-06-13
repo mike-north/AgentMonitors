@@ -39,6 +39,12 @@ export interface Observation {
   snapshotText?: string;
   /** Source-defined stable object identity, e.g. a PR number or document id */
   objectKey?: string;
+  /**
+   * Stable external identities this observation refers to, such as issue URLs,
+   * PR URLs, task ids, or provider-native object URIs. Events sharing any key
+   * can be queried together across monitors and source plugins.
+   */
+  correlationKeys?: string[];
   /** Source-defined query metadata used for read-time scoping */
   queryScope?: Record<string, string | string[]>;
   /**

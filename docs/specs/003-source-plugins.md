@@ -73,17 +73,23 @@ The interface definition (verified: `libs/core/src/observation/types.ts`):
 
 Each `Observation` **MAY** include the following fields (verified: `libs/core/src/observation/types.ts`):
 
-| Field          | Type                                  | Description                                                                |
-| -------------- | ------------------------------------- | -------------------------------------------------------------------------- |
-| `title`        | `string`                              | **Required.** Human-readable title for the inbox item.                     |
-| `body`         | `string?`                             | Optional body/description.                                                 |
-| `summary`      | `string?`                             | Optional short summary for lightweight delivery surfaces.                  |
-| `payload`      | `unknown?`                            | Raw source payload, preserved for later querying.                          |
-| `snapshotText` | `string?`                             | Optional textual snapshot for diffing and timeline views.                  |
-| `objectKey`    | `string?`                             | Source-defined stable object identity (e.g., a PR number, file path, URL). |
-| `queryScope`   | `Record<string, string \| string[]>?` | Source-defined query metadata used for read-time scoping.                  |
-| `changeKind`   | `ChangeKind?`                         | The lifecycle transition this observation reports (see below).             |
-| `snapshot`     | `unknown?`                            | Point-in-time snapshot metadata captured at fire time.                     |
+| Field             | Type                                  | Description                                                                |
+| ----------------- | ------------------------------------- | -------------------------------------------------------------------------- |
+| `title`           | `string`                              | **Required.** Human-readable title for the inbox item.                     |
+| `body`            | `string?`                             | Optional body/description.                                                 |
+| `summary`         | `string?`                             | Optional short summary for lightweight delivery surfaces.                  |
+| `payload`         | `unknown?`                            | Raw source payload, preserved for later querying.                          |
+| `snapshotText`    | `string?`                             | Optional textual snapshot for diffing and timeline views.                  |
+| `objectKey`       | `string?`                             | Source-defined stable object identity (e.g., a PR number, file path, URL). |
+| `correlationKeys` | `string[]?`                           | Stable external identities for cross-source joins.                         |
+| `queryScope`      | `Record<string, string \| string[]>?` | Source-defined query metadata used for read-time scoping.                  |
+| `changeKind`      | `ChangeKind?`                         | The lifecycle transition this observation reports (see below).             |
+| `snapshot`        | `unknown?`                            | Point-in-time snapshot metadata captured at fire time.                     |
+
+`correlationKeys` are stable, externally-referenceable identities such as PR URLs, issue IDs, task
+IDs, provider-native object URIs, or other source-independent handles. The runtime persists them on
+the materialized event and supports filtering events by a single shared key, giving callers a
+cross-source join surface without requiring a full derived-monitor rules engine.
 
 `ChangeKind` is a **source-agnostic** vocabulary so consumers reason about change uniformly across
 sources: `created` (object entered scope), `modified` (changed while in scope), `deleted` (destroyed

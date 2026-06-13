@@ -42,6 +42,10 @@ eventsCommand
   )
   .option('--tag <tag>', 'Filter by tag (repeatable)', collectTag, [])
   .option('--scope <pairs>', 'Scope filters like key=value,key2=value2')
+  .option(
+    '--correlation-key <key>',
+    'Filter by shared external correlation key',
+  )
   .option('--unread', 'Only unread events')
   .option('--since-baseline', 'Only include events since the session baseline')
   .addOption(
@@ -57,6 +61,7 @@ eventsCommand
       urgency?: 'low' | 'normal' | 'high';
       tag: string[];
       scope?: string;
+      correlationKey?: string;
       unread?: boolean;
       sinceBaseline?: boolean;
       format: string;
@@ -70,6 +75,9 @@ eventsCommand
             ...(options.urgency ? { urgency: options.urgency } : {}),
             ...(options.tag.length > 0 ? { tags: options.tag } : {}),
             ...(scope ? { scope } : {}),
+            ...(options.correlationKey
+              ? { correlationKey: options.correlationKey }
+              : {}),
             ...(options.unread ? { unreadOnly: true } : {}),
             ...(options.sinceBaseline ? { sinceBaseline: true } : {}),
           },
