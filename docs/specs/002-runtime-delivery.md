@@ -103,7 +103,43 @@ If a monitor omits `notify`: `high` urgency **MUST** default to `debounce` with 
 
 This default is part of the runtime contract and explains why high-urgency signals are not delivered the instant a single source observation appears.
 
-Verified: `libs/core/src/runtime/types.ts` — `defaultNotifyConfigForUrgency()` (lines 201–210): returns `{ strategy: 'debounce', 'settle-for': '15s' }` for `high` urgency, `undefined` (immediate) for all other urgencies.
+#### Effective urgency (source salience within the authored band)
+
+A monitor's `urgency` frontmatter is an authored **band** `lo..hi` (see
+[001 §3.2](./001-monitor-definition.md)); a bare scalar is the degenerate band `x..x`. A source
+observation **MAY** carry an optional `salience` (see [003 §2.3](./003-source-plugins.md)) — the
+source's domain judgment of how interrupt-worthy _this_ observation is (PP3 — a domain observation,
+not runtime reasoning). It is named `salience`, not `urgency`, because `urgency` stays the
+monitor-level policy knob.
+
+For each observation, the runtime **MUST** resolve the **effective urgency** as:
+
+```
+effective_urgency = clamp(salience ?? band.lo, band.lo, band.hi)
+```
+
+- No `salience` → the band's low bound (the authored base / default urgency).
+- `salience` inside the band → it escalates (or de-escalates) within it.
+- `salience` outside the band → it is clamped to the nearest bound (above → `band.hi`, below →
+  `band.lo`).
+
+Notify dispatch **MUST** evaluate the default notify behavior against the **effective** urgency, and
+event materialization ([§5.1](#51-derived-defaults)) **MUST** persist the effective urgency.
+
+Because a degenerate band (`lo === hi`) clamps every salience back to the single authored level, a
+monitor authored with a bare scalar `urgency` can **never** be escalated by a source — preserving PP5
+(urgency stays user-controlled) and full backward compatibility. Escalation is therefore always an
+explicit, visible authorial grant: the runtime only ever escalates within a band the author wrote.
+
+##### Debounce interaction: escalation flushes the whole held batch early
+
+When an **escalated** observation (its effective urgency exceeds the band's low bound) arrives while a
+debounce batch is **held**, the runtime **MUST** flush the _entire_ held batch — the already-held
+observations plus the escalated one — immediately, rather than waiting for the batch's `dueAt`. The
+runtime **MUST NOT** split the batch (emit only the escalated observation and keep the rest held):
+splitting risks ordering confusion across the durable event stream. Held-first ordering is preserved.
+
+Verified: `libs/core/src/runtime/types.ts` — `defaultNotifyConfigForUrgency()`: returns `{ strategy: 'debounce', 'settle-for': '15s' }` for `high` urgency, `undefined` (immediate) for all other urgencies. `libs/core/src/runtime/service.ts` — `effectiveObservationUrgency()` resolves the clamp; `dispatchNotify()` evaluates notify against the effective urgency and performs the whole-batch early flush on an escalated observation.
 
 ### 4.2 Throttle semantics
 
@@ -132,6 +168,10 @@ Verified: `libs/core/src/runtime/service.ts` — `processObservation()` (lines 5
 If an emitted observation omits fields, the runtime **MUST** derive them as follows:
 
 - `body`: observation body, otherwise monitor instructions
+- `urgency`: the **effective urgency** = `clamp(observation.salience ?? band.lo, band.lo, band.hi)`
+  (see [§4.1](#41-default-notify-behavior)). With no `salience`, this is the band's low bound (the
+  monitor's authored base urgency). The persisted `monitor_events.urgency` is the same effective value
+  notify timing used, so a held batch and its event rows agree.
 - `summary`: observation summary, otherwise observation body, otherwise title
 - `objectKey`: observation `objectKey`, otherwise the monitor ID
 - `queryScope`: observation `queryScope`, otherwise `{}` — and if the observation sets `changeKind`

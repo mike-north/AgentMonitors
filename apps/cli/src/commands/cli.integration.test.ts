@@ -461,6 +461,52 @@ describe('validate', () => {
     expect(result.stdout.toLowerCase()).toMatch(/scope|array|type/);
   });
 
+  // issue #109 / 001 §3.2: an authored urgency band `lo..hi` is valid.
+  it('accepts a range urgency band (lo..hi)', () => {
+    const dir = path.join(tempDir, 'validate-range-urgency-test');
+    const monitorDir = path.join(dir, 'monitors', 'banded');
+    mkdirSync(monitorDir, { recursive: true });
+    const body = [
+      '---',
+      'name: Banded',
+      'watch:',
+      '  type: file-fingerprint',
+      '  globs: ["*.ts"]',
+      'urgency: normal..high',
+      '---',
+      'Handle it.',
+      '',
+    ].join('\n');
+    writeFileSync(path.join(monitorDir, 'MONITOR.md'), body, 'utf-8');
+
+    const result = run(['validate', path.join(dir, 'monitors')]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('Valid monitors: 1');
+  });
+
+  // issue #109 / 001 §3.2: an inverted band (lo > hi) must be rejected.
+  it('rejects an inverted urgency band (high..normal)', () => {
+    const dir = path.join(tempDir, 'validate-inverted-urgency-test');
+    const monitorDir = path.join(dir, 'monitors', 'inverted');
+    mkdirSync(monitorDir, { recursive: true });
+    const body = [
+      '---',
+      'name: Inverted',
+      'watch:',
+      '  type: file-fingerprint',
+      '  globs: ["*.ts"]',
+      'urgency: high..normal',
+      '---',
+      'Handle it.',
+      '',
+    ].join('\n');
+    writeFileSync(path.join(monitorDir, 'MONITOR.md'), body, 'utf-8');
+
+    const result = run(['validate', path.join(dir, 'monitors')]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout.toLowerCase()).toContain('urgency');
+  });
+
   it('hints when a monitor uses the old top-level source/scope shape', () => {
     const dir = path.join(tempDir, 'validate-old-shape-test');
     const monitorDir = path.join(dir, 'monitors', 'old-shape');

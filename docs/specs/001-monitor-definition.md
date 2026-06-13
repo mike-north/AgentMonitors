@@ -81,7 +81,7 @@ Each monitor frontmatter object **MUST** contain:
 | --------- | -------- | -------- | ------------------------------------------------------------------------------------------------- |
 | `name`    | string   | no       | Human-readable display name; defaults to the monitor id (filename or directory name) when omitted |
 | `watch`   | object   | yes      | Intent-first observation config: `type` names the source; remaining keys are per-source config    |
-| `urgency` | enum     | yes      | `low`, `normal`, or `high`                                                                        |
+| `urgency` | string   | yes      | A level (`low`/`normal`/`high`) **or** an authored band `lo..hi` (see [§3.2](#32-urgency))        |
 | `notify`  | object   | no       | Explicit debounce/throttle policy                                                                 |
 | `tags`    | string[] | no       | Tags for later filtering                                                                          |
 
@@ -111,9 +111,24 @@ watch:
 
 ### 3.2 `urgency`
 
-The `urgency` field **MUST** accept exactly: `low`, `normal`, `high`. Even though earlier public docs emphasized only `normal` and `high`, the implemented schema, runtime, and CLI all support `low` (PP5).
+The three urgency **levels** are `low`, `normal`, `high`, ordered `low < normal < high`. Even though earlier public docs emphasized only `normal` and `high`, the implemented schema, runtime, and CLI all support `low` (PP5).
 
-> Verified: `libs/core/src/schema/monitor-schema.ts` — `z.enum(['low', 'normal', 'high'])`. Also confirmed in `libs/core/src/schema/types.ts` — `export type Urgency = 'low' | 'normal' | 'high'`.
+The `urgency` field is authored as an **urgency band** — the range the runtime is permitted to deliver within. It **MUST** be one of:
+
+- **A bare level**, e.g. `urgency: normal`. This is the **degenerate band** `normal..normal`: the monitor always delivers at exactly that level and a source can never escalate it. This is the historical form, so every existing monitor keeps its exact behavior (backward compatible).
+- **A range** `lo..hi`, e.g. `urgency: normal..high`. `lo` is the **base / default** effective urgency (used when a source attaches no `salience`); `hi` is the **ceiling** a source's per-observation `salience` is allowed to escalate to. Surrounding and internal whitespace around the bounds is tolerated (`normal .. high`).
+
+The schema **MUST** reject:
+
+- A bound that is not one of `low`/`normal`/`high` (e.g. `low..critical`).
+- An **inverted** range where `lo > hi` over the `low < normal < high` ordering (e.g. `high..normal`, `normal..low`).
+- A malformed range (more or fewer than two bounds, or an empty bound — e.g. `low..normal..high`, `..high`).
+
+The parsed band exposes its low bound as `frontmatter.urgency` (kept under that key for backward compatibility with every consumer that reads a single urgency level) and its high bound as `frontmatter.urgencyMax` (equal to `urgency` for a bare level).
+
+How a source's per-observation `salience` interacts with the band — `effective = clamp(salience ?? band.lo, band.lo, band.hi)` — is specified in [002 §4.1](./002-runtime-delivery.md) and [003 §2.3](./003-source-plugins.md). Because escalation is only ever permitted **within a band the author wrote**, urgency stays user-controlled (PP5).
+
+> Verified: `libs/core/src/schema/monitor-schema.ts` — `urgencyBandSchema` parses a bare level or a `lo..hi` range, rejects unknown/empty bounds, malformed ranges, and inverted ranges, and the frontmatter transform flattens the band into `urgency` (low bound) + `urgencyMax` (high bound). `libs/core/src/schema/types.ts` — `export type Urgency = 'low' | 'normal' | 'high'`.
 
 ### 3.4 `notify`
 

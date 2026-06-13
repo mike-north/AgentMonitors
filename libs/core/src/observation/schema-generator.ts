@@ -47,7 +47,14 @@ export function generateMonitorSchema(
           type: { type: 'string', enum: sourceNames },
         },
       },
-      urgency: { type: 'string', enum: ['low', 'normal', 'high'] },
+      // A bare level (`normal`) or an authored band `lo..hi` (`normal..high`).
+      // This editor-hint schema enforces only the *shape* of each bound; the
+      // authoritative parser (`monitorFrontmatterSchema`) additionally rejects
+      // an inverted range (`lo > hi`). See 001 §3.2.
+      urgency: {
+        type: 'string',
+        pattern: '^(low|normal|high)(\\s*\\.\\.\\s*(low|normal|high))?$',
+      },
       notify: {
         type: 'object',
         required: ['strategy'],

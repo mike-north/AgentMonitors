@@ -83,6 +83,7 @@ Each `Observation` **MAY** include the following fields (verified: `libs/core/sr
 | `objectKey`    | `string?`                             | Source-defined stable object identity (e.g., a PR number, file path, URL). |
 | `queryScope`   | `Record<string, string \| string[]>?` | Source-defined query metadata used for read-time scoping.                  |
 | `changeKind`   | `ChangeKind?`                         | The lifecycle transition this observation reports (see below).             |
+| `salience`     | `Urgency?`                            | Source-classified per-observation salience (`low` \| `normal` \| `high`).  |
 | `snapshot`     | `unknown?`                            | Point-in-time snapshot metadata captured at fire time.                     |
 
 `ChangeKind` is a **source-agnostic** vocabulary so consumers reason about change uniformly across
@@ -92,6 +93,21 @@ no information lost). `deleted` and `descoped` are deliberately distinct (e.g., 
 _deleted_ vs _closed_ while watching open PRs). When an observation sets `changeKind`, the runtime
 copies it into the materialized event's `queryScope.changeKind` so it is filterable without each
 source populating `queryScope` itself (see [002 §5.1](./002-runtime-delivery.md)). Verified:
+`libs/core/src/observation/types.ts`, `libs/core/src/runtime/service.ts`.
+
+Observation `salience` is the source's per-observation **domain judgment** of how interrupt-worthy
+_this_ observation is — a domain observation (PP3), not runtime reasoning. It is deliberately named
+`salience`, **not** `urgency`: `urgency` stays the monitor-level policy knob authored in `MONITOR.md`.
+
+The runtime does **not** let a source set urgency directly. Instead it resolves the _effective_
+urgency by clamping `salience` into the monitor's authored `urgency` **band** `lo..hi` (see
+[001 §3.2](./001-monitor-definition.md)):
+`effective = clamp(salience ?? band.lo, band.lo, band.hi)`. So a source can escalate a single
+observation only **within** the band the author granted, and a `salience` outside the band is clamped
+to the nearest bound. A monitor authored with a bare scalar `urgency` (the degenerate band `x..x`) can
+never be escalated, so adding `salience` is always safe and backward compatible. The notify-timing and
+event-materialization consequences are specified in
+[002 §4.1](./002-runtime-delivery.md) and [002 §5.1](./002-runtime-delivery.md). Verified:
 `libs/core/src/observation/types.ts`, `libs/core/src/runtime/service.ts`.
 
 ### 2.4 Stateful sources
