@@ -13,6 +13,7 @@ import {
   callDaemon,
   createDaemonServer,
   daemonAvailable,
+  DaemonConnectionError,
 } from './daemon-ipc.js';
 import { createRuntime } from './runtime.js';
 
@@ -52,9 +53,22 @@ describe('callDaemon', () => {
       server.listen(socketPath, () => resolve());
     });
 
-    await expect(
-      callDaemon('status', {}, { socketPath, timeoutMs: 200 }),
-    ).rejects.toThrow('boom');
+    // A daemon-side application error (the daemon answered with `error`) must
+    // surface as a plain Error — NOT a DaemonConnectionError. Callers with a
+    // "daemon unavailable" fallback rely on this distinction so they do not mask
+    // a real application failure as "daemon not running" (issue #94 review,
+    // comment 3408123745).
+    const rejection = await callDaemon(
+      'status',
+      {},
+      {
+        socketPath,
+        timeoutMs: 200,
+      },
+    ).catch((error: unknown) => error);
+    expect(rejection).toBeInstanceOf(Error);
+    expect(rejection).not.toBeInstanceOf(DaemonConnectionError);
+    expect((rejection as Error).message).toBe('boom');
 
     await new Promise<void>((resolve, reject) => {
       server.close((error) => {
@@ -65,6 +79,22 @@ describe('callDaemon', () => {
         resolve();
       });
     });
+  });
+
+  it('rejects with a DaemonConnectionError when the daemon is unreachable (no socket)', async () => {
+    // No server is listening on this path → a socket-level connection failure.
+    // This is the only error class for which a caller's "daemon unavailable"
+    // fallback may fire (issue #94 review, comment 3408123745).
+    const socketPath = tempSocketPath('no-daemon');
+    const rejection = await callDaemon(
+      'status',
+      {},
+      {
+        socketPath,
+        timeoutMs: 200,
+      },
+    ).catch((error: unknown) => error);
+    expect(rejection).toBeInstanceOf(DaemonConnectionError);
   });
 
   it('rejects cleanly on invalid daemon payloads without double-settlement noise', async () => {

@@ -17,6 +17,7 @@ import {
 } from '@agentmonitors/core';
 import { registerCoreSources } from '../sources.js';
 import { reportError } from '../output.js';
+import { DaemonConnectionError } from '../daemon-ipc.js';
 import {
   explainMonitorClient,
   listObservationHistoryClient,
@@ -70,6 +71,9 @@ function explainVerdict(stages: MonitorExplainStage[]) {
 function statusGlyph(status: MonitorExplainStageStatus): string {
   if (status === 'ok') return '✓';
   if (status === 'pending') return '⏳';
+  // A healthy/idle stage (e.g. the watched target genuinely hasn't changed,
+  // issue #94) is rendered distinctly from both delivered (✓) and failure (✗).
+  if (status === 'healthy') return '○';
   return '✗';
 }
 
@@ -421,6 +425,15 @@ monitorTestCommand
         printExplainText(report);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+        // Only fall back to the "daemon unavailable" diagnosis when the daemon
+        // was genuinely unreachable (connection refused / no socket / timeout).
+        // A daemon-side application error (e.g. an explain failure or a method
+        // error) must be surfaced verbatim — masking it as "daemon not running"
+        // hides the real failure (issue #94 review, comment 3408123745).
+        if (!(err instanceof DaemonConnectionError)) {
+          reportError(`Explain failed: ${message}`, json);
+          return;
+        }
         const report = await buildDaemonUnavailableReport({
           monitorId,
           monitorsDir,

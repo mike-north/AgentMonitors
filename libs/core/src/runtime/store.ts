@@ -333,6 +333,17 @@ export class RuntimeStore {
     if (query.objectKey)
       conditions.push(eq(monitorEvents.objectKey, query.objectKey));
     if (query.since) conditions.push(gt(monitorEvents.createdAt, query.since));
+    // Scope to the requested workspace plus workspace-agnostic events. The inbox
+    // DB is global; the same monitorId can exist in multiple workspaces, so a
+    // workspace-scoped caller (e.g. `monitor explain`) must not see another
+    // workspace's events (issue #94 review, comment 3408123729).
+    if (query.workspacePath !== undefined) {
+      const workspaceCondition = or(
+        eq(monitorEvents.workspacePath, query.workspacePath),
+        isNull(monitorEvents.workspacePath),
+      );
+      if (workspaceCondition) conditions.push(workspaceCondition);
+    }
 
     let rows = query.sessionId
       ? asInternalDb(this.db)
@@ -474,7 +485,20 @@ export class RuntimeStore {
 
   listDeliveryProjectionsForMonitor(
     monitorId: string,
+    workspacePath?: string,
   ): MonitorDeliveryProjection[] {
+    const conditions = [eq(monitorEvents.monitorId, monitorId)];
+    // Scope to the requested workspace's sessions plus workspace-agnostic
+    // (global) sessions. The inbox DB is global and the same monitorId can exist
+    // in multiple workspaces, so an unscoped query overcounts projections from
+    // other workspaces' sessions (issue #94 review, comment 3408123736).
+    if (workspacePath !== undefined) {
+      const workspaceCondition = or(
+        eq(agentSessions.workspacePath, workspacePath),
+        isNull(agentSessions.workspacePath),
+      );
+      if (workspaceCondition) conditions.push(workspaceCondition);
+    }
     const rows = asInternalDb(this.db)
       .select({
         event: monitorEvents,
@@ -487,7 +511,7 @@ export class RuntimeStore {
         agentSessions,
         eq(sessionEventState.sessionId, agentSessions.id),
       )
-      .where(eq(monitorEvents.monitorId, monitorId))
+      .where(and(...conditions))
       .orderBy(desc(monitorEvents.createdAt))
       .all();
 

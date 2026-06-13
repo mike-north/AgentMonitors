@@ -451,20 +451,25 @@ export class AgentMonitorRuntime {
         ),
       );
     } else if (latestObservation.result === 'no-change') {
+      // A genuinely quiet tick is healthy, not a fault (issue #94): the watched
+      // target simply hasn't changed. Render distinctly from a real failure.
       stages.push(
         explainStage(
           'observation',
-          'failure',
-          'The source ran successfully but observed 0 changes.',
+          'healthy',
+          'Source ran, observed 0 changes — your watched target genuinely hasn’t changed (not a bug).',
           latestObservation.observationData,
         ),
       );
     } else if (latestObservation.result === 'rebaselined') {
+      // The source advanced its baseline without computing a delta (e.g. a
+      // force-pushed/gc'd ref). No change was emitted, which is healthy — not a
+      // fault (issue #94).
       stages.push(
         explainStage(
           'observation',
-          'failure',
-          'The source rebaselined and did not emit a change on the latest tick.',
+          'healthy',
+          'Source rebaselined and emitted no change — your watched target is being tracked, nothing to report (not a bug).',
           latestObservation.observationData,
         ),
       );
@@ -478,6 +483,13 @@ export class AgentMonitorRuntime {
         ),
       );
     }
+
+    // A healthy/idle observation means the watched target genuinely hasn't
+    // changed (issue #94): the absence of downstream events/projections is the
+    // *expected* outcome, not a fault, so the later stages must not render ✗.
+    const observationHealthy =
+      latestObservation?.result === 'no-change' ||
+      latestObservation?.result === 'rebaselined';
 
     const notifyState = runtimeState.notifyState;
     const pendingDebounce = notifyState.pendingDebounce;
@@ -516,15 +528,28 @@ export class AgentMonitorRuntime {
     }
 
     const events = this.store
-      .listEvents({ monitorId: input.monitorId })
+      .listEvents({
+        monitorId: input.monitorId,
+        // Scope to the explained workspace so a same-id monitor in another
+        // workspace cannot leak its events into this report (issue #94 review).
+        ...(input.workspacePath !== undefined
+          ? { workspacePath: input.workspacePath }
+          : {}),
+      })
       .slice(0, eventLimit);
     if (events.length === 0) {
       stages.push(
-        explainStage(
-          'materialization',
-          'failure',
-          'No monitor_events rows exist for this monitor.',
-        ),
+        observationHealthy
+          ? explainStage(
+              'materialization',
+              'healthy',
+              'No events materialized — expected, because the source observed no changes (not a bug).',
+            )
+          : explainStage(
+              'materialization',
+              'failure',
+              'No monitor_events rows exist for this monitor.',
+            ),
       );
     } else {
       stages.push(
@@ -539,6 +564,9 @@ export class AgentMonitorRuntime {
 
     const projections = this.store.listDeliveryProjectionsForMonitor(
       input.monitorId,
+      // Scope to the explained workspace's sessions (plus global sessions) so
+      // projections from other workspaces are not overcounted (issue #94 review).
+      input.workspacePath,
     );
     const leadSessions = this.store
       .sessionsForWorkspace(input.workspacePath)
@@ -575,11 +603,17 @@ export class AgentMonitorRuntime {
       );
     } else {
       stages.push(
-        explainStage(
-          'delivery',
-          'pending',
-          'Delivery has not started because no event has materialized yet.',
-        ),
+        observationHealthy
+          ? explainStage(
+              'delivery',
+              'healthy',
+              'Nothing to deliver — the source observed no changes, so there is no signal to project (not a bug).',
+            )
+          : explainStage(
+              'delivery',
+              'pending',
+              'Delivery has not started because no event has materialized yet.',
+            ),
       );
     }
 

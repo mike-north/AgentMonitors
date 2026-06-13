@@ -877,7 +877,7 @@ Handle it.
     expect(report.stages[0]?.reason).toContain('failed to parse or validate');
   });
 
-  it('explains errored and unchanged source outcomes at the observation stage', async () => {
+  it('explains an errored source as a failure but an unchanged source as healthy/idle (not a bug, issue #94)', async () => {
     const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
     tempDirs.push(rootDir);
     const dbPath = path.join(rootDir, 'agentmon.db');
@@ -948,6 +948,9 @@ Handle unchanged.
       }),
     );
 
+    // Issue #94 contract: "your watched thing genuinely didn't change" is NOT a
+    // bug. A no-change observation must surface as a distinct healthy/idle
+    // status with an affirmative verdict — never a ✗ failure.
     const unchanged = await runtime.explainMonitor({
       monitorId: 'zzz-unchanged-monitor',
       monitorsDir,
@@ -955,11 +958,81 @@ Handle unchanged.
     });
     expect(unchanged.verdict).toMatchObject({
       stage: 'observation',
-      status: 'failure',
+      status: 'healthy',
     });
+    const unchangedObservation = unchanged.stages.find(
+      (stage) => stage.id === 'observation',
+    );
+    expect(unchangedObservation?.status).toBe('healthy');
+    // Affirmative, not-a-bug wording (002 §10.7 / issue #94).
+    expect(unchangedObservation?.reason).toContain('0 changes');
+    expect(unchangedObservation?.reason).toContain('not a bug');
+    // A healthy/idle monitor must carry no ✗ failure anywhere downstream: the
+    // absence of events/projections is expected, not a fault.
+    expect(unchanged.stages.some((stage) => stage.status === 'failure')).toBe(
+      false,
+    );
     expect(
-      unchanged.stages.find((stage) => stage.id === 'observation')?.reason,
-    ).toContain('observed 0 changes');
+      unchanged.stages.find((stage) => stage.id === 'materialization')?.status,
+    ).toBe('healthy');
+    expect(
+      unchanged.stages.find((stage) => stage.id === 'delivery')?.status,
+    ).toBe('healthy');
+  });
+
+  it('explains a rebaselined source as healthy/idle (not a bug, issue #94)', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    const monitorsDir = path.join(rootDir, '.claude', 'monitors');
+    const rebaselineMonitorDir = path.join(monitorsDir, 'rebaseline-monitor');
+    mkdirSync(rebaselineMonitorDir, { recursive: true });
+    writeFileSync(
+      path.join(rebaselineMonitorDir, 'MONITOR.md'),
+      `---
+name: Rebaseline monitor
+watch:
+  type: rebaseline-source
+  interval: '1s'
+urgency: normal
+---
+Handle rebaseline.
+`,
+      'utf-8',
+    );
+
+    const registry = new SourceRegistry();
+    registry.register({
+      name: 'rebaseline-source',
+      scopeSchema: { type: 'object' },
+      // Zero observations + outcome:'rebaselined' → runtime records 'rebaselined'.
+      observe: () =>
+        Promise.resolve({ observations: [], outcome: 'rebaselined' }),
+    });
+    const runtime = new AgentMonitorRuntime(
+      new RuntimeStore(createDb(dbPath)),
+      registry,
+      [claudeCodeAdapter],
+    );
+    await runtime.tick(monitorsDir, rootDir);
+
+    const report = await runtime.explainMonitor({
+      monitorId: 'rebaseline-monitor',
+      monitorsDir,
+      workspacePath: rootDir,
+    });
+    expect(report.verdict).toMatchObject({
+      stage: 'observation',
+      status: 'healthy',
+    });
+    const observation = report.stages.find(
+      (stage) => stage.id === 'observation',
+    );
+    expect(observation?.status).toBe('healthy');
+    expect(observation?.reason).toContain('not a bug');
+    expect(report.stages.some((stage) => stage.status === 'failure')).toBe(
+      false,
+    );
   });
 
   it('explains a monitor stopped by pending debounce notify state', async () => {
@@ -1064,6 +1137,106 @@ Handle unchanged.
         }),
       ]),
     );
+  });
+
+  it('scopes explain events and projections to the explained workspace when the same monitorId exists in two workspaces (issue #94 review, session isolation)', async () => {
+    // The inbox DB is GLOBAL (not per-workspace), so the same monitorId can be
+    // materialized in two different workspaces. `monitor explain` for one
+    // workspace must NOT count the other workspace's events or projections
+    // (comments 3408123729 + 3408123736).
+    const dbRoot = mkdtempSync(path.join(tmpdir(), 'agentmon-shared-db-'));
+    tempDirs.push(dbRoot);
+    const dbPath = path.join(dbRoot, 'agentmon.db');
+
+    const writeSharedMonitor = (rootDir: string): string => {
+      const monitorDir = path.join(
+        rootDir,
+        '.claude',
+        'monitors',
+        'shared-monitor',
+      );
+      mkdirSync(monitorDir, { recursive: true });
+      writeFileSync(
+        path.join(monitorDir, 'MONITOR.md'),
+        `---
+name: Shared monitor
+watch:
+  type: shared-source
+  interval: '1s'
+urgency: normal
+---
+Handle it.
+`,
+        'utf-8',
+      );
+      return path.join(rootDir, '.claude', 'monitors');
+    };
+
+    const workspaceA = mkdtempSync(path.join(tmpdir(), 'agentmon-ws-a-'));
+    const workspaceB = mkdtempSync(path.join(tmpdir(), 'agentmon-ws-b-'));
+    tempDirs.push(workspaceA, workspaceB);
+    const monitorsDirA = writeSharedMonitor(workspaceA);
+    const monitorsDirB = writeSharedMonitor(workspaceB);
+
+    // One source, one shared DB, two workspaces.
+    const source: ObservationSource = {
+      name: 'shared-source',
+      scopeSchema: { type: 'object' },
+      observe: () =>
+        Promise.resolve({
+          observations: [{ title: 'shared change', objectKey: 'obj-shared' }],
+        }),
+    };
+    const runtime = createRuntime(dbPath, source);
+
+    // A lead session in each workspace so each materialized event projects.
+    const sessionA = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-ws-a',
+        workspacePath: workspaceA,
+      }),
+    );
+    runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-ws-b',
+        workspacePath: workspaceB,
+      }),
+    );
+
+    // Workspace A ticks once (1 event, projected to sessionA). Workspace B ticks
+    // twice (2 events, projected to sessionB). If explain leaked across
+    // workspaces, A would report B's extra event/projections too.
+    await runtime.tick(monitorsDirA, workspaceA);
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    await runtime.tick(monitorsDirB, workspaceB);
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    await runtime.tick(monitorsDirB, workspaceB);
+
+    const explainA = await runtime.explainMonitor({
+      monitorId: 'shared-monitor',
+      monitorsDir: monitorsDirA,
+      workspacePath: workspaceA,
+    });
+
+    // Materialization stage: only workspace A's single event.
+    expect(explainA.events).toHaveLength(1);
+    expect(
+      explainA.events.every((event) => event.workspacePath === workspaceA),
+    ).toBe(true);
+
+    // Delivery stage: only projections to workspace A's session.
+    expect(
+      explainA.projections.every(
+        (projection) => projection.sessionId === sessionA.id,
+      ),
+    ).toBe(true);
+    expect(
+      explainA.projections.every(
+        (projection) => projection.workspacePath === workspaceA,
+      ),
+    ).toBe(true);
+    // Exactly one projection (A's single event → A's single session).
+    expect(explainA.projections).toHaveLength(1);
   });
 
   it('classifies a debounced-flush tick (emit with zero new observations) as triggered, not no-change', async () => {
