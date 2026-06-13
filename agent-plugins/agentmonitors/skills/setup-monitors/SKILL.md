@@ -53,11 +53,24 @@ monitor definitions when they should be shared by the team.
 | --- | --- | --- |
 | Local files changed, created, deleted, or descoped | `file-fingerprint` | `globs`; optional `cwd` |
 | HTTP response/status changed | `api-poll` | `url`; optional `method`, `headers`, `auth`, `change-detection`, `interval` |
+| Output of a command/script changed (e.g. `git status`, a CLI health check, a script's JSON) | `command-poll` | `command` (argv array); optional `interval`, `change-detection`, `cwd`, `env`, `timeout` |
 | Time-based reminder or recurring check | `schedule` | `cron`; optional `timezone`, `label` |
 | Git ref advances touching paths | `incoming-changes` | `paths`; optional `cwd`, `branch`, `interval` |
 
-If no shipped source fits, say it is not monitorable yet. Do not use `command-poll` until the CLI
-actually lists it.
+If no shipped source fits, say it is not monitorable yet.
+
+The minimal `command-poll` shape is:
+
+```yaml
+watch:
+  type: command-poll
+  command:
+    - git
+    - status
+    - --porcelain
+```
+
+`command` is an argv array (not a shell string). The default `change-detection.strategy` is `text-diff`; use `json-diff` when the command outputs JSON.
 
 3. Ask only for fields required by the chosen source. Prefer defaults for everything else:
    - `urgency: normal` unless the user needs idle-only (`low`) or interrupting (`high`) delivery.
@@ -114,7 +127,7 @@ When the user says "it did not fire", do not guess. Run:
 agentmonitors monitor explain <id> --dir .claude/monitors
 ```
 
-Use the stopped stage to fix the monitor:
+`monitor explain` prints a ✓/✗/○/⏳ status for each pipeline stage, then a final **Verdict** naming the stage where the signal stopped and the reason. Use the Verdict stage to fix the monitor:
 
 - `definition`: parse/schema/source config problem; edit `MONITOR.md`, then run `validate`.
 - `scheduling`: daemon not running or not due; enable the project, start a session, or adjust interval/cron.

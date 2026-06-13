@@ -13,7 +13,11 @@ const SETUP_MONITORS_SKILL = path.join(
 );
 
 function skillText(): string {
-  return readFileSync(SETUP_MONITORS_SKILL, 'utf-8');
+  const raw = readFileSync(SETUP_MONITORS_SKILL, 'utf-8');
+  // Normalize: strip a leading UTF-8 BOM (U+FEFF) and convert CRLF -> LF so
+  // that Windows-saved files are handled by the same regex patterns as Unix files.
+  // Mirror the normalization in apps/cli/src/commands/validate.ts.
+  return raw.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n');
 }
 
 function frontmatterDescription(text: string): string {
@@ -46,6 +50,7 @@ describe('activation plugin setup-monitors skill', () => {
     for (const sourceType of [
       'file-fingerprint',
       'api-poll',
+      'command-poll',
       'schedule',
       'incoming-changes',
     ]) {
