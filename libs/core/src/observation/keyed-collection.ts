@@ -130,9 +130,22 @@ function assertValidSegment(path: string, segment: string): void {
  * Normalize dotted paths so authors may write either explicit-root `$.tasks` or
  * bare root-relative `tasks`. Keeping this at the helper boundary gives every
  * source the same compatibility behavior without duplicating path handling.
+ *
+ * Leniency applies **only** to truly bare paths (no leading `$`). A path that
+ * begins with `$` is interpreted as explicit-root JSONPath and must therefore be
+ * exactly `$` or start with `$.`. A malformed root such as `"$tasks"` is an
+ * authoring error — silently rewriting it to `"$.$tasks"` would look up a literal
+ * `$tasks` field instead of surfacing the mistake.
  */
 function normalizeDottedPath(path: string): string {
   if (path === '$' || path.startsWith('$.')) return path;
+  if (path.startsWith('$')) {
+    throw new Error(
+      `Invalid collection path "${path}": a path beginning with "$" must be ` +
+        `explicit-root form ("$" or "$.field"). Write "${path.slice(1)}" for a ` +
+        `bare root-relative path, or "$.${path.slice(1)}" for explicit-root form.`,
+    );
+  }
   return `$.${path}`;
 }
 

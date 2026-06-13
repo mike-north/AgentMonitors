@@ -125,6 +125,23 @@ describe('resolveDottedPath', () => {
       /unsupported syntax/,
     );
   });
+
+  // Regression for PR #107 Copilot review: a path that begins with `$` but is
+  // NOT proper explicit-root (`$` or `$.field`) is a malformed root, not a bare
+  // root-relative path. It must surface an authoring error rather than silently
+  // becoming `$.$tasks` and looking up a literal `$tasks` field.
+  it('rejects a `$`-prefixed path that is not explicit-root form (e.g. "$tasks")', () => {
+    // Throwing (rather than returning the `$tasks` array) is the whole point:
+    // the author mistake surfaces instead of silently resolving the wrong field.
+    expect(() =>
+      resolveDottedPath({ $tasks: [{ id: 'a' }] }, '$tasks'),
+    ).toThrow(/must be.*explicit-root/i);
+  });
+
+  it('still resolves a bare path whose field name happens to contain `$` (no leading `$`)', () => {
+    // Leniency applies to truly bare paths; a non-leading `$` is a plain field char.
+    expect(resolveDottedPath({ a$b: 1 }, 'a$b')).toBe(1);
+  });
 });
 
 describe('diffKeyedCollection — baseline (003 §12)', () => {
