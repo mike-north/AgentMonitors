@@ -329,6 +329,72 @@ describe('source-command-poll', () => {
       expect(next.observations[0]?.objectKey).toBe('tasks#b');
     });
 
+    it('accepts a bare dotted collection path and reports per-item changes', async () => {
+      const key = 'items';
+      const barePathCollection = { path: 'items', key: 'id' };
+      const baseline = await source.observe(
+        {
+          command: jsonArgv({ items: [{ id: 'x', name: 'A' }] }),
+          key,
+          'change-detection': {
+            strategy: 'json-diff',
+            collection: barePathCollection,
+          },
+        },
+        ctx(),
+      );
+
+      const modified = await source.observe(
+        {
+          command: jsonArgv({ items: [{ id: 'x', name: 'B' }] }),
+          key,
+          'change-detection': {
+            strategy: 'json-diff',
+            collection: barePathCollection,
+          },
+        },
+        ctx(baseline.nextState),
+      );
+      expect(modified.observations).toHaveLength(1);
+      expect(modified.observations[0]?.changeKind).toBe('modified');
+      expect(modified.observations[0]?.objectKey).toBe('items#x');
+
+      const created = await source.observe(
+        {
+          command: jsonArgv({
+            items: [
+              { id: 'x', name: 'B' },
+              { id: 'y', name: 'C' },
+            ],
+          }),
+          key,
+          'change-detection': {
+            strategy: 'json-diff',
+            collection: barePathCollection,
+          },
+        },
+        ctx(modified.nextState),
+      );
+      expect(created.observations).toHaveLength(1);
+      expect(created.observations[0]?.changeKind).toBe('created');
+      expect(created.observations[0]?.objectKey).toBe('items#y');
+
+      const descoped = await source.observe(
+        {
+          command: jsonArgv({ items: [{ id: 'x', name: 'B' }] }),
+          key,
+          'change-detection': {
+            strategy: 'json-diff',
+            collection: barePathCollection,
+          },
+        },
+        ctx(created.nextState),
+      );
+      expect(descoped.observations).toHaveLength(1);
+      expect(descoped.observations[0]?.changeKind).toBe('descoped');
+      expect(descoped.observations[0]?.objectKey).toBe('items#y');
+    });
+
     it('element addition → created; removal → descoped (not deleted)', async () => {
       const baseline = await source.observe(
         {

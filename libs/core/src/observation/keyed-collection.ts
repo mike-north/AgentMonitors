@@ -11,21 +11,22 @@ import type { ChangeKind, Observation } from './types.js';
  * companion to §11), keeping create/modified/descoped semantics identical across
  * sources rather than duplicating — and risking divergence — in each plugin.
  *
- * `path` syntax (resolving §12's open design point): a **minimal `$.`-prefixed
- * dotted path** — a root `$` followed by `.field` segments (`$.tasks`,
- * `$.data.items`). No wildcards, filters, or recursive descent. `path` MUST select
- * exactly one array; `ignore-paths` entries use the same dotted syntax and address
- * fields **within each element** (relative to the element root, e.g. `$.fetchedAt`).
+ * `path` syntax (resolving §12's open design point): a **minimal dotted path**.
+ * Both explicit-root (`$.tasks`, `$.data.items`) and bare root-relative (`tasks`,
+ * `data.items`) forms are accepted. No wildcards, filters, or recursive descent.
+ * `path` MUST select exactly one array; `ignore-paths` entries use the same dotted
+ * syntax and address fields **within each element** (relative to the element root,
+ * e.g. `$.fetchedAt` or `fetchedAt`).
  */
 
 /** A parsed `change-detection.collection` config (003 §12). */
 export interface KeyedCollectionConfig {
-  /** Dotted `$.`-path to the array within the parsed output (e.g. `$.tasks`). */
+  /** Dotted path to the array within the parsed output (e.g. `$.tasks` or `tasks`). */
   path: string;
   /** Field on each element whose value is the per-object identity (e.g. `id`). */
   key: string;
   /**
-   * Optional dotted `$.`-paths, relative to each element, removed before content
+   * Optional dotted paths, relative to each element, removed before content
    * comparison so churn fields (timestamps, etc.) do not produce spurious
    * `modified` observations.
    */
@@ -126,20 +127,39 @@ function assertValidSegment(path: string, segment: string): void {
 }
 
 /**
- * Resolve a minimal `$.`-prefixed dotted path against a parsed value, returning the
- * value at that path (or `undefined` if any segment is missing). Accepts exactly the
- * form §12's examples use: a root `$`, then `.field` segments. Rejects any other
- * shape (no `[index]`, wildcards, filters, or recursive descent) with a precise
- * error so authoring mistakes surface clearly.
+ * Normalize dotted paths so authors may write either explicit-root `$.tasks` or
+ * bare root-relative `tasks`. Keeping this at the helper boundary gives every
+ * source the same compatibility behavior without duplicating path handling.
+ *
+ * Leniency applies **only** to truly bare paths (no leading `$`). A path that
+ * begins with `$` is interpreted as explicit-root JSONPath and must therefore be
+ * exactly `$` or start with `$.`. A malformed root such as `"$tasks"` is an
+ * authoring error — silently rewriting it to `"$.$tasks"` would look up a literal
+ * `$tasks` field instead of surfacing the mistake.
  */
-export function resolveDottedPath(root: unknown, path: string): unknown {
-  if (path === '$') return root;
-  if (!path.startsWith('$.')) {
+function normalizeDottedPath(path: string): string {
+  if (path === '$' || path.startsWith('$.')) return path;
+  if (path.startsWith('$')) {
     throw new Error(
-      `Invalid collection path "${path}": must start with "$." (e.g. "$.tasks")`,
+      `Invalid collection path "${path}": a path beginning with "$" must be ` +
+        `explicit-root form ("$" or "$.field"). Write "${path.slice(1)}" for a ` +
+        `bare root-relative path, or "$.${path.slice(1)}" for explicit-root form.`,
     );
   }
-  const segments = path.slice(2).split('.');
+  return `$.${path}`;
+}
+
+/**
+ * Resolve a minimal dotted path against a parsed value, returning the value at that
+ * path (or `undefined` if any segment is missing). Accepts both `$.field` and bare
+ * root-relative `field` forms. Rejects unsupported shapes (no `[index]`, wildcards,
+ * filters, or recursive descent) with a precise error so authoring mistakes surface
+ * clearly.
+ */
+export function resolveDottedPath(root: unknown, path: string): unknown {
+  const normalizedPath = normalizeDottedPath(path);
+  if (normalizedPath === '$') return root;
+  const segments = normalizedPath.slice(2).split('.');
   let current: unknown = root;
   for (const segment of segments) {
     if (segment.length === 0) {
@@ -159,19 +179,15 @@ export function resolveDottedPath(root: unknown, path: string): unknown {
 }
 
 /**
- * Remove a single `$.`-dotted path from within an element (mutating a clone). Used
+ * Remove a single dotted path from within an element (mutating a clone). Used
  * to strip `ignore-paths` fields before content comparison. A path that does not
  * resolve is a no-op (missing intermediate key). Rejects unsupported segment syntax
  * (same grammar as {@link resolveDottedPath}) with a precise author-facing error.
  */
 function removeDottedPath(value: unknown, path: string): void {
-  if (path === '$') return;
-  if (!path.startsWith('$.')) {
-    throw new Error(
-      `Invalid ignore-paths entry "${path}": must start with "$." (e.g. "$.fetchedAt")`,
-    );
-  }
-  const segments = path.slice(2).split('.');
+  const normalizedPath = normalizeDottedPath(path);
+  if (normalizedPath === '$') return;
+  const segments = normalizedPath.slice(2).split('.');
   let current: unknown = value;
   for (let i = 0; i < segments.length - 1; i++) {
     const segment = segments[i];

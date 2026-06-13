@@ -54,6 +54,22 @@ describe('parseKeyedCollectionConfig', () => {
     });
   });
 
+  it('parses bare dotted path strings for author-friendly monitor config', () => {
+    const parsed = parseKeyedCollectionConfig({
+      strategy: 'json-diff',
+      collection: {
+        path: 'tasks',
+        key: 'id',
+        'ignore-paths': ['fetchedAt'],
+      },
+    });
+    expect(parsed).toEqual({
+      path: 'tasks',
+      key: 'id',
+      ignorePaths: ['fetchedAt'],
+    });
+  });
+
   it('rejects a collection block missing path', () => {
     expect(() =>
       parseKeyedCollectionConfig({ collection: { key: 'id' } }),
@@ -85,10 +101,13 @@ describe('resolveDottedPath', () => {
     expect(resolveDottedPath({ a: {} }, '$.a.missing')).toBeUndefined();
   });
 
-  it('rejects a path that does not start with $.', () => {
-    expect(() => resolveDottedPath({}, 'tasks')).toThrow(
-      /must start with "\$\."/,
-    );
+  it('accepts bare dotted paths as root-relative', () => {
+    expect(resolveDottedPath({ tasks: [{ id: 'a' }] }, 'tasks')).toEqual([
+      { id: 'a' },
+    ]);
+    expect(
+      resolveDottedPath({ data: { tasks: [1, 2] } }, 'data.tasks'),
+    ).toEqual([1, 2]);
   });
 
   it('rejects an empty path segment', () => {
@@ -105,6 +124,23 @@ describe('resolveDottedPath', () => {
     expect(() => resolveDottedPath({}, '$.tasks.*')).toThrow(
       /unsupported syntax/,
     );
+  });
+
+  // Regression for PR #107 Copilot review: a path that begins with `$` but is
+  // NOT proper explicit-root (`$` or `$.field`) is a malformed root, not a bare
+  // root-relative path. It must surface an authoring error rather than silently
+  // becoming `$.$tasks` and looking up a literal `$tasks` field.
+  it('rejects a `$`-prefixed path that is not explicit-root form (e.g. "$tasks")', () => {
+    // Throwing (rather than returning the `$tasks` array) is the whole point:
+    // the author mistake surfaces instead of silently resolving the wrong field.
+    expect(() =>
+      resolveDottedPath({ $tasks: [{ id: 'a' }] }, '$tasks'),
+    ).toThrow(/must be.*explicit-root/i);
+  });
+
+  it('still resolves a bare path whose field name happens to contain `$` (no leading `$`)', () => {
+    // Leniency applies to truly bare paths; a non-leading `$` is a plain field char.
+    expect(resolveDottedPath({ a$b: 1 }, 'a$b')).toBe(1);
   });
 });
 
@@ -299,6 +335,25 @@ describe('diffKeyedCollection — ignore-paths (003 §12)', () => {
     );
     expect(next.observations).toHaveLength(1);
     expect(next.observations[0]?.changeKind).toBe('modified');
+  });
+
+  it('accepts bare ignore-path entries as element-relative paths', () => {
+    const config: KeyedCollectionConfig = {
+      path: 'tasks',
+      key: 'id',
+      ignorePaths: ['fetchedAt'],
+    };
+    const first = baseline(
+      { tasks: [{ id: 'a', v: 1, fetchedAt: 't0' }] },
+      config,
+    );
+    const next = diffKeyedCollection(
+      { tasks: [{ id: 'a', v: 1, fetchedAt: 't1' }] },
+      config,
+      MONITOR_KEY,
+      first.snapshot,
+    );
+    expect(next.observations).toHaveLength(0);
   });
 });
 

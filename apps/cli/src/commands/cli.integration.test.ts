@@ -640,6 +640,43 @@ describe('validate', () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain('Valid monitors: 1');
   });
+
+  // Reconciliation proof (PR #107 over the #111 tightened schema): a keyed-collection
+  // monitor written with the bare-dotted authoring shorthand (`path: tasks`, not
+  // `$.tasks`) must still pass `validate`. #111 added an explicit
+  // `additionalProperties: false` allow-list to `command-poll`'s change-detection that
+  // intentionally KEEPS `collection`; #107 lets authors write bare paths inside it.
+  // Both must survive: the bare-path form validates clean (exit 0) under the tightened
+  // schema rather than being rejected as an unknown shape.
+  it('accepts a bare-path json-diff + collection monitor (command-poll)', () => {
+    const dir = path.join(tempDir, 'validate-collection-bare-path');
+    const monitorDir = path.join(dir, 'monitors', 'coll-bare');
+    mkdirSync(monitorDir, { recursive: true });
+    const body = [
+      '---',
+      'name: Tasks',
+      'watch:',
+      '  type: command-poll',
+      '  command:',
+      '    - echo',
+      '    - "{}"',
+      '  change-detection:',
+      '    strategy: json-diff',
+      '    collection:',
+      '      path: tasks', // bare dotted form — no `$.` prefix (#107)
+      "      key: 'id'",
+      '      ignore-paths:',
+      '        - fetchedAt', // bare element-relative ignore path (#107)
+      'urgency: normal',
+      '---',
+      'Handle it.',
+      '',
+    ].join('\n');
+    writeFileSync(path.join(monitorDir, 'MONITOR.md'), body, 'utf-8');
+    const result = run(['validate', path.join(dir, 'monitors')]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('Valid monitors: 1');
+  });
 });
 
 describe('scan', () => {

@@ -482,7 +482,7 @@ const scopeSchema: JsonSchema = {
             path: {
               type: 'string',
               description:
-                'Dotted $.-path to the array within the parsed JSON (e.g. "$.tasks")',
+                'Dotted path to the array within the parsed JSON (e.g. "tasks" or "$.tasks")',
             },
             key: {
               type: 'string',
@@ -493,7 +493,7 @@ const scopeSchema: JsonSchema = {
               type: 'array',
               items: { type: 'string' },
               description:
-                'Dotted $.-paths (relative to each element) removed before comparison',
+                'Dotted paths (relative to each element, e.g. "fetchedAt" or "$.fetchedAt") removed before comparison',
             },
           },
           required: ['path', 'key'],
