@@ -17,7 +17,9 @@ Settled with the design agent before the build:
 - **Hero headline:** ship the variant toggle; **default-show "Give your agent ears."** with "Your agent can look and act. It can't hear. Until now." as the explanatory variant. **"Stop being the polling loop" is the Section-2 headline, NOT a hero option** (hero = promise; §2 = problem).
 - **Aesthetic:** technical / terminal — monospace accents, schematic, **engineer-warm**; keep minimal-grade restraint/whitespace so it reads premium, not gimmicky-terminal. Wit lives in copy + diagrams, not loud chrome. (Avoid the forgettable Linear/Vercel refined-minimal default.)
 - **Signature accent:** **warm amber / sound-wave gold** — on-metaphor (sound/warmth/the "ears lighting up" glow), engineer-warm on a dark base, and ownable vs. the blue/green/purple dev-tool norm.
-- **Diagram split:** **build live (CSS/SVG, theme-aware)** the schematic ones — fan-out (#3), anatomy (#4), annotated `MONITOR.md` (#5); **leave clean labeled placeholders** for the illustration-grade ones the imagery agent will craft — hero eyes/hands/ears (#1) and the before/after "you are the loop" scene (#2).
+- **Hero (selected 2026-06-14):** Variant **C** (left-aligned, schematic-forward) wins — build it full-page, with **Variant B's subhead**. Replace the abstract eyes/hands/ears triad as the hero centerpiece with the **outcome-framed listening hub** (see Hero visual below); keep the triad only as a small supporting chip (`eyes ✓ hands ✓ ears ←`), the category claim.
+- **Narrative principle — outcomes earn mechanisms:** lead with **outcomes** (the things you get told about) to win attention; _then_ spend that attention on **mechanism** (the `MONITOR.md`, the daemon, the diff) on scroll. Hero = outcome; §3 = how you express it. Never open with mechanism.
+- **Diagram split:** **build live (CSS/SVG, theme-aware)** — the **hero listening hub (#1, now a live build — see Hero visual)**, fan-out (#3), anatomy (#4), annotated `MONITOR.md` (#5). The imagery agent now crafts only the before/after "you are the loop" scene (#2).
 
 ### Extra guardrails (additive to §"Hard guardrails" below)
 
@@ -53,7 +55,30 @@ them**. Agent Monitors is that missing sense. Lead with this; make it the visual
   and tells your agent the moment they change. No polling loop. No re-asking. Your agent finds out
   on its own."
 - **Primary CTA:** `Get started` (→ quickstart). **Secondary:** `How it works`.
-- **Hero visual:** the eyes/hands/ears diagram (Imagery shot 1) — ears lighting up.
+- **Hero visual:** the **listening hub** (live, animated, outcome-framed) — see the spec below.
+
+### Hero visual — the listening hub (outcome-framed, live build)
+
+Replaces the abstract eyes/hands/ears triad as the centerpiece. A short, **typographic** stack of
+**"listening for…" intent lines** (outcomes, not mechanisms) beside an ear glyph with concentric
+amber sound-wave arcs. Most lines sit dim ("listening…"); **on load, one resolves to amber and a
+pulse travels to the ear, which brightens.** Each line reads like a monitor's _body_ — reinforcing
+the model — and it lands "what ears means" in one beat. This fits the mono/engineer-warm aesthetic
+better than icon-nodes.
+
+- **Use developer / chief-of-staff outcomes** (this is the core audience), e.g.:
+  - `listening for the upstream API spec to change…`
+  - `listening for a new CVE in your dependencies…`
+  - `listening for CI to finish…` → resolves to: `CI finished. your agent already knows.`
+  - (others: a PR gets its first review; a watched file changes; a config flag flips)
+- **Do NOT use personal-life outcomes here** (the "email from a sender" / "OmniFocus task done"
+  examples belong on the ambient #125 page, not the core hero — different audience).
+- **Honesty:** the agent is the **receiver** — outcomes resolve and the pulse travels _to_ the ear;
+  never depict the agent reaching out to poll (any polling is the invisible daemon, off-stage).
+- **Motion:** animate the resolve + pulse on load (loop subtly or fire once); `prefers-reduced-motion`
+  → render one line already resolved + ear lit, no motion.
+- Keep the **`eyes ✓ hands ✓ ears ←`** triad as a small supporting chip in the hero (the category
+  claim), not the centerpiece.
 
 ### Section 2 — "You are the polling loop"
 
@@ -154,11 +179,9 @@ Shared visual language: clean, modern, technical-but-warm; flat/line illustratio
 schematic; legible in **both light and dark**; minimal text in-image (labels only). Consistent
 palette and iconography across all five so they read as a set.
 
-1. **The missing sense (hero).** An agent (abstract figure or device) with **eyes** (a
-   screenshot/viewport glyph) and **hands** (a tool/wrench glyph) clearly lit/active, and **ears**
-   greyed-out — then a state where the ears switch on, labeled "Agent Monitors." Must communicate
-   "two senses present, one missing, now added" in a single glance. This is the hero; make it
-   striking.
+1. **(Moved to a live build — not imagery-agent work.)** The hero visual is now the
+   **outcome-framed listening hub**, built live by the design agent (see Part A → "Hero visual —
+   the listening hub"). The imagery agent's set is **#2–#5** below.
 2. **You are the loop (before → after).** Left: a tired person manually re-asking an agent in a
    repetitive cycle ("any updates? …again? …again?") — the human visibly _is_ the loop. Right: the
    person at ease while a small monitor element catches a change and hands it to the agent, which is
