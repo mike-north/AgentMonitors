@@ -44,7 +44,18 @@ next breath). Do **not** sound like generic SaaS.
 
 **Agents have eyes and hands, but no ears.** They can _look_ (screenshots, browser, computer-use)
 and _act_ (tools), but they have no **involuntary, always-on sense for the world changing around
-them**. Agent Monitors is that missing sense. Lead with this; make it the visual and verbal anchor.
+them**. Agent Monitors is that missing sense.
+
+**But eyes/hands is positioning, not a comprehension crutch — keep it OUT of the hero's critical
+path.** The rendered hero must land for someone who never parses the eyes/hands reference: the
+headline ("Give your agent ears") + the listening hub already do that experientially. Eyes/hands
+does two jobs — (1) a comprehension scaffold, which backfires for anyone who doesn't already hold
+the model, and (2) a **strategic positioning** claim that's genuinely sharp _for our core dev
+audience_ ("eyes = computer-use, hands = MCP/tools — ears is the sense the platforms don't build").
+Use it for job 2 only, as a **positioning beat _after_ the outcomes have hooked them** (outcomes
+earn the category claim, just like they earn mechanism), e.g. a transition into "How it works":
+_"Your agent can already see and act — eyes, and hands. Hearing is the sense it's missing, and the
+one nobody else is building."_ Do not gate the hero on it.
 
 ### Hero section
 
@@ -94,8 +105,11 @@ doubles as "gets the answer, not the homework").
   never depict the agent reaching out to poll (any polling is the invisible daemon, off-stage).
 - **Motion:** animate the resolve + pulse on load (loop subtly or fire once); `prefers-reduced-motion`
   → render one line already resolved + ear lit, no motion.
-- Keep the **`eyes ✓ hands ✓ ears ←`** triad as a small supporting chip in the hero (the category
-  claim), not the centerpiece.
+- Keep the **`eyes ✓ hands ✓ ears ←`** triad only as a **quiet** supporting chip (the ✓✓←
+  pattern reads as "the new third sense" even to someone who can't name what eyes/hands map to) —
+  **never the centerpiece, and cut it from the hero if it competes for attention.** The hero stands
+  on the headline + listening hub; eyes/hands is the positioning beat below, not a hero gate (see
+  "The one idea").
 
 ### Section 2 — "You are the polling loop"
 
