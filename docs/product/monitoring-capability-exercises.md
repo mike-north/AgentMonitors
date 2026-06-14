@@ -98,13 +98,13 @@ tests whether that order holds and where per-agent divergence enters the chain.
 | C43 | **Diff the _derived/rendered_ artifact**, not the raw source — so deltas are semantic and cheap (a new line appears, "urgent" shows up)                                                                                                                                  | Shape→Deliver        | Per-recipient baseline                       | —                         | E8                                 | Foundational _(pins Observe → Shape/render → diff → deliver order)_                                                   |
 | C44 | **Scheduled / windowed rollup** Pace mode (e.g. a 9am daily digest of everything accumulated) — cuts interruption noise _and_ lets observation cadence relax, lowering token + observation cost                                                                          | Pace                 | Shared                                       | Yes (schedule/window)     | CoS rollup _(resolved 2026-06-14)_ | Important                                                                                                             |
 | C45 | Run the cheap **Interpret** stage by invoking the **user's own installed AI tool** (e.g. `claude -p …`) — AM ships **no model and holds no credentials**, inheriting the user's existing **data-governance / compliance** posture                                        | Interpret            | Shared                                       | Yes (which tool)          | E1/E5 _(resolved 2026-06-14)_      | Core _(trust/compliance principle)_                                                                                   |
-| C46 | Turnkey **declarative transform/filter** (jq, CEL) over structured formats (JSON / YAML / TOON / TOML); the author **declares the payload form** (prose \| structured \| artifact \| rendered)                                                                           | Shape/Deliver        | Shared                                       | Yes (transform + form)    | E5/E8 _(resolved 2026-06-14)_      | Important                                                                                                             |
+| C46 | Turnkey **declarative transform/filter** (jq, CEL) over structured formats (JSON / YAML / TOON [Token-Oriented Object Notation] / TOML); the author **declares the payload form** (prose \| structured \| artifact \| rendered)                                          | Shape/Deliver        | Shared                                       | Yes (transform + form)    | E5/E8 _(resolved 2026-06-14)_      | Important                                                                                                             |
 
 ---
 
 ## Synthesis — what to build, in what order
 
-Drawn from Exercises 1–8 (below) and the 43-capability ledger (above). This is the section the fleet
+Drawn from Exercises 1–8 (below) and the capability ledger (above). This is the section the fleet
 should read first; the exercises are the evidence.
 
 ### S1. The pipeline, locked
@@ -131,7 +131,7 @@ Observe / Trigger  →  [Compose]  →  Shape  →  Pace  →  ║seam║  →  
 - **Three independent clocks** (E2): observation latency, Pace (settle/deadline/immediate), and
   per-recipient delivery timing. They compose; they don't conflict.
 
-### S2. Capability areas (the 43, grouped)
+### S2. Capability areas (grouped)
 
 | Area                              | Capabilities                                | One-line                                                                                                                                     |
 | --------------------------------- | ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -547,7 +547,7 @@ react to**, and that's precisely the signal.
 **C24**) — extracting the relevant rows, possibly with cheap interpretation.
 
 **Evaluate the condition — including absence.** The empty branch fires on **non-occurrence**: nobody
-signed up by the bound (**C32**). A change-only monitor _cannot express this_ — you can only see "the
+signed up by the deadline (**C32**). A change-only monitor _cannot express this_ — you can only see "the
 dog didn't bark" by evaluating at a deadline.
 
 **React — and branch on the result (C33).**
