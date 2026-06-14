@@ -7,6 +7,25 @@
 
 ---
 
+## Resolved decisions (2026-06-14) — honor these in Part A & B
+
+Settled with the design agent before the build:
+
+- **Scope:** full one-page landing site (all brief sections), at prototype fidelity — not pixel-perfect; we iterate from the whole narrative.
+- **Variations:** explore **2–3 _hero_ directions side-by-side** first (the make-or-break, highest-risk visual), pick the winner, then build the full page in that direction. Do **not** fork the whole page into 3 versions.
+- **Tweaks panel controls:** theme (light/dark), **hero headline variant**, accent color, display font. _Not_ section density (designer's craft, not a toggle).
+- **Hero headline:** ship the variant toggle; **default-show "Give your agent ears."** with "Your agent can look and act. It can't hear. Until now." as the explanatory variant. **"Stop being the polling loop" is the Section-2 headline, NOT a hero option** (hero = promise; §2 = problem).
+- **Aesthetic:** technical / terminal — monospace accents, schematic, **engineer-warm**; keep minimal-grade restraint/whitespace so it reads premium, not gimmicky-terminal. Wit lives in copy + diagrams, not loud chrome. (Avoid the forgettable Linear/Vercel refined-minimal default.)
+- **Signature accent:** **warm amber / sound-wave gold** — on-metaphor (sound/warmth/the "ears lighting up" glow), engineer-warm on a dark base, and ownable vs. the blue/green/purple dev-tool norm.
+- **Diagram split:** **build live (CSS/SVG, theme-aware)** the schematic ones — fan-out (#3), anatomy (#4), annotated `MONITOR.md` (#5); **leave clean labeled placeholders** for the illustration-grade ones the imagery agent will craft — hero eyes/hands/ears (#1) and the before/after "you are the loop" scene (#2).
+
+### Extra guardrails (additive to §"Hard guardrails" below)
+
+- **No fabricated social proof** — no invented "trusted by" logos, user counts, testimonials, or metrics. (This audience spots and punishes it instantly.)
+- **Honor `prefers-reduced-motion`** — the ears-lighting-up animation needs a still fallback; keyboard-navigable; legible contrast in both themes.
+- **Feel fast and light** — perf signals competence to a dev audience; avoid heavy animation-framework bloat.
+- **No marketing clichés** ("supercharge / revolutionize / unleash"); no stock-photo humans (visual language is schematic/illustrated).
+
 ## Part A — Design agent prompt (React landing site)
 
 **Paste from here ↓**
