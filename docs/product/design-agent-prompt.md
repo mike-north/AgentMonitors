@@ -59,18 +59,35 @@ them**. Agent Monitors is that missing sense. Lead with this; make it the visual
 
 ### Hero visual — the listening hub (outcome-framed, live build)
 
-Replaces the abstract eyes/hands/ears triad as the centerpiece. A short, **typographic** stack of
+Replaces the abstract eyes/hands/ears triad as the centerpiece. A **typographic** stack of several
 **"listening for…" intent lines** (outcomes, not mechanisms) beside an ear glyph with concentric
-amber sound-wave arcs. Most lines sit dim ("listening…"); **on load, one resolves to amber and a
-pulse travels to the ear, which brightens.** Each line reads like a monitor's _body_ — reinforcing
-the model — and it lands "what ears means" in one beat. This fits the mono/engineer-warm aesthetic
-better than icon-nodes.
+amber sound-wave arcs. Each line reads like a monitor's _body_ — reinforcing the model — and it
+lands "what ears means" in one beat. Fits the mono/engineer-warm aesthetic better than icon-nodes.
 
-- **Use developer / chief-of-staff outcomes** (this is the core audience), e.g.:
-  - `listening for the upstream API spec to change…`
-  - `listening for a new CVE in your dependencies…`
-  - `listening for CI to finish…` → resolves to: `CI finished. your agent already knows.`
-  - (others: a PR gets its first review; a watched file changes; a config flag flips)
+**The stack also carries pillar #1 (breadth/scale).** A varied list of recognizable signals shows
+that **one agent can listen to many things at once without getting lost** — the "monitor everything
+that matters" story, shown not told. (Distinct from imagery #3 fan-out, which is _many agents, one
+source_; this is _one agent, many signal types_. Don't blur them.) Use ~5–7 developer /
+chief-of-staff outcomes, e.g.:
+
+- `listening for a code review on your PR…` (GitHub)
+- `listening for a new security advisory…`
+- `listening for a new release of a dependency…`
+- `listening for CI to finish…` (GitHub Actions) → resolves: `CI failed on main. your agent already knows.`
+- `listening for a failed deploy…` (Vercel)
+- `listening for the product spec to change…` (Google Doc)
+- `listening for the eng spec to change on main…` (git remote)
+
+**Choreography — calm at scale, NOT busy (this makes or breaks it):** the promise is that the agent
+_isn't_ overwhelmed, so a simultaneous strobe of 7 signals reads as an alert storm and argues
+against us. Instead: all lines sit **dim and quiet ("listening…")** by default; signals resolve to
+amber **one at a time, gently, staggered** (resolve → settle → next), the eye following a single
+resolution at a time; and the **ear/agent stays steady**, receiving clean _already-resolved_ pulses
+— visibly never piling up or panicking. That steadiness IS the "without getting lost" point (and
+doubles as "gets the answer, not the homework").
+
+- Optional caption (describes the visual — not a fabricated metric): _"One agent. Seven things it's
+  listening for. It speaks up for the one that matters."_
 - **Do NOT use personal-life outcomes here** (the "email from a sender" / "OmniFocus task done"
   examples belong on the ambient #125 page, not the core hero — different audience).
 - **Honesty:** the agent is the **receiver** — outcomes resolve and the pulse travels _to_ the ear;
