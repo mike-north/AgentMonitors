@@ -20,6 +20,11 @@ Settled with the design agent before the build:
 - **Hero (selected 2026-06-14):** Variant **C** (left-aligned, schematic-forward) wins — build it full-page, with **Variant B's subhead**. Replace the abstract eyes/hands/ears triad as the hero centerpiece with the **outcome-framed listening hub** (see Hero visual below); keep the triad only as a small supporting chip (`eyes ✓ hands ✓ ears ←`), the category claim.
 - **Narrative principle — outcomes earn mechanisms:** lead with **outcomes** (the things you get told about) to win attention; _then_ spend that attention on **mechanism** (the `MONITOR.md`, the daemon, the diff) on scroll. Hero = outcome; §3 = how you express it. Never open with mechanism.
 - **Diagram split:** **build live (CSS/SVG, theme-aware)** — the **hero listening hub (#1, now a live build — see Hero visual)**, fan-out (#3), anatomy (#4), annotated `MONITOR.md` (#5). The imagery agent now crafts only the before/after "you are the loop" scene (#2).
+- **Host framing — lead with the mechanism, not one vendor (updated 2026-06-14):** Agent Monitors
+  plugs into the **hooks** that agentic coding tools share — it is **not Claude-Code-only.** Treat
+  **Claude Code, Codex (CLI _and_ macOS desktop app), and Cursor** as the supported set, and frame it as
+  _"works wherever your agent has hooks / a persistent harness."_ De-emphasize single-vendor language
+  everywhere (eyebrow, examples, CTAs, quickstart). No roadmap dates.
 
 ### Extra guardrails (additive to §"Hard guardrails" below)
 
@@ -36,7 +41,7 @@ You are designing a **landing/marketing site** (React prototype, responsive, lig
 **Agent Monitors** — an open, local-first tool that gives AI coding agents a sense they don't have
 yet. The eventual production site is Next.js + Markdoc on Vercel, but produce a clean React
 prototype we can integrate. Audience: **developers who use agentic coding tools** (Claude Code,
-Codex) — technical, skeptical of marketing fluff, but they respond to a sharp idea and a little wit.
+Codex, Cursor — anything with hooks) — technical, skeptical of marketing fluff, but they respond to a sharp idea and a little wit.
 Tone: confident, plain-spoken, a touch playful; credible to engineers (every claim grounded in the
 next breath). Do **not** sound like generic SaaS.
 
@@ -59,7 +64,7 @@ one nobody else is building."_ Do not gate the hero on it.
 
 ### Hero section
 
-- **Eyebrow:** Open-source · local-first · works with Claude Code
+- **Eyebrow:** Open-source · local-first · works with Claude Code, Codex & Cursor
 - **Headline (pick/iterate; A/B these):** "Give your agent ears." / "Your agent can look and act.
   It can't hear. Until now."
 - **Subhead:** "Agent Monitors watches the things you care about — files, APIs, repos, docs, CLIs —
@@ -182,8 +187,9 @@ ear canal. Monitors are the hearing."_
 npm install -g @agentmonitors/cli
 ```
 
-Then: install the plugin, drop a `MONITOR.md`, and the next time something changes your agent hears
-about it. Keep this section short and confidence-building; link to full docs.
+Then: install the integration for your agent (a hook/plugin), drop a `MONITOR.md`, and the next time
+something changes your agent hears about it. Keep this section short and confidence-building; link to
+full docs.
 
 ### Footer / nav
 
@@ -198,6 +204,8 @@ about it. Keep this section short and confidence-building; link to full docs.
 - Agent Monitors **senses and routes**; it does **not** perform actions — the agent acts with its
   own tools. Never imply Agent Monitors "does" things to external systems.
 - No internal codenames, wave numbers, or roadmap dates anywhere in copy.
+- **Don't imply Claude-Code-exclusivity.** Frame host support around the shared **hook** mechanism —
+  Claude Code, Codex (CLI + desktop), Cursor; lead with "works with your agent's hooks."
 - Every metaphor line is followed immediately by a concrete, literal explanation.
 
 **↑ Paste to here.**

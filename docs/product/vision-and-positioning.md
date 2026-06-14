@@ -114,7 +114,7 @@ Two things de-risk this:
 ## Near-term focus
 
 1. Make _time-to-first-signal_ trivial — intent-first authoring, one-command run.
-2. Prove portability with one non-Claude host (Codex first).
+2. Prove portability with non-Claude hosts (Codex and Cursor).
 3. Invest depth in delivery decisioning (the moat), keep source breadth lean.
 4. Resolve the open standard questions, especially a re-observable post-condition language
    for reliable reactions.

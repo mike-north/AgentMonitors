@@ -127,16 +127,17 @@ Ordered by what to lead with, NOT equal weight:
 
 ## 5. Hosts & reach (honest framing)
 
-The no-loop magic depends on a **persistent harness** (a hook or a local daemon). So:
+The no-loop magic depends on a **persistent harness** — the **hooks** that agentic coding tools share,
+backed by a local daemon. So:
 
-- **Today:** Claude Code.
-- **Natural expansion (in-scope — desktop harnesses):** Codex desktop app, Claude Cowork. Each is a
-  new adapter; the daemon + hook/channel model is unchanged. (Vision doc's "Codex first.")
+- **Supported:** the hook-capable agentic coding tools — **Claude Code, Codex (CLI and macOS desktop
+  app), and Cursor.** Each is a thin adapter over the same daemon + hook/channel model; the core is
+  host-agnostic.
 - **Deferred (harness-less hosted web — ChatGPT/Claude on the web):** the only path is an
   agent-waking loop, which contradicts the thesis — **not marketed.** See issue #126.
 
-Site language: _"Works with Claude Code today; built to work wherever your agent has a persistent
-harness — the desktop agents next."_ No dated promises; no "coming soon: web."
+Site language: lead with the shared **hook mechanism**, not a single vendor — _"Works wherever your
+agent has hooks — Claude Code, Codex, and Cursor."_ No "coming soon: web."
 
 ## 6. Voice & honesty guardrails
 
