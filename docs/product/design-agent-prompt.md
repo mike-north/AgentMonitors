@@ -157,3 +157,37 @@ palette and iconography across all five so they read as a set.
 
 Deliver each as a standalone asset (transparent or theme-aware background) sized for web hero/section
 use; provide light and dark variants where contrast matters (shots 1 and 4 especially).
+
+---
+
+## Part C — Terminal style guide (one palette, shared by the site's terminal mockups AND the real CLI)
+
+The site uses a technical/terminal aesthetic and will render fake-terminal blocks; the real
+`agentmonitors` CLI is also the first-five-minutes surface. Define **one** terminal styling spec so
+both match — a warm-amber "a monitor fired" line in the user's terminal should echo the site's "ears
+lighting up." Deliver a **one-page spec** (palette + conventions + a sample of real output styled),
+not a CLI redesign. The design agent _proposes_ this; eng implements it later in `apps/cli`.
+
+**Produce:**
+
+- The signature **amber/gold accent as a terminal-safe color**, with fallbacks down the tiers
+  (truecolor → 256 → 16). Plus semantic colors: success, warning, error, and a dim/secondary.
+- The **signal-moment styling** — how "a monitor fired / here's what changed" reads in the terminal
+  (the CLI echo of "ears lighting up"); used sparingly, this is where the accent earns its keep.
+- **Glyph/typographic conventions** consistent with the site's schematic feel. Reuse the existing
+  `monitor explain` glyphs — `✓` ok, `○` healthy/idle, `✗` failure — and tint, don't replace.
+- A worked **sample**: a styled `monitor explain` verdict and a `daemon` tick line, shown in both a
+  light- and dark-background terminal.
+
+**Terminal constraints — these are correctness rules, not taste; violating them breaks the CLI:**
+
+- **Honor `NO_COLOR`** (any value present ⇒ no color) and emit **zero ANSI codes when stdout is not a
+  TTY** (piped/redirected).
+- **`--format json` output is never colored**, TTY or not — it is machine-parsed.
+- **Degrade gracefully** truecolor → 256 → 16 → none; pick sane ANSI fallbacks for amber.
+- **Legible on light _and_ dark** terminal backgrounds (a pale gold dies on white — choose a
+  mid/deep amber).
+- **Never rely on color alone** — glyph + label carry the meaning; color only reinforces (colorblind
+  and `NO_COLOR` users lose nothing).
+- **Restraint** — most output stays default foreground; accent is for the signal moment + key
+  glyphs, not everywhere.
