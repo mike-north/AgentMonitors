@@ -392,8 +392,9 @@ Each stage carries a `status` of `ok`, `pending`, `healthy`, or `failure`:
   expected absence of events/projections. The verdict for a genuinely idle monitor is therefore an
   affirmative `healthy` at the observation stage (e.g. "Source ran, observed 0 changes — your watched
   target genuinely hasn't changed (not a bug).").
-- `failure` — a real fault: invalid definition, errored observe, missing expected projection, or an
-  unreachable daemon.
+- `failure` — a real fault: invalid definition, errored observe, or a missing expected projection.
+  (An unreachable daemon is **not** itself a stage failure: the CLI falls back to an in-process read
+  of the persisted store — see the no-daemon fallback below.)
 
 The method MUST NOT mutate runtime state. **It MUST scope to the requested workspace.** The inbox DB
 is global (not per-workspace), so the same `monitorId` can exist in multiple workspaces; the
@@ -401,11 +402,16 @@ materialization stage filters `monitor_events` to `workspacePath` (plus workspac
 and the delivery stage filters projections to that workspace's sessions (plus global sessions), so
 one workspace's report never counts another workspace's events or projections. If events exist but
 there is no lead session matching the workspace (including global sessions), the delivery stage
-reports that no lead session is registered. If the daemon socket is unavailable, the CLI fallback may
-still validate the local definition and then report scheduling as failed because the daemon is not
-running. The fallback fires **only** for a genuine connection failure (socket refused/absent or
-request timeout); a daemon-side application error is surfaced verbatim rather than masked as "daemon
-not running".
+reports that no lead session is registered. If the daemon socket is unavailable, the CLI does **not**
+fabricate a scheduling failure: because `explainMonitor` is a pure read over the persisted store, the
+CLI runs the **same** method in-process against the local SQLite DB (`explainMonitorInProcess`) and
+returns the real per-stage diagnosis built from the last persisted tick (#150). A monitor that fired
+before the daemon stopped is therefore diagnosed truthfully — never reported as a false scheduling
+failure. Only when the daemon is unreachable **and** the store holds no persisted state for the
+monitor (no `observation_history` and no `monitor_events` rows) does the CLI emit an actionable
+remediation message instead of a report ([005 §6](./005-cli-reference.md)). The in-process fallback
+fires **only** for a genuine connection failure (socket refused/absent or request timeout); a
+daemon-side application error is surfaced verbatim rather than masked as "daemon not running".
 
 ## 11. Agent Integration (Adapters)
 

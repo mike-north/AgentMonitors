@@ -4,11 +4,8 @@ import { setTimeout } from 'node:timers/promises';
 import { Command, Option } from 'commander';
 import {
   parseMonitor,
-  scanMonitors,
   SourceRegistry,
-  validateScope,
   type MonitorExplainReport,
-  type MonitorExplainStage,
   type MonitorExplainStageId,
   type MonitorExplainStageStatus,
   type ObservationContext,
@@ -20,8 +17,26 @@ import { reportError } from '../output.js';
 import { DaemonConnectionError } from '../daemon-ipc.js';
 import {
   explainMonitorClient,
+  explainMonitorInProcess,
   listObservationHistoryClient,
+  listObservationHistoryInProcess,
 } from '../runtime-client.js';
+
+/**
+ * Banner shown when `monitor explain` / `monitor history` fall back to reading
+ * the persisted SQLite store because no daemon is reachable. Issue #150.
+ */
+const NO_DAEMON_BANNER =
+  'No daemon running — showing persisted state from the last tick.';
+
+/**
+ * Actionable remediation shown when the daemon is down AND there is genuinely
+ * nothing persisted to read (no DB rows for the monitor). Replaces the raw Node
+ * `connect ENOENT …` error, which gave the author no next step. Issue #150,
+ * PM decision (b)(i).
+ */
+const NO_DAEMON_REMEDIATION =
+  'No daemon running and no persisted state to show. Start it with `agentmonitors daemon run`, or use `agentmonitors monitor test <path>` for a one-shot check.';
 
 export const monitorTestCommand = new Command('monitor').description(
   'Monitor utilities',
@@ -35,63 +50,6 @@ const EXPLAIN_STAGE_LABELS: Record<MonitorExplainStageId, string> = {
   materialization: 'Materialization',
   delivery: 'Projection and delivery',
 };
-
-function monitorIdFromFilePath(filePath: string): string {
-  const base = path.basename(filePath);
-  return base === 'MONITOR.md'
-    ? path.basename(path.dirname(filePath))
-    : path.parse(filePath).name;
-}
-
-function explainStage(
-  id: MonitorExplainStageId,
-  status: MonitorExplainStageStatus,
-  reason: string,
-  details?: Record<string, unknown>,
-): MonitorExplainStage {
-  return {
-    id,
-    label: EXPLAIN_STAGE_LABELS[id],
-    status,
-    reason,
-    ...(details ? { details } : {}),
-  };
-}
-
-/**
- * Severity rank for explain stage statuses. Higher = more severe.
- * A healthy/ok stage must NEVER mask a downstream failure or pending.
- * Ranking: failure(3) > pending(2) > healthy(1) > ok(0).
- * Keep in sync with the identical ranking in libs/core/src/runtime/service.ts.
- */
-const STAGE_STATUS_SEVERITY: Record<MonitorExplainStageStatus, number> = {
-  ok: 0,
-  healthy: 1,
-  pending: 2,
-  failure: 3,
-};
-
-function explainVerdict(stages: MonitorExplainStage[]) {
-  // Select the highest-severity stage. failure > pending > healthy > ok.
-  // Using `find(status !== 'ok')` was the regression introduced in #98: a
-  // healthy Observation stage (status='healthy', not 'ok') would short-circuit
-  // and mask a downstream failure or pending (#149).
-  let worst: MonitorExplainStage | undefined;
-  for (const stage of stages) {
-    if (
-      worst === undefined ||
-      STAGE_STATUS_SEVERITY[stage.status] > STAGE_STATUS_SEVERITY[worst.status]
-    ) {
-      worst = stage;
-    }
-  }
-  const stage = worst ?? stages[stages.length - 1];
-  return {
-    status: stage?.status ?? 'ok',
-    stage: stage?.id ?? 'delivery',
-    reason: stage?.reason ?? 'Monitor delivered successfully.',
-  };
-}
 
 function statusGlyph(status: MonitorExplainStageStatus): string {
   if (status === 'ok') return '✓';
@@ -110,97 +68,6 @@ function printExplainText(report: MonitorExplainReport): void {
   console.log(
     `Verdict: ${report.verdict.status} at ${EXPLAIN_STAGE_LABELS[report.verdict.stage]} - ${report.verdict.reason}`,
   );
-}
-
-async function buildDaemonUnavailableReport(input: {
-  monitorId: string;
-  monitorsDir: string;
-  workspacePath?: string;
-  errorMessage: string;
-}): Promise<MonitorExplainReport> {
-  const generatedAt = new Date();
-  const stages: MonitorExplainStage[] = [];
-  const scan = await scanMonitors(input.monitorsDir);
-  const parseError = scan.errors.find(
-    (error) => monitorIdFromFilePath(error.filePath) === input.monitorId,
-  );
-  const monitor = scan.monitors.find(
-    (candidate) => candidate.monitor.id === input.monitorId,
-  )?.monitor;
-
-  if (parseError) {
-    stages.push(
-      explainStage(
-        'definition',
-        'failure',
-        `MONITOR.md failed to parse or validate: ${parseError.error}`,
-        { filePath: parseError.filePath },
-      ),
-    );
-  } else if (!monitor) {
-    stages.push(
-      explainStage(
-        'definition',
-        'failure',
-        `Monitor "${input.monitorId}" was not found in ${input.monitorsDir}.`,
-      ),
-    );
-  } else {
-    const registry = new SourceRegistry();
-    registerCoreSources(registry);
-    const sourceName = monitor.frontmatter.watch.type;
-    const source = registry.get(sourceName);
-    const { type: _type, ...monitorWatchConfig } = monitor.frontmatter.watch;
-    const scopeErrors = source
-      ? validateScope(monitorWatchConfig, source.scopeSchema)
-      : [`Unknown source "${sourceName}".`];
-    stages.push(
-      scopeErrors.length === 0
-        ? explainStage('definition', 'ok', 'Monitor definition is valid.', {
-            filePath: monitor.filePath,
-            sourceName,
-          })
-        : explainStage(
-            'definition',
-            'failure',
-            `Monitor definition is invalid: ${scopeErrors.join('; ')}`,
-            { filePath: monitor.filePath, sourceName },
-          ),
-    );
-  }
-
-  if (stages[0]?.status === 'ok') {
-    stages.push(
-      explainStage(
-        'scheduling',
-        'failure',
-        `The daemon is not running or unreachable: ${input.errorMessage}`,
-        { workspacePath: input.workspacePath },
-      ),
-    );
-  }
-
-  return {
-    monitorId: input.monitorId,
-    generatedAt,
-    ...(monitor
-      ? {
-          monitor: {
-            id: monitor.id,
-            displayName: monitor.displayName,
-            filePath: monitor.filePath,
-            sourceName: monitor.frontmatter.watch.type,
-            urgency: monitor.frontmatter.urgency,
-          },
-        }
-      : {}),
-    stages,
-    verdict: explainVerdict(stages),
-    observations: [],
-    events: [],
-    projections: [],
-    leadSessions: [],
-  };
 }
 
 /** Format observations as JSON output. */
@@ -459,16 +326,77 @@ monitorTestCommand
           reportError(`Explain failed: ${message}`, json);
           return;
         }
-        const report = await buildDaemonUnavailableReport({
+        // The daemon is unreachable. A read-only diagnosis tool must not require
+        // a live daemon: read the persisted SQLite store in-process and run the
+        // SAME explain the daemon would (issue #150, PM decision (a)). This gives
+        // the real per-stage diagnosis from the last tick — NOT a false
+        // "✗ Scheduling: failure" for a monitor that actually fired.
+        const report = await explainMonitorInProcess({
           monitorId,
           monitorsDir,
           workspacePath,
-          errorMessage: message,
+          ...(Number.isFinite(historyLimit) && historyLimit > 0
+            ? { historyLimit }
+            : {}),
+          ...(Number.isFinite(eventLimit) && eventLimit > 0
+            ? { eventLimit }
+            : {}),
         });
-        if (json) {
-          console.log(JSON.stringify(report, null, 2));
+
+        // Decide how to surface the in-process report based on what it contains.
+        //
+        // Three cases:
+        //
+        // (A) Definition stage is not 'ok' (parse error, monitor not found,
+        //     duplicate ID, unknown source, …). The report carries the exact
+        //     failure the author needs. Show it WITHOUT the no-daemon banner —
+        //     there is no persisted state involved; the banner would be
+        //     misleading. Exit 0 (mirrors the live-daemon path).
+        //
+        // (B) Definition stage is 'ok' AND there IS persisted state (observation
+        //     history or materialized events). The report is a real diagnosis from
+        //     the last tick. Show it WITH the no-daemon banner so the author knows
+        //     it came from the store, not a live daemon. Exit 0.
+        //
+        // (C) Definition stage is 'ok' AND nothing has been persisted (no
+        //     observations, no events). The daemon is down and nothing has ever
+        //     ticked. Show the actionable remediation line (issue #150, PM
+        //     decision (b)(i)) — not a raw ENOENT. Exit 1.
+        //     NOTE: a definition-failure report must never be replaced by the
+        //     remediation message; definition failures reach case (A).
+        const definitionStage = report.stages.find(
+          (stage) => stage.id === 'definition',
+        );
+        const definitionOk = definitionStage?.status === 'ok';
+        const hasPersistedState =
+          report.observations.length > 0 || report.events.length > 0;
+
+        if (!definitionOk) {
+          // Case (A): definition failure — show report, no banner.
+          if (json) {
+            console.log(JSON.stringify(report, null, 2));
+            return;
+          }
+          printExplainText(report);
           return;
         }
+
+        if (!hasPersistedState) {
+          // Case (C): definition ok, nothing persisted — remediation only.
+          reportError(NO_DAEMON_REMEDIATION, json);
+          return;
+        }
+
+        // Case (B): definition ok, persisted state exists — show report + banner.
+        if (json) {
+          // Preserve the full report and annotate that it came from the
+          // persisted-state fallback (the daemon was not reached).
+          console.log(
+            JSON.stringify({ notice: NO_DAEMON_BANNER, ...report }, null, 2),
+          );
+          return;
+        }
+        console.log(NO_DAEMON_BANNER);
         printExplainText(report);
       }
     },
@@ -493,13 +421,14 @@ monitorTestCommand
       options: { socket?: string; limit: string; format: string },
     ) => {
       const json = options.format === 'json';
+      const limit = Number.parseInt(options.limit, 10);
+      const query = {
+        ...(monitorId ? { monitorId } : {}),
+        ...(Number.isFinite(limit) && limit > 0 ? { limit } : {}),
+      };
       try {
-        const limit = Number.parseInt(options.limit, 10);
         const records = await listObservationHistoryClient(
-          {
-            ...(monitorId ? { monitorId } : {}),
-            ...(Number.isFinite(limit) && limit > 0 ? { limit } : {}),
-          },
+          query,
           options.socket,
         );
 
@@ -518,7 +447,33 @@ monitorTestCommand
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        reportError(`History failed: ${message}`, json);
+        // Only fall back to the in-process DB read when the daemon was genuinely
+        // unreachable. A daemon-side application error must surface verbatim
+        // (mirrors `monitor explain`; the #94/#98 distinction must hold).
+        if (!(err instanceof DaemonConnectionError)) {
+          reportError(`History failed: ${message}`, json);
+          return;
+        }
+        // The daemon is unreachable. Read observation history directly from the
+        // persisted SQLite store in-process (issue #150, PM decision (a)) —
+        // history is read-only durable state and shouldn't need a live daemon.
+        const records = listObservationHistoryInProcess(query);
+        if (records.length === 0) {
+          // Daemon down AND nothing persisted → actionable remediation, not a
+          // raw ENOENT (issue #150, PM decision (b)(i)).
+          reportError(NO_DAEMON_REMEDIATION, json);
+          return;
+        }
+        if (json) {
+          console.log(JSON.stringify(records, null, 2));
+          return;
+        }
+        console.log(NO_DAEMON_BANNER);
+        for (const record of records) {
+          console.log(
+            `${String(record.createdAt)}  ${record.result.padEnd(10)}  ${record.monitorId}  (${record.sourceName})`,
+          );
+        }
       }
     },
   );
