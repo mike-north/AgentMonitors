@@ -1,7 +1,7 @@
 {
   "name": "@agentmonitors/cli",
   "description": "CLI for Agent Monitors — validate, scan, query, and manage observation inboxes",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "publishConfig": {
     "registry": "https://registry.npmjs.org",
     "access": "public"
