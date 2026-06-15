@@ -91,6 +91,8 @@ Each monitor has persisted runtime state containing: `lastObservationAt`, `sourc
 
 This split is important: source plugins own change-detection state, while the runtime owns notification timing behavior.
 
+**Restart-safety / upgrade backfill (issue #109):** When a persisted `notifyState.pendingDebounce` batch is hydrated on daemon restart, envelopes written before the range-urgency upgrade may lack an `effectiveUrgency` field. The runtime **MUST** backfill it on hydration using `effectiveObservationUrgency(monitor, observation)` so that the materialized `monitor_events.urgency` row is never written with an undefined value. `effectiveObservationUrgency` degrades cleanly when the hydrated monitor snapshot itself lacks `urgencyMax` (old monitor): the `URGENCY_BY_RANK[NaN] ?? lo` fallback returns the monitor's base urgency.
+
 Verified: `libs/core/src/runtime/types.ts` — `MonitorRuntimeState` (lines 131–135); `libs/core/src/inbox/schema.ts` — `monitorState` table (lines 98–105).
 
 ## 4. Notify Dispatch

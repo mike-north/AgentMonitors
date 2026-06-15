@@ -142,7 +142,16 @@ function effectiveObservationUrgency(
   observation: Observation,
 ): Urgency {
   const lo = monitor.frontmatter.urgency;
-  const hi = monitor.frontmatter.urgencyMax;
+  // `urgencyMax` may be absent on a monitor snapshot hydrated from pre-upgrade
+  // persisted state (before the range-urgency change was deployed). Treat a
+  // missing value as a degenerate band (`hi === lo`) — the observation can never
+  // escalate, and we return the base urgency. This is the same semantics as a
+  // bare scalar urgency (full backward compat). See 002 §3 restart-safety note.
+  // The cast to `Urgency | undefined` is intentional: at compile time
+  // `MonitorFrontmatter.urgencyMax` is always `Urgency`, but pre-upgrade
+  // deserialized JSON may lack the field entirely.
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+  const hi = (monitor.frontmatter.urgencyMax as Urgency | undefined) ?? lo;
   const desired = observation.salience ?? lo;
   const rank = Math.min(
     Math.max(URGENCY_RANK[desired], URGENCY_RANK[lo]),
@@ -175,7 +184,19 @@ function hydrateStoredObservationEnvelope(
       envelope.observedAt instanceof Date
         ? envelope.observedAt
         : new Date(envelope.observedAt),
-    effectiveUrgency: envelope.effectiveUrgency,
+    // Restart-safety / upgrade backfill (002 §3, issue #109): a debounce batch
+    // persisted BEFORE the range-urgency upgrade will have no `effectiveUrgency`
+    // field on its envelopes. Recompute it from the envelope's `monitor` +
+    // `observation` so the materialized event row is never written with
+    // `undefined` urgency. `effectiveObservationUrgency` degrades cleanly when
+    // the hydrated monitor snapshot itself lacks `urgencyMax` (old monitor).
+    // The cast to `Urgency | undefined` is intentional: at compile time
+    // `StoredObservationEnvelope.effectiveUrgency` is always `Urgency`, but
+    // pre-upgrade deserialized JSON may lack the field entirely.
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+    effectiveUrgency:
+      (envelope.effectiveUrgency as Urgency | undefined) ??
+      effectiveObservationUrgency(envelope.monitor, envelope.observation),
   };
 }
 

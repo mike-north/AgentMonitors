@@ -882,6 +882,128 @@ Handle it.
     }
   });
 
+  // Regression: restart-safety after range-urgency upgrade (issue #109).
+  //
+  // A daemon persisted a `notifyState.pendingDebounce` batch BEFORE the
+  // range-urgency upgrade shipped (i.e. the envelope objects have no
+  // `effectiveUrgency` field). On the next restart, `hydrateStoredObservationEnvelope`
+  // used to pass `effectiveUrgency: envelope.effectiveUrgency` straight through,
+  // yielding `undefined`. That `undefined` flowed to `processObservation` and
+  // was written as the event's `urgency`, producing an invalid DB row.
+  //
+  // The fix: backfill with `effectiveObservationUrgency(monitor, observation)` when
+  // the field is absent. This also degrades cleanly when the persisted monitor
+  // snapshot itself lacks `urgencyMax` (old monitor): `URGENCY_BY_RANK[NaN] ?? lo`
+  // returns the base urgency (`lo`).
+  it('backfills effectiveUrgency on hydration of a pre-upgrade debounce batch (restart-safety, issue #109)', async () => {
+    vi.useFakeTimers();
+    const T0 = new Date('2026-01-15T10:00:00.000Z');
+    vi.setSystemTime(T0);
+    try {
+      const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-upgrade-'));
+      tempDirs.push(rootDir);
+      // A plain `normal` monitor — degenerate band — to match a pre-upgrade
+      // monitor snapshot that has no `urgencyMax` field.
+      const monitorsDir = createMonitorFile(
+        rootDir,
+        'upgrade-source',
+        'normal',
+        'Handle it.',
+        "  interval: '1s'\nnotify:\n  strategy: debounce\n  settle-for: 30s\n",
+      );
+
+      const source: ObservationSource = {
+        name: 'upgrade-source',
+        scopeSchema: { type: 'object', properties: {} },
+        stateful: true,
+        // Returns no observations — the only emission on the flush tick is the
+        // pre-seeded, pre-upgrade persisted batch.
+        async observe(): Promise<ObservationResult> {
+          return { observations: [], nextState: {} };
+        },
+      };
+
+      // Build the runtime with a concrete DB so we can seed state directly.
+      const db = createDb(':memory:');
+      const registry = new SourceRegistry();
+      registry.register(source);
+      const store = new RuntimeStore(db);
+      const runtime = new AgentMonitorRuntime(store, registry, [
+        claudeCodeAdapter,
+      ]);
+
+      const session = runtime.openSession(
+        claudeCodeAdapter.createSessionInput({
+          hostSessionId: 'claude-session-upgrade',
+          workspacePath: rootDir,
+        }),
+      );
+
+      // Seed a pre-upgrade persisted debounce batch: observation envelope without
+      // `effectiveUrgency` (field is deliberately absent — simulates state
+      // serialized before the range-urgency change was deployed).
+      // `dueAt` is in the past relative to the tick time below so the batch flushes.
+      const preUpgradeEnvelope = {
+        monitor: {
+          id: 'test-monitor',
+          displayName: 'Test monitor',
+          // Old monitor snapshot: frontmatter has `urgency` but no `urgencyMax`.
+          frontmatter: {
+            name: 'Test monitor',
+            watch: { type: 'upgrade-source' },
+            urgency: 'normal',
+            // `urgencyMax` intentionally absent — simulates pre-upgrade snapshot.
+          },
+          instructions: 'Handle it.',
+          filePath: path.join(
+            rootDir,
+            '.claude',
+            'monitors',
+            'test-monitor',
+            'MONITOR.md',
+          ),
+        },
+        observation: {
+          title: 'Pre-upgrade observation',
+          summary: 'Pre-upgrade observation',
+          // `salience` absent — simulates pre-upgrade observation.
+        },
+        observedAt: T0.toISOString(),
+        // `effectiveUrgency` intentionally absent — the key pre-upgrade condition.
+      };
+
+      store.setMonitorState('test-monitor', {
+        notifyState: {
+          pendingDebounce: {
+            observations: [preUpgradeEnvelope],
+            // dueAt is 1ms before the tick time (advance below) so it expires.
+            dueAt: new Date(T0.getTime() + 999).toISOString(),
+          },
+        },
+      });
+
+      // Advance past the dueAt so the batch is eligible to flush.
+      vi.advanceTimersByTime(1_000);
+
+      // Run a tick — the source returns no new observations, but the persisted
+      // batch is now due and must flush through hydrateStoredObservationEnvelope.
+      const tick = await runtime.tick(monitorsDir, rootDir);
+      expect(tick.emittedEventIds).toHaveLength(1);
+
+      // The materialized event MUST have a valid urgency, never `undefined`.
+      // For a pre-upgrade plain-normal monitor with no salience, effective
+      // urgency degrades to the base urgency: `normal`.
+      const events = runtime.listEvents({
+        sessionId: session.id,
+        unreadOnly: true,
+      });
+      expect(events).toHaveLength(1);
+      expect(events[0]?.urgency).toBe('normal');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('projects events only into matching workspace sessions and supports scope filters', () => {
     const workspaceA = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-a-'));
     const workspaceB = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-b-'));
