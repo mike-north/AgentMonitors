@@ -1,6 +1,7 @@
 import { Command, Option } from 'commander';
 import { SourceRegistry } from '@agentmonitors/core';
 import { registerCoreSources } from '../sources.js';
+import { renderToon } from '../toon-format.js';
 
 export const sourceCommand = new Command('source').description(
   'Manage observation source plugins',
@@ -11,8 +12,8 @@ sourceCommand
   .description('List installed observation sources')
   .addOption(
     new Option('--format <format>', 'Output format')
-      .choices(['text', 'json'])
-      .default('text'),
+      .choices(['toon', 'json', 'text'])
+      .default('toon'),
   )
   .action((options: { format: string }) => {
     const registry = new SourceRegistry();
@@ -20,7 +21,7 @@ sourceCommand
 
     const sources: ReturnType<SourceRegistry['list']> = registry.list();
 
-    if (options.format === 'json') {
+    if (options.format === 'json' || options.format === 'toon') {
       const output = sources.map((source) => {
         const requiredFields =
           (source.scopeSchema['required'] as string[] | undefined) ?? [];
@@ -36,7 +37,11 @@ sourceCommand
           required: requiredFields,
         };
       });
-      console.log(JSON.stringify(output, null, 2));
+      if (options.format === 'json') {
+        console.log(JSON.stringify(output, null, 2));
+      } else {
+        console.log(renderToon(output));
+      }
       return;
     }
 

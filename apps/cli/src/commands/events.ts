@@ -1,5 +1,6 @@
 import { Command, Option } from 'commander';
 import { reportError } from '../output.js';
+import { renderToon } from '../toon-format.js';
 import {
   acknowledgeEventsClient,
   listEventsClient,
@@ -46,8 +47,8 @@ eventsCommand
   .option('--since-baseline', 'Only include events since the session baseline')
   .addOption(
     new Option('--format <format>', 'Output format')
-      .choices(['text', 'json'])
-      .default('text'),
+      .choices(['toon', 'json', 'text'])
+      .default('toon'),
   )
   .action(
     async (options: {
@@ -79,6 +80,11 @@ eventsCommand
           console.log(JSON.stringify(events, null, 2));
           return;
         }
+        if (options.format === 'toon') {
+          console.log(renderToon(events));
+          return;
+        }
+        // text format
         if (events.length === 0) {
           console.log('No events found.');
           return;

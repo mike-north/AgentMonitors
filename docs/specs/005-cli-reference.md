@@ -12,6 +12,22 @@ The binary is named **`agentmonitors`** and is described as _"Durable observatio
 
 Per AP6, all public CLI behaviour must be derivable from core contracts. The CLI wraps `@agentmonitors/core` and four bundled source packages (`@agentmonitors/source-file-fingerprint`, `@agentmonitors/source-api-poll`, `@agentmonitors/source-schedule`, `@agentmonitors/source-incoming-changes`).
 
+### Output formats (`--format`)
+
+Structured-output commands — `events list`, `scan`, `monitor history`, `monitor explain`, and `source list` — support three output formats via `--format`:
+
+| Value  | Description                                                                                                                                                                                                                                                                |
+| ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `toon` | **Default.** TOON (Token-Oriented Object Notation) — a compact, human-readable encoding optimised for agent context windows. Losslessly encodes the same data model as JSON with ~40% fewer tokens for typical monitor output shapes. Uses `@toon-format/toon` `encode()`. |
+| `json` | JSON (`JSON.stringify(value, null, 2)`). **Byte-for-byte unchanged** — always produces identical output to the pre-toon behaviour. All existing JSON consumers and tests are unaffected.                                                                                   |
+| `text` | Human-readable plain text (columnar tables, one record per line). Intended for interactive terminal use by authors.                                                                                                                                                        |
+
+**Design invariants:**
+
+- TOON is a **terminal rendering transform only** — durable storage (SQLite `monitor_events`, snapshots, source state, hook-state files) and the daemon IPC wire remain JSON everywhere.
+- `--format json` is never changed. Adding `toon` as the new default is purely additive from a JSON consumer's perspective.
+- TOON round-trips losslessly: `decode(encode(value))` equals the original JSON value. Tests assert this property for every structured-output command.
+
 ### In-process vs. socket commands
 
 Commands divide into two transport modes:
@@ -177,16 +193,18 @@ Finds and lists all `MONITOR.md` files in a directory without performing validat
 agentmonitors scan [dir] [options]
 ```
 
-| Argument / Flag     | Type                  | Default            | Description                   |
-| ------------------- | --------------------- | ------------------ | ----------------------------- |
-| `[dir]`             | positional (optional) | `.claude/monitors` | Directory to scan             |
-| `--format <format>` | option (choices)      | `text`             | Output format: `text`, `json` |
+| Argument / Flag     | Type                  | Default            | Description                           |
+| ------------------- | --------------------- | ------------------ | ------------------------------------- |
+| `[dir]`             | positional (optional) | `.claude/monitors` | Directory to scan                     |
+| `--format <format>` | option (choices)      | `toon`             | Output format: `toon`, `json`, `text` |
 
 ### Output
 
 **Text format:** a columnar table with headers `ID`, `Name`, `Source`, `Urgency` (column widths 30, 40, 20, open). If parse errors occurred, appends `<n> file(s) failed to parse.`
 
 If no monitors and no errors: prints `No monitors found.`
+
+**TOON format (`--format toon`, default):** encodes the same data model as the JSON format using `@toon-format/toon` `encode()`. Decodes losslessly back to the identical JSON value.
 
 **JSON format (`--format json`):**
 
@@ -364,14 +382,14 @@ for a one-shot check."_ — and exits 1, rather than a raw Node `connect ENOENT 
 `History failed: <message>`, never masked as "daemon not running" (the #94/#98 distinction holds).
 
 ```
-agentmonitors monitor history [monitorId] [--socket <path>] [--limit <n>] [--format <text|json>]
+agentmonitors monitor history [monitorId] [--socket <path>] [--limit <n>] [--format <toon|text|json>]
 ```
 
-| Argument / Flag | Default | Description                         |
-| --------------- | ------- | ----------------------------------- |
-| `[monitorId]`   | —       | Filter to a single monitor id       |
-| `--limit <n>`   | `50`    | Maximum rows (newest first)         |
-| `--format`      | `text`  | `text` (one row per line) or `json` |
+| Argument / Flag | Default | Description                                            |
+| --------------- | ------- | ------------------------------------------------------ |
+| `[monitorId]`   | —       | Filter to a single monitor id                          |
+| `--limit <n>`   | `50`    | Maximum rows (newest first)                            |
+| `--format`      | `toon`  | `toon` (default), `text` (one row per line), or `json` |
 
 Each row reports `result` — `triggered` (≥1 observation became an event), `suppressed` (observations
 returned but none emitted this tick), `no-change` (the source returned nothing), `errored` (the
@@ -390,18 +408,18 @@ recent `observation_history`, `monitor_state.notify_state`, `monitor_events`, an
 `session_event_state` projection rows.
 
 ```
-agentmonitors monitor explain <monitorId> [--dir <path>] [--workspace <path>] [--socket <path>] [--history-limit <n>] [--event-limit <n>] [--format <text|json>]
+agentmonitors monitor explain <monitorId> [--dir <path>] [--workspace <path>] [--socket <path>] [--history-limit <n>] [--event-limit <n>] [--format <toon|text|json>]
 ```
 
-| Argument / Flag       | Default             | Description                                    |
-| --------------------- | ------------------- | ---------------------------------------------- |
-| `<monitorId>`         | —                   | Monitor id to diagnose                         |
-| `--dir <path>`        | `.claude/monitors`  | Directory containing monitor definitions       |
-| `--workspace <path>`  | current working dir | Workspace path used for session projection     |
-| `--socket <path>`     | resolved default    | Unix domain socket path for the daemon         |
-| `--history-limit <n>` | `10`                | Observation history rows included in JSON      |
-| `--event-limit <n>`   | `10`                | Materialized event rows included in JSON       |
-| `--format`            | `text`              | `text` (stage summary) or `json` (full report) |
+| Argument / Flag       | Default             | Description                                                       |
+| --------------------- | ------------------- | ----------------------------------------------------------------- |
+| `<monitorId>`         | —                   | Monitor id to diagnose                                            |
+| `--dir <path>`        | `.claude/monitors`  | Directory containing monitor definitions                          |
+| `--workspace <path>`  | current working dir | Workspace path used for session projection                        |
+| `--socket <path>`     | resolved default    | Unix domain socket path for the daemon                            |
+| `--history-limit <n>` | `10`                | Observation history rows included in structured output            |
+| `--event-limit <n>`   | `10`                | Materialized event rows included in structured output             |
+| `--format`            | `toon`              | `toon` (default), `text` (stage summary), or `json` (full report) |
 
 Text output prints one line per stage with a status glyph, followed by a verdict:
 
@@ -492,13 +510,15 @@ command arguments remain normal CLI errors.
 agentmonitors source list [--format <format>]
 ```
 
-| Flag                | Type    | Default | Description    |
-| ------------------- | ------- | ------- | -------------- |
-| `--format <format>` | choices | `text`  | `text`, `json` |
+| Flag                | Type    | Default | Description            |
+| ------------------- | ------- | ------- | ---------------------- |
+| `--format <format>` | choices | `toon`  | `toon`, `json`, `text` |
 
 Lists all sources registered via `registerCoreSources()` (currently: `file-fingerprint`, `api-poll`, `schedule`, `incoming-changes`).
 
-**Text output:**
+**TOON format (`--format toon`, default):** encodes the source list using `@toon-format/toon` `encode()`. Decodes losslessly to the JSON value below.
+
+**Text output (`--format text`):**
 
 ```
 Installed sources:
@@ -508,7 +528,7 @@ Installed sources:
     Required: <field1>, ... (or "(none)")
 ```
 
-**JSON output:**
+**JSON output (`--format json`):**
 
 ```json
 [
@@ -883,11 +903,13 @@ agentmonitors events list --session <id> [options]
 | `--scope <pairs>`     | string              | —                | Scope filters as `key=value,key2=value2`       |
 | `--unread`            | boolean flag        | —                | Only unread events                             |
 | `--since-baseline`    | boolean flag        | —                | Only events since the session baseline         |
-| `--format <format>`   | choices             | `text`           | `text`, `json`                                 |
+| `--format <format>`   | choices             | `toon`           | `toon`, `json`, `text`                         |
 
-**Text output:** one line per event: `<id>  <monitorId>  <urgency>  <title>`
+**TOON output (default):** encodes the `MonitorEventRecord[]` array using `@toon-format/toon` `encode()`. Decodes losslessly to the JSON value.
 
-**JSON output:** `MonitorEventRecord[]` array.
+**Text output (`--format text`):** one line per event: `<id>  <monitorId>  <urgency>  <title>`
+
+**JSON output (`--format json`):** `MonitorEventRecord[]` array.
 
 **Scope parsing:** the `--scope` value is split on `,`, then each segment is split on `=` to build a `Record<string, string>`. Segments that cannot be parsed as `key=value` are silently dropped.
 

@@ -20,6 +20,7 @@ import { spawn } from 'node:child_process';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { writeLocalState } from '../local-state.js';
 import { daemonAvailable, callDaemon } from '../daemon-ipc.js';
+import { decodeToon } from '../toon-format.js';
 
 const CLI_PATH = path.resolve(__dirname, '../../dist/index.cjs');
 const CLI_PACKAGE_DIR = path.resolve(__dirname, '../..');
@@ -996,7 +997,7 @@ describe('scan', () => {
 
 describe('source list', () => {
   it('lists sources in text format', () => {
-    const result = run(['source', 'list']);
+    const result = run(['source', 'list', '--format', 'text']);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain('Config fields:');
     expect(result.stdout).not.toContain('Scope fields:');
@@ -1019,6 +1020,105 @@ describe('source list', () => {
     expect(names).toContain('schedule');
     expect(names).toContain('incoming-changes');
     expect(parsed[0]).toHaveProperty('configFields');
+  });
+
+  it('lists sources in toon format by default (no --format flag)', () => {
+    const result = run(['source', 'list']);
+    expect(result.exitCode).toBe(0);
+    // TOON output does not use JSON braces for the root array
+    expect(result.stdout).not.toMatch(/^\s*\[$/m);
+    // All source names are present in the toon output
+    expect(result.stdout).toContain('file-fingerprint');
+    expect(result.stdout).toContain('api-poll');
+  });
+
+  it('toon source list output round-trips to identical JSON value as --format json', () => {
+    const jsonResult = run(['source', 'list', '--format', 'json']);
+    const toonResult = run(['source', 'list', '--format', 'toon']);
+    expect(jsonResult.exitCode).toBe(0);
+    expect(toonResult.exitCode).toBe(0);
+    const fromJson = JSON.parse(jsonResult.stdout) as unknown;
+    const fromToon = decodeToon(toonResult.stdout);
+    expect(fromToon).toEqual(fromJson);
+  });
+
+  it('rejects invalid --format value for source list', () => {
+    const result = run(['source', 'list', '--format', 'xml']);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('xml');
+  });
+});
+
+describe('--format toon for structured-output commands', () => {
+  it('scan defaults to toon output (no --format flag)', () => {
+    const dir = path.join(tempDir, 'scan-toon-default');
+    const monitorsDir = path.join(dir, 'monitors');
+    mkdirSync(monitorsDir, { recursive: true });
+    run(['init', 'my-monitor', '--dir', monitorsDir], dir);
+    const result = run(['scan', monitorsDir]);
+    expect(result.exitCode).toBe(0);
+    // Not raw JSON (no outer braces)
+    expect(result.stdout.trim()).not.toMatch(/^\{/);
+    // The monitor id is present
+    expect(result.stdout).toContain('my-monitor');
+  });
+
+  it('scan toon output round-trips to identical JSON value as --format json', () => {
+    const dir = path.join(tempDir, 'scan-toon-roundtrip');
+    const monitorsDir = path.join(dir, 'monitors');
+    mkdirSync(monitorsDir, { recursive: true });
+    run(['init', 'rtrip-monitor', '--dir', monitorsDir], dir);
+    const jsonResult = run(['scan', monitorsDir, '--format', 'json']);
+    const toonResult = run(['scan', monitorsDir, '--format', 'toon']);
+    expect(jsonResult.exitCode).toBe(0);
+    expect(toonResult.exitCode).toBe(0);
+    const fromJson = JSON.parse(jsonResult.stdout) as unknown;
+    const fromToon = decodeToon(toonResult.stdout);
+    expect(fromToon).toEqual(fromJson);
+  });
+
+  it('scan --format json output is byte-for-byte unchanged (no regression)', () => {
+    const dir = path.join(tempDir, 'scan-json-unchanged');
+    const monitorsDir = path.join(dir, 'monitors');
+    mkdirSync(monitorsDir, { recursive: true });
+    run(['init', 'stable-monitor', '--dir', monitorsDir], dir);
+    // --format json must still produce valid JSON with the documented shape
+    const result = run(['scan', monitorsDir, '--format', 'json']);
+    expect(result.exitCode).toBe(0);
+    const parsed = JSON.parse(result.stdout) as {
+      monitors: {
+        id: string;
+        name: string;
+        source: string;
+        urgency: string;
+        tags: string[];
+        notify: string | null;
+      }[];
+      errors: { filePath: string; error: string }[];
+      duplicateIds: string[];
+    };
+    expect(parsed.monitors).toHaveLength(1);
+    expect(parsed.monitors[0]).toMatchObject({
+      id: 'stable-monitor',
+      source: 'file-fingerprint',
+    });
+    expect(parsed.errors).toHaveLength(0);
+    expect(parsed.duplicateIds).toHaveLength(0);
+  });
+
+  it('scan --format toon produces toon (not json, not plain text table)', () => {
+    const dir = path.join(tempDir, 'scan-toon-explicit');
+    const monitorsDir = path.join(dir, 'monitors');
+    mkdirSync(monitorsDir, { recursive: true });
+    run(['init', 'explicit-toon-monitor', '--dir', monitorsDir], dir);
+    const result = run(['scan', monitorsDir, '--format', 'toon']);
+    expect(result.exitCode).toBe(0);
+    // Not the text table format (text has a header row with padded columns)
+    expect(result.stdout).not.toContain('ID'.padEnd(30));
+    // Is TOON (contains the monitor id as a value, not as a JSON key with quotes)
+    expect(result.stdout).toContain('explicit-toon-monitor');
+    // Is parseable by the TOON decoder
+    expect(() => decodeToon(result.stdout)).not.toThrow();
   });
 });
 
@@ -1868,6 +1968,8 @@ This monitor fires on a schedule.
         dir,
         '--socket',
         socketPath,
+        '--format',
+        'text',
       ],
       env,
       dir,
@@ -2014,6 +2116,8 @@ This monitor fires on a schedule.
         dir,
         '--socket',
         socketPath,
+        '--format',
+        'text',
       ],
       env,
       dir,
@@ -2057,7 +2161,15 @@ This monitor fires on a schedule.
 
     // Text form: banner + the persisted row, NOT an ENOENT error.
     const text = runWithEnv(
-      ['monitor', 'history', 'fires', '--socket', socketPath],
+      [
+        'monitor',
+        'history',
+        'fires',
+        '--socket',
+        socketPath,
+        '--format',
+        'text',
+      ],
       env,
       dir,
     );

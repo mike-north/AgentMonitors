@@ -14,6 +14,7 @@ import {
 } from '@agentmonitors/core';
 import { registerCoreSources } from '../sources.js';
 import { reportError } from '../output.js';
+import { renderToon } from '../toon-format.js';
 import { DaemonConnectionError } from '../daemon-ipc.js';
 import {
   explainMonitorClient,
@@ -307,8 +308,8 @@ monitorTestCommand
   .option('--event-limit <n>', 'Materialized event rows to include', '10')
   .addOption(
     new Option('--format <format>', 'Output format')
-      .choices(['text', 'json'])
-      .default('text'),
+      .choices(['toon', 'json', 'text'])
+      .default('toon'),
   )
   .action(
     async (
@@ -323,6 +324,7 @@ monitorTestCommand
       },
     ) => {
       const json = options.format === 'json';
+      const toon = options.format === 'toon';
       const monitorsDir = path.resolve(options.dir);
       const workspacePath = path.resolve(options.workspace ?? process.cwd());
       const historyLimit = Number.parseInt(options.historyLimit, 10);
@@ -345,6 +347,10 @@ monitorTestCommand
 
         if (json) {
           console.log(JSON.stringify(report, null, 2));
+          return;
+        }
+        if (toon) {
+          console.log(renderToon(report));
           return;
         }
         printExplainText(report);
@@ -410,6 +416,10 @@ monitorTestCommand
             console.log(JSON.stringify(report, null, 2));
             return;
           }
+          if (toon) {
+            console.log(renderToon(report));
+            return;
+          }
           printExplainText(report);
           return;
         }
@@ -429,6 +439,12 @@ monitorTestCommand
           );
           return;
         }
+        if (toon) {
+          // Annotate the TOON report with the no-daemon notice in the same way
+          // the JSON path does — spread notice into the encoded object.
+          console.log(renderToon({ notice: NO_DAEMON_BANNER, ...report }));
+          return;
+        }
         console.log(NO_DAEMON_BANNER);
         printExplainText(report);
       }
@@ -445,8 +461,8 @@ monitorTestCommand
   .option('--limit <n>', 'Maximum rows to return', '50')
   .addOption(
     new Option('--format <format>', 'Output format')
-      .choices(['text', 'json'])
-      .default('text'),
+      .choices(['toon', 'json', 'text'])
+      .default('toon'),
   )
   .action(
     async (
@@ -454,6 +470,7 @@ monitorTestCommand
       options: { socket?: string; limit: string; format: string },
     ) => {
       const json = options.format === 'json';
+      const toon = options.format === 'toon';
       const limit = Number.parseInt(options.limit, 10);
       const query = {
         ...(monitorId ? { monitorId } : {}),
@@ -469,6 +486,11 @@ monitorTestCommand
           console.log(JSON.stringify(records, null, 2));
           return;
         }
+        if (toon) {
+          console.log(renderToon(records));
+          return;
+        }
+        // text format
         if (records.length === 0) {
           console.log('No observation history.');
           return;
@@ -499,6 +521,13 @@ monitorTestCommand
         }
         if (json) {
           console.log(JSON.stringify(records, null, 2));
+          return;
+        }
+        if (toon) {
+          // Print the no-daemon banner first (as in text mode) so the author
+          // knows the data came from persisted store, then the TOON payload.
+          console.log(NO_DAEMON_BANNER);
+          console.log(renderToon(records));
           return;
         }
         console.log(NO_DAEMON_BANNER);

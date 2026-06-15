@@ -21,13 +21,14 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
     "@agentmonitors/core": "workspace:*",
     "@agentmonitors/source-api-poll": "workspace:*",
     "@agentmonitors/source-command-poll": "workspace:*",
     "@agentmonitors/source-file-fingerprint": "workspace:*",
     "@agentmonitors/source-incoming-changes": "workspace:*",
     "@agentmonitors/source-schedule": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@toon-format/toon": "^2.3.0",
     "better-sqlite3": "^11.9.1",
     "commander": "^14.0.3",
     "zod": "^3.25.76"
