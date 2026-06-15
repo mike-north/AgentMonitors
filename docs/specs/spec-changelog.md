@@ -24,6 +24,7 @@ unaffected (the degenerate band `x..x` is never escalated — backward compatibl
   `normal..high` band monitor and `urgency: 'normal'` for a modification on the same monitor.
 - Minor changeset: `@agentmonitors/source-file-fingerprint` (new salience behavior).
 - Refs: issue #151.
+
 ## 2026-06-15 — monitor explain verdict uses severity ranking, not first-non-ok (005 §6.4, regression #149)
 
 `explainVerdict()` previously selected the _first_ stage whose status `!== 'ok'`. After the `healthy`

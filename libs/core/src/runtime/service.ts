@@ -587,22 +587,57 @@ export class AgentMonitorRuntime {
     const suppressedUntil = notifyState.suppressedUntil
       ? new Date(notifyState.suppressedUntil)
       : null;
-    // Track whether the notify stage is currently holding a batch so the
-    // materialization stage can reflect 'pending' rather than 'failure' (#149).
+    // Track whether the notify layer has a queued batch (holding or overdue) so
+    // the materialization stage can reflect 'pending' rather than 'failure'
+    // (#149, Copilot review #155).
+    //
+    // IMPORTANT: pendingDebounce can be present even when dueAt <= now. That
+    // happens when the settle window has expired but the daemon tick has not
+    // yet run to flush and clear the batch. In that window the batch is still
+    // queued — it will materialize on the next tick — so materialization is
+    // still pending, not a failure. The notify stage distinguishes "actively
+    // settling" (dueAt > now) from "ready to flush on next tick" (dueAt <= now)
+    // with distinct text, but both are semantically pending.
     let notifyPending = false;
-    if (pendingDebounce && new Date(pendingDebounce.dueAt) > now) {
+    // A debounce-held materialization message that describes the current hold
+    // state for the materialization stage reason (set when notifyPending is true
+    // due to a debounce batch, null when pending is due to throttle).
+    let debounceMaterializationReason: string | null = null;
+    if (pendingDebounce) {
       notifyPending = true;
-      stages.push(
-        explainStage(
-          'notify',
-          'pending',
-          `debounce is holding ${String(pendingDebounce.observations.length)} observation(s) until ${pendingDebounce.dueAt}.`,
-          {
-            dueAt: pendingDebounce.dueAt,
-            observations: pendingDebounce.observations.length,
-          },
-        ),
-      );
+      const dueAt = new Date(pendingDebounce.dueAt);
+      const isOverdue = dueAt <= now;
+      if (isOverdue) {
+        stages.push(
+          explainStage(
+            'notify',
+            'pending',
+            `debounce settle window has elapsed; ${String(pendingDebounce.observations.length)} observation(s) will be flushed on the next daemon tick.`,
+            {
+              dueAt: pendingDebounce.dueAt,
+              observations: pendingDebounce.observations.length,
+              overdue: true,
+            },
+          ),
+        );
+        debounceMaterializationReason =
+          'No monitor_events rows yet — the debounce settle window has elapsed and the batch will flush on the next daemon tick.';
+      } else {
+        stages.push(
+          explainStage(
+            'notify',
+            'pending',
+            `debounce is holding ${String(pendingDebounce.observations.length)} observation(s) until ${pendingDebounce.dueAt}.`,
+            {
+              dueAt: pendingDebounce.dueAt,
+              observations: pendingDebounce.observations.length,
+              overdue: false,
+            },
+          ),
+        );
+        debounceMaterializationReason =
+          'No monitor_events rows yet — the notify layer is holding the batch until the debounce settle window elapses.';
+      }
     } else if (suppressedUntil && suppressedUntil > now) {
       notifyPending = true;
       stages.push(
@@ -634,11 +669,11 @@ export class AgentMonitorRuntime {
       })
       .slice(0, eventLimit);
     if (events.length === 0) {
-      // When no event has materialized yet because the notify layer is correctly
-      // holding a debounce/throttle batch (#149), materialization is pending —
-      // not a failure. The observation was observed but the runtime hasn't
-      // flushed it yet. Only treat it as failure when the notify layer is clear
-      // and there is still nothing materialized (unexpected absence).
+      // When no event has materialized yet because the notify layer has a queued
+      // batch (actively settling or overdue-but-unflushed), materialization is
+      // pending — not a failure. The observation was observed but the runtime
+      // hasn't flushed it yet. Only treat it as failure when the notify layer is
+      // clear and there is still nothing materialized (unexpected absence).
       stages.push(
         observationHealthy
           ? explainStage(
@@ -650,7 +685,8 @@ export class AgentMonitorRuntime {
             ? explainStage(
                 'materialization',
                 'pending',
-                'No monitor_events rows yet — the notify layer is holding the batch until the debounce/throttle settles.',
+                debounceMaterializationReason ??
+                  'No monitor_events rows yet — the notify layer is holding the batch until the throttle window elapses.',
               )
             : explainStage(
                 'materialization',

@@ -1780,10 +1780,14 @@ Handle it.
       workspacePath: rootDir,
     });
 
-    // Notify stage must be pending (debounce holding the batch).
-    expect(report.stages.find((stage) => stage.id === 'notify')?.status).toBe(
-      'pending',
-    );
+    // Notify stage must be pending (debounce actively holding the batch, dueAt
+    // still in the future). The overdue flag in details must be false.
+    const notifyStage = report.stages.find((stage) => stage.id === 'notify');
+    expect(notifyStage?.status).toBe('pending');
+    expect(
+      (notifyStage?.details as { overdue?: boolean } | undefined)?.overdue,
+    ).toBe(false);
+    expect(notifyStage?.reason).toContain('debounce is holding');
 
     // Materialization stage must be pending (no event yet, but that's expected
     // because notify is holding). Pre-fix: this was 'failure' (#149 repro).
@@ -1791,6 +1795,7 @@ Handle it.
       (stage) => stage.id === 'materialization',
     );
     expect(materializationStage?.status).toBe('pending');
+    expect(materializationStage?.reason).toContain('settle window');
 
     // Verdict: pending at notify (the highest-severity stage).
     // The pending notify + pending materialization both rank above ok observation,
@@ -1805,6 +1810,74 @@ Handle it.
     const json = JSON.parse(JSON.stringify(report)) as typeof report;
     expect(json.verdict.status).toBe('pending');
     expect(json.verdict.stage).toBe('notify');
+  });
+
+  it('materialization is pending (not failure) when debounce settle window has elapsed but the next daemon tick has not yet flushed the batch (Copilot review #155)', async () => {
+    // Scenario (Copilot review #155): pendingDebounce can be present with
+    // dueAt <= now when the settle window has expired but the next tick/watch
+    // cycle has not yet run to flush and clear the batch. In that window the
+    // batch is still queued — it will materialize on the next tick — so
+    // materialization is still pending, not a failure. The notify stage renders
+    // "settle window has elapsed; will flush on next tick" rather than the
+    // "holding until T" text used while the window is still open.
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    // Use a real 1s settle window so we can let it expire before calling explain.
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'overdue-debounce-source',
+      'high',
+      'Handle it.',
+      "  interval: '1s'\nnotify:\n  strategy: debounce\n  settle-for: 1s\n",
+    );
+
+    const source: ObservationSource = {
+      name: 'overdue-debounce-source',
+      scopeSchema: { type: 'object' },
+      observe: () =>
+        Promise.resolve({
+          observations: [
+            { title: 'queued observation', objectKey: 'obj-overdue' },
+          ],
+        }),
+    };
+
+    const runtime = createRuntime(dbPath, source);
+    // Tick 1: observation is held in the debounce batch (dueAt = now + 1s).
+    await runtime.tick(monitorsDir, rootDir);
+
+    // Simulate explaining after the settle window has expired but before the
+    // next flush tick: pass a `now` that is 2 seconds in the future, making
+    // the stored dueAt appear overdue.
+    const futureNow = new Date(Date.now() + 2_000);
+    const report = await runtime.explainMonitor({
+      monitorId: 'test-monitor',
+      monitorsDir,
+      workspacePath: rootDir,
+      now: futureNow,
+    });
+
+    // Notify stage must still be pending (the batch is queued, just overdue).
+    const notifyStage = report.stages.find((stage) => stage.id === 'notify');
+    expect(notifyStage?.status).toBe('pending');
+    // The reason must reference "next tick", not "holding until".
+    expect(notifyStage?.reason).toContain('next daemon tick');
+    // The overdue flag in details must be true.
+    expect(
+      (notifyStage?.details as { overdue?: boolean } | undefined)?.overdue,
+    ).toBe(true);
+
+    // Materialization stage must be pending (the batch hasn't been flushed yet).
+    // Pre-fix: this fell through to `notify = ok` → materialization = failure.
+    const materializationStage = report.stages.find(
+      (stage) => stage.id === 'materialization',
+    );
+    expect(materializationStage?.status).toBe('pending');
+    expect(materializationStage?.reason).toContain('next daemon tick');
+
+    // Verdict: pending (not failure) — the batch will materialize on next tick.
+    expect(report.verdict.status).toBe('pending');
   });
 
   it('a genuinely all-healthy/idle monitor still yields the healthy not-a-bug verdict after #149 fix (regression guard for #98)', async () => {
