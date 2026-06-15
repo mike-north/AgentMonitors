@@ -27,6 +27,8 @@
   --green: #79c28c;
   --red: #e5736b;
   --code-bg: #0c0a07;
+  /* faint background lattice for the before/after illustration */
+  --grid: rgba(236, 230, 219, 0.05);
 
   /* signature amber / sound-wave gold — baked default (dark theme) */
   --signal: #f2a93b;
@@ -756,106 +758,195 @@ h3 {
   color: var(--signal);
 }
 
-/* ---------- "you are the loop" schematic (problem section) ----------
-   A real CSS/SVG figure standing in for the imagery-agent's before/after
-   illustration (shot #2), which is a separate deliverable not yet produced.
-   Built schematic + honest rather than shipping a dashed placeholder. */
-.loopfig {
-  display: grid;
-  grid-template-columns: 1fr auto 1fr;
-  gap: clamp(14px, 2vw, 22px);
-  align-items: stretch;
-}
-@media (max-width: 520px) {
-  .loopfig {
-    grid-template-columns: 1fr;
-  }
-  .loopfig-arrow {
-    transform: rotate(90deg);
-    justify-self: center;
-  }
-}
-.loopfig-before,
-.loopfig-after {
+/* ---------- "you are the loop" before/after illustration (problem section) ----------
+   The finished themed SVG figure: a weary person trapped in a repeating
+   ask-loop (left) versus a monitor catching a change in the world and handing
+   it to an already-acting agent (right). Tokens are the site's existing
+   :root variables; only --grid (the faint background lattice) is added there. */
+.ba {
+  position: relative;
   border: 1px solid var(--border);
   border-radius: 14px;
-  padding: 20px;
-  background: var(--surface);
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  min-height: 200px;
+  background: linear-gradient(180deg, var(--surface), var(--bg-2));
+  overflow: hidden;
+  padding: 18px;
+  box-shadow: 0 24px 60px -48px rgba(0, 0, 0, 0.7);
 }
-.loopfig-after {
-  border-color: color-mix(in oklab, var(--signal) 32%, var(--border));
-  background: linear-gradient(180deg, var(--signal-soft), var(--surface));
+.ba::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image: linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 30px 30px;
+  opacity: 0.5;
+  -webkit-mask-image: radial-gradient(120% 100% at 50% 40%, #000 30%, transparent 90%);
+  mask-image: radial-gradient(120% 100% at 50% 40%, #000 30%, transparent 90%);
 }
-.loopfig-tag {
+.ba svg {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+.ba .fig {
+  fill: none;
+  stroke: var(--text-dim);
+  stroke-width: 2.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.ba .fig-weary {
+  stroke: var(--text-faint);
+}
+.ba .fig-calm {
+  stroke: var(--text-2);
+}
+.ba .node {
+  fill: var(--surface-2);
+  stroke: var(--border-2);
+  stroke-width: 1.6;
+}
+.ba .node-face {
+  fill: none;
+  stroke: var(--text-dim);
+  stroke-width: 1.8;
+  stroke-linecap: round;
+}
+.ba .node-lit {
+  fill: var(--signal-soft);
+  stroke: var(--signal);
+}
+.ba .node-lit-face {
+  stroke: var(--signal);
+}
+.ba .loop {
+  fill: none;
+  stroke: var(--red);
+  stroke-width: 1.8;
+  opacity: 0.62;
+  stroke-linecap: round;
+}
+.ba .ask {
   font-family: var(--mono);
   font-size: 11px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--text-dim);
+  fill: var(--text-dim);
 }
-.loopfig-tag.sig {
-  color: var(--signal);
+.ba .flow {
+  fill: none;
+  stroke: var(--signal);
+  stroke-width: 1.8;
+  stroke-linecap: round;
 }
-.loopfig-cycle {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-top: auto;
+.ba .flow-told {
+  fill: none;
+  stroke: var(--signal);
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-dasharray: 2 5;
+  opacity: 0.62;
 }
-.loopfig-cycle span {
-  font-family: var(--mono);
-  font-size: 12.5px;
-  color: var(--text-2);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 7px 10px;
-  position: relative;
+.ba .flow-faint {
+  stroke: color-mix(in oklab, var(--signal) 45%, transparent);
+  fill: none;
+  stroke-width: 1.8;
+  stroke-linecap: round;
 }
-.loopfig-cycle span::before {
-  content: '↻';
-  position: absolute;
-  right: 9px;
-  top: 50%;
-  transform: translateY(-50%);
-  color: var(--text-faint);
+.ba .glow {
+  fill: var(--signal);
 }
-.loopfig-signal {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-top: auto;
-  font-family: var(--mono);
-  font-size: 12.5px;
+.ba .spark {
+  stroke: var(--signal);
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  fill: none;
 }
-.loopfig-fire {
-  color: var(--signal-glow);
+.ba .ear {
+  fill: none;
+  stroke: var(--signal);
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
-.loopfig-handoff {
-  color: var(--text-2);
-  padding-left: 14px;
+.ba .world {
+  fill: none;
+  stroke: var(--text-2);
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
-.loopfig-you {
-  font-family: var(--display);
-  font-weight: 600;
-  font-size: 15px;
-  letter-spacing: -0.01em;
-  color: var(--text-dim);
+.ba .seam {
+  stroke: var(--border-2);
+  stroke-width: 1.4;
+  stroke-dasharray: 3 6;
+  opacity: 0.6;
 }
-.loopfig-you.sig {
-  color: var(--signal);
+.ba .seam-arrow {
+  fill: var(--text-faint);
 }
-.loopfig-arrow {
-  color: var(--text-faint);
-  display: grid;
-  place-items: center;
+.ba .flow-dot {
+  fill: var(--signal-glow);
 }
-.loopfig-arrow svg {
-  width: 24px;
-  height: 24px;
+/* Fallback: browsers without CSS motion-path support render the dot at SVG
+   origin (0,0) which appears as a stray pixel in the top-left corner.
+   When offset-path is NOT supported, translate the dot to its resting
+   position at the path endpoint (≈406,156) near the agent node.
+   We deliberately do NOT set cx/cy on the <circle> element, because in
+   supporting browsers cx/cy would be added on top of the offset transform,
+   double-positioning the dot (it would land at cx+offset_x, cy+offset_y). */
+@supports not (offset-path: path('')) {
+  .ba .flow-dot {
+    transform: translate(406px, 156px);
+  }
+}
+.ba .calm-dot {
+  fill: var(--signal);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .ba .loop {
+    stroke-dasharray: 6 7;
+    animation: ba-cycle 2.6s linear infinite;
+  }
+  .ba .flow-dot {
+    animation: ba-travel 3.4s cubic-bezier(0.5, 0, 0.5, 1) infinite;
+  }
+  .ba .ask-fade {
+    animation: ba-ask 3.6s ease-in-out infinite;
+  }
+}
+@keyframes ba-cycle {
+  to {
+    stroke-dashoffset: -26;
+  }
+}
+@keyframes ba-travel {
+  0% {
+    offset-distance: 0%;
+    opacity: 0;
+  }
+  12% {
+    opacity: 1;
+  }
+  82% {
+    opacity: 1;
+  }
+  100% {
+    offset-distance: 100%;
+    opacity: 0;
+  }
+}
+@keyframes ba-ask {
+  0%,
+  100% {
+    opacity: 0.28;
+  }
+  50% {
+    opacity: 0.85;
+  }
 }
 
 /* ---------- how it works: monitor.md + steps + anatomy ---------- */
