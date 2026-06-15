@@ -289,9 +289,9 @@ export function QuickGrid({ children }: { readonly children: ReactNode }): JSX.E
  * Commands verified against @agentmonitors/cli@0.6.0 (issue #135):
  * - `npm install -g @agentmonitors/cli` — install step
  * - `agentmonitors init <name> --type api-poll` — real form; `api-poll` is a
- *   valid `--type` choice (file-fingerprint|api-poll|command-poll|schedule|
+ *   valid `--type` choice (file-fingerprint, api-poll, command-poll, schedule,
  *   incoming-changes); default is file-fingerprint when omitted
- * - `agentmonitors daemon run` — real subcommand (`daemon` has: once|run|status|stop)
+ * - `agentmonitors daemon run` — real subcommand (`daemon` has: once, run, status, stop)
  * Keep these in sync with apps/website/src/pages/index.md quickstart section
  * and apps/website/src/pages/docs/getting-started.md.
  */
