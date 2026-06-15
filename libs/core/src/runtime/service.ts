@@ -968,8 +968,11 @@ export class AgentMonitorRuntime {
         // Record skipped monitors so callers can distinguish "not yet due" from
         // "no monitors found" (issue #152). nextDueAt is computed from the same
         // scheduling decision — single source of truth, never recomputed.
+        // Fall back to `now` (not epoch 0) when lastObservationAt is absent so
+        // the computed nextDueAt stays meaningful even under partial/missing state.
         const state = this.store.getMonitorState(monitor.id);
-        const lastObservationAt = state.lastObservationAt?.getTime() ?? 0;
+        const lastObservationAt =
+          state.lastObservationAt?.getTime() ?? now.getTime();
         const nextDueAt = new Date(lastObservationAt + schedule.nextPollMs);
         skippedMonitors.push({ monitorId: monitor.id, nextDueAt });
         continue;
