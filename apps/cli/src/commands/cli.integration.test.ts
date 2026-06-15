@@ -507,6 +507,34 @@ describe('validate', () => {
     expect(result.stdout.toLowerCase()).toContain('urgency');
   });
 
+  // Copilot thread 3410689135: the generated JSON Schema pattern for `urgency`
+  // must accept the same leading/trailing whitespace that the Zod parser accepts
+  // (it calls `.trim()` before validating bounds). Both validation surfaces must
+  // agree so editors that consume the generated schema don't flag valid files.
+  it('accepts a whitespace-padded urgency value that the parser trims', () => {
+    const dir = path.join(tempDir, 'validate-whitespace-urgency-test');
+    const monitorDir = path.join(dir, 'monitors', 'ws-padded');
+    mkdirSync(monitorDir, { recursive: true });
+    // Quoted YAML string with surrounding spaces — YAML preserves them, so the
+    // parser receives the string with leading/trailing spaces and must trim.
+    const body = [
+      '---',
+      'name: Whitespace padded',
+      'watch:',
+      '  type: file-fingerprint',
+      '  globs: ["*.ts"]',
+      "urgency: ' normal .. high '",
+      '---',
+      'Handle it.',
+      '',
+    ].join('\n');
+    writeFileSync(path.join(monitorDir, 'MONITOR.md'), body, 'utf-8');
+
+    const result = run(['validate', path.join(dir, 'monitors')]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('Valid monitors: 1');
+  });
+
   it('hints when a monitor uses the old top-level source/scope shape', () => {
     const dir = path.join(tempDir, 'validate-old-shape-test');
     const monitorDir = path.join(dir, 'monitors', 'old-shape');
@@ -1345,6 +1373,9 @@ describe('schema generate', () => {
     // both bare levels (`normal`) and bands (`normal..high`) are accepted.
     // `low` is first-class (PP5). All three bare levels and the `..` band
     // separator must be covered by the pattern.
+    // Copilot thread 3410689135: the pattern must also tolerate the same
+    // leading/trailing whitespace the Zod parser accepts (`.trim()` before
+    // validating bounds), so `\s*` anchors are required at both ends.
     const urgencySchema = schema.properties?.urgency;
     expect(urgencySchema?.type).toBe('string');
     expect(urgencySchema?.pattern).toContain('low');
@@ -1353,6 +1384,8 @@ describe('schema generate', () => {
     // `..` band separator: the JSON schema stores the regex-escaped form `\.\.`
     // (two regex-literal-dot assertions), so the pattern string contains `\\.`
     expect(urgencySchema?.pattern).toContain('\\.');
+    // Leading/trailing whitespace tolerance: `\s*` anchors at both ends.
+    expect(urgencySchema?.pattern).toContain('\\s*');
   });
 
   it('writes the schema to a file with -o', () => {
