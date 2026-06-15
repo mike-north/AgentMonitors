@@ -446,18 +446,28 @@ monitor (all stages `healthy`) reports a `healthy` verdict.
 **No-daemon fallback (#150):** if the daemon is not reachable (a genuine connection failure — socket
 refused/absent or request timeout), `monitor explain` runs the **same** `explainMonitor` in-process
 against the persisted SQLite store, exactly as `daemon once` runs a tick in-process. A read-only
-diagnosis tool must not require a live daemon: the data from the last tick is already in the DB. When
-the store holds persisted state for the monitor (any `observation_history` or `monitor_events` rows),
-the command renders the real per-stage diagnosis prefixed with the banner _"No daemon running —
-showing persisted state from the last tick."_ (text) or annotated with a `"notice"` field alongside
-the full report (JSON), exiting 0. This means a monitor that actually fired is **never** reported as
-a false `✗ Scheduling: failure` just because no daemon is running. When the daemon is down **and**
-there is genuinely nothing persisted to read (no history and no events for the monitor), the command
-prints an actionable remediation line — _"No daemon running and no persisted state to show. Start it
-with `agentmonitors daemon run`, or use `agentmonitors monitor test <path>` for a one-shot check."_ —
-and exits 1, rather than a raw Node `connect ENOENT …`. A daemon-side **application** error (the
-daemon answered with an error) is **not** masked as "daemon not running": it is surfaced verbatim as
-`Explain failed: <message>` with exit code 1. Malformed command arguments remain normal CLI errors.
+diagnosis tool must not require a live daemon: the data from the last tick is already in the DB.
+**Crucially, a daemon connection failure is NOT itself reported as a stage `failure`** — unlike the
+pre-#150 behaviour which fabricated a `✗ Scheduling: failure` verdict, the in-process path runs the
+full pipeline read and produces real stage statuses from persisted state.
+
+The report is rendered according to three cases:
+
+- **Definition failure** (parse error, monitor not found, duplicate ID, unknown source): the report
+  is shown as-is — no no-daemon banner, since there is no persisted state involved; the definition
+  failure is the complete diagnosis. Exits 0.
+- **Definition ok, persisted state exists** (`observation_history` or `monitor_events` rows present):
+  the real per-stage diagnosis is shown, prefixed with the banner _"No daemon running — showing
+  persisted state from the last tick."_ (text) or annotated with a `"notice"` field alongside the
+  full report (JSON). Exits 0.
+- **Definition ok, nothing persisted** (no history, no events — the daemon never ran): an actionable
+  remediation line is printed — _"No daemon running and no persisted state to show. Start it with
+  `agentmonitors daemon run`, or use `agentmonitors monitor test <path>` for a one-shot check."_ —
+  rather than a raw Node `connect ENOENT …`. Exits 1.
+
+A daemon-side **application** error (the daemon answered with an error) is **not** masked as "daemon
+not running": it is surfaced verbatim as `Explain failed: <message>` with exit code 1. Malformed
+command arguments remain normal CLI errors.
 
 ---
 

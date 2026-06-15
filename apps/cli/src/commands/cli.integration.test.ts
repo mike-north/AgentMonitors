@@ -1681,7 +1681,7 @@ This monitor fires on a schedule.
     expect(report.events.length).toBeGreaterThan(0);
   });
 
-  it('explain with the daemon down and NOTHING persisted emits an actionable remediation, not a raw ENOENT', () => {
+  it('explain with the daemon down and NOTHING persisted emits an actionable remediation, not a raw ENOENT (definition ok, case C)', () => {
     const dir = path.join(tempDir, 'explain-nodaemon-empty');
     const monitorsRoot = path.join(dir, '.claude', 'monitors');
     const monitorsDir = path.join(monitorsRoot, 'fires');
@@ -1719,6 +1719,56 @@ This monitor fires on a schedule.
     expect(result.stderr).toContain('monitor test');
     expect(result.stderr).not.toContain('ENOENT');
     expect(result.stderr).not.toContain('.sock');
+    // The remediation (not the no-daemon banner) is what appears.
+    expect(result.stdout).not.toContain(
+      'No daemon running — showing persisted state',
+    );
+  });
+
+  it('explain with the daemon down surfaces a definition failure directly (no banner, no remediation) when the monitor is not found (case A, Copilot review id=3415776081)', () => {
+    // Regression: the pre-fix "no persisted state → remediation" heuristic also
+    // fired when the definition stage was `failure` (parse error, monitor not
+    // found, duplicate ID), swallowing the actionable definition error. A
+    // definition-stage failure must surface the in-process report directly —
+    // no no-daemon banner (there is no persisted state involved; the definition
+    // failure IS the diagnosis) and no remediation message.
+    const dir = path.join(tempDir, 'explain-nodaemon-notfound');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    // Create the monitors directory but NOT the 'missing' sub-dir / MONITOR.md.
+    mkdirSync(monitorsRoot, { recursive: true });
+
+    const dbPath = path.join(dir, 'empty.db');
+    const socketPath = deadSocketPath('explain-notfound');
+    const env = { AGENTMONITORS_DB: dbPath, AGENTMONITORS_SOCKET: socketPath };
+
+    const result = runWithEnv(
+      [
+        'monitor',
+        'explain',
+        'missing', // monitor that doesn't exist
+        '--dir',
+        monitorsRoot,
+        '--workspace',
+        dir,
+        '--socket',
+        socketPath,
+      ],
+      env,
+      dir,
+    );
+
+    // Definition failure → report is shown, exits 0 (mirrors the daemon path).
+    expect(result.exitCode).toBe(0);
+    // The definition failure reason must appear in the output.
+    expect(result.stdout).toContain('Verdict:');
+    expect(result.stdout).toMatch(/Definition:.*not found/i);
+    // No no-daemon banner (nothing persisted; the report IS the diagnosis).
+    expect(result.stdout).not.toContain(
+      'No daemon running — showing persisted state',
+    );
+    // No generic remediation (would hide the definition error).
+    expect(result.stderr).not.toContain('agentmonitors daemon run');
+    expect(result.stderr).not.toContain('ENOENT');
   });
 
   it('history reads persisted observation rows in-process when the daemon is down (not an ENOENT error)', () => {

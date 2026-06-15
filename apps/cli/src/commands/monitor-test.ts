@@ -343,19 +343,51 @@ monitorTestCommand
             : {}),
         });
 
-        // "Nothing actionable to read": no observation history AND no
-        // materialized events for this monitor. The DB has no state from a tick
-        // (e.g. the daemon never ran), so rendering an explain report would only
-        // show a misleading "no observation history" failure. Instead, surface
-        // the actionable remediation line (issue #150, PM decision (b)(i)) — not
-        // a raw ENOENT.
+        // Decide how to surface the in-process report based on what it contains.
+        //
+        // Three cases:
+        //
+        // (A) Definition stage is not 'ok' (parse error, monitor not found,
+        //     duplicate ID, unknown source, …). The report carries the exact
+        //     failure the author needs. Show it WITHOUT the no-daemon banner —
+        //     there is no persisted state involved; the banner would be
+        //     misleading. Exit 0 (mirrors the live-daemon path).
+        //
+        // (B) Definition stage is 'ok' AND there IS persisted state (observation
+        //     history or materialized events). The report is a real diagnosis from
+        //     the last tick. Show it WITH the no-daemon banner so the author knows
+        //     it came from the store, not a live daemon. Exit 0.
+        //
+        // (C) Definition stage is 'ok' AND nothing has been persisted (no
+        //     observations, no events). The daemon is down and nothing has ever
+        //     ticked. Show the actionable remediation line (issue #150, PM
+        //     decision (b)(i)) — not a raw ENOENT. Exit 1.
+        //     NOTE: a definition-failure report must never be replaced by the
+        //     remediation message; definition failures reach case (A).
+        const definitionStage = report.stages.find(
+          (stage) => stage.id === 'definition',
+        );
+        const definitionOk = definitionStage?.status === 'ok';
         const hasPersistedState =
           report.observations.length > 0 || report.events.length > 0;
+
+        if (!definitionOk) {
+          // Case (A): definition failure — show report, no banner.
+          if (json) {
+            console.log(JSON.stringify(report, null, 2));
+            return;
+          }
+          printExplainText(report);
+          return;
+        }
+
         if (!hasPersistedState) {
+          // Case (C): definition ok, nothing persisted — remediation only.
           reportError(NO_DAEMON_REMEDIATION, json);
           return;
         }
 
+        // Case (B): definition ok, persisted state exists — show report + banner.
         if (json) {
           // Preserve the full report and annotate that it came from the
           // persisted-state fallback (the daemon was not reached).
