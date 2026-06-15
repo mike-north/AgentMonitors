@@ -30,6 +30,9 @@
   "author": "Mike North <michael.l.north@gmail.com>",
   "license": "UNLICENSED",
   "packageManager": "pnpm@10.30.3",
+  "engines": {
+    "node": ">=24"
+  },
   "devDependencies": {
     "@ai-plugin-marketplace/cli": "^0.2.0",
     "@ai-plugin-marketplace/core": "^0.3.0",
