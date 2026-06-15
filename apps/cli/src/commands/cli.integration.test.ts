@@ -1333,16 +1333,26 @@ describe('schema generate', () => {
         watch?: {
           properties?: { type?: { enum?: string[] } };
         };
-        urgency?: { enum?: string[] };
+        // issue #109 / 001 §3.2: urgency is now a bare level OR a `lo..hi` band,
+        // so the JSON Schema uses `pattern` (shape-only) rather than `enum`.
+        urgency?: { type?: string; pattern?: string };
       };
     };
     expect(schema.properties?.watch?.properties?.type?.enum).toEqual(
       expect.arrayContaining(['file-fingerprint', 'api-poll', 'schedule']),
     );
-    // `low` is first-class (PP5)
-    expect(schema.properties?.urgency?.enum).toEqual(
-      expect.arrayContaining(['low', 'normal', 'high']),
-    );
+    // issue #109 / 001 §3.2: editor-hint schema uses pattern, not enum, so that
+    // both bare levels (`normal`) and bands (`normal..high`) are accepted.
+    // `low` is first-class (PP5). All three bare levels and the `..` band
+    // separator must be covered by the pattern.
+    const urgencySchema = schema.properties?.urgency;
+    expect(urgencySchema?.type).toBe('string');
+    expect(urgencySchema?.pattern).toContain('low');
+    expect(urgencySchema?.pattern).toContain('normal');
+    expect(urgencySchema?.pattern).toContain('high');
+    // `..` band separator: the JSON schema stores the regex-escaped form `\.\.`
+    // (two regex-literal-dot assertions), so the pattern string contains `\\.`
+    expect(urgencySchema?.pattern).toContain('\\.');
   });
 
   it('writes the schema to a file with -o', () => {
