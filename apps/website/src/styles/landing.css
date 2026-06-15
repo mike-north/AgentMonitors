@@ -890,6 +890,18 @@ h3 {
 .ba .flow-dot {
   fill: var(--signal-glow);
 }
+/* Fallback: browsers without CSS motion-path support render the dot at SVG
+   origin (0,0) which appears as a stray pixel in the top-left corner.
+   When offset-path is NOT supported, translate the dot to its resting
+   position at the path endpoint (≈406,156) near the agent node.
+   We deliberately do NOT set cx/cy on the <circle> element, because in
+   supporting browsers cx/cy would be added on top of the offset transform,
+   double-positioning the dot (it would land at cx+offset_x, cy+offset_y). */
+@supports not (offset-path: path('')) {
+  .ba .flow-dot {
+    transform: translate(406px, 156px);
+  }
+}
 .ba .calm-dot {
   fill: var(--signal);
 }

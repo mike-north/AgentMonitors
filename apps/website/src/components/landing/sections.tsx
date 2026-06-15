@@ -142,7 +142,7 @@ export function YouAreTheLoop(): JSX.Element {
       role="img"
       aria-label="Before and after. Left: a weary person trapped in a loop, repeatedly asking their agent — any new comments, did CI pass, again, again. Right: the loop is gone — a monitor catches a change out in the world and hands it to the agent, which is already acting, while the person sits at ease."
     >
-      <svg viewBox="0 0 560 360" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <svg viewBox="0 0 560 360" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden={true} focusable={false}>
         <defs>
           <marker id="ba-red" markerWidth="9" markerHeight="9" refX="5" refY="4" orient="auto">
             <path d="M1 1 L6 4 L1 7" fill="none" stroke="var(--red)" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" opacity="0.7" />
