@@ -27,8 +27,11 @@ Several author-facing DX improvements shipped as a cluster:
   message, and re-throws `"fetch failed: <cause>"` so `monitor explain` shows the real reason.
 
 - **003 §4.7 (api-poll `monitor test` baseline output):** `monitor test` now prints the HTTP
-  status code and response body size after the baseline for `api-poll` sources, making bad URLs
-  (4xx, connection refused, etc.) immediately visible rather than silently baselined as success.
+  status code and UTF-8 response body size after the baseline for `api-poll` sources. This makes
+  transport-level successes with unexpected responses (e.g. a 404 on a mistyped-but-resolvable URL,
+  or an empty 200) immediately visible. Network-level failures (ECONNREFUSED, ENOTFOUND, …) are a
+  separate case: they throw before a baseline exists and are surfaced via §4.6 error propagation
+  (visible in `monitor explain`), not via the status/size line.
 
 ## 2026-06-15 — `monitor explain` / `monitor history` read the persisted DB in-process when no daemon is running (005 §6, 002 §10.7, #150)
 

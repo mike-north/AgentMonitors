@@ -566,6 +566,38 @@ describe('validate', () => {
     expect(result.stdout).not.toContain('/MONITOR.md');
   });
 
+  // Copilot review fix (id=3416005973): monitorIdFromPath must mirror parseMonitor's
+  // empty/dot-prefixed guard so it returns '' for such ids (triggering the file-path
+  // fallback in the caller) rather than a confusing ".hidden-monitor" label.
+  // Note: glob's `**` pattern silently skips dot-prefixed directories, so a
+  // `.hidden-monitor` folder in the monitors tree is simply not discovered — the
+  // validate command exits 0 with "No monitors found." This test confirms that
+  // behaviour (dot-prefixed folders are not surfaced as errors).
+  it('silently skips dot-prefixed monitor folder names (glob excludes them)', () => {
+    const dir = path.join(tempDir, 'validate-dot-id-test');
+    const monitorsDir = path.join(dir, 'monitors');
+    const monitorDir = path.join(monitorsDir, '.hidden-monitor');
+    mkdirSync(monitorDir, { recursive: true });
+    const body = [
+      '---',
+      'name: Dot Prefixed',
+      'watch:',
+      '  type: file-fingerprint',
+      '  globs: ["*.ts"]',
+      'urgency: normal',
+      '---',
+      'Handle it.',
+      '',
+    ].join('\n');
+    writeFileSync(path.join(monitorDir, 'MONITOR.md'), body, 'utf-8');
+
+    const result = run(['validate', monitorsDir]);
+    // glob skips dot-prefixed dirs: no monitors found, exits 0, no ".hidden-monitor" label.
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).not.toContain('.hidden-monitor');
+    expect(result.stdout).toContain('No monitors found.');
+  });
+
   // Issue #153 item 2: validate with a file path must name monitor test as the
   // symmetric command.
   it('rejects a file path and names monitor test as the alternative', () => {
@@ -579,6 +611,9 @@ describe('validate', () => {
     expect(result.exitCode).toBe(1);
     // Error must mention the symmetric command so authors know what to use instead
     expect(result.stderr).toContain('monitor test');
+    // The path in the remediation must be single-quoted to handle spaces/special chars.
+    // Copilot fix id=3416006173.
+    expect(result.stderr).toContain(`'${monitorFile}'`);
   });
 
   // Copilot thread 3410689135: the generated JSON Schema pattern for `urgency`

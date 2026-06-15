@@ -144,10 +144,9 @@ If a file path (rather than a directory) is passed: prints an error to stderr na
 }
 ```
 
-(The `errors[].filePath` key is the monitor ID in text format output; the JSON key name is
-preserved for backward compatibility with consumers that parse the JSON output.)
-
-```
+(In text output, each invalid monitor is labelled by its monitor ID. In JSON output, the
+`errors[].filePath` field carries the monitor ID as its value; the key name `filePath` is
+preserved for backward compatibility with existing JSON consumers.)
 
 ### Validation logic (current)
 
@@ -175,10 +174,8 @@ Finds and lists all `MONITOR.md` files in a directory without performing validat
 ### Usage
 
 ```
-
 agentmonitors scan [dir] [options]
-
-````
+```
 
 | Argument / Flag     | Type                  | Default            | Description                   |
 | ------------------- | --------------------- | ------------------ | ----------------------------- |
@@ -207,7 +204,7 @@ If no monitors and no errors: prints `No monitors found.`
   ],
   "errors": [{ "filePath": "<string>", "error": "<string>" }]
 }
-````
+```
 
 Note: `tags` defaults to `[]` when absent; `notify` defaults to `null` when absent.
 

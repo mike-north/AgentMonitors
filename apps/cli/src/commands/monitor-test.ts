@@ -149,7 +149,10 @@ function printApiPollBaselineSummary(
   const status = typeof state['status'] === 'number' ? state['status'] : null;
   const body = typeof state['body'] === 'string' ? state['body'] : null;
   if (status === null) return;
-  const sizeStr = body !== null ? ` (${String(body.length)} bytes)` : '';
+  // Use Buffer.byteLength for the UTF-8 byte count, not body.length (which is
+  // UTF-16 code units and would undercount multi-byte characters). Issue #153.
+  const sizeStr =
+    body !== null ? ` (${String(Buffer.byteLength(body, 'utf8'))} bytes)` : '';
   console.log(`  HTTP ${String(status)}${sizeStr}`);
 }
 

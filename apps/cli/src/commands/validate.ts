@@ -10,15 +10,20 @@ import { registerCoreSources } from '../sources.js';
 import { requireDirectory } from '../validation.js';
 
 /**
- * Derive the monitor ID from a file path, mirroring the logic in parseMonitor.
- * Used to display the monitor ID rather than the full file path in error output
- * (ID = parent dir name for MONITOR.md files, stem for flat .md files).
+ * Derive the monitor ID from a file path, mirroring the logic in parseMonitor
+ * exactly — including the empty/dot-prefixed guard. Returns an empty string
+ * when the ID cannot be safely derived so the caller can fall back to the full
+ * file path (matching parseMonitor's "Could not derive a monitor id" error path).
  */
 function monitorIdFromPath(filePath: string): string {
   const base = path.basename(filePath);
-  return base === 'MONITOR.md'
-    ? path.basename(path.dirname(filePath))
-    : path.parse(filePath).name;
+  const id =
+    base === 'MONITOR.md'
+      ? path.basename(path.dirname(filePath))
+      : path.parse(filePath).name;
+  // Mirror parseMonitor's guard: reject empty or dot-prefixed ids (e.g. '.foo').
+  if (!id || id.startsWith('.')) return '';
+  return id;
 }
 
 /**

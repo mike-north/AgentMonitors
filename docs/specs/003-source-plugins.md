@@ -261,7 +261,15 @@ When Node `fetch` throws (ECONNREFUSED, ENOTFOUND, timeout, …), it wraps the r
 
 ### 4.7 `monitor test` baseline output
 
-`agentmonitors monitor test` for an `api-poll` monitor prints the HTTP status code and response body size (in bytes) after establishing the baseline, before running the second observation. This surfaces bad URLs (4xx, connection refused, etc.) that would otherwise silently baseline as "success." Example:
+`agentmonitors monitor test` for an `api-poll` monitor prints the HTTP status code and response body
+size (UTF-8 bytes, via `Buffer.byteLength`) after establishing the baseline, before running the
+second observation. This surfaces transport-level successes with unexpected status codes or empty
+bodies — for example, a mistyped-but-resolvable URL returning a 404, or a misconfigured endpoint
+returning an empty 200 — that would otherwise silently baseline as "no change yet."
+
+Note: network-level failures (ECONNREFUSED, DNS, timeout) throw _before_ any baseline is
+established and are handled separately by §4.6 error propagation; they do not produce a status/size
+line. Example output for a successful (transport-level) request:
 
 ```
 Testing monitor "api-health" (source: api-poll)...

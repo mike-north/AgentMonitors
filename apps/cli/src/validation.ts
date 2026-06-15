@@ -15,7 +15,7 @@ export function requireDirectory(dirPath: string, json: boolean): boolean {
   try {
     if (!statSync(dirPath).isDirectory()) {
       reportError(
-        `"${dirPath}" is a file, not a directory. Pass the directory containing MONITOR.md files. To test a single monitor file, use: agentmonitors monitor test ${dirPath}`,
+        `"${dirPath}" is a file, not a directory. Pass the directory containing MONITOR.md files. To test a single monitor file, use: agentmonitors monitor test '${dirPath}'`,
         json,
       );
       return false;
