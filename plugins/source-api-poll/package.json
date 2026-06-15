@@ -1,7 +1,7 @@
 {
   "name": "@agentmonitors/source-api-poll",
   "description": "HTTP endpoint polling and change detection for Agent Monitors",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "publishConfig": {
     "registry": "https://registry.npmjs.org",
     "access": "public"

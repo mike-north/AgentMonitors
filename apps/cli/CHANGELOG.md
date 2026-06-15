@@ -1,5 +1,18 @@
 # @agentmonitors/cli
 
+## 0.6.1
+
+### Patch Changes
+
+- Updated dependencies [dfb124a]
+- Updated dependencies [07f8cf7]
+  - @agentmonitors/core@0.8.0
+  - @agentmonitors/source-api-poll@0.2.3
+  - @agentmonitors/source-command-poll@0.2.3
+  - @agentmonitors/source-file-fingerprint@0.2.4
+  - @agentmonitors/source-incoming-changes@0.2.4
+  - @agentmonitors/source-schedule@0.1.4
+
 ## 0.6.0
 
 ### Minor Changes
