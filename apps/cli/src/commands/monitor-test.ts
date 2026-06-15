@@ -58,9 +58,34 @@ function explainStage(
   };
 }
 
+/**
+ * Severity rank for explain stage statuses. Higher = more severe.
+ * A healthy/ok stage must NEVER mask a downstream failure or pending.
+ * Ranking: failure(3) > pending(2) > healthy(1) > ok(0).
+ * Keep in sync with the identical ranking in libs/core/src/runtime/service.ts.
+ */
+const STAGE_STATUS_SEVERITY: Record<MonitorExplainStageStatus, number> = {
+  ok: 0,
+  healthy: 1,
+  pending: 2,
+  failure: 3,
+};
+
 function explainVerdict(stages: MonitorExplainStage[]) {
-  const stopped = stages.find((stage) => stage.status !== 'ok');
-  const stage = stopped ?? stages[stages.length - 1];
+  // Select the highest-severity stage. failure > pending > healthy > ok.
+  // Using `find(status !== 'ok')` was the regression introduced in #98: a
+  // healthy Observation stage (status='healthy', not 'ok') would short-circuit
+  // and mask a downstream failure or pending (#149).
+  let worst: MonitorExplainStage | undefined;
+  for (const stage of stages) {
+    if (
+      worst === undefined ||
+      STAGE_STATUS_SEVERITY[stage.status] > STAGE_STATUS_SEVERITY[worst.status]
+    ) {
+      worst = stage;
+    }
+  }
+  const stage = worst ?? stages[stages.length - 1];
   return {
     status: stage?.status ?? 'ok',
     stage: stage?.id ?? 'delivery',

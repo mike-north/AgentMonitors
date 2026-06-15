@@ -414,7 +414,7 @@ never `✗`. JSON output returns:
     }
   ],
   "verdict": {
-    "status": "ok|pending|failure",
+    "status": "ok|pending|healthy|failure",
     "stage": "definition|scheduling|observation|notify|materialization|delivery",
     "reason": "<one-line reason>"
   },
@@ -424,6 +424,11 @@ never `✗`. JSON output returns:
   "leadSessions": []
 }
 ```
+
+**Verdict severity ranking**: the verdict reflects the _highest-severity_ stage, not the first
+non-`ok` stage. The severity order is `failure` > `pending` > `healthy` > `ok`. A `healthy` or
+`ok` observation stage never masks a downstream `failure` or `pending` (#149). A fully idle
+monitor (all stages `healthy`) reports a `healthy` verdict.
 
 If the daemon is not reachable (a genuine connection failure — socket refused/absent or request
 timeout), the command still validates the local definition and returns a stage 2 scheduling failure
