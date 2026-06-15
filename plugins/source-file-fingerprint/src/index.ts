@@ -104,6 +104,14 @@ async function buildPresentObservation(
  * Build an observation for a file that has left the matched set: `deleted`
  * (gone from disk — information lost) or `descoped` (still on disk, no longer
  * matched by the globs). No snapshot text: there is no current content to record.
+ *
+ * Salience policy: a `deleted` observation carries `salience: 'high'` because
+ * information is permanently lost and an agent should react promptly. A
+ * `descoped` observation carries no salience, leaving the effective urgency at
+ * the monitor's band floor (`band.lo`) — the file still exists, no information
+ * is lost.
+ *
+ * @see docs/specs/003-source-plugins.md §3.4 (salience policy)
  */
 function buildAbsentObservation(
   filePath: string,
@@ -111,7 +119,7 @@ function buildAbsentObservation(
   previousHash: string,
 ): Observation {
   const summary = `${CHANGE_TITLES[changeKind]}: ${filePath}`;
-  return {
+  const observation: Observation = {
     title: summary,
     summary,
     changeKind,
@@ -120,6 +128,13 @@ function buildAbsentObservation(
     queryScope: { filePath },
     snapshot: { filePath, previousHash },
   };
+  // A deleted file's information is permanently lost; escalate salience so
+  // a `normal..high` band monitor delivers at `high` urgency. `descoped`
+  // carries no salience (the file still exists — no information lost).
+  if (changeKind === 'deleted') {
+    observation.salience = 'high';
+  }
+  return observation;
 }
 
 const scopeSchema: JsonSchema = {
