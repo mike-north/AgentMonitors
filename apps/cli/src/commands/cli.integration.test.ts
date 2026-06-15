@@ -507,6 +507,80 @@ describe('validate', () => {
     expect(result.stdout.toLowerCase()).toContain('urgency');
   });
 
+  // Issue #153 item 3: the inverted-range error must not repeat "urgency" twice.
+  // Before the fix: `urgency: urgency range "high..normal" is inverted …`
+  // After: `urgency: range "high..normal" is inverted …`
+  it('inverted urgency error does not double the field name', () => {
+    const dir = path.join(tempDir, 'validate-inverted-urgency-nodupe-test');
+    const monitorDir = path.join(dir, 'monitors', 'inverted-dupe');
+    mkdirSync(monitorDir, { recursive: true });
+    const body = [
+      '---',
+      'name: Inverted Dupe',
+      'watch:',
+      '  type: file-fingerprint',
+      '  globs: ["*.ts"]',
+      'urgency: high..normal',
+      '---',
+      'Handle it.',
+      '',
+    ].join('\n');
+    writeFileSync(path.join(monitorDir, 'MONITOR.md'), body, 'utf-8');
+
+    const result = run(['validate', path.join(dir, 'monitors')]);
+    expect(result.exitCode).toBe(1);
+    // The error line must contain exactly one "urgency" occurrence as the
+    // field prefix, and the message itself must not repeat it.
+    const errorLine = result.stdout
+      .split('\n')
+      .find((l) => l.includes('inverted'));
+    expect(errorLine).toBeDefined();
+    // Should be "urgency: range …" not "urgency: urgency range …"
+    expect(errorLine).toMatch(/urgency:\s+range/);
+    expect(errorLine).not.toMatch(/urgency:\s+urgency/);
+  });
+
+  // Issue #153 item 1: invalid monitors must display the monitor ID (like valid
+  // monitors do) rather than the full file path.
+  it('invalid monitors display the monitor ID, not the full file path', () => {
+    const dir = path.join(tempDir, 'validate-error-id-test');
+    const monitorDir = path.join(dir, 'monitors', 'my-broken-monitor');
+    mkdirSync(monitorDir, { recursive: true });
+    // Write a monitor with invalid frontmatter (missing required watch.type)
+    const body = [
+      '---',
+      'name: Broken',
+      'watch:',
+      '  type: unknown-source-xyz',
+      'urgency: normal',
+      '---',
+      'Handle it.',
+      '',
+    ].join('\n');
+    writeFileSync(path.join(monitorDir, 'MONITOR.md'), body, 'utf-8');
+
+    const result = run(['validate', path.join(dir, 'monitors')]);
+    expect(result.exitCode).toBe(1);
+    // The error must show the monitor ID, not the absolute path to MONITOR.md
+    expect(result.stdout).toContain('my-broken-monitor');
+    expect(result.stdout).not.toContain('/MONITOR.md');
+  });
+
+  // Issue #153 item 2: validate with a file path must name monitor test as the
+  // symmetric command.
+  it('rejects a file path and names monitor test as the alternative', () => {
+    const dir = path.join(tempDir, 'validate-file-arg-test');
+    const monitorDir = path.join(dir, 'monitors', 'some-monitor');
+    mkdirSync(monitorDir, { recursive: true });
+    run(['init', 'some-monitor', '--dir', path.join(dir, 'monitors')], dir);
+
+    const monitorFile = path.join(monitorDir, 'MONITOR.md');
+    const result = run(['validate', monitorFile]);
+    expect(result.exitCode).toBe(1);
+    // Error must mention the symmetric command so authors know what to use instead
+    expect(result.stderr).toContain('monitor test');
+  });
+
   // Copilot thread 3410689135: the generated JSON Schema pattern for `urgency`
   // must accept the same leading/trailing whitespace that the Zod parser accepts
   // (it calls `.trim()` before validating bounds). Both validation surfaces must

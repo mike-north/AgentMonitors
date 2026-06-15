@@ -1,5 +1,6 @@
 import { Command, Option } from 'commander';
 import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import {
   scanMonitors,
   SourceRegistry,
@@ -7,6 +8,18 @@ import {
 } from '@agentmonitors/core';
 import { registerCoreSources } from '../sources.js';
 import { requireDirectory } from '../validation.js';
+
+/**
+ * Derive the monitor ID from a file path, mirroring the logic in parseMonitor.
+ * Used to display the monitor ID rather than the full file path in error output
+ * (ID = parent dir name for MONITOR.md files, stem for flat .md files).
+ */
+function monitorIdFromPath(filePath: string): string {
+  const base = path.basename(filePath);
+  return base === 'MONITOR.md'
+    ? path.basename(path.dirname(filePath))
+    : path.parse(filePath).name;
+}
 
 /**
  * Returns the actionable BP3 error when a `change-detection.collection` block is
@@ -125,7 +138,11 @@ export const validateCommand = new Command('validate')
 
     const allErrors = [
       ...result.errors.map((e) => ({
-        filePath: e.filePath,
+        // Use the monitor ID (derived from the folder/stem name) rather than the
+        // full file path so error output is consistent with valid-monitor output,
+        // which already uses the ID. Fall back to the file path if ID derivation
+        // returns an empty/dot-prefixed string (e.g. an unusual path).
+        filePath: monitorIdFromPath(e.filePath) || e.filePath,
         error: [e.error, oldSourceScopeShapeHint(e.filePath)]
           .filter(Boolean)
           .join('; '),

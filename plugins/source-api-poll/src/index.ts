@@ -212,10 +212,31 @@ const source: ObservationSource = {
       parseScopeConfig(config);
     const authHeaders = resolveAuth(auth);
 
-    const response = await fetch(url, {
-      method: method ?? 'GET',
-      headers: { ...authHeaders, ...headers },
-    });
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: method ?? 'GET',
+        headers: { ...authHeaders, ...headers },
+      });
+    } catch (fetchErr) {
+      // Node's undici/fetch wraps the real network failure (ECONNREFUSED,
+      // ENOTFOUND, timeout …) as `err.cause`. The outer `err.message` is the
+      // generic "fetch failed", which is unhelpful in `monitor explain` output.
+      // Re-throw a new error that includes the real cause in the message so
+      // callers — both `monitor test` and the runtime's observation-history
+      // audit — see the underlying reason. Issue #153 (item 6).
+      const causeMsg =
+        fetchErr instanceof Error && fetchErr.cause instanceof Error
+          ? fetchErr.cause.message
+          : null;
+      const baseMsg =
+        fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+      // Use fetchErr as the cause to satisfy the preserve-caught-error rule;
+      // the full cause chain is reachable via err.cause.cause.
+      throw new Error(causeMsg ? `${baseMsg}: ${causeMsg}` : baseMsg, {
+        cause: fetchErr,
+      });
+    }
 
     const body = await response.text();
     const prev =

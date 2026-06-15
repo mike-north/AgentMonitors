@@ -90,7 +90,7 @@ const urgencyBandSchema = z.string().transform((raw, ctx) => {
   if (urgencyRank[loRaw] > urgencyRank[hiRaw]) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
-      message: `urgency range "${loRaw}..${hiRaw}" is inverted — the low bound must not exceed the high bound`,
+      message: `range "${loRaw}..${hiRaw}" is inverted — the low bound must not exceed the high bound`,
     });
     return z.NEVER;
   }

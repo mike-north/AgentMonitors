@@ -285,6 +285,69 @@ describe('source-api-poll', () => {
     });
   });
 
+  // Issue #153 item 6: Node fetch wraps the real cause (ECONNREFUSED/DNS/timeout)
+  // as err.cause. The source must propagate it so `monitor explain` shows the
+  // real reason instead of the generic "fetch failed".
+  describe('network error cause propagation (issue #153 item 6)', () => {
+    it('surfaces the underlying cause message when fetch throws', async () => {
+      const underlying = new Error('connect ECONNREFUSED 127.0.0.1:9999');
+      const fetchError = new TypeError('fetch failed');
+      // Simulate how Node undici sets the cause
+      Object.defineProperty(fetchError, 'cause', {
+        value: underlying,
+        enumerable: true,
+      });
+
+      vi.stubGlobal('fetch', vi.fn().mockRejectedValue(fetchError));
+
+      await expect(
+        source.observe(
+          { url: 'http://127.0.0.1:9999/unreachable' },
+          { now: new Date() },
+        ),
+      ).rejects.toThrow(/fetch failed.*ECONNREFUSED/i);
+    });
+
+    it('sets the caught fetchErr as the Error cause property (full chain reachable)', async () => {
+      const underlying = new Error('getaddrinfo ENOTFOUND nxdomain.invalid');
+      const fetchError = new TypeError('fetch failed');
+      Object.defineProperty(fetchError, 'cause', {
+        value: underlying,
+        enumerable: true,
+      });
+
+      vi.stubGlobal('fetch', vi.fn().mockRejectedValue(fetchError));
+
+      let thrown: unknown;
+      try {
+        await source.observe(
+          { url: 'http://nxdomain.invalid' },
+          { now: new Date() },
+        );
+      } catch (err) {
+        thrown = err;
+      }
+
+      expect(thrown).toBeInstanceOf(Error);
+      // The direct cause is the original fetchErr (preserve-caught-error);
+      // the underlying network error is reachable as thrown.cause.cause.
+      expect((thrown as Error).cause).toBe(fetchError);
+      expect(((thrown as Error).cause as TypeError).cause).toBe(underlying);
+    });
+
+    it('still throws when fetch fails with no cause', async () => {
+      const fetchError = new TypeError('fetch failed');
+      vi.stubGlobal('fetch', vi.fn().mockRejectedValue(fetchError));
+
+      await expect(
+        source.observe(
+          { url: 'http://unreachable.invalid' },
+          { now: new Date() },
+        ),
+      ).rejects.toThrow('fetch failed');
+    });
+  });
+
   describe('cache isolation', () => {
     it('different configs for same URL maintain separate baselines', async () => {
       const mockFetch = vi.fn();
