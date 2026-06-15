@@ -45,7 +45,7 @@ holding, not a fault.
 
 `RuntimeTickResult` gains a `skippedMonitors: { monitorId, nextDueAt }[]` field, populated from the
 same scheduling decision that gates evaluation — never recomputed separately. `daemon once` appends a
-parenthetical suffix when non-empty: `(N skipped: interval not elapsed — next due in Xs)`, reporting
+parenthetical suffix when non-empty: `(N not yet due — next due in Xs)`, reporting
 the soonest next-due time. Previously a second `daemon once` run within a monitor's interval printed
 `Evaluated 0 monitor(s), emitted 0 event(s).` — identical to the "no monitors found" output, giving
 the author a silent dead end (issue #152). The genuine empty/no-monitors path is unchanged.

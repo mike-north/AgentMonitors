@@ -1141,8 +1141,7 @@ When the file changes, review it.
     expect(secondRun.exitCode).toBe(0);
     // Must report the skipped count and a next-due hint so the author can
     // distinguish this from "no monitors found" (the ambiguous pre-fix output).
-    expect(secondRun.stdout).toContain('1 skipped');
-    expect(secondRun.stdout).toContain('interval not elapsed');
+    expect(secondRun.stdout).toContain('1 not yet due');
     expect(secondRun.stdout).toContain('next due in');
     // Must still report 0 evaluated (the monitor was not run this tick).
     expect(secondRun.stdout).toContain('Evaluated 0 monitor(s)');
@@ -1177,7 +1176,8 @@ When the file changes, review it.
     const dir = path.join(tempDir, 'once-mixed-skipped');
     const monitorsRoot = path.join(dir, '.claude', 'monitors');
     mkdirSync(dir, { recursive: true });
-    writeFileSync(path.join(dir, 'watched-slow.txt'), 'initial-slow', 'utf-8');
+    // Match the glob in longIntervalMonitorBody ('watched.txt').
+    writeFileSync(path.join(dir, 'watched.txt'), 'initial-slow', 'utf-8');
     writeFileSync(path.join(dir, 'watched-fast.txt'), 'initial-fast', 'utf-8');
     // Long-interval monitor: will be skipped on the second run.
     writeMonitor(monitorsRoot, 'slow-monitor', longIntervalMonitorBody);
@@ -1210,15 +1210,15 @@ When the file changes, review it.
     expect(firstRun.stdout).toContain('Evaluated 2 monitor(s)');
 
     // Second run immediately after: slow-monitor is skipped (5m not elapsed);
-    // fast-monitor is evaluated again (1s interval already elapsed).
+    // fast-monitor is evaluated again (interval: 0s, always due).
     const secondRun = runWithEnv(
       ['daemon', 'once', monitorsRoot, '--workspace', dir],
       env,
     );
     expect(secondRun.exitCode).toBe(0);
     expect(secondRun.stdout).toContain('Evaluated 1 monitor(s)');
-    expect(secondRun.stdout).toContain('1 skipped');
-    expect(secondRun.stdout).toContain('interval not elapsed');
+    expect(secondRun.stdout).toContain('1 not yet due');
+    expect(secondRun.stdout).toContain('next due in');
   });
 });
 
