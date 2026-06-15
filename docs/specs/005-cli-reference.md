@@ -23,6 +23,8 @@ Commands divide into two transport modes:
 
 **`daemon once` is notable:** although it lives under the `daemon` command group, its implementation in `runtime-client.ts` (`daemonTickClient`) calls `createRuntime()` and `runtime.tick()` directly without using the socket. It is a single-tick in-process run, not a socket call. This is consistent with [002-runtime-delivery.md](./002-runtime-delivery.md).
 
+**`monitor history` and `monitor explain` are socket-first but degrade gracefully:** both round-trip the daemon socket when one is reachable, but on a genuine connection failure they fall back to reading the persisted SQLite store **in-process** (via `daemonStatus`-style `createRuntime()` calls — `listObservationHistoryInProcess` / `explainMonitorInProcess` in `runtime-client.ts`). This keeps read-only diagnosis working after `daemon once` with no daemon running (#150). See their sections in §6 for the banner and remediation semantics.
+
 ### Socket path resolution
 
 The daemon socket path is resolved in this priority order (implemented in `daemon-ipc.ts`):
@@ -334,11 +336,22 @@ Exits 1 on: file not found, parse error, unknown source, observation exception. 
 
 ### `monitor history` — Observation audit trail
 
-**Status:** Fully implemented (socket).
+**Status:** Fully implemented (socket with a no-daemon in-process DB fallback).
 
 Lists the per-tick outcomes the runtime records for each due monitor
 ([002 §"Persistence Schema"](./002-runtime-delivery.md)) — useful for answering "why didn't my
-monitor fire?". Round-trips through the daemon socket (`history.list`).
+monitor fire?". Round-trips through the daemon socket (`history.list`) when a daemon is reachable.
+
+**No-daemon fallback (#150):** observation history is read-only durable state, so if the daemon is
+unreachable (a genuine connection failure — socket refused/absent or request timeout) the command
+reads the persisted SQLite store **in-process** instead of erroring. When it returns rows, text
+output is prefixed with the banner _"No daemon running — showing persisted state from the last
+tick."_ (the `--format json` array is unchanged). When the daemon is down **and** there are no
+persisted rows, it prints an actionable remediation line — _"No daemon running and no persisted
+state to show. Start it with `agentmonitors daemon run`, or use `agentmonitors monitor test <path>`
+for a one-shot check."_ — and exits 1, rather than a raw Node `connect ENOENT …`. A daemon-side
+**application** error (the daemon answered with an error) is still surfaced verbatim as
+`History failed: <message>`, never masked as "daemon not running" (the #94/#98 distinction holds).
 
 ```
 agentmonitors monitor history [monitorId] [--socket <path>] [--limit <n>] [--format <text|json>]
@@ -359,7 +372,7 @@ plus the monitor id, source name, and timestamp.
 
 ### `monitor explain` — Pipeline diagnosis
 
-**Status:** Fully implemented (socket with daemon-unavailable fallback).
+**Status:** Fully implemented (socket with a no-daemon in-process DB fallback).
 
 Diagnoses where a single monitor's signal currently stops. The command asks the daemon for a
 read-only staged report (`monitor.explain`) built from the monitor definition, scheduling state,
@@ -430,12 +443,21 @@ non-`ok` stage. The severity order is `failure` > `pending` > `healthy` > `ok`. 
 `ok` observation stage never masks a downstream `failure` or `pending` (#149). A fully idle
 monitor (all stages `healthy`) reports a `healthy` verdict.
 
-If the daemon is not reachable (a genuine connection failure — socket refused/absent or request
-timeout), the command still validates the local definition and returns a stage 2 scheduling failure
-that says the daemon is not running or unreachable, exiting 0. A daemon-side **application** error
-(the daemon answered with an error) is **not** masked as "daemon not running": it is surfaced
-verbatim as `Explain failed: <message>` with exit code 1. Malformed command arguments remain normal
-CLI errors.
+**No-daemon fallback (#150):** if the daemon is not reachable (a genuine connection failure — socket
+refused/absent or request timeout), `monitor explain` runs the **same** `explainMonitor` in-process
+against the persisted SQLite store, exactly as `daemon once` runs a tick in-process. A read-only
+diagnosis tool must not require a live daemon: the data from the last tick is already in the DB. When
+the store holds persisted state for the monitor (any `observation_history` or `monitor_events` rows),
+the command renders the real per-stage diagnosis prefixed with the banner _"No daemon running —
+showing persisted state from the last tick."_ (text) or annotated with a `"notice"` field alongside
+the full report (JSON), exiting 0. This means a monitor that actually fired is **never** reported as
+a false `✗ Scheduling: failure` just because no daemon is running. When the daemon is down **and**
+there is genuinely nothing persisted to read (no history and no events for the monitor), the command
+prints an actionable remediation line — _"No daemon running and no persisted state to show. Start it
+with `agentmonitors daemon run`, or use `agentmonitors monitor test <path>` for a one-shot check."_ —
+and exits 1, rather than a raw Node `connect ENOENT …`. A daemon-side **application** error (the
+daemon answered with an error) is **not** masked as "daemon not running": it is surfaced verbatim as
+`Explain failed: <message>` with exit code 1. Malformed command arguments remain normal CLI errors.
 
 ---
 

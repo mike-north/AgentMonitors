@@ -1541,66 +1541,263 @@ When files change, review them.
   }, 30_000);
 });
 
-describe('monitor explain', () => {
-  it('returns JSON stage diagnostics when the daemon is not running', () => {
-    const dir = path.join(tempDir, 'explain-daemon-down');
-    const monitorsDir = path.join(dir, '.claude', 'monitors', 'watch-files');
+// Issue #150: `monitor explain` / `monitor history` must read persisted SQLite
+// directly when no daemon is reachable (PM decision (a)), clearly labeled, and
+// must NOT report a false "✗ Scheduling: failure" for a monitor that actually
+// fired. When the daemon is down AND nothing is persisted, they emit an
+// actionable remediation line instead of a raw `connect ENOENT …` (decision
+// (b)(i)). These tests pin a FILE-backed DB so state survives across CLI
+// invocations (the in-process fallback reads the same file `daemon once` wrote).
+describe('monitor explain / history without a live daemon (issue #150)', () => {
+  // A schedule monitor with cron '* * * * *' is due every tick, so a single
+  // `daemon once` materializes exactly one event into the DB — giving the
+  // in-process explain real persisted state to diagnose.
+  const FIRING_MONITOR = `---
+name: Emits every tick
+watch:
+  type: schedule
+  cron: '* * * * *'
+  timezone: UTC
+urgency: normal
+---
+This monitor fires on a schedule.
+`;
+
+  function deadSocketPath(label: string): string {
+    return path.join(
+      '/tmp',
+      `agentmon-${label}-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+  }
+
+  it('reads persisted state after `daemon once` and shows the real diagnosis (no false "Scheduling failure"), with the no-daemon banner', () => {
+    const dir = path.join(tempDir, 'explain-nodaemon-persisted');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    const monitorsDir = path.join(monitorsRoot, 'fires');
     mkdirSync(monitorsDir, { recursive: true });
     writeFileSync(
       path.join(monitorsDir, 'MONITOR.md'),
-      `---
-name: Watch files
-watch:
-  type: file-fingerprint
-  globs:
-    - watched.txt
-urgency: normal
----
-When files change, review them.
-`,
+      FIRING_MONITOR,
       'utf-8',
     );
 
-    const socketPath = path.join(
-      '/tmp',
-      `agentmon-explain-missing-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    const dbPath = path.join(dir, 'agentmon.db');
+    const socketPath = deadSocketPath('explain-persisted');
+    const env = { AGENTMONITORS_DB: dbPath, AGENTMONITORS_SOCKET: socketPath };
+
+    // Materialize an event into the file DB in-process (no daemon, no socket).
+    const once = runWithEnv(
+      ['daemon', 'once', monitorsRoot, '--workspace', dir],
+      env,
+      dir,
     );
+    expect(once.exitCode).toBe(0);
+    expect(once.stdout).toContain('emitted 1 event(s)');
+
+    // Now explain with NO daemon running (the socket points at a dead path).
     const result = runWithEnv(
       [
         'monitor',
         'explain',
-        'watch-files',
+        'fires',
         '--dir',
-        path.join(dir, '.claude', 'monitors'),
+        monitorsRoot,
+        '--workspace',
+        dir,
+        '--socket',
+        socketPath,
+      ],
+      env,
+      dir,
+    );
+
+    expect(result.exitCode).toBe(0);
+    // The persisted-state banner is present...
+    expect(result.stdout).toContain(
+      'No daemon running — showing persisted state from the last tick.',
+    );
+    // ...and it does NOT print a false scheduling failure for a fired monitor.
+    expect(result.stdout).not.toContain('✗ Scheduling');
+    expect(result.stdout).not.toContain('Verdict: failure at Scheduling');
+    // The real diagnosis ran: definition is valid and the monitor materialized
+    // an event, so materialization is reported as OK (a real per-stage result).
+    expect(result.stdout).toContain('Monitor fires');
+    expect(result.stdout).toMatch(/Materialization:.*monitor_events row/);
+  });
+
+  it('reads persisted state in --format json (no false scheduling failure) and annotates the no-daemon notice', () => {
+    const dir = path.join(tempDir, 'explain-nodaemon-json');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    const monitorsDir = path.join(monitorsRoot, 'fires');
+    mkdirSync(monitorsDir, { recursive: true });
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      FIRING_MONITOR,
+      'utf-8',
+    );
+
+    const dbPath = path.join(dir, 'agentmon.db');
+    const socketPath = deadSocketPath('explain-json');
+    const env = { AGENTMONITORS_DB: dbPath, AGENTMONITORS_SOCKET: socketPath };
+
+    const once = runWithEnv(
+      ['daemon', 'once', monitorsRoot, '--workspace', dir],
+      env,
+      dir,
+    );
+    expect(once.exitCode).toBe(0);
+
+    const result = runWithEnv(
+      [
+        'monitor',
+        'explain',
+        'fires',
+        '--dir',
+        monitorsRoot,
+        '--workspace',
+        dir,
         '--socket',
         socketPath,
         '--format',
         'json',
       ],
-      { AGENTMONITORS_SOCKET: socketPath },
+      env,
       dir,
     );
 
     expect(result.exitCode).toBe(0);
     const report = JSON.parse(result.stdout) as {
+      notice: string;
       verdict: { stage: string; status: string };
-      stages: { id: string; status: string; reason: string }[];
+      stages: { id: string; status: string }[];
+      events: unknown[];
     };
-    expect(report.verdict).toMatchObject({
-      stage: 'scheduling',
-      status: 'failure',
-    });
-    expect(report.stages.find((stage) => stage.id === 'definition')).toEqual(
-      expect.objectContaining({ status: 'ok' }),
-    );
-    expect(report.stages.find((stage) => stage.id === 'scheduling')).toEqual(
-      expect.objectContaining({
-        status: 'failure',
-        reason: expect.stringContaining('daemon is not running'),
-      }),
-    );
+    expect(report.notice).toContain('No daemon running');
+    // The fired monitor must NOT be reported as failing at Scheduling.
+    expect(report.verdict.stage).not.toBe('scheduling');
+    expect(
+      report.stages.find((stage) => stage.id === 'scheduling'),
+    ).not.toEqual(expect.objectContaining({ status: 'failure' }));
+    expect(report.events.length).toBeGreaterThan(0);
   });
 
+  it('explain with the daemon down and NOTHING persisted emits an actionable remediation, not a raw ENOENT', () => {
+    const dir = path.join(tempDir, 'explain-nodaemon-empty');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    const monitorsDir = path.join(monitorsRoot, 'fires');
+    mkdirSync(monitorsDir, { recursive: true });
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      FIRING_MONITOR,
+      'utf-8',
+    );
+
+    // Fresh DB path that no tick ever wrote to → no persisted rows.
+    const dbPath = path.join(dir, 'empty.db');
+    const socketPath = deadSocketPath('explain-empty');
+    const env = { AGENTMONITORS_DB: dbPath, AGENTMONITORS_SOCKET: socketPath };
+
+    const result = runWithEnv(
+      [
+        'monitor',
+        'explain',
+        'fires',
+        '--dir',
+        monitorsRoot,
+        '--workspace',
+        dir,
+        '--socket',
+        socketPath,
+      ],
+      env,
+      dir,
+    );
+
+    expect(result.exitCode).toBe(1);
+    // Actionable remediation, not a raw Node connect error.
+    expect(result.stderr).toContain('agentmonitors daemon run');
+    expect(result.stderr).toContain('monitor test');
+    expect(result.stderr).not.toContain('ENOENT');
+    expect(result.stderr).not.toContain('.sock');
+  });
+
+  it('history reads persisted observation rows in-process when the daemon is down (not an ENOENT error)', () => {
+    const dir = path.join(tempDir, 'history-nodaemon-persisted');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    const monitorsDir = path.join(monitorsRoot, 'fires');
+    mkdirSync(monitorsDir, { recursive: true });
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      FIRING_MONITOR,
+      'utf-8',
+    );
+
+    const dbPath = path.join(dir, 'agentmon.db');
+    const socketPath = deadSocketPath('history-persisted');
+    const env = { AGENTMONITORS_DB: dbPath, AGENTMONITORS_SOCKET: socketPath };
+
+    const once = runWithEnv(
+      ['daemon', 'once', monitorsRoot, '--workspace', dir],
+      env,
+      dir,
+    );
+    expect(once.exitCode).toBe(0);
+
+    // Text form: banner + the persisted row, NOT an ENOENT error.
+    const text = runWithEnv(
+      ['monitor', 'history', 'fires', '--socket', socketPath],
+      env,
+      dir,
+    );
+    expect(text.exitCode).toBe(0);
+    expect(text.stdout).toContain(
+      'No daemon running — showing persisted state from the last tick.',
+    );
+    expect(text.stdout).toContain('fires');
+    expect(text.stderr).not.toContain('ENOENT');
+
+    // JSON form still works through the in-process path.
+    const json = runWithEnv(
+      [
+        'monitor',
+        'history',
+        'fires',
+        '--socket',
+        socketPath,
+        '--format',
+        'json',
+      ],
+      env,
+      dir,
+    );
+    expect(json.exitCode).toBe(0);
+    const rows = JSON.parse(json.stdout) as { monitorId: string }[];
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every((row) => row.monitorId === 'fires')).toBe(true);
+  });
+
+  it('history with the daemon down and NOTHING persisted emits an actionable remediation, not a raw ENOENT', () => {
+    const dir = path.join(tempDir, 'history-nodaemon-empty');
+    mkdirSync(dir, { recursive: true });
+    const dbPath = path.join(dir, 'empty.db');
+    const socketPath = deadSocketPath('history-empty');
+    const env = { AGENTMONITORS_DB: dbPath, AGENTMONITORS_SOCKET: socketPath };
+
+    const result = runWithEnv(
+      ['monitor', 'history', '--socket', socketPath],
+      env,
+      dir,
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('agentmonitors daemon run');
+    expect(result.stderr).toContain('monitor test');
+    expect(result.stderr).not.toContain('ENOENT');
+    expect(result.stderr).not.toContain('.sock');
+  });
+});
+
+describe('monitor explain', () => {
   it('surfaces a daemon-side application error instead of masking it as "daemon not running" (issue #94 review)', async () => {
     // Regression for comment 3408123745: when the daemon answers `monitor.explain`
     // with an application error (the daemon IS running and reachable), the CLI must
