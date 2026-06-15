@@ -1,5 +1,6 @@
 import { Command, Option } from 'commander';
 import { reportError } from '../output.js';
+import { renderToon, resolveFormat } from '../toon-format.js';
 import {
   acknowledgeEventsClient,
   listEventsClient,
@@ -46,8 +47,9 @@ eventsCommand
   .option('--since-baseline', 'Only include events since the session baseline')
   .addOption(
     new Option('--format <format>', 'Output format')
-      .choices(['text', 'json'])
-      .default('text'),
+      .choices(['toon', 'json', 'text'])
+
+      .default(undefined, 'auto (toon for agents, text for humans)'),
   )
   .action(
     async (options: {
@@ -59,8 +61,9 @@ eventsCommand
       scope?: string;
       unread?: boolean;
       sinceBaseline?: boolean;
-      format: string;
+      format: string | undefined;
     }) => {
+      const format = resolveFormat(options.format);
       try {
         const scope = parseScope(options.scope);
         const events = await listEventsClient(
@@ -75,10 +78,15 @@ eventsCommand
           },
           options.socket,
         );
-        if (options.format === 'json') {
+        if (format === 'json') {
           console.log(JSON.stringify(events, null, 2));
           return;
         }
+        if (format === 'toon') {
+          console.log(renderToon(events));
+          return;
+        }
+        // text format
         if (events.length === 0) {
           console.log('No events found.');
           return;
@@ -90,7 +98,7 @@ eventsCommand
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        reportError(message, options.format === 'json');
+        reportError(message, format === 'json');
       }
     },
   );

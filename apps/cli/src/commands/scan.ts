@@ -1,21 +1,24 @@
 import { Command, Option } from 'commander';
 import { scanMonitors } from '@agentmonitors/core';
 import { requireDirectory } from '../validation.js';
+import { renderToon, resolveFormat } from '../toon-format.js';
 
 export const scanCommand = new Command('scan')
   .description('Find and summarize all MONITOR.md files')
   .argument('[dir]', 'Directory to scan', '.claude/monitors')
   .addOption(
     new Option('--format <format>', 'Output format')
-      .choices(['text', 'json'])
-      .default('text'),
+      .choices(['toon', 'json', 'text'])
+
+      .default(undefined, 'auto (toon for agents, text for humans)'),
   )
-  .action(async (dir: string, options: { format: string }) => {
-    if (!requireDirectory(dir, options.format === 'json')) return;
+  .action(async (dir: string, options: { format: string | undefined }) => {
+    const format = resolveFormat(options.format);
+    if (!requireDirectory(dir, format === 'json')) return;
 
     const result = await scanMonitors(dir);
 
-    if (options.format === 'json') {
+    if (format === 'json' || format === 'toon') {
       const output = {
         monitors: result.monitors.map((m) => ({
           id: m.monitor.id,
@@ -31,7 +34,11 @@ export const scanCommand = new Command('scan')
         })),
         duplicateIds: result.duplicateIds,
       };
-      console.log(JSON.stringify(output, null, 2));
+      if (format === 'json') {
+        console.log(JSON.stringify(output, null, 2));
+      } else {
+        console.log(renderToon(output));
+      }
       return;
     }
 

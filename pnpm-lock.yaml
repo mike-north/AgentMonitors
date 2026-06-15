@@ -83,12 +83,18 @@ importers:
       '@modelcontextprotocol/sdk':
         specifier: ^1.29.0
         version: 1.29.0(@cfworker/json-schema@4.1.1)(zod@3.25.76)
+      '@toon-format/toon':
+        specifier: ^2.3.0
+        version: 2.3.0
       better-sqlite3:
         specifier: ^11.9.1
         version: 11.10.0
       commander:
         specifier: ^14.0.3
         version: 14.0.3
+      is-agentic-tui:
+        specifier: ^0.2.0
+        version: 0.2.0
       zod:
         specifier: ^3.25.76
         version: 3.25.76
@@ -1557,6 +1563,9 @@ packages:
   '@swc/helpers@0.5.15':
     resolution: {integrity: sha512-JQ5TuMi45Owi4/BIMAJBoSQoOJu12oOk/gADqlcUL9JEdHB8vyjUSsxqeNXnmXHjYKMi2WcYtezGEEhqUI/E2g==}
 
+  '@toon-format/toon@2.3.0':
+    resolution: {integrity: sha512-/Ew9etdRQKVMnm9fDaCG0JjyAOK/O7T0M97oum1aW4W+UR8ZhVVPBanIV7oWgHBiGlnVxV9M55PWQCHofDV07w==}
+
   '@tybys/wasm-util@0.9.0':
     resolution: {integrity: sha512-6+7nlbMVX/PVDCwaIQ8nTOPveOcFLSt8GcXdx8hD0bt39uWxYT88uXzqTd4fTvqta7oeUJqudepapKNt2DYJFw==}
 
@@ -2756,6 +2765,10 @@ packages:
   ipaddr.js@1.9.1:
     resolution: {integrity: sha512-0KI/607xoxSToH7GjN1FfSbLoU0+btTicjsQSWQlh/hZykN8KpmMf7uYwPW3R+akZ6R/w18ZlXSHBYXiYUPO3g==}
     engines: {node: '>= 0.10'}
+
+  is-agentic-tui@0.2.0:
+    resolution: {integrity: sha512-fgzns7pBWl7hczWlbR4qG4iskMC9t2a9d904EZlxwYwY7H9m6LTprp2wQiI77x4oZ14RrxH57A4I8SdExsCLjg==}
+    engines: {node: '>=20'}
 
   is-arrayish@0.2.1:
     resolution: {integrity: sha512-zz06S8t0ozoDXMG+ube26zeCTNXcKIPJZJi8hBrF4idCLms4CG9QtK7qBl1boi5ODzFpjswb5JPmHCbMpjaYzg==}
@@ -5327,6 +5340,8 @@ snapshots:
     dependencies:
       tslib: 2.8.1
 
+  '@toon-format/toon@2.3.0': {}
+
   '@tybys/wasm-util@0.9.0':
     dependencies:
       tslib: 2.8.1
@@ -6564,6 +6579,8 @@ snapshots:
   ip-address@10.2.0: {}
 
   ipaddr.js@1.9.1: {}
+
+  is-agentic-tui@0.2.0: {}
 
   is-arrayish@0.2.1: {}
 

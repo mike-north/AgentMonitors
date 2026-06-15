@@ -20,6 +20,7 @@ import { spawn } from 'node:child_process';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { writeLocalState } from '../local-state.js';
 import { daemonAvailable, callDaemon } from '../daemon-ipc.js';
+import { decodeToon } from '../toon-format.js';
 
 const CLI_PATH = path.resolve(__dirname, '../../dist/index.cjs');
 const CLI_PACKAGE_DIR = path.resolve(__dirname, '../..');
@@ -73,6 +74,79 @@ function runWithEnv(
   const opts: ExecFileSyncOptions = {
     encoding: 'utf-8',
     env: { ...process.env, ...env },
+    cwd,
+  };
+  try {
+    const stdout = execFileSync('node', [CLI_PATH, ...args], opts) as string;
+    return { stdout, stderr: '', exitCode: 0 };
+  } catch (err) {
+    const e = err as { stdout: string; stderr: string; status: number };
+    return {
+      stdout: (e.stdout ?? '') as string,
+      stderr: (e.stderr ?? '') as string,
+      exitCode: e.status ?? 1,
+    };
+  }
+}
+
+/**
+ * All environment variables that `is-agentic-tui` inspects to detect an agentic
+ * TUI. Used by {@link runAsHuman} to build a clean non-agentic subprocess env.
+ *
+ * @see https://github.com/mike-north/is-agentic-tui
+ */
+const AGENTIC_TUI_ENV_KEYS = [
+  // Claude Code
+  'CLAUDECODE',
+  'CLAUDE_CODE_ENTRYPOINT',
+  'CLAUDE_PATH',
+  // Cursor
+  'CURSOR_AGENT',
+  'CURSOR_INVOKED_AS',
+  // Gemini CLI
+  'GEMINI_CLI',
+  // Aider
+  'AIDER',
+  'OR_APP_NAME',
+  'OR_SITE_URL',
+  // Codex
+  'CODEX_SANDBOX',
+  'CODEX_THREAD_ID',
+  // Cline
+  'CLINE_ACTIVE',
+  // Kiro CLI
+  'Q_TERM',
+  'QTERM_SESSION_ID',
+] as const;
+
+/**
+ * Runs the CLI as if it were called by a human (non-agentic) terminal.
+ *
+ * Strips all environment variables that `is-agentic-tui` uses for detection so
+ * the test is hermetic even when the test runner itself runs inside an agentic
+ * TUI such as Claude Code (which sets `CLAUDECODE=1`, `CLAUDE_CODE_ENTRYPOINT`,
+ * etc. in the current process's environment, which would otherwise be inherited).
+ */
+function runAsHuman(
+  args: string[],
+  extraEnv: Record<string, string> = {},
+  cwd?: string,
+): RunResult {
+  // Build an env that excludes all agentic-TUI signals so detection sees a
+  // clean non-agentic environment regardless of what the test runner inherits.
+  const agenticKeys = new Set<string>(AGENTIC_TUI_ENV_KEYS);
+  const env: Record<string, string> = {
+    ...Object.fromEntries(
+      Object.entries(process.env).filter(
+        ([k, v]) => v !== undefined && !agenticKeys.has(k),
+      ) as [string, string][],
+    ),
+    ...extraEnv,
+  };
+
+  const opts: ExecFileSyncOptions = {
+    encoding: 'utf-8',
+    env,
     cwd,
   };
   try {
@@ -996,7 +1070,7 @@ describe('scan', () => {
 
 describe('source list', () => {
   it('lists sources in text format', () => {
-    const result = run(['source', 'list']);
+    const result = run(['source', 'list', '--format', 'text']);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain('Config fields:');
     expect(result.stdout).not.toContain('Scope fields:');
@@ -1019,6 +1093,140 @@ describe('source list', () => {
     expect(names).toContain('schedule');
     expect(names).toContain('incoming-changes');
     expect(parsed[0]).toHaveProperty('configFields');
+  });
+
+  it('auto-detects toon when run by an agent (no --format flag, CLAUDECODE=1)', () => {
+    const result = runWithEnv(['source', 'list'], {
+      AGENTMONITORS_DB: ':memory:',
+      CLAUDECODE: '1',
+    });
+    expect(result.exitCode).toBe(0);
+    // TOON output does not use JSON braces for the root array
+    expect(result.stdout).not.toMatch(/^\s*\[$/m);
+    // All source names are present in the toon output
+    expect(result.stdout).toContain('file-fingerprint');
+    expect(result.stdout).toContain('api-poll');
+  });
+
+  it('auto-detects text when run by a human (no --format flag, no agentic env vars)', () => {
+    // runAsHuman strips all env vars that is-agentic-tui uses so the test is
+    // hermetic even when the test runner itself runs inside an agentic TUI.
+    const result = runAsHuman(['source', 'list'], {
+      AGENTMONITORS_DB: ':memory:',
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('Config fields:');
+    expect(result.stdout).toContain('file-fingerprint');
+  });
+
+  it('toon source list output round-trips to identical JSON value as --format json', () => {
+    const jsonResult = run(['source', 'list', '--format', 'json']);
+    const toonResult = run(['source', 'list', '--format', 'toon']);
+    expect(jsonResult.exitCode).toBe(0);
+    expect(toonResult.exitCode).toBe(0);
+    const fromJson = JSON.parse(jsonResult.stdout) as unknown;
+    const fromToon = decodeToon(toonResult.stdout);
+    expect(fromToon).toEqual(fromJson);
+  });
+
+  it('rejects invalid --format value for source list', () => {
+    const result = run(['source', 'list', '--format', 'xml']);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('xml');
+  });
+});
+
+describe('--format toon for structured-output commands', () => {
+  it('scan auto-detects toon when run by an agent (no --format flag, CLAUDECODE=1)', () => {
+    const dir = path.join(tempDir, 'scan-toon-default');
+    const monitorsDir = path.join(dir, 'monitors');
+    mkdirSync(monitorsDir, { recursive: true });
+    run(['init', 'my-monitor', '--dir', monitorsDir], dir);
+    const result = runWithEnv(['scan', monitorsDir], {
+      AGENTMONITORS_DB: ':memory:',
+      CLAUDECODE: '1',
+    });
+    expect(result.exitCode).toBe(0);
+    // Not raw JSON (no outer braces)
+    expect(result.stdout.trim()).not.toMatch(/^\{/);
+    // The monitor id is present
+    expect(result.stdout).toContain('my-monitor');
+  });
+
+  it('scan auto-detects text when run by a human (no --format flag, no agentic env vars)', () => {
+    const dir = path.join(tempDir, 'scan-toon-human-default');
+    const monitorsDir = path.join(dir, 'monitors');
+    mkdirSync(monitorsDir, { recursive: true });
+    run(['init', 'human-monitor', '--dir', monitorsDir], dir);
+    // runAsHuman strips all env vars that is-agentic-tui uses so the test is
+    // hermetic even when the test runner itself runs inside an agentic TUI.
+    const result = runAsHuman(['scan', monitorsDir], {
+      AGENTMONITORS_DB: ':memory:',
+    });
+    expect(result.exitCode).toBe(0);
+    // Human text format has a header row with padded columns
+    expect(result.stdout).toContain('ID');
+    expect(result.stdout).toContain('human-monitor');
+  });
+
+  it('scan toon output round-trips to identical JSON value as --format json', () => {
+    const dir = path.join(tempDir, 'scan-toon-roundtrip');
+    const monitorsDir = path.join(dir, 'monitors');
+    mkdirSync(monitorsDir, { recursive: true });
+    run(['init', 'rtrip-monitor', '--dir', monitorsDir], dir);
+    const jsonResult = run(['scan', monitorsDir, '--format', 'json']);
+    const toonResult = run(['scan', monitorsDir, '--format', 'toon']);
+    expect(jsonResult.exitCode).toBe(0);
+    expect(toonResult.exitCode).toBe(0);
+    const fromJson = JSON.parse(jsonResult.stdout) as unknown;
+    const fromToon = decodeToon(toonResult.stdout);
+    expect(fromToon).toEqual(fromJson);
+  });
+
+  it('scan --format json output is byte-for-byte unchanged (no regression)', () => {
+    const dir = path.join(tempDir, 'scan-json-unchanged');
+    const monitorsDir = path.join(dir, 'monitors');
+    mkdirSync(monitorsDir, { recursive: true });
+    run(['init', 'stable-monitor', '--dir', monitorsDir], dir);
+    // --format json must still produce valid JSON with the documented shape
+    const result = run(['scan', monitorsDir, '--format', 'json']);
+    expect(result.exitCode).toBe(0);
+    // duplicateIds is DuplicateMonitorId[] — objects with { id, filePaths } —
+    // NOT string[]. The CLI passes result.duplicateIds through directly.
+    const parsed = JSON.parse(result.stdout) as {
+      monitors: {
+        id: string;
+        name: string;
+        source: string;
+        urgency: string;
+        tags: string[];
+        notify: string | null;
+      }[];
+      errors: { filePath: string; error: string }[];
+      duplicateIds: { id: string; filePaths: string[] }[];
+    };
+    expect(parsed.monitors).toHaveLength(1);
+    expect(parsed.monitors[0]).toMatchObject({
+      id: 'stable-monitor',
+      source: 'file-fingerprint',
+    });
+    expect(parsed.errors).toHaveLength(0);
+    expect(parsed.duplicateIds).toHaveLength(0);
+  });
+
+  it('scan --format toon produces toon (not json, not plain text table)', () => {
+    const dir = path.join(tempDir, 'scan-toon-explicit');
+    const monitorsDir = path.join(dir, 'monitors');
+    mkdirSync(monitorsDir, { recursive: true });
+    run(['init', 'explicit-toon-monitor', '--dir', monitorsDir], dir);
+    const result = run(['scan', monitorsDir, '--format', 'toon']);
+    expect(result.exitCode).toBe(0);
+    // Not the text table format (text has a header row with padded columns)
+    expect(result.stdout).not.toContain('ID'.padEnd(30));
+    // Is TOON (contains the monitor id as a value, not as a JSON key with quotes)
+    expect(result.stdout).toContain('explicit-toon-monitor');
+    // Is parseable by the TOON decoder
+    expect(() => decodeToon(result.stdout)).not.toThrow();
   });
 });
 
@@ -1868,6 +2076,8 @@ This monitor fires on a schedule.
         dir,
         '--socket',
         socketPath,
+        '--format',
+        'text',
       ],
       env,
       dir,
@@ -2014,6 +2224,8 @@ This monitor fires on a schedule.
         dir,
         '--socket',
         socketPath,
+        '--format',
+        'text',
       ],
       env,
       dir,
@@ -2057,7 +2269,15 @@ This monitor fires on a schedule.
 
     // Text form: banner + the persisted row, NOT an ENOENT error.
     const text = runWithEnv(
-      ['monitor', 'history', 'fires', '--socket', socketPath],
+      [
+        'monitor',
+        'history',
+        'fires',
+        '--socket',
+        socketPath,
+        '--format',
+        'text',
+      ],
       env,
       dir,
     );
