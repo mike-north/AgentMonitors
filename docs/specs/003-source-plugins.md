@@ -199,6 +199,56 @@ Modeling rules:
 > runtime then diffs that one snapshot against the consumer's baseline exactly as it would a
 > single-call snapshot.
 
+### 2.7 Sources surface raw facts; the runtime computes derived facts
+
+> **Status: target.** Every rule in this section is **target**, not current behavior. It draws the
+> line between the **raw facts** a source surfaces and the **derived/relative facts** the runtime's
+> Shape stage computes from them ([002 §1.1.4](./002-runtime-delivery.md#114-shape-deterministic-derived-facts)).
+> It reaffirms, and does not contradict, the source/runtime split of §2.5 and PP3/AP3
+> ([000](./000-principles.md)). Formalizes a resolved decision from the monitoring capability study
+> ([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
+> §S2 area C, E8; ledger row **C41**).
+
+A source's job in this division of labor is to surface the **raw facts** — the observable primitives
+of the watched thing — in its `snapshot`/`snapshotText`/`payload`. A source **MUST NOT** compute the
+recipient-facing derived/relative facts ("past due", "stalled", "revealed", "urgent"); those are the
+runtime Shape stage's job, computed once on the shared snapshot against the runtime-injected `now`.
+
+Concretely:
+
+- **Raw facts (source).** The source surfaces the underlying values a derived fact is computed from —
+  a `due` timestamp, a `defer-until` timestamp, a `priority` field, the set of a project's child task
+  states. It surfaces them **as observed**, without interpreting their relationship to the current
+  time or to each other. A source MUST NOT bake the current wall-clock into the snapshot (e.g. emit a
+  pre-computed "past due" flag), because that would (a) make the snapshot non-reproducible and churn
+  the diff (§2.6), and (b) place a time-relative judgment — which depends on _when the runtime
+  evaluates_, not on _what the source observed_ — on the wrong side of the contract.
+- **Derived facts (runtime).** The runtime Shape stage computes the relative/aggregate facts from
+  those raw facts plus the injected `now`
+  ([002 §1.1.4](./002-runtime-delivery.md#114-shape-deterministic-derived-facts)). This is what keeps
+  the derived fact deterministic, reproducible (a fixed `now` yields a fixed fact), and **shared**
+  (one computation for all recipients).
+
+The boundary is the same one §2.5 draws for diffs, applied to facts: the source observes _what is
+true of the watched thing_; the runtime derives _what that means relative to now_ and _what is new for
+a consumer_. A source that surfaces a stable `due` timestamp lets the runtime decide "past due" at
+evaluation time; a source that emits a pre-computed "past due" flag has put runtime-time, runtime-`now`
+reasoning inside the source — outside this contract.
+
+> **Why this matters for the diff.** A pre-computed time-relative flag in the snapshot would flip from
+> run to run purely because `now` advanced (a task silently crossing "due soon" with no underlying
+> change), producing a phantom diff against the consumer's baseline. Surfacing the raw timestamp and
+> deriving the fact in Shape — diffed only once it is rendered into the artifact
+> ([002 §1.1.5](./002-runtime-delivery.md#115-shape-render-to-a-stable-artifact-then-diff-the-artifact))
+> — makes the delta correspond to a real, meaningful change (the marker appearing in the rendered
+> line).
+
+**Validation implication.** A source whose snapshot embeds a time-relative or aggregate _derived_ fact
+(rather than the raw inputs) violates this rule; the derived-fact computation belongs to the runtime
+Shape stage. The motivating case is the E8 OmniFocus composite (§2.6): the source surfaces each task's
+raw `due`/`defer-until`/`priority` and child states; the runtime derives `past due`/`due soon`/
+`revealed`/`urgent`.
+
 ## 3. Bundled Source: `file-fingerprint`
 
 Source name: `"file-fingerprint"` (verified: `plugins/source-file-fingerprint/src/index.ts` line 75).
