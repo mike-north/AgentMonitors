@@ -285,6 +285,15 @@ export function QuickGrid({ children }: { readonly children: ReactNode }): JSX.E
  * The first-five-minutes terminal mock. Styled with the shared amber "signal"
  * palette so the site's "ears lighting up" echoes the real CLI's signal line.
  * Host-agnostic per the brief (Claude Code, Codex, Cursor).
+ *
+ * Commands verified against @agentmonitors/cli@0.6.0 (issue #135):
+ * - `npm install -g @agentmonitors/cli` — install step
+ * - `agentmonitors init <name> --type api-poll` — real form; `api-poll` is a
+ *   valid `--type` choice (file-fingerprint|api-poll|command-poll|schedule|
+ *   incoming-changes); default is file-fingerprint when omitted
+ * - `agentmonitors daemon run` — real subcommand (`daemon` has: once|run|status|stop)
+ * Keep these in sync with apps/website/src/pages/index.md quickstart section
+ * and apps/website/src/pages/docs/getting-started.md.
  */
 export function QuickstartTerminal(): JSX.Element {
   return (
