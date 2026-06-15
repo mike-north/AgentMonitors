@@ -8,7 +8,7 @@
 
 This document specifies the contract implemented by observation source plugins and the current behavior of the bundled sources: `file-fingerprint`, `api-poll`, `command-poll`, `schedule`, `incoming-changes`. The runtime depends on sources to detect change, but the runtime owns scheduling, notify dispatch, and delivery timing (PP3).
 
-Section §13 (the cursor protocol) is a normative design that is **not yet implemented** (PP7); it moves to current status, with `verified:` references, when it ships. §11 (`command-poll`) and §12 (keyed-collection change detection) have shipped and are now **current** behavior (verified: `plugins/source-command-poll/src/index.ts`, `plugins/source-command-poll/src/index.test.ts`; the shared helper `libs/core/src/observation/keyed-collection.ts` with `libs/core/src/observation/keyed-collection.test.ts`, consumed by both `plugins/source-api-poll/src/index.ts` and `plugins/source-command-poll/src/index.ts`).
+Sections §2.5 (snapshots-not-diffs), §2.6 (composite observation), and §13 (the cursor protocol) are normative **target** rules that are not yet implemented or that reaffirm an existing invariant in the source contract (PP7); each moves to current status, with `verified:` references, when it ships. §11 (`command-poll`) and §12 (keyed-collection change detection) have shipped and are now **current** behavior (verified: `plugins/source-command-poll/src/index.ts`, `plugins/source-command-poll/src/index.test.ts`; the shared helper `libs/core/src/observation/keyed-collection.ts` with `libs/core/src/observation/keyed-collection.test.ts`, consumed by both `plugins/source-api-poll/src/index.ts` and `plugins/source-command-poll/src/index.ts`).
 
 ### Principles Satisfied
 
@@ -115,6 +115,89 @@ event-materialization consequences are specified in
 If `stateful` is `true`, the first successful `observe()` call **MAY** return an empty `observations` array while storing an initial baseline in `nextState`. That is not an error case — it is how baseline-then-detect sources work (PP6). On subsequent calls, the stored state is available via `context.previousState`.
 
 `file-fingerprint`, `api-poll`, `command-poll`, and `incoming-changes` all declare `stateful: true`. `schedule` does not declare `stateful` (defaults to `false`).
+
+### 2.5 Sources return snapshots, not diffs; the runtime is the sole diff producer
+
+> **Status: target (reaffirms a current invariant).** This makes explicit, in the source contract,
+> the division of labor already required by PP3 and AP3 ([000](./000-principles.md)) and implemented
+> by the runtime's object-level diff ([002 §5.2](./002-runtime-delivery.md)). The rule is restated
+> here so a plugin author reads it where they author a source. Formalizes a resolved decision from
+> the monitoring capability study
+> ([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
+> §S4; ledger rows C2, C6, C43).
+
+A source **observes current state**; it does **not** compute deltas for delivery. Concretely:
+
+- A source's job is to acquire the **current** state of the watched thing and return it as
+  observations — including a `snapshotText` (and/or `snapshot` metadata) capturing _what the thing
+  is now_ — together with **its own change-detection state** via `nextState` (e.g. file fingerprints,
+  the last API body, a last-seen commit SHA). The `nextState` a source carries is the source's
+  _internal_ mechanism for noticing _that_ something changed since it last looked; it is **not** the
+  per-recipient baseline used to compute _what is new for a given consumer_.
+- The **runtime is the sole producer of the diff that drives delivery.** It owns diffing,
+  parameterized by **the consumer's baseline** — today the latest stored object snapshot for
+  `(workspacePath, monitorId, objectKey)` ([002 §5.2](./002-runtime-delivery.md), SP5); under the
+  target pipeline model, the **per-recipient** baseline/cursor right of the shared/per-recipient seam
+  ([002 §1.1.2](./002-runtime-delivery.md#112-the-shared--per-recipient-seam)). A source MUST NOT
+  attempt to compute "what is new for recipient X" — it cannot, because it does not hold any
+  recipient's baseline.
+
+This split is what lets one shared observation fan out to many recipients with divergent baselines
+(capability C15): the source observes once; the runtime diffs that one shared snapshot against each
+consumer's baseline.
+
+> **Why a source still carries `nextState`.** Holding change-detection state in the source (the
+> `stateful` baseline of §2.4) is **not** the same as the source producing the delivery diff. The
+> source uses `nextState` only to decide _whether to emit an observation at all_ and to advance its
+> own cursor; the meaning of "new" relative to a **consumer** is always the runtime's to compute. A
+> source that emits a fully formed delta packet (and lets the runtime pass it through untouched) is
+> outside this contract.
+
+**Validation implication.** A source whose `observe()` returns pre-diffed "what changed for the
+consumer" packets instead of current-state snapshots violates this rule; the bundled sources
+(`file-fingerprint`, `api-poll`, `command-poll`, `incoming-changes`) all return current-state
+snapshots plus `nextState`, and the runtime computes the delivered diff (see each source's
+`index.test.ts` and [002 §5.2](./002-runtime-delivery.md)).
+
+### 2.6 Composite observation (one observation from many source calls)
+
+> **Status: target.** Formalizes a resolved decision from the monitoring capability study
+> ([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
+> §S1, §S2 area A; ledger row C40). No bundled source assembles a composite observation today; the
+> contract below states how one is modeled when it does.
+
+A single `Observation` **MAY** be assembled from **multiple** source queries or calls — many requests
+reduced into **one composite whole-state snapshot** — before it leaves the source. This is the
+**[Compose]** stage of the pipeline model ([002 §1.1.1](./002-runtime-delivery.md#111-the-locked-stage-order)),
+which sits on the **shared** (left) side of the seam: the composition runs **once** per observation,
+not per recipient.
+
+Modeling rules:
+
+- The composite is assembled **inside** `observe()` (or `watch()`): the source issues however many
+  underlying queries it needs and returns the assembled whole as **one** `Observation`. The runtime
+  sees a single observation and is unaware of the fan-in; no contract change is needed on the runtime
+  side.
+- The composite snapshot MUST present a **stable, deterministic** `snapshotText`/`snapshot` — the
+  same underlying state assembled in the same way MUST render identically run-to-run, so the
+  runtime's diff against the consumer's baseline ([§2.5](#25-sources-return-snapshots-not-diffs-the-runtime-is-the-sole-diff-producer))
+  is meaningful rather than churned by call ordering or transient fields.
+- The composite carries **one** `objectKey` identifying the assembled whole (the composite _is_ the
+  observed object), not one per underlying call. A source that genuinely tracks many independent
+  objects should instead emit many observations (or use keyed-collection change detection, §12) —
+  composition is for assembling **one** logical snapshot from many calls, not for batching unrelated
+  objects.
+- Partial-failure policy is the source's concern: a source MAY treat a failed underlying call as a
+  failed observation (no `nextState` advance, so the prior baseline is preserved per
+  [002 §3](./002-runtime-delivery.md)) or as a degraded-but-valid composite, but it MUST NOT silently
+  emit a composite that omits part of its declared whole without that omission being visible in the
+  snapshot — otherwise the runtime would diff against an incomparable baseline.
+
+> **Example (the C40 motivating case).** A source that must call an external API once per entity to
+> reconstruct a whole document issues N calls within a single `observe()` and reduces them into one
+> ordered, rendered `snapshotText` — the composite whole-body snapshot — under one `objectKey`. The
+> runtime then diffs that one snapshot against the consumer's baseline exactly as it would a
+> single-call snapshot.
 
 ## 3. Bundled Source: `file-fingerprint`
 

@@ -50,6 +50,16 @@ is authoritative; this page is a quick index, not the contract.
 
 ## Runtime & delivery
 
+- **Post-processing pipeline (target)** — The conceptual stage order an observation flows through:
+  `Observe → [Compose] → Shape → Pace → ⟦seam⟧ → Diff → Interpret → Deliver → [React]`. Names and
+  fixes the order and the one structural seam. [002 §1.1](./002-runtime-delivery.md).
+- **Shared / per-recipient seam (target)** — The boundary between Pace and Diff. Everything left of
+  it (Observe…Pace) is computed **once** and shared across all recipients; everything right of it
+  (Diff…Deliver) is **per recipient**, against that recipient's baseline/cursor. The structural
+  reason fan-out is cheap (capability C15). [002 §1.1.2](./002-runtime-delivery.md#112-the-shared--per-recipient-seam).
+- **Composite observation (target)** — One `Observation` assembled from **many** source queries/calls
+  into a single whole-state snapshot, on the shared side of the seam (the `[Compose]` stage). Carries
+  one `objectKey` for the assembled whole. [003 §2.6](./003-source-plugins.md). (capability C40)
 - **Runtime** — The poll-and-project engine: scans monitors, evaluates due sources, persists
   source/notify state, materializes events, refreshes hook state.
   [002 §2](./002-runtime-delivery.md). (AP3)
