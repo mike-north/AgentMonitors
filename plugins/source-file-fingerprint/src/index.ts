@@ -107,10 +107,11 @@ async function buildPresentObservation(
  *
  * Salience policy: a `deleted` observation carries `salience: 'high'` because
  * information is permanently lost and an agent should react promptly. A
- * `descoped` observation carries no salience (defaults to `normal`) because the
- * file still exists — no information is lost.
+ * `descoped` observation carries no salience, leaving the effective urgency at
+ * the monitor's band floor (`band.lo`) — the file still exists, no information
+ * is lost.
  *
- * @see docs/specs/003-source-plugins.md §3.2 (salience policy)
+ * @see docs/specs/003-source-plugins.md §3.4 (salience policy)
  */
 function buildAbsentObservation(
   filePath: string,

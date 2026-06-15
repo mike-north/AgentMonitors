@@ -197,10 +197,11 @@ describe('source-file-fingerprint', () => {
     });
   });
 
-  // Salience policy (003 §3.2): a `deleted` observation carries `salience:
+  // Salience policy (003 §3.4): a `deleted` observation carries `salience:
   // 'high'` so a `normal..high` band monitor can escalate on file deletion.
-  // Other change kinds carry no salience (default `normal`).
-  describe('salience (003 §3.2)', () => {
+  // Other change kinds carry no salience, leaving effective urgency at the
+  // monitor's band floor (band.lo).
+  describe('salience (003 §3.4)', () => {
     it('emits salience: high on a deleted observation', async () => {
       const dir = makeTempDir();
       const filePath = path.join(dir, 'a.txt');
@@ -225,7 +226,7 @@ describe('source-file-fingerprint', () => {
       expect(obs?.salience).toBe('high');
     });
 
-    it('emits no salience on a modified observation (defaults to normal)', async () => {
+    it('emits no salience on a modified observation (effective urgency stays at band floor)', async () => {
       const dir = makeTempDir();
       const filePath = path.join(dir, 'a.txt');
       writeFileSync(filePath, 'hello');
@@ -249,7 +250,7 @@ describe('source-file-fingerprint', () => {
       expect(obs?.salience).toBeUndefined();
     });
 
-    it('emits no salience on a created observation (defaults to normal)', async () => {
+    it('emits no salience on a created observation (effective urgency stays at band floor)', async () => {
       const dir = makeTempDir();
       writeFileSync(path.join(dir, 'a.txt'), 'a');
       const baseline = await source.observe(
@@ -353,8 +354,9 @@ describe('source-file-fingerprint', () => {
 //
 // This proves RANGE urgency is now reachable end-to-end with a bundled source.
 //
-// Fake timers are used to advance time between ticks so the monitor's 30s
-// default poll interval is satisfied without real wall-clock waiting.
+// Fake timers are used to advance time between ticks so the monitor's 1s
+// poll interval (set in the MONITOR.md fixture) is satisfied without real
+// wall-clock waiting.
 //
 // @see docs/specs/003-source-plugins.md §3.4 (file-fingerprint salience policy)
 // @see docs/specs/002-runtime-delivery.md §4.1 (clamp formula)
