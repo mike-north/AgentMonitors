@@ -284,6 +284,19 @@ export interface ErroredObservation {
 }
 
 /**
+ * A monitor that was found but skipped on a tick because its interval has not
+ * yet elapsed since the last observation. Surfaced so callers (e.g. daemon
+ * once) can distinguish "skipped, not yet due" from "no monitors found".
+ *
+ * @see docs/specs/002-runtime-delivery.md §2.4
+ */
+export interface SkippedMonitor {
+  monitorId: string;
+  /** The earliest time at which this monitor will be due for its next tick. */
+  nextDueAt: Date;
+}
+
+/**
  * Summary returned by a single `AgentMonitorRuntime.tick()` call.
  *
  * Note: errored monitors (whose `observe()` threw, or whose `ingest()` failed)
@@ -292,11 +305,16 @@ export interface ErroredObservation {
  * They are additionally listed in `erroredObservations`, populated from the
  * same path that writes an `errored` row to `observation_history`, so the tick
  * itself can report the failure rather than silently print `emitted 0`.
+ *
+ * Monitors found in the directory but skipped because their interval has not
+ * elapsed are listed in `skippedMonitors` so callers can distinguish
+ * "skipped, not yet due" from "no monitors found" (issue #152).
  */
 export interface RuntimeTickResult {
   evaluatedMonitors: string[];
   emittedEventIds: string[];
   erroredObservations: ErroredObservation[];
+  skippedMonitors: SkippedMonitor[];
 }
 
 /**

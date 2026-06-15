@@ -947,6 +947,7 @@ export class AgentMonitorRuntime {
     const emittedEventIds: string[] = [];
     const evaluated: string[] = [];
     const erroredObservations: ErroredObservation[] = [];
+    const skippedMonitors: { monitorId: string; nextDueAt: Date }[] = [];
 
     for (const parsed of result.monitors) {
       const monitor = parsed.monitor;
@@ -963,7 +964,16 @@ export class AgentMonitorRuntime {
       if (this.activeWatchers.has(monitor.id)) continue;
 
       const schedule = this.scheduleForMonitor(monitor, now);
-      if (!schedule.due) continue;
+      if (!schedule.due) {
+        // Record skipped monitors so callers can distinguish "not yet due" from
+        // "no monitors found" (issue #152). nextDueAt is computed from the same
+        // scheduling decision — single source of truth, never recomputed.
+        const state = this.store.getMonitorState(monitor.id);
+        const lastObservationAt = state.lastObservationAt?.getTime() ?? 0;
+        const nextDueAt = new Date(lastObservationAt + schedule.nextPollMs);
+        skippedMonitors.push({ monitorId: monitor.id, nextDueAt });
+        continue;
+      }
 
       evaluated.push(monitor.id);
 
@@ -1055,6 +1065,7 @@ export class AgentMonitorRuntime {
       evaluatedMonitors: evaluated,
       emittedEventIds,
       erroredObservations,
+      skippedMonitors,
     };
   }
 

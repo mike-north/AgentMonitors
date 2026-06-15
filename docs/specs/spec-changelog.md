@@ -41,6 +41,21 @@ and no event has materialized yet, the Materialization stage now reports `pendin
 `failure`/✗ — the absence of materialized events is correct behavior when the notify layer is
 holding, not a fault.
 
+## 2026-06-15 — `daemon once` distinguishes skipped-not-due monitors from no-monitors-found (002 §2.4, 005 §9.1)
+
+`RuntimeTickResult` gains a `skippedMonitors: { monitorId, nextDueAt }[]` field, populated from the
+same scheduling decision that gates evaluation — never recomputed separately. `daemon once` appends a
+parenthetical suffix when non-empty: `(N skipped: interval not elapsed — next due in Xs)`, reporting
+the soonest next-due time. Previously a second `daemon once` run within a monitor's interval printed
+`Evaluated 0 monitor(s), emitted 0 event(s).` — identical to the "no monitors found" output, giving
+the author a silent dead end (issue #152). The genuine empty/no-monitors path is unchanged.
+
+- **Proof:** `apps/cli/src/commands/cli.integration.test.ts` — `describe('daemon once skipped-not-due
+visibility (issue #152)')`: three tests cover (a) skipped suffix on second run, (b) empty-dir
+  unchanged, (c) mixed evaluated + skipped counts reported accurately.
+- Patch changesets: `@agentmonitors/core` (new `skippedMonitors` field + `SkippedMonitor` type in the
+  public surface) and `@agentmonitors/cli` (user-visible tick output suffix).
+
 ## 2026-06-14 — Hydration backfill for pre-upgrade debounce batches (002 §3, restart-safety)
 
 `hydrateStoredObservationEnvelope` now backfills a missing `effectiveUrgency` field (present on envelopes serialized before the range-urgency upgrade) by recomputing it from `effectiveObservationUrgency(monitor, observation)`. Without this, the first daemon restart after upgrade would materialize an invalid (undefined) urgency row. Degrades cleanly when the hydrated monitor snapshot itself lacks `urgencyMax`: returns the base urgency via `URGENCY_BY_RANK[NaN] ?? lo`.

@@ -27,6 +27,29 @@ function appendErroredLines(
   return [summary, ...lines].join('\n');
 }
 
+/**
+ * Append a skipped-monitors suffix to a tick summary so a second `daemon once`
+ * run within a monitor's interval is never mistaken for "no monitors found"
+ * (issue #152). Returns the summary unchanged when nothing was skipped.
+ *
+ * The suffix reports the total skipped count and the soonest next-due time so
+ * an author immediately knows how long to wait, e.g.:
+ *   `(2 skipped: interval not elapsed — next due in 28s)`
+ */
+function appendSkippedSuffix(
+  summary: string,
+  skipped: RuntimeTickResult['skippedMonitors'],
+  now: Date,
+): string {
+  if (skipped.length === 0) return summary;
+  const soonestMs = Math.min(
+    ...skipped.map((s) => s.nextDueAt.getTime() - now.getTime()),
+  );
+  const soonestSec = Math.max(0, Math.ceil(soonestMs / 1000));
+  const label = skipped.length === 1 ? 'skipped' : 'skipped';
+  return `${summary} (${String(skipped.length)} ${label}: interval not elapsed — next due in ${String(soonestSec)}s)`;
+}
+
 async function runLoop(
   monitorsDir: string,
   workspacePath: string,
@@ -187,6 +210,7 @@ daemonCommand
       options: { workspace: string; format: string },
     ) => {
       try {
+        const now = new Date();
         const result = await daemonTickClient(monitorsDir, options.workspace);
         if (options.format === 'json') {
           console.log(JSON.stringify(result, null, 2));
@@ -199,7 +223,12 @@ daemonCommand
         const base = `Evaluated ${String(result.evaluatedMonitors.length)} monitor(s), emitted ${String(result.emittedEventIds.length)} event(s)${
           erroredCount > 0 ? `, ${String(erroredCount)} errored:` : '.'
         }`;
-        console.log(appendErroredLines(base, result.erroredObservations));
+        // Append skipped-monitors context so a second `daemon once` within a
+        // monitor's interval is not mistaken for "no monitors found" (issue #152).
+        const withErrors = appendErroredLines(base, result.erroredObservations);
+        console.log(
+          appendSkippedSuffix(withErrors, result.skippedMonitors, now),
+        );
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         reportError(message, options.format === 'json');

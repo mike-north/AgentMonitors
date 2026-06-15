@@ -592,13 +592,23 @@ indented `  <monitorId>: <message>` line per errored monitor (so a silently-swal
 is not hidden behind a clean `emitted 0`). When nothing errored the line is unchanged, ending with
 `.`, so a genuine no-change tick stays clean.
 
+When one or more monitors were found but skipped because their interval has not elapsed, the summary
+is extended with a parenthetical suffix: `(<n> skipped: interval not elapsed — next due in <s>s)`,
+where `<s>` is the number of seconds until the soonest-due skipped monitor. This makes a second
+`daemon once` run within a monitor's interval distinguishable from "no monitors found" — the two
+situations previously produced identical output (issue #152).
+
+The default polling interval for `file-fingerprint` and `command-poll` is 30 seconds; for `api-poll`
+it is 5 minutes. Authors may override with `watch.interval: <duration>` in the `MONITOR.md` frontmatter.
+
 **JSON output (`--format json`):** the raw `RuntimeTickResult` object:
 
 ```json
 {
   "evaluatedMonitors": ["<monitorId>", ...],
   "emittedEventIds": ["<eventId>", ...],
-  "erroredObservations": [{ "monitorId": "<monitorId>", "message": "<error>" }, ...]
+  "erroredObservations": [{ "monitorId": "<monitorId>", "message": "<error>" }, ...],
+  "skippedMonitors": [{ "monitorId": "<monitorId>", "nextDueAt": "<iso8601>" }, ...]
 }
 ```
 
