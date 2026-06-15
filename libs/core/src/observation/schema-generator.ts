@@ -51,9 +51,14 @@ export function generateMonitorSchema(
       // This editor-hint schema enforces only the *shape* of each bound; the
       // authoritative parser (`monitorFrontmatterSchema`) additionally rejects
       // an inverted range (`lo > hi`). See 001 §3.2.
+      //
+      // Leading/trailing whitespace is allowed (`\s*` anchors at both ends)
+      // to mirror the Zod parser, which calls `.trim()` on the raw value
+      // before validating bounds. Whitespace around `..` was already allowed.
       urgency: {
         type: 'string',
-        pattern: '^(low|normal|high)(\\s*\\.\\.\\s*(low|normal|high))?$',
+        pattern:
+          '^\\s*(low|normal|high)(\\s*\\.\\.\\s*(low|normal|high))?\\s*$',
       },
       notify: {
         type: 'object',

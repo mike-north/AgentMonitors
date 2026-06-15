@@ -96,6 +96,36 @@ describe('generateMonitorSchema', () => {
     }
   });
 
+  // Copilot thread 3410689135: the generated urgency pattern must tolerate the
+  // same leading/trailing whitespace the Zod parser accepts (it calls `.trim()`
+  // before validating bounds). Editors consuming the generated schema must not
+  // flag `urgency: ' normal '` or `urgency: ' normal .. high '` as invalid.
+  it('urgency pattern accepts leading/trailing whitespace to mirror the Zod parser', () => {
+    const schema = generateMonitorSchema([]);
+    const properties = schema.properties as Record<
+      string,
+      { type?: string; pattern?: string }
+    >;
+    const pattern = properties.urgency?.pattern;
+    expect(pattern).toBeDefined();
+    if (!pattern) return;
+
+    const re = new RegExp(pattern);
+    // Bare levels — trimmed by the parser; the pattern must also accept them.
+    expect(re.test(' normal ')).toBe(true);
+    expect(re.test(' low ')).toBe(true);
+    expect(re.test(' high ')).toBe(true);
+    // Range with surrounding whitespace.
+    expect(re.test(' normal .. high ')).toBe(true);
+    // Canonical (no whitespace) forms still pass.
+    expect(re.test('normal')).toBe(true);
+    expect(re.test('normal..high')).toBe(true);
+    // Invalid values still fail (pattern is a shape-only guard, not the
+    // authoritative parser, but it must not accept nonsense strings).
+    expect(re.test('critical')).toBe(false);
+    expect(re.test('')).toBe(false);
+  });
+
   it('includes notify schema with debounce and throttle', () => {
     const schema = generateMonitorSchema([]);
 
