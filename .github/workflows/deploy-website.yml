@@ -61,12 +61,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
       - name: Install Vercel CLI
         run: npm install --global vercel@53
 
       # Remote build + deploy (proven for this monorepo: the site builds standalone
       # with root = apps/website). Matches the working manual `vercel --prod --cwd apps/website`.
+      # Token is read from the VERCEL_TOKEN env var (safer than a --token=… CLI arg,
+      # which can leak via process listings / logs).
       - name: Deploy production
-        run: vercel deploy --prod --yes --cwd apps/website --token="$VERCEL_TOKEN"
+        run: vercel deploy --prod --yes --cwd apps/website
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
