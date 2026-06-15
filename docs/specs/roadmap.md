@@ -97,6 +97,47 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
 > `apps/cli/src/commands/cli.integration.test.ts`. See [003 §12](./003-source-plugins.md) and
 > [spec-changelog.md](./spec-changelog.md).
 
+### G10 — Post-processing pipeline stages + per-recipient seam (P2)
+
+- **Current:** the runtime implements a subset of the locked pipeline as
+  `Observe → Notify(≈Pace) → Materialize/Diff → Project → Deliver`, with the diff computed **once
+  per object** against the latest stored snapshot ([002 §5.2](./002-runtime-delivery.md)) and then
+  projected into each matching session ([002 §6](./002-runtime-delivery.md)) — a single **shared**
+  baseline.
+- **Target:** the full stage model and seam of
+  [002 §1.1](./002-runtime-delivery.md) — `Observe → [Compose] → Shape → Pace → ⟦seam⟧ → Diff →
+Interpret → Deliver → [React]` — with **Shape** (render before Pace and before Diff), **Pace**
+  modes, and a **per-recipient Diff** computed against each recipient's own baseline/cursor right of
+  the shared/per-recipient seam (so divergent-baseline recipients each hear the right span; fan-out
+  multiplies only genuinely per-baseline work, capability C15). The per-stage detail lands with the
+  follow-on Shape / Interpret / baseline-Diff / Pace work.
+- **Governs:** PP3, AP3 ([000](./000-principles.md)), [002 §1.1](./002-runtime-delivery.md),
+  the capability study ([§S1, §S4, §S5](../product/monitoring-capability-exercises.md); rows
+  C6/C15/C43).
+- **Files:** `libs/core/src/runtime/service.ts`, `libs/core/src/runtime/store.ts`,
+  `libs/core/src/runtime/diff.ts` (and the per-recipient baseline persistence).
+- **Proof:** per-stage tests landing with the follow-on work (a divergent-baseline fan-out test
+  proving two recipients with different last-seen points receive different spans from one shared
+  observation); until then [002 §1.1](./002-runtime-delivery.md) stays _target_.
+
+### G11 — Source contract: snapshots-not-diffs (explicit) + composite observation (P3)
+
+- **Current:** the runtime is already the sole producer of the delivery diff (PP3, AP3,
+  [002 §5.2](./002-runtime-delivery.md)); the source contract did not state this **explicitly**, and
+  composite (many-call) observations were unmodeled.
+- **Target:** [003 §2.5](./003-source-plugins.md) (sources return current-state snapshots +
+  `nextState`; the runtime owns the consumer-baseline diff) is reaffirmed in the source contract and,
+  for §2.5, becomes _current_ with `verified:` references once a test asserts a bundled source returns
+  snapshots (not pre-diffed consumer packets); [003 §2.6](./003-source-plugins.md) (composite
+  observation, capability C40) ships when a source assembles one observation from many calls under one
+  `objectKey`.
+- **Governs:** PP3, AP3 ([000](./000-principles.md)), [003 §2.5–§2.6](./003-source-plugins.md),
+  the capability study ([§S1, §S4](../product/monitoring-capability-exercises.md); rows C2/C6/C40/C43).
+- **Files:** `libs/core/src/observation/types.ts`, the bundled sources under `plugins/source-*`.
+- **Proof:** §2.5 — a source unit test asserting `observe()` returns current-state snapshots + the
+  runtime computes the diff; §2.6 — an integration test of a source that reduces N calls into one
+  stable composite snapshot. Until then [003 §2.5–§2.6](./003-source-plugins.md) stays _target_.
+
 > The cursor protocol ([003 §13](./003-source-plugins.md)) is deliberately **not** a roadmap item:
 > per #81 it is designed only as far as a sketch, to be fully specified if measured poll cost ever
 > justifies it.

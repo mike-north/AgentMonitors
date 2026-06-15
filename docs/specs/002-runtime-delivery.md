@@ -24,6 +24,75 @@ The repository's most important behavior lives here: not merely detecting change
 | Agent integration (adapters)      | AP1, AP3                |
 | Legacy inbox split                | AP2                     |
 
+## 1.1 Post-Processing Pipeline Model
+
+> **Status: target.** Every rule in this section is **target**, not current behavior. It names the
+> conceptual stages an observation passes through on its way to delivery and fixes their order and
+> the one structural seam between them. The current runtime (§2–§9) implements a subset of this
+> model — `Observe → Notify (≈ Pace) → Materialize/Diff → Project → Deliver` — under different
+> names and with the diff computed once per object rather than per recipient (§5.2). This section is
+> the vocabulary the follow-on pipeline work builds on; individual stages are specified in detail by
+> later target work and are introduced here only to lock the names, responsibilities, and order.
+> This formalizes already-resolved decisions from the monitoring capability study
+> ([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
+> §S1, §S4, §S5; ledger rows C6, C15, C43). It does **not** contradict any _current_ rule: the
+> current object-level diff (§5.2) is the degenerate case of the per-recipient diff below, and
+> "runtime owns diffing" (PP3, AP3, [003 §2.5](./003-source-plugins.md)) is reaffirmed, not changed.
+
+### 1.1.1 The locked stage order
+
+An observation flows through these stages, in this order (square brackets mark **optional** stages
+that not every monitor uses):
+
+```
+Observe → [Compose] → Shape → Pace → ⟦per-recipient seam⟧ → Diff → Interpret → Deliver → [React]
+```
+
+| Stage         | Side of seam            | Responsibility                                                                                                                                                                                                                                                                             |
+| ------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Observe**   | Shared                  | Acquire the current state of the watched thing on a cadence (poll/watch/ingest), or compose a trigger. Owned by the source ([003 §2](./003-source-plugins.md)); the runtime owns _when_ it runs (PP3, AP3).                                                                                |
+| **[Compose]** | Shared, optional        | Assemble **one** observation from multiple source queries/calls into a single composite snapshot before anything downstream (capability C40; specified for the source side in [003 §2.6](./003-source-plugins.md)). Omitted when one call already yields the whole observation.            |
+| **Shape**     | Shared                  | Deterministically filter / identify / group / compute / **render** the raw snapshot into a stable, token-efficient artifact (capabilities C3–C5, C21, C41, C42). Runs **before** Pace and **before** Diff so both operate on the shaped signal, never the raw source (C43).                |
+| **Pace**      | Shared                  | Decide _when_ a shaped signal becomes a candidate for delivery — settle / deadline / immediate / scheduled-rollup (the runtime's notify timing, §4). One settle decision is made once for all recipients. A clock independent of observation cadence and of per-recipient delivery timing. |
+| **Diff**      | **Per-recipient**       | Compute _what is new_ for **this recipient** relative to **that recipient's** baseline/cursor (capabilities C6, C43). The only useful diff is against a specific recipient's last-seen point, so this is the first per-recipient stage.                                                    |
+| **Interpret** | Per-recipient           | Optionally produce a cheap, natural-language reading of the **per-recipient delta** (summarize / suppress / triage; capabilities C10/C11/C38). Optional by default; never on the critical path. Judges the _change_ against author criteria, never the recipient's private state.          |
+| **Deliver**   | Per-recipient           | Hand the right, well-timed, durable packet to **this recipient** at an appropriate delivery lifecycle (§9). Different recipients may receive different packets (or none) from one monitor.                                                                                                 |
+| **[React]**   | Per-recipient, optional | An executor agent (which **may be** the recipient itself) acts on the delivered packet. Out of the runtime's delivery contract today (NP2); named here only to fix its position in the order. Specified by later target work.                                                              |
+
+### 1.1.2 The shared / per-recipient seam
+
+The single most important structural fact in this model is the **seam** between Pace and Diff:
+
+- **Everything LEFT of the seam (Observe … Pace) is computed ONCE and SHARED** across all recipient
+  sessions, no matter how many recipients a monitor fans out to: one acquisition, one compose, one
+  Shape/render, one Pace/settle decision. Nothing left of the seam may depend on recipient identity.
+  A stage that branched on _which_ recipient is asking would have to run N times and would defeat
+  the efficiency this seam exists to provide.
+- **Everything RIGHT of the seam (Diff … Deliver) is PER-RECIPIENT**, because the only useful diff
+  is against **that recipient's own baseline/cursor**. Two recipients that happen to hold the
+  _identical_ baseline (and therefore would compute the identical span) MAY be deduplicated — the
+  per-recipient work is multiplied only where baselines genuinely differ (capability C15).
+
+This seam is what makes fan-out cheap: the expensive shared work (acquire, reduce, render, settle)
+runs once; only the genuinely per-baseline work multiplies. It is the structural reason a single
+monitor can serve a whole fleet without recomputing its observation per session
+([capability study §S1](../product/monitoring-capability-exercises.md), ledger row C15).
+
+> **Relationship to current behavior.** Today the runtime computes a textual diff **once per object**
+> against the latest stored snapshot for `(workspacePath, monitorId, objectKey)` (§5.2, SP5) and then
+> projects the materialized event into each matching session (§6). That is the seam with a single
+> shared baseline — the degenerate, correct case of the per-recipient Diff above. Moving the baseline
+> to be **per recipient** (so a session away for an hour and a session away for a day each hear the
+> right span) is the _target_ change this model names; it is an efficiency-and-correctness refinement
+> over the current shared-baseline diff, not a contradiction of it.
+
+### 1.1.3 Three independent clocks
+
+Pace timing, observation cadence, and per-recipient delivery timing are **three independent clocks**.
+They compose and do not conflict: a source may observe every 30s, Pace may hold a high-urgency batch
+for a 15s settle (§4.1), and an individual recipient may not be delivered to until its next
+turn-boundary (§9). None of the three is derivable from the others.
+
 ## 2. Runtime Tick Model
 
 For each runtime tick, the implementation **MUST**:
@@ -199,6 +268,12 @@ The diff format is a line-level unified-style representation capped at 20 change
 Verified: `libs/core/src/runtime/service.ts` — `processObservation()` lines 566–616; `libs/core/src/runtime/diff.ts` — `buildTextDiff()` (lines 7–26, cap at 20 lines visible at line 21).
 
 This makes snapshot history an object-level concern rather than a monitor-level or session-level concern (SP5).
+
+> **Pipeline model (target).** In the stage vocabulary of [§1.1](#11-post-processing-pipeline-model),
+> this is the **Diff** stage with a single **shared** baseline (the latest stored object snapshot).
+> The _target_ Diff is computed **per recipient against that recipient's baseline/cursor**, right of
+> the shared/per-recipient seam ([§1.1.2](#112-the-shared--per-recipient-seam)); the current
+> object-level diff is its degenerate shared-baseline case.
 
 ## 6. Session Projection
 
