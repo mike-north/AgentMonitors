@@ -137,6 +137,34 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
   runtime computes the diff; §2.6 — an integration test of a source that reduces N calls into one
   stable composite snapshot. Until then [003 §2.5–§2.6](./003-source-plugins.md) stays _target_.
 
+### G12 — Scheduled-rollup Pace mode (P2)
+
+- **Current:** `notify.strategy` accepts only `debounce` and `throttle`; a monitor authored with
+  `strategy: rollup` is rejected by `agentmonitors validate`. Observations cannot be accumulated and
+  delivered on a schedule; every observation is either emitted immediately (no `notify`) or held
+  until settle/throttle.
+- **Target:** the `rollup` strategy ([001 §3.6](./001-monitor-definition.md),
+  [002 §4.4–§4.5](./002-runtime-delivery.md)) is accepted by `agentmonitors validate` and
+  implemented by the runtime: incoming observations accumulate in durable `notifyState` between
+  window openings; the runtime evaluates the author's `window` cron on each tick; when the window
+  fires and the batch is non-empty, the batch is flushed into event materialization and the
+  accumulation state is cleared; an empty window produces no delivery. The observation cadence is
+  independent of the delivery schedule, and authors **SHOULD** relax `watch.interval` to match the
+  window frequency (lower token + observation cost; see capability C44, §S5.2).
+- **Governs:** PP5, PP7 ([000](./000-principles.md)), [001 §3.6](./001-monitor-definition.md),
+  [002 §4.4–§4.5](./002-runtime-delivery.md); capability study C44 /
+  [§S5.2](../product/monitoring-capability-exercises.md).
+- **Files:** `libs/core/src/schema/monitor-schema.ts` (schema acceptance), `libs/core/src/runtime/service.ts`
+  (`dispatchNotify()` rollup branch, window evaluation, accumulation state flush), `libs/core/src/runtime/types.ts`
+  (`PendingRollupState` shape), `libs/core/src/inbox/schema.ts` (persist accumulation batch in
+  `monitor_state.notify_state`).
+- **Proof:** (a) `agentmonitors validate` accepts a `rollup` monitor and rejects a monitor with
+  `strategy: rollup` but missing `window`; (b) a runtime test proves observations accumulate
+  durably across ticks without delivering between windows; (c) a runtime test proves the window
+  opening flushes the batch and clears accumulation state; (d) a runtime test proves an empty
+  window produces no delivery; (e) a runtime test proves the accumulation batch survives a daemon
+  restart (restart-safety, matching BP1).
+
 > The cursor protocol ([003 §13](./003-source-plugins.md)) is deliberately **not** a roadmap item:
 > per #81 it is designed only as far as a sketch, to be fully specified if measured poll cost ever
 > justifies it.
