@@ -7,7 +7,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDb } from '../inbox/db.js';
 import { SourceRegistry } from '../observation/registry.js';
 import type {
@@ -35,7 +35,9 @@ function createRuntime(
 function createMonitorFile(
   rootDir: string,
   sourceName: string,
-  urgency: 'low' | 'normal' | 'high' = 'normal',
+  // Accepts a bare level (`normal`) or an authored band (`normal..high`); the
+  // value is injected verbatim into the YAML `urgency:` field.
+  urgency = 'normal',
   body = 'Handle it.',
   extraWatchConfig = '',
 ): string {
@@ -589,6 +591,418 @@ Handle it.
     });
     expect(unread).toHaveLength(2);
   }, 20_000);
+
+  // --- RANGE urgency + per-observation salience (issue #109) ---------------
+  //
+  // Contract (002 §4.1, §5.1; 003 §2.3): a monitor's authored `urgency` is a
+  // band `lo..hi`; a source observation MAY carry a `salience`; the runtime
+  // resolves the effective urgency as `clamp(salience ?? lo, lo, hi)`. The
+  // materialized event row carries that effective urgency. See also the schema-
+  // and parser-level tests for band parse/validation.
+
+  it('salience within the authored band escalates the materialized event urgency (002 §5.1)', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    // Band normal..high authorizes a source to escalate up to `high`. An
+    // explicit throttle notify is used so the (escalated) observation emits on
+    // the first tick — otherwise escalating to `high` would engage the default
+    // 15s high-urgency debounce and the event would still be held. We are
+    // asserting the *materialized urgency*, not notify timing here.
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'salience-within-band',
+      'normal..high',
+      'Handle salient changes.',
+      'notify:\n  strategy: throttle\n  suppress-for: 1h\n',
+    );
+
+    const source: ObservationSource = {
+      name: 'salience-within-band',
+      scopeSchema: { type: 'object', properties: {} },
+      async observe(): Promise<ObservationResult> {
+        return {
+          observations: [
+            {
+              title: 'Flagged item crossed overdue',
+              summary: 'Flagged item crossed overdue',
+              salience: 'high',
+            },
+          ],
+        };
+      },
+    };
+
+    const runtime = createRuntime(':memory:', source);
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-session-salience-within-band',
+        workspacePath: rootDir,
+      }),
+    );
+
+    const tick = await runtime.tick(monitorsDir, rootDir);
+    expect(tick.emittedEventIds).toHaveLength(1);
+
+    const unread = runtime.listEvents({
+      sessionId: session.id,
+      unreadOnly: true,
+    });
+    expect(unread).toHaveLength(1);
+    // clamp(high, normal, high) === high — escalated within the band.
+    expect(unread[0]?.urgency).toBe('high');
+  });
+
+  it('clamps a salience above the band to the high bound (002 §4.1)', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    // Band low..normal: a `high` salience must clamp down to `normal`.
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'salience-above-band',
+      'low..normal',
+    );
+
+    const source: ObservationSource = {
+      name: 'salience-above-band',
+      scopeSchema: { type: 'object', properties: {} },
+      async observe(): Promise<ObservationResult> {
+        return {
+          observations: [
+            {
+              title: 'Source thinks this is urgent',
+              summary: 'Source thinks this is urgent',
+              salience: 'high',
+            },
+          ],
+        };
+      },
+    };
+
+    const runtime = createRuntime(':memory:', source);
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-session-salience-above-band',
+        workspacePath: rootDir,
+      }),
+    );
+
+    const tick = await runtime.tick(monitorsDir, rootDir);
+    expect(tick.emittedEventIds).toHaveLength(1);
+
+    const unread = runtime.listEvents({
+      sessionId: session.id,
+      unreadOnly: true,
+    });
+    expect(unread).toHaveLength(1);
+    // clamp(high, low, normal) === normal — clamped to the band's high bound.
+    expect(unread[0]?.urgency).toBe('normal');
+  });
+
+  it('clamps a salience below the band to the low bound (002 §4.1)', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    // Band normal..high: a `low` salience must clamp up to `normal`.
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'salience-below-band',
+      'normal..high',
+    );
+
+    const source: ObservationSource = {
+      name: 'salience-below-band',
+      scopeSchema: { type: 'object', properties: {} },
+      async observe(): Promise<ObservationResult> {
+        return {
+          observations: [
+            {
+              title: 'Source thinks this is noise',
+              summary: 'Source thinks this is noise',
+              salience: 'low',
+            },
+          ],
+        };
+      },
+    };
+
+    const runtime = createRuntime(':memory:', source);
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-session-salience-below-band',
+        workspacePath: rootDir,
+      }),
+    );
+
+    const tick = await runtime.tick(monitorsDir, rootDir);
+    expect(tick.emittedEventIds).toHaveLength(1);
+
+    const unread = runtime.listEvents({
+      sessionId: session.id,
+      unreadOnly: true,
+    });
+    expect(unread).toHaveLength(1);
+    // clamp(low, normal, high) === normal — clamped to the band's low bound.
+    expect(unread[0]?.urgency).toBe('normal');
+  });
+
+  it('a degenerate band (bare scalar urgency) never escalates — backward compat (003 §2.3)', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    // Bare scalar `normal` is the degenerate band normal..normal: a `high`
+    // salience cannot escalate it. This is the exact behavior an existing
+    // monitor (authored before salience existed) must keep.
+    const monitorsDir = createMonitorFile(rootDir, 'degenerate-band', 'normal');
+
+    const source: ObservationSource = {
+      name: 'degenerate-band',
+      scopeSchema: { type: 'object', properties: {} },
+      async observe(): Promise<ObservationResult> {
+        return {
+          observations: [
+            {
+              title: 'Source thinks this is urgent',
+              summary: 'Source thinks this is urgent',
+              salience: 'high',
+            },
+          ],
+        };
+      },
+    };
+
+    const runtime = createRuntime(':memory:', source);
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-session-degenerate-band',
+        workspacePath: rootDir,
+      }),
+    );
+
+    const tick = await runtime.tick(monitorsDir, rootDir);
+    expect(tick.emittedEventIds).toHaveLength(1);
+
+    const unread = runtime.listEvents({
+      sessionId: session.id,
+      unreadOnly: true,
+    });
+    expect(unread).toHaveLength(1);
+    // clamp(high, normal, normal) === normal — no escalation past the scalar.
+    expect(unread[0]?.urgency).toBe('normal');
+  });
+
+  it('an escalated observation flushes the whole held debounce batch early without splitting it (002 §4.1)', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-15T10:00:00.000Z'));
+    try {
+      const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+      tempDirs.push(rootDir);
+      // Band normal..high with an explicit long debounce: every observation is
+      // held to settle. tick 1 holds a `normal` observation; tick 2 delivers a
+      // `high`-salience (escalated) observation that must flush the WHOLE batch
+      // immediately — well before the 30s settle window — and must NOT split it
+      // (both observations emit together, held-first ordering preserved).
+      const monitorsDir = createMonitorFile(
+        rootDir,
+        'early-flush',
+        'normal..high',
+        'Handle it.',
+        "  interval: '1s'\nnotify:\n  strategy: debounce\n  settle-for: 30s\n",
+      );
+
+      let cycle = 0;
+      const source: ObservationSource = {
+        name: 'early-flush',
+        scopeSchema: { type: 'object', properties: {} },
+        stateful: true,
+        async observe(): Promise<ObservationResult> {
+          cycle += 1;
+          if (cycle === 1) {
+            return {
+              observations: [
+                { title: 'Held normal item', summary: 'Held normal item' },
+              ],
+              nextState: { cycle },
+            };
+          }
+          if (cycle === 2) {
+            return {
+              observations: [
+                {
+                  title: 'Escalated item',
+                  summary: 'Escalated item',
+                  salience: 'high',
+                },
+              ],
+              nextState: { cycle },
+            };
+          }
+          return { observations: [], nextState: { cycle } };
+        },
+      };
+
+      const runtime = createRuntime(':memory:', source);
+      const session = runtime.openSession(
+        claudeCodeAdapter.createSessionInput({
+          hostSessionId: 'claude-session-early-flush',
+          workspacePath: rootDir,
+        }),
+      );
+
+      // Tick 1: the normal observation is held in the debounce batch.
+      const firstTick = await runtime.tick(monitorsDir, rootDir);
+      expect(firstTick.emittedEventIds).toHaveLength(0);
+
+      // Advance only 1s — far short of the 30s settle window — so any emission
+      // on tick 2 can ONLY be the escalation-driven early flush, not a normal
+      // settle expiry.
+      vi.advanceTimersByTime(1_000);
+
+      // Tick 2: the escalated observation flushes the whole batch early.
+      const secondTick = await runtime.tick(monitorsDir, rootDir);
+      // Whole batch (held normal + escalated high) — NOT split: 2 events.
+      expect(secondTick.emittedEventIds).toHaveLength(2);
+
+      const unread = runtime.listEvents({
+        sessionId: session.id,
+        unreadOnly: true,
+      });
+      expect(unread).toHaveLength(2);
+      // Held-first ordering preserved (the batch was flushed, not reordered).
+      const titles = unread
+        .slice()
+        .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+        .map((event) => event.title);
+      expect(titles).toContain('Held normal item');
+      expect(titles).toContain('Escalated item');
+      // The escalated event carries the escalated effective urgency.
+      const escalated = unread.find(
+        (event) => event.title === 'Escalated item',
+      );
+      expect(escalated?.urgency).toBe('high');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Regression: restart-safety after range-urgency upgrade (issue #109).
+  //
+  // A daemon persisted a `notifyState.pendingDebounce` batch BEFORE the
+  // range-urgency upgrade shipped (i.e. the envelope objects have no
+  // `effectiveUrgency` field). On the next restart, `hydrateStoredObservationEnvelope`
+  // used to pass `effectiveUrgency: envelope.effectiveUrgency` straight through,
+  // yielding `undefined`. That `undefined` flowed to `processObservation` and
+  // was written as the event's `urgency`, producing an invalid DB row.
+  //
+  // The fix: backfill with `effectiveObservationUrgency(monitor, observation)` when
+  // the field is absent. This also degrades cleanly when the persisted monitor
+  // snapshot itself lacks `urgencyMax` (old monitor): `URGENCY_BY_RANK[NaN] ?? lo`
+  // returns the base urgency (`lo`).
+  it('backfills effectiveUrgency on hydration of a pre-upgrade debounce batch (restart-safety, issue #109)', async () => {
+    vi.useFakeTimers();
+    const T0 = new Date('2026-01-15T10:00:00.000Z');
+    vi.setSystemTime(T0);
+    try {
+      const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-upgrade-'));
+      tempDirs.push(rootDir);
+      // A plain `normal` monitor — degenerate band — to match a pre-upgrade
+      // monitor snapshot that has no `urgencyMax` field.
+      const monitorsDir = createMonitorFile(
+        rootDir,
+        'upgrade-source',
+        'normal',
+        'Handle it.',
+        "  interval: '1s'\nnotify:\n  strategy: debounce\n  settle-for: 30s\n",
+      );
+
+      const source: ObservationSource = {
+        name: 'upgrade-source',
+        scopeSchema: { type: 'object', properties: {} },
+        stateful: true,
+        // Returns no observations — the only emission on the flush tick is the
+        // pre-seeded, pre-upgrade persisted batch.
+        async observe(): Promise<ObservationResult> {
+          return { observations: [], nextState: {} };
+        },
+      };
+
+      // Build the runtime with a concrete DB so we can seed state directly.
+      const db = createDb(':memory:');
+      const registry = new SourceRegistry();
+      registry.register(source);
+      const store = new RuntimeStore(db);
+      const runtime = new AgentMonitorRuntime(store, registry, [
+        claudeCodeAdapter,
+      ]);
+
+      const session = runtime.openSession(
+        claudeCodeAdapter.createSessionInput({
+          hostSessionId: 'claude-session-upgrade',
+          workspacePath: rootDir,
+        }),
+      );
+
+      // Seed a pre-upgrade persisted debounce batch: observation envelope without
+      // `effectiveUrgency` (field is deliberately absent — simulates state
+      // serialized before the range-urgency change was deployed).
+      // `dueAt` is in the past relative to the tick time below so the batch flushes.
+      const preUpgradeEnvelope = {
+        monitor: {
+          id: 'test-monitor',
+          displayName: 'Test monitor',
+          // Old monitor snapshot: frontmatter has `urgency` but no `urgencyMax`.
+          frontmatter: {
+            name: 'Test monitor',
+            watch: { type: 'upgrade-source' },
+            urgency: 'normal',
+            // `urgencyMax` intentionally absent — simulates pre-upgrade snapshot.
+          },
+          instructions: 'Handle it.',
+          filePath: path.join(
+            rootDir,
+            '.claude',
+            'monitors',
+            'test-monitor',
+            'MONITOR.md',
+          ),
+        },
+        observation: {
+          title: 'Pre-upgrade observation',
+          summary: 'Pre-upgrade observation',
+          // `salience` absent — simulates pre-upgrade observation.
+        },
+        observedAt: T0.toISOString(),
+        // `effectiveUrgency` intentionally absent — the key pre-upgrade condition.
+      };
+
+      store.setMonitorState('test-monitor', {
+        notifyState: {
+          pendingDebounce: {
+            observations: [preUpgradeEnvelope],
+            // dueAt is 1ms before the tick time (advance below) so it expires.
+            dueAt: new Date(T0.getTime() + 999).toISOString(),
+          },
+        },
+      });
+
+      // Advance past the dueAt so the batch is eligible to flush.
+      vi.advanceTimersByTime(1_000);
+
+      // Run a tick — the source returns no new observations, but the persisted
+      // batch is now due and must flush through hydrateStoredObservationEnvelope.
+      const tick = await runtime.tick(monitorsDir, rootDir);
+      expect(tick.emittedEventIds).toHaveLength(1);
+
+      // The materialized event MUST have a valid urgency, never `undefined`.
+      // For a pre-upgrade plain-normal monitor with no salience, effective
+      // urgency degrades to the base urgency: `normal`.
+      const events = runtime.listEvents({
+        sessionId: session.id,
+        unreadOnly: true,
+      });
+      expect(events).toHaveLength(1);
+      expect(events[0]?.urgency).toBe('normal');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   it('projects events only into matching workspace sessions and supports scope filters', () => {
     const workspaceA = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-a-'));

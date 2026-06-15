@@ -1,4 +1,6 @@
 /** JSON Schema type — a plain object describing a JSON Schema fragment. */
+import type { Urgency } from '../schema/types.js';
+
 export type JsonSchema = Record<string, unknown>;
 
 /**
@@ -47,6 +49,25 @@ export interface Observation {
    * so it is filterable without each source populating `queryScope` itself.
    */
   changeKind?: ChangeKind;
+  /**
+   * Optional source-classified **salience** for this observation — the source's
+   * domain judgment of how interrupt-worthy *this specific* observation is
+   * (PP3: a domain observation, not runtime reasoning). It is deliberately named
+   * `salience`, not `urgency`: `urgency` stays the monitor-level policy knob
+   * authored in `MONITOR.md`.
+   *
+   * The runtime resolves the *effective* urgency as
+   * `clamp(salience ?? band.lo, band.lo, band.hi)`, where `band` is the
+   * monitor's authored `urgency` range. So salience can escalate the effective
+   * urgency only **within** the author's band; a salience outside the band is
+   * clamped to the nearest bound. A monitor with a bare scalar `urgency` (the
+   * degenerate band `x..x`) can never be escalated, preserving PP5 and full
+   * backward compatibility.
+   *
+   * @see docs/specs/003-source-plugins.md §2.3
+   * @see docs/specs/002-runtime-delivery.md §4.1
+   */
+  salience?: Urgency;
   /** Point-in-time snapshot metadata captured at fire time */
   snapshot?: unknown;
 }

@@ -461,6 +461,52 @@ describe('validate', () => {
     expect(result.stdout.toLowerCase()).toMatch(/scope|array|type/);
   });
 
+  // issue #109 / 001 §3.2: an authored urgency band `lo..hi` is valid.
+  it('accepts a range urgency band (lo..hi)', () => {
+    const dir = path.join(tempDir, 'validate-range-urgency-test');
+    const monitorDir = path.join(dir, 'monitors', 'banded');
+    mkdirSync(monitorDir, { recursive: true });
+    const body = [
+      '---',
+      'name: Banded',
+      'watch:',
+      '  type: file-fingerprint',
+      '  globs: ["*.ts"]',
+      'urgency: normal..high',
+      '---',
+      'Handle it.',
+      '',
+    ].join('\n');
+    writeFileSync(path.join(monitorDir, 'MONITOR.md'), body, 'utf-8');
+
+    const result = run(['validate', path.join(dir, 'monitors')]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('Valid monitors: 1');
+  });
+
+  // issue #109 / 001 §3.2: an inverted band (lo > hi) must be rejected.
+  it('rejects an inverted urgency band (high..normal)', () => {
+    const dir = path.join(tempDir, 'validate-inverted-urgency-test');
+    const monitorDir = path.join(dir, 'monitors', 'inverted');
+    mkdirSync(monitorDir, { recursive: true });
+    const body = [
+      '---',
+      'name: Inverted',
+      'watch:',
+      '  type: file-fingerprint',
+      '  globs: ["*.ts"]',
+      'urgency: high..normal',
+      '---',
+      'Handle it.',
+      '',
+    ].join('\n');
+    writeFileSync(path.join(monitorDir, 'MONITOR.md'), body, 'utf-8');
+
+    const result = run(['validate', path.join(dir, 'monitors')]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout.toLowerCase()).toContain('urgency');
+  });
+
   it('hints when a monitor uses the old top-level source/scope shape', () => {
     const dir = path.join(tempDir, 'validate-old-shape-test');
     const monitorDir = path.join(dir, 'monitors', 'old-shape');
@@ -1287,16 +1333,26 @@ describe('schema generate', () => {
         watch?: {
           properties?: { type?: { enum?: string[] } };
         };
-        urgency?: { enum?: string[] };
+        // issue #109 / 001 §3.2: urgency is now a bare level OR a `lo..hi` band,
+        // so the JSON Schema uses `pattern` (shape-only) rather than `enum`.
+        urgency?: { type?: string; pattern?: string };
       };
     };
     expect(schema.properties?.watch?.properties?.type?.enum).toEqual(
       expect.arrayContaining(['file-fingerprint', 'api-poll', 'schedule']),
     );
-    // `low` is first-class (PP5)
-    expect(schema.properties?.urgency?.enum).toEqual(
-      expect.arrayContaining(['low', 'normal', 'high']),
-    );
+    // issue #109 / 001 §3.2: editor-hint schema uses pattern, not enum, so that
+    // both bare levels (`normal`) and bands (`normal..high`) are accepted.
+    // `low` is first-class (PP5). All three bare levels and the `..` band
+    // separator must be covered by the pattern.
+    const urgencySchema = schema.properties?.urgency;
+    expect(urgencySchema?.type).toBe('string');
+    expect(urgencySchema?.pattern).toContain('low');
+    expect(urgencySchema?.pattern).toContain('normal');
+    expect(urgencySchema?.pattern).toContain('high');
+    // `..` band separator: the JSON schema stores the regex-escaped form `\.\.`
+    // (two regex-literal-dot assertions), so the pattern string contains `\\.`
+    expect(urgencySchema?.pattern).toContain('\\.');
   });
 
   it('writes the schema to a file with -o', () => {

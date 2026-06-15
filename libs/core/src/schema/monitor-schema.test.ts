@@ -176,6 +176,108 @@ describe('monitorFrontmatterSchema', () => {
       expect(result.success).toBe(false);
     });
 
+    describe('urgency band (range) — issue #109 / 001 §3.2', () => {
+      it('parses a bare scalar as a degenerate band (urgency === urgencyMax)', () => {
+        // Backward compat: `urgency: normal` is the band normal..normal.
+        const result = monitorFrontmatterSchema.safeParse({
+          ...validMinimal,
+          urgency: 'normal',
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        expect(result.data.urgency).toBe('normal');
+        expect(result.data.urgencyMax).toBe('normal');
+      });
+
+      it('parses a range "normal..high" into low/high bounds', () => {
+        const result = monitorFrontmatterSchema.safeParse({
+          ...validMinimal,
+          urgency: 'normal..high',
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        // The band's low bound is kept under `urgency` (the base/default
+        // effective urgency); the high bound under `urgencyMax`.
+        expect(result.data.urgency).toBe('normal');
+        expect(result.data.urgencyMax).toBe('high');
+      });
+
+      it('parses the widest band "low..high"', () => {
+        const result = monitorFrontmatterSchema.safeParse({
+          ...validMinimal,
+          urgency: 'low..high',
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        expect(result.data.urgency).toBe('low');
+        expect(result.data.urgencyMax).toBe('high');
+      });
+
+      it('parses an explicit degenerate range "high..high"', () => {
+        const result = monitorFrontmatterSchema.safeParse({
+          ...validMinimal,
+          urgency: 'high..high',
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        expect(result.data.urgency).toBe('high');
+        expect(result.data.urgencyMax).toBe('high');
+      });
+
+      it('tolerates surrounding/internal whitespace in a range', () => {
+        const result = monitorFrontmatterSchema.safeParse({
+          ...validMinimal,
+          urgency: ' normal .. high ',
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        expect(result.data.urgency).toBe('normal');
+        expect(result.data.urgencyMax).toBe('high');
+      });
+
+      it('rejects an inverted range "high..normal" (lo must be ≤ hi)', () => {
+        const result = monitorFrontmatterSchema.safeParse({
+          ...validMinimal,
+          urgency: 'high..normal',
+        });
+        expect(result.success).toBe(false);
+        if (result.success) return;
+        expect(result.error.issues[0]?.message).toMatch(/invert/i);
+      });
+
+      it('rejects an inverted range "normal..low"', () => {
+        const result = monitorFrontmatterSchema.safeParse({
+          ...validMinimal,
+          urgency: 'normal..low',
+        });
+        expect(result.success).toBe(false);
+      });
+
+      it('rejects a range with an unknown bound "low..critical"', () => {
+        const result = monitorFrontmatterSchema.safeParse({
+          ...validMinimal,
+          urgency: 'low..critical',
+        });
+        expect(result.success).toBe(false);
+      });
+
+      it('rejects a malformed range with more than two bounds', () => {
+        const result = monitorFrontmatterSchema.safeParse({
+          ...validMinimal,
+          urgency: 'low..normal..high',
+        });
+        expect(result.success).toBe(false);
+      });
+
+      it('rejects an empty bound "..high"', () => {
+        const result = monitorFrontmatterSchema.safeParse({
+          ...validMinimal,
+          urgency: '..high',
+        });
+        expect(result.success).toBe(false);
+      });
+    });
+
     it('rejects non-kebab-case watch.type', () => {
       const result = monitorFrontmatterSchema.safeParse({
         ...validMinimal,

@@ -241,6 +241,16 @@ export interface StoredObservationEnvelope {
   monitor: MonitorDefinition;
   observation: Observation;
   observedAt: Date;
+  /**
+   * The urgency the runtime resolved for this observation —
+   * `clamp(observation.salience ?? band.lo, band.lo, band.hi)` over the
+   * monitor's authored `urgency` band. Drives both notify timing (the
+   * high-urgency debounce default) and the materialized `monitor_events.urgency`
+   * row, so a held batch and its event rows agree on the effective urgency.
+   *
+   * @see docs/specs/002-runtime-delivery.md §4.1, §5.1
+   */
+  effectiveUrgency: Urgency;
 }
 
 export interface ProcessObservationInput {
@@ -249,6 +259,13 @@ export interface ProcessObservationInput {
   observation: Observation;
   observedAt: Date;
   workspacePath?: string;
+  /**
+   * The effective urgency resolved at notify time
+   * (`clamp(salience ?? band.lo, band.lo, band.hi)`). The materialized
+   * `monitor_events.urgency` row MUST use this value so the persisted event and
+   * the notify-timing decision agree (002 §5.1).
+   */
+  effectiveUrgency: Urgency;
 }
 
 export interface PollingDecision {

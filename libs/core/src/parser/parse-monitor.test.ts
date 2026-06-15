@@ -112,6 +112,45 @@ urgency: normal
     expect(result.error).toContain('watch');
   });
 
+  it('parses a range urgency band from YAML frontmatter (issue #109 / 001 §3.2)', () => {
+    // Proves `normal..high` survives gray-matter/YAML as a plain scalar (no
+    // quoting needed) and is expanded into the low/high band bounds.
+    const content = yaml`---
+name: Salience-aware monitor
+watch:
+  type: file-fingerprint
+  globs:
+    - "**/*.ts"
+urgency: normal..high
+---
+
+Handle salient changes.
+`;
+    const result = parseMonitor(content, '/monitors/banded/MONITOR.md');
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.monitor.frontmatter.urgency).toBe('normal');
+    expect(result.monitor.frontmatter.urgencyMax).toBe('high');
+  });
+
+  it('rejects an inverted range urgency band (issue #109 / 001 §3.2)', () => {
+    const content = yaml`---
+name: Inverted band
+watch:
+  type: file-fingerprint
+  globs:
+    - "**/*.ts"
+urgency: high..normal
+---
+
+Handle it.
+`;
+    const result = parseMonitor(content, '/monitors/inverted/MONITOR.md');
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toContain('urgency');
+  });
+
   it('returns error for invalid frontmatter values', () => {
     const content = yaml`---
 name: Test

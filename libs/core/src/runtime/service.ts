@@ -1,7 +1,7 @@
 import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { scanMonitors } from '../parser/scan-monitors.js';
-import type { MonitorDefinition } from '../schema/types.js';
+import type { MonitorDefinition, Urgency } from '../schema/types.js';
 import { validateScope } from '../schema/validate-scope.js';
 import { parseDuration } from '../notify/notifier.js';
 import type { Observation } from '../observation/types.js';
@@ -113,12 +113,65 @@ function explainVerdict(stages: MonitorExplainStage[]): {
   };
 }
 
+const URGENCY_BY_RANK = ['low', 'normal', 'high'] as const satisfies Urgency[];
+const URGENCY_RANK: Record<Urgency, number> = {
+  low: 0,
+  normal: 1,
+  high: 2,
+};
+
+/**
+ * Resolve the effective urgency for a single observation: clamp the source's
+ * per-observation `salience` (defaulting to the band's low bound when absent)
+ * into the monitor's authored `urgency` band `[lo, hi]`.
+ *
+ * - No `salience` → the band's low bound (the authored base urgency).
+ * - `salience` within the band → the salience escalates (or de-escalates)
+ *   within it.
+ * - `salience` above the band → clamped to `hi`; below the band → clamped to
+ *   `lo`.
+ *
+ * A degenerate band (a bare scalar `urgency`, so `lo === hi`) can never be
+ * escalated — every salience clamps back to the single authored level,
+ * preserving PP5 and full backward compatibility.
+ *
+ * @see docs/specs/002-runtime-delivery.md §4.1
+ */
+function effectiveObservationUrgency(
+  monitor: MonitorDefinition,
+  observation: Observation,
+): Urgency {
+  const lo = monitor.frontmatter.urgency;
+  // `urgencyMax` may be absent on a monitor snapshot hydrated from pre-upgrade
+  // persisted state (before the range-urgency change was deployed). Treat a
+  // missing value as a degenerate band (`hi === lo`) — the observation can never
+  // escalate, and we return the base urgency. This is the same semantics as a
+  // bare scalar urgency (full backward compat). See 002 §3 restart-safety note.
+  // The cast to `Urgency | undefined` is intentional: at compile time
+  // `MonitorFrontmatter.urgencyMax` is always `Urgency`, but pre-upgrade
+  // deserialized JSON may lack the field entirely.
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+  const hi = (monitor.frontmatter.urgencyMax as Urgency | undefined) ?? lo;
+  const desired = observation.salience ?? lo;
+  const rank = Math.min(
+    Math.max(URGENCY_RANK[desired], URGENCY_RANK[lo]),
+    URGENCY_RANK[hi],
+  );
+  // rank is clamped into [lo, hi] ⊆ [0, 2], so this lookup is always defined.
+  return URGENCY_BY_RANK[rank] ?? lo;
+}
+
 function serializeObservation(
   monitor: MonitorDefinition,
   observation: Observation,
   observedAt: Date,
 ): StoredObservationEnvelope {
-  return { monitor, observation, observedAt };
+  return {
+    monitor,
+    observation,
+    observedAt,
+    effectiveUrgency: effectiveObservationUrgency(monitor, observation),
+  };
 }
 
 function hydrateStoredObservationEnvelope(
@@ -131,6 +184,19 @@ function hydrateStoredObservationEnvelope(
       envelope.observedAt instanceof Date
         ? envelope.observedAt
         : new Date(envelope.observedAt),
+    // Restart-safety / upgrade backfill (002 §3, issue #109): a debounce batch
+    // persisted BEFORE the range-urgency upgrade will have no `effectiveUrgency`
+    // field on its envelopes. Recompute it from the envelope's `monitor` +
+    // `observation` so the materialized event row is never written with
+    // `undefined` urgency. `effectiveObservationUrgency` degrades cleanly when
+    // the hydrated monitor snapshot itself lacks `urgencyMax` (old monitor).
+    // The cast to `Urgency | undefined` is intentional: at compile time
+    // `StoredObservationEnvelope.effectiveUrgency` is always `Urgency`, but
+    // pre-upgrade deserialized JSON may lack the field entirely.
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+    effectiveUrgency:
+      (envelope.effectiveUrgency as Urgency | undefined) ??
+      effectiveObservationUrgency(envelope.monitor, envelope.observation),
   };
 }
 
@@ -1000,6 +1066,7 @@ export class AgentMonitorRuntime {
           observation: emitted.observation,
           observedAt: emitted.observedAt,
           workspacePath: options.workspacePath,
+          effectiveUrgency: emitted.effectiveUrgency,
         });
         emittedEventIds.push(event.id);
       } catch (materializeError) {
@@ -1271,11 +1338,38 @@ export class AgentMonitorRuntime {
     }
 
     for (const observation of observations) {
+      const envelope = serializeObservation(monitor, observation, observedAt);
+      // Notify timing is evaluated against the observation's *effective*
+      // urgency (salience clamped into the monitor's band), not the monitor's
+      // base urgency — so a source can escalate a single observation onto the
+      // high-urgency debounce path (within the authored band) without changing
+      // the monitor's default.
       const notify = defaultNotifyConfigForUrgency(
-        monitor.frontmatter.urgency,
+        envelope.effectiveUrgency,
         monitor.frontmatter.notify,
       );
-      const envelope = serializeObservation(monitor, observation, observedAt);
+      // An observation is "escalated" when source salience pushed its effective
+      // urgency above the monitor's authored base (band low bound). A degenerate
+      // band (bare scalar urgency) can never be escalated.
+      const isEscalated =
+        URGENCY_RANK[envelope.effectiveUrgency] >
+        URGENCY_RANK[monitor.frontmatter.urgency];
+
+      // Whole-batch early flush (002 §4.1): an escalated observation landing in
+      // a held debounce batch flushes the ENTIRE batch — the already-held
+      // observations plus this one — immediately, rather than splitting the
+      // batch (splitting risks ordering confusion). This is the only path that
+      // can short-circuit a settling debounce window before its `dueAt`.
+      if (isEscalated && nextState.pendingDebounce) {
+        emitted.push(
+          ...nextState.pendingDebounce.observations.map(
+            hydrateStoredObservationEnvelope,
+          ),
+          envelope,
+        );
+        delete nextState.pendingDebounce;
+        continue;
+      }
 
       if (!notify) {
         emitted.push(envelope);
@@ -1347,7 +1441,7 @@ export class AgentMonitorRuntime {
       workspacePath: input.workspacePath ?? null,
       monitorId: input.monitor.id,
       sourceName: input.sourceName,
-      urgency: input.monitor.frontmatter.urgency,
+      urgency: input.effectiveUrgency,
       title: input.observation.title,
       body: input.observation.body ?? input.monitor.instructions,
       summary:
