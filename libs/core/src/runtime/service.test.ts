@@ -1656,6 +1656,204 @@ Handle it.
     expect(explainA.projections).toHaveLength(1);
   });
 
+  // --- Regression tests for #149: verdict severity ranking ----------------
+  //
+  // Bug: explainVerdict() selected the *first* stage whose status !== 'ok',
+  // so a healthy Observation stage (status='healthy') short-circuited the scan
+  // and masked a downstream failure or pending stage. The fix ranks statuses
+  // failure(3) > pending(2) > healthy(1) > ok(0) and selects the worst.
+
+  it('verdict selects downstream failure over a healthy observation stage (regression #149: healthy-obs + delivery failure → failure verdict)', async () => {
+    // Scenario: observation ran with no change (healthy/○), but no lead session
+    // is registered, so if an event had materialized it would not have projected.
+    // The key case from the issue: event materialized (from a prior trigger) but
+    // now the source is quiet. We simulate this by: first doing a triggered tick
+    // (creates the event), then doing a no-change tick (observation=healthy),
+    // and explaining WITHOUT a registered lead session.
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+
+    let callCount = 0;
+    const source: ObservationSource = {
+      name: 'verdict-ranking-source',
+      scopeSchema: { type: 'object' },
+      observe: () => {
+        callCount++;
+        // First tick: emit an observation (event materializes).
+        // Subsequent ticks: no change (observation=healthy).
+        return Promise.resolve(
+          callCount === 1
+            ? {
+                observations: [
+                  {
+                    title: 'change detected',
+                    objectKey: 'obj-verdict',
+                  },
+                ],
+              }
+            : { observations: [] },
+        );
+      },
+    };
+
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'verdict-ranking-source',
+      'normal',
+      'Handle it.',
+      "  interval: '1s'\n",
+    );
+    const runtime = createRuntime(dbPath, source);
+
+    // Tick 1: event materializes. No lead session yet.
+    await runtime.tick(monitorsDir, rootDir);
+    // Tick 2: source is quiet (no-change → observation=healthy). Still no session.
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    await runtime.tick(monitorsDir, rootDir);
+
+    const report = await runtime.explainMonitor({
+      monitorId: 'test-monitor',
+      monitorsDir,
+      workspacePath: rootDir,
+    });
+
+    // Observation stage is healthy (no-change on latest tick).
+    expect(
+      report.stages.find((stage) => stage.id === 'observation')?.status,
+    ).toBe('healthy');
+
+    // Materialization stage: events exist from tick 1 → ok.
+    expect(
+      report.stages.find((stage) => stage.id === 'materialization')?.status,
+    ).toBe('ok');
+
+    // Delivery stage is failure: events exist but no lead session registered.
+    const deliveryStage = report.stages.find(
+      (stage) => stage.id === 'delivery',
+    );
+    expect(deliveryStage?.status).toBe('failure');
+    expect(deliveryStage?.reason).toContain('No lead session');
+
+    // Verdict must reflect the downstream failure, NOT the healthy observation.
+    // Pre-fix: verdict was { status: 'healthy', stage: 'observation' } — the
+    // healthy observation masked the delivery failure (#149 repro).
+    expect(report.verdict.status).toBe('failure');
+    expect(report.verdict.stage).toBe('delivery');
+    expect(report.verdict.reason).toContain('No lead session');
+  });
+
+  it('verdict and materialization stage are pending (not failure) when debounce is holding the batch (regression #149)', async () => {
+    // Scenario: source emitted an observation, but the debounce settle window has
+    // not expired. No event has materialized yet — that's correct behavior, not a
+    // fault. Pre-fix: the materialization stage rendered ✗/failure because the
+    // code only checked observationHealthy (false for a triggered result), not
+    // whether the notify layer was holding the batch.
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'debounce-pending-verdict-source',
+      'high',
+      'Handle it.',
+      "  interval: '1s'\nnotify:\n  strategy: debounce\n  settle-for: 30s\n",
+    );
+
+    const source: ObservationSource = {
+      name: 'debounce-pending-verdict-source',
+      scopeSchema: { type: 'object' },
+      observe: () =>
+        Promise.resolve({
+          observations: [
+            { title: 'debounced observation', objectKey: 'obj-debounce' },
+          ],
+        }),
+    };
+
+    const runtime = createRuntime(dbPath, source);
+    await runtime.tick(monitorsDir, rootDir);
+
+    const report = await runtime.explainMonitor({
+      monitorId: 'test-monitor',
+      monitorsDir,
+      workspacePath: rootDir,
+    });
+
+    // Notify stage must be pending (debounce holding the batch).
+    expect(report.stages.find((stage) => stage.id === 'notify')?.status).toBe(
+      'pending',
+    );
+
+    // Materialization stage must be pending (no event yet, but that's expected
+    // because notify is holding). Pre-fix: this was 'failure' (#149 repro).
+    const materializationStage = report.stages.find(
+      (stage) => stage.id === 'materialization',
+    );
+    expect(materializationStage?.status).toBe('pending');
+
+    // Verdict: pending at notify (the highest-severity stage).
+    // The pending notify + pending materialization both rank above ok observation,
+    // and 'failure' > 'pending', so the first pending stage (notify) wins on tie.
+    expect(report.verdict.status).toBe('pending');
+    // The verdict stage is notify: it's the earliest-encountered pending stage
+    // (both notify and materialization are pending, same severity, notify comes
+    // first in the stage list).
+    expect(report.verdict.stage).toBe('notify');
+
+    // --format json contract: verdict.status and verdict.stage must be correct.
+    const json = JSON.parse(JSON.stringify(report)) as typeof report;
+    expect(json.verdict.status).toBe('pending');
+    expect(json.verdict.stage).toBe('notify');
+  });
+
+  it('a genuinely all-healthy/idle monitor still yields the healthy not-a-bug verdict after #149 fix (regression guard for #98)', async () => {
+    // #98 established that a no-change/idle monitor is NOT a bug and must show
+    // the ○ healthy verdict. The #149 severity-ranking fix must not regress that.
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'all-healthy-source',
+      'normal',
+      'Handle it.',
+      "  interval: '1s'\n",
+    );
+
+    const source: ObservationSource = {
+      name: 'all-healthy-source',
+      scopeSchema: { type: 'object' },
+      observe: () => Promise.resolve({ observations: [] }),
+    };
+
+    const runtime = createRuntime(dbPath, source);
+    await runtime.tick(monitorsDir, rootDir);
+
+    const report = await runtime.explainMonitor({
+      monitorId: 'test-monitor',
+      monitorsDir,
+      workspacePath: rootDir,
+    });
+
+    // All downstream stages should also be healthy.
+    expect(report.stages.some((stage) => stage.status === 'failure')).toBe(
+      false,
+    );
+    expect(
+      report.stages.find((stage) => stage.id === 'observation')?.status,
+    ).toBe('healthy');
+    expect(
+      report.stages.find((stage) => stage.id === 'materialization')?.status,
+    ).toBe('healthy');
+    expect(report.stages.find((stage) => stage.id === 'delivery')?.status).toBe(
+      'healthy',
+    );
+
+    // Verdict must be healthy, not-a-bug (#98 contract preserved).
+    expect(report.verdict.status).toBe('healthy');
+  });
+
   it('classifies a debounced-flush tick (emit with zero new observations) as triggered, not no-change', async () => {
     // Regression for PR #30: a tick that flushes a previously-debounced batch has
     // zero *new* observations yet still emits events. It must be recorded as

@@ -99,13 +99,37 @@ function explainStage(
   };
 }
 
+/**
+ * Severity rank for explain stage statuses. Higher = more severe.
+ * A healthy/ok stage must NEVER mask a downstream failure or pending.
+ * Ranking: failure(3) > pending(2) > healthy(1) > ok(0).
+ */
+const STAGE_STATUS_SEVERITY: Record<MonitorExplainStageStatus, number> = {
+  ok: 0,
+  healthy: 1,
+  pending: 2,
+  failure: 3,
+};
+
 function explainVerdict(stages: MonitorExplainStage[]): {
   status: MonitorExplainStageStatus;
   stage: MonitorExplainStageId;
   reason: string;
 } {
-  const stopped = stages.find((stage) => stage.status !== 'ok');
-  const stage = stopped ?? stages[stages.length - 1];
+  // Select the highest-severity stage. failure > pending > healthy > ok.
+  // Using `find(status !== 'ok')` was the regression introduced in #98: a
+  // healthy Observation stage (status='healthy', not 'ok') would short-circuit
+  // and mask a downstream failure or pending (#149).
+  let worst: MonitorExplainStage | undefined;
+  for (const stage of stages) {
+    if (
+      worst === undefined ||
+      STAGE_STATUS_SEVERITY[stage.status] > STAGE_STATUS_SEVERITY[worst.status]
+    ) {
+      worst = stage;
+    }
+  }
+  const stage = worst ?? stages[stages.length - 1];
   return {
     status: stage?.status ?? 'ok',
     stage: stage?.id ?? 'delivery',
@@ -563,7 +587,11 @@ export class AgentMonitorRuntime {
     const suppressedUntil = notifyState.suppressedUntil
       ? new Date(notifyState.suppressedUntil)
       : null;
+    // Track whether the notify stage is currently holding a batch so the
+    // materialization stage can reflect 'pending' rather than 'failure' (#149).
+    let notifyPending = false;
     if (pendingDebounce && new Date(pendingDebounce.dueAt) > now) {
+      notifyPending = true;
       stages.push(
         explainStage(
           'notify',
@@ -576,6 +604,7 @@ export class AgentMonitorRuntime {
         ),
       );
     } else if (suppressedUntil && suppressedUntil > now) {
+      notifyPending = true;
       stages.push(
         explainStage(
           'notify',
@@ -605,6 +634,11 @@ export class AgentMonitorRuntime {
       })
       .slice(0, eventLimit);
     if (events.length === 0) {
+      // When no event has materialized yet because the notify layer is correctly
+      // holding a debounce/throttle batch (#149), materialization is pending —
+      // not a failure. The observation was observed but the runtime hasn't
+      // flushed it yet. Only treat it as failure when the notify layer is clear
+      // and there is still nothing materialized (unexpected absence).
       stages.push(
         observationHealthy
           ? explainStage(
@@ -612,11 +646,17 @@ export class AgentMonitorRuntime {
               'healthy',
               'No events materialized — expected, because the source observed no changes (not a bug).',
             )
-          : explainStage(
-              'materialization',
-              'failure',
-              'No monitor_events rows exist for this monitor.',
-            ),
+          : notifyPending
+            ? explainStage(
+                'materialization',
+                'pending',
+                'No monitor_events rows yet — the notify layer is holding the batch until the debounce/throttle settles.',
+              )
+            : explainStage(
+                'materialization',
+                'failure',
+                'No monitor_events rows exist for this monitor.',
+              ),
       );
     } else {
       stages.push(
