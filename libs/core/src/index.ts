@@ -108,6 +108,7 @@ export type {
   SessionEventFilter,
   SessionUnreadCounts,
   SessionHookState,
+  SkippedMonitor,
   StoredObservationEnvelope,
   WatchHandle,
   UrgencyCounts,

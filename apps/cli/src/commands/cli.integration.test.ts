@@ -1069,6 +1069,159 @@ This monitor fires on a schedule.
   });
 });
 
+/**
+ * Regression for issue #152: `daemon once` printed `Evaluated 0 monitor(s),
+ * emitted 0 event(s).` both when (a) no monitors were found AND (b) monitors
+ * existed but were skipped because their `interval` had not elapsed. The
+ * identical output made it impossible to distinguish the two cases.
+ *
+ * These tests drive two sequential `daemon once` invocations against the same
+ * real (file-backed) SQLite database so the second run sees persisted state
+ * from the first and skips the monitor as "not yet due".
+ *
+ * @see https://github.com/mike-north/AgentMonitors/issues/152
+ */
+describe('daemon once skipped-not-due visibility (issue #152)', () => {
+  // file-fingerprint with a 5-minute interval: the first tick establishes a
+  // baseline; the second tick immediately after must skip it (not yet due).
+  const longIntervalMonitorBody = `---
+name: Long interval monitor
+watch:
+  type: file-fingerprint
+  globs:
+    - watched.txt
+  interval: 5m
+urgency: normal
+---
+When the file changes, review it.
+`;
+
+  function writeMonitor(
+    monitorsRoot: string,
+    monitorId: string,
+    body: string,
+  ): void {
+    const monitorDir = path.join(monitorsRoot, monitorId);
+    mkdirSync(monitorDir, { recursive: true });
+    writeFileSync(path.join(monitorDir, 'MONITOR.md'), body, 'utf-8');
+  }
+
+  // Acceptance criterion (issue #152): a second `daemon once` run within a
+  // monitor's interval reports the monitor as skipped (not due), NOT a bare
+  // "Evaluated 0 monitor(s)". The skipped suffix must include the count and
+  // a next-due hint.
+  //
+  // Regression: pre-fix both runs printed an identical summary; the second run
+  // was indistinguishable from "no monitors found".
+  it('reports skipped-not-due monitors on second run instead of bare "Evaluated 0"', () => {
+    const dir = path.join(tempDir, 'once-skipped-not-due');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, 'watched.txt'), 'initial', 'utf-8');
+    writeMonitor(monitorsRoot, 'slow-monitor', longIntervalMonitorBody);
+
+    // Use a real file-backed DB so state persists between CLI invocations.
+    const dbPath = path.join(dir, 'agentmon.db');
+    const env = { AGENTMONITORS_DB: dbPath };
+
+    // First run: monitor has no prior state → it is evaluated and baselines.
+    const firstRun = runWithEnv(
+      ['daemon', 'once', monitorsRoot, '--workspace', dir],
+      env,
+    );
+    expect(firstRun.exitCode).toBe(0);
+    expect(firstRun.stdout).toContain('Evaluated 1 monitor(s)');
+    expect(firstRun.stdout).not.toContain('skipped');
+
+    // Second run immediately after: interval has not elapsed → skipped.
+    const secondRun = runWithEnv(
+      ['daemon', 'once', monitorsRoot, '--workspace', dir],
+      env,
+    );
+    expect(secondRun.exitCode).toBe(0);
+    // Must report the skipped count and a next-due hint so the author can
+    // distinguish this from "no monitors found" (the ambiguous pre-fix output).
+    expect(secondRun.stdout).toContain('1 not yet due');
+    expect(secondRun.stdout).toContain('next due in');
+    // Must still report 0 evaluated (the monitor was not run this tick).
+    expect(secondRun.stdout).toContain('Evaluated 0 monitor(s)');
+  });
+
+  // The genuinely empty/no-monitors path must remain distinct: it prints the
+  // existing "Evaluated 0 monitor(s), emitted 0 event(s)." without a skipped
+  // suffix (because no monitors were found to skip).
+  it('does not add a skipped suffix when no monitors are found (empty dir)', () => {
+    const dir = path.join(tempDir, 'once-empty-monitors');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    mkdirSync(monitorsRoot, { recursive: true }); // Exists but empty.
+
+    const dbPath = path.join(dir, 'agentmon.db');
+    const env = { AGENTMONITORS_DB: dbPath };
+
+    const result = runWithEnv(
+      ['daemon', 'once', monitorsRoot, '--workspace', dir],
+      env,
+    );
+    expect(result.exitCode).toBe(0);
+    // The no-monitors path ends with a plain period — no skipped suffix.
+    expect(result.stdout).toContain(
+      'Evaluated 0 monitor(s), emitted 0 event(s).',
+    );
+    expect(result.stdout).not.toContain('skipped');
+  });
+
+  // When skipped monitors coexist with evaluated monitors (one monitor is
+  // due and another is not), the output reports both accurately.
+  it('reports both evaluated and skipped counts when mixed', () => {
+    const dir = path.join(tempDir, 'once-mixed-skipped');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    mkdirSync(dir, { recursive: true });
+    // Match the glob in longIntervalMonitorBody ('watched.txt').
+    writeFileSync(path.join(dir, 'watched.txt'), 'initial-slow', 'utf-8');
+    writeFileSync(path.join(dir, 'watched-fast.txt'), 'initial-fast', 'utf-8');
+    // Long-interval monitor: will be skipped on the second run.
+    writeMonitor(monitorsRoot, 'slow-monitor', longIntervalMonitorBody);
+    // Zero-interval monitor (0s): always due — elapsed >= 0 is always true.
+    writeMonitor(
+      monitorsRoot,
+      'fast-monitor',
+      `---
+name: Zero interval monitor
+watch:
+  type: file-fingerprint
+  globs:
+    - watched-fast.txt
+  interval: 0s
+urgency: normal
+---
+When the file changes, review it.
+`,
+    );
+
+    const dbPath = path.join(dir, 'agentmon.db');
+    const env = { AGENTMONITORS_DB: dbPath };
+
+    // First run: both monitors are evaluated (no prior state).
+    const firstRun = runWithEnv(
+      ['daemon', 'once', monitorsRoot, '--workspace', dir],
+      env,
+    );
+    expect(firstRun.exitCode).toBe(0);
+    expect(firstRun.stdout).toContain('Evaluated 2 monitor(s)');
+
+    // Second run immediately after: slow-monitor is skipped (5m not elapsed);
+    // fast-monitor is evaluated again (interval: 0s, always due).
+    const secondRun = runWithEnv(
+      ['daemon', 'once', monitorsRoot, '--workspace', dir],
+      env,
+    );
+    expect(secondRun.exitCode).toBe(0);
+    expect(secondRun.stdout).toContain('Evaluated 1 monitor(s)');
+    expect(secondRun.stdout).toContain('1 not yet due');
+    expect(secondRun.stdout).toContain('next due in');
+  });
+});
+
 describe('runtime flow', () => {
   it('opens a session, detects file changes through the daemon, claims a hook delivery, and acknowledges events', async () => {
     const dir = path.join(tempDir, 'runtime-flow');

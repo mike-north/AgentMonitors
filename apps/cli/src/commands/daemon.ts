@@ -27,6 +27,33 @@ function appendErroredLines(
   return [summary, ...lines].join('\n');
 }
 
+/**
+ * Append a skipped-monitors suffix to a tick summary so a second `daemon once`
+ * run within a monitor's next-due window is never mistaken for "no monitors
+ * found" (issue #152). Returns the summary unchanged when nothing was skipped.
+ *
+ * The suffix reports the total skipped count and the soonest next-due time so
+ * an author immediately knows how long to wait, e.g.:
+ *   `(2 not yet due — next due in 28s)`
+ *
+ * The wording is intentionally generic: "not yet due" is accurate for both
+ * interval-based monitors (file-fingerprint, api-poll) and schedule monitors
+ * whose cron window has not opened, avoiding "interval not elapsed" language
+ * that would be misleading for cron-driven sources.
+ */
+function appendSkippedSuffix(
+  summary: string,
+  skipped: RuntimeTickResult['skippedMonitors'],
+  now: Date,
+): string {
+  if (skipped.length === 0) return summary;
+  const soonestMs = Math.min(
+    ...skipped.map((s) => s.nextDueAt.getTime() - now.getTime()),
+  );
+  const soonestSec = Math.max(0, Math.ceil(soonestMs / 1000));
+  return `${summary} (${String(skipped.length)} not yet due — next due in ${String(soonestSec)}s)`;
+}
+
 async function runLoop(
   monitorsDir: string,
   workspacePath: string,
@@ -187,6 +214,7 @@ daemonCommand
       options: { workspace: string; format: string },
     ) => {
       try {
+        const now = new Date();
         const result = await daemonTickClient(monitorsDir, options.workspace);
         if (options.format === 'json') {
           console.log(JSON.stringify(result, null, 2));
@@ -199,7 +227,17 @@ daemonCommand
         const base = `Evaluated ${String(result.evaluatedMonitors.length)} monitor(s), emitted ${String(result.emittedEventIds.length)} event(s)${
           erroredCount > 0 ? `, ${String(erroredCount)} errored:` : '.'
         }`;
-        console.log(appendErroredLines(base, result.erroredObservations));
+        // Append skipped-monitors context to the summary line first (issue #152),
+        // then append per-monitor errored lines. This ensures the skipped suffix
+        // stays on the summary rather than the last errored line.
+        const withSkipped = appendSkippedSuffix(
+          base,
+          result.skippedMonitors,
+          now,
+        );
+        console.log(
+          appendErroredLines(withSkipped, result.erroredObservations),
+        );
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         reportError(message, options.format === 'json');
