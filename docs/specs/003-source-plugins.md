@@ -168,6 +168,22 @@ never reports its matched files as `created`. The baseline is detected by the ab
 prior `FingerprintState` in `context.previousState`. Verified:
 `plugins/source-file-fingerprint/src/index.ts`.
 
+### 3.4 Salience policy
+
+`file-fingerprint` classifies a `deleted` observation as **`salience: 'high'`** because information
+is permanently lost and an agent should react promptly. All other change kinds (`created`,
+`modified`, `descoped`) carry **no `salience`** field (which the runtime treats as the band floor —
+`salience ?? band.lo`). This means:
+
+- A monitor authored with `urgency: normal..high` over a watched directory will receive a `high`-urgency
+  delivery when a file is deleted and a `normal`-urgency delivery for any other change.
+- A monitor authored with a bare scalar `urgency: normal` (the degenerate band `normal..normal`)
+  is **never escalated** — the clamp formula preserves backward compatibility regardless of `salience`.
+
+Verified: `plugins/source-file-fingerprint/src/index.ts` (`buildAbsentObservation`) and the
+salience + end-to-end escalation tests in
+`plugins/source-file-fingerprint/src/index.test.ts`.
+
 ## 4. Bundled Source: `api-poll`
 
 Source name: `"api-poll"` (verified: `plugins/source-api-poll/src/index.ts` line 147).

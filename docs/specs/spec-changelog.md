@@ -9,6 +9,22 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-06-15 — file-fingerprint salience policy: `deleted` → `high`, others → default (003 §3.4)
+
+`file-fingerprint` now emits `salience: 'high'` on `deleted` observations (information permanently
+lost) and no `salience` on `created`, `modified`, or `descoped` observations (file still exists or
+no information lost). This makes RANGE urgency reachable end-to-end with a bundled source: a monitor
+authored with `urgency: normal..high` will receive a `high`-urgency delivery on file deletion and a
+`normal`-urgency delivery for all other change kinds. Monitors with a bare scalar `urgency` are
+unaffected (the degenerate band `x..x` is never escalated — backward compatible per 003 §2.3).
+
+- **Proof:** `plugins/source-file-fingerprint/src/index.test.ts` — unit tests asserting `salience:
+'high'` on `deleted` and absent salience on `modified`, `created`, `descoped`; end-to-end
+  integration tests proving the runtime materializes `urgency: 'high'` for a deletion on a
+  `normal..high` band monitor and `urgency: 'normal'` for a modification on the same monitor.
+- Minor changeset: `@agentmonitors/source-file-fingerprint` (new salience behavior).
+- Refs: issue #151.
+
 ## 2026-06-14 — Hydration backfill for pre-upgrade debounce batches (002 §3, restart-safety)
 
 `hydrateStoredObservationEnvelope` now backfills a missing `effectiveUrgency` field (present on envelopes serialized before the range-urgency upgrade) by recomputing it from `effectiveObservationUrgency(monitor, observation)`. Without this, the first daemon restart after upgrade would materialize an invalid (undefined) urgency row. Degrades cleanly when the hydrated monitor snapshot itself lacks `urgencyMax`: returns the base urgency via `URGENCY_BY_RANK[NaN] ?? lo`.
