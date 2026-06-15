@@ -105,8 +105,7 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
   projected into each matching session ([002 §6](./002-runtime-delivery.md)) — a single **shared**
   baseline.
 - **Target:** the full stage model and seam of
-  [002 §1.1](./002-runtime-delivery.md) — `Observe → [Compose] → Shape → Pace → ⟦seam⟧ → Diff →
-Interpret → Deliver → [React]` — with **Shape** (render before Pace and before Diff), **Pace**
+  [002 §1.1](./002-runtime-delivery.md) — `Observe → [Compose] → Shape → Pace → ⟦seam⟧ → Diff → Interpret → Deliver → [React]` — with **Shape** (render before Pace and before Diff), **Pace**
   modes, and a **per-recipient Diff** computed against each recipient's own baseline/cursor right of
   the shared/per-recipient seam (so divergent-baseline recipients each hear the right span; fan-out
   multiplies only genuinely per-baseline work, capability C15). The per-stage detail lands with the
