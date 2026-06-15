@@ -226,11 +226,12 @@ If no monitors and no errors: prints `No monitors found.`
       "notify": "<string | null>"
     }
   ],
-  "errors": [{ "filePath": "<string>", "error": "<string>" }]
+  "errors": [{ "filePath": "<string>", "error": "<string>" }],
+  "duplicateIds": [{ "id": "<string>", "filePaths": ["<string>"] }]
 }
 ```
 
-Note: `tags` defaults to `[]` when absent; `notify` defaults to `null` when absent.
+Note: `tags` defaults to `[]` when absent; `notify` defaults to `null` when absent; `duplicateIds` is `[]` when no collisions exist. Each entry carries the colliding monitor `id` (derived from the folder name) and the `filePaths` of all `MONITOR.md` files that derive that id (at least two).
 
 ### Exit codes
 

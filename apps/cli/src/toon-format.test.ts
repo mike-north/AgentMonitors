@@ -101,6 +101,10 @@ describe('renderToon', () => {
   // command. These are spec-derived from the JSON output contract in 005 §4–§7.
 
   it('round-trips the scan output shape', () => {
+    // duplicateIds is DuplicateMonitorId[] — objects with { id, filePaths },
+    // NOT string[]. The CLI passes result.duplicateIds through directly.
+    // @see apps/cli/src/commands/scan.ts (line: duplicateIds: result.duplicateIds)
+    // @see libs/core/src/runtime/types.ts DuplicateMonitorId
     const scanOutput = {
       monitors: [
         {
@@ -113,7 +117,12 @@ describe('renderToon', () => {
         },
       ],
       errors: [] as { filePath: string; error: string }[],
-      duplicateIds: [] as string[],
+      duplicateIds: [
+        {
+          id: 'duplicate-monitor',
+          filePaths: ['/monitors/a/MONITOR.md', '/monitors/b/MONITOR.md'],
+        },
+      ] as { id: string; filePaths: string[] }[],
     };
     const toon = renderToon(scanOutput);
     const decoded = decodeToon(toon);
@@ -135,14 +144,28 @@ describe('renderToon', () => {
   });
 
   it('round-trips the events list output shape', () => {
+    // Full MonitorEventRecord JSON shape as emitted by `events list --format json`.
+    // The command does JSON.stringify(events) directly; Date fields become ISO strings.
+    // @see libs/core/src/runtime/types.ts MonitorEventRecord
+    // @see apps/cli/src/commands/events.ts (JSON.stringify(events, null, 2))
     const eventsOutput = [
       {
         id: 'evt-123',
+        workspacePath: '/home/user/project',
         monitorId: 'watch-files',
+        sourceName: 'file-fingerprint',
         urgency: 'normal',
         title: 'File changed',
+        body: 'The file watched.txt was modified.',
+        summary: 'watched.txt modified',
+        payload: { kind: 'modified', path: 'watched.txt' },
+        snapshotMetadata: null,
+        snapshotText: null,
+        diffText: null,
+        objectKey: null,
+        queryScope: {},
+        tags: ['ci'],
         createdAt: '2024-01-15T10:00:00.000Z',
-        state: 'unread',
       },
     ];
     const toon = renderToon(eventsOutput);
@@ -151,11 +174,15 @@ describe('renderToon', () => {
   });
 
   it('round-trips the monitor history output shape', () => {
+    // Full ObservationHistoryRecord JSON shape as emitted by `monitor history --format json`.
+    // id is a string (not number), observationData is Record<string, unknown>.
+    // @see libs/core/src/runtime/types.ts ObservationHistoryRecord
     const historyOutput = [
       {
-        id: 1,
+        id: 'obs-abc-123',
         monitorId: 'watch-files',
         sourceName: 'file-fingerprint',
+        observationData: { observed: 1, emitted: 1 },
         result: 'triggered',
         createdAt: '2024-01-15T10:00:00.000Z',
       },

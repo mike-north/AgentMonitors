@@ -1191,6 +1191,8 @@ describe('--format toon for structured-output commands', () => {
     // --format json must still produce valid JSON with the documented shape
     const result = run(['scan', monitorsDir, '--format', 'json']);
     expect(result.exitCode).toBe(0);
+    // duplicateIds is DuplicateMonitorId[] — objects with { id, filePaths } —
+    // NOT string[]. The CLI passes result.duplicateIds through directly.
     const parsed = JSON.parse(result.stdout) as {
       monitors: {
         id: string;
@@ -1201,7 +1203,7 @@ describe('--format toon for structured-output commands', () => {
         notify: string | null;
       }[];
       errors: { filePath: string; error: string }[];
-      duplicateIds: string[];
+      duplicateIds: { id: string; filePaths: string[] }[];
     };
     expect(parsed.monitors).toHaveLength(1);
     expect(parsed.monitors[0]).toMatchObject({
