@@ -31,6 +31,7 @@
     "@toon-format/toon": "^2.3.0",
     "better-sqlite3": "^11.9.1",
     "commander": "^14.0.3",
+    "is-agentic-tui": "^0.2.0",
     "zod": "^3.25.76"
   },
   "license": "UNLICENSED",

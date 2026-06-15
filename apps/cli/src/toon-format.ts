@@ -10,6 +10,9 @@
  */
 import { encode, decode } from '@toon-format/toon';
 
+export type { ResolvedFormat } from './format-resolver.js';
+export { resolveFormat, clearAgentDetectionCache } from './format-resolver.js';
+
 /**
  * Render an arbitrary JSON-serialisable value as a TOON string for terminal
  * output. This is the only place in the CLI that calls `encode()`; all callers

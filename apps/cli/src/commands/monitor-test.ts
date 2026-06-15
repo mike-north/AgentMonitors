@@ -14,7 +14,7 @@ import {
 } from '@agentmonitors/core';
 import { registerCoreSources } from '../sources.js';
 import { reportError } from '../output.js';
-import { renderToon } from '../toon-format.js';
+import { renderToon, resolveFormat } from '../toon-format.js';
 import { DaemonConnectionError } from '../daemon-ipc.js';
 import {
   explainMonitorClient,
@@ -309,7 +309,8 @@ monitorTestCommand
   .addOption(
     new Option('--format <format>', 'Output format')
       .choices(['toon', 'json', 'text'])
-      .default('toon'),
+
+      .default(undefined, 'auto (toon for agents, text for humans)'),
   )
   .action(
     async (
@@ -320,11 +321,12 @@ monitorTestCommand
         socket?: string;
         historyLimit: string;
         eventLimit: string;
-        format: string;
+        format: string | undefined;
       },
     ) => {
-      const json = options.format === 'json';
-      const toon = options.format === 'toon';
+      const format = resolveFormat(options.format);
+      const json = format === 'json';
+      const toon = format === 'toon';
       const monitorsDir = path.resolve(options.dir);
       const workspacePath = path.resolve(options.workspace ?? process.cwd());
       const historyLimit = Number.parseInt(options.historyLimit, 10);
@@ -462,15 +464,17 @@ monitorTestCommand
   .addOption(
     new Option('--format <format>', 'Output format')
       .choices(['toon', 'json', 'text'])
-      .default('toon'),
+
+      .default(undefined, 'auto (toon for agents, text for humans)'),
   )
   .action(
     async (
       monitorId: string | undefined,
-      options: { socket?: string; limit: string; format: string },
+      options: { socket?: string; limit: string; format: string | undefined },
     ) => {
-      const json = options.format === 'json';
-      const toon = options.format === 'toon';
+      const format = resolveFormat(options.format);
+      const json = format === 'json';
+      const toon = format === 'toon';
       const limit = Number.parseInt(options.limit, 10);
       const query = {
         ...(monitorId ? { monitorId } : {}),

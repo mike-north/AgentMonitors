@@ -41,12 +41,19 @@ current — the current runtime implements a subset under different names and is
   composite observation), each with proof criteria.
 - Spec-only — no implementation or published-package behavior change, so no changeset.
 
-## 2026-06-15 — CLI: add `--format toon` option, default structured-output commands to TOON (#121)
+## 2026-06-15 — CLI: auto-detect format (toon for agents, text for humans); revert hardcoded toon default (#121)
+
+**005 §1 (output formats):**
+
+- **Default changed from hardcoded `toon` to auto-detect.** When `--format` is omitted, the CLI inspects the process environment via `is-agentic-tui` to determine whether it is running inside an agentic TUI (Claude Code, Cursor, Gemini CLI, etc.) and selects `toon` for agents and `text` for interactive humans. An explicit `--format` flag always wins.
+- Library: `is-agentic-tui` (ISC, no deps). Confirmed no `new Function` / `Function(` usage — passes the CSP/Workers constraint.
+- Per-command `Default` column in §4, §6, §7.1, §11.1 updated from `toon` to `auto (see §1)`.
+
+## 2026-06-15 — CLI: add `--format toon` option with TOON rendering (#121)
 
 **005 §1 (output formats), §4 (scan), §7.1 (source list), §11.1 (events list), §6 (monitor history / explain):**
 
 - Added `toon` as a `--format` choice on all five structured-output commands (`events list`, `scan`, `monitor history`, `monitor explain`, `source list`).
-- **Default changed from `text` to `toon`** for those five commands. `--format text` remains available and unchanged.
 - `--format json` output is **byte-for-byte identical** to the pre-change behaviour — no regressions for JSON consumers.
 - TOON is a terminal rendering transform applied at the CLI output edge only. Durable storage (SQLite `monitor_events`, snapshots, source state, hook-state files) and the daemon IPC wire stay JSON.
 - Round-trip safety: `decode(encode(value))` equals the original JSON value; asserted by tests for each command.

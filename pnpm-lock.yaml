@@ -92,6 +92,9 @@ importers:
       commander:
         specifier: ^14.0.3
         version: 14.0.3
+      is-agentic-tui:
+        specifier: ^0.2.0
+        version: 0.2.0
       zod:
         specifier: ^3.25.76
         version: 3.25.76
@@ -2762,6 +2765,10 @@ packages:
   ipaddr.js@1.9.1:
     resolution: {integrity: sha512-0KI/607xoxSToH7GjN1FfSbLoU0+btTicjsQSWQlh/hZykN8KpmMf7uYwPW3R+akZ6R/w18ZlXSHBYXiYUPO3g==}
     engines: {node: '>= 0.10'}
+
+  is-agentic-tui@0.2.0:
+    resolution: {integrity: sha512-fgzns7pBWl7hczWlbR4qG4iskMC9t2a9d904EZlxwYwY7H9m6LTprp2wQiI77x4oZ14RrxH57A4I8SdExsCLjg==}
+    engines: {node: '>=20'}
 
   is-arrayish@0.2.1:
     resolution: {integrity: sha512-zz06S8t0ozoDXMG+ube26zeCTNXcKIPJZJi8hBrF4idCLms4CG9QtK7qBl1boi5ODzFpjswb5JPmHCbMpjaYzg==}
@@ -6572,6 +6579,8 @@ snapshots:
   ip-address@10.2.0: {}
 
   ipaddr.js@1.9.1: {}
+
+  is-agentic-tui@0.2.0: {}
 
   is-arrayish@0.2.1: {}
 

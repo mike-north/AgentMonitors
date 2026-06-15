@@ -3,9 +3,18 @@
  *
  * @see https://toonformat.dev/
  * @see https://github.com/toon-format/toon
+ * @see https://github.com/mike-north/is-agentic-tui
  */
-import { describe, it, expect } from 'vitest';
-import { renderToon, decodeToon } from './toon-format.js';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { renderToon, decodeToon, resolveFormat } from './toon-format.js';
+
+// Mock is-agentic-tui so resolveFormat unit tests are hermetic regardless of
+// which agentic env vars happen to be set in the test-runner environment
+// (e.g. CLAUDE_CODE_ENTRYPOINT when running inside Claude Code).
+vi.mock('is-agentic-tui', () => ({
+  isAgenticTui: vi.fn(() => false),
+  clearCache: vi.fn(),
+}));
 
 describe('renderToon', () => {
   it('round-trips a plain object back to the identical JSON value', () => {
@@ -198,5 +207,61 @@ describe('decodeToon', () => {
     const toon = renderToon(original);
     const decoded = decodeToon(toon);
     expect(decoded).toEqual(original);
+  });
+});
+
+describe('resolveFormat', () => {
+  // Obtain a typed reference to the mock so we can control its return value per
+  // test. The module-level `vi.mock('is-agentic-tui', ...)` above replaces the
+  // real library with a controlled stub, making these tests hermetic regardless
+  // of which agentic env vars are set in the process running the test suite
+  // (e.g. CLAUDE_CODE_ENTRYPOINT when tests run inside Claude Code).
+  let mockIsAgenticTui: ReturnType<typeof vi.fn>;
+
+  beforeEach(async () => {
+    const mod = await import('is-agentic-tui');
+    mockIsAgenticTui = mod.isAgenticTui as ReturnType<typeof vi.fn>;
+    // Default to non-agentic; individual tests override as needed.
+    mockIsAgenticTui.mockReturnValue(false);
+  });
+
+  // (a) Agent detected + no --format → toon
+  it('returns toon when isAgenticTui() returns true and no explicit format', () => {
+    mockIsAgenticTui.mockReturnValue(true);
+    expect(resolveFormat(undefined)).toBe('toon');
+  });
+
+  // (b) Human (interactive) + no --format → text
+  it('returns text when isAgenticTui() returns false and no explicit format', () => {
+    mockIsAgenticTui.mockReturnValue(false);
+    expect(resolveFormat(undefined)).toBe('text');
+  });
+
+  // (c) Explicit --format always overrides auto-detection
+  it('returns toon when --format toon is explicit, regardless of detection', () => {
+    mockIsAgenticTui.mockReturnValue(false);
+    expect(resolveFormat('toon')).toBe('toon');
+  });
+
+  it('returns json when --format json is explicit, even when agent is detected', () => {
+    mockIsAgenticTui.mockReturnValue(true);
+    expect(resolveFormat('json')).toBe('json');
+  });
+
+  it('returns text when --format text is explicit, even when agent is detected', () => {
+    mockIsAgenticTui.mockReturnValue(true);
+    expect(resolveFormat('text')).toBe('text');
+  });
+
+  // Negative: unknown/garbage values fall back to auto-detection
+  it('falls back to auto-detect for unrecognised explicit values (returns text when non-agentic)', () => {
+    mockIsAgenticTui.mockReturnValue(false);
+    // 'auto' is not a valid value — falls through to detection.
+    expect(resolveFormat('auto')).toBe('text');
+  });
+
+  it('falls back to auto-detect for unrecognised explicit values (returns toon when agentic)', () => {
+    mockIsAgenticTui.mockReturnValue(true);
+    expect(resolveFormat('auto')).toBe('toon');
   });
 });

@@ -90,6 +90,79 @@ function runWithEnv(
 }
 
 /**
+ * All environment variables that `is-agentic-tui` inspects to detect an agentic
+ * TUI. Used by {@link runAsHuman} to build a clean non-agentic subprocess env.
+ *
+ * @see https://github.com/mike-north/is-agentic-tui
+ */
+const AGENTIC_TUI_ENV_KEYS = [
+  // Claude Code
+  'CLAUDECODE',
+  'CLAUDE_CODE_ENTRYPOINT',
+  'CLAUDE_PATH',
+  // Cursor
+  'CURSOR_AGENT',
+  'CURSOR_INVOKED_AS',
+  // Gemini CLI
+  'GEMINI_CLI',
+  // Aider
+  'AIDER',
+  'OR_APP_NAME',
+  'OR_SITE_URL',
+  // Codex
+  'CODEX_SANDBOX',
+  'CODEX_THREAD_ID',
+  // Cline
+  'CLINE_ACTIVE',
+  // Kiro CLI
+  'Q_TERM',
+  'QTERM_SESSION_ID',
+] as const;
+
+/**
+ * Runs the CLI as if it were called by a human (non-agentic) terminal.
+ *
+ * Strips all environment variables that `is-agentic-tui` uses for detection so
+ * the test is hermetic even when the test runner itself runs inside an agentic
+ * TUI such as Claude Code (which sets `CLAUDECODE=1`, `CLAUDE_CODE_ENTRYPOINT`,
+ * etc. in the current process's environment, which would otherwise be inherited).
+ */
+function runAsHuman(
+  args: string[],
+  extraEnv: Record<string, string> = {},
+  cwd?: string,
+): RunResult {
+  // Build an env that excludes all agentic-TUI signals so detection sees a
+  // clean non-agentic environment regardless of what the test runner inherits.
+  const agenticKeys = new Set<string>(AGENTIC_TUI_ENV_KEYS);
+  const env: Record<string, string> = {
+    ...Object.fromEntries(
+      Object.entries(process.env).filter(
+        ([k, v]) => v !== undefined && !agenticKeys.has(k),
+      ) as [string, string][],
+    ),
+    ...extraEnv,
+  };
+
+  const opts: ExecFileSyncOptions = {
+    encoding: 'utf-8',
+    env,
+    cwd,
+  };
+  try {
+    const stdout = execFileSync('node', [CLI_PATH, ...args], opts) as string;
+    return { stdout, stderr: '', exitCode: 0 };
+  } catch (err) {
+    const e = err as { stdout: string; stderr: string; status: number };
+    return {
+      stdout: (e.stdout ?? '') as string,
+      stderr: (e.stderr ?? '') as string,
+      exitCode: e.status ?? 1,
+    };
+  }
+}
+
+/**
  * Like {@link runWithEnv} but pipes `input` to the child's STDIN. Claude Code
  * hooks receive their payload as JSON on stdin (not env vars), so the
  * `hook deliver` tests must feed the payload this way. `execFileSync`'s `input`
@@ -1022,14 +1095,28 @@ describe('source list', () => {
     expect(parsed[0]).toHaveProperty('configFields');
   });
 
-  it('lists sources in toon format by default (no --format flag)', () => {
-    const result = run(['source', 'list']);
+  it('auto-detects toon when run by an agent (no --format flag, CLAUDECODE=1)', () => {
+    const result = runWithEnv(['source', 'list'], {
+      AGENTMONITORS_DB: ':memory:',
+      CLAUDECODE: '1',
+    });
     expect(result.exitCode).toBe(0);
     // TOON output does not use JSON braces for the root array
     expect(result.stdout).not.toMatch(/^\s*\[$/m);
     // All source names are present in the toon output
     expect(result.stdout).toContain('file-fingerprint');
     expect(result.stdout).toContain('api-poll');
+  });
+
+  it('auto-detects text when run by a human (no --format flag, no agentic env vars)', () => {
+    // runAsHuman strips all env vars that is-agentic-tui uses so the test is
+    // hermetic even when the test runner itself runs inside an agentic TUI.
+    const result = runAsHuman(['source', 'list'], {
+      AGENTMONITORS_DB: ':memory:',
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('Config fields:');
+    expect(result.stdout).toContain('file-fingerprint');
   });
 
   it('toon source list output round-trips to identical JSON value as --format json', () => {
@@ -1050,17 +1137,36 @@ describe('source list', () => {
 });
 
 describe('--format toon for structured-output commands', () => {
-  it('scan defaults to toon output (no --format flag)', () => {
+  it('scan auto-detects toon when run by an agent (no --format flag, CLAUDECODE=1)', () => {
     const dir = path.join(tempDir, 'scan-toon-default');
     const monitorsDir = path.join(dir, 'monitors');
     mkdirSync(monitorsDir, { recursive: true });
     run(['init', 'my-monitor', '--dir', monitorsDir], dir);
-    const result = run(['scan', monitorsDir]);
+    const result = runWithEnv(['scan', monitorsDir], {
+      AGENTMONITORS_DB: ':memory:',
+      CLAUDECODE: '1',
+    });
     expect(result.exitCode).toBe(0);
     // Not raw JSON (no outer braces)
     expect(result.stdout.trim()).not.toMatch(/^\{/);
     // The monitor id is present
     expect(result.stdout).toContain('my-monitor');
+  });
+
+  it('scan auto-detects text when run by a human (no --format flag, no agentic env vars)', () => {
+    const dir = path.join(tempDir, 'scan-toon-human-default');
+    const monitorsDir = path.join(dir, 'monitors');
+    mkdirSync(monitorsDir, { recursive: true });
+    run(['init', 'human-monitor', '--dir', monitorsDir], dir);
+    // runAsHuman strips all env vars that is-agentic-tui uses so the test is
+    // hermetic even when the test runner itself runs inside an agentic TUI.
+    const result = runAsHuman(['scan', monitorsDir], {
+      AGENTMONITORS_DB: ':memory:',
+    });
+    expect(result.exitCode).toBe(0);
+    // Human text format has a header row with padded columns
+    expect(result.stdout).toContain('ID');
+    expect(result.stdout).toContain('human-monitor');
   });
 
   it('scan toon output round-trips to identical JSON value as --format json', () => {

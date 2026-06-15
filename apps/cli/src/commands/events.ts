@@ -1,6 +1,6 @@
 import { Command, Option } from 'commander';
 import { reportError } from '../output.js';
-import { renderToon } from '../toon-format.js';
+import { renderToon, resolveFormat } from '../toon-format.js';
 import {
   acknowledgeEventsClient,
   listEventsClient,
@@ -48,7 +48,8 @@ eventsCommand
   .addOption(
     new Option('--format <format>', 'Output format')
       .choices(['toon', 'json', 'text'])
-      .default('toon'),
+
+      .default(undefined, 'auto (toon for agents, text for humans)'),
   )
   .action(
     async (options: {
@@ -60,8 +61,9 @@ eventsCommand
       scope?: string;
       unread?: boolean;
       sinceBaseline?: boolean;
-      format: string;
+      format: string | undefined;
     }) => {
+      const format = resolveFormat(options.format);
       try {
         const scope = parseScope(options.scope);
         const events = await listEventsClient(
@@ -76,11 +78,11 @@ eventsCommand
           },
           options.socket,
         );
-        if (options.format === 'json') {
+        if (format === 'json') {
           console.log(JSON.stringify(events, null, 2));
           return;
         }
-        if (options.format === 'toon') {
+        if (format === 'toon') {
           console.log(renderToon(events));
           return;
         }
@@ -96,7 +98,7 @@ eventsCommand
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        reportError(message, options.format === 'json');
+        reportError(message, format === 'json');
       }
     },
   );
