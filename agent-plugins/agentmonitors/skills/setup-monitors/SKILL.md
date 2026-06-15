@@ -10,10 +10,10 @@ questions, write the project-local files yourself, validate them, and verify the
 
 Monitoring needs two project-local pieces:
 
-1. `.claude/agentmonitors.local.md` with `enabled: true` so hooks boot/register the daemon.
+1. `.claude/agentmonitors.local.md` with `enabled: true` — required so the session-start hook
+   registers the daemon. Without it, `agentmonitors session start` quick-exits and no automated
+   monitoring runs while you work. (One-shot ticks via `daemon once` work without it.)
 2. One or more monitor definitions under `.claude/monitors/`.
-
-Without the activation file, `agentmonitors session start` quick-exits and no monitor ticks.
 
 ## Prerequisites
 
@@ -47,7 +47,17 @@ monitor definitions when they should be shared by the team.
 ## Author A Monitor
 
 1. Restate the user's intent as a monitor outcome: what changed, and what should the agent do?
-2. Choose the smallest shipped `watch.type` that matches the intent:
+2. Scaffold the monitor with `agentmonitors init` rather than writing `MONITOR.md` by hand —
+   this produces a valid stub with correct frontmatter and avoids common authoring mistakes:
+
+```bash
+agentmonitors init <name> --type <source> --dir .claude/monitors
+# Examples:
+agentmonitors init watch-ts --type file-fingerprint --dir .claude/monitors
+agentmonitors init api-health --type api-poll --dir .claude/monitors
+```
+
+3. Choose the smallest shipped `watch.type` that matches the intent:
 
 | Intent | Use `watch.type` | Ask for |
 | --- | --- | --- |
@@ -72,10 +82,10 @@ watch:
 
 `command` is an argv array (not a shell string). The default `change-detection.strategy` is `text-diff`; use `json-diff` when the command outputs JSON.
 
-3. Ask only for fields required by the chosen source. Prefer defaults for everything else:
+4. Ask only for fields required by the chosen source. Prefer defaults for everything else:
    - `urgency: normal` unless the user needs idle-only (`low`) or interrupting (`high`) delivery.
    - Add `notify:` only when the user asks for batching/throttling behavior.
-4. Write `.claude/monitors/<id>/MONITOR.md` (or a flat `.claude/monitors/<id>.md`). Use the monitor
+5. Edit `.claude/monitors/<id>/MONITOR.md` (or a flat `.claude/monitors/<id>.md`). Use the monitor
    body for the user's judgment and instructions, not facts already captured in `watch:`.
 
 Example body style:
@@ -97,27 +107,32 @@ agentmonitors validate .claude/monitors
 Verification is mandatory. The monitor is not done until it has fired once or until you clearly tell
 the user what external condition is still needed to make it fire.
 
-Use the cheapest real verification:
+**Standard verification flow (no live daemon required):**
 
-- `file-fingerprint`: create or modify a scratch file matched by the monitor, run the monitor through
-  a baseline tick, then a changed tick.
-- `api-poll`: use `agentmonitors monitor test <path/to/MONITOR.md>` if the endpoint can be polled
-  safely; for status/body-change verification, point at a controllable scratch endpoint when possible.
+```bash
+# 1. Trigger the condition the monitor watches (e.g. touch a file, make an API call)
+# 2. Run one observation tick in-process:
+agentmonitors daemon once .claude/monitors
+# 3. Inspect results — no daemon needed; reads persisted state in-process:
+agentmonitors monitor history <id>
+agentmonitors monitor explain <id> --dir .claude/monitors
+```
+
+`monitor history` and `monitor explain` read the persisted SQLite store and work even when no
+daemon is running (they print a "No daemon running — showing persisted state" notice in that case).
+
+Use the cheapest real verification per source:
+
+- `file-fingerprint`: modify a scratch file matched by the monitor's globs, then run `daemon once`.
+- `api-poll`: use `agentmonitors monitor test <path/to/MONITOR.md>` for a connectivity check (shows
+  HTTP status and response size); for change detection, point at a controllable endpoint or run two
+  `daemon once` ticks with different URL content in between.
 - `schedule`: choose a near-future cron while testing, or use `agentmonitors monitor test` to verify
   source configuration before restoring the intended cron.
 - `incoming-changes`: use a scratch git repo or harmless pathspec; advance the ref with a small commit
   touching a matched path.
 
-Useful commands:
-
-```bash
-agentmonitors monitor test .claude/monitors/<id>/MONITOR.md
-agentmonitors monitor history <id>
-agentmonitors monitor explain <id> --dir .claude/monitors
-```
-
-If a daemon-backed check is needed, use the project daemon started by the hooks or start a temporary
-daemon, then stop it when done. Confirm the final report with `monitor history` or `monitor explain`.
+For all sources, confirm with `monitor history` or `monitor explain` after the tick.
 
 ## Debug Loop
 

@@ -129,6 +129,33 @@ export function createFollowupObservationContext(
   };
 }
 
+/**
+ * For api-poll sources, extract and print the HTTP status and response body size
+ * from the baseline state so authors can immediately spot bad URLs (e.g. a 404
+ * or an error body) that would silently baseline as "success". Issue #153.
+ */
+function printApiPollBaselineSummary(
+  baselineState: unknown,
+  json: boolean,
+): void {
+  if (json) return; // JSON output is handled by the caller via printJsonResult
+  if (
+    baselineState === null ||
+    typeof baselineState !== 'object' ||
+    Array.isArray(baselineState)
+  )
+    return;
+  const state = baselineState as Record<string, unknown>;
+  const status = typeof state['status'] === 'number' ? state['status'] : null;
+  const body = typeof state['body'] === 'string' ? state['body'] : null;
+  if (status === null) return;
+  // Use Buffer.byteLength for the UTF-8 byte count, not body.length (which is
+  // UTF-16 code units and would undercount multi-byte characters). Issue #153.
+  const sizeStr =
+    body !== null ? ` (${String(Buffer.byteLength(body, 'utf8'))} bytes)` : '';
+  console.log(`  HTTP ${String(status)}${sizeStr}`);
+}
+
 /** Handle the baseline-then-detect flow for stateful sources. */
 async function handleStatefulSource(
   source: ObservationSource,
@@ -141,6 +168,12 @@ async function handleStatefulSource(
     console.log(
       `\nBaseline established. The "${source.name}" source requires a prior baseline before it can detect changes.`,
     );
+    // For api-poll, show the HTTP status and response size from the baseline
+    // so authors can spot bad URLs before they silently baseline on error
+    // responses. Issue #153 (item 5).
+    if (source.name === 'api-poll') {
+      printApiPollBaselineSummary(context.previousState, json);
+    }
     console.log(
       'Running a second observation to demonstrate change detection...\n',
     );

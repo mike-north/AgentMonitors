@@ -255,6 +255,30 @@ This treats the polled URL as the source-defined object identity (SP3).
 
 `api-poll` declares `stateful: true`. The first call fetches the URL, stores `{ body, status }` as `nextState`, and returns an empty `observations` array. Subsequent calls compare against `context.previousState` and emit an observation only when `hasChanged` returns `true`.
 
+### 4.6 Network error propagation
+
+When Node `fetch` throws (ECONNREFUSED, ENOTFOUND, timeout, …), it wraps the real OS-level error as `err.cause`. The source catches the `TypeError("fetch failed")`, builds a composite message `"fetch failed: <cause.message>"`, and re-throws a new `Error` with that message and `cause` set to the original fetch error. This means `monitor explain` and observation-history audit rows show the real reason (e.g. `"fetch failed: connect ECONNREFUSED 127.0.0.1:9999"`) instead of the generic `"fetch failed"`. (Verified: `plugins/source-api-poll/src/index.ts`.)
+
+### 4.7 `monitor test` baseline output
+
+`agentmonitors monitor test` for an `api-poll` monitor prints the HTTP status code and response body
+size (UTF-8 bytes, via `Buffer.byteLength`) after establishing the baseline, before running the
+second observation. This surfaces transport-level successes with unexpected status codes or empty
+bodies — for example, a mistyped-but-resolvable URL returning a 404, or a misconfigured endpoint
+returning an empty 200 — that would otherwise silently baseline as "no change yet."
+
+Note: network-level failures (ECONNREFUSED, DNS, timeout) throw _before_ any baseline is
+established and are handled separately by §4.6 error propagation; they do not produce a status/size
+line. Example output for a successful (transport-level) request:
+
+```
+Testing monitor "api-health" (source: api-poll)...
+
+Baseline established. The "api-poll" source requires a prior baseline before it can detect changes.
+  HTTP 200 (1234 bytes)
+Running a second observation to demonstrate change detection...
+```
+
 ## 5. Bundled Source: `schedule`
 
 Source name: `"schedule"` (verified: `plugins/source-schedule/src/index.ts` line 47).

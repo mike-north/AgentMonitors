@@ -117,11 +117,17 @@ Valid monitors: <n>
 ...
 
 Invalid monitors: <n>
-  <filePath>: <error message>
+  <id>: <error message>
 ...
 ```
 
+Both valid and invalid monitor lines use the monitor ID (the folder/stem name) as the identifier.
+If the ID cannot be derived from the path (unusual), the full file path is used as a fallback.
+
 If no monitors are found: prints `No monitors found.`
+
+If a file path (rather than a directory) is passed: prints an error to stderr naming
+`agentmonitors monitor test` as the symmetric command for single-file testing, and exits 1.
 
 **JSON format (`--format json`):**
 
@@ -137,6 +143,10 @@ If no monitors are found: prints `No monitors found.`
   ]
 }
 ```
+
+(In text output, each invalid monitor is labelled by its monitor ID. In JSON output, the
+`errors[].filePath` field carries the monitor ID as its value; the key name `filePath` is
+preserved for backward compatibility with existing JSON consumers.)
 
 ### Validation logic (current)
 
