@@ -63,6 +63,30 @@ A **delivery transport** is the generalization. Every transport **MUST**:
 > **daemon IPC surface** ([002 §10](./002-runtime-delivery.md)), not a new core type — a transport is
 > anything that drives that IPC to surface `DeliveryClaim`s while honoring the rules above.
 
+### 2.1 The Interpret adapter is upstream of transports, not a transport
+
+> **Status: target.** Marks the boundary an Interpret-stage AI-tool invocation crosses. Formalizes
+> the resolved decision from the monitoring capability study
+> ([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
+> §S4, resolved §S5 item 3; ledger row **C45**); the runtime contract is
+> [002 §1.1.8](./002-runtime-delivery.md#118-interpret-a-cheap-agentic-digest-via-the-users-own-ai-tool).
+
+The optional **Interpret** stage ([002 §1.1.8](./002-runtime-delivery.md#118-interpret-a-cheap-agentic-digest-via-the-users-own-ai-tool))
+invokes the **user's own installed AI tool** (e.g. `claude -p …`) to produce the `prose`-form digest
+and apply the agentic significance gate. That invocation is **host-specific** and **MUST** live behind
+an adapter boundary, exactly as hook names live behind the `claudeCodeAdapter` — and **never** in the
+runtime core (the host-agnostic-core invariant, [002 §11.1](./002-runtime-delivery.md#111-the-agentruntimeadapter-contract),
+AP3).
+
+Crucially, this is **not** a delivery transport. A delivery transport (§2 above) **surfaces** an
+already-produced `DeliveryClaim` into a session and **MUST NOT** re-derive what is worth delivering;
+the Interpret adapter sits **upstream** of that — it helps **produce** the packet's `prose` content
+(and may suppress it) **before** any transport surfaces it. The two boundaries do not overlap:
+Interpret runs after Diff and before Deliver ([002 §1.1.1](./002-runtime-delivery.md#111-the-locked-stage-order));
+a transport runs at Deliver. Because Agent Monitors **ships no model and holds no credentials**, the
+Interpret adapter inherits the user's existing data-governance and egress posture by construction —
+the same trust principle stated in [002 §1.1.8](./002-runtime-delivery.md#118-interpret-a-cheap-agentic-digest-via-the-users-own-ai-tool).
+
 ## 3. Hook-State Transport (Current)
 
 The hook-state transport is the portable default and is fully specified in
