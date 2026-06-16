@@ -381,12 +381,19 @@ export class RuntimeStore {
           // prior snapshot for a non-baseline event (so the NEXT event spans
           // prior → next), or this event's own artifact at a baseline event
           // (nothing precedes it). Advanced only at claim thereafter.
+          //
+          // Provenance: `baselineSnapshotId` must reference the snapshot that
+          // supplied `baselineContent`.  When seeding from `previous` (the
+          // pre-event snapshot content), there is no cursor-accessible snapshot
+          // id in scope, so we use NULL — the id is only set when seeding from
+          // the current event's own artifact (the baseline case). (Copilot
+          // review: comment 2.)
           this.seedSessionObjectCursor({
             sessionId: session.id,
             monitorId: event.monitorId,
             objectKey,
             workspacePath: event.workspacePath,
-            baselineSnapshotId: event.id,
+            baselineSnapshotId: previous !== null ? null : event.id,
             baselineContent: previous ?? artifact,
           });
         }
@@ -514,6 +521,44 @@ export class RuntimeStore {
     const result = new Map<string, string>();
     for (const row of rows) {
       if (row.diffText !== null) result.set(row.eventId, row.diffText);
+    }
+    return result;
+  }
+
+  /**
+   * Batch variant of {@link perRecipientDiffsForSession}: fetches per-recipient
+   * diff text for `eventId` across ALL the given `sessionIds` in a SINGLE query,
+   * then groups the results by session id in memory.
+   *
+   * Use this instead of calling {@link perRecipientDiffsForSession} in a per-
+   * session loop (which would be O(N) queries for N recipients).  (G10, 002
+   * §1.1.2; Copilot review: comment 3.)
+   *
+   * @returns Map from sessionId → diff text for the event.  Sessions with a NULL
+   *   or missing row are omitted; callers should fall back to the shared event
+   *   diff or the snapshot artifact.
+   */
+  perRecipientDiffsForAllSessions(
+    sessionIds: string[],
+    eventId: string,
+  ): Map<string, string> {
+    if (sessionIds.length === 0) return new Map();
+    const rows = asInternalDb(this.db)
+      .select({
+        sessionId: sessionEventState.sessionId,
+        diffText: sessionEventState.diffText,
+      })
+      .from(sessionEventState)
+      .where(
+        and(
+          inArray(sessionEventState.sessionId, sessionIds),
+          eq(sessionEventState.eventId, eventId),
+        ),
+      )
+      .all();
+    const result = new Map<string, string>();
+    for (const row of rows) {
+      if (row.diffText !== null) result.set(row.sessionId, row.diffText);
     }
     return result;
   }
@@ -1026,7 +1071,12 @@ export class RuntimeStore {
     for (const row of rows) {
       if (row.snapshotText === null || row.objectKey === null) continue;
       const workspacePath = row.workspacePath ?? null;
-      const key = [row.monitorId, row.objectKey, workspacePath ?? ''].join(' ');
+      // Use NUL (\0) delimiter — cannot appear in monitor IDs, object keys, or
+      // workspace paths, so this is collision-free even when those values contain
+      // spaces or any other printable character. (Copilot review: comment 1.)
+      const key = [row.monitorId, row.objectKey, workspacePath ?? ''].join(
+        '\0',
+      );
       newestByObject.set(key, {
         monitorId: row.monitorId,
         objectKey: row.objectKey,

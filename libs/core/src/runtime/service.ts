@@ -1997,19 +1997,20 @@ export class AgentMonitorRuntime {
     // identical, so this collapses to exactly today's single shared call (the
     // G14 behavior PR-A must not change).
     const sharedFallback = diffText ?? event.snapshotText ?? '';
-    const deltaForSession = (sessionId: string): string => {
-      const recipientDiffs = this.store.perRecipientDiffsForSession(sessionId, [
-        event.id,
-      ]);
-      return recipientDiffs.get(event.id) ?? sharedFallback;
-    };
+    // Fetch all per-recipient diffs for every projected session in ONE query
+    // (avoids the N+1 pattern of calling perRecipientDiffsForSession once per
+    // recipient in the loop below). (G10, 002 §1.1.2; Copilot review: comment 3.)
+    const allRecipientDiffs = this.store.perRecipientDiffsForAllSessions(
+      sessionIds,
+      event.id,
+    );
     const criteria = monitor.instructions;
 
     // Group recipients by their distinct delta so the adapter runs once per
     // distinct input, not once per recipient.
     const sessionsByDelta = new Map<string, string[]>();
     for (const sessionId of sessionIds) {
-      const delta = deltaForSession(sessionId);
+      const delta = allRecipientDiffs.get(sessionId) ?? sharedFallback;
       const bucket = sessionsByDelta.get(delta);
       if (bucket) bucket.push(sessionId);
       else sessionsByDelta.set(delta, [sessionId]);

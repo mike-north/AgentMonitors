@@ -262,6 +262,121 @@ describe('per-recipient baseline seam (G10 PR-A, 002 §1.1.2)', () => {
   });
 });
 
+describe('cursor key collision regression (Copilot review comment 1)', () => {
+  /**
+   * Regression guard: the `newestByObject` map key in `advanceCursorsForClaimedEvents`
+   * must not collide when `monitorId`, `objectKey`, or `workspacePath` contain spaces
+   * (or any printable character). Previously the key was built with `.join(' ')`,
+   * which caused:
+   *   monitorId="a b", objectKey="c"  →  key "a b c "   (same as)
+   *   monitorId="a",   objectKey="b c" →  key "a b c "
+   * The fix is to use `\0` as the delimiter (unprintable, cannot appear in these fields).
+   */
+  it('objectKey containing a space does not bleed across to a distinct objectKey cursor', () => {
+    const { store } = freshStore();
+    // Session is scoped to WORKSPACE ('/ws') — same workspace used by materializeFor.
+    const session = openLead(store, 'sess-spacekey');
+
+    // Two DISTINCT object keys that would collide under a space-joined composite key:
+    //   "watcher" + " " + "obj key" + " " + ""  →  "watcher obj key "   (same as)
+    //   "watcher" + " " + "obj"     + " " + "key" if workspace had a space "key"
+    //
+    // Here we pick a simpler pair that also collides under join(' '):
+    //   KEY_WITH_SPACE = "obj key"  → joined key: "watcher obj key /ws"
+    //   KEY_OTHER      = "obj"      → joined key: "watcher obj /ws"  (different, so not
+    //                                  the /ws case; but verify isolation anyway)
+    //
+    // The bug was: two objects whose (monitorId+key+workspace) join-strings happen to
+    // match.  E.g. monitorId="w", key="a b", workspace="" → "w a b"
+    //              monitorId="w", key="a",   workspace="b" → "w a b"   (SAME — bug).
+    // After the fix (\0 delimiter) these are "w\0a b\0" vs "w\0a\0b" — always distinct.
+    //
+    // We exercise the fix by tracking two objects with spaces in their keys through
+    // markClaimed and asserting cursor isolation.
+    const KEY_WITH_SPACE = 'obj key'; // objectKey that contains a space
+    const KEY_OTHER = 'obj'; // a distinct objectKey
+
+    function materializeFor(key: string, artifact: string): string {
+      const previous = store.latestSnapshot(MONITOR_ID, key, WORKSPACE);
+      const sharedDiff = previous
+        ? buildTextDiff(previous.content, artifact)
+        : null;
+      const event = store.insertEvent(
+        {
+          workspacePath: WORKSPACE,
+          monitorId: MONITOR_ID,
+          sourceName: 'manual',
+          urgency: 'normal',
+          title: 'change',
+          body: '',
+          summary: '',
+          payload: {},
+          snapshotMetadata: {},
+          snapshotText: artifact,
+          diffText: sharedDiff,
+          objectKey: key,
+          queryScope: {},
+          tags: [],
+          createdAt: nextTime(),
+        },
+        { previousContent: previous?.content ?? null },
+      );
+      store.saveSnapshot({
+        workspacePath: WORKSPACE,
+        monitorId: MONITOR_ID,
+        objectKey: key,
+        eventId: event.id,
+        content: artifact,
+      });
+      return event.id;
+    }
+
+    // Establish an initial snapshot + cursor for both keys.
+    const e1a = materializeFor(KEY_WITH_SPACE, 'v1');
+    const e1b = materializeFor(KEY_OTHER, 'u1');
+
+    // Advance the cursor for KEY_WITH_SPACE by claiming its event; do NOT advance
+    // KEY_OTHER — it must remain anchored at u1.
+    store.markClaimed(session.id, [e1a], 'turn-interruptible');
+
+    // Verify KEY_WITH_SPACE cursor advanced to v1.
+    const cursorSpace = store.getSessionObjectCursor(
+      session.id,
+      MONITOR_ID,
+      KEY_WITH_SPACE,
+      WORKSPACE,
+    );
+    expect(cursorSpace?.baselineContent).toBe('v1');
+
+    // Verify KEY_OTHER cursor is UNAFFECTED — it must still be anchored at u1
+    // (the seed value from e1b's projection). A buggy space-join key would cause
+    // the markClaimed loop to overwrite KEY_OTHER's cursor when processing e1a.
+    const cursorOther = store.getSessionObjectCursor(
+      session.id,
+      MONITOR_ID,
+      KEY_OTHER,
+      WORKSPACE,
+    );
+    expect(cursorOther?.baselineContent).toBe('u1');
+
+    // After a second observation for KEY_OTHER: the recipient must span from u1,
+    // NOT from v1 (which would be the result of a cross-object cursor bleed).
+    const e2b = materializeFor(KEY_OTHER, 'u2');
+    const delta = store.perRecipientDiffsForSession(session.id, [e2b]).get(e2b);
+    expect(delta).toBe('- 1: u1\n+ 1: u2'); // proves no bleed from KEY_WITH_SPACE
+    expect(delta).not.toBe('- 1: v1\n+ 1: u2'); // explicit: bleed would produce this
+
+    // Claim both e1b and e2b so KEY_OTHER's cursor advances to u2; then verify
+    // KEY_WITH_SPACE's next observation still spans from v1 (not u2, i.e. no reverse bleed).
+    store.markClaimed(session.id, [e1b, e2b], 'turn-interruptible');
+    const e2a = materializeFor(KEY_WITH_SPACE, 'v2');
+    const deltaSpace = store
+      .perRecipientDiffsForSession(session.id, [e2a])
+      .get(e2a);
+    expect(deltaSpace).toBe('- 1: v1\n+ 1: v2'); // spans from correct cursor
+  });
+});
+
 /**
  * Force a `session_event_state` row back to the pre-G10 shape (NULL per-recipient
  * `diff_text`) to exercise the legacy fallback path. The store only ever WRITES
