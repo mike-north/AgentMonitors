@@ -158,6 +158,51 @@ If present, `tags` **MUST** be an array of strings. Tags have no runtime semanti
 
 > Verified: `libs/core/src/schema/monitor-schema.ts` line 40 — `tags: z.array(z.string()).optional()`.
 
+### 3.6 `notify: rollup` — scheduled/windowed rollup (_target_)
+
+> **Status: target.** The authoring surface and runtime semantics described in this section are the
+> target design (capability C44; resolved
+> [`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
+> §S5.2). They are **not** yet implemented. The current schema accepts only `debounce` and `throttle`
+> strategies; a monitor with `strategy: rollup` is rejected by `agentmonitors validate` until this
+> is built.
+
+The third Pace mode is **scheduled / windowed rollup**: the runtime accumulates all observations
+produced between delivery windows and delivers them together at the next scheduled window opening
+(e.g. once at 09:00 every weekday). Unlike `debounce` (settle on quiet) and `throttle` (suppress
+within a fixed window), rollup makes _delivery time_ the primary constraint — the agent receives a
+digest on a human-readable schedule, never per-change.
+
+```yaml
+notify:
+  strategy: rollup
+  window: '0 9 * * 1-5' # cron — when the window opens (required)
+  timezone: America/Los_Angeles # optional; defaults to UTC
+```
+
+**Field semantics (target):**
+
+| Field      | Type   | Required | Meaning                                                                                            |
+| ---------- | ------ | -------- | -------------------------------------------------------------------------------------------------- |
+| `strategy` | string | yes      | Must be `rollup`                                                                                   |
+| `window`   | string | yes      | Five-field cron expression defining the recurring delivery time; same grammar as `schedule` source |
+| `timezone` | string | no       | IANA timezone for `window` evaluation; defaults to `UTC`                                           |
+
+**Interaction with observation cadence (target):** a `rollup` monitor does **not** need to observe
+at low latency — if delivery is once daily there is no benefit to polling every 30 seconds. Authors
+**SHOULD** pair a `rollup` notify with a relaxed `watch.interval` (e.g. `1h`), which reduces both
+observation cost and token cost without changing the delivery outcome. The runtime **MUST NOT**
+enforce this coupling — relaxing cadence remains the author's choice — but tooling **SHOULD** surface
+a hint when a rollup monitor's `interval` is set tighter than its delivery window.
+
+**Accumulation semantics (target):** all observations produced since the last window opening are
+held in durable accumulation state in `monitorState.notifyState`. On the next window opening the
+runtime flushes the entire accumulated batch as a single composite delivery, then clears the batch.
+If no observations accumulated, the window opening produces no delivery (no empty pings).
+
+**Cross-references:** [002 §4.4](./002-runtime-delivery.md) for runtime semantics; [002 §4.5](./002-runtime-delivery.md)
+for the complete Pace mode reference; capability study C44 / §S5.2.
+
 ## 4. Monitor Identity and Uniqueness
 
 Monitor IDs **MUST** be unique within a scanned monitor tree (SP2). The runtime stores monitor state by `monitorId`, so two monitors deriving the same ID would alias each other's persisted source and notify state — a durable-state correctness hazard, not a cosmetic one.
@@ -237,6 +282,36 @@ Review stale monitors, old failed items, and event volume trends.
 - `low` urgency is a valid authoring value
 - the schedule source uses per-source config (`cron`, `timezone`, `label`) flat inside `watch:`
 - human-readable labels belong in source-specific config where appropriate
+
+### 7.3 Daily digest rollup monitor (_target_)
+
+> **Status: target.** `strategy: rollup` is not yet implemented; this example documents the
+> intended authoring surface (§3.6, [002 §4.4](./002-runtime-delivery.md)).
+
+```md
+---
+name: Chief-of-Staff Daily Digest
+watch:
+  type: api-poll
+  url: 'https://api.example.com/updates'
+  interval: 1h
+urgency: low
+notify:
+  strategy: rollup
+  window: '0 9 * * 1-5'
+  timezone: America/Los_Angeles
+tags: [digest, daily]
+---
+
+Summarize all updates since the last digest and surface any action items.
+```
+
+**What this example illustrates (target):**
+
+- `strategy: rollup` is the third Pace mode, alongside `debounce` and `throttle`
+- `window` is a cron expression defining when the accumulated batch is delivered
+- `interval: 1h` relaxes observation cadence to match the delivery frequency — no benefit to polling every 30 s when delivery is once daily
+- `urgency: low` is a natural pairing: rollup delivery is a background digest, not an interrupt
 
 ## 8. Validation Implications
 

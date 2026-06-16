@@ -231,6 +231,93 @@ The pending debounce state uses the `PendingDebounceState` shape: `{ observation
 
 Verified: `libs/core/src/runtime/types.ts` — `PendingDebounceState` (lines 137–140).
 
+### 4.4 Scheduled-rollup Pace mode (_target_)
+
+> **Status: target.** The scheduled-rollup Pace mode is **not yet implemented**. This section
+> specifies the intended semantics (capability C44; resolved in the monitoring capability study
+> [`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
+> §S5.2). The authoring surface lives in [001 §3.6](./001-monitor-definition.md).
+
+**Overview.** The `rollup` strategy accumulates all shaped observations produced between delivery
+windows and flushes them as a single composite delivery when the next window opens — for example, a
+9am weekday digest. It is the third Pace mode alongside `debounce` (settle on quiet) and `throttle`
+(suppress within a fixed window). Where debounce and throttle are reactive (a change triggers the
+clock), rollup is _proactive_: the delivery schedule is fixed by the author, not by change frequency.
+
+**The three-clocks principle (§1.1.3) applied to rollup.** Rollup makes the independence of the
+three clocks especially visible:
+
+- **Observation clock** — how often the source polls (e.g. every hour). Can be as slow as the
+  delivery window or slower; there is no requirement to poll at low latency when delivery is a daily
+  digest. This is the key cost advantage of rollup: the author **SHOULD** relax `watch.interval`
+  to match the delivery frequency (see [001 §3.6](./001-monitor-definition.md)), reducing both
+  observation cost and token cost without changing the delivery outcome.
+- **Pace clock** — the rollup window schedule (e.g. `0 9 * * 1-5`). Determines _when_ the
+  accumulated batch is flushed. Independent of how often the source observes.
+- **Delivery clock** — when the agent next reaches a delivery lifecycle (§9). The flushed batch
+  lands in session projection and is picked up at the next appropriate lifecycle, independent of
+  when the window opened.
+
+**Runtime semantics (target):**
+
+1. **Accumulation.** Each observation produced since the last window flush is appended to a durable
+   accumulation batch in `monitorState.notifyState` (analogous to `pendingDebounce` but without a
+   `dueAt` reset on each new observation — the flush time is schedule-driven, not settle-driven).
+   Observations are accumulated across daemon restarts; the batch **MUST** survive a restart.
+
+2. **Window evaluation.** On each runtime tick the runtime evaluates the monitor's `window` cron
+   expression against the current time using the configured `timezone` (defaulting to `UTC`). The
+   window fires at most once per minute (same guard as the schedule source, §2.2). If the window
+   matches and the accumulated batch is non-empty, the batch is flushed as a single composite
+   emission and the accumulation state is cleared.
+
+3. **Empty window.** If the window opens but no observations have accumulated since the last flush,
+   the runtime produces no delivery (no empty pings — preserving C14).
+
+4. **Batch representation.** The flushed batch becomes one or more `monitor_events` rows (one per
+   accumulated observation) rather than a single merged row, so the full event history is
+   queryable. The runtime **MAY** synthesize a composite summary for the delivery payload. The exact
+   materialization shape is left to the implementation within these constraints.
+
+5. **Relationship to urgency.** Urgency applies to the _accumulated_ observations individually.
+   The effective urgency of the flush follows the most-escalated observation in the batch if the
+   batch is flushed as a unit. If materialized as individual events, each event carries its own
+   effective urgency.
+
+6. **No per-change interrupts.** A monitor with `strategy: rollup` **MUST NOT** deliver anything
+   outside a window opening. Observations accumulate silently between windows. This is the defining
+   property: the author trades per-change interrupts for a predictable delivery schedule.
+
+**Relationship to the Pace stage (§1.1.1).** Rollup is entirely on the **shared** side of the
+seam: accumulation, window evaluation, and the flush decision are computed once for all recipients
+before the per-recipient Diff stage runs. The flushed batch enters the normal materialization →
+projection → delivery pipeline (§5 → §6 → §9).
+
+**Cadence-relaxation note.** The most important operational consequence of rollup is that it
+_permits_ relaxing the observation cadence without any delivery-quality loss. A monitor delivering a
+9am daily digest wastes resources polling every 30 seconds — the capability study (C44, §S5.2)
+explicitly names lower token and observation cost as a first-class motivation for the rollup mode.
+
+### 4.5 Complete Pace mode reference (_target_)
+
+> **Status: target** (for the rollup row; the three existing rows reflect current behavior).
+> This section collects all four Pace modes in one place so authors and implementers can compare
+> them. The modes are not hierarchical — each solves a different delivery-timing problem.
+
+| Mode                   | `notify` strategy | Trigger for delivery                           | Cost profile                                   | Primary use case                                                 |
+| ---------------------- | ----------------- | ---------------------------------------------- | ---------------------------------------------- | ---------------------------------------------------------------- |
+| **Immediate**          | _(omit notify)_   | Each observation emits immediately             | Highest (one delivery per observation)         | Low-latency streams; `high` urgency events after debounce window |
+| **Settle (debounce)**  | `debounce`        | First tick after the watched signal goes quiet | Moderate (burst absorbed into one delivery)    | Spec docs that are edited incrementally; noisy file changes      |
+| **Throttle**           | `throttle`        | First observation after the suppression window | Low (at most one delivery per suppress window) | High-volume sources where only the latest state matters          |
+| **Scheduled rollup** ⚑ | `rollup`          | Window opening (cron schedule)                 | Lowest (observation cadence can be relaxed)    | Chief-of-staff digests; end-of-day summaries                     |
+
+> ⚑ _target_ — not yet implemented. See §4.4 and [001 §3.6](./001-monitor-definition.md).
+
+**The Pace set is now complete.** The four modes cover the full range of "when should a shaped
+signal become a candidate for delivery" (§1.1.1): immediately on change, after the signal settles,
+at most once per window, or on an author-defined schedule. No further Pace modes are anticipated at
+this stage.
+
 ## 5. Event Materialization
 
 Each emitted observation becomes one row in the `monitor_events` table. The runtime **MUST** persist at least: `id`, `workspacePath`, `monitorId`, `sourceName`, `urgency`, `title`, `body`, `summary`, `payload`, `snapshotMetadata`, `snapshotText`, `diffText`, `objectKey`, `queryScope`, `tags`, `createdAt`.
