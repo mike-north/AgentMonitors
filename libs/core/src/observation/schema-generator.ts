@@ -94,7 +94,7 @@ export function generateMonitorSchema(
                 type: 'string',
                 pattern: '^\\s*\\S+(?:\\s+\\S+){4}\\s*$',
               },
-              timezone: { type: 'string' },
+              timezone: { type: 'string', minLength: 1 },
             },
             required: ['strategy', 'window'],
           },

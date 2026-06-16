@@ -252,6 +252,14 @@ export interface NotifyRuntimeState {
   suppressedUntil?: string;
   pendingDebounce?: PendingDebounceState;
   pendingRollup?: PendingRollupState;
+  /**
+   * The epoch-minute (Math.floor(ms / 60_000)) of the most recent rollup window
+   * flush. Guards against duplicate flushes within the same calendar minute when
+   * the tick interval is shorter than 60 s (002 §4.4 step 2 "at most once per
+   * minute"). Persisted independently of `pendingRollup` so the guard survives
+   * the flush that deletes `pendingRollup`.
+   */
+  rollupLastFiredMinute?: number;
 }
 
 export interface StoredObservationEnvelope {

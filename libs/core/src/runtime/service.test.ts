@@ -3354,7 +3354,8 @@ Handle it.
           unreadOnly: true,
         });
         expect(delivered).toHaveLength(2);
-        // Both accumulated observations are present, oldest first.
+        // Both accumulated observations are present (sorted for deterministic
+        // assertion order, since listEvents returns newest-first by default).
         expect(delivered.map((e) => e.title).sort()).toEqual([
           'Change A',
           'Change B',
@@ -3474,6 +3475,128 @@ Handle it.
           new RuntimeStore(createDb(dbPath)).getMonitorState('test-monitor')
             .notifyState.pendingRollup,
         ).toBeUndefined();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    // (f) Once-per-minute guard (002 §4.4 step 2): two ticks within the same
+    //     calendar minute must produce exactly ONE flush, not two.
+    //     `cronMatchesDate` returns true for any timestamp within the matching
+    //     minute, so without the `rollupLastFiredMinute` guard a sub-minute tick
+    //     interval would emit the batch twice. This is a regression test for
+    //     the guard introduced alongside G12.
+    it('fires the window at most once per minute even when ticked twice in the same window minute', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(OUTSIDE_WINDOW);
+      try {
+        const rootDir = mkdtempSync(
+          path.join(tmpdir(), 'agentmon-rollup-once-'),
+        );
+        tempDirs.push(rootDir);
+        const monitorsDir = rollupMonitorDir(rootDir, 'rollup-once');
+
+        const db = createDb(':memory:');
+        const registry = new SourceRegistry();
+        // One observation to accumulate, then empty thereafter.
+        registry.register(
+          queuedSource('rollup-once', [{ title: 'Single Change' }]),
+        );
+        const store = new RuntimeStore(db);
+        const runtime = new AgentMonitorRuntime(store, registry, [
+          claudeCodeAdapter,
+        ]);
+        runtime.openSession(
+          claudeCodeAdapter.createSessionInput({
+            hostSessionId: 'claude-rollup-once',
+            workspacePath: rootDir,
+          }),
+        );
+
+        // Tick 1 (08:00): accumulate the observation, window not open yet.
+        const tick1 = await runtime.tick(monitorsDir, rootDir);
+        expect(tick1.emittedEventIds).toHaveLength(0);
+
+        // Advance to the window minute (09:00:05 — still minute 09:00).
+        vi.setSystemTime(AT_WINDOW);
+
+        // Tick 2 (09:00:05): window fires, batch flushes — ONE event emitted.
+        const tick2 = await runtime.tick(monitorsDir, rootDir);
+        expect(tick2.emittedEventIds).toHaveLength(1);
+
+        // Advance 30 seconds — still within the 09:00 minute.
+        vi.setSystemTime(new Date(AT_WINDOW.getTime() + 30_000));
+
+        // Tick 3 (09:00:35, same calendar minute as tick 2): the window cron
+        // still matches this timestamp. The once-per-minute guard MUST prevent
+        // a second flush. The batch was already cleared so nothing is emitted.
+        const tick3 = await runtime.tick(monitorsDir, rootDir);
+        expect(tick3.emittedEventIds).toHaveLength(0);
+
+        // rollupLastFiredMinute is persisted so it survives to guard tick 3.
+        const state = store.getMonitorState('test-monitor');
+        expect(state.notifyState.rollupLastFiredMinute).toBe(
+          Math.floor(AT_WINDOW.getTime() / 60_000),
+        );
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    // (g) Explain path treats pendingRollup as a pending hold (002 §4.4 step 6):
+    //     when observations are accumulated between windows, `monitor explain`
+    //     must surface the notify stage as 'pending' and describe the hold —
+    //     consistent with how the debounce strategy reports its held batch.
+    it('explain shows notify stage as pending when rollup is accumulating', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(OUTSIDE_WINDOW);
+      try {
+        const rootDir = mkdtempSync(
+          path.join(tmpdir(), 'agentmon-rollup-explain-'),
+        );
+        tempDirs.push(rootDir);
+        const monitorsDir = rollupMonitorDir(rootDir, 'rollup-explain');
+
+        const db = createDb(':memory:');
+        const registry = new SourceRegistry();
+        // One observation to accumulate; the window is closed so it stays held.
+        registry.register(
+          queuedSource('rollup-explain', [{ title: 'Queued Change' }]),
+        );
+        const store = new RuntimeStore(db);
+        const runtime = new AgentMonitorRuntime(store, registry, [
+          claudeCodeAdapter,
+        ]);
+        runtime.openSession(
+          claudeCodeAdapter.createSessionInput({
+            hostSessionId: 'claude-rollup-explain',
+            workspacePath: rootDir,
+          }),
+        );
+
+        // Tick at 08:00 (outside window): observation accumulates, not flushed.
+        const tick = await runtime.tick(monitorsDir, rootDir);
+        expect(tick.emittedEventIds).toHaveLength(0);
+
+        // explain() must report the notify stage as 'pending' with a message
+        // describing the rollup hold, and materialization must also be 'pending'
+        // (not 'failure') since the batch will flush on the next window.
+        const report = await runtime.explainMonitor({
+          monitorId: 'test-monitor',
+          monitorsDir,
+          workspacePath: rootDir,
+          now: OUTSIDE_WINDOW,
+        });
+
+        const notifyStage = report.stages.find((s) => s.id === 'notify');
+        expect(notifyStage?.status).toBe('pending');
+        expect(notifyStage?.reason).toMatch(/rollup is holding 1 observation/);
+        expect(notifyStage?.reason).toMatch(/0 9 \* \* \*/);
+
+        const materializationStage = report.stages.find(
+          (s) => s.id === 'materialization',
+        );
+        expect(materializationStage?.status).toBe('pending');
       } finally {
         vi.useRealTimers();
       }

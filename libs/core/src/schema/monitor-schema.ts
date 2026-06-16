@@ -44,7 +44,24 @@ const rollupNotifySchema = z.object({
       cronPattern,
       'Must be a five-field cron expression (e.g., "0 9 * * 1-5")',
     ),
-  timezone: z.string().min(1).optional(),
+  timezone: z
+    .string()
+    .min(1)
+    .refine(
+      (tz) => {
+        try {
+          Intl.DateTimeFormat(undefined, { timeZone: tz });
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      {
+        message:
+          'Must be a valid IANA time zone name (e.g., "America/New_York", "UTC")',
+      },
+    )
+    .optional(),
 });
 
 const notifySchema = z.discriminatedUnion('strategy', [
