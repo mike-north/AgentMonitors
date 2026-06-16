@@ -27,7 +27,32 @@ export type JsonSchema = Record<string, unknown>;
  */
 export type ChangeKind = 'created' | 'modified' | 'deleted' | 'descoped';
 
-/** Data returned by an observation source when it detects a change or event. */
+/**
+ * Data returned by an observation source when it detects a change or event.
+ *
+ * **Sources return current-state snapshots, not diffs (003 §2.5).** An
+ * `Observation` describes *what the watched thing is now* — its `snapshotText`
+ * and/or `snapshot` metadata capture the current state — never a pre-computed
+ * "what changed for the consumer" delta. The runtime is the **sole producer of
+ * the delivery diff**: it diffs each observation's `snapshotText` against the
+ * consumer's stored baseline (002 §5.2). A source MUST NOT attempt to compute
+ * "what is new for recipient X" — it does not hold any recipient's baseline, so
+ * that is structurally the runtime's job. This split is what lets one shared
+ * observation fan out to recipients with divergent baselines.
+ *
+ * A source still carries change-detection state via {@link ObservationResult.nextState}
+ * (003 §2.4) — but only to decide *whether to emit at all* and to advance its
+ * own cursor, never to produce the consumer-facing delta.
+ *
+ * A single `Observation` MAY be a **composite** assembled from many underlying
+ * source calls reduced into one stable, deterministic snapshot under one
+ * `objectKey` (003 §2.6) — the runtime sees and diffs it exactly as a
+ * single-call snapshot.
+ *
+ * @see docs/specs/003-source-plugins.md §2.5
+ * @see docs/specs/003-source-plugins.md §2.6
+ * @see docs/specs/002-runtime-delivery.md §5.2
+ */
 export interface Observation {
   /** Human-readable title for the inbox item */
   title: string;
@@ -88,7 +113,15 @@ export interface ObservationContext {
 
 export interface ObservationResult {
   observations: Observation[];
-  /** Persisted state to use during the next observation cycle */
+  /**
+   * Persisted state to use during the next observation cycle.
+   *
+   * This is the source's **own change-detection state** (file fingerprints, the
+   * last API body, a last-seen commit SHA) — used only to decide *whether* to
+   * emit and to advance the source's own cursor. It is **not** a per-recipient
+   * baseline and is never the delivery diff: the runtime owns the consumer
+   * baseline and is the sole diff producer (003 §2.5, 002 §5.2).
+   */
   nextState?: unknown;
   /**
    * Optional diagnostic: a source sets this to signal that this cycle was a

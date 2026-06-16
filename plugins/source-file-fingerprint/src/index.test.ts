@@ -520,3 +520,133 @@ When files change, act on it.
     expect(unread[0]?.urgency).toBe('normal');
   });
 });
+
+// Proof for 003 §2.5 (snapshots-not-diffs): a BUNDLED source returns
+// current-state snapshots + its own change-detection state (`nextState`); it
+// does NOT pre-diff. The runtime is the sole producer of the delivery diff,
+// computed against the consumer's stored baseline (002 §5.2). This drives a real
+// bundled source through the real runtime and asserts each half of the contract.
+//
+// @see docs/specs/003-source-plugins.md §2.5
+// @see docs/specs/002-runtime-delivery.md §5.2
+describe('file-fingerprint × runtime: snapshots-not-diffs (003 §2.5)', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    vi.useRealTimers();
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('the source returns a current-state snapshot, never a pre-diffed packet', async () => {
+    const watchDir = makeTempDir();
+    const filePath = path.join(watchDir, 'a.txt');
+    writeFileSync(filePath, 'line one\nline two\n', 'utf-8');
+
+    // Baseline run: stateful source records fingerprints, emits nothing.
+    const baseline = await source.observe(
+      { globs: ['*.txt'], cwd: watchDir },
+      { now: new Date() },
+    );
+    expect(baseline.observations).toHaveLength(0);
+    // The source carries its OWN change-detection state forward (§2.4/§2.5):
+    // this is not a per-recipient baseline and not a diff.
+    expect(baseline.nextState).toBeDefined();
+
+    writeFileSync(filePath, 'line one\nline two CHANGED\n', 'utf-8');
+    const next = await source.observe(
+      { globs: ['*.txt'], cwd: watchDir },
+      { previousState: baseline.nextState, now: new Date() },
+    );
+
+    expect(next.observations).toHaveLength(1);
+    const obs = next.observations[0];
+    // §2.5: the observation is the CURRENT whole-file state, not a delta. The
+    // snapshot equals the full current file content — both old and new lines are
+    // present, proving it is a snapshot rather than a "what changed" packet.
+    expect(obs?.snapshotText).toBe('line one\nline two CHANGED\n');
+    expect(obs?.snapshotText).toContain('line one'); // unchanged line still present
+    // The source never produces a diff: the Observation contract has no diff
+    // field, and the source must not smuggle one into the payload either.
+    expect(obs).not.toHaveProperty('diffText');
+    expect(obs).not.toHaveProperty('diff');
+  });
+
+  it('the runtime — not the source — computes the delivery diff against the baseline', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-15T10:00:00.000Z'));
+
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'fp-25-'));
+    tempDirs.push(rootDir);
+    const watchDir = mkdtempSync(path.join(tmpdir(), 'fp-25-watch-'));
+    tempDirs.push(watchDir);
+
+    const watchedFile = path.join(watchDir, 'doc.txt');
+    writeFileSync(watchedFile, 'alpha\nbeta\n', 'utf-8');
+
+    const monitorDir = path.join(rootDir, '.claude', 'monitors', 'snap-25');
+    mkdirSync(monitorDir, { recursive: true });
+    writeFileSync(
+      path.join(monitorDir, 'MONITOR.md'),
+      `---
+name: Snapshot 2.5
+watch:
+  type: file-fingerprint
+  globs:
+    - '*.txt'
+  cwd: ${JSON.stringify(watchDir)}
+  interval: '1s'
+urgency: normal
+---
+When the file changes, act on it.
+`,
+      'utf-8',
+    );
+    const monitorsDir = path.join(rootDir, '.claude', 'monitors');
+
+    const db = createDb(':memory:');
+    const registry = new SourceRegistry();
+    registry.register(source);
+    const runtime = new AgentMonitorRuntime(new RuntimeStore(db), registry, [
+      claudeCodeAdapter,
+    ]);
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-snap-25',
+        workspacePath: rootDir,
+      }),
+    );
+
+    // Tick 1: stateful-source baseline. Emits nothing; the runtime has no stored
+    // snapshot yet, so nothing to diff.
+    await runtime.tick(monitorsDir, rootDir);
+
+    // First change: the source emits the current snapshot. The runtime stores it
+    // as the first baseline snapshot for this object. (No prior runtime snapshot
+    // existed, so this first materialized event has no diff — the runtime's diff
+    // baseline is its OWN snapshot store, distinct from the source's `nextState`.)
+    vi.advanceTimersByTime(2_000);
+    writeFileSync(watchedFile, 'alpha\nbeta v2\n', 'utf-8');
+    await runtime.tick(monitorsDir, rootDir);
+
+    // Second change: the source again emits the current whole-file snapshot; the
+    // RUNTIME computes the diff against the snapshot it stored on the first
+    // change — the source did not, and cannot, compute this consumer diff.
+    vi.advanceTimersByTime(2_000);
+    writeFileSync(watchedFile, 'alpha\nbeta v3\n', 'utf-8');
+    await runtime.tick(monitorsDir, rootDir);
+
+    const events = runtime.listEvents({ sessionId: session.id });
+    expect(events).toHaveLength(2);
+    // The latest event carries the runtime-produced diff, computed from the
+    // runtime's own stored baseline (the v2 snapshot) against the v3 snapshot.
+    const latest = events.find((e) => e.snapshotText === 'alpha\nbeta v3\n');
+    expect(latest?.diffText).not.toBeNull();
+    expect(latest?.diffText).toContain('v3');
+    // … and the snapshot the runtime persisted is the source's current-state
+    // whole, verbatim — not a delta.
+    expect(latest?.snapshotText).toBe('alpha\nbeta v3\n');
+  });
+});
