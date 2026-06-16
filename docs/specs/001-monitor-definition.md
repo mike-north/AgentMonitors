@@ -149,6 +149,9 @@ notify:
   suppress-for: 30m
 ```
 
+A third shape, the scheduled-rollup Pace mode (`strategy: rollup` with a required `window` cron),
+is specified in [§3.6](#36-notify-rollup--scheduledwindowed-rollup-current).
+
 Duration strings **MUST** match `^\d+[smhd]$` (one or more digits followed by exactly one of `s`, `m`, `h`, `d`). Examples: `30s`, `5m`, `1h`, `2d`.
 
 If `notify` is omitted, default delivery behavior is defined in [002-runtime-delivery.md](./002-runtime-delivery.md).
@@ -161,14 +164,22 @@ If present, `tags` **MUST** be an array of strings. Tags have no runtime semanti
 
 > Verified: `libs/core/src/schema/monitor-schema.ts` line 40 — `tags: z.array(z.string()).optional()`.
 
-### 3.6 `notify: rollup` — scheduled/windowed rollup (_target_)
+### 3.6 `notify: rollup` — scheduled/windowed rollup (_current_)
 
-> **Status: target.** The authoring surface and runtime semantics described in this section are the
-> target design (capability C44; resolved
+> **Status: current** (G12, capability C44; resolved
 > [`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
-> §S5.2). They are **not** yet implemented. The current schema accepts only `debounce` and `throttle`
-> strategies; a monitor with `strategy: rollup` is rejected by `agentmonitors validate` until this
-> is built.
+> §S5.2). The schema accepts `rollup` alongside `debounce` and `throttle`, requiring a `window`
+> cron; the runtime accumulates observations durably and flushes on the window.
+>
+> Verified: `libs/core/src/schema/monitor-schema.ts` — `rollupNotifySchema` (requires
+> `strategy: 'rollup'` + a five-field cron `window`; optional `timezone`) is the third arm of
+> `notifySchema`. `libs/core/src/runtime/service.ts` — `dispatchRollup()` (accumulate →
+> `cronMatchesDate(window)` window eval → flush+clear on a non-empty window). Proven by
+> `libs/core/src/schema/monitor-schema.test.ts` ("rollup notify" — accept with `window`, reject
+> missing `window`/malformed cron), `apps/cli/src/commands/cli.integration.test.ts` (`validate`
+> accepts a rollup monitor, rejects one missing `window`), and
+> `libs/core/src/runtime/service.test.ts` ("rollup Pace mode" — durable accumulation across ticks,
+> window flush+clear, empty-window no-delivery, and restart-safety of the accumulated batch).
 
 The third Pace mode is **scheduled / windowed rollup**: the runtime accumulates all observations
 produced between delivery windows and delivers them together at the next scheduled window opening
@@ -445,10 +456,10 @@ Review stale monitors, old failed items, and event volume trends.
 - the schedule source uses per-source config (`cron`, `timezone`, `label`) flat inside `watch:`
 - human-readable labels belong in source-specific config where appropriate
 
-### 7.3 Daily digest rollup monitor (_target_)
+### 7.3 Daily digest rollup monitor (_current_)
 
-> **Status: target.** `strategy: rollup` is not yet implemented; this example documents the
-> intended authoring surface (§3.6, [002 §4.4](./002-runtime-delivery.md)).
+> **Status: current** (G12). `strategy: rollup` is implemented; this example documents the
+> authoring surface (§3.6, [002 §4.4](./002-runtime-delivery.md)).
 
 ```md
 ---

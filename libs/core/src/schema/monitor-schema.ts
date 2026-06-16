@@ -22,9 +22,52 @@ const throttleNotifySchema = z.object({
     ),
 });
 
+// A five-field cron expression (minute hour day month weekday) — the same
+// grammar the `schedule` source accepts for `cron`. We validate only the
+// field count here (cheap, structural); individual field grammar is evaluated
+// at runtime by `cronMatchesDate` (a malformed field simply never matches),
+// matching how the schedule source treats `scope.cron`. See 001 §3.6.
+const cronPattern = /^\s*\S+(?:\s+\S+){4}\s*$/;
+
+/**
+ * The third Pace mode (G12 / 001 §3.6, 002 §4.4): the runtime accumulates
+ * observations between delivery windows and flushes them as a single composite
+ * delivery when the author's `window` cron next fires. `window` is required —
+ * a `rollup` strategy without a delivery schedule has no flush trigger, so it
+ * is rejected by `validate` (proof criterion (a)).
+ */
+const rollupNotifySchema = z.object({
+  strategy: z.literal('rollup'),
+  window: z
+    .string()
+    .regex(
+      cronPattern,
+      'Must be a five-field cron expression (e.g., "0 9 * * 1-5")',
+    ),
+  timezone: z
+    .string()
+    .min(1)
+    .refine(
+      (tz) => {
+        try {
+          Intl.DateTimeFormat(undefined, { timeZone: tz });
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      {
+        message:
+          'Must be a valid IANA time zone name (e.g., "America/New_York", "UTC")',
+      },
+    )
+    .optional(),
+});
+
 const notifySchema = z.discriminatedUnion('strategy', [
   debounceNotifySchema,
   throttleNotifySchema,
+  rollupNotifySchema,
 ]);
 
 /**
@@ -179,4 +222,9 @@ export type NotifyConfig = z.infer<typeof notifySchema>;
  */
 export type BaselineStrategy = (typeof baselineStrategyValues)[number];
 
-export { notifySchema, debounceNotifySchema, throttleNotifySchema };
+export {
+  notifySchema,
+  debounceNotifySchema,
+  throttleNotifySchema,
+  rollupNotifySchema,
+};

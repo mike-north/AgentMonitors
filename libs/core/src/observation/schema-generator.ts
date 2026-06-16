@@ -84,6 +84,20 @@ export function generateMonitorSchema(
             },
             required: ['strategy', 'suppress-for'],
           },
+          {
+            // Scheduled-rollup Pace mode (001 §3.6). `window` is a five-field
+            // cron expression defining the recurring delivery time; `timezone`
+            // is an optional IANA zone (defaults to UTC at runtime).
+            properties: {
+              strategy: { const: 'rollup' },
+              window: {
+                type: 'string',
+                pattern: '^\\s*\\S+(?:\\s+\\S+){4}\\s*$',
+              },
+              timezone: { type: 'string', minLength: 1 },
+            },
+            required: ['strategy', 'window'],
+          },
         ],
       },
       tags: {

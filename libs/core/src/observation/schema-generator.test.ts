@@ -126,13 +126,22 @@ describe('generateMonitorSchema', () => {
     expect(re.test('')).toBe(false);
   });
 
-  it('includes notify schema with debounce and throttle', () => {
+  it('includes notify schema with debounce, throttle, and rollup', () => {
     const schema = generateMonitorSchema([]);
 
     const properties = schema.properties as Record<string, unknown>;
     const notify = properties.notify as Record<string, unknown>;
     expect(notify.type).toBe('object');
-    expect(notify.oneOf).toHaveLength(2);
+    // Three Pace modes: debounce, throttle, and scheduled-rollup (G12, 001 §3.6).
+    const oneOf = notify.oneOf as {
+      properties: { strategy: { const: string } };
+    }[];
+    expect(oneOf).toHaveLength(3);
+    expect(oneOf.map((branch) => branch.properties.strategy.const)).toEqual([
+      'debounce',
+      'throttle',
+      'rollup',
+    ]);
   });
 
   it('handles empty sources list', () => {

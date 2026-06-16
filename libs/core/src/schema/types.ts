@@ -18,4 +18,4 @@ export interface MonitorDefinition {
 }
 
 export type Urgency = 'low' | 'normal' | 'high';
-export type NotifyStrategy = 'debounce' | 'throttle';
+export type NotifyStrategy = 'debounce' | 'throttle' | 'rollup';

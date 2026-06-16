@@ -392,6 +392,72 @@ describe('monitorFrontmatterSchema', () => {
     });
   });
 
+  // Scheduled-rollup Pace mode (G12). Proof criterion (a): `validate` accepts a
+  // rollup monitor (with a `window` cron) and rejects `strategy: rollup` missing
+  // `window`. `validate` runs the frontmatter through this schema (via
+  // parseMonitor), so asserting acceptance/rejection here is the contract test.
+  //
+  // @see docs/specs/001-monitor-definition.md §3.6
+  // @see docs/specs/002-runtime-delivery.md §4.4
+  describe('rollup notify (G12, 001 §3.6)', () => {
+    it('accepts a rollup monitor with a window cron', () => {
+      const result = monitorFrontmatterSchema.safeParse({
+        ...validMinimal,
+        notify: { strategy: 'rollup', window: '0 9 * * 1-5' },
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      // The discriminated union narrows to the rollup branch.
+      expect(result.data.notify).toEqual({
+        strategy: 'rollup',
+        window: '0 9 * * 1-5',
+      });
+    });
+
+    it('accepts a rollup monitor with an optional timezone', () => {
+      const result = monitorFrontmatterSchema.safeParse({
+        ...validMinimal,
+        notify: {
+          strategy: 'rollup',
+          window: '0 9 * * 1-5',
+          timezone: 'America/Los_Angeles',
+        },
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      expect(result.data.notify).toEqual({
+        strategy: 'rollup',
+        window: '0 9 * * 1-5',
+        timezone: 'America/Los_Angeles',
+      });
+    });
+
+    it('rejects a rollup monitor missing the required window', () => {
+      const result = monitorFrontmatterSchema.safeParse({
+        ...validMinimal,
+        notify: { strategy: 'rollup' },
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects a rollup window that is not a five-field cron expression', () => {
+      // Four fields — too few for a five-field cron.
+      const result = monitorFrontmatterSchema.safeParse({
+        ...validMinimal,
+        notify: { strategy: 'rollup', window: '0 9 * *' },
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects an empty rollup window string', () => {
+      const result = monitorFrontmatterSchema.safeParse({
+        ...validMinimal,
+        notify: { strategy: 'rollup', window: '' },
+      });
+      expect(result.success).toBe(false);
+    });
+  });
+
   describe('tags validation', () => {
     it('accepts empty tags array', () => {
       const result = monitorFrontmatterSchema.safeParse({
