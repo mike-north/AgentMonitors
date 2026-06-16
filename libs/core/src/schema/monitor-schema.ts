@@ -27,6 +27,29 @@ const notifySchema = z.discriminatedUnion('strategy', [
   throttleNotifySchema,
 ]);
 
+/**
+ * The two author-declared baseline strategies for the per-recipient Diff stage.
+ *
+ * - `incremental` (**default**) — every observation in a recipient's catch-up
+ *   span is delivered in order (play-by-play). A recipient that missed _N_
+ *   shaped observations receives _N_ deltas. This is the closest equivalent of
+ *   today's runtime behavior (one event per materialized observation), so it
+ *   preserves full backward compatibility.
+ * - `net` — the catch-up span is collapsed into a **single net delta** (the
+ *   shaped state at the delivery point versus the recipient's baseline);
+ *   intermediate observations are discarded.
+ *
+ * Omitting `baseline-strategy` entirely is equivalent to `incremental`.
+ *
+ * @see docs/specs/001-monitor-definition.md §3.7
+ * @see docs/specs/002-runtime-delivery.md §1.1.7
+ */
+const baselineStrategyValues = ['incremental', 'net'] as const;
+
+const baselineStrategySchema = z
+  .enum(baselineStrategyValues)
+  .default('incremental');
+
 const urgencyLevels = ['low', 'normal', 'high'] as const;
 const urgencyRank: Record<(typeof urgencyLevels)[number], number> = {
   low: 0,
@@ -122,10 +145,21 @@ export const monitorFrontmatterSchema = z
     watch: watchSchema,
     urgency: urgencyBandSchema,
     notify: notifySchema.optional(),
+    // Author-declared baseline strategy for the per-recipient Diff stage. The
+    // YAML key is kebab-case (`baseline-strategy`); it is renamed to the
+    // camelCase `baselineStrategy` in the transform below so consumers read a
+    // stable, defaulted value. Omitting the field yields `incremental` (the
+    // `.default()`), which is backward compatible. An unknown value (anything
+    // other than `incremental`/`net`) is rejected by the enum. See 001 §3.7 /
+    // 002 §1.1.7.
+    'baseline-strategy': baselineStrategySchema,
     tags: z.array(z.string()).optional(),
   })
-  .transform(({ urgency, ...rest }) => ({
+  .transform(({ urgency, 'baseline-strategy': baselineStrategy, ...rest }) => ({
     ...rest,
+    // Surface the defaulted, validated baseline strategy under a camelCase key
+    // (002 §1.1.7). `incremental` when the author omitted the field.
+    baselineStrategy,
     // Flatten the parsed band: `urgency` is the band's low bound — the base /
     // default effective urgency used when no source `salience` is present (kept
     // under this key for backward compatibility with every existing consumer) —
@@ -138,5 +172,11 @@ export const monitorFrontmatterSchema = z
 
 export type MonitorFrontmatter = z.infer<typeof monitorFrontmatterSchema>;
 export type NotifyConfig = z.infer<typeof notifySchema>;
+
+/**
+ * The author-declared per-recipient Diff baseline strategy (001 §3.7,
+ * 002 §1.1.7). `incremental` is the default and backward-compatible behavior.
+ */
+export type BaselineStrategy = (typeof baselineStrategyValues)[number];
 
 export { notifySchema, debounceNotifySchema, throttleNotifySchema };

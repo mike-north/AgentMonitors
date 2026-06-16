@@ -72,6 +72,51 @@ describe('monitorFrontmatterSchema', () => {
       }
     });
 
+    // G13 / 001 §3.7 / 002 §1.1.7: the `baseline-strategy` authoring field.
+    describe('baseline-strategy (G13, 001 §3.7)', () => {
+      it('accepts baseline-strategy: incremental', () => {
+        const result = monitorFrontmatterSchema.safeParse({
+          ...validMinimal,
+          'baseline-strategy': 'incremental',
+        });
+        expect(result.success).toBe(true);
+        if (result.success) {
+          // 001 §3.7: surfaced under the camelCase `baselineStrategy` key.
+          expect(result.data.baselineStrategy).toBe('incremental');
+        }
+      });
+
+      it('accepts baseline-strategy: net', () => {
+        const result = monitorFrontmatterSchema.safeParse({
+          ...validMinimal,
+          'baseline-strategy': 'net',
+        });
+        expect(result.success).toBe(true);
+        if (result.success) {
+          expect(result.data.baselineStrategy).toBe('net');
+        }
+      });
+
+      it('defaults to incremental when baseline-strategy is omitted (backward compatible)', () => {
+        // 001 §3.7 / 002 §1.1.7: omitting the field MUST behave as `incremental`.
+        const result = monitorFrontmatterSchema.safeParse(validMinimal);
+        expect(result.success).toBe(true);
+        if (result.success) {
+          expect(result.data.baselineStrategy).toBe('incremental');
+        }
+      });
+
+      it('rejects an unknown baseline-strategy value', () => {
+        // 001 §3.7: only `incremental` and `net` are valid; anything else is an
+        // authoring error caught by `validate`.
+        const result = monitorFrontmatterSchema.safeParse({
+          ...validMinimal,
+          'baseline-strategy': 'cumulative',
+        });
+        expect(result.success).toBe(false);
+      });
+    });
+
     it('parses a minimal monitor without event-kind', () => {
       const result = monitorFrontmatterSchema.safeParse({
         watch: { type: 'file-fingerprint', globs: ['x'] },

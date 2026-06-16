@@ -159,35 +159,24 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
   window produces no delivery; (e) a runtime test proves the accumulation batch survives a daemon
   restart (restart-safety, matching BP1).
 
-### G13 — Author-declared baseline strategy for per-recipient Diff (P2)
-
-- **Current:** the runtime delivers observations in the order they were materialized (one event per
-  shaped observation), which is the degenerate/closest case of the `incremental` strategy — every
-  observation is its own step. Recipients that missed multiple observation cycles receive each event
-  individually in order. There is no mechanism for a monitor to request `net` diff semantics (a
-  single endpoint delta collapsing intermediate churn), and no `baseline-strategy` frontmatter field
-  exists.
-- **Target:** the `baseline-strategy` field ([001 §3.7](./001-monitor-definition.md#37-baseline-strategy-target),
-  [002 §1.1.7](./002-runtime-delivery.md#117-baseline-strategy-per-recipient-diff-semantics-target))
-  is accepted by `agentmonitors validate` and implemented by the runtime Diff stage:
-  (a) `baseline-strategy: incremental` (default) — delivers each observation in the catch-up span
-  in order, preserving backward compatibility; (b) `baseline-strategy: net` — collapses the
-  catch-up span to a single net delta (current shaped state vs. the recipient's baseline), discarding
-  intermediate observations. The default is `incremental`; omitting the field is backward compatible.
-- **Governs:** [001 §3.7](./001-monitor-definition.md#37-baseline-strategy-target),
-  [002 §1.1.7](./002-runtime-delivery.md#117-baseline-strategy-per-recipient-diff-semantics-target);
-  the capability study
-  ([§S5.1](../product/monitoring-capability-exercises.md); rows C6 / C7; E1 / E2).
-- **Files:** `libs/core/src/schema/monitor-schema.ts` (schema acceptance, default `incremental`),
-  `libs/core/src/runtime/service.ts` (per-recipient Diff logic, catch-up span collapse for `net`),
-  `libs/core/src/runtime/store.ts` (per-recipient baseline/cursor persistence).
-- **Proof:** (a) `agentmonitors validate` accepts `baseline-strategy: incremental` and `net`, rejects
-  unknown values; (b) a runtime test proves a `net` monitor with a recipient that missed _N_
-  observations receives one net delta; (c) a runtime test proves an `incremental` monitor with the
-  same scenario receives _N_ ordered deltas; (d) a runtime test proves omitting `baseline-strategy`
-  behaves identically to `incremental` (backward compatible). Until then
-  [001 §3.7](./001-monitor-definition.md#37-baseline-strategy-target) and
-  [002 §1.1.7](./002-runtime-delivery.md#117-baseline-strategy-per-recipient-diff-semantics-target)
+> G13 (author-declared baseline strategy) **shipped** — the `baseline-strategy` frontmatter field is
+> now accepted by `agentmonitors validate` and enforced by the runtime Diff stage. `incremental`
+> (default) materializes every observation in a catch-up span as its own ordered delta (backward
+> compatible, the degenerate "one event per observation" behavior); `net` collapses the span per
+> `objectKey` to a **single** net delta (the last observation of each object's run, diffed against the
+> prior snapshot baseline), discarding intermediate churn. Omitting the field is `incremental`.
+> Implemented as `baselineStrategySchema` (`libs/core/src/schema/monitor-schema.ts`,
+> `z.enum(['incremental','net']).default('incremental')`) and `collapseToNetSpan()` in
+> `ingest()` (`libs/core/src/runtime/service.ts`). Proven by the schema tests (accept
+> `incremental`/`net`, default to `incremental`, reject unknown), the runtime tests ("baseline
+> strategy (G13, 002 §1.1.7)" — `net` → one net delta, `incremental` → N ordered deltas, omitting ≡
+> `incremental`), and the `validate` CLI integration tests. See
+> [001 §3.7](./001-monitor-definition.md#37-baseline-strategy-current),
+> [002 §1.1.7](./002-runtime-delivery.md#117-baseline-strategy-per-recipient-diff-semantics-current),
+> and [spec-changelog.md](./spec-changelog.md). The **full per-recipient-baseline seam** (two
+> recipients at divergent stored baselines each receiving an independently-spanned Diff) remains
+> tracked under **G10**; `baseline-strategy` is the author-declared mode that seam will apply per
+> recipient.
 
 ### G14 — Interpret stage: cheap agentic digest + significance gate via the user's own AI tool (P2)
 
