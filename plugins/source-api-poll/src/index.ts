@@ -48,9 +48,14 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
   const composite = parseCompositeConfig(config['change-detection']);
 
   const url = config['url'];
-  // In composite mode (003 §2.6) the whole is assembled from per-part URLs, so
-  // a top-level `url` is not required; otherwise it is mandatory.
-  if (typeof url !== 'string' && !composite) {
+  // `url` is optional only in composite mode (§2.6), which supplies per-part
+  // URLs instead. But if it IS present it must be a string on ALL paths — a
+  // non-string `url` alongside `composite` is a misconfiguration that would
+  // otherwise be silently dropped.
+  if (url !== undefined && typeof url !== 'string') {
+    throw new Error('scope.url must be a string');
+  }
+  if (url === undefined && !composite) {
     throw new Error('scope.url must be a string');
   }
 
@@ -338,16 +343,21 @@ async function observeComposite(
   method: string | undefined,
   previousState: unknown,
 ): Promise<ObservationResult> {
-  // Issue every underlying call. A failed part fails the whole observation:
-  // fetchBody throws, so `nextState` never advances and the prior baseline is
-  // preserved (002 §3) — we never silently emit a composite missing a part.
-  const fetched: FetchedPart[] = [];
-  for (const part of composite.parts) {
-    const { body } = await fetchBody(part.url, method, combinedHeaders);
-    fetched.push({ id: part.id, body });
-  }
+  // Issue all underlying calls CONCURRENTLY (Promise.all) so latency is
+  // bounded by the slowest part, not the sum of all parts. A failed part still
+  // fails the whole observation: Promise.all rejects on any rejection, so
+  // `nextState` never advances and the prior baseline is preserved (002 §3) —
+  // we never silently emit a composite missing a part.
+  const results = await Promise.all(
+    composite.parts.map(async (part) => {
+      const { body } = await fetchBody(part.url, method, combinedHeaders);
+      return { id: part.id, body } satisfies FetchedPart;
+    }),
+  );
 
-  const rendered = renderCompositeSnapshot(fetched);
+  // Render ONCE: the same string drives both change-detection (nextState) and
+  // the observation snapshotText, avoiding a second render on change.
+  const rendered = renderCompositeSnapshot(results);
   const nextState: CompositeState = { composite: rendered };
 
   const prev = isCompositeState(previousState) ? previousState : undefined;
@@ -358,7 +368,7 @@ async function observeComposite(
   }
 
   return {
-    observations: [buildCompositeObservation(composite, fetched)],
+    observations: [buildCompositeObservation(composite, results, rendered)],
     nextState,
   };
 }

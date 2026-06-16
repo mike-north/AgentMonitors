@@ -125,16 +125,20 @@ export function renderCompositeSnapshot(parts: FetchedPart[]): string {
 }
 
 /**
- * Assemble a single composite `Observation` from the fetched parts. The
- * observation carries **one** `objectKey` (the whole) and a deterministic
- * `snapshotText`; it is a current-state snapshot, never a pre-diffed delta —
- * the runtime computes the diff against the consumer baseline (§2.5).
+ * Assemble a single composite `Observation` from the config and the
+ * **already-rendered** snapshot text. Callers must render once via
+ * {@link renderCompositeSnapshot} and pass the result here to avoid a second
+ * render (fix 3: single render, shared between change-detection and the
+ * observation). The observation carries **one** `objectKey` (the whole) and a
+ * deterministic `snapshotText`; it is a current-state snapshot, never a
+ * pre-diffed delta — the runtime computes the diff against the consumer
+ * baseline (§2.5).
  */
 export function buildCompositeObservation(
   config: CompositeConfig,
   parts: FetchedPart[],
+  snapshotText: string,
 ): Observation {
-  const snapshotText = renderCompositeSnapshot(parts);
   const title = config.title ?? `Composite snapshot: ${config.objectKey}`;
   return {
     title,

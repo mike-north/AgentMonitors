@@ -595,6 +595,26 @@ describe('source-api-poll', () => {
       ).rejects.toThrow(/mutually exclusive/);
     });
 
+    // Fix 1 (Copilot review): a non-string `url` alongside `composite` must be
+    // rejected even though `url` is not required in composite mode. A present
+    // but wrong-typed `url` is a misconfiguration on any path.
+    it('rejects a non-string url even when composite is present', async () => {
+      await expect(
+        source.observe(
+          {
+            url: 42, // non-string — must be rejected regardless of composite
+            'change-detection': {
+              composite: {
+                'object-key': 'k',
+                parts: [{ id: 'a', url: 'https://x/a' }],
+              },
+            },
+          },
+          { now: new Date() },
+        ),
+      ).rejects.toThrow(/scope\.url must be a string/);
+    });
+
     describe('composite helpers (unit)', () => {
       it('parseCompositeConfig returns undefined when no composite block', () => {
         expect(parseCompositeConfig({ strategy: 'text-diff' })).toBeUndefined();
@@ -628,18 +648,25 @@ describe('source-api-poll', () => {
       });
 
       it('buildCompositeObservation carries one objectKey and no diff', () => {
+        const parts = [
+          { id: 'a', body: 'A' },
+          { id: 'b', body: 'B' },
+        ];
+        // Caller renders once and passes the result; buildCompositeObservation
+        // must NOT render again (fix 3).
+        const snapshotText = renderCompositeSnapshot(parts);
         const obs = buildCompositeObservation(
           { objectKey: 'whole', parts: [], title: 'T' },
-          [
-            { id: 'a', body: 'A' },
-            { id: 'b', body: 'B' },
-          ],
+          parts,
+          snapshotText,
         );
         expect(obs.objectKey).toBe('whole');
         expect(obs.title).toBe('T');
         expect(obs).not.toHaveProperty('diffText');
         expect(obs.snapshotText).toContain('A');
         expect(obs.snapshotText).toContain('B');
+        // The snapshotText is exactly the pre-rendered value (no second render).
+        expect(obs.snapshotText).toBe(snapshotText);
       });
     });
   });
