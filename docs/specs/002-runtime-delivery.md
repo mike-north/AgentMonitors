@@ -275,6 +275,87 @@ Rules for the payload-form step:
 > fails validation, [001 §5.2](./001-monitor-definition.md#52-payload-form-target)); the same snapshot
 > under `payload: rendered` yields the §1.1.5 text artifact instead.
 
+### 1.1.7 Baseline strategy: per-recipient Diff semantics (_target_)
+
+> **Status: target.** Every rule in this section is **target**, not current behavior. It specifies
+> how the **Diff** stage ([§1.1.1](#111-the-locked-stage-order), [§1.1.2](#112-the-shared--per-recipient-seam))
+> spans a **catch-up span** when a recipient has missed several changes between deliveries.
+> The two modes are parameterized by the `baseline-strategy` authoring field
+> ([001 §3.7](./001-monitor-definition.md#37-baseline-strategy-target)). Formalizes a resolved
+> decision from the monitoring capability study
+> ([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
+> §S5.1; ledger rows **C6**, **C7**). It does **not** contradict any _current_ rule: the current
+> runtime delivers observations in materialization order (the degenerate incremental case, as named
+> below) and the source/runtime diff split (PP3, AP3, [003 §2.5](./003-source-plugins.md)) is
+> unchanged — the baseline strategy parameterizes the per-recipient Diff already named in §1.1.2,
+> not a new diff surface.
+
+A **catch-up span** is the set of shaped observations that accumulated for a monitor between a
+recipient's last-seen baseline and the current delivery point. When a recipient has been away for
+multiple observation cycles, its catch-up span may contain several intermediate observations.
+
+The `baseline-strategy` field declares how the runtime's per-recipient **Diff** stage processes
+this span:
+
+| Strategy          | What the recipient receives for a catch-up span                                                                                                                                                                                                                            |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`incremental`** | Each intermediate observation since the recipient's baseline, **in order** — a play-by-play of every change step. A recipient that missed _N_ shaped observations receives _N_ deltas, sequentially.                                                                       |
+| **`net`**         | A **single net delta** representing _where things stand now_ versus the recipient's baseline — the intermediate observations between delivery windows are collapsed into the endpoint difference only. A recipient that missed _N_ shaped observations receives one delta. |
+
+**Semantics of each strategy:**
+
+- **`incremental` (default).** The runtime delivers each observation in the catch-up span
+  individually and in the order they were materialized. The recipient sees the full play-by-play.
+  This is appropriate when the _sequence_ of changes carries meaning — when a recipient needs to
+  know not just the final state but how things evolved. Comment threads (E1; capability C6) are a
+  natural fit: each reply is a discrete step.
+
+  > **Backward compatibility.** The current runtime already delivers observations in materialization
+  > order, one per event. This is the degenerate case of `incremental` where every observation is a
+  > step of its own catch-up span. `incremental` therefore names the _closest equivalent_ of today's
+  > behavior: monitors that omit `baseline-strategy` get `incremental` by default and behave exactly
+  > as they do today.
+
+- **`net`.** The runtime collapses the catch-up span: it compares the shaped state at the
+  _delivery point_ against the recipient's baseline and delivers a single net delta. Intermediate
+  observations — edits, reverts, re-edits — are absorbed; only the endpoint difference surfaces.
+  This is appropriate when only the _current state relative to the recipient's baseline_ matters
+  and the intermediate path is noise. Shared spec documents (E2; capability C7 "size/shape the
+  change to the span") are the natural fit: an agent that missed several editing bursts wants to
+  know "what does the spec look like now vs. what I was building against," not a
+  keystroke-by-keystroke replay. The monitoring capability study (E2 findings) records this as an
+  intent-driven authoring choice, contrasted with E1 where `incremental` was the right call.
+
+**Default is `incremental`.** A monitor that omits `baseline-strategy` **MUST** behave as
+`incremental`. This is the default because:
+
+1. It is the closest match to the current runtime's delivery behavior (backward compatible).
+2. It is the conservative default — the author who wants `net` is explicitly requesting
+   information loss (the intermediate steps), so that choice should be explicit.
+
+**Interaction with the shared / per-recipient seam.** The baseline strategy is a per-recipient
+concern: it governs how the Diff stage (right of the seam, §1.1.2) processes a specific
+recipient's catch-up span. It does **not** affect the shared side of the seam (Observe, Shape,
+Pace run once, unchanged). Two recipients of the same monitor at different baselines each receive
+their own span processed under the same declared strategy.
+
+**Interaction with Pace modes.** The baseline strategy is independent of the Pace mode. A `net`
+strategy on a `debounce` monitor still settles first (Pace), then collapses the catch-up span for
+delivery (Diff). A recipient that was live for every settled observation and never missed a window
+receives a zero-span catch-up regardless of strategy — `incremental` and `net` are identical in
+this degenerate case (no intermediate steps to collapse).
+
+> **Cross-references:** [001 §3.7](./001-monitor-definition.md#37-baseline-strategy-target)
+> for the authoring field; capability study C6 (per-agent what's-new), C7 (size-to-span), E1 and
+> E2 (the two motivating contrasts); §S5.1 (resolved: default incremental).
+>
+> **Test implication.** A monitor with `baseline-strategy: incremental` and a recipient that missed
+> three observations receives three deltas in order. A monitor with `baseline-strategy: net` and a
+> recipient that missed three observations receives one net delta equivalent to diffing the baseline
+> snapshot against the final observation's snapshot. In both cases a recipient that missed nothing
+> receives the standard single-step delta — `incremental` and `net` are behaviorally equivalent
+> when the catch-up span contains exactly one observation.
+
 ## 2. Runtime Tick Model
 
 For each runtime tick, the implementation **MUST**:

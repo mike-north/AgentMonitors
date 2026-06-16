@@ -77,17 +77,18 @@ All discovered paths are resolved to absolute paths before parsing.
 
 Each monitor frontmatter object **MUST** contain:
 
-| Field     | Type     | Required | Meaning                                                                                                      |
-| --------- | -------- | -------- | ------------------------------------------------------------------------------------------------------------ |
-| `name`    | string   | no       | Human-readable display name; defaults to the monitor id (filename or directory name) when omitted            |
-| `watch`   | object   | yes      | Intent-first observation config: `type` names the source; remaining keys are per-source config               |
-| `urgency` | string   | yes      | A level (`low`/`normal`/`high`) **or** an authored band `lo..hi` (see [§3.2](#32-urgency))                   |
-| `notify`  | object   | no       | Explicit debounce/throttle policy                                                                            |
-| `shape`   | object   | no       | _Target._ Deterministic Shape declaration: derived facts + render (see [§5.1](#51-shape-declaration-target)) |
-| `payload` | object   | no       | _Target._ Author-declared payload form + transform (see [§5.2](#52-payload-form-target))                     |
-| `tags`    | string[] | no       | Tags for later filtering                                                                                     |
+| Field               | Type     | Required | Meaning                                                                                                                        |
+| ------------------- | -------- | -------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `name`              | string   | no       | Human-readable display name; defaults to the monitor id (filename or directory name) when omitted                              |
+| `watch`             | object   | yes      | Intent-first observation config: `type` names the source; remaining keys are per-source config                                 |
+| `urgency`           | string   | yes      | A level (`low`/`normal`/`high`) **or** an authored band `lo..hi` (see [§3.2](#32-urgency))                                     |
+| `notify`            | object   | no       | Explicit debounce/throttle policy                                                                                              |
+| `shape`             | object   | no       | _Target._ Deterministic Shape declaration: derived facts + render (see [§5.1](#51-shape-declaration-target))                   |
+| `payload`           | object   | no       | _Target._ Author-declared payload form + transform (see [§5.2](#52-payload-form-target))                                       |
+| `baseline-strategy` | string   | no       | _Target._ How the per-recipient Diff spans a catch-up span — `incremental` or `net` (see [§3.7](#37-baseline-strategy-target)) |
+| `tags`              | string[] | no       | Tags for later filtering                                                                                                       |
 
-> Verified: `libs/core/src/schema/monitor-schema.ts` — the `monitorFrontmatterSchema` Zod object requires `watch` and `urgency`; `name`, `notify`, and `tags` are optional. The `shape` and `payload` fields are **target** (see [§5.1](#51-shape-declaration-target), [§5.2](#52-payload-form-target)) and are not yet in the current schema.
+> Verified: `libs/core/src/schema/monitor-schema.ts` — the `monitorFrontmatterSchema` Zod object requires `watch` and `urgency`; `name`, `notify`, and `tags` are optional. The `shape`, `payload`, and `baseline-strategy` fields are **target** (see [§5.1](#51-shape-declaration-target), [§5.2](#52-payload-form-target), [§3.7](#37-baseline-strategy-target)) and are not yet in the current schema.
 
 ### 3.1 `watch`
 
@@ -204,6 +205,59 @@ If no observations accumulated, the window opening produces no delivery (no empt
 
 **Cross-references:** [002 §4.4](./002-runtime-delivery.md) for runtime semantics; [002 §4.5](./002-runtime-delivery.md)
 for the complete Pace mode reference; capability study C44 / §S5.2.
+
+### 3.7 `baseline-strategy` (_target_)
+
+> **Status: target.** Every rule in this section is **target**, not current behavior. No current
+> frontmatter field selects a baseline strategy; the field below is the authoring surface for the
+> per-recipient Diff strategy whose runtime semantics are specified in
+> [002 §1.1.7](./002-runtime-delivery.md#117-baseline-strategy-per-recipient-diff-semantics-target).
+> Formalizes a resolved decision from the monitoring capability study
+> ([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
+> §S5.1; ledger rows **C6**, **C7**).
+
+A monitor **MAY** declare a `baseline-strategy` field that controls how the per-recipient **Diff**
+stage ([002 §1.1.7](./002-runtime-delivery.md#117-baseline-strategy-per-recipient-diff-semantics-target))
+spans a _catch-up span_ — the set of shaped observations that accumulated since the recipient's
+last-seen baseline. It is **optional**; omitting it is equivalent to `incremental` (see backward
+compatibility below).
+
+The two values are:
+
+```yaml
+baseline-strategy: incremental # default — play-by-play of each step since baseline
+```
+
+```yaml
+baseline-strategy: net # net delta only — where things stand now vs. baseline
+```
+
+| Value             | Diff a recipient receives across a catch-up span                                                                                                                                                                                              |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`incremental`** | Every intermediate observation since the recipient's baseline, delivered **in order** (play-by-play). A recipient that missed three changes receives three deltas, in sequence. Preserves the full history of how things changed.             |
+| **`net`**         | A single delta representing **where things stand now** versus the recipient's baseline — intermediate churn between delivery windows is collapsed into the endpoint difference. A recipient that missed three changes receives one net delta. |
+
+**Default is `incremental`.** A monitor that omits `baseline-strategy` behaves as if it had declared
+`baseline-strategy: incremental`. This preserves backward compatibility: the current runtime
+delivers observations sequentially in the order they were materialized, which is the degenerate
+(every-observation-is-a-step) case of the incremental strategy.
+
+**Choosing between the two strategies:**
+
+- **`incremental`** is appropriate when the _sequence_ of changes carries meaning — when a
+  recipient needs to know not just the final state but how things got there. Comment threads (E1)
+  are a natural fit: each reply is a discrete step the recipient should process in turn.
+- **`net`** is appropriate when only the _current state relative to the recipient's baseline_
+  matters — when the path through intermediate states is noise. Spec documents (E2) are a natural
+  fit: an agent that missed several editing bursts wants to know "what does the spec look like now
+  vs. what I was building against," not a keystroke-by-keystroke replay. As the monitoring
+  capability study notes (E2 findings): `net` is the useful question for document-state monitors
+  watched by multiple agents at divergent baselines.
+
+> **Cross-references:** [002 §1.1.7](./002-runtime-delivery.md#117-baseline-strategy-per-recipient-diff-semantics-target)
+> for runtime Diff semantics; capability study C6 (per-agent what's-new), C7 (size-to-span);
+> §S5.1 (resolved: default incremental). See also §1.1.2 for the shared/per-recipient seam that
+> makes the baseline per-recipient in the first place.
 
 ## 4. Monitor Identity and Uniqueness
 
@@ -407,6 +461,41 @@ Summarize all updates since the last digest and surface any action items.
 - `window` is a cron expression defining when the accumulated batch is delivered
 - `interval: 1h` relaxes observation cadence to match the delivery frequency — no benefit to polling every 30 s when delivery is once daily
 - `urgency: low` is a natural pairing: rollup delivery is a background digest, not an interrupt
+
+### 7.4 Net-delta spec-doc monitor (_target_)
+
+> **Status: target.** `baseline-strategy: net` is not yet implemented; this example documents the
+> intended authoring surface (§3.7, [002 §1.1.7](./002-runtime-delivery.md)).
+
+```md
+---
+name: Shared Spec Docs
+watch:
+  type: file-fingerprint
+  globs:
+    - 'docs/specs/**/*.md'
+  interval: 30s
+urgency: normal
+notify:
+  strategy: debounce
+  settle-for: 3m
+baseline-strategy: net
+tags: [specs, fleet]
+---
+
+The shared spec docs have changed since you last checked. Review the net diff and determine
+whether any aspect of your current task needs to be adjusted.
+```
+
+**What this example illustrates (target):**
+
+- `baseline-strategy: net` is appropriate for shared documents where a fleet of agents at
+  divergent baselines each wants to know "how does the spec look now vs. what I was building
+  against," not a replay of every intermediate edit burst (E2)
+- omitting `baseline-strategy` entirely is equivalent to `incremental` — this field only needs
+  to be set when `net` is the desired behavior
+- the field works alongside any `notify` strategy; the baseline strategy governs how the
+  per-recipient Diff spans a catch-up span, which is independent of Pace
 
 ## 8. Validation Implications
 
