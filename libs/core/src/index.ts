@@ -10,6 +10,7 @@ export type {
   MonitorDefinition,
   Urgency,
   NotifyStrategy,
+  BaselineStrategy,
 } from './schema/types.js';
 
 // Parser

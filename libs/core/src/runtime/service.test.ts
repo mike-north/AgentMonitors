@@ -2975,4 +2975,227 @@ Handle it.
     const triggered = history.filter((h) => h.result === 'triggered');
     expect(triggered).toHaveLength(1);
   });
+
+  // --- G13: author-declared baseline strategy (incremental vs net) ---------
+  //
+  // Contract (001 §3.7, 002 §1.1.7): the per-recipient Diff stage spans a
+  // *catch-up span* — the set of shaped observations that accumulated for a
+  // recipient since its baseline. `baseline-strategy` declares how that span is
+  // delivered:
+  //   - `incremental` (default): each observation in the span, in order — a
+  //     recipient that missed N observations receives N ordered deltas.
+  //   - `net`: a single net delta (the endpoint state vs. the baseline) — a
+  //     recipient that missed N observations receives ONE delta; intermediate
+  //     observations are discarded and never advance the snapshot baseline.
+  //   - omitting the field behaves identically to `incremental` (backward
+  //     compatible).
+  //
+  // Each test establishes a baseline snapshot on tick 1, then delivers a
+  // catch-up span of N=3 successive states (one shared objectKey) in a single
+  // tick 2. Expected delta counts are written by hand from 002 §1.1.7.
+  describe('baseline strategy (G13, 002 §1.1.7)', () => {
+    const SPAN_OBJECT_KEY = 'doc-1';
+    // Baseline established on tick 1, then a 3-observation catch-up span on
+    // tick 2. Distinct text per state so each transition is a real diff.
+    const BASELINE_STATE = 'line-a\nline-b\nline-c\n';
+    const SPAN_STATES = [
+      'line-a EDIT-1\nline-b\nline-c\n',
+      'line-a EDIT-1\nline-b EDIT-2\nline-c\n',
+      'line-a EDIT-1\nline-b EDIT-2\nline-c EDIT-3\n',
+    ] as const;
+
+    /**
+     * Write a MONITOR.md that watches `scripted-span` with an optional
+     * `baseline-strategy` frontmatter line. `urgency: normal` + no `notify`
+     * means every observation in a single `observe()` call emits immediately as
+     * one catch-up span (no debounce/throttle in play — the baseline strategy is
+     * the only variable under test).
+     */
+    function writeSpanMonitor(
+      rootDir: string,
+      baselineStrategyLine: string,
+    ): string {
+      const monitorsDir = path.join(
+        rootDir,
+        '.claude',
+        'monitors',
+        'span-monitor',
+      );
+      mkdirSync(monitorsDir, { recursive: true });
+      writeFileSync(
+        path.join(monitorsDir, 'MONITOR.md'),
+        `---
+name: Span monitor
+watch:
+  type: scripted-span
+  interval: '1s'
+urgency: normal
+${baselineStrategyLine}---
+Handle it.
+`,
+        'utf-8',
+      );
+      return path.join(rootDir, '.claude', 'monitors');
+    }
+
+    /**
+     * A source scripted to emit, on its FIRST observe(), a single baseline
+     * observation, and on its SECOND observe(), the full catch-up span of
+     * `SPAN_STATES` (all in one call — a recipient that missed every
+     * intermediate change). Subsequent observe() calls emit nothing.
+     */
+    function scriptedSpanSource(): ObservationSource {
+      let call = 0;
+      return {
+        name: 'scripted-span',
+        scopeSchema: { type: 'object', properties: {} },
+        observe: (): Promise<ObservationResult> => {
+          call += 1;
+          if (call === 1) {
+            return Promise.resolve({
+              observations: [
+                {
+                  title: 'baseline',
+                  objectKey: SPAN_OBJECT_KEY,
+                  snapshotText: BASELINE_STATE,
+                },
+              ],
+            });
+          }
+          if (call === 2) {
+            return Promise.resolve({
+              observations: SPAN_STATES.map((snapshotText, index) => ({
+                title: `edit ${String(index + 1)}`,
+                summary: `edit ${String(index + 1)}`,
+                objectKey: SPAN_OBJECT_KEY,
+                snapshotText,
+              })),
+            });
+          }
+          return Promise.resolve({ observations: [] });
+        },
+      };
+    }
+
+    /**
+     * Drive tick 1 (baseline) then tick 2 (the N-observation catch-up span) for
+     * a monitor authored with the given `baseline-strategy` line, returning the
+     * events delivered to the recipient session ordered oldest-first.
+     */
+    async function deliverSpan(
+      baselineStrategyLine: string,
+      hostSessionId: string,
+    ): Promise<MonitorEventRecord[]> {
+      const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-g13-'));
+      tempDirs.push(rootDir);
+      const monitorsDir = writeSpanMonitor(rootDir, baselineStrategyLine);
+      const runtime = createRuntime(':memory:', scriptedSpanSource());
+      const session = runtime.openSession(
+        claudeCodeAdapter.createSessionInput({
+          hostSessionId,
+          workspacePath: rootDir,
+        }),
+      );
+
+      // Tick 1: establish the baseline snapshot (one observation, no prior
+      // snapshot → no diff). This is the recipient's baseline.
+      await runtime.tick(monitorsDir, rootDir);
+      // The interval is 1s; advance past it so tick 2 is due.
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      // Tick 2: deliver the 3-observation catch-up span in one shot.
+      await runtime.tick(monitorsDir, rootDir);
+
+      // Oldest-first so delta order is asserted directly.
+      return runtime.listEvents({ sessionId: session.id }).slice().reverse();
+    }
+
+    // Criterion (b): a `net` recipient that missed N observations receives ONE
+    // net delta — the endpoint state vs. the baseline (002 §1.1.7).
+    it('net: a recipient that missed N observations receives one net delta', async () => {
+      const events = await deliverSpan(
+        'baseline-strategy: net\n',
+        'claude-g13-net',
+      );
+
+      // Tick 1 (baseline) materialized 1 event with no diff; the net catch-up
+      // span on tick 2 collapses to exactly 1 event → 2 total.
+      expect(events).toHaveLength(2);
+
+      const spanEvents = events.filter((event) => event.title !== 'baseline');
+      // 002 §1.1.7: ONE net delta for a 3-observation span.
+      expect(spanEvents).toHaveLength(1);
+
+      const net = spanEvents[0];
+      // The surviving observation is the LAST in the span (where things stand
+      // now): edit 3.
+      expect(net?.title).toBe('edit 3');
+      // The net delta is the baseline (tick-1 snapshot) vs. the endpoint state
+      // (EDIT-3), so the diff reflects all three lines changing — the
+      // intermediate states were collapsed, not replayed.
+      expect(net?.snapshotText).toBe(SPAN_STATES[2]);
+      expect(net?.diffText).toContain('EDIT-1');
+      expect(net?.diffText).toContain('EDIT-2');
+      expect(net?.diffText).toContain('EDIT-3');
+    });
+
+    /**
+     * Assert an `incremental`-style delivery (002 §1.1.7): the recipient
+     * receives one event per span observation (N=3), every intermediate
+     * observation materialized — NOT collapsed. The proof is the count (3, vs.
+     * `net`'s 1) and that all three distinct endpoint states are present as
+     * separate events, so no intermediate churn was discarded.
+     *
+     * Note: each event still carries its own non-empty diff (its state changed
+     * from the prior point), but the exact prior-snapshot each diffed against is
+     * not asserted — within a sub-second span the shared snapshot store ties on
+     * its one-second `createdAt`, so the precise diff base is not deterministic.
+     * The spec's incremental guarantee is "N ordered deltas delivered as N
+     * events", which is what is asserted here.
+     */
+    function expectIncrementalChain(events: MonitorEventRecord[]): void {
+      const spanEvents = events.filter((event) => event.title !== 'baseline');
+      // 002 §1.1.7: N=3 deltas, play-by-play (one event per step, nothing
+      // collapsed).
+      expect(spanEvents).toHaveLength(3);
+      const byTitle = new Map(spanEvents.map((event) => [event.title, event]));
+      expect([...byTitle.keys()].sort()).toEqual([
+        'edit 1',
+        'edit 2',
+        'edit 3',
+      ]);
+
+      // Every intermediate observation survived as its own event with its own
+      // endpoint snapshot — the play-by-play, not a single net delta.
+      expect(byTitle.get('edit 1')?.snapshotText).toBe(SPAN_STATES[0]);
+      expect(byTitle.get('edit 2')?.snapshotText).toBe(SPAN_STATES[1]);
+      expect(byTitle.get('edit 3')?.snapshotText).toBe(SPAN_STATES[2]);
+
+      // Each step is a real, non-empty delta (the state changed at each point).
+      for (const title of ['edit 1', 'edit 2', 'edit 3']) {
+        expect(byTitle.get(title)?.diffText).toBeTruthy();
+      }
+    }
+
+    // Criterion (c): an `incremental` recipient in the same scenario receives N
+    // ordered deltas (002 §1.1.7).
+    it('incremental: a recipient that missed N observations receives N ordered deltas', async () => {
+      const events = await deliverSpan(
+        'baseline-strategy: incremental\n',
+        'claude-g13-incremental',
+      );
+      // Tick 1 baseline (1 event) + the 3-observation span delivered as 3 deltas.
+      expect(events).toHaveLength(4);
+      expectIncrementalChain(events);
+    });
+
+    // Criterion (d): omitting `baseline-strategy` behaves identically to
+    // `incremental` (backward compatible — 001 §3.7 / 002 §1.1.7).
+    it('omitting baseline-strategy behaves identically to incremental', async () => {
+      const events = await deliverSpan('', 'claude-g13-omitted');
+      // Same outcome as the explicit `incremental` case: baseline + N=3 deltas,
+      // never collapsed.
+      expect(events).toHaveLength(4);
+      expectIncrementalChain(events);
+    });
+  });
 });

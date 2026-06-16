@@ -275,20 +275,33 @@ Rules for the payload-form step:
 > fails validation, [001 §5.2](./001-monitor-definition.md#52-payload-form-target)); the same snapshot
 > under `payload: rendered` yields the §1.1.5 text artifact instead.
 
-### 1.1.7 Baseline strategy: per-recipient Diff semantics (_target_)
+### 1.1.7 Baseline strategy: per-recipient Diff semantics (_current_)
 
-> **Status: target.** Every rule in this section is **target**, not current behavior. It specifies
-> how the **Diff** stage ([§1.1.1](#111-the-locked-stage-order), [§1.1.2](#112-the-shared--per-recipient-seam))
-> spans a **catch-up span** when a recipient has missed several changes between deliveries.
-> The two modes are parameterized by the `baseline-strategy` authoring field
-> ([001 §3.7](./001-monitor-definition.md#37-baseline-strategy-target)). Formalizes a resolved
+> **Status: current.** The `baseline-strategy` field and its two modes (`incremental` / `net`) are
+> implemented (roadmap G13). It specifies how the **Diff** stage
+> ([§1.1.1](#111-the-locked-stage-order), [§1.1.2](#112-the-shared--per-recipient-seam)) spans a
+> **catch-up span** when a recipient has missed several changes between deliveries. The two modes are
+> parameterized by the `baseline-strategy` authoring field
+> ([001 §3.7](./001-monitor-definition.md#37-baseline-strategy-current)). Formalizes a resolved
 > decision from the monitoring capability study
 > ([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
-> §S5.1; ledger rows **C6**, **C7**). It does **not** contradict any _current_ rule: the current
-> runtime delivers observations in materialization order (the degenerate incremental case, as named
-> below) and the source/runtime diff split (PP3, AP3, [003 §2.5](./003-source-plugins.md)) is
-> unchanged — the baseline strategy parameterizes the per-recipient Diff already named in §1.1.2,
-> not a new diff surface.
+> §S5.1; ledger rows **C6**, **C7**). The source/runtime diff split (PP3, AP3,
+> [003 §2.5](./003-source-plugins.md)) is unchanged — the baseline strategy parameterizes the
+> per-recipient Diff already named in §1.1.2, not a new diff surface.
+>
+> Verified: `libs/core/src/runtime/service.ts` — `ingest()` reads
+> `monitor.frontmatter.baselineStrategy`; for `net` it calls `collapseToNetSpan()` (per `objectKey`,
+> keeping the LAST observation of each object's run) so the surviving observation is diffed against
+> the prior snapshot baseline, discarding intermediates; for `incremental` (default) the emitted span
+> is materialized unchanged, one event per observation. Tested by
+> `libs/core/src/runtime/service.test.ts` ("baseline strategy (G13, 002 §1.1.7)").
+>
+> Scope note: the catch-up span is currently the set of observations emitted into a single delivery
+> over the runtime's **shared** snapshot baseline ([§5.2](#52-snapshots-and-diffs)). The full
+> per-recipient-baseline seam — where two recipients of the same monitor at **divergent** stored
+> baselines each receive an independently-spanned Diff — remains tracked under roadmap **G10** (the
+> shared/per-recipient Diff persistence). `baseline-strategy` is the author-declared mode that G10's
+> per-recipient Diff will apply per recipient.
 
 A **catch-up span** is the set of shaped observations that accumulated for a monitor between a
 recipient's last-seen baseline and the current delivery point. When a recipient has been away for
@@ -345,7 +358,7 @@ delivery (Diff). A recipient that was live for every settled observation and nev
 receives a zero-span catch-up regardless of strategy — `incremental` and `net` are identical in
 this degenerate case (no intermediate steps to collapse).
 
-> **Cross-references:** [001 §3.7](./001-monitor-definition.md#37-baseline-strategy-target)
+> **Cross-references:** [001 §3.7](./001-monitor-definition.md#37-baseline-strategy-current)
 > for the authoring field; capability study C6 (per-agent what's-new), C7 (size-to-span), E1 and
 > E2 (the two motivating contrasts); §S5.1 (resolved: default incremental).
 >

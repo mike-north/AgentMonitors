@@ -198,6 +198,44 @@ function serializeObservation(
   };
 }
 
+/**
+ * The per-object identity of an observation in a catch-up span, mirroring the
+ * key `processObservation` diffs against: the explicit `objectKey`, or the
+ * monitor id when the observation declares none. Net collapse operates per
+ * object because each object is its own independent catch-up span (002 §1.1.7).
+ */
+function envelopeObjectKey(envelope: StoredObservationEnvelope): string {
+  return envelope.observation.objectKey ?? envelope.monitor.id;
+}
+
+/**
+ * Collapse an emitted catch-up span to its `net` form (G13, 002 §1.1.7): for
+ * each object (`objectKey`), keep only the LAST emitted observation — "where
+ * things stand now" — and discard the intermediates. Order is preserved by the
+ * surviving (last) observation's position so a multi-object span still
+ * materializes in a stable order. The dropped intermediates are never
+ * materialized, so they never advance the per-object snapshot baseline; the
+ * surviving observation is therefore diffed against the shared snapshot baseline
+ * (`store.latestSnapshot`), yielding a single net delta per object. The full
+ * per-recipient-baseline seam (divergent stored baselines per session) is future G10 work.
+ *
+ * A span with one observation per object is returned unchanged — `incremental`
+ * and `net` are behaviorally identical when there is nothing to collapse.
+ */
+function collapseToNetSpan(
+  emitted: StoredObservationEnvelope[],
+): StoredObservationEnvelope[] {
+  // Map each object to the index of its LAST emitted observation. Iterating in
+  // order and overwriting leaves the final occurrence as the survivor.
+  const lastIndexByObject = new Map<string, number>();
+  emitted.forEach((envelope, index) => {
+    lastIndexByObject.set(envelopeObjectKey(envelope), index);
+  });
+  const survivors = new Set(lastIndexByObject.values());
+  // Preserve span order: emit survivors in their original positions.
+  return emitted.filter((_envelope, index) => survivors.has(index));
+}
+
 function hydrateStoredObservationEnvelope(
   envelope: StoredObservationEnvelope,
 ): StoredObservationEnvelope {
@@ -1140,6 +1178,29 @@ export class AgentMonitorRuntime {
       observationData: { observed, emitted: emittedCount },
     });
 
+    // Baseline strategy (G13, 002 §1.1.7): the author-declared `baseline-strategy`
+    // parameterizes how a recipient's catch-up span is materialized into deltas.
+    //
+    // - `incremental` (default): every emitted observation in the span becomes
+    //   its own event, in order — the play-by-play. This is the unchanged,
+    //   backward-compatible behavior.
+    // - `net`: the catch-up span is collapsed per object to a single net delta —
+    //   only the LAST observation of each `objectKey` run survives, so the Diff
+    //   stage (processObservation) compares the shared snapshot baseline
+    //   (`store.latestSnapshot`, keyed by workspace/monitor/object) against the
+    //   endpoint state. Intermediate observations are discarded and never
+    //   materialized — so they never advance the per-object snapshot baseline,
+    //   which is exactly what makes the surviving delta a net delta.
+    //   Note: the full per-recipient-baseline seam (divergent stored baselines
+    //   per session) is future G10 work.
+    //
+    // A span containing a single observation is identical under both strategies
+    // (002 §1.1.7 — no intermediate steps to collapse).
+    const span =
+      monitor.frontmatter.baselineStrategy === 'net'
+        ? collapseToNetSpan(dispatch.emitted)
+        : dispatch.emitted;
+
     // Per-observation materialization isolation (issue #46): a single failing
     // observation must not drop the already-durably-written ids of its
     // batch-mates, and must not cause emittedEventIds to disagree with what is
@@ -1148,7 +1209,7 @@ export class AgentMonitorRuntime {
     // The batch-level triggered/suppressed/no-change row recorded above is
     // unaffected — it reflects what was *dispatched*, not what materialized.
     const emittedEventIds: string[] = [];
-    for (const emitted of dispatch.emitted) {
+    for (const emitted of span) {
       try {
         const event = this.processObservation({
           monitor: emitted.monitor,

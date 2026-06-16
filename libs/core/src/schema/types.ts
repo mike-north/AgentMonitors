@@ -1,4 +1,8 @@
-export type { MonitorFrontmatter, NotifyConfig } from './monitor-schema.js';
+export type {
+  MonitorFrontmatter,
+  NotifyConfig,
+  BaselineStrategy,
+} from './monitor-schema.js';
 
 export interface MonitorDefinition {
   /** Monitor id — the folder name for `<id>/MONITOR.md`, or the filename stem for a flat `<id>.md`. */

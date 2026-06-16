@@ -581,6 +581,56 @@ describe('validate', () => {
     expect(result.stdout.toLowerCase()).toContain('urgency');
   });
 
+  // G13 / 001 §3.7 / 002 §1.1.7: `baseline-strategy` accepts incremental and
+  // net, and rejects any other value.
+  for (const strategy of ['incremental', 'net'] as const) {
+    it(`accepts baseline-strategy: ${strategy}`, () => {
+      const dir = path.join(tempDir, `validate-baseline-${strategy}-test`);
+      const monitorDir = path.join(dir, 'monitors', 'baselined');
+      mkdirSync(monitorDir, { recursive: true });
+      const body = [
+        '---',
+        'name: Baselined',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs: ["*.ts"]',
+        'urgency: normal',
+        `baseline-strategy: ${strategy}`,
+        '---',
+        'Handle it.',
+        '',
+      ].join('\n');
+      writeFileSync(path.join(monitorDir, 'MONITOR.md'), body, 'utf-8');
+
+      const result = run(['validate', path.join(dir, 'monitors')]);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain('Valid monitors: 1');
+    });
+  }
+
+  it('rejects an unknown baseline-strategy value', () => {
+    const dir = path.join(tempDir, 'validate-baseline-unknown-test');
+    const monitorDir = path.join(dir, 'monitors', 'bad-baseline');
+    mkdirSync(monitorDir, { recursive: true });
+    const body = [
+      '---',
+      'name: Bad baseline',
+      'watch:',
+      '  type: file-fingerprint',
+      '  globs: ["*.ts"]',
+      'urgency: normal',
+      'baseline-strategy: cumulative',
+      '---',
+      'Handle it.',
+      '',
+    ].join('\n');
+    writeFileSync(path.join(monitorDir, 'MONITOR.md'), body, 'utf-8');
+
+    const result = run(['validate', path.join(dir, 'monitors')]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout.toLowerCase()).toContain('baseline-strategy');
+  });
+
   // Issue #153 item 3: the inverted-range error must not repeat "urgency" twice.
   // Before the fix: `urgency: urgency range "high..normal" is inverted …`
   // After: `urgency: range "high..normal" is inverted …`
