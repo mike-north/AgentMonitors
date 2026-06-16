@@ -9,6 +9,7 @@ import type { SourceRegistry } from '../observation/registry.js';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import type { AgentRuntimeAdapter } from '../adapter/types.js';
 import { buildTextDiff } from './diff.js';
+import { shapeObservation } from './shape-stage.js';
 import { RuntimeStore } from './store.js';
 import type {
   AgentSessionRecord,
@@ -1281,7 +1282,9 @@ export class AgentMonitorRuntime {
           workspacePath: options.workspacePath,
           effectiveUrgency: emitted.effectiveUrgency,
         });
-        emittedEventIds.push(event.id);
+        // A `payload.form: structured` CEL gate evaluating false suppresses the
+        // delivery entirely (002 §1.1.6) — no event is materialized.
+        if (event) emittedEventIds.push(event.id);
       } catch (materializeError) {
         try {
           this.store.recordObservationHistory({
@@ -1738,7 +1741,24 @@ export class AgentMonitorRuntime {
 
   private processObservation(input: ProcessObservationInput) {
     const objectKey = input.observation.objectKey ?? input.monitor.id;
-    const previousSnapshot = input.observation.snapshotText
+
+    // ── Shape stage (G15, 002 §1.1.4–§1.1.6) ──────────────────────────────
+    // Runs on the shared side of the seam, BEFORE Diff. When the monitor
+    // declares `shape`, render the shaped snapshot (the source's raw facts +
+    // the derived facts computed at the injected `now`) into a stable, diffable
+    // artifact, and diff THAT artifact — never the raw source. The injected
+    // `now` is the tick clock (`observedAt`); no ambient `Date.now()` is read.
+    const shaped = shapeObservation(input.observation, input.observedAt, {
+      shape: input.monitor.frontmatter.shape,
+      payload: input.monitor.frontmatter.payload,
+    });
+    // A `payload.form: structured` + `cel: false` gate suppresses delivery
+    // entirely (§1.1.6) — record nothing as an event.
+    if (shaped.suppressed) return null;
+
+    const effectiveSnapshotText = shaped.snapshotText;
+
+    const previousSnapshot = effectiveSnapshotText
       ? this.store.latestSnapshot(
           input.monitor.id,
           objectKey,
@@ -1747,11 +1767,8 @@ export class AgentMonitorRuntime {
       : null;
 
     const diffText =
-      input.observation.snapshotText && previousSnapshot
-        ? buildTextDiff(
-            previousSnapshot.content,
-            input.observation.snapshotText,
-          )
+      effectiveSnapshotText && previousSnapshot
+        ? buildTextDiff(previousSnapshot.content, effectiveSnapshotText)
         : null;
 
     const event = this.store.insertEvent({
@@ -1765,9 +1782,9 @@ export class AgentMonitorRuntime {
         input.observation.summary ??
         input.observation.body ??
         input.observation.title,
-      payload: input.observation.payload ?? {},
+      payload: shaped.payload ?? input.observation.payload ?? {},
       snapshotMetadata: input.observation.snapshot ?? {},
-      snapshotText: input.observation.snapshotText ?? null,
+      snapshotText: effectiveSnapshotText ?? null,
       diffText,
       objectKey,
       // Make the source-agnostic changeKind queryable without each source having
@@ -1786,13 +1803,13 @@ export class AgentMonitorRuntime {
     // transaction. Currently a saveSnapshot failure after a successful insertEvent
     // leaves an event row without its snapshot — best-effort: the ingest() caller
     // catches this and records an errored history row for the observation.
-    if (input.observation.snapshotText) {
+    if (effectiveSnapshotText) {
       this.store.saveSnapshot({
         workspacePath: input.workspacePath ?? null,
         monitorId: input.monitor.id,
         objectKey,
         eventId: event.id,
-        content: input.observation.snapshotText,
+        content: effectiveSnapshotText,
       });
     }
 

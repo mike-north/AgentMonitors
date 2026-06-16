@@ -2,6 +2,8 @@
 export {
   monitorFrontmatterSchema,
   notifySchema,
+  shapeSchema,
+  payloadSchema,
 } from './schema/monitor-schema.js';
 export { validateScope } from './schema/validate-scope.js';
 export type {
@@ -12,6 +14,12 @@ export type {
   NotifyStrategy,
   BaselineStrategy,
 } from './schema/types.js';
+export type {
+  PayloadForm,
+  PayloadEncoding,
+  ShapeConfig,
+  PayloadConfig,
+} from './schema/monitor-schema.js';
 
 // Parser
 export { parseMonitor, parseMonitorFile } from './parser/parse-monitor.js';
@@ -77,7 +85,32 @@ export type { HookState, UrgentItem } from './hook-bridge/types.js';
 // Runtime
 export { AgentMonitorRuntime } from './runtime/service.js';
 export { RuntimeStore } from './runtime/store.js';
-export { buildTextDiff, fingerprintText } from './runtime/diff.js';
+export {
+  buildTextDiff,
+  fingerprintText,
+  renderShapeArtifact,
+} from './runtime/diff.js';
+// Shape stage (G15): deterministic derived facts + render-then-diff
+export {
+  computeDerivedFacts,
+  renderArtifact,
+  validateCelPredicate,
+} from './runtime/shape.js';
+export type { DerivedFactRule, DerivedFact } from './runtime/shape.js';
+export {
+  applyPayloadTransform,
+  validatePayloadTransform,
+} from './runtime/transform.js';
+export type {
+  PayloadTransform,
+  TransformLanguage,
+  TransformOutcome,
+} from './runtime/transform.js';
+export { shapeObservation } from './runtime/shape-stage.js';
+export type {
+  ShapeStageConfig,
+  ShapedObservation,
+} from './runtime/shape-stage.js';
 export type {
   AgentLifecycleEvent,
   AgentSessionRole,

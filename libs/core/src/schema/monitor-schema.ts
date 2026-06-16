@@ -1,4 +1,9 @@
 import { z } from 'zod';
+import { validateCelPredicate } from '../runtime/shape.js';
+import {
+  validatePayloadTransform,
+  type TransformLanguage,
+} from '../runtime/transform.js';
 
 const durationPattern = /^\d+[smhd]$/;
 
@@ -179,6 +184,116 @@ const watchSchema = z
   })
   .catchall(z.unknown());
 
+/**
+ * The deterministic **Shape** declaration ([001 §5.1](../../docs/specs/001-monitor-definition.md#51-shape-declaration-target)).
+ *
+ * `derive` is an ordered list of named derived facts; each `when` is a CEL
+ * boolean predicate over `(snapshot, now)`. `render` opts into rendering the
+ * shaped state to the diffable artifact ([002 §1.1.5](../../docs/specs/002-runtime-delivery.md#115-shape-render-to-a-stable-artifact-then-diff-the-artifact)).
+ * A malformed CEL predicate is rejected (determinism is a validation obligation,
+ * [004 §2.2](../../docs/specs/004-validation-testing.md)).
+ */
+const deriveRuleSchema = z.object({
+  name: z.string().min(1, 'shape.derive[].name must be non-empty'),
+  when: z.string().min(1, 'shape.derive[].when must be a CEL predicate'),
+});
+
+const shapeSchema = z
+  .object({
+    derive: z.array(deriveRuleSchema).optional(),
+    render: z.literal('rendered').optional(),
+  })
+  .superRefine((shape, ctx) => {
+    for (const [index, rule] of (shape.derive ?? []).entries()) {
+      const error = validateCelPredicate(rule.when);
+      if (error) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['derive', index, 'when'],
+          message: `malformed CEL predicate: ${error}`,
+        });
+      }
+    }
+  });
+
+const transformLanguages = ['jq', 'cel'] as const satisfies readonly [
+  TransformLanguage,
+  TransformLanguage,
+];
+
+/**
+ * The author-declared payload **form** — one of `prose`, `structured`,
+ * `artifact`, `rendered` ([001 §5.2](../../docs/specs/001-monitor-definition.md#52-payload-form-target),
+ * [002 §1.1.6](../../docs/specs/002-runtime-delivery.md#116-author-declared-payload-form)).
+ *
+ * This is a **stable contract** the follow-on Interpret stage (G14) builds on:
+ * the `prose` form is the one form that invokes Interpret; `structured`,
+ * `artifact`, and `rendered` are the deterministic-floor forms. Authored as an
+ * explicit union (not a derived alias) so the contract is hand-pinned.
+ */
+export type PayloadForm = 'prose' | 'structured' | 'artifact' | 'rendered';
+
+/** The output serialization for a `structured` payload (`json` default). */
+export type PayloadEncoding = 'json' | 'yaml' | 'toon' | 'toml';
+
+const payloadForms = [
+  'prose',
+  'structured',
+  'artifact',
+  'rendered',
+] as const satisfies readonly PayloadForm[];
+const payloadEncodings = [
+  'json',
+  'yaml',
+  'toon',
+  'toml',
+] as const satisfies readonly PayloadEncoding[];
+
+const payloadFormSchema = z.enum(payloadForms);
+const payloadEncodingSchema = z.enum(payloadEncodings);
+
+const payloadTransformSchema = z.object({
+  language: z.enum(transformLanguages),
+  expression: z
+    .string()
+    .min(1, 'payload.transform.expression must be non-empty'),
+});
+
+/**
+ * The author-declared **payload form** ([001 §5.2](../../docs/specs/001-monitor-definition.md#52-payload-form-target)).
+ *
+ * `form` is one of `prose | structured | artifact | rendered`. A `transform` is
+ * valid **only** under `form: structured`; a malformed `jq`/`cel` expression is
+ * rejected. `encoding` is a downstream serialization concern.
+ */
+const payloadSchema = z
+  .object({
+    form: payloadFormSchema,
+    transform: payloadTransformSchema.optional(),
+    encoding: payloadEncodingSchema.optional(),
+  })
+  .superRefine((payload, ctx) => {
+    if (payload.transform && payload.form !== 'structured') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['transform'],
+        message:
+          'payload.transform is only valid when payload.form is "structured"',
+      });
+      return;
+    }
+    if (payload.transform) {
+      const error = validatePayloadTransform(payload.transform);
+      if (error) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['transform', 'expression'],
+          message: `malformed ${payload.transform.language} transform: ${error}`,
+        });
+      }
+    }
+  });
+
 export const monitorFrontmatterSchema = z
   .object({
     name: z
@@ -197,6 +312,8 @@ export const monitorFrontmatterSchema = z
     // 002 §1.1.7.
     'baseline-strategy': baselineStrategySchema,
     tags: z.array(z.string()).optional(),
+    shape: shapeSchema.optional(),
+    payload: payloadSchema.optional(),
   })
   .transform(({ urgency, 'baseline-strategy': baselineStrategy, ...rest }) => ({
     ...rest,
@@ -222,9 +339,20 @@ export type NotifyConfig = z.infer<typeof notifySchema>;
  */
 export type BaselineStrategy = (typeof baselineStrategyValues)[number];
 
+/**
+ * The parsed `shape` frontmatter block ([001 §5.1](../../docs/specs/001-monitor-definition.md#51-shape-declaration-current)).
+ */
+export type ShapeConfig = z.infer<typeof shapeSchema>;
+
+/**
+ * The parsed `payload` frontmatter block ([001 §5.2](../../docs/specs/001-monitor-definition.md#52-payload-form-current)).
+ */
+export type PayloadConfig = z.infer<typeof payloadSchema>;
+
 export {
   notifySchema,
   debounceNotifySchema,
   throttleNotifySchema,
   rollupNotifySchema,
 };
+export { shapeSchema, payloadSchema };
