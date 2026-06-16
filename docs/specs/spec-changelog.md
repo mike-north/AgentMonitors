@@ -32,7 +32,7 @@ capability C44; resolved §S5.2). Spec-only; all new rules are marked **target**
   cron + timezone, same guard as the schedule source); non-empty batch → flush and clear; empty
   window → no delivery (no empty pings, C14). Key clarifications: the flushed batch enters the
   normal materialization → projection → delivery pipeline (§5 → §6 → §9); rollup is entirely on
-  the shared side of the seam (§1.1.1); the delivery clock (§9) is independent of the window clock
+  the shared side of the seam (§1.1.2); the delivery clock (§9) is independent of the window clock
   (§1.1.3). Three-clocks analysis applied: observation cadence **SHOULD** be relaxed independently,
   reducing token and observation cost (C44, §S5.2 primary motivation).
 
