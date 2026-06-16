@@ -80,6 +80,22 @@ export const monitorSnapshots = sqliteTable('monitor_snapshots', {
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
 });
 
+/**
+ * The per-recipient Interpret decision (G14, 002 §1.1.8). Recorded on
+ * `session_event_state` because Interpret runs **right of the per-recipient
+ * seam** — its verdict is per recipient, not the shared tick-level
+ * `observation_history`. `deliver` = the agentic gate passed (or no gate);
+ * `suppress` = the agentic gate judged the delta not substantive (no delivery);
+ * `failed` = the AI tool errored and the runtime fell back to the deterministic
+ * `rendered` artifact (best-effort, 002 §1.1.8).
+ */
+export const interpretDecisionValues = [
+  'deliver',
+  'suppress',
+  'failed',
+] as const;
+export type InterpretDecision = (typeof interpretDecisionValues)[number];
+
 export const sessionEventState = sqliteTable('session_event_state', {
   id: text('id').primaryKey(),
   sessionId: text('session_id').notNull(),
@@ -88,6 +104,15 @@ export const sessionEventState = sqliteTable('session_event_state', {
   acknowledgedAt: integer('acknowledged_at', { mode: 'timestamp' }),
   lastClaimAt: integer('last_claim_at', { mode: 'timestamp' }),
   lastClaimLifecycle: text('last_claim_lifecycle'),
+  // Per-recipient Interpret verdict (G14, 002 §1.1.8); absent for the deterministic
+  // forms that never invoke Interpret. `interpret_reason` is the agentic-gate
+  // suppression reason or the fallback-failure detail; `interpret_digest` is the
+  // delivered cheap digest when the decision is `deliver`.
+  interpretDecision: text('interpret_decision', {
+    enum: interpretDecisionValues,
+  }),
+  interpretReason: text('interpret_reason'),
+  interpretDigest: text('interpret_digest'),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
   updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
 });

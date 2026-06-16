@@ -164,6 +164,15 @@ export interface MonitorExplainStage {
 
 export type MonitorDeliveryState = 'unread' | 'claimed' | 'acknowledged';
 
+/**
+ * The per-recipient Interpret verdict recorded on a projection (G14, 002 §1.1.8):
+ * `deliver` — the agentic gate passed (or no gate) and a digest was produced;
+ * `suppress` — the agentic gate judged the delta not substantive, so no delivery;
+ * `failed` — the AI tool errored and the runtime fell back to the deterministic
+ * `rendered` artifact (best-effort).
+ */
+export type InterpretDecision = 'deliver' | 'suppress' | 'failed';
+
 export interface MonitorDeliveryProjection {
   eventId: string;
   sessionId: string;
@@ -176,6 +185,12 @@ export interface MonitorDeliveryProjection {
   lastClaimAt?: Date;
   lastClaimLifecycle?: string;
   acknowledgedAt?: Date;
+  /** The per-recipient Interpret verdict (G14), absent for non-`prose` deliveries. */
+  interpretDecision?: InterpretDecision;
+  /** The agentic-gate suppression reason or the fallback-failure detail. */
+  interpretReason?: string;
+  /** The delivered cheap digest when `interpretDecision` is `deliver`. */
+  interpretDigest?: string;
 }
 
 export interface MonitorExplainInput {

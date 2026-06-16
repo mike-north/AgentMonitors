@@ -122,6 +122,7 @@ export type {
   DeliveryMode,
   ErroredObservation,
   EventQuery,
+  InterpretDecision,
   MonitorDeliveryProjection,
   MonitorDeliveryState,
   MonitorEventRecord,
@@ -152,3 +153,10 @@ export type {
 // Adapters
 export { claudeCodeAdapter } from './adapter/claude.js';
 export type { AgentRuntimeAdapter } from './adapter/types.js';
+export { createClaudeInterpretAdapter } from './adapter/interpret.js';
+export type {
+  InterpretAdapter,
+  InterpretInput,
+  InterpretResult,
+  ClaudeInterpretAdapterOptions,
+} from './adapter/interpret.js';

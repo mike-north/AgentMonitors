@@ -65,7 +65,9 @@ A **delivery transport** is the generalization. Every transport **MUST**:
 
 ### 2.1 The Interpret adapter is upstream of transports, not a transport
 
-> **Status: target.** Marks the boundary an Interpret-stage AI-tool invocation crosses. Formalizes
+> **Status: current** (G14, Refs #178). Marks the boundary an Interpret-stage AI-tool invocation
+> crosses, now implemented behind the `InterpretAdapter` interface
+> (`libs/core/src/adapter/interpret.ts`, concrete `createClaudeInterpretAdapter`). Formalizes
 > the resolved decision from the monitoring capability study
 > ([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
 > §S4, resolved §S5 item 3; ledger row **C45**); the runtime contract is
@@ -86,6 +88,10 @@ Interpret runs after Diff and before Deliver ([002 §1.1.1](./002-runtime-delive
 a transport runs at Deliver. Because Agent Monitors **ships no model and holds no credentials**, the
 Interpret adapter inherits the user's existing data-governance and egress posture by construction —
 the same trust principle stated in [002 §1.1.8](./002-runtime-delivery.md#118-interpret-a-cheap-agentic-digest-via-the-users-own-ai-tool).
+
+Verified: `libs/core/src/adapter/interpret.ts` — the `InterpretAdapter` interface and the concrete
+`createClaudeInterpretAdapter` shell-out; `libs/core/src/runtime/service.ts` — `runInterpret` invokes
+the adapter upstream of any transport (after Diff, before Deliver), never re-derived at Deliver.
 
 ## 3. Hook-State Transport (Current)
 
