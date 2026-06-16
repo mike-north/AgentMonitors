@@ -3198,4 +3198,285 @@ Handle it.
       expectIncrementalChain(events);
     });
   });
+
+  // --- Scheduled-rollup Pace mode (G12) ------------------------------------
+  //
+  // Contract (001 §3.6, 002 §4.4): a `notify.strategy: rollup` monitor
+  // accumulates every observation in durable `notifyState.pendingRollup` and
+  // delivers nothing until the author's `window` cron fires. On the window
+  // opening the whole accumulated batch is flushed as one composite delivery
+  // and the accumulation state is cleared; an empty window produces no delivery.
+  // The batch MUST survive a daemon restart (restart-safety, BP1).
+  //
+  // The window cron is evaluated against the injected `now` (fake timers), so
+  // these tests are fully deterministic. A short `interval` makes the monitor
+  // due every tick; time is advanced past the interval between ticks.
+  describe('rollup Pace mode (G12, 002 §4.4)', () => {
+    // A source that hands out one queued observation per tick (or none when the
+    // queue is exhausted), so a test can drive accumulation tick by tick.
+    function queuedSource(
+      name: string,
+      queue: { title: string }[],
+    ): ObservationSource {
+      return {
+        name,
+        scopeSchema: { type: 'object', properties: {} },
+        stateful: true,
+        async observe(): Promise<ObservationResult> {
+          const next = queue.shift();
+          return {
+            observations: next
+              ? [{ title: next.title, summary: next.title }]
+              : [],
+            nextState: {},
+          };
+        },
+      };
+    }
+
+    // Window opens at 09:00 UTC daily; 08:00 UTC is firmly outside it.
+    const WINDOW = '0 9 * * *';
+    const OUTSIDE_WINDOW = new Date('2026-03-20T08:00:00.000Z');
+    const AT_WINDOW = new Date('2026-03-20T09:00:00.000Z');
+
+    function rollupMonitorDir(rootDir: string, sourceName: string): string {
+      return createMonitorFile(
+        rootDir,
+        sourceName,
+        'normal',
+        'Daily digest.',
+        `  interval: '1s'\nnotify:\n  strategy: rollup\n  window: '${WINDOW}'\n`,
+      );
+    }
+
+    // (b) Observations accumulate durably across ticks WITHOUT delivering
+    //     between windows (002 §4.4 step 1 + step 6).
+    it('accumulates observations across ticks without delivering between windows', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(OUTSIDE_WINDOW);
+      try {
+        const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-rollup-'));
+        tempDirs.push(rootDir);
+        const monitorsDir = rollupMonitorDir(rootDir, 'rollup-accumulate');
+
+        const db = createDb(':memory:');
+        const registry = new SourceRegistry();
+        registry.register(
+          queuedSource('rollup-accumulate', [
+            { title: 'Change A' },
+            { title: 'Change B' },
+          ]),
+        );
+        const store = new RuntimeStore(db);
+        const runtime = new AgentMonitorRuntime(store, registry, [
+          claudeCodeAdapter,
+        ]);
+        const session = runtime.openSession(
+          claudeCodeAdapter.createSessionInput({
+            hostSessionId: 'claude-rollup-accumulate',
+            workspacePath: rootDir,
+          }),
+        );
+
+        // Tick 1 (08:00, outside the window): Change A is accumulated, not
+        // delivered.
+        const tick1 = await runtime.tick(monitorsDir, rootDir);
+        expect(tick1.emittedEventIds).toHaveLength(0);
+
+        // Advance past the 1s interval so the monitor is due again, still 08:00.
+        vi.setSystemTime(new Date(OUTSIDE_WINDOW.getTime() + 2_000));
+
+        // Tick 2 (still outside the window): Change B is accumulated, not
+        // delivered.
+        const tick2 = await runtime.tick(monitorsDir, rootDir);
+        expect(tick2.emittedEventIds).toHaveLength(0);
+
+        // Nothing has been delivered to the session.
+        expect(
+          runtime.listEvents({ sessionId: session.id, unreadOnly: true }),
+        ).toHaveLength(0);
+
+        // Both observations are held durably in notifyState.pendingRollup.
+        const held =
+          store.getMonitorState('test-monitor').notifyState.pendingRollup;
+        expect(held?.observations).toHaveLength(2);
+        expect(held?.observations.map((o) => o.observation.title)).toEqual([
+          'Change A',
+          'Change B',
+        ]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    // (c) The window opening flushes the whole accumulated batch and clears the
+    //     accumulation state (002 §4.4 step 2).
+    it('flushes the accumulated batch and clears state when the window fires', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(OUTSIDE_WINDOW);
+      try {
+        const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-rollup-'));
+        tempDirs.push(rootDir);
+        const monitorsDir = rollupMonitorDir(rootDir, 'rollup-flush');
+
+        const db = createDb(':memory:');
+        const registry = new SourceRegistry();
+        registry.register(
+          queuedSource('rollup-flush', [
+            { title: 'Change A' },
+            { title: 'Change B' },
+          ]),
+        );
+        const store = new RuntimeStore(db);
+        const runtime = new AgentMonitorRuntime(store, registry, [
+          claudeCodeAdapter,
+        ]);
+        const session = runtime.openSession(
+          claudeCodeAdapter.createSessionInput({
+            hostSessionId: 'claude-rollup-flush',
+            workspacePath: rootDir,
+          }),
+        );
+
+        // Tick 1 (08:00): accumulate Change A, no delivery.
+        const tick1 = await runtime.tick(monitorsDir, rootDir);
+        expect(tick1.emittedEventIds).toHaveLength(0);
+
+        // Tick 2 (09:00, window fires): Change B arrives this tick and the whole
+        // batch (A + B) flushes as one composite delivery — two event rows
+        // (002 §4.4 step 4: one row per accumulated observation).
+        vi.setSystemTime(AT_WINDOW);
+        const tick2 = await runtime.tick(monitorsDir, rootDir);
+        expect(tick2.emittedEventIds).toHaveLength(2);
+
+        const delivered = runtime.listEvents({
+          sessionId: session.id,
+          unreadOnly: true,
+        });
+        expect(delivered).toHaveLength(2);
+        // Both accumulated observations are present, oldest first.
+        expect(delivered.map((e) => e.title).sort()).toEqual([
+          'Change A',
+          'Change B',
+        ]);
+
+        // The accumulation state is cleared after the flush.
+        expect(
+          store.getMonitorState('test-monitor').notifyState.pendingRollup,
+        ).toBeUndefined();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    // (d) An empty window produces no delivery (002 §4.4 step 3 — no empty
+    //     pings). The window opens but nothing accumulated since the last flush.
+    it('produces no delivery when the window opens with an empty batch', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(AT_WINDOW);
+      try {
+        const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-rollup-'));
+        tempDirs.push(rootDir);
+        const monitorsDir = rollupMonitorDir(rootDir, 'rollup-empty');
+
+        const db = createDb(':memory:');
+        const registry = new SourceRegistry();
+        // Empty queue: the source never returns an observation.
+        registry.register(queuedSource('rollup-empty', []));
+        const store = new RuntimeStore(db);
+        const runtime = new AgentMonitorRuntime(store, registry, [
+          claudeCodeAdapter,
+        ]);
+        const session = runtime.openSession(
+          claudeCodeAdapter.createSessionInput({
+            hostSessionId: 'claude-rollup-empty',
+            workspacePath: rootDir,
+          }),
+        );
+
+        // Tick at 09:00 (the window IS open) with nothing accumulated: no
+        // delivery, and no pendingRollup state is created.
+        const tick = await runtime.tick(monitorsDir, rootDir);
+        expect(tick.emittedEventIds).toHaveLength(0);
+        expect(
+          runtime.listEvents({ sessionId: session.id, unreadOnly: true }),
+        ).toHaveLength(0);
+        expect(
+          store.getMonitorState('test-monitor').notifyState.pendingRollup,
+        ).toBeUndefined();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    // (e) Restart-safety (BP1, 002 §4.4 step 1): an accumulated batch persisted
+    //     before a daemon restart survives the restart and flushes on the next
+    //     window opening. Modeled with a file-backed DB and TWO independent
+    //     runtime instances (the first is dropped entirely, simulating a daemon
+    //     stop), so the batch is recovered only from durable persistence.
+    it('survives a daemon restart and flushes the recovered batch on the next window', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(OUTSIDE_WINDOW);
+      try {
+        const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-rollup-'));
+        tempDirs.push(rootDir);
+        const dbPath = path.join(rootDir, 'agentmon.db');
+        const monitorsDir = rollupMonitorDir(rootDir, 'rollup-restart');
+
+        // --- Daemon instance #1: accumulate a batch, then "crash" (drop it). ---
+        const runtimeA = createRuntime(
+          dbPath,
+          queuedSource('rollup-restart', [{ title: 'Pre-restart change' }]),
+        );
+        const session = runtimeA.openSession(
+          claudeCodeAdapter.createSessionInput({
+            hostSessionId: 'claude-rollup-restart',
+            workspacePath: rootDir,
+          }),
+        );
+
+        // Tick at 08:00 (outside window): the observation accumulates durably.
+        const tickA = await runtimeA.tick(monitorsDir, rootDir);
+        expect(tickA.emittedEventIds).toHaveLength(0);
+
+        // Confirm the batch was persisted to disk before the restart.
+        const persisted = new RuntimeStore(createDb(dbPath)).getMonitorState(
+          'test-monitor',
+        ).notifyState.pendingRollup;
+        expect(persisted?.observations).toHaveLength(1);
+
+        // --- Daemon instance #2: fresh runtime over the SAME on-disk DB. ---
+        // The accumulated batch exists only in durable persistence now; the
+        // source queue is empty so the only thing that can flush is the
+        // recovered batch.
+        vi.setSystemTime(AT_WINDOW);
+        const runtimeB = createRuntime(
+          dbPath,
+          queuedSource('rollup-restart', []),
+        );
+
+        // Tick at 09:00 (window fires): the recovered pre-restart batch flushes.
+        const tickB = await runtimeB.tick(monitorsDir, rootDir);
+        expect(tickB.emittedEventIds).toHaveLength(1);
+
+        const delivered = runtimeB.listEvents({
+          sessionId: session.id,
+          unreadOnly: true,
+        });
+        expect(delivered).toHaveLength(1);
+        expect(delivered[0]?.title).toBe('Pre-restart change');
+        // A valid urgency was materialized for the restart-recovered envelope
+        // (hydration backfill, 002 §3 / §4.4 step 1), never `undefined`.
+        expect(delivered[0]?.urgency).toBe('normal');
+
+        // The accumulation state is cleared after the post-restart flush.
+        expect(
+          new RuntimeStore(createDb(dbPath)).getMonitorState('test-monitor')
+            .notifyState.pendingRollup,
+        ).toBeUndefined();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
 });

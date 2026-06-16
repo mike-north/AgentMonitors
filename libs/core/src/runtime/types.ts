@@ -232,9 +232,26 @@ export interface PendingDebounceState {
   dueAt: string;
 }
 
+/**
+ * Durable accumulation state for the scheduled-rollup Pace mode
+ * (`notify.strategy: rollup`, 001 §3.6 / 002 §4.4). Every observation produced
+ * since the last window flush is appended to `observations`; unlike
+ * `PendingDebounceState` there is **no** `dueAt` reset on each new observation —
+ * the flush time is schedule-driven (the author's `window` cron), not
+ * settle-driven. The batch is persisted in `monitor_state.notify_state` and
+ * **MUST** survive a daemon restart (002 §4.4 step 1, BP1); it is hydrated and
+ * flushed on the first tick where the window cron fires with a non-empty batch.
+ *
+ * @see docs/specs/002-runtime-delivery.md §4.4
+ */
+export interface PendingRollupState {
+  observations: StoredObservationEnvelope[];
+}
+
 export interface NotifyRuntimeState {
   suppressedUntil?: string;
   pendingDebounce?: PendingDebounceState;
+  pendingRollup?: PendingRollupState;
 }
 
 export interface StoredObservationEnvelope {

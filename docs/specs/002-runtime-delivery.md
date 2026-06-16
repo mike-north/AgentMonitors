@@ -550,11 +550,11 @@ Verified: `libs/core/src/runtime/types.ts` — `RuntimeTickResult`, `ErroredObse
 
 ## 3. Persisted Monitor State
 
-Each monitor has persisted runtime state containing: `lastObservationAt`, `sourceState`, `notifyState`. `sourceState` is owned by the source plugin and returned via `nextState`. `notifyState` is owned by the runtime and records delivery timing state such as active suppression windows for throttle and pending observation batches for debounce.
+Each monitor has persisted runtime state containing: `lastObservationAt`, `sourceState`, `notifyState`. `sourceState` is owned by the source plugin and returned via `nextState`. `notifyState` is owned by the runtime and records delivery timing state such as active suppression windows for throttle, pending observation batches for debounce, and the accumulated rollup batch (`pendingRollup`, [§4.4](#44-scheduled-rollup-pace-mode-current)) held between delivery windows.
 
 This split is important: source plugins own change-detection state, while the runtime owns notification timing behavior.
 
-**Restart-safety / upgrade backfill (issue #109):** When a persisted `notifyState.pendingDebounce` batch is hydrated on daemon restart, envelopes written before the range-urgency upgrade may lack an `effectiveUrgency` field. The runtime **MUST** backfill it on hydration using `effectiveObservationUrgency(monitor, observation)` so that the materialized `monitor_events.urgency` row is never written with an undefined value. `effectiveObservationUrgency` degrades cleanly when the hydrated monitor snapshot itself lacks `urgencyMax` (old monitor): the `URGENCY_BY_RANK[NaN] ?? lo` fallback returns the monitor's base urgency.
+**Restart-safety / upgrade backfill (issue #109):** When a persisted `notifyState.pendingDebounce` or `notifyState.pendingRollup` batch is hydrated on daemon restart, envelopes written before the range-urgency upgrade may lack an `effectiveUrgency` field. The runtime **MUST** backfill it on hydration using `effectiveObservationUrgency(monitor, observation)` so that the materialized `monitor_events.urgency` row is never written with an undefined value. `effectiveObservationUrgency` degrades cleanly when the hydrated monitor snapshot itself lacks `urgencyMax` (old monitor): the `URGENCY_BY_RANK[NaN] ?? lo` fallback returns the monitor's base urgency. The `pendingRollup` batch survives daemon restarts and flushes on the next window opening (BP1; [§4.4](#44-scheduled-rollup-pace-mode-current)).
 
 Verified: `libs/core/src/runtime/types.ts` — `MonitorRuntimeState` (lines 131–135); `libs/core/src/inbox/schema.ts` — `monitorState` table (lines 98–105).
 
@@ -622,12 +622,22 @@ The pending debounce state uses the `PendingDebounceState` shape: `{ observation
 
 Verified: `libs/core/src/runtime/types.ts` — `PendingDebounceState` (lines 137–140).
 
-### 4.4 Scheduled-rollup Pace mode (_target_)
+### 4.4 Scheduled-rollup Pace mode (_current_)
 
-> **Status: target.** The scheduled-rollup Pace mode is **not yet implemented**. This section
-> specifies the intended semantics (capability C44; resolved in the monitoring capability study
+> **Status: current** (G12; capability C44, resolved in the monitoring capability study
 > [`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
 > §S5.2). The authoring surface lives in [001 §3.6](./001-monitor-definition.md).
+>
+> Verified: `libs/core/src/runtime/service.ts` — `dispatchRollup()` implements steps 1–6 below
+> (accumulate into `notifyState.pendingRollup`; evaluate the `window` cron via `cronMatchesDate`
+> in the configured `timezone`; flush the whole batch and clear state on a non-empty window; no
+> delivery on an empty window; one materialized event per accumulated observation). The
+> accumulation batch is persisted in `monitor_state.notify_state` (`PendingRollupState`,
+> `libs/core/src/runtime/types.ts`) and hydrated with the §3 `effectiveUrgency` backfill on
+> restart. Proven by `libs/core/src/runtime/service.test.ts` ("rollup Pace mode": durable
+> accumulation across ticks without between-window delivery; window flush+clear; empty-window
+> no-delivery; restart-safety of the batch) and the `validate` tests named in
+> [001 §3.6](./001-monitor-definition.md).
 
 **Overview.** The `rollup` strategy accumulates all shaped observations produced between delivery
 windows and flushes them as a single composite delivery when the next window opens — for example, a
@@ -689,20 +699,20 @@ _permits_ relaxing the observation cadence without any delivery-quality loss. A 
 9am daily digest wastes resources polling every 30 seconds — the capability study (C44, §S5.2)
 explicitly names lower token and observation cost as a first-class motivation for the rollup mode.
 
-### 4.5 Complete Pace mode reference (_target_)
+### 4.5 Complete Pace mode reference (_current_)
 
-> **Status: target** (for the rollup row; the three existing rows reflect current behavior).
+> **Status: current** (all four rows reflect current behavior; the rollup row landed with G12).
 > This section collects all four Pace modes in one place so authors and implementers can compare
 > them. The modes are not hierarchical — each solves a different delivery-timing problem.
 
-| Mode                   | `notify` strategy | Trigger for delivery                           | Cost profile                                   | Primary use case                                                 |
-| ---------------------- | ----------------- | ---------------------------------------------- | ---------------------------------------------- | ---------------------------------------------------------------- |
-| **Immediate**          | _(omit notify)_   | Each observation emits immediately             | Highest (one delivery per observation)         | Low-latency streams; `high` urgency events after debounce window |
-| **Settle (debounce)**  | `debounce`        | First tick after the watched signal goes quiet | Moderate (burst absorbed into one delivery)    | Spec docs that are edited incrementally; noisy file changes      |
-| **Throttle**           | `throttle`        | First observation after the suppression window | Low (at most one delivery per suppress window) | High-volume sources where only the latest state matters          |
-| **Scheduled rollup** ⚑ | `rollup`          | Window opening (cron schedule)                 | Lowest (observation cadence can be relaxed)    | Chief-of-staff digests; end-of-day summaries                     |
+| Mode                  | `notify` strategy | Trigger for delivery                           | Cost profile                                   | Primary use case                                                 |
+| --------------------- | ----------------- | ---------------------------------------------- | ---------------------------------------------- | ---------------------------------------------------------------- |
+| **Immediate**         | _(omit notify)_   | Each observation emits immediately             | Highest (one delivery per observation)         | Low-latency streams; `high` urgency events after debounce window |
+| **Settle (debounce)** | `debounce`        | First tick after the watched signal goes quiet | Moderate (burst absorbed into one delivery)    | Spec docs that are edited incrementally; noisy file changes      |
+| **Throttle**          | `throttle`        | First observation after the suppression window | Low (at most one delivery per suppress window) | High-volume sources where only the latest state matters          |
+| **Scheduled rollup**  | `rollup`          | Window opening (cron schedule)                 | Lowest (observation cadence can be relaxed)    | Chief-of-staff digests; end-of-day summaries                     |
 
-> ⚑ _target_ — not yet implemented. See §4.4 and [001 §3.6](./001-monitor-definition.md).
+> Scheduled rollup landed with G12 — see §4.4 and [001 §3.6](./001-monitor-definition.md).
 
 **The Pace set is now complete.** The four modes cover the full range of "when should a shaped
 signal become a candidate for delivery" (§1.1.1): immediately on change, after the signal settles,

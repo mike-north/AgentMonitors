@@ -131,33 +131,22 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
 > `plugins/source-api-poll/src/index.test.ts`). See [spec-changelog.md](./spec-changelog.md). Did not
 > touch `runtime/service.ts` or `monitor-schema.ts` (the runtime already owned the diff).
 
-### G12 — Scheduled-rollup Pace mode (P2)
-
-- **Current:** `notify.strategy` accepts only `debounce` and `throttle`; a monitor authored with
-  `strategy: rollup` is rejected by `agentmonitors validate`. Observations cannot be accumulated and
-  delivered on a schedule; every observation is either emitted immediately (no `notify`) or held
-  until settle/throttle.
-- **Target:** the `rollup` strategy ([001 §3.6](./001-monitor-definition.md),
-  [002 §4.4–§4.5](./002-runtime-delivery.md)) is accepted by `agentmonitors validate` and
-  implemented by the runtime: incoming observations accumulate in durable `notifyState` between
-  window openings; the runtime evaluates the author's `window` cron on each tick; when the window
-  fires and the batch is non-empty, the batch is flushed into event materialization and the
-  accumulation state is cleared; an empty window produces no delivery. The observation cadence is
-  independent of the delivery schedule, and authors **SHOULD** relax `watch.interval` to match the
-  window frequency (lower token + observation cost; see capability C44, §S5.2).
-- **Governs:** PP5, PP7 ([000](./000-principles.md)), [001 §3.6](./001-monitor-definition.md),
-  [002 §4.4–§4.5](./002-runtime-delivery.md); capability study C44 /
-  [§S5.2](../product/monitoring-capability-exercises.md).
-- **Files:** `libs/core/src/schema/monitor-schema.ts` (schema acceptance), `libs/core/src/runtime/service.ts`
-  (`dispatchNotify()` rollup branch, window evaluation, accumulation state flush), `libs/core/src/runtime/types.ts`
-  (`PendingRollupState` shape), `libs/core/src/inbox/schema.ts` (persist accumulation batch in
-  `monitor_state.notify_state`).
-- **Proof:** (a) `agentmonitors validate` accepts a `rollup` monitor and rejects a monitor with
-  `strategy: rollup` but missing `window`; (b) a runtime test proves observations accumulate
-  durably across ticks without delivering between windows; (c) a runtime test proves the window
-  opening flushes the batch and clears accumulation state; (d) a runtime test proves an empty
-  window produces no delivery; (e) a runtime test proves the accumulation batch survives a daemon
-  restart (restart-safety, matching BP1).
+> G12 (Scheduled-rollup Pace mode) **shipped** — `notify.strategy: rollup` is now current. The
+> schema accepts a `rollup` monitor with a required five-field cron `window` (optional `timezone`,
+> default UTC) and rejects `strategy: rollup` missing `window` (`rollupNotifySchema`,
+> `libs/core/src/schema/monitor-schema.ts`). The runtime's `dispatchRollup()`
+> (`libs/core/src/runtime/service.ts`) accumulates every observation into a durable
+> `notifyState.pendingRollup` batch (`PendingRollupState`, `libs/core/src/runtime/types.ts`,
+> persisted in `monitor_state.notify_state`), evaluates the `window` cron each tick via
+> `cronMatchesDate`, and on a non-empty window flushes the whole batch (one `monitor_events` row
+> per accumulated observation) and clears accumulation; an empty window produces no delivery. The
+> batch survives a daemon restart and reuses the issue-#109 `effectiveUrgency` hydration backfill
+> (BP1). All five proof criteria are covered: schema accept/reject
+> (`libs/core/src/schema/monitor-schema.test.ts`) and `validate` accept/reject through the real CLI
+> (`apps/cli/src/commands/cli.integration.test.ts`); durable accumulation, window flush+clear,
+> empty-window no-delivery, and restart-safety (`libs/core/src/runtime/service.test.ts`, "rollup
+> Pace mode"). See [001 §3.6](./001-monitor-definition.md),
+> [002 §4.4–§4.5](./002-runtime-delivery.md), and [spec-changelog.md](./spec-changelog.md).
 
 > G13 (author-declared baseline strategy) **shipped** — the `baseline-strategy` frontmatter field is
 > now accepted by `agentmonitors validate` and enforced by the runtime Diff stage. `incremental`

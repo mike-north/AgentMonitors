@@ -1476,6 +1476,15 @@ export class AgentMonitorRuntime {
     const emitted: StoredObservationEnvelope[] = [];
     const nextState: NotifyRuntimeState = { ...state };
 
+    // Scheduled-rollup Pace mode (002 §4.4). A `rollup` monitor accumulates
+    // every observation in durable `notifyState.pendingRollup` and delivers
+    // nothing until the author's `window` cron fires (no per-change interrupts,
+    // §4.4 step 6). It never uses the debounce/throttle/immediate paths below,
+    // so it short-circuits the rest of dispatchNotify.
+    if (monitor.frontmatter.notify?.strategy === 'rollup') {
+      return this.dispatchRollup(monitor, observations, observedAt, nextState);
+    }
+
     if (nextState.pendingDebounce) {
       const dueAt = new Date(nextState.pendingDebounce.dueAt);
       if (dueAt.getTime() <= observedAt.getTime()) {
@@ -1544,6 +1553,13 @@ export class AgentMonitorRuntime {
         continue;
       }
 
+      // `rollup` monitors are dispatched entirely by `dispatchRollup` and never
+      // reach this loop, so the only remaining strategy here is `debounce`.
+      // This narrows the union (excluding `rollup`) so `settle-for` is typed.
+      if (notify.strategy !== 'debounce') {
+        continue;
+      }
+
       if (nextState.pendingDebounce) {
         nextState.pendingDebounce = {
           observations: [
@@ -1568,6 +1584,78 @@ export class AgentMonitorRuntime {
     }
 
     return { emitted, nextState };
+  }
+
+  /**
+   * Scheduled-rollup Pace mode dispatch (002 §4.4). On each tick:
+   *
+   * 1. **Accumulate** every new observation into the durable
+   *    `notifyState.pendingRollup` batch (no `dueAt` reset — the flush time is
+   *    schedule-driven, not settle-driven). Persisted across restarts (§4.4
+   *    step 1, BP1) because `notifyState` is serialized into
+   *    `monitor_state.notify_state`.
+   * 2. **Evaluate** the author's `window` cron against `observedAt` in the
+   *    configured `timezone` (default UTC). The window fires at most once per
+   *    minute is enforced by the tick cadence + the cron's minute field.
+   * 3. **Flush** the whole batch as the emitted set and clear accumulation iff
+   *    the window matches AND the batch is non-empty. An empty window produces
+   *    no delivery (§4.4 step 3 — no empty pings).
+   *
+   * Observations that arrive on the same tick the window fires are included in
+   * that window's delivery (they were produced at-or-before this opening).
+   * Each accumulated observation becomes its own `monitor_events` row downstream
+   * (§4.4 step 4), so the full event history is queryable.
+   */
+  private dispatchRollup(
+    monitor: MonitorDefinition,
+    observations: Observation[],
+    observedAt: Date,
+    nextState: NotifyRuntimeState,
+  ): NotifyDispatchResult {
+    const notify = monitor.frontmatter.notify;
+    // Defensive: this method is only reached for rollup monitors, but narrow
+    // the discriminated union so `window`/`timezone` are accessible.
+    if (notify?.strategy !== 'rollup') {
+      return { emitted: [], nextState };
+    }
+
+    // 1. Accumulate. Hydrate any restart-persisted envelopes (backfilling
+    // `effectiveUrgency` per 002 §3 / issue #109) so a batch that survived a
+    // daemon restart materializes with a valid urgency, then append this tick's
+    // new observations.
+    const accumulated: StoredObservationEnvelope[] = [
+      ...(nextState.pendingRollup?.observations ?? []).map(
+        hydrateStoredObservationEnvelope,
+      ),
+      ...observations.map((observation) =>
+        serializeObservation(monitor, observation, observedAt),
+      ),
+    ];
+
+    // 2. Evaluate the delivery window.
+    const windowFires = cronMatchesDate(
+      notify.window,
+      observedAt,
+      notify.timezone ?? 'UTC',
+    );
+
+    // 3. Flush iff the window fires AND the batch is non-empty; an empty window
+    // produces no delivery (§4.4 step 3).
+    if (windowFires && accumulated.length > 0) {
+      delete nextState.pendingRollup;
+      return { emitted: accumulated, nextState };
+    }
+
+    // Otherwise keep accumulating silently — no per-change interrupts (§4.4
+    // step 6). Persist the batch (durable accumulation, §4.4 step 1) only when
+    // there is something to hold; an empty window with nothing accumulated
+    // leaves `pendingRollup` absent.
+    if (accumulated.length > 0) {
+      nextState.pendingRollup = { observations: accumulated };
+    } else {
+      delete nextState.pendingRollup;
+    }
+    return { emitted: [], nextState };
   }
 
   private processObservation(input: ProcessObservationInput) {

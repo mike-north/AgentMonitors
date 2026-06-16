@@ -631,6 +631,59 @@ describe('validate', () => {
     expect(result.stdout.toLowerCase()).toContain('baseline-strategy');
   });
 
+  // G12 / 001 §3.6, 002 §4.4: a scheduled-rollup monitor (`strategy: rollup`
+  // with a `window` cron) is accepted by `validate`. Proof criterion (a),
+  // exercised end-to-end through the real CLI.
+  it('accepts a rollup notify monitor with a window cron', () => {
+    const dir = path.join(tempDir, 'validate-rollup-accept-test');
+    const monitorDir = path.join(dir, 'monitors', 'daily-digest');
+    mkdirSync(monitorDir, { recursive: true });
+    const body = [
+      '---',
+      'name: Daily digest',
+      'watch:',
+      '  type: file-fingerprint',
+      '  globs: ["*.ts"]',
+      'notify:',
+      '  strategy: rollup',
+      "  window: '0 9 * * 1-5'",
+      'urgency: low',
+      '---',
+      'Handle it.',
+      '',
+    ].join('\n');
+    writeFileSync(path.join(monitorDir, 'MONITOR.md'), body, 'utf-8');
+
+    const result = run(['validate', path.join(dir, 'monitors')]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('Valid monitors: 1');
+  });
+
+  // G12 / 001 §3.6: `strategy: rollup` WITHOUT the required `window` is rejected.
+  // Proof criterion (a), rejection half.
+  it('rejects a rollup notify monitor missing the required window', () => {
+    const dir = path.join(tempDir, 'validate-rollup-reject-test');
+    const monitorDir = path.join(dir, 'monitors', 'bad-rollup');
+    mkdirSync(monitorDir, { recursive: true });
+    const body = [
+      '---',
+      'name: Bad rollup',
+      'watch:',
+      '  type: file-fingerprint',
+      '  globs: ["*.ts"]',
+      'notify:',
+      '  strategy: rollup',
+      'urgency: low',
+      '---',
+      'Handle it.',
+      '',
+    ].join('\n');
+    writeFileSync(path.join(monitorDir, 'MONITOR.md'), body, 'utf-8');
+
+    const result = run(['validate', path.join(dir, 'monitors')]);
+    expect(result.exitCode).toBe(1);
+  });
+
   // Issue #153 item 3: the inverted-range error must not repeat "urgency" twice.
   // Before the fix: `urgency: urgency range "high..normal" is inverted …`
   // After: `urgency: range "high..normal" is inverted …`

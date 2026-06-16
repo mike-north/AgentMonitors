@@ -104,6 +104,7 @@ export type {
   ObservationOutcome,
   OpenSessionInput,
   PendingDebounceState,
+  PendingRollupState,
   RuntimeStatus,
   RuntimeTickResult,
   SessionEventFilter,
