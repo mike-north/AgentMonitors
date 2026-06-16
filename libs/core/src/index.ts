@@ -142,6 +142,7 @@ export type {
   RuntimeStatus,
   RuntimeTickResult,
   SessionEventFilter,
+  SessionObjectCursorRecord,
   SessionUnreadCounts,
   SessionHookState,
   SkippedMonitor,

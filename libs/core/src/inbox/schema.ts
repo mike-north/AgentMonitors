@@ -104,6 +104,13 @@ export const sessionEventState = sqliteTable('session_event_state', {
   acknowledgedAt: integer('acknowledged_at', { mode: 'timestamp' }),
   lastClaimAt: integer('last_claim_at', { mode: 'timestamp' }),
   lastClaimLifecycle: text('last_claim_lifecycle'),
+  // The PER-RECIPIENT delta (G10, 002 §1.1.2): the diff of this event's shaped
+  // artifact against THIS session's own baseline cursor at projection time.
+  // Right of the Pace→Diff seam, so two sessions at divergent baselines record
+  // different spans from the SAME shared `monitor_events` row. `NULL` for a
+  // baseline event (no prior to diff) and for legacy rows materialized before
+  // G10 — delivery/explain fall back to the shared `monitor_events.diff_text`.
+  diffText: text('diff_text'),
   // Per-recipient Interpret verdict (G14, 002 §1.1.8); absent for the deterministic
   // forms that never invoke Interpret. `interpret_reason` is the agentic-gate
   // suppression reason or the fallback-failure detail; `interpret_digest` is the
@@ -123,6 +130,37 @@ export const monitorState = sqliteTable('monitor_state', {
   lastFingerprint: text('last_fingerprint'),
   sourceState: text('source_state').notNull().default('{}'),
   notifyState: text('notify_state').notNull().default('{}'),
+  updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
+});
+
+/**
+ * The PER-RECIPIENT baseline cursor (G10, 002 §1.1.2). One row per
+ * `(session_id, monitor_id, object_key, workspace_path)`: the last shaped
+ * artifact this recipient was caught up to, the anchor its per-recipient Diff
+ * spans FROM. Lives in the same durable SQLite DB so cursors survive a daemon
+ * restart/reboot (002 §3, BP1); session-keyed so isolation is structural (one
+ * session advancing its cursor never moves another's).
+ *
+ * `baseline_content` is DENORMALIZED (the full artifact text, not just a
+ * snapshot id) so a recipient's baseline is prune-immune: pruning
+ * `monitor_snapshots` history can never strand a cursor without a baseline to
+ * diff against. `baseline_snapshot_id` records which event/snapshot the baseline
+ * came from for diagnosis.
+ *
+ * Seed/advance rules (decided): materialization SEEDS a cursor only when none
+ * exists (new recipient = caught up to the pre-event state); it never advances
+ * an existing one. `markClaimed` advances the cursor to the artifact of the
+ * newest event the recipient just claimed for that object. Cursors persist
+ * across dormancy — a resuming session keeps its cursors.
+ */
+export const sessionObjectCursor = sqliteTable('session_object_cursor', {
+  id: text('id').primaryKey(),
+  sessionId: text('session_id').notNull(),
+  monitorId: text('monitor_id').notNull(),
+  objectKey: text('object_key').notNull(),
+  workspacePath: text('workspace_path'),
+  baselineSnapshotId: text('baseline_snapshot_id'),
+  baselineContent: text('baseline_content').notNull().default(''),
   updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
 });
 

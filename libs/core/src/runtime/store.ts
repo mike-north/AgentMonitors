@@ -20,6 +20,7 @@ import {
   monitorState,
   observationHistory,
   sessionEventState,
+  sessionObjectCursor,
 } from '../inbox/schema.js';
 import type {
   AgentSessionRecord,
@@ -34,7 +35,9 @@ import type {
   OpenSessionInput,
   RuntimeStatus,
   SessionHookState,
+  SessionObjectCursorRecord,
 } from './types.js';
+import { buildTextDiff } from './diff.js';
 
 type InternalInboxDb = BetterSQLite3Database<
   typeof import('../inbox/schema.js')
@@ -295,7 +298,30 @@ export class RuntimeStore {
     db.insert(monitorState).values(values).run();
   }
 
-  insertEvent(input: Omit<MonitorEventRecord, 'id'>): MonitorEventRecord {
+  /**
+   * Materialize ONE shared `monitor_events` row and project it into matching
+   * lead sessions (002 §6), computing a PER-RECIPIENT delta for each (G10,
+   * 002 §1.1.2) — the shared artifact diffed against THAT session's own baseline
+   * cursor, recorded on `session_event_state.diff_text`.
+   *
+   * The per-recipient diff lives here (not after an Interpret await) so all
+   * durable writes complete synchronously BEFORE the critical-path boundary,
+   * preserving the `ingest()` ordering invariant (002 §1.1.8).
+   *
+   * @param input - The shared event row. `input.diffText` is the shared
+   *   object-level diff (against the latest stored snapshot) used for
+   *   `events list`/history display.
+   * @param baseline - The object's snapshot state immediately BEFORE this event
+   *   (`previousContent`, or `null`/absent at a baseline event). Used to SEED a
+   *   first-time recipient's cursor so a session registered after an earlier
+   *   change hears only changes AFTER it registered, not a full-current-state
+   *   first delta (decided semantics Q1). When omitted, no per-recipient diff is
+   *   computed (snapshot-less event).
+   */
+  insertEvent(
+    input: Omit<MonitorEventRecord, 'id'>,
+    baseline?: { previousContent: string | null },
+  ): MonitorEventRecord {
     const db = asInternalDb(this.db);
     const id = ulid();
     db.insert(monitorEvents)
@@ -320,15 +346,58 @@ export class RuntimeStore {
       .run();
 
     const event = this.getEventById(id);
+    const artifact = event.snapshotText;
+    const objectKey = event.objectKey;
     const projectedSessionIds: string[] = [];
     for (const session of this.sessionsForWorkspace(event.workspacePath).filter(
       (candidate) => candidate.role === 'lead',
     )) {
+      // ── Per-recipient Diff (G10, 002 §1.1.2) ──────────────────────────────
+      // Compute this session's delta against ITS OWN baseline cursor, and seed
+      // the cursor on first projection. Only meaningful for snapshot-bearing
+      // events keyed by an objectKey; snapshot-less events leave diff_text NULL.
+      let perRecipientDiff: string | null = null;
+      if (artifact !== null && objectKey !== null) {
+        const cursor = this.getSessionObjectCursor(
+          session.id,
+          event.monitorId,
+          objectKey,
+          event.workspacePath,
+        );
+        if (cursor) {
+          // Existing recipient: span from its own cursor. Never advanced here —
+          // materialization SEEDS only; the cursor advances at claim
+          // (markClaimed), so a recipient that stayed away keeps spanning from
+          // its last-seen point across multiple shared observations.
+          perRecipientDiff = buildTextDiff(cursor.baselineContent, artifact);
+        } else {
+          // First projection of this object to this session = "caught up to the
+          // pre-event state": its delta is the shared diff (prior → artifact),
+          // identical to today's single-baseline behavior (backward-compat).
+          const previous = baseline?.previousContent ?? null;
+          perRecipientDiff =
+            previous !== null ? buildTextDiff(previous, artifact) : null;
+          // Seed the cursor to the state the recipient is now caught up to: the
+          // prior snapshot for a non-baseline event (so the NEXT event spans
+          // prior → next), or this event's own artifact at a baseline event
+          // (nothing precedes it). Advanced only at claim thereafter.
+          this.seedSessionObjectCursor({
+            sessionId: session.id,
+            monitorId: event.monitorId,
+            objectKey,
+            workspacePath: event.workspacePath,
+            baselineSnapshotId: event.id,
+            baselineContent: previous ?? artifact,
+          });
+        }
+      }
+
       db.insert(sessionEventState)
         .values({
           id: ulid(),
           sessionId: session.id,
           eventId: event.id,
+          diffText: perRecipientDiff,
           createdAt: event.createdAt,
           updatedAt: event.createdAt,
         })
@@ -413,6 +482,38 @@ export class RuntimeStore {
     const result = new Map<string, string>();
     for (const row of rows) {
       if (row.interpretDigest) result.set(row.eventId, row.interpretDigest);
+    }
+    return result;
+  }
+
+  /**
+   * Return the PER-RECIPIENT delta for a set of events for one session (G10,
+   * 002 §1.1.2): the diff this session computed against its OWN baseline cursor,
+   * recorded on `session_event_state.diff_text`. Only events with a
+   * non-NULL per-recipient `diff_text` are included; callers fall back to the
+   * shared `MonitorEventRecord.diffText` for legacy (pre-G10, NULL) rows.
+   */
+  perRecipientDiffsForSession(
+    sessionId: string,
+    eventIds: string[],
+  ): Map<string, string> {
+    if (eventIds.length === 0) return new Map();
+    const rows = asInternalDb(this.db)
+      .select({
+        eventId: sessionEventState.eventId,
+        diffText: sessionEventState.diffText,
+      })
+      .from(sessionEventState)
+      .where(
+        and(
+          eq(sessionEventState.sessionId, sessionId),
+          inArray(sessionEventState.eventId, eventIds),
+        ),
+      )
+      .all();
+    const result = new Map<string, string>();
+    for (const row of rows) {
+      if (row.diffText !== null) result.set(row.eventId, row.diffText);
     }
     return result;
   }
@@ -542,6 +643,136 @@ export class RuntimeStore {
     return row ? { content: row.content } : null;
   }
 
+  /**
+   * The per-recipient baseline cursor (G10, 002 §1.1.2) for one
+   * `(sessionId, monitorId, objectKey, workspacePath)`, or `null` if this
+   * recipient has never had this object projected. NULL `workspacePath` (global)
+   * is matched with `IS NULL` so a global cursor is read back exactly.
+   */
+  getSessionObjectCursor(
+    sessionId: string,
+    monitorId: string,
+    objectKey: string,
+    workspacePath?: string | null,
+  ): SessionObjectCursorRecord | null {
+    const row = asInternalDb(this.db)
+      .select()
+      .from(sessionObjectCursor)
+      .where(
+        and(
+          eq(sessionObjectCursor.sessionId, sessionId),
+          eq(sessionObjectCursor.monitorId, monitorId),
+          eq(sessionObjectCursor.objectKey, objectKey),
+          workspacePath == null
+            ? isNull(sessionObjectCursor.workspacePath)
+            : eq(sessionObjectCursor.workspacePath, workspacePath),
+        ),
+      )
+      .get();
+    if (!row) return null;
+    return {
+      sessionId: row.sessionId,
+      monitorId: row.monitorId,
+      objectKey: row.objectKey,
+      workspacePath: row.workspacePath ?? null,
+      baselineSnapshotId: row.baselineSnapshotId ?? null,
+      baselineContent: row.baselineContent,
+      updatedAt: row.updatedAt,
+    };
+  }
+
+  /**
+   * SEED a per-recipient cursor (G10, 002 §1.1.2). Insert-only: if a cursor for
+   * the key already exists it is left untouched — materialization seeds a cursor
+   * only on a recipient's first projection of an object; it never advances an
+   * existing one (that is {@link advanceSessionObjectCursor}, called at claim).
+   */
+  seedSessionObjectCursor(input: {
+    sessionId: string;
+    monitorId: string;
+    objectKey: string;
+    workspacePath: string | null;
+    baselineSnapshotId: string | null;
+    baselineContent: string;
+  }): void {
+    const existing = this.getSessionObjectCursor(
+      input.sessionId,
+      input.monitorId,
+      input.objectKey,
+      input.workspacePath,
+    );
+    if (existing) return;
+    asInternalDb(this.db)
+      .insert(sessionObjectCursor)
+      .values({
+        id: ulid(),
+        sessionId: input.sessionId,
+        monitorId: input.monitorId,
+        objectKey: input.objectKey,
+        workspacePath: input.workspacePath,
+        baselineSnapshotId: input.baselineSnapshotId,
+        baselineContent: input.baselineContent,
+        updatedAt: new Date(),
+      })
+      .run();
+  }
+
+  /**
+   * ADVANCE a per-recipient cursor (G10, 002 §1.1.2) to a freshly-seen artifact
+   * — the recipient was just shown this state, so its NEXT diff should span FROM
+   * here. Called from {@link markClaimed}. Upserts so an advance can also create
+   * the cursor if a legacy claim path never seeded one.
+   */
+  advanceSessionObjectCursor(input: {
+    sessionId: string;
+    monitorId: string;
+    objectKey: string;
+    workspacePath: string | null;
+    baselineSnapshotId: string | null;
+    baselineContent: string;
+  }): void {
+    const db = asInternalDb(this.db);
+    const existing = this.getSessionObjectCursor(
+      input.sessionId,
+      input.monitorId,
+      input.objectKey,
+      input.workspacePath,
+    );
+    const now = new Date();
+    if (existing) {
+      db.update(sessionObjectCursor)
+        .set({
+          baselineSnapshotId: input.baselineSnapshotId,
+          baselineContent: input.baselineContent,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(sessionObjectCursor.sessionId, input.sessionId),
+            eq(sessionObjectCursor.monitorId, input.monitorId),
+            eq(sessionObjectCursor.objectKey, input.objectKey),
+            input.workspacePath == null
+              ? isNull(sessionObjectCursor.workspacePath)
+              : eq(sessionObjectCursor.workspacePath, input.workspacePath),
+          ),
+        )
+        .run();
+      return;
+    }
+    db.insert(sessionObjectCursor)
+      .values({
+        id: ulid(),
+        sessionId: input.sessionId,
+        monitorId: input.monitorId,
+        objectKey: input.objectKey,
+        workspacePath: input.workspacePath,
+        baselineSnapshotId: input.baselineSnapshotId,
+        baselineContent: input.baselineContent,
+        updatedAt: now,
+      })
+      .run();
+  }
+
   recordObservationHistory(input: {
     monitorId: string;
     sourceName: string;
@@ -645,6 +876,13 @@ export class RuntimeStore {
       ...(state.interpretDigest
         ? { interpretDigest: state.interpretDigest }
         : {}),
+      // Per-recipient delta (G10, 002 §1.1.2): the diff this recipient computed
+      // against its own cursor. Fall back to the shared event-level diff for
+      // legacy (pre-G10) rows where the per-recipient column is NULL.
+      ...(() => {
+        const diff = state.diffText ?? event.diffText;
+        return diff !== null ? { diffText: diff } : {};
+      })(),
     }));
   }
 
@@ -748,6 +986,66 @@ export class RuntimeStore {
         ),
       )
       .run();
+
+    // Advance this recipient's per-object baseline cursor (G10, 002 §1.1.2): the
+    // cursor means "the last artifact this recipient was actually shown", so a
+    // claim moves it to the artifact of the NEWEST claimed event for each object.
+    // Only snapshot-bearing events carry an artifact to advance to.
+    this.advanceCursorsForClaimedEvents(sessionId, eventIds);
+  }
+
+  /**
+   * For a set of just-claimed events, advance the recipient's per-object cursor
+   * to the artifact of the NEWEST (latest `createdAt`, then ULID-ordered) claimed
+   * event of each `(monitorId, objectKey, workspacePath)`. Events without a
+   * snapshot artifact are skipped (nothing to span from). (G10, 002 §1.1.2.)
+   */
+  private advanceCursorsForClaimedEvents(
+    sessionId: string,
+    eventIds: string[],
+  ): void {
+    const rows = asInternalDb(this.db)
+      .select()
+      .from(monitorEvents)
+      .where(inArray(monitorEvents.id, eventIds))
+      .orderBy(asc(monitorEvents.createdAt), asc(monitorEvents.id))
+      .all();
+
+    // Iterating in ascending order and overwriting leaves the NEWEST claimed
+    // event per object as the survivor.
+    const newestByObject = new Map<
+      string,
+      {
+        monitorId: string;
+        objectKey: string;
+        workspacePath: string | null;
+        eventId: string;
+        artifact: string;
+      }
+    >();
+    for (const row of rows) {
+      if (row.snapshotText === null || row.objectKey === null) continue;
+      const workspacePath = row.workspacePath ?? null;
+      const key = [row.monitorId, row.objectKey, workspacePath ?? ''].join(' ');
+      newestByObject.set(key, {
+        monitorId: row.monitorId,
+        objectKey: row.objectKey,
+        workspacePath,
+        eventId: row.id,
+        artifact: row.snapshotText,
+      });
+    }
+
+    for (const target of newestByObject.values()) {
+      this.advanceSessionObjectCursor({
+        sessionId,
+        monitorId: target.monitorId,
+        objectKey: target.objectKey,
+        workspacePath: target.workspacePath,
+        baselineSnapshotId: target.eventId,
+        baselineContent: target.artifact,
+      });
+    }
   }
 
   updateSessionRecap(sessionId: string): void {

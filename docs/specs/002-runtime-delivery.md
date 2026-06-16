@@ -61,6 +61,28 @@ Observe → [Compose] → Shape → Pace → ⟦per-recipient seam⟧ → Diff �
 
 ### 1.1.2 The shared / per-recipient seam
 
+> **Status: current (G10 PR-A) for the per-recipient Diff substrate.** The structural seam below — a
+> single shared `monitor_events` artifact materialized once, then diffed **per recipient against each
+> recipient's own baseline cursor** — is now built. Two lead sessions at divergent stored baselines
+> each receive an independently-spanned Diff from one shared observation. The named-but-not-yet-wired
+> remainder (rewiring the `net` collapse, [§1.1.7](#117-baseline-strategy-per-recipient-diff-semantics-current),
+> and Interpret, [§1.1.8](#118-interpret-a-cheap-agentic-digest-via-the-users-own-ai-tool), to span
+> _per recipient_ rather than over the shared baseline) is tracked under roadmap **G10 PR-B**; those
+> stages keep working unchanged on top of this substrate because co-registered recipients seed
+> identical cursors.
+>
+> Verified: the per-recipient baseline cursor `session_object_cursor`
+> (`libs/core/src/inbox/schema.ts`, denormalized `baseline_content` for prune-immunity) and the
+> per-recipient delta `session_event_state.diff_text`. `RuntimeStore.insertEvent`
+> (`libs/core/src/runtime/store.ts`) materializes ONE shared event, then for each projected lead
+> session diffs the shaped artifact against that session's own cursor (seeding a first-time recipient
+> to the pre-event state so a late joiner hears only changes after it registered); `markClaimed`
+> advances a recipient's cursor to the artifact it was just shown. Durable writes stay before any
+> Interpret await (the `ingest()` ordering invariant). Proven by
+> `libs/core/src/runtime/per-recipient-diff.test.ts` (divergent-baseline fan-out, cursor
+> restart-safety, session isolation, single-session backward-compat + legacy-NULL fallback,
+> new-session seed).
+
 The single most important structural fact in this model is the **seam** between Pace and Diff:
 
 - **Everything LEFT of the seam (Observe … Pace) is computed ONCE and SHARED** across all recipient
@@ -78,13 +100,16 @@ runs once; only the genuinely per-baseline work multiplies. It is the structural
 monitor can serve a whole fleet without recomputing its observation per session
 ([capability study §S1](../product/monitoring-capability-exercises.md), ledger row C15).
 
-> **Relationship to current behavior.** Today the runtime computes a textual diff **once per object**
-> against the latest stored snapshot for `(workspacePath, monitorId, objectKey)` (§5.2, SP5) and then
-> projects the materialized event into each matching session (§6). That is the seam with a single
-> shared baseline — the degenerate, correct case of the per-recipient Diff above. Moving the baseline
-> to be **per recipient** (so a session away for an hour and a session away for a day each hear the
-> right span) is the _target_ change this model names; it is an efficiency-and-correctness refinement
-> over the current shared-baseline diff, not a contradiction of it.
+> **Relationship to current behavior.** The runtime still computes a shared object-level diff once
+> per object against the latest stored snapshot for `(workspacePath, monitorId, objectKey)` (§5.2,
+> SP5) — that shared diff is retained on `monitor_events.diff_text` for `events list`/history display.
+> On top of it (G10 PR-A), the materialized event is projected into each matching session (§6) and a
+> **per-recipient** delta is computed against each session's own cursor, recorded on
+> `session_event_state.diff_text`. A single session at the shared baseline (or sessions co-registered
+> at the same point) reproduces the shared diff byte-for-byte — the degenerate case — while a session
+> away for an hour and a session away for a day each hear the right span. This is an
+> efficiency-and-correctness refinement over the prior single-shared-baseline diff, not a
+> contradiction of it.
 
 ### 1.1.3 Three independent clocks
 
@@ -797,11 +822,13 @@ Verified: `libs/core/src/runtime/service.ts` — `processObservation()` lines 56
 
 This makes snapshot history an object-level concern rather than a monitor-level or session-level concern (SP5).
 
-> **Pipeline model (target).** In the stage vocabulary of [§1.1](#11-post-processing-pipeline-model),
-> this is the **Diff** stage with a single **shared** baseline (the latest stored object snapshot).
-> The _target_ Diff is computed **per recipient against that recipient's baseline/cursor**, right of
-> the shared/per-recipient seam ([§1.1.2](#112-the-shared--per-recipient-seam)); the current
-> object-level diff is its degenerate shared-baseline case.
+> **Pipeline model.** In the stage vocabulary of [§1.1](#11-post-processing-pipeline-model), the diff
+> described here is the **shared object-level** diff against the latest stored object snapshot,
+> retained on `monitor_events.diff_text` for `events list`/history. As of G10 PR-A the **delivered**
+> Diff is computed **per recipient against that recipient's own baseline cursor**, right of the
+> shared/per-recipient seam ([§1.1.2](#112-the-shared--per-recipient-seam)), and recorded on
+> `session_event_state.diff_text`; the shared object-level diff here is its degenerate
+> single-baseline case (a recipient at the shared baseline gets a byte-identical span).
 
 ## 6. Session Projection
 
@@ -809,7 +836,9 @@ Persisted events are not directly tied to one session. They are projected into m
 
 Current projection rules: an event in workspace `W` projects into lead sessions whose `workspacePath` matches `W` **and** into lead sessions whose `workspacePath` is `null`, representing global visibility. Subagent sessions are tracked but do not receive automatic event projection.
 
-Verified: `libs/core/src/runtime/store.ts` — `insertEvent()` lines 285–298: filters `sessionsForWorkspace(event.workspacePath)` with `.filter(candidate => candidate.role === 'lead')`. `sessionsForWorkspace()` (lines 418–433) returns sessions matching the workspace path **or** sessions with a `null` workspace path.
+As of G10 PR-A, the projection step also computes each recipient's **per-recipient delta** — the shared event's shaped artifact diffed against that session's own baseline cursor (`session_object_cursor`, [§1.1.2](#112-the-shared--per-recipient-seam)) — and records it on `session_event_state.diff_text`. A session's first projection of an object seeds its cursor to the pre-event state (so a late joiner hears only changes after it registered); `markClaimed` advances the cursor to the artifact the recipient was shown. Legacy rows (materialized before G10) carry a `NULL` `session_event_state.diff_text` and fall back to the shared `monitor_events.diff_text`.
+
+Verified: `libs/core/src/runtime/store.ts` — `insertEvent()` filters `sessionsForWorkspace(event.workspacePath)` with `.filter(candidate => candidate.role === 'lead')` and computes/records the per-recipient `diff_text` in the same projection loop (durable before any Interpret await). `sessionsForWorkspace()` returns sessions matching the workspace path **or** sessions with a `null` workspace path. Proven by `libs/core/src/runtime/per-recipient-diff.test.ts`.
 
 ### 6.1 Session identity
 
@@ -1169,17 +1198,38 @@ The draft omitted this table. It is required for snapshot diff computation (§5.
 
 Per-session delivery tracking for each projected event. Drives the unread/claimed/acknowledged state machine (§7).
 
-| Column                 | Type             | Notes                                             |
-| ---------------------- | ---------------- | ------------------------------------------------- |
-| `id`                   | TEXT PK          | ULID                                              |
-| `session_id`           | TEXT NOT NULL    | FK to `agent_sessions.id`                         |
-| `event_id`             | TEXT NOT NULL    | FK to `monitor_events.id`                         |
-| `first_notified_at`    | INTEGER nullable | Set when event is first claimed; `NULL` = pending |
-| `acknowledged_at`      | INTEGER nullable | Set by explicit ack; `NULL` = unread              |
-| `last_claim_at`        | INTEGER nullable | Time of most recent claim                         |
-| `last_claim_lifecycle` | TEXT nullable    | Lifecycle at most recent claim                    |
-| `created_at`           | INTEGER NOT NULL |                                                   |
-| `updated_at`           | INTEGER NOT NULL |                                                   |
+| Column                 | Type             | Notes                                                                       |
+| ---------------------- | ---------------- | --------------------------------------------------------------------------- |
+| `id`                   | TEXT PK          | ULID                                                                        |
+| `session_id`           | TEXT NOT NULL    | FK to `agent_sessions.id`                                                   |
+| `event_id`             | TEXT NOT NULL    | FK to `monitor_events.id`                                                   |
+| `first_notified_at`    | INTEGER nullable | Set when event is first claimed; `NULL` = pending                           |
+| `acknowledged_at`      | INTEGER nullable | Set by explicit ack; `NULL` = unread                                        |
+| `last_claim_at`        | INTEGER nullable | Time of most recent claim                                                   |
+| `last_claim_lifecycle` | TEXT nullable    | Lifecycle at most recent claim                                              |
+| `diff_text`            | TEXT nullable    | Per-recipient delta (G10); `NULL` ⇒ fall back to `monitor_events.diff_text` |
+| `interpret_decision`   | TEXT nullable    | Per-recipient Interpret verdict (G14); `NULL` for non-`prose`               |
+| `interpret_reason`     | TEXT nullable    | Interpret suppression/failure detail (G14)                                  |
+| `interpret_digest`     | TEXT nullable    | Delivered cheap digest when verdict is `deliver` (G14)                      |
+| `created_at`           | INTEGER NOT NULL |                                                                             |
+| `updated_at`           | INTEGER NOT NULL |                                                                             |
+
+### `session_object_cursor`
+
+The per-recipient baseline cursor (G10, [§1.1.2](#112-the-shared--per-recipient-seam)). One row per `(session_id, monitor_id, object_key, workspace_path)`: the last shaped artifact this recipient was caught up to, the anchor its per-recipient Diff spans FROM. Unique on the four key columns (`COALESCE(workspace_path, '')` collapses the global/`NULL` case). `baseline_content` is denormalized (the full artifact text) so a recipient's baseline is prune-immune. Survives daemon restart (BP1); session-keyed so isolation is structural.
+
+| Column                 | Type             | Notes                                                 |
+| ---------------------- | ---------------- | ----------------------------------------------------- |
+| `id`                   | TEXT PK          | ULID                                                  |
+| `session_id`           | TEXT NOT NULL    | FK to `agent_sessions.id`                             |
+| `monitor_id`           | TEXT NOT NULL    |                                                       |
+| `object_key`           | TEXT NOT NULL    |                                                       |
+| `workspace_path`       | TEXT nullable    | `NULL` = global                                       |
+| `baseline_snapshot_id` | TEXT nullable    | The event/snapshot the baseline came from (diagnosis) |
+| `baseline_content`     | TEXT NOT NULL    | Denormalized full artifact (defaults to `''`)         |
+| `updated_at`           | INTEGER NOT NULL | Set on seed and on each claim-advance                 |
+
+Verified: `libs/core/src/inbox/schema.ts` (`sessionObjectCursor`), `libs/core/src/inbox/db.ts` (DDL + unique index + additive `diff_text` migration), `libs/core/src/runtime/store.ts` (`getSessionObjectCursor` / `seedSessionObjectCursor` / `advanceSessionObjectCursor`).
 
 ### `agent_sessions`
 

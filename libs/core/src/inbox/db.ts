@@ -186,5 +186,36 @@ export function createDb(dbPath: string): InboxDb {
   addColumnIfMissing(sqlite, 'session_event_state', 'interpret_reason', 'TEXT');
   addColumnIfMissing(sqlite, 'session_event_state', 'interpret_digest', 'TEXT');
 
+  // Per-recipient baseline cursor + per-recipient delta (G10, 002 §1.1.2).
+  db.run(sql`
+    CREATE TABLE IF NOT EXISTS session_object_cursor (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      monitor_id TEXT NOT NULL,
+      object_key TEXT NOT NULL,
+      workspace_path TEXT,
+      baseline_snapshot_id TEXT,
+      baseline_content TEXT NOT NULL DEFAULT '',
+      updated_at INTEGER NOT NULL
+    )
+  `);
+
+  // Unique on the cursor key. SQLite treats NULLs as DISTINCT in a UNIQUE index,
+  // which would let duplicate cursors accumulate for global (NULL-workspace)
+  // sessions; `COALESCE(workspace_path, '')` collapses the NULL case so a global
+  // recipient gets exactly one cursor per (session, monitor, object).
+  db.run(sql`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_session_object_cursor_key
+      ON session_object_cursor (
+        session_id, monitor_id, object_key, COALESCE(workspace_path, '')
+      )
+  `);
+
+  // Additive migration (G10, 002 §1.1.2): a `session_event_state` table created
+  // before G10 lacks the per-recipient `diff_text` column. Add it if missing so
+  // pre-existing durable DBs stay forward-compatible; legacy rows keep a NULL
+  // here and delivery/explain fall back to the shared `monitor_events.diff_text`.
+  addColumnIfMissing(sqlite, 'session_event_state', 'diff_text', 'TEXT');
+
   return db as unknown as InboxDb;
 }
