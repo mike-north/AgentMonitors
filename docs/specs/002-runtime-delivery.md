@@ -356,6 +356,121 @@ this degenerate case (no intermediate steps to collapse).
 > receives the standard single-step delta — `incremental` and `net` are behaviorally equivalent
 > when the catch-up span contains exactly one observation.
 
+### 1.1.8 Interpret: a cheap agentic digest via the user's own AI tool
+
+> **Status: target.** Every rule in this section is **target**, not current behavior. It details the
+> **Interpret** stage of [§1.1.1](#111-the-locked-stage-order): the optional, cheap, agentic reading
+> of the **per-recipient delta** that runs **after** the per-recipient Diff and before Deliver, on the
+> **per-recipient** (right) side of the seam ([§1.1.2](#112-the-shared--per-recipient-seam)). It is
+> invoked **only** when the author declares `payload.form: prose`
+> ([001 §5.2](./001-monitor-definition.md#52-payload-form-target),
+> [§1.1.6](#116-author-declared-payload-form)); the other three forms skip it. Formalizes a resolved
+> decision from the monitoring capability study
+> ([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
+> §S4, resolved §S5 item 3; ledger rows **C45/C10/C11/C38/C12**, with E5 as the flagship — the first
+> scenario where this stage _is_ the product, not a layer above the deterministic floor). It does
+> **not** contradict any _current_ rule: today every monitor delivers its textual diff with no agentic
+> reading, so Interpret being absent is the degenerate (and default) case, and the runtime's existing
+> deterministic `structured`-`cel` gate ([§1.1.6](#116-author-declared-payload-form)) is the
+> _deterministic_ sibling of the _agentic_ gate below — they are distinct stages, not competitors.
+
+The runtime **MAY**, for a `prose`-form monitor, run an **optional Interpret stage** that produces a
+**cheap, natural-language digest** of the per-recipient delta — and, optionally, applies an **agentic
+significance gate** that suppresses delivery when the change is not substantive (capabilities
+C10/C11/C38). Interpret is the one stage that invokes an AI model; everything left of it is
+deterministic.
+
+**Rules for the Interpret stage:**
+
+- **Optional, and never on the critical path.** A monitor that does not declare `payload.form: prose`
+  gets no Interpret stage; the deterministic-floor forms (`structured` / `artifact` / `rendered`,
+  [§1.1.6](#116-author-declared-payload-form)) deliver without it. Even for a `prose` monitor,
+  Interpret is best-effort: an Interpret failure (the tool is missing, errors, or times out) **MUST
+  NOT** drop the underlying delta — the runtime falls back to delivering the deterministic
+  `rendered` artifact of §1.1.5 (degrading to today's behavior) and records the Interpret failure as
+  explainable (below). Delivery correctness never depends on a model call succeeding (PP4, AP3).
+
+- **Runs after Diff, on the per-recipient delta.** Interpret consumes the output of the per-recipient
+  Diff ([§1.1.2](#112-the-shared--per-recipient-seam)) — _what is new for this recipient_ — never the
+  raw source snapshot and never the whole shared artifact. Because it is right of the seam, an
+  Interpret call **MAY** be deduplicated across recipients that computed the **identical** span
+  (capability C15), but otherwise multiplies per genuinely-distinct baseline. It is sized to the span:
+  a one-line change yields a one-line digest (C10).
+
+- **Judges the change against author criteria, never the recipient's private state.** Interpret may
+  classify the delta against **author-supplied criteria and reference data** ("is this a question I
+  must answer?", "is the sender on the VIP roster?" — C38, the multi-class triage of E5; C11 is its
+  binary passing-vs-notify case). It **MUST NOT** depend on the receiving agent's private runtime
+  context — the same stable boundary the capability study fixed across E2 and E5
+  ([§S2 area F](../product/monitoring-capability-exercises.md)). This keeps Interpret a pure function
+  of `(delta, author criteria/data)` and therefore portable across recipients and explainable in
+  isolation.
+
+- **Runs via the user's own installed AI tool — Agent Monitors ships no model and holds no
+  credentials.** The digest/gate is produced by **shelling out to whatever AI CLI the user already
+  has installed** (e.g. `claude -p …`, resolved §S5 item 3 / C45). This is a first-class
+  **trust/compliance principle**, not merely an implementation detail: summarization runs through the
+  user's _existing_ tooling, so the deployment **inherits the user's existing data-governance and
+  egress posture by construction**. Agent Monitors never becomes a model vendor or a
+  data-exfiltration surface — it senses and routes; the user's own tool reads. (Distinct from the
+  heavy executor of the [React] stage, which is likewise the user's own agent, [§S4](../product/monitoring-capability-exercises.md).)
+
+- **The tool invocation is host-agnostic, behind an adapter interface — never in the runtime core.**
+  Which AI tool to invoke, the command string, and how to pass the delta in / read the digest out are
+  **host-specific** and **MUST** live behind an adapter boundary, exactly as Claude-specific hook
+  names and transcript behavior live in the Claude adapter (`libs/core/src/adapter/claude.ts`) and
+  never in the runtime core (the host-agnostic-core invariant, §11.1, AP3). The runtime core owns
+  _when_ Interpret runs (after Diff, before Deliver), _whether_ it runs (the `prose` gate), and the
+  recording of its decision; an adapter owns _how_ the user's tool is invoked. A new host that wires a
+  different AI CLI is a new adapter, not a change to the core. Where the digest is a delivery-transport
+  concern, see [006](./006-agent-integration.md).
+
+- **The agentic significance gate is distinct from the deterministic `cel` gate.** Two suppression
+  mechanisms exist and **MUST NOT** be conflated:
+
+  | Gate                          | Stage / side of seam                              | Decides by                                                | Suppresses when                                |
+  | ----------------------------- | ------------------------------------------------- | --------------------------------------------------------- | ---------------------------------------------- |
+  | **`cel` significance gate**   | Shape / `structured` payload, **shared** (§1.1.6) | a deterministic boolean predicate over canonical JSON     | predicate is `false`                           |
+  | **Agentic significance gate** | Interpret, **per-recipient** (this section)       | cheap model judgment of the delta against author criteria | the change is judged not substantive (C11/C38) |
+
+  The deterministic `cel` gate runs **once** on the shared shaped snapshot and is reproducible and
+  hallucination-free; reach for it whenever the "is this substantive?" decision can be expressed as a
+  predicate (it is cheaper and auditable). The agentic gate exists for the **irreducibly agentic**
+  judgments a predicate cannot express — "is this Slack mention a question I must answer vs. idle
+  chatter?" (E5) — and runs per-recipient inside Interpret. An author **MAY** use both: a deterministic
+  `cel` pre-filter on the shared side, then an agentic gate on what survives, per recipient (the
+  "deterministic-first, agentic-second" pattern of [§S2 / E5](../product/monitoring-capability-exercises.md)).
+
+- **Every suppress/deliver decision is recorded and explainable.** When Interpret suppresses (the
+  agentic gate fires) or delivers, the decision and its reason **MUST** be recorded so that **"why
+  nothing fired" is inspectable** (capability C12 — the silent-failure-honesty invariant). Because the
+  Interpret decision is **per-recipient** (right of the seam), it is recorded on the per-recipient
+  delivery/projection surface (`session_event_state` projection, surfaced by the
+  projection-and-delivery stage of `monitor explain`, §10.7) — **not** the shared, tick-level
+  `observation_history` (§15), which records the _deterministic_, pre-seam outcomes (`triggered` /
+  `suppressed` / `no-change` / `errored` / `rebaselined`) and where the deterministic `cel`-gate
+  suppression already lands. A recipient (or its operator) **MUST** be able to ask the pipeline why a
+  delta did or did not surface for that recipient and receive the recorded Interpret verdict
+  (deliver / suppressed-as-not-substantive / interpret-failed-fell-back), never silence. An agentic
+  suppression is a deliberate, recorded outcome — never a silent drop.
+
+> **Example (E5 — Interpret is the product).** A chief-of-staff monitor watches a Slack mention stream
+> with `payload.form: prose`. Shape deterministically pre-filters to mentions of the principal and does a
+> reference-data VIP-roster lookup (a `cel`/`jq` step, shared, no model). On what survives, Interpret
+> runs the user's own `claude -p` per recipient to classify the delta against the author's criteria:
+> _passing chatter_ → the agentic gate suppresses (recorded as suppressed-not-substantive, C11/C12);
+> _a question, VIP involvement, or an action item_ → a one-line digest is delivered (C10/C38). Agent
+> Monitors supplied no model and saw no credentials; the principal's own Claude install read the
+> message, inheriting their org's data-governance posture.
+>
+> **Test implication.** With the user's AI tool stubbed by a deterministic fake adapter (host-agnostic
+> boundary, §11.1): a delta the fake classifies "passing" produces **no** delivery and a recorded
+> per-recipient suppression reason retrievable via `monitor explain` (§10.7); a delta classified
+> "question" produces a `prose` delivery whose digest is the fake's output. A monitor **without**
+> `payload.form: prose` never invokes the adapter at all. When the fake adapter throws, the recipient
+> still receives the §1.1.5 `rendered` artifact (best-effort fallback) and the Interpret failure is
+> recorded as explainable — proving delivery never depends on the model call succeeding.
+
 ## 2. Runtime Tick Model
 
 For each runtime tick, the implementation **MUST**:

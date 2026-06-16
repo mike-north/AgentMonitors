@@ -227,6 +227,44 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
   behaves identically to `incremental` (backward compatible). Until then
   [001 §3.7](./001-monitor-definition.md#37-baseline-strategy-target) and
   [002 §1.1.7](./002-runtime-delivery.md#117-baseline-strategy-per-recipient-diff-semantics-target)
+
+### G14 — Interpret stage: cheap agentic digest + significance gate via the user's own AI tool (P2)
+
+- **Current:** the runtime delivers a textual diff with no agentic reading; there is no Interpret
+  stage, no `prose`-triggered summarization, no agentic significance gate, and no adapter for invoking
+  an external AI tool. Suppression today is only deterministic (debounce/throttle, and the _target_
+  `cel` gate of [002 §1.1.6](./002-runtime-delivery.md#116-author-declared-payload-form)).
+- **Target:** the optional Interpret stage of
+  [002 §1.1.8](./002-runtime-delivery.md#118-interpret-a-cheap-agentic-digest-via-the-users-own-ai-tool),
+  invoked **only** for `payload.form: prose` ([001 §5.2](./001-monitor-definition.md#52-payload-form-target)):
+  (a) it runs **after** the per-recipient Diff, on the per-recipient delta, producing a **cheap digest**
+  sized to the span (C10) and an optional **agentic significance gate** (suppress-if-not-substantive,
+  C11/C38); (b) it runs by **shelling out to the user's own installed AI tool** (e.g. `claude -p …`) —
+  **Agent Monitors ships no model and holds no credentials** (C45); (c) the tool invocation is
+  **host-agnostic, behind an adapter interface, never in the runtime core**
+  ([002 §11.1](./002-runtime-delivery.md#111-the-agentruntimeadapter-contract), [006 §2.1](./006-agent-integration.md#21-the-interpret-adapter-is-upstream-of-transports-not-a-transport));
+  (d) it is **best-effort** — a tool failure falls back to the deterministic `rendered` artifact and is
+  recorded; (e) **every suppress/deliver decision is recorded and explainable** on the per-recipient
+  surface (`session_event_state`, via `monitor explain` [§10.7](./002-runtime-delivery.md#107-monitor-pipeline-diagnosis)),
+  so "why nothing fired" is inspectable (C12).
+- **Governs:** PP4, AP3 ([000](./000-principles.md)),
+  [002 §1.1.8](./002-runtime-delivery.md#118-interpret-a-cheap-agentic-digest-via-the-users-own-ai-tool),
+  [006 §2.1](./006-agent-integration.md#21-the-interpret-adapter-is-upstream-of-transports-not-a-transport),
+  the capability study ([§S4, §S5 item 3](../product/monitoring-capability-exercises.md); rows
+  C45/C10/C11/C38/C12). It is the per-stage Interpret detail under the
+  [§1.1](./002-runtime-delivery.md#11-post-processing-pipeline-model) umbrella that **G10** names.
+- **Files:** `libs/core/src/adapter/` (the AI-tool invocation adapter, host-agnostic boundary),
+  `libs/core/src/runtime/service.ts` (the post-Diff Interpret invocation + best-effort fallback),
+  `libs/core/src/runtime/types.ts` (the per-recipient Interpret decision recorded for projection).
+- **Proof:** with the user's AI tool replaced by a deterministic fake adapter: (a) a `prose` monitor
+  invokes the adapter and a non-`prose` monitor never does; (b) a delta the fake classifies
+  "substantive" yields a `prose` delivery whose digest is the fake's output; (c) a delta classified
+  "not substantive" yields **no** delivery and a per-recipient suppression reason retrievable via
+  `monitor explain` (C12); (d) when the fake adapter throws, the recipient still receives the §1.1.5
+  `rendered` artifact (best-effort fallback) and the failure is recorded; (e) the runtime never reads a
+  model credential or ships a model — the only AI call is the adapter shell-out. Until then
+  [002 §1.1.8](./002-runtime-delivery.md#118-interpret-a-cheap-agentic-digest-via-the-users-own-ai-tool)
+  and [006 §2.1](./006-agent-integration.md#21-the-interpret-adapter-is-upstream-of-transports-not-a-transport)
   stay _target_.
 
 > The cursor protocol ([003 §13](./003-source-plugins.md)) is deliberately **not** a roadmap item:
