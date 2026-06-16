@@ -65,6 +65,10 @@ jobs:
         uses: actions/setup-node@v5
         with:
           node-version: 24
+          # This job has no pnpm (it only runs npm + the Vercel CLI). setup-node@v5
+          # otherwise auto-detects the repo's pnpm and fails caching with
+          # "Unable to locate executable file: pnpm". Disable the auto cache here.
+          package-manager-cache: false
 
       - name: Install Vercel CLI
         run: npm install --global vercel@53
