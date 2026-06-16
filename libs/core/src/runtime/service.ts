@@ -215,8 +215,9 @@ function envelopeObjectKey(envelope: StoredObservationEnvelope): string {
  * surviving (last) observation's position so a multi-object span still
  * materializes in a stable order. The dropped intermediates are never
  * materialized, so they never advance the per-object snapshot baseline; the
- * surviving observation is therefore diffed against the recipient's baseline,
- * yielding a single net delta per object.
+ * surviving observation is therefore diffed against the shared snapshot baseline
+ * (`store.latestSnapshot`), yielding a single net delta per object. The full
+ * per-recipient-baseline seam (divergent stored baselines per session) is future G10 work.
  *
  * A span with one observation per object is returned unchanged — `incremental`
  * and `net` are behaviorally identical when there is nothing to collapse.
@@ -1185,10 +1186,13 @@ export class AgentMonitorRuntime {
     //   backward-compatible behavior.
     // - `net`: the catch-up span is collapsed per object to a single net delta —
     //   only the LAST observation of each `objectKey` run survives, so the Diff
-    //   stage (processObservation) compares the recipient's baseline snapshot
-    //   against the endpoint state. Intermediate observations are discarded and
-    //   never materialized — so they never advance the per-object snapshot
-    //   baseline, which is exactly what makes the surviving delta a net delta.
+    //   stage (processObservation) compares the shared snapshot baseline
+    //   (`store.latestSnapshot`, keyed by workspace/monitor/object) against the
+    //   endpoint state. Intermediate observations are discarded and never
+    //   materialized — so they never advance the per-object snapshot baseline,
+    //   which is exactly what makes the surviving delta a net delta.
+    //   Note: the full per-recipient-baseline seam (divergent stored baselines
+    //   per session) is future G10 work.
     //
     // A span containing a single observation is identical under both strategies
     // (002 §1.1.7 — no intermediate steps to collapse).
