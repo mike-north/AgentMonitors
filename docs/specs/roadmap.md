@@ -165,39 +165,6 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
   window produces no delivery; (e) a runtime test proves the accumulation batch survives a daemon
   restart (restart-safety, matching BP1).
 
-### G12 — Deterministic Shape stage: derived facts + render-then-diff + payload form (P2)
-
-- **Current:** the runtime computes a textual diff over the raw `snapshotText` ([002 §5.2](./002-runtime-delivery.md))
-  and delivers the monitor body + diff as a textual payload. There is no deterministic compute of
-  derived/relative facts, no explicit render-to-artifact step, and no author-declared payload form;
-  no `shape`/`payload` frontmatter exists.
-- **Target:** the deterministic Shape stage of
-  [002 §1.1.4–§1.1.6](./002-runtime-delivery.md#114-shape-deterministic-derived-facts), authored via
-  [001 §5.1–§5.2](./001-monitor-definition.md#51-shape-declaration-target):
-  (a) **derived facts** computed as a pure function of `(shaped snapshot, injected now)` on the shared
-  side of the seam, before Pace/Diff (C41); (b) **render** the shaped state to a stable, diffable
-  text artifact and **diff that artifact**, not the raw source (C42/C43); (c) an **author-declared
-  payload form** (`prose | structured | artifact | rendered`) with a turnkey **jq/CEL** transform over
-  canonical JSON for the `structured` form (C46). Sources surface the raw facts these consume and do
-  **not** pre-compute them ([003 §2.7](./003-source-plugins.md)).
-- **Governs:** PP3, AP3 ([000](./000-principles.md)),
-  [001 §5.1–§5.2](./001-monitor-definition.md#51-shape-declaration-target),
-  [002 §1.1.4–§1.1.6](./002-runtime-delivery.md#114-shape-deterministic-derived-facts),
-  [003 §2.7](./003-source-plugins.md), the capability study
-  ([§S1, §S2 areas C/E/G, §S3 Tier 1, §S5 item 5](../product/monitoring-capability-exercises.md); rows
-  C41/C42/C43/C46). It is the per-stage Shape detail under the [§1.1](./002-runtime-delivery.md#11-post-processing-pipeline-model)
-  umbrella that **G10** names.
-- **Files:** `libs/core/src/schema/monitor-schema.ts` (the `shape`/`payload` frontmatter),
-  `libs/core/src/runtime/service.ts`, `libs/core/src/runtime/diff.ts` (render-then-diff), and a
-  deterministic transform evaluator (jq/CEL).
-- **Proof:** a fixed-`now` derived-facts test (a defer threshold crossing yields exactly `revealed`,
-  one minute earlier yields none — proving purity over `(snapshot, now)`); a byte-stable render test
-  (same shaped state → identical artifact → no phantom diff; one crossed threshold → exactly one added
-  `revealed` line); a payload-form test (`structured` + a `jq` projection yields the projected fields,
-  `rendered` yields the text artifact, a malformed transform fails `validate`). Until then
-  [001 §5.1–§5.2](./001-monitor-definition.md#51-shape-declaration-target) and
-  [002 §1.1.4–§1.1.6](./002-runtime-delivery.md#114-shape-deterministic-derived-facts) stay _target_.
-
 ### G13 — Author-declared baseline strategy for per-recipient Diff (P2)
 
 - **Current:** the runtime delivers observations in the order they were materialized (one event per
@@ -266,6 +233,39 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
   [002 §1.1.8](./002-runtime-delivery.md#118-interpret-a-cheap-agentic-digest-via-the-users-own-ai-tool)
   and [006 §2.1](./006-agent-integration.md#21-the-interpret-adapter-is-upstream-of-transports-not-a-transport)
   stay _target_.
+
+### G15 — Deterministic Shape stage: derived facts + render-then-diff + payload form (P2)
+
+- **Current:** the runtime computes a textual diff over the raw `snapshotText` ([002 §5.2](./002-runtime-delivery.md))
+  and delivers the monitor body + diff as a textual payload. There is no deterministic compute of
+  derived/relative facts, no explicit render-to-artifact step, and no author-declared payload form;
+  no `shape`/`payload` frontmatter exists.
+- **Target:** the deterministic Shape stage of
+  [002 §1.1.4–§1.1.6](./002-runtime-delivery.md#114-shape-deterministic-derived-facts), authored via
+  [001 §5.1–§5.2](./001-monitor-definition.md#51-shape-declaration-target):
+  (a) **derived facts** computed as a pure function of `(shaped snapshot, injected now)` on the shared
+  side of the seam, before Pace/Diff (C41); (b) **render** the shaped state to a stable, diffable
+  text artifact and **diff that artifact**, not the raw source (C42/C43); (c) an **author-declared
+  payload form** (`prose | structured | artifact | rendered`) with a turnkey **jq/CEL** transform over
+  canonical JSON for the `structured` form (C46). Sources surface the raw facts these consume and do
+  **not** pre-compute them ([003 §2.7](./003-source-plugins.md)).
+- **Governs:** PP3, AP3 ([000](./000-principles.md)),
+  [001 §5.1–§5.2](./001-monitor-definition.md#51-shape-declaration-target),
+  [002 §1.1.4–§1.1.6](./002-runtime-delivery.md#114-shape-deterministic-derived-facts),
+  [003 §2.7](./003-source-plugins.md), the capability study
+  ([§S1, §S2 areas C/E/G, §S3 Tier 1, §S5 item 5](../product/monitoring-capability-exercises.md); rows
+  C41/C42/C43/C46). It is the per-stage Shape detail under the [§1.1](./002-runtime-delivery.md#11-post-processing-pipeline-model)
+  umbrella that **G10** names.
+- **Files:** `libs/core/src/schema/monitor-schema.ts` (the `shape`/`payload` frontmatter),
+  `libs/core/src/runtime/service.ts`, `libs/core/src/runtime/diff.ts` (render-then-diff), and a
+  deterministic transform evaluator (jq/CEL).
+- **Proof:** a fixed-`now` derived-facts test (a defer threshold crossing yields exactly `revealed`,
+  one minute earlier yields none — proving purity over `(snapshot, now)`); a byte-stable render test
+  (same shaped state → identical artifact → no phantom diff; one crossed threshold → exactly one added
+  `revealed` line); a payload-form test (`structured` + a `jq` projection yields the projected fields,
+  `rendered` yields the text artifact, a malformed transform fails `validate`). Until then
+  [001 §5.1–§5.2](./001-monitor-definition.md#51-shape-declaration-target) and
+  [002 §1.1.4–§1.1.6](./002-runtime-delivery.md#114-shape-deterministic-derived-facts) stay _target_.
 
 > The cursor protocol ([003 §13](./003-source-plugins.md)) is deliberately **not** a roadmap item:
 > per #81 it is designed only as far as a sketch, to be fully specified if measured poll cost ever

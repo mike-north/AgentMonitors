@@ -9,6 +9,20 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-06-15 — Roadmap gap dedupe: Deterministic Shape gap renumbered G12→G15 (roadmap) — Refs #168
+
+The roadmap contained two `### G12` headings introduced by separate PRs (#144 and #147), making gap
+IDs non-unique and non-monotonic (sequence read G10, G11, G12, G12, G13, G14). No behavior change.
+
+- The Deterministic Shape stage gap (originally G12 from #144) is **renumbered to G15** and
+  **relocated** to appear after G14 (Interpret stage), making it the last gap in the sequence.
+- The Scheduled-rollup Pace gap (#147) **retains G12**; G13 and G14 are unchanged.
+- This file's reference to the Shape gap (the `Post-processing pipeline…` entry below) is updated
+  from G12 to G15 to match.
+- Gap IDs are now unique and monotonic: G10, G11, G12, G13, G14, G15.
+
+Docs-only — no implementation or published-package behavior change, so no changeset.
+
 ## 2026-06-15 — Author-declared baseline strategy: `incremental` vs `net` per-recipient Diff (001 §3.7, §7.4; 002 §1.1.7; roadmap G13) — Refs #146
 
 Formalizes a resolved decision from the monitoring capability study
@@ -168,7 +182,7 @@ is reaffirmed, not changed.
   or aggregate derived facts (which depend on runtime-`now` and would churn the diff); the runtime
   Shape stage derives them. This is where the raw facts the §1.1.4 rules consume originate.
 - Glossary entries added (derived fact, rendered artifact, payload form). Roadmap gains target gap
-  **G12** (deterministic Shape: derived facts + render-then-diff + payload form), with proof criteria;
+  **G15** (deterministic Shape: derived facts + render-then-diff + payload form), with proof criteria;
   it is the per-stage detail under the §1.1 umbrella that G10 names.
 - **Acceptance (004 §6):** every rule is normative + marked _target_; each tricky rule carries an
   example (E8 derived facts, E6↔E8 payload poles) and a test implication (fixed-`now` reproducibility,
