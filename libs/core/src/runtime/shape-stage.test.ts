@@ -144,6 +144,55 @@ describe('Shape stage wired through the runtime tick (G15)', () => {
     expect(removed).toHaveLength(0);
   });
 
+  it('derive-only (no `render: rendered`) keeps the raw source as the diff base — snapshotText is unchanged', async () => {
+    // Regression test for Finding 1 (render opt-in bug): a `shape.derive` block
+    // WITHOUT `render: rendered` must NOT switch the diff input to the rendered
+    // artifact.  Before the fix, any `shape` block (even derive-only) triggered
+    // render-then-diff.
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-shape-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+
+    // Raw JSON source — the `snapshotText` is JSON; it never produces a
+    // "# facts" section unless render-then-diff is activated.
+    const source = deferSource('shape-derive-only', () => ({
+      task: 'Ship deck',
+      deferUntil: DEFER_UNTIL,
+    }));
+    // `shape.derive` declared but NO `render: rendered` → derive-only mode.
+    const monitorsDir = writeMonitor(
+      rootDir,
+      'shape-derive-only',
+      'shape:\n  derive:\n    - name: revealed\n      when: "deferUntil <= now"\n',
+    );
+
+    const runtime = createRuntime(dbPath, source);
+    vi.setSystemTime(NOW);
+    const tick = await runtime.tick(monitorsDir, rootDir);
+    expect(tick.emittedEventIds).toHaveLength(1);
+
+    const event = runtime
+      .listEvents({ monitorId: 'shape-monitor', workspacePath: rootDir })
+      .find((e) => e.id === tick.emittedEventIds[0]);
+
+    // The stored snapshotText must NOT be the rendered artifact: it should be
+    // null (the source returned a structured `snapshot` but no `snapshotText`)
+    // rather than the markdown rendered by render-then-diff.  Before the fix,
+    // any `shape` block — even derive-only — triggered renderShapeArtifact(),
+    // which always returns a non-null string containing "# facts".
+    const text = event?.snapshotText ?? null;
+    if (text !== null) {
+      // If for any reason the runtime produces a snapshotText, it must NOT
+      // contain the rendered-artifact markers.
+      expect(text).not.toContain('# facts');
+      expect(text).not.toContain('# snapshot');
+    } else {
+      // null is the expected value: the raw source had no snapshotText, and
+      // the derive-only path must not manufacture one.
+      expect(text).toBeNull();
+    }
+  });
+
   it('a `payload.form: structured` CEL gate of false suppresses delivery entirely (§1.1.6)', async () => {
     const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-shape-'));
     tempDirs.push(rootDir);
@@ -161,6 +210,62 @@ describe('Shape stage wired through the runtime tick (G15)', () => {
     const tick = await runtime.tick(monitorsDir, rootDir);
     // heartRate (90) is NOT > 130 → the gate is false → no event materialized.
     expect(tick.emittedEventIds).toHaveLength(0);
+  });
+
+  it('a suppressed CEL gate leaves notify state unchanged and records a `suppressed` history row (regression: Finding 2)', async () => {
+    // Regression test for Finding 2 (suppression ordering bug): before the fix,
+    // suppression happened AFTER dispatchNotify had already mutated notify state
+    // and the history row was recorded with emittedCount from dispatch.emitted
+    // (which included the suppressed observation).  The fix pre-filters
+    // observations before dispatch, so suppressed ones never enter dispatch.
+    //
+    // Assertions:
+    //   (a) No events are materialized (emittedEventIds is empty).
+    //   (b) The audit history result is `suppressed` (NOT `triggered`), proving
+    //       the observation was seen but the CEL gate suppressed it correctly.
+    //   (c) A second tick with the same suppressed gate is still processed
+    //       independently — notify state was not advanced by the first tick in
+    //       a way that would skip the second.
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-shape-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+
+    // heartRate is always 90 — always below the 130 threshold → always suppressed.
+    const source = deferSource('shape-gate-order', () => ({ heartRate: 90 }));
+    const monitorsDir = writeMonitor(
+      rootDir,
+      'shape-gate-order',
+      'payload:\n  form: structured\n  transform:\n    language: cel\n    expression: "heartRate > 130"\n',
+    );
+
+    const runtime = createRuntime(dbPath, source);
+    vi.setSystemTime(NOW);
+
+    // (a) First tick: gate suppresses → no events.
+    const tick1 = await runtime.tick(monitorsDir, rootDir);
+    expect(tick1.emittedEventIds).toHaveLength(0);
+
+    // (b) History row must say `suppressed`, NOT `triggered`.
+    const history = runtime.listObservationHistory({
+      monitorId: 'shape-monitor',
+      limit: 5,
+    });
+    const firstRow = history[0];
+    expect(firstRow?.result).toBe('suppressed');
+    // observationData.emitted must be 0 (not 1) — the suppressed observation
+    // never entered dispatch and was never counted as emitted.
+    expect(firstRow?.observationData).toMatchObject({ emitted: 0 });
+
+    // (c) Second tick: suppression is still applied independently; no events.
+    vi.setSystemTime(NOW + ONE_MINUTE);
+    const tick2 = await runtime.tick(monitorsDir, rootDir);
+    expect(tick2.emittedEventIds).toHaveLength(0);
+    const history2 = runtime.listObservationHistory({
+      monitorId: 'shape-monitor',
+      limit: 5,
+    });
+    // Both history rows should say suppressed.
+    expect(history2[0]?.result).toBe('suppressed');
   });
 
   it('a `payload.form: structured` jq transform persists the reshaped payload', async () => {

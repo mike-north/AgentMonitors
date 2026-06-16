@@ -81,9 +81,12 @@ export function shapeObservation(
     snapshotText: observation.snapshotText,
   };
 
-  // (a/b) Derived facts + render-then-diff: only when `shape` is declared. The
-  // artifact becomes the diff input instead of the raw source.
-  if (config.shape) {
+  // (a/b) Derived facts + render-then-diff: ONLY when `shape.render: rendered`
+  // is the explicit opt-in (§1.1.5). A monitor that declares `shape.derive`
+  // without `render: rendered` computes facts (for future use) but keeps the
+  // raw source bytes as the diff/storage text — the rendered artifact path is
+  // NOT activated by a bare `shape` block.
+  if (config.shape?.render === 'rendered') {
     result.snapshotText = renderShapeArtifact(
       shapedSnapshot(observation),
       now.getTime(),

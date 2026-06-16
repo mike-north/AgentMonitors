@@ -1196,10 +1196,24 @@ export class AgentMonitorRuntime {
       sourceOutcome?: 'rebaselined';
     },
   ): string[] {
+    // Pre-filter: a `payload.form: structured` CEL gate that evaluates `false`
+    // suppresses delivery entirely (002 §1.1.6). This check MUST run BEFORE
+    // dispatchNotify so that suppressed observations never advance notify state
+    // and are never counted as emitted in the audit history row.  Running it
+    // inside processObservation (after dispatch) was incorrect: the history row
+    // would say `triggered` even though no event was ever materialized.
+    const passedObservations = observations.filter((obs) => {
+      const shaped = shapeObservation(obs, now, {
+        shape: monitor.frontmatter.shape,
+        payload: monitor.frontmatter.payload,
+      });
+      return !shaped.suppressed;
+    });
+
     const monitorState = this.store.getMonitorState(monitor.id);
     const dispatch = this.dispatchNotify(
       monitor,
-      observations,
+      passedObservations,
       now,
       monitorState.notifyState,
     );
@@ -1282,8 +1296,6 @@ export class AgentMonitorRuntime {
           workspacePath: options.workspacePath,
           effectiveUrgency: emitted.effectiveUrgency,
         });
-        // A `payload.form: structured` CEL gate evaluating false suppresses the
-        // delivery entirely (002 §1.1.6) — no event is materialized.
         if (event) emittedEventIds.push(event.id);
       } catch (materializeError) {
         try {
@@ -1752,8 +1764,9 @@ export class AgentMonitorRuntime {
       shape: input.monitor.frontmatter.shape,
       payload: input.monitor.frontmatter.payload,
     });
-    // A `payload.form: structured` + `cel: false` gate suppresses delivery
-    // entirely (§1.1.6) — record nothing as an event.
+    // Defensive guard: suppressed observations are pre-filtered in ingest()
+    // BEFORE dispatchNotify, so this branch should not be reached in normal
+    // operation. Retained as a safety net for any future call sites.
     if (shaped.suppressed) return null;
 
     const effectiveSnapshotText = shaped.snapshotText;
