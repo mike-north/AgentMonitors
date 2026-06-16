@@ -119,23 +119,17 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
   proving two recipients with different last-seen points receive different spans from one shared
   observation); until then [002 §1.1](./002-runtime-delivery.md) stays _target_.
 
-### G11 — Source contract: snapshots-not-diffs (explicit) + composite observation (P3)
-
-- **Current:** the runtime is already the sole producer of the delivery diff (PP3, AP3,
-  [002 §5.2](./002-runtime-delivery.md)); the source contract did not state this **explicitly**, and
-  composite (many-call) observations were unmodeled.
-- **Target:** [003 §2.5](./003-source-plugins.md) (sources return current-state snapshots +
-  `nextState`; the runtime owns the consumer-baseline diff) is reaffirmed in the source contract and,
-  for §2.5, becomes _current_ with `verified:` references once a test asserts a bundled source returns
-  snapshots (not pre-diffed consumer packets); [003 §2.6](./003-source-plugins.md) (composite
-  observation, capability C40) ships when a source assembles one observation from many calls under one
-  `objectKey`.
-- **Governs:** PP3, AP3 ([000](./000-principles.md)), [003 §2.5–§2.6](./003-source-plugins.md),
-  the capability study ([§S1, §S4](../product/monitoring-capability-exercises.md); rows C2/C6/C40/C43).
-- **Files:** `libs/core/src/observation/types.ts`, the bundled sources under `plugins/source-*`.
-- **Proof:** §2.5 — a source unit test asserting `observe()` returns current-state snapshots + the
-  runtime computes the diff; §2.6 — an integration test of a source that reduces N calls into one
-  stable composite snapshot. Until then [003 §2.5–§2.6](./003-source-plugins.md) stays _target_.
+> G11 (source contract: snapshots-not-diffs + composite observation) **shipped** — both
+> [003 §2.5](./003-source-plugins.md) and [003 §2.6](./003-source-plugins.md) are now **current**.
+> §2.5 (sources return current-state snapshots + `nextState`; the runtime is the sole producer of the
+> consumer-baseline diff, PP3/AP3) is reaffirmed on the `Observation`/`ObservationResult` types
+> (`libs/core/src/observation/types.ts`) and proven against the bundled `file-fingerprint` source
+> driven through the real runtime (`plugins/source-file-fingerprint/src/index.test.ts`,
+> "snapshots-not-diffs (003 §2.5)"). §2.6 (composite observation, C40) ships as the `api-poll`
+> `change-detection.composite` mode — N sub-resource calls reduced into one deterministic snapshot
+> under one `objectKey` (`plugins/source-api-poll/src/composite.ts`,
+> `plugins/source-api-poll/src/index.test.ts`). See [spec-changelog.md](./spec-changelog.md). Did not
+> touch `runtime/service.ts` or `monitor-schema.ts` (the runtime already owned the diff).
 
 ### G12 — Scheduled-rollup Pace mode (P2)
 

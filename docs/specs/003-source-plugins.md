@@ -8,7 +8,7 @@
 
 This document specifies the contract implemented by observation source plugins and the current behavior of the bundled sources: `file-fingerprint`, `api-poll`, `command-poll`, `schedule`, `incoming-changes`. The runtime depends on sources to detect change, but the runtime owns scheduling, notify dispatch, and delivery timing (PP3).
 
-Sections §2.5 (snapshots-not-diffs), §2.6 (composite observation), and §13 (the cursor protocol) are normative **target** rules that are not yet implemented or that reaffirm an existing invariant in the source contract (PP7); each moves to current status, with `verified:` references, when it ships. §11 (`command-poll`) and §12 (keyed-collection change detection) have shipped and are now **current** behavior (verified: `plugins/source-command-poll/src/index.ts`, `plugins/source-command-poll/src/index.test.ts`; the shared helper `libs/core/src/observation/keyed-collection.ts` with `libs/core/src/observation/keyed-collection.test.ts`, consumed by both `plugins/source-api-poll/src/index.ts` and `plugins/source-command-poll/src/index.ts`).
+Section §13 (the cursor protocol) remains a normative **target** rule that is not yet implemented; it moves to current status, with `verified:` references, when it ships. §2.5 (snapshots-not-diffs) and §2.6 (composite observation) have shipped and are now **current** behavior (verified below in each section). §11 (`command-poll`) and §12 (keyed-collection change detection) have shipped and are now **current** behavior (verified: `plugins/source-command-poll/src/index.ts`, `plugins/source-command-poll/src/index.test.ts`; the shared helper `libs/core/src/observation/keyed-collection.ts` with `libs/core/src/observation/keyed-collection.test.ts`, consumed by both `plugins/source-api-poll/src/index.ts` and `plugins/source-command-poll/src/index.ts`).
 
 ### Principles Satisfied
 
@@ -118,13 +118,18 @@ If `stateful` is `true`, the first successful `observe()` call **MAY** return an
 
 ### 2.5 Sources return snapshots, not diffs; the runtime is the sole diff producer
 
-> **Status: target (reaffirms a current invariant).** This makes explicit, in the source contract,
-> the division of labor already required by PP3 and AP3 ([000](./000-principles.md)) and implemented
-> by the runtime's object-level diff ([002 §5.2](./002-runtime-delivery.md)). The rule is restated
-> here so a plugin author reads it where they author a source. Formalizes a resolved decision from
-> the monitoring capability study
+> **Status: current.** This makes explicit, in the source contract, the division of labor already
+> required by PP3 and AP3 ([000](./000-principles.md)) and implemented by the runtime's object-level
+> diff ([002 §5.2](./002-runtime-delivery.md)). The rule is restated here so a plugin author reads it
+> where they author a source. Formalizes a resolved decision from the monitoring capability study
 > ([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
-> §S4; ledger rows C2, C6, C43).
+> §S4; ledger rows C2, C6, C43). Verified: the contract is documented on the `Observation` /
+> `ObservationResult` types (`libs/core/src/observation/types.ts`); a bundled source returns
+> current-state snapshots while the runtime computes the delivery diff against its own stored
+> baseline — proven end-to-end by `plugins/source-file-fingerprint/src/index.test.ts` (the
+> "snapshots-not-diffs (003 §2.5)" block: the source's observation is the full current file content
+> with no diff field, and the runtime — not the source — materializes the `diffText`) and
+> `libs/core/src/runtime/service.test.ts` ("computes a diff against the prior snapshot").
 
 A source **observes current state**; it does **not** compute deltas for delivery. Concretely:
 
@@ -161,10 +166,17 @@ snapshots plus `nextState`, and the runtime computes the delivered diff (see eac
 
 ### 2.6 Composite observation (one observation from many source calls)
 
-> **Status: target.** Formalizes a resolved decision from the monitoring capability study
+> **Status: current.** Formalizes a resolved decision from the monitoring capability study
 > ([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
-> §S1, §S2 area A; ledger row C40). No bundled source assembles a composite observation today; the
-> contract below states how one is modeled when it does.
+> §S1, §S2 area A; ledger row C40). The bundled `api-poll` source assembles a composite observation
+> via its `change-detection.composite` mode (verified: `plugins/source-api-poll/src/composite.ts` and
+> the `parseCompositeConfig`/`renderCompositeSnapshot`/`buildCompositeObservation` helpers wired into
+> `plugins/source-api-poll/src/index.ts`; proven by `plugins/source-api-poll/src/index.test.ts` — the
+> "composite observation (003 §2.6)" block reduces N calls into one observation under one
+> `objectKey`, renders a deterministic snapshot regardless of part-fetch ordering, and fails the
+> whole observation on a failed underlying call; the "composite × runtime integration" block drives
+> it through the real runtime, materializing one event per change under the one `objectKey` with the
+> runtime computing the diff).
 
 A single `Observation` **MAY** be assembled from **multiple** source queries or calls — many requests
 reduced into **one composite whole-state snapshot** — before it leaves the source. This is the
@@ -198,6 +210,34 @@ Modeling rules:
 > ordered, rendered `snapshotText` — the composite whole-body snapshot — under one `objectKey`. The
 > runtime then diffs that one snapshot against the consumer's baseline exactly as it would a
 > single-call snapshot.
+
+The bundled `api-poll` source realizes this via a `change-detection.composite` block: one
+`object-key` for the assembled whole plus a list of `parts` (each an `id` and a `url`). On each
+`observe()` it fetches every part and renders them — **sorted by `id`** so completion order never
+churns the snapshot — into one composite `snapshotText` under the one `object-key`:
+
+```yaml
+watch:
+  type: api-poll
+  interval: '5m'
+  change-detection:
+    composite:
+      object-key: 'order-42' # the composite IS the object — one key for the whole
+      title: 'Order 42'
+      parts: # N underlying calls reduced into one snapshot
+        - id: 'header'
+          url: 'https://api.example.com/orders/42'
+        - id: 'line-1'
+          url: 'https://api.example.com/orders/42/lines/1'
+        - id: 'line-2'
+          url: 'https://api.example.com/orders/42/lines/2'
+```
+
+`change-detection.composite` and `change-detection.collection` (§12) are mutually exclusive:
+composite assembles **one** whole from many calls, whereas keyed-collection tracks **many**
+independent objects. A failed underlying call fails the whole observation (the source does not
+advance its state, so the prior baseline is preserved per [002 §3](./002-runtime-delivery.md)),
+rather than silently emitting a composite missing a part.
 
 ### 2.7 Sources surface raw facts; the runtime computes derived facts
 
