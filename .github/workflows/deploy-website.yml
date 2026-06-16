@@ -1,0 +1,79 @@
+name: Deploy Website
+
+# GitHub-Actions-driven production deploy for apps/website (Vercel project `site`,
+# agentmonitors.io). Deliberately NOT Vercel's "deploy every commit on main" git
+# integration: validation runs first and gates the deploy (the `deploy` job
+# `needs:` the `validate` job), so a broken site never reaches production.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'apps/website/**'
+      - '.github/workflows/deploy-website.yml'
+  workflow_dispatch: {}
+
+# Never run two production deploys at once; queue rather than cancel an in-flight one.
+concurrency:
+  group: deploy-website-production
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The validation gate. Add more here (lint, tests, full `pnpm check`) to put
+      # broader checks on the critical path — the deploy job won't run unless this passes.
+      - name: Type-check website
+        run: pnpm --filter @agentmonitors/website check
+
+  deploy:
+    name: Deploy to Vercel (production)
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Non-sensitive Vercel identifiers for the `site` project (agentmonitors.io).
+    # The only secret is VERCEL_TOKEN.
+    env:
+      VERCEL_ORG_ID: team_x4xCAqcSsXQ7yu4ojx1AzWFD
+      VERCEL_PROJECT_ID: prj_hazDwikwUblJE5G6ah5ZLFiVQNAR
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - name: Install Vercel CLI
+        run: npm install --global vercel@53
+
+      # Remote build + deploy (proven for this monorepo: the site builds standalone
+      # with root = apps/website). Matches the working manual `vercel --prod --cwd apps/website`.
+      # Token is read from the VERCEL_TOKEN env var (safer than a --token=… CLI arg,
+      # which can leak via process listings / logs).
+      - name: Deploy production
+        run: vercel deploy --prod --yes --cwd apps/website
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
