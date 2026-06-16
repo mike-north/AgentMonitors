@@ -8,6 +8,7 @@ import type { Observation } from '../observation/types.js';
 import type { SourceRegistry } from '../observation/registry.js';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import type { AgentRuntimeAdapter } from '../adapter/types.js';
+import type { InterpretAdapter } from '../adapter/interpret.js';
 import { buildTextDiff } from './diff.js';
 import { shapeObservation } from './shape-stage.js';
 import { RuntimeStore } from './store.js';
@@ -366,6 +367,16 @@ export class AgentMonitorRuntime {
     private readonly store: RuntimeStore,
     private readonly registry: SourceRegistry,
     private readonly adapters: AgentRuntimeAdapter[] = [claudeCodeAdapter],
+    /**
+     * The optional **Interpret adapter** (G14, 002 §1.1.8). When present, a
+     * `payload.form: prose` monitor's per-recipient delta is read by the user's
+     * own AI tool to produce a cheap digest + agentic significance gate. When
+     * absent, Interpret never runs (fully backward compatible) and `prose`
+     * deliveries carry the deterministic `rendered` artifact. The runtime core
+     * never embeds the tool's command string — the host-specific invocation lives
+     * behind this adapter (002 §11.1, 006 §2.1, AP3).
+     */
+    private readonly interpretAdapter?: InterpretAdapter,
   ) {}
 
   adapter(name: string): AgentRuntimeAdapter {
@@ -796,14 +807,39 @@ export class AgentMonitorRuntime {
         },
         {},
       );
+      // Per-recipient Interpret verdicts (G14, 002 §1.1.8): surface why a `prose`
+      // delta was suppressed-as-not-substantive or fell back after a tool failure,
+      // so "why nothing fired" is inspectable (capability C12). The verdict is
+      // recorded right of the seam, on each projection.
+      const interpretVerdicts = projections
+        .filter((projection) => projection.interpretDecision)
+        .map((projection) => ({
+          sessionId: projection.sessionId,
+          decision: projection.interpretDecision,
+          ...(projection.interpretReason
+            ? { reason: projection.interpretReason }
+            : {}),
+          ...(projection.interpretDigest
+            ? { digest: projection.interpretDigest }
+            : {}),
+        }));
+      const suppressedCount = interpretVerdicts.filter(
+        (v) => v.decision === 'suppress',
+      ).length;
+      const interpretSuffix =
+        suppressedCount > 0
+          ? ` Interpret suppressed ${String(suppressedCount)} as not substantive (recorded per-recipient).`
+          : '';
       stages.push(
         explainStage(
           'delivery',
           'ok',
           `Events are projected to lead sessions (${Object.entries(counts)
             .map(([state, count]) => `${state}: ${String(count)}`)
-            .join(', ')}).`,
-          counts,
+            .join(', ')}).${interpretSuffix}`,
+          interpretVerdicts.length > 0
+            ? { ...counts, interpret: interpretVerdicts }
+            : counts,
         ),
       );
     } else {
@@ -1061,7 +1097,7 @@ export class AgentMonitorRuntime {
           });
           for (const emitted of rollupDispatch.emitted) {
             try {
-              const event = this.processObservation({
+              const event = await this.processObservation({
                 monitor: emitted.monitor,
                 sourceName: emitted.monitor.frontmatter.watch.type,
                 observation: emitted.observation,
@@ -1134,7 +1170,7 @@ export class AgentMonitorRuntime {
       // continue so the tick is not aborted.
       try {
         emittedEventIds.push(
-          ...this.ingest(monitor, observationResult.observations, now, {
+          ...(await this.ingest(monitor, observationResult.observations, now, {
             workspacePath,
             ...(observationResult.nextState !== undefined
               ? { nextSourceState: { value: observationResult.nextState } }
@@ -1142,7 +1178,7 @@ export class AgentMonitorRuntime {
             ...(observationResult.outcome
               ? { sourceOutcome: observationResult.outcome }
               : {}),
-          }),
+          })),
         );
       } catch (ingestError) {
         const message =
@@ -1188,7 +1224,7 @@ export class AgentMonitorRuntime {
    * untouched. Synchronous start-to-finish, so concurrent watchers on the
    * single-threaded event loop never interleave a monitor's state mutation.
    */
-  private ingest(
+  private async ingest(
     monitor: MonitorDefinition,
     observations: Observation[],
     now: Date,
@@ -1197,7 +1233,7 @@ export class AgentMonitorRuntime {
       nextSourceState?: { value: unknown };
       sourceOutcome?: 'rebaselined';
     },
-  ): string[] {
+  ): Promise<string[]> {
     // Pre-filter: a `payload.form: structured` CEL gate that evaluates `false`
     // suppresses delivery entirely (002 §1.1.6). This check MUST run BEFORE
     // dispatchNotify so that suppressed observations never advance notify state
@@ -1290,7 +1326,7 @@ export class AgentMonitorRuntime {
     const emittedEventIds: string[] = [];
     for (const emitted of span) {
       try {
-        const event = this.processObservation({
+        const event = await this.processObservation({
           monitor: emitted.monitor,
           sourceName: emitted.monitor.frontmatter.watch.type,
           observation: emitted.observation,
@@ -1447,7 +1483,9 @@ export class AgentMonitorRuntime {
         // The audit write is best-effort — if recordObservationHistory itself
         // throws we swallow it so a failed audit row never kills the watcher.
         try {
-          this.ingest(monitor, [observation], new Date(), { workspacePath });
+          await this.ingest(monitor, [observation], new Date(), {
+            workspacePath,
+          });
           this.refreshWorkspaceSessions(workspacePath);
         } catch (ingestError) {
           try {
@@ -1753,7 +1791,7 @@ export class AgentMonitorRuntime {
     return { emitted: [], nextState };
   }
 
-  private processObservation(input: ProcessObservationInput) {
+  private async processObservation(input: ProcessObservationInput) {
     const objectKey = input.observation.objectKey ?? input.monitor.id;
 
     // ── Shape stage (G15, 002 §1.1.4–§1.1.6) ──────────────────────────────
@@ -1828,6 +1866,75 @@ export class AgentMonitorRuntime {
       });
     }
 
+    // ── Interpret stage (G14, 002 §1.1.8) ─────────────────────────────────
+    // Runs AFTER the per-recipient Diff/projection, on the per-recipient delta,
+    // and ONLY for `payload.form: prose`. Best-effort and off the critical path:
+    // a tool failure falls back to the deterministic `rendered` artifact
+    // (already projected above) and is recorded as explainable. The host-specific
+    // tool invocation lives behind `this.interpretAdapter` — never here.
+    if (
+      input.monitor.frontmatter.payload?.form === 'prose' &&
+      this.interpretAdapter
+    ) {
+      await this.runInterpret(input.monitor, event, diffText);
+    }
+
     return event;
+  }
+
+  /**
+   * Drive the per-recipient Interpret stage (G14, 002 §1.1.8) over every lead
+   * session the just-materialized `event` projected into. For each recipient the
+   * adapter reads the per-recipient delta and either delivers a cheap digest or
+   * suppresses the projection as not-substantive; every verdict is recorded on
+   * `session_event_state` so "why nothing fired" is inspectable via
+   * `monitor explain` (002 §10.7, capability C12).
+   *
+   * Best-effort: an adapter rejection (tool missing / errors / times out) MUST
+   * NOT drop the underlying delta — the projection stays deliverable as the
+   * deterministic `rendered` artifact and the failure is recorded (`failed`).
+   */
+  private async runInterpret(
+    monitor: MonitorDefinition,
+    event: { id: string; diffText: string | null; snapshotText: string | null },
+    diffText: string | null,
+  ): Promise<void> {
+    const adapter = this.interpretAdapter;
+    if (!adapter) return;
+    // The per-recipient delta: the rendered diff for this recipient, falling back
+    // to the full artifact when this is a baseline (no prior snapshot to diff).
+    const delta = diffText ?? event.snapshotText ?? '';
+    const criteria = monitor.instructions;
+    for (const sessionId of this.store.projectedSessionIdsForLastEvent()) {
+      try {
+        const result = await adapter.interpret({
+          delta,
+          criteria,
+          monitorId: monitor.id,
+        });
+        if (result.decision === 'suppress') {
+          this.store.recordInterpretDecision(sessionId, event.id, {
+            decision: 'suppress',
+            reason: result.reason,
+          });
+        } else {
+          this.store.recordInterpretDecision(sessionId, event.id, {
+            decision: 'deliver',
+            digest: result.digest,
+          });
+        }
+      } catch (interpretError) {
+        // Best-effort fallback (PP4, AP3): record the failure and leave the
+        // projection deliverable as the deterministic `rendered` artifact.
+        const message =
+          interpretError instanceof Error
+            ? interpretError.message
+            : String(interpretError);
+        this.store.recordInterpretDecision(sessionId, event.id, {
+          decision: 'failed',
+          reason: message,
+        });
+      }
+    }
   }
 }

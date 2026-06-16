@@ -1,4 +1,15 @@
-import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from 'drizzle-orm';
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  gt,
+  inArray,
+  isNull,
+  ne,
+  or,
+  sql,
+} from 'drizzle-orm';
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import { ulid } from 'ulid';
 import type { InboxDb } from '../inbox/db.js';
@@ -92,6 +103,19 @@ function deliveryStateForRow(row: {
   if (row.acknowledgedAt) return 'acknowledged';
   if (row.firstNotifiedAt) return 'claimed';
   return 'unread';
+}
+
+/**
+ * A delivery-query condition that excludes per-recipient projections the
+ * Interpret agentic gate suppressed (G14, 002 §1.1.8): the row is retained for
+ * `monitor explain` but is never surfaced to a transport. `deliver`/`failed`
+ * (best-effort fallback) and the absent (non-`prose`) case all deliver normally.
+ */
+function notInterpretSuppressed() {
+  return or(
+    isNull(sessionEventState.interpretDecision),
+    ne(sessionEventState.interpretDecision, 'suppress'),
+  );
 }
 
 function scopeMatches(
@@ -296,6 +320,7 @@ export class RuntimeStore {
       .run();
 
     const event = this.getEventById(id);
+    const projectedSessionIds: string[] = [];
     for (const session of this.sessionsForWorkspace(event.workspacePath).filter(
       (candidate) => candidate.role === 'lead',
     )) {
@@ -308,8 +333,56 @@ export class RuntimeStore {
           updatedAt: event.createdAt,
         })
         .run();
+      projectedSessionIds.push(session.id);
     }
+    this.lastProjectedSessionIds = projectedSessionIds;
     return event;
+  }
+
+  /**
+   * The lead-session ids the most recent {@link insertEvent} projected the event
+   * into (the per-recipient seam, 002 §1.1.2). The runtime reads these to drive
+   * the per-recipient Interpret stage (G14) without re-querying.
+   */
+  private lastProjectedSessionIds: string[] = [];
+
+  /** @returns the lead-session ids the last {@link insertEvent} projected into. */
+  projectedSessionIdsForLastEvent(): string[] {
+    return this.lastProjectedSessionIds;
+  }
+
+  /**
+   * Record the per-recipient Interpret verdict (G14, 002 §1.1.8) on the
+   * `session_event_state` projection. When `decision` is `suppress`, the
+   * projection is retained (so the verdict stays explainable via
+   * `monitor explain`, 002 §10.7) but excluded from delivery by
+   * {@link unreadEventsForSession}/{@link pendingEventsForSession}.
+   */
+  recordInterpretDecision(
+    sessionId: string,
+    eventId: string,
+    decision: {
+      decision: 'deliver' | 'suppress' | 'failed';
+      reason?: string | undefined;
+      digest?: string | undefined;
+    },
+  ): void {
+    const now = new Date();
+    asInternalDb(this.db)
+      .update(sessionEventState)
+      .set({
+        interpretDecision: decision.decision,
+        interpretReason: decision.reason ?? null,
+        interpretDigest: decision.digest ?? null,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(sessionEventState.sessionId, sessionId),
+          eq(sessionEventState.eventId, eventId),
+        ),
+      )
+      .run();
   }
 
   getEventById(id: string): MonitorEventRecord {
@@ -531,6 +604,15 @@ export class RuntimeStore {
         ? { lastClaimLifecycle: state.lastClaimLifecycle }
         : {}),
       ...(state.acknowledgedAt ? { acknowledgedAt: state.acknowledgedAt } : {}),
+      ...(state.interpretDecision
+        ? { interpretDecision: state.interpretDecision }
+        : {}),
+      ...(state.interpretReason
+        ? { interpretReason: state.interpretReason }
+        : {}),
+      ...(state.interpretDigest
+        ? { interpretDigest: state.interpretDigest }
+        : {}),
     }));
   }
 
@@ -564,7 +646,13 @@ export class RuntimeStore {
       })
       .from(sessionEventState)
       .innerJoin(monitorEvents, eq(sessionEventState.eventId, monitorEvents.id))
-      .where(and(...conditions, isNull(sessionEventState.acknowledgedAt)))
+      .where(
+        and(
+          ...conditions,
+          isNull(sessionEventState.acknowledgedAt),
+          notInterpretSuppressed(),
+        ),
+      )
       .orderBy(asc(monitorEvents.createdAt))
       .all();
     return rows.map((row) => rowToEvent(row.event));
@@ -587,6 +675,7 @@ export class RuntimeStore {
           ...conditions,
           isNull(sessionEventState.acknowledgedAt),
           isNull(sessionEventState.firstNotifiedAt),
+          notInterpretSuppressed(),
         ),
       )
       .orderBy(asc(monitorEvents.createdAt))

@@ -20,6 +20,23 @@ export interface InboxDb {
  *
  * @param dbPath - Path to the SQLite database file, or ':memory:' for in-memory
  */
+/**
+ * Add `column` (`type`) to `table` if it does not already exist. SQLite has no
+ * `ADD COLUMN IF NOT EXISTS`, so we probe `PRAGMA table_info` first. Used for
+ * additive, backward-compatible schema evolution on durable DBs created by an
+ * earlier version (no destructive migration framework exists yet).
+ */
+function addColumnIfMissing(
+  client: BetterSQLiteClient,
+  table: string,
+  column: string,
+  type: string,
+): void {
+  const columns = client.pragma(`table_info(${table})`) as { name: string }[];
+  if (columns.some((c) => c.name === column)) return;
+  client.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+}
+
 export function createDb(dbPath: string): InboxDb {
   if (dbPath !== ':memory:') {
     mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -148,10 +165,26 @@ export function createDb(dbPath: string): InboxDb {
       acknowledged_at INTEGER,
       last_claim_at INTEGER,
       last_claim_lifecycle TEXT,
+      interpret_decision TEXT,
+      interpret_reason TEXT,
+      interpret_digest TEXT,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     )
   `);
+
+  // Additive migration (G14, 002 §1.1.8): a `session_event_state` table created
+  // by an earlier version lacks the per-recipient Interpret columns. `CREATE
+  // TABLE IF NOT EXISTS` will not add them, so add each missing column to keep
+  // pre-existing durable DBs forward-compatible (restart-safety, BP1).
+  addColumnIfMissing(
+    sqlite,
+    'session_event_state',
+    'interpret_decision',
+    'TEXT',
+  );
+  addColumnIfMissing(sqlite, 'session_event_state', 'interpret_reason', 'TEXT');
+  addColumnIfMissing(sqlite, 'session_event_state', 'interpret_digest', 'TEXT');
 
   return db as unknown as InboxDb;
 }

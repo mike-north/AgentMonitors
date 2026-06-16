@@ -396,13 +396,15 @@ this degenerate case (no intermediate steps to collapse).
 
 ### 1.1.8 Interpret: a cheap agentic digest via the user's own AI tool
 
-> **Status: target.** Every rule in this section is **target**, not current behavior. It details the
-> **Interpret** stage of [§1.1.1](#111-the-locked-stage-order): the optional, cheap, agentic reading
-> of the **per-recipient delta** that runs **after** the per-recipient Diff and before Deliver, on the
-> **per-recipient** (right) side of the seam ([§1.1.2](#112-the-shared--per-recipient-seam)). It is
-> invoked **only** when the author declares `payload.form: prose`
-> ([001 §5.2](./001-monitor-definition.md#52-payload-form-target),
-> [§1.1.6](#116-author-declared-payload-form)); the other three forms skip it. Formalizes a resolved
+> **Status: current** (G14, Refs #178). The rules in this section are implemented behavior. It
+> details the **Interpret** stage of [§1.1.1](#111-the-locked-stage-order): the optional, cheap,
+> agentic reading of the **per-recipient delta** that runs **after** the per-recipient Diff and before
+> Deliver, on the **per-recipient** (right) side of the seam
+> ([§1.1.2](#112-the-shared--per-recipient-seam)). It is invoked **only** when the author declares
+> `payload.form: prose` ([001 §5.2](./001-monitor-definition.md#52-payload-form-target),
+> [§1.1.6](#116-author-declared-payload-form)); the other three forms skip it. The stage is disabled
+> unless an `InterpretAdapter` is injected into `AgentMonitorRuntime`, so the default (no adapter)
+> behavior is the degenerate, fully-backward-compatible case. Formalizes a resolved
 > decision from the monitoring capability study
 > ([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
 > §S4, resolved §S5 item 3; ledger rows **C45/C10/C11/C38/C12**, with E5 as the flagship — the first
@@ -508,6 +510,19 @@ deterministic.
 > `payload.form: prose` never invokes the adapter at all. When the fake adapter throws, the recipient
 > still receives the §1.1.5 `rendered` artifact (best-effort fallback) and the Interpret failure is
 > recorded as explainable — proving delivery never depends on the model call succeeding.
+
+Verified: `libs/core/src/adapter/interpret.ts` — `InterpretAdapter` interface and
+`createClaudeInterpretAdapter` (the host-specific `claude -p` argv-only invocation, behind the
+adapter boundary); `libs/core/src/runtime/service.ts` — `processObservation` invokes the stage only
+for `payload.form: prose` and only when an adapter is injected, `runInterpret` records each
+per-recipient verdict and falls back on failure; `libs/core/src/runtime/store.ts` —
+`recordInterpretDecision` plus the `notInterpretSuppressed` delivery exclusion;
+`libs/core/src/inbox/schema.ts` / `db.ts` — the `session_event_state.interpret_decision /
+interpret_reason / interpret_digest` columns (additive migration). Proven by
+`libs/core/src/runtime/interpret-stage.test.ts` (proof criteria a–e: prose-only invocation,
+substantive→deliver-with-digest, not-substantive→no-delivery-with-explainable-reason,
+tool-throws→rendered-fallback-recorded, no-adapter→no-AI-call) and
+`libs/core/src/adapter/interpret.test.ts` (the concrete adapter's argv/stdout contract).
 
 ## 2. Runtime Tick Model
 
