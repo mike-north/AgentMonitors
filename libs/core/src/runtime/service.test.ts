@@ -3908,9 +3908,16 @@ Daily digest.
         // All three edits delivered as their own events — the play-by-play.
         expect(flush.emittedEventIds).toHaveLength(STATES.length);
 
-        const delivered = ctx.runtime.listEvents({ sessionId: ctx.sessionId });
+        // listEvents() returns newest-first; reverse to get chronological order
+        // so we can assert delivery sequence directly without sorting (sorting
+        // would discard ordering and miss a regression that reorders events).
+        const delivered = ctx.runtime
+          .listEvents({ sessionId: ctx.sessionId })
+          .slice()
+          .reverse();
         expect(delivered).toHaveLength(STATES.length);
-        expect(delivered.map((e) => e.title).sort()).toEqual([
+        // 002 §1.1.7: N=3 ordered deltas — edit 1 before edit 2 before edit 3.
+        expect(delivered.map((e) => e.title)).toEqual([
           'edit 1',
           'edit 2',
           'edit 3',

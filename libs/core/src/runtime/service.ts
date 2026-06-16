@@ -1350,11 +1350,15 @@ export class AgentMonitorRuntime {
    *     row from step 1 is unaffected — it reflects what was *dispatched*, not
    *     what materialized.
    *
-   * `observed` is the count of NEW observations dispatched this tick (it drives
-   * `suppressed` vs `no-change` classification). The not-due rollup flush passes
-   * `observed: 0` because it dispatches no new observations — only the already-
-   * accumulated batch is emitted — so a non-empty flush there classifies as
-   * `triggered` (emitted > 0), the fix for P2.
+   * `observed` is the raw count of observations the source reported this tick
+   * (i.e. `observations.length` from the `observe()` result, **before** notify
+   * dispatch and the Shape pre-filter). It is used only for the history-row
+   * classification: when `emitted > 0` the row is always `triggered` regardless
+   * of `observed`; `observed` only distinguishes `suppressed` (source returned
+   * something but dispatch held it) from `no-change` (source returned nothing).
+   * The not-due rollup flush passes `observed: 0` because no source `observe()`
+   * call was made on that tick — only the already-accumulated batch is emitted —
+   * so a non-empty flush there correctly classifies as `triggered` (emitted > 0).
    */
   private async materializeSpan(
     monitor: MonitorDefinition,
