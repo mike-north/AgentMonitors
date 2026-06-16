@@ -198,6 +198,37 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
   [001 §5.1–§5.2](./001-monitor-definition.md#51-shape-declaration-target) and
   [002 §1.1.4–§1.1.6](./002-runtime-delivery.md#114-shape-deterministic-derived-facts) stay _target_.
 
+### G13 — Author-declared baseline strategy for per-recipient Diff (P2)
+
+- **Current:** the runtime delivers observations in the order they were materialized (one event per
+  shaped observation), which is the degenerate/closest case of the `incremental` strategy — every
+  observation is its own step. Recipients that missed multiple observation cycles receive each event
+  individually in order. There is no mechanism for a monitor to request `net` diff semantics (a
+  single endpoint delta collapsing intermediate churn), and no `baseline-strategy` frontmatter field
+  exists.
+- **Target:** the `baseline-strategy` field ([001 §3.7](./001-monitor-definition.md#37-baseline-strategy-target),
+  [002 §1.1.7](./002-runtime-delivery.md#117-baseline-strategy-per-recipient-diff-semantics-target))
+  is accepted by `agentmonitors validate` and implemented by the runtime Diff stage:
+  (a) `baseline-strategy: incremental` (default) — delivers each observation in the catch-up span
+  in order, preserving backward compatibility; (b) `baseline-strategy: net` — collapses the
+  catch-up span to a single net delta (current shaped state vs. the recipient's baseline), discarding
+  intermediate observations. The default is `incremental`; omitting the field is backward compatible.
+- **Governs:** [001 §3.7](./001-monitor-definition.md#37-baseline-strategy-target),
+  [002 §1.1.7](./002-runtime-delivery.md#117-baseline-strategy-per-recipient-diff-semantics-target);
+  the capability study
+  ([§S5.1](../product/monitoring-capability-exercises.md); rows C6 / C7; E1 / E2).
+- **Files:** `libs/core/src/schema/monitor-schema.ts` (schema acceptance, default `incremental`),
+  `libs/core/src/runtime/service.ts` (per-recipient Diff logic, catch-up span collapse for `net`),
+  `libs/core/src/runtime/store.ts` (per-recipient baseline/cursor persistence).
+- **Proof:** (a) `agentmonitors validate` accepts `baseline-strategy: incremental` and `net`, rejects
+  unknown values; (b) a runtime test proves a `net` monitor with a recipient that missed _N_
+  observations receives one net delta; (c) a runtime test proves an `incremental` monitor with the
+  same scenario receives _N_ ordered deltas; (d) a runtime test proves omitting `baseline-strategy`
+  behaves identically to `incremental` (backward compatible). Until then
+  [001 §3.7](./001-monitor-definition.md#37-baseline-strategy-target) and
+  [002 §1.1.7](./002-runtime-delivery.md#117-baseline-strategy-per-recipient-diff-semantics-target)
+  stay _target_.
+
 > The cursor protocol ([003 §13](./003-source-plugins.md)) is deliberately **not** a roadmap item:
 > per #81 it is designed only as far as a sketch, to be fully specified if measured poll cost ever
 > justifies it.
