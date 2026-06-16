@@ -455,7 +455,7 @@ deterministic.
   suppression is a deliberate, recorded outcome — never a silent drop.
 
 > **Example (E5 — Interpret is the product).** A chief-of-staff monitor watches a Slack mention stream
-> with `payload: prose`. Shape deterministically pre-filters to mentions of the principal and does a
+> with `payload.form: prose`. Shape deterministically pre-filters to mentions of the principal and does a
 > reference-data VIP-roster lookup (a `cel`/`jq` step, shared, no model). On what survives, Interpret
 > runs the user's own `claude -p` per recipient to classify the delta against the author's criteria:
 > _passing chatter_ → the agentic gate suppresses (recorded as suppressed-not-substantive, C11/C12);
