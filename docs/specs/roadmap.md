@@ -99,25 +99,42 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
 
 ### G10 — Post-processing pipeline stages + per-recipient seam (P2)
 
-- **Current:** the runtime implements a subset of the locked pipeline as
-  `Observe → Notify(≈Pace) → Materialize/Diff → Project → Deliver`, with the diff computed **once
-  per object** against the latest stored snapshot ([002 §5.2](./002-runtime-delivery.md)) and then
-  projected into each matching session ([002 §6](./002-runtime-delivery.md)) — a single **shared**
-  baseline.
-- **Target:** the full stage model and seam of
-  [002 §1.1](./002-runtime-delivery.md) — `Observe → [Compose] → Shape → Pace → ⟦seam⟧ → Diff → Interpret → Deliver → [React]` — with **Shape** (render before Pace and before Diff), **Pace**
-  modes, and a **per-recipient Diff** computed against each recipient's own baseline/cursor right of
-  the shared/per-recipient seam (so divergent-baseline recipients each hear the right span; fan-out
-  multiplies only genuinely per-baseline work, capability C15). The per-stage detail lands with the
-  follow-on Shape / Interpret / baseline-Diff / Pace work.
+> **PR-A landed.** The per-recipient baseline **seam + per-recipient Diff** substrate is built and
+> proven: a shared `monitor_events` artifact is materialized once, then diffed **per recipient
+> against each recipient's own baseline cursor** (`session_object_cursor` →
+> `session_event_state.diff_text`), so two sessions at divergent stored baselines each hear the right
+> span from one shared observation. Cursor semantics: a late joiner seeds caught-up (hears only
+> changes after it registered), the cursor advances at claim, and cursors persist across dormancy and
+> restart (BP1). See [002 §1.1.2](./002-runtime-delivery.md#112-the-shared--per-recipient-seam) (now
+> _current_ for the substrate), [002 §5.2 / §6](./002-runtime-delivery.md), and
+> [spec-changelog.md](./spec-changelog.md). Proven by
+> `libs/core/src/runtime/per-recipient-diff.test.ts`.
+>
+> **PR-B remains (keep this item open).** Rewire G13 (`net` collapse,
+> [§1.1.7](./002-runtime-delivery.md)) and G14 (Interpret dedup,
+> [§1.1.8](./002-runtime-delivery.md)) to span **per recipient** rather than over the shared
+> baseline. They currently keep working unchanged on top of the PR-A substrate (co-registered
+> recipients seed identical cursors). The remaining gap below is scoped to that rewire.
+
+- **Current:** the per-recipient Diff seam is built (PR-A, above): one shared artifact, per-recipient
+  delta against each recipient's cursor. The `net` collapse ([002 §1.1.7](./002-runtime-delivery.md))
+  and Interpret ([002 §1.1.8](./002-runtime-delivery.md)) still operate over the **shared** snapshot
+  baseline rather than each recipient's cursor (they remain behaviorally unchanged on the new
+  substrate).
+- **Target (PR-B):** rewire the `net` collapse and Interpret to span **per recipient** off the
+  baseline cursor, completing the right-of-seam stages of
+  [002 §1.1](./002-runtime-delivery.md) — `Observe → [Compose] → Shape → Pace → ⟦seam⟧ → Diff → Interpret → Deliver → [React]` — so per-recipient `net`/Interpret multiply only genuinely
+  per-baseline work (capability C15).
 - **Governs:** PP3, AP3 ([000](./000-principles.md)), [002 §1.1](./002-runtime-delivery.md),
   the capability study ([§S1, §S4, §S5](../product/monitoring-capability-exercises.md); rows
   C6/C15/C43).
 - **Files:** `libs/core/src/runtime/service.ts`, `libs/core/src/runtime/store.ts`,
-  `libs/core/src/runtime/diff.ts` (and the per-recipient baseline persistence).
-- **Proof:** per-stage tests landing with the follow-on work (a divergent-baseline fan-out test
-  proving two recipients with different last-seen points receive different spans from one shared
-  observation); until then [002 §1.1](./002-runtime-delivery.md) stays _target_.
+  `libs/core/src/runtime/diff.ts` (and the per-recipient baseline persistence,
+  `libs/core/src/inbox/schema.ts` — landed in PR-A).
+- **Proof:** the PR-A divergent-baseline fan-out test
+  (`libs/core/src/runtime/per-recipient-diff.test.ts`) proves the seam; PR-B adds per-recipient
+  `net`/Interpret tests. Until PR-B, [002 §1.1.7](./002-runtime-delivery.md) / §1.1.8 stay scoped to
+  the shared baseline.
 
 > G11 (source contract: snapshots-not-diffs + composite observation) **shipped** — both
 > [003 §2.5](./003-source-plugins.md) and [003 §2.6](./003-source-plugins.md) are now **current**.

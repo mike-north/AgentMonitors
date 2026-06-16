@@ -173,6 +173,23 @@ export type MonitorDeliveryState = 'unread' | 'claimed' | 'acknowledged';
  */
 export type InterpretDecision = 'deliver' | 'suppress' | 'failed';
 
+/**
+ * A per-recipient baseline cursor (G10, 002 §1.1.2): the last shaped artifact a
+ * given session was caught up to for one `(monitorId, objectKey, workspacePath)`
+ * object. The recipient's Diff stage spans FROM `baselineContent`.
+ * `baselineContent` is denormalized (prune-immune); `baselineSnapshotId` records
+ * which event/snapshot the baseline came from, for diagnosis.
+ */
+export interface SessionObjectCursorRecord {
+  sessionId: string;
+  monitorId: string;
+  objectKey: string;
+  workspacePath: string | null;
+  baselineSnapshotId: string | null;
+  baselineContent: string;
+  updatedAt: Date;
+}
+
 export interface MonitorDeliveryProjection {
   eventId: string;
   sessionId: string;
@@ -185,6 +202,14 @@ export interface MonitorDeliveryProjection {
   lastClaimAt?: Date;
   lastClaimLifecycle?: string;
   acknowledgedAt?: Date;
+  /**
+   * The PER-RECIPIENT delta for this projection (G10, 002 §1.1.2): the diff of
+   * the shared event's artifact against THIS session's own baseline cursor.
+   * Absent for a baseline event (nothing to diff) and for legacy rows
+   * materialized before G10 — consumers fall back to the shared
+   * `MonitorEventRecord.diffText` in that case.
+   */
+  diffText?: string;
   /** The per-recipient Interpret verdict (G14), absent for non-`prose` deliveries. */
   interpretDecision?: InterpretDecision;
   /** The agentic-gate suppression reason or the fallback-failure detail. */

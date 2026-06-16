@@ -1897,33 +1897,44 @@ export class AgentMonitorRuntime {
         ? buildTextDiff(previousSnapshot.content, effectiveSnapshotText)
         : null;
 
-    const event = this.store.insertEvent({
-      workspacePath: input.workspacePath ?? null,
-      monitorId: input.monitor.id,
-      sourceName: input.sourceName,
-      urgency: input.effectiveUrgency,
-      title: input.observation.title,
-      body: input.observation.body ?? input.monitor.instructions,
-      summary:
-        input.observation.summary ??
-        input.observation.body ??
-        input.observation.title,
-      payload: shaped.payload ?? input.observation.payload ?? {},
-      snapshotMetadata: input.observation.snapshot ?? {},
-      snapshotText: effectiveSnapshotText ?? null,
-      diffText,
-      objectKey,
-      // Make the source-agnostic changeKind queryable without each source having
-      // to duplicate it into its own queryScope.
-      queryScope: {
-        ...(input.observation.queryScope ?? {}),
-        ...(input.observation.changeKind
-          ? { changeKind: input.observation.changeKind }
-          : {}),
+    const event = this.store.insertEvent(
+      {
+        workspacePath: input.workspacePath ?? null,
+        monitorId: input.monitor.id,
+        sourceName: input.sourceName,
+        urgency: input.effectiveUrgency,
+        title: input.observation.title,
+        body: input.observation.body ?? input.monitor.instructions,
+        summary:
+          input.observation.summary ??
+          input.observation.body ??
+          input.observation.title,
+        payload: shaped.payload ?? input.observation.payload ?? {},
+        snapshotMetadata: input.observation.snapshot ?? {},
+        snapshotText: effectiveSnapshotText ?? null,
+        // The SHARED object-level diff (against the latest stored snapshot) for
+        // `events list`/history display (002 §5.2). The PER-RECIPIENT delta is
+        // computed inside insertEvent's projection loop and recorded on each
+        // session's session_event_state.diff_text (G10, 002 §1.1.2).
+        diffText,
+        objectKey,
+        // Make the source-agnostic changeKind queryable without each source having
+        // to duplicate it into its own queryScope.
+        queryScope: {
+          ...(input.observation.queryScope ?? {}),
+          ...(input.observation.changeKind
+            ? { changeKind: input.observation.changeKind }
+            : {}),
+        },
+        tags: input.monitor.frontmatter.tags ?? [],
+        createdAt: input.observedAt,
       },
-      tags: input.monitor.frontmatter.tags ?? [],
-      createdAt: input.observedAt,
-    });
+      // The object's snapshot state immediately BEFORE this event — used to seed
+      // a first-time recipient's cursor so it hears only changes AFTER it
+      // registered (decided semantics Q1; backward-compat with the single-baseline
+      // diff above when there is one recipient at the shared baseline).
+      { previousContent: previousSnapshot?.content ?? null },
+    );
 
     // TODO(#46 follow-up): make insertEvent+saveSnapshot atomic via a
     // transaction. Currently a saveSnapshot failure after a successful insertEvent
@@ -1977,48 +1988,69 @@ export class AgentMonitorRuntime {
     const sessionIds = this.store.projectedSessionIdsForLastEvent();
     if (sessionIds.length === 0) return;
 
-    // The per-recipient delta: the rendered diff for this event, falling back to
-    // the full artifact when this is a baseline (no prior snapshot to diff).
-    // All sessions that received this event share the same rendered delta, so we
-    // invoke the adapter ONCE and apply the single verdict to every recipient.
-    // This is both correct (same input → same verdict) and efficient (no
-    // N-per-recipient round-trips to an external tool for identical inputs).
-    const delta = diffText ?? event.snapshotText ?? '';
+    // The per-recipient delta (G10, 002 §1.1.2): each recipient is judged on the
+    // diff it actually computed against ITS OWN baseline cursor (recorded on
+    // session_event_state.diff_text), falling back to the shared event diff, then
+    // the full artifact at a baseline. Recipients sharing the same delta get ONE
+    // adapter call (same input → same verdict, no redundant tool round-trips).
+    // When recipients are co-registered at the same baseline their deltas are
+    // identical, so this collapses to exactly today's single shared call (the
+    // G14 behavior PR-A must not change).
+    const sharedFallback = diffText ?? event.snapshotText ?? '';
+    // Fetch all per-recipient diffs for every projected session in ONE query
+    // (avoids the N+1 pattern of calling perRecipientDiffsForSession once per
+    // recipient in the loop below). (G10, 002 §1.1.2; Copilot review: comment 3.)
+    const allRecipientDiffs = this.store.perRecipientDiffsForAllSessions(
+      sessionIds,
+      event.id,
+    );
     const criteria = monitor.instructions;
 
-    let result: Awaited<ReturnType<typeof adapter.interpret>> | undefined;
-    let errorMessage: string | undefined;
-    try {
-      result = await adapter.interpret({
-        delta,
-        criteria,
-        monitorId: monitor.id,
-      });
-    } catch (interpretError) {
-      // Best-effort fallback (PP4, AP3): record the failure and leave every
-      // projection deliverable as the deterministic `rendered` artifact.
-      errorMessage =
-        interpretError instanceof Error
-          ? interpretError.message
-          : String(interpretError);
+    // Group recipients by their distinct delta so the adapter runs once per
+    // distinct input, not once per recipient.
+    const sessionsByDelta = new Map<string, string[]>();
+    for (const sessionId of sessionIds) {
+      const delta = allRecipientDiffs.get(sessionId) ?? sharedFallback;
+      const bucket = sessionsByDelta.get(delta);
+      if (bucket) bucket.push(sessionId);
+      else sessionsByDelta.set(delta, [sessionId]);
     }
 
-    for (const sessionId of sessionIds) {
-      if (errorMessage !== undefined) {
-        this.store.recordInterpretDecision(sessionId, event.id, {
-          decision: 'failed',
-          reason: errorMessage,
+    for (const [delta, deltaSessionIds] of sessionsByDelta) {
+      let result: Awaited<ReturnType<typeof adapter.interpret>> | undefined;
+      let errorMessage: string | undefined;
+      try {
+        result = await adapter.interpret({
+          delta,
+          criteria,
+          monitorId: monitor.id,
         });
-      } else if (result?.decision === 'suppress') {
-        this.store.recordInterpretDecision(sessionId, event.id, {
-          decision: 'suppress',
-          reason: result.reason,
-        });
-      } else if (result?.decision === 'deliver') {
-        this.store.recordInterpretDecision(sessionId, event.id, {
-          decision: 'deliver',
-          digest: result.digest,
-        });
+      } catch (interpretError) {
+        // Best-effort fallback (PP4, AP3): record the failure and leave every
+        // projection deliverable as the deterministic `rendered` artifact.
+        errorMessage =
+          interpretError instanceof Error
+            ? interpretError.message
+            : String(interpretError);
+      }
+
+      for (const sessionId of deltaSessionIds) {
+        if (errorMessage !== undefined) {
+          this.store.recordInterpretDecision(sessionId, event.id, {
+            decision: 'failed',
+            reason: errorMessage,
+          });
+        } else if (result?.decision === 'suppress') {
+          this.store.recordInterpretDecision(sessionId, event.id, {
+            decision: 'suppress',
+            reason: result.reason,
+          });
+        } else if (result?.decision === 'deliver') {
+          this.store.recordInterpretDecision(sessionId, event.id, {
+            decision: 'deliver',
+            digest: result.digest,
+          });
+        }
       }
     }
   }
