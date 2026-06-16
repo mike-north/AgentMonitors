@@ -246,11 +246,17 @@ Rules for the payload-form step:
   Choosing `structured` for a computing recipient is the explicit way to **skip a lossy digest** (E6).
 - **`structured` is produced by a declarative transform over JSON.** When the form is `structured`,
   the author declares a **turnkey declarative transform/filter** — **`jq`** (extraction/reshaping) or
-  **`CEL`** (predicate/boolean selection) — that the runtime evaluates deterministically. The
-  transform operates over the **canonical JSON** form of the shaped snapshot: even when the author
-  _thinks_ in YAML / TOON / TOML, the predicate/transform surface is defined on JSON (the canonical
-  interchange form), and the chosen output encoding (JSON / YAML / TOON / TOML) is a downstream
-  serialization concern, not part of the predicate semantics.
+  **`cel`** (significance gate) — that the runtime evaluates deterministically. The transform operates
+  over the **canonical JSON** form of the shaped snapshot: even when the author _thinks_ in YAML /
+  toon / TOML, the predicate/transform surface is defined on JSON (the canonical interchange form),
+  and the chosen output encoding (`json` / `yaml` / `toon` / `toml`) is a downstream serialization
+  concern, not part of the predicate semantics. The two languages have distinct, non-overlapping
+  roles: **`jq` reshapes** — its output is the reshaped JSON delivered as the structured payload;
+  **`cel` gates** — it evaluates to a boolean, where `true` delivers the canonical (un-reshaped)
+  shaped snapshot as the structured payload and `false` **suppresses delivery entirely**. A suppressed
+  delivery is not silently dropped: the runtime records it as suppressed so it remains explainable
+  ([§1.1.1](#111-the-locked-stage-order)). To both gate and reshape, use `jq` with an explicit
+  condition in the filter expression.
 - **The transform is on the shared side of the seam.** A `jq`/`CEL` transform is a deterministic
   reduction of the **shared** shaped snapshot, so it runs **once** (left of the seam,
   [§1.1.2](#112-the-shared--per-recipient-seam)), not per recipient. It is **not** arbitrary user code

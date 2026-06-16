@@ -252,17 +252,18 @@ shape:
 Authoring rules:
 
 - **`shape.derive`** is an ordered list of named derived facts. Each entry has a `name` (the marker
-  surfaced in the rendered artifact) and a deterministic `when` predicate evaluated over the shaped
-  snapshot plus the runtime-injected `now` (never an ambient clock — see
-  [002 §1.1.4](./002-runtime-delivery.md#114-shape-deterministic-derived-facts)). The predicate
-  surface is the same declarative language as the transform surface (§5.2): a constrained expression,
-  **not** arbitrary code.
+  surfaced in the rendered artifact) and a deterministic `when` **CEL boolean predicate** evaluated
+  over `(snapshot, now)` — the shaped snapshot plus the runtime-injected `now` (never an ambient
+  clock — see [002 §1.1.4](./002-runtime-delivery.md#114-shape-deterministic-derived-facts)). CEL is
+  used here specifically because `when` is a _condition_ (boolean selection), not a reshaping
+  expression; jq is reserved for extraction/reshaping (§5.2 `payload.transform`). The predicate is a
+  constrained declarative expression, **not** arbitrary code.
 - **`shape.render`** opts into rendering the shaped state to the stable, token-efficient text artifact
   that the runtime then diffs ([002 §1.1.5](./002-runtime-delivery.md#115-shape-render-to-a-stable-artifact-then-diff-the-artifact)).
   The rendered form is markdown-ish text, never JSON — chosen so the diff is semantic and cheap.
 - **Determinism is a validation obligation.** Because instability produces phantom diffs, a `shape`
   declaration MUST be a pure function of `(snapshot, now)`. Predicates that reference anything outside
-  the snapshot and `now` are invalid (see [004 §2.2](./004-validation-testing.md)).
+  the snapshot and `now` are invalid (target — see [004 §2.2](./004-validation-testing.md)).
 
 > **What this example proves:** an author can move timestamp/aggregate reasoning below the model
 > (C41), name the resulting markers, and opt into the diffable render (C42/C43) — without writing any
@@ -308,7 +309,7 @@ Authoring rules:
   semantics.
 - **Validation.** A `payload.transform` under any `form` other than `structured` is rejected; a
   malformed `jq`/`cel` expression is rejected; an unknown `form`, `language`, or `encoding` is
-  rejected (see [004 §2.2](./004-validation-testing.md)).
+  rejected (target — see [004 §2.2](./004-validation-testing.md)).
 
 > **What this example proves:** the same pipeline serves opposite recipients — a computing domain
 > agent gets `structured` numbers via a `jq` projection (E6), while a watch-it-for-change recipient

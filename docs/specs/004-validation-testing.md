@@ -36,6 +36,16 @@ When parse-time validation sees the old top-level `source:` + `scope:` shape, `v
 
 The validator is `@cfworker/json-schema`, which walks the schema at runtime rather than compiling with the `Function` constructor, so validation is safe under restrictive CSP / Workers-style environments.
 
+> **Target extension (not yet implemented).** Validation of `shape` predicate determinism and
+> `payload.form` / `payload.transform` / `payload.encoding` is a **_target_** obligation for the
+> `validate` surface. When implemented, `validate` will additionally reject: a `shape.derive.when`
+> CEL predicate that references symbols outside `(snapshot, now)`; a `payload.transform` under any
+> `form` other than `structured`; a malformed `jq` or `cel` expression; and an unknown `form`,
+> `language`, or `encoding` value. The cross-references from
+> [001 §5.1](./001-monitor-definition.md#51-shape-target) and
+> [001 §5.2](./001-monitor-definition.md#52-payload-form-target) point at this _target_ guarantee,
+> not the current `watch`/`scopeSchema` validation already in place.
+
 ### 2.3 `agentmonitors schema generate`
 
 The schema-generation path proves that the source registry can produce a combined editor-facing schema for monitor authoring. It is a contract surface for: allowed top-level monitor fields; allowed urgency values; source-discriminated watch config shapes.
