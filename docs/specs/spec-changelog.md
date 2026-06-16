@@ -24,8 +24,7 @@ Builds on the per-recipient seam already formalized in [002 §1.1.2](./002-runti
   is per-monitor author intent; the runtime enforces it in the per-recipient Diff stage right of
   the seam (§1.1.2). Motivation and cross-references to C6 / C7 / E1 / E2 / §S5.1 included.
 
-- **001 §7.4 — net-delta spec-doc authoring example (target).** Illustrates `baseline-strategy:
-net` for a shared spec-doc monitor serving a fleet of agents at divergent baselines (the E2
+- **001 §7.4 — net-delta spec-doc authoring example (target).** Illustrates `baseline-strategy: net` for a shared spec-doc monitor serving a fleet of agents at divergent baselines (the E2
   scenario), paired with `notify: debounce` — the field works alongside any Pace mode.
 
 - **002 §1.1.7 — Diff: catch-up span and baseline-strategy semantics (target).** Defines the

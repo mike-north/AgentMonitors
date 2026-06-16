@@ -279,7 +279,7 @@ Rules for the payload-form step:
 
 > **Status: target.** Every rule in this section is **target**, not current behavior. It specifies
 > how the **Diff** stage ([§1.1.1](#111-the-locked-stage-order), [§1.1.2](#112-the-shared--per-recipient-seam))
-> spans a **catch-up window** when a recipient has missed several changes between deliveries.
+> spans a **catch-up span** when a recipient has missed several changes between deliveries.
 > The two modes are parameterized by the `baseline-strategy` authoring field
 > ([001 §3.7](./001-monitor-definition.md#37-baseline-strategy-target)). Formalizes a resolved
 > decision from the monitoring capability study

@@ -77,16 +77,16 @@ All discovered paths are resolved to absolute paths before parsing.
 
 Each monitor frontmatter object **MUST** contain:
 
-| Field               | Type     | Required | Meaning                                                                                                                          |
-| ------------------- | -------- | -------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `name`              | string   | no       | Human-readable display name; defaults to the monitor id (filename or directory name) when omitted                                |
-| `watch`             | object   | yes      | Intent-first observation config: `type` names the source; remaining keys are per-source config                                   |
-| `urgency`           | string   | yes      | A level (`low`/`normal`/`high`) **or** an authored band `lo..hi` (see [§3.2](#32-urgency))                                       |
-| `notify`            | object   | no       | Explicit debounce/throttle policy                                                                                                |
-| `shape`             | object   | no       | _Target._ Deterministic Shape declaration: derived facts + render (see [§5.1](#51-shape-declaration-target))                     |
-| `payload`           | object   | no       | _Target._ Author-declared payload form + transform (see [§5.2](#52-payload-form-target))                                         |
-| `baseline-strategy` | string   | no       | _Target._ How the per-recipient Diff spans a catch-up window — `incremental` or `net` (see [§3.7](#37-baseline-strategy-target)) |
-| `tags`              | string[] | no       | Tags for later filtering                                                                                                         |
+| Field               | Type     | Required | Meaning                                                                                                                        |
+| ------------------- | -------- | -------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `name`              | string   | no       | Human-readable display name; defaults to the monitor id (filename or directory name) when omitted                              |
+| `watch`             | object   | yes      | Intent-first observation config: `type` names the source; remaining keys are per-source config                                 |
+| `urgency`           | string   | yes      | A level (`low`/`normal`/`high`) **or** an authored band `lo..hi` (see [§3.2](#32-urgency))                                     |
+| `notify`            | object   | no       | Explicit debounce/throttle policy                                                                                              |
+| `shape`             | object   | no       | _Target._ Deterministic Shape declaration: derived facts + render (see [§5.1](#51-shape-declaration-target))                   |
+| `payload`           | object   | no       | _Target._ Author-declared payload form + transform (see [§5.2](#52-payload-form-target))                                       |
+| `baseline-strategy` | string   | no       | _Target._ How the per-recipient Diff spans a catch-up span — `incremental` or `net` (see [§3.7](#37-baseline-strategy-target)) |
+| `tags`              | string[] | no       | Tags for later filtering                                                                                                       |
 
 > Verified: `libs/core/src/schema/monitor-schema.ts` — the `monitorFrontmatterSchema` Zod object requires `watch` and `urgency`; `name`, `notify`, and `tags` are optional. The `shape`, `payload`, and `baseline-strategy` fields are **target** (see [§5.1](#51-shape-declaration-target), [§5.2](#52-payload-form-target), [§3.7](#37-baseline-strategy-target)) and are not yet in the current schema.
 
@@ -218,7 +218,7 @@ for the complete Pace mode reference; capability study C44 / §S5.2.
 
 A monitor **MAY** declare a `baseline-strategy` field that controls how the per-recipient **Diff**
 stage ([002 §1.1.7](./002-runtime-delivery.md#117-baseline-strategy-per-recipient-diff-semantics-target))
-spans a _catch-up window_ — the set of shaped observations that accumulated since the recipient's
+spans a _catch-up span_ — the set of shaped observations that accumulated since the recipient's
 last-seen baseline. It is **optional**; omitting it is equivalent to `incremental` (see backward
 compatibility below).
 
@@ -495,7 +495,7 @@ whether any aspect of your current task needs to be adjusted.
 - omitting `baseline-strategy` entirely is equivalent to `incremental` — this field only needs
   to be set when `net` is the desired behavior
 - the field works alongside any `notify` strategy; the baseline strategy governs how the
-  per-recipient Diff spans a catch-up window, which is independent of Pace
+  per-recipient Diff spans a catch-up span, which is independent of Pace
 
 ## 8. Validation Implications
 
