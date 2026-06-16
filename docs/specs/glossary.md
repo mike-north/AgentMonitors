@@ -25,6 +25,12 @@ is authoritative; this page is a quick index, not the contract.
 - **Notify policy** — A monitor's optional `debounce` (`settle-for`) or `throttle`
   (`suppress-for`) configuration. Omitted ⇒ urgency-based defaults.
   [001 §3.4](./001-monitor-definition.md), [002 §4](./002-runtime-delivery.md).
+- **Payload form (target)** — The author-declared shape of what a monitor delivers:
+  `prose | structured | artifact | rendered`. `prose` invokes the optional Interpret stage; the
+  others are deterministic-floor forms. `structured` is produced by a turnkey declarative **jq/CEL**
+  transform over the canonical JSON form of the shaped snapshot.
+  [001 §5.2](./001-monitor-definition.md#52-payload-form-target),
+  [002 §1.1.6](./002-runtime-delivery.md#116-author-declared-payload-form). (capability C46)
 
 ## Sources & observation
 
@@ -60,6 +66,16 @@ is authoritative; this page is a quick index, not the contract.
 - **Composite observation (target)** — One `Observation` assembled from **many** source queries/calls
   into a single whole-state snapshot, on the shared side of the seam (the `[Compose]` stage). Carries
   one `objectKey` for the assembled whole. [003 §2.6](./003-source-plugins.md). (capability C40)
+- **Derived fact (target)** — A relative/aggregate fact (e.g. "past due", "stalled", "revealed",
+  "urgent") computed by the **Shape** stage as a **pure function of `(shaped snapshot, injected now)`**
+  — deterministic, shared, no model. Sources surface the **raw facts** it consumes and do not
+  pre-compute it. [002 §1.1.4](./002-runtime-delivery.md#114-shape-deterministic-derived-facts),
+  [003 §2.7](./003-source-plugins.md). (capability C41)
+- **Rendered artifact (target)** — The stable, token-efficient, markdown-ish (not JSON) text the
+  **Shape** stage renders the shaped state into; the runtime diffs **this artifact**, not the raw
+  source, so deltas are semantic and cheap. Deterministic render is a prerequisite for a useful diff.
+  [002 §1.1.5](./002-runtime-delivery.md#115-shape-render-to-a-stable-artifact-then-diff-the-artifact).
+  (capabilities C42/C43)
 - **Runtime** — The poll-and-project engine: scans monitors, evaluates due sources, persists
   source/notify state, materializes events, refreshes hook state.
   [002 §2](./002-runtime-delivery.md). (AP3)

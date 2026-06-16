@@ -93,6 +93,188 @@ They compose and do not conflict: a source may observe every 30s, Pace may hold 
 for a 15s settle (§4.1), and an individual recipient may not be delivered to until its next
 turn-boundary (§9). None of the three is derivable from the others.
 
+### 1.1.4 Shape: deterministic derived facts
+
+> **Status: target.** Every rule in this section is **target**, not current behavior. It details the
+> **Shape** stage of [§1.1.1](#111-the-locked-stage-order): the deterministic computation the runtime
+> performs on a shared, post-Compose snapshot **before** Pace and **before** Diff. It is on the
+> **shared** (left) side of the seam ([§1.1.2](#112-the-shared--per-recipient-seam)), so it runs
+> **once** per observation regardless of recipient count. Formalizes a resolved decision from the
+> monitoring capability study
+> ([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
+> §S1, §S2 area C, §S3 Tier 1, E8; ledger row **C41**). The raw facts this stage consumes originate at
+> the source/observation surface ([003 §2.7](./003-source-plugins.md)).
+
+The Shape stage **MAY** compute **derived / relative facts** from the raw observation
+deterministically — facts the recipient would otherwise have to reason about, burning model tokens on
+arithmetic and aggregation that has one correct answer. Computing them below the model is the point:
+it is reproducible, cheap, and cannot hallucinate. (E8 records the status quo without this stage as
+_"nearly 100% waste"_ — an agent doing timestamp and aggregate reasoning on every poll.)
+
+A **derived fact** is a value computed by an author-declared deterministic rule over the shaped
+snapshot (and the runtime-supplied `now`), surfaced in the rendered artifact (§1.1.5) so the
+recipient reads a conclusion rather than recomputing it. The four motivating rule shapes from E8
+(capability C41) are:
+
+| Derived fact                | Deterministic rule (illustrative)                                                      | Raw inputs                     |
+| --------------------------- | -------------------------------------------------------------------------------------- | ------------------------------ |
+| **past due** / **due soon** | compare an item's `due` timestamp to `now` (and to an author-set "soon" horizon)       | a timestamp field + `now`      |
+| **stalled**                 | a project all of whose tasks are blocked (no actionable next step)                     | the set of child task states   |
+| **revealed**                | a deferred item whose defer-until threshold has now been crossed (`defer-until ≤ now`) | a defer timestamp + `now`      |
+| **urgent**                  | a priority signal combined with deadline proximity crossing an author-set bound        | priority + a timestamp + `now` |
+
+Rules for the derived-facts step:
+
+- **Deterministic and reproducible.** A derived fact MUST be a pure function of the shaped snapshot
+  plus the runtime-supplied `now` — the same inputs MUST yield the same fact every run. No model call,
+  no network, no wall-clock read other than the injected `now`. This is what keeps the fact on the
+  **shared** side of the seam (one computation serves every recipient) and out of the
+  hallucination-prone Interpret stage.
+- **`now` is the only time input, and it is injected.** Relative facts ("past due", "due soon",
+  "revealed") are computed against the runtime-supplied `now` (the same `now` threaded to
+  `observe()`, [002 §2](#2-runtime-tick-model)) — never an ambient `Date.now()` read inside the rule —
+  so a tick is reproducible and testable with a fixed clock.
+- **Author-declared.** Which facts to compute, and their thresholds (the "soon" horizon, the urgency
+  proximity bound), are author configuration, not built-in policy — the rule set is part of the
+  monitor definition's Shape declaration ([001 §5.1](./001-monitor-definition.md#51-shape-declaration-target)).
+  A monitor that declares no derived facts gets none; this stage is **optional**.
+- **Runs before Diff (and before Pace).** Derived facts are computed on the **shared** snapshot and
+  baked into the rendered artifact (§1.1.5) **before** the per-recipient Diff, so that a fact
+  _appearing_ or _changing_ (a task gaining an "urgent" marker, a "revealed" line showing up) is
+  itself a diffable delta. Computing derived facts after the Diff would put recipient-independent work
+  on the per-recipient side and defeat the seam.
+
+> **Example (E8).** A `command-poll`-style monitor composes an OmniFocus whole-body snapshot
+> ([003 §2.6–§2.7](./003-source-plugins.md)). Shape computes, for each task: `past due` when
+> `due < now`, `due soon` when `now ≤ due ≤ now + 48h`, `revealed` when a previously-deferred task has
+> `defer-until ≤ now`, and `urgent` when `priority = high ∧ due ≤ now + 24h` — all from the injected
+> `now`, no model. The recipient is handed _"Ship the deck — urgent, due soon"_, never a raw
+> timestamp it must subtract `now` from.
+>
+> **Test implication.** With a fixed `now`, a snapshot whose single task crosses its defer threshold
+> produces exactly the `revealed` fact (and no other), and a snapshot one minute earlier produces
+> none — proving the rule is a pure function of `(snapshot, now)` and reproducible run-to-run.
+
+### 1.1.5 Shape: render to a stable artifact, then diff the artifact
+
+> **Status: target.** Every rule in this section is **target**, not current behavior. It details the
+> **render** half of Shape and pins its relationship to the **Diff** stage. Formalizes resolved
+> decisions from the monitoring capability study
+> ([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
+> §S1, §S2 area C/E, §S3 Tier 1, E8; ledger rows **C42** and **C43**). It refines, and does not
+> contradict, the current object-level diff (§5.2): the current diff runs over `snapshotText` already;
+> this names the artifact that `snapshotText` becomes once Shape renders it.
+
+After computing derived facts (§1.1.4), the Shape stage **MAY** **render** the shaped state into a
+**stable, token-efficient, human-readable artifact** (markdown-ish text, **not** JSON), and the
+runtime **MUST** then compute the **Diff** over that **rendered artifact**, never over the raw source
+snapshot.
+
+This pins the pipeline order concretely (capability C43):
+
+```
+Observe → [Compose] → Shape(compute facts → render artifact) → Pace → ⟦seam⟧ → Diff(of the rendered artifact) → …
+```
+
+Rules for the render-then-diff step:
+
+- **Render is deterministic and stable.** The same shaped state MUST render to byte-identical text
+  run-to-run: stable element ordering, stable field ordering, no transient fields (no embedded
+  wall-clock unless it is a derived fact), no incidental whitespace churn. Instability here manifests
+  downstream as phantom diffs (a delta with no real change), so determinism is a hard requirement, not
+  a nicety. (This is the same stability the composite snapshot already requires,
+  [003 §2.6](./003-source-plugins.md).)
+- **The rendered artifact is the diff input.** The Diff stage (§5.2, and the per-recipient target Diff
+  of §1.1.2) compares **this artifact** against the consumer's baseline. Because the artifact is shaped
+  to diff cleanly, semantic deltas fall out as line-level changes for free: a newly-`revealed` task is
+  a **new line**, a task becoming `urgent` is a **changed line**, a `past due` marker **appears** — all
+  with zero recipient reasoning. The diff is cheap (line-level text) and semantic (the lines _mean_
+  the derived facts).
+- **Render is shared; the diff baseline is per-recipient.** Rendering is one shared computation (left
+  of the seam, §1.1.2). The **baseline** the rendered artifact is diffed against is per-recipient
+  (right of the seam): two recipients at different last-seen points see different spans of the **same**
+  rendered artifact. Render once; diff that one artifact against each baseline (capability C15).
+- **Why render before diff, not diff the raw source.** Diffing the raw source (a JSON body, raw CLI
+  output) yields opaque, noisy deltas (a reordered key, a changed internal id) that do not correspond
+  to anything the recipient cares about. Diffing the **rendered** artifact yields deltas that are
+  exactly the meaningful changes, because the render already discarded the irrelevant and computed the
+  derived facts. **Deterministic render is therefore a prerequisite for a useful diff** — it is why
+  Shape MUST precede Diff.
+
+> **Example (E8).** The OmniFocus snapshot renders to a markdown-ish overview — one line per task with
+> its derived markers — explicitly **not** JSON. Between two ticks a deferred task crosses its reveal
+> threshold: the rendered artifact gains one line, and the recipient is handed only that **delta** (a
+> single new line), not the whole overview and not raw JSON to re-derive. A script could produce the
+> rendered artifact today; the _monitor_ is what observes it on a tight loop and delivers **only the
+> change**, cheaply and at low latency.
+>
+> **Test implication.** Rendering the same shaped state twice yields byte-identical text (no phantom
+> diff); rendering a state with one task's defer threshold newly crossed yields an artifact whose diff
+> against the prior artifact is exactly one added `revealed` line.
+
+### 1.1.6 Author-declared payload form
+
+> **Status: target.** Every rule in this section is **target**, not current behavior. It names the
+> **payload form** an author declares for a monitor — the form the shaped/diffed output takes when it
+> is delivered — and the deterministic transform surface that produces a `structured` payload.
+> Formalizes a resolved decision from the monitoring capability study
+> ([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
+> §S5 item 5, §S2 areas C/G, E5/E8; ledger row **C46**). The authoring field is specified in
+> [001 §5.2](./001-monitor-definition.md#52-payload-form-target); this section specifies its runtime
+> meaning. It does not contradict any _current_ rule: today every monitor effectively delivers a
+> `rendered`/`prose` payload (the textual diff + monitor body); the declared form generalizes that.
+
+A monitor's author **MAY** declare the **payload form** — the shape of what the Shape/Deliver pipeline
+hands the recipient. The four forms are:
+
+| Form             | What the recipient receives                                                                                  | When to choose it                                                                                                                                                    | Capability evidence |
+| ---------------- | ------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- |
+| **`prose`**      | A natural-language reading of the change (an Interpret summary, [§1.1.1](#111-the-locked-stage-order)).      | A human, or a high-level orchestrator agent, who wants to be _told_ the substance.                                                                                   | E1, E2              |
+| **`structured`** | Machine-structured data the recipient computes over (the result of a declarative transform, below).          | A **computing domain agent** that must operate on values precisely; a prose digest would be **lossy** (E6 — a trainer needs sets/weights/RPE, not "good chest day"). | E5, E6              |
+| **`artifact`**   | A handle to a derived external artifact (e.g. a produced-document URL), mechanics hidden from the recipient. | A reaction produced something out-of-band and only the result handle should be delivered.                                                                            | E3, E4              |
+| **`rendered`**   | The stable, diffable text artifact of §1.1.5 (or its per-recipient delta).                                   | A recipient that **watches/reads** a status and wants only the change (E8).                                                                                          | E8                  |
+
+Rules for the payload-form step:
+
+- **Form is author-declared, not inferred.** The form is part of the monitor definition
+  ([001 §5.2](./001-monitor-definition.md#52-payload-form-target)); the runtime does not guess it from
+  the source. Omitting it preserves today's behavior (a `rendered`/`prose` textual delivery).
+- **`prose` ⇒ Interpret may run; the other forms may skip it.** `structured`, `artifact`, and
+  `rendered` are deterministic-floor forms that do **not** require the Interpret stage. `prose` is the
+  one form that invokes Interpret (cheap agentic summary, [capability study §S4 C45](../product/monitoring-capability-exercises.md))
+  — and even then Interpret stays optional and off the critical path ([§1.1.1](#111-the-locked-stage-order)).
+  Choosing `structured` for a computing recipient is the explicit way to **skip a lossy digest** (E6).
+- **`structured` is produced by a declarative transform over JSON.** When the form is `structured`,
+  the author declares a **turnkey declarative transform/filter** — **`jq`** (extraction/reshaping) or
+  **`cel`** (significance gate) — that the runtime evaluates deterministically. The transform operates
+  over the **canonical JSON** form of the shaped snapshot: even when the author _thinks_ in YAML /
+  toon / TOML, the predicate/transform surface is defined on JSON (the canonical interchange form),
+  and the chosen output encoding (`json` / `yaml` / `toon` / `toml`) is a downstream serialization
+  concern, not part of the predicate semantics. The two languages have distinct, non-overlapping
+  roles: **`jq` reshapes** — its output is the reshaped JSON delivered as the structured payload;
+  **`cel` gates** — it evaluates to a boolean, where `true` delivers the canonical (un-reshaped)
+  shaped snapshot as the structured payload and `false` **suppresses delivery entirely**. A suppressed
+  delivery is not silently dropped: the runtime records it as suppressed so it remains explainable
+  ([§1.1.1](#111-the-locked-stage-order)). To both gate and reshape, use `jq` with an explicit
+  condition in the filter expression.
+- **The transform is on the shared side of the seam.** A `jq`/`CEL` transform is a deterministic
+  reduction of the **shared** shaped snapshot, so it runs **once** (left of the seam,
+  [§1.1.2](#112-the-shared--per-recipient-seam)), not per recipient. It is **not** arbitrary user code
+  — it is a constrained, declarative expression language (this is what makes it a turnkey affordance
+  rather than a sandboxed-execution surface, [capability study §S5a](../product/monitoring-capability-exercises.md)).
+
+> **Example (E6 vs E8 — the two poles).** A workout monitor declares `payload: structured` with a `jq`
+> transform that projects each set's `{ weight, reps, rpe }` and the session `heartRate` — the trainer
+> agent receives the **numbers** it must compute weight adjustments from, never a prose digest that
+> would destroy them. The OmniFocus overview monitor (E8) declares `payload: rendered` — its recipient
+> watches the diffable artifact and wants only the changed lines. Same pipeline, opposite declared
+> forms, chosen by "compute precisely on it" vs. "monitor it for change."
+>
+> **Test implication.** A monitor declaring `payload: structured` with a `jq` projection, evaluated
+> against a fixed shaped snapshot, yields exactly the projected fields (and a malformed transform
+> fails validation, [001 §5.2](./001-monitor-definition.md#52-payload-form-target)); the same snapshot
+> under `payload: rendered` yields the §1.1.5 text artifact instead.
+
 ## 2. Runtime Tick Model
 
 For each runtime tick, the implementation **MUST**:

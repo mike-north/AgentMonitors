@@ -77,15 +77,17 @@ All discovered paths are resolved to absolute paths before parsing.
 
 Each monitor frontmatter object **MUST** contain:
 
-| Field     | Type     | Required | Meaning                                                                                           |
-| --------- | -------- | -------- | ------------------------------------------------------------------------------------------------- |
-| `name`    | string   | no       | Human-readable display name; defaults to the monitor id (filename or directory name) when omitted |
-| `watch`   | object   | yes      | Intent-first observation config: `type` names the source; remaining keys are per-source config    |
-| `urgency` | string   | yes      | A level (`low`/`normal`/`high`) **or** an authored band `lo..hi` (see [§3.2](#32-urgency))        |
-| `notify`  | object   | no       | Explicit debounce/throttle policy                                                                 |
-| `tags`    | string[] | no       | Tags for later filtering                                                                          |
+| Field     | Type     | Required | Meaning                                                                                                      |
+| --------- | -------- | -------- | ------------------------------------------------------------------------------------------------------------ |
+| `name`    | string   | no       | Human-readable display name; defaults to the monitor id (filename or directory name) when omitted            |
+| `watch`   | object   | yes      | Intent-first observation config: `type` names the source; remaining keys are per-source config               |
+| `urgency` | string   | yes      | A level (`low`/`normal`/`high`) **or** an authored band `lo..hi` (see [§3.2](#32-urgency))                   |
+| `notify`  | object   | no       | Explicit debounce/throttle policy                                                                            |
+| `shape`   | object   | no       | _Target._ Deterministic Shape declaration: derived facts + render (see [§5.1](#51-shape-declaration-target)) |
+| `payload` | object   | no       | _Target._ Author-declared payload form + transform (see [§5.2](#52-payload-form-target))                     |
+| `tags`    | string[] | no       | Tags for later filtering                                                                                     |
 
-> Verified: `libs/core/src/schema/monitor-schema.ts` — the `monitorFrontmatterSchema` Zod object requires `watch` and `urgency`; `name`, `notify`, and `tags` are optional.
+> Verified: `libs/core/src/schema/monitor-schema.ts` — the `monitorFrontmatterSchema` Zod object requires `watch` and `urgency`; `name`, `notify`, and `tags` are optional. The `shape` and `payload` fields are **target** (see [§5.1](#51-shape-declaration-target), [§5.2](#52-payload-form-target)) and are not yet in the current schema.
 
 ### 3.1 `watch`
 
@@ -220,6 +222,99 @@ The Markdown body after the frontmatter is the monitor's handling instructions. 
 The stored value is the trimmed body — leading and trailing whitespace are removed. An empty body is permitted (results in an empty string after trimming).
 
 > Verified: `libs/core/src/parser/parse-monitor.ts` line 49 — `instructions: parsed.content.trim()`; `libs/core/src/schema/types.ts` line 9 — `instructions: string` (no minimum length constraint, so empty string is valid).
+
+### 5.1 Shape declaration (target)
+
+> **Status: target.** Every rule in this section is **target**, not current behavior. No current
+> frontmatter field declares Shape behavior; the schema below is the authoring surface for the
+> deterministic **Shape** stage whose runtime semantics are specified in
+> [002 §1.1.4–§1.1.5](./002-runtime-delivery.md#114-shape-deterministic-derived-facts). Formalizes a
+> resolved decision from the monitoring capability study
+> ([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
+> §S2 area C, §S3 Tier 1, E8; ledger rows **C41**, **C42**, **C43**).
+
+A monitor **MAY** declare a `shape` block describing the deterministic post-processing applied to the
+shared snapshot before Pace and Diff. It is **optional**; a monitor with no `shape` block gets no
+derived facts and no explicit render (today's behavior — the raw `snapshotText` is the diff input).
+
+```yaml
+shape:
+  derive: # author-declared deterministic facts (capability C41)
+    - name: past-due
+      when: 'due < now' # a deterministic predicate over the shaped snapshot + injected `now`
+    - name: due-soon
+      when: 'now <= due && due <= now + 48h'
+    - name: urgent
+      when: "priority == 'high' && due <= now + 24h"
+  render: rendered # produce the stable, diffable text artifact (capability C42/C43)
+```
+
+Authoring rules:
+
+- **`shape.derive`** is an ordered list of named derived facts. Each entry has a `name` (the marker
+  surfaced in the rendered artifact) and a deterministic `when` **CEL boolean predicate** evaluated
+  over `(snapshot, now)` — the shaped snapshot plus the runtime-injected `now` (never an ambient
+  clock — see [002 §1.1.4](./002-runtime-delivery.md#114-shape-deterministic-derived-facts)). CEL is
+  used here specifically because `when` is a _condition_ (boolean selection), not a reshaping
+  expression; jq is reserved for extraction/reshaping (§5.2 `payload.transform`). The predicate is a
+  constrained declarative expression, **not** arbitrary code.
+- **`shape.render`** opts into rendering the shaped state to the stable, token-efficient text artifact
+  that the runtime then diffs ([002 §1.1.5](./002-runtime-delivery.md#115-shape-render-to-a-stable-artifact-then-diff-the-artifact)).
+  The rendered form is markdown-ish text, never JSON — chosen so the diff is semantic and cheap.
+- **Determinism is a validation obligation.** Because instability produces phantom diffs, a `shape`
+  declaration MUST be a pure function of `(snapshot, now)`. Predicates that reference anything outside
+  the snapshot and `now` are invalid (target — see [004 §2.2](./004-validation-testing.md)).
+
+> **What this example proves:** an author can move timestamp/aggregate reasoning below the model
+> (C41), name the resulting markers, and opt into the diffable render (C42/C43) — without writing any
+> code, only declarative predicates. The recipient reads _"urgent, due soon"_ rather than a raw
+> timestamp it must subtract `now` from.
+
+### 5.2 Payload form (target)
+
+> **Status: target.** Every rule in this section is **target**, not current behavior. No current
+> frontmatter field declares a payload form; the field below is the authoring surface for the
+> author-declared payload form whose runtime meaning is specified in
+> [002 §1.1.6](./002-runtime-delivery.md#116-author-declared-payload-form). Formalizes
+> a resolved decision from the monitoring capability study
+> ([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
+> §S5 item 5, §S2 areas C/G, E5/E6/E8; ledger row **C46**).
+
+A monitor **MAY** declare a `payload` block stating the **form** of what is delivered to the recipient
+and, for the `structured` form, the deterministic transform that produces it. It is **optional**;
+omitting it preserves today's textual (`rendered`/`prose`) delivery.
+
+```yaml
+payload:
+  form: structured # one of: prose | structured | artifact | rendered
+  transform: # only for form: structured — a turnkey declarative transform
+    language: jq # jq (extraction/reshaping) or cel (predicate/boolean selection)
+    expression: '.sets[] | { weight, reps, rpe }'
+  encoding: json # output serialization: json (default) | yaml | toon | toml
+```
+
+Authoring rules:
+
+- **`payload.form`** MUST be one of `prose`, `structured`, `artifact`, `rendered` (the four forms of
+  [002 §1.1.6](./002-runtime-delivery.md#116-author-declared-payload-form)). The form
+  is **declared, not inferred** — the runtime does not guess it from the source. `prose` is the only
+  form that invokes the optional Interpret stage; the other three are deterministic-floor forms (and
+  `structured` is the explicit way to avoid a lossy digest for a computing recipient — E6).
+- **`payload.transform`** is valid **only** when `form: structured`. Its `language` is **`jq`** or
+  **`cel`**, and its `expression` is evaluated over the **canonical JSON** form of the shaped snapshot
+  (predicate semantics are defined on JSON regardless of the chosen `encoding`). The transform is a
+  constrained declarative expression — a turnkey affordance, **not** arbitrary user code.
+- **`payload.encoding`** selects the output serialization (`json` default; `yaml` / `toon` / `toml`
+  also permitted) and is a downstream concern that does not change the transform's predicate
+  semantics.
+- **Validation.** A `payload.transform` under any `form` other than `structured` is rejected; a
+  malformed `jq`/`cel` expression is rejected; an unknown `form`, `language`, or `encoding` is
+  rejected (target — see [004 §2.2](./004-validation-testing.md)).
+
+> **What this example proves:** the same pipeline serves opposite recipients — a computing domain
+> agent gets `structured` numbers via a `jq` projection (E6), while a watch-it-for-change recipient
+> gets the `rendered` diffable artifact (E8) — and the choice is one declarative field, not bespoke
+> code (C46).
 
 ## 6. Scope and Activation Notes
 
