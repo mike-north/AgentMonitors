@@ -475,4 +475,129 @@ describe('monitorFrontmatterSchema', () => {
       expect(result.success).toBe(false);
     });
   });
+
+  // ── Shape / payload frontmatter (G15, 001 §5.1–§5.2) ────────────────────
+  describe('shape declaration (001 §5.1)', () => {
+    it('accepts a monitor without shape (backward compatible)', () => {
+      const result = monitorFrontmatterSchema.safeParse(validMinimal);
+      expect(result.success).toBe(true);
+      if (result.success) expect(result.data.shape).toBeUndefined();
+    });
+
+    it('accepts a shape with derived facts and render', () => {
+      const result = monitorFrontmatterSchema.safeParse({
+        ...validMinimal,
+        shape: {
+          derive: [
+            { name: 'past-due', when: 'due < now' },
+            { name: 'revealed', when: 'deferUntil <= now' },
+          ],
+          render: 'rendered',
+        },
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it('rejects a malformed CEL predicate in shape.derive (004 §2.2)', () => {
+      const result = monitorFrontmatterSchema.safeParse({
+        ...validMinimal,
+        shape: { derive: [{ name: 'broken', when: 'due <' }] },
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects a non-"rendered" render value', () => {
+      const result = monitorFrontmatterSchema.safeParse({
+        ...validMinimal,
+        shape: { render: 'json' },
+      });
+      expect(result.success).toBe(false);
+    });
+  });
+
+  describe('payload form (001 §5.2)', () => {
+    it('accepts each of the four payload forms', () => {
+      for (const form of ['prose', 'structured', 'artifact', 'rendered']) {
+        const result = monitorFrontmatterSchema.safeParse({
+          ...validMinimal,
+          payload: { form },
+        });
+        expect(result.success, `form "${form}" should be accepted`).toBe(true);
+      }
+    });
+
+    it('rejects an unknown payload form', () => {
+      const result = monitorFrontmatterSchema.safeParse({
+        ...validMinimal,
+        payload: { form: 'summary' },
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it('accepts a structured payload with a well-formed jq transform', () => {
+      const result = monitorFrontmatterSchema.safeParse({
+        ...validMinimal,
+        payload: {
+          form: 'structured',
+          transform: {
+            language: 'jq',
+            expression: '.sets | map({weight: .weight})',
+          },
+        },
+      });
+      expect(result.success).toBe(true);
+    });
+
+    it('rejects a malformed jq transform — fails validate (002 §1.1.6)', () => {
+      const result = monitorFrontmatterSchema.safeParse({
+        ...validMinimal,
+        payload: {
+          form: 'structured',
+          transform: { language: 'jq', expression: '.sets[ | broken' },
+        },
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects a malformed cel transform — fails validate', () => {
+      const result = monitorFrontmatterSchema.safeParse({
+        ...validMinimal,
+        payload: {
+          form: 'structured',
+          transform: { language: 'cel', expression: 'heartRate >' },
+        },
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects a transform under a non-structured form (001 §5.2)', () => {
+      const result = monitorFrontmatterSchema.safeParse({
+        ...validMinimal,
+        payload: {
+          form: 'rendered',
+          transform: { language: 'jq', expression: '.heartRate' },
+        },
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects an unknown transform language', () => {
+      const result = monitorFrontmatterSchema.safeParse({
+        ...validMinimal,
+        payload: {
+          form: 'structured',
+          transform: { language: 'jsonpath', expression: '$.x' },
+        },
+      });
+      expect(result.success).toBe(false);
+    });
+
+    it('rejects an unknown encoding', () => {
+      const result = monitorFrontmatterSchema.safeParse({
+        ...validMinimal,
+        payload: { form: 'structured', encoding: 'xml' },
+      });
+      expect(result.success).toBe(false);
+    });
+  });
 });

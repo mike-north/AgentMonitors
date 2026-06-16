@@ -83,12 +83,12 @@ Each monitor frontmatter object **MUST** contain:
 | `watch`             | object   | yes      | Intent-first observation config: `type` names the source; remaining keys are per-source config                                  |
 | `urgency`           | string   | yes      | A level (`low`/`normal`/`high`) **or** an authored band `lo..hi` (see [§3.2](#32-urgency))                                      |
 | `notify`            | object   | no       | Explicit debounce/throttle policy                                                                                               |
-| `shape`             | object   | no       | _Target._ Deterministic Shape declaration: derived facts + render (see [§5.1](#51-shape-declaration-target))                    |
-| `payload`           | object   | no       | _Target._ Author-declared payload form + transform (see [§5.2](#52-payload-form-target))                                        |
+| `shape`             | object   | no       | Deterministic Shape declaration: derived facts + render (see [§5.1](#51-shape-declaration-current))                             |
+| `payload`           | object   | no       | Author-declared payload form + transform (see [§5.2](#52-payload-form-current))                                                 |
 | `baseline-strategy` | string   | no       | How the per-recipient Diff spans a catch-up span — `incremental` (default) or `net` (see [§3.7](#37-baseline-strategy-current)) |
 | `tags`              | string[] | no       | Tags for later filtering                                                                                                        |
 
-> Verified: `libs/core/src/schema/monitor-schema.ts` — the `monitorFrontmatterSchema` Zod object requires `watch` and `urgency`; `name`, `notify`, and `tags` are optional. `baseline-strategy` is current — an optional `z.enum(['incremental', 'net'])` defaulting to `incremental` (see [§3.7](#37-baseline-strategy-current)). The `shape` and `payload` fields remain **target** (see [§5.1](#51-shape-declaration-target), [§5.2](#52-payload-form-target)) and are not yet in the current schema.
+> Verified: `libs/core/src/schema/monitor-schema.ts` — the `monitorFrontmatterSchema` Zod object requires `watch` and `urgency`; `name`, `notify`, `tags`, `shape`, and `payload` are optional. The `shape` and `payload` fields are **current** (G15): `shapeSchema`/`payloadSchema` accept the §5.1/§5.2 authoring surface and reject malformed CEL/jq transforms (`libs/core/src/schema/monitor-schema.test.ts`). `baseline-strategy` is also **current** (G13) — an optional `z.enum(['incremental', 'net'])` defaulting to `incremental` (see [§3.7](#37-baseline-strategy-current)).
 
 ### 3.1 `watch`
 
@@ -303,13 +303,21 @@ The stored value is the trimmed body — leading and trailing whitespace are rem
 
 ### 5.1 Shape declaration (target)
 
-> **Status: target.** Every rule in this section is **target**, not current behavior. No current
-> frontmatter field declares Shape behavior; the schema below is the authoring surface for the
-> deterministic **Shape** stage whose runtime semantics are specified in
+> **Status: current (G15).** This section is **current** behavior. The `shape` frontmatter field
+> declares Shape behavior; the schema below is the authoring surface for the deterministic **Shape**
+> stage whose runtime semantics are specified in
 > [002 §1.1.4–§1.1.5](./002-runtime-delivery.md#114-shape-deterministic-derived-facts). Formalizes a
 > resolved decision from the monitoring capability study
 > ([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
 > §S2 area C, §S3 Tier 1, E8; ledger rows **C41**, **C42**, **C43**).
+>
+> Verified: `libs/core/src/schema/monitor-schema.ts` (`shapeSchema`: `derive` rules with CEL `when`
+> predicates, `render: rendered`, malformed-CEL rejection); `libs/core/src/runtime/shape.ts`
+> (`computeDerivedFacts` pure over `(snapshot, now)`, `renderArtifact` byte-stable);
+> `libs/core/src/runtime/diff.ts` (`renderShapeArtifact`); wired in
+> `libs/core/src/runtime/service.ts` (`processObservation` → `shapeObservation`, diffing the rendered
+> artifact). Proven by `libs/core/src/runtime/shape.test.ts`,
+> `libs/core/src/runtime/shape-stage.test.ts`, and `libs/core/src/schema/monitor-schema.test.ts`.
 
 A monitor **MAY** declare a `shape` block describing the deterministic post-processing applied to the
 shared snapshot before Pace and Diff. It is **optional**; a monitor with no `shape` block gets no
@@ -340,8 +348,11 @@ Authoring rules:
   that the runtime then diffs ([002 §1.1.5](./002-runtime-delivery.md#115-shape-render-to-a-stable-artifact-then-diff-the-artifact)).
   The rendered form is markdown-ish text, never JSON — chosen so the diff is semantic and cheap.
 - **Determinism is a validation obligation.** Because instability produces phantom diffs, a `shape`
-  declaration MUST be a pure function of `(snapshot, now)`. Predicates that reference anything outside
-  the snapshot and `now` are invalid (target — see [004 §2.2](./004-validation-testing.md)).
+  declaration MUST be a pure function of `(snapshot, now)`. CEL is structurally pure (no I/O, no
+  clock) and a malformed predicate is **rejected at validate** (current). Statically rejecting a
+  predicate that _references an identifier outside the snapshot and `now`_ remains **target** — see
+  [004 §2.2](./004-validation-testing.md); today such a reference evaluates to "fact does not hold"
+  (a deterministic, snapshot-only outcome) rather than a parse-time rejection.
 
 > **What this example proves:** an author can move timestamp/aggregate reasoning below the model
 > (C41), name the resulting markers, and opt into the diffable render (C42/C43) — without writing any
@@ -350,13 +361,20 @@ Authoring rules:
 
 ### 5.2 Payload form (target)
 
-> **Status: target.** Every rule in this section is **target**, not current behavior. No current
-> frontmatter field declares a payload form; the field below is the authoring surface for the
-> author-declared payload form whose runtime meaning is specified in
+> **Status: current (G15).** This section is **current** behavior. The `payload` frontmatter field
+> declares a payload form; its runtime meaning is specified in
 > [002 §1.1.6](./002-runtime-delivery.md#116-author-declared-payload-form). Formalizes
 > a resolved decision from the monitoring capability study
 > ([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
 > §S5 item 5, §S2 areas C/G, E5/E6/E8; ledger row **C46**).
+>
+> Verified: `libs/core/src/schema/monitor-schema.ts` (`payloadSchema`: the four-form enum, the
+> `structured`-only transform rule, malformed-transform rejection, encoding enum);
+> `libs/core/src/runtime/transform.ts` (`applyPayloadTransform` — `jq` reshapes, `cel` gates with
+> `false` ⇒ suppress); wired in `libs/core/src/runtime/service.ts`. The `PayloadForm` type
+> (`prose | structured | artifact | rendered`) is exported as a stable named contract. Proven by
+> `libs/core/src/runtime/transform.test.ts`, `libs/core/src/runtime/shape-stage.test.ts`, and
+> `libs/core/src/schema/monitor-schema.test.ts`.
 
 A monitor **MAY** declare a `payload` block stating the **form** of what is delivered to the recipient
 and, for the `structured` form, the deterministic transform that produces it. It is **optional**;
@@ -367,9 +385,15 @@ payload:
   form: structured # one of: prose | structured | artifact | rendered
   transform: # only for form: structured — a turnkey declarative transform
     language: jq # jq (extraction/reshaping) or cel (predicate/boolean selection)
-    expression: '.sets[] | { weight, reps, rpe }'
+    expression: '.sets | map({weight: .weight, reps: .reps, rpe: .rpe})'
   encoding: json # output serialization: json (default) | yaml | toon | toml
 ```
+
+> The bundled `jq` evaluator is `jq-in-the-browser` (chosen for CSP/Workers safety — no `Function`
+> constructor or `eval`). It implements a practical subset of `jq`: object construction requires
+> explicit keys (`{weight: .weight}`, not the `{weight}` shorthand), and array collection is via
+> `map(...)` rather than `[ … ]` around a pipe. `cel` predicates are evaluated by `cel-js` (also
+> `Function`/`eval`-free).
 
 Authoring rules:
 
@@ -387,7 +411,7 @@ Authoring rules:
   semantics.
 - **Validation.** A `payload.transform` under any `form` other than `structured` is rejected; a
   malformed `jq`/`cel` expression is rejected; an unknown `form`, `language`, or `encoding` is
-  rejected (target — see [004 §2.2](./004-validation-testing.md)).
+  rejected (current — see [004 §2.2](./004-validation-testing.md)).
 
 > **What this example proves:** the same pipeline serves opposite recipients — a computing domain
 > agent gets `structured` numbers via a `jq` projection (E6), while a watch-it-for-change recipient

@@ -241,13 +241,19 @@ rather than silently emitting a composite missing a part.
 
 ### 2.7 Sources surface raw facts; the runtime computes derived facts
 
-> **Status: target.** Every rule in this section is **target**, not current behavior. It draws the
+> **Status: current (G15).** This section is **current** behavior. It draws the
 > line between the **raw facts** a source surfaces and the **derived/relative facts** the runtime's
 > Shape stage computes from them ([002 §1.1.4](./002-runtime-delivery.md#114-shape-deterministic-derived-facts)).
 > It reaffirms, and does not contradict, the source/runtime split of §2.5 and PP3/AP3
 > ([000](./000-principles.md)). Formalizes a resolved decision from the monitoring capability study
 > ([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
 > §S2 area C, E8; ledger row **C41**).
+>
+> Verified: the runtime Shape stage (`libs/core/src/runtime/shape.ts`,
+> `libs/core/src/runtime/shape-stage.ts`) computes the relative facts from a source's raw snapshot
+> plus the injected `now`; `libs/core/src/runtime/shape-stage.test.ts` drives a source that surfaces a
+> raw `deferUntil` timestamp (never a pre-computed "revealed" flag) and asserts the runtime derives
+> `revealed` against `now`.
 
 A source's job in this division of labor is to surface the **raw facts** — the observable primitives
 of the watched thing — in its `snapshot`/`snapshotText`/`payload`. A source **MUST NOT** compute the

@@ -9,6 +9,7 @@ import type { SourceRegistry } from '../observation/registry.js';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import type { AgentRuntimeAdapter } from '../adapter/types.js';
 import { buildTextDiff } from './diff.js';
+import { shapeObservation } from './shape-stage.js';
 import { RuntimeStore } from './store.js';
 import type {
   AgentSessionRecord,
@@ -1068,7 +1069,9 @@ export class AgentMonitorRuntime {
                 workspacePath,
                 effectiveUrgency: emitted.effectiveUrgency,
               });
-              emittedEventIds.push(event.id);
+              // Rollup batch entries passed the Shape pre-filter at ingest time,
+              // so suppression here is not expected; guard defensively.
+              if (event) emittedEventIds.push(event.id);
             } catch {
               // best-effort: materialization failure must not abort the tick
             }
@@ -1195,10 +1198,24 @@ export class AgentMonitorRuntime {
       sourceOutcome?: 'rebaselined';
     },
   ): string[] {
+    // Pre-filter: a `payload.form: structured` CEL gate that evaluates `false`
+    // suppresses delivery entirely (002 §1.1.6). This check MUST run BEFORE
+    // dispatchNotify so that suppressed observations never advance notify state
+    // and are never counted as emitted in the audit history row.  Running it
+    // inside processObservation (after dispatch) was incorrect: the history row
+    // would say `triggered` even though no event was ever materialized.
+    const passedObservations = observations.filter((obs) => {
+      const shaped = shapeObservation(obs, now, {
+        shape: monitor.frontmatter.shape,
+        payload: monitor.frontmatter.payload,
+      });
+      return !shaped.suppressed;
+    });
+
     const monitorState = this.store.getMonitorState(monitor.id);
     const dispatch = this.dispatchNotify(
       monitor,
-      observations,
+      passedObservations,
       now,
       monitorState.notifyState,
     );
@@ -1281,7 +1298,7 @@ export class AgentMonitorRuntime {
           workspacePath: options.workspacePath,
           effectiveUrgency: emitted.effectiveUrgency,
         });
-        emittedEventIds.push(event.id);
+        if (event) emittedEventIds.push(event.id);
       } catch (materializeError) {
         try {
           this.store.recordObservationHistory({
@@ -1738,7 +1755,25 @@ export class AgentMonitorRuntime {
 
   private processObservation(input: ProcessObservationInput) {
     const objectKey = input.observation.objectKey ?? input.monitor.id;
-    const previousSnapshot = input.observation.snapshotText
+
+    // ── Shape stage (G15, 002 §1.1.4–§1.1.6) ──────────────────────────────
+    // Runs on the shared side of the seam, BEFORE Diff. When the monitor
+    // declares `shape`, render the shaped snapshot (the source's raw facts +
+    // the derived facts computed at the injected `now`) into a stable, diffable
+    // artifact, and diff THAT artifact — never the raw source. The injected
+    // `now` is the tick clock (`observedAt`); no ambient `Date.now()` is read.
+    const shaped = shapeObservation(input.observation, input.observedAt, {
+      shape: input.monitor.frontmatter.shape,
+      payload: input.monitor.frontmatter.payload,
+    });
+    // Defensive guard: suppressed observations are pre-filtered in ingest()
+    // BEFORE dispatchNotify, so this branch should not be reached in normal
+    // operation. Retained as a safety net for any future call sites.
+    if (shaped.suppressed) return null;
+
+    const effectiveSnapshotText = shaped.snapshotText;
+
+    const previousSnapshot = effectiveSnapshotText
       ? this.store.latestSnapshot(
           input.monitor.id,
           objectKey,
@@ -1747,11 +1782,8 @@ export class AgentMonitorRuntime {
       : null;
 
     const diffText =
-      input.observation.snapshotText && previousSnapshot
-        ? buildTextDiff(
-            previousSnapshot.content,
-            input.observation.snapshotText,
-          )
+      effectiveSnapshotText && previousSnapshot
+        ? buildTextDiff(previousSnapshot.content, effectiveSnapshotText)
         : null;
 
     const event = this.store.insertEvent({
@@ -1765,9 +1797,9 @@ export class AgentMonitorRuntime {
         input.observation.summary ??
         input.observation.body ??
         input.observation.title,
-      payload: input.observation.payload ?? {},
+      payload: shaped.payload ?? input.observation.payload ?? {},
       snapshotMetadata: input.observation.snapshot ?? {},
-      snapshotText: input.observation.snapshotText ?? null,
+      snapshotText: effectiveSnapshotText ?? null,
       diffText,
       objectKey,
       // Make the source-agnostic changeKind queryable without each source having
@@ -1786,13 +1818,13 @@ export class AgentMonitorRuntime {
     // transaction. Currently a saveSnapshot failure after a successful insertEvent
     // leaves an event row without its snapshot — best-effort: the ingest() caller
     // catches this and records an errored history row for the observation.
-    if (input.observation.snapshotText) {
+    if (effectiveSnapshotText) {
       this.store.saveSnapshot({
         workspacePath: input.workspacePath ?? null,
         monitorId: input.monitor.id,
         objectKey,
         eventId: event.id,
-        content: input.observation.snapshotText,
+        content: effectiveSnapshotText,
       });
     }
 

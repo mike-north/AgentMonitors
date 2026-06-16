@@ -95,7 +95,7 @@ turn-boundary (§9). None of the three is derivable from the others.
 
 ### 1.1.4 Shape: deterministic derived facts
 
-> **Status: target.** Every rule in this section is **target**, not current behavior. It details the
+> **Status: current (G15).** This section is **current** behavior. It details the
 > **Shape** stage of [§1.1.1](#111-the-locked-stage-order): the deterministic computation the runtime
 > performs on a shared, post-Compose snapshot **before** Pace and **before** Diff. It is on the
 > **shared** (left) side of the seam ([§1.1.2](#112-the-shared--per-recipient-seam)), so it runs
@@ -104,6 +104,12 @@ turn-boundary (§9). None of the three is derivable from the others.
 > ([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
 > §S1, §S2 area C, §S3 Tier 1, E8; ledger row **C41**). The raw facts this stage consumes originate at
 > the source/observation surface ([003 §2.7](./003-source-plugins.md)).
+>
+> Verified: `libs/core/src/runtime/shape.ts` (`computeDerivedFacts` — pure over `(snapshot, now)`,
+> `now` injected, never an ambient clock) wired inside `processObservation`
+> (`libs/core/src/runtime/service.ts` via `libs/core/src/runtime/shape-stage.ts`) before Diff. Proven
+> by `libs/core/src/runtime/shape.test.ts` (fixed-`now` purity: a crossed threshold yields exactly
+> `revealed`, one minute earlier none) and `libs/core/src/runtime/shape-stage.test.ts`.
 
 The Shape stage **MAY** compute **derived / relative facts** from the raw observation
 deterministically — facts the recipient would otherwise have to reason about, burning model tokens on
@@ -157,13 +163,21 @@ Rules for the derived-facts step:
 
 ### 1.1.5 Shape: render to a stable artifact, then diff the artifact
 
-> **Status: target.** Every rule in this section is **target**, not current behavior. It details the
-> **render** half of Shape and pins its relationship to the **Diff** stage. Formalizes resolved
-> decisions from the monitoring capability study
+> **Status: current (G15).** This section is **current** behavior when a monitor declares `shape`. It
+> details the **render** half of Shape and pins its relationship to the **Diff** stage. Formalizes
+> resolved decisions from the monitoring capability study
 > ([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
 > §S1, §S2 area C/E, §S3 Tier 1, E8; ledger rows **C42** and **C43**). It refines, and does not
 > contradict, the current object-level diff (§5.2): the current diff runs over `snapshotText` already;
 > this names the artifact that `snapshotText` becomes once Shape renders it.
+>
+> Verified: `libs/core/src/runtime/shape.ts` (`renderArtifact` — byte-stable, sorted keys, facts in
+> authored order) and `libs/core/src/runtime/diff.ts` (`renderShapeArtifact`); when `shape` is
+> declared, `processObservation` (`libs/core/src/runtime/service.ts`) diffs the rendered artifact, not
+> the raw source. Proven by `libs/core/src/runtime/shape.test.ts` (same shaped state → byte-identical
+> artifact → no phantom diff; one crossed threshold → exactly one added `revealed` line) and
+> `libs/core/src/runtime/shape-stage.test.ts` (the same, end-to-end through a runtime tick: identical
+> raw source across ticks yields exactly the `revealed` line in the rendered-artifact diff).
 
 After computing derived facts (§1.1.4), the Shape stage **MAY** **render** the shaped state into a
 **stable, token-efficient, human-readable artifact** (markdown-ish text, **not** JSON), and the
@@ -214,7 +228,7 @@ Rules for the render-then-diff step:
 
 ### 1.1.6 Author-declared payload form
 
-> **Status: target.** Every rule in this section is **target**, not current behavior. It names the
+> **Status: current (G15).** This section is **current** behavior. It names the
 > **payload form** an author declares for a monitor — the form the shaped/diffed output takes when it
 > is delivered — and the deterministic transform surface that produces a `structured` payload.
 > Formalizes a resolved decision from the monitoring capability study
@@ -223,6 +237,17 @@ Rules for the render-then-diff step:
 > [001 §5.2](./001-monitor-definition.md#52-payload-form-target); this section specifies its runtime
 > meaning. It does not contradict any _current_ rule: today every monitor effectively delivers a
 > `rendered`/`prose` payload (the textual diff + monitor body); the declared form generalizes that.
+>
+> Verified: `libs/core/src/runtime/transform.ts` (`applyPayloadTransform` — `jq` reshapes the
+> delivered payload, a `cel` gate of `false` suppresses delivery entirely) wired into
+> `processObservation` (`libs/core/src/runtime/service.ts`), and the stable exported `PayloadForm`
+> type (`prose | structured | artifact | rendered`). Both evaluators are CSP/Workers-safe (no
+> `Function`/`eval`): `jq-in-the-browser` and `cel-js`. Proven by
+> `libs/core/src/runtime/transform.test.ts` (a `jq` projection yields the projected fields; a `cel`
+> gate suppresses; a malformed transform fails validation) and
+> `libs/core/src/runtime/shape-stage.test.ts` (the `structured`/`jq` reshape and `cel`-gate
+> suppression end-to-end through a tick). The optional **Interpret** stage that `prose` invokes
+> remains **target** ([§1.1.8](#118-interpret-a-cheap-agentic-digest-via-the-users-own-ai-tool), G14).
 
 A monitor's author **MAY** declare the **payload form** — the shape of what the Shape/Deliver pipeline
 hands the recipient. The four forms are:
