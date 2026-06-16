@@ -1069,7 +1069,9 @@ export class AgentMonitorRuntime {
                 workspacePath,
                 effectiveUrgency: emitted.effectiveUrgency,
               });
-              emittedEventIds.push(event.id);
+              // Rollup batch entries passed the Shape pre-filter at ingest time,
+              // so suppression here is not expected; guard defensively.
+              if (event) emittedEventIds.push(event.id);
             } catch {
               // best-effort: materialization failure must not abort the tick
             }
