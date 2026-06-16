@@ -17,7 +17,7 @@ import type {
 } from '../observation/types.js';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import { RuntimeStore } from './store.js';
-import type { MonitorEventRecord } from './types.js';
+import type { MonitorEventRecord, RuntimeTickResult } from './types.js';
 import { AgentMonitorRuntime, cronMatchesDate } from './service.js';
 
 function createRuntime(
@@ -3597,6 +3597,373 @@ Handle it.
           (s) => s.id === 'materialization',
         );
         expect(materializationStage?.status).toBe('pending');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  // --- Rollup not-due flush composition (issue #180, G12 × G13) -------------
+  //
+  // Bug: tick() flushes a rollup batch via two paths. The DUE path goes through
+  // ingest() (which applies `net` collapse — 002 §1.1.7 — AND records a
+  // `triggered` observation_history row — 002 §10.7). The NOT-DUE path (the
+  // source poll interval has NOT elapsed but the delivery window opens) is the
+  // *normal* operating mode for a rollup monitor whose `watch.interval` is
+  // relaxed to match the window (002 §4.4), and it had drifted: it applied
+  // neither behavior. Both paths now route through the shared materializeSpan().
+  //
+  // Expected delta/history counts below are written BY HAND from the spec, not
+  // captured from program output.
+  describe('rollup not-due flush composition (issue #180, 002 §1.1.7 / §10.7)', () => {
+    const NET_OBJECT_KEY = 'doc-1';
+    // Three successive states of one object accumulated across three ticks.
+    // Distinct text per state so each transition is a real diff and the net
+    // collapse vs. the play-by-play are unambiguously distinguishable.
+    const STATES = [
+      'line-a EDIT-1\nline-b\nline-c\n',
+      'line-a EDIT-1\nline-b EDIT-2\nline-c\n',
+      'line-a EDIT-1\nline-b EDIT-2\nline-c EDIT-3\n',
+    ] as const;
+
+    // Window opens at 09:00 UTC daily; the accumulation ticks run at 08:00.
+    const WINDOW = '0 9 * * *';
+    const ACCUM_BASE = new Date('2026-03-20T08:00:00.000Z');
+    const WINDOW_AT = new Date('2026-03-20T09:00:00.000Z');
+
+    /**
+     * A rollup source that emits, on each of its first three observe() calls,
+     * one observation for the shared `NET_OBJECT_KEY` carrying the next state in
+     * `STATES` (title/summary `edit 1..3`). Subsequent calls emit nothing. This
+     * accumulates a 3-observation single-object catch-up span into the durable
+     * `pendingRollup` batch before the window fires.
+     */
+    function netRollupSource(name: string): ObservationSource {
+      let call = 0;
+      return {
+        name,
+        scopeSchema: { type: 'object', properties: {} },
+        stateful: true,
+        observe(): Promise<ObservationResult> {
+          const index = call;
+          call += 1;
+          if (index < STATES.length) {
+            return Promise.resolve({
+              observations: [
+                {
+                  title: `edit ${String(index + 1)}`,
+                  summary: `edit ${String(index + 1)}`,
+                  objectKey: NET_OBJECT_KEY,
+                  snapshotText: STATES[index],
+                },
+              ],
+              nextState: {},
+            });
+          }
+          return Promise.resolve({ observations: [], nextState: {} });
+        },
+      };
+    }
+
+    /**
+     * Write a rollup MONITOR.md with the given source, the given
+     * `baseline-strategy` line, `interval: '2s'`, and the daily 09:00 window.
+     */
+    function writeNetRollupMonitor(
+      rootDir: string,
+      sourceName: string,
+      baselineStrategyLine: string,
+    ): string {
+      const monitorsDir = path.join(
+        rootDir,
+        '.claude',
+        'monitors',
+        'test-monitor',
+      );
+      mkdirSync(monitorsDir, { recursive: true });
+      writeFileSync(
+        path.join(monitorsDir, 'MONITOR.md'),
+        `---
+name: Net rollup monitor
+watch:
+  type: ${sourceName}
+  interval: '2s'
+urgency: normal
+notify:
+  strategy: rollup
+  window: '${WINDOW}'
+${baselineStrategyLine}---
+Daily digest.
+`,
+        'utf-8',
+      );
+      return path.join(rootDir, '.claude', 'monitors');
+    }
+
+    /**
+     * Accumulate the three `STATES` observations across three DUE ticks at
+     * 08:00:00/02/04 (interval 2s, so each tick is due), then flush via the
+     * NOT-DUE path: set `lastObservationAt` to exactly the window minus 1s so
+     * elapsed = 1000ms < 2000ms (not due), and tick at 09:00:00. The window
+     * fires on this not-due tick — the path under test. Returns the runtime,
+     * store, and session so each test can assert on events + history.
+     */
+    function setupNotDueFlush(
+      sourceName: string,
+      baselineStrategyLine: string,
+    ): {
+      runtime: AgentMonitorRuntime;
+      store: RuntimeStore;
+      sessionId: string;
+      monitorsDir: string;
+      rootDir: string;
+    } {
+      const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-180-'));
+      tempDirs.push(rootDir);
+      const monitorsDir = writeNetRollupMonitor(
+        rootDir,
+        sourceName,
+        baselineStrategyLine,
+      );
+      const db = createDb(':memory:');
+      const registry = new SourceRegistry();
+      registry.register(netRollupSource(sourceName));
+      const store = new RuntimeStore(db);
+      const runtime = new AgentMonitorRuntime(store, registry, [
+        claudeCodeAdapter,
+      ]);
+      const session = runtime.openSession(
+        claudeCodeAdapter.createSessionInput({
+          hostSessionId: `claude-180-${sourceName}`,
+          workspacePath: rootDir,
+        }),
+      );
+      return {
+        runtime,
+        store,
+        sessionId: session.id,
+        monitorsDir,
+        rootDir,
+      };
+    }
+
+    /**
+     * Drive the three accumulation ticks at 08:00:00/02/04 then the not-due
+     * window tick at 09:00:00. Returns the tick result of the flush tick.
+     */
+    async function driveNotDueFlush(ctx: {
+      runtime: AgentMonitorRuntime;
+      store: RuntimeStore;
+      monitorsDir: string;
+      rootDir: string;
+    }): Promise<RuntimeTickResult> {
+      // Three DUE ticks at 08:00:00, 08:00:02, 08:00:04 (interval 2s → each due
+      // after the prior tick set lastObservationAt). Each accumulates one
+      // observation into pendingRollup; the window is closed, so nothing is
+      // delivered.
+      for (let i = 0; i < STATES.length; i += 1) {
+        vi.setSystemTime(new Date(ACCUM_BASE.getTime() + i * 2_000));
+        const tick = await ctx.runtime.tick(ctx.monitorsDir, ctx.rootDir);
+        expect(tick.emittedEventIds).toHaveLength(0);
+      }
+
+      // Confirm the full 3-observation span is held durably before the flush.
+      const held =
+        ctx.store.getMonitorState('test-monitor').notifyState.pendingRollup;
+      expect(held?.observations).toHaveLength(STATES.length);
+
+      // Force the NOT-DUE condition at the window: lastObservationAt = window −
+      // 1s. The integer 'timestamp' column truncates to whole seconds, so
+      // elapsed = 1000ms < 2000ms (interval 2s) → the monitor is NOT due, yet
+      // the 09:00 window opens. This is the not-due rollup branch (the bug).
+      ctx.store.setMonitorState('test-monitor', {
+        sourceState: ctx.store.getMonitorState('test-monitor').sourceState,
+        notifyState: ctx.store.getMonitorState('test-monitor').notifyState,
+        lastObservationAt: new Date(WINDOW_AT.getTime() - 1_000),
+      });
+
+      vi.setSystemTime(WINDOW_AT);
+      return ctx.runtime.tick(ctx.monitorsDir, ctx.rootDir);
+    }
+
+    // Criterion 1 (P1, 002 §1.1.7): rollup + net, window fires on a NOT-DUE tick
+    // after 3 accumulated edits to one objectKey → exactly ONE net delta. Before
+    // the fix the not-due branch bypassed collapseToNetSpan and delivered all 3
+    // (play-by-play). 002 §1.1.7: a recipient that missed N observations of one
+    // object receives ONE net delta.
+    it('net: not-due window flush delivers exactly one net delta (not the play-by-play)', async () => {
+      vi.useFakeTimers();
+      try {
+        const ctx = setupNotDueFlush(
+          'rollup-180-net',
+          'baseline-strategy: net\n',
+        );
+        const flush = await driveNotDueFlush(ctx);
+
+        // ONE net delta, not three.
+        expect(flush.emittedEventIds).toHaveLength(1);
+
+        const delivered = ctx.runtime.listEvents({ sessionId: ctx.sessionId });
+        expect(delivered).toHaveLength(1);
+        // The survivor is the LAST observation of the run (where things stand
+        // now): edit 3, with the endpoint snapshot.
+        expect(delivered[0]?.title).toBe('edit 3');
+        expect(delivered[0]?.snapshotText).toBe(STATES[2]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    // Criterion 1 control (002 §1.1.7): the DUE path (via ingest()) already
+    // yields one net delta for the same span. Asserting both paths agree proves
+    // the shared helper made the not-due path match the due path — no drift.
+    it('net: due-path flush also delivers exactly one net delta (control — both paths agree)', async () => {
+      vi.useFakeTimers();
+      try {
+        const ctx = setupNotDueFlush(
+          'rollup-180-net-due',
+          'baseline-strategy: net\n',
+        );
+
+        // Accumulate the three edits across due ticks (window closed).
+        for (let i = 0; i < STATES.length; i += 1) {
+          vi.setSystemTime(new Date(ACCUM_BASE.getTime() + i * 2_000));
+          const tick = await ctx.runtime.tick(ctx.monitorsDir, ctx.rootDir);
+          expect(tick.emittedEventIds).toHaveLength(0);
+        }
+
+        // DUE flush: lastObservationAt is 08:00:04, the window is 09:00:00, so
+        // elapsed ≫ 2s → the monitor IS due and the window opens → ingest()
+        // path. No setMonitorState override.
+        vi.setSystemTime(WINDOW_AT);
+        const flush = await ctx.runtime.tick(ctx.monitorsDir, ctx.rootDir);
+
+        expect(flush.emittedEventIds).toHaveLength(1);
+        const delivered = ctx.runtime.listEvents({ sessionId: ctx.sessionId });
+        expect(delivered).toHaveLength(1);
+        expect(delivered[0]?.title).toBe('edit 3');
+        expect(delivered[0]?.snapshotText).toBe(STATES[2]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    // Criterion 2 (P2, 002 §10.7 / §1.1.6): the not-due flush records a
+    // `triggered` observation_history row retrievable via listObservationHistory
+    // and surfaced by monitor explain. Before the fix the not-due branch wrote
+    // NO history row, so a real daily-digest delivery was invisible to the audit
+    // trail (it appeared as "nothing triggered").
+    it('records a triggered observation_history row for the not-due flush (audit trail)', async () => {
+      vi.useFakeTimers();
+      try {
+        const ctx = setupNotDueFlush(
+          'rollup-180-history',
+          'baseline-strategy: net\n',
+        );
+        const flush = await driveNotDueFlush(ctx);
+        expect(flush.emittedEventIds).toHaveLength(1);
+
+        const history = ctx.runtime.listObservationHistory({
+          monitorId: 'test-monitor',
+        });
+        // The most-recent row (newest-first) is the flush. It MUST be
+        // `triggered` — a real delivery happened — not the prior `suppressed`
+        // accumulation rows.
+        expect(history[0]?.result).toBe('triggered');
+        // The audit row counts what was *dispatched* into the flush (the whole
+        // accumulated span of 3), not what survived the net collapse — matching
+        // ingest()'s due-path behavior, where the row reflects dispatch, not
+        // materialization (002 §10.7). The `triggered` result is the contract;
+        // this count assertion just pins the row to the due-path semantics.
+        expect(history[0]?.observationData['emitted']).toBe(STATES.length);
+        expect(history[0]?.observationData['observed']).toBe(0);
+
+        // The audit row is surfaced by `monitor explain` (002 §10.7): the
+        // report's observation history carries the `triggered` row.
+        const report = await ctx.runtime.explainMonitor({
+          monitorId: 'test-monitor',
+          monitorsDir: ctx.monitorsDir,
+          workspacePath: ctx.rootDir,
+          now: WINDOW_AT,
+        });
+        expect(report.observations[0]?.result).toBe('triggered');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    // Criterion 3 (no regression, 002 §1.1.7): rollup + incremental (default)
+    // on the not-due path still delivers N ordered deltas — the play-by-play is
+    // preserved, not collapsed. The shared helper must leave the incremental
+    // span untouched.
+    it('incremental: not-due window flush still delivers N ordered deltas (no regression)', async () => {
+      vi.useFakeTimers();
+      try {
+        const ctx = setupNotDueFlush(
+          'rollup-180-incremental',
+          'baseline-strategy: incremental\n',
+        );
+        const flush = await driveNotDueFlush(ctx);
+
+        // All three edits delivered as their own events — the play-by-play.
+        expect(flush.emittedEventIds).toHaveLength(STATES.length);
+
+        // listEvents() returns newest-first; reverse to get chronological order
+        // so we can assert delivery sequence directly without sorting (sorting
+        // would discard ordering and miss a regression that reorders events).
+        const delivered = ctx.runtime
+          .listEvents({ sessionId: ctx.sessionId })
+          .slice()
+          .reverse();
+        expect(delivered).toHaveLength(STATES.length);
+        // 002 §1.1.7: N=3 ordered deltas — edit 1 before edit 2 before edit 3.
+        expect(delivered.map((e) => e.title)).toEqual([
+          'edit 1',
+          'edit 2',
+          'edit 3',
+        ]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    // No regression for the empty not-due tick: the window check runs on EVERY
+    // not-due tick, but an empty flush (window closed, or nothing accumulated)
+    // must NOT write a `no-change` audit row each tick — only a real flush is
+    // recorded. (The call site guards materializeSpan on emitted.length > 0.)
+    it('does not record an audit row for a not-due tick that flushes nothing', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(ACCUM_BASE);
+      try {
+        const ctx = setupNotDueFlush(
+          'rollup-180-empty',
+          'baseline-strategy: net\n',
+        );
+
+        // First due tick at 08:00:00 accumulates edit 1 (suppressed: held in the
+        // closed window) and writes its own audit row via ingest().
+        await ctx.runtime.tick(ctx.monitorsDir, ctx.rootDir);
+        const afterAccum = ctx.runtime.listObservationHistory({
+          monitorId: 'test-monitor',
+        }).length;
+
+        // Force NOT-DUE but window still CLOSED (08:00:00 + 1s lastObservationAt,
+        // tick at 08:00:00.5 → elapsed < 2s, window not open). Several not-due
+        // ticks must not append audit rows.
+        ctx.store.setMonitorState('test-monitor', {
+          sourceState: ctx.store.getMonitorState('test-monitor').sourceState,
+          notifyState: ctx.store.getMonitorState('test-monitor').notifyState,
+          lastObservationAt: ACCUM_BASE,
+        });
+        vi.setSystemTime(new Date(ACCUM_BASE.getTime() + 500));
+        const notDue = await ctx.runtime.tick(ctx.monitorsDir, ctx.rootDir);
+        expect(notDue.emittedEventIds).toHaveLength(0);
+
+        // No new audit row was written for the empty not-due window check.
+        expect(
+          ctx.runtime.listObservationHistory({ monitorId: 'test-monitor' })
+            .length,
+        ).toBe(afterAccum);
       } finally {
         vi.useRealTimers();
       }

@@ -1117,19 +1117,23 @@ export class AgentMonitorRuntime {
             notifyState: rollupDispatch.nextState,
             lastObservationAt: monitorStateForSkip.lastObservationAt ?? null,
           });
-          for (const emitted of rollupDispatch.emitted) {
+          // Route the flushed batch through the SAME span materialization as
+          // `ingest()` (issue #180) so the not-due path applies the `net`
+          // baseline collapse (002 §1.1.7) and records the `triggered`
+          // observation_history row (002 §10.7) — the due path already does both.
+          // Only invoke it when the window actually flushed something: an empty
+          // window check runs every not-due tick and must NOT flood the audit
+          // trail with `no-change` rows. `observed: 0` because this path
+          // dispatches no NEW observations — only the already-accumulated batch.
+          if (rollupDispatch.emitted.length > 0) {
             try {
-              const event = await this.processObservation({
-                monitor: emitted.monitor,
-                sourceName: emitted.monitor.frontmatter.watch.type,
-                observation: emitted.observation,
-                observedAt: emitted.observedAt,
-                workspacePath,
-                effectiveUrgency: emitted.effectiveUrgency,
-              });
-              // Rollup batch entries passed the Shape pre-filter at ingest time,
-              // so suppression here is not expected; guard defensively.
-              if (event) emittedEventIds.push(event.id);
+              emittedEventIds.push(
+                ...(await this.materializeSpan(
+                  monitor,
+                  rollupDispatch.emitted,
+                  { observed: 0, workspacePath },
+                )),
+              );
             } catch {
               // best-effort: materialization failure must not abort the tick
             }
@@ -1294,15 +1298,79 @@ export class AgentMonitorRuntime {
       lastObservationAt: now,
     });
 
-    // Audit trail: record this monitor's outcome (G6). Shared by the tick loop
-    // and the watcher, so watch-mode observations are audited identically.
-    // Classify by what was *emitted*, not by new observations: a batch can emit
-    // a previously-debounced observation with zero new observations (e.g. the
-    // default high-urgency settle flushing), which is still a `triggered`
-    // outcome. Only `suppressed` (observations seen but held/throttled) and
-    // `no-change` (nothing seen) depend on the observation count.
-    const observed = observations.length;
-    const emittedCount = dispatch.emitted.length;
+    // Audit-history recording, `net` baseline collapse, and per-observation
+    // materialization are shared with the not-due rollup flush in tick() via
+    // materializeSpan() (issue #180): both the source-interval-elapsed (`ingest`)
+    // path and the window-fires-on-a-not-due-tick path MUST apply the `net`
+    // collapse (002 §1.1.7) and write the `triggered` history row (002 §10.7),
+    // so the single helper is the only place that logic lives.
+    return await this.materializeSpan(monitor, dispatch.emitted, {
+      observed: observations.length,
+      workspacePath: options.workspacePath,
+      ...(options.sourceOutcome
+        ? { sourceOutcome: options.sourceOutcome }
+        : {}),
+    });
+  }
+
+  /**
+   * Materialize a dispatched catch-up span into durable events, shared by BOTH
+   * flush paths so they can never drift (issue #180):
+   *
+   *  - `ingest()` — the source-interval-elapsed ("due") path, and
+   *  - the not-due rollup branch in `tick()` — where the source poll interval
+   *    has NOT elapsed but the rollup delivery window opens. Per 002 §4.4 this
+   *    is the *normal* operating mode for a rollup monitor whose `watch.interval`
+   *    is relaxed to match the delivery window.
+   *
+   * The helper performs, in order:
+   *
+   *  1. **Audit trail (G6, 002 §10.7 / §1.1.6).** Records the monitor's outcome
+   *     row, classified by what was *emitted*, not by new observations — a batch
+   *     can emit a previously-held observation with zero new observations (e.g. a
+   *     debounce flush, or a rollup window firing on a not-due tick), which is
+   *     still a `triggered` outcome. Only `suppressed` (observations seen but
+   *     held/throttled) and `no-change` (nothing seen) depend on the observation
+   *     count.
+   *  2. **`net` baseline collapse (G13, 002 §1.1.7).** When the monitor declares
+   *     `baseline-strategy: net`, the span is collapsed per object to a single
+   *     net delta (`collapseToNetSpan`) — only the LAST observation of each
+   *     `objectKey` run survives, so the Diff stage (processObservation) compares
+   *     the shared snapshot baseline against the endpoint state. Intermediate
+   *     observations are discarded and never materialized, so they never advance
+   *     the per-object snapshot baseline — which is exactly what makes the
+   *     surviving delta a *net* delta. `incremental` (default) leaves the span
+   *     untouched: every emitted observation becomes its own event, in order.
+   *     A span with one observation per object is identical under both strategies.
+   *     (The full per-recipient-baseline seam is future G10 work.)
+   *  3. **Per-observation materialization with isolation (issue #46).** A single
+   *     failing observation must not drop the already-durably-written ids of its
+   *     batch-mates; on failure a best-effort `errored` history row is written
+   *     for the individual observation and the loop continues. The batch-level
+   *     row from step 1 is unaffected — it reflects what was *dispatched*, not
+   *     what materialized.
+   *
+   * `observed` is the raw count of observations the source reported this tick
+   * (i.e. `observations.length` from the `observe()` result, **before** notify
+   * dispatch and the Shape pre-filter). It is used only for the history-row
+   * classification: when `emitted > 0` the row is always `triggered` regardless
+   * of `observed`; `observed` only distinguishes `suppressed` (source returned
+   * something but dispatch held it) from `no-change` (source returned nothing).
+   * The not-due rollup flush passes `observed: 0` because no source `observe()`
+   * call was made on that tick — only the already-accumulated batch is emitted —
+   * so a non-empty flush there correctly classifies as `triggered` (emitted > 0).
+   */
+  private async materializeSpan(
+    monitor: MonitorDefinition,
+    emitted: StoredObservationEnvelope[],
+    options: {
+      observed: number;
+      workspacePath: string;
+      sourceOutcome?: 'rebaselined';
+    },
+  ): Promise<string[]> {
+    const observed = options.observed;
+    const emittedCount = emitted.length;
     this.store.recordObservationHistory({
       monitorId: monitor.id,
       sourceName: monitor.frontmatter.watch.type,
@@ -1323,46 +1391,21 @@ export class AgentMonitorRuntime {
       observationData: { observed, emitted: emittedCount },
     });
 
-    // Baseline strategy (G13, 002 §1.1.7): the author-declared `baseline-strategy`
-    // parameterizes how a recipient's catch-up span is materialized into deltas.
-    //
-    // - `incremental` (default): every emitted observation in the span becomes
-    //   its own event, in order — the play-by-play. This is the unchanged,
-    //   backward-compatible behavior.
-    // - `net`: the catch-up span is collapsed per object to a single net delta —
-    //   only the LAST observation of each `objectKey` run survives, so the Diff
-    //   stage (processObservation) compares the shared snapshot baseline
-    //   (`store.latestSnapshot`, keyed by workspace/monitor/object) against the
-    //   endpoint state. Intermediate observations are discarded and never
-    //   materialized — so they never advance the per-object snapshot baseline,
-    //   which is exactly what makes the surviving delta a net delta.
-    //   Note: the full per-recipient-baseline seam (divergent stored baselines
-    //   per session) is future G10 work.
-    //
-    // A span containing a single observation is identical under both strategies
-    // (002 §1.1.7 — no intermediate steps to collapse).
     const span =
       monitor.frontmatter.baselineStrategy === 'net'
-        ? collapseToNetSpan(dispatch.emitted)
-        : dispatch.emitted;
+        ? collapseToNetSpan(emitted)
+        : emitted;
 
-    // Per-observation materialization isolation (issue #46): a single failing
-    // observation must not drop the already-durably-written ids of its
-    // batch-mates, and must not cause emittedEventIds to disagree with what is
-    // actually in the DB. On failure we record a best-effort errored history row
-    // for the individual observation and continue to the next in the batch.
-    // The batch-level triggered/suppressed/no-change row recorded above is
-    // unaffected — it reflects what was *dispatched*, not what materialized.
     const emittedEventIds: string[] = [];
-    for (const emitted of span) {
+    for (const envelope of span) {
       try {
         const event = await this.processObservation({
-          monitor: emitted.monitor,
-          sourceName: emitted.monitor.frontmatter.watch.type,
-          observation: emitted.observation,
-          observedAt: emitted.observedAt,
+          monitor: envelope.monitor,
+          sourceName: envelope.monitor.frontmatter.watch.type,
+          observation: envelope.observation,
+          observedAt: envelope.observedAt,
           workspacePath: options.workspacePath,
-          effectiveUrgency: emitted.effectiveUrgency,
+          effectiveUrgency: envelope.effectiveUrgency,
         });
         if (event) emittedEventIds.push(event.id);
       } catch (materializeError) {
