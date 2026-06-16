@@ -16,6 +16,7 @@ import type {
   AgentSessionRecord,
   DeliveryClaim,
   EventQuery,
+  MonitorEventRecord,
   MonitorExplainInput,
   MonitorExplainReport,
   MonitorExplainStage,
@@ -900,6 +901,18 @@ export class AgentMonitorRuntime {
       total: unreadCounts.low + unreadCounts.normal + unreadCounts.high,
     };
 
+    /**
+     * Build the recipient-visible summary for one event (G14, 002 §1.1.8):
+     * prefer the per-session Interpret digest when present (the agentic gate
+     * produced a cheap digest for this recipient), otherwise fall back to the
+     * deterministic `summary` → `body` → `title` chain.
+     */
+    const recipientSummary = (
+      event: MonitorEventRecord,
+      digests: Map<string, string>,
+    ): string =>
+      digests.get(event.id) ?? (event.summary || event.body || event.title);
+
     if (lifecycle === 'turn-interruptible') {
       const unreadNormal = this.store.unreadEventsForSession(
         sessionId,
@@ -912,6 +925,10 @@ export class AgentMonitorRuntime {
           DEFAULT_HIGH_URGENCY_SETTLE_MS,
       );
       if (settledHigh.length > 0) {
+        const digests = this.store.interpretDigestsForSession(
+          sessionId,
+          settledHigh.map((event) => event.id),
+        );
         this.store.markClaimed(
           sessionId,
           settledHigh.map((event) => event.id),
@@ -927,14 +944,14 @@ export class AgentMonitorRuntime {
           message: summarizeEvents(
             settledHigh.map((event) => ({
               title: event.title,
-              summary: event.summary || event.body || event.title,
+              summary: recipientSummary(event, digests),
             })),
           ),
           events: settledHigh.map((event) => ({
             eventId: event.id,
             monitorId: event.monitorId,
             title: event.title,
-            summary: event.summary || event.body || event.title,
+            summary: recipientSummary(event, digests),
             urgency: event.urgency,
             createdAt: event.createdAt.toISOString(),
             body: event.body,
@@ -995,12 +1012,17 @@ export class AgentMonitorRuntime {
 
     const unread = this.store.unreadEventsForSession(sessionId);
     if (lifecycle === 'post-compact' && unread.length > 0) {
+      const recapSlice = unread.slice(-MAX_RECAP_EVENTS);
+      const digests = this.store.interpretDigestsForSession(
+        sessionId,
+        recapSlice.map((event) => event.id),
+      );
       const message = [
         'Recap of recent AgentMon activity since your last recap:',
         summarizeEvents(
-          unread.slice(-MAX_RECAP_EVENTS).map((event) => ({
+          recapSlice.map((event) => ({
             title: event.title,
-            summary: event.summary || event.body || event.title,
+            summary: recipientSummary(event, digests),
           })),
         ),
         `Run \`${fullHistoryCommand(sessionId)}\` for recent history.`,
@@ -1019,11 +1041,11 @@ export class AgentMonitorRuntime {
         mode: 'recap',
         unreadCounts: sessionUnreadCounts,
         message,
-        events: unread.slice(-MAX_RECAP_EVENTS).map((event) => ({
+        events: recapSlice.map((event) => ({
           eventId: event.id,
           monitorId: event.monitorId,
           title: event.title,
-          summary: event.summary || event.body || event.title,
+          summary: recipientSummary(event, digests),
           urgency: event.urgency,
           createdAt: event.createdAt.toISOString(),
           body: event.body,
@@ -1221,8 +1243,16 @@ export class AgentMonitorRuntime {
    * `nextSourceState` is provided only by `observe()` (which returns the next
    * source state); the watcher omits it, since a long-lived `watch()` owns its
    * own in-memory state and the runtime leaves the persisted `sourceState`
-   * untouched. Synchronous start-to-finish, so concurrent watchers on the
-   * single-threaded event loop never interleave a monitor's state mutation.
+   * untouched.
+   *
+   * **Ordering guarantee (G14, 002 §1.1.8):** all durable monitor-state mutation
+   * (notify state via `setMonitorState`, per-recipient event rows via
+   * `insertEvent`, and snapshot rows via `saveSnapshot`) completes synchronously
+   * before the first `await` — the Interpret shell-out. If the process dies mid-
+   * Interpret, the projected rows survive and are deliverable without a digest
+   * (best-effort fallback, PP4). Concurrent watchers on the single-threaded event
+   * loop therefore never interleave a monitor's durable-state mutations with
+   * another monitor's, even though `ingest()` is now `async`.
    */
   private async ingest(
     monitor: MonitorDefinition,
@@ -1901,38 +1931,50 @@ export class AgentMonitorRuntime {
   ): Promise<void> {
     const adapter = this.interpretAdapter;
     if (!adapter) return;
-    // The per-recipient delta: the rendered diff for this recipient, falling back
-    // to the full artifact when this is a baseline (no prior snapshot to diff).
+    const sessionIds = this.store.projectedSessionIdsForLastEvent();
+    if (sessionIds.length === 0) return;
+
+    // The per-recipient delta: the rendered diff for this event, falling back to
+    // the full artifact when this is a baseline (no prior snapshot to diff).
+    // All sessions that received this event share the same rendered delta, so we
+    // invoke the adapter ONCE and apply the single verdict to every recipient.
+    // This is both correct (same input → same verdict) and efficient (no
+    // N-per-recipient round-trips to an external tool for identical inputs).
     const delta = diffText ?? event.snapshotText ?? '';
     const criteria = monitor.instructions;
-    for (const sessionId of this.store.projectedSessionIdsForLastEvent()) {
-      try {
-        const result = await adapter.interpret({
-          delta,
-          criteria,
-          monitorId: monitor.id,
-        });
-        if (result.decision === 'suppress') {
-          this.store.recordInterpretDecision(sessionId, event.id, {
-            decision: 'suppress',
-            reason: result.reason,
-          });
-        } else {
-          this.store.recordInterpretDecision(sessionId, event.id, {
-            decision: 'deliver',
-            digest: result.digest,
-          });
-        }
-      } catch (interpretError) {
-        // Best-effort fallback (PP4, AP3): record the failure and leave the
-        // projection deliverable as the deterministic `rendered` artifact.
-        const message =
-          interpretError instanceof Error
-            ? interpretError.message
-            : String(interpretError);
+
+    let result: Awaited<ReturnType<typeof adapter.interpret>> | undefined;
+    let errorMessage: string | undefined;
+    try {
+      result = await adapter.interpret({
+        delta,
+        criteria,
+        monitorId: monitor.id,
+      });
+    } catch (interpretError) {
+      // Best-effort fallback (PP4, AP3): record the failure and leave every
+      // projection deliverable as the deterministic `rendered` artifact.
+      errorMessage =
+        interpretError instanceof Error
+          ? interpretError.message
+          : String(interpretError);
+    }
+
+    for (const sessionId of sessionIds) {
+      if (errorMessage !== undefined) {
         this.store.recordInterpretDecision(sessionId, event.id, {
           decision: 'failed',
-          reason: message,
+          reason: errorMessage,
+        });
+      } else if (result?.decision === 'suppress') {
+        this.store.recordInterpretDecision(sessionId, event.id, {
+          decision: 'suppress',
+          reason: result.reason,
+        });
+      } else if (result?.decision === 'deliver') {
+        this.store.recordInterpretDecision(sessionId, event.id, {
+          decision: 'deliver',
+          digest: result.digest,
         });
       }
     }

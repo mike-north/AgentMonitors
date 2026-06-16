@@ -16,11 +16,6 @@ export interface InboxDb {
 }
 
 /**
- * Create a database connection and ensure tables exist.
- *
- * @param dbPath - Path to the SQLite database file, or ':memory:' for in-memory
- */
-/**
  * Add `column` (`type`) to `table` if it does not already exist. SQLite has no
  * `ADD COLUMN IF NOT EXISTS`, so we probe `PRAGMA table_info` first. Used for
  * additive, backward-compatible schema evolution on durable DBs created by an
@@ -37,6 +32,11 @@ function addColumnIfMissing(
   client.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
 }
 
+/**
+ * Create a database connection and ensure tables exist.
+ *
+ * @param dbPath - Path to the SQLite database file, or ':memory:' for in-memory
+ */
 export function createDb(dbPath: string): InboxDb {
   if (dbPath !== ':memory:') {
     mkdirSync(path.dirname(dbPath), { recursive: true });

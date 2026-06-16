@@ -284,6 +284,81 @@ describe('Interpret stage (G14, 002 §1.1.8)', () => {
     expect(projection?.interpretDigest).toBe(DIGEST);
   });
 
+  it('(b) the Interpret digest IS the recipient-visible summary in claimDelivery (not the raw body)', async () => {
+    // Regression for Copilot comment 3418449211: the digest must reach the
+    // recipient, not just be stored on session_event_state. Before this fix,
+    // claimDelivery used event.summary/body/title and the digest was never surfaced.
+    const DIGEST = 'Pipeline failed on step 3 — urgent review needed.';
+    const fake = fakeAdapter(() => ({ decision: 'deliver', digest: DIGEST }));
+    const { runtime, monitorsDir, rootDir } = setup(
+      'prose',
+      scriptedSource(['v1', 'v2']),
+      fake,
+    );
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'sess-1',
+        workspacePath: rootDir,
+      }),
+    );
+
+    await runtime.tick(monitorsDir, rootDir); // baseline (urgency: high→settle applies; use normal here via monitor spec)
+    await pause();
+    await runtime.tick(monitorsDir, rootDir); // delta → interpret → deliver
+
+    // The monitor is `normal` urgency (see writeMonitor), so a post-compact
+    // recap carries the events with their summaries.
+    const claim = runtime.claimDelivery(session.id, 'post-compact');
+    expect(claim).not.toBeNull();
+    // Every event in the recap must use the Interpret digest, not the raw summary.
+    const digestEvent = claim?.events.find((e) => e.summary === DIGEST);
+    expect(digestEvent).toBeDefined();
+  });
+
+  it('(b) the adapter is called ONCE per event even when multiple sessions share the same delta', async () => {
+    // Regression for Copilot comment 3418449196: runInterpret previously called
+    // the adapter once per projected session with identical inputs, causing N
+    // redundant round-trips to the user's AI tool. The correct behavior is one
+    // call per distinct delta, with the verdict applied to all recipients.
+    const fake = fakeAdapter(() => ({ decision: 'deliver', digest: 'ok' }));
+    const { runtime, store, monitorsDir, rootDir } = setup(
+      'prose',
+      scriptedSource(['v1', 'v2']),
+      fake,
+    );
+
+    // Open TWO lead sessions in the same workspace — both receive the same event
+    // projection from insertEvent and must share the single adapter invocation.
+    const session1 = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'sess-A',
+        workspacePath: rootDir,
+      }),
+    );
+    const session2 = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'sess-B',
+        workspacePath: rootDir,
+      }),
+    );
+
+    await runtime.tick(monitorsDir, rootDir); // baseline: 1 call (delta = snapshotText)
+    expect(fake.calls).toHaveLength(1);
+
+    await pause();
+    await runtime.tick(monitorsDir, rootDir); // delta event: must be exactly 1 MORE call, not 2
+
+    // Two sessions, one event — adapter must have been called exactly once per
+    // tick (total 2), not once per session (total 4).
+    expect(fake.calls).toHaveLength(2);
+
+    // Both sessions received the `deliver` verdict from the single adapter call.
+    const unread1 = diffEvent(store.unreadEventsForSession(session1.id));
+    const unread2 = diffEvent(store.unreadEventsForSession(session2.id));
+    expect(unread1).toBeDefined();
+    expect(unread2).toBeDefined();
+  });
+
   it('(c) a "not substantive" delta yields NO delivery and an explainable suppression reason', async () => {
     const REASON = 'idle chatter, no question for the principal';
     const fake = fakeAdapter(() => ({ decision: 'suppress', reason: REASON }));

@@ -348,7 +348,7 @@ export class RuntimeStore {
 
   /** @returns the lead-session ids the last {@link insertEvent} projected into. */
   projectedSessionIdsForLastEvent(): string[] {
-    return this.lastProjectedSessionIds;
+    return [...this.lastProjectedSessionIds];
   }
 
   /**
@@ -383,6 +383,38 @@ export class RuntimeStore {
         ),
       )
       .run();
+  }
+
+  /**
+   * Return the per-session interpret verdicts for a set of events (G14,
+   * 002 §1.1.8). Used by the delivery path to prefer the agentic digest over
+   * the raw `summary`/`body` for `prose` monitors. Only rows that have an
+   * `interpret_digest` recorded are included; callers fall back to
+   * `event.summary || event.body || event.title` when absent.
+   */
+  interpretDigestsForSession(
+    sessionId: string,
+    eventIds: string[],
+  ): Map<string, string> {
+    if (eventIds.length === 0) return new Map();
+    const rows = asInternalDb(this.db)
+      .select({
+        eventId: sessionEventState.eventId,
+        interpretDigest: sessionEventState.interpretDigest,
+      })
+      .from(sessionEventState)
+      .where(
+        and(
+          eq(sessionEventState.sessionId, sessionId),
+          inArray(sessionEventState.eventId, eventIds),
+        ),
+      )
+      .all();
+    const result = new Map<string, string>();
+    for (const row of rows) {
+      if (row.interpretDigest) result.set(row.eventId, row.interpretDigest);
+    }
+    return result;
   }
 
   getEventById(id: string): MonitorEventRecord {
