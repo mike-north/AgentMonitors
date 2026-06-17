@@ -19,7 +19,7 @@ Settled with the design agent before the build:
 - **Signature accent:** **warm amber / sound-wave gold** — on-metaphor (sound/warmth/the "ears lighting up" glow), engineer-warm on a dark base, and ownable vs. the blue/green/purple dev-tool norm.
 - **Hero (selected 2026-06-14):** Variant **C** (left-aligned, schematic-forward) wins — build it full-page, with **Variant B's subhead**. Replace the abstract eyes/hands/ears triad as the hero centerpiece with the **outcome-framed listening hub** (see Hero visual below); keep the triad only as a small supporting chip (`eyes ✓ hands ✓ ears ←`), the category claim.
 - **Narrative principle — outcomes earn mechanisms:** lead with **outcomes** (the things you get told about) to win attention; _then_ spend that attention on **mechanism** (the `MONITOR.md`, the daemon, the diff) on scroll. Hero = outcome; §3 = how you express it. Never open with mechanism.
-- **Diagram split:** **build live (CSS/SVG, theme-aware)** — the **hero listening hub (#1, now a live build — see Hero visual)**, fan-out (#3), anatomy (#4), annotated `MONITOR.md` (#5). The imagery agent now crafts only the before/after "you are the loop" scene (#2).
+- **Diagram split:** **build live (CSS/SVG, theme-aware)** — the **hero listening hub (#1)**, fan-out (#3), anatomy (#4), annotated `MONITOR.md` (#5). The before/after "you are the loop" scene (#2) was also completed: a CSS/SVG schematic shipped in PR #134 and was replaced by the finished imagery-agent illustration in PR #138. **All five shots are now delivered and integrated.**
 - **Host framing — lead with the mechanism, not one vendor (updated 2026-06-14):** Agent Monitors
   plugs into the **hooks** that agentic coding tools share — it is **not Claude-Code-only.** Treat
   **Claude Code, Codex (CLI _and_ macOS desktop app), and Cursor** as the supported set, and frame it as
@@ -214,30 +214,36 @@ full docs.
 
 ## Part B — Imagery agent brief (5 diagrams)
 
+> **Status (2026-06-15): all five shots delivered and integrated.** The brief below is preserved as
+> handoff history. Disposition of each shot is noted in brackets.
+
 Shared visual language: clean, modern, technical-but-warm; flat/line illustration or crisp
 schematic; legible in **both light and dark**; minimal text in-image (labels only). Consistent
 palette and iconography across all five so they read as a set.
 
-1. **(Moved to a live build — not imagery-agent work.)** The hero visual is now the
-   **outcome-framed listening hub**, built live by the design agent (see Part A → "Hero visual —
-   the listening hub"). The imagery agent's set is **#2–#5** below.
-2. **You are the loop (before → after).** Left: a tired person manually re-asking an agent in a
-   repetitive cycle ("any updates? …again? …again?") — the human visibly _is_ the loop. Right: the
-   person at ease while a small monitor element catches a change and hands it to the agent, which is
-   already acting. Emotional, not technical.
-3. **Fan-out.** Left: ~20 agent icons each with its own arrow polling one API — a tangle, with
-   stress cues (rate-limit/lock warning marks). Right: the same 20 agents drawing from a single
-   monitor/hub with one clean arrow to the source. Conveys "many loops → one watch."
-4. **The anatomy (channels-durable).** A left-to-right flow: **the world** (icons: file, API, repo,
-   doc, CLI) → **ear canal** (a labeled "transport: channel / hook / CLI" segment) → **the monitor**
-   (labeled "the hearing: detects change + knows what to listen for") → **the agent**. Makes
-   "channels = ear canal, monitors = hearing" self-evident.
-5. **The unit.** A clean, annotated `MONITOR.md` card: the `watch:` frontmatter block tagged **"what
-   to watch — handled for you"**, and the markdown body tagged **"what it means + what to do — your
-   judgment, run by the agent."** Editorial/diagrammatic, not a raw code screenshot.
-
-Deliver each as a standalone asset (transparent or theme-aware background) sized for web hero/section
-use; provide light and dark variants where contrast matters (shots 1 and 4 especially).
+1. **[Delivered — live CSS/SVG build, PR #134.]** The hero visual is the **outcome-framed listening
+   hub**, built live by the design agent as a theme-aware CSS/SVG component (`ListeningHub`) in
+   `apps/website/src/components/landing/`. See Part A → "Hero visual — the listening hub".
+2. **[Delivered — integrated illustration, PR #138 (closes #136).]** The before/after "you are the
+   loop" scene. PR #134 first shipped a CSS/SVG schematic as a placeholder (`YouAreTheLoop`); PR
+   #138 replaced it with the finished imagery-agent illustration (inline SVG, `viewBox="0 0 560 360"`,
+   animated `ba-cycle`/`ba-travel`/`ba-ask` keyframes, `prefers-reduced-motion` fallback). Left:
+   a tired person manually re-asking an agent in a repetitive cycle ("any updates? …again? …again?")
+   — the human visibly _is_ the loop. Right: the person at ease while a small monitor element
+   catches a change and hands it to the agent, which is already acting. Emotional, not technical.
+3. **[Delivered — live CSS/SVG build, PR #134.]** Fan-out diagram built as `FanOut` component. Left:
+   ~20 agent icons each with its own arrow polling one API — a tangle, with stress cues
+   (rate-limit/lock warning marks). Right: the same 20 agents drawing from a single monitor/hub with
+   one clean arrow to the source. Conveys "many loops → one watch."
+4. **[Delivered — live CSS/SVG build, PR #134.]** Anatomy diagram built as `Anatomy` component. A
+   left-to-right flow: **the world** (icons: file, API, repo, doc, CLI) → **ear canal** (a labeled
+   "transport: channel / hook / CLI" segment) → **the monitor** (labeled "the hearing: detects
+   change + knows what to listen for") → **the agent**. Makes "channels = ear canal, monitors =
+   hearing" self-evident.
+5. **[Delivered — live CSS/SVG build, PR #134.]** The unit, built as `MonitorUnit` component. A
+   clean, annotated `MONITOR.md` card: the `watch:` frontmatter block tagged **"what to watch —
+   handled for you"**, and the markdown body tagged **"what it means + what to do — your judgment,
+   run by the agent."** Editorial/diagrammatic, not a raw code screenshot.
 
 ---
 
