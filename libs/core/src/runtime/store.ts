@@ -11,7 +11,18 @@ import {
   sql,
 } from 'drizzle-orm';
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
-import { ulid } from 'ulid';
+import { monotonicFactory, ulid } from 'ulid';
+
+/**
+ * Monotonic ULID factory for `monitor_events` ids (G10 PR-B). Plain `ulid()` is
+ * NOT ordered within a single millisecond, but the per-recipient `net` collapse
+ * and the claim-time cursor advance both need a deterministic "newest event per
+ * object" tiebreak when a tick materializes several events for one object in the
+ * same millisecond (their `created_at` ties at the runtime tick clock). A
+ * monotonic factory makes `id` strictly increasing in insertion order, so
+ * ordering by `(created_at, id)` reflects materialization order exactly.
+ */
+const eventUlid = monotonicFactory();
 import type { InboxDb } from '../inbox/db.js';
 import {
   agentSessions,
@@ -93,6 +104,7 @@ function rowToEvent(
     snapshotText: row.snapshotText ?? null,
     diffText: row.diffText ?? null,
     objectKey: row.objectKey ?? null,
+    baselineStrategy: row.baselineStrategy ?? null,
     queryScope: parseJson(row.queryScope, {}),
     tags: parseJson(row.tags, []),
     createdAt: row.createdAt,
@@ -119,6 +131,16 @@ function notInterpretSuppressed() {
     isNull(sessionEventState.interpretDecision),
     ne(sessionEventState.interpretDecision, 'suppress'),
   );
+}
+
+/**
+ * A delivery-query condition that excludes per-recipient projections the `net`
+ * collapse suppressed (G10 PR-B, 002 §1.1.7): an older intermediate of a `net`
+ * monitor's catch-up span whose newest sibling was delivered instead. The row is
+ * retained for `monitor explain` but is never surfaced to a transport.
+ */
+function notNetSuppressed() {
+  return isNull(sessionEventState.netSuppressedAt);
 }
 
 function scopeMatches(
@@ -323,7 +345,7 @@ export class RuntimeStore {
     baseline?: { previousContent: string | null },
   ): MonitorEventRecord {
     const db = asInternalDb(this.db);
-    const id = ulid();
+    const id = eventUlid();
     db.insert(monitorEvents)
       .values({
         id,
@@ -339,6 +361,7 @@ export class RuntimeStore {
         snapshotText: input.snapshotText,
         diffText: input.diffText,
         objectKey: input.objectKey,
+        baselineStrategy: input.baselineStrategy,
         queryScope: JSON.stringify(input.queryScope),
         tags: JSON.stringify(input.tags),
         createdAt: input.createdAt,
@@ -921,6 +944,11 @@ export class RuntimeStore {
       ...(state.interpretDigest
         ? { interpretDigest: state.interpretDigest }
         : {}),
+      // Per-recipient `net`-collapse suppression marker (G10 PR-B, 002 §1.1.7):
+      // an older intermediate of a `net` catch-up span whose newest sibling was
+      // delivered instead. Retained here so the collapse stays explainable via
+      // `monitor explain` (§10.7), but it was never surfaced to a transport.
+      ...(state.netSuppressedAt ? { netSuppressed: true } : {}),
       // Per-recipient delta (G10, 002 §1.1.2): the diff this recipient computed
       // against its own cursor. Fall back to the shared event-level diff for
       // legacy (pre-G10) rows where the per-recipient column is NULL.
@@ -966,9 +994,10 @@ export class RuntimeStore {
           ...conditions,
           isNull(sessionEventState.acknowledgedAt),
           notInterpretSuppressed(),
+          notNetSuppressed(),
         ),
       )
-      .orderBy(asc(monitorEvents.createdAt))
+      .orderBy(asc(monitorEvents.createdAt), asc(monitorEvents.id))
       .all();
     return rows.map((row) => rowToEvent(row.event));
   }
@@ -991,9 +1020,10 @@ export class RuntimeStore {
           isNull(sessionEventState.acknowledgedAt),
           isNull(sessionEventState.firstNotifiedAt),
           notInterpretSuppressed(),
+          notNetSuppressed(),
         ),
       )
-      .orderBy(asc(monitorEvents.createdAt))
+      .orderBy(asc(monitorEvents.createdAt), asc(monitorEvents.id))
       .all();
     return rows.map((row) => rowToEvent(row.event));
   }
@@ -1008,6 +1038,157 @@ export class RuntimeStore {
         and(
           eq(sessionEventState.sessionId, sessionId),
           inArray(sessionEventState.eventId, eventIds),
+        ),
+      )
+      .run();
+  }
+
+  /**
+   * Apply the per-recipient `net` collapse to a recipient's candidate delivery
+   * set at claim time (G10 PR-B, 002 §1.1.7).
+   *
+   * For each event whose persisted `baselineStrategy` is `net`, group the
+   * candidates by `(monitorId, objectKey)` and keep only the NEWEST event of
+   * each group as DELIVERED — "where things stand now" against this recipient's
+   * own baseline cursor. The newest delivered event's per-recipient
+   * `session_event_state.diff_text` is RECOMPUTED as
+   * `buildTextDiff(cursor.baselineContent, newestArtifact)` so the delta spans
+   * the recipient's cursor → endpoint (not the shared snapshot baseline). The
+   * older same-object events are recorded CLAIMED-BUT-SUPPRESSED
+   * (`net_suppressed_at`): retained for `monitor explain` but excluded from
+   * delivery (unread/pending/recap).
+   *
+   * `incremental` (default / NULL) events always pass through unchanged, in
+   * order. Events without a `snapshotText`/`objectKey` (snapshot-less) cannot be
+   * net-collapsed and pass through. A `net` group with a single event is a
+   * no-op (`net` ≡ `incremental` in the degenerate single-observation span).
+   *
+   * @param sessionId - the claiming recipient.
+   * @param candidates - the recipient's candidate events, OLDEST-FIRST.
+   * @returns the events to actually deliver (suppressed intermediates removed),
+   *   preserving the input order. The caller still passes the FULL candidate set
+   *   (delivered + suppressed) to {@link markClaimed} so the cursor advances to
+   *   the newest claimed artifact and the suppressed rows are consumed
+   *   (`first_notified_at`).
+   */
+  collapseNetForClaim(
+    sessionId: string,
+    candidates: MonitorEventRecord[],
+  ): MonitorEventRecord[] {
+    // Identify, per (monitorId, objectKey), the NEWEST `net` event in the
+    // candidate set; every OLDER `net` sibling of a multi-event group is
+    // suppressed. Order by (createdAt, id): events materialized in the same tick
+    // share a createdAt, so the monotonic `id` (see `eventUlid`) breaks the tie
+    // in insertion order — the last is the true endpoint ("where things stand
+    // now", 002 §1.1.7).
+    const ordered = [...candidates].sort((a, b) => {
+      const byTime = a.createdAt.getTime() - b.createdAt.getTime();
+      return byTime !== 0 ? byTime : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    });
+    const newestNetByObject = new Map<string, MonitorEventRecord>();
+    const netGroupSize = new Map<string, number>();
+    for (const event of ordered) {
+      if (event.baselineStrategy !== 'net') continue;
+      if (event.snapshotText === null || event.objectKey === null) continue;
+      const key = [event.monitorId, event.objectKey].join('\0');
+      newestNetByObject.set(key, event);
+      netGroupSize.set(key, (netGroupSize.get(key) ?? 0) + 1);
+    }
+
+    if (newestNetByObject.size === 0) return candidates;
+
+    const suppressedIds: string[] = [];
+    const delivered: MonitorEventRecord[] = [];
+    for (const event of candidates) {
+      const collapsible =
+        event.baselineStrategy === 'net' &&
+        event.snapshotText !== null &&
+        event.objectKey !== null;
+      if (!collapsible) {
+        delivered.push(event);
+        continue;
+      }
+      const key = [event.monitorId, event.objectKey].join('\0');
+      const newest = newestNetByObject.get(key);
+      if (newest?.id === event.id) {
+        // The surviving net delta: when the group ACTUALLY collapsed (>1 event),
+        // recompute its per-recipient diff_text against THIS recipient's cursor →
+        // endpoint artifact (002 §1.1.7), so the delivered delta spans the whole
+        // catch-up, not just the last step. A single-event group ("missed
+        // nothing") is left byte-identical to what materialization recorded — the
+        // degenerate case where `net` ≡ `incremental` (criterion 2), so a
+        // baseline event with a NULL delta is not rewritten to an empty diff.
+        const groupSize = netGroupSize.get(key) ?? 1;
+        if (groupSize > 1 && event.snapshotText !== null) {
+          // objectKey is non-null: the `collapsible` guard above already asserts
+          // `event.objectKey !== null`. The `??` fallback removed in G10 PR-B was
+          // dead code; a null objectKey here is a logic bug, not a valid fallback.
+          const cursor = this.getSessionObjectCursor(
+            sessionId,
+            event.monitorId,
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+            event.objectKey!,
+            event.workspacePath,
+          );
+          if (cursor) {
+            this.setPerRecipientDiff(
+              sessionId,
+              event.id,
+              buildTextDiff(cursor.baselineContent, event.snapshotText),
+            );
+          }
+        }
+        delivered.push(event);
+      } else {
+        // An older intermediate of a multi-event net group: suppress it.
+        suppressedIds.push(event.id);
+      }
+    }
+
+    if (suppressedIds.length > 0) {
+      this.markNetSuppressed(sessionId, suppressedIds);
+    }
+    return delivered;
+  }
+
+  /**
+   * Record the per-recipient `net`-collapse suppression marker (G10 PR-B,
+   * 002 §1.1.7) on the given projections: claimed-but-suppressed intermediates,
+   * retained for `monitor explain` but excluded from delivery.
+   */
+  private markNetSuppressed(sessionId: string, eventIds: string[]): void {
+    if (eventIds.length === 0) return;
+    const now = new Date();
+    asInternalDb(this.db)
+      .update(sessionEventState)
+      .set({ netSuppressedAt: now, updatedAt: now })
+      .where(
+        and(
+          eq(sessionEventState.sessionId, sessionId),
+          inArray(sessionEventState.eventId, eventIds),
+        ),
+      )
+      .run();
+  }
+
+  /**
+   * Overwrite the per-recipient delta (`session_event_state.diff_text`) for one
+   * projection. Used by the `net` collapse to re-anchor the surviving delta to
+   * the recipient's cursor → endpoint span at claim time (G10 PR-B, 002 §1.1.7).
+   */
+  private setPerRecipientDiff(
+    sessionId: string,
+    eventId: string,
+    diffText: string,
+  ): void {
+    const now = new Date();
+    asInternalDb(this.db)
+      .update(sessionEventState)
+      .set({ diffText, updatedAt: now })
+      .where(
+        and(
+          eq(sessionEventState.sessionId, sessionId),
+          eq(sessionEventState.eventId, eventId),
         ),
       )
       .run();

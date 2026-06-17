@@ -201,44 +201,6 @@ function serializeObservation(
   };
 }
 
-/**
- * The per-object identity of an observation in a catch-up span, mirroring the
- * key `processObservation` diffs against: the explicit `objectKey`, or the
- * monitor id when the observation declares none. Net collapse operates per
- * object because each object is its own independent catch-up span (002 §1.1.7).
- */
-function envelopeObjectKey(envelope: StoredObservationEnvelope): string {
-  return envelope.observation.objectKey ?? envelope.monitor.id;
-}
-
-/**
- * Collapse an emitted catch-up span to its `net` form (G13, 002 §1.1.7): for
- * each object (`objectKey`), keep only the LAST emitted observation — "where
- * things stand now" — and discard the intermediates. Order is preserved by the
- * surviving (last) observation's position so a multi-object span still
- * materializes in a stable order. The dropped intermediates are never
- * materialized, so they never advance the per-object snapshot baseline; the
- * surviving observation is therefore diffed against the shared snapshot baseline
- * (`store.latestSnapshot`), yielding a single net delta per object. The full
- * per-recipient-baseline seam (divergent stored baselines per session) is future G10 work.
- *
- * A span with one observation per object is returned unchanged — `incremental`
- * and `net` are behaviorally identical when there is nothing to collapse.
- */
-function collapseToNetSpan(
-  emitted: StoredObservationEnvelope[],
-): StoredObservationEnvelope[] {
-  // Map each object to the index of its LAST emitted observation. Iterating in
-  // order and overwriting leaves the final occurrence as the survivor.
-  const lastIndexByObject = new Map<string, number>();
-  emitted.forEach((envelope, index) => {
-    lastIndexByObject.set(envelopeObjectKey(envelope), index);
-  });
-  const survivors = new Set(lastIndexByObject.values());
-  // Preserve span order: emit survivors in their original positions.
-  return emitted.filter((_envelope, index) => survivors.has(index));
-}
-
 function hydrateStoredObservationEnvelope(
   envelope: StoredObservationEnvelope,
 ): StoredObservationEnvelope {
@@ -925,9 +887,20 @@ export class AgentMonitorRuntime {
           DEFAULT_HIGH_URGENCY_SETTLE_MS,
       );
       if (settledHigh.length > 0) {
+        // Per-recipient `net` collapse (G10 PR-B, 002 §1.1.7): deliver only the
+        // newest event per object for a `net` monitor; record the older
+        // intermediates claimed-but-suppressed. The FULL candidate set is still
+        // claimed (markClaimed) so the cursor advances to the newest artifact
+        // and the suppressed rows are consumed — only the delivered subset is
+        // surfaced to the recipient. Diffs are recomputed inside collapse, so
+        // this must run BEFORE the digest lookup reads the (re-anchored) deltas.
+        const deliveredHigh = this.store.collapseNetForClaim(
+          sessionId,
+          settledHigh,
+        );
         const digests = this.store.interpretDigestsForSession(
           sessionId,
-          settledHigh.map((event) => event.id),
+          deliveredHigh.map((event) => event.id),
         );
         this.store.markClaimed(
           sessionId,
@@ -942,12 +915,12 @@ export class AgentMonitorRuntime {
           urgency: 'high',
           unreadCounts: sessionUnreadCounts,
           message: summarizeEvents(
-            settledHigh.map((event) => ({
+            deliveredHigh.map((event) => ({
               title: event.title,
               summary: recipientSummary(event, digests),
             })),
           ),
-          events: settledHigh.map((event) => ({
+          events: deliveredHigh.map((event) => ({
             eventId: event.id,
             monitorId: event.monitorId,
             title: event.title,
@@ -967,6 +940,12 @@ export class AgentMonitorRuntime {
         normalPending.length > 0 &&
         normalPending.length === unreadNormal.length
       ) {
+        // Record per-recipient `net` suppression for the intermediates of this
+        // claimed batch (G10 PR-B, 002 §1.1.7). This branch surfaces only the
+        // generic inbox prompt (no event payloads), but the collapse must still
+        // run so suppressed intermediates are recorded/explainable and the
+        // cursor advances correctly via the full-set markClaimed below.
+        this.store.collapseNetForClaim(sessionId, normalPending);
         this.store.markClaimed(
           sessionId,
           normalPending.map((event) => event.id),
@@ -993,6 +972,9 @@ export class AgentMonitorRuntime {
       lowUnread.length > 0 && lowUnread.length === unreadLow.length;
 
     if (lifecycle === 'turn-idle' && shouldSendLow) {
+      // Record per-recipient `net` suppression for this claimed batch's
+      // intermediates (G10 PR-B, 002 §1.1.7); see the normal branch above.
+      this.store.collapseNetForClaim(sessionId, lowUnread);
       this.store.markClaimed(
         sessionId,
         lowUnread.map((event) => event.id),
@@ -1012,7 +994,13 @@ export class AgentMonitorRuntime {
 
     const unread = this.store.unreadEventsForSession(sessionId);
     if (lifecycle === 'post-compact' && unread.length > 0) {
-      const recapSlice = unread.slice(-MAX_RECAP_EVENTS);
+      // Per-recipient `net` collapse (G10 PR-B, 002 §1.1.7) over the FULL unread
+      // set, then recap only the delivered (post-collapse) tail. The full set is
+      // still claimed below so the cursor advances and suppressed intermediates
+      // are consumed. Collapse re-anchors the surviving delta, so it must run
+      // before the digest lookup.
+      const deliveredUnread = this.store.collapseNetForClaim(sessionId, unread);
+      const recapSlice = deliveredUnread.slice(-MAX_RECAP_EVENTS);
       const digests = this.store.interpretDigestsForSession(
         sessionId,
         recapSlice.map((event) => event.id),
@@ -1118,9 +1106,10 @@ export class AgentMonitorRuntime {
             lastObservationAt: monitorStateForSkip.lastObservationAt ?? null,
           });
           // Route the flushed batch through the SAME span materialization as
-          // `ingest()` (issue #180) so the not-due path applies the `net`
-          // baseline collapse (002 §1.1.7) and records the `triggered`
-          // observation_history row (002 §10.7) — the due path already does both.
+          // `ingest()` (issue #180) so the not-due path records the `triggered`
+          // observation_history row (002 §10.7) and writes every emitted
+          // observation onto the shared chain — the due path already does both.
+          // (The `net` collapse is per-recipient at claim time; G10 PR-B.)
           // Only invoke it when the window actually flushed something: an empty
           // window check runs every not-due tick and must NOT flood the audit
           // trail with `no-change` rows. `observed: 0` because this path
@@ -1298,12 +1287,13 @@ export class AgentMonitorRuntime {
       lastObservationAt: now,
     });
 
-    // Audit-history recording, `net` baseline collapse, and per-observation
-    // materialization are shared with the not-due rollup flush in tick() via
-    // materializeSpan() (issue #180): both the source-interval-elapsed (`ingest`)
-    // path and the window-fires-on-a-not-due-tick path MUST apply the `net`
-    // collapse (002 §1.1.7) and write the `triggered` history row (002 §10.7),
-    // so the single helper is the only place that logic lives.
+    // Audit-history recording and per-observation materialization are shared
+    // with the not-due rollup flush in tick() via materializeSpan() (issue
+    // #180): both the source-interval-elapsed (`ingest`) path and the
+    // window-fires-on-a-not-due-tick path write the `triggered` history row
+    // (002 §10.7) and record every emitted observation on the shared chain.
+    // The `net` collapse (002 §1.1.7) is NO LONGER applied here — it is a
+    // per-recipient claim-time decision (G10 PR-B); see materializeSpan().
     return await this.materializeSpan(monitor, dispatch.emitted, {
       observed: observations.length,
       workspacePath: options.workspacePath,
@@ -1332,18 +1322,7 @@ export class AgentMonitorRuntime {
    *     still a `triggered` outcome. Only `suppressed` (observations seen but
    *     held/throttled) and `no-change` (nothing seen) depend on the observation
    *     count.
-   *  2. **`net` baseline collapse (G13, 002 §1.1.7).** When the monitor declares
-   *     `baseline-strategy: net`, the span is collapsed per object to a single
-   *     net delta (`collapseToNetSpan`) — only the LAST observation of each
-   *     `objectKey` run survives, so the Diff stage (processObservation) compares
-   *     the shared snapshot baseline against the endpoint state. Intermediate
-   *     observations are discarded and never materialized, so they never advance
-   *     the per-object snapshot baseline — which is exactly what makes the
-   *     surviving delta a *net* delta. `incremental` (default) leaves the span
-   *     untouched: every emitted observation becomes its own event, in order.
-   *     A span with one observation per object is identical under both strategies.
-   *     (The full per-recipient-baseline seam is future G10 work.)
-   *  3. **Per-observation materialization with isolation (issue #46).** A single
+   *  2. **Per-observation materialization with isolation (issue #46).** A single
    *     failing observation must not drop the already-durably-written ids of its
    *     batch-mates; on failure a best-effort `errored` history row is written
    *     for the individual observation and the loop continues. The batch-level
@@ -1391,13 +1370,20 @@ export class AgentMonitorRuntime {
       observationData: { observed, emitted: emittedCount },
     });
 
-    const span =
-      monitor.frontmatter.baselineStrategy === 'net'
-        ? collapseToNetSpan(emitted)
-        : emitted;
-
+    // G10 PR-B (002 §1.1.7, Decision Q3): the shared `monitor_events` chain
+    // records EVERY emitted observation in order, regardless of
+    // `baseline-strategy`. The `net` collapse is no longer applied here — it is
+    // a PER-RECIPIENT decision deferred to claim time (`collapseNetForClaim`),
+    // because an away recipient's net delta must be diffed against ITS OWN
+    // cursor, not the shared snapshot baseline. Keeping every intermediate on
+    // the shared chain is the incremental substrate every recipient diffs over
+    // (precise over cheap). A single tick that emits multiple observations to
+    // one object therefore now materializes one shared event each; the
+    // claim-time per-recipient collapse delivers only the newest of them to a
+    // `net` recipient (the same-tick span `collapseToNetSpan` used to fold,
+    // semantics preserved on the per-recipient side).
     const emittedEventIds: string[] = [];
-    for (const envelope of span) {
+    for (const envelope of emitted) {
       try {
         const event = await this.processObservation({
           monitor: envelope.monitor,
@@ -1918,6 +1904,11 @@ export class AgentMonitorRuntime {
         // session's session_event_state.diff_text (G10, 002 §1.1.2).
         diffText,
         objectKey,
+        // Persist the author-declared baseline strategy on the shared event so
+        // the per-recipient `net` collapse can run at claim time without
+        // re-scanning monitor definitions (G10 PR-B, 002 §1.1.7). Defaults to
+        // `incremental` when the monitor omits the field.
+        baselineStrategy: input.monitor.frontmatter.baselineStrategy,
         // Make the source-agnostic changeKind queryable without each source having
         // to duplicate it into its own queryScope.
         queryScope: {

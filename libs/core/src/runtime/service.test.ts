@@ -3080,12 +3080,19 @@ Handle it.
     /**
      * Drive tick 1 (baseline) then tick 2 (the N-observation catch-up span) for
      * a monitor authored with the given `baseline-strategy` line, returning the
-     * events delivered to the recipient session ordered oldest-first.
+     * recipient session id, the runtime, the monitorsDir, and the shared
+     * `monitor_events` chain for the session ordered oldest-first.
      */
     async function deliverSpan(
       baselineStrategyLine: string,
       hostSessionId: string,
-    ): Promise<MonitorEventRecord[]> {
+    ): Promise<{
+      runtime: AgentMonitorRuntime;
+      monitorsDir: string;
+      rootDir: string;
+      sessionId: string;
+      events: MonitorEventRecord[];
+    }> {
       const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-g13-'));
       tempDirs.push(rootDir);
       const monitorsDir = writeSpanMonitor(rootDir, baselineStrategyLine);
@@ -3105,37 +3112,81 @@ Handle it.
       // Tick 2: deliver the 3-observation catch-up span in one shot.
       await runtime.tick(monitorsDir, rootDir);
 
-      // Oldest-first so delta order is asserted directly.
-      return runtime.listEvents({ sessionId: session.id }).slice().reverse();
+      // Oldest-first so the shared chain order is asserted directly.
+      const events = runtime
+        .listEvents({ sessionId: session.id })
+        .slice()
+        .reverse();
+      return { runtime, monitorsDir, rootDir, sessionId: session.id, events };
     }
 
-    // Criterion (b): a `net` recipient that missed N observations receives ONE
-    // net delta — the endpoint state vs. the baseline (002 §1.1.7).
-    it('net: a recipient that missed N observations receives one net delta', async () => {
-      const events = await deliverSpan(
-        'baseline-strategy: net\n',
-        'claude-g13-net',
-      );
+    // Criterion (b) + G10 PR-B (002 §1.1.7, Decision Q3): under `net`, the
+    // SHARED `monitor_events` chain now records EVERY intermediate (N=3 span
+    // events + baseline = 4), but the per-recipient DELIVERY collapses to ONE
+    // net delta at claim — the newest event per object — with the older
+    // intermediates recorded claimed-but-suppressed (explainable, not delivered).
+    it('net: the shared chain keeps every intermediate, but the recipient is delivered one net delta', async () => {
+      const { runtime, monitorsDir, rootDir, sessionId, events } =
+        await deliverSpan('baseline-strategy: net\n', 'claude-g13-net');
 
-      // Tick 1 (baseline) materialized 1 event with no diff; the net catch-up
-      // span on tick 2 collapses to exactly 1 event → 2 total.
-      expect(events).toHaveLength(2);
-
+      // G10 PR-B / criterion 4 (no shared-collapse regression): the shared chain
+      // is the incremental substrate — all three span observations materialized,
+      // none collapsed. Baseline (1) + N=3 = 4 total shared events.
+      expect(events).toHaveLength(4);
       const spanEvents = events.filter((event) => event.title !== 'baseline');
-      // 002 §1.1.7: ONE net delta for a 3-observation span.
-      expect(spanEvents).toHaveLength(1);
+      expect(spanEvents).toHaveLength(3);
+      // The three span events share a sub-second tick timestamp, so listEvents'
+      // createdAt ordering ties; assert the SET of titles + each title's own
+      // endpoint snapshot (nothing folded), not a strict order.
+      const byTitle = new Map(spanEvents.map((event) => [event.title, event]));
+      expect([...byTitle.keys()].sort()).toEqual([
+        'edit 1',
+        'edit 2',
+        'edit 3',
+      ]);
+      expect(byTitle.get('edit 1')?.snapshotText).toBe(SPAN_STATES[0]);
+      expect(byTitle.get('edit 2')?.snapshotText).toBe(SPAN_STATES[1]);
+      expect(byTitle.get('edit 3')?.snapshotText).toBe(SPAN_STATES[2]);
 
-      const net = spanEvents[0];
-      // The surviving observation is the LAST in the span (where things stand
-      // now): edit 3.
-      expect(net?.title).toBe('edit 3');
-      // The net delta is the baseline (tick-1 snapshot) vs. the endpoint state
-      // (EDIT-3), so the diff reflects all three lines changing — the
-      // intermediate states were collapsed, not replayed.
-      expect(net?.snapshotText).toBe(SPAN_STATES[2]);
-      expect(net?.diffText).toContain('EDIT-1');
-      expect(net?.diffText).toContain('EDIT-2');
-      expect(net?.diffText).toContain('EDIT-3');
+      // Claim the catch-up span (normal urgency → turn-interruptible). The
+      // per-recipient `net` collapse runs at claim: only the newest event per
+      // object is delivered; the two intermediates are recorded suppressed.
+      runtime.claimDelivery(sessionId, 'turn-interruptible');
+
+      const report = await runtime.explainMonitor({
+        monitorId: 'span-monitor',
+        monitorsDir,
+        workspacePath: rootDir,
+      });
+      const spanIds = new Set(spanEvents.map((event) => event.id));
+      const spanProjections = report.projections.filter(
+        (projection) =>
+          projection.sessionId === sessionId && spanIds.has(projection.eventId),
+      );
+      // ONE delivered (not net-suppressed) + TWO claimed-but-suppressed.
+      const delivered = spanProjections.filter((p) => !p.netSuppressed);
+      const suppressed = spanProjections.filter((p) => p.netSuppressed);
+      expect(delivered).toHaveLength(1);
+      expect(suppressed).toHaveLength(2);
+
+      // The surviving net delta is the NEWEST event (edit 3, where things stand
+      // now), and its per-recipient diff spans the recipient's baseline →
+      // endpoint, so all three line edits appear in one delta (collapsed, not
+      // replayed). 002 §1.1.7.
+      const survivor = events.find((e) => e.id === delivered[0]?.eventId);
+      expect(survivor?.title).toBe('edit 3');
+      expect(survivor?.snapshotText).toBe(SPAN_STATES[2]);
+      const netDelta = delivered[0]?.diffText;
+      expect(netDelta).toContain('EDIT-1');
+      expect(netDelta).toContain('EDIT-2');
+      expect(netDelta).toContain('EDIT-3');
+
+      // The two suppressed intermediates are edits 1 and 2 — recorded, retrievable
+      // via explain, never delivered.
+      const suppressedTitles = suppressed
+        .map((p) => events.find((e) => e.id === p.eventId)?.title)
+        .sort();
+      expect(suppressedTitles).toEqual(['edit 1', 'edit 2']);
     });
 
     /**
@@ -3179,7 +3230,7 @@ Handle it.
     // Criterion (c): an `incremental` recipient in the same scenario receives N
     // ordered deltas (002 §1.1.7).
     it('incremental: a recipient that missed N observations receives N ordered deltas', async () => {
-      const events = await deliverSpan(
+      const { events } = await deliverSpan(
         'baseline-strategy: incremental\n',
         'claude-g13-incremental',
       );
@@ -3191,7 +3242,7 @@ Handle it.
     // Criterion (d): omitting `baseline-strategy` behaves identically to
     // `incremental` (backward compatible — 001 §3.7 / 002 §1.1.7).
     it('omitting baseline-strategy behaves identically to incremental', async () => {
-      const events = await deliverSpan('', 'claude-g13-omitted');
+      const { events } = await deliverSpan('', 'claude-g13-omitted');
       // Same outcome as the explicit `incremental` case: baseline + N=3 deltas,
       // never collapsed.
       expect(events).toHaveLength(4);
@@ -3786,12 +3837,48 @@ Daily digest.
       return ctx.runtime.tick(ctx.monitorsDir, ctx.rootDir);
     }
 
-    // Criterion 1 (P1, 002 §1.1.7): rollup + net, window fires on a NOT-DUE tick
-    // after 3 accumulated edits to one objectKey → exactly ONE net delta. Before
-    // the fix the not-due branch bypassed collapseToNetSpan and delivered all 3
-    // (play-by-play). 002 §1.1.7: a recipient that missed N observations of one
-    // object receives ONE net delta.
-    it('net: not-due window flush delivers exactly one net delta (not the play-by-play)', async () => {
+    /**
+     * Claim the not-due/due flush as the recipient and assert the per-recipient
+     * `net` collapse (G10 PR-B, 002 §1.1.7): the shared chain materialized all
+     * three rollup edits, but the recipient is delivered exactly ONE net delta
+     * (the newest, edit 3, against its baseline) with the two intermediates
+     * recorded claimed-but-suppressed and explainable.
+     */
+    async function expectNetDeliveryCollapsedToOne(ctx: {
+      runtime: AgentMonitorRuntime;
+      sessionId: string;
+      monitorsDir: string;
+      rootDir: string;
+    }): Promise<void> {
+      ctx.runtime.claimDelivery(ctx.sessionId, 'turn-interruptible');
+      const report = await ctx.runtime.explainMonitor({
+        monitorId: 'test-monitor',
+        monitorsDir: ctx.monitorsDir,
+        workspacePath: ctx.rootDir,
+        now: WINDOW_AT,
+      });
+      const mine = report.projections.filter(
+        (p) => p.sessionId === ctx.sessionId,
+      );
+      const delivered = mine.filter((p) => !p.netSuppressed);
+      const suppressed = mine.filter((p) => p.netSuppressed);
+      expect(delivered).toHaveLength(1);
+      expect(suppressed).toHaveLength(2);
+      // The delivered survivor is the newest event (edit 3, endpoint state).
+      const survivor = report.events.find(
+        (e) => e.id === delivered[0]?.eventId,
+      );
+      expect(survivor?.title).toBe('edit 3');
+      expect(survivor?.snapshotText).toBe(STATES[2]);
+    }
+
+    // Criterion 1 (P1, 002 §1.1.7) + G10 PR-B: rollup + net, window fires on a
+    // NOT-DUE tick after 3 accumulated edits to one objectKey. The SHARED chain
+    // now records all three (the incremental substrate, Decision Q3); the
+    // per-recipient DELIVERY collapses to ONE net delta at claim. (Pre-PR-B the
+    // collapse was applied on the shared chain — issue #180; now it is moved to
+    // claim-time, so both flush paths keep parity by recording all three.)
+    it('net: not-due window flush records all three on the shared chain; the recipient gets one net delta', async () => {
       vi.useFakeTimers();
       try {
         const ctx = setupNotDueFlush(
@@ -3800,24 +3887,23 @@ Daily digest.
         );
         const flush = await driveNotDueFlush(ctx);
 
-        // ONE net delta, not three.
-        expect(flush.emittedEventIds).toHaveLength(1);
+        // Shared chain: all three rollup edits materialized (no shared collapse).
+        expect(flush.emittedEventIds).toHaveLength(STATES.length);
+        const shared = ctx.runtime.listEvents({ sessionId: ctx.sessionId });
+        expect(shared).toHaveLength(STATES.length);
 
-        const delivered = ctx.runtime.listEvents({ sessionId: ctx.sessionId });
-        expect(delivered).toHaveLength(1);
-        // The survivor is the LAST observation of the run (where things stand
-        // now): edit 3, with the endpoint snapshot.
-        expect(delivered[0]?.title).toBe('edit 3');
-        expect(delivered[0]?.snapshotText).toBe(STATES[2]);
+        // Per-recipient delivery collapses to one net delta at claim.
+        await expectNetDeliveryCollapsedToOne(ctx);
       } finally {
         vi.useRealTimers();
       }
     });
 
-    // Criterion 1 control (002 §1.1.7): the DUE path (via ingest()) already
-    // yields one net delta for the same span. Asserting both paths agree proves
-    // the shared helper made the not-due path match the due path — no drift.
-    it('net: due-path flush also delivers exactly one net delta (control — both paths agree)', async () => {
+    // Criterion 1 control (002 §1.1.7): the DUE path (via ingest()) records the
+    // same three shared events and the same single per-recipient net delivery.
+    // Asserting both paths agree proves the shared helper kept the not-due path
+    // matching the due path — no drift (issue #180 invariant, PR-B form).
+    it('net: due-path flush agrees with the not-due path (both record three shared events, deliver one net delta)', async () => {
       vi.useFakeTimers();
       try {
         const ctx = setupNotDueFlush(
@@ -3838,11 +3924,11 @@ Daily digest.
         vi.setSystemTime(WINDOW_AT);
         const flush = await ctx.runtime.tick(ctx.monitorsDir, ctx.rootDir);
 
-        expect(flush.emittedEventIds).toHaveLength(1);
-        const delivered = ctx.runtime.listEvents({ sessionId: ctx.sessionId });
-        expect(delivered).toHaveLength(1);
-        expect(delivered[0]?.title).toBe('edit 3');
-        expect(delivered[0]?.snapshotText).toBe(STATES[2]);
+        expect(flush.emittedEventIds).toHaveLength(STATES.length);
+        const shared = ctx.runtime.listEvents({ sessionId: ctx.sessionId });
+        expect(shared).toHaveLength(STATES.length);
+
+        await expectNetDeliveryCollapsedToOne(ctx);
       } finally {
         vi.useRealTimers();
       }
@@ -3861,7 +3947,9 @@ Daily digest.
           'baseline-strategy: net\n',
         );
         const flush = await driveNotDueFlush(ctx);
-        expect(flush.emittedEventIds).toHaveLength(1);
+        // G10 PR-B: the shared chain records all three (per-recipient collapse
+        // happens at claim, not on the shared chain).
+        expect(flush.emittedEventIds).toHaveLength(STATES.length);
 
         const history = ctx.runtime.listObservationHistory({
           monitorId: 'test-monitor',

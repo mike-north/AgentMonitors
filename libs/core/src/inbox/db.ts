@@ -138,11 +138,18 @@ export function createDb(dbPath: string): InboxDb {
       snapshot_text TEXT,
       diff_text TEXT,
       object_key TEXT,
+      baseline_strategy TEXT,
       query_scope TEXT NOT NULL DEFAULT '{}',
       tags TEXT NOT NULL DEFAULT '[]',
       created_at INTEGER NOT NULL
     )
   `);
+
+  // Additive migration (G10 PR-B, 002 §1.1.7): a `monitor_events` table created
+  // before PR-B lacks the persisted `baseline_strategy` column. Add it if
+  // missing so the per-recipient `net` collapse can read each event's strategy
+  // at claim time; legacy rows keep NULL and are treated as `incremental`.
+  addColumnIfMissing(sqlite, 'monitor_events', 'baseline_strategy', 'TEXT');
 
   db.run(sql`
     CREATE TABLE IF NOT EXISTS monitor_snapshots (
@@ -168,6 +175,7 @@ export function createDb(dbPath: string): InboxDb {
       interpret_decision TEXT,
       interpret_reason TEXT,
       interpret_digest TEXT,
+      net_suppressed_at INTEGER,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     )
@@ -216,6 +224,16 @@ export function createDb(dbPath: string): InboxDb {
   // pre-existing durable DBs stay forward-compatible; legacy rows keep a NULL
   // here and delivery/explain fall back to the shared `monitor_events.diff_text`.
   addColumnIfMissing(sqlite, 'session_event_state', 'diff_text', 'TEXT');
+
+  // Additive migration (G10 PR-B, 002 §1.1.7): a `session_event_state` table
+  // created before PR-B lacks the per-recipient `net`-collapse suppression
+  // marker. Add it if missing; legacy rows keep NULL (never net-suppressed).
+  addColumnIfMissing(
+    sqlite,
+    'session_event_state',
+    'net_suppressed_at',
+    'INTEGER',
+  );
 
   return db as unknown as InboxDb;
 }

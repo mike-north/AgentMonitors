@@ -97,44 +97,39 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
 > `apps/cli/src/commands/cli.integration.test.ts`. See [003 §12](./003-source-plugins.md) and
 > [spec-changelog.md](./spec-changelog.md).
 
-### G10 — Post-processing pipeline stages + per-recipient seam (P2)
-
-> **PR-A landed.** The per-recipient baseline **seam + per-recipient Diff** substrate is built and
-> proven: a shared `monitor_events` artifact is materialized once, then diffed **per recipient
-> against each recipient's own baseline cursor** (`session_object_cursor` →
-> `session_event_state.diff_text`), so two sessions at divergent stored baselines each hear the right
-> span from one shared observation. Cursor semantics: a late joiner seeds caught-up (hears only
-> changes after it registered), the cursor advances at claim, and cursors persist across dormancy and
-> restart (BP1). See [002 §1.1.2](./002-runtime-delivery.md#112-the-shared--per-recipient-seam) (now
-> _current_ for the substrate), [002 §5.2 / §6](./002-runtime-delivery.md), and
-> [spec-changelog.md](./spec-changelog.md). Proven by
-> `libs/core/src/runtime/per-recipient-diff.test.ts`.
+> G10 (Post-processing pipeline stages + per-recipient seam) **shipped** — both PRs landed.
 >
-> **PR-B remains (keep this item open).** Rewire G13 (`net` collapse,
-> [§1.1.7](./002-runtime-delivery.md)) and G14 (Interpret dedup,
-> [§1.1.8](./002-runtime-delivery.md)) to span **per recipient** rather than over the shared
-> baseline. They currently keep working unchanged on top of the PR-A substrate (co-registered
-> recipients seed identical cursors). The remaining gap below is scoped to that rewire.
-
-- **Current:** the per-recipient Diff seam is built (PR-A, above): one shared artifact, per-recipient
-  delta against each recipient's cursor. The `net` collapse ([002 §1.1.7](./002-runtime-delivery.md))
-  and Interpret ([002 §1.1.8](./002-runtime-delivery.md)) still operate over the **shared** snapshot
-  baseline rather than each recipient's cursor (they remain behaviorally unchanged on the new
-  substrate).
-- **Target (PR-B):** rewire the `net` collapse and Interpret to span **per recipient** off the
-  baseline cursor, completing the right-of-seam stages of
-  [002 §1.1](./002-runtime-delivery.md) — `Observe → [Compose] → Shape → Pace → ⟦seam⟧ → Diff → Interpret → Deliver → [React]` — so per-recipient `net`/Interpret multiply only genuinely
-  per-baseline work (capability C15).
-- **Governs:** PP3, AP3 ([000](./000-principles.md)), [002 §1.1](./002-runtime-delivery.md),
-  the capability study ([§S1, §S4, §S5](../product/monitoring-capability-exercises.md); rows
-  C6/C15/C43).
-- **Files:** `libs/core/src/runtime/service.ts`, `libs/core/src/runtime/store.ts`,
-  `libs/core/src/runtime/diff.ts` (and the per-recipient baseline persistence,
-  `libs/core/src/inbox/schema.ts` — landed in PR-A).
-- **Proof:** the PR-A divergent-baseline fan-out test
-  (`libs/core/src/runtime/per-recipient-diff.test.ts`) proves the seam; PR-B adds per-recipient
-  `net`/Interpret tests. Until PR-B, [002 §1.1.7](./002-runtime-delivery.md) / §1.1.8 stay scoped to
-  the shared baseline.
+> **PR-A** built the per-recipient baseline **seam + per-recipient Diff** substrate: a shared
+> `monitor_events` artifact is materialized once, then diffed **per recipient against each recipient's
+> own baseline cursor** (`session_object_cursor` → `session_event_state.diff_text`), so two sessions
+> at divergent stored baselines each hear the right span from one shared observation. Cursor
+> semantics: a late joiner seeds caught-up, the cursor advances at claim, and cursors persist across
+> dormancy and restart (BP1). Proven by `libs/core/src/runtime/per-recipient-diff.test.ts`.
+>
+> **PR-B (Refs #182)** rewired the right-of-seam stages onto that substrate, completing
+> [002 §1.1](./002-runtime-delivery.md) — `Observe → [Compose] → Shape → Pace → ⟦seam⟧ → Diff →
+Interpret → Deliver → [React]`:
+>
+> - **`net` collapse is now per-recipient at claim time** ([002 §1.1.7](./002-runtime-delivery.md#117-baseline-strategy-per-recipient-diff-semantics-current)).
+>   The shared chain records **every** observation in order (the incremental substrate, Decision Q3);
+>   `RuntimeStore.collapseNetForClaim` (driven by `claimDelivery`) delivers only the newest event per
+>   `objectKey` for a `net` monitor — delta recomputed against that recipient's cursor → endpoint —
+>   and records the older intermediates **claimed-but-suppressed** (`session_event_state.net_suppressed_at`,
+>   explainable via `monitor explain`, never delivered). The cursor still advances to the newest
+>   claimed artifact when intermediates are suppressed. `baseline_strategy` is persisted on each
+>   `monitor_events` row so claim needs no monitor re-scan.
+> - **Interpret runs once per distinct per-recipient delta** ([002 §1.1.8](./002-runtime-delivery.md#118-interpret-a-cheap-agentic-digest-via-the-users-own-ai-tool)).
+>   `runInterpret` groups projected sessions by distinct `diff_text` and invokes the adapter once per
+>   distinct delta (Decision Q4: at materialize on the single-event delta; a claim-time `net` re-diff
+>   does not re-invoke the adapter unless the collapsed delta differs).
+>
+> Proven by `libs/core/src/runtime/net-per-recipient.test.ts` (away-across-N → one net delta + 2
+> suppressed; `incremental` 3-ordered-deltas contrast; missed-nothing degenerate; backward-compat;
+> divergent-baseline Interpret → 2 calls, identical → 1 fanned; shared-chain keeps all N) and the
+> updated `net`/rollup tests in `libs/core/src/runtime/service.test.ts`. Files touched:
+> `libs/core/src/runtime/service.ts`, `store.ts`, `types.ts`, `libs/core/src/inbox/schema.ts` / `db.ts`.
+> See [002 §1.1.2 / §1.1.7 / §1.1.8](./002-runtime-delivery.md) (now _current_, G10 complete) and
+> [spec-changelog.md](./spec-changelog.md).
 
 > G11 (source contract: snapshots-not-diffs + composite observation) **shipped** — both
 > [003 §2.5](./003-source-plugins.md) and [003 §2.6](./003-source-plugins.md) are now **current**.
