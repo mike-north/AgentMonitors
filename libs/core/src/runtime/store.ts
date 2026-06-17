@@ -997,7 +997,7 @@ export class RuntimeStore {
           notNetSuppressed(),
         ),
       )
-      .orderBy(asc(monitorEvents.createdAt))
+      .orderBy(asc(monitorEvents.createdAt), asc(monitorEvents.id))
       .all();
     return rows.map((row) => rowToEvent(row.event));
   }
@@ -1023,7 +1023,7 @@ export class RuntimeStore {
           notNetSuppressed(),
         ),
       )
-      .orderBy(asc(monitorEvents.createdAt))
+      .orderBy(asc(monitorEvents.createdAt), asc(monitorEvents.id))
       .all();
     return rows.map((row) => rowToEvent(row.event));
   }
@@ -1120,11 +1120,14 @@ export class RuntimeStore {
         // baseline event with a NULL delta is not rewritten to an empty diff.
         const groupSize = netGroupSize.get(key) ?? 1;
         if (groupSize > 1 && event.snapshotText !== null) {
+          // objectKey is non-null: the `collapsible` guard above already asserts
+          // `event.objectKey !== null`. The `??` fallback removed in G10 PR-B was
+          // dead code; a null objectKey here is a logic bug, not a valid fallback.
           const cursor = this.getSessionObjectCursor(
             sessionId,
             event.monitorId,
-            // collapsible guarantees objectKey !== null
-            event.objectKey ?? event.monitorId,
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+            event.objectKey!,
             event.workspacePath,
           );
           if (cursor) {

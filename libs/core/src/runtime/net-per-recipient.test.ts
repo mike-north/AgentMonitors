@@ -30,7 +30,7 @@
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDb } from '../inbox/db.js';
 import { SourceRegistry } from '../observation/registry.js';
 import type {
@@ -470,11 +470,6 @@ Tell me only if the change is substantive.
   return path.join(rootDir, '.claude', 'monitors');
 }
 
-const TICK_GAP_MS = 1_100;
-function pause(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, TICK_GAP_MS));
-}
-
 function setupProse(fake: InterpretAdapter): {
   runtime: AgentMonitorRuntime;
   store: RuntimeStore;
@@ -500,107 +495,125 @@ describe('Interpret per distinct delta on the per-recipient seam (G10 PR-B, 002 
   // for the shared event (one call per distinct delta), each verdict recorded on
   // its own session.
   it('3a. two recipients at divergent baselines → adapter invoked TWICE (one per distinct delta)', async () => {
-    const fake = recordingDeliverAdapter();
-    const { runtime, store, monitorsDir, rootDir } = setupProse(fake);
-    const a = runtime.openSession(
-      claudeCodeAdapter.createSessionInput({
-        hostSessionId: 'sess-A',
+    vi.useFakeTimers();
+    try {
+      const T0 = new Date('2024-01-01T00:00:00.000Z').getTime();
+      vi.setSystemTime(T0);
+
+      const fake = recordingDeliverAdapter();
+      const { runtime, store, monitorsDir, rootDir } = setupProse(fake);
+      const a = runtime.openSession(
+        claudeCodeAdapter.createSessionInput({
+          hostSessionId: 'sess-A',
+          workspacePath: rootDir,
+        }),
+      );
+      const b = runtime.openSession(
+        claudeCodeAdapter.createSessionInput({
+          hostSessionId: 'sess-B',
+          workspacePath: rootDir,
+        }),
+      );
+
+      // Tick 1 (v1 baseline): both seed their cursor to v1 → identical → ONE call.
+      await runtime.tick(monitorsDir, rootDir);
+      expect(fake.calls).toHaveLength(1);
+
+      // Tick 2 (v2): advance clock >1s so the 1s-interval monitor is due again.
+      // Both still co-registered at v1 → identical v1→v2 → ONE call.
+      vi.setSystemTime(T0 + 1_100);
+      await runtime.tick(monitorsDir, rootDir);
+      expect(fake.calls).toHaveLength(2);
+
+      // A claims through v2 → A's cursor advances to v2. B stays away → B's cursor
+      // remains at v1. Their baselines now DIVERGE.
+      runtime.claimDelivery(a.id, 'turn-interruptible');
+
+      // Tick 3 (v3): ONE shared event, but A spans v2→v3 while B spans v1→v3 —
+      // DISTINCT deltas → the adapter is invoked TWICE for this event.
+      vi.setSystemTime(T0 + 2_200);
+      await runtime.tick(monitorsDir, rootDir);
+      expect(fake.calls).toHaveLength(4); // 1 + 1 + 2 (divergent)
+
+      // The two v3 calls carried the two DISTINCT per-recipient deltas.
+      const v3Calls = fake.calls.slice(2).map((c) => c.delta);
+      expect(new Set(v3Calls).size).toBe(2);
+
+      // Each session recorded the digest keyed on ITS OWN v3 delta.
+      const report = await runtime.explainMonitor({
+        monitorId: 'interp',
+        monitorsDir,
         workspacePath: rootDir,
-      }),
-    );
-    const b = runtime.openSession(
-      claudeCodeAdapter.createSessionInput({
-        hostSessionId: 'sess-B',
-        workspacePath: rootDir,
-      }),
-    );
-
-    // Tick 1 (v1 baseline): both seed their cursor to v1 → identical → ONE call.
-    await runtime.tick(monitorsDir, rootDir);
-    expect(fake.calls).toHaveLength(1);
-
-    // Tick 2 (v2): both still co-registered at v1 → identical v1→v2 → ONE call.
-    await pause();
-    await runtime.tick(monitorsDir, rootDir);
-    expect(fake.calls).toHaveLength(2);
-
-    // A claims through v2 → A's cursor advances to v2. B stays away → B's cursor
-    // remains at v1. Their baselines now DIVERGE.
-    runtime.claimDelivery(a.id, 'turn-interruptible');
-
-    // Tick 3 (v3): ONE shared event, but A spans v2→v3 while B spans v1→v3 —
-    // DISTINCT deltas → the adapter is invoked TWICE for this event.
-    await pause();
-    await runtime.tick(monitorsDir, rootDir);
-    expect(fake.calls).toHaveLength(4); // 1 + 1 + 2 (divergent)
-
-    // The two v3 calls carried the two DISTINCT per-recipient deltas.
-    const v3Calls = fake.calls.slice(2).map((c) => c.delta);
-    expect(new Set(v3Calls).size).toBe(2);
-
-    // Each session recorded the digest keyed on ITS OWN v3 delta.
-    const report = await runtime.explainMonitor({
-      monitorId: 'interp',
-      monitorsDir,
-      workspacePath: rootDir,
-    });
-    const v3Event = report.events.find((e) => e.snapshotText === 'v3');
-    expect(v3Event).toBeDefined();
-    const projA = report.projections.find(
-      (p) => p.sessionId === a.id && p.eventId === v3Event?.id,
-    );
-    const projB = report.projections.find(
-      (p) => p.sessionId === b.id && p.eventId === v3Event?.id,
-    );
-    // Distinct per-recipient deltas → distinct recorded digests (verdict per
-    // session, 002 §1.1.8).
-    expect(projA?.interpretDigest).toBeDefined();
-    expect(projB?.interpretDigest).toBeDefined();
-    expect(projA?.interpretDigest).not.toBe(projB?.interpretDigest);
-    void store;
+      });
+      const v3Event = report.events.find((e) => e.snapshotText === 'v3');
+      expect(v3Event).toBeDefined();
+      const projA = report.projections.find(
+        (p) => p.sessionId === a.id && p.eventId === v3Event?.id,
+      );
+      const projB = report.projections.find(
+        (p) => p.sessionId === b.id && p.eventId === v3Event?.id,
+      );
+      // Distinct per-recipient deltas → distinct recorded digests (verdict per
+      // session, 002 §1.1.8).
+      expect(projA?.interpretDigest).toBeDefined();
+      expect(projB?.interpretDigest).toBeDefined();
+      expect(projA?.interpretDigest).not.toBe(projB?.interpretDigest);
+      void store;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   // Criterion 3: two recipients at IDENTICAL baselines → adapter invoked ONCE,
   // verdict fanned to both.
   it('3b. two recipients at identical baselines → adapter invoked ONCE, verdict fanned', async () => {
-    const fake = recordingDeliverAdapter();
-    const { runtime, monitorsDir, rootDir } = setupProse(fake);
-    const a = runtime.openSession(
-      claudeCodeAdapter.createSessionInput({
-        hostSessionId: 'sess-A',
+    vi.useFakeTimers();
+    try {
+      const T0 = new Date('2024-01-01T00:00:00.000Z').getTime();
+      vi.setSystemTime(T0);
+
+      const fake = recordingDeliverAdapter();
+      const { runtime, monitorsDir, rootDir } = setupProse(fake);
+      const a = runtime.openSession(
+        claudeCodeAdapter.createSessionInput({
+          hostSessionId: 'sess-A',
+          workspacePath: rootDir,
+        }),
+      );
+      const b = runtime.openSession(
+        claudeCodeAdapter.createSessionInput({
+          hostSessionId: 'sess-B',
+          workspacePath: rootDir,
+        }),
+      );
+
+      // Both stay co-registered (neither claims), so every tick their cursors and
+      // therefore their per-recipient deltas are identical → one call per tick.
+      await runtime.tick(monitorsDir, rootDir); // baseline: 1 call
+      expect(fake.calls).toHaveLength(1);
+
+      // Advance clock >1s so the 1s-interval monitor is due again.
+      vi.setSystemTime(T0 + 1_100);
+      await runtime.tick(monitorsDir, rootDir); // v2: still identical → 1 more call
+      expect(fake.calls).toHaveLength(2);
+
+      // The single v2 call's verdict was fanned to BOTH sessions (same digest).
+      const report = await runtime.explainMonitor({
+        monitorId: 'interp',
+        monitorsDir,
         workspacePath: rootDir,
-      }),
-    );
-    const b = runtime.openSession(
-      claudeCodeAdapter.createSessionInput({
-        hostSessionId: 'sess-B',
-        workspacePath: rootDir,
-      }),
-    );
-
-    // Both stay co-registered (neither claims), so every tick their cursors and
-    // therefore their per-recipient deltas are identical → one call per tick.
-    await runtime.tick(monitorsDir, rootDir); // baseline: 1 call
-    expect(fake.calls).toHaveLength(1);
-
-    await pause();
-    await runtime.tick(monitorsDir, rootDir); // v2: still identical → 1 more call
-    expect(fake.calls).toHaveLength(2);
-
-    // The single v2 call's verdict was fanned to BOTH sessions (same digest).
-    const report = await runtime.explainMonitor({
-      monitorId: 'interp',
-      monitorsDir,
-      workspacePath: rootDir,
-    });
-    const v2Event = report.events.find((e) => e.snapshotText === 'v2');
-    const projA = report.projections.find(
-      (p) => p.sessionId === a.id && p.eventId === v2Event?.id,
-    );
-    const projB = report.projections.find(
-      (p) => p.sessionId === b.id && p.eventId === v2Event?.id,
-    );
-    expect(projA?.interpretDigest).toBe(projB?.interpretDigest);
-    expect(projA?.interpretDigest).toBeDefined();
+      });
+      const v2Event = report.events.find((e) => e.snapshotText === 'v2');
+      const projA = report.projections.find(
+        (p) => p.sessionId === a.id && p.eventId === v2Event?.id,
+      );
+      const projB = report.projections.find(
+        (p) => p.sessionId === b.id && p.eventId === v2Event?.id,
+      );
+      expect(projA?.interpretDigest).toBe(projB?.interpretDigest);
+      expect(projA?.interpretDigest).toBeDefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
