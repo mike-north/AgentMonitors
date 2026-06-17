@@ -105,7 +105,11 @@ Two things de-risk this:
 - **The free local runtime is the reference implementation** — the thing that makes the
   standard _runnable_ the day someone writes their first `MONITOR.md`, before any second
   host ships support. It is enterprise-friendly precisely because it is an ordinary local
-  developer-tool process with a no-managed-tool delivery path.
+  developer-tool process with a no-managed-tool delivery path. When optional summarization
+  runs, it calls the AI tool already installed on the developer's machine — Agent Monitors
+  ships no model and holds no credentials of its own. In corporate environments, that means
+  the data-governance and egress posture is inherited from the user's existing,
+  already-sanctioned tooling rather than introduced as a new surface to review.
 - **The standard is useful with dumb delivery.** Anyone can take the format and a trivial
   "fire the hook on every change" runtime and get value with none of our intelligence. Our
   decisioning is a superset enhancement, never a requirement. That bright line is what
