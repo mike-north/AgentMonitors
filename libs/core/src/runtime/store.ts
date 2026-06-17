@@ -1048,9 +1048,11 @@ export class RuntimeStore {
    * set at claim time (G10 PR-B, 002 §1.1.7).
    *
    * For each event whose persisted `baselineStrategy` is `net`, group the
-   * candidates by `(monitorId, objectKey)` and keep only the NEWEST event of
-   * each group as DELIVERED — "where things stand now" against this recipient's
-   * own baseline cursor. The newest delivered event's per-recipient
+   * candidates by `(monitorId, objectKey, workspacePath)` — the same 3-tuple
+   * used by {@link advanceCursorsForClaimedEvents} and the
+   * `session_object_cursor` UNIQUE index — and keep only the NEWEST event of
+   * each group as DELIVERED — "where things stand now" against this
+   * recipient's own baseline cursor. The newest delivered event's per-recipient
    * `session_event_state.diff_text` is RECOMPUTED as
    * `buildTextDiff(cursor.baselineContent, newestArtifact)` so the delta spans
    * the recipient's cursor → endpoint (not the shared snapshot baseline). The
