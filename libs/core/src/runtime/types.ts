@@ -64,6 +64,13 @@ export interface MonitorEventRecord {
   snapshotText: string | null;
   diffText: string | null;
   objectKey: string | null;
+  /**
+   * The monitor's author-declared baseline strategy at materialization time
+   * (G13/G10 PR-B, 002 §1.1.7), persisted on the shared event so the
+   * per-recipient `net` collapse runs at claim without re-scanning monitors.
+   * `null` on legacy rows materialized before PR-B — treated as `incremental`.
+   */
+  baselineStrategy: 'incremental' | 'net' | null;
   queryScope: Record<string, string | string[]>;
   tags: string[];
   createdAt: Date;
@@ -216,6 +223,14 @@ export interface MonitorDeliveryProjection {
   interpretReason?: string;
   /** The delivered cheap digest when `interpretDecision` is `deliver`. */
   interpretDigest?: string;
+  /**
+   * Set when this projection was CLAIMED-BUT-SUPPRESSED by the per-recipient
+   * `net` collapse (G10 PR-B, 002 §1.1.7): an older intermediate of a `net`
+   * monitor's catch-up span whose newest sibling was delivered instead. The row
+   * is retained so the collapse stays explainable, but it was never surfaced to
+   * a transport.
+   */
+  netSuppressed?: boolean;
 }
 
 export interface MonitorExplainInput {

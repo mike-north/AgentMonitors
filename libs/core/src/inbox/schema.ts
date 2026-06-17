@@ -65,6 +65,13 @@ export const monitorEvents = sqliteTable('monitor_events', {
   snapshotText: text('snapshot_text'),
   diffText: text('diff_text'),
   objectKey: text('object_key'),
+  // The monitor's author-declared baseline strategy (G13/G10 PR-B, 002 §1.1.7),
+  // persisted on the shared event so the per-recipient `net` collapse can run at
+  // claim time without re-scanning monitor definitions. NULL on legacy rows
+  // materialized before PR-B; treated as `incremental` (the default).
+  baselineStrategy: text('baseline_strategy', {
+    enum: ['incremental', 'net'],
+  }),
   queryScope: text('query_scope').notNull().default('{}'),
   tags: text('tags').notNull().default('[]'),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
@@ -120,6 +127,13 @@ export const sessionEventState = sqliteTable('session_event_state', {
   }),
   interpretReason: text('interpret_reason'),
   interpretDigest: text('interpret_digest'),
+  // The per-recipient `net` collapse marker (G10 PR-B, 002 §1.1.7). When a `net`
+  // monitor's recipient claims a multi-event catch-up span for one object, the
+  // newest event is delivered and the older intermediates are recorded
+  // CLAIMED-BUT-SUPPRESSED here: the row is retained (so the collapse stays
+  // explainable via `monitor explain`, 002 §10.7) but excluded from delivery
+  // (unread/pending/recap). Set at claim time alongside `first_notified_at`.
+  netSuppressedAt: integer('net_suppressed_at', { mode: 'timestamp' }),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
   updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
 });

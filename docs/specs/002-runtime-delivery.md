@@ -61,15 +61,14 @@ Observe → [Compose] → Shape → Pace → ⟦per-recipient seam⟧ → Diff �
 
 ### 1.1.2 The shared / per-recipient seam
 
-> **Status: current (G10 PR-A) for the per-recipient Diff substrate.** The structural seam below — a
-> single shared `monitor_events` artifact materialized once, then diffed **per recipient against each
-> recipient's own baseline cursor** — is now built. Two lead sessions at divergent stored baselines
-> each receive an independently-spanned Diff from one shared observation. The named-but-not-yet-wired
-> remainder (rewiring the `net` collapse, [§1.1.7](#117-baseline-strategy-per-recipient-diff-semantics-current),
-> and Interpret, [§1.1.8](#118-interpret-a-cheap-agentic-digest-via-the-users-own-ai-tool), to span
-> _per recipient_ rather than over the shared baseline) is tracked under roadmap **G10 PR-B**; those
-> stages keep working unchanged on top of this substrate because co-registered recipients seed
-> identical cursors.
+> **Status: current (G10 complete).** The structural seam below — a single shared `monitor_events`
+> artifact materialized once, then diffed **per recipient against each recipient's own baseline
+> cursor** — is built (PR-A) and the right-of-seam stages now exploit it (PR-B): the `net` collapse
+> ([§1.1.7](#117-baseline-strategy-per-recipient-diff-semantics-current)) is a **per-recipient
+> claim-time** decision, and Interpret ([§1.1.8](#118-interpret-a-cheap-agentic-digest-via-the-users-own-ai-tool))
+> runs **once per distinct per-recipient delta**. Two lead sessions at divergent stored baselines each
+> receive an independently-spanned Diff (and net/Interpret result) from one shared observation, while
+> co-registered recipients still share the single computation.
 >
 > Verified: the per-recipient baseline cursor `session_object_cursor`
 > (`libs/core/src/inbox/schema.ts`, denormalized `baseline_content` for prune-immunity) and the
@@ -339,19 +338,26 @@ Rules for the payload-form step:
 > [003 §2.5](./003-source-plugins.md)) is unchanged — the baseline strategy parameterizes the
 > per-recipient Diff already named in §1.1.2, not a new diff surface.
 >
-> Verified: `libs/core/src/runtime/service.ts` — `ingest()` reads
-> `monitor.frontmatter.baselineStrategy`; for `net` it calls `collapseToNetSpan()` (per `objectKey`,
-> keeping the LAST observation of each object's run) so the surviving observation is diffed against
-> the prior snapshot baseline, discarding intermediates; for `incremental` (default) the emitted span
-> is materialized unchanged, one event per observation. Tested by
-> `libs/core/src/runtime/service.test.ts` ("baseline strategy (G13, 002 §1.1.7)").
->
-> Scope note: the catch-up span is currently the set of observations emitted into a single delivery
-> over the runtime's **shared** snapshot baseline ([§5.2](#52-snapshots-and-diffs)). The full
-> per-recipient-baseline seam — where two recipients of the same monitor at **divergent** stored
-> baselines each receive an independently-spanned Diff — remains tracked under roadmap **G10** (the
-> shared/per-recipient Diff persistence). `baseline-strategy` is the author-declared mode that G10's
-> per-recipient Diff will apply per recipient.
+> Verified (G10 PR-B, Refs #182): the `net` collapse is now **per recipient at claim time**, not on
+> the shared span. The shared `monitor_events` chain records **every** observation in order — the
+> incremental substrate (Decision Q3, precise over cheap) — so an away recipient can be served a
+> correct net delta against **its own** cursor. At claim, `RuntimeStore.collapseNetForClaim`
+> (`libs/core/src/runtime/store.ts`, driven by `AgentMonitorRuntime.claimDelivery` in
+> `libs/core/src/runtime/service.ts`) groups a recipient's unclaimed events per `objectKey`; for a
+> `net` monitor it delivers only the **newest** event per object — with its per-recipient `diff_text`
+> recomputed as `buildTextDiff(cursor.baselineContent, newestArtifact)` (cursor → endpoint) when the
+> group actually collapsed — and records the older intermediates **claimed-but-suppressed**
+> (`session_event_state.net_suppressed_at`): retained and explainable via `monitor explain`
+> ([§10.7](#107-monitor-pipeline-diagnosis)), never delivered. `incremental` (default) delivers all
+> in order. The per-recipient cursor still advances to the newest claimed artifact (`markClaimed`)
+> even when intermediates are suppressed. The monitor's `baseline-strategy` is persisted on each
+> `monitor_events` row (`baseline_strategy`) so the claim-time decision needs no monitor re-scan.
+> Tested by `libs/core/src/runtime/net-per-recipient.test.ts` (away-across-N → one net delta + 2
+> suppressed; `incremental` contrast; missed-nothing degenerate; shared-chain keeps all N) and
+> `libs/core/src/runtime/service.test.ts` ("baseline strategy (G13, 002 §1.1.7)", and the rollup
+> not-due/due-path parity tests). The full per-recipient-baseline seam — two recipients at **divergent**
+> stored baselines each receiving an independently-spanned net Diff — is now **current** (G10
+> complete).
 
 A **catch-up span** is the set of shaped observations that accumulated for a monitor between a
 recipient's last-seen baseline and the current delivery point. When a recipient has been away for
@@ -399,8 +405,15 @@ this span:
 **Interaction with the shared / per-recipient seam.** The baseline strategy is a per-recipient
 concern: it governs how the Diff stage (right of the seam, §1.1.2) processes a specific
 recipient's catch-up span. It does **not** affect the shared side of the seam (Observe, Shape,
-Pace run once, unchanged). Two recipients of the same monitor at different baselines each receive
-their own span processed under the same declared strategy.
+Pace run once, unchanged) — the shared `monitor_events` chain records **every** observation in order
+regardless of strategy (the incremental substrate). The `net` collapse is therefore applied **per
+recipient at claim time**: when a recipient claims its unclaimed catch-up span, its events are
+grouped per `objectKey` and, under `net`, only the newest event per object is delivered (its delta
+recomputed against **that recipient's** cursor → endpoint), with the older intermediates recorded
+**claimed-but-suppressed** (retained and explainable via `monitor explain`, §10.7 — never delivered,
+never a silent drop). Two recipients of the same monitor at different baselines each receive their
+own collapsed span. A within-tick burst that emits several observations for one object collapses the
+same way (the newest of the burst is the surviving net delta for an away recipient).
 
 **Interaction with Pace modes.** The baseline strategy is independent of the Pace mode. A `net`
 strategy on a `debounce` monitor still settles first (Pace), then collapses the catch-up span for
@@ -535,6 +548,25 @@ deterministic.
 > `payload.form: prose` never invokes the adapter at all. When the fake adapter throws, the recipient
 > still receives the §1.1.5 `rendered` artifact (best-effort fallback) and the Interpret failure is
 > recorded as explainable — proving delivery never depends on the model call succeeding.
+
+**Interpret runs at materialize on the per-recipient single-event delta — the common case
+(Decision Q4).** Interpret is invoked on each per-recipient delta as it materializes (after the
+per-recipient Diff, before Deliver), deduplicated across recipients that computed the **identical**
+delta and multiplied per genuinely-distinct baseline. A later claim-time `net` collapse
+([§1.1.7](#117-baseline-strategy-per-recipient-diff-semantics-current)) re-diffs the surviving
+delta against the recipient's cursor → endpoint, but it **does not re-invoke the adapter** unless the
+collapsed delta string differs from what was already interpreted (the recorded digest stays valid for
+an unchanged delta). This keeps Interpret off the claim critical path: the common case (a recipient
+whose per-recipient delta is a single materialized event) carries its already-computed digest into
+delivery, and only a genuinely-changed collapsed delta would warrant a fresh reading.
+
+Verified (G10 PR-B): per-recipient distinct-delta dedup is implemented in `runInterpret`
+(`libs/core/src/runtime/service.ts`) — it groups projected sessions by their distinct
+`session_event_state.diff_text` and invokes the adapter once per distinct delta, recording the
+verdict on every session in that group. Proven by
+`libs/core/src/runtime/net-per-recipient.test.ts` (two recipients at **divergent** baselines → adapter
+invoked **twice**, distinct digests recorded per session; **identical** baselines → invoked **once**,
+verdict fanned).
 
 Verified: `libs/core/src/adapter/interpret.ts` — `InterpretAdapter` interface and
 `createClaudeInterpretAdapter` (the host-specific `claude -p` argv-only invocation, behind the
