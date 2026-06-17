@@ -398,6 +398,180 @@ describe('net per-recipient collapse at claim (G10 PR-B, 002 §1.1.7)', () => {
 });
 
 // ───────────────────────────────────────────────────────────────────────────
+// Regression: #186 — collapseNetForClaim omitted workspacePath from the
+// object-identity grouping key → cross-workspace fold dropped a delivery for
+// global (null-workspace) sessions. The fix adds workspacePath to BOTH the
+// candidate-group key and the newest-per-group key, matching
+// advanceCursorsForClaimedEvents and the session_object_cursor UNIQUE index.
+// 002 §1.1.7: "newest event per object" must use the same object identity as
+// the per-recipient cursor (workspace-scoped).
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * Materialize ONE shared event for {@link OBJECT_KEY} carrying `artifact` in a
+ * SPECIFIC workspace (not the module-level `WORKSPACE` constant). Used for the
+ * multi-workspace regression.
+ */
+function materializeInWorkspace(
+  store: RuntimeStore,
+  workspace: string,
+  artifact: string,
+  baselineStrategy: 'incremental' | 'net',
+): string {
+  const previous = store.latestSnapshot(MONITOR_ID, OBJECT_KEY, workspace);
+  const sharedDiff = previous
+    ? buildTextDiff(previous.content, artifact)
+    : null;
+  const event = store.insertEvent(
+    {
+      workspacePath: workspace,
+      monitorId: MONITOR_ID,
+      sourceName: 'manual',
+      urgency: 'normal',
+      title: artifact,
+      body: '',
+      summary: '',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: artifact,
+      diffText: sharedDiff,
+      objectKey: OBJECT_KEY,
+      baselineStrategy,
+      queryScope: {},
+      tags: [],
+      createdAt: nextTime(),
+    },
+    { previousContent: previous?.content ?? null },
+  );
+  store.saveSnapshot({
+    workspacePath: workspace,
+    monitorId: MONITOR_ID,
+    objectKey: OBJECT_KEY,
+    eventId: event.id,
+    content: artifact,
+  });
+  return event.id;
+}
+
+/** Open a global (null-workspace) lead session. */
+function openGlobalLead(store: RuntimeStore, hostSessionId: string): string {
+  return store.openSession({
+    adapter: 'claude-code',
+    hostSessionId,
+    agentIdentity: hostSessionId,
+    role: 'lead',
+    workspacePath: null,
+    hookStatePath: `/global/${hostSessionId}.json`,
+  }).id;
+}
+
+describe('regression #186: collapseNetForClaim workspace-isolation (002 §1.1.7)', () => {
+  // Regression acceptance criterion: a global (null-workspace) lead session
+  // receives projections from two distinct workspaces for the same
+  // (monitorId, objectKey). Under `net`, BOTH workspaces' newest events must
+  // be delivered independently — neither suppresses the other, because they
+  // are distinct workspace-scoped objects, not siblings in the same net chain.
+  //
+  // Pre-fix: the grouping key was (monitorId, objectKey) without workspacePath,
+  // so wsA and wsB events were folded into one group → only the global-newest
+  // was delivered and the other was wrongly net_suppressed.
+  // Post-fix: the key is (monitorId, objectKey, workspacePath) — two groups →
+  // both newest events delivered.
+  it('global session net: same (monitorId,objectKey) in two workspaces → BOTH delivered, neither suppressed', () => {
+    const WS_A = '/workspace-alpha';
+    const WS_B = '/workspace-beta';
+    const store = freshStore();
+
+    // Open the global lead session (workspacePath: null). It will receive
+    // projections from every workspace's events (sessionsForWorkspace: the
+    // global session is included for any workspace's materialization).
+    const globalSession = openGlobalLead(store, 'sess-global');
+
+    // Materialize a baseline in each workspace so the global session seeds
+    // its per-object cursor for each (monitorId, objectKey, workspacePath).
+    // Claim them to advance cursors to the baseline state.
+    materializeInWorkspace(store, WS_A, 'a0', 'net'); // wsA baseline
+    materializeInWorkspace(store, WS_B, 'b0', 'net'); // wsB baseline
+    claimNet(store, globalSession); // consume baselines; cursors → a0, b0
+
+    // Now each workspace materializes a SECOND event. Both share the same
+    // (monitorId='watcher', objectKey='obj-1') but differ in workspacePath.
+    // The global session is away for both — it never claimed between them.
+    const eA2 = materializeInWorkspace(store, WS_A, 'a1', 'net'); // wsA newest
+    const eB2 = materializeInWorkspace(store, WS_B, 'b1', 'net'); // wsB newest
+
+    // Claim: with the bug, only one of {eA2, eB2} is delivered; the other is
+    // wrongly net_suppressed. With the fix, both are delivered.
+    const delivered = claimNet(store, globalSession);
+
+    // Both workspace-newest events must be delivered (one per workspace).
+    // Order is unspecified (sorted by createdAt/id); check by id set.
+    const deliveredIds = new Set(delivered.map((e) => e.id));
+    expect(deliveredIds).toContain(eA2); // wsA newest delivered
+    expect(deliveredIds).toContain(eB2); // wsB newest delivered
+    expect(delivered).toHaveLength(2); // exactly two — no extras
+
+    // Neither is net-suppressed.
+    const allProjections = [
+      ...store.listDeliveryProjectionsForMonitor(MONITOR_ID, WS_A),
+      ...store.listDeliveryProjectionsForMonitor(MONITOR_ID, WS_B),
+    ];
+    const suppressedForGlobal = allProjections.filter(
+      (p) => p.sessionId === globalSession && p.netSuppressed,
+    );
+    expect(suppressedForGlobal).toHaveLength(0);
+
+    // Cursor consistency: each workspace-scoped cursor must advance to its own
+    // newest artifact (a1 for wsA, b1 for wsB), not to the other workspace's.
+    const cursorA = store.getSessionObjectCursor(
+      globalSession,
+      MONITOR_ID,
+      OBJECT_KEY,
+      WS_A,
+    );
+    const cursorB = store.getSessionObjectCursor(
+      globalSession,
+      MONITOR_ID,
+      OBJECT_KEY,
+      WS_B,
+    );
+    expect(cursorA?.baselineContent).toBe('a1');
+    expect(cursorB?.baselineContent).toBe('b1');
+  });
+
+  // Single-workspace behaviour is unchanged: a global session receiving events
+  // from ONE workspace still collapses multiple net intermediates into one.
+  it('global session net: single workspace still collapses intermediates correctly', () => {
+    const WS_A = '/workspace-alpha';
+    const store = freshStore();
+    const globalSession = openGlobalLead(store, 'sess-global-single');
+
+    materializeInWorkspace(store, WS_A, 'a0', 'net'); // baseline
+    claimNet(store, globalSession); // cursor → a0
+
+    const e1 = materializeInWorkspace(store, WS_A, 'a1', 'net');
+    const e2 = materializeInWorkspace(store, WS_A, 'a2', 'net');
+    const e3 = materializeInWorkspace(store, WS_A, 'a3', 'net');
+
+    const delivered = claimNet(store, globalSession);
+
+    // Only the newest is delivered.
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]?.id).toBe(e3);
+
+    // Intermediates e1, e2 are net-suppressed.
+    const projections = store.listDeliveryProjectionsForMonitor(
+      MONITOR_ID,
+      WS_A,
+    );
+    const suppressed = projections.filter(
+      (p) => p.sessionId === globalSession && p.netSuppressed,
+    );
+    expect(suppressed.map((p) => p.eventId).sort()).toEqual([e1, e2].sort());
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
 // Criterion 3: G14 Interpret per DISTINCT per-recipient delta (002 §1.1.8).
 // Driven through the real runtime tick so the per-recipient deltas are produced
 // by the genuine projection path (PR-A seam), with a deterministic fake adapter.

@@ -1048,9 +1048,11 @@ export class RuntimeStore {
    * set at claim time (G10 PR-B, 002 §1.1.7).
    *
    * For each event whose persisted `baselineStrategy` is `net`, group the
-   * candidates by `(monitorId, objectKey)` and keep only the NEWEST event of
-   * each group as DELIVERED — "where things stand now" against this recipient's
-   * own baseline cursor. The newest delivered event's per-recipient
+   * candidates by `(monitorId, objectKey, workspacePath)` — the same 3-tuple
+   * used by {@link advanceCursorsForClaimedEvents} and the
+   * `session_object_cursor` UNIQUE index — and keep only the NEWEST event of
+   * each group as DELIVERED — "where things stand now" against this
+   * recipient's own baseline cursor. The newest delivered event's per-recipient
    * `session_event_state.diff_text` is RECOMPUTED as
    * `buildTextDiff(cursor.baselineContent, newestArtifact)` so the delta spans
    * the recipient's cursor → endpoint (not the shared snapshot baseline). The
@@ -1075,12 +1077,18 @@ export class RuntimeStore {
     sessionId: string,
     candidates: MonitorEventRecord[],
   ): MonitorEventRecord[] {
-    // Identify, per (monitorId, objectKey), the NEWEST `net` event in the
-    // candidate set; every OLDER `net` sibling of a multi-event group is
-    // suppressed. Order by (createdAt, id): events materialized in the same tick
-    // share a createdAt, so the monotonic `id` (see `eventUlid`) breaks the tie
-    // in insertion order — the last is the true endpoint ("where things stand
-    // now", 002 §1.1.7).
+    // Identify, per (monitorId, objectKey, workspacePath), the NEWEST `net`
+    // event in the candidate set; every OLDER `net` sibling of a multi-event
+    // group is suppressed. Order by (createdAt, id): events materialized in the
+    // same tick share a createdAt, so the monotonic `id` (see `eventUlid`)
+    // breaks the tie in insertion order — the last is the true endpoint ("where
+    // things stand now", 002 §1.1.7).
+    //
+    // IMPORTANT: the grouping key must include workspacePath (using the same
+    // 3-tuple as advanceCursorsForClaimedEvents and the session_object_cursor
+    // UNIQUE index). Omitting it caused cross-workspace folding for global
+    // (null-workspace) sessions that receive projections from multiple
+    // workspaces, silently dropping a delivery (regression #186).
     const ordered = [...candidates].sort((a, b) => {
       const byTime = a.createdAt.getTime() - b.createdAt.getTime();
       return byTime !== 0 ? byTime : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
@@ -1090,7 +1098,11 @@ export class RuntimeStore {
     for (const event of ordered) {
       if (event.baselineStrategy !== 'net') continue;
       if (event.snapshotText === null || event.objectKey === null) continue;
-      const key = [event.monitorId, event.objectKey].join('\0');
+      const key = [
+        event.monitorId,
+        event.objectKey,
+        event.workspacePath ?? '',
+      ].join('\0');
       newestNetByObject.set(key, event);
       netGroupSize.set(key, (netGroupSize.get(key) ?? 0) + 1);
     }
@@ -1108,7 +1120,11 @@ export class RuntimeStore {
         delivered.push(event);
         continue;
       }
-      const key = [event.monitorId, event.objectKey].join('\0');
+      const key = [
+        event.monitorId,
+        event.objectKey,
+        event.workspacePath ?? '',
+      ].join('\0');
       const newest = newestNetByObject.get(key);
       if (newest?.id === event.id) {
         // The surviving net delta: when the group ACTUALLY collapsed (>1 event),
