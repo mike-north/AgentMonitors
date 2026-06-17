@@ -227,7 +227,7 @@ palette and iconography across all five so they read as a set.
 2. **[Delivered — integrated illustration, PR #138 (closes #136).]** The before/after "you are the
    loop" scene. PR #134 first shipped a CSS/SVG schematic as a placeholder (`YouAreTheLoop`); PR
    #138 replaced it with the finished imagery-agent illustration (inline SVG, `viewBox="0 0 560 360"`,
-   animated `.ba-cycle`/`.ba-travel`/`.ba-ask` keyframes, `prefers-reduced-motion` fallback). Left:
+   animated `ba-cycle`/`ba-travel`/`ba-ask` keyframes, `prefers-reduced-motion` fallback). Left:
    a tired person manually re-asking an agent in a repetitive cycle ("any updates? …again? …again?")
    — the human visibly _is_ the loop. Right: the person at ease while a small monitor element
    catches a change and hands it to the agent, which is already acting. Emotional, not technical.
