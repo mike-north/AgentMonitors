@@ -110,19 +110,25 @@ Ordered by what to lead with, NOT equal weight:
 4. **Local-first / privacy.** The daemon is local; snapshots/diffs/history live on _your_ disk, not
    a third party's cloud. For internal Slack/Docs/PM data (or, later, your body and home network)
    this is a real unlock a SaaS poller can't match.
-5. **Fan-out (one watch, many agents).** 20 agents polling = 20 loops, 20× egress, rate-limit and
+5. **No model vendor, no data-exfiltration surface.** When Agent Monitors runs optional
+   summarization, it calls _your_ AI tool (the one already installed on your machine) rather than
+   routing data through a managed cloud model. Agent Monitors ships no model and needs no
+   AI-provider credentials of its own, so in corporate environments the data-governance and egress
+   posture for summarization is inherited from your existing, already-sanctioned tooling — not a
+   new surface to approve.
+6. **Fan-out (one watch, many agents).** 20 agents polling = 20 loops, 20× egress, rate-limit and
    SSH/git-lock contention. One centralized watch → one ingress, no contention. (Switchboard image.)
-6. **Maintainability.** A declarative `MONITOR.md` (frontmatter + body) vs. shell scripts scattered
+7. **Maintainability.** A declarative `MONITOR.md` (frontmatter + body) vs. shell scripts scattered
    through skill/script folders you can't find. One versioned place.
-7. **Forward-compatibility / host-agnostic.** `MONITOR.md` declares _what to watch_ and _what it
+8. **Forward-compatibility / host-agnostic.** `MONITOR.md` declares _what to watch_ and _what it
    means_ — never the mechanism. New transport (a channel) or new host: adopted by Agent Monitors,
    and **your existing monitors just work.** See §5.
-8. **Well-timed, non-disruptive delivery.** Arrives at a turn boundary, not mid-thought; survives
+9. **Well-timed, non-disruptive delivery.** Arrives at a turn boundary, not mid-thought; survives
    compaction. "Told when you can act, without derailing the agent."
-9. **Reliable _reactions_ (deliver-and-verify)** — for the "what you can build on it" section, not
-   the hero: an obligation closes only when re-observation confirms the end-state → idempotent,
-   survives interruption.
-10. **(Minor) You can see why it fired** — `monitor explain`/history; scattered shell loops are a
+10. **Reliable _reactions_ (deliver-and-verify)** — for the "what you can build on it" section, not
+    the hero: an obligation closes only when re-observation confirms the end-state → idempotent,
+    survives interruption.
+11. **(Minor) You can see why it fired** — `monitor explain`/history; scattered shell loops are a
     black box when notifications stop.
 
 ## 5. Hosts & reach (honest framing)
