@@ -112,9 +112,10 @@ Ordered by what to lead with, NOT equal weight:
    this is a real unlock a SaaS poller can't match.
 5. **No model vendor, no data-exfiltration surface.** When Agent Monitors runs optional
    summarization, it calls _your_ AI tool (the one already installed on your machine) rather than
-   routing data through a managed cloud model. Agent Monitors ships no model and holds no
-   credentials, so in corporate environments the data-governance and egress posture is inherited
-   from your existing, already-sanctioned tooling — not a new surface to approve.
+   routing data through a managed cloud model. Agent Monitors ships no model and needs no
+   AI-provider credentials of its own, so in corporate environments the data-governance and egress
+   posture for summarization is inherited from your existing, already-sanctioned tooling — not a
+   new surface to approve.
 6. **Fan-out (one watch, many agents).** 20 agents polling = 20 loops, 20× egress, rate-limit and
    SSH/git-lock contention. One centralized watch → one ingress, no contention. (Switchboard image.)
 7. **Maintainability.** A declarative `MONITOR.md` (frontmatter + body) vs. shell scripts scattered
