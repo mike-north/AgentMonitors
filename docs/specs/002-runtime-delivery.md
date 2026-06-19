@@ -336,28 +336,34 @@ Rules for the payload-form step:
 > ([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
 > §S5.1; ledger rows **C6**, **C7**). The source/runtime diff split (PP3, AP3,
 > [003 §2.5](./003-source-plugins.md)) is unchanged — the baseline strategy parameterizes the
-> per-recipient Diff already named in §1.1.2, not a new diff surface.
+> per-recipient Diff already named in §1.1.2, not a new diff surface. Default changed from
+> `incremental` → `net` on 2026-06-19 (strategy-call decision, Refs #110).
 >
-> Verified (G10 PR-B, Refs #182): the `net` collapse is now **per recipient at claim time**, not on
-> the shared span. The shared `monitor_events` chain records **every** observation in order — the
-> incremental substrate (Decision Q3, precise over cheap) — so an away recipient can be served a
-> correct net delta against **its own** cursor. At claim, `RuntimeStore.collapseNetForClaim`
-> (`libs/core/src/runtime/store.ts`, driven by `AgentMonitorRuntime.claimDelivery` in
-> `libs/core/src/runtime/service.ts`) groups a recipient's unclaimed events per `objectKey`; for a
-> `net` monitor it delivers only the **newest** event per object — with its per-recipient `diff_text`
-> recomputed as `buildTextDiff(cursor.baselineContent, newestArtifact)` (cursor → endpoint) when the
-> group actually collapsed — and records the older intermediates **claimed-but-suppressed**
+> Verified (G10 PR-B, Refs #182; default-net, Refs #110): the `net` collapse is **per recipient at
+> claim time**, not on the shared span. The shared `monitor_events` chain records **every**
+> observation in order — the incremental substrate (Decision Q3, precise over cheap) — so an away
+> recipient can be served a correct net delta against **its own** cursor. At claim,
+> `RuntimeStore.collapseNetForClaim` (`libs/core/src/runtime/store.ts`, driven by
+> `AgentMonitorRuntime.claimDelivery` in `libs/core/src/runtime/service.ts`) groups a recipient's
+> unclaimed events per `(monitorId, objectKey, workspacePath)`; for a `net` monitor it delivers only
+> the **newest** event per object — with its per-recipient `diff_text` recomputed as
+> `buildTextDiff(cursor.baselineContent, newestArtifact)` (cursor → endpoint) when the group
+> actually collapsed — and records the older intermediates **claimed-but-suppressed**
 > (`session_event_state.net_suppressed_at`): retained and explainable via `monitor explain`
-> ([§10.7](#107-monitor-pipeline-diagnosis)), never delivered. `incremental` (default) delivers all
-> in order. The per-recipient cursor still advances to the newest claimed artifact (`markClaimed`)
-> even when intermediates are suppressed. The monitor's `baseline-strategy` is persisted on each
-> `monitor_events` row (`baseline_strategy`) so the claim-time decision needs no monitor re-scan.
+> ([§10.7](#107-monitor-pipeline-diagnosis)), never delivered. `incremental` (explicit opt-out)
+> delivers all in order. The per-recipient cursor still advances to the newest claimed artifact
+> (`markClaimed`) even when intermediates are suppressed. The monitor's `baseline-strategy` is
+> persisted on each `monitor_events` row (`baseline_strategy`) so the claim-time decision needs no
+> monitor re-scan.
 > Tested by `libs/core/src/runtime/net-per-recipient.test.ts` (away-across-N → one net delta + 2
-> suppressed; `incremental` contrast; missed-nothing degenerate; shared-chain keeps all N) and
-> `libs/core/src/runtime/service.test.ts` ("baseline strategy (G13, 002 §1.1.7)", and the rollup
-> not-due/due-path parity tests). The full per-recipient-baseline seam — two recipients at **divergent**
-> stored baselines each receiving an independently-spanned net Diff — is now **current** (G10
-> complete).
+> suppressed; `incremental` contrast; missed-nothing degenerate; shared-chain keeps all N),
+> `libs/core/src/runtime/service.test.ts` ("baseline strategy (G13, 002 §1.1.7)" — omitting ≡
+> `net`, explicit `net` → 1 delta, explicit `incremental` → N ordered deltas; rollup
+> not-due/due-path parity tests), and
+> `libs/core/src/runtime/object-consolidation.test.ts` (canonical 15-saves → 1 delta end-to-end;
+> two objects → two deltas in one envelope; incremental opt-out → N deltas). The full
+> per-recipient-baseline seam — two recipients at **divergent** stored baselines each receiving an
+> independently-spanned net Diff — is **current** (G10 complete).
 
 A **catch-up span** is the set of shaped observations that accumulated for a monitor between a
 recipient's last-seen baseline and the current delivery point. When a recipient has been away for
@@ -366,54 +372,51 @@ multiple observation cycles, its catch-up span may contain several intermediate 
 The `baseline-strategy` field declares how the runtime's per-recipient **Diff** stage processes
 this span:
 
-| Strategy          | What the recipient receives for a catch-up span                                                                                                                                                                                                                            |
-| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`incremental`** | Each intermediate observation since the recipient's baseline, **in order** — a play-by-play of every change step. A recipient that missed _N_ shaped observations receives _N_ deltas, sequentially.                                                                       |
-| **`net`**         | A **single net delta** representing _where things stand now_ versus the recipient's baseline — the intermediate observations between delivery windows are collapsed into the endpoint difference only. A recipient that missed _N_ shaped observations receives one delta. |
+| Strategy            | What the recipient receives for a catch-up span                                                                                                                                                                                                                                                                                                                                                                                 |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`net`** (default) | A **single before/after delta** representing _where things stand now_ versus the recipient's baseline — intermediate observations between delivery windows are collapsed into the endpoint difference. A recipient that missed _N_ shaped observations receives **one** delta. Multiple objects changing in the same window each produce their own before/after event in the same claim envelope (per object, not per monitor). |
+| **`incremental`**   | Each intermediate observation since the recipient's baseline, **in order** — a play-by-play of every change step. A recipient that missed _N_ shaped observations receives _N_ deltas, sequentially.                                                                                                                                                                                                                            |
 
 **Semantics of each strategy:**
 
-- **`incremental` (default).** The runtime delivers each observation in the catch-up span
+- **`net` (default).** The runtime collapses the catch-up span per object: it compares the shaped
+  state at the _delivery point_ against the recipient's baseline and delivers a single net delta.
+  Intermediate observations — edits, reverts, re-edits — are absorbed; only the endpoint difference
+  surfaces. This is the standard delivery contract: one before/after delta per changed object per
+  notification window, with zero reasoning in the daemon (2026-06-19 strategy-call decision,
+  Refs #110). The envelope may carry multiple events when multiple objects changed. Shared spec
+  documents (E2; capability C7 "size/shape the change to the span") are the archetypal fit: an
+  agent that missed several editing bursts wants "what does the spec look like now vs. what I was
+  building against."
+
+- **`incremental` (explicit opt-out).** The runtime delivers each observation in the catch-up span
   individually and in the order they were materialized. The recipient sees the full play-by-play.
   This is appropriate when the _sequence_ of changes carries meaning — when a recipient needs to
   know not just the final state but how things evolved. Comment threads (E1; capability C6) are a
-  natural fit: each reply is a discrete step.
+  natural fit: each reply is a discrete step. Declare `baseline-strategy: incremental` explicitly
+  when the full ordered history matters.
 
-  > **Backward compatibility.** The current runtime already delivers observations in materialization
-  > order, one per event. This is the degenerate case of `incremental` where every observation is a
-  > step of its own catch-up span. `incremental` therefore names the _closest equivalent_ of today's
-  > behavior: monitors that omit `baseline-strategy` get `incremental` by default and behave exactly
-  > as they do today.
+**Default is `net`.** A monitor that omits `baseline-strategy` **MUST** behave as `net`. This is
+the default because:
 
-- **`net`.** The runtime collapses the catch-up span: it compares the shaped state at the
-  _delivery point_ against the recipient's baseline and delivers a single net delta. Intermediate
-  observations — edits, reverts, re-edits — are absorbed; only the endpoint difference surfaces.
-  This is appropriate when only the _current state relative to the recipient's baseline_ matters
-  and the intermediate path is noise. Shared spec documents (E2; capability C7 "size/shape the
-  change to the span") are the natural fit: an agent that missed several editing bursts wants to
-  know "what does the spec look like now vs. what I was building against," not a
-  keystroke-by-keystroke replay. The monitoring capability study (E2 findings) records this as an
-  intent-driven authoring choice, contrasted with E1 where `incremental` was the right call.
-
-**Default is `incremental`.** A monitor that omits `baseline-strategy` **MUST** behave as
-`incremental`. This is the default because:
-
-1. It is the closest match to the current runtime's delivery behavior (backward compatible).
-2. It is the conservative default — the author who wants `net` is explicitly requesting
-   information loss (the intermediate steps), so that choice should be explicit.
+1. It is the standard per-object consolidation contract: one before/after delta per changed object
+   per notification window, the most useful signal for the vast majority of monitors.
+2. Authors who want the full ordered history must declare it explicitly — `incremental` is an
+   intentional opt-in to the more verbose delivery mode.
 
 **Interaction with the shared / per-recipient seam.** The baseline strategy is a per-recipient
 concern: it governs how the Diff stage (right of the seam, §1.1.2) processes a specific
 recipient's catch-up span. It does **not** affect the shared side of the seam (Observe, Shape,
 Pace run once, unchanged) — the shared `monitor_events` chain records **every** observation in order
-regardless of strategy (the incremental substrate). The `net` collapse is therefore applied **per
+regardless of strategy (the incremental substrate, Decision Q3). The `net` collapse is applied **per
 recipient at claim time**: when a recipient claims its unclaimed catch-up span, its events are
-grouped per `objectKey` and, under `net`, only the newest event per object is delivered (its delta
-recomputed against **that recipient's** cursor → endpoint), with the older intermediates recorded
-**claimed-but-suppressed** (retained and explainable via `monitor explain`, §10.7 — never delivered,
-never a silent drop). Two recipients of the same monitor at different baselines each receive their
-own collapsed span. A within-tick burst that emits several observations for one object collapses the
-same way (the newest of the burst is the surviving net delta for an away recipient).
+grouped per `(monitorId, objectKey, workspacePath)` and, under `net`, only the newest event per
+object is delivered (its delta recomputed against **that recipient's** cursor → endpoint), with the
+older intermediates recorded **claimed-but-suppressed** (retained and explainable via `monitor
+explain`, §10.7 — never delivered, never a silent drop). Two recipients of the same monitor at
+different baselines each receive their own collapsed span. A within-tick burst that emits several
+observations for one object collapses the same way (the newest of the burst is the surviving net
+delta for an away recipient).
 
 **Interaction with Pace modes.** The baseline strategy is independent of the Pace mode. A `net`
 strategy on a `debounce` monitor still settles first (Pace), then collapses the catch-up span for
@@ -423,14 +426,16 @@ this degenerate case (no intermediate steps to collapse).
 
 > **Cross-references:** [001 §3.7](./001-monitor-definition.md#37-baseline-strategy-current)
 > for the authoring field; capability study C6 (per-agent what's-new), C7 (size-to-span), E1 and
-> E2 (the two motivating contrasts); §S5.1 (resolved: default incremental).
+> E2 (the two motivating contrasts); §S5.1 (original decision: default incremental); 2026-06-19
+> decision memo in #110 (default flipped to net).
 >
-> **Test implication.** A monitor with `baseline-strategy: incremental` and a recipient that missed
-> three observations receives three deltas in order. A monitor with `baseline-strategy: net` and a
-> recipient that missed three observations receives one net delta equivalent to diffing the baseline
-> snapshot against the final observation's snapshot. In both cases a recipient that missed nothing
-> receives the standard single-step delta — `incremental` and `net` are behaviorally equivalent
-> when the catch-up span contains exactly one observation.
+> **Test implication.** A monitor that omits `baseline-strategy` (or declares `net`) and a
+> recipient that missed three observations receives **one** net delta equivalent to diffing the
+> baseline snapshot against the final observation's snapshot. A monitor with
+> `baseline-strategy: incremental` and a recipient that missed three observations receives three
+> deltas in order. In both cases a recipient that missed nothing receives the standard single-step
+> delta — `incremental` and `net` are behaviorally equivalent when the catch-up span contains
+> exactly one observation.
 
 ### 1.1.8 Interpret: a cheap agentic digest via the user's own AI tool
 

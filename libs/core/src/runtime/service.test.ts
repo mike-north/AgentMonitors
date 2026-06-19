@@ -2976,19 +2976,19 @@ Handle it.
     expect(triggered).toHaveLength(1);
   });
 
-  // --- G13: author-declared baseline strategy (incremental vs net) ---------
+  // --- G13: author-declared baseline strategy (net default vs incremental) --
   //
-  // Contract (001 §3.7, 002 §1.1.7): the per-recipient Diff stage spans a
-  // *catch-up span* — the set of shaped observations that accumulated for a
-  // recipient since its baseline. `baseline-strategy` declares how that span is
-  // delivered:
-  //   - `incremental` (default): each observation in the span, in order — a
-  //     recipient that missed N observations receives N ordered deltas.
-  //   - `net`: a single net delta (the endpoint state vs. the baseline) — a
-  //     recipient that missed N observations receives ONE delta; intermediate
-  //     observations are discarded and never advance the snapshot baseline.
-  //   - omitting the field behaves identically to `incremental` (backward
-  //     compatible).
+  // Contract (001 §3.7, 002 §1.1.7; default changed 2026-06-19, Refs #110):
+  // the per-recipient Diff stage spans a *catch-up span* — the set of shaped
+  // observations that accumulated for a recipient since its baseline.
+  // `baseline-strategy` declares how that span is delivered:
+  //   - `net` (default): a single net delta (the endpoint state vs. the
+  //     baseline) — a recipient that missed N observations receives ONE delta;
+  //     intermediate observations are discarded. Omitting the field yields
+  //     `net` (the standard delivery contract).
+  //   - `incremental`: each observation in the span, in order — a recipient
+  //     that missed N observations receives N ordered deltas. Use when the
+  //     sequence matters (e.g. comment threads); must be declared explicitly.
   //
   // Each test establishes a baseline snapshot on tick 1, then delivers a
   // catch-up span of N=3 successive states (one shared objectKey) in a single
@@ -3239,14 +3239,39 @@ Handle it.
       expectIncrementalChain(events);
     });
 
-    // Criterion (d): omitting `baseline-strategy` behaves identically to
-    // `incremental` (backward compatible — 001 §3.7 / 002 §1.1.7).
-    it('omitting baseline-strategy behaves identically to incremental', async () => {
-      const { events } = await deliverSpan('', 'claude-g13-omitted');
-      // Same outcome as the explicit `incremental` case: baseline + N=3 deltas,
-      // never collapsed.
+    // Criterion (d): omitting `baseline-strategy` defaults to `net` (2026-06-19
+    // decision, Refs #110 / 001 §3.7 / 002 §1.1.7). The omitted-field case
+    // must behave identically to an explicit `baseline-strategy: net` — the
+    // recipient is delivered ONE net delta for a catch-up span of N observations.
+    it('omitting baseline-strategy defaults to net (one net delta per object)', async () => {
+      const { runtime, monitorsDir, rootDir, sessionId, events } =
+        await deliverSpan('', 'claude-g13-omitted');
+
+      // Baseline (1 event) + 3 span observations on the SHARED chain (the
+      // incremental substrate is unchanged regardless of strategy).
       expect(events).toHaveLength(4);
-      expectIncrementalChain(events);
+
+      // Per-recipient delivery under the net default: claim the catch-up span;
+      // exactly ONE delivered event for the single object (the newest of the 3).
+      runtime.claimDelivery(sessionId, 'turn-interruptible');
+      const report = await runtime.explainMonitor({
+        monitorId: 'span-monitor',
+        monitorsDir,
+        workspacePath: rootDir,
+      });
+      const spanEvents = events.filter((e) => e.title !== 'baseline');
+      const spanIds = new Set(spanEvents.map((e) => e.id));
+      const spanProjections = report.projections.filter(
+        (p) => p.sessionId === sessionId && spanIds.has(p.eventId),
+      );
+      // ONE delivered (not net-suppressed) — identical behavior to explicit `net`.
+      const delivered = spanProjections.filter((p) => !p.netSuppressed);
+      const suppressed = spanProjections.filter((p) => p.netSuppressed);
+      expect(delivered).toHaveLength(1);
+      expect(suppressed).toHaveLength(2);
+      // The surviving event is the endpoint (edit 3, where things stand now).
+      const survivor = events.find((e) => e.id === delivered[0]?.eventId);
+      expect(survivor?.title).toBe('edit 3');
     });
   });
 
@@ -3980,7 +4005,7 @@ Daily digest.
       }
     });
 
-    // Criterion 3 (no regression, 002 §1.1.7): rollup + incremental (default)
+    // Criterion 3 (no regression, 002 §1.1.7): rollup + explicit `incremental`
     // on the not-due path still delivers N ordered deltas — the play-by-play is
     // preserved, not collapsed. The shared helper must leave the incremental
     // span untouched.

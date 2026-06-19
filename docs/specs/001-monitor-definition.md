@@ -85,10 +85,10 @@ Each monitor frontmatter object **MUST** contain:
 | `notify`            | object   | no       | Explicit debounce/throttle policy                                                                                               |
 | `shape`             | object   | no       | Deterministic Shape declaration: derived facts + render (see [§5.1](#51-shape-declaration-current))                             |
 | `payload`           | object   | no       | Author-declared payload form + transform (see [§5.2](#52-payload-form-current))                                                 |
-| `baseline-strategy` | string   | no       | How the per-recipient Diff spans a catch-up span — `incremental` (default) or `net` (see [§3.7](#37-baseline-strategy-current)) |
+| `baseline-strategy` | string   | no       | How the per-recipient Diff spans a catch-up span — `net` (default) or `incremental` (see [§3.7](#37-baseline-strategy-current)) |
 | `tags`              | string[] | no       | Tags for later filtering                                                                                                        |
 
-> Verified: `libs/core/src/schema/monitor-schema.ts` — the `monitorFrontmatterSchema` Zod object requires `watch` and `urgency`; `name`, `notify`, `tags`, `shape`, and `payload` are optional. The `shape` and `payload` fields are **current** (G15): `shapeSchema`/`payloadSchema` accept the §5.1/§5.2 authoring surface and reject malformed CEL/jq transforms (`libs/core/src/schema/monitor-schema.test.ts`). `baseline-strategy` is also **current** (G13) — an optional `z.enum(['incremental', 'net'])` defaulting to `incremental` (see [§3.7](#37-baseline-strategy-current)).
+> Verified: `libs/core/src/schema/monitor-schema.ts` — the `monitorFrontmatterSchema` Zod object requires `watch` and `urgency`; `name`, `notify`, `tags`, `shape`, and `payload` are optional. The `shape` and `payload` fields are **current** (G15): `shapeSchema`/`payloadSchema` accept the §5.1/§5.2 authoring surface and reject malformed CEL/jq transforms (`libs/core/src/schema/monitor-schema.test.ts`). `baseline-strategy` is also **current** (G13) — an optional `z.enum(['incremental', 'net'])` defaulting to `net` (see [§3.7](#37-baseline-strategy-current)).
 
 ### 3.1 `watch`
 
@@ -225,63 +225,68 @@ for the complete Pace mode reference; capability study C44 / §S5.2.
 > [002 §1.1.7](./002-runtime-delivery.md#117-baseline-strategy-per-recipient-diff-semantics-current)
 > (shipped under roadmap G13). Formalizes a resolved decision from the monitoring capability study
 > ([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
-> §S5.1; ledger rows **C6**, **C7**).
+> §S5.1; ledger rows **C6**, **C7**). Default changed from `incremental` → `net` on 2026-06-19
+> (strategy-call decision, Refs #110); `incremental` is now the explicit opt-out.
 >
 > Verified: `libs/core/src/schema/monitor-schema.ts` — `baselineStrategySchema` is a
-> `z.enum(['incremental', 'net']).default('incremental')`; the frontmatter transform renames the
-> YAML key `baseline-strategy` to `baselineStrategy` and defaults it to `incremental` when omitted.
-> `libs/core/src/runtime/service.ts` — `ingest()` collapses the emitted catch-up span via
-> `collapseToNetSpan()` (per-object, keeping the last observation) when `baselineStrategy === 'net'`,
-> and delivers the span unchanged for `incremental`. Tested by
+> `z.enum(['incremental', 'net']).default('net')`; the frontmatter transform renames the
+> YAML key `baseline-strategy` to `baselineStrategy` and defaults it to `net` when omitted.
+> At claim, `RuntimeStore.collapseNetForClaim` (`libs/core/src/runtime/store.ts`) groups unclaimed
+> events per `(monitorId, objectKey, workspacePath)` and, under `net`, delivers only the newest
+> event per object — recomputing its per-recipient diff against the recipient's own cursor →
+> endpoint — recording older intermediates claimed-but-suppressed (never delivered, always
+> explainable via `monitor explain`). Tested by
 > `libs/core/src/schema/monitor-schema.test.ts` ("baseline-strategy" — accepts `incremental`/`net`,
-> defaults to `incremental`, rejects unknown), `libs/core/src/runtime/service.test.ts` ("baseline
-> strategy (G13, 002 §1.1.7)" — `net` collapses an N-observation span to one net delta,
-> `incremental` delivers N, omitting behaves as `incremental`), and
-> `apps/cli/src/commands/cli.integration.test.ts` (`validate` accepts `incremental`/`net`, rejects
-> unknown).
+> defaults to `net`, rejects unknown), `libs/core/src/runtime/service.test.ts` ("baseline
+> strategy (G13, 002 §1.1.7)" — omitting behaves as `net`, explicit `net` collapses N-observation
+> span to one net delta, explicit `incremental` delivers N ordered deltas),
+> `libs/core/src/runtime/object-consolidation.test.ts` (canonical 15-saves case +
+> per-object-not-per-monitor + incremental opt-out, all end-to-end through the real runtime tick),
+> and `apps/cli/src/commands/cli.integration.test.ts` (`validate` accepts `incremental`/`net`,
+> rejects unknown).
 
 A monitor **MAY** declare a `baseline-strategy` field that controls how the per-recipient **Diff**
 stage ([002 §1.1.7](./002-runtime-delivery.md#117-baseline-strategy-per-recipient-diff-semantics-current))
 spans a _catch-up span_ — the set of shaped observations that accumulated since the recipient's
-last-seen baseline. It is **optional**; omitting it is equivalent to `incremental` (see backward
-compatibility below).
+last-seen baseline. It is **optional**; omitting it is equivalent to `net` (the standard
+per-object consolidation contract).
 
 The two values are:
 
 ```yaml
-baseline-strategy: incremental # default — play-by-play of each step since baseline
+baseline-strategy: net # default — one before/after delta per changed object per window
 ```
 
 ```yaml
-baseline-strategy: net # net delta only — where things stand now vs. baseline
+baseline-strategy: incremental # opt-out — play-by-play of each step since baseline
 ```
 
-| Value             | Diff a recipient receives across a catch-up span                                                                                                                                                                                              |
-| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`incremental`** | Every intermediate observation since the recipient's baseline, delivered **in order** (play-by-play). A recipient that missed three changes receives three deltas, in sequence. Preserves the full history of how things changed.             |
-| **`net`**         | A single delta representing **where things stand now** versus the recipient's baseline — intermediate churn between delivery windows is collapsed into the endpoint difference. A recipient that missed three changes receives one net delta. |
+| Value               | Diff a recipient receives across a catch-up span                                                                                                                                                                                                                                                                                                                                                                  |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`net`** (default) | A **single before/after delta** representing _where things stand now_ versus the recipient's baseline — intermediate churn between delivery windows is collapsed into the endpoint difference. A recipient that missed three changes receives **one** net delta. Multiple objects changing in the same window each produce their own before/after event in the same claim envelope (per object, not per monitor). |
+| **`incremental`**   | Every intermediate observation since the recipient's baseline, delivered **in order** (play-by-play). A recipient that missed three changes receives three deltas, in sequence. Preserves the full history of how things changed.                                                                                                                                                                                 |
 
-**Default is `incremental`.** A monitor that omits `baseline-strategy` behaves as if it had declared
-`baseline-strategy: incremental`. This preserves backward compatibility: the current runtime
-delivers observations sequentially in the order they were materialized, which is the degenerate
-(every-observation-is-a-step) case of the incremental strategy.
+**Default is `net`.** A monitor that omits `baseline-strategy` behaves as if it had declared
+`baseline-strategy: net`. This is the standard delivery contract: one before/after delta per changed
+object per notification window, with zero reasoning in the daemon (2026-06-19 strategy-call
+decision, Refs #110).
 
 **Choosing between the two strategies:**
 
-- **`incremental`** is appropriate when the _sequence_ of changes carries meaning — when a
-  recipient needs to know not just the final state but how things got there. Comment threads (E1)
-  are a natural fit: each reply is a discrete step the recipient should process in turn.
-- **`net`** is appropriate when only the _current state relative to the recipient's baseline_
-  matters — when the path through intermediate states is noise. Spec documents (E2) are a natural
-  fit: an agent that missed several editing bursts wants to know "what does the spec look like now
-  vs. what I was building against," not a keystroke-by-keystroke replay. As the monitoring
-  capability study notes (E2 findings): `net` is the useful question for document-state monitors
-  watched by multiple agents at divergent baselines.
+- **`net`** (default) is appropriate for the vast majority of monitors: the recipient wants to know
+  _where things stand now_ relative to their last baseline, not a replay of every intermediate save.
+  Spec documents (E2) are the archetypal fit: an agent that missed several editing bursts wants
+  "what does the spec look like now vs. what I was building against."
+- **`incremental`** is the explicit opt-out — appropriate when the _sequence_ of changes carries
+  meaning and the recipient needs to process each step in turn. Comment threads (E1) are a natural
+  fit: each reply is a discrete step. Declare `baseline-strategy: incremental` explicitly when the
+  full ordered history matters.
 
 > **Cross-references:** [002 §1.1.7](./002-runtime-delivery.md#117-baseline-strategy-per-recipient-diff-semantics-current)
 > for runtime Diff semantics; capability study C6 (per-agent what's-new), C7 (size-to-span);
-> §S5.1 (resolved: default incremental). See also §1.1.2 for the shared/per-recipient seam that
-> makes the baseline per-recipient in the first place.
+> §S5.1 (original decision: default incremental); 2026-06-19 decision memo in #110 (default
+> flipped to net). See also §1.1.2 for the shared/per-recipient seam that makes the baseline
+> per-recipient in the first place.
 
 ## 4. Monitor Identity and Uniqueness
 
@@ -512,8 +517,11 @@ Summarize all updates since the last digest and surface any action items.
 
 ### 7.4 Net-delta spec-doc monitor (_current_)
 
-> **Status: current.** `baseline-strategy: net` is implemented (roadmap G13); this example shows the
-> authoring surface (§3.7, [002 §1.1.7](./002-runtime-delivery.md#117-baseline-strategy-per-recipient-diff-semantics-current)).
+> **Status: current.** `baseline-strategy: net` is the default (2026-06-19 decision, Refs #110);
+> this example shows the authoring surface (§3.7,
+> [002 §1.1.7](./002-runtime-delivery.md#117-baseline-strategy-per-recipient-diff-semantics-current)).
+> The explicit `baseline-strategy: net` line below is redundant with the default but shown for
+> clarity; authors may omit it.
 
 ```md
 ---
@@ -527,7 +535,7 @@ urgency: normal
 notify:
   strategy: debounce
   settle-for: 3m
-baseline-strategy: net
+# baseline-strategy: net  # this is now the default — omit or include, same behavior
 tags: [specs, fleet]
 ---
 
@@ -535,13 +543,13 @@ The shared spec docs have changed since you last checked. Review the net diff an
 whether any aspect of your current task needs to be adjusted.
 ```
 
-**What this example illustrates (target):**
+**What this example illustrates (_current_):**
 
-- `baseline-strategy: net` is appropriate for shared documents where a fleet of agents at
-  divergent baselines each wants to know "how does the spec look now vs. what I was building
-  against," not a replay of every intermediate edit burst (E2)
-- omitting `baseline-strategy` entirely is equivalent to `incremental` — this field only needs
-  to be set when `net` is the desired behavior
+- `baseline-strategy: net` is the default — a fleet of agents at divergent baselines each receives
+  "how does the spec look now vs. what I was building against," not a replay of every intermediate
+  edit burst (E2)
+- omitting `baseline-strategy` entirely yields `net` (the default); only declare
+  `baseline-strategy: incremental` when the full ordered history matters (e.g. comment threads)
 - the field works alongside any `notify` strategy; the baseline strategy governs how the
   per-recipient Diff spans a catch-up span, which is independent of Pace
 
