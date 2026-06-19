@@ -67,10 +67,12 @@ const OBJECT_A = 'docs/spec.md';
 const OBJECT_B = 'docs/other.md';
 
 /**
- * A stateful source whose `observe()` returns whatever observations the test
- * pre-loaded for the current tick (one entry per tick). This lets a test
- * script a precise sequence of per-object "saves" landing on successive ticks,
- * exactly as a file-watch source would report independent edits.
+ * A stateful source whose `observe()` returns the observations scripted for the
+ * current tick. Once the script is exhausted (tick index ≥ ticks.length), the
+ * last tick's observations are replayed on every subsequent tick. This lets a
+ * test script a precise sequence of per-object "saves" landing on successive
+ * ticks, exactly as a file-watch source would report independent edits, while
+ * avoiding an out-of-bounds read after the burst window has settled.
  */
 function scriptedSource(
   ticks: { objectKey: string; snapshotText: string }[][],
