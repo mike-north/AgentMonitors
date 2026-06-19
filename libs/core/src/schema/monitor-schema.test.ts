@@ -97,12 +97,13 @@ describe('monitorFrontmatterSchema', () => {
         }
       });
 
-      it('defaults to incremental when baseline-strategy is omitted (backward compatible)', () => {
-        // 001 §3.7 / 002 §1.1.7: omitting the field MUST behave as `incremental`.
+      it('defaults to net when baseline-strategy is omitted (per-object consolidation, Refs #110)', () => {
+        // 001 §3.7 / 002 §1.1.7 (2026-06-19 decision): omitting the field MUST
+        // behave as `net` — one before/after delta per changed object per window.
         const result = monitorFrontmatterSchema.safeParse(validMinimal);
         expect(result.success).toBe(true);
         if (result.success) {
-          expect(result.data.baselineStrategy).toBe('incremental');
+          expect(result.data.baselineStrategy).toBe('net');
         }
       });
 

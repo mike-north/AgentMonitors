@@ -161,23 +161,24 @@ Interpret → Deliver → [React]`:
 > [002 §4.4–§4.5](./002-runtime-delivery.md), and [spec-changelog.md](./spec-changelog.md).
 
 > G13 (author-declared baseline strategy) **shipped** — the `baseline-strategy` frontmatter field is
-> now accepted by `agentmonitors validate` and enforced by the runtime Diff stage. `incremental`
-> (default) materializes every observation in a catch-up span as its own ordered delta (backward
-> compatible, the degenerate "one event per observation" behavior); `net` collapses the span per
-> `objectKey` to a **single** net delta (the last observation of each object's run, diffed against the
-> prior snapshot baseline), discarding intermediate churn. Omitting the field is `incremental`.
-> Implemented as `baselineStrategySchema` (`libs/core/src/schema/monitor-schema.ts`,
-> `z.enum(['incremental','net']).default('incremental')`) and `collapseToNetSpan()` in
-> `ingest()` (`libs/core/src/runtime/service.ts`). Proven by the schema tests (accept
-> `incremental`/`net`, default to `incremental`, reject unknown), the runtime tests ("baseline
-> strategy (G13, 002 §1.1.7)" — `net` → one net delta, `incremental` → N ordered deltas, omitting ≡
-> `incremental`), and the `validate` CLI integration tests. See
+> now accepted by `agentmonitors validate` and enforced by the runtime Diff stage. `net`
+> (default since 2026-06-19, Refs #110) collapses the catch-up span per `objectKey` to a **single**
+> before/after delta (the newest event per object, diffed against the recipient's own cursor →
+> endpoint), discarding intermediate churn; the envelope may carry multiple events when multiple
+> objects changed (per object, not per monitor). `incremental` (explicit opt-out) delivers every
+> observation in the span as its own ordered delta. Omitting the field is `net`. Implemented as
+> `baselineStrategySchema` (`libs/core/src/schema/monitor-schema.ts`,
+> `z.enum(['incremental','net']).default('net')`) and `RuntimeStore.collapseNetForClaim`
+> (`libs/core/src/runtime/store.ts`), applied per-recipient at claim time (G10 PR-B). Proven by the
+> schema tests (accept `incremental`/`net`, default to `net`, reject unknown), the runtime tests
+> ("baseline strategy (G13, 002 §1.1.7)" — omitting ≡ `net`, explicit `net` → 1 delta, explicit
+> `incremental` → N ordered deltas), `libs/core/src/runtime/object-consolidation.test.ts`
+> (15-saves canonical case end-to-end), and the `validate` CLI integration tests. See
 > [001 §3.7](./001-monitor-definition.md#37-baseline-strategy-current),
 > [002 §1.1.7](./002-runtime-delivery.md#117-baseline-strategy-per-recipient-diff-semantics-current),
-> and [spec-changelog.md](./spec-changelog.md). The **full per-recipient-baseline seam** (two
-> recipients at divergent stored baselines each receiving an independently-spanned Diff) remains
-> tracked under **G10**; `baseline-strategy` is the author-declared mode that seam will apply per
-> recipient.
+> and [spec-changelog.md](./spec-changelog.md). The **full per-recipient-baseline seam** is
+> **current** (G10 complete; `baseline-strategy` is the author-declared mode applied per recipient
+> at claim time).
 
 > G14 (Interpret stage — cheap agentic digest + significance gate via the user's own AI tool)
 > **shipped** — the optional Interpret stage of
