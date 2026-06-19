@@ -27,6 +27,10 @@ The current repository contains both public-facing docs and implementation code.
 
 **PP8: Implementation contract beats presentation docs.** The canonical internal specs govern implementation work. Public website docs are allowed to summarize or simplify, but they must not become the only place where behavior is defined.
 
+**PP9: Agents declare and move on.** An agent may declaratively express monitoring intent, but performs no watching mechanics itself and never polls or blocks waiting for a signal. The daemon owns all observation and waiting; signals are pushed to the agent when ready.
+
+**PP10: Deterministic daemon floor.** The daemon performs only deterministic work — observe, shape, diff, persist, project, deliver — and ships no model and holds no model-provider credentials. Any summarization or interpretation runs via the user's own installed AI tool, opt-in and behind an adapter, never in the daemon core.
+
 ## 3. Semantic Properties
 
 **SP1: Monitor identity is directory-derived.** A monitor's stable machine identifier is the parent directory name of its `MONITOR.md` file.
@@ -53,6 +57,8 @@ The current repository contains both public-facing docs and implementation code.
 
 **AP6: Public CLI behavior should be derivable from core runtime and parsing contracts.** Commands may wrap the library, but they should not silently invent behavior that bypasses the core model.
 
+**AP7: One pipeline, two authoring paths.** Ephemeral, agent-declared, session-scoped monitors and persistent `MONITOR.md` monitors are the same runtime machinery. Ephemeral monitors are an additional authoring and lifecycle path into the one pipeline, not a parallel system.
+
 ## 5. Boundary Properties
 
 **BP1: Schedule matching is best-effort and non-backfilling.** A scheduled trigger fires only when a runtime tick lands in a matching time window. Missed windows are not replayed.
@@ -71,13 +77,15 @@ The current repository contains both public-facing docs and implementation code.
 
 **NP4: Watch-mode source execution is opt-in and additive, not the default.** The runtime drives continuous `watch()` for sources that implement it (via `AgentMonitorRuntime.watchMonitors()`, started by `daemon run`); sources without `watch()` run on the one-shot `observe()` tick loop. `observe()` remains required on every source — it is the fallback for one-shot ticks (e.g. `daemon once`) and for any monitor not currently watched. A watched monitor is driven only by its watcher; the tick loop skips its `observe()` so it is never processed twice.
 
+**NP5: Not a cloud-agent delivery target (current scope).** Agent Monitors delivers to local agent hosts only; cloud-hosted agents are out of scope while the only known integration path is a polling loop that contradicts the push model (pairs with NP1). Revisit only if a host exposes a local push/hook primitive.
+
 ## 7. Cross-Reference Index
 
-| Property set                            | Referenced by                                                               |
-| --------------------------------------- | --------------------------------------------------------------------------- |
-| PP1–PP3, SP1–SP2, AP4                   | [001 — Monitor Definition & Authoring](./001-monitor-definition.md)         |
-| PP1, PP4–PP7, SP3–SP5, AP1–AP3, BP1–BP2 | [002 — Runtime, Delivery & Persistence](./002-runtime-delivery.md)          |
-| PP3, PP6–PP7, AP4, BP3, NP3–NP4         | [003 — Source Plugins](./003-source-plugins.md)                             |
-| PP7–PP8, AP4–AP6, BP3                   | [004 — Validation & Testing](./004-validation-testing.md)                   |
-| AP6, PP5                                | [005 — CLI Reference](./005-cli-reference.md)                               |
-| PP4, AP1, AP6, BP2                      | [006 — Agent Integration & Delivery Transports](./006-agent-integration.md) |
+| Property set                                           | Referenced by                                                               |
+| ------------------------------------------------------ | --------------------------------------------------------------------------- |
+| PP1–PP3, SP1–SP2, AP4                                  | [001 — Monitor Definition & Authoring](./001-monitor-definition.md)         |
+| PP1, PP4–PP7, PP9–PP10, SP3–SP5, AP1–AP3, AP7, BP1–BP2 | [002 — Runtime, Delivery & Persistence](./002-runtime-delivery.md)          |
+| PP3, PP6–PP7, AP4, BP3, NP3–NP4                        | [003 — Source Plugins](./003-source-plugins.md)                             |
+| PP7–PP8, AP4–AP6, BP3                                  | [004 — Validation & Testing](./004-validation-testing.md)                   |
+| AP6, PP5, PP10                                         | [005 — CLI Reference](./005-cli-reference.md)                               |
+| PP4, PP9–PP10, AP1, AP6–AP7, BP2, NP5                  | [006 — Agent Integration & Delivery Transports](./006-agent-integration.md) |
