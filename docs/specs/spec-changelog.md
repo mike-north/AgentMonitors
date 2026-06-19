@@ -29,9 +29,11 @@ Ratified in the 2026-06-19 product call. Four new principles added to
   that contradicts the push model (pairs with NP1). Revisit only if a host exposes a local
   push/hook primitive.
 
-These invariants ground the forthcoming multi-host agent-facing work (#126) and dependent chains
-(#124, #110). The §7 cross-reference index is updated: PP9, PP10, and AP7 added to the `002` row;
-PP9, PP10, AP7, and NP5 added to the `006` row; PP10 added to the `005` row.
+These invariants ground the multi-host, local-agent-facing direction (#126, recast in the
+2026-06-19 product call from "defer web/cloud-agent support" to active multi-host local-agent
+support) and dependent chains (#124). The §7 cross-reference index is updated: PP9, PP10, and AP7
+added to the `002` row; PP9, PP10, AP7, and NP5 added to the `006` row; PP10 added to the `005`
+row.
 
 Spec-only — no implementation or published-package behavior change, so no changeset. Refs #126.
 
