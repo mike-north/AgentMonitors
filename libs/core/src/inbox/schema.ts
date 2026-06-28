@@ -184,7 +184,14 @@ export const observationHistory = sqliteTable('observation_history', {
   sourceName: text('source_name').notNull(),
   observationData: text('observation_data').notNull().default('{}'),
   result: text('result', {
-    enum: ['triggered', 'suppressed', 'no-change', 'errored', 'rebaselined'],
+    enum: [
+      'triggered',
+      'suppressed',
+      'no-change',
+      'no-files-matched',
+      'errored',
+      'rebaselined',
+    ],
   }).notNull(),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
 });

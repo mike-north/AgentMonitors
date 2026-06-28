@@ -2785,6 +2785,69 @@ Handle it.
     expect(history[0]?.result).toBe('no-change');
   });
 
+  it('passes workspacePath to observe context so sources can resolve project-relative scope (issue #193)', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'workspace-aware-source',
+      'normal',
+      'Handle it.',
+      "  interval: '1s'\n",
+    );
+
+    let observedWorkspacePath: string | undefined;
+    const source: ObservationSource = {
+      name: 'workspace-aware-source',
+      scopeSchema: { type: 'object' },
+      observe: (_config, context): Promise<ObservationResult> => {
+        observedWorkspacePath = context.workspacePath;
+        return Promise.resolve({ observations: [] });
+      },
+    };
+
+    const runtime = createRuntime(dbPath, source);
+    await runtime.tick(monitorsDir, rootDir);
+
+    expect(observedWorkspacePath).toBe(rootDir);
+  });
+
+  it('records no-files-matched history when source sets outcome:no-files-matched (issue #193)', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'no-files-matched-source',
+      'normal',
+      'Handle it.',
+      "  interval: '1s'\n",
+    );
+
+    const source: ObservationSource = {
+      name: 'no-files-matched-source',
+      scopeSchema: { type: 'object' },
+      stateful: true,
+      observe: (): Promise<ObservationResult> =>
+        Promise.resolve({
+          observations: [],
+          nextState: { fingerprints: {} },
+          outcome: 'no-files-matched',
+        }),
+    };
+
+    const runtime = createRuntime(dbPath, source);
+    await runtime.tick(monitorsDir, rootDir);
+
+    const history = runtime.listObservationHistory({
+      monitorId: 'test-monitor',
+    });
+    expect(history).toHaveLength(1);
+    expect(history[0]?.result).toBe('no-files-matched');
+    expect(history[0]?.observationData).toEqual({ observed: 0, emitted: 0 });
+  });
+
   // Issue #56 (precedence invariant): the classification orders
   // emitted>0 → 'triggered' ABOVE the rebaselined check. A source that both
   // emits an observation AND signals outcome:'rebaselined' must record

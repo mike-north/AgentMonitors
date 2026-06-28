@@ -4,7 +4,7 @@ import { scanMonitors } from '../parser/scan-monitors.js';
 import type { MonitorDefinition, Urgency } from '../schema/types.js';
 import { validateScope } from '../schema/validate-scope.js';
 import { parseDuration } from '../notify/notifier.js';
-import type { Observation } from '../observation/types.js';
+import type { Observation, ObservationContext } from '../observation/types.js';
 import type { SourceRegistry } from '../observation/registry.js';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import type { AgentRuntimeAdapter } from '../adapter/types.js';
@@ -562,6 +562,15 @@ export class AgentMonitorRuntime {
           'observation',
           'healthy',
           'Source ran, observed 0 changes — your watched target genuinely hasn’t changed (not a bug).',
+          latestObservation.observationData,
+        ),
+      );
+    } else if (latestObservation.result === 'no-files-matched') {
+      stages.push(
+        explainStage(
+          'observation',
+          'failure',
+          'The source ran but matched zero files; check the monitor globs and cwd.',
           latestObservation.observationData,
         ),
       );
@@ -1149,6 +1158,7 @@ export class AgentMonitorRuntime {
           {
             previousState: monitorState.sourceState,
             now,
+            workspacePath,
           },
         );
       } catch (observeError) {
@@ -1254,7 +1264,7 @@ export class AgentMonitorRuntime {
     options: {
       workspacePath: string;
       nextSourceState?: { value: unknown };
-      sourceOutcome?: 'rebaselined';
+      sourceOutcome?: 'rebaselined' | 'no-files-matched';
     },
   ): Promise<string[]> {
     // Pre-filter: a `payload.form: structured` CEL gate that evaluates `false`
@@ -1345,7 +1355,7 @@ export class AgentMonitorRuntime {
     options: {
       observed: number;
       workspacePath: string;
-      sourceOutcome?: 'rebaselined';
+      sourceOutcome?: 'rebaselined' | 'no-files-matched';
     },
   ): Promise<string[]> {
     const observed = options.observed;
@@ -1362,8 +1372,8 @@ export class AgentMonitorRuntime {
             // while also returning (suppressed) observations can't mask a
             // genuine `suppressed` tick — the invariant is enforced here at the
             // runtime boundary, not left to source authors.
-            observed === 0 && options.sourceOutcome === 'rebaselined'
-            ? 'rebaselined'
+            observed === 0 && options.sourceOutcome !== undefined
+            ? options.sourceOutcome
             : observed > 0
               ? 'suppressed'
               : 'no-change',
@@ -1515,11 +1525,7 @@ export class AgentMonitorRuntime {
     monitor: MonitorDefinition,
     watch: (
       config: Record<string, unknown>,
-      context: {
-        previousState?: unknown;
-        now: Date;
-        signal: AbortSignal;
-      },
+      context: ObservationContext & { signal: AbortSignal },
     ) => AsyncIterable<Observation>,
     workspacePath: string,
     signal: AbortSignal,
@@ -1529,6 +1535,7 @@ export class AgentMonitorRuntime {
     const iterable = watch(watchConfig(monitor.frontmatter.watch), {
       previousState: monitorState.sourceState,
       now: new Date(),
+      workspacePath,
       signal,
     });
     try {

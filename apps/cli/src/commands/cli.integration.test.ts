@@ -2580,6 +2580,10 @@ describe('monitor test', () => {
     run(['init', 'fp-monitor', '--dir', monitorsDir], dir);
 
     const monitorFile = path.join(monitorsDir, 'fp-monitor', 'MONITOR.md');
+    writeFileSync(
+      path.join(path.dirname(monitorFile), 'index.ts'),
+      'export const value = 1;\n',
+    );
     const result = run(['monitor', 'test', monitorFile]);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain('Baseline established');
@@ -2593,6 +2597,10 @@ describe('monitor test', () => {
     run(['init', 'fp-json', '--dir', monitorsDir], dir);
 
     const monitorFile = path.join(monitorsDir, 'fp-json', 'MONITOR.md');
+    writeFileSync(
+      path.join(path.dirname(monitorFile), 'index.ts'),
+      'export const value = 1;\n',
+    );
     const result = run(['monitor', 'test', monitorFile, '--format', 'json']);
     expect(result.exitCode).toBe(0);
     const parsed = JSON.parse(result.stdout);
@@ -2600,6 +2608,46 @@ describe('monitor test', () => {
     expect(parsed.source).toBe('file-fingerprint');
     expect(parsed.baseline).toBe(true);
     expect(parsed).toHaveProperty('observations');
+  });
+
+  it('reports zero-match file-fingerprint scopes without establishing a baseline', () => {
+    const dir = path.join(tempDir, 'monitor-test-no-files');
+    const monitorsDir = path.join(dir, '.claude', 'monitors');
+    mkdirSync(monitorsDir, { recursive: true });
+    run(['init', 'fp-empty', '--dir', monitorsDir], dir);
+
+    const monitorFile = path.join(monitorsDir, 'fp-empty', 'MONITOR.md');
+    const result = run(['monitor', 'test', monitorFile], '/tmp');
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('No files matched');
+    expect(result.stderr).toContain('globs');
+    expect(result.stdout).not.toContain('Baseline established');
+  });
+
+  it('reports zero-match file-fingerprint scopes as structured JSON', () => {
+    const dir = path.join(tempDir, 'monitor-test-no-files-json');
+    const monitorsDir = path.join(dir, '.codex', 'monitors');
+    mkdirSync(monitorsDir, { recursive: true });
+    run(['init', 'fp-empty-json', '--dir', monitorsDir], dir);
+
+    const monitorFile = path.join(monitorsDir, 'fp-empty-json', 'MONITOR.md');
+    const result = run(
+      ['monitor', 'test', monitorFile, '--format', 'json'],
+      '/tmp',
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toBe('');
+    const parsed = JSON.parse(result.stdout);
+    expect(parsed).toMatchObject({
+      monitor: 'My monitor',
+      source: 'file-fingerprint',
+      baseline: false,
+      outcome: 'no-files-matched',
+      observations: [],
+    });
+    expect(parsed.error).toContain('watch.globs');
   });
 
   it('errors on invalid MONITOR.md content', () => {
