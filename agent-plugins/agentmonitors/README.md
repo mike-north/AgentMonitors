@@ -9,11 +9,11 @@ for the full contract.
 
 This plugin connects the Claude Code lifecycle to the `agentmonitors` CLI:
 
-| Hook event         | Command(s)                                                      |
-| ------------------ | -------------------------------------------------------------- |
-| `SessionStart`     | `agentmonitors session start` then `agentmonitors hook deliver` |
-| `UserPromptSubmit` | `agentmonitors hook deliver`                                    |
-| `SessionEnd`       | `agentmonitors session end`                                     |
+| Hook event         | Command(s)                    | Notes                                                                         |
+| ------------------ | ----------------------------- | ----------------------------------------------------------------------------- |
+| `SessionStart`     | `agentmonitors session start` | Also surfaces the post-compact recap in the same process (no chaining needed) |
+| `UserPromptSubmit` | `agentmonitors hook deliver`  |                                                                               |
+| `SessionEnd`       | `agentmonitors session end`   |                                                                               |
 
 It also registers the **channel MCP** (`agentmonitors channel serve`, see
 [`.mcp.json`](./.mcp.json)) and a bundled **`setup-monitors`** skill that walks you through enabling
