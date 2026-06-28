@@ -98,7 +98,7 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
     // the supported inline form rather than just rejecting it.
     const shellHint =
       typeof command === 'string'
-        ? ` A bare string is not run as a shell. For a pipeline or shell operators, wrap it in argv: ["sh", "-c", ${JSON.stringify(command)}].`
+        ? ` A bare string is not run as a shell. For a pipeline or other shell operators, wrap it in argv: ["sh", "-c", ${JSON.stringify(command)}].`
         : ' For a shell pipeline, use the argv form ["sh", "-c", "<pipeline>"].';
     throw new Error(
       `scope.command must be a non-empty array of strings (argv form, e.g. ["git", "status"]).${shellHint}`,
@@ -446,7 +446,7 @@ const scopeSchema: JsonSchema = {
       minItems: 1,
       description:
         'Argv array; command[0] is the executable (resolved via PATH). Spawned directly, never via a shell. ' +
-        "For a pipeline or shell operators, spawn a shell explicitly: ['sh', '-c', 'git status -sb | grep ahead'].",
+        "For a pipeline or other shell operators, spawn a shell explicitly: ['sh', '-c', 'git status -sb | grep ahead'].",
     },
     cwd: {
       type: 'string',
