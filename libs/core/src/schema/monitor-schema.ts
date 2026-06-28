@@ -105,6 +105,8 @@ const urgencyRank: Record<(typeof urgencyLevels)[number], number> = {
   high: 2,
 };
 
+const DEFAULT_URGENCY_BAND = { lo: 'normal', hi: 'normal' } as const;
+
 /**
  * The authored `urgency` frontmatter value. It is a **band** the runtime is
  * allowed to deliver within:
@@ -335,8 +337,8 @@ export const monitorFrontmatterSchema = z
     //
     // An omitted `urgency` defaults to the degenerate band `normal..normal`, so
     // the minimal monitor (`watch:` + body) is valid and delivers at `normal`.
-    urgency: (urgency ?? { lo: 'normal', hi: 'normal' }).lo,
-    urgencyMax: (urgency ?? { lo: 'normal', hi: 'normal' }).hi,
+    urgency: (urgency ?? DEFAULT_URGENCY_BAND).lo,
+    urgencyMax: (urgency ?? DEFAULT_URGENCY_BAND).hi,
   }));
 
 export type MonitorFrontmatter = z.infer<typeof monitorFrontmatterSchema>;
