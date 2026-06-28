@@ -6,6 +6,11 @@ import { daemonAvailable, resolveSocketPath } from '../daemon-ipc.js';
 import { readLocalState } from '../local-state.js';
 import { renderHookDelivery } from '../hook-deliver-render.js';
 import { readHookPayload } from '../hook-payload.js';
+import {
+  isManualDaemonConnectionError,
+  manualDaemonErrorMessage,
+  resolveManualDaemonSocketPath,
+} from '../manual-daemon.js';
 
 export const hookCommand = new Command('hook').description(
   'Claim hook-delivery payloads from the runtime',
@@ -38,7 +43,7 @@ hookCommand
         const claim = await claimDeliveryClient(
           options.session,
           options.lifecycle,
-          options.socket,
+          resolveManualDaemonSocketPath(options.socket),
         );
         if (options.format === 'json') {
           console.log(JSON.stringify(claim, null, 2));
@@ -50,8 +55,10 @@ hookCommand
         }
         console.log(claim.message);
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        reportError(message, options.format === 'json');
+        reportError(
+          manualDaemonErrorMessage(error),
+          !isManualDaemonConnectionError(error) && options.format === 'json',
+        );
       }
     },
   );

@@ -5,6 +5,11 @@ import {
   acknowledgeEventsClient,
   listEventsClient,
 } from '../runtime-client.js';
+import {
+  isManualDaemonConnectionError,
+  manualDaemonErrorMessage,
+  resolveManualDaemonSocketPath,
+} from '../manual-daemon.js';
 
 function parseScope(scope?: string): Record<string, string> | undefined {
   if (!scope) return undefined;
@@ -76,7 +81,7 @@ eventsCommand
             ...(options.unread ? { unreadOnly: true } : {}),
             ...(options.sinceBaseline ? { sinceBaseline: true } : {}),
           },
-          options.socket,
+          resolveManualDaemonSocketPath(options.socket),
         );
         if (format === 'json') {
           console.log(JSON.stringify(events, null, 2));
@@ -97,8 +102,10 @@ eventsCommand
           );
         }
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        reportError(message, format === 'json');
+        reportError(
+          manualDaemonErrorMessage(error),
+          !isManualDaemonConnectionError(error) && format === 'json',
+        );
       }
     },
   );
@@ -122,7 +129,15 @@ eventsCommand
         ?.split(',')
         .map((value) => value.trim())
         .filter(Boolean);
-      await acknowledgeEventsClient(options.session, ids, options.socket);
-      console.log('Acknowledged events.');
+      try {
+        await acknowledgeEventsClient(
+          options.session,
+          ids,
+          resolveManualDaemonSocketPath(options.socket),
+        );
+        console.log('Acknowledged events.');
+      } catch (error) {
+        reportError(manualDaemonErrorMessage(error), false);
+      }
     },
   );
