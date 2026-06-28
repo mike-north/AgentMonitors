@@ -439,8 +439,15 @@ lifecycle and emits nothing otherwise.
 | `PreToolUse`       | **no** (permissionDecision) | — (emit nothing)     | nothing — additionalContext would be ignored                    |
 | `Stop`             | **no** (top-level decision) | — (emit nothing)     | nothing — additionalContext would be ignored                    |
 
-Note: for `turn-interruptible`, `normal` urgency returns `events: []` (reminder text only, no body
-injection). The body is surfaced only for **high-urgency settled events** and **post-compact recap**.
+Note: for `turn-interruptible`, `normal` urgency (and `low` at `turn-idle`) returns `events: []`
+(reminder text only, no body injection). The body is surfaced only for **high-urgency settled
+events** and **post-compact recap**. "Reminder text only" is **not** silence: `hook deliver` renders
+the claim's advisory `message` (the same line `hook claim` surfaces) verbatim into
+`hookSpecificOutput.additionalContext`, so a default (`normal`-urgency) monitor produces a visible
+mid-turn reminder — just without the per-event body block. The underlying rows are claimed but **not**
+acknowledged (BP2 / SP4 — see §5.5), so the event stays unread and re-discoverable via
+`agentmonitors events list --unread`. `renderHookDelivery` returns `null` (the command prints
+nothing) only when the claim is `null` or carries neither events nor a reminder message.
 
 ### 5.5 Unread-recoverability (truncation never loses an event)
 

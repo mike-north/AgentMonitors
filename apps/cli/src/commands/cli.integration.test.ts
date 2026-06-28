@@ -4139,6 +4139,152 @@ describe('hook deliver', () => {
     }
   }, 40_000); // high-urgency settle = 15s + baseline + detection + headroom
 
+  // Issue #198 (AC1, AC6): a DEFAULT `normal`-urgency monitor must produce a
+  // visible mid-turn signal. `hook deliver` with a `UserPromptSubmit`
+  // (turn-interruptible) payload must emit a non-empty reminder line in
+  // `additionalContext` — NOT silence — and claiming it must leave the event
+  // unread (claimed ≠ acknowledged, BP2/SP4), so it stays re-discoverable via
+  // `events list --unread`.
+  it('hook deliver emits a reminder line for a pending normal-urgency change (and leaves it unread)', async () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-hd-normal-'));
+    const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-files');
+    mkdirSync(monitorsDir, { recursive: true });
+
+    const watchedFile = path.join(ws, 'watched.txt');
+    writeFileSync(watchedFile, 'initial content', 'utf-8');
+
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      [
+        '---',
+        'name: Watch files',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs:',
+        '    - "watched.txt"',
+        `  cwd: ${JSON.stringify(ws)}`,
+        '  interval: "1s"',
+        // DEFAULT urgency. normal turn-interruptible claims return events:[]
+        // with only a reminder message — the case this issue fixes.
+        'urgency: normal',
+        '---',
+        'When files change, review them.',
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+
+    const socket = path.join(
+      '/tmp',
+      `agentmon-hdn-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const db = path.join(ws, 'hd-normal.db');
+    const hostSessionId = `hd-normal-${Date.now()}`;
+
+    writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 30_000 });
+
+    const env: Record<string, string> = {
+      CLAUDE_CODE_SESSION_ID: hostSessionId,
+      CLAUDE_PROJECT_DIR: ws,
+      AGENTMONITORS_DB: db,
+      AGENTMONITORS_SOCKET: socket,
+    };
+
+    const daemon = await startDaemon(
+      path.join(ws, '.claude', 'monitors'),
+      ws,
+      env,
+      socket,
+    );
+
+    try {
+      const sessionOpen = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          hostSessionId,
+          '--workspace',
+          ws,
+          '--format',
+          'json',
+        ],
+        env,
+        ws,
+      );
+      expect(sessionOpen.exitCode).toBe(0);
+      const session = JSON.parse(sessionOpen.stdout) as { id: string };
+
+      // Let the baseline tick complete, then change the file.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
+      writeFileSync(watchedFile, 'changed content', 'utf-8');
+
+      const unread = () =>
+        runWithEnv(
+          [
+            'events',
+            'list',
+            '--session',
+            session.id,
+            '--unread',
+            '--format',
+            'json',
+          ],
+          env,
+          ws,
+        );
+
+      // normal urgency materializes without the 15s high-urgency settle window.
+      const eventDeadline = Date.now() + 10_000;
+      while (Date.now() < eventDeadline) {
+        const result = unread();
+        if (result.exitCode === 0 && JSON.parse(result.stdout).length >= 1) {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      expect(JSON.parse(unread().stdout)).toHaveLength(1);
+
+      const deliverResult = runWithStdin(
+        ['hook', 'deliver'],
+        env,
+        JSON.stringify({
+          session_id: hostSessionId,
+          hook_event_name: 'UserPromptSubmit',
+          cwd: ws,
+        }),
+        ws,
+      );
+
+      expect(deliverResult.exitCode).toBe(0);
+      // The core defect: this used to be empty for normal urgency.
+      expect(deliverResult.stdout.trim()).not.toBe('');
+
+      const output = JSON.parse(deliverResult.stdout) as {
+        continue: boolean;
+        hookSpecificOutput: {
+          hookEventName: string;
+          additionalContext: string;
+        };
+      };
+      expect(output.continue).toBe(true);
+      expect(output.hookSpecificOutput.hookEventName).toBe('UserPromptSubmit');
+      // A non-empty advisory reminder line is injected.
+      expect(output.hookSpecificOutput.additionalContext.trim()).not.toBe('');
+      // Reminder only — NO per-event body block is injected for normal urgency.
+      expect(output.hookSpecificOutput.additionalContext).not.toContain('### ');
+      expect(output).not.toHaveProperty('permissionDecision');
+
+      // AC6: claiming via hook deliver marks the row claimed but NOT
+      // acknowledged — the event is still listed by events list --unread.
+      expect(JSON.parse(unread().stdout)).toHaveLength(1);
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it('hook deliver exits 0 and prints nothing when there is nothing pending', async () => {
     const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-hd-empty-'));
     const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-files');
