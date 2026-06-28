@@ -127,7 +127,32 @@ export function createFollowupObservationContext(
   return {
     now: new Date(),
     previousState: context.previousState,
+    ...(context.workspacePath !== undefined
+      ? { workspacePath: context.workspacePath }
+      : {}),
   };
+}
+
+/**
+ * Resolve the project config root for a MONITOR.md path. Project monitors live
+ * under `<root>/.claude/monitors/...` or `<root>/.codex/monitors/...`; source
+ * dry-runs need that root so relative file globs do not depend on process cwd.
+ */
+function configRootForMonitorFile(filePath: string): string {
+  const resolvedPath = path.resolve(filePath);
+  const segments = resolvedPath.split(path.sep);
+  let configDirIndex = -1;
+  for (let index = segments.length - 1; index >= 0; index -= 1) {
+    const segment = segments[index];
+    if (segment === '.claude' || segment === '.codex') {
+      configDirIndex = index;
+      break;
+    }
+  }
+  if (configDirIndex > 0) {
+    return segments.slice(0, configDirIndex).join(path.sep) || path.sep;
+  }
+  return path.dirname(resolvedPath);
 }
 
 /**
@@ -264,12 +289,14 @@ monitorTestCommand
     }
 
     try {
-      let context: ObservationContext = { now: new Date() };
+      const workspacePath = configRootForMonitorFile(filePath);
+      let context: ObservationContext = { now: new Date(), workspacePath };
       const firstResult = await source.observe(monitorWatchConfig, context);
       const observations = firstResult.observations;
       context = {
         now: new Date(),
         previousState: firstResult.nextState,
+        workspacePath,
       };
 
       if (observations.length === 0 && source.stateful) {
@@ -456,7 +483,7 @@ monitorTestCommand
 monitorTestCommand
   .command('history')
   .description(
-    'Show recent observation outcomes per tick (triggered / suppressed / no-change / errored / rebaselined)',
+    'Show recent observation outcomes per tick (triggered / suppressed / no-change / no-files-matched / errored / rebaselined)',
   )
   .argument('[monitorId]', 'Filter to a single monitor id')
   .option('--socket <path>', 'Unix domain socket path for the daemon')

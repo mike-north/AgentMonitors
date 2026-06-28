@@ -399,8 +399,9 @@ agentmonitors monitor history [monitorId] [--socket <path>] [--limit <n>] [--for
 | `--format`      | auto (see §1) | `toon`, `text` (one row per line), or `json` |
 
 Each row reports `result` — `triggered` (≥1 observation became an event), `suppressed` (observations
-returned but none emitted this tick), `no-change` (the source returned nothing), `errored` (the
-source's `observe()` or its `ingest()` threw; the failure was isolated so other monitors still ran — see
+returned but none emitted this tick), `no-change` (the source returned nothing), `no-files-matched`
+(a file-system source matched zero files), `errored` (the source's `observe()` or its `ingest()`
+threw; the failure was isolated so other monitors still ran — see
 [002 §`observation_history`](./002-runtime-delivery.md)), or `rebaselined` (the source advanced its
 baseline without computing a delta, e.g. after a force-pushed/gc'd ref; distinct from `no-change`) —
 plus the monitor id, source name, and timestamp.
