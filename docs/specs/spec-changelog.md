@@ -9,6 +9,34 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-06-28 — `file-fingerprint` `globs` accepts a string or an array (003 §3)
+
+Ergonomics: the single-file/single-glob case can now be written as `globs: notes.md` instead of
+`globs: ['notes.md']`. [003 §3.1](./003-source-plugins.md) updated to state that `globs` accepts a
+bare string (a single pattern) or an array of strings (OR-ed), with the string form normalized to a
+one-element array. Empty patterns are rejected. Backward compatible. Part of the "simple cases feel
+simple" authoring-ergonomics pass.
+
+## 2026-06-28 — `urgency` is now optional, defaulting to `normal` (001 §3, §3.2)
+
+Ergonomics: `urgency` was a required frontmatter field; it is now **optional** and defaults to the
+degenerate band `normal..normal` when omitted, so the minimal valid monitor is a `watch:` block plus
+a body. [001 §3](./001-monitor-definition.md) (field table + verified note) and §3.2 updated.
+Backward compatible — every monitor that declares `urgency` (a level or a `lo..hi` band) is
+unchanged. The default is intentionally `normal` (not `high`): the simplest monitor does not
+interrupt the current turn; an author opts into mid-session interruption with `urgency: high`
+(gradual reveal). Per maintainer decision, 2026-06-28. Part of the "simple cases feel simple"
+authoring-ergonomics pass.
+
+## 2026-06-28 — `command-poll` teaches the inline pipeline idiom (003 §11.1)
+
+Ergonomics/discoverability (no contract change): the argv-only rule for `command` is unchanged, but
+a bare-string `command` is now rejected with a message that names the supported inline form,
+`['sh', '-c', '<pipeline>']`, and the `init --type command-poll` template documents it in a comment.
+[003 §11.1](./003-source-plugins.md) clarifies that shell features are opt-in via an explicit
+`['sh','-c',…]` argv (the shell is `argv[0]`, author-chosen, not silently interposed). Part of the
+"simple cases feel simple" authoring-ergonomics pass.
+
 ## 2026-06-19 — Four invariants added to 000: PP9, PP10, AP7, NP5 — Refs #126
 
 Ratified in the 2026-06-19 product call. Four new principles added to

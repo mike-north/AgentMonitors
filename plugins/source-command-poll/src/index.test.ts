@@ -73,6 +73,32 @@ describe('source-command-poll', () => {
         source.observe({ command: 'echo hi' }, ctx()),
       ).rejects.toThrow('command');
     });
+
+    it('guides a bare-string command toward the sh -c argv form (003 §11.1)', async () => {
+      // A pipeline written as a bare string is the most common mistake; the error
+      // must teach the supported inline form rather than just rejecting it.
+      await expect(
+        source.observe({ command: 'git status | grep main' }, ctx()),
+      ).rejects.toThrow(/\["sh", "-c", "git status \| grep main"\]/);
+    });
+
+    it('accepts an explicit sh -c argv form (the supported pipeline idiom)', async () => {
+      // ["sh","-c","<pipeline>"] is a valid argv array — shell features are opt-in
+      // by spawning a shell explicitly, not by the source word-splitting a string.
+      const baseline = await source.observe(
+        { command: ['sh', '-c', 'printf one'] },
+        ctx(),
+      );
+      expect(baseline.observations).toHaveLength(0);
+      const changed = await source.observe(
+        { command: ['sh', '-c', 'printf two'] },
+        ctx(baseline.nextState),
+      );
+      expect(changed.observations).toHaveLength(1);
+      expect(changed.observations[0]?.title).toContain(
+        'Command output changed',
+      );
+    });
   });
 
   // AC1 — no shell: a shell-metacharacter argv element is passed through verbatim.
