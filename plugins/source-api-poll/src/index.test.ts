@@ -205,6 +205,35 @@ describe('source-api-poll', () => {
       );
     });
 
+    it('json-diff: redacts URL secrets from non-JSON warnings', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {
+        // Intentionally quiet: this test asserts the warning text below.
+      });
+      const mockFetch = vi.fn();
+      vi.stubGlobal('fetch', mockFetch);
+
+      mockFetch.mockResolvedValueOnce({
+        text: () => Promise.resolve('<html>open</html>'),
+        status: 200,
+      });
+      await source.observe(
+        {
+          url: 'https://user:secret@status.example.com/incidents/123?token=abc#frag',
+          'change-detection': { strategy: 'json-diff' },
+        },
+        { now: new Date() },
+      );
+
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('https://status.example.com/incidents/123'),
+      );
+      expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('secret'));
+      expect(warn).not.toHaveBeenCalledWith(
+        expect.stringContaining('token=abc'),
+      );
+      expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('frag'));
+    });
+
     it('text-diff: does not warn for non-JSON bodies', async () => {
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {
         // Intentionally quiet: text-diff is the expected HTML/plain-text mode.

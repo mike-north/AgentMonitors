@@ -170,6 +170,19 @@ function parsesAsJson(body: string): boolean {
   }
 }
 
+function redactUrlForWarning(url: string): string {
+  try {
+    const parsed = new URL(url);
+    parsed.username = '';
+    parsed.password = '';
+    parsed.search = '';
+    parsed.hash = '';
+    return parsed.toString();
+  } catch {
+    return url.split(/[?#]/u)[0] ?? url;
+  }
+}
+
 function warnIfJsonDiffFallsBackToText(
   url: string,
   curr: CachedResponse,
@@ -179,7 +192,7 @@ function warnIfJsonDiffFallsBackToText(
   if (bodies.every(parsesAsJson)) return;
 
   console.warn(
-    `Warning: api-poll monitor for ${url} uses strategy: json-diff, but the response body is not valid JSON. Falling back to text comparison; use strategy: text-diff for HTML/plain pages or json-diff for JSON APIs.`,
+    `Warning: api-poll monitor for ${redactUrlForWarning(url)} uses strategy: json-diff, but the response body is not valid JSON. Falling back to text comparison; use strategy: text-diff for HTML/plain pages or json-diff for JSON APIs.`,
   );
 }
 
