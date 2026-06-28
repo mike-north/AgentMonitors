@@ -701,8 +701,19 @@ watch:
 **`command` MUST be an argv array; a shell string form MUST NOT be accepted.** The child is spawned
 directly (`execFile` semantics, `shell: false`): there is no word-splitting, globbing, quoting, or
 injection surface, and what executes is exactly what the author wrote, token for token. This is the
-decision for #81's first open question; a `sh -c` convenience form is rejected — an author who needs
-shell features writes them into a script and polls the script.
+decision for #81's first open question; a bare-string `command` (which would imply implicit shell
+word-splitting) is rejected — an author who needs shell features writes them into a script and polls
+the script.
+
+**Shell features are opt-in, not implicit.** An author who genuinely needs a pipeline or shell
+operator spawns a shell _explicitly_ in argv form — `command: ['sh', '-c', 'git status -sb | grep ahead']`
+— which the source runs verbatim like any other argv (the shell is `argv[0]`, chosen by the author,
+not silently interposed by the source). This is the supported inline equivalent of "write a script
+and poll it." When `command` is given as a bare string, `parseScopeConfig` rejects it with a message
+that names this `['sh', '-c', …]` form, so the common pipeline mistake is self-correcting. Verified:
+`plugins/source-command-poll/src/index.ts` (`parseScopeConfig` error) and
+`plugins/source-command-poll/src/index.test.ts` ("guides a bare-string command toward the sh -c argv
+form", "accepts an explicit sh -c argv form").
 
 **`env` is merged over the inherited daemon environment** (decision for #81's second open
 question). Restricting the inherited environment adds hygiene, not security — the command runs as
