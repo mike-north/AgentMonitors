@@ -26,15 +26,22 @@ name: Human-readable display name  # optional; identity comes from the directory
 watch:                              # required — what to observe
   type: <source-type>              # discriminated union tag — always explicit
   # ... source-specific config ...
-urgency: normal                     # optional: high | normal | low (default: normal)
+urgency: high                       # required — high | normal | low (see Urgency below)
 notify:                             # optional — delivery timing
   strategy: debounce
   settle-for: 5m
 ---
 ```
 
-The minimal valid monitor is a `watch:` block plus a body — every other field is optional
-with a sensible default.
+The minimal valid monitor is a `watch:` block, an `urgency`, and a body. `urgency` is required so
+the interrupt level is always an explicit author choice — there is no implicit default. Everything
+else (`name`, `notify`, `shape`, `payload`, `baseline-strategy`, `tags`) is optional and reveals
+itself only when a specific need calls for it.
+
+> **Want to be notified _during_ a session?** Use `urgency: high`. With the standard Claude Code
+> plugin, `high` events are surfaced at the next turn boundary, while `normal`/`low` events are held
+> for the next session's recap rather than interrupting the current one (see [Urgency](#urgency)).
+> For "tell me when X changes so I can react now", `high` is the right choice.
 
 ## The body: handling instructions
 
@@ -106,6 +113,42 @@ watch:
 - **Bearer token:** `type: bearer` with `token` (inline) or `token-env` (env var name)
 - **Basic auth:** `type: basic` with `username` and `password` fields
 
+### `command-poll`
+
+Runs a local command on an interval and detects when its output changes — the local-process
+sibling of `api-poll`. Use it to watch anything a CLI can report: `git status`, `kubectl get`,
+build tooling, a health-check script.
+
+```yaml
+watch:
+  type: command-poll
+  command:                       # argv array, run directly (no shell)
+    - git
+    - status
+    - --porcelain
+  interval: 5m                   # optional — polling interval
+  change-detection:              # optional
+    strategy: text-diff          # text-diff (default) | json-diff | exit-code
+  cwd: /path/to/repo             # optional
+  timeout: 30s                   # optional — wall-clock limit
+```
+
+`command` is an **argv array**, spawned directly with no shell — what you write is exactly what
+runs, with no word-splitting, globbing, or injection surface. To use a **pipeline or shell
+operators**, spawn a shell explicitly in argv form:
+
+```yaml
+watch:
+  type: command-poll
+  command: ['sh', '-c', 'git status -sb | grep ahead']   # the supported pipeline idiom
+  change-detection:
+    strategy: json-diff          # use json-diff when the command emits JSON, e.g. curl | jq
+```
+
+Use `strategy: json-diff` when the output is JSON (compares semantically, ignoring key order and
+whitespace); `text-diff` (the default) for plain text; `exit-code` to fire only when the exit code
+changes.
+
 ### `schedule`
 
 Fires on a cron schedule — no change-detection, purely time-driven.
@@ -134,17 +177,23 @@ watch:
 
 ## Urgency
 
-`urgency` controls how the runtime surfaces the signal to the agent:
+`urgency` controls how — and how urgently — the runtime surfaces the signal to the agent. It is a
+**required** field: pick the interrupt level deliberately.
 
-| Value | Delivery behaviour |
+| Value | Delivery behaviour (standard Claude Code plugin) |
 |---|---|
-| `high` | Interrupt the agent at the earliest interruptible point (15 s debounce settle) |
-| `normal` | Surface at turn-idle — the agent sees it after its current turn completes |
-| `low` | Surface at idle or post-compact — lowest priority |
+| `high` | Surfaced **during the session**, at the next turn boundary, after a 15 s settle window. Choose this for "tell me when X changes so I can react now." |
+| `normal` | Held and surfaced in the **next session's startup recap** rather than interrupting the current turn. Choose this for background changes the agent should know about but needn't act on immediately. |
+| `low` | Same as `normal` but lowest priority — quietest. |
 
 ```yaml
 urgency: high   # or normal, or low
 ```
+
+> **Why this matters for the simplest case.** If you want the agent to be notified *mid-session* the
+> moment a file or command output changes, use `urgency: high`. `normal`/`low` changes are real and
+> durable — queryable via `agentmonitors events list` and replayed in the next session's recap — but
+> the standard plugin does not interrupt the current turn for them.
 
 ## Notify strategies
 
@@ -170,11 +219,40 @@ notify:
   suppress-for: 30m   # notify once, then ignore for 30 minutes
 ```
 
+### Rollup
+
+Accumulate everything since the last window and deliver it as a single digest on a schedule —
+delivery time is the constraint, not change time. Good for a daily summary instead of per-change
+pings:
+
+```yaml
+notify:
+  strategy: rollup
+  window: '0 9 * * 1-5'          # cron — when the digest is delivered (weekdays at 9 AM)
+  timezone: America/Los_Angeles   # optional — defaults to UTC
+```
+
+Pair `rollup` with a relaxed `watch.interval` (e.g. `1h`) — there is no benefit to polling every
+30 s when delivery is once a day.
+
 ## Progressive disclosure
 
-The design rule: simple stays simple, power reveals on friction. Start with just `watch:`
-and a body. Add `when:` (fire less often), `deliver:` (say more), or `until:` (reliable
-reaction) only when a specific friction motivates them — never up front.
+The design rule: simple stays simple, power reveals only when a real need calls for it. Reach for
+each field in this order, and only when its specific friction shows up:
+
+1. **Start minimal** — `watch:` (what to observe), `urgency:` (how loud), and a body (what to do).
+   This is enough for the great majority of monitors.
+2. **`notify:`** — when a monitor fires too often. Add `debounce` to wait for quiet, `throttle` to
+   cap frequency, or `rollup` to batch into a scheduled digest. (See [Notify strategies](#notify-strategies).)
+3. **`shape:`** — when the agent shouldn't have to recompute facts from raw data. Declare derived
+   facts (e.g. `past-due`, `urgent`) so the diff is over meaning, not noise.
+4. **`payload:`** — when the recipient needs a specific delivery form (`structured` JSON for a
+   computing agent, `prose` for a human-readable digest) rather than the default text.
+5. **`baseline-strategy:`** — when an agent rejoining after a gap needs the full play-by-play
+   (`incremental`) instead of the default net diff (`net`).
+
+Each step is independent; you never need a later one to use an earlier one. Start at step 1 and stop
+as soon as the monitor does what you want.
 
 See the [use cases](/docs/use-cases) page for real patterns across this spectrum.
 
