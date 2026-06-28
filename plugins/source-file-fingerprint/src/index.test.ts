@@ -92,6 +92,93 @@ describe('source-file-fingerprint', () => {
     );
   });
 
+  describe('workspace-relative path resolution (issue #193)', () => {
+    it('resolves relative globs from context.workspacePath instead of process cwd', async () => {
+      const workspacePath = makeTempDir();
+      const otherCwd = makeTempDir();
+      mkdirSync(path.join(workspacePath, 'watched'), { recursive: true });
+      const filePath = path.join(workspacePath, 'watched', 'note.md');
+      writeFileSync(filePath, 'hello');
+
+      const originalCwd = process.cwd();
+      process.chdir(otherCwd);
+      try {
+        const result = await source.observe(
+          { globs: ['watched/**/*.md'] },
+          { now: new Date(), workspacePath },
+        );
+
+        const next = result.nextState as {
+          fingerprints: Record<string, string>;
+        };
+        expect(Object.keys(next.fingerprints)).toEqual([filePath]);
+        expect(result.outcome).toBeUndefined();
+      } finally {
+        process.chdir(originalCwd);
+      }
+    });
+
+    it('resolves relative cwd from context.workspacePath', async () => {
+      const workspacePath = makeTempDir();
+      mkdirSync(path.join(workspacePath, 'docs'), { recursive: true });
+      const filePath = path.join(workspacePath, 'docs', 'readme.md');
+      writeFileSync(filePath, 'hello');
+
+      const result = await source.observe(
+        { globs: ['*.md'], cwd: 'docs' },
+        { now: new Date(), workspacePath },
+      );
+
+      const next = result.nextState as { fingerprints: Record<string, string> };
+      expect(Object.keys(next.fingerprints)).toEqual([filePath]);
+    });
+
+    it('honors absolute cwd and absolute globs unchanged', async () => {
+      const workspacePath = makeTempDir();
+      const absoluteRoot = makeTempDir();
+      mkdirSync(path.join(workspacePath, 'docs'), { recursive: true });
+      mkdirSync(path.join(absoluteRoot, 'docs'), { recursive: true });
+      const cwdFile = path.join(absoluteRoot, 'docs', 'absolute-cwd.md');
+      const globFile = path.join(absoluteRoot, 'docs', 'absolute-glob.md');
+      writeFileSync(path.join(workspacePath, 'docs', 'workspace.md'), 'wrong');
+      writeFileSync(cwdFile, 'cwd');
+      writeFileSync(globFile, 'glob');
+
+      const cwdResult = await source.observe(
+        { globs: ['*.md'], cwd: path.join(absoluteRoot, 'docs') },
+        { now: new Date(), workspacePath },
+      );
+      const globResult = await source.observe(
+        { globs: [path.join(absoluteRoot, 'docs', 'absolute-glob.md')] },
+        { now: new Date(), workspacePath },
+      );
+
+      const cwdNext = cwdResult.nextState as {
+        fingerprints: Record<string, string>;
+      };
+      const globNext = globResult.nextState as {
+        fingerprints: Record<string, string>;
+      };
+      expect(Object.keys(cwdNext.fingerprints).sort()).toEqual(
+        [cwdFile, globFile].sort(),
+      );
+      expect(Object.keys(globNext.fingerprints)).toEqual([globFile]);
+    });
+
+    it('reports a distinct no-files-matched outcome for zero-match globs', async () => {
+      const workspacePath = makeTempDir();
+
+      const result = await source.observe(
+        { globs: ['missing/**/*.md'] },
+        { now: new Date(), workspacePath },
+      );
+
+      expect(result.observations).toHaveLength(0);
+      expect(result.outcome).toBe('no-files-matched');
+      expect(result.nextState).toEqual({ fingerprints: {} });
+    });
+  });
+
   // Ergonomic shorthand: a single pattern may be written as a bare string
   // (003 §3 — `globs` accepts a string or an array of strings).
   describe('globs string shorthand (003 §3)', () => {
@@ -228,6 +315,7 @@ describe('source-file-fingerprint', () => {
       );
 
       expect(result.observations).toHaveLength(1);
+      expect(result.outcome).toBeUndefined();
       const obs = result.observations[0];
       expect(obs?.title).toContain('b.txt');
       expect(changeKindOf(obs)).toBe('created');

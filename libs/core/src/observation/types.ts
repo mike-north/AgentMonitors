@@ -103,6 +103,12 @@ export interface ObservationContext {
   /** Timestamp supplied by the runtime */
   now: Date;
   /**
+   * Workspace/config root supplied by the runtime when a monitor is evaluated in
+   * a project context. File-system-oriented sources use this to resolve
+   * project-relative scope without depending on the daemon process cwd.
+   */
+  workspacePath?: string;
+  /**
    * Abort signal for continuous `watch()` execution. The runtime aborts it to
    * tear a watcher down (daemon shutdown, monitor removal). A `watch()`
    * implementation **SHOULD** stop yielding and release resources when it fires.
@@ -124,14 +130,12 @@ export interface ObservationResult {
    */
   nextState?: unknown;
   /**
-   * Optional diagnostic: a source sets this to signal that this cycle was a
-   * graceful re-baseline (it advanced its persisted state to the current point
-   * but could not compute a delta — e.g. a gc'd/force-pushed prior ref), as
-   * opposed to a genuine "nothing changed". The runtime records it as a
-   * `rebaselined` observation-history outcome instead of `no-change`. Omitted by
-   * sources that don't distinguish this case.
+   * Optional diagnostic: a source sets this to signal that a zero-observation
+   * cycle has a distinct meaning, as opposed to a genuine "nothing changed".
+   * The runtime records it as the matching observation-history outcome instead
+   * of `no-change`. Omitted by sources that don't distinguish a special case.
    */
-  outcome?: 'rebaselined';
+  outcome?: 'rebaselined' | 'no-files-matched';
 }
 
 /**

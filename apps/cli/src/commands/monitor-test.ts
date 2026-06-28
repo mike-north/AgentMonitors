@@ -9,6 +9,7 @@ import {
   type MonitorExplainStageId,
   type MonitorExplainStageStatus,
   type ObservationContext,
+  type ObservationResult,
   type ObservationSource,
   type Observation,
 } from '@agentmonitors/core';
@@ -127,7 +128,70 @@ export function createFollowupObservationContext(
   return {
     now: new Date(),
     previousState: context.previousState,
+    ...(context.workspacePath !== undefined
+      ? { workspacePath: context.workspacePath }
+      : {}),
   };
+}
+
+/**
+ * Resolve the project config root for a MONITOR.md path. Project monitors live
+ * under `<root>/.claude/monitors/...` or `<root>/.codex/monitors/...`; source
+ * dry-runs need that root so relative file globs do not depend on process cwd.
+ */
+type ConfigRootPathApi = Pick<typeof path, 'dirname' | 'resolve' | 'sep'>;
+
+export function configRootForMonitorFile(
+  filePath: string,
+  pathApi: ConfigRootPathApi = path,
+): string {
+  const resolvedPath = pathApi.resolve(filePath);
+  const segments = resolvedPath.split(pathApi.sep);
+  let configDirIndex = -1;
+  for (let index = segments.length - 1; index >= 0; index -= 1) {
+    const segment = segments[index];
+    if (segment === '.claude' || segment === '.codex') {
+      configDirIndex = index;
+      break;
+    }
+  }
+  if (configDirIndex > 0) {
+    // Build the concrete `.claude`/`.codex` directory and ask the path module
+    // for its parent. Joining only the parent segments turns `C:\` into `C:`
+    // on Windows drive-root projects, which is not an absolute Node path.
+    return pathApi.dirname(
+      segments.slice(0, configDirIndex + 1).join(pathApi.sep),
+    );
+  }
+  return pathApi.dirname(resolvedPath);
+}
+
+function reportNoFilesMatched(
+  monitorName: string,
+  sourceName: string,
+  workspacePath: string,
+  json: boolean,
+): void {
+  const message = `No files matched this monitor's globs. Check watch.globs and watch.cwd relative to workspace: ${workspacePath}`;
+  if (json) {
+    console.log(
+      JSON.stringify(
+        {
+          monitor: monitorName,
+          source: sourceName,
+          baseline: false,
+          outcome: 'no-files-matched' satisfies ObservationResult['outcome'],
+          observations: [],
+          error: message,
+        },
+        null,
+        2,
+      ),
+    );
+  } else {
+    console.error(`Error: ${message}`);
+  }
+  process.exitCode = 1;
 }
 
 /**
@@ -264,15 +328,21 @@ monitorTestCommand
     }
 
     try {
-      let context: ObservationContext = { now: new Date() };
+      const workspacePath = configRootForMonitorFile(filePath);
+      let context: ObservationContext = { now: new Date(), workspacePath };
       const firstResult = await source.observe(monitorWatchConfig, context);
       const observations = firstResult.observations;
       context = {
         now: new Date(),
         previousState: firstResult.nextState,
+        workspacePath,
       };
 
-      if (observations.length === 0 && source.stateful) {
+      if (firstResult.outcome === 'no-files-matched') {
+        // A zero-match scope is an authoring diagnostic, not a valid baseline;
+        // stop here so text and JSON output cannot imply quiet success.
+        reportNoFilesMatched(monitorName, source.name, workspacePath, json);
+      } else if (observations.length === 0 && source.stateful) {
         await handleStatefulSource(
           source,
           monitorWatchConfig,
@@ -456,7 +526,7 @@ monitorTestCommand
 monitorTestCommand
   .command('history')
   .description(
-    'Show recent observation outcomes per tick (triggered / suppressed / no-change / errored / rebaselined)',
+    'Show recent observation outcomes per tick (triggered / suppressed / no-change / no-files-matched / errored / rebaselined)',
   )
   .argument('[monitorId]', 'Filter to a single monitor id')
   .option('--socket <path>', 'Unix domain socket path for the daemon')

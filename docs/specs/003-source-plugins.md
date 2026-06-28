@@ -62,6 +62,9 @@ The interface definition (verified: `libs/core/src/observation/types.ts`):
 
 - `context.previousState?: unknown` — persisted state from the previous observation cycle, if any.
 - `context.now: Date` — timestamp supplied by the runtime.
+- `context.workspacePath?: string` — runtime workspace/config root for project monitor evaluation.
+  File-system-oriented sources use this to resolve project-relative scope without depending on the
+  daemon process cwd. User-level monitor scoping is a separate design decision.
 - `context.signal?: AbortSignal` — supplied to `watch()` only; the runtime aborts it to tear the watcher down (daemon shutdown, monitor removal). A `watch()` implementation **SHOULD** stop yielding and release resources when it fires. Unused by `observe()`.
 
 ### 2.3 Observation result
@@ -70,6 +73,9 @@ The interface definition (verified: `libs/core/src/observation/types.ts`):
 
 - `observations: Observation[]` — zero or more source observations.
 - `nextState?: unknown` — optional source-owned persisted state to use in the next cycle.
+- `outcome?: "rebaselined" | "no-files-matched"` — optional diagnostic for a zero-observation run
+  that is meaningfully different from ordinary `no-change`. The runtime records it in
+  `observation_history` only when the source returned zero observations and emitted nothing.
 
 Each `Observation` **MAY** include the following fields (verified: `libs/core/src/observation/types.ts`):
 
@@ -326,9 +332,19 @@ contains an empty pattern. Verified: `plugins/source-file-fingerprint/src/index.
 (`parseScopeConfig`) and `plugins/source-file-fingerprint/src/index.test.ts` ("globs string
 shorthand").
 
+For project monitors, relative `globs` and a relative `cwd` resolve against the runtime
+workspace/config root (`ObservationContext.workspacePath`), not the daemon process cwd. An absolute
+`cwd` and absolute glob patterns are honored as-is. When no workspace/config root is supplied, the
+source falls back to Node/glob's process-cwd behavior.
+
 ### 3.2 Behavior
 
 The source expands each glob pattern using `globSync` with `absolute: true`, so matched paths are always absolute. For each matched file, it computes a SHA-256 hash using Node.js `crypto.createHash('sha256')`.
+
+If a run matches zero files, the source returns no observations and sets
+`ObservationResult.outcome: "no-files-matched"`. The runtime records that as a distinct
+`observation_history` outcome instead of ordinary `no-change`, so CLI diagnostics can distinguish
+a broken glob/cwd from a matched file set with no content changes.
 
 Current fingerprints are stored in `nextState.fingerprints` (a `Record<string, string>` keyed by absolute file path). On each call, the source compares each file's current hash against `context.previousState.fingerprints[filePath]`.
 
@@ -617,6 +633,8 @@ watch:
 ```
 
 **What this example proves:** `file-fingerprint` scope is file-system oriented; `cwd` changes where glob patterns are resolved (passed as the `cwd` option to `globSync`), while `objectKey` and `queryScope.filePath` always use the absolute file path regardless of `cwd`.
+When this example is authored as a project monitor, a relative `cwd` is resolved from the
+workspace/config root.
 
 ### 9.2 Status-code-only API watcher
 

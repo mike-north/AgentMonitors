@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
+import path from 'node:path';
 import { globSync } from 'glob';
 import type {
   ChangeKind,
@@ -204,6 +205,34 @@ function parsePreviousState(previousState: unknown): FingerprintState {
   return { fingerprints: {} };
 }
 
+/**
+ * Resolve the base directory for relative glob patterns. Project monitor paths
+ * are rooted at the runtime workspace/config root, not at the daemon process cwd.
+ * Without a workspace context, fall back to Node's normal process-cwd behavior.
+ */
+function resolveGlobCwd(
+  cwd: string | undefined,
+  workspacePath: string | undefined,
+): string | undefined {
+  if (cwd === undefined) {
+    return workspacePath;
+  }
+  if (path.isAbsolute(cwd)) {
+    return cwd;
+  }
+  return workspacePath !== undefined ? path.resolve(workspacePath, cwd) : cwd;
+}
+
+function expandGlob(pattern: string, cwd: string | undefined): string[] {
+  if (path.isAbsolute(pattern)) {
+    return globSync(pattern, { absolute: true });
+  }
+  return globSync(pattern, {
+    ...(cwd !== undefined ? { cwd } : {}),
+    absolute: true,
+  });
+}
+
 const source: ObservationSource = {
   name: 'file-fingerprint',
   stateful: true,
@@ -214,6 +243,7 @@ const source: ObservationSource = {
     context: ObservationContext = { now: new Date() },
   ): Promise<ObservationResult> {
     const { globs, cwd } = parseScopeConfig(config);
+    const globCwd = resolveGlobCwd(cwd, context.workspacePath);
     // A first run (no valid prior state) only establishes the baseline; it must
     // not report every matched file as `created`.
     const isBaseline = !isFingerprintState(context.previousState);
@@ -225,10 +255,7 @@ const source: ObservationSource = {
     // hashed and reported a single time).
     const currentHashes = new Map<string, string>();
     for (const pattern of globs) {
-      const files = globSync(pattern, {
-        ...(cwd !== undefined ? { cwd } : {}),
-        absolute: true,
-      });
+      const files = expandGlob(pattern, globCwd);
       for (const filePath of files) {
         if (!currentHashes.has(filePath)) {
           currentHashes.set(filePath, await hashFile(filePath));
@@ -276,6 +303,9 @@ const source: ObservationSource = {
     return {
       observations,
       nextState: { fingerprints: nextFingerprints },
+      ...(currentHashes.size === 0 && observations.length === 0
+        ? { outcome: 'no-files-matched' }
+        : {}),
     };
   },
 };

@@ -428,6 +428,8 @@ export interface RuntimeStatus {
  * - `suppressed`: observations were returned but none emitted this tick —
  *   throttled or held in a debounce batch.
  * - `no-change`: the source returned no observations.
+ * - `no-files-matched`: the source returned no observations because its
+ *   file-system scope matched zero files; distinct from a quiet matched set.
  * - `errored`: a failure occurred and was isolated so the tick (or watcher)
  *   continued. Two cases produce this outcome:
  *   (1) The monitor's `observe()` threw or rejected in the tick loop. In this
@@ -449,6 +451,7 @@ export type ObservationOutcome =
   | 'triggered'
   | 'suppressed'
   | 'no-change'
+  | 'no-files-matched'
   | 'errored'
   | 'rebaselined';
 
