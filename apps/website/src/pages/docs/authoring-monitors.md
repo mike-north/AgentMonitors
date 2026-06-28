@@ -134,7 +134,7 @@ watch:
 ```
 
 `command` is an **argv array**, spawned directly with no shell — what you write is exactly what
-runs, with no word-splitting, globbing, or injection surface. To use a **pipeline or shell
+runs, with no word-splitting, globbing, or injection surface. To use a **pipeline or other shell
 operators**, spawn a shell explicitly in argv form:
 
 ```yaml
@@ -191,10 +191,20 @@ session (`high`) or stay quietest (`low`).
 urgency: high   # or normal, or low
 ```
 
+`urgency` also accepts an **escalation band** `lo..hi` (e.g. `normal..high`) — the low bound is the
+default level and the high bound is the ceiling a source's per-observation salience may escalate to
+(for example, `file-fingerprint` raises a file *deletion* to `high`). A bare level like `normal` is
+just the degenerate band `normal..normal`. Bands are an advanced control; reach for one only when you
+want a source to be able to raise urgency on its own.
+
 > **Why this matters for the simplest case.** If you want the agent to be notified *mid-session* the
 > moment a file or command output changes, use `urgency: high`. `normal`/`low` changes are real and
-> durable — queryable via `agentmonitors events list` and replayed in the next session's recap — but
-> the standard plugin does not interrupt the current turn for them.
+> durable — queryable any time via `agentmonitors events list` and replayed in the next session's
+> recap — but the standard plugin's turn-boundary hook (`agentmonitors hook deliver` on
+> `UserPromptSubmit`) injects only **settled high-urgency** events into the running turn; it emits
+> nothing for `normal`/`low`, so those do not interrupt the current session. (A lightweight "messages
+> pending" reminder for `normal` is available on demand via `agentmonitors hook claim`, but the
+> standard plugin does not auto-inject it mid-turn.)
 
 ## Notify strategies
 
