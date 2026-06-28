@@ -88,8 +88,22 @@ function truncateForCap(value: string, cap: number): string {
 
 /**
  * Render a {@link DeliveryClaim} into the advisory hook-output payload that a
- * turn-boundary hook prints to stdout. Returns `null` when there is nothing to
- * inject (null claim or zero events), so the caller can skip stdout entirely.
+ * turn-boundary hook prints to stdout. Returns `null` only when there is
+ * genuinely nothing to surface — a null claim, or a claim carrying neither
+ * event bodies nor a reminder message — so the caller can skip stdout entirely.
+ *
+ * Two delivery shapes are rendered (issue #198):
+ *
+ * - **Body injection** — a claim with `events` (settled `high`-urgency
+ *   turn-interruptible events, or the `post-compact` recap) renders a lead line
+ *   plus a per-event block carrying the monitor body.
+ * - **Reminder line** — a `normal`/`low` turn-boundary claim carries no event
+ *   bodies (`events: []`) but a populated `message` (the same advisory line
+ *   `hook claim` surfaces). It renders that message as a sanitized, length-capped
+ *   reminder line, with **no** body injection — so a default (`normal`-urgency)
+ *   monitor produces a visible mid-turn signal instead of silence. The
+ *   underlying rows are claimed but NOT acknowledged (BP2 / SP4), so the event
+ *   stays unread and re-discoverable via `agentmonitors events list --unread`.
  *
  * The renderer is **pure and side-effect-free**: no I/O, no mutation. Text is
  * preserved faithfully (a monitor body is trusted, user-authored markdown) with
@@ -106,7 +120,26 @@ export function renderHookDelivery(
   claim: DeliveryClaim | null,
   hookEventName: string,
 ): HookDeliveryOutput | null {
-  if (!claim || claim.events.length === 0) return null;
+  if (!claim) return null;
+
+  // Reminder-only delivery (issue #198): a `normal`/`low` turn-boundary claim
+  // has no event bodies to inject, only a lightweight advisory `message`. Body
+  // injection stays reserved for `high` and the `post-compact` recap (both of
+  // which populate `events`), so surface the message as a reminder line instead
+  // of emitting nothing. A genuinely empty claim (no events, blank message) is
+  // never produced by the runtime — `claimDelivery` returns `null` when nothing
+  // is pending — but we still guard for it so the caller stays silent.
+  if (claim.events.length === 0) {
+    const reminder = sanitize(claim.message);
+    if (reminder.trim().length === 0) return null;
+    return {
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName,
+        additionalContext: truncateForCap(reminder, MAX_ADDITIONAL_CONTEXT),
+      },
+    };
+  }
 
   const leadLine =
     'AgentMon: monitored changes are pending — consider handling them before continuing.';

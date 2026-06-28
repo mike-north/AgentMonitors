@@ -57,11 +57,78 @@ describe('renderHookDelivery', () => {
     expect(renderHookDelivery(null, 'PreToolUse')).toBeNull();
   });
 
-  // (b) zero-events claim → null
-  it('returns null when the claim has no events', () => {
+  // (b) zero-events claim with a BLANK message → null. The runtime never
+  // produces this (claimDelivery returns null when nothing is pending), but the
+  // renderer must stay silent defensively rather than emit an empty reminder.
+  it('returns null when the claim has no events and a blank message', () => {
     expect(
-      renderHookDelivery(makeClaim({ events: [] }), 'PreToolUse'),
+      renderHookDelivery(
+        makeClaim({ events: [], message: '   ' }),
+        'PreToolUse',
+      ),
     ).toBeNull();
+  });
+
+  // (b.2 — issue #198, AC1) a NORMAL-urgency turn-interruptible claim carries
+  // events:[] but a populated reminder message. It must render a non-empty
+  // additionalContext (the reminder line), NOT null — otherwise a default
+  // monitor is silent mid-session.
+  it('renders a reminder line for a normal-urgency claim with no event bodies', () => {
+    const out = renderHookDelivery(
+      makeClaim({
+        urgency: 'normal',
+        events: [],
+        message: 'AgentMon messages are available. Read the inbox.',
+        unreadCounts: { low: 0, normal: 1, high: 0, total: 1 },
+      }),
+      'UserPromptSubmit',
+    );
+    expect(out).not.toBeNull();
+    expect(out?.continue).toBe(true);
+    expect(out?.hookSpecificOutput.hookEventName).toBe('UserPromptSubmit');
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx.trim()).not.toBe('');
+    expect(ctx).toContain('AgentMon messages are available. Read the inbox.');
+    // Reminder only — no body-injection block markers leak in.
+    expect(ctx).not.toContain('### ');
+    // Advisory only — no permissionDecision field.
+    expect(out).not.toHaveProperty('permissionDecision');
+  });
+
+  // (b.3 — issue #198, AC2) the same for LOW urgency (turn-idle reminder).
+  it('renders a reminder line for a low-urgency claim with no event bodies', () => {
+    const out = renderHookDelivery(
+      makeClaim({
+        urgency: 'low',
+        lifecycle: 'turn-idle',
+        events: [],
+        message: 'AgentMon has inbox updates ready for review.',
+        unreadCounts: { low: 1, normal: 0, high: 0, total: 1 },
+      }),
+      'UserPromptSubmit',
+    );
+    expect(out).not.toBeNull();
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx.trim()).not.toBe('');
+    expect(ctx).toContain('AgentMon has inbox updates ready for review.');
+    expect(ctx).not.toContain('### ');
+  });
+
+  // (b.4 — issue #198, AC1) the reminder text is sanitized (control characters
+  // stripped) and round-trips as valid JSON, like the body-injection path.
+  it('sanitizes the reminder message and produces valid JSON', () => {
+    const out = renderHookDelivery(
+      makeClaim({
+        urgency: 'normal',
+        events: [],
+        message: 'AgentMon messages are available.\x00 Read the inbox.',
+      }),
+      'UserPromptSubmit',
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).not.toContain('\x00');
+    expect(ctx).toContain('AgentMon messages are available. Read the inbox.');
+    expect(() => JSON.parse(JSON.stringify(out))).not.toThrow();
   });
 
   // (c) a claim with a high-urgency event → full advisory wire output
@@ -78,6 +145,35 @@ describe('renderHookDelivery', () => {
     );
     // Advisory only — no permissionDecision field
     expect(out).not.toHaveProperty('permissionDecision');
+  });
+
+  // (c.2 — issue #198, AC4) a post-compact recap claim carries events with
+  // bodies; the renderer still injects the full per-event block(s) verbatim —
+  // the reminder-only path (events:[]) must not change this behavior.
+  it('renders a post-compact recap claim with full body blocks (unchanged)', () => {
+    const out = renderHookDelivery(
+      makeClaim({
+        mode: 'recap',
+        urgency: undefined,
+        lifecycle: 'post-compact',
+        message: 'Recap of recent AgentMon activity since your last recap:',
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'watch-src',
+            title: 'Files changed',
+            summary: 'Files changed',
+            body: 'Review the diff; flag risky changes.',
+            urgency: 'normal',
+            createdAt: '2026-06-04T00:00:00.000Z',
+          },
+        ],
+      }),
+      'SessionStart',
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).toContain('### watch-src');
+    expect(ctx).toContain('Review the diff; flag risky changes.');
   });
 
   // hookEventName is echoed exactly

@@ -1016,7 +1016,7 @@ event.
 4. Check daemon availability. If unreachable → exit 0, print nothing.
 5. List sessions, find the one matching `session_id`. If not found → exit 0, print nothing.
 6. Call `claimDelivery(sessionId, lifecycle)`. If null → exit 0, print nothing.
-7. Render via `renderHookDelivery(claim, hookEventName)`. If null (empty events) → exit 0, print nothing.
+7. Render via `renderHookDelivery(claim, hookEventName)`. It returns `null` (→ exit 0, print nothing) **only** when the claim is `null` or carries neither event bodies nor a reminder message. A `normal`/`low` claim with `events: []` but a populated `message` renders that message as a reminder line (see Note below) — it is **not** silent.
 8. Print the wire JSON to stdout and exit 0.
 
 **ALWAYS exits 0.** Any internal error is swallowed to avoid interrupting the user's session. A hook
@@ -1034,13 +1034,29 @@ that exits non-zero can block tool calls.
 }
 ```
 
+**Wire output (reminder only — a pending `normal`/`low` change, no body injection):**
+
+```json
+{
+  "continue": true,
+  "hookSpecificOutput": {
+    "hookEventName": "UserPromptSubmit",
+    "additionalContext": "AgentMon messages are available. Read the inbox."
+  }
+}
+```
+
 **No output** when nothing is pending (empty stdout + exit 0).
 
 Note: for a derived `turn-interruptible` lifecycle, `normal` urgency produces `events: []` (reminder
-only — no body injection). Body text is surfaced for **high-urgency settled events** and
-**`post-compact`** (`SessionStart`) recap. Over-cap context is truncated at a code-point boundary
-with an explicit `[truncated …]` marker; the truncated-away events stay unread (claiming ≠ acking)
-and are re-discoverable via `events list --unread`.
+only — no body injection); `low` does likewise at `turn-idle`. "Reminder only" is **not** silence:
+the command emits a hook JSON object whose `additionalContext` is the claim's advisory `message`
+(e.g. `"AgentMon messages are available. Read the inbox."` — the same line `hook claim` surfaces), so
+a default (`normal`-urgency) monitor produces a visible mid-turn reminder. Body text is surfaced only
+for **high-urgency settled events** and **`post-compact`** (`SessionStart`) recap. The claimed rows
+are not acknowledged, so the event stays unread and re-discoverable via `events list --unread`.
+Over-cap context is truncated at a code-point boundary with an explicit `[truncated …]` marker; the
+truncated-away events stay unread (claiming ≠ acking) and are likewise re-discoverable.
 
 See [006 §5](./006-agent-integration.md) for the full transport spec and hook registration examples.
 
