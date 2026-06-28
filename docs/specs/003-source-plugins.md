@@ -313,9 +313,10 @@ watch:
   globs:
     - '**/*.ts'
   cwd: /optional/base/path
+  interval: 30s
 ```
 
-Required field: `globs`. Optional field: `cwd` (string).
+Required field: `globs`. Optional fields: `cwd` (string), `interval` (duration string).
 
 `globs` accepts **either** a single pattern as a bare string **or** an array of patterns
 (OR-ed together). The single-file/single-glob case is therefore the one-line form:
@@ -336,6 +337,11 @@ For project monitors, relative `globs` and a relative `cwd` resolve against the 
 workspace/config root (`ObservationContext.workspacePath`), not the daemon process cwd. An absolute
 `cwd` and absolute glob patterns are honored as-is. When no workspace/config root is supplied, the
 source falls back to Node/glob's process-cwd behavior.
+
+`interval` is the per-monitor observe interval: the runtime calls `file-fingerprint` only when this
+monitor is due. If omitted, the effective default is approximately `30s`. Authors tune it with
+`watch.interval`; this is distinct from the daemon `--poll-ms` loop-wake interval, which controls
+how often the daemon checks whether any monitor is due.
 
 ### 3.2 Behavior
 

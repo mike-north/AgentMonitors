@@ -540,9 +540,12 @@ agentmonitors source list [--format <format>]
 | ------------------- | ------- | ------------- | ---------------------- |
 | `--format <format>` | choices | auto (see §1) | `toon`, `json`, `text` |
 
-Lists all sources registered via `registerCoreSources()` (currently: `file-fingerprint`, `api-poll`, `schedule`, `incoming-changes`).
+Lists all sources registered via `registerCoreSources()` (currently: `file-fingerprint`,
+`api-poll`, `command-poll`, `schedule`, `incoming-changes`).
 
-**TOON format (`--format toon`):** encodes the source list using `@toon-format/toon` `encode()`. Decodes losslessly to the JSON value below.
+**TOON format (`--format toon`):** encodes the source list using `@toon-format/toon` `encode()`.
+It carries the same fields as the JSON value below; `fieldDescriptions` is rendered as
+`{ field, description }` rows so long descriptions with bracketed examples round-trip cleanly.
 
 **Text output (`--format text`):**
 
@@ -551,6 +554,7 @@ Installed sources:
 
   <name>
     Config fields: <field1>, <field2>, ...
+    - <field1>: <description>
     Required: <field1>, ... (or "(none)")
 ```
 
@@ -562,12 +566,15 @@ Installed sources:
     "name": "<string>",
     "configFields": ["<string>"],
     "scopeFields": ["<string>"],
+    "fieldDescriptions": { "<field>": "<description>" },
     "required": ["<string>"]
   }
 ]
 ```
 
 `scopeFields` remains as a backwards-compatible JSON alias for existing consumers. New users should read `configFields`; these are fields written flat inside `watch:` alongside `type`, not under a `scope:` key.
+`fieldDescriptions` is additive metadata derived from each source's JSON Schema `description` and
+rendered as plain terminal-safe text.
 
 ### §7.2 `source search` — placeholder
 
@@ -688,8 +695,10 @@ whose cron window has not yet opened. This makes a second `daemon once` run with
 next-due window distinguishable from "no monitors found" — the two situations previously produced
 identical output (issue #152).
 
-The default polling interval for `file-fingerprint` and `command-poll` is 30 seconds; for `api-poll`
-it is 5 minutes. Authors may override with `watch.interval: <duration>` in the `MONITOR.md` frontmatter.
+The default per-monitor observe interval for `file-fingerprint` and `command-poll` is 30 seconds;
+for `api-poll` it is 5 minutes. Authors may override with `watch.interval: <duration>` in the
+`MONITOR.md` frontmatter. This observe interval is distinct from daemon `--poll-ms`: `--poll-ms`
+is only how often the daemon wakes up to ask the runtime whether any monitor is due.
 
 **JSON output (`--format json`):** the raw `RuntimeTickResult` object:
 
@@ -716,7 +725,7 @@ agentmonitors daemon run [monitorsDir] [options]
 | `--socket <path>`      | string                | resolved default   | Unix domain socket path for the daemon                                     |
 | `--reap-after-ms <ms>` | number (string)       | `300000`           | Stop after this many ms with no active sessions; `0` disables idle reaping |
 
-Starts the daemon loop: creates a Unix domain socket server, listens for IPC commands, then polls `runtime.tick()` at `--poll-ms` intervals.
+Starts the daemon loop: creates a Unix domain socket server, listens for IPC commands, then polls `runtime.tick()` at `--poll-ms` intervals. `--poll-ms` is the loop-wake cadence; per-monitor observation is still gated by each monitor's schedule or `watch.interval`.
 
 **Startup check:** refuses to start if another daemon is already listening at the resolved socket path (exits with error message and code 1).
 

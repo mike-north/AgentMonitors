@@ -87,7 +87,8 @@ printf '\n## a change\n' >> notes.md
 
 **c. Wait for detection, then ask for pending notifications.** Detection is not instant: the file
 is re-checked on a ~30s interval and a `high` change then settles for ~15s. Worst case the change
-lands just after a check, so allow up to ~90s and re-poll if the first attempt is empty:
+lands just after a check, so allow up to ~90s and re-poll if the first attempt is empty. Set
+`watch.interval` in the monitor frontmatter to tune the file re-check cadence:
 
 ```bash
 sleep 50

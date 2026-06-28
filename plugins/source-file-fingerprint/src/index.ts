@@ -177,6 +177,14 @@ const scopeSchema: JsonSchema = {
       type: 'string',
       description: 'Working directory for glob resolution',
     },
+    interval: {
+      type: 'string',
+      default: '30s',
+      pattern: '^\\d+[smhd]$',
+      description:
+        'Default observe interval is 30s. Set watch.interval to tune how often ' +
+        'this monitor re-checks matching files; this is separate from the daemon loop wake interval.',
+    },
   },
   required: ['globs'],
 };
