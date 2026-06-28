@@ -26,7 +26,10 @@ describe('generateMonitorSchema', () => {
     expect(schema.$schema).toBe('http://json-schema.org/draft-07/schema#');
     expect(schema.type).toBe('object');
     expect(schema.required).toContain('watch');
-    expect(schema.required).toContain('urgency');
+    // urgency is optional (defaults to normal, 001 §3.2) — it must NOT be marked
+    // required in the generated schema, or editor tooling would reject a valid
+    // minimal monitor (watch + body).
+    expect(schema.required).not.toContain('urgency');
     expect(schema.required).not.toContain('source');
     expect(schema.required).not.toContain('scope');
     expect(schema.required).not.toContain('event-kind');
@@ -35,7 +38,7 @@ describe('generateMonitorSchema', () => {
     expect(properties).not.toHaveProperty('source');
     expect(properties).not.toHaveProperty('scope');
     expect(properties).toHaveProperty('watch');
-    expect(schema.required).toEqual(['watch', 'urgency']);
+    expect(schema.required).toEqual(['watch']);
   });
 
   it('enumerates source names in watch.type property', () => {

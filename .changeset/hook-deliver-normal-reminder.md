@@ -10,7 +10,7 @@ A default file-fingerprint monitor (`urgency: normal`) was silent mid-session. T
 event bodies (`events: []`), even though the claim had a populated advisory `message`. `hook claim`
 reported the reminder while `hook deliver` — the actually-wired command — did not.
 
-`renderHookDelivery` now renders the claim's advisory `message` verbatim into
+`renderHookDelivery` now renders the claim's advisory `message` (sanitized and length-capped) into
 `hookSpecificOutput.additionalContext` for a `normal`/`low` reminder claim, producing a visible
 mid-turn reminder line (no per-event body block). The claimed rows are still **not** acknowledged
 (BP2 / SP4), so the event stays unread and re-discoverable via `agentmonitors events list --unread`.

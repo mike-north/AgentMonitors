@@ -77,18 +77,18 @@ All discovered paths are resolved to absolute paths before parsing.
 
 Each monitor frontmatter object **MUST** contain:
 
-| Field               | Type     | Required | Meaning                                                                                                                         |
-| ------------------- | -------- | -------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `name`              | string   | no       | Human-readable display name; defaults to the monitor id (filename or directory name) when omitted                               |
-| `watch`             | object   | yes      | Intent-first observation config: `type` names the source; remaining keys are per-source config                                  |
-| `urgency`           | string   | yes      | A level (`low`/`normal`/`high`) **or** an authored band `lo..hi` (see [§3.2](#32-urgency))                                      |
-| `notify`            | object   | no       | Explicit debounce/throttle policy                                                                                               |
-| `shape`             | object   | no       | Deterministic Shape declaration: derived facts + render (see [§5.1](#51-shape-declaration-current))                             |
-| `payload`           | object   | no       | Author-declared payload form + transform (see [§5.2](#52-payload-form-current))                                                 |
-| `baseline-strategy` | string   | no       | How the per-recipient Diff spans a catch-up span — `net` (default) or `incremental` (see [§3.7](#37-baseline-strategy-current)) |
-| `tags`              | string[] | no       | Tags for later filtering                                                                                                        |
+| Field               | Type     | Required | Meaning                                                                                                                           |
+| ------------------- | -------- | -------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `name`              | string   | no       | Human-readable display name; defaults to the monitor id (filename or directory name) when omitted                                 |
+| `watch`             | object   | yes      | Intent-first observation config: `type` names the source; remaining keys are per-source config                                    |
+| `urgency`           | string   | no       | A level (`low`/`normal`/`high`) **or** an authored band `lo..hi` (see [§3.2](#32-urgency)); **defaults to `normal`** when omitted |
+| `notify`            | object   | no       | Explicit debounce/throttle policy                                                                                                 |
+| `shape`             | object   | no       | Deterministic Shape declaration: derived facts + render (see [§5.1](#51-shape-declaration-current))                               |
+| `payload`           | object   | no       | Author-declared payload form + transform (see [§5.2](#52-payload-form-current))                                                   |
+| `baseline-strategy` | string   | no       | How the per-recipient Diff spans a catch-up span — `net` (default) or `incremental` (see [§3.7](#37-baseline-strategy-current))   |
+| `tags`              | string[] | no       | Tags for later filtering                                                                                                          |
 
-> Verified: `libs/core/src/schema/monitor-schema.ts` — the `monitorFrontmatterSchema` Zod object requires `watch` and `urgency`; `name`, `notify`, `tags`, `shape`, and `payload` are optional. The `shape` and `payload` fields are **current** (G15): `shapeSchema`/`payloadSchema` accept the §5.1/§5.2 authoring surface and reject malformed CEL/jq transforms (`libs/core/src/schema/monitor-schema.test.ts`). `baseline-strategy` is also **current** (G13) — an optional `z.enum(['incremental', 'net'])` defaulting to `net` (see [§3.7](#37-baseline-strategy-current)).
+> Verified: `libs/core/src/schema/monitor-schema.ts` — the `monitorFrontmatterSchema` Zod object requires only `watch`; `urgency`, `name`, `notify`, `tags`, `shape`, and `payload` are optional. An omitted `urgency` flattens to the degenerate band `normal..normal` (i.e. `urgency: 'normal'`, `urgencyMax: 'normal'`) in the frontmatter transform, so the minimal valid monitor is a `watch:` block plus a body (`libs/core/src/schema/monitor-schema.test.ts` — "defaults a missing urgency to normal"). The `shape` and `payload` fields are **current** (G15): `shapeSchema`/`payloadSchema` accept the §5.1/§5.2 authoring surface and reject malformed CEL/jq transforms (`libs/core/src/schema/monitor-schema.test.ts`). `baseline-strategy` is also **current** (G13) — an optional `z.enum(['incremental', 'net'])` defaulting to `net` (see [§3.7](#37-baseline-strategy-current)).
 
 ### 3.1 `watch`
 
@@ -116,7 +116,10 @@ watch:
 
 The three urgency **levels** are `low`, `normal`, `high`, ordered `low < normal < high`. Even though earlier public docs emphasized only `normal` and `high`, the implemented schema, runtime, and CLI all support `low` (PP5).
 
-The `urgency` field is authored as an **urgency band** — the range the runtime is permitted to deliver within. It **MUST** be one of:
+The `urgency` field is **optional**. When omitted it defaults to the degenerate band
+`normal..normal` (i.e. `urgency: 'normal'`), so the minimal monitor needs only a `watch:` block and
+a body. When present, it is authored as an **urgency band** — the range the runtime is permitted to
+deliver within — and **MUST** be one of:
 
 - **A bare level**, e.g. `urgency: normal`. This is the **degenerate band** `normal..normal`: the monitor always delivers at exactly that level and a source can never escalate it. This is the historical form, so every existing monitor keeps its exact behavior (backward compatible).
 - **A range** `lo..hi`, e.g. `urgency: normal..high`. `lo` is the **base / default** effective urgency (used when a source attaches no `salience`); `hi` is the **ceiling** a source's per-observation `salience` is allowed to escalate to. Surrounding and internal whitespace around the bounds is tolerated (`normal .. high`).

@@ -99,8 +99,8 @@ function truncateForCap(value: string, cap: number): string {
  *   plus a per-event block carrying the monitor body.
  * - **Reminder line** — a `normal`/`low` turn-boundary claim carries no event
  *   bodies (`events: []`) but a populated `message` (the same advisory line
- *   `hook claim` surfaces). It renders that message verbatim as a lightweight
- *   reminder, with **no** body injection — so a default (`normal`-urgency)
+ *   `hook claim` surfaces). It renders that message as a sanitized, length-capped
+ *   reminder line, with **no** body injection — so a default (`normal`-urgency)
  *   monitor produces a visible mid-turn signal instead of silence. The
  *   underlying rows are claimed but NOT acknowledged (BP2 / SP4), so the event
  *   stays unread and re-discoverable via `agentmonitors events list --unread`.
