@@ -309,7 +309,22 @@ watch:
   cwd: /optional/base/path
 ```
 
-Required field: `globs` (array of strings). Optional field: `cwd` (string). Validated by `parseScopeConfig` — throws if `globs` is missing or not an array of strings.
+Required field: `globs`. Optional field: `cwd` (string).
+
+`globs` accepts **either** a single pattern as a bare string **or** an array of patterns
+(OR-ed together). The single-file/single-glob case is therefore the one-line form:
+
+```yaml
+watch:
+  type: file-fingerprint
+  globs: notes.md # equivalent to globs: ['notes.md']
+```
+
+Validated by `parseScopeConfig`, which normalizes the string form to a one-element array and
+throws if `globs` is missing, is neither a string nor an array of strings, is an empty array, or
+contains an empty pattern. Verified: `plugins/source-file-fingerprint/src/index.ts`
+(`parseScopeConfig`) and `plugins/source-file-fingerprint/src/index.test.ts` ("globs string
+shorthand").
 
 ### 3.2 Behavior
 
