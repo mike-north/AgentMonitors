@@ -37,7 +37,10 @@ export function generateMonitorSchema(
     $schema: 'http://json-schema.org/draft-07/schema#',
     title: 'Agent Monitor Definition',
     type: 'object',
-    required: ['watch', 'urgency'],
+    // Only `watch` is required. `urgency` is optional and defaults to `normal`
+    // in the parser (001 §3.2), so the generated JSON Schema must not mark it
+    // required — otherwise editor tooling would flag a valid minimal monitor.
+    required: ['watch'],
     properties: {
       name: { type: 'string', minLength: 1 },
       watch: {
