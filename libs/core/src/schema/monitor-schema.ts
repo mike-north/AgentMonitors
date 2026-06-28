@@ -301,7 +301,12 @@ export const monitorFrontmatterSchema = z
       .min(1, 'Monitor name must be non-empty when present')
       .optional(),
     watch: watchSchema,
-    urgency: urgencyBandSchema,
+    // Optional: an omitted `urgency` defaults to the degenerate band
+    // `normal..normal` (see the transform below). Keeping the simplest monitor to
+    // `watch:` + body is the gradual-reveal floor; an author opts into `high`
+    // (interrupt) or a `lo..hi` escalation band only when they need it (PP5 — the
+    // default never escalates on its own). 001 §3.2.
+    urgency: urgencyBandSchema.optional(),
     notify: notifySchema.optional(),
     // Author-declared baseline strategy for the per-recipient Diff stage. The
     // YAML key is kebab-case (`baseline-strategy`); it is renamed to the
@@ -327,8 +332,11 @@ export const monitorFrontmatterSchema = z
     // and `urgencyMax` is the band's high bound (equal to `urgency` for a
     // scalar). Source salience may escalate the effective urgency between these
     // two, clamping outside the band. See 002 §4.1 / 003 §2.3.
-    urgency: urgency.lo,
-    urgencyMax: urgency.hi,
+    //
+    // An omitted `urgency` defaults to the degenerate band `normal..normal`, so
+    // the minimal monitor (`watch:` + body) is valid and delivers at `normal`.
+    urgency: (urgency ?? { lo: 'normal', hi: 'normal' }).lo,
+    urgencyMax: (urgency ?? { lo: 'normal', hi: 'normal' }).hi,
   }));
 
 export type MonitorFrontmatter = z.infer<typeof monitorFrontmatterSchema>;

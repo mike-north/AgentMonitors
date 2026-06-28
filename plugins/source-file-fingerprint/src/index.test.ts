@@ -8,6 +8,7 @@ import {
   SourceRegistry,
   claudeCodeAdapter,
   createDb,
+  validateScope,
 } from '@agentmonitors/core';
 import source, { isNotFoundError } from './index.js';
 
@@ -175,6 +176,119 @@ describe('source-file-fingerprint', () => {
       expect(result.observations).toHaveLength(0);
       expect(result.outcome).toBe('no-files-matched');
       expect(result.nextState).toEqual({ fingerprints: {} });
+    });
+  });
+
+  // Ergonomic shorthand: a single pattern may be written as a bare string
+  // (003 §3 — `globs` accepts a string or an array of strings).
+  describe('globs string shorthand (003 §3)', () => {
+    it('accepts a single glob written as a bare string and detects changes', async () => {
+      const dir = makeTempDir();
+      writeFileSync(path.join(dir, 'notes.md'), 'hello');
+
+      // Baseline with the string form.
+      const baseline = await source.observe(
+        { globs: 'notes.md', cwd: dir },
+        { now: new Date() },
+      );
+      expect(baseline.observations).toEqual([]);
+
+      writeFileSync(path.join(dir, 'notes.md'), 'changed');
+      const next = await source.observe(
+        { globs: 'notes.md', cwd: dir },
+        { previousState: baseline.nextState, now: new Date() },
+      );
+      expect(next.observations).toHaveLength(1);
+      expect(next.observations[0]?.changeKind).toBe('modified');
+    });
+
+    it('treats the string form identically to a one-element array', async () => {
+      const dir = makeTempDir();
+      writeFileSync(path.join(dir, 'a.txt'), 'x');
+      const asString = await source.observe(
+        { globs: '*.txt', cwd: dir },
+        { now: new Date() },
+      );
+      const asArray = await source.observe(
+        { globs: ['*.txt'], cwd: dir },
+        { now: new Date() },
+      );
+      // Same baseline behavior (no observations on first run for both forms).
+      expect(asString.observations).toEqual(asArray.observations);
+    });
+
+    it('rejects an empty string', async () => {
+      await expect(
+        source.observe({ globs: '' }, { now: new Date() }),
+      ).rejects.toThrow('globs');
+    });
+
+    it('rejects an empty array', async () => {
+      await expect(
+        source.observe({ globs: [] }, { now: new Date() }),
+      ).rejects.toThrow('globs');
+    });
+
+    it('rejects a non-string, non-array globs value', async () => {
+      await expect(
+        source.observe({ globs: 42 }, { now: new Date() }),
+      ).rejects.toThrow('globs');
+    });
+  });
+
+  describe('scopeSchema accepts string or array globs (003 §3)', () => {
+    it('accepts a bare string', () => {
+      expect(validateScope({ globs: 'notes.md' }, source.scopeSchema)).toEqual(
+        [],
+      );
+    });
+
+    it('accepts an array of strings', () => {
+      expect(
+        validateScope({ globs: ['a.ts', 'b.ts'] }, source.scopeSchema),
+      ).toEqual([]);
+    });
+
+    it('rejects a number', () => {
+      expect(
+        validateScope({ globs: 42 }, source.scopeSchema).length,
+      ).toBeGreaterThan(0);
+    });
+
+    it('rejects an empty array', () => {
+      expect(
+        validateScope({ globs: [] }, source.scopeSchema).length,
+      ).toBeGreaterThan(0);
+    });
+
+    it('rejects a missing globs field', () => {
+      expect(validateScope({}, source.scopeSchema).length).toBeGreaterThan(0);
+    });
+
+    it('rejects a whitespace-only string pattern', () => {
+      expect(
+        validateScope({ globs: '   ' }, source.scopeSchema).length,
+      ).toBeGreaterThan(0);
+    });
+
+    it('rejects an empty string in the array form', () => {
+      expect(
+        validateScope({ globs: [''] }, source.scopeSchema).length,
+      ).toBeGreaterThan(0);
+    });
+
+    it('rejects a blank entry alongside a valid one in the array form', () => {
+      expect(
+        validateScope({ globs: ['a.ts', '   '] }, source.scopeSchema).length,
+      ).toBeGreaterThan(0);
+    });
+  });
+
+  describe('parseScopeConfig error messages (003 §3)', () => {
+    it('reports a dedicated "is required" error when globs is absent', async () => {
+      await expect(source.observe({}, { now: new Date() })).rejects.toThrow(
+        'scope.globs is required',
+      );
     });
   });
 

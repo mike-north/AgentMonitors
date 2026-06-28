@@ -188,10 +188,15 @@ describe('monitorFrontmatterSchema', () => {
       expect(result.success).toBe(false);
     });
 
-    it('rejects missing urgency', () => {
+    it('defaults a missing urgency to normal (001 §3.2 — urgency is optional)', () => {
       const { urgency: _, ...rest } = validMinimal;
       const result = monitorFrontmatterSchema.safeParse(rest);
-      expect(result.success).toBe(false);
+      expect(result.success).toBe(true);
+      if (result.success) {
+        // Omitted urgency flattens to the degenerate band normal..normal.
+        expect(result.data.urgency).toBe('normal');
+        expect(result.data.urgencyMax).toBe('normal');
+      }
     });
 
     it('rejects old source/scope shape (hard cut — no back-compat)', () => {
