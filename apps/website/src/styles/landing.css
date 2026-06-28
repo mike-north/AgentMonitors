@@ -301,11 +301,22 @@ h3 {
 }
 /* On narrow screens the wordmark + GitHub icon + CTA can't all fit on one row,
    which clipped the "Get started" button off the right edge. Collapse the brand
-   to its logo mark (still the home link) so the GitHub link and primary CTA stay
-   fully visible. The mark alone leaves ample room down to the smallest phones. */
+   to its logo mark so the GitHub link and primary CTA stay fully visible. The
+   wordmark is visually hidden (not display:none) so it stays in the
+   accessibility tree — the logo Mark is aria-hidden, so removing the text would
+   leave the home link with no accessible name. */
 @media (max-width: 440px) {
   .nav-inner .brand b {
-    display: none;
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
   }
 }
 
