@@ -177,6 +177,32 @@ describe('source-file-fingerprint', () => {
     it('rejects a missing globs field', () => {
       expect(validateScope({}, source.scopeSchema).length).toBeGreaterThan(0);
     });
+
+    it('rejects a whitespace-only string pattern', () => {
+      expect(
+        validateScope({ globs: '   ' }, source.scopeSchema).length,
+      ).toBeGreaterThan(0);
+    });
+
+    it('rejects an empty string in the array form', () => {
+      expect(
+        validateScope({ globs: [''] }, source.scopeSchema).length,
+      ).toBeGreaterThan(0);
+    });
+
+    it('rejects a blank entry alongside a valid one in the array form', () => {
+      expect(
+        validateScope({ globs: ['a.ts', '   '] }, source.scopeSchema).length,
+      ).toBeGreaterThan(0);
+    });
+  });
+
+  describe('parseScopeConfig error messages (003 §3)', () => {
+    it('reports a dedicated "is required" error when globs is absent', async () => {
+      await expect(source.observe({}, { now: new Date() })).rejects.toThrow(
+        'scope.globs is required',
+      );
+    });
   });
 
   // G3: beyond modify, the source distinguishes created / deleted / descoped.

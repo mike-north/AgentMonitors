@@ -17,6 +17,11 @@ interface ScopeConfig {
 
 function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
   const raw = config['globs'];
+  // Distinguish "required field absent" from "present but wrong type" so the
+  // author gets a precise message (mirrors the scope schema's `required`).
+  if (raw === undefined) {
+    throw new Error('scope.globs is required');
+  }
   // Ergonomic shorthand: a single pattern may be written as a bare string
   // (`globs: notes.md`) instead of a one-element array (`globs: ['notes.md']`).
   // Normalize either form to the internal `string[]`.
@@ -156,8 +161,15 @@ const scopeSchema: JsonSchema = {
         'Glob pattern(s) to match files. A single pattern may be written as a ' +
         'bare string (e.g. "notes.md"); multiple patterns as an array (OR-ed together).',
       oneOf: [
-        { type: 'string', minLength: 1 },
-        { type: 'array', items: { type: 'string' }, minItems: 1 },
+        // `pattern: \\S` requires at least one non-whitespace character, so a
+        // blank or whitespace-only pattern is rejected at validate time — keeping
+        // the schema aligned with parseScopeConfig (which rejects blank patterns).
+        { type: 'string', minLength: 1, pattern: '\\S' },
+        {
+          type: 'array',
+          items: { type: 'string', minLength: 1, pattern: '\\S' },
+          minItems: 1,
+        },
       ],
     },
     cwd: {
