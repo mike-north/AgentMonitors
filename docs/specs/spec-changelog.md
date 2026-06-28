@@ -24,7 +24,9 @@ glob/cwd separately from a watched file set with no content changes.
   gained `"no-files-matched"`; `ObservationOutcome` gained `"no-files-matched"`.
 - **Runtime/CLI:** `tick()` and `watch()` pass `workspacePath` into source contexts, and
   `monitor test` derives the config root from the supplied `MONITOR.md` path for direct source
-  dry-runs.
+  dry-runs. `monitor test` also short-circuits `no-files-matched` results as an authoring
+  diagnostic: it exits 1, prints an explicit `watch.globs` / `watch.cwd` message, and does not
+  establish a baseline.
 - **Tests:** `plugins/source-file-fingerprint/src/index.test.ts` covers relative glob/cwd
   resolution, absolute path preservation, and zero-match outcome. `libs/core/src/runtime/service.test.ts`
   covers runtime context propagation and the distinct history outcome.

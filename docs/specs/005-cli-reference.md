@@ -345,6 +345,9 @@ agentmonitors monitor test <path> [options]
 **Text format:**
 
 - Prints `Testing monitor "<name>" (source: <sourceName>)...`
+- If a source reports `outcome: "no-files-matched"` (currently `file-fingerprint` when its
+  scope expands to zero files), prints an error naming `watch.globs` / `watch.cwd` and does not
+  establish a baseline or run the second observation.
 - For stateful sources with no first-run observations: prints baseline message, runs second observation, then either prints observations or explains no changes were detected.
 - Prints observation titles and snapshots.
 
@@ -363,11 +366,26 @@ agentmonitors monitor test <path> [options]
 
 `baseline: true` indicates the JSON result is from the second (post-baseline) observation.
 
-**Error output:** Uses `reportError()` — JSON `{ "error": "<message>" }` to stdout when `--format json`; `Error: <message>` to stderr otherwise. Exits 1.
+When a source reports `outcome: "no-files-matched"`, JSON output is:
+
+```json
+{
+  "monitor": "<name>",
+  "source": "<sourceName>",
+  "baseline": false,
+  "outcome": "no-files-matched",
+  "observations": [],
+  "error": "<message>"
+}
+```
+
+**Error output:** Uses `reportError()` — JSON `{ "error": "<message>" }` to stdout when `--format json`; `Error: <message>` to stderr otherwise. The `no-files-matched` diagnostic uses the structured JSON shape above for `--format json` and the same `Error: <message>` stderr convention for text. Exits 1.
 
 ### Exit codes
 
-Exits 1 on: file not found, parse error, unknown source, observation exception. Exits 0 on successful dry-run (even with zero observations).
+Exits 1 on: file not found, parse error, unknown source, observation exception, or
+`no-files-matched`. Exits 0 on successful dry-run, including genuine quiet/no-change runs where the
+source matched its scope.
 
 ### `monitor history` — Observation audit trail
 
