@@ -26,22 +26,22 @@ name: Human-readable display name  # optional; identity comes from the directory
 watch:                              # required — what to observe
   type: <source-type>              # discriminated union tag — always explicit
   # ... source-specific config ...
-urgency: high                       # required — high | normal | low (see Urgency below)
+urgency: high                       # optional — high | normal | low (default: normal)
 notify:                             # optional — delivery timing
   strategy: debounce
   settle-for: 5m
 ---
 ```
 
-The minimal valid monitor is a `watch:` block, an `urgency`, and a body. `urgency` is required so
-the interrupt level is always an explicit author choice — there is no implicit default. Everything
-else (`name`, `notify`, `shape`, `payload`, `baseline-strategy`, `tags`) is optional and reveals
-itself only when a specific need calls for it.
+The minimal valid monitor is just a `watch:` block and a body — everything else (`urgency`, `name`,
+`notify`, `shape`, `payload`, `baseline-strategy`, `tags`) is optional and reveals itself only when a
+specific need calls for it. An omitted `urgency` defaults to `normal`.
 
-> **Want to be notified _during_ a session?** Use `urgency: high`. With the standard Claude Code
-> plugin, `high` events are surfaced at the next turn boundary, while `normal`/`low` events are held
-> for the next session's recap rather than interrupting the current one (see [Urgency](#urgency)).
-> For "tell me when X changes so I can react now", `high` is the right choice.
+> **Want to be notified _during_ a session?** Set `urgency: high`. With the standard Claude Code
+> plugin, `high` events are surfaced at the next turn boundary, while the default `normal` (and
+> `low`) events are held for the next session's recap rather than interrupting the current one (see
+> [Urgency](#urgency)). For "tell me when X changes so I can react now", `high` is the right choice —
+> this is the one field worth setting even though it's optional.
 
 ## The body: handling instructions
 
@@ -177,8 +177,9 @@ watch:
 
 ## Urgency
 
-`urgency` controls how — and how urgently — the runtime surfaces the signal to the agent. It is a
-**required** field: pick the interrupt level deliberately.
+`urgency` controls how — and how urgently — the runtime surfaces the signal to the agent. It is
+**optional and defaults to `normal`**; set it explicitly when you want to interrupt the current
+session (`high`) or stay quietest (`low`).
 
 | Value | Delivery behaviour (standard Claude Code plugin) |
 |---|---|
@@ -240,8 +241,9 @@ Pair `rollup` with a relaxed `watch.interval` (e.g. `1h`) — there is no benefi
 The design rule: simple stays simple, power reveals only when a real need calls for it. Reach for
 each field in this order, and only when its specific friction shows up:
 
-1. **Start minimal** — `watch:` (what to observe), `urgency:` (how loud), and a body (what to do).
-   This is enough for the great majority of monitors.
+1. **Start minimal** — `watch:` (what to observe) and a body (what to do). This is enough for the
+   great majority of monitors. Add `urgency: high` here too if you want to be interrupted
+   mid-session (the default `normal` waits for the next session's recap).
 2. **`notify:`** — when a monitor fires too often. Add `debounce` to wait for quiet, `throttle` to
    cap frequency, or `rollup` to batch into a scheduled digest. (See [Notify strategies](#notify-strategies).)
 3. **`shape:`** — when the agent shouldn't have to recompute facts from raw data. Declare derived
