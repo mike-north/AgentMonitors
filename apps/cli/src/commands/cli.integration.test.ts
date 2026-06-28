@@ -2625,6 +2625,31 @@ describe('monitor test', () => {
     expect(result.stdout).not.toContain('Baseline established');
   });
 
+  it('reports zero-match file-fingerprint scopes as structured JSON', () => {
+    const dir = path.join(tempDir, 'monitor-test-no-files-json');
+    const monitorsDir = path.join(dir, '.codex', 'monitors');
+    mkdirSync(monitorsDir, { recursive: true });
+    run(['init', 'fp-empty-json', '--dir', monitorsDir], dir);
+
+    const monitorFile = path.join(monitorsDir, 'fp-empty-json', 'MONITOR.md');
+    const result = run(
+      ['monitor', 'test', monitorFile, '--format', 'json'],
+      '/tmp',
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toBe('');
+    const parsed = JSON.parse(result.stdout);
+    expect(parsed).toMatchObject({
+      monitor: 'My monitor',
+      source: 'file-fingerprint',
+      baseline: false,
+      outcome: 'no-files-matched',
+      observations: [],
+    });
+    expect(parsed.error).toContain('watch.globs');
+  });
+
   it('errors on invalid MONITOR.md content', () => {
     const dir = path.join(tempDir, 'monitor-test-invalid');
     mkdirSync(dir, { recursive: true });
