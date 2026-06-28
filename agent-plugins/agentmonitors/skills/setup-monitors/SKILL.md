@@ -82,10 +82,24 @@ watch:
 
 `command` is an argv array (not a shell string). The default `change-detection.strategy` is `text-diff`; use `json-diff` when the command outputs JSON.
 
-4. Ask only for fields required by the chosen source. Prefer defaults for everything else:
-   - `urgency: normal` unless the user needs idle-only (`low`) or interrupting (`high`) delivery.
-   - Add `notify:` only when the user asks for batching/throttling behavior.
-5. Edit `.claude/monitors/<id>/MONITOR.md` (or a flat `.claude/monitors/<id>.md`). Use the monitor
+4. **Choose urgency by intent — this controls when the agent is notified:**
+
+   | Intent | Use `urgency` | When delivered |
+   | --- | --- | --- |
+   | Interrupt the agent mid-turn when the change arrives ("stop me if the build breaks") | `high` | At the next prompt or tool boundary, after a ~15 s settle window |
+   | Surface at the next quiet moment; do not interrupt a turn in progress | `normal` (default) | As a reminder only at turn boundaries; full body at session recap |
+   | Surface only when idle or at session start | `low` | Session recap only |
+
+   **For "notify me when it changes", use `urgency: high`.** A `normal`-urgency monitor does not
+   inject its body text mid-turn — it surfaces as a brief reminder message only, and the full
+   monitor text arrives only at session recap (`SessionStart`). If the user wants to be interrupted
+   by the change, `urgency: high` is the right default.
+
+   Regardless of urgency, detection latency is **at least 30–45 s** — see Verify It Fires below.
+
+5. Ask only for fields required by the chosen source. Prefer defaults for everything else.
+   Add `notify:` only when the user asks for batching/throttling behavior.
+6. Edit `.claude/monitors/<id>/MONITOR.md` (or a flat `.claude/monitors/<id>.md`). Use the monitor
    body for the user's judgment and instructions, not facts already captured in `watch:`.
 
 Example body style:
@@ -104,35 +118,66 @@ agentmonitors validate .claude/monitors
 
 ## Verify It Fires
 
-Verification is mandatory. The monitor is not done until it has fired once or until you clearly tell
-the user what external condition is still needed to make it fire.
+Verification proves the agent will be **notified**, not just that an event materialised. The two are
+distinct: `monitor explain` can report a materialised event that was never delivered to a session.
+Run the notification verification flow below — it simulates exactly what the plugin hooks do.
 
-**Standard verification flow (no live daemon required):**
+### Detection latency
+
+After a file change the monitor's observe interval (~30 s default) must elapse before the daemon
+detects it, then the urgency settle window (15 s for `high`) must elapse before delivery is
+attempted. **Total for a high-urgency monitor: ~45 s.** An empty `hook deliver` response on the
+first check is expected — it does not mean the monitor is broken. Wait and re-poll.
+
+### Notification verification flow
 
 ```bash
-# 1. Trigger the condition the monitor watches (e.g. touch a file, make an API call)
-# 2. Run one observation tick in-process:
-agentmonitors daemon once .claude/monitors
-# 3. Inspect results — no daemon needed; reads persisted state in-process:
-agentmonitors monitor history <id>
-agentmonitors monitor explain <id> --dir .claude/monitors
+# 1. Choose a session ID for this test run (any unique string)
+SESSION_ID="verify-$(date +%s)"
+CWD=$(pwd)
+
+# 2. Register the session and boot the daemon (simulates the SessionStart hook)
+echo "{\"session_id\":\"$SESSION_ID\",\"cwd\":\"$CWD\",\"hook_event_name\":\"SessionStart\"}" \
+  | agentmonitors session start
+
+# 3. Trigger the monitored condition
+#    file-fingerprint: touch a file matched by the monitor's globs
+touch path/to/monitored/file.txt
+
+# 4. Wait for detection + settle
+#    ~30 s observe interval + ~15 s settle for urgency: high = ~45 s total
+sleep 45
+
+# 5. Simulate the UserPromptSubmit hook — claim any pending deliveries
+echo "{\"session_id\":\"$SESSION_ID\",\"cwd\":\"$CWD\",\"hook_event_name\":\"UserPromptSubmit\"}" \
+  | agentmonitors hook deliver
 ```
 
-`monitor history` and `monitor explain` read the persisted SQLite store and work even when no
-daemon is running (they print a "No daemon running — showing persisted state" notice in that case).
+**Success signal:** the output is a JSON object with a non-empty `additionalContext` field:
 
-Use the cheapest real verification per source:
+```json
+{
+  "continue": true,
+  "hookSpecificOutput": {
+    "hookEventName": "UserPromptSubmit",
+    "additionalContext": "AgentMon: monitored changes are pending — consider handling them before continuing.\n\n### <your-monitor-id> (high)\n..."
+  }
+}
+```
 
-- `file-fingerprint`: modify a scratch file matched by the monitor's globs, then run `daemon once`.
-- `api-poll`: use `agentmonitors monitor test <path/to/MONITOR.md>` for a connectivity check (shows
-  HTTP status and response size); for change detection, point at a controllable endpoint or run two
-  `daemon once` ticks with different URL content in between.
+**If the output is empty** (no JSON printed), the settle window may not have elapsed yet or the
+daemon hasn't completed its first tick. Wait 15–30 s and re-run step 5 — do not change any files
+or re-run step 2 between retries.
+
+Use the cheapest real trigger per source:
+
+- `file-fingerprint`: touch a file matched by the monitor's globs.
+- `api-poll`: use `agentmonitors monitor test <path/to/MONITOR.md>` for a connectivity check; for
+  change detection, point at a controllable endpoint or modify the response between two ticks.
 - `schedule`: choose a near-future cron while testing, or use `agentmonitors monitor test` to verify
   source configuration before restoring the intended cron.
 - `incoming-changes`: use a scratch git repo or harmless pathspec; advance the ref with a small commit
   touching a matched path.
-
-For all sources, confirm with `monitor history` or `monitor explain` after the tick.
 
 ## Debug Loop
 
@@ -142,7 +187,8 @@ When the user says "it did not fire", do not guess. Run:
 agentmonitors monitor explain <id> --dir .claude/monitors
 ```
 
-`monitor explain` prints a ✓/✗/○/⏳ status for each pipeline stage, then a final **Verdict** naming the stage where the signal stopped and the reason. Use the Verdict stage to fix the monitor:
+`monitor explain` prints a ✓/✗/○/⏳ status for each pipeline stage, then a final **Verdict** naming
+the stage where the signal stopped and the reason. Use the Verdict stage to fix the monitor:
 
 - `definition`: parse/schema/source config problem; edit `MONITOR.md`, then run `validate`.
 - `scheduling`: daemon not running or not due; enable the project, start a session, or adjust interval/cron.
@@ -150,3 +196,19 @@ agentmonitors monitor explain <id> --dir .claude/monitors
 - `notify`: debounce/throttle is holding observations; wait or adjust `notify`.
 - `materialization`: source observed but no event was written; inspect runtime error details.
 - `delivery`: event exists but no lead session is available, or events are unread/claimed/acknowledged.
+
+**If `monitor explain` shows delivery failure but you believe an event should have been delivered:**
+`monitor explain`'s delivery verdict reflects the daemon's session state and can disagree with the
+hook-state file when sessions fall out of sync. The **authoritative check** is `events list`:
+
+```bash
+# Find the AgentMon session ID (not the host session_id) from session list
+agentmonitors session list
+
+# Check unread events for that session
+agentmonitors events list --session <agentmon-session-id> --unread
+```
+
+Non-empty output from `events list --session … --unread` confirms the event reached the session and
+is pending delivery; the `monitor explain` delivery verdict may be stale. If `events list` is also
+empty, the event has not reached the session — work backwards through the Verdict stages above.
