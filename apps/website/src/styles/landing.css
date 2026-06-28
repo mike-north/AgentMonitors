@@ -299,6 +299,15 @@ h3 {
     display: none;
   }
 }
+/* On narrow screens the wordmark + GitHub icon + CTA can't all fit on one row,
+   which clipped the "Get started" button off the right edge. Collapse the brand
+   to its logo mark (still the home link) so the GitHub link and primary CTA stay
+   fully visible. The mark alone leaves ample room down to the smallest phones. */
+@media (max-width: 440px) {
+  .nav-inner .brand b {
+    display: none;
+  }
+}
 
 /* ---------- hero ---------- */
 .hero {
@@ -723,27 +732,38 @@ h3 {
   flex-direction: column;
   gap: 11px;
 }
+/* Markdown list items carry no icon element and may contain inline markup
+   (e.g. <strong>). The marker is therefore drawn as an absolutely-positioned
+   pseudo-element in the left padding, leaving the item a normal flow block so
+   all inline content wraps as ordinary prose. (A grid/flex layout here would
+   place each inline element child into its own narrow track, wrapping text one
+   word per line.) */
 .pp li {
-  display: grid;
-  grid-template-columns: 16px 1fr;
-  gap: 10px;
+  position: relative;
+  padding-left: 26px;
   font-size: 14.5px;
   color: var(--text-2);
   line-height: 1.45;
   text-wrap: pretty;
 }
-.pp li svg {
-  width: 15px;
-  height: 15px;
-  margin-top: 3px;
+.pp li::before {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 16px;
+  font-family: var(--mono);
+  font-size: 12px;
+  text-align: center;
 }
-.pp.before li svg {
+.pp.before li::before {
+  content: '\2715'; /* ✕ — a problem of the old way */
   color: var(--text-faint);
 }
 .pp.after li {
   color: var(--text);
 }
-.pp.after li svg {
+.pp.after li::before {
+  content: '\2713'; /* ✓ — what you get instead */
   color: var(--signal);
 }
 .oneliner {
