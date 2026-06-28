@@ -59,7 +59,10 @@ describe('activation plugin setup-monitors skill', () => {
 
     expect(text).toContain('agentmonitors validate');
     expect(text).toContain('agentmonitors monitor test');
-    expect(text).toContain('agentmonitors monitor history');
+    // Firing verification is proven via the hook-deliver flow (session start →
+    // hook deliver → events list --unread), not via `monitor history`.
+    expect(text).toContain('agentmonitors session start');
+    expect(text).toContain('agentmonitors hook deliver');
     expect(text).toContain('agentmonitors monitor explain');
     expect(text).toMatch(/not done until.+fired/i);
   });
@@ -72,15 +75,19 @@ describe('activation plugin setup-monitors skill', () => {
     expect(text).toMatch(/agentmonitors init .+ --type .+ --dir/);
   });
 
-  it('verify-it-fires step uses daemon once + history/explain without requiring a live daemon', () => {
+  it('verify-it-fires step uses the hook-deliver flow to prove delivery, with explain-based debugging that needs no live daemon', () => {
     const text = skillText();
-    // The verify step must direct agents to run `daemon once` for a tick,
-    // then use `monitor history` / `monitor explain` to confirm firing.
-    // Both commands now read persisted state in-process (no daemon required).
-    // Issue #153 (item 4) / Issue #150.
-    expect(text).toContain('daemon once');
-    expect(text).toMatch(/monitor history.+\n.+monitor explain/ms);
-    // Must not imply that history/explain always require a live daemon
+    // The verify step must prove the agent is *notified*, not just that an
+    // event materialised. It directs agents to register a session
+    // (`session start`), trigger the condition, then claim pending deliveries
+    // via `hook deliver` and confirm with `events list --unread`.
+    // Issue #201 / Issue #153 (item 4) / Issue #150.
+    expect(text).toContain('agentmonitors session start');
+    expect(text).toContain('agentmonitors hook deliver');
+    expect(text).toMatch(/events list .*--unread/);
+    expect(text).toContain('agentmonitors monitor explain');
+    // The debug loop's explain/events-list inspection reads persisted state, so
+    // it must not imply those commands always require a live daemon.
     expect(text).toMatch(/no daemon.+persisted/i);
   });
 

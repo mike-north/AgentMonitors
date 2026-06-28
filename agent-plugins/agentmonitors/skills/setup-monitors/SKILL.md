@@ -122,6 +122,10 @@ Verification proves the agent will be **notified**, not just that an event mater
 distinct: `monitor explain` can report a materialised event that was never delivered to a session.
 Run the notification verification flow below — it simulates exactly what the plugin hooks do.
 
+**The monitor is not done until it has fired and been delivered once.** A monitor that validates
+cleanly but has never produced a delivered notification is unverified — treat the flow below as a
+required step, not an optional smoke test.
+
 ### Detection latency
 
 After a file change the monitor's observe interval (~30 s default) must elapse before the daemon
@@ -186,6 +190,9 @@ When the user says "it did not fire", do not guess. Run:
 ```bash
 agentmonitors monitor explain <id> --dir .claude/monitors
 ```
+
+**No daemon** needs to be running for this loop: `monitor explain` reads the persisted runtime state
+(events and session state) directly from disk. The same applies to `events list` below.
 
 `monitor explain` prints a ✓/✗/○/⏳ status for each pipeline stage, then a final **Verdict** naming
 the stage where the signal stopped and the reason. Use the Verdict stage to fix the monitor:
