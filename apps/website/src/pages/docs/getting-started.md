@@ -57,7 +57,7 @@ You can scaffold other source types with `--type`:
 
 ```bash
 agentmonitors init api-watcher --type api-poll
-agentmonitors init daily-standup --type schedule
+agentmonitors init git-status --type command-poll
 agentmonitors init spec-watcher --type incoming-changes
 ```
 
@@ -123,15 +123,37 @@ For a single tick (useful in CI or scripts):
 agentmonitors daemon once
 ```
 
-## See events
+## Get notified in an agent session
 
-After the daemon has run at least one tick:
+The daemon records durable events, but an agent is notified only after a session is registered and a
+delivery hook asks for pending work. In normal Claude Code use, the Agent Monitors plugin handles
+that wiring for you:
+
+- `SessionStart` runs `agentmonitors session start` to register the session and boot the
+  per-project daemon.
+- `UserPromptSubmit` runs `agentmonitors hook deliver` to inject pending monitor context into the
+  agent turn.
+
+For the complete, copy-pasteable verification path, follow
+[Notify your agent when a file changes](/docs/notify-when-a-file-changes). That guide enables the
+project, starts a real session through the same hook payload Claude Code sends, changes a watched
+file, and confirms the agent receives non-empty `additionalContext`.
+
+## Inspect session events
+
+Event inspection is session-scoped. After a session exists, pass its id explicitly:
 
 ```bash
-agentmonitors events list
+agentmonitors events list --session <session-id> --unread
 ```
+
+The notification guide above shows the session setup path. Use this command when you want to inspect
+what a registered session still has unread; use `hook deliver` when you want to verify what the
+agent actually receives.
 
 ## Next steps
 
+- [Notify your agent when a file changes](/docs/notify-when-a-file-changes) — end-to-end delivery
+  verification
 - [Authoring monitors](/docs/authoring-monitors) — all sources, urgency levels, notify strategies
 - [Use cases](/docs/use-cases) — patterns from simple file-watching to fleet supervision
