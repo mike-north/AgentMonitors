@@ -49,13 +49,29 @@ Commands divide into two transport modes:
 
 ### Socket path resolution
 
-The daemon socket path is resolved in this priority order (implemented in `daemon-ipc.ts`):
+The base daemon socket path is resolved in this priority order (implemented in `daemon-ipc.ts`):
 
 1. `--socket <path>` CLI flag (where present)
 2. `AGENTMONITORS_SOCKET` environment variable
 3. `<dbDir>/agentmonitors.sock` (defaults to `~/.local/share/agentmonitors/agentmonitors.sock`)
 
 If the resolved path exceeds 100 characters (Unix socket limit), it falls back to `/tmp/agentmonitors-<sha256-prefix>.sock`.
+
+Manual daemon commands that operate on the active project — `session open`, `session close`,
+`session list`, `events list`, `events ack`, and `hook claim` — insert the enabled workspace's
+persisted local socket between steps 2 and 3. With no `--socket` and no `AGENTMONITORS_SOCKET`, they
+read `.claude/agentmonitors.local.md` from the command workspace (`--workspace` for `session open`;
+otherwise `CLAUDE_PROJECT_DIR` when set, then the process cwd). If that file has `enabled: true` and
+a `socket:` value, the command uses that per-workspace socket so manual inspection reaches the same
+daemon as the plugin hook path. Outside an enabled workspace, the global default in step 3 is
+unchanged.
+
+When those manual daemon commands cannot reach the resolved socket, they report a single actionable
+stderr line that says no daemon is running for this workspace and tells the author to start one with
+`agentmonitors daemon run` or let it start automatically when a Claude Code session opens. They exit
+non-zero and do not expose a raw `DaemonConnectionError` stack trace. Daemon-side application errors
+are still surfaced as normal command errors and, where a command supports `--format json`, still use
+the command's JSON error shape.
 
 ### Database path resolution
 

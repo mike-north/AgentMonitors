@@ -14,6 +14,11 @@ import { workspacePaths } from '../workspace-paths.js';
 import { spawnDetachedDaemon } from '../detached-spawn.js';
 import { readHookPayload } from '../hook-payload.js';
 import { renderHookDelivery } from '../hook-deliver-render.js';
+import {
+  isManualDaemonConnectionError,
+  manualDaemonErrorMessage,
+  resolveManualDaemonSocketPath,
+} from '../manual-daemon.js';
 
 export const sessionCommand = new Command('session').description(
   'Manage agent sessions tracked by AgentMon',
@@ -51,6 +56,10 @@ sessionCommand
       format: string;
     }) => {
       try {
+        const socket = resolveManualDaemonSocketPath(
+          options.socket,
+          options.workspace,
+        );
         const session = await openSessionClient(
           claudeCodeAdapter.createSessionInput({
             hostSessionId: options.hostSessionId,
@@ -63,7 +72,7 @@ sessionCommand
               ? { hookStatePath: options.hookStatePath }
               : {}),
           }),
-          options.socket,
+          socket,
         );
         if (options.format === 'json') {
           console.log(JSON.stringify(session, null, 2));
@@ -73,8 +82,10 @@ sessionCommand
         console.log(`Agent identity: ${session.agentIdentity}`);
         console.log(`Hook state: ${session.hookStatePath}`);
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        reportError(message, options.format === 'json');
+        reportError(
+          manualDaemonErrorMessage(error),
+          !isManualDaemonConnectionError(error) && options.format === 'json',
+        );
       }
     },
   );
@@ -92,15 +103,20 @@ sessionCommand
   .action(
     async (sessionId: string, options: { socket?: string; format: string }) => {
       try {
-        const session = await closeSessionClient(sessionId, options.socket);
+        const session = await closeSessionClient(
+          sessionId,
+          resolveManualDaemonSocketPath(options.socket),
+        );
         if (options.format === 'json') {
           console.log(JSON.stringify(session, null, 2));
           return;
         }
         console.log(`Closed session: ${session.id}`);
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        reportError(message, options.format === 'json');
+        reportError(
+          manualDaemonErrorMessage(error),
+          !isManualDaemonConnectionError(error) && options.format === 'json',
+        );
       }
     },
   );
@@ -115,18 +131,27 @@ sessionCommand
       .default('text'),
   )
   .action(async (options: { socket?: string; format: string }) => {
-    const sessions = await listSessionsClient(options.socket);
-    if (options.format === 'json') {
-      console.log(JSON.stringify(sessions, null, 2));
-      return;
-    }
-    if (sessions.length === 0) {
-      console.log('No sessions found.');
-      return;
-    }
-    for (const session of sessions) {
-      console.log(
-        `${session.id}  ${session.status}  ${session.agentIdentity}  ${session.workspacePath ?? '(global)'}`,
+    try {
+      const sessions = await listSessionsClient(
+        resolveManualDaemonSocketPath(options.socket),
+      );
+      if (options.format === 'json') {
+        console.log(JSON.stringify(sessions, null, 2));
+        return;
+      }
+      if (sessions.length === 0) {
+        console.log('No sessions found.');
+        return;
+      }
+      for (const session of sessions) {
+        console.log(
+          `${session.id}  ${session.status}  ${session.agentIdentity}  ${session.workspacePath ?? '(global)'}`,
+        );
+      }
+    } catch (error) {
+      reportError(
+        manualDaemonErrorMessage(error),
+        !isManualDaemonConnectionError(error) && options.format === 'json',
       );
     }
   });

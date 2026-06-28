@@ -89,6 +89,37 @@ function runWithEnv(
   }
 }
 
+function runWithCleanEnv(
+  args: string[],
+  env: Record<string, string>,
+  cwd?: string,
+): RunResult {
+  const strippedKeys = new Set(['AGENTMONITORS_SOCKET']);
+  const opts: ExecFileSyncOptions = {
+    encoding: 'utf-8',
+    env: {
+      ...Object.fromEntries(
+        Object.entries(process.env).filter(
+          ([key, value]) => value !== undefined && !strippedKeys.has(key),
+        ) as [string, string][],
+      ),
+      ...env,
+    },
+    cwd,
+  };
+  try {
+    const stdout = execFileSync('node', [CLI_PATH, ...args], opts) as string;
+    return { stdout, stderr: '', exitCode: 0 };
+  } catch (err) {
+    const e = err as { stdout: string; stderr: string; status: number };
+    return {
+      stdout: (e.stdout ?? '') as string,
+      stderr: (e.stderr ?? '') as string,
+      exitCode: e.status ?? 1,
+    };
+  }
+}
+
 /**
  * All environment variables that `is-agentic-tui` inspects to detect an agentic
  * TUI. Used by {@link runAsHuman} to build a clean non-agentic subprocess env.
@@ -2045,6 +2076,219 @@ describe('session list and close', () => {
       await daemon.waitForExit();
     }
   }, 30_000);
+});
+
+describe('manual daemon socket commands', () => {
+  it('session list uses the enabled project local socket when no socket override is present', async () => {
+    const { ws, socket, db, hostSessionId } = bootLazyWorkspace(5_000);
+    const env = { CLAUDE_PROJECT_DIR: ws, AGENTMONITORS_DB: db };
+
+    try {
+      const start = runWithStdin(
+        ['session', 'start'],
+        env,
+        sessionStartPayload(hostSessionId, ws),
+        ws,
+      );
+      expect(start.exitCode).toBe(0);
+      expect(await daemonAvailable(socket)).toBe(true);
+
+      const list = runWithCleanEnv(
+        ['session', 'list', '--format', 'json'],
+        env,
+        ws,
+      );
+      expect(list.exitCode).toBe(0);
+      const sessions = JSON.parse(list.stdout) as {
+        id: string;
+        hostSessionId: string;
+      }[];
+      const startedSession = sessions.find(
+        (s) => s.hostSessionId === hostSessionId,
+      );
+      expect(startedSession).toBeDefined();
+      if (!startedSession) {
+        throw new Error('Expected session start to register a session');
+      }
+
+      const opened = runWithCleanEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          `${hostSessionId}-manual`,
+          '--workspace',
+          ws,
+          '--format',
+          'json',
+        ],
+        env,
+        ws,
+      );
+      expect(opened.exitCode).toBe(0);
+
+      const events = runWithCleanEnv(
+        ['events', 'list', '--session', startedSession.id, '--format', 'json'],
+        env,
+        ws,
+      );
+      expect(events.exitCode).toBe(0);
+      expect(JSON.parse(events.stdout)).toEqual([]);
+
+      const claim = runWithCleanEnv(
+        [
+          'hook',
+          'claim',
+          '--session',
+          startedSession.id,
+          '--lifecycle',
+          'turn-interruptible',
+        ],
+        env,
+        ws,
+      );
+      expect(claim.exitCode).toBe(0);
+      expect(JSON.parse(claim.stdout)).toBeNull();
+
+      const close = runWithCleanEnv(
+        ['session', 'close', startedSession.id, '--format', 'json'],
+        env,
+        ws,
+      );
+      expect(close.exitCode).toBe(0);
+    } finally {
+      try {
+        await callDaemon('stop', {}, { socketPath: socket });
+      } catch {
+        // already stopped or never started — ignore
+      }
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('explicit socket inputs take precedence over the enabled project local socket', async () => {
+    const primary = bootLazyWorkspace(5_000);
+    const override = bootLazyWorkspace(5_000);
+    const primaryHostSessionId = `${primary.hostSessionId}-primary`;
+    const overrideHostSessionId = `${override.hostSessionId}-override`;
+    const primaryEnv = {
+      CLAUDE_PROJECT_DIR: primary.ws,
+      AGENTMONITORS_DB: primary.db,
+    };
+    const overrideEnv = {
+      CLAUDE_PROJECT_DIR: override.ws,
+      AGENTMONITORS_DB: override.db,
+    };
+
+    const expectOverrideSessionOnly = (result: RunResult) => {
+      expect(result.exitCode).toBe(0);
+      const sessions = JSON.parse(result.stdout) as { hostSessionId: string }[];
+      expect(
+        sessions.some((s) => s.hostSessionId === overrideHostSessionId),
+      ).toBe(true);
+      expect(
+        sessions.some((s) => s.hostSessionId === primaryHostSessionId),
+      ).toBe(false);
+    };
+
+    try {
+      const primaryStart = runWithStdin(
+        ['session', 'start'],
+        primaryEnv,
+        sessionStartPayload(primaryHostSessionId, primary.ws),
+        primary.ws,
+      );
+      expect(primaryStart.exitCode).toBe(0);
+
+      const overrideStart = runWithStdin(
+        ['session', 'start'],
+        overrideEnv,
+        sessionStartPayload(overrideHostSessionId, override.ws),
+        override.ws,
+      );
+      expect(overrideStart.exitCode).toBe(0);
+      expect(await daemonAvailable(primary.socket)).toBe(true);
+      expect(await daemonAvailable(override.socket)).toBe(true);
+
+      expectOverrideSessionOnly(
+        runWithCleanEnv(
+          ['session', 'list', '--format', 'json'],
+          {
+            ...primaryEnv,
+            AGENTMONITORS_SOCKET: override.socket,
+          },
+          primary.ws,
+        ),
+      );
+
+      expectOverrideSessionOnly(
+        runWithCleanEnv(
+          ['session', 'list', '--socket', override.socket, '--format', 'json'],
+          primaryEnv,
+          primary.ws,
+        ),
+      );
+
+      expectOverrideSessionOnly(
+        runWithCleanEnv(
+          ['session', 'list', '--socket', override.socket, '--format', 'json'],
+          {
+            ...primaryEnv,
+            AGENTMONITORS_SOCKET: primary.socket,
+          },
+          primary.ws,
+        ),
+      );
+    } finally {
+      for (const socket of [primary.socket, override.socket]) {
+        try {
+          await callDaemon('stop', {}, { socketPath: socket });
+        } catch {
+          // already stopped or never started — ignore
+        }
+      }
+      rmSync(primary.ws, { recursive: true, force: true });
+      rmSync(override.ws, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('manual socket commands report an actionable no-daemon message without a stack trace', () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-manual-down-'));
+    const socket = path.join(
+      '/tmp',
+      `agentmon-down-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const db = path.join(ws, 'manual-down.db');
+    writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 5_000 });
+    const env = { CLAUDE_PROJECT_DIR: ws, AGENTMONITORS_DB: db };
+
+    try {
+      for (const args of [
+        ['session', 'open', '--host-session-id', 'missing-host'],
+        ['session', 'close', 'missing-session'],
+        ['session', 'list'],
+        ['events', 'list', '--session', 'missing-session'],
+        ['events', 'ack', '--session', 'missing-session'],
+        [
+          'hook',
+          'claim',
+          '--session',
+          'missing-session',
+          '--lifecycle',
+          'turn-interruptible',
+        ],
+      ]) {
+        const result = runWithCleanEnv(args, env, ws);
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toContain('No daemon running for this workspace');
+        expect(result.stderr).toContain('agentmonitors daemon run');
+        expect(result.stderr).not.toContain('DaemonConnectionError');
+        expect(result.stderr).not.toContain('at ');
+      }
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('monitor history', () => {
