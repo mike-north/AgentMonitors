@@ -116,12 +116,12 @@ Human-readable only (no `--format` flag).
 
 Each source produces a distinct starter frontmatter block:
 
-| Source             | Key config fields in template                                                |
-| ------------------ | ---------------------------------------------------------------------------- |
-| `file-fingerprint` | `globs: ['**/*.ts']`                                                         |
-| `api-poll`         | `url`, `method: GET`, `interval: 5m`, `change-detection.strategy: json-diff` |
-| `schedule`         | `cron: '0 9 * * 1-5'`, `timezone: UTC`                                       |
-| `incoming-changes` | `paths: ['docs/specs/**']`, `branch: main`                                   |
+| Source             | Key config fields in template                                                                                                                                           |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `file-fingerprint` | `globs: ['**/*.ts']`                                                                                                                                                    |
+| `api-poll`         | `url`, `method: GET`, `interval: 5m`, `change-detection.strategy: text-diff` with inline guidance to use `text-diff` for HTML/plain pages and `json-diff` for JSON APIs |
+| `schedule`         | `cron: '0 9 * * 1-5'`, `timezone: UTC`                                                                                                                                  |
+| `incoming-changes` | `paths: ['docs/specs/**']`, `branch: main`                                                                                                                              |
 
 ---
 

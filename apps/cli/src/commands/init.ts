@@ -26,8 +26,9 @@ watch:
   url: 'https://api.example.com/endpoint'
   method: GET
   interval: 5m
+  # Use text-diff for HTML/plain pages. For JSON APIs, switch to json-diff.
   change-detection:
-    strategy: json-diff
+    strategy: text-diff
 urgency: normal
 ---
 

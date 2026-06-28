@@ -92,7 +92,7 @@ watch:
   method: GET                  # optional — defaults to GET
   interval: 5m                 # optional — polling interval (e.g. 5m, 30s, 1h)
   change-detection:            # optional
-    strategy: json-diff        # text-diff (default) | json-diff | status-code
+    strategy: text-diff        # text-diff (HTML/plain) | json-diff (JSON APIs) | status-code
   auth:                        # optional
     type: bearer
     token-env: API_TOKEN       # reads from environment variable
@@ -104,8 +104,8 @@ watch:
 
 | Strategy | Behaviour |
 |---|---|
-| `text-diff` | Compares raw response body text (default) |
-| `json-diff` | Parses JSON and compares semantically (ignores key order and whitespace) |
+| `text-diff` | Compares raw response body text (default). Use this for HTML pages, status pages, and plain text endpoints. |
+| `json-diff` | Parses JSON and compares semantically (ignores key order and whitespace). Use this only for JSON APIs; if the body is not valid JSON, `api-poll` warns and falls back to text comparison. |
 | `status-code` | Only detects changes in HTTP status code |
 
 **Auth types:**

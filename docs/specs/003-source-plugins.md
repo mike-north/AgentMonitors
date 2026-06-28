@@ -412,10 +412,15 @@ watch:
     type: bearer
     token-env: API_TOKEN
   change-detection:
-    strategy: json-diff
+    strategy: text-diff
 ```
 
 Required field: `url` (string). Important optional fields: `method`, `headers`, `interval`, `auth`, `change-detection`.
+
+Authoring guidance: use `text-diff` for HTML pages, status pages, and plain text endpoints; use
+`json-diff` for JSON APIs. The `agentmonitors init --type api-poll` template defaults to
+`text-diff` and includes this guidance inline so web-page watching does not silently opt into JSON
+semantics.
 
 `interval` is declared in the scope schema with pattern `^\d+[smhd]$` but is used by the scheduling engine, not by the plugin directly (verified: scope schema comment at `plugins/source-api-poll/src/index.ts` line 131).
 
@@ -425,13 +430,15 @@ Required field: `url` (string). Important optional fields: `method`, `headers`, 
 
 Supported strategies (verified: `plugins/source-api-poll/src/index.ts`, `ChangeStrategy` type and `hasChanged` function):
 
-| Strategy      | Semantics                                                                                                                                  |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `text-diff`   | Compare raw response body strings. This is the **default** when no strategy is specified or the value is unrecognized.                     |
-| `json-diff`   | Parse both bodies as JSON, recursively sort object keys, then compare serialized strings. Ignores key ordering and whitespace differences. |
-| `status-code` | Compare only HTTP status codes; body changes are ignored.                                                                                  |
+| Strategy      | Semantics                                                                                                                                                     |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `text-diff`   | Compare raw response body strings. This is the **default** when no strategy is specified or the value is unrecognized. Use for HTML/plain endpoints.          |
+| `json-diff`   | Parse both bodies as JSON, recursively sort object keys, then compare serialized strings. Ignores key ordering and whitespace differences. Use for JSON APIs. |
+| `status-code` | Compare only HTTP status codes; body changes are ignored.                                                                                                     |
 
-If `json-diff` parsing fails for either body, the implementation falls back to raw text comparison (verified: `plugins/source-api-poll/src/index.ts` lines 96–101).
+For plain `json-diff`, if parsing fails for either body, the implementation emits a warning and
+falls back to raw text comparison (verified: `plugins/source-api-poll/src/index.ts`). Keyed
+collection mode remains JSON-only and fails before diffing when the response body is not valid JSON.
 
 ### 4.3 Authentication
 
@@ -764,8 +771,9 @@ Mirrors `api-poll` (§4.2), substituting the local-process equivalents:
 | `json-diff` | `stdout` parsed as JSON, key-order/whitespace-insensitive (same algorithm as `api-poll`) |         |
 | `exit-code` | Exit codes only; `stdout` changes are ignored                                            |         |
 
-`json-diff` falls back to raw text comparison when either side fails to parse, identical to
-`api-poll`. `exit-code` is first-class in v1 (decision for #81's fourth open question); the broader
+`json-diff` falls back to raw text comparison when either side fails to parse, using the same
+comparison fallback algorithm as plain `api-poll` `json-diff`. `exit-code` is first-class in v1
+(decision for #81's fourth open question); the broader
 "predicate over the result" generalization is explicitly deferred — if it lands later, `exit-code`
 becomes sugar for one such predicate, which is a compatible evolution.
 

@@ -4,7 +4,11 @@
  * These tests spawn the built CLI as a subprocess and verify
  * stdout, stderr, and exit codes.
  */
-import { execFileSync, type ExecFileSyncOptions } from 'node:child_process';
+import {
+  execFileSync,
+  spawnSync,
+  type ExecFileSyncOptions,
+} from 'node:child_process';
 import {
   chmodSync,
   existsSync,
@@ -47,6 +51,11 @@ interface DaemonHandle {
   waitForExit: () => Promise<void>;
 }
 
+interface HttpBodyServerHandle {
+  port: number;
+  stop: () => Promise<void>;
+}
+
 function run(args: string[], cwd?: string): RunResult {
   const opts: ExecFileSyncOptions = {
     encoding: 'utf-8',
@@ -64,6 +73,19 @@ function run(args: string[], cwd?: string): RunResult {
       exitCode: e.status ?? 1,
     };
   }
+}
+
+function runCapturingStderr(args: string[], cwd?: string): RunResult {
+  const result = spawnSync('node', [CLI_PATH, ...args], {
+    encoding: 'utf-8',
+    env: { ...process.env, AGENTMONITORS_DB: ':memory:' },
+    cwd,
+  });
+  return {
+    stdout: result.stdout ?? '',
+    stderr: result.stderr ?? '',
+    exitCode: result.status ?? 1,
+  };
 }
 
 function runWithEnv(
@@ -297,6 +319,82 @@ async function startDaemon(
   );
 }
 
+async function startHttpBodyServer(
+  dir: string,
+  body: string,
+): Promise<HttpBodyServerHandle> {
+  const serverScript = path.join(
+    dir,
+    `http-body-${Math.random().toString(16).slice(2)}.cjs`,
+  );
+  writeFileSync(
+    serverScript,
+    `const { createServer } = require('node:http');
+const body = process.argv[2] || '';
+const server = createServer((_req, res) => {
+  res.writeHead(200, { 'content-type': 'text/html' });
+  res.end(body);
+});
+server.listen(0, '127.0.0.1', () => {
+  const address = server.address();
+  process.stdout.write('HTTP_BODY_SERVER_PORT ' + address.port + '\\n');
+});
+process.on('SIGTERM', () => {
+  server.close(() => process.exit(0));
+});
+`,
+    'utf-8',
+  );
+
+  // `runCapturingStderr()` drives the CLI synchronously, so the endpoint under
+  // test must live in its own process instead of this blocked Vitest worker.
+  const server = spawn('node', [serverScript, body], {
+    cwd: dir,
+    env: process.env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let serverStdout = '';
+  let serverStderr = '';
+  server.stdout.setEncoding('utf-8');
+  server.stderr.setEncoding('utf-8');
+  server.stdout.on('data', (chunk: string) => {
+    serverStdout += chunk;
+  });
+  server.stderr.on('data', (chunk: string) => {
+    serverStderr += chunk;
+  });
+
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const match = /HTTP_BODY_SERVER_PORT (\d+)/.exec(serverStdout);
+    if (match) {
+      return {
+        port: Number(match[1]),
+        stop: () =>
+          new Promise<void>((resolve) => {
+            if (server.exitCode !== null) {
+              resolve();
+              return;
+            }
+            server.kill('SIGTERM');
+            server.once('exit', () => {
+              resolve();
+            });
+          }),
+      };
+    }
+    if (server.exitCode !== null) {
+      throw new Error(
+        `HTTP body fixture exited early (code ${String(server.exitCode)}).\nSTDOUT:\n${serverStdout}\nSTDERR:\n${serverStderr}`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+
+  server.kill('SIGTERM');
+  throw new Error(`HTTP body fixture did not start.\nSTDERR:\n${serverStderr}`);
+}
+
 let tempDir: string;
 
 beforeAll(() => {
@@ -368,6 +466,7 @@ describe('init', () => {
   it('scaffolds an api-poll monitor with --type', () => {
     const dir = path.join(tempDir, 'init-test-2');
     mkdirSync(dir, { recursive: true });
+    const monitorFile = path.join(dir, 'monitors', 'api-watcher', 'MONITOR.md');
     const result = run(
       [
         'init',
@@ -381,6 +480,10 @@ describe('init', () => {
     );
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain('Created monitor');
+    const body = readFileSync(monitorFile, 'utf-8');
+    expect(body).toContain('strategy: text-diff');
+    expect(body).toContain('HTML/plain pages');
+    expect(body).toContain('JSON APIs');
   });
 
   it('scaffolds an incoming-changes monitor that passes validate', () => {
@@ -2852,6 +2955,44 @@ describe('monitor test', () => {
     expect(parsed.source).toBe('file-fingerprint');
     expect(parsed.baseline).toBe(true);
     expect(parsed).toHaveProperty('observations');
+  });
+
+  it('warns when api-poll json-diff receives a non-JSON response body', async () => {
+    const dir = path.join(tempDir, 'monitor-test-api-poll-json-warning');
+    mkdirSync(dir, { recursive: true });
+    const server = await startHttpBodyServer(dir, '<html>status page</html>');
+
+    try {
+      const monitorDir = path.join(dir, 'monitors', 'api-page');
+      mkdirSync(monitorDir, { recursive: true });
+      const monitorFile = path.join(monitorDir, 'MONITOR.md');
+      writeFileSync(
+        monitorFile,
+        [
+          '---',
+          'name: API page',
+          'watch:',
+          '  type: api-poll',
+          `  url: 'http://127.0.0.1:${String(server.port)}/status'`,
+          '  change-detection:',
+          '    strategy: json-diff',
+          '---',
+          'Check the status page.',
+          '',
+        ].join('\n'),
+        'utf-8',
+      );
+
+      const result = runCapturingStderr(['monitor', 'test', monitorFile], dir);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain('Baseline established');
+      expect(result.stderr).toContain('Warning:');
+      expect(result.stderr).toContain('json-diff');
+      expect(result.stderr).toContain('not valid JSON');
+      expect(result.stderr).toContain('text-diff');
+    } finally {
+      await server.stop();
+    }
   });
 
   it('reports zero-match file-fingerprint scopes without establishing a baseline', () => {

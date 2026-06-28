@@ -165,6 +165,67 @@ describe('source-api-poll', () => {
       });
       expect(changed.observations).toHaveLength(1);
     });
+
+    it('json-diff: warns and falls back to text comparison for non-JSON bodies', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {
+        // Intentionally quiet: this test asserts the warning text below.
+      });
+      const mockFetch = vi.fn();
+      vi.stubGlobal('fetch', mockFetch);
+
+      const config = {
+        url: 'https://status.example.com/incidents/123',
+        'change-detection': { strategy: 'json-diff' },
+      };
+
+      mockFetch.mockResolvedValueOnce({
+        text: () => Promise.resolve('<html>open</html>'),
+        status: 200,
+      });
+      const baseline = await source.observe(config, { now: new Date() });
+      expect(baseline.observations).toHaveLength(0);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('json-diff'));
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('not valid JSON'),
+      );
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('text-diff'));
+
+      warn.mockClear();
+      mockFetch.mockResolvedValueOnce({
+        text: () => Promise.resolve('<html>resolved</html>'),
+        status: 200,
+      });
+      const changed = await source.observe(config, {
+        previousState: baseline.nextState,
+        now: new Date(),
+      });
+      expect(changed.observations).toHaveLength(1);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('not valid JSON'),
+      );
+    });
+
+    it('text-diff: does not warn for non-JSON bodies', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {
+        // Intentionally quiet: text-diff is the expected HTML/plain-text mode.
+      });
+      const mockFetch = vi.fn();
+      vi.stubGlobal('fetch', mockFetch);
+
+      mockFetch.mockResolvedValueOnce({
+        text: () => Promise.resolve('<html>open</html>'),
+        status: 200,
+      });
+      await source.observe(
+        {
+          url: 'https://status.example.com/incidents/123',
+          'change-detection': { strategy: 'text-diff' },
+        },
+        { now: new Date() },
+      );
+
+      expect(warn).not.toHaveBeenCalled();
+    });
   });
 
   // Keyed-collection change detection (003 §12) wired through api-poll. The shared
@@ -297,6 +358,20 @@ describe('source-api-poll', () => {
           { now: new Date() },
         ),
       ).rejects.toThrow(/requires strategy: json-diff/);
+    });
+
+    it('requires JSON without emitting the plain json-diff text fallback warning', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {
+        // Intentionally quiet: collection mode is JSON-only and does not fall back.
+      });
+      const mockFetch = vi.fn();
+      vi.stubGlobal('fetch', mockFetch);
+      mockBody('<html>not json</html>');
+
+      await expect(
+        source.observe(collectionConfig, { now: new Date() }),
+      ).rejects.toThrow(SyntaxError);
+      expect(warn).not.toHaveBeenCalled();
     });
   });
 

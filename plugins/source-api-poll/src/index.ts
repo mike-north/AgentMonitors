@@ -152,12 +152,35 @@ function hasChanged(
         const currJson = JSON.stringify(sortKeys(JSON.parse(curr.body)));
         return prevJson !== currJson;
       } catch {
-        // Fall back to text comparison if JSON parsing fails
+        // observe() emits the user-facing warning; this preserves the existing
+        // fallback comparison semantics once either body fails JSON parsing.
         return prev.body !== curr.body;
       }
     case 'text-diff':
       return prev.body !== curr.body;
   }
+}
+
+function parsesAsJson(body: string): boolean {
+  try {
+    JSON.parse(body);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function warnIfJsonDiffFallsBackToText(
+  url: string,
+  curr: CachedResponse,
+  prev: CachedResponse | undefined,
+): void {
+  const bodies = prev === undefined ? [curr.body] : [prev.body, curr.body];
+  if (bodies.every(parsesAsJson)) return;
+
+  console.warn(
+    `Warning: api-poll monitor for ${url} uses strategy: json-diff, but the response body is not valid JSON. Falling back to text comparison; use strategy: text-diff for HTML/plain pages or json-diff for JSON APIs.`,
+  );
 }
 
 const scopeSchema: JsonSchema = {
@@ -417,6 +440,11 @@ const source: ObservationSource = {
       !Array.isArray(context.previousState)
         ? (context.previousState as CachedResponse)
         : undefined;
+    const curr: CachedResponse = { body, status: status };
+
+    if (changeDetection === 'json-diff' && collection === undefined) {
+      warnIfJsonDiffFallsBackToText(url, curr, prev);
+    }
 
     // ---- Keyed-collection mode (003 §12) ----------------------------------------
     // Parse the body as JSON and diff per keyed object, instead of treating the
@@ -436,8 +464,6 @@ const source: ObservationSource = {
       };
       return { observations: result.observations, nextState: curr };
     }
-
-    const curr: CachedResponse = { body, status: status };
 
     if (prev !== undefined && hasChanged(changeDetection, prev, curr)) {
       return {

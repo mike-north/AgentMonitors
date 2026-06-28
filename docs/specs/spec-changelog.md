@@ -9,6 +9,23 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-06-28 — `api-poll` guides HTML vs JSON strategy selection and warns on non-JSON `json-diff` (003 §4.1–4.2, 005 §2) — Refs #219
+
+The `agentmonitors init --type api-poll` template now defaults to `strategy: text-diff` with an
+inline comment explaining that `text-diff` is for HTML/plain pages and `json-diff` is for JSON APIs.
+The authoring docs and CLI reference now carry the same guidance.
+
+When an `api-poll` monitor is explicitly configured with `strategy: json-diff` but the current or
+previous response body is not valid JSON, the source emits a warning before preserving the existing
+fallback to raw text comparison. This makes web-page/status-page misconfiguration visible in
+`monitor test` and daemon observation runs without removing the fallback behavior.
+
+- **Proof:** `plugins/source-api-poll/src/index.test.ts` covers the `json-diff` non-JSON warning and
+  the no-warning `text-diff` path; `apps/cli/src/commands/cli.integration.test.ts` covers scaffold
+  guidance and `monitor test` stderr for a non-JSON `json-diff` response.
+- Patch changesets: `@agentmonitors/source-api-poll` and `@agentmonitors/cli` user-visible
+  authoring/warning behavior.
+
 ## 2026-06-28 — Manual daemon commands use the enabled workspace socket (005 §1) — Refs #199
 
 `session open`, `session close`, `session list`, `events list`, `events ack`, and `hook claim` now
