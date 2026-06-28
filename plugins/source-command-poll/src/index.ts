@@ -92,8 +92,16 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
     command.length === 0 ||
     !command.every((c): c is string => typeof c === 'string')
   ) {
+    // `command` is argv-only by design — the child is spawned with `shell: false`,
+    // so there is no word-splitting/quoting/injection surface (003 §11.1). The most
+    // common mistake is writing a shell pipeline as a bare string; point authors at
+    // the supported inline form rather than just rejecting it.
+    const shellHint =
+      typeof command === 'string'
+        ? ` A bare string is not run as a shell. For a pipeline or shell operators, wrap it in argv: ["sh", "-c", ${JSON.stringify(command)}].`
+        : ' For a shell pipeline, use the argv form ["sh", "-c", "<pipeline>"].';
     throw new Error(
-      'scope.command must be a non-empty array of strings (argv form, e.g. ["git", "status"])',
+      `scope.command must be a non-empty array of strings (argv form, e.g. ["git", "status"]).${shellHint}`,
     );
   }
 
@@ -437,7 +445,8 @@ const scopeSchema: JsonSchema = {
       items: { type: 'string' },
       minItems: 1,
       description:
-        'Argv array; command[0] is the executable (resolved via PATH). Spawned directly, never via a shell.',
+        'Argv array; command[0] is the executable (resolved via PATH). Spawned directly, never via a shell. ' +
+        "For a pipeline or shell operators, spawn a shell explicitly: ['sh', '-c', 'git status -sb | grep ahead'].",
     },
     cwd: {
       type: 'string',

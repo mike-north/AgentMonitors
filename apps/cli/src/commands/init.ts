@@ -39,6 +39,8 @@ When the API response changes, review the differences and take appropriate actio
 name: My command monitor
 watch:
   type: command-poll
+  # command is an argv array, run directly (no shell). For a pipeline or shell
+  # operators, wrap it: command: ['sh', '-c', 'git status -sb | grep ahead']
   command:
     - git
     - status
