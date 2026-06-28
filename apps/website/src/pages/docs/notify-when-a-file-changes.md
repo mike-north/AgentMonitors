@@ -116,5 +116,6 @@ future `high`-urgency change.
 
 ## Next steps
 
-- [Authoring monitors](/docs/authoring-monitors) — all sources, urgency levels, notify strategies
+- [Authoring monitors](/docs/authoring-monitors) — all sources, urgency levels, notify strategies,
+  plus delivery-verification recipes for `api-poll` and `command-poll`
 - [Use cases](/docs/use-cases) — patterns from simple file-watching to fleet supervision

@@ -133,6 +133,15 @@ detects it, then the urgency settle window (15 s for `high`) must elapse before 
 attempted. **Total for a high-urgency monitor: ~45 s.** An empty `hook deliver` response on the
 first check is expected — it does not mean the monitor is broken. Wait and re-poll.
 
+For fast verification, temporarily set the monitor's `watch.interval` to `5s` while testing, then
+restore the intended interval before finishing. The standard `agentmonitors session start` path
+boots a project daemon that ticks frequently enough for this. If you start the daemon manually
+instead, run it with a low poll interval too:
+
+```bash
+agentmonitors daemon run .claude/monitors --poll-ms 1000
+```
+
 ### Notification verification flow
 
 ```bash
@@ -176,12 +185,119 @@ or re-run step 2 between retries.
 Use the cheapest real trigger per source:
 
 - `file-fingerprint`: touch a file matched by the monitor's globs.
-- `api-poll`: use `agentmonitors monitor test <path/to/MONITOR.md>` for a connectivity check; for
-  change detection, point at a controllable endpoint or modify the response between two ticks.
+- `api-poll`: use `agentmonitors monitor test <path/to/MONITOR.md>` for a connectivity check. To
+  prove delivery, point the monitor at a controllable endpoint and change the response between two
+  ticks. Do not expect a live URL/API you do not control to fire on demand; wait for the resource to
+  actually change or use a scratch endpoint for verification.
+- `command-poll`: make the command read a harmless scratch input, then change that input between two
+  ticks. This proves the command ran, diffed, materialised an event, and delivered to the session.
 - `schedule`: choose a near-future cron while testing, or use `agentmonitors monitor test` to verify
   source configuration before restoring the intended cron.
 - `incoming-changes`: use a scratch git repo or harmless pathspec; advance the ref with a small commit
   touching a matched path.
+
+### Copy-paste delivery recipes
+
+These recipes use the same plugin-style session and hook commands as the generic flow above. They do
+not require custom sockets.
+
+**command-poll:** make the command read a scratch file, then change the file.
+
+```bash
+mkdir -p .claude
+cat > .claude/agentmonitors.local.md <<'EOF'
+---
+enabled: true
+---
+EOF
+
+mkdir -p .claude/monitors/verify-command
+printf 'before\n' > .agentmonitors-command-state.txt
+
+cat > .claude/monitors/verify-command/MONITOR.md <<'EOF'
+---
+name: Verify command-poll delivery
+watch:
+  type: command-poll
+  command:
+    - cat
+    - .agentmonitors-command-state.txt
+  interval: 5s
+urgency: high
+---
+
+Command output changed. Inspect the new state and decide whether action is needed.
+EOF
+
+agentmonitors validate .claude/monitors
+
+export SESSION_ID="verify-command-$(date +%s)"
+printf '{"session_id":"%s","cwd":"%s","hook_event_name":"SessionStart"}' "$SESSION_ID" "$PWD" \
+  | agentmonitors session start
+
+sleep 10  # Let the first command-poll observation establish its baseline.
+printf 'after\n' > .agentmonitors-command-state.txt
+sleep 25
+
+printf '{"session_id":"%s","cwd":"%s","hook_event_name":"UserPromptSubmit"}' "$SESSION_ID" "$PWD" \
+  | agentmonitors hook deliver
+```
+
+**api-poll:** serve a scratch JSON file locally, then change the file.
+
+```bash
+mkdir -p .claude
+cat > .claude/agentmonitors.local.md <<'EOF'
+---
+enabled: true
+---
+EOF
+
+mkdir -p .claude/monitors/verify-api
+printf '{"status":"before"}\n' > .agentmonitors-api-response.json
+python3 -m http.server 8765 --bind 127.0.0.1 >/tmp/agentmonitors-api.log 2>&1 &
+SERVER_PID=$!
+
+cat > .claude/monitors/verify-api/MONITOR.md <<'EOF'
+---
+name: Verify api-poll delivery
+watch:
+  type: api-poll
+  url: 'http://127.0.0.1:8765/.agentmonitors-api-response.json'
+  interval: 5s
+  change-detection:
+    strategy: json-diff
+urgency: high
+---
+
+API response changed. Inspect the new response and decide whether action is needed.
+EOF
+
+agentmonitors validate .claude/monitors
+
+export SESSION_ID="verify-api-$(date +%s)"
+printf '{"session_id":"%s","cwd":"%s","hook_event_name":"SessionStart"}' "$SESSION_ID" "$PWD" \
+  | agentmonitors session start
+
+sleep 10  # Let the first api-poll observation establish its baseline.
+printf '{"status":"after"}\n' > .agentmonitors-api-response.json
+sleep 25
+
+printf '{"session_id":"%s","cwd":"%s","hook_event_name":"UserPromptSubmit"}' "$SESSION_ID" "$PWD" \
+  | agentmonitors hook deliver
+
+kill "$SERVER_PID" 2>/dev/null || true
+```
+
+For either recipe, success is the same as the generic flow: `hook deliver` prints hook JSON with a
+non-empty `additionalContext`. If you need to confirm the event reached the session even after a
+claim, find the AgentMon session id and list unread events:
+
+```bash
+AGENTMON_SESSION_ID="$(agentmonitors session list --format json \
+  | node -e 'let input=""; process.stdin.on("data", d => input += d); process.stdin.on("end", () => { const sessions = JSON.parse(input); const match = sessions.find(s => s.hostSessionId === process.env.SESSION_ID); if (!match) process.exit(1); console.log(match.id); });')"
+agentmonitors events list --session "$AGENTMON_SESSION_ID" --unread
+```
 
 ## Debug Loop
 

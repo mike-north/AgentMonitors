@@ -274,6 +274,128 @@ See the [use cases](/docs/use-cases) page for real patterns across this spectrum
 agentmonitors validate .claude/monitors
 ```
 
+## Verify delivery
+
+Validation proves the monitor is well-formed. Delivery verification proves the agent will actually
+see a notification in a session. For a quick test, temporarily set `watch.interval: 5s` and
+`urgency: high`, then restore the intended interval after verification. If you start a daemon
+manually, use a low poll interval too:
+
+```bash
+agentmonitors daemon run .claude/monitors --poll-ms 1000
+```
+
+The normal plugin-style path does not require custom sockets. Each recipe below writes a temporary
+monitor, validates it, starts a session with the same hook command Claude Code runs, changes the
+watched input, and then asks the hook transport for pending delivery.
+
+### `command-poll` recipe
+
+Use a scratch input file so you can induce a real command-output change.
+
+```bash
+mkdir -p .claude
+cat > .claude/agentmonitors.local.md <<'EOF'
+---
+enabled: true
+---
+EOF
+
+mkdir -p .claude/monitors/verify-command
+printf 'before\n' > .agentmonitors-command-state.txt
+
+cat > .claude/monitors/verify-command/MONITOR.md <<'EOF'
+---
+name: Verify command-poll delivery
+watch:
+  type: command-poll
+  command:
+    - cat
+    - .agentmonitors-command-state.txt
+  interval: 5s
+urgency: high
+---
+
+Command output changed. Inspect the new state and decide whether action is needed.
+EOF
+
+agentmonitors validate .claude/monitors
+
+export SESSION_ID="verify-command-$(date +%s)"
+printf '{"session_id":"%s","cwd":"%s","hook_event_name":"SessionStart"}' "$SESSION_ID" "$PWD" \
+  | agentmonitors session start
+
+sleep 10  # Let the first command-poll observation establish its baseline.
+printf 'after\n' > .agentmonitors-command-state.txt
+sleep 25
+
+printf '{"session_id":"%s","cwd":"%s","hook_event_name":"UserPromptSubmit"}' "$SESSION_ID" "$PWD" \
+  | agentmonitors hook deliver
+```
+
+### `api-poll` recipe
+
+Point the monitor at a controllable endpoint. This example serves a scratch JSON file locally and
+then changes the response.
+
+```bash
+mkdir -p .claude
+cat > .claude/agentmonitors.local.md <<'EOF'
+---
+enabled: true
+---
+EOF
+
+mkdir -p .claude/monitors/verify-api
+printf '{"status":"before"}\n' > .agentmonitors-api-response.json
+python3 -m http.server 8765 --bind 127.0.0.1 >/tmp/agentmonitors-api.log 2>&1 &
+SERVER_PID=$!
+
+cat > .claude/monitors/verify-api/MONITOR.md <<'EOF'
+---
+name: Verify api-poll delivery
+watch:
+  type: api-poll
+  url: 'http://127.0.0.1:8765/.agentmonitors-api-response.json'
+  interval: 5s
+  change-detection:
+    strategy: json-diff
+urgency: high
+---
+
+API response changed. Inspect the new response and decide whether action is needed.
+EOF
+
+agentmonitors validate .claude/monitors
+
+export SESSION_ID="verify-api-$(date +%s)"
+printf '{"session_id":"%s","cwd":"%s","hook_event_name":"SessionStart"}' "$SESSION_ID" "$PWD" \
+  | agentmonitors session start
+
+sleep 10  # Let the first api-poll observation establish its baseline.
+printf '{"status":"after"}\n' > .agentmonitors-api-response.json
+sleep 25
+
+printf '{"session_id":"%s","cwd":"%s","hook_event_name":"UserPromptSubmit"}' "$SESSION_ID" "$PWD" \
+  | agentmonitors hook deliver
+
+kill "$SERVER_PID" 2>/dev/null || true
+```
+
+Success is a JSON object whose `hookSpecificOutput.additionalContext` contains the monitor body. To
+also confirm the event reached the session, list unread events for the AgentMon session:
+
+```bash
+AGENTMON_SESSION_ID="$(agentmonitors session list --format json \
+  | node -e 'let input=""; process.stdin.on("data", d => input += d); process.stdin.on("end", () => { const sessions = JSON.parse(input); const match = sessions.find(s => s.hostSessionId === process.env.SESSION_ID); if (!match) process.exit(1); console.log(match.id); });')"
+agentmonitors events list --session "$AGENTMON_SESSION_ID" --unread
+```
+
+For resources you do not control, such as a live third-party API or a remote repository, you can
+confirm authoring and connectivity with `agentmonitors monitor test <path/to/MONITOR.md>`, but a
+real delivery requires the external resource to change. Use a controllable scratch endpoint or input
+when you need proof immediately.
+
 ## Generate a JSON Schema for editor autocompletion
 
 ```bash
