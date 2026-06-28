@@ -313,7 +313,19 @@ async function fetchBody(
       cause: fetchErr,
     });
   }
-  return { body: await response.text(), status: response.status };
+
+  const { status } = response;
+  if (status < 200 || status > 299) {
+    // HTTP error pages are observation failures, not source state. Cancel the
+    // body stream so the CLI can exit without reading or baselining error pages.
+    await response.body?.cancel().catch(() => undefined);
+    throw new Error(
+      `api-poll received HTTP ${String(status)} — check auth/url; not establishing a baseline on an error response`,
+    );
+  }
+
+  const body = await response.text();
+  return { body, status };
 }
 
 /** Source-owned change-detection state for composite mode (§2.6). */

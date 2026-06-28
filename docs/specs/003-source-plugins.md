@@ -425,11 +425,11 @@ Required field: `url` (string). Important optional fields: `method`, `headers`, 
 
 Supported strategies (verified: `plugins/source-api-poll/src/index.ts`, `ChangeStrategy` type and `hasChanged` function):
 
-| Strategy      | Semantics                                                                                                                                  |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `text-diff`   | Compare raw response body strings. This is the **default** when no strategy is specified or the value is unrecognized.                     |
-| `json-diff`   | Parse both bodies as JSON, recursively sort object keys, then compare serialized strings. Ignores key ordering and whitespace differences. |
-| `status-code` | Compare only HTTP status codes; body changes are ignored.                                                                                  |
+| Strategy      | Semantics                                                                                                                                                |
+| ------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `text-diff`   | Compare raw response body strings. This is the **default** when no strategy is specified or the value is unrecognized.                                   |
+| `json-diff`   | Parse both bodies as JSON, recursively sort object keys, then compare serialized strings. Ignores key ordering and whitespace differences.               |
+| `status-code` | Compare only successful HTTP status codes; body changes are ignored. Non-2xx responses are observation errors and never participate in change detection. |
 
 If `json-diff` parsing fails for either body, the implementation falls back to raw text comparison (verified: `plugins/source-api-poll/src/index.ts` lines 96–101).
 
@@ -463,23 +463,29 @@ This treats the polled URL as the source-defined object identity (SP3).
 
 ### 4.5 Stateful behavior
 
-`api-poll` declares `stateful: true`. The first call fetches the URL, stores `{ body, status }` as `nextState`, and returns an empty `observations` array. Subsequent calls compare against `context.previousState` and emit an observation only when `hasChanged` returns `true`.
+`api-poll` declares `stateful: true`. The first successful 2xx call fetches the URL, stores `{ body, status }` as `nextState`, and returns an empty `observations` array. Subsequent successful 2xx calls compare against `context.previousState` and emit an observation only when `hasChanged` returns `true`. Non-2xx responses throw before returning `nextState`, so an auth or URL mistake cannot silently establish or advance a baseline.
 
-### 4.6 Network error propagation
+### 4.6 HTTP and network error propagation
+
+When `fetch` returns a non-2xx HTTP response, the source checks the status before reading the response body, cancels the body stream to release the fetch handle, then throws before returning `nextState`:
+
+> `api-poll received HTTP <status> — check auth/url; not establishing a baseline on an error response`
+
+The runtime records the thrown source error as an errored observation attempt, and `monitor test` exits non-zero with the status-bearing message instead of printing baseline output. This applies to the initial baseline request and to later observations, including `change-detection.composite` parts.
 
 When Node `fetch` throws (ECONNREFUSED, ENOTFOUND, timeout, …), it wraps the real OS-level error as `err.cause`. The source catches the `TypeError("fetch failed")`, builds a composite message `"fetch failed: <cause.message>"`, and re-throws a new `Error` with that message and `cause` set to the original fetch error. This means `monitor explain` and observation-history audit rows show the real reason (e.g. `"fetch failed: connect ECONNREFUSED 127.0.0.1:9999"`) instead of the generic `"fetch failed"`. (Verified: `plugins/source-api-poll/src/index.ts`.)
 
 ### 4.7 `monitor test` baseline output
 
 `agentmonitors monitor test` for an `api-poll` monitor prints the HTTP status code and response body
-size (UTF-8 bytes, via `Buffer.byteLength`) after establishing the baseline, before running the
-second observation. This surfaces transport-level successes with unexpected status codes or empty
-bodies — for example, a mistyped-but-resolvable URL returning a 404, or a misconfigured endpoint
-returning an empty 200 — that would otherwise silently baseline as "no change yet."
+size (UTF-8 bytes, via `Buffer.byteLength`) after establishing a successful 2xx baseline, before
+running the second observation. This surfaces empty successful bodies — for example, a
+misconfigured endpoint returning an empty 200 — that would otherwise silently baseline as "no
+change yet."
 
-Note: network-level failures (ECONNREFUSED, DNS, timeout) throw _before_ any baseline is
-established and are handled separately by §4.6 error propagation; they do not produce a status/size
-line. Example output for a successful (transport-level) request:
+Note: non-2xx HTTP responses and network-level failures (ECONNREFUSED, DNS, timeout) throw
+_before_ any baseline is established and are handled by §4.6 error propagation; they do not produce
+a status/size line. Example output for a successful request:
 
 ```
 Testing monitor "api-health" (source: api-poll)...

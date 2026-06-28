@@ -116,10 +116,10 @@ describe('source-api-poll', () => {
       });
       expect(noChange.observations).toHaveLength(0);
 
-      // Different status — should fire
+      // Different successful status — should fire
       mockFetch.mockResolvedValueOnce({
         text: () => Promise.resolve('body-v2'),
-        status: 500,
+        status: 204,
       });
       const changed = await source.observe(config, {
         previousState: noChange.nextState,
@@ -164,6 +164,61 @@ describe('source-api-poll', () => {
         now: new Date(),
       });
       expect(changed.observations).toHaveLength(1);
+    });
+  });
+
+  describe('HTTP error responses', () => {
+    it('rejects a 401 response before establishing a baseline', async () => {
+      const text = vi.fn().mockResolvedValue('unauthorized');
+      const cancel = vi.fn().mockResolvedValue(undefined);
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockResolvedValue({
+          text,
+          status: 401,
+          body: { cancel },
+        }),
+      );
+
+      await expect(
+        source.observe(
+          { url: 'https://api.example.com/protected' },
+          { now: new Date() },
+        ),
+      ).rejects.toThrow(
+        'api-poll received HTTP 401 — check auth/url; not establishing a baseline on an error response',
+      );
+      expect(text).not.toHaveBeenCalled();
+      expect(cancel).toHaveBeenCalledOnce();
+    });
+
+    it('rejects a 500 response instead of diffing or advancing state', async () => {
+      const mockFetch = vi.fn();
+      vi.stubGlobal('fetch', mockFetch);
+
+      const config = {
+        url: 'https://api.example.com/flaky',
+        'change-detection': { strategy: 'status-code' },
+      };
+
+      mockFetch.mockResolvedValueOnce({
+        text: () => Promise.resolve('ok'),
+        status: 200,
+      });
+      const baseline = await source.observe(config, { now: new Date() });
+      expect(baseline.nextState).toEqual({ body: 'ok', status: 200 });
+
+      mockFetch.mockResolvedValueOnce({
+        text: () => Promise.resolve('server error'),
+        status: 500,
+      });
+
+      await expect(
+        source.observe(config, {
+          previousState: baseline.nextState,
+          now: new Date(),
+        }),
+      ).rejects.toThrow(/HTTP 500.*not establishing a baseline/);
     });
   });
 

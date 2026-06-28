@@ -47,6 +47,11 @@ interface DaemonHandle {
   waitForExit: () => Promise<void>;
 }
 
+interface HttpStatusServerHandle {
+  port: number;
+  stop: () => Promise<void>;
+}
+
 function run(args: string[], cwd?: string): RunResult {
   const opts: ExecFileSyncOptions = {
     encoding: 'utf-8',
@@ -294,6 +299,86 @@ async function startDaemon(
   child.kill('SIGTERM');
   throw new Error(
     `Timed out waiting for daemon startup.\nSTDOUT:\n${stdout}\nSTDERR:\n${stderr}`,
+  );
+}
+
+async function startHttpStatusServer(
+  dir: string,
+  status: number,
+  body: string,
+): Promise<HttpStatusServerHandle> {
+  const serverScript = path.join(
+    dir,
+    `http-status-${String(status)}-${Math.random().toString(16).slice(2)}.cjs`,
+  );
+  writeFileSync(
+    serverScript,
+    `const { createServer } = require('node:http');
+const status = Number(process.argv[2]);
+const body = process.argv[3] || '';
+const server = createServer((_req, res) => {
+  res.writeHead(status, { 'content-type': 'text/plain' });
+  res.end(body);
+});
+server.listen(0, '127.0.0.1', () => {
+  const address = server.address();
+  process.stdout.write('HTTP_STATUS_SERVER_PORT ' + address.port + '\\n');
+});
+process.on('SIGTERM', () => {
+  server.close(() => process.exit(0));
+});
+`,
+    'utf-8',
+  );
+
+  // Synchronous CLI invocations block this Vitest worker's event loop, so HTTP
+  // fixtures that the CLI fetches must run in a separate process.
+  const server = spawn('node', [serverScript, String(status), body], {
+    cwd: dir,
+    env: process.env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let serverStdout = '';
+  let serverStderr = '';
+  server.stdout.setEncoding('utf-8');
+  server.stderr.setEncoding('utf-8');
+  server.stdout.on('data', (chunk: string) => {
+    serverStdout += chunk;
+  });
+  server.stderr.on('data', (chunk: string) => {
+    serverStderr += chunk;
+  });
+
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const match = /HTTP_STATUS_SERVER_PORT (\d+)/.exec(serverStdout);
+    if (match) {
+      return {
+        port: Number(match[1]),
+        stop: () =>
+          new Promise<void>((resolve) => {
+            if (server.exitCode !== null) {
+              resolve();
+              return;
+            }
+            server.kill('SIGTERM');
+            server.once('exit', () => {
+              resolve();
+            });
+          }),
+      };
+    }
+    if (server.exitCode !== null) {
+      throw new Error(
+        `HTTP status fixture exited early (code ${String(server.exitCode)}).\nSTDOUT:\n${serverStdout}\nSTDERR:\n${serverStderr}`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+
+  server.kill('SIGTERM');
+  throw new Error(
+    `HTTP status fixture did not start.\nSTDERR:\n${serverStderr}`,
   );
 }
 
@@ -1481,6 +1566,79 @@ This monitor fires on a schedule.
     expect(result.stdout).toContain('breaks-on-observe:');
     expect(result.stdout).toContain('must select an array');
     expect(result.stdout).toContain('emitted 0 event(s)');
+  });
+
+  it('surfaces a non-2xx api-poll response in daemon once output and persisted history', async () => {
+    const dir = path.join(tempDir, 'once-api-poll-http-500');
+    mkdirSync(dir, { recursive: true });
+    const server = await startHttpStatusServer(dir, 500, 'server error');
+
+    try {
+      const monitorsRoot = path.join(dir, '.claude', 'monitors');
+      writeMonitor(
+        monitorsRoot,
+        'api-down',
+        `---
+name: API down
+watch:
+  type: api-poll
+  url: 'http://127.0.0.1:${String(server.port)}/status'
+  interval: 1s
+urgency: normal
+---
+Check the API health endpoint.
+`,
+      );
+
+      const dbPath = path.join(dir, 'agentmon.db');
+      const socketPath = path.join(
+        '/tmp',
+        `agentmon-api-poll-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+      );
+      const env = {
+        AGENTMONITORS_DB: dbPath,
+        AGENTMONITORS_SOCKET: socketPath,
+      };
+
+      const once = runWithEnv(
+        ['daemon', 'once', monitorsRoot, '--workspace', dir],
+        env,
+        dir,
+      );
+      expect(once.exitCode).toBe(0);
+      expect(once.stdout).toContain('1 errored:');
+      expect(once.stdout).toContain('api-down:');
+      expect(once.stdout).toContain('HTTP 500');
+
+      const history = runWithEnv(
+        [
+          'monitor',
+          'history',
+          'api-down',
+          '--socket',
+          socketPath,
+          '--format',
+          'json',
+        ],
+        env,
+        dir,
+      );
+      expect(history.exitCode).toBe(0);
+      const rows = JSON.parse(history.stdout) as {
+        monitorId: string;
+        result: string;
+      }[];
+      expect(
+        rows.some(
+          (row) =>
+            row.monitorId === 'api-down' &&
+            row.result === 'errored' &&
+            JSON.stringify(row).includes('HTTP 500'),
+        ),
+      ).toBe(true);
+    } finally {
+      await server.stop();
+    }
   });
 
   // Acceptance criterion 2: a genuine no-change still reports `emitted 0` with
@@ -2852,6 +3010,43 @@ describe('monitor test', () => {
     expect(parsed.source).toBe('file-fingerprint');
     expect(parsed.baseline).toBe(true);
     expect(parsed).toHaveProperty('observations');
+  });
+
+  it('surfaces non-2xx api-poll responses as monitor-test errors without establishing a baseline', async () => {
+    const dir = path.join(tempDir, 'monitor-test-api-poll-401');
+    const monitorsDir = path.join(dir, 'monitors');
+    mkdirSync(monitorsDir, { recursive: true });
+    const server = await startHttpStatusServer(dir, 401, 'unauthorized');
+
+    try {
+      const monitorDir = path.join(monitorsDir, 'api-auth');
+      mkdirSync(monitorDir, { recursive: true });
+      const monitorFile = path.join(monitorDir, 'MONITOR.md');
+      writeFileSync(
+        monitorFile,
+        [
+          '---',
+          'name: API auth',
+          'watch:',
+          '  type: api-poll',
+          `  url: 'http://127.0.0.1:${String(server.port)}/protected'`,
+          '  change-detection:',
+          '    strategy: text-diff',
+          '---',
+          'Check the API auth path.',
+          '',
+        ].join('\n'),
+        'utf-8',
+      );
+
+      const result = run(['monitor', 'test', monitorFile], dir);
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain('HTTP 401');
+      expect(result.stderr).toContain('not establishing a baseline');
+      expect(result.stdout).not.toContain('Baseline established');
+    } finally {
+      await server.stop();
+    }
   });
 
   it('reports zero-match file-fingerprint scopes without establishing a baseline', () => {

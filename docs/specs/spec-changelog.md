@@ -9,6 +9,25 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-06-28 — `api-poll` rejects non-2xx HTTP responses before baseline (003 §4.2, §4.5–4.7) — Refs #220
+
+The bundled `api-poll` source now treats non-2xx HTTP responses as observation errors rather than
+valid response snapshots. A 401, 404, 500, or other error response throws with the HTTP status in the
+message and returns no `nextState`, so broken auth, mistyped URLs, and server errors cannot
+silently establish or advance a baseline. Successful 2xx responses keep the existing baseline and
+diff behavior, including `status-code` comparisons between successful statuses.
+
+`monitor test` now exits non-zero for a non-2xx `api-poll` response before printing baseline
+status/size output. Runtime observation history and daemon runs surface the same thrown source
+error through the existing errored-observation path.
+
+- **Proof:** `plugins/source-api-poll/src/index.test.ts` covers 2xx `status-code` comparison plus
+  401 initial-baseline and 500 post-baseline rejection; `apps/cli/src/commands/cli.integration.test.ts`
+  covers `monitor test` surfacing a 401 without establishing a baseline and `daemon once` /
+  persisted `monitor history` surfacing a 500 as `errored`.
+- Patch changesets: `@agentmonitors/source-api-poll` and `@agentmonitors/cli` user-visible
+  observation/error behavior.
+
 ## 2026-06-28 — Manual daemon commands use the enabled workspace socket (005 §1) — Refs #199
 
 `session open`, `session close`, `session list`, `events list`, `events ack`, and `hook claim` now
