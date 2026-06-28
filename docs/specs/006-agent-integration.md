@@ -287,6 +287,9 @@ the tool call.
 Because only some events honor `additionalContext` (see §5.4), the command derives the delivery
 lifecycle from the firing event and **emits nothing** for events that would ignore the context. The
 hook config is therefore the same single command line for every event: `agentmonitors hook deliver`.
+The default output remains the Claude Code hook wire JSON; `--format json` selects that same wire
+shape explicitly, while `--format text` prints only the rendered `additionalContext` for manual
+inspection.
 
 This transport is fully self-contained (no MCP server, no channel capability requirement) and works
 in any environment that can run Claude Code hooks.
@@ -318,8 +321,10 @@ session id from the environment.
 
 ### 5.1 Wire Contract
 
-The hook reads its payload from stdin (§5.0), then prints a JSON object to stdout and **MUST exit 0**
-— non-zero exit or a missing `continue` field causes Claude Code to ignore the output. The shape:
+The hook reads its payload from stdin (§5.0), then prints a JSON object to stdout in the
+default/json format and **MUST exit 0**. Non-zero exit or a missing `continue` field causes Claude
+Code to ignore hook output, so installed hook commands use the default/json wire format. The wire
+shape:
 
 ```json
 {
@@ -354,8 +359,8 @@ The hook reads its payload from stdin (§5.0), then prints a JSON object to stdo
 
 - **No `permissionDecision` field** — advisory; the agent decides what to do.
 
-When there is nothing pending, the command **MUST** print nothing and exit 0 — an empty stdout is
-the signal to Claude Code to proceed silently.
+When there is nothing pending, the command **MUST** print nothing and exit 0 in every format — an
+empty stdout is the signal to Claude Code to proceed silently.
 
 ### 5.2 Behavior
 
@@ -372,8 +377,11 @@ the signal to Claude Code to proceed silently.
 6. Call `listSessionsClient(socket)`, find the session whose `hostSessionId` matches `sessionId`.
    If not found → exit 0, print nothing.
 7. Call `claimDeliveryClient(sessionId, lifecycle, socket)`. If null → exit 0, print nothing.
-8. Render via `renderHookDelivery(claim, hookEventName)`. If null (empty events) → exit 0, print nothing.
-9. `process.stdout.write(JSON.stringify(output))` → exit 0.
+8. Render via `renderHookDelivery(claim, hookEventName)`. If null (no event bodies and no reminder
+   message) → exit 0, print nothing.
+9. Write output and exit 0. The omitted/default format and `--format json` write compact hook wire
+   JSON via `JSON.stringify(output)`. `--format text` writes only
+   `output.hookSpecificOutput.additionalContext`.
 
 **Any internal error MUST be swallowed.** The command is invoked by a Claude Code hook; an
 unhandled error would interrupt the user's session. The wrapping try/catch ensures the command
@@ -417,7 +425,8 @@ Register it only on **context events** (the events that honor `additionalContext
 ```
 
 `--lifecycle` remains available as an **optional override** (primarily for tests); when omitted, the
-lifecycle is derived from the event per §5.4.
+lifecycle is derived from the event per §5.4. `--format text` is available for manual inspection but
+is not used by hook registration because Claude Code expects the default/json wire object.
 
 ### 5.4 Event → lifecycle mapping & `additionalContext` support
 

@@ -1009,13 +1009,14 @@ Claims a pending delivery payload for a session at the specified lifecycle point
 ### §12.2 `hook deliver`
 
 ```
-agentmonitors hook deliver [--lifecycle <lifecycle>] [--socket <path>]
+agentmonitors hook deliver [--lifecycle <lifecycle>] [--format <format>] [--socket <path>]
 ```
 
-| Flag                      | Type    | Default          | Description                                                                                                   |
-| ------------------------- | ------- | ---------------- | ------------------------------------------------------------------------------------------------------------- |
-| `--lifecycle <lifecycle>` | choices | derived          | Optional override (`turn-interruptible`, `turn-idle`, `post-compact`); normally derived from the firing event |
-| `--socket <path>`         | string  | from `.local.md` | Override daemon socket path                                                                                   |
+| Flag                      | Type    | Default          | Description                                                                                                                |
+| ------------------------- | ------- | ---------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `--lifecycle <lifecycle>` | choices | derived          | Optional override (`turn-interruptible`, `turn-idle`, `post-compact`); normally derived from the firing event              |
+| `--format <format>`       | choices | hook wire JSON   | `json` emits the compact Claude Code hook object; `text` emits only the rendered `additionalContext` for manual inspection |
+| `--socket <path>`         | string  | from `.local.md` | Override daemon socket path                                                                                                |
 
 **Designed to run as a Claude Code lifecycle hook.** Reads the hook payload as **JSON on stdin**
 (Claude Code delivers hook input via stdin, **not** env vars — there is no `CLAUDE_CODE_SESSION_ID`
@@ -1023,6 +1024,11 @@ env var). It uses `session_id`, `hook_event_name`, and `cwd` from the payload, c
 deliveries for that session, and emits them as **advisory, non-blocking `additionalContext`** at the
 turn boundary. The lifecycle is derived from `hook_event_name`; the same command line works on every
 event.
+
+Emission requires an enabled project, an explicit per-workspace `socket:` in
+`.claude/agentmonitors.local.md` (or `--socket`), a reachable daemon, and a tracked AgentMon session
+whose `hostSessionId` matches the hook payload's `session_id`. Empty output means nothing is pending
+or the workspace/session is not configured.
 
 **Behavior:**
 
@@ -1033,12 +1039,14 @@ event.
 5. List sessions, find the one matching `session_id`. If not found → exit 0, print nothing.
 6. Call `claimDelivery(sessionId, lifecycle)`. If null → exit 0, print nothing.
 7. Render via `renderHookDelivery(claim, hookEventName)`. It returns `null` (→ exit 0, print nothing) **only** when the claim is `null` or carries neither event bodies nor a reminder message. A `normal`/`low` claim with `events: []` but a populated `message` renders that message as a reminder line (see Note below) — it is **not** silent.
-8. Print the wire JSON to stdout and exit 0.
+8. Print the selected output format to stdout and exit 0.
 
 **ALWAYS exits 0.** Any internal error is swallowed to avoid interrupting the user's session. A hook
 that exits non-zero can block tool calls.
 
-**Wire output (when there is something pending):**
+**Default output and `--format json` (when there is something pending):** compact Claude Code hook
+wire JSON. The example below is pretty-printed for readability; the command emits the compact
+`JSON.stringify(output)` form on stdout.
 
 ```json
 {
@@ -1063,6 +1071,18 @@ that exits non-zero can block tool calls.
 ```
 
 **No output** when nothing is pending (empty stdout + exit 0).
+
+**Text output (`--format text`):** prints only the rendered
+`hookSpecificOutput.additionalContext` string, with no JSON wrapper. This format is for manual
+inspection; hook configurations should use the default/json wire output.
+
+**Lifecycle → urgency surfacing:**
+
+| Lifecycle            | Derived from hook events          | Surfaced payload                                                                |
+| -------------------- | --------------------------------- | ------------------------------------------------------------------------------- |
+| `turn-interruptible` | `UserPromptSubmit`, `PostToolUse` | settled high-urgency event bodies; normal-urgency changes as reminder text only |
+| `turn-idle`          | override only                     | low-urgency changes as reminder text only                                       |
+| `post-compact`       | `SessionStart`                    | all unread event bodies as a recap                                              |
 
 Note: for a derived `turn-interruptible` lifecycle, `normal` urgency produces `events: []` (reminder
 only — no body injection); `low` does likewise at `turn-idle`. "Reminder only" is **not** silence:

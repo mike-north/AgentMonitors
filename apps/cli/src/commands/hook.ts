@@ -100,9 +100,32 @@ hookCommand
       'Optional override; normally the lifecycle is derived from the firing event',
     ).choices(['turn-interruptible', 'turn-idle', 'post-compact']),
   )
+  .addOption(
+    new Option(
+      '--format <format>',
+      'Output format; default/json emit hook wire JSON, text emits advisory context only',
+    ).choices(['text', 'json']),
+  )
   .option('--socket <path>', 'Unix domain socket path for the daemon')
+  .addHelpText(
+    'after',
+    `
+Emission preconditions:
+  Requires an enabled project, a per-workspace socket in .claude/agentmonitors.local.md
+  (or --socket), a reachable daemon, and a matching tracked session for the hook payload session_id.
+  Empty output means nothing is pending or this workspace/session is not configured.
+
+Output formats:
+  default/json  Compact Claude Code hook wire JSON when something is pending.
+  text          Rendered additionalContext only, for manual inspection.
+`,
+  )
   .action(
-    async (options: { lifecycle?: DeliveryLifecycle; socket?: string }) => {
+    async (options: {
+      lifecycle?: DeliveryLifecycle;
+      socket?: string;
+      format?: 'text' | 'json';
+    }) => {
       // This command is invoked by Claude Code hooks.  ANY failure MUST be
       // silent (print nothing, exit 0) — surfacing an error would disrupt
       // the user's session.  All IPC / resolution work is wrapped in try/catch
@@ -156,10 +179,16 @@ hookCommand
 
         // Render and emit.  The echoed hookEventName must match the firing
         // event so the host honors the additionalContext. Null → nothing
-        // pending → print nothing.
+        // pending → print nothing. The default remains the hook wire JSON
+        // because this command is normally wired directly into Claude hooks;
+        // text is an inspection aid for humans running it manually.
         const output = renderHookDelivery(claim, hookEventName ?? '');
         if (output !== null) {
-          process.stdout.write(JSON.stringify(output));
+          if (options.format === 'text') {
+            process.stdout.write(output.hookSpecificOutput.additionalContext);
+          } else {
+            process.stdout.write(JSON.stringify(output));
+          }
         }
       } catch {
         // Any internal error is swallowed: a hook that throws would interrupt
