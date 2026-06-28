@@ -16,12 +16,23 @@ interface ScopeConfig {
 }
 
 function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
-  const globs = config['globs'];
-  if (
-    !Array.isArray(globs) ||
-    !globs.every((g): g is string => typeof g === 'string')
+  const raw = config['globs'];
+  // Ergonomic shorthand: a single pattern may be written as a bare string
+  // (`globs: notes.md`) instead of a one-element array (`globs: ['notes.md']`).
+  // Normalize either form to the internal `string[]`.
+  let globs: string[];
+  if (typeof raw === 'string') {
+    globs = [raw];
+  } else if (
+    Array.isArray(raw) &&
+    raw.every((g): g is string => typeof g === 'string')
   ) {
-    throw new Error('scope.globs must be an array of strings');
+    globs = raw;
+  } else {
+    throw new Error('scope.globs must be a string or an array of strings');
+  }
+  if (globs.length === 0 || globs.some((g) => g.trim() === '')) {
+    throw new Error('scope.globs must not contain empty patterns');
   }
   const cwd = typeof config['cwd'] === 'string' ? config['cwd'] : undefined;
   return { globs, cwd };
@@ -141,9 +152,13 @@ const scopeSchema: JsonSchema = {
   type: 'object',
   properties: {
     globs: {
-      type: 'array',
-      items: { type: 'string' },
-      description: 'Glob patterns to match files',
+      description:
+        'Glob pattern(s) to match files. A single pattern may be written as a ' +
+        'bare string (e.g. "notes.md"); multiple patterns as an array (OR-ed together).',
+      oneOf: [
+        { type: 'string', minLength: 1 },
+        { type: 'array', items: { type: 'string' }, minItems: 1 },
+      ],
     },
     cwd: {
       type: 'string',
