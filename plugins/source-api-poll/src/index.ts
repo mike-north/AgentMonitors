@@ -435,9 +435,12 @@ function redactUrlForWarning(url: string): string {
     parsed.hash = '';
     return parsed.toString();
   } catch {
-    return url
-      .replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/@]*@/i, '$1')
-      .replace(/[?#].*$/, '');
+    // Parsing failed, so we cannot reliably locate the userinfo (`user:pass@`)
+    // or query/fragment boundaries — best-effort regexes can miss a `user:pass@`
+    // when there's no `scheme://` prefix. This helper now guards durably
+    // persisted error messages (observation_history), so we must never risk
+    // leaking a credential. Return a fixed safe placeholder instead.
+    return '[unparseable url redacted]';
   }
 }
 
@@ -500,7 +503,7 @@ async function observeComposite(
       // status-transition watcher, so every part must be a 2xx success.
       if (!isSuccessStatus(status)) {
         throw new Error(
-          `api-poll received HTTP ${String(status)} from composite part "${part.id}" (${part.url}) — check auth/url; not establishing a baseline on an error response`,
+          `api-poll received HTTP ${String(status)} from composite part "${part.id}" (${redactUrlForWarning(part.url)}) — check auth/url; not establishing a baseline on an error response`,
         );
       }
       return { id: part.id, body } satisfies FetchedPart;
@@ -588,7 +591,7 @@ const source: ObservationSource = {
     // as an error, because diffing an error body is meaningless.
     if (changeDetection !== 'status-code' && !isSuccessStatus(status)) {
       throw new Error(
-        `api-poll received HTTP ${String(status)} from ${url} — check auth/url; not establishing a baseline on an error response`,
+        `api-poll received HTTP ${String(status)} from ${redactUrlForWarning(url)} — check auth/url; not establishing a baseline on an error response`,
       );
     }
 
