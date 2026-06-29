@@ -27,6 +27,11 @@ watch:
   method: GET
   interval: 5m
   change-detection:
+    # Pick the strategy by what the URL returns:
+    #   text-diff  — HTML pages / plain-text status pages (the safe default for
+    #                watching a web page; json-diff would mis-diff HTML)
+    #   json-diff  — JSON APIs (compares semantically, ignoring key order/whitespace)
+    #   status-code — only fire when the HTTP status changes (e.g. 200 -> 503)
     strategy: json-diff
 urgency: normal
 ---

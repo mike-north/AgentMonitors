@@ -425,13 +425,26 @@ Required field: `url` (string). Important optional fields: `method`, `headers`, 
 
 Supported strategies (verified: `plugins/source-api-poll/src/index.ts`, `ChangeStrategy` type and `hasChanged` function):
 
-| Strategy      | Semantics                                                                                                                                  |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `text-diff`   | Compare raw response body strings. This is the **default** when no strategy is specified or the value is unrecognized.                     |
-| `json-diff`   | Parse both bodies as JSON, recursively sort object keys, then compare serialized strings. Ignores key ordering and whitespace differences. |
-| `status-code` | Compare only HTTP status codes; body changes are ignored.                                                                                  |
+| Strategy      | Semantics                                                                                                                                  | Use for                                                                |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------- |
+| `text-diff`   | Compare raw response body strings. This is the **default** when no strategy is specified or the value is unrecognized.                     | HTML pages, plain-text status pages — the correct choice for web pages |
+| `json-diff`   | Parse both bodies as JSON, recursively sort object keys, then compare serialized strings. Ignores key ordering and whitespace differences. | JSON APIs                                                              |
+| `status-code` | Compare only HTTP status codes; body changes are ignored.                                                                                  | Watching whether an endpoint goes up/down (e.g. 200 → 503)             |
 
-If `json-diff` parsing fails for either body, the implementation falls back to raw text comparison (verified: `plugins/source-api-poll/src/index.ts` lines 96–101).
+The author should pick the strategy by **what the endpoint returns**: `text-diff` for HTML/plain-text
+pages (the common "tell me when this web page changed" case), `json-diff` for JSON APIs. The `api-poll`
+scaffold (`apps/cli/src/commands/init.ts`) and the authoring docs state this inline.
+
+If `json-diff` parsing fails for either body, the implementation falls back to raw text comparison
+(verified: `plugins/source-api-poll/src/index.ts`, `hasChanged`). Because that fallback is silent and
+is almost always the wrong strategy for the body in question, the source attaches a **non-fatal
+warning** to the `ObservationResult` (`ObservationResult.warnings`) when `strategy: json-diff` is
+configured but the fetched body does not parse as JSON. `agentmonitors monitor test` prints the
+warning (`Warning: api-poll: change-detection.strategy is json-diff but the response … does not parse
+as JSON; … Use strategy: text-diff …`) so the author sees the misconfiguration during a dry-run rather
+than getting quietly wrong diffing in production. The warning does not change the observation outcome —
+the baseline/diff still proceeds via the text fallback. (Verified: `plugins/source-api-poll/src/index.ts`;
+`plugins/source-api-poll/src/index.test.ts`. Issue #219.)
 
 ### 4.3 Authentication
 
@@ -463,7 +476,41 @@ This treats the polled URL as the source-defined object identity (SP3).
 
 ### 4.5 Stateful behavior
 
-`api-poll` declares `stateful: true`. The first call fetches the URL, stores `{ body, status }` as `nextState`, and returns an empty `observations` array. Subsequent calls compare against `context.previousState` and emit an observation only when `hasChanged` returns `true`.
+`api-poll` declares `stateful: true`. The first **successful (2xx)** call fetches the URL, stores
+`{ body, status }` as `nextState`, and returns an empty `observations` array. Subsequent calls compare
+against `context.previousState` and emit an observation only when `hasChanged` returns `true`.
+
+A **non-2xx** response is not a valid baseline for body-diffing strategies — see §4.8.
+
+### 4.8 Non-2xx responses → errored observation
+
+A non-2xx HTTP response (e.g. a `401` from a missing/invalid bearer token, a `403`, a `404`, a `500`
+error page) is **not** silently used to establish or advance a change-detection baseline for the
+`text-diff` and `json-diff` strategies. Baselining on an error body makes a misconfigured monitor
+appear to "work" — it would baseline on, and then diff, error pages — with no signal that auth or the
+URL is broken (the failure mode in issue #220, where a bad token produced `HTTP 401` yet the monitor
+validated and observed "successfully").
+
+Instead, for `text-diff`/`json-diff` the source **throws** on a non-2xx status with a status-bearing
+message:
+
+> `api-poll received HTTP <status> from <url> — check auth/url; not establishing a baseline on an error response`
+
+Because the source throws, the runtime records an **`errored`** observation outcome (no `nextState`
+advance, so any prior baseline is preserved per [002 §3](./002-runtime-delivery.md)); `daemon once` /
+`daemon run` include it in their error reporting; `monitor history` shows the tick as `errored`; and
+`monitor test` reports `Observation failed: api-poll received HTTP <status> …`.
+
+**Exception — `status-code`:** the `status-code` strategy exists precisely to detect status
+transitions (an endpoint going `200 → 503`). For it, a non-2xx status is a legitimate **observed
+signal**, not an error — the status itself is the watched object — so `status-code` does **not** throw
+on non-2xx. Only the body-diffing strategies treat a non-2xx as an error, because diffing an error
+body is meaningless.
+
+Successful (2xx) responses baseline and diff exactly as before (no regression). This is distinct from
+§4.6 **network**-level failures (ECONNREFUSED, DNS, timeout), which throw before any response status is
+known; §4.8 covers transport-level success with a non-2xx status. (Verified:
+`plugins/source-api-poll/src/index.ts`; `plugins/source-api-poll/src/index.test.ts`. Issue #220.)
 
 ### 4.6 Network error propagation
 

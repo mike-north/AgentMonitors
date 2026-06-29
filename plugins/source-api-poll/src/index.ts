@@ -316,6 +316,34 @@ async function fetchBody(
   return { body: await response.text(), status: response.status };
 }
 
+/** Whether an HTTP status code is in the 2xx success range. */
+function isSuccessStatus(status: number): boolean {
+  return status >= 200 && status < 300;
+}
+
+/**
+ * Whether `body` parses as JSON. Used to warn when `strategy: json-diff` is
+ * configured against a body that is not JSON (e.g. an HTML status page), which
+ * would silently degrade to text comparison (003 §4.2, issue #219).
+ */
+function isParseableJson(body: string): boolean {
+  try {
+    JSON.parse(body);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Warning text for `strategy: json-diff` against a non-JSON body (issue #219).
+ * Exported-adjacent constant kept beside the source so the test asserts the same
+ * message the author sees.
+ */
+function jsonDiffNonJsonWarning(url: string): string {
+  return `api-poll: change-detection.strategy is json-diff but the response from ${url} does not parse as JSON; falling back to text comparison. Use strategy: text-diff for HTML/plain-text pages.`;
+}
+
 /** Source-owned change-detection state for composite mode (§2.6). */
 interface CompositeState {
   /** The prior rendered composite snapshot, used to decide whether to emit. */
@@ -411,12 +439,42 @@ const source: ObservationSource = {
     }
 
     const { body, status } = await fetchBody(url, method, combinedHeaders);
+
+    // ---- Non-2xx → errored observation (issue #220) -----------------------------
+    // Establishing a change-detection baseline on an error body (e.g. a 401 from a
+    // missing/invalid bearer token, or a 500 error page) makes a misconfigured
+    // monitor look like it "works": it would baseline on the error page and diff
+    // error pages, with no signal that auth/url is broken. Throw so the runtime
+    // records an `errored` observation (no baseline advance) and `monitor test`
+    // surfaces the status, instead of silently baselining.
+    //
+    // EXCEPTION: `status-code` strategy is precisely about detecting status
+    // transitions (e.g. an endpoint going 200 → 503), so for it a non-2xx is a
+    // legitimate observed signal — the status IS the watched object — not an
+    // error. Only body-diffing strategies (text-diff / json-diff) treat a non-2xx
+    // as an error, because diffing an error body is meaningless.
+    if (changeDetection !== 'status-code' && !isSuccessStatus(status)) {
+      throw new Error(
+        `api-poll received HTTP ${String(status)} from ${url} — check auth/url; not establishing a baseline on an error response`,
+      );
+    }
+
     const prev =
       context.previousState &&
       typeof context.previousState === 'object' &&
       !Array.isArray(context.previousState)
         ? (context.previousState as CachedResponse)
         : undefined;
+
+    // ---- json-diff on a non-JSON body → warning (issue #219) --------------------
+    // `json-diff` silently degrades to text comparison when a body does not parse
+    // as JSON (003 §4.2). That is the wrong strategy for HTML/plain-text pages and
+    // is invisible by default. Surface a warning (non-fatal) so `monitor test`
+    // tells the author to switch to text-diff, rather than diffing HTML as JSON.
+    const warnings: string[] =
+      changeDetection === 'json-diff' && !collection && !isParseableJson(body)
+        ? [jsonDiffNonJsonWarning(url)]
+        : [];
 
     // ---- Keyed-collection mode (003 §12) ----------------------------------------
     // Parse the body as JSON and diff per keyed object, instead of treating the
@@ -438,6 +496,7 @@ const source: ObservationSource = {
     }
 
     const curr: CachedResponse = { body, status: status };
+    const warningFields = warnings.length > 0 ? { warnings } : {};
 
     if (prev !== undefined && hasChanged(changeDetection, prev, curr)) {
       return {
@@ -463,12 +522,14 @@ const source: ObservationSource = {
           },
         ],
         nextState: curr,
+        ...warningFields,
       };
     }
 
     return {
       observations: [],
       nextState: curr,
+      ...warningFields,
     };
   },
 };

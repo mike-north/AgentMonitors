@@ -91,8 +91,8 @@ watch:
   url: 'https://api.example.com/status'
   method: GET                  # optional — defaults to GET
   interval: 5m                 # optional — polling interval (e.g. 5m, 30s, 1h)
-  change-detection:            # optional
-    strategy: json-diff        # text-diff (default) | json-diff | status-code
+  change-detection:            # optional — pick by what the URL returns:
+    strategy: json-diff        # text-diff for HTML/plain pages · json-diff for JSON APIs · status-code for status-only
   auth:                        # optional
     type: bearer
     token-env: API_TOKEN       # reads from environment variable
@@ -102,11 +102,21 @@ watch:
 
 **Change detection strategies:**
 
-| Strategy | Behaviour |
-|---|---|
-| `text-diff` | Compares raw response body text (default) |
-| `json-diff` | Parses JSON and compares semantically (ignores key order and whitespace) |
-| `status-code` | Only detects changes in HTTP status code |
+| Strategy | Behaviour | Use for |
+|---|---|---|
+| `text-diff` | Compares raw response body text (default) | HTML pages, plain-text status pages — the right choice for watching a web page |
+| `json-diff` | Parses JSON and compares semantically (ignores key order and whitespace) | JSON APIs |
+| `status-code` | Only detects changes in HTTP status code | Watching whether an endpoint goes up/down (e.g. 200 → 503) |
+
+Choose the strategy by **what the endpoint returns**. `json-diff` against an HTML/plain-text page
+silently degrades to text comparison and gives poor diffs — `agentmonitors monitor test` warns when
+`json-diff` is configured but the body does not parse as JSON, so prefer `text-diff` for pages.
+
+A non-2xx response (e.g. a `401` from a missing/invalid token, or a `500` error page) is treated as
+an **errored** observation for `text-diff`/`json-diff` — the monitor does **not** baseline on the
+error body, and `monitor test` / `monitor history` surface the status — so a broken auth/URL is not
+silently masked. (`status-code` is the exception: there the status itself is the watched signal, so a
+non-2xx is a legitimate change, not an error.)
 
 **Auth types:**
 
