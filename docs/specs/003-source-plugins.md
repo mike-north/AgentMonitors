@@ -468,6 +468,14 @@ everything else — `text/html`, `text/plain`, and a missing/unknown `Content-Ty
 This makes the common "watch a web page" case zero-config: omit `change-detection` and the source picks
 `text-diff` for an HTML page and `json-diff` for a JSON API automatically.
 
+Rendered HTML can still be a noisy input even when `text-diff` is the correct strategy. Many real
+status pages embed per-request timestamps, CSRF tokens, nonces, or build metadata, so the raw HTML
+body differs on every poll despite no user-visible status change. For status-page monitoring,
+authors SHOULD prefer a machine-readable status endpoint when available (for example, a
+Statuspage-style `/api/v2/status.json` URL) because JSON summary endpoints are generally stable
+until the status itself changes. If only rendered HTML is available, authors SHOULD expect noise and
+pair the monitor with a `notify.strategy: debounce` window when appropriate.
+
 **An explicit `change-detection.strategy` always wins.** When the author specifies a strategy it is used
 **verbatim**, with no inference and no Content-Type override — user specification is absolute. So an
 explicit `json-diff` against an HTML page stays `json-diff` (and triggers the warning below), and an

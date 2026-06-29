@@ -132,6 +132,21 @@ watch:
 everything else — HTML, plain text, or a missing/unknown `Content-Type` — uses `text-diff`. So the
 common "tell me when this web page changed" case is zero-config.
 
+For status pages, prefer the machine-readable status endpoint when one exists. Rendered HTML often
+contains per-request timestamps, CSRF tokens, nonces, or build metadata; raw `text-diff` sees those
+as changes and can fire every poll even when the actual service status is unchanged.
+
+```yaml
+watch:
+  type: api-poll
+  url: 'https://status.example.com/api/v2/status.json'
+  interval: 5m
+```
+
+Many Statuspage-backed sites expose `/api/v2/status.json`, which is designed to be stable until the
+reported status changes. If a site only exposes rendered HTML, consider pairing the monitor with a
+`notify.strategy: debounce` window and expect more noise.
+
 **An explicit `strategy` always wins** — it is used verbatim with no inference or override. So an
 explicit `json-diff` against an HTML page stays `json-diff` (and `agentmonitors monitor test` warns
 that the body does not parse as JSON, steering you to `text-diff`); an explicit `text-diff` against a
