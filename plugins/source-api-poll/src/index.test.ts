@@ -90,6 +90,25 @@ describe('source-api-poll', () => {
   });
 
   describe('change-detection strategies', () => {
+    // Regression: an unrecognized but *present* strategy value must throw
+    // immediately rather than silently falling through to Content-Type inference.
+    // Before the fix, e.g. `strategy: jsondiff` (typo) would set
+    // `explicitStrategy = undefined` and infer from Content-Type — violating
+    // "explicit always wins" and hiding the author error.
+    it('unrecognized explicit strategy throws a descriptive error and does NOT infer', async () => {
+      await expect(
+        source.observe(
+          {
+            url: 'https://api.example.com/data',
+            'change-detection': { strategy: 'jsondiff' }, // typo — not a valid strategy
+          },
+          { now: new Date() },
+        ),
+      ).rejects.toThrow(
+        /unknown change-detection\.strategy "jsondiff" \(expected one of: json-diff, text-diff, status-code\)/,
+      );
+    });
+
     it('status-code: detects status change, ignores body change', async () => {
       const mockFetch = vi.fn();
       vi.stubGlobal('fetch', mockFetch);

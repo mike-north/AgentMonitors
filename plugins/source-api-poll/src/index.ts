@@ -36,7 +36,7 @@ interface ScopeConfig {
   /**
    * The change-detection strategy as written by the author, or `undefined` when
    * the author omitted `change-detection.strategy`. The omitted case is resolved
-   * after the fetch by inferring from the response `Content-Type` (003 §4.3,
+   * after the fetch by inferring from the response `Content-Type` (003 §4.2,
    * issue #230); an explicit value always wins (no inference, no override).
    */
   explicitStrategy: ChangeStrategy | undefined;
@@ -67,9 +67,28 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
 
   // The strategy is honored *verbatim* when the author specifies one; when it is
   // OMITTED we leave `explicitStrategy` undefined and infer it from the response
-  // Content-Type after the fetch (003 §4.3, issue #230). Explicit always wins.
+  // Content-Type after the fetch (003 §4.2, issue #230). Explicit always wins.
+  //
+  // An unrecognized strategy value is an authoring error — not a signal to fall
+  // through to inference. If the author wrote e.g. `strategy: jsondiff` (a
+  // typo), silently inferring would violate "explicit always wins" and hide the
+  // mistake. Throw immediately with a descriptive message so the author sees the
+  // bad value, rather than observing unexpected behavior at runtime.
   const cd = config['change-detection'] as { strategy?: string } | undefined;
   const strategy = cd?.strategy;
+  const knownStrategies: ChangeStrategy[] = [
+    'json-diff',
+    'text-diff',
+    'status-code',
+  ];
+  if (
+    strategy !== undefined &&
+    !knownStrategies.includes(strategy as ChangeStrategy)
+  ) {
+    throw new Error(
+      `unknown change-detection.strategy "${strategy}" (expected one of: json-diff, text-diff, status-code)`,
+    );
+  }
   const explicitStrategy: ChangeStrategy | undefined =
     strategy === 'status-code' ||
     strategy === 'json-diff' ||
@@ -361,9 +380,9 @@ function isSuccessStatus(status: number): boolean {
 /**
  * Whether a `Content-Type` header indicates a JSON body: the `application/json`
  * media type or any structured-syntax `+json` suffix (e.g. `application/ld+json`,
- * `application/vnd.api+json`), per RFC 6839. Parameters (`; charset=utf-8`) and
+ * `application/vnd.api+json`), per RFC 6838. Parameters (`; charset=utf-8`) and
  * case are ignored. Used to infer the change-detection strategy when the author
- * omits `change-detection.strategy` (003 §4.3, issue #230).
+ * omits `change-detection.strategy` (003 §4.2, issue #230).
  *
  * @see https://www.rfc-editor.org/rfc/rfc6838#section-4.2.8 (+json suffix)
  */
@@ -378,7 +397,7 @@ function isJsonContentType(contentType: string | undefined): boolean {
  * Resolve the effective change-detection strategy. An explicit author value is
  * used verbatim (explicit always wins). When omitted, infer from the response
  * `Content-Type`: JSON media types → `json-diff`; everything else (text/html,
- * text/plain, missing/unknown) → `text-diff` (003 §4.3, issue #230).
+ * text/plain, missing/unknown) → `text-diff` (003 §4.2, issue #230).
  */
 function resolveStrategy(
   explicit: ChangeStrategy | undefined,
@@ -530,7 +549,7 @@ const source: ObservationSource = {
     );
 
     // Resolve the effective strategy: explicit wins verbatim; otherwise infer
-    // from the response Content-Type (003 §4.3, issue #230). Inference can only
+    // from the response Content-Type (003 §4.2, issue #230). Inference can only
     // produce a body-diffing strategy (json-diff / text-diff), never status-code.
     const changeDetection = resolveStrategy(explicitStrategy, contentType);
 
