@@ -78,6 +78,7 @@ function printJsonResult(
   sourceName: string,
   baseline: boolean,
   observations: Observation[],
+  warnings: string[] = [],
 ): void {
   console.log(
     JSON.stringify(
@@ -89,11 +90,27 @@ function printJsonResult(
           title: o.title,
           snapshot: o.snapshot,
         })),
+        // Only present non-empty warnings so unaffected monitors keep a clean
+        // JSON shape; consumers treat absence as "no warnings".
+        ...(warnings.length > 0 ? { warnings } : {}),
       },
       null,
       2,
     ),
   );
+}
+
+/**
+ * Print non-fatal source warnings (003 §4.2, issue #219) to stderr so a `monitor
+ * test` dry-run surfaces likely misconfigurations (e.g. json-diff on an HTML
+ * page) without masking them as success. Text output only; JSON callers embed
+ * warnings in the payload.
+ */
+function printWarnings(warnings: string[] | undefined): void {
+  if (!warnings) return;
+  for (const warning of warnings) {
+    console.error(`Warning: ${warning}`);
+  }
 }
 
 /** Print observations in human-readable text format. */
@@ -252,9 +269,19 @@ async function handleStatefulSource(
   const secondObservations = secondResult.observations;
 
   if (json) {
-    printJsonResult(monitorName, source.name, true, secondObservations);
+    printJsonResult(
+      monitorName,
+      source.name,
+      true,
+      secondObservations,
+      secondResult.warnings ?? [],
+    );
     return;
   }
+
+  // Surface non-fatal source warnings (e.g. json-diff against a non-JSON body,
+  // issue #219) before the change-detection summary so the author sees them.
+  printWarnings(secondResult.warnings);
 
   if (secondObservations.length > 0) {
     printTextObservations(secondObservations);
@@ -351,10 +378,18 @@ monitorTestCommand
           context,
         );
       } else if (json) {
-        printJsonResult(monitorName, source.name, false, observations);
+        printJsonResult(
+          monitorName,
+          source.name,
+          false,
+          observations,
+          firstResult.warnings ?? [],
+        );
       } else if (observations.length === 0) {
+        printWarnings(firstResult.warnings);
         console.log('No observations produced.');
       } else {
+        printWarnings(firstResult.warnings);
         printTextObservations(observations);
       }
     } catch (err) {

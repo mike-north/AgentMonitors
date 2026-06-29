@@ -2935,6 +2935,198 @@ describe('monitor test', () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('Parse error');
   });
+
+  // Issues #219 / #220: `monitor test` exercises the api-poll source against a
+  // REAL HTTP endpoint, proving end-to-end that a non-2xx status surfaces as an
+  // errored observation, and that json-diff on a non-JSON body surfaces the
+  // steering warning. The endpoint MUST run out-of-process: `run` uses the
+  // blocking `execFileSync`, which freezes this test process's event loop, so an
+  // in-test `http.Server` could never serve a request while the CLI is polling.
+  // We spawn a tiny standalone server as a child process and discover its port
+  // from the line it prints.
+  describe('api-poll over a real endpoint (#219, #220)', () => {
+    function writeApiPollMonitor(
+      dir: string,
+      url: string,
+      strategy: string,
+    ): string {
+      const monitorDir = path.join(dir, 'ap');
+      mkdirSync(monitorDir, { recursive: true });
+      const monitorFile = path.join(monitorDir, 'MONITOR.md');
+      writeFileSync(
+        monitorFile,
+        [
+          '---',
+          'name: AP test',
+          'watch:',
+          '  type: api-poll',
+          `  url: '${url}'`,
+          '  change-detection:',
+          `    strategy: ${strategy}`,
+          'urgency: normal',
+          '---',
+          '',
+          'Body.',
+          '',
+        ].join('\n'),
+        'utf-8',
+      );
+      return monitorFile;
+    }
+
+    /**
+     * Start a fixed-response HTTP server in a separate process and resolve its
+     * base URL. The server replies with `status`/`body` to every request and
+     * sends `Connection: close` so undici opens a fresh connection per poll.
+     */
+    async function startServer(
+      status: number,
+      body: string,
+    ): Promise<{ url: string; stop: () => void }> {
+      const serverDir = mkdtempSync(path.join(tmpdir(), 'ap-server-'));
+      const serverScript = path.join(serverDir, 'server.cjs');
+      writeFileSync(
+        serverScript,
+        [
+          "const http = require('node:http');",
+          `const status = ${String(status)};`,
+          `const body = ${JSON.stringify(body)};`,
+          'const server = http.createServer((_req, res) => {',
+          "  res.setHeader('Connection', 'close');",
+          '  res.statusCode = status;',
+          '  res.end(body);',
+          '});',
+          "server.listen(0, '127.0.0.1', () => {",
+          '  const addr = server.address();',
+          "  process.stdout.write('PORT ' + addr.port + '\\n');",
+          '});',
+        ].join('\n'),
+        'utf-8',
+      );
+
+      const child = spawn('node', [serverScript], {
+        stdio: ['ignore', 'pipe', 'inherit'],
+      });
+      const url = await new Promise<string>((resolve, reject) => {
+        let buf = '';
+        const timer = setTimeout(
+          () => reject(new Error('server did not report a port in time')),
+          5000,
+        );
+        child.stdout.on('data', (chunk: Buffer) => {
+          buf += chunk.toString('utf-8');
+          const match = /PORT (\d+)/.exec(buf);
+          if (match) {
+            clearTimeout(timer);
+            resolve(`http://127.0.0.1:${match[1]}/`);
+          }
+        });
+        child.on('error', reject);
+      });
+
+      return {
+        url,
+        stop: () => {
+          child.kill();
+          rmSync(serverDir, { recursive: true, force: true });
+        },
+      };
+    }
+
+    it('AC #220: a 401 endpoint produces an errored observation with the HTTP status (text)', async () => {
+      const dir = path.join(tempDir, 'ap-401');
+      const { url, stop } = await startServer(401, 'Unauthorized');
+      try {
+        const monitorFile = writeApiPollMonitor(dir, url, 'text-diff');
+        const result = run(['monitor', 'test', monitorFile]);
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toContain('Observation failed');
+        expect(result.stderr).toContain('HTTP 401');
+        expect(result.stdout).not.toContain('Baseline established');
+      } finally {
+        stop();
+      }
+    });
+
+    it('AC #220: a 500 endpoint errors as JSON with the HTTP status', async () => {
+      const dir = path.join(tempDir, 'ap-500');
+      const { url, stop } = await startServer(500, '<html>error</html>');
+      try {
+        const monitorFile = writeApiPollMonitor(dir, url, 'json-diff');
+        const result = run([
+          'monitor',
+          'test',
+          monitorFile,
+          '--format',
+          'json',
+        ]);
+        expect(result.exitCode).toBe(1);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.error).toContain('HTTP 500');
+      } finally {
+        stop();
+      }
+    });
+
+    it('AC #220: a 200 endpoint baselines (no regression)', async () => {
+      const dir = path.join(tempDir, 'ap-200');
+      const { url, stop } = await startServer(200, '{"ok":true}');
+      try {
+        const monitorFile = writeApiPollMonitor(dir, url, 'json-diff');
+        const result = run(['monitor', 'test', monitorFile]);
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout).toContain('Baseline established');
+        expect(result.stdout).toContain('HTTP 200');
+      } finally {
+        stop();
+      }
+    });
+
+    it('AC #219: json-diff against an HTML body surfaces the steering warning (JSON output)', async () => {
+      const dir = path.join(tempDir, 'ap-warn');
+      const { url, stop } = await startServer(
+        200,
+        '<!DOCTYPE html><html><body>status</body></html>',
+      );
+      try {
+        const monitorFile = writeApiPollMonitor(dir, url, 'json-diff');
+        const result = run([
+          'monitor',
+          'test',
+          monitorFile,
+          '--format',
+          'json',
+        ]);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.warnings).toBeDefined();
+        expect(parsed.warnings[0]).toContain('json-diff');
+        expect(parsed.warnings[0]).toContain('text-diff');
+      } finally {
+        stop();
+      }
+    });
+
+    it('AC #219: json-diff against a JSON body emits no warning', async () => {
+      const dir = path.join(tempDir, 'ap-nowarn');
+      const { url, stop } = await startServer(200, '{"status":"ok"}');
+      try {
+        const monitorFile = writeApiPollMonitor(dir, url, 'json-diff');
+        const result = run([
+          'monitor',
+          'test',
+          monitorFile,
+          '--format',
+          'json',
+        ]);
+        expect(result.exitCode).toBe(0);
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.warnings ?? []).toHaveLength(0);
+      } finally {
+        stop();
+      }
+    });
+  });
 });
 
 describe('inbox list', () => {

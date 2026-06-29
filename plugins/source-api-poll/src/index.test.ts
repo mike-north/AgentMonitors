@@ -363,6 +363,178 @@ describe('source-api-poll', () => {
     });
   });
 
+  // Issue #220: a non-2xx response must become an errored observation (the
+  // source throws) rather than silently baselining on the error body — except
+  // for the status-code strategy, where a non-2xx is a legitimate observed
+  // signal. The runtime turns a thrown observe() into an `errored` history row;
+  // these tests assert at the source layer (throw / no-throw) which is what
+  // that behavior is built on.
+  describe('non-2xx → errored observation (issue #220)', () => {
+    function mockStatus(body: string, status: number): void {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockResolvedValue({
+          text: () => Promise.resolve(body),
+          status,
+        }),
+      );
+    }
+
+    it('AC1/AC2: 401 throws a status-bearing error and establishes no baseline (text-diff)', async () => {
+      mockStatus('Unauthorized', 401);
+      const url = 'https://api.example.com/secured';
+      await expect(
+        source.observe({ url }, { now: new Date() }),
+      ).rejects.toThrow(/api-poll received HTTP 401/);
+      // Message identifies the status and the "not establishing a baseline" intent.
+      await expect(
+        source.observe({ url }, { now: new Date() }),
+      ).rejects.toThrow(/not establishing a baseline on an error response/);
+    });
+
+    it('AC1: 500 throws (json-diff) — no silent baseline on an error page', async () => {
+      mockStatus('<html>Internal Server Error</html>', 500);
+      await expect(
+        source.observe(
+          {
+            url: 'https://api.example.com/json',
+            'change-detection': { strategy: 'json-diff' },
+          },
+          { now: new Date() },
+        ),
+      ).rejects.toThrow(/api-poll received HTTP 500/);
+    });
+
+    it('AC1: 404 throws (default text-diff)', async () => {
+      mockStatus('Not Found', 404);
+      await expect(
+        source.observe(
+          { url: 'https://api.example.com/missing' },
+          { now: new Date() },
+        ),
+      ).rejects.toThrow(/api-poll received HTTP 404/);
+    });
+
+    it('AC3: a 2xx response baselines exactly as before (no regression)', async () => {
+      mockStatus('{"ok":true}', 200);
+      const result = await source.observe(
+        { url: 'https://api.example.com/ok' },
+        { now: new Date() },
+      );
+      expect(result.observations).toHaveLength(0);
+      expect(result.nextState).toBeDefined();
+    });
+
+    it('AC3: 2xx success boundaries (200, 204, 299) baseline; 300 errors', async () => {
+      for (const status of [200, 204, 299]) {
+        mockStatus('body', status);
+        const result = await source.observe(
+          { url: `https://api.example.com/edge-${String(status)}` },
+          { now: new Date() },
+        );
+        expect(result.nextState).toBeDefined();
+      }
+      mockStatus('redirect', 300);
+      await expect(
+        source.observe(
+          { url: 'https://api.example.com/edge-300' },
+          { now: new Date() },
+        ),
+      ).rejects.toThrow(/api-poll received HTTP 300/);
+    });
+
+    it('exception: status-code strategy does NOT throw on a non-2xx (status is the watched signal)', async () => {
+      const mockFetch = vi.fn();
+      vi.stubGlobal('fetch', mockFetch);
+      const config = {
+        url: 'https://api.example.com/health',
+        'change-detection': { strategy: 'status-code' },
+      };
+      // Baseline on a healthy 200.
+      mockFetch.mockResolvedValueOnce({
+        text: () => Promise.resolve('ok'),
+        status: 200,
+      });
+      const baseline = await source.observe(config, { now: new Date() });
+      expect(baseline.observations).toHaveLength(0);
+      // Endpoint goes 200 -> 503: must be observed, not thrown.
+      mockFetch.mockResolvedValueOnce({
+        text: () => Promise.resolve('down'),
+        status: 503,
+      });
+      const changed = await source.observe(config, {
+        previousState: baseline.nextState,
+        now: new Date(),
+      });
+      expect(changed.observations).toHaveLength(1);
+    });
+  });
+
+  // Issue #219: json-diff against a non-JSON body silently degrades to text
+  // comparison. The source must surface a non-fatal warning so `monitor test`
+  // can steer the author to text-diff, without changing the observation outcome.
+  describe('json-diff on non-JSON body → warning (issue #219)', () => {
+    function mockBody(body: string): void {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockResolvedValue({
+          text: () => Promise.resolve(body),
+          status: 200,
+        }),
+      );
+    }
+
+    it('warns when json-diff is configured but the body is not JSON', async () => {
+      mockBody('<!DOCTYPE html><html><body>Status page</body></html>');
+      const result = await source.observe(
+        {
+          url: 'https://status.example.com/incidents',
+          'change-detection': { strategy: 'json-diff' },
+        },
+        { now: new Date() },
+      );
+      expect(result.warnings).toBeDefined();
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings?.[0]).toMatch(/json-diff/);
+      expect(result.warnings?.[0]).toMatch(/does not parse as JSON/);
+      expect(result.warnings?.[0]).toMatch(/text-diff/);
+    });
+
+    it('does NOT warn when json-diff body parses as JSON', async () => {
+      mockBody('{"status":"operational"}');
+      const result = await source.observe(
+        {
+          url: 'https://api.example.com/status.json',
+          'change-detection': { strategy: 'json-diff' },
+        },
+        { now: new Date() },
+      );
+      // Absent or empty — no warning for a valid JSON body.
+      expect(result.warnings ?? []).toHaveLength(0);
+    });
+
+    it('does NOT warn for text-diff against a non-JSON body (correct strategy)', async () => {
+      mockBody('<html>page</html>');
+      const result = await source.observe(
+        {
+          url: 'https://status.example.com/page',
+          'change-detection': { strategy: 'text-diff' },
+        },
+        { now: new Date() },
+      );
+      expect(result.warnings ?? []).toHaveLength(0);
+    });
+
+    it('does NOT warn for the default (text-diff) strategy', async () => {
+      mockBody('<html>page</html>');
+      const result = await source.observe(
+        { url: 'https://status.example.com/page' },
+        { now: new Date() },
+      );
+      expect(result.warnings ?? []).toHaveLength(0);
+    });
+  });
+
   describe('cache isolation', () => {
     it('different configs for same URL maintain separate baselines', async () => {
       const mockFetch = vi.fn();
@@ -574,6 +746,60 @@ describe('source-api-poll', () => {
       await expect(source.observe(cfg, { now: new Date() })).rejects.toThrow(
         /boom/,
       );
+    });
+
+    // Issue #220 (composite parity): the non-2xx → errored-observation behavior
+    // added for the single-URL path MUST also apply to each composite part. A
+    // non-2xx part body would otherwise be baselined into the rendered snapshot,
+    // making a misconfigured monitor look healthy and diffing error pages.
+    it('a non-2xx composite part throws a status-bearing error (no baseline on error body)', async () => {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn((input: string) =>
+          input === 'https://api.example.com/orders/42'
+            ? Promise.resolve({
+                text: () => Promise.resolve('{"status":"open"}'),
+                status: 200,
+              })
+            : // A line endpoint returns 401 (e.g. expired token): must not baseline.
+              Promise.resolve({
+                text: () => Promise.resolve('Unauthorized'),
+                status: 401,
+              }),
+        ),
+      );
+      // The error identifies the status, the offending part id/url, and the
+      // "not establishing a baseline" intent — consistent with the single-URL path.
+      await expect(
+        source.observe(compositeConfig, { now: new Date() }),
+      ).rejects.toThrow(/api-poll received HTTP 401 from composite part/);
+      await expect(
+        source.observe(compositeConfig, { now: new Date() }),
+      ).rejects.toThrow(/not establishing a baseline on an error response/);
+    });
+
+    it('a 2xx composite still baselines/observes normally (no regression from the non-2xx guard)', async () => {
+      mockByUrl({
+        'https://api.example.com/orders/42': '{"status":"open"}',
+        'https://api.example.com/orders/42/lines/1': '{"qty":1}',
+        'https://api.example.com/orders/42/lines/2': '{"qty":2}',
+      });
+      const baseline = await source.observe(compositeConfig, {
+        now: new Date(),
+      });
+      expect(baseline.observations).toHaveLength(0);
+
+      mockByUrl({
+        'https://api.example.com/orders/42': '{"status":"shipped"}',
+        'https://api.example.com/orders/42/lines/1': '{"qty":1}',
+        'https://api.example.com/orders/42/lines/2': '{"qty":2}',
+      });
+      const next = await source.observe(compositeConfig, {
+        previousState: baseline.nextState,
+        now: new Date(),
+      });
+      expect(next.observations).toHaveLength(1);
+      expect(next.observations[0]?.objectKey).toBe('order-42');
     });
 
     it('rejects composite combined with keyed-collection (mutually exclusive)', async () => {
