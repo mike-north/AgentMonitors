@@ -25,6 +25,18 @@ Resolved follow-ups from the `api-poll` change-detection cluster.
   non-2xx responses instead of baselining them. 004 §3.2 now includes required rows for non-2xx
   errored behavior and explicit `json-diff` / non-JSON warnings.
 
+## 2026-06-29 — `file-fingerprint` bare-string `ignore` shorthand (003 §3.1) — Refs #241
+
+`file-fingerprint` now accepts `ignore` as either a bare string or a string array, matching the
+existing `globs` shorthand.
+
+- **003 §3.1 — clarified.** A single exclude glob may be written as `ignore: '**/x.txt'` and is
+  normalized to the same internal `string[]` representation as `ignore: ['**/x.txt']`.
+
+- **Parser/schema parity.** Both `parseScopeConfig` and `scopeSchema` accept the string form and
+  still reject blank or whitespace-only patterns. `schema-parity.test.ts` pins the accepted
+  bare-string case and rejected blank-string case.
+
 ## 2026-06-29 — `file-fingerprint` ignore exclude globs (003 §3.1, §3.2) — Refs #232
 
 `file-fingerprint` now accepts an optional `ignore: string[]` exclude-glob array alongside `globs`.

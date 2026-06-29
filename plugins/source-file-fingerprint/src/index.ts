@@ -44,13 +44,17 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
   const rawIgnore = config['ignore'];
   let ignore: string[] = [];
   if (rawIgnore !== undefined) {
-    if (
+    // Match `globs` ergonomics: a single exclude may be written as a bare string
+    // and is normalized to the same internal `string[]` representation.
+    if (typeof rawIgnore === 'string') {
+      ignore = [rawIgnore];
+    } else if (
       Array.isArray(rawIgnore) &&
       rawIgnore.every((g): g is string => typeof g === 'string')
     ) {
       ignore = rawIgnore;
     } else {
-      throw new Error('scope.ignore must be an array of strings');
+      throw new Error('scope.ignore must be a string or an array of strings');
     }
     if (ignore.some((g) => g.trim() === '')) {
       throw new Error('scope.ignore must not contain empty patterns');
@@ -194,10 +198,16 @@ const scopeSchema: JsonSchema = {
       description: 'Working directory for glob resolution',
     },
     ignore: {
-      type: 'array',
-      items: { type: 'string', minLength: 1, pattern: '\\S' },
+      oneOf: [
+        { type: 'string', minLength: 1, pattern: '\\S' },
+        {
+          type: 'array',
+          items: { type: 'string', minLength: 1, pattern: '\\S' },
+        },
+      ],
       description:
-        'Optional exclude glob pattern(s). Files matched by globs and by ignore ' +
+        'Optional exclude glob pattern(s). A single exclude may be written as a ' +
+        'bare string. Files matched by globs and by ignore ' +
         'are omitted from baseline and change detection. Resolved against the same base as globs.',
     },
     interval: {
