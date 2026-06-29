@@ -51,6 +51,16 @@ Resolves a contradiction between the spec and the implementation. The spec alrea
 High-urgency body injection and the post-compact recap are byte-unchanged. Affects published-package
 behavior (`@agentmonitors/cli`), so a changeset accompanies this change. Refs #198.
 
+## 2026-06-28 — file-fingerprint observe interval is surfaced in schema, CLI, and docs (003 §3.1; 005 §7, §9) — Refs #204
+
+`file-fingerprint` now documents `watch.interval` in its source schema with the effective `30s`
+default. `agentmonitors source list` includes source field descriptions, so the interval knob is
+visible alongside `globs` and `cwd`.
+
+Docs now distinguish the per-monitor observe interval from daemon `--poll-ms`: `watch.interval`
+controls when a specific monitor is due to re-check files, while `--poll-ms` is only the daemon
+loop-wake cadence. No default timing behavior changed.
+
 ## 2026-06-28 — file-fingerprint project globs resolve from config root, not daemon cwd (002 §10.7, §15; 003 §3.1, §3.2; 005 §6) — Refs #193
 
 Project-level `file-fingerprint` monitors now resolve relative `globs` and relative `cwd` from the

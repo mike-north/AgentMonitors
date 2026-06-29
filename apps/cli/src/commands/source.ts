@@ -3,6 +3,34 @@ import { SourceRegistry } from '@agentmonitors/core';
 import { registerCoreSources } from '../sources.js';
 import { renderToon, resolveFormat } from '../toon-format.js';
 
+function fieldDescriptions(
+  properties: Record<string, unknown>,
+): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(properties).flatMap(([name, schema]) => {
+      const description =
+        typeof schema === 'object' &&
+        schema !== null &&
+        'description' in schema &&
+        typeof schema.description === 'string'
+          ? schema.description
+          : undefined;
+      return description === undefined ? [] : [[name, description]];
+    }),
+  );
+}
+
+function toonFieldDescriptions(
+  descriptions: Record<string, string>,
+): { field: string; description: string }[] {
+  // TOON's nested object-map form can misread bracketed examples inside quoted
+  // scalar values. An explicit list preserves the exact description text.
+  return Object.entries(descriptions).map(([field, description]) => ({
+    field,
+    description,
+  }));
+}
+
 export const sourceCommand = new Command('source').description(
   'Manage observation source plugins',
 );
@@ -32,10 +60,15 @@ sourceCommand
             | Record<string, unknown>
             | undefined) ?? {};
         const configFields = Object.keys(properties);
+        const descriptions = fieldDescriptions(properties);
         return {
           name: source.name,
           configFields,
           scopeFields: configFields,
+          fieldDescriptions:
+            format === 'toon'
+              ? toonFieldDescriptions(descriptions)
+              : descriptions,
           required: requiredFields,
         };
       });
@@ -62,6 +95,10 @@ sourceCommand
           | undefined) ?? {};
       console.log(`  ${source.name}`);
       console.log(`    Config fields: ${Object.keys(properties).join(', ')}`);
+      const descriptions = fieldDescriptions(properties);
+      for (const [field, description] of Object.entries(descriptions)) {
+        console.log(`    - ${field}: ${description}`);
+      }
       console.log(`    Required: ${requiredFields.join(', ') || '(none)'}`);
       console.log('');
     }

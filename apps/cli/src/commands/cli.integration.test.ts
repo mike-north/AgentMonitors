@@ -1207,6 +1207,8 @@ describe('source list', () => {
     const result = run(['source', 'list', '--format', 'text']);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain('Config fields:');
+    expect(result.stdout).toContain('interval');
+    expect(result.stdout).toContain('Default observe interval is 30s');
     expect(result.stdout).not.toContain('Scope fields:');
     expect(result.stdout).toContain('file-fingerprint');
     expect(result.stdout).toContain('api-poll');
@@ -1227,6 +1229,21 @@ describe('source list', () => {
     expect(names).toContain('schedule');
     expect(names).toContain('incoming-changes');
     expect(parsed[0]).toHaveProperty('configFields');
+    const fileFingerprint = parsed.find(
+      (source: { name: string }) => source.name === 'file-fingerprint',
+    ) as {
+      configFields: string[];
+      fieldDescriptions: Record<string, string>;
+    };
+    expect(fileFingerprint.configFields).toContain('interval');
+    expect(fileFingerprint.fieldDescriptions['interval']).toContain(
+      'Default observe interval is 30s',
+    );
+    const commandPoll = parsed.find(
+      (source: { name: string }) => source.name === 'command-poll',
+    ) as { fieldDescriptions: Record<string, string> };
+    expect(commandPoll.fieldDescriptions['command']).toContain('command[0]');
+    expect(commandPoll.fieldDescriptions['command']).toContain("['sh', '-c'");
   });
 
   it('auto-detects toon when run by an agent (no --format flag, CLAUDECODE=1)', () => {
@@ -1253,14 +1270,29 @@ describe('source list', () => {
     expect(result.stdout).toContain('file-fingerprint');
   });
 
-  it('toon source list output round-trips to identical JSON value as --format json', () => {
+  it('toon source list output round-trips to the JSON value after normalizing description rows', () => {
     const jsonResult = run(['source', 'list', '--format', 'json']);
     const toonResult = run(['source', 'list', '--format', 'toon']);
     expect(jsonResult.exitCode).toBe(0);
     expect(toonResult.exitCode).toBe(0);
     const fromJson = JSON.parse(jsonResult.stdout) as unknown;
-    const fromToon = decodeToon(toonResult.stdout);
-    expect(fromToon).toEqual(fromJson);
+    const fromToon = decodeToon(toonResult.stdout) as {
+      fieldDescriptions:
+        | Record<string, string>
+        | { field: string; description: string }[];
+    }[];
+    const normalizedToon = fromToon.map((source) => ({
+      ...source,
+      fieldDescriptions: Array.isArray(source.fieldDescriptions)
+        ? Object.fromEntries(
+            source.fieldDescriptions.map(({ field, description }) => [
+              field,
+              description,
+            ]),
+          )
+        : source.fieldDescriptions,
+    }));
+    expect(normalizedToon).toEqual(fromJson);
   });
 
   it('rejects invalid --format value for source list', () => {

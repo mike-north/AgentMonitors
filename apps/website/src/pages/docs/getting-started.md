@@ -99,7 +99,8 @@ agentmonitors monitor test .claude/monitors/my-first-monitor/MONITOR.md
 
 > **Note:** `file-fingerprint` and `api-poll` use a baseline-then-detect pattern. The first
 > run establishes the baseline; `monitor test` runs a second observation automatically so
-> you can see the change-detection in action.
+> you can see the change-detection in action. For daemon delivery, `file-fingerprint`
+> re-checks files on a ~30s observe interval by default; set `watch.interval` to tune that cadence.
 
 ## Scan all monitors
 
