@@ -336,10 +336,11 @@ contains an empty pattern. Verified: `plugins/source-file-fingerprint/src/index.
 (`parseScopeConfig`) and `plugins/source-file-fingerprint/src/index.test.ts` ("globs string
 shorthand").
 
-For project monitors, relative `globs` and a relative `cwd` resolve against the runtime
-workspace/config root (`ObservationContext.workspacePath`), not the daemon process cwd. An absolute
-`cwd` and absolute glob patterns are honored as-is. When no workspace/config root is supplied, the
-source falls back to Node/glob's process-cwd behavior.
+For project monitors, the effective `cwd` defaults to the runtime workspace/config root
+(`ObservationContext.workspacePath`), i.e. the project directory containing `.claude`. Relative
+`globs` therefore match project files by default. A relative `cwd` resolves against that same root;
+an absolute `cwd` and absolute glob patterns are honored as-is. When no workspace/config root is
+supplied, the source falls back to Node/glob's process-cwd behavior.
 
 `ignore` accepts **either** a single exclude pattern as a bare string **or** an array of exclude
 patterns, mirroring `globs`. The single-exclude case is therefore:

@@ -1255,6 +1255,13 @@ describe('source list', () => {
     expect(fileFingerprint.fieldDescriptions['ignore']).toContain(
       'exclude glob',
     );
+    expect(fileFingerprint.fieldDescriptions['cwd']).toContain(
+      'workspace/config root',
+    );
+    expect(fileFingerprint.fieldDescriptions['cwd']).toContain(
+      'project directory containing .claude',
+    );
+    expect(fileFingerprint.fieldDescriptions['cwd']).toContain('process cwd');
     expect(fileFingerprint.fieldDescriptions['interval']).toContain(
       'Default observe interval is 30s',
     );
