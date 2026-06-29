@@ -4794,6 +4794,16 @@ describe('hook deliver', () => {
       // AC6: claiming via hook deliver marks the row claimed but NOT
       // acknowledged — the event is still listed by events list --unread.
       expect(JSON.parse(unread().stdout)).toHaveLength(1);
+
+      // Issue #235: ack-all means every event returned by `events list --unread`,
+      // including a claimed-but-unread event, not only never-claimed rows.
+      const ack = runWithEnv(
+        ['events', 'ack', '--session', session.id],
+        env,
+        ws,
+      );
+      expect(ack.exitCode).toBe(0);
+      expect(JSON.parse(unread().stdout)).toHaveLength(0);
     } finally {
       daemon.stop();
       await daemon.waitForExit();
