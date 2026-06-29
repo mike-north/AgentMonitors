@@ -422,12 +422,32 @@ function isParseableJson(body: string): boolean {
 }
 
 /**
+ * Remove URL components that commonly carry credentials or request-scoped
+ * tokens before embedding a URL in a non-fatal warning. The source should still
+ * fetch the author's exact URL; only diagnostic text gets the redacted form.
+ */
+function redactUrlForWarning(url: string): string {
+  try {
+    const parsed = new URL(url);
+    parsed.username = '';
+    parsed.password = '';
+    parsed.search = '';
+    parsed.hash = '';
+    return parsed.toString();
+  } catch {
+    return url
+      .replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/@]*@/i, '$1')
+      .replace(/[?#].*$/, '');
+  }
+}
+
+/**
  * Warning text for `strategy: json-diff` against a non-JSON body (issue #219).
  * Exported-adjacent constant kept beside the source so the test asserts the same
  * message the author sees.
  */
 function jsonDiffNonJsonWarning(url: string): string {
-  return `api-poll: change-detection.strategy is json-diff but the response from ${url} does not parse as JSON; falling back to text comparison. Use strategy: text-diff for HTML/plain-text pages.`;
+  return `api-poll: change-detection.strategy is json-diff but the response from ${redactUrlForWarning(url)} does not parse as JSON; falling back to text comparison. Use strategy: text-diff for HTML/plain-text pages.`;
 }
 
 /** Source-owned change-detection state for composite mode (§2.6). */

@@ -567,10 +567,12 @@ When Node `fetch` throws (ECONNREFUSED, ENOTFOUND, timeout, …), it wraps the r
 ### 4.7 `monitor test` baseline output
 
 `agentmonitors monitor test` for an `api-poll` monitor prints the HTTP status code and response body
-size (UTF-8 bytes, via `Buffer.byteLength`) after establishing the baseline, before running the
-second observation. This surfaces transport-level successes with unexpected status codes or empty
-bodies — for example, a mistyped-but-resolvable URL returning a 404, or a misconfigured endpoint
-returning an empty 200 — that would otherwise silently baseline as "no change yet."
+size (UTF-8 bytes, via `Buffer.byteLength`) after establishing a successful baseline, before running
+the second observation. For body-diffing strategies (`text-diff` / `json-diff`), only **2xx**
+responses establish that baseline; non-2xx responses are rejected as errored observations per §4.8.
+This output therefore surfaces successful-but-suspicious responses, such as a misconfigured endpoint
+returning an empty 200. A monitor that intentionally watches non-2xx status transitions should use
+`change-detection.strategy: status-code`, where the status itself is the observed signal.
 
 Note: network-level failures (ECONNREFUSED, DNS, timeout) throw _before_ any baseline is
 established and are handled separately by §4.6 error propagation; they do not produce a status/size

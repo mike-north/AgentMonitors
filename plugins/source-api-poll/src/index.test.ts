@@ -519,6 +519,25 @@ describe('source-api-poll', () => {
       expect(result.warnings?.[0]).toMatch(/text-diff/);
     });
 
+    it('redacts credentials, query, and fragment from the non-JSON warning URL', async () => {
+      mockBody('<!DOCTYPE html><html><body>Status page</body></html>');
+      const result = await source.observe(
+        {
+          url: 'https://user:pass@status.example.com/incidents?token=secret#frag',
+          'change-detection': { strategy: 'json-diff' },
+        },
+        { now: new Date() },
+      );
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings?.[0]).toContain(
+        'https://status.example.com/incidents',
+      );
+      expect(result.warnings?.[0]).not.toContain('user');
+      expect(result.warnings?.[0]).not.toContain('pass');
+      expect(result.warnings?.[0]).not.toContain('token=secret');
+      expect(result.warnings?.[0]).not.toContain('#frag');
+    });
+
     it('does NOT warn when json-diff body parses as JSON', async () => {
       mockBody('{"status":"operational"}');
       const result = await source.observe(
