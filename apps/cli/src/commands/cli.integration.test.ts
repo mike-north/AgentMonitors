@@ -4499,6 +4499,17 @@ describe('plugin hooks.json config-drift UAT', () => {
 // ---------------------------------------------------------------------------
 
 describe('hook deliver', () => {
+  it('hook deliver help documents format and emission preconditions', () => {
+    const result = run(['hook', 'deliver', '--help']);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('--format <format>');
+    expect(result.stdout).toContain('enabled project');
+    expect(result.stdout).toContain('.claude/agentmonitors.local.md');
+    expect(result.stdout).toContain('reachable daemon');
+    expect(result.stdout).toContain('matching tracked session');
+    expect(result.stdout).toContain('Empty output means');
+  });
+
   it('hook deliver emits the pending monitor body as advisory context', async () => {
     // Scaffold a workspace with a file-fingerprint monitor that has a
     // distinctive body text we can assert on.
@@ -4633,6 +4644,9 @@ describe('hook deliver', () => {
 
       expect(deliverResult.exitCode).toBe(0);
       expect(deliverResult.stdout.trim()).not.toBe('');
+      expect(deliverResult.stdout).toBe(
+        JSON.stringify(JSON.parse(deliverResult.stdout)),
+      );
 
       const output = JSON.parse(deliverResult.stdout) as {
         continue: boolean;
@@ -4816,6 +4830,262 @@ describe('hook deliver', () => {
     }
   }, 30_000);
 
+  it('hook deliver --format json emits compact hook wire JSON when pending', async () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-hd-json-'));
+    const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-files');
+    mkdirSync(monitorsDir, { recursive: true });
+
+    const watchedFile = path.join(ws, 'watched.txt');
+    writeFileSync(watchedFile, 'initial content', 'utf-8');
+
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      [
+        '---',
+        'name: Watch files',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs:',
+        '    - "watched.txt"',
+        `  cwd: ${JSON.stringify(ws)}`,
+        '  interval: "1s"',
+        'urgency: normal',
+        '---',
+        'When files change, review them.',
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+
+    const socket = path.join(
+      '/tmp',
+      `agentmon-hdj-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const db = path.join(ws, 'hd-json.db');
+    const hostSessionId = `hd-json-${Date.now()}`;
+
+    writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 30_000 });
+
+    const env: Record<string, string> = {
+      CLAUDE_CODE_SESSION_ID: hostSessionId,
+      CLAUDE_PROJECT_DIR: ws,
+      AGENTMONITORS_DB: db,
+      AGENTMONITORS_SOCKET: socket,
+    };
+
+    const daemon = await startDaemon(
+      path.join(ws, '.claude', 'monitors'),
+      ws,
+      env,
+      socket,
+    );
+
+    try {
+      const sessionOpen = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          hostSessionId,
+          '--workspace',
+          ws,
+          '--format',
+          'json',
+        ],
+        env,
+        ws,
+      );
+      expect(sessionOpen.exitCode).toBe(0);
+      const session = JSON.parse(sessionOpen.stdout) as { id: string };
+
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
+      writeFileSync(watchedFile, 'changed content', 'utf-8');
+
+      const unread = () =>
+        runWithEnv(
+          [
+            'events',
+            'list',
+            '--session',
+            session.id,
+            '--unread',
+            '--format',
+            'json',
+          ],
+          env,
+          ws,
+        );
+
+      const eventDeadline = Date.now() + 10_000;
+      while (Date.now() < eventDeadline) {
+        const result = unread();
+        if (result.exitCode === 0 && JSON.parse(result.stdout).length >= 1) {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      expect(JSON.parse(unread().stdout)).toHaveLength(1);
+
+      const deliverResult = runWithStdin(
+        ['hook', 'deliver', '--format', 'json'],
+        env,
+        JSON.stringify({
+          session_id: hostSessionId,
+          hook_event_name: 'UserPromptSubmit',
+          cwd: ws,
+        }),
+        ws,
+      );
+
+      expect(deliverResult.exitCode).toBe(0);
+      expect(deliverResult.stdout.trim()).not.toBe('');
+      expect(deliverResult.stdout).toBe(
+        JSON.stringify(JSON.parse(deliverResult.stdout)),
+      );
+
+      const output = JSON.parse(deliverResult.stdout) as {
+        continue: boolean;
+        hookSpecificOutput: {
+          hookEventName: string;
+          additionalContext: string;
+        };
+      };
+      expect(output.continue).toBe(true);
+      expect(output.hookSpecificOutput.hookEventName).toBe('UserPromptSubmit');
+      expect(output.hookSpecificOutput.additionalContext).toContain(
+        'AgentMon messages are available.',
+      );
+      expect(output.hookSpecificOutput.additionalContext).not.toContain('### ');
+      expect(output).not.toHaveProperty('permissionDecision');
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('hook deliver --format text emits only the rendered advisory context', async () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-hd-text-'));
+    const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-files');
+    mkdirSync(monitorsDir, { recursive: true });
+
+    const watchedFile = path.join(ws, 'watched.txt');
+    writeFileSync(watchedFile, 'initial content', 'utf-8');
+
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      [
+        '---',
+        'name: Watch files',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs:',
+        '    - "watched.txt"',
+        `  cwd: ${JSON.stringify(ws)}`,
+        '  interval: "1s"',
+        'urgency: normal',
+        '---',
+        'When files change, review them.',
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+
+    const socket = path.join(
+      '/tmp',
+      `agentmon-hdt-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const db = path.join(ws, 'hd-text.db');
+    const hostSessionId = `hd-text-${Date.now()}`;
+
+    writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 30_000 });
+
+    const env: Record<string, string> = {
+      CLAUDE_CODE_SESSION_ID: hostSessionId,
+      CLAUDE_PROJECT_DIR: ws,
+      AGENTMONITORS_DB: db,
+      AGENTMONITORS_SOCKET: socket,
+    };
+
+    const daemon = await startDaemon(
+      path.join(ws, '.claude', 'monitors'),
+      ws,
+      env,
+      socket,
+    );
+
+    try {
+      const sessionOpen = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          hostSessionId,
+          '--workspace',
+          ws,
+          '--format',
+          'json',
+        ],
+        env,
+        ws,
+      );
+      expect(sessionOpen.exitCode).toBe(0);
+      const session = JSON.parse(sessionOpen.stdout) as { id: string };
+
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
+      writeFileSync(watchedFile, 'changed content', 'utf-8');
+
+      const unread = () =>
+        runWithEnv(
+          [
+            'events',
+            'list',
+            '--session',
+            session.id,
+            '--unread',
+            '--format',
+            'json',
+          ],
+          env,
+          ws,
+        );
+
+      const eventDeadline = Date.now() + 10_000;
+      while (Date.now() < eventDeadline) {
+        const result = unread();
+        if (result.exitCode === 0 && JSON.parse(result.stdout).length >= 1) {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      expect(JSON.parse(unread().stdout)).toHaveLength(1);
+
+      const deliverResult = runWithStdin(
+        ['hook', 'deliver', '--format', 'text'],
+        env,
+        JSON.stringify({
+          session_id: hostSessionId,
+          hook_event_name: 'UserPromptSubmit',
+          cwd: ws,
+        }),
+        ws,
+      );
+
+      expect(deliverResult.exitCode).toBe(0);
+      expect(deliverResult.stdout.trim()).not.toBe('');
+      expect(() => JSON.parse(deliverResult.stdout)).toThrow();
+      expect(deliverResult.stdout).toContain(
+        'AgentMon messages are available.',
+      );
+      expect(deliverResult.stdout).not.toContain('hookSpecificOutput');
+      expect(deliverResult.stdout).not.toContain('### ');
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it('hook deliver exits 0 and prints nothing when there is nothing pending', async () => {
     const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-hd-empty-'));
     const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-files');
@@ -4909,7 +5179,7 @@ describe('hook deliver', () => {
     try {
       // A payload missing session_id → not a tracked Claude session → no-op.
       const result = runWithStdin(
-        ['hook', 'deliver'],
+        ['hook', 'deliver', '--format', 'json'],
         { CLAUDE_PROJECT_DIR: ws },
         JSON.stringify({ hook_event_name: 'PostToolUse', cwd: ws }),
         ws,
