@@ -77,11 +77,15 @@ watch:
     - '*.config.js'
   ignore:
     - 'src/generated/**'
-  cwd: /path/to/project   # optional — defaults to the monitors root
+  cwd: /path/to/project   # optional — defaults to the workspace/config root
 ```
 
 Uses a **baseline-then-detect** pattern: the first observation establishes the baseline;
 subsequent observations diff against it. A single isolated run cannot detect change.
+
+When `cwd` is omitted, relative `globs` match files under the workspace/config root — the project
+directory containing `.claude`. A relative `cwd` resolves against that same root; an absolute `cwd`
+is used as-is.
 
 Use `ignore` for files your fired action writes back into the project. For example, if you watch
 `'**/*.txt'` and the action records `notified-2026-06-29.txt`, add

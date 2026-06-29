@@ -195,7 +195,11 @@ const scopeSchema: JsonSchema = {
     },
     cwd: {
       type: 'string',
-      description: 'Working directory for glob resolution',
+      description:
+        'Working directory for glob resolution. Defaults to the workspace/config root ' +
+        '(the project directory containing .claude); relative cwd values resolve against ' +
+        'that root, and absolute cwd values are used as-is. If no workspace/config root ' +
+        'is provided, glob resolution falls back to Node/glob process cwd behavior.',
     },
     ignore: {
       oneOf: [
