@@ -313,9 +313,10 @@ watch:
   globs:
     - '**/*.ts'
   cwd: /optional/base/path
+  interval: 30s
 ```
 
-Required field: `globs`. Optional field: `cwd` (string).
+Required field: `globs`. Optional fields: `cwd` (string), `interval` (duration string).
 
 `globs` accepts **either** a single pattern as a bare string **or** an array of patterns
 (OR-ed together). The single-file/single-glob case is therefore the one-line form:
@@ -336,6 +337,11 @@ For project monitors, relative `globs` and a relative `cwd` resolve against the 
 workspace/config root (`ObservationContext.workspacePath`), not the daemon process cwd. An absolute
 `cwd` and absolute glob patterns are honored as-is. When no workspace/config root is supplied, the
 source falls back to Node/glob's process-cwd behavior.
+
+`interval` is the per-monitor observe interval: the runtime calls `file-fingerprint` only when this
+monitor is due. If omitted, the effective default is approximately `30s`. Authors tune it with
+`watch.interval`; this is distinct from the daemon `--poll-ms` loop-wake interval, which controls
+how often the daemon checks whether any monitor is due.
 
 ### 3.2 Behavior
 
@@ -411,8 +417,17 @@ watch:
   auth:
     type: bearer
     token-env: API_TOKEN
-  change-detection:
-    strategy: json-diff
+  # change-detection is OPTIONAL. When omitted, the strategy is inferred from the
+  # response Content-Type (§4.2). Set it only to override the inferred default.
+```
+
+The common "watch a web page" case needs **no** `change-detection` block at all:
+
+```yaml
+watch:
+  type: api-poll
+  url: 'https://example.com/page'
+  interval: 5m
 ```
 
 Required field: `url` (string). Important optional fields: `method`, `headers`, `interval`, `auth`, `change-detection`.
@@ -425,13 +440,44 @@ Required field: `url` (string). Important optional fields: `method`, `headers`, 
 
 Supported strategies (verified: `plugins/source-api-poll/src/index.ts`, `ChangeStrategy` type and `hasChanged` function):
 
-| Strategy      | Semantics                                                                                                                                  |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `text-diff`   | Compare raw response body strings. This is the **default** when no strategy is specified or the value is unrecognized.                     |
-| `json-diff`   | Parse both bodies as JSON, recursively sort object keys, then compare serialized strings. Ignores key ordering and whitespace differences. |
-| `status-code` | Compare only HTTP status codes; body changes are ignored.                                                                                  |
+| Strategy      | Semantics                                                                                                                                  | Use for                                                                |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------- |
+| `text-diff`   | Compare raw response body strings.                                                                                                         | HTML pages, plain-text status pages — the correct choice for web pages |
+| `json-diff`   | Parse both bodies as JSON, recursively sort object keys, then compare serialized strings. Ignores key ordering and whitespace differences. | JSON APIs                                                              |
+| `status-code` | Compare only HTTP status codes; body changes are ignored.                                                                                  | Watching whether an endpoint goes up/down (e.g. 200 → 503)             |
 
-If `json-diff` parsing fails for either body, the implementation falls back to raw text comparison (verified: `plugins/source-api-poll/src/index.ts` lines 96–101).
+**`change-detection.strategy` is optional (issue #230).** When the author **omits** it, the strategy is
+**inferred from the response `Content-Type`**: a JSON media type (`application/json` or any
+structured-syntax `+json` suffix such as `application/ld+json`, per RFC 6838) infers `json-diff`;
+everything else — `text/html`, `text/plain`, and a missing/unknown `Content-Type` — infers `text-diff`.
+This makes the common "watch a web page" case zero-config: omit `change-detection` and the source picks
+`text-diff` for an HTML page and `json-diff` for a JSON API automatically.
+
+Rendered HTML can still be a noisy input even when `text-diff` is the correct strategy. Many real
+status pages embed per-request timestamps, CSRF tokens, nonces, or build metadata, so the raw HTML
+body differs on every poll despite no user-visible status change. For status-page monitoring,
+authors SHOULD prefer a machine-readable status endpoint when available (for example, a
+Statuspage-style `/api/v2/status.json` URL) because JSON summary endpoints are generally stable
+until the status itself changes. If only rendered HTML is available, authors SHOULD expect noise and
+pair the monitor with a `notify.strategy: debounce` window when appropriate.
+
+**An explicit `change-detection.strategy` always wins.** When the author specifies a strategy it is used
+**verbatim**, with no inference and no Content-Type override — user specification is absolute. So an
+explicit `json-diff` against an HTML page stays `json-diff` (and triggers the warning below), and an
+explicit `text-diff` against a JSON body stays `text-diff`. (Verified: `plugins/source-api-poll/src/index.ts`,
+`resolveStrategy` / `isJsonContentType`; `plugins/source-api-poll/src/index.test.ts`.)
+
+If `json-diff` parsing fails for either body, the implementation falls back to raw text comparison
+(verified: `plugins/source-api-poll/src/index.ts`, `hasChanged`). Because that fallback is silent and
+is almost always the wrong strategy for the body in question, the source attaches a **non-fatal
+warning** to the `ObservationResult` (`ObservationResult.warnings`) when an **explicit** `strategy: json-diff`
+is configured but the fetched body does not parse as JSON. (An **inferred** strategy never warns: inference
+picks `json-diff` only for JSON `Content-Type`s, so it never mismatches the body — issue #230.)
+`agentmonitors monitor test` prints the warning (`Warning: api-poll: change-detection.strategy is json-diff
+but the response … does not parse as JSON; … Use strategy: text-diff …`) so the author sees the
+misconfiguration during a dry-run rather than getting quietly wrong diffing in production. The warning does
+not change the observation outcome — the baseline/diff still proceeds via the text fallback. (Verified:
+`plugins/source-api-poll/src/index.ts`; `plugins/source-api-poll/src/index.test.ts`. Issues #219, #230.)
 
 ### 4.3 Authentication
 
@@ -463,7 +509,41 @@ This treats the polled URL as the source-defined object identity (SP3).
 
 ### 4.5 Stateful behavior
 
-`api-poll` declares `stateful: true`. The first call fetches the URL, stores `{ body, status }` as `nextState`, and returns an empty `observations` array. Subsequent calls compare against `context.previousState` and emit an observation only when `hasChanged` returns `true`.
+`api-poll` declares `stateful: true`. The first **successful (2xx)** call fetches the URL, stores
+`{ body, status }` as `nextState`, and returns an empty `observations` array. Subsequent calls compare
+against `context.previousState` and emit an observation only when `hasChanged` returns `true`.
+
+A **non-2xx** response is not a valid baseline for body-diffing strategies — see §4.8.
+
+### 4.8 Non-2xx responses → errored observation
+
+A non-2xx HTTP response (e.g. a `401` from a missing/invalid bearer token, a `403`, a `404`, a `500`
+error page) is **not** silently used to establish or advance a change-detection baseline for the
+`text-diff` and `json-diff` strategies. Baselining on an error body makes a misconfigured monitor
+appear to "work" — it would baseline on, and then diff, error pages — with no signal that auth or the
+URL is broken (the failure mode in issue #220, where a bad token produced `HTTP 401` yet the monitor
+validated and observed "successfully").
+
+Instead, for `text-diff`/`json-diff` the source **throws** on a non-2xx status with a status-bearing
+message:
+
+> `api-poll received HTTP <status> from <url> — check auth/url; not establishing a baseline on an error response`
+
+Because the source throws, the runtime records an **`errored`** observation outcome (no `nextState`
+advance, so any prior baseline is preserved per [002 §3](./002-runtime-delivery.md)); `daemon once` /
+`daemon run` include it in their error reporting; `monitor history` shows the tick as `errored`; and
+`monitor test` reports `Observation failed: api-poll received HTTP <status> …`.
+
+**Exception — `status-code`:** the `status-code` strategy exists precisely to detect status
+transitions (an endpoint going `200 → 503`). For it, a non-2xx status is a legitimate **observed
+signal**, not an error — the status itself is the watched object — so `status-code` does **not** throw
+on non-2xx. Only the body-diffing strategies treat a non-2xx as an error, because diffing an error
+body is meaningless.
+
+Successful (2xx) responses baseline and diff exactly as before (no regression). This is distinct from
+§4.6 **network**-level failures (ECONNREFUSED, DNS, timeout), which throw before any response status is
+known; §4.8 covers transport-level success with a non-2xx status. (Verified:
+`plugins/source-api-poll/src/index.ts`; `plugins/source-api-poll/src/index.test.ts`. Issue #220.)
 
 ### 4.6 Network error propagation
 
@@ -563,6 +643,12 @@ The resumption token is the last-seen commit SHA. If the daemon is offline acros
 ### 6.4 v1 scope boundary
 
 `incoming-changes` v1 fires on **any** ref advance touching `paths` — a pull, merge, fast-forward, or a local commit. Filtering to "only others' changes / only on fetch-merge" is a planned later refinement, not v1. A non-fast-forward advance (rebase, force-push) yields a meaningful net `git diff <prev>..<current>` and will not crash.
+
+This means `incoming-changes` is not a "remote branch is ahead" detector. It observes the local
+commit graph after that graph advances; it does not run `git fetch` or query the remote. Authors who
+want a pre-pull/rebase signal SHOULD use `command-poll` with
+`git ls-remote origin refs/heads/<branch>` and `text-diff` (§11.3), because `git status` and local
+remote-tracking refs such as `origin/main` are stale until some other process fetches.
 
 ### 6.5 Error resilience
 
@@ -768,6 +854,29 @@ Mirrors `api-poll` (§4.2), substituting the local-process equivalents:
 `api-poll`. `exit-code` is first-class in v1 (decision for #81's fourth open question); the broader
 "predicate over the result" generalization is explicitly deferred — if it lands later, `exit-code`
 becomes sugar for one such predicate, which is a compatible evolution.
+
+`json-diff` requires `stdout` to be exactly one JSON value. A shell pipeline such as
+`curl ... | jq '.[].name'` emits a newline-delimited stream of JSON values, and `jq -r '.[].name'`
+emits plain text lines; neither is a single JSON document. Authors SHOULD use `text-diff` for a
+stable ordered stream, or wrap the stream into one JSON array with `jq -s` before selecting
+`json-diff`.
+
+For "notify me when upstream commits land on a branch before I pull", the recommended command is
+side-effect-free remote ref polling:
+
+```yaml
+watch:
+  type: command-poll
+  command: ['git', 'ls-remote', 'origin', 'refs/heads/main']
+  interval: 5m
+  change-detection:
+    strategy: text-diff
+```
+
+`git ls-remote` queries the remote directly without mutating the local repository. In contrast,
+`git status` and `git rev-parse origin/main` only read local state and are stale until a fetch, while
+`incoming-changes` (§6.4) reports local graph advances after a pull/merge/local commit rather than a
+remote-ahead condition.
 
 Plain `json-diff` MAY set top-level `change-detection.ignore-paths` to remove noisy fields before
 comparison, e.g. `ignore-paths: ['duration']` or `ignore-paths: ['$.duration']`. Paths use the same

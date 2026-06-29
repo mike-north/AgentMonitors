@@ -120,53 +120,86 @@ agentmonitors validate .claude/monitors
 
 Verification proves the agent will be **notified**, not just that an event materialised. The two are
 distinct: `monitor explain` can report a materialised event that was never delivered to a session.
-Run the notification verification flow below — it simulates exactly what the plugin hooks do.
+Run the reliable manual-test recipe below — it is the only path that works end-to-end without
+running inside a Claude Code session.
 
 **The monitor is not done until it has fired and been delivered once.** A monitor that validates
 cleanly but has never produced a delivered notification is unverified — treat the flow below as a
 required step, not an optional smoke test.
 
-### Detection latency
+### Why `session start` is not the manual-test path
 
-After a file change the monitor's observe interval (~30 s default) must elapse before the daemon
-detects it, then the urgency settle window (15 s for `high`) must elapse before delivery is
-attempted. **Total for a high-urgency monitor: ~45 s.** An empty `hook deliver` response on the
-first check is expected — it does not mean the monitor is broken. Wait and re-poll.
+`agentmonitors session start` is designed for the **plugin's `SessionStart` hook**: it lazy-boots a
+daemon with automatic idle reaping (`reap-after-ms` defaults to 5 minutes), so a long multi-step
+manual verification will often trigger the reaper before you reach the delivery check. If you then
+run `session open` or `hook deliver` manually, those commands may target a different socket than the
+daemon that just exited, producing `No lead session is registered` or an empty response. In the live
+plugin flow this is fine because hooks keep the daemon alive. For manual testing, use the recipe
+below instead.
 
-For fast verification, temporarily set the monitor's `watch.interval` to `5s` while testing, then
-restore the intended interval before finishing. The standard `agentmonitors session start` path
-boots a project daemon that ticks frequently enough for this. If you start the daemon manually
-instead, run it with a low poll interval too:
+### Fast-test setup: shorten intervals before verifying
 
-```bash
-agentmonitors daemon run .claude/monitors --poll-ms 1000
+The default poll interval is 30 s for `file-fingerprint` and `command-poll`, 5 min for `api-poll`.
+For a test cycle, set a short interval in the `MONITOR.md` frontmatter:
+
+```yaml
+watch:
+  type: command-poll
+  command: [cat, tracked/state.txt]
+  interval: 5s       # shorten for testing; restore the real value before committing
+notify:
+  strategy: debounce
+  settle-for: 5s     # shorten the urgency settle window too
+urgency: high
 ```
 
-### Notification verification flow
+You can also pass `--poll-ms <ms>` to `daemon run` to override the daemon's tick rate (default
+30 000 ms). With `interval: 5s` in the monitor and `--poll-ms 5000` on the daemon, a full
+detect-and-settle cycle takes ~10–15 s instead of ~45 s.
+
+### Reliable manual-test recipe
+
+Use an explicit socket path to guarantee all steps talk to the same daemon, regardless of whether
+the workspace has an enabled `.claude/agentmonitors.local.md`.
 
 ```bash
-# 1. Choose a session ID for this test run (any unique string)
-SESSION_ID="verify-$(date +%s)"
 CWD=$(pwd)
+HOST_ID="verify-$(date +%s)"
+SOCKET="/tmp/agentmon-verify-$$.sock"
 
-# 2. Register the session and boot the daemon (simulates the SessionStart hook)
-echo "{\"session_id\":\"$SESSION_ID\",\"cwd\":\"$CWD\",\"hook_event_name\":\"SessionStart\"}" \
-  | agentmonitors session start
+# 1. Start a daemon that never idle-reaps (--reap-after-ms 0).
+#    Pass --socket so all steps share the same socket.
+#    Use --poll-ms for a faster tick during testing (default: 30000).
+agentmonitors daemon run .claude/monitors --socket "$SOCKET" --reap-after-ms 0 --poll-ms 5000 &
+DAEMON_PID=$!
+sleep 1   # let the socket appear
 
-# 3. Trigger the monitored condition
-#    file-fingerprint: touch a file matched by the monitor's globs
-touch path/to/monitored/file.txt
+# 2. Open a lead session on the same socket.
+#    Note the AgentMon session ID printed on "Opened session:" line.
+agentmonitors session open --socket "$SOCKET" --host-session-id "$HOST_ID" --role lead --workspace "$CWD"
+# → Opened session: <AGENTMON_SESSION_ID>
+AGENTMON_SESSION_ID=<paste the id from above>
 
-# 4. Wait for detection + settle
-#    ~30 s observe interval + ~15 s settle for urgency: high = ~45 s total
-sleep 45
+# 3. Trigger the monitored condition (see per-source recipes below).
 
-# 5. Simulate the UserPromptSubmit hook — claim any pending deliveries
-echo "{\"session_id\":\"$SESSION_ID\",\"cwd\":\"$CWD\",\"hook_event_name\":\"UserPromptSubmit\"}" \
-  | agentmonitors hook deliver
+# 4. Wait for detect + settle.
+#    interval + settle-for from MONITOR.md — e.g. 5s + 5s = 10s minimum, add a few seconds margin.
+sleep 15
+
+# 5. Confirm the event reached the session:
+agentmonitors events list --socket "$SOCKET" --session "$AGENTMON_SESSION_ID" --unread
+
+# 5b. Simulate the UserPromptSubmit hook — claim any pending deliveries and confirm notification:
+echo "{\"session_id\":\"$HOST_ID\",\"cwd\":\"$CWD\",\"hook_event_name\":\"UserPromptSubmit\"}" \
+  | agentmonitors hook deliver --socket "$SOCKET"
+
+# 6. Clean up.
+kill "$DAEMON_PID"
 ```
 
-**Success signal:** the output is a JSON object with a non-empty `additionalContext` field:
+**Success signal:** step 5 prints at least one event row (with monitor ID, urgency, and title),
+confirming the event reached the session. Step 5b (`hook deliver`) returning a JSON object with a
+non-empty `additionalContext` field confirms the delivery hook would notify the agent:
 
 ```json
 {
@@ -178,23 +211,78 @@ echo "{\"session_id\":\"$SESSION_ID\",\"cwd\":\"$CWD\",\"hook_event_name\":\"Use
 }
 ```
 
-**If the output is empty** (no JSON printed), the settle window may not have elapsed yet or the
-daemon hasn't completed its first tick. Wait 15–30 s and re-run step 5 — do not change any files
-or re-run step 2 between retries.
+**If step 5 prints `No events found.`**, the settle window may not have elapsed yet. Wait and
+re-run steps 5–5b — do not change any files or re-open the session between retries.
 
-Use the cheapest real trigger per source:
+### Per-source trigger recipes
 
-- `file-fingerprint`: touch a file matched by the monitor's globs.
-- `api-poll`: use `agentmonitors monitor test <path/to/MONITOR.md>` for a connectivity check. To
-  prove delivery, point the monitor at a controllable endpoint and change the response between two
-  ticks. Do not expect a live URL/API you do not control to fire on demand; wait for the resource to
-  actually change or use a scratch endpoint for verification.
-- `command-poll`: make the command read a harmless scratch input, then change that input between two
-  ticks. This proves the command ran, diffed, materialised an event, and delivered to the session.
-- `schedule`: choose a near-future cron while testing, or use `agentmonitors monitor test` to verify
-  source configuration before restoring the intended cron.
-- `incoming-changes`: use a scratch git repo or harmless pathspec; advance the ref with a small commit
-  touching a matched path.
+#### `file-fingerprint`
+
+```bash
+# Step 3: touch any file matched by watch.globs
+touch path/to/monitored/file.txt
+```
+
+#### `command-poll`
+
+```bash
+# Step 3: cause the command's output to change.
+# Example — the monitor runs `cat tracked/state.txt`:
+echo "changed" >> tracked/state.txt
+
+# Example — the monitor runs `git status --porcelain`:
+echo "temp" > some-untracked-file.txt
+# (the status output now includes the new file)
+```
+
+`command-poll` uses a baseline-then-detect pattern: the first tick establishes a baseline; the
+second tick detects the change. With `interval: 5s` and the daemon, this means two ticks must
+run after the session is opened — the first produces a baseline, the second detects the diff.
+Trigger the change **between** the two ticks (i.e. after the session opens but before the second
+tick) for fastest detection. If the daemon has already run one tick before you trigger the
+change, the change fires on the next tick.
+
+#### `api-poll`
+
+```bash
+# Connectivity check (no daemon needed):
+agentmonitors monitor test .claude/monitors/<id>/MONITOR.md
+
+# Step 3 for change detection: the response from your endpoint must change between two ticks.
+# Options:
+#   - Point watch.url at a controllable local server and update its response.
+#   - Use a service that returns a timestamp or counter (changes every poll, useful for testing).
+#   - Add a query param that forces a cache-bust and changes the response.
+```
+
+**For external resources you do not control** (a live third-party URL, a remote API, a remote
+repo): `agentmonitors monitor test` confirms the source is correctly configured and can reach the
+endpoint, but an actual change-fire requires the remote resource to change between two of the
+daemon's ticks. You can confirm authoring is correct; you cannot force a remote change. Set
+expectations accordingly — your monitor is verified once the remote resource naturally changes
+and the event arrives.
+
+#### `schedule`
+
+```bash
+# Step 3: set a cron that fires in the next ~1 minute while testing.
+# In MONITOR.md frontmatter, set e.g.:
+#   cron: '* * * * *'  # every minute
+# Restore the intended cron after verification.
+# Or use agentmonitors monitor test to confirm the cron parses correctly.
+agentmonitors monitor test .claude/monitors/<id>/MONITOR.md
+```
+
+#### `incoming-changes`
+
+```bash
+# Step 3: advance the tracked git ref by committing to a path in watch.paths.
+# Use a scratch branch or harmless file if you do not want to push real commits.
+touch docs/scratch-verify.txt
+git add docs/scratch-verify.txt
+git commit -m "verify incoming-changes monitor" --no-gpg-sign
+# Then trigger a fetch/merge that advances the ref (or simulate with `git pull`).
+```
 
 ### Copy-paste delivery recipes
 

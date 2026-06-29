@@ -237,6 +237,25 @@ describe('source-file-fingerprint', () => {
   });
 
   describe('scopeSchema accepts string or array globs (003 §3)', () => {
+    it('documents the runtime observe interval knob', () => {
+      const properties = source.scopeSchema['properties'] as Record<
+        string,
+        { description?: string; default?: string; type?: string }
+      >;
+      expect(properties['interval']).toMatchObject({
+        type: 'string',
+        default: '30s',
+      });
+      expect(properties['interval']?.description).toContain('30s');
+      expect(properties['interval']?.description).toContain('watch.interval');
+      expect(
+        validateScope(
+          { globs: 'notes.md', interval: '5s' },
+          source.scopeSchema,
+        ),
+      ).toEqual([]);
+    });
+
     it('accepts a bare string', () => {
       expect(validateScope({ globs: 'notes.md' }, source.scopeSchema)).toEqual(
         [],

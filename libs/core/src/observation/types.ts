@@ -136,6 +136,18 @@ export interface ObservationResult {
    * of `no-change`. Omitted by sources that don't distinguish a special case.
    */
   outcome?: 'rebaselined' | 'no-files-matched';
+  /**
+   * Optional non-fatal diagnostics a source attaches to an otherwise-successful
+   * observation cycle. A warning does **not** mark the cycle as errored — the
+   * `nextState` and `observations` are still valid — but it surfaces a likely
+   * misconfiguration the author should fix. Example: `api-poll` configured with
+   * `change-detection.strategy: json-diff` against a body that does not parse as
+   * JSON, which silently degrades to text comparison (003 §4.2).
+   *
+   * `agentmonitors monitor test` prints these so authors see the problem during
+   * a dry-run instead of getting quietly wrong diffing in production.
+   */
+  warnings?: string[];
 }
 
 /**

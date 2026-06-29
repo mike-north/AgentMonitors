@@ -85,14 +85,26 @@ subsequent observations diff against it. A single isolated run cannot detect cha
 
 Polls an HTTP endpoint and detects response changes.
 
+Watching a web page needs **no** `change-detection` block — the strategy is inferred from the
+response `Content-Type`:
+
+```yaml
+watch:
+  type: api-poll
+  url: 'https://example.com/page'
+  interval: 5m                 # optional — polling interval (e.g. 5m, 30s, 1h)
+```
+
+The full set of options:
+
 ```yaml
 watch:
   type: api-poll
   url: 'https://api.example.com/status'
   method: GET                  # optional — defaults to GET
   interval: 5m                 # optional — polling interval (e.g. 5m, 30s, 1h)
-  change-detection:            # optional
-    strategy: json-diff        # text-diff (default) | json-diff | status-code
+  change-detection:            # optional — inferred from Content-Type when omitted:
+    strategy: json-diff        # set ONLY to override · text-diff for HTML/plain · json-diff for JSON · status-code for status-only
   auth:                        # optional
     type: bearer
     token-env: API_TOKEN       # reads from environment variable
@@ -102,11 +114,42 @@ watch:
 
 **Change detection strategies:**
 
-| Strategy | Behaviour |
-|---|---|
-| `text-diff` | Compares raw response body text (default) |
-| `json-diff` | Parses JSON and compares semantically (ignores key order and whitespace) |
-| `status-code` | Only detects changes in HTTP status code |
+| Strategy | Behaviour | Use for |
+|---|---|---|
+| `text-diff` | Compares raw response body text | HTML pages, plain-text status pages — the right choice for watching a web page |
+| `json-diff` | Parses JSON and compares semantically (ignores key order and whitespace) | JSON APIs |
+| `status-code` | Only detects changes in HTTP status code | Watching whether an endpoint goes up/down (e.g. 200 → 503) |
+
+**`change-detection` is optional.** When you omit it, the strategy is **inferred from the response
+`Content-Type`**: a JSON media type (`application/json` or any `+json` suffix) uses `json-diff`;
+everything else — HTML, plain text, or a missing/unknown `Content-Type` — uses `text-diff`. So the
+common "tell me when this web page changed" case is zero-config.
+
+For status pages, prefer the machine-readable status endpoint when one exists. Rendered HTML often
+contains per-request timestamps, CSRF tokens, nonces, or build metadata; raw `text-diff` sees those
+as changes and can fire every poll even when the actual service status is unchanged.
+
+```yaml
+watch:
+  type: api-poll
+  url: 'https://status.example.com/api/v2/status.json'
+  interval: 5m
+```
+
+Many Statuspage-backed sites expose `/api/v2/status.json`, which is designed to be stable until the
+reported status changes. If a site only exposes rendered HTML, consider pairing the monitor with a
+`notify.strategy: debounce` window and expect more noise.
+
+**An explicit `strategy` always wins** — it is used verbatim with no inference or override. So an
+explicit `json-diff` against an HTML page stays `json-diff` (and `agentmonitors monitor test` warns
+that the body does not parse as JSON, steering you to `text-diff`); an explicit `text-diff` against a
+JSON body stays `text-diff`.
+
+A non-2xx response (e.g. a `401` from a missing/invalid token, or a `500` error page) is treated as
+an **errored** observation for `text-diff`/`json-diff` — the monitor does **not** baseline on the
+error body, and `monitor test` / `monitor history` surface the status — so a broken auth/URL is not
+silently masked. (`status-code` is the exception: there the status itself is the watched signal, so a
+non-2xx is a legitimate change, not an error.)
 
 **Auth types:**
 
@@ -140,14 +183,37 @@ operators**, spawn a shell explicitly in argv form:
 ```yaml
 watch:
   type: command-poll
-  command: ['sh', '-c', 'git status -sb | grep ahead']   # the supported pipeline idiom
+  command: ['sh', '-c', "curl -fsS https://api.example.com/repos | jq -r '.[].name' | sort"]
   change-detection:
-    strategy: json-diff          # use json-diff when the command emits JSON, e.g. curl | jq
+    strategy: text-diff          # jq -r streams lines; compare the stable text output
 ```
 
-Use `strategy: json-diff` when the output is JSON (compares semantically, ignoring key order and
-whitespace); `text-diff` (the default) for plain text; `exit-code` to fire only when the exit code
-changes.
+Use `strategy: json-diff` only when stdout is a single JSON value, such as one object or one array.
+A common `jq '.[].name'` or `jq -r '.[].name'` pipeline emits a stream of values or lines, not one
+JSON document; use `text-diff` for that stable ordered output, or wrap the stream into one JSON
+array with `jq -s` before choosing `json-diff`. `exit-code` fires only when the exit code changes.
+
+#### Watch for upstream commits
+
+To be notified when a remote branch advances before you pull or rebase, poll the remote directly:
+
+```yaml
+watch:
+  type: command-poll
+  command:
+    - git
+    - ls-remote
+    - origin
+    - refs/heads/main
+  interval: 5m
+  change-detection:
+    strategy: text-diff
+```
+
+`git ls-remote` asks the remote for the current ref without mutating your local repository. Do not
+use `git status` or `git rev-parse origin/main` for this: they read local remote-tracking refs, which
+are stale until something runs `git fetch`. `incoming-changes` is also a different tool: it fires
+after your local commit graph advances through a pull, merge, or local commit.
 
 ### `schedule`
 
@@ -174,6 +240,9 @@ watch:
     - 'docs/specs/**'
   branch: main                  # optional — defaults to current branch
 ```
+
+Use `command-poll` with `git ls-remote` when you need to know the remote branch is ahead before you
+pull. `incoming-changes` observes your local graph after it advances; it does not query the remote.
 
 ## Urgency
 
@@ -287,7 +356,9 @@ agentmonitors daemon run .claude/monitors --poll-ms 1000
 
 The normal plugin-style path does not require custom sockets. Each recipe below writes a temporary
 monitor, validates it, starts a session with the same hook command Claude Code runs, changes the
-watched input, and then asks the hook transport for pending delivery.
+watched input, and then asks the hook transport for pending delivery. `hook deliver` resolves the
+session through the enabled-project `.claude/agentmonitors.local.md` path, so these recipes create
+that file instead of hand-starting an unrelated daemon.
 
 ### `command-poll` recipe
 

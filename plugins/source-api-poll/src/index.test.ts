@@ -90,6 +90,25 @@ describe('source-api-poll', () => {
   });
 
   describe('change-detection strategies', () => {
+    // Regression: an unrecognized but *present* strategy value must throw
+    // immediately rather than silently falling through to Content-Type inference.
+    // Before the fix, e.g. `strategy: jsondiff` (typo) would set
+    // `explicitStrategy = undefined` and infer from Content-Type — violating
+    // "explicit always wins" and hiding the author error.
+    it('unrecognized explicit strategy throws a descriptive error and does NOT infer', async () => {
+      await expect(
+        source.observe(
+          {
+            url: 'https://api.example.com/data',
+            'change-detection': { strategy: 'jsondiff' }, // typo — not a valid strategy
+          },
+          { now: new Date() },
+        ),
+      ).rejects.toThrow(
+        /unknown change-detection\.strategy "jsondiff" \(expected one of: json-diff, text-diff, status-code\)/,
+      );
+    });
+
     it('status-code: detects status change, ignores body change', async () => {
       const mockFetch = vi.fn();
       vi.stubGlobal('fetch', mockFetch);
@@ -363,6 +382,326 @@ describe('source-api-poll', () => {
     });
   });
 
+  // Issue #220: a non-2xx response must become an errored observation (the
+  // source throws) rather than silently baselining on the error body — except
+  // for the status-code strategy, where a non-2xx is a legitimate observed
+  // signal. The runtime turns a thrown observe() into an `errored` history row;
+  // these tests assert at the source layer (throw / no-throw) which is what
+  // that behavior is built on.
+  describe('non-2xx → errored observation (issue #220)', () => {
+    function mockStatus(body: string, status: number): void {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockResolvedValue({
+          text: () => Promise.resolve(body),
+          status,
+        }),
+      );
+    }
+
+    it('AC1/AC2: 401 throws a status-bearing error and establishes no baseline (text-diff)', async () => {
+      mockStatus('Unauthorized', 401);
+      const url = 'https://api.example.com/secured';
+      await expect(
+        source.observe({ url }, { now: new Date() }),
+      ).rejects.toThrow(/api-poll received HTTP 401/);
+      // Message identifies the status and the "not establishing a baseline" intent.
+      await expect(
+        source.observe({ url }, { now: new Date() }),
+      ).rejects.toThrow(/not establishing a baseline on an error response/);
+    });
+
+    it('AC1: 500 throws (json-diff) — no silent baseline on an error page', async () => {
+      mockStatus('<html>Internal Server Error</html>', 500);
+      await expect(
+        source.observe(
+          {
+            url: 'https://api.example.com/json',
+            'change-detection': { strategy: 'json-diff' },
+          },
+          { now: new Date() },
+        ),
+      ).rejects.toThrow(/api-poll received HTTP 500/);
+    });
+
+    it('AC1: 404 throws (default text-diff)', async () => {
+      mockStatus('Not Found', 404);
+      await expect(
+        source.observe(
+          { url: 'https://api.example.com/missing' },
+          { now: new Date() },
+        ),
+      ).rejects.toThrow(/api-poll received HTTP 404/);
+    });
+
+    it('AC3: a 2xx response baselines exactly as before (no regression)', async () => {
+      mockStatus('{"ok":true}', 200);
+      const result = await source.observe(
+        { url: 'https://api.example.com/ok' },
+        { now: new Date() },
+      );
+      expect(result.observations).toHaveLength(0);
+      expect(result.nextState).toBeDefined();
+    });
+
+    it('AC3: 2xx success boundaries (200, 204, 299) baseline; 300 errors', async () => {
+      for (const status of [200, 204, 299]) {
+        mockStatus('body', status);
+        const result = await source.observe(
+          { url: `https://api.example.com/edge-${String(status)}` },
+          { now: new Date() },
+        );
+        expect(result.nextState).toBeDefined();
+      }
+      mockStatus('redirect', 300);
+      await expect(
+        source.observe(
+          { url: 'https://api.example.com/edge-300' },
+          { now: new Date() },
+        ),
+      ).rejects.toThrow(/api-poll received HTTP 300/);
+    });
+
+    it('exception: status-code strategy does NOT throw on a non-2xx (status is the watched signal)', async () => {
+      const mockFetch = vi.fn();
+      vi.stubGlobal('fetch', mockFetch);
+      const config = {
+        url: 'https://api.example.com/health',
+        'change-detection': { strategy: 'status-code' },
+      };
+      // Baseline on a healthy 200.
+      mockFetch.mockResolvedValueOnce({
+        text: () => Promise.resolve('ok'),
+        status: 200,
+      });
+      const baseline = await source.observe(config, { now: new Date() });
+      expect(baseline.observations).toHaveLength(0);
+      // Endpoint goes 200 -> 503: must be observed, not thrown.
+      mockFetch.mockResolvedValueOnce({
+        text: () => Promise.resolve('down'),
+        status: 503,
+      });
+      const changed = await source.observe(config, {
+        previousState: baseline.nextState,
+        now: new Date(),
+      });
+      expect(changed.observations).toHaveLength(1);
+    });
+  });
+
+  // Issue #219: json-diff against a non-JSON body silently degrades to text
+  // comparison. The source must surface a non-fatal warning so `monitor test`
+  // can steer the author to text-diff, without changing the observation outcome.
+  describe('json-diff on non-JSON body → warning (issue #219)', () => {
+    function mockBody(body: string): void {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockResolvedValue({
+          text: () => Promise.resolve(body),
+          status: 200,
+        }),
+      );
+    }
+
+    it('warns when json-diff is configured but the body is not JSON', async () => {
+      mockBody('<!DOCTYPE html><html><body>Status page</body></html>');
+      const result = await source.observe(
+        {
+          url: 'https://status.example.com/incidents',
+          'change-detection': { strategy: 'json-diff' },
+        },
+        { now: new Date() },
+      );
+      expect(result.warnings).toBeDefined();
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings?.[0]).toMatch(/json-diff/);
+      expect(result.warnings?.[0]).toMatch(/does not parse as JSON/);
+      expect(result.warnings?.[0]).toMatch(/text-diff/);
+    });
+
+    it('does NOT warn when json-diff body parses as JSON', async () => {
+      mockBody('{"status":"operational"}');
+      const result = await source.observe(
+        {
+          url: 'https://api.example.com/status.json',
+          'change-detection': { strategy: 'json-diff' },
+        },
+        { now: new Date() },
+      );
+      // Absent or empty — no warning for a valid JSON body.
+      expect(result.warnings ?? []).toHaveLength(0);
+    });
+
+    it('does NOT warn for text-diff against a non-JSON body (correct strategy)', async () => {
+      mockBody('<html>page</html>');
+      const result = await source.observe(
+        {
+          url: 'https://status.example.com/page',
+          'change-detection': { strategy: 'text-diff' },
+        },
+        { now: new Date() },
+      );
+      expect(result.warnings ?? []).toHaveLength(0);
+    });
+
+    it('does NOT warn for the default (text-diff) strategy', async () => {
+      mockBody('<html>page</html>');
+      const result = await source.observe(
+        { url: 'https://status.example.com/page' },
+        { now: new Date() },
+      );
+      expect(result.warnings ?? []).toHaveLength(0);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Issue #230: infer change-detection strategy from the response Content-Type
+  // when `change-detection.strategy` is OMITTED. An explicit value always wins
+  // verbatim (no inference, no override). The inferred path never warns, because
+  // inference picks the correct strategy for the body.
+  //
+  // @see docs/specs/003-source-plugins.md §4.3
+  // @see https://www.rfc-editor.org/rfc/rfc6838#section-4.2.8 (+json suffix)
+  // ---------------------------------------------------------------------------
+  describe('strategy inference from Content-Type (issue #230)', () => {
+    /**
+     * Mock a two-poll sequence (baseline then a changed body) for one URL, with
+     * an optional `Content-Type` header. Returns the observation produced by the
+     * second poll so a test can assert the *resolved* strategy (carried on
+     * `payload.strategy`) and the surfaced warnings.
+     */
+    async function observeWithContentType(
+      config: Record<string, unknown>,
+      contentType: string | undefined,
+      bodies: { first: string; second: string },
+    ): Promise<Awaited<ReturnType<typeof source.observe>>> {
+      const headers =
+        contentType === undefined
+          ? undefined
+          : {
+              get: (name: string) =>
+                name === 'content-type' ? contentType : null,
+            };
+      const mockFetch = vi.fn();
+      vi.stubGlobal('fetch', mockFetch);
+
+      mockFetch.mockResolvedValueOnce({
+        text: () => Promise.resolve(bodies.first),
+        status: 200,
+        headers,
+      });
+      const baseline = await source.observe(config, { now: new Date() });
+
+      mockFetch.mockResolvedValueOnce({
+        text: () => Promise.resolve(bodies.second),
+        status: 200,
+        headers,
+      });
+      return source.observe(config, {
+        previousState: baseline.nextState,
+        now: new Date(),
+      });
+    }
+
+    // AC1: omitted + application/json → json-diff
+    it('omitted strategy + application/json → json-diff', async () => {
+      const result = await observeWithContentType(
+        { url: 'https://api.example.com/data.json' },
+        'application/json',
+        { first: '{"v":1}', second: '{"v":2}' },
+      );
+      expect(result.observations).toHaveLength(1);
+      expect(result.observations[0]?.payload?.['strategy']).toBe('json-diff');
+    });
+
+    // AC1: a structured-syntax +json suffix (e.g. application/ld+json) → json-diff
+    it('omitted strategy + application/ld+json (charset param) → json-diff', async () => {
+      const result = await observeWithContentType(
+        { url: 'https://api.example.com/feed' },
+        'application/ld+json; charset=utf-8',
+        { first: '{"v":1}', second: '{"v":2}' },
+      );
+      expect(result.observations).toHaveLength(1);
+      expect(result.observations[0]?.payload?.['strategy']).toBe('json-diff');
+    });
+
+    // AC1: omitted + text/html → text-diff
+    it('omitted strategy + text/html → text-diff', async () => {
+      const result = await observeWithContentType(
+        { url: 'https://example.com/page' },
+        'text/html; charset=utf-8',
+        { first: '<html>v1</html>', second: '<html>v2</html>' },
+      );
+      expect(result.observations).toHaveLength(1);
+      expect(result.observations[0]?.payload?.['strategy']).toBe('text-diff');
+    });
+
+    // AC1: omitted + missing Content-Type → text-diff
+    it('omitted strategy + missing Content-Type → text-diff', async () => {
+      const result = await observeWithContentType(
+        { url: 'https://example.com/unknown' },
+        undefined,
+        { first: 'plain v1', second: 'plain v2' },
+      );
+      expect(result.observations).toHaveLength(1);
+      expect(result.observations[0]?.payload?.['strategy']).toBe('text-diff');
+    });
+
+    // AC3: an inferred strategy NEVER warns, even when a JSON Content-Type body
+    // happens not to parse — inference is by header, not body, and never claims
+    // a json-diff mismatch.
+    it('inferred json-diff does NOT emit the #219 warning', async () => {
+      const result = await observeWithContentType(
+        { url: 'https://api.example.com/maybe.json' },
+        'application/json',
+        { first: '{"v":1}', second: '{"v":2}' },
+      );
+      expect(result.warnings ?? []).toHaveLength(0);
+    });
+
+    // AC2: explicit json-diff wins over a text/html Content-Type (honored, NOT
+    // overridden to text-diff) AND emits the #219 warning for the non-JSON body.
+    it('explicit json-diff + text/html → json-diff (honored) and warns', async () => {
+      const result = await observeWithContentType(
+        {
+          url: 'https://status.example.com/incidents',
+          'change-detection': { strategy: 'json-diff' },
+        },
+        'text/html; charset=utf-8',
+        {
+          first: '<html>v1</html>',
+          second: '<html>v2</html>',
+        },
+      );
+      expect(result.observations).toHaveLength(1);
+      // Honored verbatim: strategy is json-diff despite the HTML Content-Type.
+      expect(result.observations[0]?.payload?.['strategy']).toBe('json-diff');
+      // And the #219 warning fires for the explicit json-diff-on-non-JSON case.
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings?.[0]).toMatch(/json-diff/);
+      expect(result.warnings?.[0]).toMatch(/does not parse as JSON/);
+    });
+
+    // AC2: explicit text-diff wins over an application/json Content-Type
+    // (honored, NOT overridden to json-diff).
+    it('explicit text-diff + application/json → text-diff (honored)', async () => {
+      // Bodies that are JSON-equal (key reorder) but text-different: a text-diff
+      // sees a change, a json-diff would not. Asserting an observation IS emitted
+      // proves text-diff was used despite the JSON Content-Type.
+      const result = await observeWithContentType(
+        {
+          url: 'https://api.example.com/data.json',
+          'change-detection': { strategy: 'text-diff' },
+        },
+        'application/json',
+        { first: '{"a":1,"b":2}', second: '{"b":2,"a":1}' },
+      );
+      expect(result.observations).toHaveLength(1);
+      expect(result.observations[0]?.payload?.['strategy']).toBe('text-diff');
+      expect(result.warnings ?? []).toHaveLength(0);
+    });
+  });
+
   describe('cache isolation', () => {
     it('different configs for same URL maintain separate baselines', async () => {
       const mockFetch = vi.fn();
@@ -574,6 +913,60 @@ describe('source-api-poll', () => {
       await expect(source.observe(cfg, { now: new Date() })).rejects.toThrow(
         /boom/,
       );
+    });
+
+    // Issue #220 (composite parity): the non-2xx → errored-observation behavior
+    // added for the single-URL path MUST also apply to each composite part. A
+    // non-2xx part body would otherwise be baselined into the rendered snapshot,
+    // making a misconfigured monitor look healthy and diffing error pages.
+    it('a non-2xx composite part throws a status-bearing error (no baseline on error body)', async () => {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn((input: string) =>
+          input === 'https://api.example.com/orders/42'
+            ? Promise.resolve({
+                text: () => Promise.resolve('{"status":"open"}'),
+                status: 200,
+              })
+            : // A line endpoint returns 401 (e.g. expired token): must not baseline.
+              Promise.resolve({
+                text: () => Promise.resolve('Unauthorized'),
+                status: 401,
+              }),
+        ),
+      );
+      // The error identifies the status, the offending part id/url, and the
+      // "not establishing a baseline" intent — consistent with the single-URL path.
+      await expect(
+        source.observe(compositeConfig, { now: new Date() }),
+      ).rejects.toThrow(/api-poll received HTTP 401 from composite part/);
+      await expect(
+        source.observe(compositeConfig, { now: new Date() }),
+      ).rejects.toThrow(/not establishing a baseline on an error response/);
+    });
+
+    it('a 2xx composite still baselines/observes normally (no regression from the non-2xx guard)', async () => {
+      mockByUrl({
+        'https://api.example.com/orders/42': '{"status":"open"}',
+        'https://api.example.com/orders/42/lines/1': '{"qty":1}',
+        'https://api.example.com/orders/42/lines/2': '{"qty":2}',
+      });
+      const baseline = await source.observe(compositeConfig, {
+        now: new Date(),
+      });
+      expect(baseline.observations).toHaveLength(0);
+
+      mockByUrl({
+        'https://api.example.com/orders/42': '{"status":"shipped"}',
+        'https://api.example.com/orders/42/lines/1': '{"qty":1}',
+        'https://api.example.com/orders/42/lines/2': '{"qty":2}',
+      });
+      const next = await source.observe(compositeConfig, {
+        previousState: baseline.nextState,
+        now: new Date(),
+      });
+      expect(next.observations).toHaveLength(1);
+      expect(next.observations[0]?.objectKey).toBe('order-42');
     });
 
     it('rejects composite combined with keyed-collection (mutually exclusive)', async () => {

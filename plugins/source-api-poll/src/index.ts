@@ -33,7 +33,13 @@ interface ScopeConfig {
   auth: AuthConfig | undefined;
   headers: Record<string, string> | undefined;
   method: string | undefined;
-  changeDetection: ChangeStrategy;
+  /**
+   * The change-detection strategy as written by the author, or `undefined` when
+   * the author omitted `change-detection.strategy`. The omitted case is resolved
+   * after the fetch by inferring from the response `Content-Type` (003 §4.2,
+   * issue #230); an explicit value always wins (no inference, no override).
+   */
+  explicitStrategy: ChangeStrategy | undefined;
   /** Keyed-collection config (003 §12), present only under `strategy: json-diff`. */
   collection: KeyedCollectionConfig | undefined;
   /**
@@ -59,18 +65,44 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
     throw new Error('scope.url must be a string');
   }
 
+  // The strategy is honored *verbatim* when the author specifies one; when it is
+  // OMITTED we leave `explicitStrategy` undefined and infer it from the response
+  // Content-Type after the fetch (003 §4.2, issue #230). Explicit always wins.
+  //
+  // An unrecognized strategy value is an authoring error — not a signal to fall
+  // through to inference. If the author wrote e.g. `strategy: jsondiff` (a
+  // typo), silently inferring would violate "explicit always wins" and hide the
+  // mistake. Throw immediately with a descriptive message so the author sees the
+  // bad value, rather than observing unexpected behavior at runtime.
   const cd = config['change-detection'] as { strategy?: string } | undefined;
   const strategy = cd?.strategy;
-  const changeDetection: ChangeStrategy =
-    strategy === 'status-code' || strategy === 'json-diff'
+  const knownStrategies: ChangeStrategy[] = [
+    'json-diff',
+    'text-diff',
+    'status-code',
+  ];
+  if (
+    strategy !== undefined &&
+    !knownStrategies.includes(strategy as ChangeStrategy)
+  ) {
+    throw new Error(
+      `unknown change-detection.strategy "${strategy}" (expected one of: json-diff, text-diff, status-code)`,
+    );
+  }
+  const explicitStrategy: ChangeStrategy | undefined =
+    strategy === 'status-code' ||
+    strategy === 'json-diff' ||
+    strategy === 'text-diff'
       ? strategy
-      : 'text-diff';
+      : undefined;
 
   // Keyed-collection mode (003 §12) is only valid under `json-diff`. The generated
   // schema rejects `collection` under other strategies at authoring time (BP3); this
-  // is the defence-in-depth guard for the observe path.
+  // is the defence-in-depth guard for the observe path. `collection` forces an
+  // explicit `json-diff` (the schema's if/then requires it), so inference never
+  // reaches the collection path.
   const collection = parseKeyedCollectionConfig(config['change-detection']);
-  if (collection && changeDetection !== 'json-diff') {
+  if (collection && explicitStrategy !== 'json-diff') {
     throw new Error('change-detection.collection requires strategy: json-diff');
   }
 
@@ -88,7 +120,7 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
     auth: config['auth'] as AuthConfig | undefined,
     headers: config['headers'] as Record<string, string> | undefined,
     method: typeof config['method'] === 'string' ? config['method'] : undefined,
-    changeDetection,
+    explicitStrategy,
     collection,
     composite,
   };
@@ -287,7 +319,7 @@ async function fetchBody(
   url: string,
   method: string | undefined,
   combinedHeaders: Record<string, string>,
-): Promise<{ body: string; status: number }> {
+): Promise<{ body: string; status: number; contentType: string | undefined }> {
   let response: Response;
   try {
     response = await fetch(url, {
@@ -313,7 +345,89 @@ async function fetchBody(
       cause: fetchErr,
     });
   }
-  return { body: await response.text(), status: response.status };
+  return {
+    body: await response.text(),
+    status: response.status,
+    contentType: readContentType(response),
+  };
+}
+
+/**
+ * Read the `content-type` header from a fetch `Response`, tolerant of lightweight
+ * test doubles that omit `headers`. The DOM/undici `Response` type declares
+ * `headers` as always present, but a hand-built mock may not have it; reading
+ * through `unknown` keeps this safe at runtime without lying to the type system.
+ * A missing/empty header maps to `undefined` → text-diff inference (003 §4.2).
+ */
+function readContentType(response: Response): string | undefined {
+  const headers = (response as { headers?: unknown }).headers;
+  if (
+    typeof headers === 'object' &&
+    headers !== null &&
+    typeof (headers as { get?: unknown }).get === 'function'
+  ) {
+    const value = (headers as Headers).get('content-type');
+    return value ?? undefined;
+  }
+  return undefined;
+}
+
+/** Whether an HTTP status code is in the 2xx success range. */
+function isSuccessStatus(status: number): boolean {
+  return status >= 200 && status < 300;
+}
+
+/**
+ * Whether a `Content-Type` header indicates a JSON body: the `application/json`
+ * media type or any structured-syntax `+json` suffix (e.g. `application/ld+json`,
+ * `application/vnd.api+json`), per RFC 6838. Parameters (`; charset=utf-8`) and
+ * case are ignored. Used to infer the change-detection strategy when the author
+ * omits `change-detection.strategy` (003 §4.2, issue #230).
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc6838#section-4.2.8 (+json suffix)
+ */
+function isJsonContentType(contentType: string | undefined): boolean {
+  if (contentType === undefined) return false;
+  // Strip parameters (e.g. "; charset=utf-8") and normalize case/whitespace.
+  const mediaType = contentType.split(';')[0]?.trim().toLowerCase() ?? '';
+  return mediaType === 'application/json' || mediaType.endsWith('+json');
+}
+
+/**
+ * Resolve the effective change-detection strategy. An explicit author value is
+ * used verbatim (explicit always wins). When omitted, infer from the response
+ * `Content-Type`: JSON media types → `json-diff`; everything else (text/html,
+ * text/plain, missing/unknown) → `text-diff` (003 §4.2, issue #230).
+ */
+function resolveStrategy(
+  explicit: ChangeStrategy | undefined,
+  contentType: string | undefined,
+): ChangeStrategy {
+  if (explicit !== undefined) return explicit;
+  return isJsonContentType(contentType) ? 'json-diff' : 'text-diff';
+}
+
+/**
+ * Whether `body` parses as JSON. Used to warn when `strategy: json-diff` is
+ * configured against a body that is not JSON (e.g. an HTML status page), which
+ * would silently degrade to text comparison (003 §4.2, issue #219).
+ */
+function isParseableJson(body: string): boolean {
+  try {
+    JSON.parse(body);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Warning text for `strategy: json-diff` against a non-JSON body (issue #219).
+ * Exported-adjacent constant kept beside the source so the test asserts the same
+ * message the author sees.
+ */
+function jsonDiffNonJsonWarning(url: string): string {
+  return `api-poll: change-detection.strategy is json-diff but the response from ${url} does not parse as JSON; falling back to text comparison. Use strategy: text-diff for HTML/plain-text pages.`;
 }
 
 /** Source-owned change-detection state for composite mode (§2.6). */
@@ -350,7 +464,25 @@ async function observeComposite(
   // we never silently emit a composite missing a part.
   const results = await Promise.all(
     composite.parts.map(async (part) => {
-      const { body } = await fetchBody(part.url, method, combinedHeaders);
+      const { body, status } = await fetchBody(
+        part.url,
+        method,
+        combinedHeaders,
+      );
+      // ---- Non-2xx → errored observation (issue #220, composite parity) -------
+      // A composite assembles its snapshot by body-diffing the rendered whole, so
+      // a non-2xx part body (a 401/500 error page) must NOT be baselined into the
+      // snapshot — that would make a misconfigured monitor look healthy and diff
+      // error pages. Throwing here rejects the surrounding Promise.all, so
+      // `nextState` never advances and the prior baseline is preserved (002 §3),
+      // exactly as the single-URL path does. There is no `status-code` exemption
+      // in composite mode: composite is always a body-diffing assembly, never a
+      // status-transition watcher, so every part must be a 2xx success.
+      if (!isSuccessStatus(status)) {
+        throw new Error(
+          `api-poll received HTTP ${String(status)} from composite part "${part.id}" (${part.url}) — check auth/url; not establishing a baseline on an error response`,
+        );
+      }
       return { id: part.id, body } satisfies FetchedPart;
     }),
   );
@@ -387,7 +519,7 @@ const source: ObservationSource = {
       auth,
       headers,
       method,
-      changeDetection,
+      explicitStrategy,
       collection,
       composite,
     } = parseScopeConfig(config);
@@ -410,13 +542,56 @@ const source: ObservationSource = {
       throw new Error('scope.url must be a string');
     }
 
-    const { body, status } = await fetchBody(url, method, combinedHeaders);
+    const { body, status, contentType } = await fetchBody(
+      url,
+      method,
+      combinedHeaders,
+    );
+
+    // Resolve the effective strategy: explicit wins verbatim; otherwise infer
+    // from the response Content-Type (003 §4.2, issue #230). Inference can only
+    // produce a body-diffing strategy (json-diff / text-diff), never status-code.
+    const changeDetection = resolveStrategy(explicitStrategy, contentType);
+
+    // ---- Non-2xx → errored observation (issue #220) -----------------------------
+    // Establishing a change-detection baseline on an error body (e.g. a 401 from a
+    // missing/invalid bearer token, or a 500 error page) makes a misconfigured
+    // monitor look like it "works": it would baseline on the error page and diff
+    // error pages, with no signal that auth/url is broken. Throw so the runtime
+    // records an `errored` observation (no baseline advance) and `monitor test`
+    // surfaces the status, instead of silently baselining.
+    //
+    // EXCEPTION: `status-code` strategy is precisely about detecting status
+    // transitions (e.g. an endpoint going 200 → 503), so for it a non-2xx is a
+    // legitimate observed signal — the status IS the watched object — not an
+    // error. Only body-diffing strategies (text-diff / json-diff) treat a non-2xx
+    // as an error, because diffing an error body is meaningless.
+    if (changeDetection !== 'status-code' && !isSuccessStatus(status)) {
+      throw new Error(
+        `api-poll received HTTP ${String(status)} from ${url} — check auth/url; not establishing a baseline on an error response`,
+      );
+    }
+
     const prev =
       context.previousState &&
       typeof context.previousState === 'object' &&
       !Array.isArray(context.previousState)
         ? (context.previousState as CachedResponse)
         : undefined;
+
+    // ---- json-diff on a non-JSON body → warning (issue #219, #230) --------------
+    // `json-diff` silently degrades to text comparison when a body does not parse
+    // as JSON (003 §4.2). That is the wrong strategy for HTML/plain-text pages and
+    // is invisible by default. Surface a warning (non-fatal) so `monitor test`
+    // tells the author to switch to text-diff, rather than diffing HTML as JSON.
+    //
+    // The warning fires ONLY for the EXPLICIT json-diff case (issue #230): an
+    // inferred strategy never mismatches the body — inference picks json-diff only
+    // for JSON Content-Types — so an inferred choice must never warn.
+    const warnings: string[] =
+      explicitStrategy === 'json-diff' && !collection && !isParseableJson(body)
+        ? [jsonDiffNonJsonWarning(url)]
+        : [];
 
     // ---- Keyed-collection mode (003 §12) ----------------------------------------
     // Parse the body as JSON and diff per keyed object, instead of treating the
@@ -438,6 +613,7 @@ const source: ObservationSource = {
     }
 
     const curr: CachedResponse = { body, status: status };
+    const warningFields = warnings.length > 0 ? { warnings } : {};
 
     if (prev !== undefined && hasChanged(changeDetection, prev, curr)) {
       return {
@@ -463,12 +639,14 @@ const source: ObservationSource = {
           },
         ],
         nextState: curr,
+        ...warningFields,
       };
     }
 
     return {
       observations: [],
       nextState: curr,
+      ...warningFields,
     };
   },
 };
