@@ -15,8 +15,8 @@ Two related corrections to the `api-poll` source contract, plus authoring guidan
 
 - **003 §4.8 — new (Refs #220).** A non-2xx HTTP response is now an **errored** observation for the
   `text-diff`/`json-diff` strategies (the source throws a status-bearing error
-  `api-poll received HTTP <status> from <url> — check auth/url; not establishing a baseline on an
-error response`), so the runtime records `errored`, `daemon once`/`run` report it, `monitor history`
+  `api-poll received HTTP <status> from <url> — check auth/url; not establishing a baseline on an error response`),
+  so the runtime records `errored`, `daemon once`/`run` report it, `monitor history`
   shows `errored`, and `monitor test` shows `Observation failed: …`. It no longer silently baselines
   on an error body, which previously masked broken auth/URL (a bad token produced `HTTP 401` yet the
   monitor "observed successfully"). 2xx responses baseline/diff exactly as before. **Exception:** the

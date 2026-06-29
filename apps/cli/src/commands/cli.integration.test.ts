@@ -2910,7 +2910,7 @@ describe('monitor test', () => {
   // steering warning. The endpoint MUST run out-of-process: `run` uses the
   // blocking `execFileSync`, which freezes this test process's event loop, so an
   // in-test `http.Server` could never serve a request while the CLI is polling.
-  // We spawn a tiny standalone server as a detached child and discover its port
+  // We spawn a tiny standalone server as a child process and discover its port
   // from the line it prints.
   describe('api-poll over a real endpoint (#219, #220)', () => {
     function writeApiPollMonitor(

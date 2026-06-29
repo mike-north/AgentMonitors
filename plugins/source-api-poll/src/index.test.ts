@@ -748,6 +748,60 @@ describe('source-api-poll', () => {
       );
     });
 
+    // Issue #220 (composite parity): the non-2xx → errored-observation behavior
+    // added for the single-URL path MUST also apply to each composite part. A
+    // non-2xx part body would otherwise be baselined into the rendered snapshot,
+    // making a misconfigured monitor look healthy and diffing error pages.
+    it('a non-2xx composite part throws a status-bearing error (no baseline on error body)', async () => {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn((input: string) =>
+          input === 'https://api.example.com/orders/42'
+            ? Promise.resolve({
+                text: () => Promise.resolve('{"status":"open"}'),
+                status: 200,
+              })
+            : // A line endpoint returns 401 (e.g. expired token): must not baseline.
+              Promise.resolve({
+                text: () => Promise.resolve('Unauthorized'),
+                status: 401,
+              }),
+        ),
+      );
+      // The error identifies the status, the offending part id/url, and the
+      // "not establishing a baseline" intent — consistent with the single-URL path.
+      await expect(
+        source.observe(compositeConfig, { now: new Date() }),
+      ).rejects.toThrow(/api-poll received HTTP 401 from composite part/);
+      await expect(
+        source.observe(compositeConfig, { now: new Date() }),
+      ).rejects.toThrow(/not establishing a baseline on an error response/);
+    });
+
+    it('a 2xx composite still baselines/observes normally (no regression from the non-2xx guard)', async () => {
+      mockByUrl({
+        'https://api.example.com/orders/42': '{"status":"open"}',
+        'https://api.example.com/orders/42/lines/1': '{"qty":1}',
+        'https://api.example.com/orders/42/lines/2': '{"qty":2}',
+      });
+      const baseline = await source.observe(compositeConfig, {
+        now: new Date(),
+      });
+      expect(baseline.observations).toHaveLength(0);
+
+      mockByUrl({
+        'https://api.example.com/orders/42': '{"status":"shipped"}',
+        'https://api.example.com/orders/42/lines/1': '{"qty":1}',
+        'https://api.example.com/orders/42/lines/2': '{"qty":2}',
+      });
+      const next = await source.observe(compositeConfig, {
+        previousState: baseline.nextState,
+        now: new Date(),
+      });
+      expect(next.observations).toHaveLength(1);
+      expect(next.observations[0]?.objectKey).toBe('order-42');
+    });
+
     it('rejects composite combined with keyed-collection (mutually exclusive)', async () => {
       await expect(
         source.observe(

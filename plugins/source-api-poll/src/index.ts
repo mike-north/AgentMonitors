@@ -378,7 +378,25 @@ async function observeComposite(
   // we never silently emit a composite missing a part.
   const results = await Promise.all(
     composite.parts.map(async (part) => {
-      const { body } = await fetchBody(part.url, method, combinedHeaders);
+      const { body, status } = await fetchBody(
+        part.url,
+        method,
+        combinedHeaders,
+      );
+      // ---- Non-2xx → errored observation (issue #220, composite parity) -------
+      // A composite assembles its snapshot by body-diffing the rendered whole, so
+      // a non-2xx part body (a 401/500 error page) must NOT be baselined into the
+      // snapshot — that would make a misconfigured monitor look healthy and diff
+      // error pages. Throwing here rejects the surrounding Promise.all, so
+      // `nextState` never advances and the prior baseline is preserved (002 §3),
+      // exactly as the single-URL path does. There is no `status-code` exemption
+      // in composite mode: composite is always a body-diffing assembly, never a
+      // status-transition watcher, so every part must be a 2xx success.
+      if (!isSuccessStatus(status)) {
+        throw new Error(
+          `api-poll received HTTP ${String(status)} from composite part "${part.id}" (${part.url}) — check auth/url; not establishing a baseline on an error response`,
+        );
+      }
       return { id: part.id, body } satisfies FetchedPart;
     }),
   );
