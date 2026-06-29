@@ -140,14 +140,37 @@ operators**, spawn a shell explicitly in argv form:
 ```yaml
 watch:
   type: command-poll
-  command: ['sh', '-c', 'git status -sb | grep ahead']   # the supported pipeline idiom
+  command: ['sh', '-c', "curl -fsS https://api.example.com/repos | jq -r '.[].name' | sort"]
   change-detection:
-    strategy: json-diff          # use json-diff when the command emits JSON, e.g. curl | jq
+    strategy: text-diff          # jq -r streams lines; compare the stable text output
 ```
 
-Use `strategy: json-diff` when the output is JSON (compares semantically, ignoring key order and
-whitespace); `text-diff` (the default) for plain text; `exit-code` to fire only when the exit code
-changes.
+Use `strategy: json-diff` only when stdout is a single JSON value, such as one object or one array.
+A common `jq '.[].name'` or `jq -r '.[].name'` pipeline emits a stream of values or lines, not one
+JSON document; use `text-diff` for that stable ordered output, or wrap the stream into one JSON
+array with `jq -s` before choosing `json-diff`. `exit-code` fires only when the exit code changes.
+
+#### Watch for upstream commits
+
+To be notified when a remote branch advances before you pull or rebase, poll the remote directly:
+
+```yaml
+watch:
+  type: command-poll
+  command:
+    - git
+    - ls-remote
+    - origin
+    - refs/heads/main
+  interval: 5m
+  change-detection:
+    strategy: text-diff
+```
+
+`git ls-remote` asks the remote for the current ref without mutating your local repository. Do not
+use `git status` or `git rev-parse origin/main` for this: they read local remote-tracking refs, which
+are stale until something runs `git fetch`. `incoming-changes` is also a different tool: it fires
+after your local commit graph advances through a pull, merge, or local commit.
 
 ### `schedule`
 
@@ -174,6 +197,9 @@ watch:
     - 'docs/specs/**'
   branch: main                  # optional — defaults to current branch
 ```
+
+Use `command-poll` with `git ls-remote` when you need to know the remote branch is ahead before you
+pull. `incoming-changes` observes your local graph after it advances; it does not query the remote.
 
 ## Urgency
 
@@ -287,7 +313,9 @@ agentmonitors daemon run .claude/monitors --poll-ms 1000
 
 The normal plugin-style path does not require custom sockets. Each recipe below writes a temporary
 monitor, validates it, starts a session with the same hook command Claude Code runs, changes the
-watched input, and then asks the hook transport for pending delivery.
+watched input, and then asks the hook transport for pending delivery. `hook deliver` resolves the
+session through the enabled-project `.claude/agentmonitors.local.md` path, so these recipes create
+that file instead of hand-starting an unrelated daemon.
 
 ### `command-poll` recipe
 

@@ -564,6 +564,12 @@ The resumption token is the last-seen commit SHA. If the daemon is offline acros
 
 `incoming-changes` v1 fires on **any** ref advance touching `paths` — a pull, merge, fast-forward, or a local commit. Filtering to "only others' changes / only on fetch-merge" is a planned later refinement, not v1. A non-fast-forward advance (rebase, force-push) yields a meaningful net `git diff <prev>..<current>` and will not crash.
 
+This means `incoming-changes` is not a "remote branch is ahead" detector. It observes the local
+commit graph after that graph advances; it does not run `git fetch` or query the remote. Authors who
+want a pre-pull/rebase signal SHOULD use `command-poll` with
+`git ls-remote origin refs/heads/<branch>` and `text-diff` (§11.3), because `git status` and local
+remote-tracking refs such as `origin/main` are stale until some other process fetches.
+
 ### 6.5 Error resilience
 
 - If `git rev-parse` fails (not a git repo, unknown branch, option-injection guard triggered), `observe()` returns `{ observations: [] }` with no `nextState` — it silently waits for the repo/branch to become valid.
@@ -768,6 +774,29 @@ Mirrors `api-poll` (§4.2), substituting the local-process equivalents:
 `api-poll`. `exit-code` is first-class in v1 (decision for #81's fourth open question); the broader
 "predicate over the result" generalization is explicitly deferred — if it lands later, `exit-code`
 becomes sugar for one such predicate, which is a compatible evolution.
+
+`json-diff` requires `stdout` to be exactly one JSON value. A shell pipeline such as
+`curl ... | jq '.[].name'` emits a newline-delimited stream of JSON values, and `jq -r '.[].name'`
+emits plain text lines; neither is a single JSON document. Authors SHOULD use `text-diff` for a
+stable ordered stream, or wrap the stream into one JSON array with `jq -s` before selecting
+`json-diff`.
+
+For "notify me when upstream commits land on a branch before I pull", the recommended command is
+side-effect-free remote ref polling:
+
+```yaml
+watch:
+  type: command-poll
+  command: ['git', 'ls-remote', 'origin', 'refs/heads/main']
+  interval: 5m
+  change-detection:
+    strategy: text-diff
+```
+
+`git ls-remote` queries the remote directly without mutating the local repository. In contrast,
+`git status` and `git rev-parse origin/main` only read local state and are stale until a fetch, while
+`incoming-changes` (§6.4) reports local graph advances after a pull/merge/local commit rather than a
+remote-ahead condition.
 
 Plain `json-diff` MAY set top-level `change-detection.ignore-paths` to remove noisy fields before
 comparison, e.g. `ignore-paths: ['duration']` or `ignore-paths: ['$.duration']`. Paths use the same

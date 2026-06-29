@@ -9,6 +9,23 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-06-29 — `command-poll` authoring guidance for jq streams and upstream refs (003 §6.4, §11.3) — Refs #233
+
+Clarified two documentation traps in the command-poll authoring path.
+
+- **003 §11.3 — JSON stream distinction.** `json-diff` requires stdout to be one complete JSON value.
+  Common `jq '.[].field'` pipelines emit newline-delimited JSON values, and `jq -r` emits plain text
+  lines; those should use `text-diff` unless the stream is wrapped into one JSON value with `jq -s`.
+
+- **003 §11.3 + §6.4 — upstream branch recipe.** To detect a remote branch advancing before a local
+  pull/rebase, use `command-poll` with `git ls-remote origin refs/heads/<branch>` and `text-diff`.
+  `git status`/local remote-tracking refs are stale until a fetch, and `incoming-changes` observes
+  local graph advances after pull/merge/local commit rather than remote-ahead state.
+
+- **Authoring docs.** The command-poll examples now show the correct `text-diff` strategy for a
+  `curl | jq` stream and a copy-paste `git ls-remote` monitor. The delivery-verification docs note
+  that `hook deliver` resolves through the enabled-project `.claude/agentmonitors.local.md` path.
+
 ## 2026-06-28 — Manual daemon commands use the enabled workspace socket (005 §1) — Refs #199
 
 `session open`, `session close`, `session list`, `events list`, `events ack`, and `hook claim` now
