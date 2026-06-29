@@ -42,22 +42,25 @@ When the page changes, review the differences and take appropriate action.
 
   'command-poll': yaml`
 ---
-name: My command monitor
+name: Upstream branch monitor
 watch:
   type: command-poll
-  # command is an argv array, run directly (no shell). For a pipeline or other
-  # shell operators, wrap it: command: ['sh', '-c', 'git status -sb | grep ahead']
+  # command is an argv array, run directly (no shell). This example watches the
+  # remote branch tip directly; local commands such as "git status" or
+  # "git rev-parse origin/main" can stay stale until you fetch.
   command:
     - git
-    - status
-    - --porcelain
+    - ls-remote
+    - origin
+    - refs/heads/main
   interval: 5m
   change-detection:
     strategy: text-diff
 urgency: normal
 ---
 
-When the command output changes, review the differences and take appropriate action.
+When the upstream branch changes, review the new commits and decide whether they
+affect this workspace.
 `.trimStart(),
 
   schedule: yaml`

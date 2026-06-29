@@ -438,6 +438,20 @@ describe('init', () => {
     expect(parsed.valid).toBe(1);
     expect(parsed.invalid).toBe(0);
     expect(parsed.monitors[0]?.source).toBe('command-poll');
+
+    // Issue #244: the default command-poll scaffold should be safe for
+    // upstream-branch watching. `git status` only inspects local state, so it can
+    // stay stale until a fetch; `ls-remote` asks the remote directly.
+    const monitor = readFileSync(
+      path.join(monitorsDir, 'cmd-watch', 'MONITOR.md'),
+      'utf-8',
+    );
+    expect(monitor).toContain('git');
+    expect(monitor).toContain('ls-remote');
+    expect(monitor).toContain('origin');
+    expect(monitor).toContain('refs/heads/main');
+    expect(monitor).not.toContain('\n    - status\n');
+    expect(monitor).not.toContain('--porcelain');
   });
 
   it('rejects invalid --type value', () => {

@@ -63,6 +63,47 @@ package.json dependencies changed, run `pnpm install`.
 The runtime carries the body through unchanged — it never acts on it. All judgment is
 yours, executed by the agent.
 
+## Enable and verify delivery
+
+Authoring a monitor only defines the signal. To verify that any source can reach the agent, enable
+the project and run the same hook commands the Claude Code plugin runs.
+
+Create `.claude/agentmonitors.local.md` in the project root:
+
+```markdown
+---
+enabled: true
+---
+```
+
+Then validate and start a session from that same root:
+
+```bash
+agentmonitors validate .claude/monitors
+printf '{"session_id":"verify-1","cwd":"%s","hook_event_name":"SessionStart"}' "$PWD" \
+  | agentmonitors session start
+```
+
+Make the watched thing change, wait for the source interval and any settle window, then ask the hook
+for pending delivery:
+
+```bash
+printf '{"session_id":"verify-1","cwd":"%s","hook_event_name":"UserPromptSubmit"}' "$PWD" \
+  | agentmonitors hook deliver
+```
+
+This `UserPromptSubmit` payload verifies the normal turn-interruptible path. If you are verifying a
+`low`-urgency monitor, use the idle lifecycle override instead:
+
+```bash
+printf '{"session_id":"verify-1","cwd":"%s","hook_event_name":"UserPromptSubmit"}' "$PWD" \
+  | agentmonitors hook deliver --lifecycle turn-idle
+```
+
+`hook deliver` reads the enabled project from `.claude/agentmonitors.local.md`; it is not a generic
+"talk to any hand-started daemon" command. If the project is not enabled in that local file, the hook
+exits successfully and prints nothing.
+
 ## Bundled observation sources
 
 ### `file-fingerprint`
@@ -91,6 +132,9 @@ paths are excluded from both the baseline and later change detection.
 ### `api-poll`
 
 Polls an HTTP endpoint and detects response changes.
+
+After writing an `api-poll` monitor, use the [enable and verify delivery](#enable-and-verify-delivery)
+recipe to confirm that endpoint changes reach the agent.
 
 Watching a web page needs **no** `change-detection` block — the strategy is inferred from the
 response `Content-Type`:
@@ -169,6 +213,10 @@ Runs a local command on an interval and detects when its output changes — the 
 sibling of `api-poll`. Use it to watch anything a CLI can report: `git status`, `kubectl get`,
 build tooling, a health-check script.
 
+After writing a `command-poll` monitor, use the
+[enable and verify delivery](#enable-and-verify-delivery) recipe to confirm that command-output
+changes reach the agent.
+
 ```yaml
 watch:
   type: command-poll
@@ -199,6 +247,29 @@ Use `strategy: json-diff` when the output is JSON (compares semantically, ignori
 whitespace); `text-diff` (the default) for plain text; `exit-code` to fire only when the exit code
 changes.
 
+#### Watch an upstream branch
+
+To watch remote commits before they have been fetched locally, query the remote directly:
+
+```yaml
+watch:
+  type: command-poll
+  command:
+    - git
+    - ls-remote
+    - origin
+    - refs/heads/main
+  interval: 5m
+  change-detection:
+    strategy: text-diff
+```
+
+`git ls-remote origin refs/heads/<branch>` asks the remote for the branch tip without mutating local
+refs. By contrast, `git status`, `git status -sb`, and `git rev-parse origin/main` only inspect local
+state; they can stay stale until a fetch or pull updates local refs. Use `incoming-changes` when you
+want to react after the local commit graph advances through a pull, merge, fast-forward, or local
+commit.
+
 ### `schedule`
 
 Fires on a cron schedule — no change-detection, purely time-driven.
@@ -224,6 +295,10 @@ watch:
     - 'docs/specs/**'
   branch: main                  # optional — defaults to current branch
 ```
+
+`incoming-changes` is not a remote-ahead detector. It observes the local git graph after the branch
+in this workspace advances. If you need to know that a remote branch has new commits before a fetch
+or pull, use the [`command-poll` upstream branch recipe](#watch-an-upstream-branch).
 
 ## Urgency
 
