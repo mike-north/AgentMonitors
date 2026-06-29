@@ -20,23 +20,24 @@ When changes are detected, review and take appropriate action.
 
   'api-poll': yaml`
 ---
-name: My API monitor
+name: My web page monitor
 watch:
   type: api-poll
-  url: 'https://api.example.com/endpoint'
+  # The common "watch a page" case needs NO change-detection block: the strategy
+  # is inferred from the response Content-Type — JSON bodies (application/json,
+  # *+json) use json-diff, everything else (HTML/plain-text/unknown) uses
+  # text-diff. Set change-detection.strategy explicitly only to override the
+  # inferred default; an explicit value always wins:
+  #   text-diff   — compare the raw body (good for HTML / plain-text pages)
+  #   json-diff   — compare JSON semantically, ignoring key order/whitespace
+  #   status-code — only fire when the HTTP status changes (e.g. 200 -> 503)
+  url: 'https://example.com/page'
   method: GET
   interval: 5m
-  change-detection:
-    # Pick the strategy by what the URL returns:
-    #   text-diff  — HTML pages / plain-text status pages (the safe default for
-    #                watching a web page; json-diff would mis-diff HTML)
-    #   json-diff  — JSON APIs (compares semantically, ignoring key order/whitespace)
-    #   status-code — only fire when the HTTP status changes (e.g. 200 -> 503)
-    strategy: json-diff
 urgency: normal
 ---
 
-When the API response changes, review the differences and take appropriate action.
+When the page changes, review the differences and take appropriate action.
 `.trimStart(),
 
   'command-poll': yaml`

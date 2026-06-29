@@ -417,8 +417,17 @@ watch:
   auth:
     type: bearer
     token-env: API_TOKEN
-  change-detection:
-    strategy: json-diff
+  # change-detection is OPTIONAL. When omitted, the strategy is inferred from the
+  # response Content-Type (§4.2). Set it only to override the inferred default.
+```
+
+The common "watch a web page" case needs **no** `change-detection` block at all:
+
+```yaml
+watch:
+  type: api-poll
+  url: 'https://example.com/page'
+  interval: 5m
 ```
 
 Required field: `url` (string). Important optional fields: `method`, `headers`, `interval`, `auth`, `change-detection`.
@@ -433,24 +442,34 @@ Supported strategies (verified: `plugins/source-api-poll/src/index.ts`, `ChangeS
 
 | Strategy      | Semantics                                                                                                                                  | Use for                                                                |
 | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------- |
-| `text-diff`   | Compare raw response body strings. This is the **default** when no strategy is specified or the value is unrecognized.                     | HTML pages, plain-text status pages — the correct choice for web pages |
+| `text-diff`   | Compare raw response body strings.                                                                                                         | HTML pages, plain-text status pages — the correct choice for web pages |
 | `json-diff`   | Parse both bodies as JSON, recursively sort object keys, then compare serialized strings. Ignores key ordering and whitespace differences. | JSON APIs                                                              |
 | `status-code` | Compare only HTTP status codes; body changes are ignored.                                                                                  | Watching whether an endpoint goes up/down (e.g. 200 → 503)             |
 
-The author should pick the strategy by **what the endpoint returns**: `text-diff` for HTML/plain-text
-pages (the common "tell me when this web page changed" case), `json-diff` for JSON APIs. The `api-poll`
-scaffold (`apps/cli/src/commands/init.ts`) and the authoring docs state this inline.
+**`change-detection.strategy` is optional (issue #230).** When the author **omits** it, the strategy is
+**inferred from the response `Content-Type`**: a JSON media type (`application/json` or any
+structured-syntax `+json` suffix such as `application/ld+json`, per RFC 6838) infers `json-diff`;
+everything else — `text/html`, `text/plain`, and a missing/unknown `Content-Type` — infers `text-diff`.
+This makes the common "watch a web page" case zero-config: omit `change-detection` and the source picks
+`text-diff` for an HTML page and `json-diff` for a JSON API automatically.
+
+**An explicit `change-detection.strategy` always wins.** When the author specifies a strategy it is used
+**verbatim**, with no inference and no Content-Type override — user specification is absolute. So an
+explicit `json-diff` against an HTML page stays `json-diff` (and triggers the warning below), and an
+explicit `text-diff` against a JSON body stays `text-diff`. (Verified: `plugins/source-api-poll/src/index.ts`,
+`resolveStrategy` / `isJsonContentType`; `plugins/source-api-poll/src/index.test.ts`.)
 
 If `json-diff` parsing fails for either body, the implementation falls back to raw text comparison
 (verified: `plugins/source-api-poll/src/index.ts`, `hasChanged`). Because that fallback is silent and
 is almost always the wrong strategy for the body in question, the source attaches a **non-fatal
-warning** to the `ObservationResult` (`ObservationResult.warnings`) when `strategy: json-diff` is
-configured but the fetched body does not parse as JSON. `agentmonitors monitor test` prints the
-warning (`Warning: api-poll: change-detection.strategy is json-diff but the response … does not parse
-as JSON; … Use strategy: text-diff …`) so the author sees the misconfiguration during a dry-run rather
-than getting quietly wrong diffing in production. The warning does not change the observation outcome —
-the baseline/diff still proceeds via the text fallback. (Verified: `plugins/source-api-poll/src/index.ts`;
-`plugins/source-api-poll/src/index.test.ts`. Issue #219.)
+warning** to the `ObservationResult` (`ObservationResult.warnings`) when an **explicit** `strategy: json-diff`
+is configured but the fetched body does not parse as JSON. (An **inferred** strategy never warns: inference
+picks `json-diff` only for JSON `Content-Type`s, so it never mismatches the body — issue #230.)
+`agentmonitors monitor test` prints the warning (`Warning: api-poll: change-detection.strategy is json-diff
+but the response … does not parse as JSON; … Use strategy: text-diff …`) so the author sees the
+misconfiguration during a dry-run rather than getting quietly wrong diffing in production. The warning does
+not change the observation outcome — the baseline/diff still proceeds via the text fallback. (Verified:
+`plugins/source-api-poll/src/index.ts`; `plugins/source-api-poll/src/index.test.ts`. Issues #219, #230.)
 
 ### 4.3 Authentication
 

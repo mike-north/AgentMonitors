@@ -90,6 +90,25 @@ describe('source-api-poll', () => {
   });
 
   describe('change-detection strategies', () => {
+    // Regression: an unrecognized but *present* strategy value must throw
+    // immediately rather than silently falling through to Content-Type inference.
+    // Before the fix, e.g. `strategy: jsondiff` (typo) would set
+    // `explicitStrategy = undefined` and infer from Content-Type — violating
+    // "explicit always wins" and hiding the author error.
+    it('unrecognized explicit strategy throws a descriptive error and does NOT infer', async () => {
+      await expect(
+        source.observe(
+          {
+            url: 'https://api.example.com/data',
+            'change-detection': { strategy: 'jsondiff' }, // typo — not a valid strategy
+          },
+          { now: new Date() },
+        ),
+      ).rejects.toThrow(
+        /unknown change-detection\.strategy "jsondiff" \(expected one of: json-diff, text-diff, status-code\)/,
+      );
+    });
+
     it('status-code: detects status change, ignores body change', async () => {
       const mockFetch = vi.fn();
       vi.stubGlobal('fetch', mockFetch);
@@ -531,6 +550,154 @@ describe('source-api-poll', () => {
         { url: 'https://status.example.com/page' },
         { now: new Date() },
       );
+      expect(result.warnings ?? []).toHaveLength(0);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Issue #230: infer change-detection strategy from the response Content-Type
+  // when `change-detection.strategy` is OMITTED. An explicit value always wins
+  // verbatim (no inference, no override). The inferred path never warns, because
+  // inference picks the correct strategy for the body.
+  //
+  // @see docs/specs/003-source-plugins.md §4.3
+  // @see https://www.rfc-editor.org/rfc/rfc6838#section-4.2.8 (+json suffix)
+  // ---------------------------------------------------------------------------
+  describe('strategy inference from Content-Type (issue #230)', () => {
+    /**
+     * Mock a two-poll sequence (baseline then a changed body) for one URL, with
+     * an optional `Content-Type` header. Returns the observation produced by the
+     * second poll so a test can assert the *resolved* strategy (carried on
+     * `payload.strategy`) and the surfaced warnings.
+     */
+    async function observeWithContentType(
+      config: Record<string, unknown>,
+      contentType: string | undefined,
+      bodies: { first: string; second: string },
+    ): Promise<Awaited<ReturnType<typeof source.observe>>> {
+      const headers =
+        contentType === undefined
+          ? undefined
+          : {
+              get: (name: string) =>
+                name === 'content-type' ? contentType : null,
+            };
+      const mockFetch = vi.fn();
+      vi.stubGlobal('fetch', mockFetch);
+
+      mockFetch.mockResolvedValueOnce({
+        text: () => Promise.resolve(bodies.first),
+        status: 200,
+        headers,
+      });
+      const baseline = await source.observe(config, { now: new Date() });
+
+      mockFetch.mockResolvedValueOnce({
+        text: () => Promise.resolve(bodies.second),
+        status: 200,
+        headers,
+      });
+      return source.observe(config, {
+        previousState: baseline.nextState,
+        now: new Date(),
+      });
+    }
+
+    // AC1: omitted + application/json → json-diff
+    it('omitted strategy + application/json → json-diff', async () => {
+      const result = await observeWithContentType(
+        { url: 'https://api.example.com/data.json' },
+        'application/json',
+        { first: '{"v":1}', second: '{"v":2}' },
+      );
+      expect(result.observations).toHaveLength(1);
+      expect(result.observations[0]?.payload?.['strategy']).toBe('json-diff');
+    });
+
+    // AC1: a structured-syntax +json suffix (e.g. application/ld+json) → json-diff
+    it('omitted strategy + application/ld+json (charset param) → json-diff', async () => {
+      const result = await observeWithContentType(
+        { url: 'https://api.example.com/feed' },
+        'application/ld+json; charset=utf-8',
+        { first: '{"v":1}', second: '{"v":2}' },
+      );
+      expect(result.observations).toHaveLength(1);
+      expect(result.observations[0]?.payload?.['strategy']).toBe('json-diff');
+    });
+
+    // AC1: omitted + text/html → text-diff
+    it('omitted strategy + text/html → text-diff', async () => {
+      const result = await observeWithContentType(
+        { url: 'https://example.com/page' },
+        'text/html; charset=utf-8',
+        { first: '<html>v1</html>', second: '<html>v2</html>' },
+      );
+      expect(result.observations).toHaveLength(1);
+      expect(result.observations[0]?.payload?.['strategy']).toBe('text-diff');
+    });
+
+    // AC1: omitted + missing Content-Type → text-diff
+    it('omitted strategy + missing Content-Type → text-diff', async () => {
+      const result = await observeWithContentType(
+        { url: 'https://example.com/unknown' },
+        undefined,
+        { first: 'plain v1', second: 'plain v2' },
+      );
+      expect(result.observations).toHaveLength(1);
+      expect(result.observations[0]?.payload?.['strategy']).toBe('text-diff');
+    });
+
+    // AC3: an inferred strategy NEVER warns, even when a JSON Content-Type body
+    // happens not to parse — inference is by header, not body, and never claims
+    // a json-diff mismatch.
+    it('inferred json-diff does NOT emit the #219 warning', async () => {
+      const result = await observeWithContentType(
+        { url: 'https://api.example.com/maybe.json' },
+        'application/json',
+        { first: '{"v":1}', second: '{"v":2}' },
+      );
+      expect(result.warnings ?? []).toHaveLength(0);
+    });
+
+    // AC2: explicit json-diff wins over a text/html Content-Type (honored, NOT
+    // overridden to text-diff) AND emits the #219 warning for the non-JSON body.
+    it('explicit json-diff + text/html → json-diff (honored) and warns', async () => {
+      const result = await observeWithContentType(
+        {
+          url: 'https://status.example.com/incidents',
+          'change-detection': { strategy: 'json-diff' },
+        },
+        'text/html; charset=utf-8',
+        {
+          first: '<html>v1</html>',
+          second: '<html>v2</html>',
+        },
+      );
+      expect(result.observations).toHaveLength(1);
+      // Honored verbatim: strategy is json-diff despite the HTML Content-Type.
+      expect(result.observations[0]?.payload?.['strategy']).toBe('json-diff');
+      // And the #219 warning fires for the explicit json-diff-on-non-JSON case.
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings?.[0]).toMatch(/json-diff/);
+      expect(result.warnings?.[0]).toMatch(/does not parse as JSON/);
+    });
+
+    // AC2: explicit text-diff wins over an application/json Content-Type
+    // (honored, NOT overridden to json-diff).
+    it('explicit text-diff + application/json → text-diff (honored)', async () => {
+      // Bodies that are JSON-equal (key reorder) but text-different: a text-diff
+      // sees a change, a json-diff would not. Asserting an observation IS emitted
+      // proves text-diff was used despite the JSON Content-Type.
+      const result = await observeWithContentType(
+        {
+          url: 'https://api.example.com/data.json',
+          'change-detection': { strategy: 'text-diff' },
+        },
+        'application/json',
+        { first: '{"a":1,"b":2}', second: '{"b":2,"a":1}' },
+      );
+      expect(result.observations).toHaveLength(1);
+      expect(result.observations[0]?.payload?.['strategy']).toBe('text-diff');
       expect(result.warnings ?? []).toHaveLength(0);
     });
   });

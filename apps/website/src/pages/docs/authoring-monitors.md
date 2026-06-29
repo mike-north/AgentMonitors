@@ -85,14 +85,26 @@ subsequent observations diff against it. A single isolated run cannot detect cha
 
 Polls an HTTP endpoint and detects response changes.
 
+Watching a web page needs **no** `change-detection` block — the strategy is inferred from the
+response `Content-Type`:
+
+```yaml
+watch:
+  type: api-poll
+  url: 'https://example.com/page'
+  interval: 5m                 # optional — polling interval (e.g. 5m, 30s, 1h)
+```
+
+The full set of options:
+
 ```yaml
 watch:
   type: api-poll
   url: 'https://api.example.com/status'
   method: GET                  # optional — defaults to GET
   interval: 5m                 # optional — polling interval (e.g. 5m, 30s, 1h)
-  change-detection:            # optional — pick by what the URL returns:
-    strategy: json-diff        # text-diff for HTML/plain pages · json-diff for JSON APIs · status-code for status-only
+  change-detection:            # optional — inferred from Content-Type when omitted:
+    strategy: json-diff        # set ONLY to override · text-diff for HTML/plain · json-diff for JSON · status-code for status-only
   auth:                        # optional
     type: bearer
     token-env: API_TOKEN       # reads from environment variable
@@ -104,13 +116,19 @@ watch:
 
 | Strategy | Behaviour | Use for |
 |---|---|---|
-| `text-diff` | Compares raw response body text (default) | HTML pages, plain-text status pages — the right choice for watching a web page |
+| `text-diff` | Compares raw response body text | HTML pages, plain-text status pages — the right choice for watching a web page |
 | `json-diff` | Parses JSON and compares semantically (ignores key order and whitespace) | JSON APIs |
 | `status-code` | Only detects changes in HTTP status code | Watching whether an endpoint goes up/down (e.g. 200 → 503) |
 
-Choose the strategy by **what the endpoint returns**. `json-diff` against an HTML/plain-text page
-silently degrades to text comparison and gives poor diffs — `agentmonitors monitor test` warns when
-`json-diff` is configured but the body does not parse as JSON, so prefer `text-diff` for pages.
+**`change-detection` is optional.** When you omit it, the strategy is **inferred from the response
+`Content-Type`**: a JSON media type (`application/json` or any `+json` suffix) uses `json-diff`;
+everything else — HTML, plain text, or a missing/unknown `Content-Type` — uses `text-diff`. So the
+common "tell me when this web page changed" case is zero-config.
+
+**An explicit `strategy` always wins** — it is used verbatim with no inference or override. So an
+explicit `json-diff` against an HTML page stays `json-diff` (and `agentmonitors monitor test` warns
+that the body does not parse as JSON, steering you to `text-diff`); an explicit `text-diff` against a
+JSON body stays `text-diff`.
 
 A non-2xx response (e.g. a `401` from a missing/invalid token, or a `500` error page) is treated as
 an **errored** observation for `text-diff`/`json-diff` — the monitor does **not** baseline on the
