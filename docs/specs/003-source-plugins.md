@@ -303,7 +303,7 @@ raw `due`/`defer-until`/`priority` and child states; the runtime derives `past d
 
 ## 3. Bundled Source: `file-fingerprint`
 
-Source name: `"file-fingerprint"` (verified: `plugins/source-file-fingerprint/src/index.ts` line 75).
+Source name: `"file-fingerprint"` (verified: `plugins/source-file-fingerprint/src/index.ts` line 278).
 
 ### 3.1 Scope
 
@@ -318,8 +318,8 @@ watch:
   interval: 30s
 ```
 
-Required field: `globs`. Optional fields: `ignore` (array of exclude glob strings), `cwd`
-(string), `interval` (duration string).
+Required field: `globs`. Optional fields: `ignore` (exclude glob string or array of exclude glob
+strings), `cwd` (string), `interval` (duration string).
 
 `globs` accepts **either** a single pattern as a bare string **or** an array of patterns
 (OR-ed together). The single-file/single-glob case is therefore the one-line form:
@@ -341,15 +341,27 @@ workspace/config root (`ObservationContext.workspacePath`), not the daemon proce
 `cwd` and absolute glob patterns are honored as-is. When no workspace/config root is supplied, the
 source falls back to Node/glob's process-cwd behavior.
 
-`ignore` excludes files from the matched set after `globs` are expanded. A path that matches
-`globs` but also matches any `ignore` pattern is omitted from the baseline and from later change
-detection. Ignore patterns are resolved against the same base as `globs` (including relative
-`cwd`/workspace resolution), and do not support gitignore negation semantics. Use `ignore` when a
-monitor's fired action writes files that would otherwise match the watched glob; for example,
+`ignore` accepts **either** a single exclude pattern as a bare string **or** an array of exclude
+patterns, mirroring `globs`. The single-exclude case is therefore:
+
+```yaml
+watch:
+  type: file-fingerprint
+  globs: '**/*.txt'
+  ignore: '**/notified-*.txt' # equivalent to ignore: ['**/notified-*.txt']
+```
+
+`ignore` excludes files from the matched set after `globs` are expanded. A path that matches `globs`
+but also matches any `ignore` pattern is omitted from the baseline and from later change detection.
+Ignore patterns are resolved against the same base as `globs` (including relative `cwd`/workspace
+resolution), and do not support gitignore negation semantics. Use `ignore` when a monitor's fired
+action writes files that would otherwise match the watched glob; for example,
 `globs: ['**/*.txt']` with `ignore: ['**/notified-*.txt']` lets the action write
 `notified-<timestamp>.txt` without retriggering itself. Verified:
-`plugins/source-file-fingerprint/src/index.ts` (`parseScopeConfig`, `observe`) and
-`plugins/source-file-fingerprint/src/index.test.ts` ("ignore exclude globs").
+`plugins/source-file-fingerprint/src/index.ts` (`parseScopeConfig`, `observe`),
+`plugins/source-file-fingerprint/src/index.test.ts` ("ignore exclude globs"), and
+`plugins/source-file-fingerprint/src/schema-parity.test.ts` ("valid bare-string ignore exclude glob
+(shorthand)").
 
 `interval` is the per-monitor observe interval: the runtime calls `file-fingerprint` only when this
 monitor is due. If omitted, the effective default is approximately `30s`. Authors tune it with
@@ -369,7 +381,7 @@ a broken glob/cwd from a matched file set with no content changes.
 
 Current fingerprints are stored in `nextState.fingerprints` (a `Record<string, string>` keyed by absolute file path). On each call, the source compares each file's current hash against `context.previousState.fingerprints[filePath]`.
 
-When a previously seen file's hash changes, the source emits one `Observation` per changed file (verified: `plugins/source-file-fingerprint/src/index.ts` lines 99–119):
+When a previously seen file's hash changes, the source emits one `Observation` per changed file (verified: `plugins/source-file-fingerprint/src/index.ts` lines 317–335):
 
 - `title`: `"File changed: <absolute-file-path>"`
 - `summary`: `"File changed: <absolute-file-path>"`
