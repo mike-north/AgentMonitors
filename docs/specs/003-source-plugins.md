@@ -673,6 +673,11 @@ The resumption token is the last-seen commit SHA. If the daemon is offline acros
 
 `incoming-changes` v1 fires on **any** ref advance touching `paths` — a pull, merge, fast-forward, or a local commit. Filtering to "only others' changes / only on fetch-merge" is a planned later refinement, not v1. A non-fast-forward advance (rebase, force-push) yields a meaningful net `git diff <prev>..<current>` and will not crash.
 
+`incoming-changes` is a local commit-graph source, not a remote-ahead detector. It observes the ref
+as resolved in the workspace; it does not contact remotes and therefore does not notice upstream
+commits before local refs advance. To watch remote branch tips without fetching, use `command-poll`
+with `git ls-remote origin refs/heads/<branch>` (§11.8).
+
 ### 6.5 Error resilience
 
 - If `git rev-parse` fails (not a git repo, unknown branch, option-injection guard triggered), `observe()` returns `{ observations: [] }` with no `nextState` — it silently waits for the repo/branch to become valid.
@@ -982,7 +987,38 @@ issue #86's AC1–AC7):
   validate"_, _"rejects a command-poll monitor missing `command`"_, _"accepts a well-formed
   command-poll monitor"_, _"rejects unknown command-poll change-detection keys"_).
 
-### 11.8 Non-goals (v1)
+### 11.8 Upstream branch recipe
+
+`command-poll` is the source-agnostic way to watch remote branch tips because it can poll the remote
+without teaching the core runtime any git-specific API:
+
+```yaml
+watch:
+  type: command-poll
+  command:
+    - git
+    - ls-remote
+    - origin
+    - refs/heads/main
+  interval: 5m
+  change-detection:
+    strategy: text-diff
+```
+
+The command's stdout is the watched value, so `text-diff` fires when the remote reports a different
+SHA for the ref. `git ls-remote` contacts the remote directly and does not fetch or mutate local
+refs. Local status/ref commands such as `git status`, `git status -sb`, or
+`git rev-parse origin/main` are not equivalent remote-ahead checks: they inspect local working tree
+state or local remote-tracking refs, which can stay stale until `git fetch` or `git pull`.
+
+The `incoming-changes` source remains the right fit for local post-pull/post-merge provenance checks
+touching paths (§6): it reacts after the workspace commit graph advances, not when the remote first
+advertises a new commit.
+
+The `init --type command-poll` scaffold uses this recipe so a newly generated monitor does not
+silently become a local-only status check when the author's intent is upstream branch monitoring.
+
+### 11.9 Non-goals (v1)
 
 - No domain-specific source code (OmniFocus, git, gh, …) in this repo — those are `MONITOR.md`
   consumers of `command-poll`.
