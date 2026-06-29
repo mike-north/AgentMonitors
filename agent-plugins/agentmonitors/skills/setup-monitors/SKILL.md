@@ -159,19 +159,24 @@ detect-and-settle cycle takes ~10–15 s instead of ~45 s.
 
 ### Reliable manual-test recipe
 
+Use an explicit socket path to guarantee all steps talk to the same daemon, regardless of whether
+the workspace has an enabled `.claude/agentmonitors.local.md`.
+
 ```bash
 CWD=$(pwd)
 HOST_ID="verify-$(date +%s)"
+SOCKET="/tmp/agentmon-verify-$$.sock"
 
 # 1. Start a daemon that never idle-reaps (--reap-after-ms 0).
+#    Pass --socket so all steps share the same socket.
 #    Use --poll-ms for a faster tick during testing (default: 30000).
-agentmonitors daemon run .claude/monitors --reap-after-ms 0 --poll-ms 5000 &
+agentmonitors daemon run .claude/monitors --socket "$SOCKET" --reap-after-ms 0 --poll-ms 5000 &
 DAEMON_PID=$!
 sleep 1   # let the socket appear
 
 # 2. Open a lead session on the same socket.
 #    Note the AgentMon session ID printed on "Opened session:" line.
-agentmonitors session open --host-session-id "$HOST_ID" --role lead --workspace "$CWD"
+agentmonitors session open --socket "$SOCKET" --host-session-id "$HOST_ID" --role lead --workspace "$CWD"
 # → Opened session: <AGENTMON_SESSION_ID>
 AGENTMON_SESSION_ID=<paste the id from above>
 
@@ -181,19 +186,33 @@ AGENTMON_SESSION_ID=<paste the id from above>
 #    interval + settle-for from MONITOR.md — e.g. 5s + 5s = 10s minimum, add a few seconds margin.
 sleep 15
 
-# 5. Confirm delivery — check for unread events on the session:
-agentmonitors events list --session "$AGENTMON_SESSION_ID" --unread
+# 5. Confirm the event reached the session:
+agentmonitors events list --socket "$SOCKET" --session "$AGENTMON_SESSION_ID" --unread
+
+# 5b. Simulate the UserPromptSubmit hook — claim any pending deliveries and confirm notification:
+echo "{\"session_id\":\"$HOST_ID\",\"cwd\":\"$CWD\",\"hook_event_name\":\"UserPromptSubmit\"}" \
+  | agentmonitors hook deliver --socket "$SOCKET"
 
 # 6. Clean up.
 kill "$DAEMON_PID"
 ```
 
-**Success signal:** `events list` prints at least one event row (with monitor ID, urgency, and
-title). Non-empty output confirms the event reached the session and is ready for delivery by the
-hooks when the real session starts.
+**Success signal:** step 5 prints at least one event row (with monitor ID, urgency, and title),
+confirming the event reached the session. Step 5b (`hook deliver`) returning a JSON object with a
+non-empty `additionalContext` field confirms the delivery hook would notify the agent:
 
-**If the output is empty**, the settle window may not have elapsed yet. Wait and re-run step 5 — do
-not change any files or re-open the session between retries.
+```json
+{
+  "continue": true,
+  "hookSpecificOutput": {
+    "hookEventName": "UserPromptSubmit",
+    "additionalContext": "AgentMon: monitored changes are pending — consider handling them before continuing.\n\n### <your-monitor-id> (high)\n..."
+  }
+}
+```
+
+**If step 5 prints `No events found.`**, the settle window may not have elapsed yet. Wait and
+re-run steps 5–5b — do not change any files or re-open the session between retries.
 
 ### Per-source trigger recipes
 
