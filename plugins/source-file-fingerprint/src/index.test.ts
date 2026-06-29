@@ -303,6 +303,54 @@ describe('source-file-fingerprint', () => {
     });
   });
 
+  describe('ignore exclude globs (003 §3)', () => {
+    it('excludes ignored files from baseline and change detection while keeping other matches', async () => {
+      const dir = makeTempDir();
+      const watchedFile = path.join(dir, 'notes.txt');
+      const ignoredFile = path.join(dir, 'notified-1.txt');
+      writeFileSync(watchedFile, 'initial watched');
+      writeFileSync(ignoredFile, 'initial ignored');
+
+      const baseline = await source.observe(
+        { globs: ['**/*.txt'], ignore: ['**/notified-*.txt'], cwd: dir },
+        { now: new Date() },
+      );
+
+      const baselineState = baseline.nextState as {
+        fingerprints: Record<string, string>;
+      };
+      expect(Object.keys(baselineState.fingerprints)).toEqual([watchedFile]);
+
+      writeFileSync(ignoredFile, 'changed ignored');
+      const ignoredChange = await source.observe(
+        { globs: ['**/*.txt'], ignore: ['**/notified-*.txt'], cwd: dir },
+        { previousState: baseline.nextState, now: new Date() },
+      );
+      expect(ignoredChange.observations).toHaveLength(0);
+
+      writeFileSync(watchedFile, 'changed watched');
+      const watchedChange = await source.observe(
+        { globs: ['**/*.txt'], ignore: ['**/notified-*.txt'], cwd: dir },
+        { previousState: ignoredChange.nextState, now: new Date() },
+      );
+      expect(watchedChange.observations).toHaveLength(1);
+      expect(watchedChange.observations[0]?.objectKey).toBe(watchedFile);
+      expect(watchedChange.observations[0]?.changeKind).toBe('modified');
+    });
+
+    it('accepts ignore as an optional string array in the source schema', () => {
+      expect(
+        validateScope(
+          { globs: ['**/*.txt'], ignore: ['**/notified-*.txt'] },
+          source.scopeSchema,
+        ),
+      ).toEqual([]);
+      expect(
+        validateScope({ globs: ['**/*.txt'] }, source.scopeSchema),
+      ).toEqual([]);
+    });
+  });
+
   describe('parseScopeConfig error messages (003 §3)', () => {
     it('reports a dedicated "is required" error when globs is absent', async () => {
       await expect(source.observe({}, { now: new Date() })).rejects.toThrow(

@@ -312,11 +312,14 @@ watch:
   type: file-fingerprint
   globs:
     - '**/*.ts'
+  ignore:
+    - '**/generated-*.ts'
   cwd: /optional/base/path
   interval: 30s
 ```
 
-Required field: `globs`. Optional fields: `cwd` (string), `interval` (duration string).
+Required field: `globs`. Optional fields: `ignore` (array of exclude glob strings), `cwd`
+(string), `interval` (duration string).
 
 `globs` accepts **either** a single pattern as a bare string **or** an array of patterns
 (OR-ed together). The single-file/single-glob case is therefore the one-line form:
@@ -338,6 +341,16 @@ workspace/config root (`ObservationContext.workspacePath`), not the daemon proce
 `cwd` and absolute glob patterns are honored as-is. When no workspace/config root is supplied, the
 source falls back to Node/glob's process-cwd behavior.
 
+`ignore` excludes files from the matched set after `globs` are expanded. A path that matches
+`globs` but also matches any `ignore` pattern is omitted from the baseline and from later change
+detection. Ignore patterns are resolved against the same base as `globs` (including relative
+`cwd`/workspace resolution), and do not support gitignore negation semantics. Use `ignore` when a
+monitor's fired action writes files that would otherwise match the watched glob; for example,
+`globs: ['**/*.txt']` with `ignore: ['**/notified-*.txt']` lets the action write
+`notified-<timestamp>.txt` without retriggering itself. Verified:
+`plugins/source-file-fingerprint/src/index.ts` (`parseScopeConfig`, `observe`) and
+`plugins/source-file-fingerprint/src/index.test.ts` ("ignore exclude globs").
+
 `interval` is the per-monitor observe interval: the runtime calls `file-fingerprint` only when this
 monitor is due. If omitted, the effective default is approximately `30s`. Authors tune it with
 `watch.interval`; this is distinct from the daemon `--poll-ms` loop-wake interval, which controls
@@ -345,7 +358,9 @@ how often the daemon checks whether any monitor is due.
 
 ### 3.2 Behavior
 
-The source expands each glob pattern using `globSync` with `absolute: true`, so matched paths are always absolute. For each matched file, it computes a SHA-256 hash using Node.js `crypto.createHash('sha256')`.
+The source expands each glob pattern using `globSync` with `absolute: true`, so matched paths are
+always absolute, then removes any paths matched by `ignore`. For each remaining matched file, it
+computes a SHA-256 hash using Node.js `crypto.createHash('sha256')`.
 
 If a run matches zero files, the source returns no observations and sets
 `ObservationResult.outcome: "no-files-matched"`. The runtime records that as a distinct

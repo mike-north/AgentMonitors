@@ -1208,6 +1208,7 @@ describe('source list', () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain('Config fields:');
     expect(result.stdout).toContain('interval');
+    expect(result.stdout).toContain('ignore');
     expect(result.stdout).toContain('Default observe interval is 30s');
     expect(result.stdout).not.toContain('Scope fields:');
     expect(result.stdout).toContain('file-fingerprint');
@@ -1236,6 +1237,10 @@ describe('source list', () => {
       fieldDescriptions: Record<string, string>;
     };
     expect(fileFingerprint.configFields).toContain('interval');
+    expect(fileFingerprint.configFields).toContain('ignore');
+    expect(fileFingerprint.fieldDescriptions['ignore']).toContain(
+      'exclude glob',
+    );
     expect(fileFingerprint.fieldDescriptions['interval']).toContain(
       'Default observe interval is 30s',
     );

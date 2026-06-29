@@ -75,11 +75,18 @@ watch:
   globs:
     - 'src/**/*.ts'
     - '*.config.js'
+  ignore:
+    - 'src/generated/**'
   cwd: /path/to/project   # optional — defaults to the monitors root
 ```
 
 Uses a **baseline-then-detect** pattern: the first observation establishes the baseline;
 subsequent observations diff against it. A single isolated run cannot detect change.
+
+Use `ignore` for files your fired action writes back into the project. For example, if you watch
+`'**/*.txt'` and the action records `notified-2026-06-29.txt`, add
+`ignore: ['**/notified-*.txt']` so the monitor does not detect its own output and re-fire. Ignored
+paths are excluded from both the baseline and later change detection.
 
 ### `api-poll`
 
