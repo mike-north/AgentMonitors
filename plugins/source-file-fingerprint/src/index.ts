@@ -13,6 +13,7 @@ import type {
 
 interface ScopeConfig {
   globs: string[];
+  ignore: string[];
   cwd: string | undefined;
 }
 
@@ -40,8 +41,23 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
   if (globs.length === 0 || globs.some((g) => g.trim() === '')) {
     throw new Error('scope.globs must not contain empty patterns');
   }
+  const rawIgnore = config['ignore'];
+  let ignore: string[] = [];
+  if (rawIgnore !== undefined) {
+    if (
+      Array.isArray(rawIgnore) &&
+      rawIgnore.every((g): g is string => typeof g === 'string')
+    ) {
+      ignore = rawIgnore;
+    } else {
+      throw new Error('scope.ignore must be an array of strings');
+    }
+    if (ignore.some((g) => g.trim() === '')) {
+      throw new Error('scope.ignore must not contain empty patterns');
+    }
+  }
   const cwd = typeof config['cwd'] === 'string' ? config['cwd'] : undefined;
-  return { globs, cwd };
+  return { globs, ignore, cwd };
 }
 
 async function hashFile(filePath: string): Promise<string> {
@@ -177,6 +193,21 @@ const scopeSchema: JsonSchema = {
       type: 'string',
       description: 'Working directory for glob resolution',
     },
+    ignore: {
+      type: 'array',
+      items: { type: 'string', minLength: 1, pattern: '\\S' },
+      description:
+        'Optional exclude glob pattern(s). Files matched by globs and by ignore ' +
+        'are omitted from baseline and change detection. Resolved against the same base as globs.',
+    },
+    interval: {
+      type: 'string',
+      default: '30s',
+      pattern: '^\\d+[smhd]$',
+      description:
+        'Default observe interval is 30s. Set watch.interval to tune how often ' +
+        'this monitor re-checks matching files; this is separate from the daemon loop wake interval.',
+    },
   },
   required: ['globs'],
 };
@@ -242,7 +273,7 @@ const source: ObservationSource = {
     config: Record<string, unknown>,
     context: ObservationContext = { now: new Date() },
   ): Promise<ObservationResult> {
-    const { globs, cwd } = parseScopeConfig(config);
+    const { globs, ignore, cwd } = parseScopeConfig(config);
     const globCwd = resolveGlobCwd(cwd, context.workspacePath);
     // A first run (no valid prior state) only establishes the baseline; it must
     // not report every matched file as `created`.
@@ -253,10 +284,20 @@ const source: ObservationSource = {
 
     // Collect the current matches once (a path matched by multiple globs is
     // hashed and reported a single time).
+    // Excluded paths never enter the baseline. That prevents a monitor action
+    // that writes generated files back into a watched glob from retriggering itself.
+    const ignoredFiles = new Set<string>();
+    for (const pattern of ignore) {
+      for (const filePath of expandGlob(pattern, globCwd)) {
+        ignoredFiles.add(filePath);
+      }
+    }
+
     const currentHashes = new Map<string, string>();
     for (const pattern of globs) {
       const files = expandGlob(pattern, globCwd);
       for (const filePath of files) {
+        if (ignoredFiles.has(filePath)) continue;
         if (!currentHashes.has(filePath)) {
           currentHashes.set(filePath, await hashFile(filePath));
         }

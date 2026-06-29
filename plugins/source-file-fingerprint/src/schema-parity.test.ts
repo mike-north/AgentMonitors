@@ -82,6 +82,11 @@ const cases: readonly ParityCase[] = [
     expectValid: true,
   },
   {
+    label: 'valid ignore exclude globs',
+    input: { globs: ['**/*.txt'], ignore: ['**/notified-*.txt'] },
+    expectValid: true,
+  },
+  {
     label: 'whitespace-only string is rejected',
     input: { globs: '   ' },
     expectValid: false,
@@ -94,6 +99,16 @@ const cases: readonly ParityCase[] = [
   {
     label: 'missing globs is rejected',
     input: {},
+    expectValid: false,
+  },
+  {
+    label: 'non-array ignore is rejected',
+    input: { globs: ['**/*.txt'], ignore: '**/notified-*.txt' },
+    expectValid: false,
+  },
+  {
+    label: 'blank ignore entry is rejected',
+    input: { globs: ['**/*.txt'], ignore: [''] },
     expectValid: false,
   },
 ];

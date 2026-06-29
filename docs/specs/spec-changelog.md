@@ -9,6 +9,101 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-06-29 — `file-fingerprint` ignore exclude globs (003 §3.1, §3.2) — Refs #232
+
+`file-fingerprint` now accepts an optional `ignore: string[]` exclude-glob array alongside `globs`.
+
+- **003 §3.1 — clarified and extended.** A path that matches `globs` but also matches any `ignore`
+  pattern is omitted from both the initial baseline and later change detection. Ignore patterns are
+  resolved against the same base as `globs`; there is no gitignore-style negation or separate base.
+
+- **Self-trigger guidance.** The docs now call out the common footgun where a monitor watching a
+  broad glob writes its own notification artifact back into that glob, causing a re-fire loop. The
+  recommended fixes are to write outside the watched tree or exclude generated outputs with `ignore`.
+
+- **Proof:** `plugins/source-file-fingerprint/src/index.test.ts` ("ignore exclude globs") asserts an
+  ignored matching file is absent from baseline and does not emit on change, while a non-ignored
+  matching file still emits normally. `apps/cli/src/commands/cli.integration.test.ts` pins
+  `source list` exposure of the new field.
+
+## 2026-06-29 — `api-poll` status-page HTML volatility guidance (003 §4.2) — Refs #234
+
+Clarified that rendered HTML pages can be unsuitable `api-poll` inputs even when `text-diff` is
+correctly inferred from `Content-Type`.
+
+- **003 §4.2 — status-page caveat.** Many rendered status pages embed volatile per-request content
+  such as timestamps, CSRF tokens, nonces, or build metadata. Raw `text-diff` can therefore fire on
+  every poll even when service status has not changed.
+
+- **Recommended authoring path.** Prefer machine-readable status endpoints when available, such as a
+  Statuspage-style `/api/v2/status.json` URL. If only rendered HTML is available, expect noise and
+  consider `notify.strategy: debounce`.
+
+- **Authoring docs.** The `api-poll` section now includes a concrete JSON status endpoint example and
+  explains why it is preferable for status-page monitoring.
+
+## 2026-06-28 — `api-poll` infers change-detection strategy from `Content-Type` (003 §4.1, §4.2) — Refs #230
+
+`change-detection.strategy` is now **optional** for `api-poll`. Builds on the #219/#220 robustness work.
+
+- **003 §4.2 — new (Refs #230).** When `change-detection.strategy` is **omitted**, the source infers
+  it from the response `Content-Type`: a JSON media type (`application/json` or any structured-syntax
+  `+json` suffix, per RFC 6838) → `json-diff`; everything else (`text/html`, `text/plain`, a
+  missing/unknown `Content-Type`) → `text-diff`. This makes the common "watch a web page" case
+  zero-config. The previous omitted-path behavior was a static `text-diff` default; it is now this
+  Content-Type inference.
+
+- **Explicit always wins.** An explicitly configured `strategy` is used **verbatim** — no inference,
+  no override (user specification is absolute). Explicit `json-diff` against an HTML page stays
+  `json-diff`; explicit `text-diff` against a JSON body stays `text-diff`.
+
+- **#219 warning narrowed.** The json-diff-on-non-JSON warning now fires **only** for the _explicit_
+  `json-diff` case. An _inferred_ strategy never warns, because inference picks `json-diff` solely for
+  JSON `Content-Type`s and so never mismatches the body.
+
+- **003 §4.1 + scaffold + authoring docs.** The §4.1 example marks `change-detection` optional and
+  adds a no-`change-detection` "watch a web page" example; the `api-poll` scaffold
+  (`apps/cli/src/commands/init.ts`) and `apps/website/.../authoring-monitors.md` do the same.
+
+- **No public-type change.** Inference is internal to the source; `ObservationResult` is unchanged.
+
+- **Proof:** `plugins/source-api-poll/src/index.test.ts` (omitted + `application/json` → json-diff;
+  omitted + `application/ld+json` → json-diff; omitted + `text/html` → text-diff; omitted + missing
+  `Content-Type` → text-diff; inferred json-diff does not warn; explicit `json-diff` + `text/html` →
+  json-diff honored AND warns; explicit `text-diff` + JSON body → text-diff honored).
+
+## 2026-06-28 — `api-poll` change-detection robustness: non-2xx errors, json-diff-on-non-JSON warning, content-type strategy steering (003 §4.2, §4.5, §4.8) — Refs #219, #220
+
+Two related corrections to the `api-poll` source contract, plus authoring guidance.
+
+- **003 §4.8 — new (Refs #220).** A non-2xx HTTP response is now an **errored** observation for the
+  `text-diff`/`json-diff` strategies (the source throws a status-bearing error
+  `api-poll received HTTP <status> from <url> — check auth/url; not establishing a baseline on an error response`),
+  so the runtime records `errored`, `daemon once`/`run` report it, `monitor history`
+  shows `errored`, and `monitor test` shows `Observation failed: …`. It no longer silently baselines
+  on an error body, which previously masked broken auth/URL (a bad token produced `HTTP 401` yet the
+  monitor "observed successfully"). 2xx responses baseline/diff exactly as before. **Exception:** the
+  `status-code` strategy still treats a non-2xx as a legitimate observed signal (the status is the
+  watched object), so it does not throw — preserving 200 → 5xx detection.
+
+- **003 §4.2 — clarified (Refs #219).** The existing silent `json-diff` → text fallback now also
+  emits a **non-fatal warning** (`ObservationResult.warnings`) when `strategy: json-diff` is
+  configured against a body that does not parse as JSON. `agentmonitors monitor test` prints it so the
+  author is steered to `text-diff` for HTML/plain pages instead of getting quietly wrong diffing. The
+  observation outcome is unchanged (still the text fallback). The change-detection table and the
+  `api-poll` scaffold (`apps/cli/src/commands/init.ts`) now state strategy-by-content-type inline:
+  `text-diff` for HTML/plain pages, `json-diff` for JSON APIs.
+
+- **New public type field.** `ObservationResult.warnings?: string[]` — non-fatal source diagnostics,
+  surfaced by `monitor test`; does not mark the cycle errored.
+
+- **Proof:** `plugins/source-api-poll/src/index.test.ts` (401/500 → errored, no baseline; 2xx →
+  baseline ok; `status-code` non-2xx still observes; json-diff on non-JSON → warning; json-diff on
+  JSON → no warning; text-diff non-JSON → no warning); `apps/cli/src/commands/cli.integration.test.ts`
+  (`monitor test` surfaces the status-bearing error and the json-diff warning).
+- Minor changeset: `@agentmonitors/source-api-poll` behavior change; patch: `@agentmonitors/core`
+  (new optional `ObservationResult.warnings`), `@agentmonitors/cli` (`monitor test` warning output).
+
 ## 2026-06-28 — `hook deliver` accepts `--format text|json` and documents no-output preconditions (005 §12.2, 006 §5) — Refs #203
 
 `agentmonitors hook deliver` now accepts the same `--format text|json` shape as the sibling
@@ -68,6 +163,16 @@ Resolves a contradiction between the spec and the implementation. The spec alrea
 
 High-urgency body injection and the post-compact recap are byte-unchanged. Affects published-package
 behavior (`@agentmonitors/cli`), so a changeset accompanies this change. Refs #198.
+
+## 2026-06-28 — file-fingerprint observe interval is surfaced in schema, CLI, and docs (003 §3.1; 005 §7, §9) — Refs #204
+
+`file-fingerprint` now documents `watch.interval` in its source schema with the effective `30s`
+default. `agentmonitors source list` includes source field descriptions, so the interval knob is
+visible alongside `globs` and `cwd`.
+
+Docs now distinguish the per-monitor observe interval from daemon `--poll-ms`: `watch.interval`
+controls when a specific monitor is due to re-check files, while `--poll-ms` is only the daemon
+loop-wake cadence. No default timing behavior changed.
 
 ## 2026-06-28 — file-fingerprint project globs resolve from config root, not daemon cwd (002 §10.7, §15; 003 §3.1, §3.2; 005 §6) — Refs #193
 

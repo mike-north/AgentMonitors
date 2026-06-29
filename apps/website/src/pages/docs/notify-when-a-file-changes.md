@@ -53,6 +53,20 @@ urgency: high           # required for mid-session notification — see note bel
 notes.md changed. Review what changed and react if it affects current work.
 ```
 
+If the action you expect the agent to take writes files that also match the watched glob, exclude
+those outputs. Otherwise the monitor can detect its own notification artifact and fire again:
+
+```yaml
+watch:
+  type: file-fingerprint
+  globs:
+    - '**/*.txt'
+  ignore:
+    - '**/notified-*.txt'
+```
+
+The other safe option is to write generated notes outside the watched tree entirely.
+
 > **Why `high`:** mid-session delivery fires for `high`-urgency changes. A `normal` (the scaffold
 > default) or `low` change is a quieter signal that may only surface in the recap when a new
 > session starts. If you want the agent interrupted *during* a turn when the file changes, use
@@ -87,7 +101,8 @@ printf '\n## a change\n' >> notes.md
 
 **c. Wait for detection, then ask for pending notifications.** Detection is not instant: the file
 is re-checked on a ~30s interval and a `high` change then settles for ~15s. Worst case the change
-lands just after a check, so allow up to ~90s and re-poll if the first attempt is empty:
+lands just after a check, so allow up to ~90s and re-poll if the first attempt is empty. Set
+`watch.interval` in the monitor frontmatter to tune the file re-check cadence:
 
 ```bash
 sleep 50
