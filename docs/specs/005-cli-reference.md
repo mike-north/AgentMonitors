@@ -68,10 +68,10 @@ unchanged.
 
 When those manual daemon commands cannot reach the resolved socket, they report a single actionable
 stderr line that says no daemon is running for this workspace and tells the author to start one with
-`agentmonitors daemon run` or let it start automatically when a Claude Code session opens. They exit
-non-zero and do not expose a raw `DaemonConnectionError` stack trace. Daemon-side application errors
-are still surfaced as normal command errors and, where a command supports `--format json`, still use
-the command's JSON error shape.
+`agentmonitors daemon run` or let the plugin start it automatically when a Claude Code session
+opens. They exit non-zero and do not expose a raw `DaemonConnectionError` stack trace.
+Daemon-side application errors are still surfaced as normal command errors and, where a command
+supports `--format json`, still use the command's JSON error shape.
 
 ### Database path resolution
 
