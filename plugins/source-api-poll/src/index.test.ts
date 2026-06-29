@@ -411,6 +411,38 @@ describe('source-api-poll', () => {
       ).rejects.toThrow(/not establishing a baseline on an error response/);
     });
 
+    it('redacts userinfo + query credentials from the non-2xx error message (single URL)', async () => {
+      // The thrown Error.message is persisted durably to observation_history and
+      // shown in daemon output, and a 401/403 is the most common credential
+      // failure — so it must never echo the raw credential-bearing URL. Assert
+      // the secrets are ABSENT, not merely that some redaction happened.
+      mockStatus('Unauthorized', 401);
+      const url =
+        'https://user:secretpass@api.example.com/secured?token=SECRETTOKEN';
+      const observe = source.observe({ url }, { now: new Date() });
+      await expect(observe).rejects.toThrow(/api-poll received HTTP 401/);
+      let message = '';
+      try {
+        await source.observe({ url }, { now: new Date() });
+      } catch (err) {
+        message = err instanceof Error ? err.message : String(err);
+      }
+      // Host is preserved for diagnosability.
+      expect(message).toContain('api.example.com');
+      // Credentials and request-scoped tokens are stripped.
+      expect(message).not.toContain('secretpass');
+      expect(message).not.toContain('SECRETTOKEN');
+      expect(message).not.toContain('user:');
+      // The userinfo `@` separator is gone (host-only form has no `@`).
+      expect(message).not.toContain('@');
+      // Note: the hardened `new URL()`-failure fallback (returns the fixed
+      // '[unparseable url redacted]' placeholder) is not exercised here because
+      // `redactUrlForWarning` is not exported and the only reachable path
+      // requires a string that passes scope.url validation and `fetch` yet fails
+      // `new URL()` — `fetch` itself rejects such input first, so the fallback
+      // has no public test seam. It is covered by inspection of the helper.
+    });
+
     it('AC1: 500 throws (json-diff) — no silent baseline on an error page', async () => {
       mockStatus('<html>Internal Server Error</html>', 500);
       await expect(
@@ -517,6 +549,25 @@ describe('source-api-poll', () => {
       expect(result.warnings?.[0]).toMatch(/json-diff/);
       expect(result.warnings?.[0]).toMatch(/does not parse as JSON/);
       expect(result.warnings?.[0]).toMatch(/text-diff/);
+    });
+
+    it('redacts credentials, query, and fragment from the non-JSON warning URL', async () => {
+      mockBody('<!DOCTYPE html><html><body>Status page</body></html>');
+      const result = await source.observe(
+        {
+          url: 'https://user:pass@status.example.com/incidents?token=secret#frag',
+          'change-detection': { strategy: 'json-diff' },
+        },
+        { now: new Date() },
+      );
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings?.[0]).toContain(
+        'https://status.example.com/incidents',
+      );
+      expect(result.warnings?.[0]).not.toContain('user');
+      expect(result.warnings?.[0]).not.toContain('pass');
+      expect(result.warnings?.[0]).not.toContain('token=secret');
+      expect(result.warnings?.[0]).not.toContain('#frag');
     });
 
     it('does NOT warn when json-diff body parses as JSON', async () => {
@@ -943,6 +994,45 @@ describe('source-api-poll', () => {
       await expect(
         source.observe(compositeConfig, { now: new Date() }),
       ).rejects.toThrow(/not establishing a baseline on an error response/);
+    });
+
+    it('redacts userinfo + query credentials from a non-2xx composite-part error message', async () => {
+      // The composite-part throw embeds part.url, which is persisted durably to
+      // observation_history. A credential-bearing part URL must not leak there.
+      const credUrl =
+        'https://user:secretpass@api.example.com/orders/42?token=SECRETTOKEN';
+      const cfg = {
+        'change-detection': {
+          composite: {
+            'object-key': 'order-42',
+            parts: [{ id: 'header', url: credUrl }],
+          },
+        },
+      };
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(() =>
+          Promise.resolve({
+            text: () => Promise.resolve('Unauthorized'),
+            status: 401,
+          }),
+        ),
+      );
+      let message = '';
+      try {
+        await source.observe(cfg, { now: new Date() });
+      } catch (err) {
+        message = err instanceof Error ? err.message : String(err);
+      }
+      expect(message).toContain(
+        'api-poll received HTTP 401 from composite part',
+      );
+      // Host preserved; credentials and tokens stripped.
+      expect(message).toContain('api.example.com');
+      expect(message).not.toContain('secretpass');
+      expect(message).not.toContain('SECRETTOKEN');
+      expect(message).not.toContain('user:');
+      expect(message).not.toContain('@');
     });
 
     it('a 2xx composite still baselines/observes normally (no regression from the non-2xx guard)', async () => {
