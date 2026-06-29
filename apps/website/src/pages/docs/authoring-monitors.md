@@ -85,14 +85,26 @@ subsequent observations diff against it. A single isolated run cannot detect cha
 
 Polls an HTTP endpoint and detects response changes.
 
+Watching a web page needs **no** `change-detection` block — the strategy is inferred from the
+response `Content-Type`:
+
+```yaml
+watch:
+  type: api-poll
+  url: 'https://example.com/page'
+  interval: 5m                 # optional — polling interval (e.g. 5m, 30s, 1h)
+```
+
+The full set of options:
+
 ```yaml
 watch:
   type: api-poll
   url: 'https://api.example.com/status'
   method: GET                  # optional — defaults to GET
   interval: 5m                 # optional — polling interval (e.g. 5m, 30s, 1h)
-  change-detection:            # optional
-    strategy: json-diff        # text-diff (default) | json-diff | status-code
+  change-detection:            # optional — inferred from Content-Type when omitted:
+    strategy: json-diff        # set ONLY to override · text-diff for HTML/plain · json-diff for JSON · status-code for status-only
   auth:                        # optional
     type: bearer
     token-env: API_TOKEN       # reads from environment variable
@@ -102,11 +114,42 @@ watch:
 
 **Change detection strategies:**
 
-| Strategy | Behaviour |
-|---|---|
-| `text-diff` | Compares raw response body text (default) |
-| `json-diff` | Parses JSON and compares semantically (ignores key order and whitespace) |
-| `status-code` | Only detects changes in HTTP status code |
+| Strategy | Behaviour | Use for |
+|---|---|---|
+| `text-diff` | Compares raw response body text | HTML pages, plain-text status pages — the right choice for watching a web page |
+| `json-diff` | Parses JSON and compares semantically (ignores key order and whitespace) | JSON APIs |
+| `status-code` | Only detects changes in HTTP status code | Watching whether an endpoint goes up/down (e.g. 200 → 503) |
+
+**`change-detection` is optional.** When you omit it, the strategy is **inferred from the response
+`Content-Type`**: a JSON media type (`application/json` or any `+json` suffix) uses `json-diff`;
+everything else — HTML, plain text, or a missing/unknown `Content-Type` — uses `text-diff`. So the
+common "tell me when this web page changed" case is zero-config.
+
+For status pages, prefer the machine-readable status endpoint when one exists. Rendered HTML often
+contains per-request timestamps, CSRF tokens, nonces, or build metadata; raw `text-diff` sees those
+as changes and can fire every poll even when the actual service status is unchanged.
+
+```yaml
+watch:
+  type: api-poll
+  url: 'https://status.example.com/api/v2/status.json'
+  interval: 5m
+```
+
+Many Statuspage-backed sites expose `/api/v2/status.json`, which is designed to be stable until the
+reported status changes. If a site only exposes rendered HTML, consider pairing the monitor with a
+`notify.strategy: debounce` window and expect more noise.
+
+**An explicit `strategy` always wins** — it is used verbatim with no inference or override. So an
+explicit `json-diff` against an HTML page stays `json-diff` (and `agentmonitors monitor test` warns
+that the body does not parse as JSON, steering you to `text-diff`); an explicit `text-diff` against a
+JSON body stays `text-diff`.
+
+A non-2xx response (e.g. a `401` from a missing/invalid token, or a `500` error page) is treated as
+an **errored** observation for `text-diff`/`json-diff` — the monitor does **not** baseline on the
+error body, and `monitor test` / `monitor history` surface the status — so a broken auth/URL is not
+silently masked. (`status-code` is the exception: there the status itself is the watched signal, so a
+non-2xx is a legitimate change, not an error.)
 
 **Auth types:**
 

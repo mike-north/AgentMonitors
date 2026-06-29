@@ -133,8 +133,19 @@ describe('renderToon', () => {
     const sourceListOutput = [
       {
         name: 'file-fingerprint',
-        configFields: ['globs', 'cwd'],
-        scopeFields: ['globs', 'cwd'],
+        configFields: ['globs', 'cwd', 'interval'],
+        scopeFields: ['globs', 'cwd', 'interval'],
+        fieldDescriptions: [
+          { field: 'globs', description: 'Glob pattern(s) to match files.' },
+          {
+            field: 'cwd',
+            description: 'Working directory for glob resolution',
+          },
+          {
+            field: 'interval',
+            description: 'Default observe interval is 30s.',
+          },
+        ],
         required: ['globs'],
       },
     ];
