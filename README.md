@@ -20,10 +20,10 @@ delivers signals into your agent sessions automatically.
 ### 1. Install the CLI
 
 ```bash
-npm install -g @agentmonitors/cli
+npm install -g agentmonitors
 ```
 
-This puts the `agentmonitors` binary on your `PATH`. (Use `npx @agentmonitors/cli --help` to try it
+This puts the `agentmonitors` binary on your `PATH`. (Use `npx agentmonitors --help` to try it
 without a global install.)
 
 ### 2. Add the Claude Code plugin
