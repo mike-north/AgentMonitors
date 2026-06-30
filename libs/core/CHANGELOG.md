@@ -1,5 +1,11 @@
 # @agentmonitors/core
 
+## 0.9.1
+
+### Patch Changes
+
+- d4299cf: Relicense the published packages under the MIT License. Each package now declares `"license": "MIT"` and ships a `LICENSE` file in its published tarball.
+
 ## 0.9.0
 
 ### Minor Changes
