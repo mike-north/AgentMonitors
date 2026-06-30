@@ -635,7 +635,79 @@ While a monitor has an active watcher, the tick loop **MUST** skip its `observe(
 
 Verified: `libs/core/src/runtime/service.ts` — `watchMonitors()`, `consumeWatch()`, the `activeWatchers` skip in `tick()`, and the shared `ingest()` helper; `apps/cli/src/commands/daemon.ts` — watcher start/stop in `runLoop()`.
 
-### 2.4 Tick result
+### 2.4 Watch-mode source-state checkpointing (TARGET)
+
+> **Status: target.** The current implementation leaves `sourceState` untouched while a watcher is
+> running — source state is only advanced when `observe()` returns `nextState`. This section defines
+> the new core contract addition that allows an active watcher to write back its updated source state
+> durably, required for mid-watch crash safety. This rule MUST be moved to _current_ status with
+> `verified:` references when it ships (process: [004 §5–6](./004-validation-testing.md)).
+
+A source whose `watch()` implementation maintains in-memory change-detection state (e.g.,
+`file-fingerprint`'s fingerprint map) faces a crash-safety gap: if the daemon is killed between
+OS-event deliveries, the accumulated state is lost, and on restart the reconcile-on-start pass
+([003 §3.5](./003-source-plugins.md)) will re-emit observations for changes that were already
+delivered before the crash — duplicate deliveries.
+
+To close this gap, the runtime **MUST** support a **watch-checkpoint mechanism** by which an active
+watcher can periodically write back its updated `sourceState` durably, independent of yielding an
+observation.
+
+#### Contract shape
+
+The `ObservationContext` **MUST** be extended with an optional `checkpoint` callback:
+
+```typescript
+context.checkpoint?: (nextState: unknown) => Promise<void>
+```
+
+A watcher implementation calls `context.checkpoint(updatedFingerprintState)` to request a durable
+write of the updated source state. The runtime **MUST**:
+
+1. Persist the provided `nextState` into the monitor's `monitorState.sourceState` row **before**
+   processing any further observations from the same watcher (G14 durable-write-before-Interpret
+   ordering — the same ordering invariant already enforced by `ingest()` for observation materialize;
+   see [§1.1.8](#118-interpret-a-cheap-agentic-digest-via-the-users-own-ai-tool)).
+2. Return the resolved `Promise<void>` when the write is durable.
+3. NOT deliver or materialize any observation as a side effect of a checkpoint call — a checkpoint is
+   a state write only, not an observation yield.
+
+The `checkpoint` callback is supplied only to `watch()` (via `ObservationContext`); `observe()` uses
+the existing `nextState` field on `ObservationResult` for the same purpose.
+
+#### Checkpoint timing
+
+A watcher SHOULD call `checkpoint` at an interval approximately equal to the monitor's `interval`
+field (or the default 30s if omitted). The implementation MAY coalesce rapid checkpoint requests
+and is not required to checkpoint on every OS event.
+
+A checkpoint failure (the write throws or rejects) MUST NOT abort the watcher — the source SHOULD
+log a warning and continue watching. A failed checkpoint is a transient durability gap, not a watcher
+protocol violation.
+
+#### G14 ordering invariant
+
+The durable checkpoint write MUST complete before any subsequent `ingest()` call processes an
+observation yielded by the same watcher (the G14 ordering). Because `checkpoint` is called
+independently of `yield`, the runtime MUST serialize these two paths per-watcher: if a checkpoint
+write is in flight when an observation arrives, the runtime MUST await the checkpoint before
+ingesting the observation.
+
+> **Example.** A `file-fingerprint` watcher receives a burst of 10 OS events, updates its
+> in-memory fingerprint map, yields 10 observations, and calls `checkpoint` once after the burst.
+> The runtime ingests all 10 observations (funnelling each through `ingest()`), then persists the
+> updated fingerprint state from the checkpoint. If the daemon is killed after the 10 observations
+> are materialized but before the checkpoint write, a restart will reconcile from the pre-burst
+> baseline — producing the same 10 observations again as reconcile observations. (This is a
+> narrow window, bounded to the interval between burst completion and checkpoint write; it is
+> preferable to the alternative of never persisting mid-watch state at all.)
+>
+> **Test implication.** A test that (a) stubs `context.checkpoint`, (b) has the watcher yield an
+> observation, and (c) asserts that `checkpoint` was called with the updated state before
+> `context.checkpoint` resolved MUST pass. A test that forces `context.checkpoint` to throw MUST
+> confirm the watcher continues yielding subsequent observations and does NOT abort.
+
+### 2.5 Tick result
 
 `tick()` returns a `RuntimeTickResult` summarizing the tick:
 
@@ -959,7 +1031,7 @@ The CLI exposes two operational modes for the runtime:
 
 `agentmonitors daemon once [monitorsDir]` creates a local `AgentMonitorRuntime` in-process and calls `runtime.tick()` once without starting a socket server. It does not go through the daemon IPC socket.
 
-In `text` format the command prints `Evaluated N monitor(s), emitted M event(s).`. When the tick has one or more errored observations (§2.4), the trailing period is replaced by `, K errored:` followed by one indented `  <monitorId>: <message>` line per errored monitor — so a broken source is visible without any verbose flag. When `K` is zero the output is unchanged (the genuine no-change case stays clean — the command must not "cry wolf"). In `json` format the full `RuntimeTickResult`, including `erroredObservations`, is printed verbatim.
+In `text` format the command prints `Evaluated N monitor(s), emitted M event(s).`. When the tick has one or more errored observations (§2.5), the trailing period is replaced by `, K errored:` followed by one indented `  <monitorId>: <message>` line per errored monitor — so a broken source is visible without any verbose flag. When `K` is zero the output is unchanged (the genuine no-change case stays clean — the command must not "cry wolf"). In `json` format the full `RuntimeTickResult`, including `erroredObservations`, is printed verbatim.
 
 Verified: `apps/cli/src/runtime-client.ts` — `daemonTickClient()`: constructs a `createRuntime()` directly and calls `runtime.tick()`; `apps/cli/src/commands/daemon.ts` — `once` subcommand and the `appendErroredLines()` helper; `apps/cli/src/commands/cli.integration.test.ts` — `describe('daemon once error visibility (issue #117)')`.
 
@@ -974,7 +1046,7 @@ Verified: `apps/cli/src/runtime-client.ts` — `daemonTickClient()`: constructs 
 5. Handles `SIGINT` and `SIGTERM` to stop cleanly
 6. Refuses to start if the socket is already in use (another daemon is running)
 
-**Tick logging:** after each tick the loop logs a line when the tick emitted events **or** had one or more errored observations (§2.4); a clean no-change tick logs nothing. The line is `Emitted M event(s) from N monitor(s).`, and when errored it becomes `Emitted M event(s) from N monitor(s), K errored:` followed by one indented `  <monitorId>: <message>` line per errored monitor — the same surfacing as `daemon once` so a broken source is never hidden behind a silent loop.
+**Tick logging:** after each tick the loop logs a line when the tick emitted events **or** had one or more errored observations (§2.5); a clean no-change tick logs nothing. The line is `Emitted M event(s) from N monitor(s).`, and when errored it becomes `Emitted M event(s) from N monitor(s), K errored:` followed by one indented `  <monitorId>: <message>` line per errored monitor — the same surfacing as `daemon once` so a broken source is never hidden behind a silent loop.
 
 **Idle reaping:** the daemon monitors active sessions for the workspace. After each tick it counts sessions with `status === 'active'` and `workspacePath === workspacePath`. If this count stays zero continuously for `--reap-after-ms` milliseconds (default `300000`; `0` disables), the daemon stops itself cleanly. This is the primary self-termination mechanism for daemons booted by `session start`.
 
