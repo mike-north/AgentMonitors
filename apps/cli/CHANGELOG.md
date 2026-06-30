@@ -1,5 +1,18 @@
 # @agentmonitors/cli
 
+## 0.7.1
+
+### Patch Changes
+
+- d4299cf: Relicense the published packages under the MIT License. Each package now declares `"license": "MIT"` and ships a `LICENSE` file in its published tarball.
+- Updated dependencies [d4299cf]
+  - @agentmonitors/core@0.9.1
+  - @agentmonitors/source-api-poll@0.3.1
+  - @agentmonitors/source-command-poll@0.2.5
+  - @agentmonitors/source-file-fingerprint@0.3.1
+  - @agentmonitors/source-incoming-changes@0.2.6
+  - @agentmonitors/source-schedule@0.1.6
+
 ## 0.7.0
 
 ### Minor Changes

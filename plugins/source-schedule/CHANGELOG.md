@@ -1,5 +1,13 @@
 # @agentmonitors/source-schedule
 
+## 0.1.6
+
+### Patch Changes
+
+- d4299cf: Relicense the published packages under the MIT License. Each package now declares `"license": "MIT"` and ships a `LICENSE` file in its published tarball.
+- Updated dependencies [d4299cf]
+  - @agentmonitors/core@0.9.1
+
 ## 0.1.5
 
 ### Patch Changes
