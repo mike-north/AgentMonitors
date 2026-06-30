@@ -179,7 +179,7 @@ alias agentmonitors="node \"$(pwd)/apps/cli/dist/index.cjs\""
 | `apps/cli`                        | `@agentmonitors/cli` (`agentmonitors`)   | Command surface + the daemon and its IPC         |
 | `plugins/source-file-fingerprint` | `@agentmonitors/source-file-fingerprint` | File change-detection source                     |
 | `plugins/source-api-poll`         | `@agentmonitors/source-api-poll`         | HTTP polling source                              |
-| `plugins/source-command-poll`     | `@agentmonitors/source-command-poll`     | Shell-command output source                      |
+| `plugins/source-command-poll`     | `@agentmonitors/source-command-poll`     | Command (argv) output source                     |
 | `plugins/source-schedule`         | `@agentmonitors/source-schedule`         | Cron schedule source                             |
 | `plugins/source-incoming-changes` | `@agentmonitors/source-incoming-changes` | Local git-ref advance source                     |
 | `agent-plugins/agentmonitors`     | —                                        | The Claude Code plugin (hooks + skill)           |
