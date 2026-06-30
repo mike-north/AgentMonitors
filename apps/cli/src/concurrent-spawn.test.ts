@@ -9,6 +9,10 @@
  * both can probe "not live", both unlink, and the second removes the first's
  * just-bound socket — leaving two daemons running.  This file contains a
  * regression test for that scenario.
+ *
+ * NOTE: These tests are excluded from the default parallel vitest run
+ * (vitest.config.ts) and run only via vitest.serial.config.ts so that spawned
+ * daemon processes are not CPU-starved by concurrent test workers.
  */
 
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -43,18 +47,24 @@ function cliEntry(): string {
 }
 
 /**
- * Spawn `agentmonitors daemon run` in the foreground (stdio piped so we can
- * read its "listening" banner) and return the child process plus a promise that
- * resolves to the exit code when the process exits.
+ * A spawned daemon handle that captures stdout+stderr for diagnostics.
  */
-function spawnDaemon(
-  dir: string,
-  socket: string,
-): {
+interface DaemonHandle {
   child: ChildProcess;
   exitPromise: Promise<number | null>;
   readyPromise: Promise<void>;
-} {
+  /** Last ~1 KB of combined stdout+stderr output (for diagnostic messages). */
+  outputTail: () => string;
+}
+
+/**
+ * Spawn `agentmonitors daemon run` in the foreground (stdio piped so we can
+ * read its "listening" banner) and return the child process plus a promise that
+ * resolves to the exit code when the process exits.
+ *
+ * stderr is captured so that waitForDaemon can include it in timeout diagnostics.
+ */
+function spawnDaemon(dir: string, socket: string): DaemonHandle {
   const db = path.join(dir, 'i.db');
   const monitorsDir = path.join(dir, '.claude', 'monitors');
 
@@ -85,6 +95,18 @@ function spawnDaemon(
     },
   );
 
+  // Capture combined stdout+stderr, keeping the last ~1 KB.
+  const MAX_TAIL = 1024;
+  let outputBuffer = '';
+  const appendOutput = (chunk: Buffer | string): void => {
+    outputBuffer += String(chunk);
+    if (outputBuffer.length > MAX_TAIL * 2) {
+      outputBuffer = outputBuffer.slice(-MAX_TAIL);
+    }
+  };
+  child.stdout?.on('data', appendOutput);
+  child.stderr?.on('data', appendOutput);
+
   const exitPromise = new Promise<number | null>((resolve) => {
     child.on('exit', (code) => resolve(code));
   });
@@ -102,16 +124,64 @@ function spawnDaemon(
     void exitPromise.then(() => resolve());
   });
 
-  return { child, exitPromise, readyPromise };
+  return {
+    child,
+    exitPromise,
+    readyPromise,
+    outputTail: () =>
+      outputBuffer.length > MAX_TAIL
+        ? outputBuffer.slice(-MAX_TAIL)
+        : outputBuffer,
+  };
 }
 
-/** Shared helper: wait for a daemon to be available, with a timeout. */
-async function waitForDaemon(socket: string, timeoutMs: number): Promise<void> {
+/**
+ * Wait for a daemon to be available on its socket, with a timeout.
+ *
+ * On timeout, emits a diagnostic block to stderr (so it is visible in CI even
+ * when a subsequent retry attempt passes) and then throws.  The diagnostic
+ * includes the exit code (or "still running") and output tail of both daemon
+ * handles, so a genuine crash or startup failure is not hidden by retry logic.
+ */
+async function waitForDaemon(
+  socket: string,
+  timeoutMs: number,
+  handles?: [DaemonHandle, DaemonHandle],
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (await daemonAvailable(socket)) return;
     await new Promise<void>((r) => setTimeout(r, 200));
   }
+
+  // Build diagnostic block before throwing.
+  let diag = `waitForDaemon: socket ${socket} not available after ${timeoutMs}ms\n`;
+  if (handles) {
+    for (const [idx, h] of handles.entries()) {
+      const exitCode = await Promise.race([
+        h.exitPromise,
+        Promise.resolve<null>(null),
+      ]);
+      const status =
+        exitCode !== null
+          ? `exited with code ${String(exitCode)}`
+          : 'still running';
+      diag += `  daemon[${idx}]: ${status}\n`;
+      const tail = h.outputTail();
+      if (tail) {
+        diag += `  daemon[${idx}] output tail:\n${tail
+          .split('\n')
+          .map((l) => `    ${l}`)
+          .join('\n')}\n`;
+      }
+    }
+  }
+
+  // Always print the diagnostic — retry logic in the serial runner must not
+  // silently hide a real crash; the output will appear in CI logs on every
+  // failed attempt regardless of whether a later attempt passes.
+  console.error(diag);
+
   throw new Error(
     `Daemon on ${socket} did not become available within ${timeoutMs}ms`,
   );
@@ -138,9 +208,10 @@ describe('concurrent daemon spawn — single-instance guarantee (#62)', () => {
       ),
     ]);
 
-    // Allow a short settling window so the loser's exit is registered.
-    const SETTLE_MS = 2_000;
-    await new Promise<void>((r) => setTimeout(r, SETTLE_MS));
+    // Poll until the winning daemon is actually answering on the socket.
+    // Replace the old fixed sleep + single probe with a bounded wait so
+    // CPU-starved environments don't cause spurious failures.
+    await waitForDaemon(socket, 15_000, [a, b]);
 
     // Exactly one daemon must be answering on the socket.
     const available = await daemonAvailable(socket);
@@ -149,11 +220,13 @@ describe('concurrent daemon spawn — single-instance guarantee (#62)', () => {
     );
 
     // At least one process must have exited — the loser.
-    const [exitA, exitB] = await Promise.all([
-      Promise.race([a.exitPromise, Promise.resolve(undefined)]),
-      Promise.race([b.exitPromise, Promise.resolve(undefined)]),
+    // Use a bounded wait instead of a non-blocking race, so the loser gets
+    // enough time to exit even under CPU pressure.
+    const atLeastOneExited = await Promise.race([
+      a.exitPromise.then(() => true),
+      b.exitPromise.then(() => true),
+      new Promise<boolean>((r) => setTimeout(() => r(false), 10_000)),
     ]);
-    const atLeastOneExited = exitA !== undefined || exitB !== undefined;
     expect(
       atLeastOneExited,
       'the losing daemon must have exited after EADDRINUSE',
@@ -220,13 +293,10 @@ describe('stale socket + concurrent spawn — TOCTOU regression (#68)', () => {
       ),
     ]);
 
-    // Allow a settling window.
-    const SETTLE_MS = 2_000;
-    await new Promise<void>((r) => setTimeout(r, SETTLE_MS));
-
     // At most one daemon must be answering — the invariant under test.
     // (We also verify it's exactly one: a winner must exist.)
-    await waitForDaemon(socket, 5_000);
+    // Bump timeout to 15s and thread both handles for diagnostics.
+    await waitForDaemon(socket, 15_000, [a, b]);
 
     const available = await daemonAvailable(socket);
     expect(

@@ -25,6 +25,10 @@
       "dependsOn": ["^build"],
       "cache": true
     },
+    "test:serial": {
+      "dependsOn": ["^build"],
+      "cache": true
+    },
     "clean": {
       "cache": false
     },

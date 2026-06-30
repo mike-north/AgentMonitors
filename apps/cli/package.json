@@ -18,6 +18,7 @@
     "build": "tsup",
     "check": "tsc --noEmit",
     "test": "vitest run",
+    "test:serial": "vitest run --config vitest.serial.config.ts",
     "clean": "rm -rf dist"
   },
   "dependencies": {

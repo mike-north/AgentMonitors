@@ -20,6 +20,7 @@
     "publish:packages": "node scripts/publish-release-packages.mjs",
     "release": "pnpm build && pnpm publish:packages",
     "test": "NX_TUI=false nx run-many --target=test --exclude=agentmonitors-workspace",
+    "test:serial": "NX_TUI=false nx run @agentmonitors/cli:test:serial",
     "test:standalone-consumer": "node scripts/test-standalone-consumer.mjs",
     "clean": "NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace",
     "check:api-report": "NX_TUI=false nx run-many --target=check:api-report --exclude=agentmonitors-workspace",
