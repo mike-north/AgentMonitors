@@ -26,10 +26,12 @@ describe('spawnDetachedDaemon', () => {
         db,
         pollMs: 1000,
       });
-      // poll until the daemon answers (it was spawned detached, not awaited)
+      // poll until the daemon answers (it was spawned detached, not awaited).
+      // Generous bound so a slow detached boot under parallel CI load doesn't
+      // spuriously fail this readiness poll (#248).
       const start = Date.now();
       let up = false;
-      while (Date.now() - start < 10000) {
+      while (Date.now() - start < 14000) {
         if (await daemonAvailable(socket)) {
           up = true;
           break;
@@ -45,5 +47,5 @@ describe('spawnDetachedDaemon', () => {
       }
       rmSync(ws, { recursive: true, force: true });
     }
-  }, 15_000);
+  }, 20_000);
 });

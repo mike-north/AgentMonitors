@@ -138,9 +138,11 @@ describe('concurrent daemon spawn — single-instance guarantee (#62)', () => {
       ),
     ]);
 
-    // Allow a short settling window so the loser's exit is registered.
-    const SETTLE_MS = 2_000;
-    await new Promise<void>((r) => setTimeout(r, SETTLE_MS));
+    // Wait (bounded) until the winner is actually answering on the socket.
+    // A fixed settle window + a single probe was the flake (#248): under heavy
+    // CI load the winner can take longer than any fixed delay to bind and
+    // answer. Poll until ready instead of sleeping a fixed amount.
+    await waitForDaemon(socket, 15_000);
 
     // Exactly one daemon must be answering on the socket.
     const available = await daemonAvailable(socket);
@@ -148,12 +150,14 @@ describe('concurrent daemon spawn — single-instance guarantee (#62)', () => {
       true,
     );
 
-    // At least one process must have exited — the loser.
-    const [exitA, exitB] = await Promise.all([
-      Promise.race([a.exitPromise, Promise.resolve(undefined)]),
-      Promise.race([b.exitPromise, Promise.resolve(undefined)]),
+    // At least one process must have exited — the loser. Wait (bounded) for an
+    // exit rather than probing once; the loser's EADDRINUSE exit can lag under
+    // load, which would spuriously fail a single non-blocking check.
+    const atLeastOneExited = await Promise.race([
+      a.exitPromise.then(() => true),
+      b.exitPromise.then(() => true),
+      new Promise<boolean>((r) => setTimeout(() => r(false), 10_000)),
     ]);
-    const atLeastOneExited = exitA !== undefined || exitB !== undefined;
     expect(
       atLeastOneExited,
       'the losing daemon must have exited after EADDRINUSE',
@@ -220,13 +224,11 @@ describe('stale socket + concurrent spawn — TOCTOU regression (#68)', () => {
       ),
     ]);
 
-    // Allow a settling window.
-    const SETTLE_MS = 2_000;
-    await new Promise<void>((r) => setTimeout(r, SETTLE_MS));
-
     // At most one daemon must be answering — the invariant under test.
-    // (We also verify it's exactly one: a winner must exist.)
-    await waitForDaemon(socket, 5_000);
+    // (We also verify it's exactly one: a winner must exist.) Poll until the
+    // winner is ready rather than sleeping a fixed window (#248); a generous
+    // bound absorbs slow boots under CI load.
+    await waitForDaemon(socket, 15_000);
 
     const available = await daemonAvailable(socket);
     expect(
