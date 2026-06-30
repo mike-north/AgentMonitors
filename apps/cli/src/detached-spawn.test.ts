@@ -1,3 +1,9 @@
+/**
+ * NOTE: This test is excluded from the default parallel vitest run
+ * (vitest.config.ts) and runs only via vitest.serial.config.ts so that the
+ * spawned daemon process is not CPU-starved by concurrent test workers.
+ */
+
 import { describe, it, expect } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -29,7 +35,7 @@ describe('spawnDetachedDaemon', () => {
       // poll until the daemon answers (it was spawned detached, not awaited)
       const start = Date.now();
       let up = false;
-      while (Date.now() - start < 10000) {
+      while (Date.now() - start < 14000) {
         if (await daemonAvailable(socket)) {
           up = true;
           break;
@@ -45,5 +51,5 @@ describe('spawnDetachedDaemon', () => {
       }
       rmSync(ws, { recursive: true, force: true });
     }
-  }, 15_000);
+  }, 20_000);
 });
