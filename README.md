@@ -63,7 +63,8 @@ Without it, Agent Monitors stays dormant.
 
 ### Author your first monitor
 
-A **monitor** is a folder with a `MONITOR.md` file. Scaffold one with `init`:
+A **monitor** is a `MONITOR.md` file in its own folder under `.claude/monitors/` (or, for a quick
+one-off, a flat `<name>.md` file directly in that folder). Scaffold the folder form with `init`:
 
 ```bash
 agentmonitors init my-first-monitor
@@ -86,7 +87,8 @@ Config files changed. Review the diff, check whether it affects build output
 or dependencies, and update any documentation that references the changed config.
 ```
 
-The monitor's **ID is its folder name** (`my-first-monitor`). A monitor needs only a `watch:` block
+The monitor's **ID is its folder name** (`my-first-monitor`) — or the filename for a flat monitor. A
+monitor needs only a `watch:` block
 and a body — everything else is optional. Add `urgency: high` when you want a change to **interrupt**
 the agent mid-session; the default (`normal`) surfaces it at the next natural turn boundary.
 
@@ -106,13 +108,13 @@ agentmonitors monitor test .claude/monitors/my-first-monitor/MONITOR.md   # dry-
 
 Five observation sources ship in the box — pick one with `agentmonitors init <name> --type <source>`:
 
-| `--type`           | Fires when…                                                 | Key config                                            |
-| ------------------ | ----------------------------------------------------------- | ----------------------------------------------------- |
-| `file-fingerprint` | local files matching globs are created, changed, or deleted | `globs` (string or list); optional `ignore`           |
-| `api-poll`         | an HTTP endpoint's response changes                         | `url`; `text-diff`/`json-diff`/`status-code`          |
-| `command-poll`     | the output of a shell command changes                       | `command` (argv); `text-diff`/`json-diff`/`exit-code` |
-| `schedule`         | a cron time arrives                                         | `cron`; optional `timezone`                           |
-| `incoming-changes` | your local git ref advances (e.g. after a pull or merge)    | `paths`; optional `branch`                            |
+| `--type`           | Fires when…                                                 | Key config                                                      |
+| ------------------ | ----------------------------------------------------------- | --------------------------------------------------------------- |
+| `file-fingerprint` | local files matching globs are created, changed, or deleted | `globs` (string or list); optional `ignore`                     |
+| `api-poll`         | an HTTP endpoint's response changes                         | `url`; `text-diff`/`json-diff`/`status-code`                    |
+| `command-poll`     | the output of a command changes                             | `command` (argv, no shell); `text-diff`/`json-diff`/`exit-code` |
+| `schedule`         | a cron time arrives                                         | `cron`; optional `timezone`                                     |
+| `incoming-changes` | your local git ref advances (e.g. after a pull or merge)    | `paths`; optional `branch`                                      |
 
 See **[Authoring monitors](https://agentmonitors.io/docs/authoring-monitors)** for every source,
 urgency band, and notify strategy (debounce / throttle / rollup).
