@@ -11,6 +11,7 @@ const PACKAGE_DIRS = [
   'plugins/source-incoming-changes',
   'plugins/source-schedule',
   'apps/cli',
+  'apps/agentmonitors',
 ];
 const DRY_RUN = process.argv.includes('--dry-run');
 

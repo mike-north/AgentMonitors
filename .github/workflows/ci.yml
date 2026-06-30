@@ -36,3 +36,6 @@ jobs:
 
       - name: Test
         run: pnpm test
+
+      - name: Test (serial daemon-spawn)
+        run: pnpm test:serial

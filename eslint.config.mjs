@@ -61,5 +61,36 @@ export default tseslint.config(
       },
     },
   },
+  // CommonJS launcher bin — not part of any tsconfig project; disable type-checked
+  // rules and supply Node CJS globals so `require`/`module`/`__dirname` etc. are
+  // recognised without bringing in a tsconfig for a 10-line hand-written script.
+  // Split into two objects so that spreading disableTypeChecked (which sets
+  // languageOptions.parserOptions) is not silently overridden by our own
+  // languageOptions entry. `no-require-imports` is also disabled: this file is
+  // intentionally CommonJS (the `require()` calls are its entire purpose).
+  {
+    files: ['apps/agentmonitors/bin/**/*.cjs'],
+    ...tseslint.configs.disableTypeChecked,
+    rules: {
+      ...tseslint.configs.disableTypeChecked.rules,
+      '@typescript-eslint/no-require-imports': 'off',
+    },
+  },
+  {
+    files: ['apps/agentmonitors/bin/**/*.cjs'],
+    languageOptions: {
+      parserOptions: {
+        projectService: false,
+      },
+      globals: {
+        require: 'readonly',
+        module: 'readonly',
+        __dirname: 'readonly',
+        __filename: 'readonly',
+        console: 'readonly',
+        process: 'readonly',
+      },
+    },
+  },
   eslintConfigPrettier,
 );

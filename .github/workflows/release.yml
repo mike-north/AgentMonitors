@@ -70,7 +70,8 @@ jobs:
               plugins/source-file-fingerprint/package.json \
               plugins/source-incoming-changes/package.json \
               plugins/source-schedule/package.json \
-              apps/cli/package.json | \
+              apps/cli/package.json \
+              apps/agentmonitors/package.json | \
             grep -Eq '^[+-][[:space:]]+"version":'; then
             echo "should-run=true" >> "$GITHUB_OUTPUT"
             exit 0

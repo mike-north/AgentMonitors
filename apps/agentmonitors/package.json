@@ -1,0 +1,25 @@
+{
+  "name": "agentmonitors",
+  "description": "Install the Agent Monitors CLI under the short, unscoped name. Thin launcher for @agentmonitors/cli.",
+  "version": "0.7.0",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org",
+    "access": "public"
+  },
+  "bin": {
+    "agentmonitors": "./bin/agentmonitors.cjs"
+  },
+  "files": [
+    "bin"
+  ],
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@agentmonitors/cli": "workspace:*"
+  },
+  "devDependencies": {
+    "vitest": "^4.0.18"
+  },
+  "license": "UNLICENSED"
+}
