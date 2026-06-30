@@ -435,6 +435,93 @@ The public docs describe monitor roots at enterprise, user, and project scope. T
 
 This means scope precedence, override order, and multi-root composition are outside the current contract.
 
+### 6.1 Glob scope in `file-fingerprint` monitors (_target_)
+
+> **Status: target.** The sigil syntax and the home-relative `~` expansion described here are
+> the intended authoring contract for user-level monitors using the `file-fingerprint` source.
+> The **project-level** bare-relative behavior (§3.1 below) is **current** today. The
+> user-level absolute/home forms are **target** pending implementation. The bare-relative
+> rejection for user-level monitors is also **target** (it requires a guard in
+> `agentmonitors validate`). Fan-out of bare-relative user-level globs across all workspaces
+> is tracked separately in issue #258.
+
+The `globs` and `ignore` fields of a `file-fingerprint` monitor carry path patterns whose
+resolution scope is determined by **sigil-based pattern syntax** — the leading character of each
+pattern — not by a separate `scope:` discriminator field:
+
+| Leading character | Scope class      | Resolved as                                                                                                         |
+| ----------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `/`               | Absolute         | Interpreted as an absolute filesystem path. No expansion. Used as-is by `globSync`.                                 |
+| `~`               | Home-relative    | `~` or `~/…` is expanded to `os.homedir()` before glob expansion. `~user` (other users) is **not** supported.       |
+| _(bare relative)_ | Project-relative | Resolved against the workspace/config root (`context.workspacePath`). This is the current project-monitor behavior. |
+
+**No mixing within a single monitor:** all patterns within one monitor's `globs` array MUST
+belong to the same scope class (all absolute, all home-relative, or all project-relative). A
+monitor that mixes scope classes (e.g., one `/var/log/…` and one `src/**/*.ts`) MUST be split
+into two monitors — one per scope class. This constraint is enforced at `agentmonitors validate`
+time once the target sigil-parsing logic is implemented.
+
+**`~` expansion rule:** a pattern beginning with `~` **MUST** match one of these forms:
+
+- `~` alone (expands to the exact home directory path)
+- `~/…` (expands `~` to `os.homedir()`, then appends the rest of the path)
+
+Any pattern beginning with `~` followed immediately by a non-`/` character (e.g. `~user/…`,
+`~root`) is **not** supported. `agentmonitors validate` **MUST** reject such patterns with a
+clear error: _"~user home expansion is not supported; use an absolute path or ~/… instead."_
+
+**Scope class of a user-level monitor:** a `MONITOR.md` that lives in a user-level monitors root
+(i.e., the global config root rather than a project `.claude/monitors/` directory) uses either
+absolute or home-relative `globs`. Such a monitor **MUST NOT** use bare-relative `globs` —
+there is no single well-defined workspace to resolve them against without project-relative
+fan-out (see [003 §3.5](#) and issue #258). If bare-relative `globs` appear in a user-level
+monitor, `agentmonitors validate` **MUST** reject them with a clear error:
+_"Bare-relative globs in a user-level monitor are not supported until project-relative fan-out
+lands (Refs #258). Use an absolute path (/) or a home-relative path (~/) instead."_
+
+**Events produced by user-level monitors using absolute or home-relative globs** are
+workspace-agnostic (`workspacePath: null`) — they project into all lead sessions, reusing the
+existing `sessionsForWorkspace(null)` projection path. Project-level monitors are unchanged.
+
+> **Examples:**
+>
+> ```yaml
+> # User-level monitor — home-relative (target; valid user-level form)
+> watch:
+>   type: file-fingerprint
+>   globs:
+>     - '~/notes/**/*.md'
+> ```
+>
+> ```yaml
+> # User-level monitor — absolute (target; valid user-level form)
+> watch:
+>   type: file-fingerprint
+>   globs:
+>     - '/var/log/app.log'
+> ```
+>
+> ```yaml
+> # User-level monitor — bare relative (target; INVALID for user-level; rejected at validate)
+> watch:
+>   type: file-fingerprint
+>   globs:
+>     - 'src/**/*.ts' # ERROR: no workspace to resolve against in a user-level monitor
+> ```
+>
+> ```yaml
+> # Project-level monitor — bare relative (CURRENT; valid for project-level)
+> watch:
+>   type: file-fingerprint
+>   globs:
+>     - 'src/**/*.ts' # resolved against context.workspacePath; unchanged behavior
+> ```
+
+**Cross-reference:** full resolution and validation rules are specified in
+[003 §3.5](./003-source-plugins.md). The project-relative fan-out case (one user-level
+definition → N workspace-scoped instances) is tracked in issue #258 and is out of scope for
+this release.
+
 ## 7. Authoring Examples
 
 ### 7.1 File mutation monitor
@@ -556,6 +643,39 @@ whether any aspect of your current task needs to be adjusted.
 - the field works alongside any `notify` strategy; the baseline strategy governs how the
   per-recipient Diff spans a catch-up span, which is independent of Pace
 
+### 7.5 Home-relative user-level monitor (_target_)
+
+> **Status: target** (§6.1, [003 §3.5](./003-source-plugins.md)). Illustrates a user-level
+> `file-fingerprint` monitor using a home-relative `~/…` glob — valid at user-level scope. The
+> events this monitor emits are workspace-agnostic (`workspacePath: null`) and project into all
+> lead sessions.
+
+```md
+---
+name: Personal Notes Changes
+watch:
+  type: file-fingerprint
+  globs:
+    - '~/notes/**/*.md'
+  interval: 30s
+urgency: normal
+notify:
+  strategy: debounce
+  settle-for: 30s
+---
+
+Your personal notes have changed since you last checked.
+```
+
+**What this example proves:**
+
+- `~/notes/**/*.md` is a home-relative glob (leading `~`); `~` expands to `os.homedir()` before
+  glob expansion (target behavior)
+- this is the correct form for a user-level monitor watching files in the user's home directory
+- the monitor's events are workspace-agnostic and project into all lead sessions
+- bare-relative `globs: ['notes/**/*.md']` would be rejected for a user-level monitor (no
+  workspace to resolve against); `~` is the correct prefix
+
 ## 8. Validation Implications
 
 At minimum, monitor authoring validation should be able to prove:
@@ -568,3 +688,18 @@ At minimum, monitor authoring validation should be able to prove:
 - required source-specific scope fields are present
 
 The `agentmonitors validate` command enforces all of the above, including full per-source JSON Schema validation of the `watch` config (the `watch` block minus `type`) against each source's `scopeSchema` (via the exported core helper `validateScope`). See [004-validation-testing.md](./004-validation-testing.md) §2.2.
+
+**Additional validation obligations for glob scope (§6.1 — target):**
+
+Once the sigil-based glob scope logic is implemented, `agentmonitors validate` MUST also enforce:
+
+- a `file-fingerprint` user-level monitor with bare-relative `globs` is rejected with a clear
+  error referencing issue #258
+- a pattern beginning with `~` followed by a non-`/` character (e.g., `~user/…`) is rejected with
+  a clear error directing the author toward `~/…` or an absolute path
+- a `globs` array that mixes scope classes (absolute + project-relative, or home-relative +
+  absolute) within a single monitor is rejected with a clear error directing the author to split
+  into two monitors
+
+See [003 §3.5](./003-source-plugins.md) for the full source-level validation rules and the
+required test matrix.
