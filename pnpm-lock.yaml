@@ -60,6 +60,16 @@ importers:
         specifier: ^4.0.18
         version: 4.0.18(@types/node@22.19.15)(jiti@2.7.0)(yaml@2.9.0)
 
+  apps/agentmonitors:
+    dependencies:
+      '@agentmonitors/cli':
+        specifier: workspace:*
+        version: link:../cli
+    devDependencies:
+      vitest:
+        specifier: ^4.0.18
+        version: 4.0.18(@types/node@22.19.15)(jiti@2.7.0)(yaml@2.9.0)
+
   apps/cli:
     dependencies:
       '@agentmonitors/core':
