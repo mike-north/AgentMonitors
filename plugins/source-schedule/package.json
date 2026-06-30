@@ -1,7 +1,7 @@
 {
   "name": "@agentmonitors/source-schedule",
   "description": "Cron-based schedule triggers for Agent Monitors",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "publishConfig": {
     "registry": "https://registry.npmjs.org",
     "access": "public"
