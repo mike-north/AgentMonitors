@@ -30,7 +30,7 @@
     "*": "prettier --ignore-unknown --write"
   },
   "author": "Mike North <michael.l.north@gmail.com>",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "packageManager": "pnpm@10.30.3",
   "engines": {
     "node": ">=24"
