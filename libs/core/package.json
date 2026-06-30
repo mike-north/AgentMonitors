@@ -27,7 +27,7 @@
     "check:api-report": "api-extractor run --local --verbose",
     "ci:api-report": "api-extractor run --verbose"
   },
-  "license": "UNLICENSED",
+  "license": "MIT",
   "dependencies": {
     "@cfworker/json-schema": "^4.1.1",
     "better-sqlite3": "^11.9.1",
