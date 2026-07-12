@@ -1,6 +1,6 @@
 import { Command, Option } from 'commander';
 import path from 'node:path';
-import { claudeCodeAdapter } from '@agentmonitors/core';
+import { claudeCodeAdapter, scanMonitors } from '@agentmonitors/core';
 import { reportError } from '../output.js';
 import {
   claimDeliveryClient,
@@ -13,7 +13,10 @@ import { readLocalState, writeLocalState } from '../local-state.js';
 import { workspacePaths } from '../workspace-paths.js';
 import { spawnDetachedDaemon } from '../detached-spawn.js';
 import { readHookPayload } from '../hook-payload.js';
-import { renderHookDelivery } from '../hook-deliver-render.js';
+import {
+  renderHookDelivery,
+  renderMonitoringDisabledAdvisory,
+} from '../hook-deliver-render.js';
 import {
   isManualDaemonConnectionError,
   manualDaemonErrorMessage,
@@ -174,7 +177,36 @@ sessionCommand
       payload.cwd ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
 
     const state = readLocalState(workspacePath);
-    if (!state.enabled) return; // quick-exit: monitoring not enabled here
+    if (!state.enabled) {
+      // Quick-exit: monitoring not enabled here. A silent quick-exit is a
+      // dead-end for a user who authored monitors and simply missed the
+      // enable step (issue #269) — they get zero signal forever. So before
+      // exiting, check whether the project actually has monitor definitions
+      // sitting unwatched; if so, surface a one-line advisory through the
+      // SAME additionalContext mechanism used by the recap below. Still
+      // exits 0 and still does NOT open a session or boot a daemon — this
+      // is advisory only (non-goals: never auto-enable, never boot).
+      //
+      // A workspace with NO monitor definitions stays fully silent (never
+      // nag a user who hasn't opted in at all yet).
+      const disabledMonitorsDir = path.join(
+        workspacePath,
+        '.claude',
+        'monitors',
+      );
+      const scan = await scanMonitors(disabledMonitorsDir);
+      const monitorCount = scan.monitors.length + scan.errors.length;
+      if (monitorCount > 0) {
+        const advisory = renderMonitoringDisabledAdvisory(
+          monitorCount,
+          'SessionStart',
+        );
+        // stdout is the SessionStart hook's wire channel — see the identical
+        // note on the recap write below.
+        process.stdout.write(JSON.stringify(advisory));
+      }
+      return;
+    }
 
     const paths = workspacePaths(workspacePath);
     // Resolve the socket up-front through the SAME transform `daemon run` applies

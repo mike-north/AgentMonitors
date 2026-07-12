@@ -163,3 +163,47 @@ export function renderHookDelivery(
     },
   };
 }
+
+/**
+ * Render the "monitors exist but this project is not enabled" advisory
+ * (issue #269) emitted by `session start`'s quick-exit path. A workspace can
+ * have `.claude/monitors/**` definitions authored without ever flipping
+ * `.claude/agentmonitors.local.md`'s `enabled: true` — until now that state
+ * quick-exited **silently**, so a user who missed the enable step got zero
+ * breadcrumb, forever (the worst kind of onboarding dead-end).
+ *
+ * This uses the SAME `additionalContext` wire mechanism as
+ * {@link renderHookDelivery} (§5.1 of the agent-integration spec), but is a
+ * fixed advisory template rather than a rendering of a `DeliveryClaim` — there
+ * is no daemon, no session, and no claimed delivery in this path (by design;
+ * see the non-goals in issue #269: never auto-enable, never boot a daemon).
+ * The message text is a fixed template with an interpolated count, so no
+ * `sanitize()`/truncation is needed (contrast {@link renderHookDelivery},
+ * which injects untrusted monitor-authored body text).
+ *
+ * @param monitorCount - Number of monitor definitions discovered under the
+ *   project's `.claude/monitors` directory (both files that parsed
+ *   successfully and files that failed to parse — a malformed monitor is
+ *   still evidence the user tried to author one, so it still counts toward
+ *   "found").
+ * @param hookEventName - The Claude Code event name to echo; `session start`
+ *   only ever runs from `SessionStart`, so callers pass that literal.
+ */
+export function renderMonitoringDisabledAdvisory(
+  monitorCount: number,
+  hookEventName: string,
+): HookDeliveryOutput {
+  const plural = monitorCount === 1 ? '' : 's';
+  const additionalContext =
+    `AgentMon: monitoring is disabled for this project ` +
+    `(${String(monitorCount)} monitor definition${plural} found under .claude/monitors/, ` +
+    `but none of them are being watched). To enable it, create ` +
+    '`.claude/agentmonitors.local.md` in this project with `enabled: true`.';
+  return {
+    continue: true,
+    hookSpecificOutput: {
+      hookEventName,
+      additionalContext,
+    },
+  };
+}

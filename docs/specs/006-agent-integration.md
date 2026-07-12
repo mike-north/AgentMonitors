@@ -510,6 +510,23 @@ shell-guarded for the "installed plugin, missing CLI" case (a user who hasn't ye
   (exit 127) surfaced to the user on every prompt in every project. The `SessionStart` hook goes
   further and turns the miss into onboarding: when the CLI is absent it emits a one-shot
   `additionalContext` hint pointing at `npm i -g @agentmonitors/cli`.
+- **Monitors-found-but-disabled advisory (`SessionStart`, issue #269).** `session start`'s
+  quick-exit for a project that has not opted in ([002 §10.2](./002-runtime-delivery.md) "Lazy
+  boot") used to be **fully silent** in every case — including when the project already has
+  monitor definitions under `.claude/monitors/` and the user simply never flipped `enabled: true`.
+  That combination is the worst onboarding dead-end: monitors sit unobserved and nothing ever says
+  why. `session start` now scans `.claude/monitors` (via the same `scanMonitors()` the `scan`/
+  `validate` commands use) before quick-exiting on a disabled project. If it finds **zero**
+  definitions, behavior is unchanged — a user who never opted in at all is never nagged, and the
+  command exits 0 with no stdout. If it finds **one or more** (counting both files that parsed
+  successfully and files that failed to parse — a malformed monitor is still evidence the user
+  tried), it emits a single `additionalContext` advisory stating that monitoring is disabled, how
+  many monitor definitions were found, and the exact enable step (create
+  `.claude/agentmonitors.local.md` with `enabled: true`) — then still exits 0 **without** opening a
+  session or booting a daemon (this scan-and-advise step never auto-enables the project or starts
+  the runtime; it is advisory only, same as the CLI-absent hint above). Rendered by
+  `renderMonitoringDisabledAdvisory()` (`apps/cli/src/hook-deliver-render.ts`), called from
+  `apps/cli/src/commands/session.ts`'s `!state.enabled` branch.
 - **Single-process `SessionStart` (one stdin stream).** A Claude Code hook invocation provides
   **one** stdin stream for the whole command. Both `session start` and `hook deliver` read the hook
   payload with `readHookPayload()` (which consumes all of stdin), so a chained
