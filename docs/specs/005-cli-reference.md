@@ -8,9 +8,9 @@
 
 ## §1 Overview
 
-The binary is named **`agentmonitors`** and is described as _"Durable observation and inbox delivery for AI agents"_ (version `0.0.0` in the current codebase).
+The binary is named **`agentmonitors`** and is described as _"Durable observation and inbox delivery for AI agents"_. `--version` is never a hardcoded literal — `apps/cli/src/index.ts`'s `getVersion()` reads it from the CLI package's own `package.json` at runtime, so it always tracks the published release. Do not record a specific version value here; it will drift.
 
-Per AP6, all public CLI behaviour must be derivable from core contracts. The CLI wraps `@agentmonitors/core` and four bundled source packages (`@agentmonitors/source-file-fingerprint`, `@agentmonitors/source-api-poll`, `@agentmonitors/source-schedule`, `@agentmonitors/source-incoming-changes`).
+Per AP6, all public CLI behaviour must be derivable from core contracts. The CLI wraps `@agentmonitors/core` and five bundled source packages (`@agentmonitors/source-file-fingerprint`, `@agentmonitors/source-api-poll`, `@agentmonitors/source-command-poll`, `@agentmonitors/source-schedule`, `@agentmonitors/source-incoming-changes`).
 
 ### Output formats (`--format`)
 
@@ -99,11 +99,11 @@ Creates a new monitor directory under a base directory and writes a template `MO
 agentmonitors init <name> [options]
 ```
 
-| Argument / Flag     | Type                  | Default            | Description                                                                        |
-| ------------------- | --------------------- | ------------------ | ---------------------------------------------------------------------------------- |
-| `<name>`            | positional (required) | —                  | Monitor name, becomes the subdirectory name                                        |
-| `--dir <dir>`       | option                | `.claude/monitors` | Base directory for monitors                                                        |
-| `--source <source>` | option (choices)      | `file-fingerprint` | Observation source: `file-fingerprint`, `api-poll`, `schedule`, `incoming-changes` |
+| Argument / Flag | Type                  | Default            | Description                                                                                             |
+| --------------- | --------------------- | ------------------ | ------------------------------------------------------------------------------------------------------- |
+| `<name>`        | positional (required) | —                  | Monitor name, becomes the subdirectory name                                                             |
+| `--dir <dir>`   | option                | `.claude/monitors` | Base directory for monitors                                                                             |
+| `--type <type>` | option (choices)      | `file-fingerprint` | Observation source type: `file-fingerprint`, `api-poll`, `command-poll`, `schedule`, `incoming-changes` |
 
 ### Output
 
@@ -120,6 +120,7 @@ Each source produces a distinct starter frontmatter block:
 | ------------------ | ------------------------------------------------------------------------------------------------------------------ |
 | `file-fingerprint` | `globs: ['**/*.ts']`                                                                                               |
 | `api-poll`         | `url`, `method: GET`, `interval: 5m`; `change-detection.strategy` omitted so the source infers from `Content-Type` |
+| `command-poll`     | `command: [git, ls-remote, origin, refs/heads/main]`, `interval: 5m`, `change-detection.strategy: text-diff`       |
 | `schedule`         | `cron: '0 9 * * 1-5'`, `timezone: UTC`                                                                             |
 | `incoming-changes` | `paths: ['docs/specs/**']`, `branch: main`                                                                         |
 
@@ -176,6 +177,7 @@ If a file path (rather than a directory) is passed: prints an error to stderr na
   "monitors": [
     { "id": "<string>", "name": "<string>", "source": "<string>" }
   ],
+  "duplicateIds": [{ "id": "<string>", "filePaths": ["<string>"] }],
   "errors": [
     { "filePath": "<string>", "error": "<string>" }
   ]
@@ -184,7 +186,11 @@ If a file path (rather than a directory) is passed: prints an error to stderr na
 
 (In text output, each invalid monitor is labelled by its monitor ID. In JSON output, the
 `errors[].filePath` field carries the monitor ID as its value; the key name `filePath` is
-preserved for backward compatibility with existing JSON consumers.)
+preserved for backward compatibility with existing JSON consumers. `duplicateIds` is the raw
+scan-level collision list — same shape as `scan`'s `duplicateIds` (§4) — and is `[]` when there are
+no collisions; each duplicate ID is additionally folded into `errors` as an invalid-monitor entry,
+so `invalid`/`errors` already reflect the duplicate without requiring a consumer to cross-reference
+`duplicateIds`.)
 
 ### Validation logic (current)
 
@@ -1188,7 +1194,8 @@ All commands set `process.exitCode = 1` rather than calling `process.exit(1)`. T
 | `inbox`    | `fail`     | in-process                        | Fully implemented                           |
 | `inbox`    | `archive`  | in-process                        | Fully implemented                           |
 | `monitor`  | `test`     | in-process                        | Fully implemented                           |
-| `monitor`  | `history`  | socket                            | Fully implemented                           |
+| `monitor`  | `history`  | socket (with in-process fallback) | Fully implemented                           |
+| `monitor`  | `explain`  | socket (with in-process fallback) | Fully implemented                           |
 | `source`   | `list`     | in-process                        | Fully implemented                           |
 | `source`   | `search`   | —                                 | Placeholder / not implemented (NP3)         |
 | `source`   | `install`  | —                                 | Placeholder / not implemented (NP3)         |
