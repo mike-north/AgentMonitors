@@ -37,3 +37,78 @@ jobs:
 
       - name: Test (serial daemon-spawn)
         run: pnpm test:serial
+
+  # Guards the failure class in ENG_TEAM_INSTRUCTIONS.md rule 8: a package
+  # missing CHANGELOG.md, publishConfig, or a built entry point has broken
+  # the release pipeline at release time (crashing the changesets action)
+  # rather than at PR time. This detects "should this PR even run the
+  # dry-run" cheaply, without a full pnpm install, so docs-only PRs skip it.
+  release-collateral-changed:
+    name: Detect Release-Collateral Changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event_name == 'pull_request'
+    outputs:
+      changed: ${{ steps.filter.outputs.changed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Check for release-collateral-relevant changes
+        id: filter
+        shell: bash
+        run: |
+          set -euo pipefail
+          pattern='^(libs/core/|plugins/source-api-poll/|plugins/source-command-poll/|plugins/source-file-fingerprint/|plugins/source-incoming-changes/|plugins/source-schedule/|apps/cli/|apps/agentmonitors/|scripts/|\.github/workflows/(release|ci)\.yml)'
+          files="$(git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}")"
+          echo "Changed files:"
+          echo "$files"
+          if echo "$files" | grep -Eq "$pattern"; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # AC1: runs the publish dry-run (after the required build) on PRs that
+  # touch publishable package directories, scripts/, or the release
+  # workflow, path-filtered so docs-only PRs don't pay the cost. Always runs
+  # on push to main / workflow_dispatch — this is the actual pre-release
+  # checkpoint, since Release.yml only fires after this workflow succeeds.
+  # No npm auth/registry write is required: `npm pack --dry-run` and
+  # `npm view` (unauthenticated registry read) are the only network/process
+  # calls made.
+  publish-dry-run:
+    name: Publish Dry-Run Guard
+    needs: release-collateral-changed
+    if: |
+      always() &&
+      (github.event_name != 'pull_request' || needs.release-collateral-changed.outputs.changed == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build publishable packages
+        run: pnpm build
+
+      - name: Publish dry-run (validates release collateral)
+        run: pnpm publish:packages:dry-run
+
+      - name: Publish dry-run collateral tests
+        run: pnpm test:scripts
