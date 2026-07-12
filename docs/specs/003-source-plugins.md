@@ -318,10 +318,16 @@ watch:
     - '**/generated-*.ts'
   cwd: /optional/base/path
   interval: 30s
+  backend: auto # optional; auto | fs-events | watchman | inotify | kqueue | windows
 ```
 
 Required field: `globs`. Optional fields: `ignore` (exclude glob string or array of exclude glob
-strings), `cwd` (string), `interval` (duration string).
+strings), `cwd` (string), `interval` (duration string), `backend` (string; see §3.9 below).
+
+> **TARGET** — The `backend` field and the watch-mode behavior described in §3.8–§3.10 are **target**
+> behavior, not current. The current implementation of `file-fingerprint` uses `observe()` only
+> (the polling path described in §3.2). Everything in §3.8–§3.10 is the intended post-implementation
+> contract; it MUST be marked _current_ (with `verified:` references) when the feature ships.
 
 `globs` accepts **either** a single pattern as a bare string **or** an array of patterns
 (OR-ed together). The single-file/single-glob case is therefore the one-line form:
@@ -643,6 +649,180 @@ The following test scenarios cover the sigil-based glob scope feature:
 - **Cross-session projection:** a workspace-agnostic event (from an absolute or home-relative
   user-level monitor) projects into a session whose `workspacePath` is a project directory
   different from where the monitor is defined — proving `sessionsForWorkspace(null)` is used.
+
+### 3.8 Watch mode: event-driven change detection (TARGET)
+
+> **Status: target.** This section and §3.9–§3.10 describe the intended implementation of
+> `watch()` for `file-fingerprint`. None of this is current behavior; the current source uses
+> `observe()` only (§3.2). These rules MUST be moved to _current_ status with `verified:`
+> references when the feature ships (process: [004 §5–6](./004-validation-testing.md)).
+
+`file-fingerprint` **MUST** implement `watch()` and opt into the existing continuous-watch contract
+(§2, G5/NP4). Watch mode is the **default change-detection mechanism for long-lived
+`file-fingerprint` monitors**; the `interval` field becomes a fallback-only knob used when the
+watcher cannot be initialized (see §3.9).
+
+The watcher MUST be implemented via **`@parcel/watcher`** (auto mode by default). `@parcel/watcher`
+is an in-process N-API native addon that transparently uses the most capable backend available
+(FSEvents on macOS, inotify on Linux, ReadDirectoryChangesW on Windows, or Watchman when the user
+has it installed), ships prebuilt binaries so there is no compile-on-install step, and requires no
+external daemon process. It therefore preserves the local-first "ordinary dev-tool process" posture
+(PP9, NP1).
+
+#### Why `observe()` is retained (non-negotiable)
+
+`watch()` does not replace `observe()`; both MUST be implemented:
+
+1. **`daemon once`** executes a single in-process tick with no event loop to host a watcher; it
+   MUST call `observe()` directly (see [002 §10.1](./002-runtime-delivery.md)).
+2. **Unreliable filesystems** — network mounts, some FUSE/overlay/container filesystems — cannot
+   deliver reliable OS-level events; polling is the only correct mechanism on those.
+
+When the runtime's tick loop calls `observe()` while an active watcher is running for the same
+monitor, it MUST skip that monitor's `observe()` call (G5/NP4, [002 §2.3](./002-runtime-delivery.md)).
+`daemon once` always uses `observe()` regardless of whether `watch()` is implemented.
+
+#### How watch works
+
+`watch()` opens an `@parcel/watcher` subscription for the resolved glob tree (`cwd` + `globs` +
+`ignore` patterns). When the OS or Watchman delivers a file-system event for a matched path:
+
+1. The source re-computes the SHA-256 fingerprint of the affected file(s).
+2. It compares against the in-memory fingerprint state (the same `FingerprintState` shape as
+   `nextState` in §3.2).
+3. For each changed, created, or deleted path, it **yields** one `Observation` through the
+   `AsyncIterable<Observation>` exactly as `observe()` would, using the same observation shape
+   (§3.2), change-kind classification (§3.3), and salience policy (§3.4).
+4. It updates the in-memory fingerprint state.
+
+A small internal coalesce window (~50–100 ms) MAY be applied before emitting, to absorb
+editor atomic-save sequences (write-tmp → rename) as a single change event. This is an
+implementation detail of the watcher driver and MUST NOT affect the observation shape.
+
+The `context.signal` abort is the watcher's stop signal: `watch()` MUST close the underlying
+`@parcel/watcher` subscription and stop yielding when `context.signal` fires. The runtime aborts
+the signal on daemon shutdown, monitor removal, or watcher error (see [002 §2.3](./002-runtime-delivery.md)).
+
+#### Startup reconciliation (reconcile-on-start)
+
+When a watcher boots — either at daemon startup or after a restart — it MUST perform a one-shot
+`observe()` call against the **persisted fingerprint baseline** before opening the watcher
+subscription. This reconcile-on-start pass detects any file changes that occurred while the daemon
+was offline, so no downtime loss occurs. The reconcile observation flows through the same
+notify-dispatch → materialization → projection pipeline as any other observation (PP1, PP6).
+
+The sequence is:
+
+1. Load the persisted `sourceState` (fingerprints baseline).
+2. Run one full `observe()` pass against the current file tree; emit any resulting observations
+   through the runtime's `ingest()` path.
+3. Record the updated fingerprint state as the in-memory watcher baseline.
+4. Open the `@parcel/watcher` subscription (§3.8 above).
+
+> **Example (reconcile-on-start net diff).** The daemon is stopped for two minutes; during that
+> time `foo.ts` is modified and `bar.ts` is deleted. When the daemon restarts, the reconcile pass
+> diffs the current file tree against the persisted baseline, emitting a `modified` observation for
+> `foo.ts` and a `deleted` observation for `bar.ts`. The watcher then opens and from that point
+> forward delivers events in real time. No changes made during the downtime window are lost.
+>
+> **Test implication.** A test that stops the daemon, mutates a watched file, restarts, and
+> immediately calls the watcher boot sequence MUST see the mutation surfaced as a reconcile
+> observation before any OS-level watcher events arrive.
+
+### 3.9 Backend selection and failure policy (TARGET)
+
+> **Status: target.** Part of the §3.8 event-driven feature. All rules here are target.
+
+The optional `backend` scope field controls which underlying watching mechanism `@parcel/watcher`
+uses. When omitted it defaults to `auto`.
+
+| Value       | Meaning                                                                                                                              |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `auto`      | Use the best available native backend. Watchman is used if installed; otherwise FSEvents / inotify / ReadDirectoryChangesW / kqueue. |
+| `fs-events` | macOS FSEvents API (macOS only).                                                                                                     |
+| `watchman`  | Meta Watchman daemon (must be installed separately by the user).                                                                     |
+| `inotify`   | Linux inotify API (Linux only).                                                                                                      |
+| `kqueue`    | BSD/macOS kqueue API.                                                                                                                |
+| `windows`   | Windows ReadDirectoryChangesW API (Windows only).                                                                                    |
+
+Two distinct failure policies apply depending on whether `backend` is `auto` or pinned:
+
+**`auto` (default): fall back to polling with a loud warning.**
+
+If watcher initialization fails under `auto` (e.g., the filesystem is a network mount that does
+not deliver events, or `@parcel/watcher` cannot load its native addon), the source MUST:
+
+1. Fall back to the `observe()`-based poll path (using the `interval` field as the poll cadence, or
+   the default 30s if omitted).
+2. Surface a **loud warning** on the monitor — visible in `agentmonitors monitor explain` output —
+   describing that watch mode is unavailable and the monitor is polling instead.
+
+Degradation to polling MUST NOT be silent. Silent degradation would mask infrastructure problems
+(e.g. a developer unaware that a network mount cannot deliver events) and defeat the purpose of
+the `backend: auto` selection.
+
+**Pinned backend (`fs-events`, `watchman`, `inotify`, `kqueue`, `windows`): fail the monitor.**
+
+If the pinned backend is unavailable, the source MUST fail the monitor with a clear, actionable
+error. It MUST NOT silently fall back to a different native backend or to polling.
+
+Rationale: an author who pins a backend (e.g., `backend: watchman`) has expressed a hard
+requirement — typically because `auto` would pick a less capable mechanism for a very large tree.
+Silently using a different mechanism would defeat that requirement without any signal to the author.
+
+**Important: `@parcel/watcher`'s own behavior does not enforce this policy.** `@parcel/watcher`'s
+native behavior is to fall back to its default backend if the pinned one is unavailable. The
+`file-fingerprint` implementation MUST therefore check backend availability itself — before
+delegating to `@parcel/watcher` — and reject the monitor with an explicit error when a pinned
+backend is not available on the current platform or system. Delegating the check to the library is
+insufficient.
+
+> **Example (pinned fail-loud).** A monitor declares `backend: watchman` on a machine where
+> Watchman is not installed. The source detects that Watchman is unavailable (e.g., by testing the
+> `watchman` binary or probing the socket), fails the monitor with
+> `"file-fingerprint: pinned backend 'watchman' is not available on this system"`, and does not
+> fall back to FSEvents or polling. The error is surfaced in `daemon once` / `daemon run` error
+> output and in `agentmonitors monitor explain`.
+>
+> **Test implication.** A test that supplies `backend: watchman` while Watchman is not available
+> MUST see a monitor-level failure (not a silent polling fallback). A test that supplies `backend:
+auto` with watcher init forced to fail MUST see the monitor switch to polling AND a warning
+> visible in its explain output.
+
+### 3.10 Periodic source-state checkpointing during watch (TARGET)
+
+> **Status: target.** Part of the §3.8 event-driven feature. This section describes a new core
+> contract addition (also specified in [002 §2.4](./002-runtime-delivery.md)) required for
+> mid-watch crash safety. All rules here are target.
+
+While `watch()` is running, the in-memory fingerprint state advances with every OS event —
+but without periodic persistence, a mid-watch daemon crash would lose that state. On restart the
+daemon would re-observe from the last persisted baseline and re-emit observations for changes that
+had already been delivered and acknowledged, creating duplicate deliveries.
+
+To prevent this, `file-fingerprint`'s `watch()` implementation MUST periodically checkpoint its
+updated fingerprint state back to the runtime using the watch-checkpoint mechanism specified in
+[002 §2.4](./002-runtime-delivery.md). The checkpoint carries the current `FingerprintState` as
+`nextState` so the runtime can persist it durably — respecting the G14 durable-write-before-Interpret
+ordering ([002 §1.1.8](./002-runtime-delivery.md)) — before any downstream pipeline work.
+
+> **Why this is a core-contract addition.** Today ([002 §2.3](./002-runtime-delivery.md)), the
+> runtime leaves `sourceState` untouched while a watcher is running (source state is only advanced
+> by `observe()` returning `nextState`). Watch-mode checkpointing requires the runtime to accept an
+> out-of-band state write from an active watcher. The new `context`-level callback or periodic
+> `{ observation, nextState }` checkpoint shape is the mechanism for this write-back; its exact
+> TypeScript shape is specified in [002 §2.4](./002-runtime-delivery.md).
+
+A checkpoint interval of approximately the `interval` field (or the default 30s if omitted) is
+a reasonable default. The checkpoint MUST be durable before the runtime interprets the accompanying
+observation (G14 ordering). If the checkpoint write fails, `watch()` SHOULD treat this as a
+transient error, log a warning, and continue watching — a failed checkpoint is not cause to abort
+the watcher.
+
+> **Test implication.** A test that (a) starts a watcher, (b) triggers file changes that are
+> observed and yielded, (c) simulates a daemon crash before the next checkpoint, and (d) restarts the
+> daemon MUST see the reconcile-on-start pass (§3.8) report only the changes that occurred
+> _after_ the last checkpoint — not re-report changes that were delivered before the crash.
 
 ## 4. Bundled Source: `api-poll`
 
