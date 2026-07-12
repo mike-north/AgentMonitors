@@ -5709,7 +5709,9 @@ describe('hooks-only delivery parity (issue #270)', () => {
       }
       const unreadEvents = JSON.parse(unread().stdout) as { id: string }[];
       expect(unreadEvents).toHaveLength(1);
-      const eventId = unreadEvents[0]?.id;
+      const [unreadEvent] = unreadEvents;
+      if (!unreadEvent) throw new Error('expected exactly one unread event');
+      const eventId = unreadEvent.id;
 
       // 3. Delivery claimed via `hook deliver`, fed a real UserPromptSubmit
       //    stdin payload — the same wire contract Claude Code uses (006

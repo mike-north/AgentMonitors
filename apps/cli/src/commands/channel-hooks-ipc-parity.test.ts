@@ -53,8 +53,9 @@ describe('agentmon_ack MCP tool vs. hooks-only CLI: shared daemon-IPC plumbing (
       importsFromRuntimeClient(EVENTS_SOURCE, 'acknowledgeEventsClient'),
     ).toBe(true);
     // Not just imported — actually invoked by both ack handlers.
-    expect(CHANNEL_SOURCE).toContain('await acknowledgeEventsClient(');
-    expect(EVENTS_SOURCE).toContain('await acknowledgeEventsClient(');
+    // (Whitespace-tolerant so a formatter reflow can't break the assertion.)
+    expect(CHANNEL_SOURCE).toMatch(/await\s+acknowledgeEventsClient\s*\(/);
+    expect(EVENTS_SOURCE).toMatch(/await\s+acknowledgeEventsClient\s*\(/);
   });
 
   it('the channel push loop (channel.ts) and `hook deliver`/`hook claim` (hook.ts) both call claimDeliveryClient from the same module', () => {
@@ -64,7 +65,7 @@ describe('agentmon_ack MCP tool vs. hooks-only CLI: shared daemon-IPC plumbing (
     expect(importsFromRuntimeClient(HOOK_SOURCE, 'claimDeliveryClient')).toBe(
       true,
     );
-    expect(CHANNEL_SOURCE).toContain('await claimDeliveryClient(');
-    expect(HOOK_SOURCE).toContain('await claimDeliveryClient(');
+    expect(CHANNEL_SOURCE).toMatch(/await\s+claimDeliveryClient\s*\(/);
+    expect(HOOK_SOURCE).toMatch(/await\s+claimDeliveryClient\s*\(/);
   });
 });
