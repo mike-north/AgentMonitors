@@ -27,7 +27,7 @@ and add a [`spec-changelog.md`](docs/specs/spec-changelog.md) entry
 
 ## Commands
 
-pnpm + Nx monorepo (pnpm 10.30.3). All targets run through Nx with caching and dependency ordering.
+pnpm + Nx monorepo (version pinned via package.json#packageManager). All targets run through Nx with caching and dependency ordering.
 
 ```bash
 pnpm build          # build all publishable packages (excludes workspace root + website)

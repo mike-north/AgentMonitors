@@ -2,3 +2,8 @@ packages:
   - 'libs/*'
   - 'apps/*'
   - 'plugins/*'
+allowBuilds:
+  better-sqlite3: true
+  esbuild: true
+  nx: true
+  sharp: true
