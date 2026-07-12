@@ -4,7 +4,9 @@
 > **Depends on:** [000-principles.md](./000-principles.md), [002-runtime-delivery.md](./002-runtime-delivery.md)
 > **Covers:** the adapter seam, the delivery-transport abstraction, the hook-state transport
 > (current), the Claude Code **channel** transport (target), workspace/session binding,
-> cross-transport deduplication, and the availability/fallback contract
+> cross-transport deduplication, the availability/fallback contract, and the **multi-host adapter
+> matrix** (target, §11) — what a Codex or Cursor adapter must provide alongside the existing Claude
+> Code adapter, and which parts of this document are Claude-specific vs host-generic
 
 ---
 
@@ -27,12 +29,13 @@ can use (PP4, AP1, AP6).
 
 ### Principles satisfied
 
-| Section                        | Principles         |
-| ------------------------------ | ------------------ |
-| Transport seam & contract      | PP4, AP1, AP3, AP6 |
-| Hook-state transport (current) | PP4, AP1, BP2      |
-| Channel transport (target)     | PP4, BP2, NP-CH    |
-| Availability & fallback        | PP7, NP-CH         |
+| Section                                 | Principles         |
+| --------------------------------------- | ------------------ |
+| Transport seam & contract               | PP4, AP1, AP3, AP6 |
+| Hook-state transport (current)          | PP4, AP1, BP2      |
+| Channel transport (target)              | PP4, BP2, NP-CH    |
+| Availability & fallback                 | PP7, NP-CH         |
+| Multi-host adapter matrix (§11, target) | PP4, AP3, AP6, NP5 |
 
 > **NP-CH (non-property, this doc):** AgentMon does **not** require Claude Code channels. Channels
 > are a research-preview, version-gated, org-gated MCP surface (see §5). A transport that may be
@@ -635,3 +638,145 @@ Transport and integration tests should be able to prove:
   observed-not-contracted, so re-verify alongside the channel-probe diagnostic on new host versions.
 - Decide whether the channel server should open a synthetic workspace-lead session when channels are
   used **without** the hook-driven `session open` flow, or require the hook flow as a precondition.
+- **Multi-host (§11):** the concrete per-host lifecycle-hook names, session-identity signals, and
+  workspace-binding mechanisms for Codex and Cursor (CLI + desktop) are **not yet pinned** — they
+  **MUST** be confirmed with a per-host probe diagnostic (the `experiments/channel-probe` pattern
+  generalized) before each host's adapter is marked _current_. §11 fixes the adapter **contract**;
+  the probe fills the matrix cells.
+
+## 11. Multi-Host Adapter Matrix (_target_)
+
+> **Status: target.** This section generalizes the single Claude Code adapter to the local hosts
+> greenlit in Epic #259 — **Claude Code, Codex, and Cursor, each in a CLI and a desktop/IDE
+> surface**. Every rule here is target; each host's adapter **MUST** be moved to _current_ with
+> `verified:` references (adapter module + integration test + a pinning probe) when it ships, and the
+> matching [roadmap.md](./roadmap.md) gap retired. Scope is **local hosts only** — no cloud-hosted
+> agents ([NP5](./000-principles.md); the web-agent defer stands, see closed #126).
+
+### 11.1 The adapter contract, restated for N hosts
+
+A new host is a **new adapter**, never a change to the runtime core (the host-agnostic-core
+invariant, [002 §11.1](./002-runtime-delivery.md), AP3). Each host's adapter **MUST** satisfy the
+existing `AgentRuntimeAdapter` contract ([002 §11.1](./002-runtime-delivery.md),
+`libs/core/src/adapter/types.ts`) — `name`, `hookEventMap`, `defaultHookStatePath`,
+`createSessionInput`, `materializeHookState` — plus provide, for its host, the following **contract
+dimensions** (some are implied by the existing members; §11.2 makes them explicit so a matrix cell is
+unambiguous):
+
+1. **Lifecycle-event mapping** (`hookEventMap`) — map each of the seven `AgentLifecycleEvent`s
+   (`session-opened`, `session-dormant`, `turn-interruptible`, `turn-ended`, `turn-idle`,
+   `pre-compact`, `post-compact`) to the host's concrete lifecycle-hook name. A host that lacks an
+   analogue for a given event **MUST** omit/degrade that event's delivery rather than invent one
+   (the missing lifecycle simply does not fire; the durable event is still recoverable at the next
+   supported lifecycle, PP1).
+2. **Delivery lifecycle points** — identify which host events correspond to the three
+   `DeliveryLifecycle`s (`turn-interruptible`, `turn-idle`, `post-compact`) **and** which of them
+   honor **advisory, non-blocking context injection** (the `additionalContext` analogue of §5.4). The
+   adapter **MUST** emit delivery only at events that honor advisory injection; emitting at an event
+   that ignores it is a silent no-op (the §5.4 rule, generalized).
+3. **Session identity** — a documented, stable way to resolve the **host session id**
+   (`hostSessionId`) for a given invocation, so events project into the right session
+   ([002 §6.1](./002-runtime-delivery.md)). Whether it arrives on **stdin** (Claude hooks, §5.0), in
+   an **environment variable** (Claude MCP/channel, §4.4), or by a host-specific mechanism is the
+   adapter's concern; the resolved value **MUST** be the same id the session was opened under
+   (`session open --host-session-id …`).
+4. **Workspace binding** — a documented way to resolve the **workspace path** (`workspacePath`) for
+   the invocation (env var, process cwd, an MCP `roots/list` analogue, or an explicit flag), so
+   per-workspace daemon isolation ([002 §10.2](./002-runtime-delivery.md)) and workspace-scoped
+   projection hold.
+5. **Delivery-surface state** (`defaultHookStatePath` / `materializeHookState`) — a per-session state
+   location and serialization the host's integration reads (the hook-state file, or the
+   host-appropriate equivalent). The default hook-state **path** shape
+   (`<workspace>/.agentmonitors/sessions/<encoded-session>/hook-state.json`,
+   [002 §11.3](./002-runtime-delivery.md)) is host-generic and SHOULD be reused unless a host
+   requires otherwise.
+6. **Availability & fallback** — a **portable baseline** transport that always works for the host
+   (the hook-state / advisory-injection path, §3/§5), plus any **richer, additive** transport the
+   host offers (a channel/MCP-push analogue, §4). The richer transport **MUST** be additive and
+   **MUST NOT** change delivery semantics (the generalized NP-CH rule of §6): same events, same
+   urgency, same unread/claimed/acknowledged model — only the surface.
+
+### 11.2 Which parts of this document are Claude-specific vs host-generic
+
+A new adapter re-implements the **Claude-specific** rows below and **inherits** the host-generic ones
+unchanged. This classification is itself normative: a host-generic rule **MUST NOT** be re-decided
+per host, and a Claude-specific rule **MUST NOT** be assumed to hold for another host without a probe.
+
+| Concern                                                                                    | Host-generic (inherited) |  Claude-specific (re-provide per host)   |
+| ------------------------------------------------------------------------------------------ | :----------------------: | :--------------------------------------: |
+| Transport seam: consume `DeliveryClaim`, don't re-derive (§2)                              |            ✅            |                                          |
+| Claimed-not-acknowledged (BP2); lead-only projection ([002 §6](./002-runtime-delivery.md)) |            ✅            |                                          |
+| Urgency + lifecycle preservation ([002 §9](./002-runtime-delivery.md))                     |            ✅            |                                          |
+| Cross-transport dedup via claimed state (§4.5)                                             |            ✅            |                                          |
+| Content safety for any injecting transport (§4.6)                                          |            ✅            |                                          |
+| Availability/fallback **principle** (§6, NP-CH generalized)                                |            ✅            |                                          |
+| Interpret-adapter boundary exists (§2.1) — tool invocation behind an adapter               |            ✅            | concrete tool/argv is host/user-specific |
+| `hookEventMap` **values** ([002 §11.2](./002-runtime-delivery.md))                         |                          |                    ✅                    |
+| Hook **stdin** JSON contract: `session_id` / `hook_event_name` / `cwd` (§5.0)              |                          |                    ✅                    |
+| Context-event set honoring `additionalContext` + wire shape (§5.1, §5.4)                   |                          |                    ✅                    |
+| `<channel>` MCP push mechanism + field schema (§4.1–§4.2)                                  |                          |                    ✅                    |
+| Binding signals `CLAUDE_CODE_SESSION_ID` / `CLAUDE_PROJECT_DIR` / `roots/list` (§4.4)      |                          |                    ✅                    |
+| Activation packaging (aipm marketplace, `hooks.json`, `.mcp.json`) (§5.6)                  |                          |                    ✅                    |
+
+### 11.3 The matrix
+
+Columns are the six local host surfaces in scope; rows are the §11.1 contract dimensions. The
+**Claude Code** column is _current_ today (verified in `libs/core/src/adapter/claude.ts` and §3–§6
+above); the **Codex** and **Cursor** columns are **target** — each cell marked _(probe)_ **MUST** be
+pinned by a per-host diagnostic before that adapter ships (§11.6). Illustrative host details are
+marked _(unverified)_ where they reflect a plausible but not-yet-probed mechanism.
+
+| Contract dimension                                 | Claude Code (CLI / desktop)                                                                                                                | Codex (CLI / desktop)                                                                   | Cursor (CLI / IDE)                                                                 |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| **Lifecycle mapping** (`hookEventMap`)             | current — SessionStart / SessionEnd / PreToolUse / Stop / TeammateIdle / PreCompact / PostCompact ([002 §11.2](./002-runtime-delivery.md)) | _(probe)_ map to Codex lifecycle hooks; omit unsupported                                | _(probe)_ map to Cursor hooks; omit unsupported                                    |
+| **Delivery lifecycle points + advisory injection** | current — context events `UserPromptSubmit` / `PostToolUse` / `SessionStart` honor `additionalContext` (§5.4)                              | _(probe)_ identify advisory-injection-capable events                                    | _(probe)_ identify advisory-injection-capable events                               |
+| **Session identity** (`hostSessionId`)             | current — stdin `session_id` (hooks, §5.0); `CLAUDE_CODE_SESSION_ID` (MCP, §4.4)                                                           | _(probe)_ host-provided id signal                                                       | _(probe)_ host-provided id signal (unverified — e.g. a `CURSOR_`-prefixed env var) |
+| **Workspace binding** (`workspacePath`)            | current — stdin `cwd` → `CLAUDE_PROJECT_DIR` → cwd (§5.0); `roots/list` (§4.4)                                                             | _(probe)_ env / cwd / roots analogue                                                    | _(probe)_ env / cwd / workspace-folder analogue                                    |
+| **Delivery-surface state**                         | current — `hook-state.json` path (§3, [002 §11.3](./002-runtime-delivery.md))                                                              | inherit path shape unless host requires otherwise                                       | inherit path shape unless host requires otherwise                                  |
+| **Portable baseline transport**                    | current — hook-deliver / hook-state (§3, §5)                                                                                               | _(probe)_ hook/notify-command analogue; else the best always-available advisory surface | _(probe)_ hook analogue; else best always-available advisory surface               |
+| **Richer additive transport**                      | current — Claude channel MCP push (§4)                                                                                                     | _(probe)_ MCP/push analogue if any; additive only                                       | _(probe)_ MCP/push analogue if any; additive only                                  |
+
+### 11.4 CLI vs desktop surfaces
+
+Each host is scoped with **two surfaces** (CLI and desktop/IDE). The default rule:
+
+- a host's two surfaces **SHOULD** be served by **one adapter** for that host when they share the
+  same lifecycle-hook, session-identity, and workspace-binding mechanisms;
+- if a host's CLI and desktop surfaces expose **different** integration mechanisms (e.g. the CLI
+  drives stdin hooks while the desktop only offers an MCP/extension surface), the adapter **MUST**
+  branch on the surface internally (a `surface: 'cli' | 'desktop'` distinction inside the one
+  host adapter) rather than misreport one surface's mechanism for the other. It **MUST NOT** be
+  split into two unrelated adapters that duplicate the host's delivery semantics.
+
+> **Decision flagged (§10):** whether any in-scope host actually needs the internal CLI/desktop
+> branch is a per-host probe outcome; the contract only requires that the branch exist **if** the
+> mechanisms diverge.
+
+### 11.5 Delivery semantics are invariant across hosts
+
+Adding a host **MUST NOT** change any delivery semantic. For every adapter:
+
+- events, urgency bands, and the three delivery lifecycles are identical to Claude's
+  ([002 §9](./002-runtime-delivery.md)); a host only changes _the surface and the trigger events_,
+  never _what_ is worth delivering or _when_ it settles (that is runtime-owned, AP3/PP9);
+- surfacing marks rows **claimed**, never **acknowledged** (BP2); acknowledgement stays an explicit
+  act (SP4);
+- only **lead** sessions receive deliveries ([002 §6](./002-runtime-delivery.md));
+- the agent-facing verbs and ephemeral-monitor declaration of
+  [007](./007-agent-facing-interaction.md) resolve session identity through **this same adapter
+  contract** (§11.1 dimension 3), so they work on every host an adapter supports.
+
+### 11.6 Validation implications
+
+Per [004 §6](./004-validation-testing.md), each host adapter, when it ships, **MUST** carry:
+
+- an **integration test** that drives the host's **real input contract** — the actual lifecycle-hook
+  command string(s) and stdin/-env payload shape — end to end (boot, deliver, deregister), the
+  [004 §3.5](./004-validation-testing.md) "config-drift" pattern already applied to the Claude
+  `hooks.json`, not a hand-built approximation;
+- a **binding-probe artifact** (the `experiments/channel-probe` pattern generalized) that records the
+  host version and confirms the session-identity and workspace-binding signals the matrix cell
+  claims, so an observed-not-contracted signal is re-verifiable on a new host version (the §4.4
+  caveat, generalized);
+- proof that **delivery semantics are unchanged** vs the Claude adapter (§11.5): same claimed-not-ack
+  behavior (BP2), same lead-only projection, same urgency/lifecycle handling.

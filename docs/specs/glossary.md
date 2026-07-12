@@ -53,6 +53,12 @@ is authoritative; this page is a quick index, not the contract.
 - **Query scope (`queryScope`)** — Structured, queryable facets of an observation used to
   filter events (e.g. `filePath`, `url`, `cron`). Filtering targets this, not raw payload
   internals. [002 §14](./002-runtime-delivery.md).
+- **Poll cursor / source cursor protocol (target)** — The source-side poll-cost optimization sketch
+  of [003 §13](./003-source-plugins.md): a "cursor" a source advances to avoid re-reading unchanged
+  upstream data. Designed only as far as a sketch (issue #81), to be fully specified if measured poll
+  cost ever justifies it. **Disambiguation:** unrelated to **Cursor**, the editor/agent _host_ served
+  by a Cursor adapter ([006 §11](./006-agent-integration.md), roadmap G20) — same word, different
+  domain.
 
 ## Runtime & delivery
 
@@ -113,6 +119,27 @@ is authoritative; this page is a quick index, not the contract.
   and hook-state paths (e.g. `claudeCodeAdapter`). [002 §"Agent Integration"](./002-runtime-delivery.md).
 - **Claim** — Advisory surfacing of pending work to an agent at a lifecycle point. Marks rows
   claimed; does not imply completion or acknowledgement. [002 §9.4](./002-runtime-delivery.md). (BP2)
+
+## Agent-facing interaction & ephemeral monitors (target)
+
+- **Agent-facing verb (target)** — A **read-only or declaration-only** `agentmonitors` command an
+  agent uses to _act on_ a pushed signal (`snapshot`, `diff`, `summary`) or _declare_ a watch
+  (`watch`) / inspect state (`inspect`). Never claims, acknowledges, advances a cursor, or triggers a
+  fresh observation. [007 §2–§3](./007-agent-facing-interaction.md),
+  [005 §14](./005-cli-reference.md). (PP9, PP10, AP6)
+- **Ephemeral monitor (target)** — An **agent-declared, session-scoped** monitor handled by the
+  **same daemon and pipeline** as a persistent `MONITOR.md` monitor; it differs only in authoring
+  path (declared at runtime, not a file) and lifetime (bound to the declaring session, reaped when it
+  ends). Not a parallel system. [007 §4](./007-agent-facing-interaction.md). (AP7, PP9)
+- **Armed (condition met but not yet fired) (target)** — A change the daemon has **detected** but is
+  **holding** before delivery — inside a high-urgency settle window, a debounce/throttle/rollup
+  window, or a recorded `net`/Interpret suppression. Distinct from _pending_ (fired, unread) and
+  _received_ (delivered). Surfaced by `agentmonitors inspect`.
+  [007 §5.2](./007-agent-facing-interaction.md). (PP7)
+- **Multi-host adapter matrix (target)** — The per-host requirements a Codex or Cursor adapter (CLI +
+  desktop) must satisfy under the `AgentRuntimeAdapter` contract, and the classification of which
+  parts of [006](./006-agent-integration.md) are host-generic vs Claude-specific.
+  [006 §11](./006-agent-integration.md). (AP3, AP6)
 
 ## Legacy
 
