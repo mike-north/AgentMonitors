@@ -302,8 +302,9 @@ Interpret → Deliver → [React]`:
 
 > The cursor protocol ([003 §13](./003-source-plugins.md)) is deliberately **not** a roadmap item:
 > per #81 it is designed only as far as a sketch, to be fully specified if measured poll cost ever
-> justifies it. (Unrelated to the **Cursor host adapter** in G20 — "cursor protocol" is the
-> source-side poll-cursor sketch; G20 is the Cursor editor host.)
+> justifies it. (Unrelated to the **Cursor host adapter** in G20 — this "cursor protocol" is the
+> source-side poll-cursor sketch, G20 is the Cursor editor host; see the **Poll cursor / source
+> cursor protocol** disambiguation in [glossary.md](./glossary.md).)
 
 ## Test gaps
 

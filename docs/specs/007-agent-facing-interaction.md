@@ -219,14 +219,19 @@ An ephemeral monitor's lifetime is **bound to its declaring session's lifetime**
 
 - it becomes active on declaration and is evaluated on the normal runtime tick
   ([002 §2](./002-runtime-delivery.md)) exactly like a persistent monitor;
-- it **MUST** be **reaped** when its declaring session ends or goes dormant
-  ([002 §6, §10.2 idle reaping](./002-runtime-delivery.md)) — an ephemeral monitor **MUST NOT**
-  outlive its session or leak into another session (session isolation);
+- it **MUST** be **reaped** when its declaring session **ends** (explicit session close,
+  [002 §6.1](./002-runtime-delivery.md)) — an ephemeral monitor **MUST NOT** outlive its session or
+  leak into another session (session isolation). Reaping when the session transitions to **dormant**
+  (without an explicit close) is the intended behavior too, but **002 does not yet specify a
+  per-session dormancy trigger** — only explicit session close ([002 §6.1](./002-runtime-delivery.md)).
+  (The daemon's own idle self-termination, [002 §10.2](./002-runtime-delivery.md), is a **different**
+  concern: it reaps the _daemon_ after all active sessions for a workspace hit zero, not an
+  individual session.) The implementing work **MUST** define that per-session dormancy trigger (§8);
 - an agent **MAY** cancel it earlier (`agentmonitors watch cancel <id>`), which reaps it immediately;
 - while the session lives, the ephemeral monitor and its durable state (source state, snapshots,
   per-recipient cursors, unread/claimed/acknowledged rows) **MUST survive a daemon restart and a
-  reboot** (the same durability floor as persistent monitors, PP1/BP1) — a restart within the
-  session's life re-hydrates it, a restart after the session has ended does not resurrect it.
+  reboot** (the same durability floor as persistent monitors, PP1) — a restart within the session's
+  life re-hydrates it, a restart after the session has ended does not resurrect it.
 - reaping an ephemeral monitor **MUST** clean up its runtime registration and stop further
   observation; whether its already-materialized `monitor_events` are retained for post-hoc
   observability or pruned with the session is a decision flagged in §8 (default: retain unread
@@ -344,8 +349,9 @@ When this document's rules ship, tests **MUST** prove:
 - **Ephemeral identity (§4.3).** An ephemeral id is namespaced, unique against persistent ids in the
   same workspace, and stable across a tick and a daemon restart.
 - **Ephemeral lifecycle (§4.4).** An ephemeral monitor survives a daemon restart while its session is
-  active, is reaped when the session ends/goes dormant, and does **not** resurrect after session end;
-  `watch cancel` reaps immediately.
+  active, is reaped on explicit session close ([002 §6.1](./002-runtime-delivery.md)) — and, once the
+  per-session dormancy trigger is defined (§8), on dormancy — and does **not** resurrect after session
+  end; `watch cancel` reaps immediately.
 - **Session isolation (§4.6).** An ephemeral monitor's events project into the declaring session
   only, not into a sibling lead session in the same workspace.
 - **Observability three-bucket distinctness (§5).** A change inside a settle/debounce/rollup window
@@ -377,6 +383,12 @@ reviewer can pin it before build:
   the semantics are fixed regardless.
 - **Snapshot retention floor (§3.2).** How far back historical `monitor_snapshots` are retained for
   arbitrary two-point diffs, and the error shape when a referenced point has been pruned.
+- **Per-session dormancy trigger (§4.4).** 002 specifies explicit session close
+  ([002 §6.1](./002-runtime-delivery.md)) but **not** an individual-session dormancy transition (the
+  daemon-level idle self-termination of [002 §10.2](./002-runtime-delivery.md) is a distinct,
+  daemon-wide concern). The implementing work **MUST** define when a session is considered dormant
+  so ephemeral monitors reap on dormancy, not only on explicit close — and 002 gains the matching
+  rule in the same change.
 - **Ephemeral-id scheme (§4.3).** Reserved-prefix vs separate id space; only the
   uniqueness/namespacing/stability requirements are fixed here.
 - **Ephemeral event retention on reap (§4.4).** Whether already-materialized ephemeral events are

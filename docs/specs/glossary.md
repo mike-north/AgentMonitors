@@ -53,6 +53,12 @@ is authoritative; this page is a quick index, not the contract.
 - **Query scope (`queryScope`)** — Structured, queryable facets of an observation used to
   filter events (e.g. `filePath`, `url`, `cron`). Filtering targets this, not raw payload
   internals. [002 §14](./002-runtime-delivery.md).
+- **Poll cursor / source cursor protocol (target)** — The source-side poll-cost optimization sketch
+  of [003 §13](./003-source-plugins.md): a "cursor" a source advances to avoid re-reading unchanged
+  upstream data. Designed only as far as a sketch (issue #81), to be fully specified if measured poll
+  cost ever justifies it. **Disambiguation:** unrelated to **Cursor**, the editor/agent _host_ served
+  by a Cursor adapter ([006 §11](./006-agent-integration.md), roadmap G20) — same word, different
+  domain.
 
 ## Runtime & delivery
 
