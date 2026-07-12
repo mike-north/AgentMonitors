@@ -8,7 +8,7 @@
 
 ## §1 Overview
 
-The binary is named **`agentmonitors`** and is described as _"Durable observation and inbox delivery for AI agents"_. `--version` is never a hardcoded literal — `apps/cli/src/index.ts`'s `getVersion()` reads it from the CLI package's own `package.json` at runtime, so it always tracks the published release (currently `0.7.0`; do not hardcode a specific value here as it will drift).
+The binary is named **`agentmonitors`** and is described as _"Durable observation and inbox delivery for AI agents"_. `--version` is never a hardcoded literal — `apps/cli/src/index.ts`'s `getVersion()` reads it from the CLI package's own `package.json` at runtime, so it always tracks the published release. Do not record a specific version value here; it will drift.
 
 Per AP6, all public CLI behaviour must be derivable from core contracts. The CLI wraps `@agentmonitors/core` and five bundled source packages (`@agentmonitors/source-file-fingerprint`, `@agentmonitors/source-api-poll`, `@agentmonitors/source-command-poll`, `@agentmonitors/source-schedule`, `@agentmonitors/source-incoming-changes`).
 

@@ -28,8 +28,8 @@ Agent Monitors spec set in `docs/specs/`.
   `duplicateIds`).
 - **005 Appendix A — corrected.** Added the missing `monitor explain` row (present in body prose,
   absent from the inventory table) and corrected `monitor history`'s transport to note its
-  in-process no-daemon fallback, matching the already-documented behavior in §6 and the `daemon
-status` row's wording.
+  in-process no-daemon fallback, matching the already-documented behavior in §6 and matching the
+  wording already used on the `daemon status` row.
 - Full inventory pass against `apps/cli/src/index.ts` and every `apps/cli/src/commands/*.ts` file
   confirmed no other command/flag drift; the `source search|install|update|remove` placeholders were
   already correctly marked (§7.2–§7.5 headers and Appendix A `Placeholder / not implemented (NP3)`).
