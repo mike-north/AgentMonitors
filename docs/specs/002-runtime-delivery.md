@@ -1054,6 +1054,8 @@ Verified: `apps/cli/src/runtime-client.ts` — `daemonTickClient()`: constructs 
 
 **Lazy boot:** `session start` spawns `daemon run` as a detached background process when no daemon is already listening at the per-workspace socket path, waits up to 8 seconds for the socket to appear, then opens the session. The spawner unref's the child, so the parent (the hook process) can exit while the daemon continues running. The coordination file `.claude/agentmonitors.local.md` holds `enabled`, `socket`, `db`, and `reap-after-ms` fields so sibling hooks can locate the per-workspace daemon without re-deriving paths.
 
+**Quick-exit when not enabled:** if `.claude/agentmonitors.local.md` is absent or has `enabled` unset/`false`, `session start` returns without opening a session or spawning a daemon — except it is not silent when the project already has monitor definitions sitting unwatched: see the "Monitors-found-but-disabled advisory" bullet in [006 §5.6](./006-agent-integration.md) for the one-line `additionalContext` advisory that case emits (issue #269). A project with no monitor definitions at all stays fully silent, unchanged.
+
 Verified: `apps/cli/src/commands/daemon.ts` — `runLoop()`; `run` subcommand; `apps/cli/src/detached-spawn.ts` — `spawnDetachedDaemon()`; `apps/cli/src/workspace-paths.ts` — `workspacePaths()`; `apps/cli/src/local-state.ts` — `readLocalState()`/`writeLocalState()`.
 
 ### 10.3 Socket path resolution

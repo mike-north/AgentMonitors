@@ -4209,6 +4209,138 @@ describe('lazy daemon lifecycle', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Silent opt-in dead-end fix: SessionStart advisory when monitors exist but
+// the project is not enabled (issue #269)
+// ---------------------------------------------------------------------------
+
+describe('session start: monitoring-disabled advisory (issue #269)', () => {
+  // Acceptance criterion 1 + 4: real hook stdin contract in, real SessionStart
+  // hook wire-shape JSON out, no daemon boot.
+  it('emits a one-line additionalContext advisory when monitors exist but the project is not enabled, exits 0, and boots no daemon', async () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-disabled-'));
+    const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-files');
+    mkdirSync(monitorsDir, { recursive: true });
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      [
+        '---',
+        'name: Watch files',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs:',
+        '    - "*.txt"',
+        `  cwd: ${JSON.stringify(ws)}`,
+        'urgency: normal',
+        '---',
+        'When files change, review them.',
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+    // Deliberately do NOT write .claude/agentmonitors.local.md — this is the
+    // "authored monitors, missed the enable step" scenario from the issue.
+
+    const { workspacePaths } = await import('../workspace-paths.js');
+    const { socket } = workspacePaths(ws);
+    const hostSessionId = `disabled-test-${Date.now()}`;
+    // Real hook stdin payload — session_id, hook_event_name, cwd — exactly as
+    // Claude Code sends it (no hand-built approximation).
+    const env = { CLAUDE_PROJECT_DIR: ws };
+
+    try {
+      const start = runWithStdin(
+        ['session', 'start'],
+        env,
+        sessionStartPayload(hostSessionId, ws),
+        ws,
+      );
+      expect(start.exitCode).toBe(0);
+
+      // The real SessionStart hook wire shape (§5.1): continue + hookSpecificOutput.
+      const output = JSON.parse(start.stdout) as {
+        continue: boolean;
+        hookSpecificOutput: {
+          hookEventName: string;
+          additionalContext: string;
+        };
+      };
+      expect(output.continue).toBe(true);
+      expect(output.hookSpecificOutput.hookEventName).toBe('SessionStart');
+      const ctx = output.hookSpecificOutput.additionalContext;
+      // Monitoring disabled, N monitors found, exact enable step.
+      expect(ctx).toContain('disabled');
+      expect(ctx).toContain('1 monitor definition found');
+      expect(ctx).toContain('.claude/agentmonitors.local.md');
+      expect(ctx).toContain('enabled: true');
+
+      // No daemon boot: the socket session start WOULD bind to (were it not
+      // quick-exiting) is never opened.
+      expect(await daemonAvailable(socket)).toBe(false);
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  // Acceptance criterion 2 (regression): unchanged fully-silent quick-exit
+  // when the workspace has no monitor definitions at all — a user who never
+  // opted in is never nagged.
+  it('stays fully silent when the workspace has no monitor definitions', () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-nomonitors-'));
+    // No .claude/monitors dir and no .claude/agentmonitors.local.md — a
+    // completely untouched workspace.
+    const hostSessionId = `nomonitors-test-${Date.now()}`;
+    const env = { CLAUDE_PROJECT_DIR: ws };
+
+    try {
+      const start = runWithStdin(
+        ['session', 'start'],
+        env,
+        sessionStartPayload(hostSessionId, ws),
+        ws,
+      );
+      expect(start.exitCode).toBe(0);
+      expect(start.stdout).toBe('');
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  // Acceptance criterion 3 (regression): when the project IS enabled, no
+  // "monitoring disabled" advisory is ever surfaced.
+  it('emits no monitoring-disabled advisory when the project is enabled', async () => {
+    const { ws, socket, env, hostSessionId } = bootLazyWorkspace(5_000);
+
+    try {
+      const start = runWithStdin(
+        ['session', 'start'],
+        env,
+        sessionStartPayload(hostSessionId, ws),
+        ws,
+      );
+      expect(start.exitCode).toBe(0);
+      // Nothing is pending on a fresh start, and the project IS enabled — the
+      // disabled-project advisory must never appear here.
+      expect(start.stdout).not.toContain('monitoring is disabled');
+
+      const end = runWithStdin(
+        ['session', 'end'],
+        env,
+        sessionEndPayload(hostSessionId, ws),
+        ws,
+      );
+      expect(end.exitCode).toBe(0);
+    } finally {
+      try {
+        await callDaemon('stop', {}, { socketPath: socket });
+      } catch {
+        // already stopped or never started — ignore
+      }
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
 // Plugin hooks.json config-drift UAT (issue #89)
 //
 // The steel-thread UAT above drives ['session','start'] / ['hook','deliver']

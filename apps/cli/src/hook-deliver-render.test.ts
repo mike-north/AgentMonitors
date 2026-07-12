@@ -5,7 +5,10 @@
  */
 import { describe, it, expect } from 'vitest';
 import type { DeliveryClaim } from '@agentmonitors/core';
-import { renderHookDelivery } from './hook-deliver-render.js';
+import {
+  renderHookDelivery,
+  renderMonitoringDisabledAdvisory,
+} from './hook-deliver-render.js';
 
 /**
  * True if `s` contains a lone (unpaired) UTF-16 surrogate code unit — the
@@ -381,5 +384,39 @@ describe('renderHookDelivery', () => {
     expect(ctx).toContain('mon-b');
     expect(ctx).toContain('Body A content');
     expect(ctx).toContain('Body B content');
+  });
+});
+
+// (issue #269) the "monitors exist but this project is not enabled" advisory
+// emitted by `session start`'s quick-exit path.
+describe('renderMonitoringDisabledAdvisory', () => {
+  it('produces the SessionStart wire shape (continue + hookSpecificOutput)', () => {
+    const out = renderMonitoringDisabledAdvisory(1, 'SessionStart');
+    expect(out.continue).toBe(true);
+    expect(out.hookSpecificOutput.hookEventName).toBe('SessionStart');
+    expect(() => JSON.parse(JSON.stringify(out))).not.toThrow();
+    // Advisory only — no permissionDecision field (BP2).
+    expect(out).not.toHaveProperty('permissionDecision');
+  });
+
+  it('states monitoring is disabled, the count, and the exact enable step', () => {
+    const out = renderMonitoringDisabledAdvisory(3, 'SessionStart');
+    const ctx = out.hookSpecificOutput.additionalContext;
+    expect(ctx).toContain('disabled');
+    expect(ctx).toContain('3 monitor definitions found');
+    expect(ctx).toContain('.claude/agentmonitors.local.md');
+    expect(ctx).toContain('enabled: true');
+  });
+
+  it('uses singular "definition" for a count of exactly 1', () => {
+    const ctx = renderMonitoringDisabledAdvisory(1, 'SessionStart')
+      .hookSpecificOutput.additionalContext;
+    expect(ctx).toContain('1 monitor definition found');
+    expect(ctx).not.toContain('1 monitor definitions');
+  });
+
+  it('echoes the passed hookEventName', () => {
+    const out = renderMonitoringDisabledAdvisory(2, 'SessionStart');
+    expect(out.hookSpecificOutput.hookEventName).toBe('SessionStart');
   });
 });
