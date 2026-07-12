@@ -570,6 +570,40 @@ Accordingly (NP-CH):
   AgentMon **MUST** treat this as an expected condition (the durable event was already delivered via
   the hook path) and **MUST NOT** surface an error.
 
+### 6.1 Operating without MCP (hooks-only mode)
+
+> **Status: current.** Verified: `apps/cli/src/commands/cli.integration.test.ts`, describe block
+> `hooks-only delivery parity (issue #270)`, test "daemon up, monitor fires, hook deliver claims a
+> real stdin payload, events ack acknowledges, events list reflects it — zero MCP/channel
+> involvement"; capability-parity assertions in
+> `apps/cli/src/commands/channel-hooks-ipc-parity.test.ts`.
+
+**MCP is never required.** The hook-deliver transport (§5) plus the CLI's `session`/`hook`/`events`
+commands are the **complete** delivery surface: every capability the channel transport (§4) offers —
+delivery, claiming, acknowledgement, status — is reachable through hooks and the CLI alone, over the
+same daemon IPC (§2's "realization" note). This is not an aspiration; it is proven end to end by the
+`hooks-only delivery parity` scenario, which drives daemon boot (`session start`, fed a real
+`SessionStart` stdin payload), a monitor firing, delivery claim (`hook deliver`, fed a real
+`UserPromptSubmit` stdin payload), acknowledgement (`events ack`), and confirmation (`events list`)
+— without ever importing, starting, or referencing the channel/MCP code path.
+
+Capability parity is not incidental, it is structural: the `agentmon_ack` MCP tool's entire
+implementation (`apps/cli/src/commands/channel.ts`) routes through `acknowledgeEventsClient`, the
+identical daemon-IPC client function the `events ack` CLI command calls (§4.3); its outbound push
+routes through `claimDeliveryClient`, the identical function `hook deliver`/`hook claim` call (§5).
+There is exactly one `events.ack` and one `hook.claim` IPC method on the daemon
+([002 §10](./002-runtime-delivery.md)); every transport — hooks, CLI, or channel — drives the same
+two calls. Disabling or stripping the MCP server therefore changes nothing about _what_ is
+delivered, _when_, or _how_ urgency/lifecycle are honored (§6 above) — the only thing that changes
+is which surface renders it: an `additionalContext` hook injection instead of a `<channel>` tag, and
+an explicit `agentmonitors events ack` invocation instead of the in-session `agentmon_ack` tool call.
+
+This is the mode a restricted corporate environment that disallows unblessed MCP servers should use:
+install the CLI, install the plugin's `hooks/hooks.json` (omit or block `.mcp.json`), and
+delivery/acknowledgement continue to work exactly as documented in §5. See
+[`agent-plugins/agentmonitors/README.md`](../../agent-plugins/agentmonitors/README.md) for the
+practical hooks-only setup instructions and the CLI equivalents of the MCP affordances.
+
 ## 7. Out of Scope
 
 - **Permission relay** (`claude/channel/permission`, `notifications/claude/channel/permission_request`
@@ -620,6 +654,9 @@ Transport and integration tests should be able to prove:
   error (§5);
 - workspace binding resolves the correct lead session when `W` has one lead, and degrades (no
   ambiguous claim) when `W` has multiple leads (§4.4).
+- the full lifecycle (boot, fire, claim, acknowledge, confirm) completes via hooks + CLI alone, with
+  no import/start/reference of the channel/MCP code path, and the ack/claim CLI commands drive the
+  identical daemon-IPC client functions the MCP tool uses (§6.1).
 
 ## 10. Open Questions
 

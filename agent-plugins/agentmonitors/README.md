@@ -36,6 +36,35 @@ Ask Claude to run the `setup-monitors` skill, or do it by hand:
 2. Scaffold a monitor: `agentmonitors init my-monitor --type file-fingerprint`.
 3. Ensure `.gitignore` ignores `.claude/*.local.*` (and optionally `.claude/monitors/*`).
 
+## Running hooks-only (no MCP)
+
+The channel MCP server (`.mcp.json`, `agentmonitors channel serve`) is **entirely optional**. If
+your environment disallows unblessed MCP servers (common on Team/Enterprise or in restricted
+corporate setups), you can strip or disable `.mcp.json` and keep everything else — delivery
+semantics are unchanged; see
+[`docs/specs/006-agent-integration.md` §6.1](../../docs/specs/006-agent-integration.md) for the
+proof and the full guarantee.
+
+**To run hooks-only:** install/keep [`hooks/hooks.json`](./hooks/hooks.json) (the three commands in
+the table above) and remove or block [`.mcp.json`](./.mcp.json) — e.g. via your Claude Code MCP
+server allowlist/denylist, or by installing only the hooks half of this plugin. Nothing else
+changes: the same monitors fire, the same events materialize, and the same
+unread/claimed/acknowledged lifecycle applies.
+
+**What actually changes:** only the in-session *acknowledge* affordance. With the channel enabled,
+you can call the `agentmon_ack` MCP tool from inside the session. Without it, use the CLI directly —
+same daemon call, different surface:
+
+| With MCP (channel enabled)                          | Hooks-only (CLI equivalent)                                       |
+| ----------------------------------------------------- | ------------------------------------------------------------------ |
+| `<channel source="agentmonitors" ...>` push           | `agentmonitors hook deliver` (wired to `UserPromptSubmit`, already in `hooks.json`) |
+| `agentmon_ack({ event_ids: [...] })` tool call         | `agentmonitors events ack --session <id> --event-ids <ids>`        |
+| (no CLI equivalent needed — same tool call, all unread)| `agentmonitors events ack --session <id>` (omit `--event-ids` to ack all unread) |
+| Inspecting what's pending from the `<channel>` tag     | `agentmonitors events list --session <id> --unread`                |
+
+`<id>` is the AgentMon session id from `agentmonitors session list`. Both surfaces call the exact
+same daemon IPC (`events.ack`, `hook.claim`) — see 006 §6.1 for the code-level proof.
+
 ## Distribution
 
 This plugin is published as content in the repo's colocated

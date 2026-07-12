@@ -5594,3 +5594,215 @@ describe('hook deliver', () => {
     }
   }, 40_000);
 });
+
+// Issue #270: prove hooks-only (no-MCP) operation is a complete, first-class
+// mode — not an implementation accident. Governing spec: docs/specs/006-
+// agent-integration.md, new subsection "Operating without MCP" (NP-CH). This
+// is the `verified:` reference that subsection points at.
+describe('hooks-only delivery parity (issue #270)', () => {
+  it('daemon up, monitor fires, hook deliver claims a real stdin payload, events ack acknowledges, events list reflects it — zero MCP/channel involvement', async () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-hooksonly-'));
+    const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-files');
+    mkdirSync(monitorsDir, { recursive: true });
+
+    const watchedFile = path.join(ws, 'watched.txt');
+    writeFileSync(watchedFile, 'initial content', 'utf-8');
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      [
+        '---',
+        'name: Watch files',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs:',
+        '    - "watched.txt"',
+        `  cwd: ${JSON.stringify(ws)}`,
+        '  interval: "1s"',
+        'urgency: normal',
+        '---',
+        'When files change, review them.',
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+
+    const socket = path.join(
+      '/tmp',
+      `agentmon-ho-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const db = path.join(ws, 'hooks-only.db');
+    const hostSessionId = `hooks-only-${Date.now()}`;
+    writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 30_000 });
+
+    // Deliberately NO CLAUDE_CODE_SESSION_ID: that env var is the
+    // channel/MCP transport's session-binding signal (006 §4.4). Every
+    // command below resolves the host session id from the hook STDIN
+    // payload instead (006 §5.0) — this is what makes the flow hooks-only.
+    const env: Record<string, string> = {
+      CLAUDE_PROJECT_DIR: ws,
+      AGENTMONITORS_DB: db,
+      AGENTMONITORS_SOCKET: socket,
+    };
+
+    try {
+      // 1. Daemon up — the hook-driven lazy-boot command (`session start`),
+      //    fed a real SessionStart stdin payload exactly as the plugin's
+      //    hooks.json wires it (006 §5.6). Nothing in this flow spawns an
+      //    MCP server or imports the channel transport (channel.ts).
+      const start = runWithStdin(
+        ['session', 'start'],
+        env,
+        JSON.stringify({
+          session_id: hostSessionId,
+          hook_event_name: 'SessionStart',
+          cwd: ws,
+        }),
+        ws,
+      );
+      expect(start.exitCode).toBe(0);
+      expect(await daemonAvailable(socket)).toBe(true);
+
+      const sessions = JSON.parse(
+        runWithEnv(
+          ['session', 'list', '--socket', socket, '--format', 'json'],
+          env,
+          ws,
+        ).stdout,
+      ) as { id: string; hostSessionId: string }[];
+      const registered = sessions.find(
+        (s) => s.hostSessionId === hostSessionId,
+      );
+      expect(registered).toBeDefined();
+      const sessionId = registered?.id ?? '';
+
+      // 2. Monitor fires — mutate the watched file after the baseline tick,
+      //    then wait for the resulting event to materialize.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
+      writeFileSync(watchedFile, 'changed content', 'utf-8');
+
+      const unread = () =>
+        runWithEnv(
+          [
+            'events',
+            'list',
+            '--session',
+            sessionId,
+            '--unread',
+            '--format',
+            'json',
+            '--socket',
+            socket,
+          ],
+          env,
+          ws,
+        );
+      const eventDeadline = Date.now() + 10_000;
+      while (Date.now() < eventDeadline) {
+        const r = unread();
+        if (
+          r.exitCode === 0 &&
+          (JSON.parse(r.stdout) as unknown[]).length >= 1
+        ) {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      const unreadEvents = JSON.parse(unread().stdout) as { id: string }[];
+      expect(unreadEvents).toHaveLength(1);
+      const eventId = unreadEvents[0]?.id;
+
+      // 3. Delivery claimed via `hook deliver`, fed a real UserPromptSubmit
+      //    stdin payload — the same wire contract Claude Code uses (006
+      //    §5.0). This is the hooks/CLI equivalent of the channel
+      //    transport's outbound push (channel.ts's poll loop, which also
+      //    calls claimDeliveryClient — confirmed statically in
+      //    channel-hooks-ipc-parity.test.ts): same daemon IPC call
+      //    (`hook.claim`), different transport.
+      const deliver = runWithStdin(
+        ['hook', 'deliver'],
+        env,
+        JSON.stringify({
+          session_id: hostSessionId,
+          hook_event_name: 'UserPromptSubmit',
+          cwd: ws,
+        }),
+        ws,
+      );
+      expect(deliver.exitCode).toBe(0);
+      expect(deliver.stdout.trim()).not.toBe('');
+      const deliverOutput = JSON.parse(deliver.stdout) as {
+        continue: boolean;
+        hookSpecificOutput: {
+          hookEventName: string;
+          additionalContext: string;
+        };
+      };
+      expect(deliverOutput.continue).toBe(true);
+      expect(deliverOutput.hookSpecificOutput.hookEventName).toBe(
+        'UserPromptSubmit',
+      );
+      expect(
+        deliverOutput.hookSpecificOutput.additionalContext.trim(),
+      ).not.toBe('');
+
+      // Claiming is not acknowledging (BP2/SP4): the event is still unread.
+      expect(JSON.parse(unread().stdout)).toHaveLength(1);
+
+      // 4. Acknowledged via `events ack` — the CLI/hooks equivalent of the
+      //    `agentmon_ack` MCP tool. The tool's entire job (channel.ts) is to
+      //    route through acknowledgeEventsClient, the exact function
+      //    `events ack` calls below (confirmed statically in
+      //    channel-hooks-ipc-parity.test.ts) — same daemon IPC call
+      //    (`events.ack`), CLI surface instead of MCP.
+      const ack = runWithEnv(
+        ['events', 'ack', '--session', sessionId, '--socket', socket],
+        env,
+        ws,
+      );
+      expect(ack.exitCode).toBe(0);
+
+      // 5. `events list` shows the acknowledged state: gone from --unread,
+      //    still present in the full listing (acknowledged, not deleted).
+      expect(JSON.parse(unread().stdout)).toHaveLength(0);
+      const all = runWithEnv(
+        [
+          'events',
+          'list',
+          '--session',
+          sessionId,
+          '--format',
+          'json',
+          '--socket',
+          socket,
+        ],
+        env,
+        ws,
+      );
+      expect(all.exitCode).toBe(0);
+      const allEvents = JSON.parse(all.stdout) as { id: string }[];
+      expect(allEvents.map((e) => e.id)).toContain(eventId);
+
+      // Deregister, hooks-only, via the same stdin contract.
+      const end = runWithStdin(
+        ['session', 'end'],
+        env,
+        JSON.stringify({
+          session_id: hostSessionId,
+          hook_event_name: 'SessionEnd',
+          cwd: ws,
+        }),
+        ws,
+      );
+      expect(end.exitCode).toBe(0);
+    } finally {
+      // No orphan daemons: stop the per-workspace daemon explicitly (it was
+      // lazily spawned by `session start`, so there is no `daemon` handle).
+      try {
+        await callDaemon('stop', {}, { socketPath: socket });
+      } catch {
+        // already stopped — ignore
+      }
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
