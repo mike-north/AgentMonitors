@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer';
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -150,8 +151,16 @@ function packArtifactIssues(pkg) {
     });
     packedEntries = JSON.parse(output);
   } catch (error) {
-    const stderr = typeof error.stderr === 'string' ? error.stderr.trim() : '';
-    return [`npm pack --dry-run failed: ${stderr || error.message}`];
+    // execFileSync's stdio is ['ignore', 'pipe', 'pipe'] with encoding set,
+    // so stderr is normally a string — but a spawn failure (e.g. `npm` not
+    // found) can throw before encoding applies, leaving stderr as a Buffer
+    // (or undefined). Handle both so the failure message is never mangled.
+    const stderr = Buffer.isBuffer(error.stderr)
+      ? error.stderr.toString('utf8')
+      : typeof error.stderr === 'string'
+        ? error.stderr
+        : '';
+    return [`npm pack --dry-run failed: ${stderr.trim() || error.message}`];
   }
 
   const packedPaths = new Set(
@@ -269,7 +278,7 @@ export function main({
 
 const isMainModule =
   process.argv[1] != null &&
-  import.meta.url === pathToFileURL(process.argv[1]).href;
+  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
 
 if (isMainModule) {
   const result = main();
