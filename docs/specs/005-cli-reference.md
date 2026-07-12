@@ -1249,7 +1249,126 @@ read: `inspect` never claims, acks, or advances a cursor.
 
 ---
 
-## §15 Exit codes & diagnostics
+## §15 `doctor` — Unified workspace health check
+
+**Source:** `apps/cli/src/commands/doctor.ts`
+**Status:** Fully implemented (in-process durable-state read + a socket ping for the daemon-reachable check).
+
+### Purpose
+
+Answers "is my monitoring working, and if not, where is it broken?" from one command, replacing the
+ad-hoc stitching of `daemon status`, `monitor explain`, `events list`, and `session list` that the
+[setup-monitors skill](../../agent-plugins/agentmonitors/skills/setup-monitors/SKILL.md) formalizes.
+It runs a named sequence of checks for the current workspace and prints a per-monitor rollup.
+
+**`doctor` diagnoses only — it never mutates state.** There is no `--fix` (a later issue may add
+remediation). It does **not** check host-plugin installation (whether the Claude Code plugin is
+installed is the host's side), and performs no MCP/channel checks. It never folds in or changes
+`monitor explain`.
+
+### Usage
+
+```
+agentmonitors doctor [--dir <path>] [--workspace <path>] [--socket <path>] [--format <text|json>]
+```
+
+| Flag                 | Default                        | Description                                                |
+| -------------------- | ------------------------------ | ---------------------------------------------------------- |
+| `--dir <path>`       | `<workspace>/.claude/monitors` | Directory containing monitor definitions                   |
+| `--workspace <path>` | current working dir            | Workspace to diagnose (session projection + event scoping) |
+| `--socket <path>`    | resolved default               | Unix domain socket path for the daemon-reachability ping   |
+| `--format <format>`  | `text`                         | Output format: `text`, `json`                              |
+
+### Transport and data source
+
+`doctor` reads its diagnosis **in-process from the persisted SQLite store** — the daemon writes the
+same store, so the report is accurate whether or not a daemon is running (the same principle as
+`daemon status`'s in-process fallback and `monitor explain`'s #150 no-daemon read). The **only** use
+of the socket is the `daemon-reachable` check's ping. The database and socket are resolved for the
+workspace the same way the daemon resolves them: `AGENTMONITORS_DB` / `AGENTMONITORS_SOCKET` win, then
+an enabled workspace's persisted `.claude/agentmonitors.local.md` `db:` / `socket:` (or the derived
+per-workspace paths), then the global defaults.
+
+### Checks
+
+`doctor` runs this ordered sequence, printing one line per check with a `pass` (`✓`), `fail` (`✗`),
+or `skip` (`○`) status and, on failure, an actionable remediation:
+
+| Check                | Passes when                                                    | Remediation on failure                                                                                                                                                                                                                                |
+| -------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `project-enabled`    | `.claude/agentmonitors.local.md` has `enabled: true`           | Run `agentmonitors init --enable-only`, or create `.claude/agentmonitors.local.md` with `enabled: true` yourself — the **same** enable step the `SessionStart` monitors-found-but-disabled advisory names (006 §5.6, §2), so all three surfaces agree |
+| `monitors-directory` | the monitors directory exists                                  | Create the directory and scaffold a monitor with `agentmonitors init`                                                                                                                                                                                 |
+| `monitors-valid`     | every discovered monitor validates (no scope/parse/dup errors) | Run `agentmonitors validate <dir>` and fix the reported errors (`skip` when there are no monitors)                                                                                                                                                    |
+| `daemon-reachable`   | the daemon answers a socket ping (path shown either way)       | Start it with `agentmonitors daemon run`, or let a Claude Code session start it automatically                                                                                                                                                         |
+| `lead-session`       | a lead session is registered for this workspace                | Open a Claude Code session (the `SessionStart` hook registers one) or `agentmonitors session open --role lead`                                                                                                                                        |
+| `monitor:<id>`       | the monitor is valid and has been observed at least once       | Start the daemon (or wait for the next tick), then check `agentmonitors monitor history <id>`; `monitor test` dry-runs it (`skip` for an invalid monitor — see `monitors-valid`)                                                                      |
+
+Each `monitor:<id>` line embeds the per-monitor rollup (below). **Exit 0 when every check passes;
+non-zero when any check fails.** A down daemon fails `daemon-reachable` but does not stop the rest of
+the diagnosis — the per-monitor rollup is still produced from persisted state and the line explicitly
+says the daemon is down.
+
+### Per-monitor rollup
+
+For each monitor, `doctor` reports: **id**, **source type**, **urgency**, **cadence** (the cron
+expression for `schedule` sources, else the observe interval), **last-observed** time (or `never`),
+**next-due** time, **last-event** time (or `none`), and the **unread / claimed / acknowledged**
+delivery-state counts for the workspace's lead session — or an explicit `never observed` marker (the
+monitor has no observation history) / `lead-session=none` marker (the workspace has no lead session).
+The three delivery states are distinct (000 AP): claiming a delivery never acknowledges it.
+
+### Output
+
+**Text format:** a workspace/monitors/daemon header, one line per check (with an indented `↳`
+remediation on failures), and a closing `Summary: <n> passed, <n> failed, <n> skipped.` line.
+
+**JSON format (`--format json`):** a stable machine-readable shape. Dates are ISO-8601 strings or
+`null`; `ok` is `true` iff no check failed.
+
+```json
+{
+  "ok": false,
+  "generatedAt": "<iso8601>",
+  "workspace": "<path>",
+  "monitorsDir": "<path>",
+  "daemon": { "running": false, "socketPath": "<path>" },
+  "leadSession": false,
+  "checks": [
+    {
+      "name": "project-enabled",
+      "status": "pass|fail|skip",
+      "detail": "<string>",
+      "remediation": "<string | null>"
+    }
+  ],
+  "monitors": [
+    {
+      "id": "<string>",
+      "sourceType": "<string>",
+      "urgency": "low|normal|high",
+      "valid": true,
+      "validationError": "<string | null>",
+      "lastObservedAt": "<iso8601 | null>",
+      "neverObserved": false,
+      "nextDueAt": "<iso8601 | null>",
+      "cadence": "<string>",
+      "lastEventAt": "<iso8601 | null>",
+      "delivery": { "unread": 0, "claimed": 0, "acknowledged": 0 }
+    }
+  ],
+  "summary": { "passed": 0, "failed": 0, "skipped": 0 }
+}
+```
+
+`checks[]` always appears in the fixed order above (`project-enabled`, `monitors-directory`,
+`monitors-valid`, `daemon-reachable`, `lead-session`, then one `monitor:<id>` per discovered
+monitor). When `leadSession` is `false`, each monitor's `delivery` counts are all `0` and represent
+"no lead session". Errors (e.g. an unreadable store) use the standard `reportError()` shape
+(`{ "error": "..." }` to stdout in JSON mode, `Error: …` to stderr otherwise) and exit 1.
+
+---
+
+## §16 Exit codes & diagnostics
 
 ### General conventions
 
@@ -1308,6 +1427,7 @@ All commands set `process.exitCode = 1` rather than calling `process.exit(1)`. T
 | `daemon`   | `run`      | creates socket server             | Fully implemented (`--reap-after-ms` added)                       |
 | `daemon`   | `status`   | socket (with in-process fallback) | Fully implemented                                                 |
 | `daemon`   | `stop`     | socket                            | Fully implemented                                                 |
+| `doctor`   | —          | in-process (+ socket ping)        | Fully implemented                                                 |
 | `session`  | `open`     | socket                            | Fully implemented                                                 |
 | `session`  | `close`    | socket                            | Fully implemented                                                 |
 | `session`  | `list`     | socket                            | Fully implemented                                                 |
