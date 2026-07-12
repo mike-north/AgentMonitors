@@ -194,6 +194,10 @@ markdown.
 {% /door %}
 {% /doors %}
 
+Using an AI coding agent? Point it at [agentmonitors.io/skill.md](/skill.md) — it's a
+self-contained, agent-readable setup guide that installs the CLI, authors a monitor, and proves
+it fires, with no other context required.
+
 {% /section %}
 
 {% siteFooter /%}

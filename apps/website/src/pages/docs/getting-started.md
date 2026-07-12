@@ -158,3 +158,7 @@ agent actually receives.
   verification
 - [Authoring monitors](/docs/authoring-monitors) — all sources, urgency levels, notify strategies
 - [Use cases](/docs/use-cases) — patterns from simple file-watching to fleet supervision
+
+Using an AI coding agent to do this setup? Point it at
+[agentmonitors.io/skill.md](/skill.md) instead — a self-contained, agent-readable version of this
+guide that installs the CLI, authors a monitor, and proves it fires on its own.
