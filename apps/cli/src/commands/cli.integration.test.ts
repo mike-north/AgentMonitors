@@ -12,6 +12,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -520,6 +521,17 @@ describe('init bootstrap (bare init)', () => {
   const LOCAL_STATE_REL = path.join('.claude', 'agentmonitors.local.md');
   const GITIGNORE_LINE = '.claude/*.local.*';
 
+  // The exact minimal enable-file shape from the setup-monitors skill's
+  // "Enable The Project" section (`agent-plugins/agentmonitors/skills/setup-monitors/SKILL.md`)
+  // and 005 §2. Written by hand from that doc, not derived from program
+  // output, so drift in either the skill doc or the implementation fails here.
+  const EXPECTED_LOCAL_STATE_CONTENTS =
+    '---\n' +
+    'enabled: true\n' +
+    '---\n' +
+    '\n' +
+    '> Local AgentMon coordination state. Gitignored; safe to delete (it is regenerated).\n';
+
   // AC1 + AC5: fresh dir → bare init (non-interactive via --yes) → enabled +
   // gitignore correct + a valid scaffolded monitor + a validate that passed.
   it('bootstraps a fresh project: enable + gitignore + valid monitor + validate (--yes)', () => {
@@ -529,9 +541,10 @@ describe('init bootstrap (bare init)', () => {
     const result = run(['init', '--yes'], dir);
     expect(result.exitCode).toBe(0);
 
-    // Step 1 — enable file with `enabled: true` (exact setup-monitors skill shape).
+    // Step 1 — enable file matches the setup-monitors skill's exact minimal
+    // shape byte-for-byte (not just a substring match on `enabled: true`).
     const localState = readFileSync(path.join(dir, LOCAL_STATE_REL), 'utf-8');
-    expect(localState).toContain('enabled: true');
+    expect(localState).toBe(EXPECTED_LOCAL_STATE_CONTENTS);
 
     // Step 2 — `.gitignore` ignores the local coordination file.
     const gitignore = readFileSync(path.join(dir, '.gitignore'), 'utf-8');
@@ -560,8 +573,8 @@ describe('init bootstrap (bare init)', () => {
     const result = run(['init', '--enable-only'], dir);
     expect(result.exitCode).toBe(0);
 
-    expect(readFileSync(path.join(dir, LOCAL_STATE_REL), 'utf-8')).toContain(
-      'enabled: true',
+    expect(readFileSync(path.join(dir, LOCAL_STATE_REL), 'utf-8')).toBe(
+      EXPECTED_LOCAL_STATE_CONTENTS,
     );
     expect(
       readFileSync(path.join(dir, '.gitignore'), 'utf-8').split('\n'),
@@ -663,6 +676,60 @@ describe('init bootstrap (bare init)', () => {
     expect(existsSync(path.join(dir, LOCAL_STATE_REL))).toBe(true);
     expect(existsSync(path.join(dir, '.claude', 'monitors'))).toBe(false);
     expect(result.stdout).toContain('--yes');
+  });
+
+  // Regression (PR #310 review): `readLocalState`'s minimal frontmatter parser
+  // only recognizes a bare `---` as the block delimiter, so a BOM-prefixed
+  // `.claude/agentmonitors.local.md` (a literal U+FEFF before `---`, which
+  // some editors/tools write) was misdetected as disabled, causing bare `init`
+  // to clobber the file — losing any `socket`/`db` fields a prior
+  // `session start` had persisted. `ensureEnabled` must fall back to a
+  // raw-text check for `enabled: true` (BOM stripped) before writing.
+  it('does not clobber a BOM-prefixed already-enabled local-state file (byte-identical)', () => {
+    const dir = path.join(tempDir, 'bootstrap-bom-enabled');
+    mkdirSync(path.join(dir, '.claude'), { recursive: true });
+
+    // A realistic already-enabled file with socket/db fields a prior
+    // `session start` persisted, prefixed with a UTF-8 BOM.
+    const localStatePath = path.join(dir, LOCAL_STATE_REL);
+    const bomPrefixedContents =
+      '\uFEFF' +
+      '---\n' +
+      'enabled: true\n' +
+      'socket: /custom/path/agentmonitors.sock\n' +
+      'db: /custom/path/agentmonitors.db\n' +
+      'reap-after-ms: 300000\n' +
+      '---\n' +
+      '\n' +
+      '> Local AgentMon coordination state. Gitignored; safe to delete (it is regenerated).\n';
+    writeFileSync(localStatePath, bomPrefixedContents, 'utf-8');
+
+    const result = run(['init', '--enable-only'], dir);
+    expect(result.exitCode).toBe(0);
+
+    // Byte-identical: bare init must not have rewritten the file at all.
+    expect(readFileSync(localStatePath, 'utf-8')).toBe(bomPrefixedContents);
+  });
+
+  // Regression (PR #310 review): `ensureGitignore` used to treat ANY
+  // `readFileSync` failure as "file absent" and create/overwrite it, which
+  // would silently clobber a `.gitignore` that exists but can't be read for
+  // some other reason (e.g. `EISDIR` when it's actually a directory, or
+  // `EACCES` on an unreadable file). Only `ENOENT` may be treated as absent;
+  // any other error must be rethrown so the command fails loudly instead of
+  // overwriting something it shouldn't.
+  it('fails loudly and does not overwrite when .gitignore is a directory (non-ENOENT read error)', () => {
+    const dir = path.join(tempDir, 'bootstrap-gitignore-is-dir');
+    mkdirSync(dir, { recursive: true });
+    const gitignorePath = path.join(dir, '.gitignore');
+    mkdirSync(gitignorePath);
+
+    const result = run(['init', '--enable-only'], dir);
+
+    expect(result.exitCode).not.toBe(0);
+    // Nothing overwritten: `.gitignore` is still a directory, not replaced by
+    // a regular file.
+    expect(statSync(gitignorePath).isDirectory()).toBe(true);
   });
 });
 

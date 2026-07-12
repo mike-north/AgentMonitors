@@ -121,6 +121,10 @@ enabled: true
 /** The single line the setup-monitors skill requires in `.gitignore`. */
 const GITIGNORE_LINE = '.claude/*.local.*';
 
+function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
+  return typeof error === 'object' && error !== null && 'code' in error;
+}
+
 interface ScaffoldResult {
   status: 'created' | 'exists';
   /** Directory of the scaffolded monitor (its `MONITOR.md` lives inside). */
@@ -156,10 +160,30 @@ function scaffoldMonitor(
  * Bootstrap step 1: ensure the project is enabled. Reuses `readLocalState` to
  * detect an already-enabled project so a re-run never rewrites the file (which
  * would clobber socket/db fields a prior `session start` persisted).
+ *
+ * `readLocalState`'s minimal frontmatter parser only recognizes a bare `---`
+ * as the block delimiter (see `local-state.ts`'s `parseFrontmatter`), so a
+ * BOM-prefixed file (a literal U+FEFF before `---`) — which some editors/tools
+ * write — fails that check and reports `enabled: false` even though the file
+ * already declares `enabled: true`. Before writing, fall back to a raw-text
+ * check (BOM stripped) so we never clobber an already-enabled file's
+ * socket/db fields.
  */
 function ensureEnabled(cwd: string): 'created' | 'already-enabled' {
   if (readLocalState(cwd).enabled) return 'already-enabled';
   const target = path.join(cwd, '.claude', 'agentmonitors.local.md');
+  let existingRaw: string | undefined;
+  try {
+    existingRaw = readFileSync(target, 'utf-8');
+  } catch {
+    existingRaw = undefined;
+  }
+  if (existingRaw !== undefined) {
+    const stripped = existingRaw.replace(/^\uFEFF/, '');
+    if (stripped.includes('enabled: true')) {
+      return 'already-enabled';
+    }
+  }
   mkdirSync(path.dirname(target), { recursive: true });
   writeFileSync(target, ENABLE_FILE_CONTENTS, 'utf-8');
   return 'created';
@@ -169,13 +193,19 @@ function ensureEnabled(cwd: string): 'created' | 'already-enabled' {
  * Bootstrap step 2: ensure `.gitignore` ignores the local coordination file.
  * Appends the line if the file exists but lacks it, creates the file if absent,
  * and is a no-op if the line is already present.
+ *
+ * Only a missing file (`ENOENT`) is treated as "absent, create it". Any other
+ * read error (e.g. `EACCES` on an unreadable file, `EISDIR` when `.gitignore`
+ * is actually a directory) is rethrown so the command fails loudly instead of
+ * silently overwriting something that isn't a plain, absent file.
  */
 function ensureGitignore(cwd: string): 'created' | 'appended' | 'present' {
   const target = path.join(cwd, '.gitignore');
   let content: string;
   try {
     content = readFileSync(target, 'utf-8');
-  } catch {
+  } catch (err) {
+    if (!isErrnoException(err) || err.code !== 'ENOENT') throw err;
     writeFileSync(target, `${GITIGNORE_LINE}\n`, 'utf-8');
     return 'created';
   }

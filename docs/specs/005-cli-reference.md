@@ -111,7 +111,7 @@ agentmonitors init [name] [options]
 | `--enable-only` | boolean               | —                  | Bootstrap only: enable the project and fix `.gitignore`, then stop (no monitor, no prompts)                            |
 | `--yes`         | boolean               | —                  | Bootstrap non-interactively: accept defaults and scaffold a starter monitor without prompting                          |
 
-`--enable-only` and `--type`/`--yes` are only meaningful for the bootstrap form; when a `<name>` is given, `init` takes the scaffold path and those bootstrap flags are ignored.
+`--enable-only` and `--yes` are only meaningful for the bootstrap form; when a `<name>` is given, `init` takes the scaffold path and those two flags are ignored. `--type` applies to both forms: it selects the scaffolded monitor's source type in the scaffold form, and (when `--yes` scaffolds a starter monitor) overrides the bootstrap form's default source type.
 
 ### Scaffold form (`init <name>`)
 
