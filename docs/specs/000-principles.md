@@ -81,11 +81,12 @@ The current repository contains both public-facing docs and implementation code.
 
 ## 7. Cross-Reference Index
 
-| Property set                                           | Referenced by                                                               |
-| ------------------------------------------------------ | --------------------------------------------------------------------------- |
-| PP1–PP3, SP1–SP2, AP4                                  | [001 — Monitor Definition & Authoring](./001-monitor-definition.md)         |
-| PP1, PP4–PP7, PP9–PP10, SP3–SP5, AP1–AP3, AP7, BP1–BP2 | [002 — Runtime, Delivery & Persistence](./002-runtime-delivery.md)          |
-| PP3, PP6–PP7, AP4, BP3, NP3–NP4                        | [003 — Source Plugins](./003-source-plugins.md)                             |
-| PP7–PP8, AP4–AP6, BP3                                  | [004 — Validation & Testing](./004-validation-testing.md)                   |
-| AP6, PP5, PP10                                         | [005 — CLI Reference](./005-cli-reference.md)                               |
-| PP4, PP9–PP10, AP1, AP6–AP7, BP2, NP5                  | [006 — Agent Integration & Delivery Transports](./006-agent-integration.md) |
+| Property set                                            | Referenced by                                                                                           |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| PP1–PP3, SP1–SP2, AP4                                   | [001 — Monitor Definition & Authoring](./001-monitor-definition.md)                                     |
+| PP1, PP4–PP7, PP9–PP10, SP3–SP5, AP1–AP3, AP7, BP1–BP2  | [002 — Runtime, Delivery & Persistence](./002-runtime-delivery.md)                                      |
+| PP3, PP6–PP7, AP4, BP3, NP3–NP4                         | [003 — Source Plugins](./003-source-plugins.md)                                                         |
+| PP7–PP8, AP4–AP6, BP3                                   | [004 — Validation & Testing](./004-validation-testing.md)                                               |
+| AP6, PP5, PP10                                          | [005 — CLI Reference](./005-cli-reference.md)                                                           |
+| PP4, PP9–PP10, AP1, AP3, AP6–AP7, BP2, NP5              | [006 — Agent Integration & Delivery Transports](./006-agent-integration.md)                             |
+| PP1, PP4, PP9–PP10, AP3, AP6–AP7, SP4–SP5, BP1–BP2, NP5 | [007 — Agent-Facing Interaction, Ephemeral Monitors & Observability](./007-agent-facing-interaction.md) |

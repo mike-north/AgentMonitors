@@ -223,9 +223,87 @@ Interpret → Deliver → [React]`:
 > [003 §2.7](./003-source-plugins.md), and [spec-changelog.md](./spec-changelog.md). The optional
 > Interpret stage that `payload: prose` invokes shipped as G14 (above).
 
+### G16 — Agent-facing act-on-signal CLI verbs (P2)
+
+- **Current:** an agent that receives a pushed signal has no read-only way to fetch the current
+  stored snapshot, diff two points in time, or get a lightweight summary; it would have to re-fetch
+  the watched resource itself.
+- **Target:** the read-only `snapshot` / `diff` / `summary` verbs of
+  [007 §3](./007-agent-facing-interaction.md) / [005 §14.1–§14.3](./005-cli-reference.md),
+  async-biased, side-effect-free (no claim/ack/cursor move, no re-observe).
+- **Governs:** PP9, PP10, AP6, SP5 ([000](./000-principles.md)),
+  [007 §2–§3](./007-agent-facing-interaction.md).
+- **Files (anticipated):** `apps/cli/src/commands/*`, `apps/cli/src/daemon-ipc.ts`,
+  `libs/core/src/runtime/store.ts` (snapshot/diff reads).
+- **Proof:** integration tests that a read returns the durable answer and leaves
+  `session_event_state` / `session_object_cursor` unchanged and invokes no source `observe()`
+  ([007 §6](./007-agent-facing-interaction.md)).
+
+### G17 — Ephemeral (session-scoped, agent-declared) monitors (P2)
+
+- **Current:** monitors exist only as persistent `MONITOR.md` files; there is no runtime,
+  session-scoped authoring path.
+- **Target:** the ephemeral-monitor model of [007 §4](./007-agent-facing-interaction.md) /
+  [005 §14.4](./005-cli-reference.md) — declared via `agentmonitors watch`, validated by the same
+  `validateScope` path, on the same pipeline (AP7), bound to and reaped with the declaring session,
+  durable across restart while the session lives, all deterministic work daemon-owned.
+- **Governs:** AP7, PP9, PP10, SP1–SP2, BP1 ([000](./000-principles.md)),
+  [007 §4](./007-agent-facing-interaction.md).
+- **Files (anticipated):** `libs/core/src/runtime/service.ts` + `store.ts` (register/reap +
+  durable state), `libs/core/src/inbox/schema.ts` (ephemeral registration table),
+  `apps/cli/src/commands/watch.ts`.
+- **Proof:** integration tests for declare→tick→deliver, reap-on-session-end, restart survival while
+  active, session-isolation, and invalid-scope rejection ([007 §6](./007-agent-facing-interaction.md)).
+- **Composes with:** #124 (dependent chains build on this primitive) and #258 (shared per-binding
+  durable-state primitive) — design so the primitives compose, not diverge
+  ([007 §4.7](./007-agent-facing-interaction.md)).
+
+### G18 — Observability surface: received / pending / armed-but-not-yet-fired (P2)
+
+- **Current:** `events list [--unread]` shows received/pending; there is no single surface for
+  "a condition is met but is being held before delivery."
+- **Target:** the `agentmonitors inspect` verb of [007 §5](./007-agent-facing-interaction.md) /
+  [005 §14.5](./005-cli-reference.md), deriving the **armed** bucket from the already-durable hold
+  substrate (settle/debounce/throttle/rollup windows, `net`/Interpret suppression) with a hold
+  reason and earliest-fire time — a pure read, no new watching.
+- **Governs:** PP4, PP7, SP4, BP2 ([000](./000-principles.md)),
+  [007 §5](./007-agent-facing-interaction.md).
+- **Files (anticipated):** `libs/core/src/runtime/store.ts` (armed-set read over `monitor_state` /
+  `session_event_state`), `apps/cli/src/commands/inspect.ts`; reuses the `monitor explain` substrate
+  ([002 §10.7](./002-runtime-delivery.md)).
+- **Proof:** integration test that a change transitions armed → pending → received across three
+  distinct, separately-asserted states ([007 §6](./007-agent-facing-interaction.md)).
+
+### G19 — Codex host adapter (CLI + desktop) (P3)
+
+- **Current:** `claudeCodeAdapter` is the only `AgentRuntimeAdapter`.
+- **Target:** a Codex adapter satisfying the multi-host contract of
+  [006 §11](./006-agent-integration.md) — lifecycle mapping, session identity, workspace binding,
+  delivery-surface state, portable baseline + any additive transport — with delivery semantics
+  invariant vs Claude (§11.5).
+- **Governs:** AP3, AP6, PP4, NP5 ([000](./000-principles.md)),
+  [006 §11](./006-agent-integration.md).
+- **Files (anticipated):** `libs/core/src/adapter/codex.ts`, activation packaging, a
+  binding-probe artifact under `experiments/`.
+- **Proof:** an integration test driving Codex's real lifecycle-hook command/stdin contract end to
+  end plus a probe artifact pinning the identity/workspace signals ([006 §11.6](./006-agent-integration.md)).
+
+### G20 — Cursor host adapter (CLI + IDE) (P3)
+
+- **Current:** `claudeCodeAdapter` is the only `AgentRuntimeAdapter`.
+- **Target:** a Cursor adapter satisfying [006 §11](./006-agent-integration.md), with an internal
+  CLI-vs-IDE surface branch only if the two surfaces' mechanisms diverge (§11.4).
+- **Governs:** AP3, AP6, PP4, NP5 ([000](./000-principles.md)),
+  [006 §11](./006-agent-integration.md).
+- **Files (anticipated):** `libs/core/src/adapter/cursor.ts`, activation packaging, a
+  binding-probe artifact under `experiments/`.
+- **Proof:** an integration test driving Cursor's real lifecycle-hook contract end to end plus a
+  probe artifact pinning the identity/workspace signals ([006 §11.6](./006-agent-integration.md)).
+
 > The cursor protocol ([003 §13](./003-source-plugins.md)) is deliberately **not** a roadmap item:
 > per #81 it is designed only as far as a sketch, to be fully specified if measured poll cost ever
-> justifies it.
+> justifies it. (Unrelated to the **Cursor host adapter** in G20 — "cursor protocol" is the
+> source-side poll-cursor sketch; G20 is the Cursor editor host.)
 
 ## Test gaps
 

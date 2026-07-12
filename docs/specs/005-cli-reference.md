@@ -38,10 +38,11 @@ Structured-output commands — `events list`, `scan`, `monitor history`, `monito
 
 Commands divide into two transport modes:
 
-| Mode                                   | Commands                                                                                                                                                       | Mechanism                                                                                      |
-| -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| **In-process** (no socket)             | `init`, `validate`, `scan`, `monitor test`, `source list`, `schema generate`, `inbox *`, `daemon once`                                                         | Operates directly on the filesystem and/or SQLite database. No daemon socket required.         |
-| **Daemon socket** (Unix domain socket) | `daemon run`, `daemon status`, `daemon stop`, `session open/close/list`, `events list/ack`, `hook claim`, `hook deliver`, `monitor history`, `monitor explain` | Sends JSON-RPC-style messages over a Unix domain socket via `callDaemon()` in `daemon-ipc.ts`. |
+| Mode                                   | Commands                                                                                                                                                       | Mechanism                                                                                                                                                                       |
+| -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **In-process** (no socket)             | `init`, `validate`, `scan`, `monitor test`, `source list`, `schema generate`, `inbox *`, `daemon once`                                                         | Operates directly on the filesystem and/or SQLite database. No daemon socket required.                                                                                          |
+| **Daemon socket** (Unix domain socket) | `daemon run`, `daemon status`, `daemon stop`, `session open/close/list`, `events list/ack`, `hook claim`, `hook deliver`, `monitor history`, `monitor explain` | Sends JSON-RPC-style messages over a Unix domain socket via `callDaemon()` in `daemon-ipc.ts`.                                                                                  |
+| **Daemon (agent-facing, _target_)**    | `snapshot`, `diff`, `summary`, `watch`, `inspect` (§14)                                                                                                        | Round-trip the daemon; transport (loopback HTTP vs the Unix socket) is an implementation detail ([007 §2.3](./007-agent-facing-interaction.md)). Read-only or declaration-only. |
 
 **`daemon once` is notable:** although it lives under the `daemon` command group, its implementation in `runtime-client.ts` (`daemonTickClient`) calls `createRuntime()` and `runtime.tick()` directly without using the socket. It is a single-tick in-process run, not a socket call. This is consistent with [002-runtime-delivery.md](./002-runtime-delivery.md).
 
@@ -1147,7 +1148,87 @@ session id it stays connected (the ack tool reports an error if called) but does
 
 ---
 
-## §14 Exit codes & diagnostics
+## §14 Agent-facing interaction & ephemeral monitors (_target_)
+
+**Status:** **target** — the whole of §14 specifies the agent-facing verbs greenlit in Epic #259.
+None ship today; each **MUST** be moved to _current_, with `verified:` references, when it ships (the
+semantic contract is [007](./007-agent-facing-interaction.md); retire the matching
+[roadmap.md](./roadmap.md) gap at that time). These commands are **read-only or declaration-only** —
+they never claim, acknowledge, advance a cursor, or trigger a fresh source observation
+([007 §2.1](./007-agent-facing-interaction.md)). They round-trip the daemon (transport — loopback
+HTTP vs the Unix socket — is an implementation detail, [007 §2.3](./007-agent-facing-interaction.md))
+and support the standard `--format` shapes (§1). An agent invokes them **in response to a pushed
+signal or at its own turn boundary**, never on a timer of its own (PP9).
+
+### §14.1 `snapshot` — fetch the current stored snapshot
+
+```
+agentmonitors snapshot <monitorId> [--object <objectKey>] [--session <id>] [--socket <path>] [--format <format>]
+```
+
+Returns the latest stored `monitor_snapshots` text for `(workspacePath, monitorId, objectKey)` — the
+same text the runtime diffs against — with **no** re-fetch of the underlying resource and **no**
+delivery-state change ([007 §3.1](./007-agent-facing-interaction.md), SP5). When the monitor watches
+exactly one object, `--object` may be omitted; when it watches several and `--object` is omitted, the
+command lists the available object keys rather than guessing.
+
+### §14.2 `diff` — diff one object between two points in time
+
+```
+agentmonitors diff <monitorId> --object <objectKey> [--from <point>] [--to <point>] [--session <id>] [--socket <path>] [--format <format>]
+```
+
+Computes a textual diff of one observed object between two stored points, each a durable event id or
+an ISO-8601 timestamp (resolved to the snapshot at/just-before it). `--from` defaults to the
+session's own baseline cursor; `--to` defaults to the latest snapshot — so a bare invocation answers
+"what has changed for me since my baseline" ([007 §3.2](./007-agent-facing-interaction.md)). Uses the
+runtime's `buildTextDiff` so agent-visible diffs match delivered diffs. A referenced point whose
+snapshot has been pruned is a **clear error**, not an empty diff.
+
+### §14.3 `summary` — lightweight payload orientation
+
+```
+agentmonitors summary <monitorId> [--object <objectKey>] [--session <id>] [--socket <path>] [--format <format>]
+```
+
+Returns a cheap orientation — monitor id, `objectKey`, urgency, `changeKind`, unread/claimed counts,
+event `title`/`summary` — **without** the full snapshot or diff
+([007 §3.3](./007-agent-facing-interaction.md)). The cheapest act-on-signal read.
+
+### §14.4 `watch` — declare / list / cancel an ephemeral monitor
+
+```
+agentmonitors watch <source> --scope <k=v,...> [--urgency <u>] [--instruction <text>] [--until <cond>] [--session <id>] [--socket <path>]
+agentmonitors watch list [--session <id>] [--socket <path>] [--format <format>]
+agentmonitors watch cancel <ephemeralId> [--session <id>] [--socket <path>]
+```
+
+Declares an **ephemeral, session-scoped** monitor on the same daemon/pipeline as a persistent
+`MONITOR.md` monitor (AP7, [007 §4](./007-agent-facing-interaction.md)) — "tell me when _X_, and
+remind me of _this instruction_ when it does." The scope is validated by the **same** `validateScope`
+path as `agentmonitors validate` (§3), so an ephemeral monitor cannot express a config a persistent
+one could not. The declaration **performs no watching**: it registers intent and returns; the daemon
+does all observation/scheduling/notify/persist/project/deliver (PP9/PP10). The monitor is **reaped
+when its declaring session ends or goes dormant** and survives a daemon restart while the session
+lives ([007 §4.4](./007-agent-facing-interaction.md)); `watch cancel` reaps it immediately.
+
+### §14.5 `inspect` — observability (received / pending / armed)
+
+```
+agentmonitors inspect [--session <id>] [--socket <path>] [--format <format>]
+```
+
+Returns, for a session, three **distinct** buckets in one read
+([007 §5](./007-agent-facing-interaction.md)): **received** (delivered/acknowledged), **pending**
+(unread — fired, waiting), and **armed-but-not-yet-fired** (a condition the daemon has detected but is
+holding inside a settle/debounce/throttle/rollup window or a recorded `net`/Interpret suppression).
+For each armed entry it reports the **hold reason** and, where deterministic, the **earliest time it
+could fire** — so the agent learns "a change is coming and roughly when" **without polling**. A pure
+read: `inspect` never claims, acks, or advances a cursor.
+
+---
+
+## §15 Exit codes & diagnostics
 
 ### General conventions
 
@@ -1182,37 +1263,44 @@ All commands set `process.exitCode = 1` rather than calling `process.exit(1)`. T
 
 ## Appendix A — Command inventory
 
-| Command    | Subcommand | Transport                         | Status                                      |
-| ---------- | ---------- | --------------------------------- | ------------------------------------------- |
-| `init`     | —          | in-process                        | Fully implemented                           |
-| `validate` | —          | in-process                        | Fully implemented (full schema)             |
-| `scan`     | —          | in-process                        | Fully implemented                           |
-| `inbox`    | `list`     | in-process                        | Fully implemented                           |
-| `inbox`    | `ack`      | in-process                        | Fully implemented                           |
-| `inbox`    | `start`    | in-process                        | Fully implemented                           |
-| `inbox`    | `complete` | in-process                        | Fully implemented                           |
-| `inbox`    | `fail`     | in-process                        | Fully implemented                           |
-| `inbox`    | `archive`  | in-process                        | Fully implemented                           |
-| `monitor`  | `test`     | in-process                        | Fully implemented                           |
-| `monitor`  | `history`  | socket (with in-process fallback) | Fully implemented                           |
-| `monitor`  | `explain`  | socket (with in-process fallback) | Fully implemented                           |
-| `source`   | `list`     | in-process                        | Fully implemented                           |
-| `source`   | `search`   | —                                 | Placeholder / not implemented (NP3)         |
-| `source`   | `install`  | —                                 | Placeholder / not implemented (NP3)         |
-| `source`   | `update`   | —                                 | Placeholder / not implemented (NP3)         |
-| `source`   | `remove`   | —                                 | Placeholder / not implemented (NP3)         |
-| `schema`   | `generate` | in-process                        | Fully implemented                           |
-| `daemon`   | `once`     | in-process                        | Fully implemented                           |
-| `daemon`   | `run`      | creates socket server             | Fully implemented (`--reap-after-ms` added) |
-| `daemon`   | `status`   | socket (with in-process fallback) | Fully implemented                           |
-| `daemon`   | `stop`     | socket                            | Fully implemented                           |
-| `session`  | `open`     | socket                            | Fully implemented                           |
-| `session`  | `close`    | socket                            | Fully implemented                           |
-| `session`  | `list`     | socket                            | Fully implemented                           |
-| `session`  | `start`    | in-process + socket (lazy boot)   | Fully implemented                           |
-| `session`  | `end`      | socket                            | Fully implemented                           |
-| `events`   | `list`     | socket                            | Fully implemented                           |
-| `events`   | `ack`      | socket                            | Fully implemented                           |
-| `hook`     | `claim`    | socket                            | Fully implemented                           |
-| `hook`     | `deliver`  | socket (always exits 0)           | Fully implemented                           |
-| `channel`  | `serve`    | stdio MCP server + socket         | Two-way (push + `agentmon_ack`)             |
+| Command    | Subcommand | Transport                         | Status                                                            |
+| ---------- | ---------- | --------------------------------- | ----------------------------------------------------------------- |
+| `init`     | —          | in-process                        | Fully implemented                                                 |
+| `validate` | —          | in-process                        | Fully implemented (full schema)                                   |
+| `scan`     | —          | in-process                        | Fully implemented                                                 |
+| `inbox`    | `list`     | in-process                        | Fully implemented                                                 |
+| `inbox`    | `ack`      | in-process                        | Fully implemented                                                 |
+| `inbox`    | `start`    | in-process                        | Fully implemented                                                 |
+| `inbox`    | `complete` | in-process                        | Fully implemented                                                 |
+| `inbox`    | `fail`     | in-process                        | Fully implemented                                                 |
+| `inbox`    | `archive`  | in-process                        | Fully implemented                                                 |
+| `monitor`  | `test`     | in-process                        | Fully implemented                                                 |
+| `monitor`  | `history`  | socket (with in-process fallback) | Fully implemented                                                 |
+| `monitor`  | `explain`  | socket (with in-process fallback) | Fully implemented                                                 |
+| `source`   | `list`     | in-process                        | Fully implemented                                                 |
+| `source`   | `search`   | —                                 | Placeholder / not implemented (NP3)                               |
+| `source`   | `install`  | —                                 | Placeholder / not implemented (NP3)                               |
+| `source`   | `update`   | —                                 | Placeholder / not implemented (NP3)                               |
+| `source`   | `remove`   | —                                 | Placeholder / not implemented (NP3)                               |
+| `schema`   | `generate` | in-process                        | Fully implemented                                                 |
+| `daemon`   | `once`     | in-process                        | Fully implemented                                                 |
+| `daemon`   | `run`      | creates socket server             | Fully implemented (`--reap-after-ms` added)                       |
+| `daemon`   | `status`   | socket (with in-process fallback) | Fully implemented                                                 |
+| `daemon`   | `stop`     | socket                            | Fully implemented                                                 |
+| `session`  | `open`     | socket                            | Fully implemented                                                 |
+| `session`  | `close`    | socket                            | Fully implemented                                                 |
+| `session`  | `list`     | socket                            | Fully implemented                                                 |
+| `session`  | `start`    | in-process + socket (lazy boot)   | Fully implemented                                                 |
+| `session`  | `end`      | socket                            | Fully implemented                                                 |
+| `events`   | `list`     | socket                            | Fully implemented                                                 |
+| `events`   | `ack`      | socket                            | Fully implemented                                                 |
+| `hook`     | `claim`    | socket                            | Fully implemented                                                 |
+| `hook`     | `deliver`  | socket (always exits 0)           | Fully implemented                                                 |
+| `channel`  | `serve`    | stdio MCP server + socket         | Two-way (push + `agentmon_ack`)                                   |
+| `snapshot` | —          | daemon (read-only)                | **Target** (§14.1, [007 §3.1](./007-agent-facing-interaction.md)) |
+| `diff`     | —          | daemon (read-only)                | **Target** (§14.2, [007 §3.2](./007-agent-facing-interaction.md)) |
+| `summary`  | —          | daemon (read-only)                | **Target** (§14.3, [007 §3.3](./007-agent-facing-interaction.md)) |
+| `watch`    | (declare)  | daemon (declaration-only)         | **Target** (§14.4, [007 §4](./007-agent-facing-interaction.md))   |
+| `watch`    | `list`     | daemon (read-only)                | **Target** (§14.4, [007 §4](./007-agent-facing-interaction.md))   |
+| `watch`    | `cancel`   | daemon                            | **Target** (§14.4, [007 §4.4](./007-agent-facing-interaction.md)) |
+| `inspect`  | —          | daemon (read-only)                | **Target** (§14.5, [007 §5](./007-agent-facing-interaction.md))   |
