@@ -64,7 +64,9 @@ The interface definition (verified: `libs/core/src/observation/types.ts`):
 - `context.now: Date` — timestamp supplied by the runtime.
 - `context.workspacePath?: string` — runtime workspace/config root for project monitor evaluation.
   File-system-oriented sources use this to resolve project-relative scope without depending on the
-  daemon process cwd. User-level monitor scoping is a separate design decision.
+  daemon process cwd. For user-level monitors using absolute or home-relative globs,
+  `workspacePath` is `null`; the source MUST NOT use the daemon process `cwd` as a fallback for
+  glob resolution. The full sigil-based glob scope rules are in [§3.5](#35-glob-scope-resolution-sigil-based-syntax-for-user-level-monitors-target).
 - `context.signal?: AbortSignal` — supplied to `watch()` only; the runtime aborts it to tear the watcher down (daemon shutdown, monitor removal). A `watch()` implementation **SHOULD** stop yielding and release resources when it fires. Unused by `observe()`.
 
 ### 2.3 Observation result
@@ -320,11 +322,11 @@ watch:
 ```
 
 Required field: `globs`. Optional fields: `ignore` (exclude glob string or array of exclude glob
-strings), `cwd` (string), `interval` (duration string), `backend` (string; see §3.5 below).
+strings), `cwd` (string), `interval` (duration string), `backend` (string; see §3.9 below).
 
-> **TARGET** — The `backend` field and the watch-mode behavior described in §3.5–§3.7 are **target**
+> **TARGET** — The `backend` field and the watch-mode behavior described in §3.8–§3.10 are **target**
 > behavior, not current. The current implementation of `file-fingerprint` uses `observe()` only
-> (the polling path described in §3.2). Everything in §3.5–§3.7 is the intended post-implementation
+> (the polling path described in §3.2). Everything in §3.8–§3.10 is the intended post-implementation
 > contract; it MUST be marked _current_ (with `verified:` references) when the feature ships.
 
 `globs` accepts **either** a single pattern as a bare string **or** an array of patterns
@@ -434,9 +436,223 @@ Verified: `plugins/source-file-fingerprint/src/index.ts` (`buildAbsentObservatio
 salience + end-to-end escalation tests in
 `plugins/source-file-fingerprint/src/index.test.ts`.
 
-### 3.5 Watch mode: event-driven change detection (TARGET)
+### 3.5 Glob scope resolution: sigil-based syntax for user-level monitors (_target_)
 
-> **Status: target.** This section and §3.6–§3.7 describe the intended implementation of
+> **Status: target** (Refs #194). The **project-level** behavior described in §3.1 — resolving
+> bare-relative `globs` against `context.workspacePath` — is **current** and unchanged. The rules
+> below add two new scope classes (absolute and home-relative) that are valid forms for
+> **user-level** monitors. User-level bare-relative glob rejection is **target** pending a guard in
+> `agentmonitors validate`. See [001 §6.1](./001-monitor-definition.md) for the authoring
+> perspective. Project-relative fan-out for user-level monitors (one definition → N
+> workspace-scoped instances) is **out of scope** for this release and is tracked in issue #258.
+
+#### 3.5.1 Scope class determination
+
+The scope class of every pattern in a monitor's `globs` (and `ignore`) array is determined by the
+**leading character** of each pattern string. No separate `scope:` field is used.
+
+| Leading character  | Scope class      | Resolution                                                                                                                                                    |
+| ------------------ | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/`                | Absolute         | Passed to `globSync` unchanged. `cwd` is irrelevant.                                                                                                          |
+| `~`                | Home-relative    | Expanded via `os.homedir()` (see §3.5.2) before being passed to `globSync`. `cwd` is irrelevant.                                                              |
+| _(any other char)_ | Project-relative | Resolved against `context.workspacePath` exactly as today (§3.1). `cwd` is resolved against that same root if provided; `globSync` is called with that `cwd`. |
+
+This determination runs **per pattern**, not per monitor. However, the no-mixing rule (§3.5.3)
+means that in practice all patterns in a given monitor will have the same scope class.
+
+#### 3.5.2 `~` expansion rule
+
+A pattern whose first character is `~` **MUST** be expanded using `os.homedir()` before glob
+expansion:
+
+- `~` alone → `os.homedir()`
+- `~/…` → `os.homedir() + '/…'`
+
+The expanded result is an **absolute path**, and `globSync` is called with it as if it were a
+`/`-prefixed pattern (no `cwd` involvement).
+
+`~user` forms (patterns beginning with `~` followed immediately by a character other than `/`)
+are **not** supported and **MUST** be rejected at `agentmonitors validate` with a clear error:
+
+> _"`~user` home expansion is not supported. Use an absolute path or `~/…` instead."_
+
+**Rationale:** `~user` expansion requires looking up another user's home directory via
+platform-specific APIs that are unreliable in daemon contexts. The common author intent
+("files in my home directory") is fully covered by `~/…`. The restriction is narrow and
+self-correcting via the validate error.
+
+#### 3.5.3 No-mixing rule
+
+All patterns within a single monitor's `globs` array (and `ignore` array) **MUST** belong to the
+same scope class. A monitor that mixes scope classes — for example, one `/var/log/x.log` (absolute)
+and one `src/**/*.ts` (project-relative) in the same `globs` array — **MUST** be rejected at
+`agentmonitors validate` with a clear error:
+
+> _"Mixed glob scope classes in one monitor: found absolute and project-relative patterns. Split
+> into two monitors — one per scope class."_
+
+**Why this constraint exists:** a single monitor corresponds to a single `sourceState` and a
+single baseline. Mixing scope classes would produce a baseline spanning both user-level files and
+project-relative files, making the baseline ambiguous when a daemon serves multiple workspaces
+(does the project-relative half belong to workspace A, workspace B, or all of them?). Two
+monitors with separate identities, separate baselines, and separate event streams avoid the
+ambiguity cleanly.
+
+**Scope classes involved in the no-mixing rule:**
+
+- absolute + home-relative = **allowed** (both are workspace-agnostic; technically two classes
+  but both resolve without a workspace; `agentmonitors validate` **SHOULD** warn that mixing
+  these two in one monitor is unusual but **MUST NOT** reject it as an error)
+- absolute + project-relative = **rejected**
+- home-relative + project-relative = **rejected**
+
+> _Note:_ in practice, mixing absolute and home-relative is extremely unlikely (authors either
+> watch files under `~` or at an absolute path, not both in one monitor). The SHOULD-warn rather
+> than MUST-reject treatment keeps the rule simple without creating a false positive footgun.
+
+#### 3.5.4 User-level monitor glob constraint (target)
+
+A `MONITOR.md` living in a **user-level monitors root** (the global config root rather than a
+project `.claude/monitors/` directory) **MUST NOT** use bare-relative `globs`. The daemon cannot
+determine which workspace root to resolve bare-relative patterns against for a user-level monitor
+without the project-relative fan-out machinery (issue #258), and silently resolving against the
+daemon process `cwd` would produce wrong paths.
+
+`agentmonitors validate` **MUST** detect this condition and reject it with a clear error:
+
+> _"Bare-relative globs in a user-level monitor are not supported (Refs #258). Use `/…` for
+> absolute paths or `~/…` for home-relative paths instead."_
+
+Until the user-level context flag is propagated into the validation path, this check **MUST** be
+implemented conservatively: if the validator is invoked with a `--user-level` flag (or an
+equivalent context indicating the monitors directory is not a project `.claude/monitors/`
+directory), bare-relative patterns are rejected. Without that flag, bare-relative patterns are
+accepted as project-relative (preserving the current behavior for project-level monitors). The
+mechanism for communicating user-vs-project context to `validate` is an implementation detail;
+the observable contract is: **bare-relative + user-level = validate error**.
+
+#### 3.5.5 Events from workspace-agnostic monitors
+
+A `file-fingerprint` user-level monitor whose `globs` are all absolute or all home-relative
+produces **workspace-agnostic** events: events whose `workspacePath` is `null`. These are
+projected into **all lead sessions** via the existing `sessionsForWorkspace(null)` path.
+
+This reuses existing infrastructure: workspace-agnostic events already exist in the runtime for
+other sources. No new projection machinery is required for the absolute/home-relative forms.
+
+Project-relative user-level monitors (which would produce per-workspace events from a single
+definition) require the fan-out machinery tracked in issue #258 and are **not** covered here.
+
+#### 3.5.6 Concrete examples
+
+**Valid — home-relative user-level monitor (target):**
+
+```yaml
+# In a user-level monitors root (global config root)
+watch:
+  type: file-fingerprint
+  globs:
+    - '~/notes/**/*.md'
+    - '~/inbox.txt'
+```
+
+`~/notes/**/*.md` and `~/inbox.txt` are both home-relative. `~` is expanded to `os.homedir()`.
+The resulting events have `workspacePath: null` and project into all lead sessions.
+
+**Valid — absolute user-level monitor (target):**
+
+```yaml
+watch:
+  type: file-fingerprint
+  globs:
+    - '/var/log/app.log'
+    - '/etc/hosts'
+```
+
+Both patterns are absolute. The resulting events have `workspacePath: null`.
+
+**Valid — project-level monitor using bare-relative (current; unchanged):**
+
+```yaml
+# In a project .claude/monitors/ directory
+watch:
+  type: file-fingerprint
+  globs:
+    - 'src/**/*.ts'
+    - 'package.json'
+```
+
+Bare-relative in a project-level monitor. Resolved against `context.workspacePath` as today. No
+change to existing behavior.
+
+**Invalid — bare-relative in a user-level monitor (target; rejected at validate):**
+
+```yaml
+# In a user-level monitors root — INVALID
+watch:
+  type: file-fingerprint
+  globs:
+    - 'src/**/*.ts' # ERROR: no workspace to resolve against at user level
+```
+
+`agentmonitors validate` rejects this with a clear error directing the author to use `~/…` or
+an absolute path.
+
+**Invalid — `~user` form (target; rejected at validate):**
+
+```yaml
+watch:
+  type: file-fingerprint
+  globs:
+    - '~alice/notes.md' # ERROR: ~user expansion is not supported
+```
+
+`agentmonitors validate` rejects this with a clear error directing the author to use an absolute
+path or `~/…`.
+
+**Invalid — mixed scope classes (target; rejected at validate):**
+
+```yaml
+watch:
+  type: file-fingerprint
+  globs:
+    - '/var/log/app.log' # absolute
+    - 'src/**/*.ts' # project-relative — MIXES scope classes
+```
+
+`agentmonitors validate` rejects this with a clear error directing the author to split into two
+monitors.
+
+#### 3.5.7 Validation implications
+
+The following test scenarios cover the sigil-based glob scope feature:
+
+- **Happy path — home-relative user-level monitor:** a user-level monitor with
+  `globs: ['~/notes/x.md']` is accepted by `agentmonitors validate`; the `~` in the pattern
+  expands to `os.homedir()` at observe time; the resulting event has `workspacePath: null`; the
+  event projects into a lead session for a different workspace (workspace-agnostic projection).
+- **Happy path — absolute user-level monitor:** a user-level monitor with
+  `globs: ['/var/log/x.log']` is accepted; the event has `workspacePath: null`.
+- **Happy path — fixed single file:** a user-level monitor with a single fixed file path
+  (e.g., `globs: ['/etc/hosts']`) is accepted; this is the simplest workspace-agnostic form.
+- **Happy path — project-relative project monitor (current, unchanged):** a project-level monitor
+  with `globs: ['src/**/*.ts']` continues to resolve against `context.workspacePath` exactly as
+  today; no behavior change.
+- **Negative — bare-relative in user-level monitor:** `agentmonitors validate --user-level`
+  with `globs: ['src/**/*.ts']` exits non-zero with a message referencing #258 and directing the
+  author to use `~/…` or an absolute path.
+- **Negative — `~user` form:** `agentmonitors validate` with `globs: ['~alice/notes.md']` exits
+  non-zero with a message saying `~user` expansion is not supported.
+- **Negative — mixed scope classes:** `agentmonitors validate` with
+  `globs: ['/var/log/x', 'src/foo.ts']` exits non-zero with a message directing the author to
+  split into two monitors.
+- **Cross-session projection:** a workspace-agnostic event (from an absolute or home-relative
+  user-level monitor) projects into a session whose `workspacePath` is a project directory
+  different from where the monitor is defined — proving `sessionsForWorkspace(null)` is used.
+
+### 3.8 Watch mode: event-driven change detection (TARGET)
+
+> **Status: target.** This section and §3.9–§3.10 describe the intended implementation of
 > `watch()` for `file-fingerprint`. None of this is current behavior; the current source uses
 > `observe()` only (§3.2). These rules MUST be moved to _current_ status with `verified:`
 > references when the feature ships (process: [004 §5–6](./004-validation-testing.md)).
@@ -444,7 +660,7 @@ salience + end-to-end escalation tests in
 `file-fingerprint` **MUST** implement `watch()` and opt into the existing continuous-watch contract
 (§2, G5/NP4). Watch mode is the **default change-detection mechanism for long-lived
 `file-fingerprint` monitors**; the `interval` field becomes a fallback-only knob used when the
-watcher cannot be initialized (see §3.6).
+watcher cannot be initialized (see §3.9).
 
 The watcher MUST be implemented via **`@parcel/watcher`** (auto mode by default). `@parcel/watcher`
 is an in-process N-API native addon that transparently uses the most capable backend available
@@ -501,7 +717,7 @@ The sequence is:
 2. Run one full `observe()` pass against the current file tree; emit any resulting observations
    through the runtime's `ingest()` path.
 3. Record the updated fingerprint state as the in-memory watcher baseline.
-4. Open the `@parcel/watcher` subscription (§3.5 above).
+4. Open the `@parcel/watcher` subscription (§3.8 above).
 
 > **Example (reconcile-on-start net diff).** The daemon is stopped for two minutes; during that
 > time `foo.ts` is modified and `bar.ts` is deleted. When the daemon restarts, the reconcile pass
@@ -513,9 +729,9 @@ The sequence is:
 > immediately calls the watcher boot sequence MUST see the mutation surfaced as a reconcile
 > observation before any OS-level watcher events arrive.
 
-### 3.6 Backend selection and failure policy (TARGET)
+### 3.9 Backend selection and failure policy (TARGET)
 
-> **Status: target.** Part of the §3.5 event-driven feature. All rules here are target.
+> **Status: target.** Part of the §3.8 event-driven feature. All rules here are target.
 
 The optional `backend` scope field controls which underlying watching mechanism `@parcel/watcher`
 uses. When omitted it defaults to `auto`.
@@ -573,9 +789,9 @@ insufficient.
 auto` with watcher init forced to fail MUST see the monitor switch to polling AND a warning
 > visible in its explain output.
 
-### 3.7 Periodic source-state checkpointing during watch (TARGET)
+### 3.10 Periodic source-state checkpointing during watch (TARGET)
 
-> **Status: target.** Part of the §3.5 event-driven feature. This section describes a new core
+> **Status: target.** Part of the §3.8 event-driven feature. This section describes a new core
 > contract addition (also specified in [002 §2.4](./002-runtime-delivery.md)) required for
 > mid-watch crash safety. All rules here are target.
 
@@ -605,7 +821,7 @@ the watcher.
 
 > **Test implication.** A test that (a) starts a watcher, (b) triggers file changes that are
 > observed and yielded, (c) simulates a daemon crash before the next checkpoint, and (d) restarts the
-> daemon MUST see the reconcile-on-start pass (§3.5) report only the changes that occurred
+> daemon MUST see the reconcile-on-start pass (§3.8) report only the changes that occurred
 > _after_ the last checkpoint — not re-report changes that were delivered before the crash.
 
 ## 4. Bundled Source: `api-poll`
