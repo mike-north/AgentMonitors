@@ -90,8 +90,8 @@ Conventions for the engineering fleet working this repo. The PM agent maintains 
      agent-readable installer served at `agentmonitors.io/skill.md`.
   5. **Fresh-environment acceptance** — scripted install→first-signal proofs on every
      supported path (hooks-only, MCP, Codex).
-  Issue bodies name the workstream they belong to; queue ranking mechanics are unchanged
-  (deadline → priority label → issue number).
+     Issue bodies name the workstream they belong to; queue ranking mechanics are unchanged
+     (deadline → priority label → issue number).
 - **Review priorities** (also in `.github/copilot-instructions.md`): durable-state bugs,
   session-isolation errors, and event loss during debounce/compaction/batching/restart
   outrank style. Design your tests to attack those first.
