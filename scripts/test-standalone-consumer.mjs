@@ -603,9 +603,13 @@ async function main() {
 // Only run when invoked directly (`node scripts/test-standalone-consumer.mjs`
 // / `pnpm test:standalone-consumer`), never as a side effect of another
 // script (e.g. the coverage-drift unit test) importing SOURCE_PLUGINS.
+// `argv[1]` is resolved to an absolute path first: `pathToFileURL` on a
+// relative path resolves against `process.cwd()` at call time rather than
+// throwing, so an unresolved relative `argv[1]` could silently mismatch
+// `import.meta.url`.
 const isMainModule =
   process.argv[1] !== undefined &&
-  import.meta.url === pathToFileURL(process.argv[1]).href;
+  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
 if (isMainModule) {
   await main();
 }
