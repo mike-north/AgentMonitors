@@ -483,6 +483,187 @@ describe('init', () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('already exists');
   });
+
+  // AC4 (issue #268): the named `init <name> --type ...` scaffold output must be
+  // byte-for-byte unchanged by the bare-init bootstrap work. The expected string
+  // is written by hand from 005 §2's documented output, so any drift (an added
+  // line, a reworded hint) fails here — not derived from the current program.
+  it('init <name> --type output is byte-for-byte unchanged (AC4 regression)', () => {
+    const dir = path.join(tempDir, 'init-byte-for-byte');
+    mkdirSync(dir, { recursive: true });
+    const monitorsDir = path.join(dir, 'monitors');
+    const result = run(
+      ['init', 'my-mon', '--dir', monitorsDir, '--type', 'file-fingerprint'],
+      dir,
+    );
+    expect(result.exitCode).toBe(0);
+    const monitorDir = path.join(monitorsDir, 'my-mon');
+    const expected =
+      `Created monitor: ${monitorDir}/MONITOR.md\n` +
+      `\n` +
+      `Edit the file to configure your monitor, then run:\n` +
+      `  agentmonitors validate ${monitorsDir}\n`;
+    expect(result.stdout).toBe(expected);
+    expect(result.stderr).toBe('');
+  });
+});
+
+// Issue #268: bare `agentmonitors init` (no name) is a one-shot project
+// bootstrap — enable the project, fix `.gitignore`, offer a first monitor,
+// validate, and print a next-steps summary. `init <name>` scaffolding is
+// covered above and must stay unchanged.
+//
+// @see https://github.com/mike-north/AgentMonitors/issues/268
+// @see docs/specs/005-cli-reference.md §2
+// @see agent-plugins/agentmonitors/skills/setup-monitors/SKILL.md
+describe('init bootstrap (bare init)', () => {
+  const LOCAL_STATE_REL = path.join('.claude', 'agentmonitors.local.md');
+  const GITIGNORE_LINE = '.claude/*.local.*';
+
+  // AC1 + AC5: fresh dir → bare init (non-interactive via --yes) → enabled +
+  // gitignore correct + a valid scaffolded monitor + a validate that passed.
+  it('bootstraps a fresh project: enable + gitignore + valid monitor + validate (--yes)', () => {
+    const dir = path.join(tempDir, 'bootstrap-yes');
+    mkdirSync(dir, { recursive: true });
+
+    const result = run(['init', '--yes'], dir);
+    expect(result.exitCode).toBe(0);
+
+    // Step 1 — enable file with `enabled: true` (exact setup-monitors skill shape).
+    const localState = readFileSync(path.join(dir, LOCAL_STATE_REL), 'utf-8');
+    expect(localState).toContain('enabled: true');
+
+    // Step 2 — `.gitignore` ignores the local coordination file.
+    const gitignore = readFileSync(path.join(dir, '.gitignore'), 'utf-8');
+    expect(gitignore.split('\n')).toContain(GITIGNORE_LINE);
+
+    // Step 3 — a starter monitor was scaffolded under the default dir.
+    expect(
+      existsSync(
+        path.join(dir, '.claude', 'monitors', 'my-monitor', 'MONITOR.md'),
+      ),
+    ).toBe(true);
+
+    // Step 4 — `validate` ran on the result and reported the monitor valid.
+    expect(result.stdout).toContain('Valid monitors: 1');
+
+    // Step 5 — the summary points at how to verify the monitor fires.
+    expect(result.stdout).toContain('Verify the monitor fires');
+    expect(result.stdout).toContain('monitor test');
+  });
+
+  // AC2: `--enable-only` performs steps 1–2 only — no monitor, no prompts, exit 0.
+  it('--enable-only enables + fixes gitignore but scaffolds no monitor', () => {
+    const dir = path.join(tempDir, 'bootstrap-enable-only');
+    mkdirSync(dir, { recursive: true });
+
+    const result = run(['init', '--enable-only'], dir);
+    expect(result.exitCode).toBe(0);
+
+    expect(readFileSync(path.join(dir, LOCAL_STATE_REL), 'utf-8')).toContain(
+      'enabled: true',
+    );
+    expect(
+      readFileSync(path.join(dir, '.gitignore'), 'utf-8').split('\n'),
+    ).toContain(GITIGNORE_LINE);
+    // No monitor scaffolding in enable-only mode.
+    expect(existsSync(path.join(dir, '.claude', 'monitors'))).toBe(false);
+  });
+
+  // AC3: re-running on an already-enabled project changes nothing and says so.
+  it('is idempotent: re-running --enable-only changes nothing and says so', () => {
+    const dir = path.join(tempDir, 'bootstrap-idempotent');
+    mkdirSync(dir, { recursive: true });
+
+    const first = run(['init', '--enable-only'], dir);
+    expect(first.exitCode).toBe(0);
+
+    const localPath = path.join(dir, LOCAL_STATE_REL);
+    const gitignorePath = path.join(dir, '.gitignore');
+    const localBefore = readFileSync(localPath, 'utf-8');
+    const gitignoreBefore = readFileSync(gitignorePath, 'utf-8');
+
+    const second = run(['init', '--enable-only'], dir);
+    expect(second.exitCode).toBe(0);
+    expect(second.stdout.toLowerCase()).toContain('already set up');
+
+    // "changes nothing": both files are byte-identical after the re-run.
+    expect(readFileSync(localPath, 'utf-8')).toBe(localBefore);
+    expect(readFileSync(gitignorePath, 'utf-8')).toBe(gitignoreBefore);
+  });
+
+  // AC3 (monitor path): a `--yes` re-run must not error on the existing monitor
+  // nor rewrite it — it reports "already set up" and leaves the file untouched.
+  it('is idempotent: re-running --yes leaves an existing monitor unchanged', () => {
+    const dir = path.join(tempDir, 'bootstrap-idempotent-yes');
+    mkdirSync(dir, { recursive: true });
+
+    const first = run(['init', '--yes'], dir);
+    expect(first.exitCode).toBe(0);
+
+    const monitorPath = path.join(
+      dir,
+      '.claude',
+      'monitors',
+      'my-monitor',
+      'MONITOR.md',
+    );
+    const before = readFileSync(monitorPath, 'utf-8');
+
+    const second = run(['init', '--yes'], dir);
+    expect(second.exitCode).toBe(0);
+    expect(second.stdout.toLowerCase()).toContain('already set up');
+    expect(readFileSync(monitorPath, 'utf-8')).toBe(before);
+  });
+
+  // AC1: `.gitignore` handling appends without clobbering existing content and
+  // never duplicates the ignore line across runs.
+  it('appends the ignore line to a pre-existing .gitignore without clobbering it', () => {
+    const dir = path.join(tempDir, 'bootstrap-gitignore-append');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      path.join(dir, '.gitignore'),
+      'node_modules\ndist\n',
+      'utf-8',
+    );
+
+    expect(run(['init', '--enable-only'], dir).exitCode).toBe(0);
+
+    const gitignore = readFileSync(path.join(dir, '.gitignore'), 'utf-8');
+    expect(gitignore).toContain('node_modules');
+    expect(gitignore).toContain('dist');
+    expect(gitignore.split('\n')).toContain(GITIGNORE_LINE);
+
+    // Re-running must not add a second copy of the line.
+    expect(run(['init', '--enable-only'], dir).exitCode).toBe(0);
+    const after = readFileSync(path.join(dir, '.gitignore'), 'utf-8');
+    const occurrences = after
+      .split('\n')
+      .filter((line) => line.trim() === GITIGNORE_LINE).length;
+    expect(occurrences).toBe(1);
+  });
+
+  // AC2 (agents/scripts): a non-interactive bare init (closed, non-TTY stdin)
+  // must not prompt or hang — it enables the project, scaffolds no monitor, and
+  // tells the caller how to opt into a starter monitor.
+  it('non-interactive bare init (no flags) enables without prompting or scaffolding', () => {
+    const dir = path.join(tempDir, 'bootstrap-noninteractive');
+    mkdirSync(dir, { recursive: true });
+
+    // Empty stdin makes the child's stdin a closed pipe (never a TTY), so the
+    // command takes the non-interactive path deterministically instead of
+    // blocking on a prompt.
+    const result = runWithStdin(
+      ['init'],
+      { AGENTMONITORS_DB: ':memory:' },
+      '',
+      dir,
+    );
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(path.join(dir, LOCAL_STATE_REL))).toBe(true);
+    expect(existsSync(path.join(dir, '.claude', 'monitors'))).toBe(false);
+    expect(result.stdout).toContain('--yes');
+  });
 });
 
 describe('validate', () => {
