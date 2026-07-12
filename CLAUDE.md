@@ -127,6 +127,10 @@ tick) and a couple of fallbacks run **in-process without the socket** — see
 - **Releases**: Changesets. Changes affecting published package behavior or public types should
   include a changeset. `scripts/check-no-major-changesets.mjs` blocks accidental major bumps; a
   pre-publish standalone-consumer check (`pnpm test:standalone-consumer`) validates the published
-  packages work for external consumers.
+  packages work for external consumers. CI's `publish-dry-run` job (path-filtered to publishable
+  package dirs, `scripts/`, and the release workflow) runs `pnpm publish:packages:dry-run` after a
+  build to catch release-collateral defects — missing `CHANGELOG.md`, missing `publishConfig`, or a
+  built entry point `npm pack` wouldn't include — on the PR that introduces them, not at release
+  time.
 - **Review priority** (per `.github/copilot-instructions.md`): durable-state bugs, session-isolation
   errors, and event loss during debounce/compaction/batching/restart come before style.
