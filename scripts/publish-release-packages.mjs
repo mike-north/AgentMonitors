@@ -5,6 +5,12 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 export const REPO_ROOT = process.cwd();
+
+// Authoritative list of publishable packages (single source of truth). Any
+// package whose directory is added here becomes a release candidate; the
+// standalone-consumer smoke test (`scripts/test-standalone-consumer.mjs`)
+// imports this list to validate its own `plugins/source-*` coverage against
+// it, so a new bundled source can never silently ship untested (issue #264).
 export const PACKAGE_DIRS = [
   'libs/core',
   'plugins/source-api-poll',
@@ -276,6 +282,11 @@ export function main({
   return { ok: true };
 }
 
+// Only run when invoked directly (`node scripts/publish-release-packages.mjs`),
+// never as a side effect of another script importing `PACKAGE_DIRS`. `argv[1]`
+// is resolved to an absolute path first: `pathToFileURL` on a relative path
+// resolves against `process.cwd()` at call time rather than throwing, so an
+// unresolved relative `argv[1]` could silently mismatch `import.meta.url`.
 const isMainModule =
   process.argv[1] != null &&
   import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;

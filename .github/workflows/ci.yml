@@ -38,6 +38,12 @@ jobs:
       - name: Test (serial daemon-spawn)
         run: pnpm test:serial
 
+      - name: Test (build script source coverage)
+        run: pnpm test:scripts
+
+      - name: Test (standalone consumer)
+        run: pnpm test:standalone-consumer
+
   # Guards the failure class in ENG_TEAM_INSTRUCTIONS.md rule 8: a package
   # missing CHANGELOG.md, publishConfig, or a built entry point has broken
   # the release pipeline at release time (crashing the changesets action)

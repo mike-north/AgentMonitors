@@ -3,26 +3,87 @@ import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Project } from 'fixturify-project';
+import { PACKAGE_DIRS } from './publish-release-packages.mjs';
+import { assertSourceCoverage } from './source-coverage.mjs';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(SCRIPT_DIR, '..');
 const PNPM_BIN = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
 const NPM_BIN = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-const PACKAGE_DEFS = [
-  { name: '@agentmonitors/core', dir: 'libs/core' },
-  { name: '@agentmonitors/source-api-poll', dir: 'plugins/source-api-poll' },
+const CORE_PACKAGE_NAME = '@agentmonitors/core';
+
+// Every bundled `plugins/source-*` package the smoke test packs, installs,
+// and exercises in the standalone consumer project. This list is the thing
+// `assertSourceCoverage` validates against `PACKAGE_DIRS` (the authoritative
+// publishable-package list in `scripts/publish-release-packages.mjs`): add a
+// new bundled source's package here (and give it a smoke assertion below,
+// see the command-poll block for the minimal direct-call pattern) whenever
+// it's added to `PACKAGE_DIRS`, or `main()` fails loudly naming the gap
+// before it does any expensive build/pack work (issue #264).
+export const SOURCE_PLUGINS = [
   {
-    name: '@agentmonitors/source-file-fingerprint',
-    dir: 'plugins/source-file-fingerprint',
+    dir: 'plugins/source-api-poll',
+    packageName: '@agentmonitors/source-api-poll',
+    sourceName: 'api-poll',
+    importName: 'apiPollSource',
   },
-  { name: '@agentmonitors/source-schedule', dir: 'plugins/source-schedule' },
   {
-    name: '@agentmonitors/source-incoming-changes',
+    dir: 'plugins/source-file-fingerprint',
+    packageName: '@agentmonitors/source-file-fingerprint',
+    sourceName: 'file-fingerprint',
+    importName: 'fileFingerprintSource',
+  },
+  {
+    dir: 'plugins/source-schedule',
+    packageName: '@agentmonitors/source-schedule',
+    sourceName: 'schedule',
+    importName: 'scheduleSource',
+  },
+  {
     dir: 'plugins/source-incoming-changes',
+    packageName: '@agentmonitors/source-incoming-changes',
+    sourceName: 'incoming-changes',
+    importName: 'incomingChangesSource',
+  },
+  {
+    dir: 'plugins/source-command-poll',
+    packageName: '@agentmonitors/source-command-poll',
+    sourceName: 'command-poll',
+    importName: 'commandPollSource',
   },
 ];
+
+const PACKAGE_DEFS = [
+  { name: CORE_PACKAGE_NAME, dir: 'libs/core' },
+  ...SOURCE_PLUGINS.map(({ packageName, dir }) => ({
+    name: packageName,
+    dir,
+  })),
+];
+
+// ---- Generated fragments for the embedded smoke scripts below ----
+// Built once from SOURCE_PLUGINS so the import/registration/assertion code
+// for each bundled source lives in exactly one place.
+const sourceImportLines = SOURCE_PLUGINS.map(
+  ({ importName, packageName }) =>
+    `import ${importName} from '${packageName}';`,
+).join('\n');
+const sourceRegisterLines = SOURCE_PLUGINS.map(
+  ({ importName }) => `registry.register(${importName});`,
+).join('\n');
+const sourceTypesArrayLines = SOURCE_PLUGINS.map(
+  ({ importName }) => `  ${importName},`,
+).join('\n');
+const packageNamesLiteral = JSON.stringify(
+  [CORE_PACKAGE_NAME, ...SOURCE_PLUGINS.map((plugin) => plugin.packageName)],
+  null,
+  2,
+);
+const sourceNamesLiteral = JSON.stringify(
+  SOURCE_PLUGINS.map((plugin) => plugin.sourceName).sort(),
+);
 
 function run(command, args, cwd) {
   const result = spawnSync(command, args, {
@@ -93,19 +154,10 @@ import {
   generateMonitorSchema,
   parseMonitorFile,
 } from '@agentmonitors/core';
-import apiPollSource from '@agentmonitors/source-api-poll';
-import fileFingerprintSource from '@agentmonitors/source-file-fingerprint';
-import scheduleSource from '@agentmonitors/source-schedule';
-import incomingChangesSource from '@agentmonitors/source-incoming-changes';
+${sourceImportLines}
 
 const projectDir = path.dirname(fileURLToPath(import.meta.url));
-const packageNames = [
-  '@agentmonitors/core',
-  '@agentmonitors/source-api-poll',
-  '@agentmonitors/source-file-fingerprint',
-  '@agentmonitors/source-schedule',
-  '@agentmonitors/source-incoming-changes',
-];
+const packageNames = ${packageNamesLiteral};
 
 for (const packageName of packageNames) {
   const packageJson = JSON.parse(
@@ -122,16 +174,8 @@ for (const packageName of packageNames) {
 }
 
 const registry = new SourceRegistry();
-registry.register(apiPollSource);
-registry.register(fileFingerprintSource);
-registry.register(scheduleSource);
-registry.register(incomingChangesSource);
-assert.deepEqual(registry.names().sort(), [
-  'api-poll',
-  'file-fingerprint',
-  'incoming-changes',
-  'schedule',
-]);
+${sourceRegisterLines}
+assert.deepEqual(registry.names().sort(), ${sourceNamesLiteral});
 
 const schema = generateMonitorSchema(registry.list());
 assert.deepEqual(schema.properties.watch.properties.type.enum.sort(), registry.names().sort());
@@ -156,6 +200,13 @@ try {
   assert.ok(address && typeof address === 'object');
   const port = address.port;
 
+  // Both fixtures below declare \`baseline-strategy: incremental\` explicitly:
+  // the default, \`net\` (001 §3.7), collapses each object's multiple
+  // observations down to one delivered "newest" event at claim time (002
+  // §1.1.7), which would undercount the per-observation event/unread
+  // assertions below (each of the 2 ticks touches the same object twice).
+  // \`incremental\` restores the original play-by-play semantics this smoke
+  // test was written against.
   const fileMonitorDir = path.join(monitorsDir, 'watch-file');
   mkdirSync(fileMonitorDir, { recursive: true });
   writeFileSync(
@@ -169,6 +220,7 @@ watch:
   cwd: \${workspaceDir}
   interval: 0s
 urgency: normal
+baseline-strategy: incremental
 ---
 Tell the agent the watched file changed.
 \`,
@@ -188,6 +240,7 @@ watch:
   change-detection:
     strategy: json-diff
 urgency: normal
+baseline-strategy: incremental
 ---
 Tell the agent the local API changed.
 \`,
@@ -265,6 +318,37 @@ Tell the agent the local API changed.
   );
   assert.equal(scheduled.observations.length, 1);
   assert.equal(scheduled.observations[0]?.title, 'Five minute timer');
+
+  // ---- command-poll source: direct-call smoke ----
+  // Exercised directly (like schedule above) rather than via a full runtime
+  // tick: command-poll's behavior is fully deterministic from \`observe()\`
+  // inputs alone (003 §11), so a tick-based fixture would add scaffolding
+  // without adding coverage. The first call establishes the baseline (no
+  // observations); the second call, with the same argv but a different
+  // \`env\` value threaded into stdout, must emit exactly one
+  // output-changed event (003 §11.3/§11.4, text-diff strategy).
+  const commandScope = {
+    command: ['node', '-e', 'console.log(process.env.SMOKE_VALUE || "")'],
+  };
+  const commandBaseline = await commandPollSource.observe(
+    { ...commandScope, env: { SMOKE_VALUE: 'one' } },
+    { now: new Date('2026-03-21T18:00:00.000Z') },
+  );
+  assert.equal(commandBaseline.observations.length, 0);
+  assert.equal(commandBaseline.nextState.baselined, true);
+
+  const commandChanged = await commandPollSource.observe(
+    { ...commandScope, env: { SMOKE_VALUE: 'two' } },
+    {
+      now: new Date('2026-03-21T18:05:00.000Z'),
+      previousState: commandBaseline.nextState,
+    },
+  );
+  assert.equal(commandChanged.observations.length, 1);
+  assert.equal(
+    commandChanged.observations[0]?.title,
+    'Command output changed: ' + commandScope.command.join(' '),
+  );
 
   // ---- incoming-changes source: git-backed smoke ----
   // The incoming-changes source shells out to git, so exercise it against a
@@ -391,16 +475,10 @@ import {
   generateMonitorSchema,
   parseMonitor,
 } from '@agentmonitors/core';
-import apiPollSource from '@agentmonitors/source-api-poll';
-import fileFingerprintSource from '@agentmonitors/source-file-fingerprint';
-import scheduleSource from '@agentmonitors/source-schedule';
-import incomingChangesSource from '@agentmonitors/source-incoming-changes';
+${sourceImportLines}
 
 const sources: ObservationSource[] = [
-  apiPollSource,
-  fileFingerprintSource,
-  scheduleSource,
-  incomingChangesSource,
+${sourceTypesArrayLines}
 ];
 
 const registry = new SourceRegistry();
@@ -478,6 +556,14 @@ async function createStandaloneProject(projectDir) {
 }
 
 async function main() {
+  // Fail loudly, before any expensive build/pack/install work, if a
+  // publishable `plugins/source-*` package (per PACKAGE_DIRS) has no
+  // corresponding entry in SOURCE_PLUGINS above (issue #264).
+  assertSourceCoverage(
+    PACKAGE_DIRS,
+    SOURCE_PLUGINS.map((plugin) => plugin.sourceName),
+  );
+
   console.log('Building published packages...');
   run(PNPM_BIN, ['build'], REPO_ROOT);
 
@@ -514,4 +600,16 @@ async function main() {
   );
 }
 
-await main();
+// Only run when invoked directly (`node scripts/test-standalone-consumer.mjs`
+// / `pnpm test:standalone-consumer`), never as a side effect of another
+// script (e.g. the coverage-drift unit test) importing SOURCE_PLUGINS.
+// `argv[1]` is resolved to an absolute path first: `pathToFileURL` on a
+// relative path resolves against `process.cwd()` at call time rather than
+// throwing, so an unresolved relative `argv[1]` could silently mismatch
+// `import.meta.url`.
+const isMainModule =
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+if (isMainModule) {
+  await main();
+}
