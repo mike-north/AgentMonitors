@@ -76,10 +76,22 @@ Conventions for the engineering fleet working this repo. The PM agent maintains 
 
 ## Context that helps
 
-- **Current campaign:** Wave 2 of the distribution strategy
-  (`docs/product/distribution-strategy.md`) kicks off **2026-06-18** — ~15 external users
-  start authoring monitors. Work that improves author-facing DX, error messages, and
-  debuggability punches above its weight until then.
+- **Current campaign (2026-07): adoption-readiness.** External authors are live (Wave 2 of
+  `docs/product/distribution-strategy.md` started 2026-06-18); the goal now is a product
+  that is effortless to adopt end-to-end. Priority order for new work:
+  1. **Truthful pipeline** — CI proves what we ship (consumer smoke coverage, release
+     dry-runs, spec/CLI parity).
+  2. **Setup + visible health** — one-shot bootstrap, a unified doctor/health surface, no
+     silent dead-ends.
+  3. **Host integration** — Claude Code polish and Codex delivery (Epic #259 governs;
+     spec precedes build), with the hooks-only/no-MCP path first-class for restricted
+     corporate environments.
+  4. **Website completeness** — CLI reference, troubleshooting, integration pages, and an
+     agent-readable installer served at `agentmonitors.io/skill.md`.
+  5. **Fresh-environment acceptance** — scripted install→first-signal proofs on every
+     supported path (hooks-only, MCP, Codex).
+     Issue bodies name the workstream they belong to; queue ranking mechanics are unchanged
+     (deadline → priority label → issue number).
 - **Review priorities** (also in `.github/copilot-instructions.md`): durable-state bugs,
   session-isolation errors, and event loss during debounce/compaction/batching/restart
   outrank style. Design your tests to attack those first.
