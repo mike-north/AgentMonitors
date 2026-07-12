@@ -4,6 +4,7 @@ import type {
   Urgency,
 } from '../schema/types.js';
 import type { Observation } from '../observation/types.js';
+import type { DuplicateMonitorId } from '../parser/scan-monitors.js';
 
 export type AgentLifecycleEvent =
   | 'session-opened'
@@ -262,6 +263,108 @@ export interface MonitorExplainReport {
   events: MonitorEventRecord[];
   projections: MonitorDeliveryProjection[];
   leadSessions: AgentSessionRecord[];
+}
+
+/**
+ * Delivery-state tallies for one monitor's projections into the lead session(s)
+ * of a single workspace. The three states are distinct (000 AP: _unread_,
+ * _claimed_, and _acknowledged_ are not the same — claiming a delivery never
+ * acknowledges it), so they are counted independently rather than collapsed.
+ */
+export interface DoctorDeliveryCounts {
+  unread: number;
+  claimed: number;
+  acknowledged: number;
+}
+
+/**
+ * A per-monitor health rollup produced by
+ * {@link AgentMonitorRuntime.doctorReport}. Every field is derived from durable
+ * state (persisted observation history, `monitor_events`, and session
+ * projections), so it is accurate whether or not a daemon is currently running —
+ * the daemon writes the same SQLite store the report reads (mirrors
+ * `daemon status` and `monitor explain`'s in-process reads).
+ */
+export interface DoctorMonitorRollup {
+  id: string;
+  displayName: string;
+  sourceName: string;
+  urgency: Urgency;
+  /** `false` when the monitor's `watch` config fails source/schema validation. */
+  valid: boolean;
+  /** The joined validation error(s); present only when `valid` is `false`. */
+  validationError?: string;
+  /**
+   * Timestamp of the most recent completed observation tick for this monitor;
+   * `undefined` when the monitor has never been observed.
+   */
+  lastObservedAt?: Date;
+  /**
+   * `true` when no observation has ever completed for this monitor (the daemon
+   * has never run it) — the explicit "never observed" marker (issue #267).
+   */
+  neverObserved: boolean;
+  /** Whether the monitor is due to observe now. */
+  due: boolean;
+  /** The next time the monitor is due to observe; `undefined` when unknown. */
+  nextDueAt?: Date;
+  /**
+   * A human-readable cadence descriptor, e.g. `every 30s` (interval sources) or
+   * `cron '0 9 * * 1-5'` (schedule sources).
+   */
+  cadence: string;
+  /**
+   * Timestamp of the most recent materialized event for this monitor in the
+   * report's workspace; `undefined` when nothing has materialized.
+   */
+  lastEventAt?: Date;
+  /** Delivery-state tallies across this workspace's lead-session projections. */
+  delivery: DoctorDeliveryCounts;
+}
+
+/** A parse-level failure attributed to a monitor id (or file path fallback). */
+export interface DoctorParseError {
+  /** The monitor id (folder/stem), or the file path when the id can't be derived. */
+  id: string;
+  error: string;
+}
+
+/** Input for {@link AgentMonitorRuntime.doctorReport}. */
+export interface DoctorReportInput {
+  /** Directory containing `MONITOR.md` definitions (e.g. `.claude/monitors`). */
+  monitorsDir: string;
+  /** Workspace path for session projection and event scoping. */
+  workspacePath?: string;
+  /** Clock override (tests). Defaults to `new Date()`. */
+  now?: Date;
+  /** Observation-history rows to inspect per monitor when detecting activity. Default `1`. */
+  historyLimit?: number;
+}
+
+/**
+ * The workspace-wide, durable-state health report behind the `agentmonitors
+ * doctor` command (005 §"doctor", issue #267). It is a read-only diagnosis of
+ * the core/daemon side; the CLI layers the project-enabled and daemon-reachable
+ * checks (both CLI-only concerns) on top of it.
+ */
+export interface MonitorDoctorReport {
+  generatedAt: Date;
+  monitorsDir: string;
+  workspacePath?: string;
+  /** Whether the monitors directory exists on disk. */
+  monitorsDirExists: boolean;
+  /** Every discovered monitor's rollup (both valid and invalid definitions). */
+  monitors: DoctorMonitorRollup[];
+  /** Count of discovered monitors that failed validation. */
+  invalidCount: number;
+  /** Monitor-id collisions across the tree (001 §4). */
+  duplicateIds: DuplicateMonitorId[];
+  /** Parse-level failures (a `MONITOR.md` that could not be parsed at all). */
+  parseErrors: DoctorParseError[];
+  /** Lead sessions registered for this workspace. */
+  leadSessions: AgentSessionRecord[];
+  /** `true` when at least one lead session exists for the workspace. */
+  hasLeadSession: boolean;
 }
 
 export type SessionUnreadCounts = UrgencyCounts & { total: number };

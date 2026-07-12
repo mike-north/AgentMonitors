@@ -1,4 +1,10 @@
-import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import path from 'node:path';
 import { scanMonitors } from '../parser/scan-monitors.js';
 import type { MonitorDefinition, Urgency } from '../schema/types.js';
@@ -15,7 +21,12 @@ import { RuntimeStore } from './store.js';
 import type {
   AgentSessionRecord,
   DeliveryClaim,
+  DoctorDeliveryCounts,
+  DoctorMonitorRollup,
+  DoctorParseError,
+  DoctorReportInput,
   EventQuery,
+  MonitorDoctorReport,
   MonitorEventRecord,
   MonitorExplainInput,
   MonitorExplainReport,
@@ -61,6 +72,26 @@ const EXPLAIN_STAGE_LABELS: Record<MonitorExplainStageId, string> = {
 function watchConfig(watch: Record<string, unknown>): Record<string, unknown> {
   const { type: _type, ...config } = watch;
   return config;
+}
+
+/**
+ * Describe a monitor's observation cadence in author-facing terms for the doctor
+ * rollup (issue #267): the cron expression for `schedule` sources, the authored
+ * `watch.interval` for interval sources, or the resolved default poll interval
+ * (`nextPollMs`) when none is authored. Intentionally generic wording so it reads
+ * correctly for every bundled source.
+ */
+function describeCadence(
+  watch: Record<string, unknown>,
+  nextPollMs: number,
+): string {
+  if (watch['type'] === 'schedule') {
+    const cron = watch['cron'];
+    return typeof cron === 'string' ? `cron '${cron}'` : 'schedule';
+  }
+  const interval = watch['interval'];
+  if (typeof interval === 'string') return `every ${interval}`;
+  return `every ${String(Math.round(nextPollMs / 1000))}s`;
 }
 const NORMAL_INBOX_PROMPT = 'AgentMon messages are available. Read the inbox.';
 const IDLE_INBOX_PROMPT = 'AgentMon has inbox updates ready for review.';
@@ -846,6 +877,132 @@ export class AgentMonitorRuntime {
       events,
       projections,
       leadSessions,
+    };
+  }
+
+  /**
+   * Produce a workspace-wide, durable-state health report — the read-only
+   * diagnosis behind `agentmonitors doctor` (005 §"doctor", issue #267). Unlike
+   * {@link explainMonitor} (single-monitor, staged) this rolls up every monitor
+   * in the tree plus the workspace's lead-session state, so an author can answer
+   * "is my monitoring working, and if not, where is it broken?" from one call.
+   *
+   * All reads are in-process against the persisted store, so the report is valid
+   * whether or not a daemon is running (the daemon writes the same SQLite file).
+   * The CLI adds the project-enabled and daemon-reachable checks, which are
+   * CLI-only concerns core does not model.
+   */
+  async doctorReport(input: DoctorReportInput): Promise<MonitorDoctorReport> {
+    const now = input.now ?? new Date();
+    const historyLimit = input.historyLimit ?? 1;
+    const { monitorsDir, workspacePath } = input;
+
+    const monitorsDirExists =
+      existsSync(monitorsDir) && statSync(monitorsDir).isDirectory();
+
+    const scan = await scanMonitors(monitorsDir);
+    const parseErrors: DoctorParseError[] = scan.errors.map((error) => ({
+      id: monitorIdFromFilePath(error.filePath) || error.filePath,
+      error: error.error,
+    }));
+
+    const leadSessions = this.store
+      .sessionsForWorkspace(workspacePath)
+      .filter((session) => session.role === 'lead');
+
+    const monitors: DoctorMonitorRollup[] = [];
+    let invalidCount = 0;
+    for (const { monitor } of scan.monitors) {
+      const sourceName = monitor.frontmatter.watch.type;
+      const source = this.registry.get(sourceName);
+      const scopeErrors = source
+        ? validateScope(
+            watchConfig(monitor.frontmatter.watch),
+            source.scopeSchema,
+          )
+        : [`Unknown source "${sourceName}".`];
+      const valid = scopeErrors.length === 0;
+      if (!valid) invalidCount += 1;
+
+      const runtimeState = this.store.getMonitorState(monitor.id);
+      const schedule = this.scheduleForMonitor(monitor, now);
+      const lastObservedAt = runtimeState.lastObservationAt;
+      const nextDueAt = schedule.due
+        ? now
+        : new Date(
+            (lastObservedAt?.getTime() ?? now.getTime()) + schedule.nextPollMs,
+          );
+
+      const history = this.store.listObservationHistory({
+        monitorId: monitor.id,
+        limit: historyLimit,
+      });
+      // "Never observed" means no completed observation tick AND no recorded
+      // observation-history row (issue #267). An errored-only monitor DID run, so
+      // it is not "never observed" even though `lastObservationAt` is unset.
+      const neverObserved =
+        lastObservedAt === undefined && history.length === 0;
+
+      const events = this.store.listEvents({
+        monitorId: monitor.id,
+        // Scope to this workspace (plus workspace-agnostic events) so a same-id
+        // monitor in another workspace cannot leak (mirrors explainMonitor).
+        ...(workspacePath !== undefined ? { workspacePath } : {}),
+      });
+      const lastEventAt = events.reduce<Date | undefined>(
+        (latest, event) =>
+          latest === undefined || event.createdAt > latest
+            ? event.createdAt
+            : latest,
+        undefined,
+      );
+
+      const delivery: DoctorDeliveryCounts = {
+        unread: 0,
+        claimed: 0,
+        acknowledged: 0,
+      };
+      for (const projection of this.store
+        .listDeliveryProjectionsForMonitor(monitor.id, workspacePath)
+        .filter((projection) => projection.sessionRole === 'lead')) {
+        if (projection.deliveryState === 'unread') delivery.unread += 1;
+        else if (projection.deliveryState === 'claimed') delivery.claimed += 1;
+        // Exhaustive over MonitorDeliveryState: the remaining case is
+        // 'acknowledged' (an explicit === check trips no-unnecessary-condition).
+        else delivery.acknowledged += 1;
+      }
+
+      monitors.push({
+        id: monitor.id,
+        displayName: monitor.displayName,
+        sourceName,
+        urgency: monitor.frontmatter.urgency,
+        valid,
+        ...(valid ? {} : { validationError: scopeErrors.join('; ') }),
+        ...(lastObservedAt ? { lastObservedAt } : {}),
+        neverObserved,
+        due: schedule.due,
+        nextDueAt,
+        cadence: describeCadence(
+          monitor.frontmatter.watch,
+          schedule.nextPollMs,
+        ),
+        ...(lastEventAt ? { lastEventAt } : {}),
+        delivery,
+      });
+    }
+
+    return {
+      generatedAt: now,
+      monitorsDir,
+      ...(workspacePath !== undefined ? { workspacePath } : {}),
+      monitorsDirExists,
+      monitors,
+      invalidCount,
+      duplicateIds: scan.duplicateIds,
+      parseErrors,
+      leadSessions,
+      hasLeadSession: leadSessions.length > 0,
     };
   }
 
