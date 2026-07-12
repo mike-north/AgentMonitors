@@ -40,7 +40,11 @@ Conventions for the engineering fleet working this repo. The PM agent maintains 
    `# <name>` / `## 0.0.0` / `- Initial release.`) — the changesets action crashes the
    release pipeline with ENOENT without one (this has broken releases twice) — plus an
    entry in `scripts/publish-release-packages.mjs` `PACKAGE_DIRS` and standard
-   `publishConfig`.
+   `publishConfig`. For a new `plugins/source-*` package, also add it to the
+   `SOURCE_PLUGINS` list in `scripts/test-standalone-consumer.mjs` (with a smoke assertion
+   exercising it): the smoke test (`pnpm test:standalone-consumer`, run in CI on every PR)
+   validates its coverage against `PACKAGE_DIRS` and fails loudly, naming the package, if
+   you forget.
 9. **Tests at the right layer.** Bug fixes ship a regression test that fails pre-fix.
    Anything touching the daemon, CLI surface, or plugin wiring gets integration coverage
    (the existing harnesses in `apps/cli/src/commands/cli.integration.test.ts` are the
