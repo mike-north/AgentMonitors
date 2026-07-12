@@ -132,4 +132,6 @@ future `high`-urgency change.
 ## Next steps
 
 - [Authoring monitors](/docs/authoring-monitors) — all sources, urgency levels, notify strategies
+- [Agent integration & delivery](/docs/agent-integration) — the full transport model behind the
+  `session start`/`hook deliver` commands above, plus running entirely without MCP
 - [Use cases](/docs/use-cases) — patterns from simple file-watching to fleet supervision
