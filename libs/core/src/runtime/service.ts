@@ -897,8 +897,16 @@ export class AgentMonitorRuntime {
     const historyLimit = input.historyLimit ?? 1;
     const { monitorsDir, workspacePath } = input;
 
-    const monitorsDirExists =
-      existsSync(monitorsDir) && statSync(monitorsDir).isDirectory();
+    // Doctor is a diagnostic surface: a stat failure (permissions, transient
+    // FS race after existsSync) is reported as "no monitors directory", never
+    // thrown — a crashing doctor cannot diagnose anything.
+    let monitorsDirExists = false;
+    try {
+      monitorsDirExists =
+        existsSync(monitorsDir) && statSync(monitorsDir).isDirectory();
+    } catch {
+      monitorsDirExists = false;
+    }
 
     const scan = await scanMonitors(monitorsDir);
     const parseErrors: DoctorParseError[] = scan.errors.map((error) => ({
@@ -926,28 +934,31 @@ export class AgentMonitorRuntime {
 
       const runtimeState = this.store.getMonitorState(monitor.id);
       const schedule = this.scheduleForMonitor(monitor, now);
-      const lastObservedAt = runtimeState.lastObservationAt;
-      const nextDueAt = schedule.due
-        ? now
-        : new Date(
-            (lastObservedAt?.getTime() ?? now.getTime()) + schedule.nextPollMs,
-          );
-
       const history = this.store.listObservationHistory({
         monitorId: monitor.id,
         limit: historyLimit,
       });
       // "Never observed" means no completed observation tick AND no recorded
       // observation-history row (issue #267). An errored-only monitor DID run, so
-      // it is not "never observed" even though `lastObservationAt` is unset.
+      // it is not "never observed" even though `lastObservationAt` is unset —
+      // and its `lastObservedAt` falls back to the newest history row's
+      // timestamp so the rollup never prints "never" for a monitor that ran.
+      const lastObservedAt =
+        runtimeState.lastObservationAt ?? history[0]?.createdAt;
       const neverObserved =
-        lastObservedAt === undefined && history.length === 0;
+        runtimeState.lastObservationAt === undefined && history.length === 0;
+
+      const nextDueAt = schedule.due
+        ? now
+        : new Date(
+            (lastObservedAt?.getTime() ?? now.getTime()) + schedule.nextPollMs,
+          );
 
       const events = this.store.listEvents({
         monitorId: monitor.id,
         // Scope to this workspace (plus workspace-agnostic events) so a same-id
         // monitor in another workspace cannot leak (mirrors explainMonitor).
-        ...(workspacePath !== undefined ? { workspacePath } : {}),
+        workspacePath,
       });
       const lastEventAt = events.reduce<Date | undefined>(
         (latest, event) =>

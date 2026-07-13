@@ -137,7 +137,9 @@ function buildChecks(
       .map((monitor) => monitor.id);
     const parseIds = report.parseErrors.map((error) => error.id);
     const dupeIds = report.duplicateIds.map((dupe) => dupe.id);
-    const problemIds = [...invalidIds, ...parseIds, ...dupeIds];
+    // One monitor can fail several ways at once (invalid scope + duplicate id,
+    // parse error + duplicate); count and list each failing id exactly once.
+    const problemIds = [...new Set([...invalidIds, ...parseIds, ...dupeIds])];
     checks.push(
       problemIds.length === 0
         ? {

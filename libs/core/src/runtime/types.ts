@@ -333,8 +333,12 @@ export interface DoctorParseError {
 export interface DoctorReportInput {
   /** Directory containing `MONITOR.md` definitions (e.g. `.claude/monitors`). */
   monitorsDir: string;
-  /** Workspace path for session projection and event scoping. */
-  workspacePath?: string;
+  /**
+   * Workspace path for session projection and event scoping. Required: an
+   * unscoped report would mix workspace-agnostic sessions with unscoped
+   * events/projections and become internally inconsistent.
+   */
+  workspacePath: string;
   /** Clock override (tests). Defaults to `new Date()`. */
   now?: Date;
   /** Observation-history rows to inspect per monitor when detecting activity. Default `1`. */

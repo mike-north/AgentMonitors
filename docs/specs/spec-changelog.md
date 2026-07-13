@@ -30,9 +30,11 @@ setup-monitors skill performs into a first-class diagnose-only command.
 - **005 §15/§16 — renumber.** The former "Exit codes & diagnostics" section is now §16 (no other doc
   cross-references it).
 - **Deliberately narrow (current).** Diagnose-only: no `--fix`, no host-plugin/MCP/channel checks,
-  and no change to `monitor explain` (issue #267 non-goals). The `project-enabled` remediation is
-  worded identically to the `SessionStart` monitors-found-but-disabled advisory (006 §5.6) so the two
-  onboarding surfaces name the same enable step.
+  and no change to `monitor explain` (issue #267 non-goals). The `project-enabled` remediation names
+  the same enable step as the `SessionStart` monitors-found-but-disabled advisory (006 §5.6) —
+  creating `.claude/agentmonitors.local.md` with `enabled: true` — but leads with `agentmonitors init
+--enable-only` (005 §2, Refs #268), the one-shot bootstrap command that now does that for you, so
+  all three onboarding surfaces agree.
 - **Core (current).** The workspace-wide durable-state diagnosis lives in
   `AgentMonitorRuntime.doctorReport()` (host-agnostic, per AP6), reusing the same store reads and
   scheduling logic as `explainMonitor`. The CLI layers the project-enabled and daemon-reachable
