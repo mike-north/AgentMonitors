@@ -85,33 +85,54 @@ The SQLite inbox database is resolved in this priority order (implemented in `db
 
 ---
 
-## §2 `init` — Scaffold a monitor
+## §2 `init` — Bootstrap the project, or scaffold a monitor
 
 **Source:** `apps/cli/src/commands/init.ts`
 **Status:** Fully implemented
 
 ### Purpose
 
-Creates a new monitor directory under a base directory and writes a template `MONITOR.md` file for the chosen observation source.
+`init` has two forms, selected by whether a `<name>` argument is present:
+
+- **`init <name>`** — the **scaffold** form. Creates a new monitor directory under a base directory and writes a template `MONITOR.md` for the chosen observation source. Behavior is unchanged from prior releases.
+- **`init`** (no name) — the **bootstrap** form. A one-shot project onboarding that enables monitoring, fixes `.gitignore`, optionally scaffolds a first monitor, validates the result, and prints a next-steps summary. This automates the manual steps previously documented only in the `setup-monitors` skill, so time-to-first-signal no longer requires reading docs.
 
 ### Usage
 
 ```
-agentmonitors init <name> [options]
+agentmonitors init [name] [options]
 ```
 
-| Argument / Flag | Type                  | Default            | Description                                                                                             |
-| --------------- | --------------------- | ------------------ | ------------------------------------------------------------------------------------------------------- |
-| `<name>`        | positional (required) | —                  | Monitor name, becomes the subdirectory name                                                             |
-| `--dir <dir>`   | option                | `.claude/monitors` | Base directory for monitors                                                                             |
-| `--type <type>` | option (choices)      | `file-fingerprint` | Observation source type: `file-fingerprint`, `api-poll`, `command-poll`, `schedule`, `incoming-changes` |
+| Argument / Flag | Type                  | Default            | Description                                                                                                            |
+| --------------- | --------------------- | ------------------ | ---------------------------------------------------------------------------------------------------------------------- |
+| `[name]`        | positional (optional) | —                  | Monitor name, becomes the subdirectory name. **Omit to run the project bootstrap** instead of scaffolding one monitor. |
+| `--dir <dir>`   | option                | `.claude/monitors` | Base directory for monitors                                                                                            |
+| `--type <type>` | option (choices)      | `file-fingerprint` | Observation source type: `file-fingerprint`, `api-poll`, `command-poll`, `schedule`, `incoming-changes`                |
+| `--enable-only` | boolean               | —                  | Bootstrap only: enable the project and fix `.gitignore`, then stop (no monitor, no prompts)                            |
+| `--yes`         | boolean               | —                  | Bootstrap non-interactively: accept defaults and scaffold a starter monitor without prompting                          |
 
-### Output
+`--enable-only` and `--yes` are only meaningful for the bootstrap form; when a `<name>` is given, `init` takes the scaffold path and those two flags are ignored. `--type` applies to both forms: it selects the scaffolded monitor's source type in the scaffold form, and (when `--yes` scaffolds a starter monitor) overrides the bootstrap form's default source type.
 
-Human-readable only (no `--format` flag).
+### Scaffold form (`init <name>`)
+
+Human-readable only (no `--format` flag). Byte-for-byte unchanged by the bootstrap addition.
 
 - **Success:** prints `Created monitor: <dir>/<name>/MONITOR.md` followed by a hint to run `agentmonitors validate <dir>`.
 - **Failure:** prints to stderr `Monitor already exists: <dir>/<name>/MONITOR.md`; exits with code 1.
+
+### Bootstrap form (`init`)
+
+Runs against the current working directory. Performs, in order:
+
+1. **Enable the project.** If `.claude/agentmonitors.local.md` does not already declare `enabled: true`, writes it with the minimal enable shape from the `setup-monitors` skill (`enabled: true` plus the "safe to delete" coordination-state note). An already-enabled file is left untouched so a re-run never clobbers socket/db fields a prior `session start` persisted.
+2. **Fix `.gitignore`.** Ensures `.gitignore` contains the line `.claude/*.local.*` — appends it (creating the file if absent) when missing; a no-op when already present. Never duplicated across runs.
+3. **Offer a first monitor.** Interactively (only on a TTY, and only when neither `--yes` nor `--enable-only` is given) prompts for a source type and monitor name, then scaffolds it through the same path as `init <name>`. `--yes` scaffolds the default monitor (`file-fingerprint`, name `my-monitor`, overridable with `--type`) with no prompt. `--enable-only` skips this step. A non-interactive invocation (non-TTY stdin) without `--yes` never prompts or hangs: it skips scaffolding and tells the caller to pass `--yes` or use `init <name>`.
+4. **Validate.** When a monitor was scaffolded, runs the `validate` command in-process against the monitors directory and prints its result.
+5. **Summarize.** Prints a "what happens next + how to verify" summary: monitoring lazy-boots on the next Claude Code session (§10.4), a one-shot `daemon once` check, and — when a monitor was created — how to verify it fires (`monitor test` and the `setup-monitors` "Verify It Fires" recipe).
+
+**Idempotency:** re-running the bootstrap on an already-enabled project whose `.gitignore` is correct (and, for `--yes`, whose default monitor already exists) changes nothing and prints an "already set up — nothing to change" message. Exits 0.
+
+**Exit codes:** exits 0 on success (including a no-op re-run). Scaffold-form duplicate errors still exit 1.
 
 ### Templates
 
@@ -1265,7 +1286,7 @@ All commands set `process.exitCode = 1` rather than calling `process.exit(1)`. T
 
 | Command    | Subcommand | Transport                         | Status                                                            |
 | ---------- | ---------- | --------------------------------- | ----------------------------------------------------------------- |
-| `init`     | —          | in-process                        | Fully implemented                                                 |
+| `init`     | —          | in-process                        | Fully implemented (bootstrap + scaffold)                          |
 | `validate` | —          | in-process                        | Fully implemented (full schema)                                   |
 | `scan`     | —          | in-process                        | Fully implemented                                                 |
 | `inbox`    | `list`     | in-process                        | Fully implemented                                                 |
