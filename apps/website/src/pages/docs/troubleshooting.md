@@ -111,9 +111,11 @@ assuming the event is lost:
   literally (`/tmp/...`). Always pass the identical `cwd` value to every command in a sequence —
   don't mix an explicit `--workspace` flag on one command with the default on another.
 - **Urgency vs. delivery point.** Only settled `high`-urgency events inject a body into the current
-  turn (`turn-interruptible`, after a 15 s settle window); `normal` and `low` events wait for a
-  reminder or the next session's recap. Check the event's `urgency` field before concluding
-  delivery is broken.
+  turn (`turn-interruptible`, after a 15 s settle window). `normal` events surface as a coalesced
+  reminder at turn boundaries and `low` events only when the session is idle; full bodies for both
+  arrive in the recap emitted at `post-compact` — which fires within the **same** session after a
+  context compaction, not only when a new session starts. Check the event's `urgency` field before
+  concluding delivery is broken.
 
 Confirm the actual transport with the real hook command:
 
@@ -165,8 +167,9 @@ detects it.
 
 ## Project not enabled
 
-Symptom: nothing ever happens — `explain` shows scheduling stuck at `pending` forever, no daemon
-ever starts, and hooks stay silent.
+Symptom: nothing ever happens — no daemon ever starts, hooks stay silent, and
+`agentmonitors monitor explain` reports it has **no daemon running and no persisted state to
+show** (nothing has ever ticked, so there is no pipeline state to explain yet).
 
 Root cause: `agentmonitors session start` **quick-exits** — without registering a session or
 booting a daemon — whenever `.claude/agentmonitors.local.md` is absent, or present with `enabled`
