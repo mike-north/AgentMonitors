@@ -160,6 +160,8 @@ agent actually receives.
 - [Agent integration & delivery](/docs/agent-integration) — how hooks and the optional MCP channel
   deliver into a session, and how to run entirely without MCP
 - [Use cases](/docs/use-cases) — patterns from simple file-watching to fleet supervision
+- [Troubleshooting](/docs/troubleshooting) — symptom-first fixes when a monitor doesn't fire or
+  doesn't notify
 
 Using an AI coding agent to do this setup? Point it at
 [agentmonitors.io/skill.md](/skill.md) instead — a self-contained, agent-readable version of this

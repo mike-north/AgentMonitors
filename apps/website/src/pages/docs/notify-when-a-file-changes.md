@@ -135,3 +135,4 @@ future `high`-urgency change.
 - [Agent integration & delivery](/docs/agent-integration) — the full transport model behind the
   `session start`/`hook deliver` commands above, plus running entirely without MCP
 - [Use cases](/docs/use-cases) — patterns from simple file-watching to fleet supervision
+- [Troubleshooting](/docs/troubleshooting) — what to do if step 3 doesn't produce a notification

@@ -101,3 +101,5 @@ it. This structural split makes monitors deterministic, testable, and portable.
   operating without MCP
 - [Use cases](/docs/use-cases) — patterns from simple to advanced
 - [The Monitor Standard](/docs/monitor-standard) — the open format specification
+- [Troubleshooting](/docs/troubleshooting) — symptom-first fixes when a monitor doesn't fire or
+  doesn't notify
