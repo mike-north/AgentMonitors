@@ -900,13 +900,13 @@ export class AgentMonitorRuntime {
     // Doctor is a diagnostic surface: a stat failure (permissions, transient
     // FS race after existsSync) is reported as "no monitors directory", never
     // thrown — a crashing doctor cannot diagnose anything.
-    let monitorsDirExists = false;
-    try {
-      monitorsDirExists =
-        existsSync(monitorsDir) && statSync(monitorsDir).isDirectory();
-    } catch {
-      monitorsDirExists = false;
-    }
+    const monitorsDirExists = (() => {
+      try {
+        return existsSync(monitorsDir) && statSync(monitorsDir).isDirectory();
+      } catch {
+        return false;
+      }
+    })();
 
     const scan = await scanMonitors(monitorsDir);
     const parseErrors: DoctorParseError[] = scan.errors.map((error) => ({
@@ -1006,7 +1006,7 @@ export class AgentMonitorRuntime {
     return {
       generatedAt: now,
       monitorsDir,
-      ...(workspacePath !== undefined ? { workspacePath } : {}),
+      workspacePath,
       monitorsDirExists,
       monitors,
       invalidCount,
