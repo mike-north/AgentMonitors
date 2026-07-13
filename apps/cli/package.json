@@ -2,6 +2,9 @@
   "name": "@agentmonitors/cli",
   "description": "CLI for Agent Monitors — validate, scan, query, and manage observation inboxes",
   "version": "0.7.0",
+  "engines": {
+    "node": ">=24"
+  },
   "publishConfig": {
     "registry": "https://registry.npmjs.org",
     "access": "public"
@@ -38,5 +41,14 @@
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^22.15.0"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mike-north/AgentMonitors.git",
+    "directory": "apps/cli"
+  },
+  "bugs": {
+    "url": "https://github.com/mike-north/AgentMonitors/issues"
+  },
+  "homepage": "https://github.com/mike-north/AgentMonitors/tree/main/apps/cli#readme"
 }

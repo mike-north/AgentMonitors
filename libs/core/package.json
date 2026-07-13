@@ -2,6 +2,9 @@
   "name": "@agentmonitors/core",
   "description": "Core library for Agent Monitors — schema, parser, inbox, plugin interface, and notification engine",
   "version": "0.9.0",
+  "engines": {
+    "node": ">=24"
+  },
   "publishConfig": {
     "registry": "https://registry.npmjs.org",
     "access": "public"
@@ -43,5 +46,14 @@
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.15.0",
     "drizzle-kit": "^0.31.3"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mike-north/AgentMonitors.git",
+    "directory": "libs/core"
+  },
+  "bugs": {
+    "url": "https://github.com/mike-north/AgentMonitors/issues"
+  },
+  "homepage": "https://github.com/mike-north/AgentMonitors/tree/main/libs/core#readme"
 }

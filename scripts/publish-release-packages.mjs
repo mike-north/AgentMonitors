@@ -182,12 +182,23 @@ function packArtifactIssues(pkg) {
   ];
 }
 
+/** True for a non-empty string; used to validate required metadata fields. */
+function isNonEmptyString(value) {
+  return typeof value === 'string' && value.length > 0;
+}
+
 /**
  * Release-collateral checks for a single package: the defect classes that
  * have previously reached release time undetected (missing CHANGELOG.md
  * crashes the changesets action; missing publishConfig or an unbuilt entry
- * point breaks `npm publish`). Returns a list of human-readable issue
- * strings — empty when the package's collateral is clean.
+ * point breaks `npm publish`), plus the runtime/project metadata a
+ * published package needs so `npm install` gives users an actionable
+ * compatibility warning instead of an opaque runtime failure, and so the
+ * npm listing links back to the repo (issue #291): a declared
+ * `engines.node`, consistent `repository`/`bugs`/`homepage` metadata, and a
+ * README.md/LICENSE the tarball actually ships. Returns a list of
+ * human-readable issue strings — empty when the package's collateral is
+ * clean.
  */
 export function collateralIssuesForPackage(pkg) {
   const issues = [];
@@ -204,6 +215,30 @@ export function collateralIssuesForPackage(pkg) {
   }
 
   issues.push(...packArtifactIssues(pkg));
+
+  if (!isNonEmptyString(pkg.packageJson.engines?.node)) {
+    issues.push('missing "engines.node" in package.json');
+  }
+
+  if (!isNonEmptyString(pkg.packageJson.repository?.url)) {
+    issues.push('missing "repository" metadata in package.json');
+  }
+
+  if (!isNonEmptyString(pkg.packageJson.bugs?.url)) {
+    issues.push('missing "bugs" metadata in package.json');
+  }
+
+  if (!isNonEmptyString(pkg.packageJson.homepage)) {
+    issues.push('missing "homepage" in package.json');
+  }
+
+  if (!existsSync(path.join(pkg.packageAbsDir, 'README.md'))) {
+    issues.push('missing README.md');
+  }
+
+  if (!existsSync(path.join(pkg.packageAbsDir, 'LICENSE'))) {
+    issues.push('missing LICENSE');
+  }
 
   return issues;
 }
