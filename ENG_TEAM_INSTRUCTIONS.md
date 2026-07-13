@@ -67,15 +67,24 @@ Conventions for the engineering fleet working this repo. The PM agent maintains 
     someone else pays.
 13. **Comment the PR link on the issue** when you open it; close the issue only when the
     change is merged and the acceptance criteria are demonstrably met.
+14. **Expect `docs/specs/spec-changelog.md` conflicts on every spec-touching rebase** — the file
+    is newest-first, so concurrent PRs always collide at the top. Resolution is mechanical: keep
+    ALL entries, yours newest-first. Never drop another PR's entry.
+15. **Push over SSH, and verify a CI run attached.** HTTPS pushes with the local OAuth token land
+    on origin but only sometimes trigger Actions (observed repeatedly). SSH intermittently times
+    out — retry it. If you had to fall back to HTTPS, check that a workflow run exists for your
+    new head before walking away; a green-looking PR with no fresh run is stale evidence.
+16. **Reply to a review thread before (or when) resolving it** — a silently-resolved thread
+    leaves no record of what changed. The reply states the fix commit and the one-line what/why.
 
 ## Hard rules
 
-14. **Never touch Version PRs** (branch `changeset-release/main`, title "Release packages"):
+17. **Never touch Version PRs** (branch `changeset-release/main`, title "Release packages"):
     no CI kicks, no auto-merge, no "fixing" their blocked status. The blocked state is
     Mike's deliberate release gate — he merges them personally.
-15. **Never flip repo visibility, publish packages locally, or add/modify repo secrets.**
+18. **Never flip repo visibility, publish packages locally, or add/modify repo secrets.**
     Releases happen only through the CI pipeline via Mike's Version-PR merge.
-16. **No internal codenames/wave numbers in public-facing content** (published packages,
+19. **No internal codenames/wave numbers in public-facing content** (published packages,
     the docs site, npm READMEs). Repo-internal docs and issues may reference them freely.
 
 ## Context that helps
