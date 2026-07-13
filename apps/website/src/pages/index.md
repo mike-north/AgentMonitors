@@ -192,6 +192,10 @@ The full `watch:` model, every source, urgency, and notify timing.
 The open, host-agnostic Monitor Standard — available as rendered HTML _and_ raw
 markdown.
 {% /door %}
+
+{% door heading="Troubleshooting" href="/docs/troubleshooting" %}
+Symptom-first fixes when a monitor doesn't fire, doesn't notify, or stops working.
+{% /door %}
 {% /doors %}
 
 Using an AI coding agent? Point it at [agentmonitors.io/skill.md](/skill.md) — it's a

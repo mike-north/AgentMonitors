@@ -158,6 +158,8 @@ agent actually receives.
   verification
 - [Authoring monitors](/docs/authoring-monitors) — all sources, urgency levels, notify strategies
 - [Use cases](/docs/use-cases) — patterns from simple file-watching to fleet supervision
+- [Troubleshooting](/docs/troubleshooting) — symptom-first fixes when a monitor doesn't fire or
+  doesn't notify
 
 Using an AI coding agent to do this setup? Point it at
 [agentmonitors.io/skill.md](/skill.md) instead — a self-contained, agent-readable version of this

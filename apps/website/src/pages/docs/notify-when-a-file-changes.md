@@ -133,3 +133,4 @@ future `high`-urgency change.
 
 - [Authoring monitors](/docs/authoring-monitors) — all sources, urgency levels, notify strategies
 - [Use cases](/docs/use-cases) — patterns from simple file-watching to fleet supervision
+- [Troubleshooting](/docs/troubleshooting) — what to do if step 3 doesn't produce a notification
