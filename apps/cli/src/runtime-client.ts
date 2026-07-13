@@ -2,7 +2,9 @@ import type {
   AgentSessionRecord,
   DeliveryClaim,
   DeliveryLifecycle,
+  DoctorReportInput,
   EventQuery,
+  MonitorDoctorReport,
   MonitorExplainInput,
   MonitorExplainReport,
   MonitorEventRecord,
@@ -153,4 +155,20 @@ export function listObservationHistoryInProcess(
 ): ObservationHistoryRecord[] {
   const runtime = createRuntime();
   return runtime.listObservationHistory(query);
+}
+
+/**
+ * Build the `agentmonitors doctor` health report *in-process* against the
+ * persisted SQLite store (issue #267). Doctor is a read-only diagnosis, so it
+ * always reads the store directly rather than round-tripping the daemon socket —
+ * the daemon writes the same DB, so the report is accurate whether or not a
+ * daemon is running (mirrors `daemon status`'s in-process read). `dbPath` is the
+ * workspace-resolved database path.
+ */
+export async function doctorReportInProcess(
+  input: DoctorReportInput,
+  dbPath: string,
+): Promise<MonitorDoctorReport> {
+  const runtime = createRuntime(dbPath);
+  return await runtime.doctorReport(input);
 }

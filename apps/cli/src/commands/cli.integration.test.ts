@@ -2982,6 +2982,377 @@ This monitor fires on a schedule.
   });
 });
 
+// Issue #267: `agentmonitors doctor` — one unified health surface. Each negative
+// test drives one failure mode and asserts the check name, the remediation text,
+// and the exit code (acceptance criterion 3). Tests use the existing CLI harness
+// with the no-orphan-daemon discipline (every started daemon is stopped in a
+// finally). doctor reads persisted state in-process, so most cases need no daemon.
+// @see docs/specs/005-cli-reference.md §"doctor"
+describe('doctor (issue #267)', () => {
+  const VALID_FILE_MONITOR = `---
+name: Watch source
+watch:
+  type: file-fingerprint
+  globs:
+    - '**/*.ts'
+urgency: normal
+---
+When source files change, review them.
+`;
+
+  // cron '* * * * *' is due every tick, so a single `daemon once` records an
+  // observation and materializes an event — giving doctor real persisted state.
+  const FIRING_SCHEDULE = `---
+name: Heartbeat
+watch:
+  type: schedule
+  cron: '* * * * *'
+  timezone: UTC
+urgency: normal
+---
+This monitor fires on a schedule.
+`;
+
+  // cron '0 0 1 1 *' (00:00 on Jan 1) is effectively never due, so the daemon
+  // ticks but never observes it — it stays "never observed" even with a live
+  // daemon and a lead session, isolating the never-observed failure mode.
+  const NEVER_DUE_SCHEDULE = `---
+name: New year
+watch:
+  type: schedule
+  cron: '0 0 1 1 *'
+  timezone: UTC
+urgency: normal
+---
+This monitor is essentially never due.
+`;
+
+  const INVALID_MONITOR = `---
+name: Mystery
+watch:
+  type: not-a-real-source
+  foo: bar
+urgency: normal
+---
+Handle it.
+`;
+
+  function doctorSocket(label: string): string {
+    return path.join(
+      '/tmp',
+      `agentmon-doctor-${label}-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+  }
+
+  function writeDoctorMonitor(root: string, id: string, body: string): void {
+    const monitorDir = path.join(root, id);
+    mkdirSync(monitorDir, { recursive: true });
+    writeFileSync(path.join(monitorDir, 'MONITOR.md'), body, 'utf-8');
+  }
+
+  // --- Negative: project not enabled ----------------------------------------
+  it('fails project-enabled with the enable-step remediation when the project is not enabled', () => {
+    const dir = path.join(tempDir, 'doctor-not-enabled');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    writeDoctorMonitor(monitorsRoot, 'watch-src', VALID_FILE_MONITOR);
+    // No .claude/agentmonitors.local.md → the project is not enabled.
+
+    const result = runWithEnv(
+      ['doctor', '--workspace', dir],
+      {
+        AGENTMONITORS_DB: ':memory:',
+        AGENTMONITORS_SOCKET: doctorSocket('not-enabled'),
+      },
+      dir,
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain('project-enabled');
+    // Leads with the one-shot bootstrap (#268) and names the SAME manual
+    // enable step as the session-start disabled advisory (#269) so all
+    // opt-in surfaces agree.
+    expect(result.stdout).toContain('agentmonitors init --enable-only');
+    expect(result.stdout).toContain('`.claude/agentmonitors.local.md`');
+    expect(result.stdout).toContain('`enabled: true`');
+  });
+
+  // --- Negative: an invalid monitor -----------------------------------------
+  it('fails monitors-valid and names `validate` as the remediation for an invalid monitor', () => {
+    const dir = path.join(tempDir, 'doctor-invalid-monitor');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    writeDoctorMonitor(monitorsRoot, 'mystery', INVALID_MONITOR);
+    writeLocalState(dir, { enabled: true });
+
+    const result = runWithEnv(
+      ['doctor', '--workspace', dir],
+      {
+        AGENTMONITORS_DB: ':memory:',
+        AGENTMONITORS_SOCKET: doctorSocket('invalid'),
+      },
+      dir,
+    );
+
+    expect(result.exitCode).toBe(1);
+    // project-enabled passes; monitors-valid is the failing check we assert.
+    expect(result.stdout).toContain('✓ project-enabled');
+    expect(result.stdout).toContain('monitors-valid');
+    expect(result.stdout).toMatch(/monitors-valid.*failed validation/);
+    expect(result.stdout).toContain('agentmonitors validate');
+  });
+
+  // --- Negative: daemon down (still works from persisted state) --------------
+  it('fails daemon-reachable but still shows the per-monitor rollup from persisted state when the daemon is down', () => {
+    const dir = path.join(tempDir, 'doctor-daemon-down');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    writeDoctorMonitor(monitorsRoot, 'heartbeat', FIRING_SCHEDULE);
+    writeLocalState(dir, { enabled: true });
+
+    const dbPath = path.join(dir, 'agentmon.db');
+    const deadSocket = doctorSocket('daemon-down');
+    const env = { AGENTMONITORS_DB: dbPath, AGENTMONITORS_SOCKET: deadSocket };
+
+    // Materialize an observation + event into the file DB in-process (no daemon).
+    const once = runWithEnv(
+      ['daemon', 'once', monitorsRoot, '--workspace', dir],
+      env,
+      dir,
+    );
+    expect(once.exitCode).toBe(0);
+    expect(once.stdout).toContain('emitted 1 event(s)');
+
+    const result = runWithEnv(['doctor', '--workspace', dir], env, dir);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain('daemon-reachable');
+    // States the daemon is down and that the data came from persisted state.
+    expect(result.stdout).toContain('showing persisted state');
+    expect(result.stdout).toContain('agentmonitors daemon run');
+    // The rollup is still shown from the last tick — last-observed is real, not
+    // "never", proving diagnosis survives a down daemon (like `monitor explain`).
+    expect(result.stdout).toContain('monitor:heartbeat');
+    expect(result.stdout).toContain('source=schedule');
+    expect(result.stdout).not.toContain('last-observed=never');
+  });
+
+  // --- Negative: no lead session (daemon reachable to isolate the failure) ---
+  it('fails lead-session with an actionable remediation when no lead session is registered', async () => {
+    const dir = path.join(tempDir, 'doctor-no-lead-session');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    writeDoctorMonitor(monitorsRoot, 'heartbeat', FIRING_SCHEDULE);
+    writeLocalState(dir, { enabled: true });
+
+    const dbPath = path.join(dir, 'agentmon.db');
+    const socketPath = doctorSocket('no-lead-session');
+    const env = { AGENTMONITORS_DB: dbPath, AGENTMONITORS_SOCKET: socketPath };
+
+    // Observe once so the monitor is not "never observed" — isolating lead-session
+    // as the sole failure.
+    runWithEnv(['daemon', 'once', monitorsRoot, '--workspace', dir], env, dir);
+
+    const daemon = await startDaemon(monitorsRoot, dir, env, socketPath);
+    try {
+      const result = runWithEnv(['doctor', '--workspace', dir], env, dir);
+
+      expect(result.exitCode).toBe(1);
+      // daemon-reachable passes (the daemon is live), isolating the failure.
+      expect(result.stdout).toContain('✓ daemon-reachable');
+      expect(result.stdout).toContain('lead-session');
+      expect(result.stdout).toMatch(/lead-session.*No lead session/);
+      expect(result.stdout).toContain('agentmonitors session open');
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+    }
+  }, 30_000);
+
+  // --- Negative: a never-observed monitor (daemon + session present) --------
+  it('fails the per-monitor check with a never-observed remediation for a monitor that has never been observed', async () => {
+    const dir = path.join(tempDir, 'doctor-never-observed');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    writeDoctorMonitor(monitorsRoot, 'newyear', NEVER_DUE_SCHEDULE);
+    writeLocalState(dir, { enabled: true });
+
+    const dbPath = path.join(dir, 'agentmon.db');
+    const socketPath = doctorSocket('never-observed');
+    const env = { AGENTMONITORS_DB: dbPath, AGENTMONITORS_SOCKET: socketPath };
+
+    const daemon = await startDaemon(monitorsRoot, dir, env, socketPath);
+    try {
+      // Register a lead session so lead-session passes and the never-observed
+      // per-monitor check is the isolated failure.
+      const open = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          'doctor-never-observed',
+          '--role',
+          'lead',
+          '--workspace',
+          dir,
+          '--format',
+          'json',
+        ],
+        env,
+        dir,
+      );
+      expect(open.exitCode).toBe(0);
+
+      const result = runWithEnv(['doctor', '--workspace', dir], env, dir);
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout).toContain('✓ lead-session');
+      // The never-due schedule monitor was never observed by the daemon.
+      expect(result.stdout).toContain('monitor:newyear');
+      expect(result.stdout).toMatch(/monitor:newyear.*never observed/);
+      // Remediation points at the observation tools.
+      expect(result.stdout).toContain('monitor history');
+      expect(result.stdout).toContain('monitor test');
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+    }
+  }, 30_000);
+
+  // --- Positive: fully healthy workspace, all checks pass, exit 0 -----------
+  it('reports all checks passing (exit 0) for a fully healthy workspace', async () => {
+    const dir = path.join(tempDir, 'doctor-healthy');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    writeDoctorMonitor(monitorsRoot, 'heartbeat', FIRING_SCHEDULE);
+    writeLocalState(dir, { enabled: true });
+
+    const dbPath = path.join(dir, 'agentmon.db');
+    const socketPath = doctorSocket('healthy');
+    const env = { AGENTMONITORS_DB: dbPath, AGENTMONITORS_SOCKET: socketPath };
+
+    // Observe once so the monitor has real observation history + a materialized
+    // event before the daemon (a not-yet-due schedule won't re-fire within 60s).
+    runWithEnv(['daemon', 'once', monitorsRoot, '--workspace', dir], env, dir);
+
+    const daemon = await startDaemon(monitorsRoot, dir, env, socketPath);
+    try {
+      const open = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          'doctor-healthy',
+          '--role',
+          'lead',
+          '--workspace',
+          dir,
+          '--format',
+          'json',
+        ],
+        env,
+        dir,
+      );
+      expect(open.exitCode).toBe(0);
+
+      const result = runWithEnv(['doctor', '--workspace', dir], env, dir);
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain('✓ project-enabled');
+      expect(result.stdout).toContain('✓ monitors-directory');
+      expect(result.stdout).toContain('✓ monitors-valid');
+      expect(result.stdout).toContain('✓ daemon-reachable');
+      expect(result.stdout).toContain('✓ lead-session');
+      expect(result.stdout).toContain('✓ monitor:heartbeat');
+      expect(result.stdout).toContain('source=schedule');
+      expect(result.stdout).not.toContain('never observed');
+      expect(result.stdout).toMatch(/Summary: \d+ passed, 0 failed/);
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+    }
+  }, 30_000);
+
+  // --- Criterion 4: stable machine-readable --json shape ---------------------
+  it('emits a stable --json shape documented in spec 005', () => {
+    const dir = path.join(tempDir, 'doctor-json-shape');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    writeDoctorMonitor(monitorsRoot, 'heartbeat', FIRING_SCHEDULE);
+    writeLocalState(dir, { enabled: true });
+
+    const dbPath = path.join(dir, 'agentmon.db');
+    const deadSocket = doctorSocket('json-shape');
+    const env = { AGENTMONITORS_DB: dbPath, AGENTMONITORS_SOCKET: deadSocket };
+
+    runWithEnv(['daemon', 'once', monitorsRoot, '--workspace', dir], env, dir);
+
+    const result = runWithEnv(
+      ['doctor', '--workspace', dir, '--format', 'json'],
+      env,
+      dir,
+    );
+    // Daemon is down → at least one check fails → exit 1, but JSON must be clean.
+    expect(result.exitCode).toBe(1);
+    const report = JSON.parse(result.stdout) as {
+      ok: boolean;
+      generatedAt: string;
+      workspace: string;
+      monitorsDir: string;
+      daemon: { running: boolean; socketPath: string };
+      leadSession: boolean;
+      checks: {
+        name: string;
+        status: string;
+        detail: string;
+        remediation: string | null;
+      }[];
+      monitors: {
+        id: string;
+        sourceType: string;
+        urgency: string;
+        valid: boolean;
+        lastObservedAt: string | null;
+        neverObserved: boolean;
+        nextDueAt: string | null;
+        cadence: string;
+        lastEventAt: string | null;
+        delivery: { unread: number; claimed: number; acknowledged: number };
+      }[];
+      summary: { passed: number; failed: number; skipped: number };
+    };
+
+    expect(report.ok).toBe(false);
+    expect(report.daemon.running).toBe(false);
+    expect(report.daemon.socketPath).toBe(deadSocket);
+    expect(report.leadSession).toBe(false);
+    // Every documented check name is present, in order.
+    expect(report.checks.map((check) => check.name)).toEqual([
+      'project-enabled',
+      'monitors-directory',
+      'monitors-valid',
+      'daemon-reachable',
+      'lead-session',
+      'monitor:heartbeat',
+    ]);
+    // The daemon-reachable check failed and carries a non-null remediation.
+    const daemonCheck = report.checks.find(
+      (check) => check.name === 'daemon-reachable',
+    );
+    expect(daemonCheck?.status).toBe('fail');
+    expect(daemonCheck?.remediation).toContain('agentmonitors daemon run');
+
+    // The per-monitor rollup shape is complete and read from persisted state.
+    const monitor = report.monitors[0];
+    expect(monitor?.id).toBe('heartbeat');
+    expect(monitor?.sourceType).toBe('schedule');
+    expect(monitor?.urgency).toBe('normal');
+    expect(monitor?.valid).toBe(true);
+    expect(monitor?.neverObserved).toBe(false);
+    expect(monitor?.lastObservedAt).not.toBeNull();
+    expect(monitor?.cadence).toBe("cron '* * * * *'");
+    expect(monitor?.delivery).toEqual({
+      unread: 0,
+      claimed: 0,
+      acknowledged: 0,
+    });
+    expect(report.summary.passed + report.summary.failed).toBeGreaterThan(0);
+  });
+});
+
 describe('monitor explain', () => {
   it('surfaces a daemon-side application error instead of masking it as "daemon not running" (issue #94 review)', async () => {
     // Regression for comment 3408123745: when the daemon answers `monitor.explain`
