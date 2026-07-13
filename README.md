@@ -191,4 +191,4 @@ lives in [CLAUDE.md](CLAUDE.md).
 
 ## License
 
-UNLICENSED. © Mike North.
+MIT. See [LICENSE](LICENSE). © 2026 Mike North.
