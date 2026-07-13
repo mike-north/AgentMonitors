@@ -45,21 +45,24 @@ _Governing spec: [`docs/specs/002-runtime-delivery.md`](https://github.com/mike-
 `urgency` (set in a monitor's frontmatter — see [Authoring monitors](/docs/authoring-monitors))
 decides which lifecycle a monitor's events surface at, and how much detail is included:
 
-| Urgency   | Surfaces at            | Timing                                     | What's included                                             |
-| --------- | ----------------------- | -------------------------------------------- | ------------------------------------------------------------ |
-| `high`    | `turn-interruptible`   | After a **15 s settle window** — not instant | The concrete events: titles, summaries, and full body text  |
-| `normal`  | `turn-interruptible`   | Immediately, but coalesced                   | A generic reminder only ("AgentMon messages are available. Read the inbox.") — no per-event detail |
-| `low`     | `turn-idle`            | Immediately, but coalesced                   | A generic reminder only ("AgentMon has inbox updates ready for review.") — no per-event detail |
+| Urgency   | Surfaces at            | Timing                                                              | What's included                                             |
+| --------- | ----------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------ |
+| `high`    | `turn-interruptible`   | After a **15 s settle window** — not instant                          | The concrete events: titles, summaries, and full body text  |
+| `normal`  | `turn-interruptible`   | **Coalesced-until-ack**: one reminder for the whole unread batch, then silent until it's acknowledged | A generic reminder only ("AgentMon messages are available. Read the inbox.") — no per-event detail |
+| `low`     | `turn-idle`            | **Coalesced-until-ack**: one reminder for the whole unread batch, then silent until it's acknowledged | A generic reminder only ("AgentMon has inbox updates ready for review.") — no per-event detail |
 
 Regardless of urgency, **every unread event is recapped at `post-compact`** (session start, after
 a context compaction) with up to the 10 most recent events shown in full — titles, summaries, and
 body text. This is the safety net: nothing that settles while an agent is away goes unseen forever.
 
-The reminder-vs-detail split for `normal`/`low` matters in practice: a `normal` monitor's change
-_will_ nudge the agent mid-session ("read the inbox"), but the agent has to go look
-(`agentmonitors events list --unread`) to see what changed. Only `high` urgency injects the actual
-event content directly into the turn. If you want the agent to react to specifics without looking
-anything up, use `urgency: high`.
+The reminder-vs-detail split for `normal`/`low` matters in practice: a `normal` (or `low`) change
+nudges the agent exactly **once** — a single coalesced reminder ("read the inbox") covering every
+currently-unread event of that urgency — and then goes quiet. It does **not** re-nudge for each
+additional `normal`/`low` event that arrives; the path only speaks again once the outstanding
+events are acknowledged (`agentmonitors events ack`). The agent still has to go look
+(`agentmonitors events list --unread`) to see what changed — the reminder never carries per-event
+detail. Only `high` urgency injects the actual event content directly into the turn. If you want
+the agent to react to specifics without acknowledging first, use `urgency: high`.
 
 _Governing spec: 002 §9.1 (high), §9.2 (normal), §9.3 (low), §9.4 (recap)._
 
@@ -120,9 +123,13 @@ tool call:
 | Capability                         | With the MCP channel enabled                         | Hooks-only (CLI equivalent)                                          |
 | ----------------------------------- | ------------------------------------------------------ | ----------------------------------------------------------------------- |
 | Mid-session delivery                | `<channel source="agentmonitors" ...>` push          | `agentmonitors hook deliver` (already wired to `UserPromptSubmit`)     |
-| Acknowledge events                  | `agentmon_ack({ event_ids: [...] })` tool call         | `agentmonitors events ack --session <id> --event-ids <ids>`             |
+| Acknowledge events                  | `agentmon_ack({ event_ids: [...] })` tool call         | `agentmonitors events ack --session <id> --event-ids <id1>,<id2>`       |
 | Acknowledge everything unread       | `agentmon_ack({})` (omit `event_ids`)                 | `agentmonitors events ack --session <id>` (omit `--event-ids`)         |
 | Inspect what's pending              | Reading the rendered `<channel>` tag                  | `agentmonitors events list --session <id> --unread`                     |
+
+`--event-ids` takes a **comma-separated** list, e.g. `--event-ids 01J...A,01J...B` — it is split on
+`,` (and each id trimmed), so space-separated ids (`--event-ids 01J...A 01J...B`) are **not**
+recognized as two ids.
 
 Both columns drive the **identical daemon IPC calls** (`hook.claim`, `events.ack`) — the channel is
 a thin push/ack front-end over the same connection the CLI uses, so there is no capability gap, only
