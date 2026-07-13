@@ -118,3 +118,70 @@ jobs:
 
       - name: Publish dry-run collateral tests
         run: pnpm test:scripts
+
+  # Website is excluded from the workspace-root `pnpm build`/`check` targets (it has its
+  # own build cycle — see apps/website/README.md), so it otherwise gets zero CI coverage
+  # on a PR. Path-filtered the same way as release-collateral-changed above, so PRs that
+  # don't touch the site skip the cost.
+  website-changed:
+    name: Detect Website Changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event_name == 'pull_request'
+    outputs:
+      changed: ${{ steps.filter.outputs.changed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Check for website changes
+        id: filter
+        shell: bash
+        run: |
+          set -euo pipefail
+          pattern='^(apps/website/|\.github/workflows/ci\.yml)'
+          files="$(git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}")"
+          echo "Changed files:"
+          echo "$files"
+          if echo "$files" | grep -Eq "$pattern"; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # AC2 (issue #274): internal link check across every site page, run against the real
+  # built-and-served site (not a hand-parsed approximation of route/anchor resolution).
+  # `--check-fragments` also validates same-page anchors; the `--skip` pattern keeps
+  # external links out of the hard-failure path per the issue's non-goals.
+  website-link-check:
+    name: Website Link Check
+    needs: website-changed
+    if: |
+      always() &&
+      (github.event_name != 'pull_request' || needs.website-changed.outputs.changed == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build website
+        run: pnpm --filter @agentmonitors/website build
+
+      - name: Check internal links
+        run: pnpm --filter @agentmonitors/website run check:links
