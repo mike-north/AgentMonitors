@@ -135,7 +135,7 @@ tick) and a couple of fallbacks run **in-process without the socket** — see
   missing `CHANGELOG.md`, missing `publishConfig`, a built entry point `npm pack` wouldn't include,
   missing `engines.node`/`repository`/`bugs`/`homepage` metadata, or a missing `README.md`/`LICENSE`
   — on the PR that introduces them, not at release time. Every published package declares
-  `engines.node` matching the exact Node version CI tests (currently `>=24`/Node 24) — see
+  `engines.node` consistent with the CI-tested Node version (currently `>=24`, with Node 24 the version CI runs) — see
   `scripts/publish-release-packages.test.ts` for the assertion that keeps the two in sync.
 - **Review priority** (per `.github/copilot-instructions.md`): durable-state bugs, session-isolation
   errors, and event loss during debounce/compaction/batching/restart come before style.

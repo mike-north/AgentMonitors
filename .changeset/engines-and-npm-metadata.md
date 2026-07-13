@@ -10,7 +10,7 @@
 ---
 
 Declare the supported Node runtime and complete npm package metadata on every published package.
-Each package now declares `"engines": { "node": ">=24" }` — the exact Node version CI tests — so
+Each package now declares `"engines": { "node": ">=24" }` — a floor at Node 24, the version CI tests — so
 an install on an unsupported Node release gets an actionable npm compatibility warning instead of
 an opaque runtime/native-addon failure. Each package also declares consistent
 `repository`/`bugs`/`homepage` metadata (pointing at its subdirectory of this repo) and ships a

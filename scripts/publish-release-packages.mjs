@@ -184,7 +184,7 @@ function packArtifactIssues(pkg) {
 
 /** True for a non-empty string; used to validate required metadata fields. */
 function isNonEmptyString(value) {
-  return typeof value === 'string' && value.length > 0;
+  return typeof value === 'string' && value.trim().length > 0;
 }
 
 /**

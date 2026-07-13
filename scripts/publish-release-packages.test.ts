@@ -491,8 +491,8 @@ describe('main({ dryRun: true })', () => {
   });
 });
 
-// Issue #291 acceptance criterion: published packages declare the exact Node
-// version CI actually tests, so a user who installs on an unsupported Node
+// Issue #291 acceptance criterion: published packages declare an engines.node
+// floor consistent with the Node version CI actually tests, so a user who installs on an unsupported Node
 // release gets an actionable npm compatibility warning rather than an opaque
 // runtime failure — and that claim can't silently drift, because both sides
 // (the real `.github/workflows/ci.yml` and the real PACKAGE_DIRS

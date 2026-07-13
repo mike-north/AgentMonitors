@@ -17,8 +17,8 @@ Claude Code is the first supported host.
 Agent Monitors has two pieces: a **CLI** that does the watching, and a **Claude Code plugin** that
 delivers signals into your agent sessions automatically.
 
-Requires **Node.js 24 or later** — the only runtime the published packages declare (`engines.node`)
-and CI tests.
+Requires **Node.js 24 or later** (`engines.node: >=24`). Node 24 is the version CI tests;
+newer majors are permitted by the range but not yet exercised in CI.
 
 ### 1. Install the CLI
 
