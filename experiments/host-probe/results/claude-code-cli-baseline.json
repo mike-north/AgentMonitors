@@ -1,0 +1,55 @@
+{
+  "host": "claude-code",
+  "surface": "cli",
+  "hostVersion": "2.1.207",
+  "probedAt": "2026-07-13T05:38:37.833Z",
+  "sessionIdentitySignal": {
+    "hook": {
+      "mechanism": "stdin.session_id",
+      "observed": true
+    },
+    "env": {
+      "mechanism": "env.CLAUDE_CODE_CHILD_SESSION|CLAUDE_CODE_SESSION_ID",
+      "observedKeys": [
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_SESSION_ID"
+      ]
+    }
+  },
+  "workspaceBindingSignal": {
+    "hook": {
+      "mechanism": "stdin.cwd",
+      "observed": true
+    },
+    "env": {
+      "mechanism": "env.CLAUDE_PROJECT_DIR",
+      "observedKeys": [
+        "CLAUDE_PROJECT_DIR"
+      ]
+    },
+    "rootsList": {
+      "attempted": true,
+      "supported": true
+    }
+  },
+  "lifecycleHookPointsFired": [
+    "PostToolUse",
+    "PreToolUse",
+    "SessionEnd",
+    "SessionStart",
+    "Stop",
+    "UserPromptSubmit"
+  ],
+  "richerTransport": {
+    "attempted": true,
+    "capabilitiesDeclared": [
+      "experimental.claude/channel",
+      "tools"
+    ]
+  },
+  "sightingCounts": {
+    "hook": 10,
+    "mcp": 3
+  },
+  "notes": "Paths and session UUIDs in this artifact and its sightings are redacted (/Users/<user>, <session-N>) \u2014 probe evidence needs key presence and hook shape, not identifying values. hostVersion 2.1.207 is the version the CLI reported at probe time; a sighting env var (CLAUDE_CODE_EXECPATH) points at a 2.1.206 install directory because the launcher auto-updated between install and probe \u2014 the reported (running) version is authoritative."
+}

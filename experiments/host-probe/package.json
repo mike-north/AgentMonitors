@@ -1,0 +1,16 @@
+{
+  "name": "agentmon-host-probe",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "description": "Generalized per-host binding-probe harness (spec 006 §11.6), generalizing experiments/channel-probe. Records session-identity/workspace-binding signals and fired lifecycle hook points for a target host, as durable evidence for the 006 §11.3 adapter matrix.",
+  "scripts": {
+    "test": "vitest run --config vitest.config.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  },
+  "devDependencies": {
+    "vitest": "^4.0.18"
+  }
+}
