@@ -90,7 +90,10 @@ If you cannot install any plugin at all, wire the hooks by hand in `.claude/sett
       {
         "matcher": "",
         "hooks": [
-          { "type": "command", "command": "agentmonitors session start" }
+          {
+            "type": "command",
+            "command": "command -v agentmonitors >/dev/null 2>&1 && agentmonitors session start || true"
+          }
         ]
       }
     ],
@@ -98,7 +101,10 @@ If you cannot install any plugin at all, wire the hooks by hand in `.claude/sett
       {
         "matcher": "",
         "hooks": [
-          { "type": "command", "command": "agentmonitors hook deliver" }
+          {
+            "type": "command",
+            "command": "command -v agentmonitors >/dev/null 2>&1 && agentmonitors hook deliver || true"
+          }
         ]
       }
     ],
@@ -106,13 +112,20 @@ If you cannot install any plugin at all, wire the hooks by hand in `.claude/sett
       {
         "matcher": "",
         "hooks": [
-          { "type": "command", "command": "agentmonitors session end" }
+          {
+            "type": "command",
+            "command": "command -v agentmonitors >/dev/null 2>&1 && agentmonitors session end || true"
+          }
         ]
       }
     ]
   }
 }
 ```
+
+Each command is guarded (`command -v … && … || true`) so the host hook never reports a failure
+when the CLI is missing from `PATH` or exits non-zero — an unguarded failing hook would disrupt
+the user's session. This mirrors the guard the official plugin's own hook wiring uses.
 
 - `SessionStart` runs `agentmonitors session start`, which lazy-boots the per-project daemon and
   registers the session (and prints a recap of anything already pending).
@@ -296,11 +309,11 @@ agentmonitors daemon run .claude/monitors --socket "$SOCKET" --reap-after-ms 0 -
 DAEMON_PID=$!
 sleep 1
 
-# 2. Open a lead session on the same socket. Note the AgentMon session id
-#    printed on the "Opened session:" line — it is NOT the same as $HOST_ID.
-agentmonitors session open --socket "$SOCKET" --host-session-id "$HOST_ID" --role lead --workspace "$CWD"
-# → Opened session: <AGENTMON_SESSION_ID>
-AGENTMON_SESSION_ID=<paste the id from the line above>
+# 2. Open a lead session on the same socket, capturing the AgentMon session
+#    id from the JSON output (it is NOT the same as $HOST_ID).
+AGENTMON_SESSION_ID=$(agentmonitors session open --socket "$SOCKET" --host-session-id "$HOST_ID" --role lead --workspace "$CWD" --format json \
+  | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).id))")
+echo "AgentMon session: $AGENTMON_SESSION_ID"
 
 # 3. Trigger the monitored condition (per-source recipes below).
 
