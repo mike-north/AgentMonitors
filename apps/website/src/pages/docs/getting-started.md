@@ -157,6 +157,8 @@ agent actually receives.
 - [Notify your agent when a file changes](/docs/notify-when-a-file-changes) — end-to-end delivery
   verification
 - [Authoring monitors](/docs/authoring-monitors) — all sources, urgency levels, notify strategies
+- [Agent integration & delivery](/docs/agent-integration) — how hooks and the optional MCP channel
+  deliver into a session, and how to run entirely without MCP
 - [Use cases](/docs/use-cases) — patterns from simple file-watching to fleet supervision
 
 Using an AI coding agent to do this setup? Point it at

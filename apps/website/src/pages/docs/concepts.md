@@ -48,9 +48,14 @@ Current bundled source types:
 
 | Value | Delivery |
 |---|---|
-| `high` | Interrupt the agent at the earliest interruptible point (15 s debounce) |
-| `normal` | Surface at turn-idle — after the current agent turn completes |
-| `low` | Surface at idle or post-compact — lowest priority |
+| `high` | Interrupt the agent at the next turn boundary, after a 15 s settle window, with full event detail |
+| `normal` | Surface a reminder at the next turn boundary — coalesced, no per-event detail |
+| `low` | Surface a reminder at turn-idle, after the current turn completes — coalesced, no per-event detail |
+
+Every unread event — any urgency — is also recapped in full at the next `post-compact` (session
+start after a context compaction), so nothing seen while an agent is away goes unnoticed. See
+[Agent integration & delivery](/docs/agent-integration) for the complete timing table and the
+transports (hooks vs. the optional MCP channel) that surface each of these.
 
 ## The delivery pipeline
 
@@ -68,7 +73,10 @@ MONITOR.md  ──parse──▶  runtime tick  ──observe()──▶  source
 3. **Notify dispatch** — the runtime applies debounce/throttle policy.
 4. **Persist** — observations become durable `monitor_events` rows in SQLite.
 5. **Project** — events are projected into matching active agent sessions.
-6. **Deliver** — the host adapter surfaces pending events at the right lifecycle point.
+6. **Deliver** — the host adapter surfaces pending events at the right lifecycle point. The
+   default surface is Claude Code hooks — no MCP server or extra setup required; see
+   [Agent integration & delivery](/docs/agent-integration) for the full transport model, including
+   how to run entirely without MCP in restricted environments.
 
 ## Scoping
 
@@ -89,5 +97,7 @@ it. This structural split makes monitors deterministic, testable, and portable.
 ## Learn more
 
 - [Authoring monitors](/docs/authoring-monitors) — the complete frontmatter reference
+- [Agent integration & delivery](/docs/agent-integration) — hooks, the optional MCP channel, and
+  operating without MCP
 - [Use cases](/docs/use-cases) — patterns from simple to advanced
 - [The Monitor Standard](/docs/monitor-standard) — the open format specification
