@@ -2,6 +2,9 @@
   "name": "@agentmonitors/source-incoming-changes",
   "description": "Git incoming-changes detection for Agent Monitors",
   "version": "0.2.5",
+  "engines": {
+    "node": ">=24"
+  },
   "publishConfig": {
     "registry": "https://registry.npmjs.org",
     "access": "public"
@@ -36,5 +39,14 @@
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^22.15.0"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mike-north/AgentMonitors.git",
+    "directory": "plugins/source-incoming-changes"
+  },
+  "bugs": {
+    "url": "https://github.com/mike-north/AgentMonitors/issues"
+  },
+  "homepage": "https://github.com/mike-north/AgentMonitors/tree/main/plugins/source-incoming-changes#readme"
 }

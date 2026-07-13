@@ -25,6 +25,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  PACKAGE_DIRS,
+  REPO_ROOT,
   collateralIssuesForPackage,
   main,
   validateReleaseCollateral,
@@ -34,6 +36,12 @@ interface FixtureOptions {
   changelog?: boolean;
   publishConfig?: boolean;
   builtEntry?: boolean;
+  engines?: boolean;
+  repository?: boolean;
+  bugs?: boolean;
+  homepage?: boolean;
+  readme?: boolean;
+  licenseFile?: boolean;
 }
 
 /** Scaffolds a minimal on-disk package under `repoRoot/packageDir`. */
@@ -43,7 +51,17 @@ function writePackageFixture(
   packageJson: Record<string, unknown>,
   options: FixtureOptions = {},
 ): void {
-  const { changelog = true, publishConfig = true, builtEntry = true } = options;
+  const {
+    changelog = true,
+    publishConfig = true,
+    builtEntry = true,
+    engines = true,
+    repository = true,
+    bugs = true,
+    homepage = true,
+    readme = true,
+    licenseFile = true,
+  } = options;
   const absDir = path.join(repoRoot, packageDir);
   mkdirSync(absDir, { recursive: true });
 
@@ -54,18 +72,45 @@ function writePackageFixture(
       access: 'public',
     };
   }
+  if (engines) {
+    finalPackageJson.engines = { node: '>=24' };
+  }
+  if (repository) {
+    finalPackageJson.repository = {
+      type: 'git',
+      url: 'git+https://github.com/fixture/example.git',
+      directory: packageDir,
+    };
+  }
+  if (bugs) {
+    finalPackageJson.bugs = {
+      url: 'https://github.com/fixture/example/issues',
+    };
+  }
+  if (homepage) {
+    finalPackageJson.homepage = `https://github.com/fixture/example/tree/main/${packageDir}#readme`;
+  }
   writeFileSync(
     path.join(absDir, 'package.json'),
     JSON.stringify(finalPackageJson, null, 2),
   );
 
+  const name =
+    typeof packageJson.name === 'string' ? packageJson.name : 'fixture';
+
   if (changelog) {
-    const name =
-      typeof packageJson.name === 'string' ? packageJson.name : 'fixture';
     writeFileSync(
       path.join(absDir, 'CHANGELOG.md'),
       `# ${name}\n\n## 0.0.1\n\n- Initial release.\n`,
     );
+  }
+
+  if (readme) {
+    writeFileSync(path.join(absDir, 'README.md'), `# ${name}\n`);
+  }
+
+  if (licenseFile) {
+    writeFileSync(path.join(absDir, 'LICENSE'), 'MIT License fixture text\n');
   }
 
   if (builtEntry) {
@@ -179,6 +224,137 @@ describe('validateReleaseCollateral', () => {
     ]);
   });
 
+  // Issue #291 acceptance criterion (negative case, engines.node variant): a
+  // package missing `engines.node` fails, named by package — this is the
+  // check that stops an unsupported-Node install from failing opaquely
+  // instead of with an actionable npm compatibility warning.
+  it('reports a missing "engines.node" by package name', () => {
+    const repoRoot = makeTmpRoot();
+    writePackageFixture(
+      repoRoot,
+      'pkg-no-engines',
+      {
+        name: '@fixture/pkg-no-engines',
+        version: '0.0.1',
+        type: 'module',
+        main: './dist/index.js',
+        files: ['dist'],
+      },
+      { engines: false },
+    );
+
+    const report = validateReleaseCollateral(['pkg-no-engines'], repoRoot);
+    expect(report.get('@fixture/pkg-no-engines')).toEqual([
+      'missing "engines.node" in package.json',
+    ]);
+  });
+
+  // Issue #291 acceptance criterion (negative case, repository variant).
+  it('reports missing "repository" metadata by package name', () => {
+    const repoRoot = makeTmpRoot();
+    writePackageFixture(
+      repoRoot,
+      'pkg-no-repository',
+      {
+        name: '@fixture/pkg-no-repository',
+        version: '0.0.1',
+        type: 'module',
+        main: './dist/index.js',
+        files: ['dist'],
+      },
+      { repository: false },
+    );
+
+    const report = validateReleaseCollateral(['pkg-no-repository'], repoRoot);
+    expect(report.get('@fixture/pkg-no-repository')).toEqual([
+      'missing "repository" metadata in package.json',
+    ]);
+  });
+
+  // Issue #291 acceptance criterion (negative case, bugs variant).
+  it('reports missing "bugs" metadata by package name', () => {
+    const repoRoot = makeTmpRoot();
+    writePackageFixture(
+      repoRoot,
+      'pkg-no-bugs',
+      {
+        name: '@fixture/pkg-no-bugs',
+        version: '0.0.1',
+        type: 'module',
+        main: './dist/index.js',
+        files: ['dist'],
+      },
+      { bugs: false },
+    );
+
+    const report = validateReleaseCollateral(['pkg-no-bugs'], repoRoot);
+    expect(report.get('@fixture/pkg-no-bugs')).toEqual([
+      'missing "bugs" metadata in package.json',
+    ]);
+  });
+
+  // Issue #291 acceptance criterion (negative case, homepage variant).
+  it('reports a missing "homepage" by package name', () => {
+    const repoRoot = makeTmpRoot();
+    writePackageFixture(
+      repoRoot,
+      'pkg-no-homepage',
+      {
+        name: '@fixture/pkg-no-homepage',
+        version: '0.0.1',
+        type: 'module',
+        main: './dist/index.js',
+        files: ['dist'],
+      },
+      { homepage: false },
+    );
+
+    const report = validateReleaseCollateral(['pkg-no-homepage'], repoRoot);
+    expect(report.get('@fixture/pkg-no-homepage')).toEqual([
+      'missing "homepage" in package.json',
+    ]);
+  });
+
+  // Issue #291 acceptance criterion (negative case, README variant).
+  it('reports a missing README.md by package name', () => {
+    const repoRoot = makeTmpRoot();
+    writePackageFixture(
+      repoRoot,
+      'pkg-no-readme',
+      {
+        name: '@fixture/pkg-no-readme',
+        version: '0.0.1',
+        type: 'module',
+        main: './dist/index.js',
+        files: ['dist'],
+      },
+      { readme: false },
+    );
+
+    const report = validateReleaseCollateral(['pkg-no-readme'], repoRoot);
+    expect(report.get('@fixture/pkg-no-readme')).toEqual(['missing README.md']);
+  });
+
+  // Issue #291 acceptance criterion (negative case, LICENSE variant).
+  it('reports a missing LICENSE by package name', () => {
+    const repoRoot = makeTmpRoot();
+    writePackageFixture(
+      repoRoot,
+      'pkg-no-license',
+      {
+        name: '@fixture/pkg-no-license',
+        version: '0.0.1',
+        type: 'module',
+        main: './dist/index.js',
+        files: ['dist'],
+      },
+      { licenseFile: false },
+    );
+
+    const report = validateReleaseCollateral(['pkg-no-license'], repoRoot);
+    expect(report.get('@fixture/pkg-no-license')).toEqual(['missing LICENSE']);
+  });
+
   it('accumulates multiple issues for the same package', () => {
     const repoRoot = makeTmpRoot();
     writePackageFixture(
@@ -204,6 +380,41 @@ describe('validateReleaseCollateral', () => {
       'missing CHANGELOG.md',
       'missing "publishConfig" in package.json',
       'npm pack would not include built entry point(s) "dist/index.js" — was the package built before this check ran?',
+    ]);
+  });
+
+  // Issue #291: all six new metadata/collateral checks accumulate together,
+  // in the same order collateralIssuesForPackage evaluates them.
+  it('accumulates every runtime/project-metadata and README/LICENSE issue for the same package', () => {
+    const repoRoot = makeTmpRoot();
+    writePackageFixture(
+      repoRoot,
+      'pkg-no-metadata',
+      {
+        name: '@fixture/pkg-no-metadata',
+        version: '0.0.1',
+        type: 'module',
+        main: './dist/index.js',
+        files: ['dist'],
+      },
+      {
+        engines: false,
+        repository: false,
+        bugs: false,
+        homepage: false,
+        readme: false,
+        licenseFile: false,
+      },
+    );
+
+    const report = validateReleaseCollateral(['pkg-no-metadata'], repoRoot);
+    expect(report.get('@fixture/pkg-no-metadata')).toEqual([
+      'missing "engines.node" in package.json',
+      'missing "repository" metadata in package.json',
+      'missing "bugs" metadata in package.json',
+      'missing "homepage" in package.json',
+      'missing README.md',
+      'missing LICENSE',
     ]);
   });
 
@@ -277,5 +488,40 @@ describe('main({ dryRun: true })', () => {
     // collateral validation short-circuited before releaseCandidates()
     // (and therefore before any npm view network call).
     expect(logged).toEqual([]);
+  });
+});
+
+// Issue #291 acceptance criterion: published packages declare an engines.node
+// floor consistent with the Node version CI actually tests, so a user who installs on an unsupported Node
+// release gets an actionable npm compatibility warning rather than an opaque
+// runtime failure — and that claim can't silently drift, because both sides
+// (the real `.github/workflows/ci.yml` and the real PACKAGE_DIRS
+// package.jsons) are read from disk here, not hand-built approximations.
+describe('published package engines.node vs CI-tested Node version (real repo)', () => {
+  it('declares engines.node matching the Node version CI tests, for every PACKAGE_DIRS package', () => {
+    const ciWorkflow = readFileSync(
+      path.join(REPO_ROOT, '.github/workflows/ci.yml'),
+      'utf8',
+    );
+    const ciNodeVersions = [
+      ...new Set(
+        [...ciWorkflow.matchAll(/node-version:\s*(\d+)/g)].map((match) =>
+          Number(match[1]),
+        ),
+      ),
+    ];
+    // CI currently tests exactly one Node version. If that ever becomes a
+    // range, this assertion (and the engines.node values below) should be
+    // revisited deliberately rather than drifting apart silently.
+    expect(ciNodeVersions).toEqual([24]);
+
+    for (const packageDir of PACKAGE_DIRS) {
+      const packageJson = JSON.parse(
+        readFileSync(path.join(REPO_ROOT, packageDir, 'package.json'), 'utf8'),
+      ) as { name?: string; engines?: { node?: string } };
+      expect(packageJson.engines?.node, `${packageDir} engines.node`).toBe(
+        '>=24',
+      );
+    }
   });
 });

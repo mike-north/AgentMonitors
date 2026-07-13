@@ -2,6 +2,9 @@
   "name": "@agentmonitors/source-schedule",
   "description": "Cron-based schedule triggers for Agent Monitors",
   "version": "0.1.5",
+  "engines": {
+    "node": ">=24"
+  },
   "publishConfig": {
     "registry": "https://registry.npmjs.org",
     "access": "public"
@@ -36,5 +39,14 @@
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^22.15.0"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mike-north/AgentMonitors.git",
+    "directory": "plugins/source-schedule"
+  },
+  "bugs": {
+    "url": "https://github.com/mike-north/AgentMonitors/issues"
+  },
+  "homepage": "https://github.com/mike-north/AgentMonitors/tree/main/plugins/source-schedule#readme"
 }

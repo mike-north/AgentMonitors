@@ -2,6 +2,9 @@
   "name": "agentmonitors",
   "description": "Install the Agent Monitors CLI under the short, unscoped name. Thin launcher for @agentmonitors/cli.",
   "version": "0.8.0",
+  "engines": {
+    "node": ">=24"
+  },
   "publishConfig": {
     "registry": "https://registry.npmjs.org",
     "access": "public"
@@ -21,5 +24,14 @@
   "devDependencies": {
     "vitest": "^4.0.18"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mike-north/AgentMonitors.git",
+    "directory": "apps/agentmonitors"
+  },
+  "bugs": {
+    "url": "https://github.com/mike-north/AgentMonitors/issues"
+  },
+  "homepage": "https://github.com/mike-north/AgentMonitors/tree/main/apps/agentmonitors#readme"
 }

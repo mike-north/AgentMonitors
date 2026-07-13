@@ -2,6 +2,9 @@
   "name": "@agentmonitors/source-api-poll",
   "description": "HTTP endpoint polling and change detection for Agent Monitors",
   "version": "0.3.0",
+  "engines": {
+    "node": ">=24"
+  },
   "publishConfig": {
     "registry": "https://registry.npmjs.org",
     "access": "public"
@@ -36,5 +39,14 @@
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^22.15.0"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mike-north/AgentMonitors.git",
+    "directory": "plugins/source-api-poll"
+  },
+  "bugs": {
+    "url": "https://github.com/mike-north/AgentMonitors/issues"
+  },
+  "homepage": "https://github.com/mike-north/AgentMonitors/tree/main/plugins/source-api-poll#readme"
 }
