@@ -10,7 +10,10 @@
     },
     "env": {
       "mechanism": "env.CLAUDE_CODE_CHILD_SESSION|CLAUDE_CODE_SESSION_ID",
-      "observedKeys": ["CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID"]
+      "observedKeys": [
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_SESSION_ID"
+      ]
     }
   },
   "workspaceBindingSignal": {
@@ -20,7 +23,9 @@
     },
     "env": {
       "mechanism": "env.CLAUDE_PROJECT_DIR",
-      "observedKeys": ["CLAUDE_PROJECT_DIR"]
+      "observedKeys": [
+        "CLAUDE_PROJECT_DIR"
+      ]
     },
     "rootsList": {
       "attempted": true,
@@ -37,16 +42,14 @@
   ],
   "richerTransport": {
     "attempted": true,
-    "capabilitiesDeclared": ["experimental.claude/channel", "tools"]
+    "capabilitiesDeclared": [
+      "experimental.claude/channel",
+      "tools"
+    ]
   },
   "sightingCounts": {
     "hook": 10,
     "mcp": 3
   },
-  "notes": [
-    "Sightings captured 2026-07-12 via a nested `claude -p` session (hooks: SessionStart/UserPromptSubmit/PreToolUse/PostToolUse/Stop/SessionEnd; MCP: agentmon-host-probe server loaded via --mcp-config).",
-    "CLAUDE_CODE_SESSION_ID WAS observed present in the hook-invocation environment in this run (matching stdin session_id), which appears to contradict 006 section 5.0's blanket 'no CLAUDE_CODE_SESSION_ID env var in a hook invocation' claim. Caveat: this run's Claude Code process was itself a nested/child session (env showed CLAUDE_CODE_CHILD_SESSION=1, CLAUDE_CODE_ENTRYPOINT=sdk-cli) launched from inside another live Claude Code session -- process-tree detection, not shell-env inheritance (confirmed by unsetting all CLAUDE_* vars in the parent shell before invoking, which did not change the result). This may be new behavior specific to nested/agent-SDK child sessions, not a standalone top-level terminal session. Re-run from a plain top-level terminal session before treating this as grounds to revise 006 section 5.0; until then the documented stdin session_id remains the primary, always-available signal.",
-    "The --dangerously-load-development-channels flag documented in experiments/channel-probe/README.md (Claude Code 2.1.157) is no longer present in this version's --help output (2.1.207), so the actual rendered <channel> push could not be independently re-confirmed this run. The MCP-server spawn signals it does NOT depend on that flag -- CLAUDE_PROJECT_DIR, cwd, CLAUDE_CODE_SESSION_ID, and roots/list -- were confirmed via a plain --mcp-config load and a tool call.",
-    "Not exercised in this baseline run: TeammateIdle, PreCompact, and PostCompact (the claudeCodeAdapter hookEventMap's remaining three lifecycle hooks) -- a short -p session has no idle wait or compaction trigger. Documented (not probed) for these three; re-run in a longer-lived or --resume session to pin them."
-  ]
+  "notes": "Paths and session UUIDs in this artifact and its sightings are redacted (/Users/<user>, <session-N>) \u2014 probe evidence needs key presence and hook shape, not identifying values. hostVersion 2.1.207 is the version the CLI reported at probe time; a sighting env var (CLAUDE_CODE_EXECPATH) points at a 2.1.206 install directory because the launcher auto-updated between install and probe \u2014 the reported (running) version is authoritative."
 }

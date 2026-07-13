@@ -88,6 +88,18 @@ const CONTEXT_EVENTS = new Set([
 ]);
 
 function recordHook(flags) {
+  // This path is invoked from LIVE host hooks: it must be best-effort and
+  // always emit a valid hook response, whatever stdin contained and whether
+  // or not the sighting could be persisted. A throwing probe would degrade
+  // the very session it is observing.
+  try {
+    recordHookInner(flags);
+  } catch {
+    process.stdout.write(JSON.stringify({ continue: true }));
+  }
+}
+
+function recordHookInner(flags) {
   const outPath =
     flags.out ??
     process.env.HOST_PROBE_ARTIFACT ??
@@ -95,7 +107,13 @@ function recordHook(flags) {
   const raw = readAllStdinSync();
   let payload = {};
   try {
-    payload = raw ? JSON.parse(raw) : {};
+    const parsed = raw ? JSON.parse(raw) : {};
+    // JSON.parse can yield null / arrays / primitives; only a plain object is
+    // a usable hook payload — anything else degrades to an empty sighting.
+    payload =
+      parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? parsed
+        : {};
   } catch {
     payload = {};
   }

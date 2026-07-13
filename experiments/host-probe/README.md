@@ -198,3 +198,10 @@ actually seen.
 Throwaway. `experiments/host-probe/` itself is committed (per spec 006 §11.6, this harness and its
 committed artifacts are the required evidence), but any scratch project directories created under
 step 1 above are not — delete them when done.
+
+## Artifact hygiene
+
+Before committing a probe artifact, redact identifying values: replace the home directory in any
+absolute path with `/Users/<user>` (or `<HOME>`) and each session UUID with a stable placeholder
+(`<session-1>`, `<session-2>`, …; keep the mapping consistent within one probe run). The matrix
+evidence needs key presence, mechanisms, and hook shapes — never real ids or personal paths.

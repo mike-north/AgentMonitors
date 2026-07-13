@@ -25,9 +25,16 @@ export function filterEnvByPrefixes(env, prefixes = DEFAULT_ENV_PREFIXES) {
   return out;
 }
 
-/** Key names (not values) among `env` that look identity- or workspace-shaped. */
+/**
+ * Key names (not values) among `env` that look identity- or workspace-shaped.
+ * A key only counts when it is actually present with a non-empty value in this
+ * sighting — an empty/undefined variable is not evidence the host provides the
+ * signal, and would produce false positives in the reduced artifact.
+ */
 export function candidateSignalKeys(env) {
-  const keys = Object.keys(env);
+  const keys = Object.keys(env).filter(
+    (k) => typeof env[k] === 'string' && env[k].length > 0,
+  );
   return {
     sessionIdLike: keys.filter((k) => SESSION_ID_KEY_PATTERN.test(k)).sort(),
     workspaceLike: keys.filter((k) => WORKSPACE_KEY_PATTERN.test(k)).sort(),
