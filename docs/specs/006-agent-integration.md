@@ -501,8 +501,11 @@ daemon would never boot and the session would never register), and the workspace
 fires per-tool, so a daemon round-trip per tool is too costly for v1). Because the aipm v0.3.0 Claude
 hooks transform only covers `PreToolUse`/`PostToolUse`/`Stop`/`UserPromptSubmit`, the lifecycle
 events (`SessionStart`/`SessionEnd`) are authored as a host-native
-[`hooks/hooks.json`](../../agent-plugins/agentmonitors/hooks/hooks.json) referenced from the plugin
-manifest, rather than via aipm's YAML→JSON hook generation.
+[`hooks/hooks.json`](../../agent-plugins/agentmonitors/hooks/hooks.json), rather than via aipm's
+YAML→JSON hook generation. Claude Code **auto-discovers** the conventional `hooks/hooks.json` path;
+the plugin manifest must **not** also reference it (a `hooks` manifest entry may only name
+_additional_ hook files — a reference resolving to the auto-discovered file is rejected at plugin
+load as a duplicate hooks file, failing the install).
 
 **Hardened command form.** The hook commands are not bare `agentmonitors …` invocations; each is
 shell-guarded for the "installed plugin, missing CLI" case (a user who hasn't yet run

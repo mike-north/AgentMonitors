@@ -7,6 +7,5 @@
     "name": "Mike North"
   },
   "keywords": ["agentmonitors", "monitoring", "channel", "mcp", "hooks"],
-  "skills": ["./skills/setup-monitors"],
-  "hooks": "./hooks/hooks.json"
+  "skills": ["./skills/setup-monitors"]
 }
