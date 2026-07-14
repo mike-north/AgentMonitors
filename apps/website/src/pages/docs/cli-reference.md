@@ -41,10 +41,12 @@ Some commands run entirely in-process against the filesystem and/or local SQLite
 `daemon once`, `doctor`). Others round-trip the daemon over a Unix domain socket
 (`daemon run/status/stop`, `session *`, `events *`, `hook *`). `monitor history` and
 `monitor explain` are socket-first but fall back to reading persisted state in-process when no
-daemon is reachable. Where a command accepts `--socket <path>`, the resolution order (unless the
-command note below says otherwise) is: `--socket` flag → `AGENTMONITORS_SOCKET` env var → the
-enabled workspace's persisted socket in `.claude/agentmonitors.local.md` → the global default
-(`~/.local/share/agentmonitors/agentmonitors.sock`). See
+daemon is reachable. Socket resolution for every `--socket`-accepting command is:
+`--socket` flag → `AGENTMONITORS_SOCKET` env var → the global default
+(`~/.local/share/agentmonitors/agentmonitors.sock`). The session-lifecycle commands
+(`session start`/`end`) additionally use the enabled workspace's persisted socket from
+`.claude/agentmonitors.local.md` as their effective override, so hook-driven sessions and manual
+commands can target the same daemon. See
 [Troubleshooting](/docs/troubleshooting) ("Which session ID do I use") for the related
 session-id distinction.
 
@@ -108,7 +110,8 @@ agentmonitors scan [dir] [options]
 agentmonitors scan .claude/monitors
 ```
 
-Discovery only — never validates. Always exits `0`.
+Discovery only — never validates. Exits `0` on any scan result (including zero monitors);
+argument errors (missing directory, path is a file) exit non-zero.
 
 ---
 
@@ -253,8 +256,9 @@ agentmonitors source update [name]
 agentmonitors source remove <name>
 ```
 
-These are placeholders. Each prints a `[not yet implemented]` message to stderr naming the manual
-workaround (`pnpm add --prefix ~/.config/agentmonitors <package-name>`) and exits `1`.
+These are placeholders: each prints a `[not yet implemented]` message to stderr and exits `1`.
+`source search` and `source install` additionally name the manual workaround
+(`pnpm add --prefix ~/.config/agentmonitors <package-name>`); `update` and `remove` do not.
 
 ---
 
@@ -443,7 +447,8 @@ printf '{"session_id":"claude-abc123","cwd":"%s","hook_event_name":"SessionStart
 agentmonitors session end
 ```
 
-No flags; same stdin hook payload as `session start`. Designed as a **`Stop`** hook.
+No flags; same stdin hook payload as `session start`. Designed as a **`SessionEnd`** hook
+(`hook_event_name: "SessionEnd"`).
 
 ```bash
 printf '{"session_id":"claude-abc123","cwd":"%s"}' "$PWD" | agentmonitors session end
@@ -559,7 +564,7 @@ agentmonitors channel serve
 
 Runs AgentMon as an MCP server over stdio, pushing pending turn-interruptible deliveries into the
 session and exposing an `agentmon_ack` tool. No `--format` flag — the stdio channel is the
-transport; nothing is printed to stdout. Intended to be spawned by Claude Code via a channel
+transport; stdout carries only the MCP JSON-RPC frames (no human-readable output). Intended to be spawned by Claude Code via a channel
 plugin, not run by hand. See
 [Agent integration & delivery](/docs/agent-integration) for the hooks-only vs. MCP tradeoffs.
 
