@@ -121,6 +121,102 @@ function deliveryStateForRow(row: {
 }
 
 /**
+ * The per-recipient `net`-collapse grouping key for an event (002 §1.1.7): the
+ * `(monitorId, objectKey, workspacePath)` 3-tuple — the SAME key used by
+ * {@link RuntimeStore.advanceCursorsForClaimedEvents} and the
+ * `session_object_cursor` UNIQUE index (its omission caused the #186
+ * cross-workspace fold). An event that cannot be net-collapsed (not `net`
+ * strategy, or missing a snapshot/objectKey) is its own singleton — it is never
+ * folded with any other event — so it gets a collision-proof per-event key. A
+ * real 3-tuple key always contains the two `\0` join separators, so a
+ * `\0`-free `singleton:<id>` key can never equal one.
+ */
+export function netCollapseGroupKey(event: MonitorEventRecord): string {
+  const collapsible =
+    event.baselineStrategy === 'net' &&
+    event.snapshotText !== null &&
+    event.objectKey !== null;
+  if (!collapsible) return `singleton:${event.id}`;
+  return [event.monitorId, event.objectKey, event.workspacePath ?? ''].join(
+    '\0',
+  );
+}
+
+/**
+ * The read-only decision half of the per-recipient `net` collapse (002 §1.1.7):
+ * given a recipient's candidate set, decide which events survive as DELIVERED
+ * (the newest event of each `net` object group, plus every non-collapsible
+ * event) and which older `net` siblings are SUPPRESSED — with NO database
+ * writes. {@link RuntimeStore.collapseNetForClaim} layers the mutating half
+ * (re-anchoring the surviving delta, recording the suppression) on top of this,
+ * and the delivery PREVIEW ({@link RuntimeStore} consumers that must size a
+ * capped hook context before claiming — issue #299) uses this half alone, so the
+ * preview and the eventual claim agree on exactly which events are delivered and
+ * in what order.
+ */
+export interface NetCollapseView {
+  /** Events to actually deliver, in the input (oldest-first) order. */
+  delivered: MonitorEventRecord[];
+  /** Older `net` intermediates folded away (claimed-but-suppressed at claim). */
+  suppressedIds: string[];
+  /** Every candidate's id → its {@link netCollapseGroupKey}. */
+  groupKeyByEventId: Map<string, string>;
+  /** For `net` groups only: group key → number of collapsible events in it. */
+  netGroupSizeByKey: Map<string, number>;
+}
+
+export function computeNetCollapseView(
+  candidates: MonitorEventRecord[],
+): NetCollapseView {
+  // Order by (createdAt, id): events materialized in the same tick share a
+  // createdAt, so the monotonic `id` (see `eventUlid`) breaks the tie in
+  // insertion order — the last is the true endpoint ("where things stand now",
+  // 002 §1.1.7).
+  const ordered = [...candidates].sort((a, b) => {
+    const byTime = a.createdAt.getTime() - b.createdAt.getTime();
+    return byTime !== 0 ? byTime : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  });
+  const newestNetByObject = new Map<string, MonitorEventRecord>();
+  const netGroupSizeByKey = new Map<string, number>();
+  for (const event of ordered) {
+    if (
+      event.baselineStrategy !== 'net' ||
+      event.snapshotText === null ||
+      event.objectKey === null
+    )
+      continue;
+    const key = netCollapseGroupKey(event);
+    newestNetByObject.set(key, event); // later (newer) overwrites earlier
+    netGroupSizeByKey.set(key, (netGroupSizeByKey.get(key) ?? 0) + 1);
+  }
+
+  const groupKeyByEventId = new Map<string, string>();
+  for (const event of candidates)
+    groupKeyByEventId.set(event.id, netCollapseGroupKey(event));
+
+  // No `net` group present → every candidate passes through unchanged.
+  if (newestNetByObject.size === 0)
+    return {
+      delivered: candidates,
+      suppressedIds: [],
+      groupKeyByEventId,
+      netGroupSizeByKey,
+    };
+
+  const suppressedIds: string[] = [];
+  const delivered: MonitorEventRecord[] = [];
+  for (const event of candidates) {
+    const key = groupKeyByEventId.get(event.id) ?? netCollapseGroupKey(event);
+    const newest = newestNetByObject.get(key);
+    // A non-collapsible event (singleton key) has no `newest` entry → delivered.
+    // A collapsible event survives iff it is the newest of its object group.
+    if (newest === undefined || newest.id === event.id) delivered.push(event);
+    else suppressedIds.push(event.id);
+  }
+  return { delivered, suppressedIds, groupKeyByEventId, netGroupSizeByKey };
+}
+
+/**
  * A delivery-query condition that excludes per-recipient projections the
  * Interpret agentic gate suppressed (G14, 002 §1.1.8): the row is retained for
  * `monitor explain` but is never surfaced to a transport. `deliver`/`failed`
@@ -1077,94 +1173,51 @@ export class RuntimeStore {
     sessionId: string,
     candidates: MonitorEventRecord[],
   ): MonitorEventRecord[] {
-    // Identify, per (monitorId, objectKey, workspacePath), the NEWEST `net`
-    // event in the candidate set; every OLDER `net` sibling of a multi-event
-    // group is suppressed. Order by (createdAt, id): events materialized in the
-    // same tick share a createdAt, so the monotonic `id` (see `eventUlid`)
-    // breaks the tie in insertion order — the last is the true endpoint ("where
-    // things stand now", 002 §1.1.7).
-    //
-    // IMPORTANT: the grouping key must include workspacePath (using the same
-    // 3-tuple as advanceCursorsForClaimedEvents and the session_object_cursor
-    // UNIQUE index). Omitting it caused cross-workspace folding for global
-    // (null-workspace) sessions that receive projections from multiple
-    // workspaces, silently dropping a delivery (regression #186).
-    const ordered = [...candidates].sort((a, b) => {
-      const byTime = a.createdAt.getTime() - b.createdAt.getTime();
-      return byTime !== 0 ? byTime : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-    });
-    const newestNetByObject = new Map<string, MonitorEventRecord>();
-    const netGroupSize = new Map<string, number>();
-    for (const event of ordered) {
-      if (event.baselineStrategy !== 'net') continue;
-      if (event.snapshotText === null || event.objectKey === null) continue;
-      const key = [
-        event.monitorId,
-        event.objectKey,
-        event.workspacePath ?? '',
-      ].join('\0');
-      newestNetByObject.set(key, event);
-      netGroupSize.set(key, (netGroupSize.get(key) ?? 0) + 1);
-    }
+    // The DECISION half (which events survive as delivered vs which older `net`
+    // siblings are suppressed) is the pure, side-effect-free
+    // {@link computeNetCollapseView} — shared verbatim with the delivery preview
+    // (issue #299) so a capped hook context claims exactly the events it renders.
+    const view = computeNetCollapseView(candidates);
 
-    if (newestNetByObject.size === 0) return candidates;
+    // No `net` group present → nothing to re-anchor or suppress; pass through.
+    if (view.netGroupSizeByKey.size === 0) return candidates;
 
-    const suppressedIds: string[] = [];
-    const delivered: MonitorEventRecord[] = [];
-    for (const event of candidates) {
-      const collapsible =
-        event.baselineStrategy === 'net' &&
-        event.snapshotText !== null &&
-        event.objectKey !== null;
-      if (!collapsible) {
-        delivered.push(event);
+    // The MUTATION half. For each surviving delivered event whose group ACTUALLY
+    // collapsed (>1 net event), recompute its per-recipient diff_text against
+    // THIS recipient's cursor → endpoint artifact (002 §1.1.7), so the delivered
+    // delta spans the whole catch-up, not just the last step. A single-event
+    // group ("missed nothing") is left byte-identical to what materialization
+    // recorded — the degenerate case where `net` ≡ `incremental`, so a baseline
+    // event with a NULL delta is not rewritten to an empty diff.
+    for (const event of view.delivered) {
+      if (
+        event.baselineStrategy !== 'net' ||
+        event.snapshotText === null ||
+        event.objectKey === null
+      )
         continue;
-      }
-      const key = [
+      const key = view.groupKeyByEventId.get(event.id);
+      const groupSize = key ? (view.netGroupSizeByKey.get(key) ?? 1) : 1;
+      if (groupSize <= 1) continue;
+      const cursor = this.getSessionObjectCursor(
+        sessionId,
         event.monitorId,
         event.objectKey,
-        event.workspacePath ?? '',
-      ].join('\0');
-      const newest = newestNetByObject.get(key);
-      if (newest?.id === event.id) {
-        // The surviving net delta: when the group ACTUALLY collapsed (>1 event),
-        // recompute its per-recipient diff_text against THIS recipient's cursor →
-        // endpoint artifact (002 §1.1.7), so the delivered delta spans the whole
-        // catch-up, not just the last step. A single-event group ("missed
-        // nothing") is left byte-identical to what materialization recorded — the
-        // degenerate case where `net` ≡ `incremental` (criterion 2), so a
-        // baseline event with a NULL delta is not rewritten to an empty diff.
-        const groupSize = netGroupSize.get(key) ?? 1;
-        if (groupSize > 1 && event.snapshotText !== null) {
-          // objectKey is non-null: the `collapsible` guard above already asserts
-          // `event.objectKey !== null`. The `??` fallback removed in G10 PR-B was
-          // dead code; a null objectKey here is a logic bug, not a valid fallback.
-          const cursor = this.getSessionObjectCursor(
-            sessionId,
-            event.monitorId,
-            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-            event.objectKey!,
-            event.workspacePath,
-          );
-          if (cursor) {
-            this.setPerRecipientDiff(
-              sessionId,
-              event.id,
-              buildTextDiff(cursor.baselineContent, event.snapshotText),
-            );
-          }
-        }
-        delivered.push(event);
-      } else {
-        // An older intermediate of a multi-event net group: suppress it.
-        suppressedIds.push(event.id);
+        event.workspacePath,
+      );
+      if (cursor) {
+        this.setPerRecipientDiff(
+          sessionId,
+          event.id,
+          buildTextDiff(cursor.baselineContent, event.snapshotText),
+        );
       }
     }
 
-    if (suppressedIds.length > 0) {
-      this.markNetSuppressed(sessionId, suppressedIds);
+    if (view.suppressedIds.length > 0) {
+      this.markNetSuppressed(sessionId, view.suppressedIds);
     }
-    return delivered;
+    return view.delivered;
   }
 
   /**

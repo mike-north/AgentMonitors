@@ -38,6 +38,7 @@ const daemonMethodSchema = z.enum([
   'events.list',
   'events.ack',
   'hook.claim',
+  'hook.preview',
   'history.list',
   'monitor.explain',
   'daemon.tick',
@@ -83,6 +84,13 @@ const eventsAckParamsSchema = z.object({
 const hookClaimParamsSchema = z.object({
   sessionId: z.string(),
   lifecycle: deliveryLifecycleSchema,
+  // Cap on how many delivered high-urgency events a `turn-interruptible` claim
+  // surfaces AND claims, so a length-bounded transport claims only what it
+  // renders and the remainder re-delivers next context event (issue #299).
+  maxEvents: z.number().int().positive().optional(),
+});
+const hookPreviewParamsSchema = z.object({
+  sessionId: z.string(),
 });
 const historyListParamsSchema = z.object({
   monitorId: z.string().optional(),
@@ -397,7 +405,17 @@ function handleRequest(
     case 'hook.claim': {
       const params = hookClaimParamsSchema.parse(request.params);
       return Promise.resolve(
-        runtime.claimDelivery(params.sessionId, params.lifecycle),
+        runtime.claimDelivery(
+          params.sessionId,
+          params.lifecycle,
+          params.maxEvents,
+        ),
+      );
+    }
+    case 'hook.preview': {
+      const params = hookPreviewParamsSchema.parse(request.params);
+      return Promise.resolve(
+        runtime.previewSettledHighDelivery(params.sessionId),
       );
     }
     case 'history.list': {

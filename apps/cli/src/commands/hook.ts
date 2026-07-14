@@ -1,10 +1,17 @@
 import { Command, Option } from 'commander';
 import type { DeliveryLifecycle } from '@agentmonitors/core';
 import { reportError } from '../output.js';
-import { claimDeliveryClient, listSessionsClient } from '../runtime-client.js';
+import {
+  claimDeliveryClient,
+  listSessionsClient,
+  previewSettledHighDeliveryClient,
+} from '../runtime-client.js';
 import { daemonAvailable, resolveSocketPath } from '../daemon-ipc.js';
 import { readLocalState } from '../local-state.js';
-import { renderHookDelivery } from '../hook-deliver-render.js';
+import {
+  packEventsUnderCap,
+  renderHookDelivery,
+} from '../hook-deliver-render.js';
 import { readHookPayload } from '../hook-payload.js';
 import {
   isManualDaemonConnectionError,
@@ -171,18 +178,48 @@ Output formats:
         if (!match) return;
 
         // Claim any pending deliveries for this session at this lifecycle point.
-        const claim = await claimDeliveryClient(
-          match.id,
-          lifecycle,
-          socketPath,
-        );
+        //
+        // For a `turn-interruptible` high-urgency delivery the visible surface is
+        // length-bounded (the 4000-char additionalContext, 006 §5.1), so we must
+        // claim ONLY the events that actually fit — otherwise events truncated
+        // out of the render would be marked claimed and never re-delivered
+        // (issue #299). We therefore PREVIEW the settled high events first, size
+        // how many whole blocks fit under the cap, then claim exactly that many;
+        // the deferred remainder stays pending and re-delivers at the next
+        // context event. Non-high deliveries (normal/low reminders inject no
+        // bodies; the post-compact recap self-heals by re-showing all unread)
+        // need no sizing, so they take the plain claim.
+        let claim = null;
+        let moreDeferred = false;
+        if (lifecycle === 'turn-interruptible') {
+          const highPreview = await previewSettledHighDeliveryClient(
+            match.id,
+            socketPath,
+          );
+          if (highPreview.length > 0) {
+            const fit = packEventsUnderCap(highPreview);
+            claim = await claimDeliveryClient(
+              match.id,
+              lifecycle,
+              socketPath,
+              fit,
+            );
+            moreDeferred = fit < highPreview.length;
+          } else {
+            claim = await claimDeliveryClient(match.id, lifecycle, socketPath);
+          }
+        } else {
+          claim = await claimDeliveryClient(match.id, lifecycle, socketPath);
+        }
 
         // Render and emit.  The echoed hookEventName must match the firing
         // event so the host honors the additionalContext. Null → nothing
         // pending → print nothing. The default remains the hook wire JSON
         // because this command is normally wired directly into Claude hooks;
         // text is an inspection aid for humans running it manually.
-        const output = renderHookDelivery(claim, hookEventName ?? '');
+        const output = renderHookDelivery(claim, hookEventName ?? '', {
+          moreDeferred,
+        });
         if (output !== null) {
           if (options.format === 'text') {
             process.stdout.write(output.hookSpecificOutput.additionalContext);

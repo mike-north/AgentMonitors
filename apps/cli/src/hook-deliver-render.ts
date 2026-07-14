@@ -1,6 +1,9 @@
-import type { DeliveryClaim } from '@agentmonitors/core';
+import type { DeliveryClaim, DeliveryEventSummary } from '@agentmonitors/core';
 
 const MAX_ADDITIONAL_CONTEXT = 4000;
+
+const LEAD_LINE =
+  'AgentMon: monitored changes are pending — consider handling them before continuing.';
 
 /**
  * Appended verbatim when the assembled context is truncated. It tells the agent
@@ -87,6 +90,102 @@ function truncateForCap(value: string, cap: number): string {
 }
 
 /**
+ * Append {@link TRUNCATION_MARKER} to `body`, trimming `body` at a Unicode
+ * code-point boundary only if the marker would push it past `cap`, so the result
+ * (marker included) is always ≤ `cap`. Used for the single pathological case
+ * where one event's own block already exceeds the cap and must be shown
+ * partially (see {@link renderHookDelivery}).
+ */
+function appendMarkerWithinCap(body: string, cap: number): string {
+  const budget = Math.max(0, cap - TRUNCATION_MARKER.length);
+  if (body.length <= budget) return body + TRUNCATION_MARKER;
+  let out = '';
+  for (const ch of body) {
+    if (out.length + ch.length > budget) break;
+    out += ch;
+  }
+  return out + TRUNCATION_MARKER;
+}
+
+/** The fixed prefix of a body-injection payload: lead line + blank line. */
+const HEADER = `${LEAD_LINE}\n\n`;
+
+/** Render one event as its `additionalContext` block (sanitized). */
+function buildEventBlock(event: DeliveryEventSummary): string {
+  const id = sanitize(event.monitorId);
+  const urgency = sanitize(event.urgency);
+  const title = sanitize(event.title);
+  const body = sanitize(event.body);
+  return `### ${id} (${urgency})\n${title}\n\n${body}`;
+}
+
+/**
+ * Greedily accumulate WHOLE event blocks whose assembled string
+ * (`header` + blocks joined by `\n`) stays within `cap`. A block is added only
+ * when it fits in full, so the visible set maps 1:1 to durable events — never a
+ * partially-shown block, which would be a claimed-but-unread event with no clean
+ * re-delivery boundary (issue #299).
+ */
+function packWholeBlocks(
+  header: string,
+  blocks: string[],
+  cap: number,
+): { text: string; includedCount: number } {
+  let body = '';
+  let includedCount = 0;
+  for (const block of blocks) {
+    const candidate = body === '' ? block : `${body}\n${block}`;
+    if ((header + candidate).length > cap) break;
+    body = candidate;
+    includedCount += 1;
+  }
+  return { text: header + body, includedCount };
+}
+
+/**
+ * How many WHOLE high-urgency event blocks (from `events`, oldest-first) the
+ * hook-deliver transport can render under its `additionalContext` cap
+ * (006 §5.1, issue #299). The transport uses this to decide how many events to
+ * CLAIM, so the claimed set equals the rendered set and the remainder stays
+ * pending for the next context event.
+ *
+ * When not everything fits, room is reserved for the truncation marker so no
+ * INCLUDED block is cut. At least 1 is returned when there is any event — there
+ * must be forward progress: the first event is surfaced (and claimed) even if
+ * its own body exceeds the cap, in which case {@link renderHookDelivery}
+ * mid-truncates it with the marker pointing at the still-unread full copy.
+ * Returns 0 for an empty list.
+ */
+export function packEventsUnderCap(
+  events: DeliveryEventSummary[],
+  cap: number = MAX_ADDITIONAL_CONTEXT,
+): number {
+  if (events.length === 0) return 0;
+  const blocks = events.map(buildEventBlock);
+  const whole = packWholeBlocks(HEADER, blocks, cap);
+  // Everything fits → no marker needed → claim them all.
+  if (whole.includedCount === blocks.length) return blocks.length;
+  // A marker will be shown; reserve its room so an included block is never cut.
+  const reserved = packWholeBlocks(
+    HEADER,
+    blocks,
+    cap - TRUNCATION_MARKER.length,
+  );
+  return Math.max(1, reserved.includedCount);
+}
+
+/** Optional signals for {@link renderHookDelivery}. */
+export interface RenderHookDeliveryOptions {
+  /**
+   * The transport deferred additional high-urgency events beyond the ones in
+   * this claim (issue #299): they were left unclaimed to re-deliver next context
+   * event, so the rendered output MUST carry the truncation marker even when the
+   * claimed events themselves fit.
+   */
+  moreDeferred?: boolean;
+}
+
+/**
  * Render a {@link DeliveryClaim} into the advisory hook-output payload that a
  * turn-boundary hook prints to stdout. Returns `null` only when there is
  * genuinely nothing to surface — a null claim, or a claim carrying neither
@@ -96,7 +195,15 @@ function truncateForCap(value: string, cap: number): string {
  *
  * - **Body injection** — a claim with `events` (settled `high`-urgency
  *   turn-interruptible events, or the `post-compact` recap) renders a lead line
- *   plus a per-event block carrying the monitor body.
+ *   plus a per-event block carrying the monitor body. Blocks are packed WHOLE
+ *   under the cap (issue #299): the visible set maps 1:1 to durable events so a
+ *   length-bounded transport can claim exactly what it renders. When events are
+ *   omitted here — because they did not fit, or because the caller deferred more
+ *   via {@link RenderHookDeliveryOptions.moreDeferred} — the
+ *   {@link TRUNCATION_MARKER} is appended pointing at the still-unread rest.
+ *   Only when a SINGLE event's own block exceeds the cap is it shown partially
+ *   (mid-truncated at a code-point boundary); its full body stays unread
+ *   (claiming ≠ acking, BP2 / SP4).
  * - **Reminder line** — a `normal`/`low` turn-boundary claim carries no event
  *   bodies (`events: []`) but a populated `message` (the same advisory line
  *   `hook claim` surfaces). It renders that message as a sanitized, length-capped
@@ -109,16 +216,15 @@ function truncateForCap(value: string, cap: number): string {
  * preserved faithfully (a monitor body is trusted, user-authored markdown) with
  * only raw control characters removed (see {@link sanitize}); the total
  * `additionalContext` is capped so a large diff cannot blow the context window.
- * When the cap is exceeded the text is truncated at a code-point boundary and an
- * explicit {@link TRUNCATION_MARKER} is appended pointing at the still-unread,
- * re-discoverable events (claiming ≠ acking, so nothing is lost).
  *
  * @param claim - The delivery claim from `claimDeliveryClient`, or null.
  * @param hookEventName - The Claude Code event name to echo (e.g. `"PreToolUse"`).
+ * @param options - See {@link RenderHookDeliveryOptions}.
  */
 export function renderHookDelivery(
   claim: DeliveryClaim | null,
   hookEventName: string,
+  options: RenderHookDeliveryOptions = {},
 ): HookDeliveryOutput | null {
   if (!claim) return null;
 
@@ -141,19 +247,35 @@ export function renderHookDelivery(
     };
   }
 
-  const leadLine =
-    'AgentMon: monitored changes are pending — consider handling them before continuing.';
+  const moreDeferred = options.moreDeferred ?? false;
+  const blocks = claim.events.map(buildEventBlock);
+  const whole = packWholeBlocks(HEADER, blocks, MAX_ADDITIONAL_CONTEXT);
 
-  const blocks = claim.events.map((e) => {
-    const id = sanitize(e.monitorId);
-    const urgency = sanitize(e.urgency);
-    const title = sanitize(e.title);
-    const body = sanitize(e.body);
-    return `### ${id} (${urgency})\n${title}\n\n${body}`;
-  });
-
-  const full = [leadLine, '', ...blocks].join('\n');
-  const additionalContext = truncateForCap(full, MAX_ADDITIONAL_CONTEXT);
+  let additionalContext: string;
+  if (whole.includedCount === blocks.length && !moreDeferred) {
+    // Every claimed event fits and nothing was deferred → no marker.
+    additionalContext = whole.text;
+  } else {
+    // A marker is needed (some claimed blocks did not fit here, and/or the caller
+    // deferred more). Repack reserving marker room so no INCLUDED block is cut.
+    const reserved = packWholeBlocks(
+      HEADER,
+      blocks,
+      MAX_ADDITIONAL_CONTEXT - TRUNCATION_MARKER.length,
+    );
+    if (reserved.includedCount >= 1) {
+      additionalContext = reserved.text + TRUNCATION_MARKER;
+    } else {
+      // Even the first block alone exceeds (cap − marker): mid-truncate block 0
+      // at a code-point boundary. This is the ONLY case a durable event is shown
+      // partially; its full body stays unread (claiming ≠ acking, 006 §5.5).
+      const firstBlock = blocks[0] ?? '';
+      additionalContext = appendMarkerWithinCap(
+        HEADER + firstBlock,
+        MAX_ADDITIONAL_CONTEXT,
+      );
+    }
+  }
 
   return {
     continue: true,

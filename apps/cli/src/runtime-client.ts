@@ -1,6 +1,7 @@
 import type {
   AgentSessionRecord,
   DeliveryClaim,
+  DeliveryEventSummary,
   DeliveryLifecycle,
   DoctorReportInput,
   EventQuery,
@@ -79,10 +80,32 @@ export async function claimDeliveryClient(
   sessionId: string,
   lifecycle: DeliveryLifecycle,
   socketPath?: string,
+  maxEvents?: number,
 ): Promise<DeliveryClaim | null> {
   return await callDaemon<DeliveryClaim | null>(
     'hook.claim',
-    { sessionId, lifecycle },
+    {
+      sessionId,
+      lifecycle,
+      ...(maxEvents !== undefined ? { maxEvents } : {}),
+    },
+    socketPath ? { socketPath } : {},
+  );
+}
+
+/**
+ * Preview the settled high-urgency events a `turn-interruptible` claim would
+ * surface for a session, WITHOUT claiming them (issue #299). The hook-deliver
+ * transport uses this to size how many whole event blocks fit under its
+ * 4000-char `additionalContext` cap before claiming exactly that many.
+ */
+export async function previewSettledHighDeliveryClient(
+  sessionId: string,
+  socketPath?: string,
+): Promise<DeliveryEventSummary[]> {
+  return await callDaemon<DeliveryEventSummary[]>(
+    'hook.preview',
+    { sessionId },
     socketPath ? { socketPath } : {},
   );
 }

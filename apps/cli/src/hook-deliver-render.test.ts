@@ -4,8 +4,9 @@
  * @see https://docs.claude.ai/en/api/claude-code/hooks
  */
 import { describe, it, expect } from 'vitest';
-import type { DeliveryClaim } from '@agentmonitors/core';
+import type { DeliveryClaim, DeliveryEventSummary } from '@agentmonitors/core';
 import {
+  packEventsUnderCap,
   renderHookDelivery,
   renderMonitoringDisabledAdvisory,
 } from './hook-deliver-render.js';
@@ -384,6 +385,120 @@ describe('renderHookDelivery', () => {
     expect(ctx).toContain('mon-b');
     expect(ctx).toContain('Body A content');
     expect(ctx).toContain('Body B content');
+  });
+
+  // (issue #299, AC1) `moreDeferred` — the transport claimed only a subset that
+  // fits and DEFERRED more high-urgency events for the next context event. Even
+  // though the surfaced event fits under the cap, the marker MUST be appended so
+  // the agent knows more is pending and re-delivering.
+  it('appends the truncation marker when the caller deferred more events', () => {
+    const out = renderHookDelivery(makeClaim(), 'PostToolUse', {
+      moreDeferred: true,
+    });
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    // The surfaced event is still shown in full…
+    expect(ctx).toContain('Review the diff; flag risky changes.');
+    // …and the marker signposts the deferred remainder.
+    expect(ctx).toContain('[truncated');
+    expect(ctx.length).toBeLessThanOrEqual(4000);
+  });
+
+  // (issue #299, AC1) whole-event packing: when two event blocks EACH fit but
+  // their COMBINED length exceeds the cap, the renderer surfaces the first block
+  // in FULL and drops the second entirely (with a marker) rather than cutting the
+  // second block mid-body. A partially-shown block would be a claimed-but-unread
+  // event with no clean re-delivery boundary.
+  it('packs whole event blocks under the cap (never a partial block)', () => {
+    const bodyA = `AAAA ${'a'.repeat(2200)}`;
+    const bodyB = `BBBB ${'b'.repeat(2200)}`;
+    const out = renderHookDelivery(
+      makeClaim({
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'mon-a',
+            title: 'Title A',
+            summary: 's',
+            body: bodyA,
+            urgency: 'high',
+            createdAt: '2026-06-04T00:00:00.000Z',
+          },
+          {
+            eventId: 'e2',
+            monitorId: 'mon-b',
+            title: 'Title B',
+            summary: 's',
+            body: bodyB,
+            urgency: 'high',
+            createdAt: '2026-06-04T00:00:01.000Z',
+          },
+        ],
+      }),
+      'PostToolUse',
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx.length).toBeLessThanOrEqual(4000);
+    // First block shown IN FULL.
+    expect(ctx).toContain(bodyA);
+    // Second block NOT shown even partially (no fragment of its body leaks in).
+    expect(ctx).not.toContain('BBBB');
+    expect(ctx).not.toContain('bbbbb');
+    // Signposted as truncated.
+    expect(ctx).toContain('[truncated');
+  });
+});
+
+// (issue #299) The transport-side sizing used to CLAIM exactly the events that
+// will be rendered under the context cap, so the truncated-away remainder stays
+// pending and re-delivers at the next context event.
+describe('packEventsUnderCap', () => {
+  function makeEvent(
+    id: string,
+    body: string,
+    overrides: Partial<DeliveryEventSummary> = {},
+  ): DeliveryEventSummary {
+    return {
+      eventId: `evt-${id}`,
+      monitorId: id,
+      title: `Title ${id}`,
+      summary: 's',
+      urgency: 'high',
+      createdAt: '2026-06-04T00:00:00.000Z',
+      body,
+      ...overrides,
+    };
+  }
+
+  it('returns 0 for an empty list', () => {
+    expect(packEventsUnderCap([])).toBe(0);
+  });
+
+  it('returns the full count when every whole block fits under the cap', () => {
+    const events = [
+      makeEvent('mon-a', 'short body A'),
+      makeEvent('mon-b', 'short body B'),
+      makeEvent('mon-c', 'short body C'),
+    ];
+    expect(packEventsUnderCap(events)).toBe(3);
+  });
+
+  it('returns only the events that fit (reserving marker room) when combined length exceeds the cap', () => {
+    // Each ~2200-char block fits alone; two combined (~4500) exceed the 4000 cap.
+    const events = [
+      makeEvent('mon-a', 'a'.repeat(2200)),
+      makeEvent('mon-b', 'b'.repeat(2200)),
+    ];
+    expect(packEventsUnderCap(events)).toBe(1);
+  });
+
+  it('returns at least 1 even when the first event alone exceeds the cap (forward progress)', () => {
+    const events = [
+      makeEvent('mon-a', 'x'.repeat(10_000)),
+      makeEvent('mon-b', 'short'),
+    ];
+    // The first is surfaced (and claimed) even though it overflows — it is
+    // mid-truncated by renderHookDelivery; the marker points at the unread rest.
+    expect(packEventsUnderCap(events)).toBe(1);
   });
 });
 

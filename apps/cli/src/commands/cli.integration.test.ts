@@ -6085,20 +6085,27 @@ describe('hook deliver', () => {
     }
   }, 30_000);
 
-  // No-event-loss proof: with two settled high-urgency events whose combined
-  // rendered body exceeds the 4000-char cap, `hook deliver` truncates the visible
-  // additionalContext (claiming all the events) but — because claiming ≠ acking
-  // (unreadEventsForSession filters on acknowledgedAt IS NULL only) — the
-  // truncated-away event(s) MUST still be re-discoverable via
-  // `events list --unread`. This proves truncation never drops a durable event.
-  it('hook deliver truncates over-cap context but the truncated-away events stay unread', async () => {
+  // Issue #299 — redelivery across the 4000-char cap. Two settled high-urgency
+  // events whose combined rendered blocks exceed the cap must be delivered ACROSS
+  // SUCCESSIVE context events, not silently lost: the first `hook deliver` renders
+  // ONE event (with the truncation marker) and claims ONLY that one; the second
+  // `hook deliver` — a real subsequent stdin hook payload — delivers the other.
+  //
+  // Pre-fix this FAILED: the claim marked BOTH events claimed before the render
+  // truncated one away, so the second deliver returned nothing and the omitted
+  // event never re-surfaced automatically (P1 signal loss). Both events stay
+  // UNREAD throughout (claiming ≠ acking), and repeated context events surface
+  // every item in order.
+  it('hook deliver claims only the rendered subset; the capped-out event re-delivers at the next hook event (#299)', async () => {
     const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-hd-trunc-'));
 
-    // Two monitors, each with a >4000-char body and watching a distinct file,
-    // so two distinct high-urgency events materialize. The first block alone
-    // overruns the 4000-char cap, so the second event's body is truncated away
-    // from the rendered context — but the event row remains unread.
-    const bigBody = 'BODYCONTENT '.repeat(450); // ~5400 chars per monitor body
+    // Two monitors, each watching a distinct file, whose bodies each FIT under
+    // the 4000-char cap individually but overrun it COMBINED — so exactly one
+    // whole event block fits per context event. A unique token at the start of
+    // each body lets us assert which event surfaced in each delivery.
+    const TOKENS = { 'mon-a': 'AAAA_TOKEN', 'mon-b': 'BBBB_TOKEN' } as const;
+    const bodyFor = (name: keyof typeof TOKENS) =>
+      `${TOKENS[name]} ${'x'.repeat(2200)}`; // ~2210 chars: fits alone, not paired
     for (const [name, file] of [
       ['mon-a', 'a.txt'],
       ['mon-b', 'b.txt'],
@@ -6119,7 +6126,7 @@ describe('hook deliver', () => {
           '  interval: "1s"',
           'urgency: high',
           '---',
-          bigBody,
+          bodyFor(name),
           '',
         ].join('\n'),
         'utf-8',
@@ -6185,51 +6192,87 @@ describe('hook deliver', () => {
           ws,
         );
 
-      // Wait for BOTH high-urgency events to materialize past the 15s settle.
-      const eventDeadline = Date.now() + 25_000;
+      // Drive a `hook deliver` on a real PostToolUse (turn-interruptible) stdin
+      // payload — the exact input contract a Claude Code hook feeds the command.
+      const deliver = () =>
+        runWithStdin(
+          ['hook', 'deliver'],
+          env,
+          JSON.stringify({
+            session_id: hostSessionId,
+            hook_event_name: 'PostToolUse',
+            cwd: ws,
+          }),
+          ws,
+        );
+      const contextOf = (stdout: string): string =>
+        stdout.trim() === ''
+          ? ''
+          : (
+              JSON.parse(stdout) as {
+                hookSpecificOutput: { additionalContext: string };
+              }
+            ).hookSpecificOutput.additionalContext;
+      const tokensIn = (ctx: string): string[] =>
+        Object.values(TOKENS).filter((t) => ctx.includes(t));
+
+      // Wait for BOTH high-urgency events to materialize as unread. Polling
+      // `events list --unread` claims NOTHING, so it never consumes a delivery
+      // (unlike `hook deliver`); once both are unread they are also settled and
+      // deliverable at the next `hook deliver`.
+      const eventDeadline = Date.now() + 45_000;
       while (Date.now() < eventDeadline) {
-        const r = unread();
-        if (r.exitCode === 0 && JSON.parse(r.stdout).length >= 2) break;
+        if (JSON.parse(unread().stdout).length >= 2) break;
         await new Promise((res) => setTimeout(res, 500));
       }
+
       const beforeDeliver = JSON.parse(unread().stdout) as { id: string }[];
       expect(beforeDeliver.length).toBe(2);
 
-      // Deliver: this claims BOTH events and renders a truncated context.
-      const deliverResult = runWithStdin(
-        ['hook', 'deliver'],
-        env,
-        JSON.stringify({
-          session_id: hostSessionId,
-          hook_event_name: 'PostToolUse',
-          cwd: ws,
-        }),
-        ws,
-      );
-      expect(deliverResult.exitCode).toBe(0);
-      const output = JSON.parse(deliverResult.stdout) as {
-        hookSpecificOutput: { additionalContext: string };
-      };
-      const ctx = output.hookSpecificOutput.additionalContext;
-      // The visible context is capped and signposted as truncated.
-      expect(ctx.length).toBeLessThanOrEqual(4000);
-      expect(ctx).toContain('[truncated');
+      // First context event: renders EXACTLY ONE whole event block, capped and
+      // signposted as truncated (a second event is pending), and claims ONLY
+      // that event.
+      const first = deliver();
+      expect(first.exitCode).toBe(0);
+      const ctx1 = contextOf(first.stdout);
+      expect(ctx1.length).toBeLessThanOrEqual(4000);
+      expect(ctx1).toContain('[truncated');
+      const firstTokens = tokensIn(ctx1);
+      expect(firstTokens).toHaveLength(1); // claim-set == render-set: one event
 
-      // No-event-loss: BOTH events remain unread after the claim (claiming ≠
-      // acking). The truncated-away event is still re-discoverable here, so it
-      // will re-deliver via the next context event.
-      const afterDeliver = JSON.parse(unread().stdout) as { id: string }[];
-      expect(afterDeliver.length).toBe(2);
-      // The exact same durable event ids are still present (nothing dropped).
-      expect(new Set(afterDeliver.map((e) => e.id))).toEqual(
+      // Both events remain UNREAD after the claim (claiming ≠ acking) — nothing
+      // was dropped, and the deferred event is still pending to re-deliver.
+      const afterFirst = JSON.parse(unread().stdout) as { id: string }[];
+      expect(afterFirst.length).toBe(2);
+      expect(new Set(afterFirst.map((e) => e.id))).toEqual(
         new Set(beforeDeliver.map((e) => e.id)),
       );
+
+      // Second context event: delivers the OTHER event (the one capped out of the
+      // first render). Pre-fix this was empty — the omitted event was claimed and
+      // never re-surfaced.
+      const second = deliver();
+      expect(second.exitCode).toBe(0);
+      const ctx2 = contextOf(second.stdout);
+      const secondTokens = tokensIn(ctx2);
+      expect(secondTokens).toHaveLength(1);
+      expect(secondTokens[0]).not.toBe(firstTokens[0]);
+      // Complete ordered delivery: across the two context events, BOTH tokens
+      // were surfaced.
+      expect(new Set([...firstTokens, ...secondTokens])).toEqual(
+        new Set(Object.values(TOKENS)),
+      );
+      // Only one event remained, so the second render fits without a marker.
+      expect(ctx2).not.toContain('[truncated');
+
+      // Third context event: nothing left to deliver at turn-interruptible.
+      expect(contextOf(deliver().stdout)).toBe('');
     } finally {
       daemon.stop();
       await daemon.waitForExit();
       rmSync(ws, { recursive: true, force: true });
     }
-  }, 40_000);
+  }, 60_000);
 });
 
 // Issue #270: prove hooks-only (no-MCP) operation is a complete, first-class
