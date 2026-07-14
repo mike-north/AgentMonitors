@@ -170,11 +170,16 @@ Make sure `.gitignore` contains:
 
 ```gitignore
 .claude/*.local.*
+.agentmonitors/
 ```
 
 This file is per-developer, not committed. Without it, `agentmonitors session start` quick-exits
 and no automated monitoring runs during a session (a one-shot `agentmonitors daemon once` still
 works without it — the opt-in only gates the session-lifecycle hooks).
+
+`.agentmonitors/` is a separate runtime-state directory (per-session hook state) the daemon
+creates the moment a session opens — it's regenerated on every run, so it's always safe to
+delete. `agentmonitors init` (bare or `--enable-only`) ignores both lines for you automatically.
 
 Only add `.claude/monitors/*` to `.gitignore` if the user wants monitors to stay personal;
 otherwise commit monitor definitions so the team shares them.

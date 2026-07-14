@@ -184,7 +184,9 @@ enabled: true
 ---
 ```
 
-and add `.claude/*.local.*` to `.gitignore` (it's regenerated, safe to delete).
+and add `.claude/*.local.*` and `.agentmonitors/` to `.gitignore` (both are regenerated, safe to
+delete — the latter is the daemon's per-session runtime-state directory, created the moment a
+session opens). `agentmonitors init` ignores both for you automatically.
 
 **Claude Code now tells you this automatically.** If `.claude/monitors/` already has one or more
 monitor definitions and the project is not yet enabled, `SessionStart` emits a one-line advisory

@@ -27,11 +27,11 @@ npm i -g @agentmonitors/cli
 
 The fastest path is `agentmonitors init` (no name) — a one-shot bootstrap that performs every step
 in this section automatically: it writes `.claude/agentmonitors.local.md` with `enabled: true`,
-ensures `.gitignore` ignores `.claude/*.local.*`, offers to scaffold a first monitor, validates the
-result, and prints a next-steps summary. Use `agentmonitors init --enable-only` to do just the
-enable + `.gitignore` steps (no monitor, no prompts), or `agentmonitors init --yes` to accept
-defaults non-interactively. It is idempotent, so re-running is safe. The manual steps below remain
-valid if you prefer to do them by hand.
+ensures `.gitignore` ignores `.claude/*.local.*` and `.agentmonitors/`, offers to scaffold a first
+monitor, validates the result, and prints a next-steps summary. Use `agentmonitors init
+--enable-only` to do just the enable + `.gitignore` steps (no monitor, no prompts), or
+`agentmonitors init --yes` to accept defaults non-interactively. It is idempotent, so re-running is
+safe. The manual steps below remain valid if you prefer to do them by hand.
 
 Create `.claude/agentmonitors.local.md`:
 
@@ -47,7 +47,11 @@ Ensure `.gitignore` contains:
 
 ```gitignore
 .claude/*.local.*
+.agentmonitors/
 ```
+
+`.agentmonitors/` is a separate runtime-state directory (per-session hook state) the daemon
+creates the moment a session opens — it's regenerated on every run, so it's always safe to delete.
 
 Only add `.claude/monitors/*` to `.gitignore` if the user wants monitors to remain personal. Commit
 monitor definitions when they should be shared by the team.
