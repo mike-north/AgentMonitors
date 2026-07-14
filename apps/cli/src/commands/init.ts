@@ -99,6 +99,107 @@ whether it affects what I'm currently working on.
 const VALID_TYPES = Object.keys(TEMPLATES);
 const DEFAULT_TYPE = 'file-fingerprint';
 const DEFAULT_MONITOR_NAME = 'my-monitor';
+const VALID_URGENCIES = ['low', 'normal', 'high'];
+
+/**
+ * Types whose template has a seedable path-pattern list: `globs:` for
+ * `file-fingerprint`, `paths:` for `incoming-changes` (spec 001 §2 field
+ * names differ per source even though `--glob` addresses both). Types not
+ * in this map have no such block, so `--glob` is rejected for them.
+ */
+const GLOB_FIELD_BY_TYPE: Partial<Record<string, 'globs' | 'paths'>> = {
+  'file-fingerprint': 'globs',
+  'incoming-changes': 'paths',
+};
+
+/** Thrown when a seed flag (`--glob`/`--name`/`--urgency`) can't be applied
+ * to the chosen `--type`. Caught by the action handler and reported as a
+ * normal CLI error (message + exit code 1), not a stack trace. */
+class InitSeedError extends Error {}
+
+/** Seed values from `--glob`/`--name`/`--urgency`, threaded into the
+ * generated frontmatter verbatim (issue #330). Only the named `init <name>`
+ * scaffold path consumes these; the bare bootstrap form ignores them
+ * (non-goal). */
+interface SeedOptions {
+  name?: string;
+  urgency?: string;
+  globs?: string[];
+}
+
+/**
+ * Render `value` as a single-quoted YAML flow scalar, matching the quoting
+ * style the templates already use for string fields (`'**\/*.ts'`,
+ * `'https://example.com/page'`). Single-quoted YAML scalars have exactly one
+ * escape rule — a literal `'` doubles to `''` — so this is safe for
+ * arbitrary user-supplied text (colons, `#`, backslashes, etc. all pass
+ * through unescaped and unmisinterpreted).
+ */
+function yamlSingleQuoted(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+/** Replace the template's `name:` frontmatter line with the seeded value. */
+function seedName(template: string, name: string): string {
+  return template.replace(/^name: .*$/m, `name: ${yamlSingleQuoted(name)}`);
+}
+
+/** Replace the template's `urgency:` frontmatter line with the seeded value.
+ * `urgency` is Commander-`.choices()`-constrained to {@link VALID_URGENCIES},
+ * so it's always a bare, unquoted YAML scalar. */
+function seedUrgency(template: string, urgency: string): string {
+  return template.replace(/^urgency: .*$/m, `urgency: ${urgency}`);
+}
+
+/**
+ * Replace the template's seedable path-pattern list (`globs:` or `paths:`,
+ * per {@link GLOB_FIELD_BY_TYPE}) with the seeded patterns. Throws
+ * {@link InitSeedError} for a `type` with no such block (e.g. `api-poll`,
+ * `command-poll`, `schedule`) so the CLI reports a clear error instead of
+ * silently dropping the flag.
+ */
+function seedGlobs(template: string, type: string, globs: string[]): string {
+  const field = GLOB_FIELD_BY_TYPE[type];
+  if (field === undefined) {
+    throw new InitSeedError(
+      `--glob is not supported for --type ${type} (only file-fingerprint and incoming-changes have a path-pattern list)`,
+    );
+  }
+  const listBlock = globs
+    .map((pattern) => `    - ${yamlSingleQuoted(pattern)}`)
+    .join('\n');
+  const blockPattern = new RegExp(`^( *)${field}:\\n(?: {4}- .*\\n)+`, 'm');
+  return template.replace(
+    blockPattern,
+    (_match, indent: string) => `${indent}${field}:\n${listBlock}\n`,
+  );
+}
+
+/**
+ * Apply `--glob`/`--name`/`--urgency` seed overrides to a template, in
+ * frontmatter-field order. A `SeedOptions` with all fields `undefined`
+ * (the default, zero-flags path) returns `template` unchanged — this keeps
+ * `init <name>` byte-for-byte identical when no seed flags are passed
+ * (AC3, issue #330).
+ */
+function applySeeds(
+  template: string,
+  type: string,
+  seeds: SeedOptions,
+): string {
+  let result = template;
+  if (seeds.name !== undefined) result = seedName(result, seeds.name);
+  if (seeds.urgency !== undefined) result = seedUrgency(result, seeds.urgency);
+  if (seeds.globs !== undefined && seeds.globs.length > 0) {
+    result = seedGlobs(result, type, seeds.globs);
+  }
+  return result;
+}
+
+/** Commander `.option()` collector for repeatable `--glob <pattern>`. */
+function collectGlob(value: string, previous: string[]): string[] {
+  return [...previous, value];
+}
 
 /**
  * The project-enable file, written verbatim from the setup-monitors skill's
@@ -137,11 +238,19 @@ interface ScaffoldResult {
  * byte-identical monitor files. Never overwrites an existing monitor: returns
  * `status: 'exists'` so each caller can decide how to react (the named path
  * errors; the bootstrap treats it as an idempotent no-op).
+ *
+ * `seeds` (default `{}`, i.e. no-op) lets the named scaffold path override
+ * specific frontmatter fields verbatim via `--glob`/`--name`/`--urgency`
+ * (issue #330); the bootstrap path never passes seeds, so its output is
+ * unaffected. Seeding is applied — and can throw {@link InitSeedError} — before
+ * any filesystem write, so a rejected seed (e.g. `--glob` on a type with no
+ * path-pattern list) never leaves a partial directory behind.
  */
 function scaffoldMonitor(
   dir: string,
   name: string,
   type: string,
+  seeds: SeedOptions = {},
 ): ScaffoldResult {
   // Commander's .choices() guarantees a valid key on the named path; the
   // bootstrap validates the interactive/`--yes` type before calling here.
@@ -151,8 +260,9 @@ function scaffoldMonitor(
   if (existsSync(path.join(monitorDir, 'MONITOR.md'))) {
     return { status: 'exists', monitorDir };
   }
+  const content = applySeeds(template, type, seeds);
   mkdirSync(monitorDir, { recursive: true });
-  writeFileSync(path.join(monitorDir, 'MONITOR.md'), template, 'utf-8');
+  writeFileSync(path.join(monitorDir, 'MONITOR.md'), content, 'utf-8');
   return { status: 'created', monitorDir };
 }
 
@@ -425,6 +535,22 @@ export const initCommand = new Command('init')
     '--yes',
     'Bootstrap non-interactively: accept defaults and scaffold a starter monitor',
   )
+  .option(
+    '--glob <pattern>',
+    'Seed watch.globs (file-fingerprint) or watch.paths (incoming-changes); repeatable. Scaffold form only.',
+    collectGlob,
+    [],
+  )
+  .option(
+    '--name <name>',
+    'Seed the frontmatter name: field (distinct from the positional <name>, which sets the directory). Scaffold form only.',
+  )
+  .addOption(
+    new Option(
+      '--urgency <urgency>',
+      'Seed the frontmatter urgency: field. Scaffold form only.',
+    ).choices(VALID_URGENCIES),
+  )
   .action(
     async (
       name: string | undefined,
@@ -433,15 +559,36 @@ export const initCommand = new Command('init')
         type: string;
         enableOnly?: boolean;
         yes?: boolean;
+        glob: string[];
+        name?: string;
+        urgency?: string;
       },
     ) => {
-      // Named form: `init <name> --type ...` — unchanged scaffold behavior.
+      // Named form: `init <name> --type ...` — unchanged scaffold behavior
+      // when no seed flags are passed (AC3, issue #330).
       if (name !== undefined) {
-        const { status, monitorDir } = scaffoldMonitor(
-          options.dir,
-          name,
-          options.type,
-        );
+        // Built conditionally (not `field: value ?? undefined`) because
+        // `exactOptionalPropertyTypes` treats an explicit `undefined` value
+        // differently from an absent key.
+        const seeds: SeedOptions = {
+          ...(options.name !== undefined ? { name: options.name } : {}),
+          ...(options.urgency !== undefined
+            ? { urgency: options.urgency }
+            : {}),
+          ...(options.glob.length > 0 ? { globs: options.glob } : {}),
+        };
+        let result: ScaffoldResult;
+        try {
+          result = scaffoldMonitor(options.dir, name, options.type, seeds);
+        } catch (err) {
+          if (err instanceof InitSeedError) {
+            console.error(err.message);
+            process.exitCode = 1;
+            return;
+          }
+          throw err;
+        }
+        const { status, monitorDir } = result;
         if (status === 'exists') {
           console.error(`Monitor already exists: ${monitorDir}/MONITOR.md`);
           process.exitCode = 1;
@@ -454,7 +601,9 @@ export const initCommand = new Command('init')
         return;
       }
 
-      // Bare form: `init` — one-shot project bootstrap.
+      // Bare form: `init` — one-shot project bootstrap. Seed flags
+      // (--glob/--name/--urgency) are intentionally not consumed here
+      // (non-goal, issue #330): the bootstrap form's behavior is unchanged.
       await runBootstrap(options);
     },
   );
