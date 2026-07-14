@@ -22,8 +22,8 @@ precision, claimed-vs-unread clarity, branding consistency, and symmetric path-a
   starts automatically when you open a Claude Code session" — that's conditioned on the Claude Code
   plugin being present, with the manual `agentmonitors daemon run` alternative on the next line.
 - **Required CLI options are now marked `(required)`** in their own `--help` output
-  (`session open --host-session-id`, `events list`/`ack --session`, `hook claim
---session`/`--lifecycle`).
+  (`session open --host-session-id`, `events list`/`ack --session`,
+  `hook claim --session`/`--lifecycle`).
 - **The `agentmonitors doctor` banner** now reads `agentmonitors doctor`, matching the real
   invocation (and the same command's own remediation text elsewhere in its output), instead of the
   prose product name "AgentMon".
