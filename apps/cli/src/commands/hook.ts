@@ -3,6 +3,7 @@ import type { DeliveryLifecycle } from '@agentmonitors/core';
 import { reportError } from '../output.js';
 import {
   claimDeliveryClient,
+  diagnoseHookDeliveryClient,
   listSessionsClient,
   previewSettledHighDeliveryClient,
 } from '../runtime-client.js';
@@ -18,6 +19,25 @@ import {
   manualDaemonErrorMessage,
   resolveManualDaemonSocketPath,
 } from '../manual-daemon.js';
+import {
+  describeCapDeferral,
+  describeClaim,
+  describeDaemonUnreachable,
+  describeDiagnosisFailure,
+  describeHolds,
+  describeInternalError,
+  describeLifecycle,
+  describeNoSessionId,
+  describeNoSessionMatch,
+  describeNoSocket,
+  describeOutput,
+  describePayload,
+  describeSessionMatch,
+  describeUnmappedLifecycle,
+  describeUnreadCounts,
+  describeWorkspace,
+  describeWorkspaceDisabled,
+} from '../hook-deliver-debug.js';
 
 export const hookCommand = new Command('hook').description(
   'Claim hook-delivery payloads from the runtime',
@@ -114,6 +134,11 @@ hookCommand
     ).choices(['text', 'json']),
   )
   .option('--socket <path>', 'Unix domain socket path for the daemon')
+  .option(
+    '--debug',
+    'Write a diagnosis of why nothing was (or was) delivered to STDERR; ' +
+      'STDOUT is byte-identical to a non-debug run in every mode (issue #334)',
+  )
   .addHelpText(
     'after',
     `
@@ -125,6 +150,12 @@ Emission preconditions:
 Output formats:
   default/json  Compact Claude Code hook wire JSON when something is pending.
   text          Rendered additionalContext only, for manual inspection.
+
+Diagnosis:
+  --debug  Writes a step-by-step diagnosis to STDERR only (session resolution,
+           workspace/socket state, unread (unacknowledged) event counts by urgency, and the hold
+           reason for anything not yet deliverable: settle window, already-claimed,
+           coalesced-until-ack, or deferred-by-cap). STDOUT never changes.
 `,
   )
   .action(
@@ -132,26 +163,47 @@ Output formats:
       lifecycle?: DeliveryLifecycle;
       socket?: string;
       format?: 'text' | 'json';
+      debug?: boolean;
     }) => {
+      const debugEnabled = options.debug === true;
+      const debug = (msg: string): void => {
+        if (debugEnabled) process.stderr.write(`${msg}\n`);
+      };
+
       // This command is invoked by Claude Code hooks.  ANY failure MUST be
-      // silent (print nothing, exit 0) — surfacing an error would disrupt
-      // the user's session.  All IPC / resolution work is wrapped in try/catch
-      // so no unhandled rejection can propagate.
+      // silent on STDOUT (print nothing, exit 0) — surfacing an error there
+      // would disrupt the user's session.  All IPC / resolution work is
+      // wrapped in try/catch so no unhandled rejection can propagate. Debug
+      // diagnosis writes ONLY to stderr and never alters this contract.
       try {
         // Claude Code delivers hook input as JSON on STDIN (not env vars).
         const payload = await readHookPayload();
+        debug(describePayload(payload));
 
         // Not a Claude Code session — quiet no-op. There is NO session-id env
         // var; the only source is the stdin payload.
         const hostSessionId = payload.session_id;
-        if (!hostSessionId) return;
+        if (!hostSessionId) {
+          debug(describeNoSessionId());
+          return;
+        }
 
         // Derive the lifecycle from the firing event unless explicitly
         // overridden. Events that do not honor additionalContext map to
         // `undefined` → quiet no-op (emitting context there is useless).
         const hookEventName = payload.hook_event_name;
         const lifecycle = options.lifecycle ?? lifecycleForEvent(hookEventName);
-        if (!lifecycle) return;
+        if (!lifecycle) {
+          debug(describeUnmappedLifecycle(hookEventName));
+          return;
+        }
+        debug(
+          describeLifecycle(
+            lifecycle,
+            options.lifecycle !== undefined,
+            hookEventName,
+          ),
+        );
 
         // Resolve the socket: explicit flag → .local.md socket → give up.
         // The workspace comes from the payload's cwd, then CLAUDE_PROJECT_DIR,
@@ -159,7 +211,11 @@ Output formats:
         const workspacePath =
           payload.cwd ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
         const state = readLocalState(workspacePath);
-        if (!state.enabled) return;
+        debug(describeWorkspace(workspacePath, state.enabled, state.socket));
+        if (!state.enabled) {
+          debug(describeWorkspaceDisabled(workspacePath));
+          return;
+        }
 
         // Require an EXPLICIT per-workspace socket (flag or `.local.md`). If
         // neither is present, bail rather than letting resolveSocketPath fall
@@ -167,7 +223,10 @@ Output formats:
         // this workspace's hook to a different workspace's daemon, breaking
         // per-workspace isolation.
         const explicitSocket = options.socket ?? state.socket;
-        if (!explicitSocket) return;
+        if (!explicitSocket) {
+          debug(describeNoSocket());
+          return;
+        }
         // Only a literal --socket flag is "explicit" for the substitution
         // warning (issue #337) — a socket read from .local.md is a derived
         // value the daemon itself chose at boot, not a user-typed request.
@@ -175,12 +234,36 @@ Output formats:
           explicit: options.socket !== undefined,
         });
 
-        if (!(await daemonAvailable(socketPath))) return;
+        if (!(await daemonAvailable(socketPath))) {
+          debug(describeDaemonUnreachable(socketPath));
+          return;
+        }
 
         // Resolve the host session id to an AgentMon session record.
         const sessions = await listSessionsClient(socketPath);
         const match = sessions.find((s) => s.hostSessionId === hostSessionId);
-        if (!match) return;
+        if (!match) {
+          debug(describeNoSessionMatch(hostSessionId, sessions));
+          return;
+        }
+        debug(describeSessionMatch(match));
+
+        // Pending-by-urgency counts + per-band hold reasons (issue #334). Pure
+        // read (never claims/mutates); computed ONLY when --debug is set, so
+        // the non-debug path makes no extra daemon round trip.
+        if (debugEnabled) {
+          try {
+            const diagnosis = await diagnoseHookDeliveryClient(
+              match.id,
+              lifecycle,
+              socketPath,
+            );
+            debug(describeUnreadCounts(diagnosis));
+            for (const holdLine of describeHolds(diagnosis)) debug(holdLine);
+          } catch (diagnosisError) {
+            debug(describeDiagnosisFailure(diagnosisError));
+          }
+        }
 
         // Claim any pending deliveries for this session at this lifecycle point.
         //
@@ -210,12 +293,15 @@ Output formats:
               fit,
             );
             moreDeferred = fit < highPreview.length;
+            if (moreDeferred)
+              debug(describeCapDeferral(highPreview.length, fit));
           } else {
             claim = await claimDeliveryClient(match.id, lifecycle, socketPath);
           }
         } else {
           claim = await claimDeliveryClient(match.id, lifecycle, socketPath);
         }
+        debug(describeClaim(claim));
 
         // Render and emit.  The echoed hookEventName must match the firing
         // event so the host honors the additionalContext. Null → nothing
@@ -225,6 +311,7 @@ Output formats:
         const output = renderHookDelivery(claim, hookEventName ?? '', {
           moreDeferred,
         });
+        debug(describeOutput(output, options.format));
         if (output !== null) {
           if (options.format === 'text') {
             process.stdout.write(output.hookSpecificOutput.additionalContext);
@@ -232,9 +319,11 @@ Output formats:
             process.stdout.write(JSON.stringify(output));
           }
         }
-      } catch {
+      } catch (error) {
         // Any internal error is swallowed: a hook that throws would interrupt
-        // the user's session (BP2 / always-exit-0 contract).
+        // the user's session (BP2 / always-exit-0 contract). Debug mode still
+        // names it on stderr — stdout stays untouched either way.
+        debug(describeInternalError(error));
       }
     },
   );

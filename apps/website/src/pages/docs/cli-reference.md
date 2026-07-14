@@ -522,7 +522,7 @@ agentmonitors hook claim --session 01hz3k9x2pabcdefg --lifecycle turn-interrupti
 ### `hook deliver`
 
 ```bash
-agentmonitors hook deliver [--lifecycle <lifecycle>] [--format <format>] [--socket <path>]
+agentmonitors hook deliver [--lifecycle <lifecycle>] [--format <format>] [--socket <path>] [--debug]
 ```
 
 | Flag                       | Default            | Description                                                                |
@@ -530,6 +530,7 @@ agentmonitors hook deliver [--lifecycle <lifecycle>] [--format <format>] [--sock
 | `--lifecycle <lifecycle>`     | derived from payload   | Optional override: `turn-interruptible`, `turn-idle`, `post-compact`            |
 | `--format <format>`           | hook wire JSON         | `json` emits compact Claude Code hook JSON; `text` emits only `additionalContext` |
 | `--socket <path>`             | from `.local.md`       | Override daemon socket path                                                     |
+| `--debug`                     | `false`                | Write a step-by-step diagnosis to **stderr**; stdout is byte-identical to a non-`--debug` run |
 
 ```bash
 printf '{"session_id":"claude-abc123","cwd":"%s","hook_event_name":"UserPromptSubmit"}' "$PWD" \
@@ -540,6 +541,17 @@ Designed to run as a Claude Code lifecycle hook. Reads the hook payload as JSON 
 (never env vars). **Always exits 0** — an internal error is swallowed rather than blocking the
 agent's turn. See [Troubleshooting](/docs/troubleshooting) ("It fired but my agent wasn't told")
 for how to interpret its output.
+
+**Diagnosing empty output:** run the same payload with `--debug` appended. Empty stdout + exit 0
+means either nothing is pending or the invocation is misconfigured — indistinguishable without
+`--debug`, which writes the difference to stderr (session resolution, workspace/socket state,
+pending-event counts by urgency, and *why* anything isn't deliverable yet: `settle-window`,
+`already-claimed`, `coalesced-until-ack`, or `deferred-by-cap`). Stdout never changes:
+
+```bash
+printf '{"session_id":"claude-abc123","cwd":"%s","hook_event_name":"UserPromptSubmit"}' "$PWD" \
+  | agentmonitors hook deliver --debug
+```
 
 ---
 

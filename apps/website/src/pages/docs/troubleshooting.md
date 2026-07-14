@@ -125,6 +125,16 @@ printf '{"session_id":"<host-session-id>","cwd":"%s","hook_event_name":"UserProm
 ```
 
 A non-empty `additionalContext` in the printed JSON is exactly what the agent would receive.
+Empty output means either nothing is pending **or** the invocation is misconfigured — those two
+cases are indistinguishable without diagnosis. Append `--debug` to the same command to see which:
+it writes a step-by-step diagnosis to stderr (session resolution, workspace/socket state,
+pending-event counts by urgency, and the hold reason for anything not yet deliverable) while
+leaving stdout untouched.
+
+```bash
+printf '{"session_id":"<host-session-id>","cwd":"%s","hook_event_name":"UserPromptSubmit"}' "$PWD" \
+  | agentmonitors hook deliver --debug
+```
 
 **Traces to:** [002 §6](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/002-runtime-delivery.md#6-session-projection)
 (session projection, exact-match workspace filtering), [002 §7](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/002-runtime-delivery.md#7-unread-claimed-and-acknowledged)

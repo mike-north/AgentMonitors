@@ -111,6 +111,19 @@ export type {
   ShapeStageConfig,
   ShapedObservation,
 } from './runtime/shape-stage.js';
+// Hook-deliver debug diagnosis (issue #334): why `hook deliver` surfaced
+// nothing at a given lifecycle — held by the settle window, or a coalesced
+// normal/low reminder suppressed by an already-claimed / partially-claimed
+// unread set. Read-only; never claims or mutates.
+export {
+  classifyReminderHold,
+  classifySettleWindowHold,
+} from './runtime/hook-delivery-diagnosis.js';
+export type {
+  HookDeliveryDiagnosis,
+  HookDeliveryHold,
+  HookDeliveryHoldReason,
+} from './runtime/hook-delivery-diagnosis.js';
 export type {
   AgentLifecycleEvent,
   AgentSessionRole,
