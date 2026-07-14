@@ -39,11 +39,11 @@ frictions in CLI output and help text.
   reference).
 - **Verified, not changed:** S2 F5's "`command-poll` baselines on the first tick, detects on the
   second" claim (skill.md) is accurate for a fresh runtime database. The one observed run that
-  contradicted it was tracing to the verification recipe reusing the machine's shared default
-  database across runs (`daemon run`/`daemon once` default to `~/.local/share/agentmonitors/inbox.db`
-  absent `AGENTMONITORS_DB`/`--db`) rather than a source-source bug; the recipe now exports an
-  isolated `AGENTMONITORS_DB` per run, matching the pattern already used for its throwaway
-  `$SOCKET`.
+  contradicted it traced to the verification recipe reusing one database across runs
+  (`daemon run`/`daemon once` defaulted to the machine-wide `~/.local/share/agentmonitors/inbox.db`
+  at the time; since #349 they derive a per-workspace path, which reruns in the same directory
+  still share) rather than a source-source bug; the recipe now exports an isolated
+  `AGENTMONITORS_DB` per run, matching the pattern already used for its throwaway `$SOCKET`.
 
 ## 2026-07-14 — Add `hook deliver --debug`: opt-in stderr diagnosis for the silent-on-idle hook path (005 §12.2.1, 006 §5.2.1) — Refs #334
 
