@@ -59,13 +59,22 @@ The base daemon socket path is resolved in this priority order (implemented in `
 If the resolved path exceeds 100 characters (Unix socket limit), it falls back to `/tmp/agentmonitors-<sha256-prefix>.sock`.
 
 Manual daemon commands that operate on the active project — `session open`, `session close`,
-`session list`, `events list`, `events ack`, and `hook claim` — insert the enabled workspace's
-persisted local socket between steps 2 and 3. With no `--socket` and no `AGENTMONITORS_SOCKET`, they
-read `.claude/agentmonitors.local.md` from the command workspace (`--workspace` for `session open`;
-otherwise `CLAUDE_PROJECT_DIR` when set, then the process cwd). If that file has `enabled: true` and
-a `socket:` value, the command uses that per-workspace socket so manual inspection reaches the same
-daemon as the plugin hook path. Outside an enabled workspace, the global default in step 3 is
-unchanged.
+`session list`, `events list`, `events ack`, `hook claim`, `doctor`, `daemon status`, and
+`daemon stop` — insert the enabled workspace's socket between steps 2 and 3 via
+`resolveManualDaemonSocketPath()` in `manual-daemon.ts`. With no `--socket` and no
+`AGENTMONITORS_SOCKET`, they read `.claude/agentmonitors.local.md` from the command workspace
+(`--workspace` for `session open`/`doctor`; otherwise `CLAUDE_PROJECT_DIR` when set, then the process
+cwd). If that file has `enabled: true`, the command uses **either** the persisted `socket:` value (if
+one has been written, e.g. by a lazily-booted daemon) **or**, when nothing has persisted one yet, the
+derived per-workspace socket (`workspacePaths()` — issue #335). Outside an enabled workspace, the
+global default in step 3 is unchanged.
+
+**`daemon run`/`daemon once` themselves resolve their bind/read socket and db the same way** (issue
+#335): with no `--socket`/`AGENTMONITORS_DB`/`AGENTMONITORS_SOCKET` overrides, an enabled workspace
+binds to its persisted-or-derived per-workspace socket/db, not the bare global default — so a
+directly-invoked `daemon run` (as the Getting Started guide instructs) always agrees with `doctor`,
+`session open`/`list`, and `daemon status`/`stop` about which daemon and which durable state they are
+each looking at. See §9.1–§9.2 and §15.
 
 When those manual daemon commands cannot reach the resolved socket, they report a single actionable
 stderr line that says no daemon is running for this workspace, tells the author to start one with
@@ -78,12 +87,24 @@ JSON error shape.
 
 ### Database path resolution
 
-The SQLite inbox database is resolved in this priority order (implemented in `db-path.ts`):
+The SQLite inbox database is resolved in this priority order (implemented in `db-path.ts` for the
+bare global default, and `workspace-db-path.ts`'s `resolveWorkspaceDbPath()` for every
+workspace-aware command — `doctor`, `daemon run`, `daemon once`, `daemon status`'s in-process
+fallback, and `session start`'s lazy boot):
 
-1. `AGENTMONITORS_DB` environment variable
-2. Default: `~/.local/share/agentmonitors/inbox.db`
+1. `AGENTMONITORS_DB` environment variable — wins outright (tests/overrides)
+2. An enabled workspace (`.claude/agentmonitors.local.md` has `enabled: true`): the persisted `db:`
+   value if one has been written, else the derived per-workspace db (`workspacePaths()` — SHA-256 hash
+   of `resolve(workspacePath)` under `XDG_DATA_HOME ?? ~/.local/share/agentmonitors/workspaces/<hash>/`)
+3. A not-enabled workspace (no project-scoped daemon to isolate to): the shared global default,
+   `~/.local/share/agentmonitors/inbox.db`
 
-> Note: no `--db` flag is exposed at the top-level program; `resolveDbPath()` accepts an optional override argument but it is not wired to a commander option in the current codebase.
+Prior to issue #335, step 2 applied only to `doctor` and `session start`'s lazy boot; `daemon
+run`/`daemon once` invoked directly (with no overrides) always used step 3 regardless of whether the
+workspace was enabled, so they wrote to a different SQLite file than `doctor` read from.
+
+> Note: no `--db` flag is exposed at the top-level program; `resolveDbPath()` accepts an optional
+> override argument but it is not wired to a commander option in the current codebase.
 
 ---
 
@@ -727,13 +748,13 @@ Exits 0 on success. No explicit error handling; filesystem errors propagate as u
 agentmonitors daemon once [monitorsDir] [options]
 ```
 
-| Argument / Flag      | Type                  | Default            | Description                             |
-| -------------------- | --------------------- | ------------------ | --------------------------------------- |
-| `[monitorsDir]`      | positional (optional) | `.claude/monitors` | Directory containing `MONITOR.md` files |
-| `--workspace <path>` | string                | `process.cwd()`    | Workspace path for session projection   |
-| `--format <format>`  | choices               | `text`             | `text`, `json`                          |
+| Argument / Flag      | Type                  | Default            | Description                                                                                          |
+| -------------------- | --------------------- | ------------------ | ---------------------------------------------------------------------------------------------------- |
+| `[monitorsDir]`      | positional (optional) | `.claude/monitors` | Directory containing `MONITOR.md` files                                                              |
+| `--workspace <path>` | string                | `process.cwd()`    | Workspace path for session projection and per-workspace db resolution (resolved to an absolute path) |
+| `--format <format>`  | choices               | `text`             | `text`, `json`                                                                                       |
 
-**Transport: in-process.** `daemonTickClient` calls `createRuntime().tick()` directly — no daemon socket is contacted.
+**Transport: in-process.** `daemonTickClient` calls `createRuntime(dbPath).tick()` directly — no daemon socket is contacted. `dbPath` is resolved via `resolveWorkspaceDbPath()` (see "Database path resolution" above) — for an enabled workspace this is the persisted-or-derived per-workspace db, not the bare global default, so `daemon once`'s writes are visible to `doctor` and every other workspace-aware command (issue #335).
 
 **Text output:** `Evaluated <n> monitor(s), emitted <n> event(s).` — when one or more monitors'
 `observe()` errored on the tick, the summary instead ends with `, <k> errored:` followed by one
@@ -771,15 +792,22 @@ is only how often the daemon wakes up to ask the runtime whether any monitor is 
 agentmonitors daemon run [monitorsDir] [options]
 ```
 
-| Argument / Flag        | Type                  | Default            | Description                                                                |
-| ---------------------- | --------------------- | ------------------ | -------------------------------------------------------------------------- |
-| `[monitorsDir]`        | positional (optional) | `.claude/monitors` | Directory containing `MONITOR.md` files                                    |
-| `--workspace <path>`   | string                | `process.cwd()`    | Workspace path for session projection                                      |
-| `--poll-ms <ms>`       | number (string)       | `30000`            | Polling interval in milliseconds                                           |
-| `--socket <path>`      | string                | resolved default   | Unix domain socket path for the daemon                                     |
-| `--reap-after-ms <ms>` | number (string)       | `300000`           | Stop after this many ms with no active sessions; `0` disables idle reaping |
+| Argument / Flag        | Type                  | Default            | Description                                                                                                 |
+| ---------------------- | --------------------- | ------------------ | ----------------------------------------------------------------------------------------------------------- |
+| `[monitorsDir]`        | positional (optional) | `.claude/monitors` | Directory containing `MONITOR.md` files                                                                     |
+| `--workspace <path>`   | string                | `process.cwd()`    | Workspace path for session projection and per-workspace db/socket resolution (resolved to an absolute path) |
+| `--poll-ms <ms>`       | number (string)       | `30000`            | Polling interval in milliseconds                                                                            |
+| `--socket <path>`      | string                | resolved default   | Unix domain socket path for the daemon                                                                      |
+| `--reap-after-ms <ms>` | number (string)       | `300000`           | Stop after this many ms with no active sessions; `0` disables idle reaping                                  |
 
 Starts the daemon loop: creates a Unix domain socket server, listens for IPC commands, then polls `runtime.tick()` at `--poll-ms` intervals. `--poll-ms` is the loop-wake cadence; per-monitor observation is still gated by each monitor's schedule or `watch.interval`.
+
+**Db/socket resolution (issue #335):** with no `--socket`/`AGENTMONITORS_DB`/`AGENTMONITORS_SOCKET`
+override, an enabled workspace binds to its persisted-or-derived per-workspace socket and db (the
+same `resolveManualDaemonSocketPath()`/`resolveWorkspaceDbPath()` every other workspace-aware command
+uses) rather than the bare global default. This is what makes a directly-invoked `daemon run` — the
+Getting Started guide's own documented usage, with no flags beyond `[monitorsDir]` — agree with
+`doctor`, `session open`/`list`, and `daemon status` about the workspace's durable state.
 
 **Startup check:** refuses to start if another daemon is already listening at the resolved socket path (exits with error message and code 1).
 
@@ -806,7 +834,14 @@ agentmonitors daemon status [options]
 | `--socket <path>`   | string  | resolved default | Unix domain socket path for the daemon |
 | `--format <format>` | choices | `text`           | `text`, `json`                         |
 
-If the daemon is reachable (socket `ping` succeeds), queries status via the socket. Otherwise falls back to calling `createRuntime().status()` in-process against the local database.
+No `--workspace` flag: like `hook claim`/`events list`, the socket resolution below is workspace-aware
+via `CLAUDE_PROJECT_DIR`/the process cwd, not an explicit flag (issue #335 — previously `daemon
+status` used only `--socket`/the bare global default, so it could disagree with `doctor`/`session
+list` about a workspace-scoped daemon they could already see). If the daemon is reachable (socket
+`ping` succeeds, resolved via `resolveManualDaemonSocketPath()` the same way `doctor` resolves it),
+queries status via the socket. Otherwise falls back to calling
+`createRuntime(resolveWorkspaceDbPath(...)).status()` in-process against the same per-workspace
+database `doctor` would read.
 
 **Text output:**
 
@@ -842,7 +877,7 @@ agentmonitors daemon stop [--socket <path>]
 | ----------------- | ------ | ---------------- | -------------------------------------- |
 | `--socket <path>` | string | resolved default | Unix domain socket path for the daemon |
 
-Sends a `stop` message to the daemon over the socket. Prints `AgentMon daemon stopping.` on success. On error, calls `reportError` to stderr and exits 1.
+Resolves the socket the same workspace-aware way `daemon status` does (issue #335). Sends a `stop` message to the daemon over the socket. Prints `AgentMon daemon stopping.` on success. On error, calls `reportError` to stderr and exits 1.
 
 ---
 
@@ -857,15 +892,15 @@ Sends a `stop` message to the daemon over the socket. Prints `AgentMon daemon st
 agentmonitors session open --host-session-id <id> [options]
 ```
 
-| Flag                       | Type              | Default          | Description                                  |
-| -------------------------- | ----------------- | ---------------- | -------------------------------------------- |
-| `--host-session-id <id>`   | string (required) | —                | Host session id from the integrating runtime |
-| `--workspace <path>`       | string            | `process.cwd()`  | Workspace path for the session               |
-| `--socket <path>`          | string            | resolved default | Unix domain socket path                      |
-| `--agent-identity <id>`    | string            | —                | Explicit AgentMon agent identity             |
-| `--hook-state-path <path>` | string            | —                | Override hook-state file path                |
-| `--role <role>`            | choices           | `lead`           | `lead`, `subagent`                           |
-| `--format <format>`        | choices           | `text`           | `text`, `json`                               |
+| Flag                       | Type              | Default                   | Description                                                                                                                                                                                                                                                      |
+| -------------------------- | ----------------- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--host-session-id <id>`   | string (required) | —                         | Host session id from the integrating runtime                                                                                                                                                                                                                     |
+| `--workspace <path>`       | string            | current working directory | Workspace path for the session; resolved to an absolute path (`path.resolve()`) the same way `doctor`/`daemon once`/`daemon run` resolve theirs (issue #335), so a relative or trailing-slash value cannot silently fail `doctor`'s exact-string workspace match |
+| `--socket <path>`          | string            | resolved default          | Unix domain socket path                                                                                                                                                                                                                                          |
+| `--agent-identity <id>`    | string            | —                         | Explicit AgentMon agent identity                                                                                                                                                                                                                                 |
+| `--hook-state-path <path>` | string            | —                         | Override hook-state file path                                                                                                                                                                                                                                    |
+| `--role <role>`            | choices           | `lead`                    | `lead`, `subagent`                                                                                                                                                                                                                                               |
+| `--format <format>`        | choices           | `text`                    | `text`, `json`                                                                                                                                                                                                                                                   |
 
 Calls `claudeCodeAdapter.createSessionInput()` before sending to the daemon (`session.open` IPC method).
 
@@ -1318,12 +1353,12 @@ installed is the host's side), and performs no MCP/channel checks. It never fold
 agentmonitors doctor [--dir <path>] [--workspace <path>] [--socket <path>] [--format <text|json>]
 ```
 
-| Flag                 | Default                        | Description                                                |
-| -------------------- | ------------------------------ | ---------------------------------------------------------- |
-| `--dir <path>`       | `<workspace>/.claude/monitors` | Directory containing monitor definitions                   |
-| `--workspace <path>` | current working dir            | Workspace to diagnose (session projection + event scoping) |
-| `--socket <path>`    | resolved default               | Unix domain socket path for the daemon-reachability ping   |
-| `--format <format>`  | `text`                         | Output format: `text`, `json`                              |
+| Flag                 | Default                        | Description                                                                              |
+| -------------------- | ------------------------------ | ---------------------------------------------------------------------------------------- |
+| `--dir <path>`       | `<workspace>/.claude/monitors` | Directory containing monitor definitions                                                 |
+| `--workspace <path>` | current working dir            | Workspace to diagnose (session projection + event scoping); resolved to an absolute path |
+| `--socket <path>`    | resolved default               | Unix domain socket path for the daemon-reachability ping                                 |
+| `--format <format>`  | `text`                         | Output format: `text`, `json`                                                            |
 
 ### Transport and data source
 
@@ -1333,21 +1368,25 @@ same store, so the report is accurate whether or not a daemon is running (the sa
 of the socket is the `daemon-reachable` check's ping. The database and socket are resolved for the
 workspace the same way the daemon resolves them: `AGENTMONITORS_DB` / `AGENTMONITORS_SOCKET` win, then
 an enabled workspace's persisted `.claude/agentmonitors.local.md` `db:` / `socket:` (or the derived
-per-workspace paths), then the global defaults.
+per-workspace paths), then the global defaults. As of issue #335, this is enforced symmetrically:
+`daemon run`/`daemon once` — including a directly-invoked one with no flags beyond `[monitorsDir]`,
+exactly as the Getting Started guide instructs — apply the identical resolution when binding, so
+`doctor`'s guess is never a _guess_ against a workspace-enabled project; it is guaranteed to be the
+daemon's actual db/socket.
 
 ### Checks
 
 `doctor` runs this ordered sequence, printing one line per check with a `pass` (`✓`), `fail` (`✗`),
 or `skip` (`○`) status and, on failure, an actionable remediation:
 
-| Check                | Passes when                                                    | Remediation on failure                                                                                                                                                                                                                                |
-| -------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `project-enabled`    | `.claude/agentmonitors.local.md` has `enabled: true`           | Run `agentmonitors init --enable-only`, or create `.claude/agentmonitors.local.md` with `enabled: true` yourself — the **same** enable step the `SessionStart` monitors-found-but-disabled advisory names (006 §5.6, §2), so all three surfaces agree |
-| `monitors-directory` | the monitors directory exists                                  | Create the directory and scaffold a monitor with `agentmonitors init`                                                                                                                                                                                 |
-| `monitors-valid`     | every discovered monitor validates (no scope/parse/dup errors) | Run `agentmonitors validate <dir>` and fix the reported errors (`skip` when there are no monitors)                                                                                                                                                    |
-| `daemon-reachable`   | the daemon answers a socket ping (path shown either way)       | Start it with `agentmonitors daemon run`, or let a Claude Code session start it automatically                                                                                                                                                         |
-| `lead-session`       | a lead session is registered for this workspace                | Open a Claude Code session (the `SessionStart` hook registers one) or `agentmonitors session open --role lead`                                                                                                                                        |
-| `monitor:<id>`       | the monitor is valid and has been observed at least once       | Start the daemon (or wait for the next tick), then check `agentmonitors monitor history <id>`; `monitor test` dry-runs it (`skip` for an invalid monitor — see `monitors-valid`)                                                                      |
+| Check                | Passes when                                                    | Remediation on failure                                                                                                                                                                                                                                                                                                                                                           |
+| -------------------- | -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `project-enabled`    | `.claude/agentmonitors.local.md` has `enabled: true`           | Run `agentmonitors init --enable-only`, or create `.claude/agentmonitors.local.md` with `enabled: true` yourself — the **same** enable step the `SessionStart` monitors-found-but-disabled advisory names (006 §5.6, §2), so all three surfaces agree                                                                                                                            |
+| `monitors-directory` | the monitors directory exists                                  | Create the directory and scaffold a monitor with `agentmonitors init`                                                                                                                                                                                                                                                                                                            |
+| `monitors-valid`     | every discovered monitor validates (no scope/parse/dup errors) | Run `agentmonitors validate <dir>` and fix the reported errors (`skip` when there are no monitors)                                                                                                                                                                                                                                                                               |
+| `daemon-reachable`   | the daemon answers a socket ping (path shown either way)       | Start it with `agentmonitors daemon run`, or let a Claude Code session start it automatically                                                                                                                                                                                                                                                                                    |
+| `lead-session`       | a lead session is registered for this workspace                | Open a Claude Code session (the `SessionStart` hook registers one) or `agentmonitors session open --role lead --workspace <path>` — the failure `detail` and remediation both **name the exact workspace path searched** (issue #335), so a future db/socket-derivation mismatch is self-diagnosing: compare it directly against `agentmonitors session list`'s workspace column |
+| `monitor:<id>`       | the monitor is valid and has been observed at least once       | Start the daemon (or wait for the next tick), then check `agentmonitors monitor history <id>`; `monitor test` dry-runs it (`skip` for an invalid monitor — see `monitors-valid`)                                                                                                                                                                                                 |
 
 Each `monitor:<id>` line embeds the per-monitor rollup (below). **Exit 0 when every check passes;
 non-zero when any check fails.** A down daemon fails `daemon-reachable` but does not stop the rest of
