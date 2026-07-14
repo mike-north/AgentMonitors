@@ -1086,9 +1086,10 @@ invocation, so there is nothing to warn about a mismatch against.
 repeated invocations with the _same_ over-limit candidate keep resolving to the same substituted
 socket, so same-argument commands still find "their" daemon. But the substituted path depends only on
 the candidate string, not on which workspace is asking: if a _different_ over-limit candidate happens
-to hash-collide (SHA-256 truncated to 16 hex chars — astronomically unlikely by chance, but possible
-via a shared/templated `--socket` value reused across otherwise-unrelated workspaces), or a stale
-daemon from an earlier, unrelated invocation of the same over-limit candidate is still listening on
+to resolve to the same derived path — either a genuine hash collision (SHA-256 truncated to 16 hex
+chars; astronomically unlikely) or, far more plausibly, the _same_ shared/templated `--socket`
+value reused across otherwise-unrelated workspaces (same input, same hash — not a collision). If a
+stale daemon from an earlier, unrelated invocation of the same over-limit candidate is still listening on
 `/tmp/agentmonitors-<hash>.sock`, a caller can silently talk to the wrong daemon. The daemon IPC does
 not currently expose a single "this daemon's workspace" identity to check against — `session.list` is
 scoped per-session (`AgentSessionRecord.workspacePath`), and a daemon using the global default DB is
