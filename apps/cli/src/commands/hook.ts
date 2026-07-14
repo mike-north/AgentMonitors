@@ -223,21 +223,16 @@ Diagnosis:
         // this workspace's hook to a different workspace's daemon, breaking
         // per-workspace isolation.
         const explicitSocket = options.socket ?? state.socket;
-<<<<<<< HEAD
-        if (!explicitSocket) return;
+        if (!explicitSocket) {
+          debug(describeNoSocket());
+          return;
+        }
         // Only a literal --socket flag is "explicit" for the substitution
         // warning (issue #337) — a socket read from .local.md is a derived
         // value the daemon itself chose at boot, not a user-typed request.
         const socketPath = resolveSocketPath(explicitSocket, {
           explicit: options.socket !== undefined,
         });
-=======
-        if (!explicitSocket) {
-          debug(describeNoSocket());
-          return;
-        }
-        const socketPath = resolveSocketPath(explicitSocket);
->>>>>>> 33df3ee (feat(cli,core): add hook deliver --debug for diagnosing silent output (#334))
 
         if (!(await daemonAvailable(socketPath))) {
           debug(describeDaemonUnreachable(socketPath));
