@@ -842,7 +842,7 @@ describe('init bootstrap (bare init)', () => {
   // Issue #336: the undocumented `.agentmonitors/` runtime-state directory
   // (per-session hook-state) must be gitignored by the same bootstrap step,
   // not just the local-coordination file.
-  const RUNTIME_DIR_GITIGNORE_LINE = '.agentmonitors/';
+  const RUNTIME_DIR_GITIGNORE_LINE = '/.agentmonitors/';
 
   // The exact minimal enable-file shape from the setup-monitors skill's
   // "Enable The Project" section (`agent-plugins/agentmonitors/skills/setup-monitors/SKILL.md`)

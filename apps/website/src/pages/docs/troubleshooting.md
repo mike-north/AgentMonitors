@@ -184,7 +184,7 @@ enabled: true
 ---
 ```
 
-and add `.claude/*.local.*` and `.agentmonitors/` to `.gitignore` (both are regenerated, safe to
+and add `.claude/*.local.*` and `/.agentmonitors/` to `.gitignore` (both are regenerated, safe to
 delete — the latter is the daemon's per-session runtime-state directory, created the moment a
 session opens). `agentmonitors init` ignores both for you automatically.
 

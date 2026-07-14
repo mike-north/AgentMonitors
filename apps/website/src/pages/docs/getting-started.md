@@ -178,7 +178,7 @@ enabled: true
 EOF
 ```
 
-Make sure `.gitignore` contains `.claude/*.local.*` and `.agentmonitors/` (the daemon's
+Make sure `.gitignore` contains `.claude/*.local.*` and `/.agentmonitors/` (the daemon's
 per-session runtime-state directory, created the moment a session opens — it's regenerated on
 every run, so it's always safe to delete). `agentmonitors init` ignores both automatically.
 

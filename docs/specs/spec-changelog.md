@@ -12,7 +12,7 @@ Agent Monitors spec set in `docs/specs/`.
 ## 2026-07-14 — Document `.agentmonitors/` and gitignore it from `init` (002 §11.3) — Refs #336
 
 A blind DX study found `.agentmonitors/` — the project-root runtime directory the core creates the
-moment a session opens (`defaultHookStatePath()`, per-session `hook-state.json`) — was entirely
+moment a session opens (`defaultHookStatePath()` derives the location; `refreshHookState()` creates it when writing per-session `hook-state.json`) — was entirely
 undocumented: no spec, skill, or getting-started doc mentioned it, so following the setup docs
 exactly left `?? .agentmonitors/` in `git status`.
 

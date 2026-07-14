@@ -1241,7 +1241,7 @@ The default hook-state path is derived by `defaultHookStatePath()`:
 Verified: `libs/core/src/adapter/claude.ts` — `safeSessionPathSegment()` (lines 4–27); `defaultHookStatePath()` (lines 40–49).
 
 > **Status: current** (Refs #336). `.agentmonitors/` is host-agnostic runtime state, not
-> source-controlled project content: `defaultHookStatePath()` creates it the moment a session
+> source-controlled project content: `defaultHookStatePath()` derives its location, and `refreshHookState()` creates it (via `writeJsonAtomic()`'s parent-`mkdir`) the moment a session
 > opens (`openSession()` calls `refreshHookState()` immediately), before any project-level
 > opt-in. Every file under it — currently just `hook-state.json` per session — is a materialized,
 > regenerable projection of the runtime's SQLite store (`RuntimeStore`, never the source of

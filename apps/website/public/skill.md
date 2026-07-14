@@ -170,7 +170,7 @@ Make sure `.gitignore` contains:
 
 ```gitignore
 .claude/*.local.*
-.agentmonitors/
+/.agentmonitors/
 ```
 
 This file is per-developer, not committed. Without it, `agentmonitors session start` quick-exits

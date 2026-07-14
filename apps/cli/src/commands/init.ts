@@ -248,7 +248,7 @@ const GITIGNORE_LINE = '.claude/*.local.*';
  * regenerable projection of the runtime's SQLite store, never the source of
  * truth, so it is safe to delete.
  */
-const RUNTIME_DIR_GITIGNORE_LINE = '.agentmonitors/';
+const RUNTIME_DIR_GITIGNORE_LINE = '/.agentmonitors/';
 
 /** All lines `agentmonitors init` ensures are present in `.gitignore`. */
 const GITIGNORE_LINES = [GITIGNORE_LINE, RUNTIME_DIR_GITIGNORE_LINE] as const;
