@@ -1141,7 +1141,7 @@ in order:
    a disabled/misconfigured workspace (§12.2 step 3, the "cwd mismatch" symptom); no socket configured;
    an unreachable daemon; or no tracked session matching `session_id` (a workspace/session mismatch).
 3. On successful resolution: the resolved AgentMon session id, workspace, and status.
-4. **Pending-event counts by urgency** for the resolved session at the resolved lifecycle (a read-only
+4. **Unread (unacknowledged) event counts by urgency** — includes claimed-but-unacknowledged events — for the resolved session at the resolved lifecycle (a read-only
    query; never claims).
 5. **Per-band hold reasons** for anything not yet deliverable, naming the mechanism:
    - `settle-window` — pending high-urgency events exist but none has aged past the 15s claim-time

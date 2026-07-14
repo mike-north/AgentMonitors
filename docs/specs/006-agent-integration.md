@@ -399,7 +399,7 @@ a real hook invocation must never inject diagnostic noise into the agent's conte
 operator with no way to tell "correctly idle" from "misconfigured" (blind DX study S3 F3).
 
 `--debug` writes a parallel diagnosis to **stderr only**, one line per step of §5.2, naming which
-branch was hit and, once a session is resolved, the pending-event counts by urgency and a per-band
+branch was hit and, once a session is resolved, the unread (unacknowledged) counts by urgency and a per-band
 hold reason for anything not yet deliverable:
 
 - `settle-window` — pending high-urgency work exists but is not yet past the 15s claim-time settle

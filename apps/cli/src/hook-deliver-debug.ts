@@ -122,11 +122,11 @@ export function describeSessionMatch(match: AgentSessionRecord): string {
   );
 }
 
-/** Pending-event counts by urgency band for the resolved session. */
+/** Unread (unacknowledged — includes claimed-but-unacked) counts by urgency band. */
 export function describeUnreadCounts(diagnosis: HookDeliveryDiagnosis): string {
   const { unreadCounts } = diagnosis;
   return line(
-    `pending events by urgency for session ${diagnosis.sessionId} at ${diagnosis.lifecycle}: ` +
+    `unread (unacknowledged) events by urgency for session ${diagnosis.sessionId} at ${diagnosis.lifecycle}: ` +
       `high=${String(unreadCounts.high)} normal=${String(unreadCounts.normal)} ` +
       `low=${String(unreadCounts.low)} (total ${String(unreadCounts.total)})`,
   );
@@ -181,7 +181,7 @@ export function describeOutput(
 ): string {
   return line(
     output
-      ? `stdout: emitting ${format === 'text' ? 'text (additionalContext only)' : 'hook wire JSON'} (${String(JSON.stringify(output).length)} bytes).`
+      ? `stdout: emitting ${format === 'text' ? 'text (additionalContext only)' : 'hook wire JSON'} (${String(Buffer.byteLength(JSON.stringify(output), 'utf8'))} bytes).`
       : 'stdout: nothing to emit (render produced no output — null claim, or an empty reminder).',
   );
 }

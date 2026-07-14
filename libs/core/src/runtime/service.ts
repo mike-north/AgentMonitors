@@ -1388,8 +1388,9 @@ export class AgentMonitorRuntime {
    * match what a real claim would decide: at `turn-interruptible`, the
    * high-urgency settle-window hold is reported whenever pending high work is
    * entirely unsettled; the normal-reminder hold is evaluated only when high
-   * would not already preempt this turn's delivery (settled high work exists
-   * and would deliver instead). At `turn-idle`, only the low-reminder hold is
+   * would not already preempt this turn's delivery (i.e. NO settled high
+   * work exists — settled high work would deliver instead and the normal
+   * reminder would not be consulted). At `turn-idle`, only the low-reminder hold is
    * evaluated. `post-compact` (the recap lifecycle) has no coalescing/settle
    * guard to explain — recap fires whenever `unreadCounts.total > 0` — so no
    * band-specific holds are computed for it.

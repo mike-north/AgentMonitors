@@ -153,7 +153,7 @@ Output formats:
 
 Diagnosis:
   --debug  Writes a step-by-step diagnosis to STDERR only (session resolution,
-           workspace/socket state, pending-event counts by urgency, and the hold
+           workspace/socket state, unread (unacknowledged) event counts by urgency, and the hold
            reason for anything not yet deliverable: settle window, already-claimed,
            coalesced-until-ack, or deferred-by-cap). STDOUT never changes.
 `,
