@@ -145,8 +145,9 @@ export async function daemonStatusClient(
 export async function daemonTickClient(
   monitorsDir: string,
   workspacePath?: string,
+  dbPath?: string,
 ): Promise<RuntimeTickResult> {
-  const runtime = createRuntime();
+  const runtime = createRuntime(dbPath);
   return await runtime.tick(monitorsDir, workspacePath);
 }
 

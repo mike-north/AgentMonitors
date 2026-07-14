@@ -354,7 +354,13 @@ export interface DoctorReportInput {
 export interface MonitorDoctorReport {
   generatedAt: Date;
   monitorsDir: string;
-  workspacePath?: string;
+  /**
+   * Always set: mirrors {@link DoctorReportInput.workspacePath}, which is
+   * required (a report can never be workspace-unscoped). Callers can rely on
+   * this to name the exact workspace a `lead-session` failure searched
+   * (issue #335) rather than treating it as possibly absent.
+   */
+  workspacePath: string;
   /** Whether the monitors directory exists on disk. */
   monitorsDirExists: boolean;
   /** Every discovered monitor's rollup (both valid and invalid definitions). */

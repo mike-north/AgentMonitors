@@ -34,7 +34,11 @@ sessionCommand
     '--host-session-id <id>',
     'Host session id from the integrating runtime',
   )
-  .option('--workspace <path>', 'Workspace path for the session', process.cwd())
+  .option(
+    '--workspace <path>',
+    'Workspace path for the session (defaults to the current working directory; resolved to an absolute path, same as `doctor`)',
+    process.cwd(),
+  )
   .option('--socket <path>', 'Unix domain socket path for the daemon')
   .option('--agent-identity <id>', 'Explicit AgentMon identity')
   .option('--hook-state-path <path>', 'Override hook-state file path')
@@ -59,14 +63,18 @@ sessionCommand
       format: string;
     }) => {
       try {
-        const socket = resolveManualDaemonSocketPath(
-          options.socket,
-          options.workspace,
-        );
+        // Resolve to an absolute, normalized path the SAME way `doctor` and
+        // `daemon once`/`daemon run` do (issue #335) — an unresolved relative
+        // value (or a trailing slash / `.`/`..` segment) would be stored
+        // verbatim on the session record and silently fail the exact-string
+        // workspace match `doctor`'s lead-session check performs, even though
+        // it is the same directory.
+        const workspace = path.resolve(options.workspace);
+        const socket = resolveManualDaemonSocketPath(options.socket, workspace);
         const session = await openSessionClient(
           claudeCodeAdapter.createSessionInput({
             hostSessionId: options.hostSessionId,
-            workspacePath: options.workspace,
+            workspacePath: workspace,
             ...(options.agentIdentity
               ? { agentIdentity: options.agentIdentity }
               : {}),

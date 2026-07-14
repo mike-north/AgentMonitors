@@ -3882,6 +3882,240 @@ Handle it.
   });
 });
 
+// Regression for issue #335 (DX study S3 F5): a daemon started *directly* via
+// `agentmonitors daemon run` — no `--socket`, no `AGENTMONITORS_DB`/
+// `AGENTMONITORS_SOCKET`, exactly as the Getting Started guide instructs and
+// exactly what the study did — used to bind to the bare global default
+// db/socket, while `agentmonitors doctor` (an enabled workspace) independently
+// derived a per-workspace-HASHED db path: a completely different SQLite file.
+// `session open`/`session list`/`daemon status` all correctly showed the
+// active lead session (they talk straight to the live daemon or its actual
+// socket), but `doctor` read an empty database and reported no lead session —
+// three commands disagreeing about the exact same durable state.
+//
+// This test drives the real sequence end-to-end as a user would hit it: an
+// isolated fake HOME (so the "no explicit overrides" default-resolution path
+// is exercised exactly like a real workstation, without touching this
+// machine's actual ~/.local/share/agentmonitors) with NO AGENTMONITORS_DB/
+// AGENTMONITORS_SOCKET set anywhere in the sequence.
+describe('daemon run/once workspace-scoped defaulting (issue #335)', () => {
+  function waitForDaemonListening(
+    args: string[],
+    env: Record<string, string>,
+    cwd: string,
+  ): Promise<{ child: ReturnType<typeof spawn>; socketPath: string }> {
+    return new Promise((resolve, reject) => {
+      const child = spawn('node', [CLI_PATH, ...args], {
+        cwd,
+        env: { ...process.env, ...env },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      const timeout = setTimeout(() => {
+        child.kill('SIGTERM');
+        reject(
+          new Error(
+            `Timed out waiting for daemon startup.\nSTDOUT:\n${stdout}\nSTDERR:\n${stderr}`,
+          ),
+        );
+      }, 15_000);
+      child.stdout?.setEncoding('utf-8');
+      child.stderr?.setEncoding('utf-8');
+      child.stdout?.on('data', (chunk: string) => {
+        stdout += chunk;
+        const match = /AgentMon daemon listening on (\S+)/.exec(stdout);
+        if (match?.[1]) {
+          clearTimeout(timeout);
+          resolve({ child, socketPath: match[1] });
+        }
+      });
+      child.stderr?.on('data', (chunk: string) => {
+        stderr += chunk;
+      });
+      child.once('exit', (code) => {
+        if (code !== null && code !== 0) {
+          clearTimeout(timeout);
+          reject(
+            new Error(
+              `Daemon exited early with code ${String(code)}.\nSTDOUT:\n${stdout}\nSTDERR:\n${stderr}`,
+            ),
+          );
+        }
+      });
+    });
+  }
+
+  it('doctor sees the lead session registered by a directly-invoked `daemon run` with no --socket/--db overrides (DX study S3 F5)', async () => {
+    const dir = path.join(tempDir, 'issue-335-unified-defaults');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors', 'heartbeat');
+    mkdirSync(monitorsRoot, { recursive: true });
+    writeFileSync(
+      path.join(monitorsRoot, 'MONITOR.md'),
+      `---
+name: Heartbeat
+watch:
+  type: schedule
+  cron: '* * * * *'
+  timezone: UTC
+urgency: normal
+---
+This monitor fires on a schedule.
+`,
+      'utf-8',
+    );
+
+    const fakeHome = mkdtempSync(path.join(tmpdir(), 'agentmon-335-home-'));
+    // Deliberately NO AGENTMONITORS_DB / AGENTMONITORS_SOCKET anywhere below —
+    // that is the exact condition that reproduces the study's finding.
+    const env = { HOME: fakeHome };
+
+    let daemonChild: ReturnType<typeof spawn> | undefined;
+    try {
+      const initResult = runWithEnv(['init', '--enable-only'], env, dir);
+      expect(initResult.exitCode).toBe(0);
+
+      const { child, socketPath } = await waitForDaemonListening(
+        ['daemon', 'run', path.join(dir, '.claude', 'monitors')],
+        env,
+        dir,
+      );
+      daemonChild = child;
+      // The derived per-workspace socket, not the bare global default — proves
+      // `daemon run` actually adopted the per-workspace convention rather than
+      // merely happening to still work.
+      expect(socketPath).not.toBe(
+        path.join(
+          fakeHome,
+          '.local',
+          'share',
+          'agentmonitors',
+          'agentmonitors.sock',
+        ),
+      );
+
+      const open = runWithEnv(
+        [
+          'session',
+          'open',
+          '--role',
+          'lead',
+          '--host-session-id',
+          'issue-335-study-session',
+          '--format',
+          'json',
+        ],
+        env,
+        dir,
+      );
+      expect(open.exitCode).toBe(0);
+      const session = JSON.parse(open.stdout) as {
+        status: string;
+        hostSessionId: string;
+      };
+      expect(session.status).toBe('active');
+
+      const list = runWithEnv(
+        ['session', 'list', '--format', 'json'],
+        env,
+        dir,
+      );
+      expect(list.exitCode).toBe(0);
+      const sessions = JSON.parse(list.stdout) as {
+        status: string;
+        hostSessionId: string;
+      }[];
+      expect(
+        sessions.some(
+          (s) =>
+            s.hostSessionId === 'issue-335-study-session' &&
+            s.status === 'active',
+        ),
+      ).toBe(true);
+
+      const status = runWithEnv(
+        ['daemon', 'status', '--format', 'json'],
+        env,
+        dir,
+      );
+      expect(status.exitCode).toBe(0);
+      const statusPayload = JSON.parse(status.stdout) as {
+        running: boolean;
+        activeSessions: number;
+      };
+      expect(statusPayload.running).toBe(true);
+      expect(statusPayload.activeSessions).toBe(1);
+
+      // The actual regression: pre-fix, this reported "No lead session is
+      // registered for this workspace" despite the three commands above all
+      // agreeing the session is active.
+      const doctorResult = runWithEnv(['doctor'], env, dir);
+      expect(doctorResult.stdout).toContain('✓ lead-session');
+      expect(doctorResult.stdout).not.toContain(
+        'No lead session is registered',
+      );
+      expect(doctorResult.exitCode).toBe(0);
+    } finally {
+      daemonChild?.kill('SIGTERM');
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('daemon once (in-process) shares the same per-workspace db doctor reads, with no overrides', () => {
+    const dir = path.join(tempDir, 'issue-335-once-unified-db');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors', 'heartbeat');
+    mkdirSync(monitorsRoot, { recursive: true });
+    writeFileSync(
+      path.join(monitorsRoot, 'MONITOR.md'),
+      `---
+name: Heartbeat
+watch:
+  type: schedule
+  cron: '* * * * *'
+  timezone: UTC
+urgency: normal
+---
+This monitor fires on a schedule.
+`,
+      'utf-8',
+    );
+
+    const fakeHome = mkdtempSync(
+      path.join(tmpdir(), 'agentmon-335-once-home-'),
+    );
+    const env = { HOME: fakeHome };
+
+    try {
+      const initResult = runWithEnv(['init', '--enable-only'], env, dir);
+      expect(initResult.exitCode).toBe(0);
+
+      const once = runWithEnv(
+        ['daemon', 'once', path.join(dir, '.claude', 'monitors')],
+        env,
+        dir,
+      );
+      expect(once.exitCode).toBe(0);
+      expect(once.stdout).toContain('emitted 1 event(s)');
+
+      // `daemon once` wrote into the derived per-workspace db, not the global
+      // default — confirmed via `doctor`, run as a SEPARATE subprocess with the
+      // same cwd/env and no overrides either, which independently derives the
+      // identical path and must see the observation `daemon once` just
+      // recorded. (Comparing against a db path computed in the *test* process
+      // itself would be unreliable: macOS resolves `/var` -> `/private/var`
+      // for a subprocess's canonicalized `process.cwd()` but not for a raw
+      // `os.tmpdir()`-derived string built in this process, so the two would
+      // hash differently despite naming the same directory — doctor's own
+      // subprocess is the correct oracle here, not a path built by this test.)
+      const doctorResult = runWithEnv(['doctor'], env, dir);
+      expect(doctorResult.stdout).toContain('✓ monitor:heartbeat');
+      expect(doctorResult.stdout).not.toContain('never observed');
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('monitor explain', () => {
   it('surfaces a daemon-side application error instead of masking it as "daemon not running" (issue #94 review)', async () => {
     // Regression for comment 3408123745: when the daemon answers `monitor.explain`

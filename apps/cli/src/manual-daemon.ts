@@ -1,5 +1,6 @@
 import { DaemonConnectionError, resolveSocketPath } from './daemon-ipc.js';
 import { readLocalState } from './local-state.js';
+import { workspacePaths } from './workspace-paths.js';
 
 // Names `agentmonitors doctor` alongside the daemon-run fix-it command (issue
 // #331): a bare "no daemon" message doesn't say whether anything else is
@@ -14,7 +15,11 @@ export const NO_WORKSPACE_DAEMON_MESSAGE =
  * Precedence is:
  * 1. An explicit command flag.
  * 2. AGENTMONITORS_SOCKET, handled by callDaemon's existing resolver.
- * 3. The enabled workspace's persisted `.claude/agentmonitors.local.md` socket.
+ * 3. The enabled workspace's persisted `.claude/agentmonitors.local.md` socket,
+ *    or — when nothing has persisted one yet (e.g. a daemon started directly
+ *    via `agentmonitors daemon run` rather than lazily booted by a Claude Code
+ *    hook) — the derived per-workspace socket ({@link workspacePaths}), which
+ *    `daemon run`/`daemon once` now also bind to by default (issue #335).
  * 4. The existing global default socket, handled by callDaemon.
  *
  * Returning undefined for cases 2 and 4 deliberately preserves the existing
@@ -31,7 +36,9 @@ export function resolveManualDaemonSocketPath(
   const workspace =
     workspacePath ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
   const state = readLocalState(workspace);
-  if (state.enabled && state.socket) return resolveSocketPath(state.socket);
+  if (state.enabled) {
+    return resolveSocketPath(state.socket ?? workspacePaths(workspace).socket);
+  }
   return undefined;
 }
 

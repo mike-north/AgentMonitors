@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { Command, Option } from 'commander';
 import type { RuntimeTickResult, WatchHandle } from '@agentmonitors/core';
 import { createRuntime } from '../runtime.js';
@@ -10,6 +11,8 @@ import {
 } from '../daemon-ipc.js';
 import { daemonStatusClient, daemonTickClient } from '../runtime-client.js';
 import { shouldReap, BOOT_GRACE_MS } from '../reap-decision.js';
+import { resolveManualDaemonSocketPath } from '../manual-daemon.js';
+import { resolveWorkspaceDbPath } from '../workspace-db-path.js';
 
 const DEFAULT_REAP_AFTER_MS = 5 * 60 * 1000;
 
@@ -60,8 +63,9 @@ async function runLoop(
   pollMs: number,
   socketPath: string,
   reapAfterMs: number,
+  dbPath: string,
 ): Promise<void> {
-  const runtime = createRuntime();
+  const runtime = createRuntime(dbPath);
   let stopping = false;
   let wakeLoop: (() => void) | undefined;
   const server = createDaemonServer({
@@ -200,7 +204,7 @@ daemonCommand
   )
   .option(
     '--workspace <path>',
-    'Workspace path for session projection',
+    'Workspace path for session projection (defaults to the current working directory)',
     process.cwd(),
   )
   .addOption(
@@ -215,7 +219,16 @@ daemonCommand
     ) => {
       try {
         const now = new Date();
-        const result = await daemonTickClient(monitorsDir, options.workspace);
+        // Resolve to an absolute, normalized path the SAME way `doctor` and
+        // `session open` do (issue #335), so an unresolved relative value
+        // cannot silently diverge from what those commands compute.
+        const workspace = path.resolve(options.workspace);
+        // Resolve the SAME per-workspace db `doctor`/`session open` assume
+        // (issue #335): an enabled workspace gets its isolated db, not the
+        // bare global default, so a directly-invoked `daemon once` agrees
+        // with every other workspace-aware command.
+        const dbPath = resolveWorkspaceDbPath(workspace);
+        const result = await daemonTickClient(monitorsDir, workspace, dbPath);
         if (options.format === 'json') {
           console.log(JSON.stringify(result, null, 2));
           return;
@@ -255,7 +268,7 @@ daemonCommand
   )
   .option(
     '--workspace <path>',
-    'Workspace path for session projection',
+    'Workspace path for session projection (defaults to the current working directory)',
     process.cwd(),
   )
   .option('--poll-ms <ms>', 'Polling interval in milliseconds', '30000')
@@ -288,9 +301,25 @@ daemonCommand
         );
         return;
       }
-      const socketPath = resolveSocketPath(options.socket, {
-        explicit: options.socket !== undefined,
-      });
+      // Resolve to an absolute, normalized path the SAME way `doctor` and
+      // `session open` do (issue #335), so an unresolved relative value
+      // cannot silently diverge from what those commands compute.
+      const workspace = path.resolve(options.workspace);
+      // Resolve db + socket the SAME per-workspace-aware way manual daemon
+      // commands (`session open`, `doctor`, ...) already do (issue #335): an
+      // enabled workspace with no persisted socket yet (e.g. the very first
+      // `daemon run` for this project, exactly as the Getting Started guide
+      // instructs) binds to its derived per-workspace socket/db rather than
+      // the bare global default, so every command diagnosing "this
+      // workspace's daemon" — including a directly-invoked one — agrees.
+      // `resolveManualDaemonSocketPath` already threads the explicit-socket
+      // over-limit warning (issue #337) through its own `explicitSocket`
+      // branch, so no separate `{ explicit }` option is needed here.
+      const socketPath = resolveSocketPath(
+        resolveManualDaemonSocketPath(options.socket, workspace) ??
+          options.socket,
+      );
+      const dbPath = resolveWorkspaceDbPath(workspace);
       if (await daemonAvailable(socketPath)) {
         reportError(
           `AgentMon daemon is already running at ${socketPath}.`,
@@ -300,10 +329,11 @@ daemonCommand
       }
       await runLoop(
         monitorsDir,
-        options.workspace,
+        workspace,
         pollMs,
         socketPath,
         reapAfterMs,
+        dbPath,
       );
     },
   );
@@ -319,16 +349,26 @@ daemonCommand
   )
   .action(async (options: { socket?: string; format: string }) => {
     try {
-      // Resolve once so an over-limit explicit --socket is only substituted
-      // (and warned about) a single time, then reused for every downstream
-      // call — resolving separately per call would print the warning twice.
-      const socketPath = resolveSocketPath(options.socket, {
-        explicit: options.socket !== undefined,
-      });
+      // Resolve the SAME per-workspace-aware socket (and, for the in-process
+      // fallback, db) that `doctor`/`session open`/`session list` already do
+      // (issue #335) — otherwise `daemon status` silently pings the bare
+      // global default and reports "not running" for a daemon every other
+      // workspace-aware command can already see. Resolved once and reused for
+      // every downstream call (`daemonAvailable`, `daemonStatusClient`, the
+      // payload) so an over-limit explicit `--socket` (issue #337, threaded
+      // through `resolveManualDaemonSocketPath`'s own `explicitSocket`
+      // branch) is only substituted/warned about a single time.
+      const socketPath = resolveSocketPath(
+        resolveManualDaemonSocketPath(options.socket) ?? options.socket,
+      );
       const running = await daemonAvailable(socketPath);
       const status = running
         ? await daemonStatusClient(socketPath)
-        : createRuntime().status();
+        : createRuntime(
+            resolveWorkspaceDbPath(
+              process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd(),
+            ),
+          ).status();
       const payload = {
         running,
         socketPath,
@@ -356,10 +396,13 @@ daemonCommand
   .option('--socket <path>', 'Unix domain socket path for the daemon')
   .action(async (options: { socket?: string }) => {
     try {
-      const socketPath = resolveSocketPath(options.socket, {
-        explicit: options.socket !== undefined,
-      });
-      await callDaemon('stop', {}, { socketPath });
+      // Same per-workspace-aware socket resolution as `daemon status`/`doctor`
+      // (issue #335), so `daemon stop` reaches the daemon those commands see.
+      // An explicit over-limit `--socket` still warns exactly once (issue
+      // #337), via `resolveManualDaemonSocketPath`'s own `explicitSocket`
+      // branch.
+      const socketPath = resolveManualDaemonSocketPath(options.socket);
+      await callDaemon('stop', {}, socketPath ? { socketPath } : {});
       console.log('AgentMon daemon stopping.');
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

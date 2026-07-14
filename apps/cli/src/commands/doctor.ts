@@ -5,12 +5,11 @@ import type {
   MonitorDoctorReport,
 } from '@agentmonitors/core';
 import { reportError } from '../output.js';
-import { readLocalState, type LocalState } from '../local-state.js';
-import { workspacePaths } from '../workspace-paths.js';
-import { resolveDbPath } from '../db-path.js';
+import { readLocalState } from '../local-state.js';
 import { daemonAvailable, resolveSocketPath } from '../daemon-ipc.js';
 import { resolveManualDaemonSocketPath } from '../manual-daemon.js';
 import { doctorReportInProcess } from '../runtime-client.js';
+import { resolveWorkspaceDbPath } from '../workspace-db-path.js';
 
 /** A single named health check with an actionable remediation on failure. */
 type DoctorCheckStatus = 'pass' | 'fail' | 'skip';
@@ -40,23 +39,16 @@ const ENABLE_REMEDIATION =
   'Run `agentmonitors init --enable-only`, or create `.claude/agentmonitors.local.md` in this project with `enabled: true` yourself.';
 const DAEMON_REMEDIATION =
   'Start it with `agentmonitors daemon run`, or it starts automatically when a Claude Code session opens.';
-const LEAD_SESSION_REMEDIATION =
-  'Open a Claude Code session in this workspace (the SessionStart hook registers a lead session), or run `agentmonitors session open --role lead --workspace <path>`.';
+// The lead-session remediation names the exact workspace path doctor searched
+// (issue #335) so a future db/socket-derivation mismatch between doctor and
+// `session open`/`session list` is self-diagnosing: compare this value against
+// `agentmonitors session list`'s workspace column directly, rather than
+// guessing whether the two commands agree.
+function leadSessionRemediation(workspacePath: string): string {
+  return `Open a Claude Code session in this workspace (the SessionStart hook registers a lead session), or run \`agentmonitors session open --role lead --workspace ${workspacePath}\`. Doctor searched for a lead session registered to workspace "${workspacePath}" — compare against \`agentmonitors session list\`.`;
+}
 const NEVER_OBSERVED_REMEDIATION =
   'The daemon has not observed this monitor yet. Start it with `agentmonitors daemon run` (or wait for the next tick), then check `agentmonitors monitor history <id>`; `agentmonitors monitor test <path>` dry-runs it now.';
-
-/**
- * Resolve the SQLite database path the daemon uses for this workspace, so the
- * in-process report reads the SAME store the daemon writes. Priority mirrors the
- * daemon's own resolution: `AGENTMONITORS_DB` wins (tests/overrides); otherwise
- * an enabled workspace uses its persisted or derived per-workspace db; a
- * not-enabled workspace falls back to the global default.
- */
-function resolveWorkspaceDbPath(workspace: string, state: LocalState): string {
-  if (process.env['AGENTMONITORS_DB']) return process.env['AGENTMONITORS_DB'];
-  if (state.enabled) return state.db ?? workspacePaths(workspace).db;
-  return resolveDbPath();
-}
 
 const STATUS_GLYPH: Record<DoctorCheckStatus, string> = {
   pass: '✓',
@@ -190,9 +182,8 @@ function buildChecks(
       : {
           name: 'lead-session',
           status: 'fail',
-          detail:
-            'No lead session is registered for this workspace (expected when no agent session is currently open).',
-          remediation: LEAD_SESSION_REMEDIATION,
+          detail: `No lead session is registered for workspace "${report.workspacePath}" (expected when no agent session is currently open).`,
+          remediation: leadSessionRemediation(report.workspacePath),
         },
   );
 
@@ -307,7 +298,11 @@ export const doctorCommand = new Command('doctor')
     '--dir <path>',
     'Directory containing monitor definitions (defaults to <workspace>/.claude/monitors)',
   )
-  .option('--workspace <path>', 'Workspace path to diagnose', process.cwd())
+  .option(
+    '--workspace <path>',
+    'Workspace path to diagnose (defaults to the current working directory)',
+    process.cwd(),
+  )
   .option('--socket <path>', 'Unix domain socket path for the daemon')
   .addOption(
     new Option('--format <format>', 'Output format')
