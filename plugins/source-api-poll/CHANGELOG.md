@@ -1,5 +1,29 @@
 # @agentmonitors/source-api-poll
 
+## 0.3.1
+
+### Patch Changes
+
+- fd2aeff: Declare the supported Node runtime and complete npm package metadata on every published package.
+  Each package now declares `"engines": { "node": ">=24" }` — a floor at Node 24, the version CI tests — so
+  an install on an unsupported Node release gets an actionable npm compatibility warning instead of
+  an opaque runtime/native-addon failure. Each package also declares consistent
+  `repository`/`bugs`/`homepage` metadata (pointing at its subdirectory of this repo) and ships a
+  `README.md`, and the root README states the Node 24 requirement in its install instructions. The
+  release-collateral validation run by `pnpm publish:packages:dry-run` (and CI's `publish-dry-run`
+  job) now fails loudly if any published package is missing `engines.node`, `repository`, `bugs`,
+  `homepage`, `README.md`, or `LICENSE`.
+- d4299cf: Relicense the published packages under the MIT License. Each package now declares `"license": "MIT"` and ships a `LICENSE` file in its published tarball.
+- Updated dependencies [a4c642f]
+- Updated dependencies [867f8b7]
+- Updated dependencies [fd2aeff]
+- Updated dependencies [697b525]
+- Updated dependencies [77d9568]
+- Updated dependencies [d4299cf]
+- Updated dependencies [0504103]
+- Updated dependencies [b7e2711]
+  - @agentmonitors/core@0.10.0
+
 ## 0.3.0
 
 ### Minor Changes
