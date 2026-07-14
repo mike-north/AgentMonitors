@@ -6275,6 +6275,227 @@ describe('hook deliver', () => {
   }, 60_000);
 });
 
+// Issue #333: reproduce/refute the blind-study S3 F2 report (normal-urgency
+// event surfaced NOTHING at any lifecycle) through the REAL contract — a durable
+// event materialized by a real daemon tick, then `hook claim` at
+// turn-interruptible over the real IPC socket (the subject's exact command).
+//
+// Verdict: NOT a first-claim bug. The FIRST turn-interruptible claim DOES
+// surface the coalesced normal reminder (002 §9.2). The study subject had run an
+// EARLIER turn-interruptible claim (S3 phase 11) that surfaced the reminder AND
+// claimed the event; the second identical claim was then correctly suppressed
+// because the reminder coalesces until acknowledgment. The real defect was the
+// SILENCE — no way to discover why. This test pins both: (1) the reminder
+// surfaces on the first claim; (2) after a claim, the reminder is suppressed and
+// `monitor explain` NAMES the reason (already-claimed / coalesced-until-ack).
+describe('hook claim normal-urgency reminder + suppression diagnosis (issue #333)', () => {
+  const NORMAL_INBOX_PROMPT =
+    'AgentMon messages are available. Read the inbox.';
+
+  it('first turn-interruptible claim surfaces the reminder; a prior claim suppresses it; monitor explain names why', async () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-333-'));
+    const monitorsRoot = path.join(ws, '.claude', 'monitors');
+    // The monitor folder name is the monitor id used by `monitor explain`.
+    const monitorsDir = path.join(monitorsRoot, 'docs-watcher');
+    mkdirSync(monitorsDir, { recursive: true });
+
+    const watchedFile = path.join(ws, 'watched.txt');
+    writeFileSync(watchedFile, 'initial content', 'utf-8');
+
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      [
+        '---',
+        'name: Docs watcher',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs:',
+        '    - "watched.txt"',
+        `  cwd: ${JSON.stringify(ws)}`,
+        '  interval: "1s"',
+        // The guide's own default urgency — the study's exact case.
+        'urgency: normal',
+        '---',
+        'When files change, review them.',
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+
+    const socket = path.join(
+      '/tmp',
+      `agentmon-333-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const db = path.join(ws, 'issue-333.db');
+    const hostSessionId = `issue-333-${Date.now()}`;
+
+    writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 30_000 });
+
+    const env: Record<string, string> = {
+      CLAUDE_CODE_SESSION_ID: hostSessionId,
+      CLAUDE_PROJECT_DIR: ws,
+      AGENTMONITORS_DB: db,
+      AGENTMONITORS_SOCKET: socket,
+    };
+
+    const daemon = await startDaemon(monitorsRoot, ws, env, socket);
+
+    try {
+      const sessionOpen = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          hostSessionId,
+          '--workspace',
+          ws,
+          '--format',
+          'json',
+        ],
+        env,
+        ws,
+      );
+      expect(sessionOpen.exitCode).toBe(0);
+      const session = JSON.parse(sessionOpen.stdout) as { id: string };
+
+      // Let the baseline tick complete, then change the watched file. A real
+      // daemon tick then materializes exactly one durable, unread normal event.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
+      writeFileSync(watchedFile, 'changed: added eval()', 'utf-8');
+
+      const unread = () =>
+        runWithEnv(
+          [
+            'events',
+            'list',
+            '--session',
+            session.id,
+            '--unread',
+            '--format',
+            'json',
+          ],
+          env,
+          ws,
+        );
+
+      // normal urgency materializes without the 15s high-urgency settle window.
+      const eventDeadline = Date.now() + 10_000;
+      while (Date.now() < eventDeadline) {
+        const result = unread();
+        if (result.exitCode === 0 && JSON.parse(result.stdout).length >= 1) {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      expect(JSON.parse(unread().stdout)).toHaveLength(1);
+
+      const claimAt = (lifecycle: string) =>
+        runWithEnv(
+          [
+            'hook',
+            'claim',
+            '--session',
+            session.id,
+            '--lifecycle',
+            lifecycle,
+            '--format',
+            'json',
+          ],
+          env,
+          ws,
+        );
+
+      // CRITERION 1 (refute the first-claim bug): the subject's exact command,
+      // with the event unread and UNCLAIMED, surfaces the coalesced generic
+      // reminder — precisely what 002 §9.2 requires. This is NOT null.
+      const first = claimAt('turn-interruptible');
+      expect(first.exitCode).toBe(0);
+      const firstClaim = JSON.parse(first.stdout) as {
+        mode: string;
+        urgency: string;
+        message: string;
+        events: unknown[];
+      } | null;
+      expect(firstClaim).not.toBeNull();
+      expect(firstClaim?.mode).toBe('delivery');
+      expect(firstClaim?.urgency).toBe('normal');
+      expect(firstClaim?.message).toBe(NORMAL_INBOX_PROMPT);
+      expect(firstClaim?.events).toEqual([]); // §9.2: reminder carries no events
+
+      // The divergent precondition from the study transcript: the first claim
+      // marked the event CLAIMED (not acknowledged). A SECOND identical claim is
+      // now correctly suppressed → `null`. This reproduces S3 F2's symptom.
+      const second = claimAt('turn-interruptible');
+      expect(second.exitCode).toBe(0);
+      expect(JSON.parse(second.stdout)).toBeNull();
+
+      // turn-idle likewise surfaces nothing (no low-urgency work), matching the
+      // study's "No pending delivery." at that lifecycle.
+      const idle = claimAt('turn-idle');
+      expect(idle.exitCode).toBe(0);
+      expect(JSON.parse(idle.stdout)).toBeNull();
+
+      // Claiming never acknowledges (BP2 / SP4): the event is still unread and
+      // re-discoverable — no signal was lost, only the reminder is paused.
+      expect(JSON.parse(unread().stdout)).toHaveLength(1);
+
+      // CRITERION 2: the silence is now discoverable. `monitor explain`'s
+      // projection-and-delivery stage NAMES the suppression reason.
+      const explain = runWithEnv(
+        [
+          'monitor',
+          'explain',
+          'docs-watcher',
+          '--dir',
+          monitorsRoot,
+          '--workspace',
+          ws,
+          '--socket',
+          socket,
+          '--format',
+          'json',
+        ],
+        env,
+        ws,
+      );
+      expect(explain.exitCode).toBe(0);
+      const report = JSON.parse(explain.stdout) as {
+        stages: {
+          id: string;
+          status: string;
+          reason: string;
+          details?: {
+            reminderSuppression?: {
+              sessionId: string;
+              urgency: string;
+              lifecycle: string;
+              reason: string;
+            }[];
+          };
+        }[];
+      };
+      const delivery = report.stages.find((stage) => stage.id === 'delivery');
+      expect(delivery).toBeDefined();
+      // Suppression is EXPECTED behavior, not a fault.
+      expect(delivery?.status).toBe('ok');
+      expect(delivery?.reason).toContain('already claimed');
+      expect(delivery?.reason).toContain('coalesced-until-ack');
+      const findings = delivery?.details?.reminderSuppression;
+      expect(findings).toHaveLength(1);
+      expect(findings?.[0]).toMatchObject({
+        sessionId: session.id,
+        urgency: 'normal',
+        lifecycle: 'turn-interruptible',
+        reason: 'already-claimed',
+      });
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 40_000);
+});
+
 // Issue #270: prove hooks-only (no-MCP) operation is a complete, first-class
 // mode — not an implementation accident. Governing spec: docs/specs/006-
 // agent-integration.md, new subsection "Operating without MCP" (NP-CH). This

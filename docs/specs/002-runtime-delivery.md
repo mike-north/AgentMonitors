@@ -1003,13 +1003,17 @@ Verified: `libs/core/src/runtime/service.ts` — `claimDelivery()` turn-interrup
 
 At `turn-interruptible`, normal-urgency events are delivered as a generic inbox reminder (`NORMAL_INBOX_PROMPT = 'AgentMon messages are available. Read the inbox.'`) only if all unread normal-urgency events are still unclaimed. This coalesces multiple normal events into one reminder until the session acknowledges them. The `events` array is empty in this case.
 
-Verified: `libs/core/src/runtime/service.ts` — lines 267–291: `normalPending.length === unreadNormal.length` guard; `NORMAL_INBOX_PROMPT` constant (line 34).
+**The reminder is coalesced-until-acknowledgment (issue #333).** Delivering the reminder claims the underlying events (`markClaimed` sets `firstNotifiedAt`; §9.4 — claiming never acknowledges), so once any unread normal event has been claimed-but-not-acknowledged, the `normalPending.length === unreadNormal.length` guard no longer holds and the reminder is **suppressed** — it does not re-fire until the claimed events are acknowledged **or** a fresh unclaimed normal event arrives. A second `hook claim --lifecycle turn-interruptible` after the first therefore correctly returns `null`. This is intended coalescing, **not** a lost signal: the events stay unread (re-discoverable via `events list --unread`) and durable. Because a silent `null` is indistinguishable from "nothing was ever pending," this suppression **MUST** be inspectable rather than presented as silence (the silent-failure-honesty invariant, [§1.1.8](#118-interpret-a-cheap-agentic-digest-via-the-users-own-ai-tool), capability C12): `monitor explain`'s projection-and-delivery stage ([§10.7](#107-monitor-pipeline-diagnosis)) names the suppression reason (`already-claimed` when every unread event of the band is claimed; `coalesced-until-ack` when a mix of claimed and unclaimed events holds the coalesced reminder back).
+
+Verified: `libs/core/src/runtime/service.ts` — the `normalPending.length === unreadNormal.length` guard in `claimDelivery`; `NORMAL_INBOX_PROMPT` constant. The suppression diagnosis is `diagnoseReminderSuppression` (`libs/core/src/runtime/reminder-diagnosis.ts`), surfaced by the `delivery` stage of `explainMonitor`. Proven by `libs/core/src/runtime/reminder-diagnosis.test.ts`, the "normal-urgency reminder suppression is explainable (issue #333)" case in `libs/core/src/runtime/service.test.ts`, and the real-daemon/IPC "hook claim normal-urgency reminder + suppression diagnosis (issue #333)" case in `apps/cli/src/commands/cli.integration.test.ts`.
 
 ### 9.3 Low urgency
 
 At `turn-idle`, low-urgency events are delivered as a generic reminder (`IDLE_INBOX_PROMPT = 'AgentMon has inbox updates ready for review.'`) only if all unread low-urgency events are still unclaimed. The `events` array is empty.
 
-Verified: `libs/core/src/runtime/service.ts` — lines 295–315: `shouldSendLow` guard; `IDLE_INBOX_PROMPT` constant (line 35).
+The low-urgency reminder is coalesced-until-acknowledgment exactly as the normal reminder is (§9.2): once an unread low event is claimed-but-not-acknowledged, the reminder is suppressed until acknowledgment or a fresh unclaimed low event, and the same `monitor explain` diagnosis (§10.7) names the reason (issue #333).
+
+Verified: `libs/core/src/runtime/service.ts` — the `shouldSendLow` guard in `claimDelivery`; `IDLE_INBOX_PROMPT` constant. Suppression diagnosis: `diagnoseReminderSuppression` (`libs/core/src/runtime/reminder-diagnosis.ts`), proven for the `low`/`turn-idle` band by `libs/core/src/runtime/reminder-diagnosis.test.ts`.
 
 ### 9.4 Recap
 
@@ -1121,7 +1125,12 @@ monitor through the persisted pipeline state and returns stages for:
 4. Notify state: active debounce or throttle state in `monitor_state.notify_state`
 5. Materialization: recent `monitor_events`
 6. Projection and delivery: `session_event_state` joined to `agent_sessions`, reported as
-   `unread`, `claimed`, or `acknowledged`
+   `unread`, `claimed`, or `acknowledged`. When a session's unread normal/low events are already
+   claimed (so the coalesced turn-interruptible/turn-idle reminder of §9.2/§9.3 is currently
+   suppressed), this stage additionally reports a `reminderSuppression` finding per session-and-band
+   naming the reason — `already-claimed` or `coalesced-until-ack` — so a `null` claim is explainable
+   rather than silent (issue #333). The stage stays `ok` (the events are projected and claimed
+   correctly; the paused reminder is expected behavior, not a fault).
 
 Each stage carries a `status` of `ok`, `pending`, `healthy`, or `failure`:
 
@@ -1244,6 +1253,15 @@ Note: the `inbox_items` table does not share rows with `monitor_events`. They ar
 4. the event remains unread until explicitly acknowledged
 
 **What this example proves:** `low` urgency is real runtime behavior, not schema-only metadata; idle-time delivery differs intentionally from interruptible delivery.
+
+### 13.3 Coalesced normal reminder, then its suppression (issue #333)
+
+1. a `urgency: normal` monitor emits a change; the event is persisted and projected into a lead session (unread, unclaimed)
+2. `turn-interruptible` evaluates the §9.2 guard — all unread normal events are unclaimed → returns a `DeliveryClaim` with `message: NORMAL_INBOX_PROMPT` and an empty `events` array, **and claims the event** (`markClaimed` sets `firstNotifiedAt`; not acknowledged)
+3. a **second** `turn-interruptible` claim finds the event unread-but-claimed → the guard no longer holds → returns `null` (the coalesced reminder does not nag again until acknowledgment or a fresh unclaimed normal event)
+4. `monitor explain <id>` reports the `delivery` stage as `ok` with a `reminderSuppression` finding naming the reason (`already-claimed`), so the `null` is explainable rather than silent
+
+**What this example proves:** the normal reminder fires on the first claim (it is _not_ silently swallowed); coalescing-until-acknowledgment means a repeat claim is intentionally quiet; claiming is not acknowledgment (the event stays unread and durable); and the "why nothing surfaced" answer is inspectable via `monitor explain`, never presented as bare silence. This is the resolution of the blind-study S3 F2 report: a first-run subject who claimed once, then claimed again, saw `null` the second time and mistook intended coalescing for a broken delivery path.
 
 ## 14. Validation Implications
 
