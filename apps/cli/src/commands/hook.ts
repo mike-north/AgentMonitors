@@ -47,10 +47,10 @@ type HookClaimLifecycle = DeliveryLifecycle;
 hookCommand
   .command('claim')
   .description('Claim a pending delivery payload for a session')
-  .requiredOption('--session <id>', 'AgentMon session id')
+  .requiredOption('--session <id>', 'AgentMon session id (required)')
   .option('--socket <path>', 'Unix domain socket path for the daemon')
   .addOption(
-    new Option('--lifecycle <lifecycle>', 'Lifecycle point')
+    new Option('--lifecycle <lifecycle>', 'Lifecycle point (required)')
       .choices(['turn-interruptible', 'turn-idle', 'post-compact'])
       .makeOptionMandatory(),
   )

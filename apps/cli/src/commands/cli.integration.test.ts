@@ -353,6 +353,56 @@ describe('CLI --help', () => {
   });
 });
 
+// Issue #338 item 2: `session open` requires `--host-session-id`, but
+// `--help` didn't mark it required, unlike commands' other required options.
+// The other `session`/`events` (and the sibling `hook claim`) commands with a
+// `.requiredOption`/mandatory `Option` had the same gap.
+describe('CLI --help marks required options as required (issue #338 item 2)', () => {
+  // Commander wraps a long option description onto a continuation line, so
+  // "(required)" can land on its own line under the flag rather than right
+  // after it. Collapse whitespace runs (including newlines) to a single
+  // space before matching so the assertion is robust to that wrapping.
+  function normalizeHelp(stdout: string): string {
+    return stdout.replace(/\s+/g, ' ');
+  }
+
+  it('session open --help marks --host-session-id as required', () => {
+    const result = run(['session', 'open', '--help']);
+    expect(result.exitCode).toBe(0);
+    expect(normalizeHelp(result.stdout)).toContain(
+      '--host-session-id <id> Host session id from the integrating runtime (required)',
+    );
+  });
+
+  it('events list --help marks --session as required', () => {
+    const result = run(['events', 'list', '--help']);
+    expect(result.exitCode).toBe(0);
+    expect(normalizeHelp(result.stdout)).toContain(
+      '--session <id> AgentMon session id (required)',
+    );
+  });
+
+  it('events ack --help marks --session as required', () => {
+    const result = run(['events', 'ack', '--help']);
+    expect(result.exitCode).toBe(0);
+    expect(normalizeHelp(result.stdout)).toContain(
+      '--session <id> AgentMon session id (required)',
+    );
+  });
+
+  it('hook claim --help marks --session and --lifecycle as required', () => {
+    const result = run(['hook', 'claim', '--help']);
+    expect(result.exitCode).toBe(0);
+    const normalized = normalizeHelp(result.stdout);
+    expect(normalized).toContain(
+      '--session <id> AgentMon session id (required)',
+    );
+    expect(normalized).toContain(
+      '--lifecycle <lifecycle> Lifecycle point (required)',
+    );
+  });
+});
+
 describe('CLI --version', () => {
   // Regression: index.ts shipped with a hardcoded `.version('0.0.0')`, so the
   // published 0.3.0 CLI reported 0.0.0 — making it impossible to tell which
@@ -514,14 +564,20 @@ describe('init', () => {
   });
 
   // AC4 (issue #268): the named `init <name> --type ...` scaffold output must be
-  // byte-for-byte unchanged by the bare-init bootstrap work. The expected string
-  // is written by hand from 005 §2's documented output, so any drift (an added
-  // line, a reworded hint) fails here — not derived from the current program.
+  // unchanged by the bare-init bootstrap work. The expected string below is
+  // written by hand from 005 §2's documented output (spec-owned-expected-string
+  // matching, not a captured snapshot of program output), so any drift (an
+  // added line, a reworded hint) fails here.
   //
   // Updated for issue #331 criterion 1: the closing output now also names
   // `agentmonitors doctor` as the health-check next step (005 §2's documented
   // output was updated in lockstep — see the added line below).
-  it('init <name> --type output is byte-for-byte unchanged (AC4 regression)', () => {
+  //
+  // Renamed from "...is byte-for-byte unchanged..." (PR #341 review, issue
+  // #338 item 8): the old title implied a gold-master/snapshot comparison,
+  // but `expected` is hand-derived from the spec, not from a prior run — the
+  // `doctor` line was an intentional addition, not preserved legacy output.
+  it('init <name> --type output matches the spec-documented next-steps text (AC4 regression)', () => {
     const dir = path.join(tempDir, 'init-byte-for-byte');
     mkdirSync(dir, { recursive: true });
     const monitorsDir = path.join(dir, 'monitors');
@@ -925,6 +981,30 @@ describe('init bootstrap (bare init)', () => {
     expect(result.stdout).toContain('agentmonitors doctor');
   });
 
+  // Issue #338 item 3: the bootstrap's "What happens next" summary used to
+  // assert "Monitoring starts automatically when you open a Claude Code
+  // session" unconditionally — an overpromise for a project bootstrapped
+  // outside Claude Code (e.g. Codex, or a bare terminal with no host plugin).
+  // The reworded summary conditions the automatic-start claim on the Claude
+  // Code plugin and states the manual `daemon run` alternative on the very
+  // next line.
+  it('the bootstrap summary conditions automatic startup on the Claude Code plugin and offers a manual daemon run alternative', () => {
+    const dir = path.join(tempDir, 'bootstrap-next-steps-wording');
+    mkdirSync(dir, { recursive: true });
+
+    const result = run(['init', '--yes'], dir);
+    expect(result.exitCode).toBe(0);
+
+    expect(result.stdout).not.toContain(
+      'Monitoring starts automatically when you open a Claude Code session',
+    );
+    expect(result.stdout).toContain(
+      "If you're using the AgentMon Claude Code plugin, monitoring starts automatically",
+    );
+    expect(result.stdout).toContain('agentmonitors daemon run');
+    expect(result.stdout).toContain('agentmonitors daemon once');
+  });
+
   // AC2: `--enable-only` performs steps 1–2 only — no monitor, no prompts, exit 0.
   it('--enable-only enables + fixes gitignore but scaffolds no monitor', () => {
     const dir = path.join(tempDir, 'bootstrap-enable-only');
@@ -1157,6 +1237,28 @@ describe('validate', () => {
     const result = run(['validate', '.', '--format', 'xml']);
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("'xml'");
+  });
+
+  // Issue #338 item 6: `validate` takes a directory; passing a single
+  // MONITOR.md file must redirect to the symmetric command (`monitor test`)
+  // instead of a generic error.
+  it('redirects to `monitor test` when given a single file instead of a directory', () => {
+    const dir = path.join(tempDir, 'validate-on-file');
+    const monitorsDir = path.join(dir, 'monitors');
+    mkdirSync(monitorsDir, { recursive: true });
+    run(['init', 'file-target', '--dir', monitorsDir], dir);
+    const monitorFile = path.join(monitorsDir, 'file-target', 'MONITOR.md');
+
+    const result = run(['validate', monitorFile]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('is a file, not a directory');
+    expect(result.stderr).toContain('agentmonitors monitor test');
+    expect(result.stderr).toContain(monitorFile);
+
+    const jsonResult = run(['validate', monitorFile, '--format', 'json']);
+    expect(jsonResult.exitCode).toBe(1);
+    const parsed = JSON.parse(jsonResult.stdout) as { error: string };
+    expect(parsed.error).toContain('agentmonitors monitor test');
   });
 
   // Regression for G1 / SP2: two folders with the same basename derive the same
@@ -2612,8 +2714,33 @@ When files change, review them.
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
       }
       expect(unread().exitCode).toBe(0);
-      const unreadEvents = JSON.parse(unread().stdout) as { id: string }[];
+      const unreadEvents = JSON.parse(unread().stdout) as {
+        id: string;
+        deliveryState?: string;
+      }[];
       expect(unreadEvents).toHaveLength(1);
+      // Issue #338 item 1: before any claim, the event's deliveryState is
+      // 'unread' -- the never-surfaced case --unread is meant to catch.
+      expect(unreadEvents[0]?.deliveryState).toBe('unread');
+
+      // The text format also surfaces deliveryState as a visible column, so a
+      // human reading `events list --unread` output can tell a never-surfaced
+      // event from a claimed-but-unacknowledged one at a glance.
+      const unreadText = runWithEnv(
+        [
+          'events',
+          'list',
+          '--session',
+          session.id,
+          '--unread',
+          '--format',
+          'text',
+        ],
+        env,
+        dir,
+      );
+      expect(unreadText.exitCode).toBe(0);
+      expect(unreadText.stdout).toContain('unread');
 
       const claim = runWithEnv(
         [
@@ -2637,6 +2764,19 @@ When files change, review them.
       expect(claimPayload.mode).toBe('delivery');
       expect(claimPayload.urgency).toBe('normal');
 
+      // Issue #338 item 1 (the core of this papercut): claiming does NOT
+      // acknowledge -- the event is still surfaced by --unread (it matches
+      // "unacknowledged", not "never seen"), but its deliveryState is now
+      // 'claimed' so a caller reading --unread output can tell the two apart.
+      const afterClaim = unread();
+      expect(afterClaim.exitCode).toBe(0);
+      const claimedEvents = JSON.parse(afterClaim.stdout) as {
+        id: string;
+        deliveryState?: string;
+      }[];
+      expect(claimedEvents).toHaveLength(1);
+      expect(claimedEvents[0]?.deliveryState).toBe('claimed');
+
       const ack = runWithEnv(
         ['events', 'ack', '--session', session.id],
         env,
@@ -2659,6 +2799,20 @@ When files change, review them.
       );
       expect(unreadAfterAck.exitCode).toBe(0);
       expect(JSON.parse(unreadAfterAck.stdout)).toHaveLength(0);
+
+      // An unfiltered query (no --unread) still returns the event, now
+      // reporting deliveryState 'acknowledged'.
+      const allAfterAck = runWithEnv(
+        ['events', 'list', '--session', session.id, '--format', 'json'],
+        env,
+        dir,
+      );
+      expect(allAfterAck.exitCode).toBe(0);
+      const acknowledgedEvents = JSON.parse(allAfterAck.stdout) as {
+        deliveryState?: string;
+      }[];
+      expect(acknowledgedEvents).toHaveLength(1);
+      expect(acknowledgedEvents[0]?.deliveryState).toBe('acknowledged');
 
       const stop = runWithEnv(['daemon', 'stop'], env, dir);
       expect(stop.exitCode).toBe(0);
@@ -2918,6 +3072,73 @@ describe('session list and close', () => {
         status: string;
       }[];
       expect(after.find((s) => s.id === session.id)?.status).toBe('dormant');
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+    }
+  }, 30_000);
+});
+
+// Issue #338 item 4: `session open --format id` prints just the bare session
+// id, so verification recipes no longer need a hand-rolled node one-liner to
+// pull `.id` out of the `--format json` payload.
+describe('session open --format id (issue #338 item 4)', () => {
+  it('prints only the bare session id, matching the id from --format json', async () => {
+    const dir = path.join(tempDir, 'session-open-format-id');
+    const monitorsDir = path.join(dir, '.claude', 'monitors');
+    mkdirSync(monitorsDir, { recursive: true });
+    const dbPath = path.join(dir, 'agentmon.db');
+    const socketPath = path.join(
+      '/tmp',
+      `agentmon-fmtid-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const env = {
+      AGENTMONITORS_DB: dbPath,
+      AGENTMONITORS_SOCKET: socketPath,
+    };
+    const daemon = await startDaemon(monitorsDir, dir, env, socketPath);
+
+    try {
+      const idResult = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          'sess-format-id',
+          '--workspace',
+          dir,
+          '--format',
+          'id',
+        ],
+        env,
+        dir,
+      );
+      expect(idResult.exitCode).toBe(0);
+      // Bare id: no surrounding JSON, no "Opened session:" prefix, no trailing
+      // content besides the newline console.log adds.
+      const printedId = idResult.stdout.trim();
+      expect(printedId).not.toContain('{');
+      expect(printedId).not.toContain('Opened session');
+
+      const jsonResult = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          'sess-format-id',
+          '--workspace',
+          dir,
+          '--format',
+          'json',
+        ],
+        env,
+        dir,
+      );
+      expect(jsonResult.exitCode).toBe(0);
+      const session = JSON.parse(jsonResult.stdout) as { id: string };
+      // Same host-session-id resumes the same AgentMon session, so both
+      // formats must report the identical id.
+      expect(printedId).toBe(session.id);
     } finally {
       daemon.stop();
       await daemon.waitForExit();
@@ -3544,6 +3765,31 @@ urgency: normal
 ---
 When source files change, review them.
 `;
+
+  // Issue #338 item 5: the doctor banner used to read "AgentMon doctor" —
+  // inconsistent with the SAME command's own remediation text, which already
+  // names the real invocation (`agentmonitors init --enable-only`). The
+  // binary is `agentmonitors`; "AgentMon" is a prose-only product name, never
+  // a command reference.
+  it('text output banner names the real invocation, not the "AgentMon" prose name', () => {
+    const dir = path.join(tempDir, 'doctor-banner');
+    mkdirSync(dir, { recursive: true });
+
+    const result = runWithEnv(
+      ['doctor', '--workspace', dir],
+      {
+        AGENTMONITORS_DB: ':memory:',
+        AGENTMONITORS_SOCKET: path.join(
+          '/tmp',
+          `agentmon-doctor-banner-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+        ),
+      },
+      dir,
+    );
+
+    expect(result.stdout.split('\n')[0]).toBe('agentmonitors doctor');
+    expect(result.stdout).not.toContain('AgentMon doctor');
+  });
 
   // cron '* * * * *' is due every tick, so a single `daemon once` records an
   // observation and materializes an event — giving doctor real persisted state.
@@ -4283,6 +4529,36 @@ describe('monitor test', () => {
     expect(result.exitCode).toBe(1);
     const parsed = JSON.parse(result.stdout);
     expect(parsed.error).toContain('Monitor file not found');
+  });
+
+  // Issue #338 item 6: `monitor test` takes a single MONITOR.md file; passing
+  // a directory used to surface a raw `EISDIR` read error. It must redirect
+  // to the symmetric command (`validate`) instead, mirroring `validate`'s own
+  // file-vs-directory redirect.
+  it('redirects to `validate` when given a directory instead of a single file', () => {
+    const dir = path.join(tempDir, 'monitor-test-on-dir');
+    const monitorsDir = path.join(dir, 'monitors');
+    mkdirSync(monitorsDir, { recursive: true });
+    run(['init', 'dir-target', '--dir', monitorsDir], dir);
+
+    const result = run(['monitor', 'test', monitorsDir]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).not.toContain('EISDIR');
+    expect(result.stderr).toContain('is a directory, not a file');
+    expect(result.stderr).toContain('agentmonitors validate');
+    expect(result.stderr).toContain(monitorsDir);
+
+    const jsonResult = run([
+      'monitor',
+      'test',
+      monitorsDir,
+      '--format',
+      'json',
+    ]);
+    expect(jsonResult.exitCode).toBe(1);
+    const parsed = JSON.parse(jsonResult.stdout) as { error: string };
+    expect(parsed.error).not.toContain('EISDIR');
+    expect(parsed.error).toContain('agentmonitors validate');
   });
 
   it('tests a valid file-fingerprint monitor', () => {

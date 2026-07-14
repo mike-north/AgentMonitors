@@ -32,7 +32,7 @@ sessionCommand
   .description('Open or resume an agent session')
   .requiredOption(
     '--host-session-id <id>',
-    'Host session id from the integrating runtime',
+    'Host session id from the integrating runtime (required)',
   )
   .option(
     '--workspace <path>',
@@ -49,7 +49,10 @@ sessionCommand
   )
   .addOption(
     new Option('--format <format>', 'Output format')
-      .choices(['text', 'json'])
+      // `id` prints just the bare session id (no JSON parsing needed) -- the
+      // common case for verification recipes that only need to capture the
+      // AgentMon session id for later commands (issue #338, item 4).
+      .choices(['text', 'json', 'id'])
       .default('text'),
   )
   .action(
@@ -87,6 +90,10 @@ sessionCommand
         );
         if (options.format === 'json') {
           console.log(JSON.stringify(session, null, 2));
+          return;
+        }
+        if (options.format === 'id') {
+          console.log(session.id);
           return;
         }
         console.log(`Opened session: ${session.id}`);

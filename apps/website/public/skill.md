@@ -307,6 +307,11 @@ has an enabled `.claude/agentmonitors.local.md`:
 CWD=$(pwd)
 HOST_ID="verify-$(date +%s)"
 SOCKET="/tmp/agentmon-verify-$$.sock"
+# Isolate this recipe's own runtime state from any other daemon on the
+# machine (and from a previous run of this same recipe in the same
+# directory). Without this, a rerun can reuse a prior baseline and skew the
+# tick-count assumptions in the per-source recipes below (issue #338).
+export AGENTMONITORS_DB="/tmp/agentmon-verify-$$.db"
 
 # 1. Start a daemon that never idle-reaps, on an explicit socket every later
 #    step will also target.
@@ -315,9 +320,9 @@ DAEMON_PID=$!
 sleep 1
 
 # 2. Open a lead session on the same socket, capturing the AgentMon session
-#    id from the JSON output (it is NOT the same as $HOST_ID).
-AGENTMON_SESSION_ID=$(agentmonitors session open --socket "$SOCKET" --host-session-id "$HOST_ID" --role lead --workspace "$CWD" --format json \
-  | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).id))")
+#    id (it is NOT the same as $HOST_ID) via --format id — prints just the
+#    bare id, no JSON parsing needed.
+AGENTMON_SESSION_ID=$(agentmonitors session open --socket "$SOCKET" --host-session-id "$HOST_ID" --role lead --workspace "$CWD" --format id)
 echo "AgentMon session: $AGENTMON_SESSION_ID"
 
 # 3. Trigger the monitored condition (per-source recipes below).
@@ -380,8 +385,14 @@ touch path/to/monitored/file.txt
 echo "changed" >> tracked/state.txt
 ```
 
-`command-poll` baselines on the first tick and detects on the second, so trigger the change
-between session-open and the second tick for the fastest detection.
+`command-poll` baselines silently on its first-ever tick and detects on any later tick where the
+output differs from that baseline. The first tick fires immediately when `daemon run` starts (step
+1 above) — **before** step 2 (session-open), which only registers a delivery recipient and does not
+affect tick timing. So trigger the change (step 3) any time after step 1; it just needs to land
+before the daemon's *next* tick (`--poll-ms`, 5000ms in this recipe) to be detected on that tick.
+This assumes a fresh baseline, which is why the recipe isolates `$AGENTMONITORS_DB` above — reusing
+a database from a prior run of this same recipe means the daemon's first tick already has a
+baseline from that earlier run, and can detect a change immediately instead of on the next tick.
 
 **`api-poll`** — the response from `watch.url` must change between two ticks. Point it at a
 controllable local server, or a source that changes every poll. Without a controllable endpoint,
@@ -439,3 +450,8 @@ Non-empty output confirms the event reached the session and is pending delivery 
 explain` delivery verdict may simply be stale. If `events list` is also empty (once the daemon is
 confirmed running), the event never reached the session; work backward through the Verdict stages
 above.
+
+**`--unread` means unacknowledged, not "never seen."** It matches every event this session hasn't
+run `events ack` on yet — including one already surfaced once at a delivery lifecycle. Each row's
+`deliveryState` field (`unread`, `claimed`, or `acknowledged`) tells you which: `claimed` means the
+event already reached a hook delivery and is waiting on `events ack`, not stuck undelivered.

@@ -510,13 +510,16 @@ async function runBootstrap(options: BootstrapOptions): Promise<void> {
 
   console.log('\nWhat happens next');
   console.log(
-    '  • Monitoring starts automatically when you open a Claude Code session',
+    "  • If you're using the AgentMon Claude Code plugin, monitoring starts automatically",
   );
   console.log(
-    '    (the SessionStart hook lazy-boots the daemon — no manual start needed).',
+    '    the next time you open a Claude Code session (SessionStart lazy-boots the daemon).',
   );
   console.log(
-    `  • Run a one-shot tick now:  agentmonitors daemon once ${options.dir}`,
+    `  • Otherwise, start the daemon yourself:  agentmonitors daemon run ${options.dir}`,
+  );
+  console.log(
+    `  • Or run a one-shot tick now:  agentmonitors daemon once ${options.dir}`,
   );
   console.log('  • Check overall health any time:  agentmonitors doctor');
 

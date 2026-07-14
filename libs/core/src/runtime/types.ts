@@ -75,6 +75,19 @@ export interface MonitorEventRecord {
   queryScope: Record<string, string | string[]>;
   tags: string[];
   createdAt: Date;
+  /**
+   * The requesting session's delivery state for this event (002 §7):
+   * `unread` (not acknowledged), `claimed` (surfaced at least once at a
+   * delivery lifecycle, but not acknowledged), or `acknowledged`. Only present
+   * when the query was session-scoped (`EventQuery.sessionId` set) — a
+   * global/unscoped `listEvents()` call has no single session's state to
+   * report, so this is `undefined` in that case. The CLI's unread filter
+   * matches an unacknowledged event and therefore includes
+   * claimed-but-unacknowledged events (002 §7); this field lets a caller tell
+   * an unread-and-unclaimed event apart from one that was already surfaced
+   * once (issue #338).
+   */
+  deliveryState?: MonitorDeliveryState;
 }
 
 export interface DeliveryEventSummary {

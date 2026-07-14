@@ -204,6 +204,9 @@ urgency: high
 CWD=$(pwd)
 HOST_ID="verify-$(date +%s)"
 SOCKET="/tmp/agentmon-verify-$$.sock"
+# Isolate this recipe's runtime state from any other daemon on the machine
+# (and from a previous run of this same recipe).
+export AGENTMONITORS_DB="/tmp/agentmon-verify-$$.db"
 
 # 1. A daemon pinned to this socket that never idle-reaps.
 agentmonitors daemon run .claude/monitors --socket "$SOCKET" --reap-after-ms 0 --poll-ms 5000 &
@@ -213,9 +216,9 @@ trap 'kill "$DAEMON_PID" 2>/dev/null' EXIT
 sleep 1
 
 # 2. A lead session on the same socket — capture its id (it is NOT $HOST_ID).
+# --format id prints just the bare id, no JSON parsing needed.
 AGENTMON_SESSION_ID=$(agentmonitors session open --socket "$SOCKET" --host-session-id "$HOST_ID" \
-  --role lead --workspace "$CWD" --format json \
-  | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).id))")
+  --role lead --workspace "$CWD" --format id)
 
 # 3. Trigger the watched change.
 touch example.ts

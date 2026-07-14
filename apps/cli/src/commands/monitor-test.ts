@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { setTimeout } from 'node:timers/promises';
 import { Command, Option } from 'commander';
 import {
@@ -15,6 +15,7 @@ import {
 } from '@agentmonitors/core';
 import { registerCoreSources } from '../sources.js';
 import { reportError } from '../output.js';
+import { requireFile } from '../validation.js';
 import { renderToon, resolveFormat } from '../toon-format.js';
 import { DaemonConnectionError, resolveSocketPath } from '../daemon-ipc.js';
 import {
@@ -309,10 +310,7 @@ monitorTestCommand
   .action(async (filePath: string, options: { format: string }) => {
     const json = options.format === 'json';
 
-    if (!existsSync(filePath)) {
-      reportError(`Monitor file not found: ${filePath}`, json);
-      return;
-    }
+    if (!requireFile(filePath, json)) return;
 
     let content: string;
     try {
