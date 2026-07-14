@@ -25,13 +25,35 @@ export function generateId(
     return attributes['id'];
   }
 
-  return children
-    .filter((child): child is string => typeof child === 'string')
-    .join(' ')
+  return renderableText(children)
     .replace(/[^a-zA-Z0-9\s-]/g, '')
     .trim()
     .replace(/\s+/g, '-')
     .toLowerCase();
+}
+
+/**
+ * Recursively extract the text of a renderable tree. Headings routinely contain
+ * inline tags — most commonly inline code like `### \`doctor\`` — whose text
+ * lives in nested Tag children; slugifying only top-level strings would give
+ * those headings empty or truncated ids and break fragment links.
+ */
+function renderableText(children: RenderableTreeNode[]): string {
+  return children
+    .map((child): string => {
+      if (typeof child === 'string') return child;
+      if (typeof child === 'number') return String(child);
+      if (
+        child !== null &&
+        typeof child === 'object' &&
+        'children' in child &&
+        Array.isArray(child.children)
+      ) {
+        return renderableText(child.children);
+      }
+      return '';
+    })
+    .join(' ');
 }
 
 export const heading = {
@@ -41,7 +63,13 @@ export const heading = {
     const children = node.transformChildren(config);
     const id = generateId(children, attributes);
 
-    return new Tag(`h${String(node.attributes['level'])}`, { ...attributes, id }, children);
+    // Omit the attribute entirely when no id could be derived — rendering
+    // id="" would be invalid as an anchor target anyway.
+    return new Tag(
+      `h${String(node.attributes['level'])}`,
+      id === '' ? attributes : { ...attributes, id },
+      children,
+    );
   },
 };
 

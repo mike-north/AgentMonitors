@@ -10,7 +10,7 @@
  * @see https://markdoc.dev/docs/nodes#example-headings-with-anchor-links
  */
 import { describe, expect, it } from 'vitest';
-import Markdoc from '@markdoc/markdoc';
+import Markdoc, { Tag } from '@markdoc/markdoc';
 
 import { generateId, heading } from './nodes';
 
@@ -35,10 +35,16 @@ describe('generateId', () => {
     expect(generateId(['Some Heading'], { id: 'custom-id' })).toBe('custom-id');
   });
 
-  it('ignores non-string children (e.g. nested inline tags) when slugifying', () => {
-    // A Tag child (e.g. from `**bold**`) is not a string; only string text nodes contribute.
-    const tagChild = new Markdoc.Tag('strong', {}, ['bold']);
-    expect(generateId(['Plain ', tagChild, 'text'], {})).toBe('plain-text');
+  it('includes nested inline-tag text (e.g. inline code, bold) when slugifying', () => {
+    // Headings like "### `file-fingerprint`" put their text inside a Tag
+    // child; slugifying only top-level strings would yield an empty id and
+    // break every fragment link targeting such headings.
+    const codeChild = new Markdoc.Tag('code', {}, ['file-fingerprint']);
+    expect(generateId([codeChild], {})).toBe('file-fingerprint');
+    const boldChild = new Markdoc.Tag('strong', {}, ['bold']);
+    expect(generateId(['Plain ', boldChild, 'text'], {})).toBe(
+      'plain-bold-text',
+    );
   });
 });
 
@@ -57,8 +63,10 @@ describe('heading node transform', () => {
     const doc = Markdoc.parse('##');
     const rendered = Markdoc.transform(doc, { nodes: { heading } });
 
-    expect(rendered).toMatchObject({
-      children: [{ name: 'h2', attributes: { id: '' } }],
-    });
+    const renderedChildren = (rendered as Tag).children;
+    const headingTag = renderedChildren[0] as Tag;
+    expect(headingTag.name).toBe('h2');
+    // The attribute is omitted entirely — id="" would be an invalid anchor.
+    expect('id' in headingTag.attributes).toBe(false);
   });
 });
