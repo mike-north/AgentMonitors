@@ -159,6 +159,7 @@ agent actually receives.
 - [Authoring monitors](/docs/authoring-monitors) — all sources, urgency levels, notify strategies
 - [Agent integration & delivery](/docs/agent-integration) — how hooks and the optional MCP channel
   deliver into a session, and how to run entirely without MCP
+- [CLI reference](/docs/cli-reference) — every command, its flags, and output formats
 - [Use cases](/docs/use-cases) — patterns from simple file-watching to fleet supervision
 - [Troubleshooting](/docs/troubleshooting) — symptom-first fixes when a monitor doesn't fire or
   doesn't notify

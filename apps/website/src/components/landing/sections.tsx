@@ -24,6 +24,7 @@ const NAV_LINKS: readonly NavLink[] = [
   { label: 'Quickstart', href: '/#quickstart' },
   { label: 'Why it holds up', href: '/#why' },
   { label: 'Docs', href: '/docs/getting-started' },
+  { label: 'CLI Reference', href: '/docs/cli-reference' },
 ];
 
 const GITHUB_URL = 'https://github.com/mike-north/AgentMonitors';

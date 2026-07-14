@@ -236,4 +236,6 @@ must come from stdin.
   end-to-end delivery recipe these commands are drawn from
 - [Authoring monitors](/docs/authoring-monitors) — the enable-and-verify-delivery recipe, all
   sources, urgency levels, and notify strategies
+- [CLI reference](/docs/cli-reference) — every command referenced above, its flags, and output
+  formats
 - [Use cases](/docs/use-cases) — patterns from simple file-watching to fleet supervision
