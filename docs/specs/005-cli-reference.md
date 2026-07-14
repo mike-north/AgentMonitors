@@ -68,11 +68,13 @@ daemon as the plugin hook path. Outside an enabled workspace, the global default
 unchanged.
 
 When those manual daemon commands cannot reach the resolved socket, they report a single actionable
-stderr line that says no daemon is running for this workspace and tells the author to start one with
+stderr line that says no daemon is running for this workspace, tells the author to start one with
 `agentmonitors daemon run` or let the plugin start it automatically when a Claude Code session
-opens. They exit non-zero and do not expose a raw `DaemonConnectionError` stack trace.
-Daemon-side application errors are still surfaced as normal command errors and, where a command
-supports `--format json`, still use the command's JSON error shape.
+opens, and points at `agentmonitors doctor` for the full workspace-health picture (issue #331 —
+`NO_WORKSPACE_DAEMON_MESSAGE` in `apps/cli/src/manual-daemon.ts`). They exit non-zero and do not
+expose a raw `DaemonConnectionError` stack trace. Daemon-side application errors are still surfaced
+as normal command errors and, where a command supports `--format json`, still use the command's
+JSON error shape.
 
 ### Database path resolution
 
@@ -115,9 +117,10 @@ agentmonitors init [name] [options]
 
 ### Scaffold form (`init <name>`)
 
-Human-readable only (no `--format` flag). Byte-for-byte unchanged by the bootstrap addition.
+Human-readable only (no `--format` flag). Unchanged by the bootstrap addition except for the
+trailing `doctor` pointer (issue #331; see below).
 
-- **Success:** prints `Created monitor: <dir>/<name>/MONITOR.md` followed by a hint to run `agentmonitors validate <dir>`.
+- **Success:** prints `Created monitor: <dir>/<name>/MONITOR.md` followed by a hint to run `agentmonitors validate <dir>` and `agentmonitors doctor`.
 - **Failure:** prints to stderr `Monitor already exists: <dir>/<name>/MONITOR.md`; exits with code 1.
 
 ### Bootstrap form (`init`)
@@ -128,7 +131,7 @@ Runs against the current working directory. Performs, in order:
 2. **Fix `.gitignore`.** Ensures `.gitignore` contains the line `.claude/*.local.*` — appends it (creating the file if absent) when missing; a no-op when already present. Never duplicated across runs.
 3. **Offer a first monitor.** Interactively (only on a TTY, and only when neither `--yes` nor `--enable-only` is given) prompts for a source type and monitor name, then scaffolds it through the same path as `init <name>`. `--yes` scaffolds the default monitor (`file-fingerprint`, name `my-monitor`, overridable with `--type`) with no prompt. `--enable-only` skips this step. A non-interactive invocation (non-TTY stdin) without `--yes` never prompts or hangs: it skips scaffolding and tells the caller to pass `--yes` or use `init <name>`.
 4. **Validate.** When a monitor was scaffolded, runs the `validate` command in-process against the monitors directory and prints its result.
-5. **Summarize.** Prints a "what happens next + how to verify" summary: monitoring lazy-boots on the next Claude Code session (§10.4), a one-shot `daemon once` check, and — when a monitor was created — how to verify it fires (`monitor test` and the `setup-monitors` "Verify It Fires" recipe).
+5. **Summarize.** Prints a "what happens next + how to verify" summary: monitoring lazy-boots on the next Claude Code session (§10.4), a one-shot `daemon once` check, a pointer to `agentmonitors doctor` as the health-check next step (issue #331 — `doctor` is otherwise undiscoverable outside `--help`), and — when a monitor was created — how to verify it fires (`monitor test` and the `setup-monitors` "Verify It Fires" recipe). The idempotent "nothing to change" re-run summary carries the same `doctor` pointer.
 
 **Idempotency:** re-running the bootstrap on an already-enabled project whose `.gitignore` is correct (and, for `--yes`, whose default monitor already exists) changes nothing and prints an "already set up — nothing to change" message. Exits 0.
 
@@ -1307,6 +1310,15 @@ Each `monitor:<id>` line embeds the per-monitor rollup (below). **Exit 0 when ev
 non-zero when any check fails.** A down daemon fails `daemon-reachable` but does not stop the rest of
 the diagnosis — the per-monitor rollup is still produced from persisted state and the line explicitly
 says the daemon is down.
+
+**Expected-state context (issue #331).** `daemon-reachable` and `lead-session` both legitimately
+fail whenever no agent session is currently open for the workspace — e.g. right after the
+`setup-monitors` skill's manual-test recipe tears down its throwaway daemon and session (§"Verify It
+Fires"). That combination previously read as a broken setup with no cue otherwise. Both checks' fail
+`detail` text now appends a clause naming this: "expected when no agent session is currently open"
+(`daemon-reachable` additionally notes the daemon starts automatically once one is). The exit-code
+contract is unchanged — both checks still fail and `doctor` still exits 1 — only the wording gains
+context.
 
 ### Per-monitor rollup
 

@@ -489,6 +489,10 @@ describe('init', () => {
   // byte-for-byte unchanged by the bare-init bootstrap work. The expected string
   // is written by hand from 005 §2's documented output, so any drift (an added
   // line, a reworded hint) fails here — not derived from the current program.
+  //
+  // Updated for issue #331 criterion 1: the closing output now also names
+  // `agentmonitors doctor` as the health-check next step (005 §2's documented
+  // output was updated in lockstep — see the added line below).
   it('init <name> --type output is byte-for-byte unchanged (AC4 regression)', () => {
     const dir = path.join(tempDir, 'init-byte-for-byte');
     mkdirSync(dir, { recursive: true });
@@ -503,7 +507,8 @@ describe('init', () => {
       `Created monitor: ${monitorDir}/MONITOR.md\n` +
       `\n` +
       `Edit the file to configure your monitor, then run:\n` +
-      `  agentmonitors validate ${monitorsDir}\n`;
+      `  agentmonitors validate ${monitorsDir}\n` +
+      `  agentmonitors doctor\n`;
     expect(result.stdout).toBe(expected);
     expect(result.stderr).toBe('');
   });
@@ -563,6 +568,10 @@ describe('init bootstrap (bare init)', () => {
     // Step 5 — the summary points at how to verify the monitor fires.
     expect(result.stdout).toContain('Verify the monitor fires');
     expect(result.stdout).toContain('monitor test');
+
+    // Criterion 1 (issue #331): the closing summary also points at
+    // `agentmonitors doctor` as the health-check next step.
+    expect(result.stdout).toContain('agentmonitors doctor');
   });
 
   // AC2: `--enable-only` performs steps 1–2 only — no monitor, no prompts, exit 0.
@@ -599,6 +608,9 @@ describe('init bootstrap (bare init)', () => {
     const second = run(['init', '--enable-only'], dir);
     expect(second.exitCode).toBe(0);
     expect(second.stdout.toLowerCase()).toContain('already set up');
+    // Criterion 1 (issue #331): the "nothing to change" closing summary also
+    // points at `agentmonitors doctor`.
+    expect(second.stdout).toContain('agentmonitors doctor');
 
     // "changes nothing": both files are byte-identical after the re-run.
     expect(readFileSync(localPath, 'utf-8')).toBe(localBefore);
@@ -2558,6 +2570,9 @@ describe('manual daemon socket commands', () => {
     }
   }, 30_000);
 
+  // Criterion 2 (issue #331): the shared daemon-unreachable message across
+  // session/events/hook commands also points at `agentmonitors doctor` for
+  // the full picture, alongside the `daemon run` fix-it command.
   it('manual socket commands report an actionable no-daemon message without a stack trace', () => {
     const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-manual-down-'));
     const socket = path.join(
@@ -2588,6 +2603,7 @@ describe('manual daemon socket commands', () => {
         expect(result.exitCode).toBe(1);
         expect(result.stderr).toContain('No daemon running for this workspace');
         expect(result.stderr).toContain('agentmonitors daemon run');
+        expect(result.stderr).toContain('agentmonitors doctor');
         expect(result.stderr).not.toContain('DaemonConnectionError');
         expect(result.stderr).not.toContain('at ');
       }
@@ -3127,6 +3143,12 @@ Handle it.
     // States the daemon is down and that the data came from persisted state.
     expect(result.stdout).toContain('showing persisted state');
     expect(result.stdout).toContain('agentmonitors daemon run');
+    // Criterion 3 (issue #331): the fail line names the expected-state context
+    // — no live agent session open is a normal reason for this to fail, not
+    // evidence of a broken setup.
+    expect(result.stdout).toContain(
+      'expected when no agent session is currently open',
+    );
     // The rollup is still shown from the last tick — last-observed is real, not
     // "never", proving diagnosis survives a down daemon (like `monitor explain`).
     expect(result.stdout).toContain('monitor:heartbeat');
@@ -3159,6 +3181,12 @@ Handle it.
       expect(result.stdout).toContain('lead-session');
       expect(result.stdout).toMatch(/lead-session.*No lead session/);
       expect(result.stdout).toContain('agentmonitors session open');
+      // Criterion 3 (issue #331): the fail line names the expected-state
+      // context — no live agent session open is a normal reason for this to
+      // fail, not evidence of a broken setup.
+      expect(result.stdout).toContain(
+        'expected when no agent session is currently open',
+      );
     } finally {
       daemon.stop();
       await daemon.waitForExit();
@@ -4891,6 +4919,9 @@ describe('session start: monitoring-disabled advisory (issue #269)', () => {
       expect(ctx).toContain('1 monitor definition found');
       expect(ctx).toContain('.claude/agentmonitors.local.md');
       expect(ctx).toContain('enabled: true');
+      // Criterion 2 (issue #331): the advisory also points at
+      // `agentmonitors doctor` for the full workspace-health picture.
+      expect(ctx).toContain('agentmonitors doctor');
 
       // No daemon boot: the socket session start WOULD bind to (were it not
       // quick-exiting) is never opened.
