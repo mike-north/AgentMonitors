@@ -4,7 +4,7 @@
 ---
 
 `agentmonitors init <name> --type <source>` now accepts three optional seed flags that land
-verbatim in the generated `MONITOR.md` frontmatter, instead of requiring a hand-edit afterward:
+into the generated `MONITOR.md` frontmatter (value-preserving; quoted as YAML scalars), instead of requiring a hand-edit afterward:
 
 - `--glob <pattern>` (repeatable) seeds `watch.globs` for `file-fingerprint` or `watch.paths` for
   `incoming-changes`; rejected with a clear error for any other `--type` (those templates have no

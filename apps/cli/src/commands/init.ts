@@ -118,7 +118,7 @@ const GLOB_FIELD_BY_TYPE: Partial<Record<string, 'globs' | 'paths'>> = {
 class InitSeedError extends Error {}
 
 /** Seed values from `--glob`/`--name`/`--urgency`, threaded into the
- * generated frontmatter verbatim (issue #330). Only the named `init <name>`
+ * generated frontmatter value-preserving (issue #330). Only the named `init <name>`
  * scaffold path consumes these; the bare bootstrap form ignores them
  * (non-goal). */
 interface SeedOptions {
@@ -136,6 +136,14 @@ interface SeedOptions {
  * through unescaped and unmisinterpreted).
  */
 function yamlSingleQuoted(value: string): string {
+  // A single-quoted YAML scalar cannot safely span lines at an arbitrary
+  // indent; reject control characters outright rather than emit a scaffold
+  // that fails its own `validate` step.
+  if (/[\r\n]/.test(value)) {
+    throw new InitSeedError(
+      'Seed values must be single-line (newlines are not allowed).',
+    );
+  }
   return `'${value.replace(/'/g, "''")}'`;
 }
 
@@ -165,13 +173,20 @@ function seedGlobs(template: string, type: string, globs: string[]): string {
       `--glob is not supported for --type ${type} (only file-fingerprint and incoming-changes have a path-pattern list)`,
     );
   }
-  const listBlock = globs
-    .map((pattern) => `    - ${yamlSingleQuoted(pattern)}`)
-    .join('\n');
-  const blockPattern = new RegExp(`^( *)${field}:\\n(?: {4}- .*\\n)+`, 'm');
+  // Derive the list-item indent from the template's own first item so
+  // seeding follows the template if its indentation ever changes.
+  const blockPattern = new RegExp(
+    `^( *)${field}:\\n(( +)- .*\\n)(?:\\3- .*\\n)*`,
+    'm',
+  );
   return template.replace(
     blockPattern,
-    (_match, indent: string) => `${indent}${field}:\n${listBlock}\n`,
+    (_match, indent: string, _first: string, itemIndent: string) => {
+      const listBlock = globs
+        .map((pattern) => `${itemIndent}- ${yamlSingleQuoted(pattern)}`)
+        .join('\n');
+      return `${indent}${field}:\n${listBlock}\n`;
+    },
   );
 }
 
@@ -240,7 +255,7 @@ interface ScaffoldResult {
  * errors; the bootstrap treats it as an idempotent no-op).
  *
  * `seeds` (default `{}`, i.e. no-op) lets the named scaffold path override
- * specific frontmatter fields verbatim via `--glob`/`--name`/`--urgency`
+ * specific frontmatter fields (value-preserving) via `--glob`/`--name`/`--urgency`
  * (issue #330); the bootstrap path never passes seeds, so its output is
  * unaffected. Seeding is applied — and can throw {@link InitSeedError} — before
  * any filesystem write, so a rejected seed (e.g. `--glob` on a type with no

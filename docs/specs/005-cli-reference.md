@@ -105,16 +105,16 @@ The SQLite inbox database is resolved in this priority order (implemented in `db
 agentmonitors init [name] [options]
 ```
 
-| Argument / Flag     | Type                  | Default            | Description                                                                                                                                  |
-| ------------------- | --------------------- | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `[name]`            | positional (optional) | —                  | Monitor name, becomes the subdirectory name. **Omit to run the project bootstrap** instead of scaffolding one monitor.                       |
-| `--dir <dir>`       | option                | `.claude/monitors` | Base directory for monitors                                                                                                                  |
-| `--type <type>`     | option (choices)      | `file-fingerprint` | Observation source type: `file-fingerprint`, `api-poll`, `command-poll`, `schedule`, `incoming-changes`                                      |
-| `--enable-only`     | boolean               | —                  | Bootstrap only: enable the project and fix `.gitignore`, then stop (no monitor, no prompts)                                                  |
-| `--yes`             | boolean               | —                  | Bootstrap non-interactively: accept defaults and scaffold a starter monitor without prompting                                                |
-| `--glob <pattern>`  | option (repeatable)   | —                  | Scaffold form only. Seeds `watch.globs` (`file-fingerprint`) or `watch.paths` (`incoming-changes`) verbatim; rejected for any other `--type` |
-| `--name <name>`     | option                | —                  | Scaffold form only. Seeds the frontmatter `name:` field verbatim (distinct from the positional `[name]`, which sets the directory)           |
-| `--urgency <level>` | option (choices)      | —                  | Scaffold form only. Seeds the frontmatter `urgency:` field verbatim: `low`, `normal`, `high`                                                 |
+| Argument / Flag     | Type                  | Default            | Description                                                                                                                                           |
+| ------------------- | --------------------- | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `[name]`            | positional (optional) | —                  | Monitor name, becomes the subdirectory name. **Omit to run the project bootstrap** instead of scaffolding one monitor.                                |
+| `--dir <dir>`       | option                | `.claude/monitors` | Base directory for monitors                                                                                                                           |
+| `--type <type>`     | option (choices)      | `file-fingerprint` | Observation source type: `file-fingerprint`, `api-poll`, `command-poll`, `schedule`, `incoming-changes`                                               |
+| `--enable-only`     | boolean               | —                  | Bootstrap only: enable the project and fix `.gitignore`, then stop (no monitor, no prompts)                                                           |
+| `--yes`             | boolean               | —                  | Bootstrap non-interactively: accept defaults and scaffold a starter monitor without prompting                                                         |
+| `--glob <pattern>`  | option (repeatable)   | —                  | Scaffold form only. Seeds `watch.globs` (`file-fingerprint`) or `watch.paths` (`incoming-changes`), value-preserving; rejected for any other `--type` |
+| `--name <name>`     | option                | —                  | Scaffold form only. Seeds the frontmatter `name:` field, value-preserving (distinct from the positional `[name]`, which sets the directory)           |
+| `--urgency <level>` | option (choices)      | —                  | Scaffold form only. Seeds the frontmatter `urgency:` field: `low`, `normal`, `high`                                                                   |
 
 `--enable-only` and `--yes` are only meaningful for the bootstrap form; when a `<name>` is given, `init` takes the scaffold path and those two flags are ignored. `--type` applies to both forms: it selects the scaffolded monitor's source type in the scaffold path, and (when `--yes` scaffolds a starter monitor) overrides the bootstrap form's default source type. `--glob`/`--name`/`--urgency` are consumed only by the scaffold form; the bootstrap form accepts but ignores them (non-goal — bootstrap behavior is unchanged, issue #330).
 
@@ -128,7 +128,7 @@ Human-readable only (no `--format` flag). Byte-for-byte unchanged by the bootstr
 
 #### Seed flags (`--glob`, `--name`, `--urgency`)
 
-Each seed flag, when passed, replaces the corresponding field in the chosen `--type`'s template with the value given, verbatim — the rest of the template (comments, other fields, body) is unchanged. `--glob` is repeatable (`--glob a --glob b` seeds a two-entry list) and is only meaningful for the two source types whose template has a path-pattern list: it writes `watch.globs` for `file-fingerprint` and `watch.paths` for `incoming-changes` (the field name differs per source; see [001 §2](./001-monitor-definition.md)). Values are re-emitted as single-quoted YAML scalars (`'` doubles to `''`), so arbitrary text — including embedded quotes, colons, or `#` — round-trips safely through `validate`. A scaffold with seed flags applied still passes `agentmonitors validate` (same as the zero-flag template).
+Each seed flag, when passed, replaces the corresponding field in the chosen `--type`'s template with the value given — value-preserving, not byte-for-byte: `--name`/`--glob` values are re-emitted as single-quoted YAML scalars. The rest of the template (comments, other fields, body) is unchanged. `--glob` is repeatable (`--glob a --glob b` seeds a two-entry list) and is only meaningful for the two source types whose template has a path-pattern list: it writes `watch.globs` for `file-fingerprint` and `watch.paths` for `incoming-changes` (the field name differs per source; see [001 §2](./001-monitor-definition.md)). Values are re-emitted as single-quoted YAML scalars (`'` doubles to `''`), so arbitrary text — including embedded quotes, colons, or `#` — round-trips safely through `validate`. A scaffold with seed flags applied still passes `agentmonitors validate` (same as the zero-flag template).
 
 ### Bootstrap form (`init`)
 

@@ -19,7 +19,7 @@ frontmatter-authoring footguns).
 
 - **005 §2 — new optional flags on the scaffold form (current).** `--glob <pattern>`
   (repeatable), `--name <name>`, `--urgency <low|normal|high>` each replace the corresponding
-  template field verbatim when passed; omitting all three keeps `init <name>` byte-for-byte
+  template field (value-preserving; `--name`/`--glob` re-emitted as single-quoted YAML scalars) when passed; omitting all three keeps `init <name>` byte-for-byte
   unchanged (unaffected regression coverage: `apps/cli/src/commands/cli.integration.test.ts`
   "AC4 regression"). `--glob` seeds `watch.globs` for `file-fingerprint` and `watch.paths` for
   `incoming-changes` — the two source types whose template has a path-pattern list — and is

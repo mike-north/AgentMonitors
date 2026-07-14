@@ -667,6 +667,31 @@ describe('init', () => {
     expect(existsSync(path.join(monitorsDir, 'bad-glob-mon'))).toBe(false);
   });
 
+  // Regression (PR #343 review): a multi-line seed value would emit an
+  // invalid single-quoted YAML scalar spanning lines — reject it loudly
+  // instead of scaffolding a monitor that fails its own validate step.
+  it('rejects a --name containing a newline instead of emitting invalid YAML', () => {
+    const dir = path.join(tempDir, 'init-newline-name');
+    const monitorsDir = path.join(dir, 'monitors');
+    mkdirSync(dir, { recursive: true });
+    const result = run(
+      [
+        'init',
+        'newline-mon',
+        '--dir',
+        monitorsDir,
+        '--type',
+        'file-fingerprint',
+        '--name',
+        'first line\nsecond line',
+      ],
+      dir,
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('must be single-line');
+    expect(existsSync(path.join(monitorsDir, 'newline-mon'))).toBe(false);
+  });
+
   // Issue #330 AC2: --name seeds the frontmatter name: field verbatim,
   // including a value that needs YAML single-quote escaping, and the result
   // still passes validate (proving the escaping round-trips correctly).
