@@ -220,7 +220,11 @@ function renderText(
   socketPath: string,
 ): string {
   const lines: string[] = [];
-  lines.push('AgentMon doctor');
+  // The banner names the real invocation ("agentmonitors doctor"), not the
+  // "AgentMon" product short-name, so it never reads as a command a user
+  // could type but that would actually fail (issue #338, item 5: the binary
+  // is `agentmonitors`; "AgentMon" is prose-only).
+  lines.push('agentmonitors doctor');
   lines.push(`Workspace: ${workspace}`);
   lines.push(`Monitors:  ${report.monitorsDir}`);
   lines.push(

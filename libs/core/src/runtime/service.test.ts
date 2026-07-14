@@ -242,6 +242,83 @@ Handle it.
     expect(hookState.unread.high).toBe(1);
   });
 
+  // Issue #338 (item 1): `events list --unread` filters on `acknowledgedAt IS
+  // NULL` (002 §7), so it INCLUDES claimed-but-unacknowledged events — a
+  // surprise for a debugger reading "unread" as "never seen". `listEvents()`
+  // must report each session-scoped event's `deliveryState` so a caller can
+  // tell the two apart, and that state must track claim/ack transitions.
+  it('reports deliveryState on session-scoped listEvents, tracking unread -> claimed -> acknowledged', () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const db = createDb(':memory:');
+    const registry = new SourceRegistry();
+    const runtime = new AgentMonitorRuntime(new RuntimeStore(db), registry, [
+      claudeCodeAdapter,
+    ]);
+
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-session-delivery-state',
+        workspacePath: rootDir,
+      }),
+    );
+
+    const store = new RuntimeStore(db);
+    store.insertEvent({
+      workspacePath: rootDir,
+      monitorId: 'urgent-monitor',
+      sourceName: 'manual',
+      urgency: 'high',
+      title: 'CI failed',
+      body: 'CI failed on the default branch',
+      summary: 'CI failed on the default branch',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey: 'ci/default',
+      queryScope: { pipeline: 'default' },
+      tags: ['ci'],
+      createdAt: new Date(Date.now() - 20_000),
+    });
+
+    // Before any claim: unread, and --unread correctly includes it.
+    const beforeClaim = runtime.listEvents({ sessionId: session.id });
+    expect(beforeClaim).toHaveLength(1);
+    expect(beforeClaim[0]?.deliveryState).toBe('unread');
+    const beforeClaimUnread = runtime.listEvents({
+      sessionId: session.id,
+      unreadOnly: true,
+    });
+    expect(beforeClaimUnread[0]?.deliveryState).toBe('unread');
+
+    // After a claim (but no ack): the event is claimed, NOT acknowledged —
+    // --unread must still surface it (it's the "surprise" this test guards).
+    runtime.claimDelivery(session.id, 'turn-interruptible');
+    const afterClaim = runtime.listEvents({
+      sessionId: session.id,
+      unreadOnly: true,
+    });
+    expect(afterClaim).toHaveLength(1);
+    expect(afterClaim[0]?.deliveryState).toBe('claimed');
+
+    // After acknowledgment: --unread excludes it, and an unfiltered query
+    // reports it as acknowledged.
+    runtime.acknowledgeSession(session.id, undefined);
+    const afterAckUnread = runtime.listEvents({
+      sessionId: session.id,
+      unreadOnly: true,
+    });
+    expect(afterAckUnread).toHaveLength(0);
+    const afterAck = runtime.listEvents({ sessionId: session.id });
+    expect(afterAck[0]?.deliveryState).toBe('acknowledged');
+
+    // A global (non-session-scoped) query has no single session's delivery
+    // state to report.
+    const unscoped = runtime.listEvents({});
+    expect(unscoped[0]?.deliveryState).toBeUndefined();
+  });
+
   it('returns recap deliveries after post-compact with recap messaging', () => {
     const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
     tempDirs.push(rootDir);

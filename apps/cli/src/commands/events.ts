@@ -36,7 +36,7 @@ export const eventsCommand = new Command('events').description(
 eventsCommand
   .command('list')
   .description('List events for a session')
-  .requiredOption('--session <id>', 'AgentMon session id')
+  .requiredOption('--session <id>', 'AgentMon session id (required)')
   .option('--socket <path>', 'Unix domain socket path for the daemon')
   .option('--monitor <id>', 'Filter by monitor id')
   .addOption(
@@ -97,8 +97,13 @@ eventsCommand
           return;
         }
         for (const event of events) {
+          // deliveryState (issue #338, 002 §7) is always present here: this
+          // query is always session-scoped (`--session` is required). It's
+          // printed as its own column so `--unread` output doesn't read as
+          // "never seen" -- --unread matches acknowledgedAt IS NULL, which
+          // INCLUDES claimed-but-unacknowledged events.
           console.log(
-            `${event.id}  ${event.monitorId}  ${event.urgency}  ${event.title}`,
+            `${event.id}  ${event.monitorId}  ${event.urgency}  ${event.deliveryState ?? 'unread'}  ${event.title}`,
           );
         }
       } catch (error) {
@@ -113,7 +118,7 @@ eventsCommand
 eventsCommand
   .command('ack')
   .description('Acknowledge one or more events for a session')
-  .requiredOption('--session <id>', 'AgentMon session id')
+  .requiredOption('--session <id>', 'AgentMon session id (required)')
   .option('--socket <path>', 'Unix domain socket path for the daemon')
   .option(
     '--event-ids <ids>',

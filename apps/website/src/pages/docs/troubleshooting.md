@@ -102,8 +102,11 @@ agentmonitors events list --session <agentmon-session-id> --unread
 ```
 
 Non-empty output confirms the event reached the session and is pending delivery, regardless of
-what `explain` showed. If `events list --unread` is **also** empty, work through these before
-assuming the event is lost:
+what `explain` showed. **Note that `--unread` means unacknowledged, not "never seen":** it
+matches both the **Unread** and **Claimed** states above, so a non-empty result can mean the event
+already reached a delivery lifecycle and is simply waiting on `agentmonitors events ack`. Each
+row's `deliveryState` field tells you which of the three states it's actually in. If
+`events list --unread` is **also** empty, work through these before assuming the event is lost:
 
 - **Workspace path mismatch.** Events project only into sessions whose `workspacePath` matches
   **exactly**, byte-for-byte — there is no path normalization. A path resolved through a symlink

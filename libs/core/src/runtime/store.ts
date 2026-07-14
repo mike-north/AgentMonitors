@@ -737,7 +737,15 @@ export class RuntimeStore {
           )
           .orderBy(desc(monitorEvents.createdAt))
           .all()
-          .map((row) => rowToEvent(row.event))
+          .map((row) => ({
+            ...rowToEvent(row.event),
+            // Only the session-scoped path joins session_event_state, so only
+            // it can report per-session delivery state (issue #338). `--unread`
+            // filters on `acknowledgedAt IS NULL` (002 §7), which INCLUDES
+            // claimed-but-unacknowledged events; this field lets a caller tell
+            // those apart from a genuinely never-surfaced event.
+            deliveryState: deliveryStateForRow(row.state),
+          }))
       : asInternalDb(this.db)
           .select()
           .from(monitorEvents)

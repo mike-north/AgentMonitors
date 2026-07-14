@@ -159,7 +159,7 @@ Runs against the current working directory. Performs, in order:
 2. **Fix `.gitignore`.** Ensures `.gitignore` contains the line `.claude/*.local.*` — appends it (creating the file if absent) when missing; a no-op when already present. Never duplicated across runs.
 3. **Offer a first monitor.** Interactively (only on a TTY, and only when neither `--yes` nor `--enable-only` is given) prompts for a source type and monitor name, then scaffolds it through the same path as `init <name>`. `--yes` scaffolds the default monitor (`file-fingerprint`, name `my-monitor`, overridable with `--type`) with no prompt. `--enable-only` skips this step. A non-interactive invocation (non-TTY stdin) without `--yes` never prompts or hangs: it skips scaffolding and tells the caller to pass `--yes` or use `init <name>`.
 4. **Validate.** When a monitor was scaffolded, runs the `validate` command in-process against the monitors directory and prints its result.
-5. **Summarize.** Prints a "what happens next + how to verify" summary: monitoring lazy-boots on the next Claude Code session (§10.4), a one-shot `daemon once` check, a pointer to `agentmonitors doctor` as the health-check next step (issue #331 — `doctor` is otherwise undiscoverable outside `--help`), and — when a monitor was created — how to verify it fires (`monitor test` and the `setup-monitors` "Verify It Fires" recipe). The idempotent "nothing to change" re-run summary carries the same `doctor` pointer.
+5. **Summarize.** Prints a "what happens next + how to verify" summary: automatic startup is conditioned on the Claude Code plugin being present ("If you're using the AgentMon Claude Code plugin, monitoring starts automatically the next time you open a Claude Code session"), with the manual `agentmonitors daemon run` alternative stated on the very next line for any other host or bare-terminal setup (issue #338 item 3 — the prior unconditional "starts automatically" phrasing overpromised outside Claude Code); a one-shot `daemon once` check; a pointer to `agentmonitors doctor` as the health-check next step (issue #331 — `doctor` is otherwise undiscoverable outside `--help`); and — when a monitor was created — how to verify it fires (`monitor test` and the `setup-monitors` "Verify It Fires" recipe). The idempotent "nothing to change" re-run summary carries the same `doctor` pointer.
 
 **Idempotency:** re-running the bootstrap on an already-enabled project whose `.gitignore` is correct (and, for `--yes`, whose default monitor already exists) changes nothing and prints an "already set up — nothing to change" message. Exits 0.
 
@@ -219,7 +219,8 @@ If the ID cannot be derived from the path (unusual), the full file path is used 
 If no monitors are found: prints `No monitors found.`
 
 If a file path (rather than a directory) is passed: prints an error to stderr naming
-`agentmonitors monitor test` as the symmetric command for single-file testing, and exits 1.
+`agentmonitors monitor test` as the symmetric command for single-file testing, and exits 1
+(`monitor test` redirects the other direction for a directory argument — §6).
 
 **JSON format (`--format json`):**
 
@@ -425,6 +426,10 @@ agentmonitors monitor test <path> [options]
   establish a baseline or run the second observation.
 - For stateful sources with no first-run observations: prints baseline message, runs second observation, then either prints observations or explains no changes were detected.
 - Prints observation titles and snapshots.
+- If a directory (rather than a single file) is passed: prints an error to stderr naming
+  `agentmonitors validate` as the symmetric command for a whole directory, and exits 1 — instead of
+  a raw `EISDIR` read error (issue #338 item 6; the shared `requireFile()` helper mirrors
+  `validate`'s own `requireDirectory()` file-vs-directory redirect, §3).
 
 **JSON format (`--format json`):**
 
@@ -900,7 +905,7 @@ agentmonitors session open --host-session-id <id> [options]
 | `--agent-identity <id>`    | string            | —                         | Explicit AgentMon agent identity                                                                                                                                                                                                                                 |
 | `--hook-state-path <path>` | string            | —                         | Override hook-state file path                                                                                                                                                                                                                                    |
 | `--role <role>`            | choices           | `lead`                    | `lead`, `subagent`                                                                                                                                                                                                                                               |
-| `--format <format>`        | choices           | `text`                    | `text`, `json`                                                                                                                                                                                                                                                   |
+| `--format <format>`        | choices           | `text`                    | `text`, `json`, `id`                                                                                                                                                                                                                                             |
 
 Calls `claudeCodeAdapter.createSessionInput()` before sending to the daemon (`session.open` IPC method).
 
@@ -913,6 +918,14 @@ Hook state: <session.hookStatePath>
 ```
 
 **JSON output:** full `AgentSessionRecord` object.
+
+**`--format id` output:** just `<session.id>` — no surrounding text, no JSON envelope. Added
+(issue #338 item 4) so verification recipes that only need the AgentMon session id for later
+commands don't need a hand-rolled JSON-parsing one-liner:
+
+```bash
+AGENTMON_SESSION_ID=$(agentmonitors session open --host-session-id "$HOST_ID" --format id)
+```
 
 ### §10.2 `session close`
 
@@ -1017,23 +1030,33 @@ After all sessions for a workspace are closed, the daemon's idle reaper will sto
 agentmonitors events list --session <id> [options]
 ```
 
-| Flag                  | Type                | Default          | Description                                    |
-| --------------------- | ------------------- | ---------------- | ---------------------------------------------- |
-| `--session <id>`      | string (required)   | —                | AgentMon session id                            |
-| `--socket <path>`     | string              | resolved default | Unix domain socket path                        |
-| `--monitor <id>`      | string              | —                | Filter by monitor id                           |
-| `--urgency <urgency>` | choices             | —                | `low`, `normal`, `high`                        |
-| `--tag <tag>`         | string (repeatable) | `[]`             | Filter by tag; may be specified multiple times |
-| `--scope <pairs>`     | string              | —                | Scope filters as `key=value,key2=value2`       |
-| `--unread`            | boolean flag        | —                | Only unread events                             |
-| `--since-baseline`    | boolean flag        | —                | Only events since the session baseline         |
-| `--format <format>`   | choices             | auto (see §1)    | `toon`, `json`, `text`                         |
+| Flag                  | Type                | Default          | Description                                          |
+| --------------------- | ------------------- | ---------------- | ---------------------------------------------------- |
+| `--session <id>`      | string (required)   | —                | AgentMon session id                                  |
+| `--socket <path>`     | string              | resolved default | Unix domain socket path                              |
+| `--monitor <id>`      | string              | —                | Filter by monitor id                                 |
+| `--urgency <urgency>` | choices             | —                | `low`, `normal`, `high`                              |
+| `--tag <tag>`         | string (repeatable) | `[]`             | Filter by tag; may be specified multiple times       |
+| `--scope <pairs>`     | string              | —                | Scope filters as `key=value,key2=value2`             |
+| `--unread`            | boolean flag        | —                | Only unread events (unacknowledged — see note below) |
+| `--since-baseline`    | boolean flag        | —                | Only events since the session baseline               |
+| `--format <format>`   | choices             | auto (see §1)    | `toon`, `json`, `text`                               |
+
+**`--unread` matches "unacknowledged," not "never seen" (002 §7; issue #338 item 1).** It filters
+on `acknowledgedAt IS NULL`, which **includes** events already claimed at a delivery lifecycle but
+not yet run through `events ack`. Each returned event's `deliveryState` field (see below)
+disambiguates: `unread` (never surfaced), `claimed` (surfaced once, still unacknowledged), or
+`acknowledged`.
 
 **TOON output (`--format toon`):** encodes the `MonitorEventRecord[]` array using `@toon-format/toon` `encode()`. Decodes losslessly to the JSON value.
 
-**Text output (`--format text`):** one line per event: `<id>  <monitorId>  <urgency>  <title>`
+**Text output (`--format text`):** one line per event: `<id>  <monitorId>  <urgency>  <deliveryState>  <title>`
 
-**JSON output (`--format json`):** `MonitorEventRecord[]` array.
+**JSON output (`--format json`):** `MonitorEventRecord[]` array. Each element carries a
+`deliveryState?: 'unread' | 'claimed' | 'acknowledged'` field reporting the **requesting session's**
+delivery state for that event (002 §7). Present only because this query is always session-scoped
+(`--session` is required); a hypothetical unscoped `listEvents()` call in core has no single
+session's state to report and leaves the field `undefined`.
 
 **Scope parsing:** the `--scope` value is split on `,`, then each segment is split on `=` to build a `Record<string, string>`. Segments that cannot be parsed as `key=value` are silently dropped.
 

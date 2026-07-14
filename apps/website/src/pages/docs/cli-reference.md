@@ -399,11 +399,14 @@ agentmonitors session open --host-session-id <id> [options]
 | `--agent-identity <id>`     | —                   | Explicit AgentMon agent identity        |
 | `--hook-state-path <path>`  | —                   | Override hook-state file path           |
 | `--role <role>`             | `lead`              | `lead`, `subagent`                      |
-| `--format <format>`         | `text`              | `text`, `json`                          |
+| `--format <format>`         | `text`              | `text`, `json`, `id`                    |
 
 ```bash
 agentmonitors session open --host-session-id claude-abc123
 ```
+
+`--format id` prints just the bare session id — no JSON parsing needed to pull it out of a
+verification script.
 
 ### `session close`
 
