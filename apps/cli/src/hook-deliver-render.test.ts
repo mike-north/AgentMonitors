@@ -523,6 +523,14 @@ describe('renderMonitoringDisabledAdvisory', () => {
     expect(ctx).toContain('enabled: true');
   });
 
+  // Criterion 2 (issue #331): the advisory also points at `agentmonitors
+  // doctor` for the full workspace-health picture, not just the enable step.
+  it('also names `agentmonitors doctor` for the full workspace-health picture', () => {
+    const ctx = renderMonitoringDisabledAdvisory(1, 'SessionStart')
+      .hookSpecificOutput.additionalContext;
+    expect(ctx).toContain('agentmonitors doctor');
+  });
+
   it('uses singular "definition" for a count of exactly 1', () => {
     const ctx = renderMonitoringDisabledAdvisory(1, 'SessionStart')
       .hookSpecificOutput.additionalContext;

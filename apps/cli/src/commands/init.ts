@@ -332,6 +332,7 @@ async function runBootstrap(options: BootstrapOptions): Promise<void> {
     console.log(
       `\nAdd another monitor with:  agentmonitors init <name> --type <type>`,
     );
+    console.log('Check overall health any time:  agentmonitors doctor');
     return;
   }
 
@@ -374,6 +375,7 @@ async function runBootstrap(options: BootstrapOptions): Promise<void> {
   console.log(
     `  • Run a one-shot tick now:  agentmonitors daemon once ${options.dir}`,
   );
+  console.log('  • Check overall health any time:  agentmonitors doctor');
 
   if (monitor.kind === 'created') {
     console.log('\nVerify the monitor fires');
@@ -448,6 +450,7 @@ export const initCommand = new Command('init')
         console.log(`Created monitor: ${monitorDir}/MONITOR.md`);
         console.log(`\nEdit the file to configure your monitor, then run:`);
         console.log(`  agentmonitors validate ${options.dir}`);
+        console.log(`  agentmonitors doctor`);
         return;
       }
 

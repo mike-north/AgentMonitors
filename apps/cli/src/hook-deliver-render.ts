@@ -303,6 +303,10 @@ export function renderHookDelivery(
  * `sanitize()`/truncation is needed (contrast {@link renderHookDelivery},
  * which injects untrusted monitor-authored body text).
  *
+ * The message also names `agentmonitors doctor` (issue #331) — the enable
+ * step alone doesn't tell the author whether the monitors they authored are
+ * otherwise healthy; `doctor` is the single command that answers that.
+ *
  * @param monitorCount - Number of monitor definitions discovered under the
  *   project's `.claude/monitors` directory (both files that parsed
  *   successfully and files that failed to parse — a malformed monitor is
@@ -320,7 +324,8 @@ export function renderMonitoringDisabledAdvisory(
     `AgentMon: monitoring is disabled for this project ` +
     `(${String(monitorCount)} monitor definition${plural} found under .claude/monitors/, ` +
     `but none of them are being watched). To enable it, create ` +
-    '`.claude/agentmonitors.local.md` in this project with `enabled: true`.';
+    '`.claude/agentmonitors.local.md` in this project with `enabled: true`. ' +
+    'Run `agentmonitors doctor` any time for the full workspace-health picture.';
   return {
     continue: true,
     hookSpecificOutput: {

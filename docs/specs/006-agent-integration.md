@@ -552,8 +552,9 @@ shell-guarded for the "installed plugin, missing CLI" case (a user who hasn't ye
   command exits 0 with no stdout. If it finds **one or more** (counting both files that parsed
   successfully and files that failed to parse — a malformed monitor is still evidence the user
   tried), it emits a single `additionalContext` advisory stating that monitoring is disabled, how
-  many monitor definitions were found, and the exact enable step (create
-  `.claude/agentmonitors.local.md` with `enabled: true`) — then still exits 0 **without** opening a
+  many monitor definitions were found, the exact enable step (create
+  `.claude/agentmonitors.local.md` with `enabled: true`), and a pointer to `agentmonitors doctor`
+  for the full workspace-health picture (issue #331) — then still exits 0 **without** opening a
   session or booting a daemon (this scan-and-advise step never auto-enables the project or starts
   the runtime; it is advisory only, same as the CLI-absent hint above). Rendered by
   `renderMonitoringDisabledAdvisory()` (`apps/cli/src/hook-deliver-render.ts`), called from

@@ -29,6 +29,13 @@ interface DoctorCheck {
 // #269) — creating `.claude/agentmonitors.local.md` with `enabled: true` —
 // but leads with the one-shot bootstrap command (issue #310) that now does
 // that for you.
+//
+// `daemon-reachable` and `lead-session`'s `detail` strings (below, in
+// buildChecks) each carry an extra context clause (issue #331): both checks
+// legitimately fail whenever no agent session is currently open (e.g. right
+// after the setup-monitors skill's manual-test recipe tears down its
+// throwaway daemon/session) — that is expected, not evidence of a broken
+// setup, so the fail line says so instead of just looking alarming.
 const ENABLE_REMEDIATION =
   'Run `agentmonitors init --enable-only`, or create `.claude/agentmonitors.local.md` in this project with `enabled: true` yourself.';
 const DAEMON_REMEDIATION =
@@ -167,7 +174,7 @@ function buildChecks(
       : {
           name: 'daemon-reachable',
           status: 'fail',
-          detail: `No daemon reachable at ${socketPath} — showing persisted state from the last tick.`,
+          detail: `No daemon reachable at ${socketPath} — showing persisted state from the last tick (expected when no agent session is currently open; the daemon starts automatically once one is).`,
           remediation: DAEMON_REMEDIATION,
         },
   );
@@ -183,7 +190,8 @@ function buildChecks(
       : {
           name: 'lead-session',
           status: 'fail',
-          detail: 'No lead session is registered for this workspace.',
+          detail:
+            'No lead session is registered for this workspace (expected when no agent session is currently open).',
           remediation: LEAD_SESSION_REMEDIATION,
         },
   );

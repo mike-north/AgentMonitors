@@ -1,8 +1,12 @@
 import { DaemonConnectionError, resolveSocketPath } from './daemon-ipc.js';
 import { readLocalState } from './local-state.js';
 
+// Names `agentmonitors doctor` alongside the daemon-run fix-it command (issue
+// #331): a bare "no daemon" message doesn't say whether anything else is
+// wrong (project not enabled, no monitors, invalid definitions) — doctor is
+// the single command that answers all of that in one pass.
 export const NO_WORKSPACE_DAEMON_MESSAGE =
-  'No daemon running for this workspace - start it with `agentmonitors daemon run`, or it starts automatically when a Claude Code session opens.';
+  'No daemon running for this workspace - start it with `agentmonitors daemon run` (or it starts automatically when a Claude Code session opens), then run `agentmonitors doctor` for the full workspace-health picture.';
 
 /**
  * Resolve the socket used by interactive/manual daemon commands.
