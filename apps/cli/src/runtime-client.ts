@@ -5,6 +5,7 @@ import type {
   DeliveryLifecycle,
   DoctorReportInput,
   EventQuery,
+  HookDeliveryDiagnosis,
   MonitorDoctorReport,
   MonitorExplainInput,
   MonitorExplainReport,
@@ -106,6 +107,24 @@ export async function previewSettledHighDeliveryClient(
   return await callDaemon<DeliveryEventSummary[]>(
     'hook.preview',
     { sessionId },
+    socketPath ? { socketPath } : {},
+  );
+}
+
+/**
+ * Diagnose (read-only) why a `claimDelivery(sessionId, lifecycle)` call would
+ * or would not surface anything right now (issue #334). Used exclusively by
+ * `hook deliver --debug` to write a stderr diagnosis alongside the unchanged
+ * stdout contract — never called on the non-debug path.
+ */
+export async function diagnoseHookDeliveryClient(
+  sessionId: string,
+  lifecycle: DeliveryLifecycle,
+  socketPath?: string,
+): Promise<HookDeliveryDiagnosis> {
+  return await callDaemon<HookDeliveryDiagnosis>(
+    'hook.diagnose',
+    { sessionId, lifecycle },
     socketPath ? { socketPath } : {},
   );
 }

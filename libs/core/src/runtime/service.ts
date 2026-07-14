@@ -23,6 +23,12 @@ import {
 } from './reminder-diagnosis.js';
 import { shapeObservation } from './shape-stage.js';
 import {
+  classifyReminderHold,
+  classifySettleWindowHold,
+  type HookDeliveryDiagnosis,
+  type HookDeliveryHold,
+} from './hook-delivery-diagnosis.js';
+import {
   RuntimeStore,
   computeNetCollapseView,
   netCollapseGroupKey,
@@ -1370,6 +1376,84 @@ export class AgentMonitorRuntime {
       delivered.map((event) => event.id),
     );
     return delivered.map((event) => toDeliveryEventSummary(event, digests));
+  }
+
+  /**
+   * Non-mutating diagnosis of why a `claimDelivery(sessionId, lifecycle)` call
+   * would (or would not) surface anything right now (issue #334). Reads only —
+   * it never claims, suppresses, re-anchors a delta, or refreshes hook state
+   * (contrast {@link claimDelivery}) — so diagnosing never consumes a delivery.
+   *
+   * Mirrors {@link claimDelivery}'s precedence exactly so the reported holds
+   * match what a real claim would decide: at `turn-interruptible`, the
+   * high-urgency settle-window hold is reported whenever pending high work is
+   * entirely unsettled; the normal-reminder hold is evaluated only when high
+   * would not already preempt this turn's delivery (settled high work exists
+   * and would deliver instead). At `turn-idle`, only the low-reminder hold is
+   * evaluated. `post-compact` (the recap lifecycle) has no coalescing/settle
+   * guard to explain — recap fires whenever `unreadCounts.total > 0` — so no
+   * band-specific holds are computed for it.
+   */
+  diagnoseHookDelivery(
+    sessionId: string,
+    lifecycle: DeliveryLifecycle,
+  ): HookDeliveryDiagnosis {
+    const now = new Date();
+    const unreadCounts = {
+      low: this.store.unreadEventsForSession(sessionId, 'low').length,
+      normal: this.store.unreadEventsForSession(sessionId, 'normal').length,
+      high: this.store.unreadEventsForSession(sessionId, 'high').length,
+    };
+    const sessionUnreadCounts = {
+      ...unreadCounts,
+      total: unreadCounts.low + unreadCounts.normal + unreadCounts.high,
+    };
+
+    const holds: HookDeliveryHold[] = [];
+    if (lifecycle === 'turn-interruptible') {
+      const pendingHigh = this.store.pendingEventsForSession(sessionId, 'high');
+      const settleHold = classifySettleWindowHold(
+        pendingHigh.map((event) => event.createdAt),
+        unreadCounts.high,
+        now,
+        DEFAULT_HIGH_URGENCY_SETTLE_MS,
+      );
+      if (settleHold) holds.push(settleHold);
+
+      // Same precedence claimDelivery uses: normal is only relevant when no
+      // settled high work exists to preempt it this turn.
+      const settledHighCount = pendingHigh.filter(
+        (event) =>
+          now.getTime() - event.createdAt.getTime() >=
+          DEFAULT_HIGH_URGENCY_SETTLE_MS,
+      ).length;
+      if (settledHighCount === 0) {
+        const pendingNormal = this.store.pendingEventsForSession(
+          sessionId,
+          'normal',
+        ).length;
+        const normalHold = classifyReminderHold(
+          'normal',
+          unreadCounts.normal,
+          pendingNormal,
+        );
+        if (normalHold) holds.push(normalHold);
+      }
+    } else if (lifecycle === 'turn-idle') {
+      const pendingLow = this.store.pendingEventsForSession(
+        sessionId,
+        'low',
+      ).length;
+      const lowHold = classifyReminderHold('low', unreadCounts.low, pendingLow);
+      if (lowHold) holds.push(lowHold);
+    }
+
+    return {
+      sessionId,
+      lifecycle,
+      unreadCounts: sessionUnreadCounts,
+      holds,
+    };
   }
 
   async tick(

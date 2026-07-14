@@ -39,6 +39,7 @@ const daemonMethodSchema = z.enum([
   'events.ack',
   'hook.claim',
   'hook.preview',
+  'hook.diagnose',
   'history.list',
   'monitor.explain',
   'daemon.tick',
@@ -91,6 +92,10 @@ const hookClaimParamsSchema = z.object({
 });
 const hookPreviewParamsSchema = z.object({
   sessionId: z.string(),
+});
+const hookDiagnoseParamsSchema = z.object({
+  sessionId: z.string(),
+  lifecycle: deliveryLifecycleSchema,
 });
 const historyListParamsSchema = z.object({
   monitorId: z.string().optional(),
@@ -444,6 +449,12 @@ function handleRequest(
       const params = hookPreviewParamsSchema.parse(request.params);
       return Promise.resolve(
         runtime.previewSettledHighDelivery(params.sessionId),
+      );
+    }
+    case 'hook.diagnose': {
+      const params = hookDiagnoseParamsSchema.parse(request.params);
+      return Promise.resolve(
+        runtime.diagnoseHookDelivery(params.sessionId, params.lifecycle),
       );
     }
     case 'history.list': {

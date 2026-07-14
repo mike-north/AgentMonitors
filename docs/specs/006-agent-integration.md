@@ -390,6 +390,36 @@ empty stdout is the signal to Claude Code to proceed silently.
 unhandled error would interrupt the user's session. The wrapping try/catch ensures the command
 always exits 0 regardless of IPC failures, missing state, or unexpected errors.
 
+### 5.2.1 `--debug` diagnosis (issue #334)
+
+Every quiet-return step in §5.2 (steps 2–8) is, by design, indistinguishable from the outside: an
+unknown `session_id`, a disabled workspace, an unreachable daemon, and genuinely "nothing pending"
+all produce identical empty stdout + exit 0. That silence is the correct **stdout** contract (§5.1) —
+a real hook invocation must never inject diagnostic noise into the agent's context — but it leaves the
+operator with no way to tell "correctly idle" from "misconfigured" (blind DX study S3 F3).
+
+`--debug` writes a parallel diagnosis to **stderr only**, one line per step of §5.2, naming which
+branch was hit and, once a session is resolved, the pending-event counts by urgency and a per-band
+hold reason for anything not yet deliverable:
+
+- `settle-window` — pending high-urgency work exists but is not yet past the 15s claim-time settle
+  window (§9.1 of [002](./002-runtime-delivery.md)).
+- `already-claimed` / `coalesced-until-ack` — the coalesced normal/low reminder ([002 §9.2/§9.3](./002-runtime-delivery.md))
+  is currently suppressed. This is the SAME vocabulary `monitor explain`'s reminder-suppression
+  diagnosis uses ([002 §10.7](./002-runtime-delivery.md), issue #333) — both surfaces explain the
+  identical coalescing guard and MUST agree on what to call it.
+- `deferred-by-cap` — settled high-urgency events existed but some were deferred by the transport's
+  own 4000-char cap (§5.5); a hold reason owned by this transport, not the runtime.
+
+**Criterion: stdout MUST be byte-identical between a `--debug` run and a non-`--debug` run of the
+same payload against the same daemon state.** `--debug` adds exactly one extra read-only daemon call
+(the diagnosis query, `hook.diagnose`) before the existing claim; it never claims, suppresses, or
+mutates state itself, and every diagnosis write targets `process.stderr`, never `process.stdout`. An
+internal error is still swallowed on stdout (the always-exit-0 contract is unchanged); `--debug`
+additionally names it on stderr instead of disappearing silently.
+
+See [005 §12.2.1](./005-cli-reference.md) for the exact line-by-line diagnosis contract.
+
 ### 5.3 Usage
 
 The same single command line is registered on every event AgentMon cares about — the command derives

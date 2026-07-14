@@ -17,7 +17,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { writeLocalState } from '../local-state.js';
 import { daemonAvailable, callDaemon } from '../daemon-ipc.js';
@@ -224,6 +224,34 @@ function runWithStdin(
       exitCode: e.status ?? 1,
     };
   }
+}
+
+/**
+ * Like {@link runWithStdin} but captures STDERR on a SUCCESSFUL (exit 0) run
+ * too. `execFileSync`-based helpers above only surface stderr when the child
+ * throws (non-zero exit) — its return value on success is stdout alone — so
+ * they cannot see `hook deliver --debug`'s diagnosis, which is written to
+ * stderr on an always-exit-0 command. `spawnSync` captures both streams
+ * unconditionally, at the cost of not throwing on a non-zero exit (fine here:
+ * `hook deliver` always exits 0 by contract, and callers assert exitCode).
+ */
+function runWithStdinCapture(
+  args: string[],
+  env: Record<string, string>,
+  input: string,
+  cwd?: string,
+): RunResult {
+  const result = spawnSync('node', [CLI_PATH, ...args], {
+    encoding: 'utf-8',
+    env: { ...process.env, ...env },
+    cwd,
+    input,
+  });
+  return {
+    stdout: result.stdout ?? '',
+    stderr: result.stderr ?? '',
+    exitCode: result.status ?? 1,
+  };
 }
 
 async function startDaemon(
@@ -7196,6 +7224,540 @@ describe('hook claim normal-urgency reminder + suppression diagnosis (issue #333
         lifecycle: 'turn-interruptible',
         reason: 'already-claimed',
       });
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 40_000);
+});
+
+// Issue #334: blind DX study S3 F3 (High) — `hook deliver` emits empty
+// stdout + exit 0 both when nothing is pending AND when the stdin payload is
+// misconfigured (bad session_id, workspace mismatch, urgency held) —
+// indistinguishable failure modes. `--debug` must write a stderr diagnosis
+// naming which branch was hit while leaving stdout byte-identical.
+describe('hook deliver --debug diagnosis (issue #334)', () => {
+  it('help documents --debug', () => {
+    const result = run(['hook', 'deliver', '--help']);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('--debug');
+    expect(result.stdout).toContain('STDOUT is byte-identical');
+  });
+
+  // Criterion 2, branch: unknown session_id. STDOUT stays empty (unchanged
+  // contract); STDERR names the specific reason (no tracked session matches).
+  it('unknown session_id: stdout stays empty, stderr names the unresolved session', async () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-334-unknown-'));
+    mkdirSync(path.join(ws, '.claude', 'monitors'), { recursive: true });
+
+    const socket = path.join(
+      '/tmp',
+      `agentmon-334-unk-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const db = path.join(ws, 'unknown.db');
+    const hostSessionId = `known-${Date.now()}`;
+
+    writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 30_000 });
+
+    const env: Record<string, string> = {
+      CLAUDE_CODE_SESSION_ID: hostSessionId,
+      CLAUDE_PROJECT_DIR: ws,
+      AGENTMONITORS_DB: db,
+      AGENTMONITORS_SOCKET: socket,
+    };
+
+    const daemon = await startDaemon(
+      path.join(ws, '.claude', 'monitors'),
+      ws,
+      env,
+      socket,
+    );
+
+    try {
+      // One REAL tracked session exists, but the hook payload names a
+      // different, never-opened host session id.
+      const sessionOpen = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          hostSessionId,
+          '--workspace',
+          ws,
+          '--format',
+          'json',
+        ],
+        env,
+        ws,
+      );
+      expect(sessionOpen.exitCode).toBe(0);
+
+      const result = runWithStdinCapture(
+        ['hook', 'deliver', '--debug'],
+        env,
+        JSON.stringify({
+          session_id: 'totally-unknown-host-session',
+          hook_event_name: 'UserPromptSubmit',
+          cwd: ws,
+        }),
+        ws,
+      );
+
+      expect(result.exitCode).toBe(0);
+      // Contract unchanged: nothing pending/resolvable → empty stdout.
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toContain(
+        'no tracked AgentMon session matches host session_id "totally-unknown-host-session"',
+      );
+      expect(result.stderr).toContain('1 session(s)');
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  // Criterion 2, branch: cwd/workspace mismatch. The hook payload's cwd
+  // points at a workspace that was never enabled — stdout stays empty, stderr
+  // names the workspace path and its enabled=false state.
+  it('cwd mismatch (disabled workspace): stdout stays empty, stderr names the workspace and its enabled state', async () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-334-cwd-a-'));
+    const otherWs = mkdtempSync(path.join(tmpdir(), 'agentmon-334-cwd-b-'));
+    mkdirSync(path.join(ws, '.claude', 'monitors'), { recursive: true });
+
+    const socket = path.join(
+      '/tmp',
+      `agentmon-334-cwd-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const db = path.join(ws, 'cwd.db');
+    const hostSessionId = `cwd-${Date.now()}`;
+
+    writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 30_000 });
+    // otherWs deliberately has NO .claude/agentmonitors.local.md — the exact
+    // "not enabled" symptom a real cwd/workspace mismatch produces.
+
+    const env: Record<string, string> = {
+      CLAUDE_CODE_SESSION_ID: hostSessionId,
+      CLAUDE_PROJECT_DIR: ws,
+      AGENTMONITORS_DB: db,
+      AGENTMONITORS_SOCKET: socket,
+    };
+
+    const daemon = await startDaemon(
+      path.join(ws, '.claude', 'monitors'),
+      ws,
+      env,
+      socket,
+    );
+
+    try {
+      const sessionOpen = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          hostSessionId,
+          '--workspace',
+          ws,
+          '--format',
+          'json',
+        ],
+        env,
+        ws,
+      );
+      expect(sessionOpen.exitCode).toBe(0);
+
+      // A VALID session id, but the payload's cwd is the OTHER (disabled)
+      // workspace — the mismatch a misconfigured hook command produces.
+      const result = runWithStdinCapture(
+        ['hook', 'deliver', '--debug'],
+        env,
+        JSON.stringify({
+          session_id: hostSessionId,
+          hook_event_name: 'UserPromptSubmit',
+          cwd: otherWs,
+        }),
+        ws,
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toContain(otherWs);
+      expect(result.stderr).toContain('is not enabled');
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+      rmSync(ws, { recursive: true, force: true });
+      rmSync(otherWs, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  // Criterion 2, branch: nothing pending. Every resolution step succeeds, but
+  // there is genuinely no unread work — stdout stays empty, stderr proves the
+  // silence is "correctly idle" (pending counts are all 0, no held events).
+  it('nothing pending: stdout stays empty, stderr shows zero pending events and no holds', async () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-334-idle-'));
+    mkdirSync(path.join(ws, '.claude', 'monitors'), { recursive: true });
+
+    const socket = path.join(
+      '/tmp',
+      `agentmon-334-idle-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const db = path.join(ws, 'idle.db');
+    const hostSessionId = `idle-${Date.now()}`;
+
+    writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 30_000 });
+
+    const env: Record<string, string> = {
+      CLAUDE_CODE_SESSION_ID: hostSessionId,
+      CLAUDE_PROJECT_DIR: ws,
+      AGENTMONITORS_DB: db,
+      AGENTMONITORS_SOCKET: socket,
+    };
+
+    const daemon = await startDaemon(
+      path.join(ws, '.claude', 'monitors'),
+      ws,
+      env,
+      socket,
+    );
+
+    try {
+      const sessionOpen = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          hostSessionId,
+          '--workspace',
+          ws,
+          '--format',
+          'json',
+        ],
+        env,
+        ws,
+      );
+      expect(sessionOpen.exitCode).toBe(0);
+      const session = JSON.parse(sessionOpen.stdout) as { id: string };
+
+      const result = runWithStdinCapture(
+        ['hook', 'deliver', '--debug'],
+        env,
+        JSON.stringify({
+          session_id: hostSessionId,
+          hook_event_name: 'UserPromptSubmit',
+          cwd: ws,
+        }),
+        ws,
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toContain(`resolved session ${session.id}`);
+      expect(result.stderr).toContain('high=0 normal=0 low=0 (total 0)');
+      expect(result.stderr).toContain('no held events for this lifecycle');
+      expect(result.stderr).toContain('claim: null');
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  // Criterion 2, branch: events held by the settle window. A high-urgency
+  // monitor with a short debounce (settle-for: 1s) materializes its event well
+  // before the SEPARATE 15s claim-time settle window (002 §9.1) elapses — a
+  // real, observable "held, not lost" state without any real-clock 15s wait.
+  it('high-urgency event held by the settle window: stdout stays empty, stderr names the settle-window hold', async () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-334-settle-'));
+    const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-fast');
+    mkdirSync(monitorsDir, { recursive: true });
+
+    const watchedFile = path.join(ws, 'watched.txt');
+    writeFileSync(watchedFile, 'initial content', 'utf-8');
+
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      [
+        '---',
+        'name: Watch fast',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs:',
+        '    - "watched.txt"',
+        `  cwd: ${JSON.stringify(ws)}`,
+        '  interval: "1s"',
+        'urgency: high',
+        // A short notify debounce (default high debounce is 15s — the SAME
+        // duration as the claim-time settle window, so it would never be
+        // observably "held" without this override; see 002 §9.1/§9.2 and the
+        // CLAUDE.md note on the default high-urgency debounce).
+        'notify:',
+        '  strategy: debounce',
+        '  settle-for: "1s"',
+        '---',
+        'When files change, review them.',
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+
+    const socket = path.join(
+      '/tmp',
+      `agentmon-334-settle-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const db = path.join(ws, 'settle.db');
+    const hostSessionId = `settle-${Date.now()}`;
+
+    writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 30_000 });
+
+    const env: Record<string, string> = {
+      CLAUDE_CODE_SESSION_ID: hostSessionId,
+      CLAUDE_PROJECT_DIR: ws,
+      AGENTMONITORS_DB: db,
+      AGENTMONITORS_SOCKET: socket,
+    };
+
+    const daemon = await startDaemon(
+      path.join(ws, '.claude', 'monitors'),
+      ws,
+      env,
+      socket,
+    );
+
+    try {
+      const sessionOpen = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          hostSessionId,
+          '--workspace',
+          ws,
+          '--format',
+          'json',
+        ],
+        env,
+        ws,
+      );
+      expect(sessionOpen.exitCode).toBe(0);
+      const session = JSON.parse(sessionOpen.stdout) as { id: string };
+
+      // Let the baseline tick complete, then change the watched file.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
+      writeFileSync(watchedFile, 'changed content', 'utf-8');
+
+      const unread = () =>
+        runWithEnv(
+          [
+            'events',
+            'list',
+            '--session',
+            session.id,
+            '--unread',
+            '--format',
+            'json',
+          ],
+          env,
+          ws,
+        );
+
+      // The 1s notify debounce materializes the event well inside a few
+      // seconds — nowhere near the SEPARATE 15s claim-time settle window.
+      const eventDeadline = Date.now() + 10_000;
+      while (Date.now() < eventDeadline) {
+        const result = unread();
+        if (result.exitCode === 0 && JSON.parse(result.stdout).length >= 1) {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      expect(JSON.parse(unread().stdout)).toHaveLength(1);
+
+      // Immediately diagnose — the event is materialized (unread) but its age
+      // (a few seconds) is still well short of the 15s claim-time settle
+      // window, so a real claim surfaces nothing this turn.
+      const result = runWithStdinCapture(
+        ['hook', 'deliver', '--debug'],
+        env,
+        JSON.stringify({
+          session_id: hostSessionId,
+          hook_event_name: 'PostToolUse',
+          cwd: ws,
+        }),
+        ws,
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toContain('high=1');
+      expect(result.stderr).toContain('held (high, settle-window)');
+      expect(result.stderr).toContain('settle window');
+      expect(result.stderr).toContain('claim: null');
+
+      // The event is genuinely held, not lost: still unread and re-discoverable.
+      expect(JSON.parse(unread().stdout)).toHaveLength(1);
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  // Criterion 1's core regression guard: --debug MUST NOT alter stdout in any
+  // mode. Two independent sessions in the SAME workspace see the SAME shared
+  // normal-urgency event (session isolation, 002 §6) — one claimed via a
+  // plain `hook deliver`, the other via `hook deliver --debug`. Their stdout
+  // must be byte-identical; only the debug run also writes to stderr.
+  it('stdout is byte-identical between a plain hook deliver and hook deliver --debug for the same delivery', async () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-334-identical-'));
+    const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-shared');
+    mkdirSync(monitorsDir, { recursive: true });
+
+    const watchedFile = path.join(ws, 'watched.txt');
+    writeFileSync(watchedFile, 'initial content', 'utf-8');
+
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      [
+        '---',
+        'name: Watch shared',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs:',
+        '    - "watched.txt"',
+        `  cwd: ${JSON.stringify(ws)}`,
+        '  interval: "1s"',
+        'urgency: normal',
+        '---',
+        'When files change, review them.',
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+
+    const socket = path.join(
+      '/tmp',
+      `agentmon-334-ident-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const db = path.join(ws, 'identical.db');
+    const hostA = `identical-a-${Date.now()}`;
+    const hostB = `identical-b-${Date.now()}`;
+
+    writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 30_000 });
+
+    const env: Record<string, string> = {
+      CLAUDE_PROJECT_DIR: ws,
+      AGENTMONITORS_DB: db,
+      AGENTMONITORS_SOCKET: socket,
+    };
+
+    const daemon = await startDaemon(
+      path.join(ws, '.claude', 'monitors'),
+      ws,
+      env,
+      socket,
+    );
+
+    try {
+      // Two independent LEAD sessions in the same workspace — each gets its
+      // own unread/claimed projection of the same shared event (002 §6).
+      for (const hostSessionId of [hostA, hostB]) {
+        const sessionOpen = runWithEnv(
+          [
+            'session',
+            'open',
+            '--host-session-id',
+            hostSessionId,
+            '--workspace',
+            ws,
+            '--format',
+            'json',
+          ],
+          env,
+          ws,
+        );
+        expect(sessionOpen.exitCode).toBe(0);
+      }
+
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
+      writeFileSync(watchedFile, 'changed content', 'utf-8');
+
+      const unreadFor = (hostSessionId: string) => {
+        const sessionsResult = runWithEnv(
+          ['session', 'list', '--format', 'json'],
+          env,
+          ws,
+        );
+        const sessions = JSON.parse(sessionsResult.stdout) as {
+          id: string;
+          hostSessionId: string;
+        }[];
+        const session = sessions.find((s) => s.hostSessionId === hostSessionId);
+        if (!session) return [];
+        const result = runWithEnv(
+          [
+            'events',
+            'list',
+            '--session',
+            session.id,
+            '--unread',
+            '--format',
+            'json',
+          ],
+          env,
+          ws,
+        );
+        return result.exitCode === 0 ? JSON.parse(result.stdout) : [];
+      };
+
+      const eventDeadline = Date.now() + 10_000;
+      while (Date.now() < eventDeadline) {
+        if (unreadFor(hostA).length >= 1 && unreadFor(hostB).length >= 1) {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      expect(unreadFor(hostA)).toHaveLength(1);
+      expect(unreadFor(hostB)).toHaveLength(1);
+
+      const payload = (hostSessionId: string): string =>
+        JSON.stringify({
+          session_id: hostSessionId,
+          hook_event_name: 'UserPromptSubmit',
+          cwd: ws,
+        });
+
+      const plain = runWithStdinCapture(
+        ['hook', 'deliver'],
+        env,
+        payload(hostA),
+        ws,
+      );
+      const debugRun = runWithStdinCapture(
+        ['hook', 'deliver', '--debug'],
+        env,
+        payload(hostB),
+        ws,
+      );
+
+      expect(plain.exitCode).toBe(0);
+      expect(debugRun.exitCode).toBe(0);
+      // The core regression guard: stdout is byte-identical in every mode.
+      expect(debugRun.stdout).toBe(plain.stdout);
+      expect(plain.stdout.trim()).not.toBe('');
+      expect(JSON.parse(plain.stdout)).toMatchObject({
+        continue: true,
+        hookSpecificOutput: {
+          hookEventName: 'UserPromptSubmit',
+          additionalContext: 'AgentMon messages are available. Read the inbox.',
+        },
+      });
+      // Only the debug run writes diagnosis — to stderr, never stdout.
+      expect(plain.stderr).toBe('');
+      expect(debugRun.stderr).not.toBe('');
+      expect(debugRun.stderr).toContain('claim: mode=delivery');
     } finally {
       daemon.stop();
       await daemon.waitForExit();

@@ -1056,14 +1056,15 @@ Claims a pending delivery payload for a session at the specified lifecycle point
 ### §12.2 `hook deliver`
 
 ```
-agentmonitors hook deliver [--lifecycle <lifecycle>] [--format <format>] [--socket <path>]
+agentmonitors hook deliver [--lifecycle <lifecycle>] [--format <format>] [--socket <path>] [--debug]
 ```
 
-| Flag                      | Type    | Default          | Description                                                                                                                |
-| ------------------------- | ------- | ---------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `--lifecycle <lifecycle>` | choices | derived          | Optional override (`turn-interruptible`, `turn-idle`, `post-compact`); normally derived from the firing event              |
-| `--format <format>`       | choices | hook wire JSON   | `json` emits the compact Claude Code hook object; `text` emits only the rendered `additionalContext` for manual inspection |
-| `--socket <path>`         | string  | from `.local.md` | Override daemon socket path                                                                                                |
+| Flag                      | Type    | Default          | Description                                                                                                                                |
+| ------------------------- | ------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--lifecycle <lifecycle>` | choices | derived          | Optional override (`turn-interruptible`, `turn-idle`, `post-compact`); normally derived from the firing event                              |
+| `--format <format>`       | choices | hook wire JSON   | `json` emits the compact Claude Code hook object; `text` emits only the rendered `additionalContext` for manual inspection                 |
+| `--socket <path>`         | string  | from `.local.md` | Override daemon socket path                                                                                                                |
+| `--debug`                 | boolean | `false`          | Write a step-by-step diagnosis to **stderr** (issue #334); **stdout is byte-identical to a non-`--debug` run in every mode** — see §12.2.1 |
 
 **Designed to run as a Claude Code lifecycle hook.** Reads the hook payload as **JSON on stdin**
 (Claude Code delivers hook input via stdin, **not** env vars — there is no `CLAUDE_CODE_SESSION_ID`
@@ -1122,6 +1123,41 @@ wire JSON. The example below is pretty-printed for readability; the command emit
 **Text output (`--format text`):** prints only the rendered
 `hookSpecificOutput.additionalContext` string, with no JSON wrapper. This format is for manual
 inspection; hook configurations should use the default/json wire output.
+
+#### §12.2.1 `--debug` diagnosis (issue #334)
+
+Empty stdout + exit 0 is the command's contract both when nothing is pending **and** when the stdin
+payload is misconfigured (unknown session, workspace not enabled, urgency held) — indistinguishable
+failure modes for the command most often run by an invisible hook system, and undiagnosable without
+a flag (blind DX study S3 F3). `--debug` writes a parallel, step-by-step diagnosis to **stderr only**;
+**stdout's contract does not change in any mode** — a hook wired without `--debug` behaves exactly as
+before, and running the identical payload with and without `--debug` produces byte-identical stdout.
+
+Each line is prefixed `agentmonitors hook deliver --debug:` for easy filtering. The diagnosis reports,
+in order:
+
+1. The parsed stdin payload's `session_id` / `hook_event_name` / `cwd` (or `(none)` when absent).
+2. Why resolution stopped, if it did — no `session_id`; an unmapped `hook_event_name` (§12.2 step 2);
+   a disabled/misconfigured workspace (§12.2 step 3, the "cwd mismatch" symptom); no socket configured;
+   an unreachable daemon; or no tracked session matching `session_id` (a workspace/session mismatch).
+3. On successful resolution: the resolved AgentMon session id, workspace, and status.
+4. **Pending-event counts by urgency** for the resolved session at the resolved lifecycle (a read-only
+   query; never claims).
+5. **Per-band hold reasons** for anything not yet deliverable, naming the mechanism:
+   - `settle-window` — pending high-urgency events exist but none has aged past the 15s claim-time
+     settle window yet (002 §9.1).
+   - `already-claimed` / `coalesced-until-ack` — the coalesced normal/low reminder (002 §9.2/§9.3) is
+     suppressed because some or all of the band's unread events are already claimed. This is the SAME
+     vocabulary `monitor explain`'s reminder-suppression diagnosis uses (002 §10.7, issue #333), so the
+     two surfaces agree on what to call it.
+   - `deferred-by-cap` — settled high-urgency events existed but some were deferred by the transport's
+     4000-char `additionalContext` cap (issue #299, §12.2's redelivery guarantee); they will redeliver
+     at the next context event.
+6. The actual `claimDelivery` result (mode/urgency/event count, or `null`).
+7. Whether anything was emitted to stdout, and in which format.
+
+Any internal error is still swallowed on stdout (the always-exit-0 contract, unchanged); in `--debug`
+mode it is additionally named on stderr rather than silently disappearing.
 
 **Lifecycle → urgency surfacing:**
 
