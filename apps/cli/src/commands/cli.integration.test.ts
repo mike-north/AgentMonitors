@@ -512,6 +512,320 @@ describe('init', () => {
     expect(result.stdout).toBe(expected);
     expect(result.stderr).toBe('');
   });
+
+  // Issue #330 AC1: each --type's watch block is a correct, minimal,
+  // source-appropriate example (per skill.md Phase 3's per-source table) with
+  // no cross-type leftovers — e.g. a command-poll scaffold must not carry a
+  // file-fingerprint-era `globs:` block.
+  it.each([
+    { type: 'file-fingerprint', ownMarker: 'globs:' },
+    { type: 'api-poll', ownMarker: 'url:' },
+    { type: 'command-poll', ownMarker: 'command:' },
+    { type: 'schedule', ownMarker: 'cron:' },
+    { type: 'incoming-changes', ownMarker: 'paths:' },
+  ])(
+    '$type scaffold carries only its own marker field, not other types’ (AC1)',
+    ({ type, ownMarker }) => {
+      const otherMarkers = [
+        'globs:',
+        'url:',
+        'command:',
+        'cron:',
+        'paths:',
+      ].filter((marker) => marker !== ownMarker);
+      const dir = path.join(tempDir, `init-ac1-${type}`);
+      mkdirSync(dir, { recursive: true });
+      const monitorsDir = path.join(dir, 'monitors');
+      const created = run(
+        ['init', 'ac1-mon', '--dir', monitorsDir, '--type', type],
+        dir,
+      );
+      expect(created.exitCode).toBe(0);
+      const monitor = readFileSync(
+        path.join(monitorsDir, 'ac1-mon', 'MONITOR.md'),
+        'utf-8',
+      );
+      expect(monitor).toContain(ownMarker);
+      for (const otherMarker of otherMarkers) {
+        expect(monitor).not.toContain(otherMarker);
+      }
+
+      const validated = run(['validate', monitorsDir, '--format', 'json'], dir);
+      expect(validated.exitCode).toBe(0);
+      const parsed = JSON.parse(validated.stdout) as {
+        valid: number;
+        invalid: number;
+      };
+      expect(parsed.valid).toBe(1);
+      expect(parsed.invalid).toBe(0);
+    },
+  );
+
+  // Issue #330 AC2: --glob seeds watch.globs verbatim for file-fingerprint,
+  // and the seeded scaffold still passes validate.
+  it('--glob seeds watch.globs verbatim for file-fingerprint (AC2)', () => {
+    const dir = path.join(tempDir, 'init-glob-ff');
+    mkdirSync(dir, { recursive: true });
+    const monitorsDir = path.join(dir, 'monitors');
+    const created = run(
+      [
+        'init',
+        'glob-mon',
+        '--dir',
+        monitorsDir,
+        '--type',
+        'file-fingerprint',
+        '--glob',
+        'src/**/*.ts',
+        '--glob',
+        'test/**/*.ts',
+      ],
+      dir,
+    );
+    expect(created.exitCode).toBe(0);
+    const monitor = readFileSync(
+      path.join(monitorsDir, 'glob-mon', 'MONITOR.md'),
+      'utf-8',
+    );
+    expect(monitor).toContain("    - 'src/**/*.ts'");
+    expect(monitor).toContain("    - 'test/**/*.ts'");
+    // The stock '**/*.ts' example must be replaced, not appended alongside.
+    expect(monitor).not.toContain("    - '**/*.ts'");
+
+    const validated = run(['validate', monitorsDir, '--format', 'json'], dir);
+    expect(validated.exitCode).toBe(0);
+    const parsed = JSON.parse(validated.stdout) as {
+      valid: number;
+      invalid: number;
+    };
+    expect(parsed.valid).toBe(1);
+    expect(parsed.invalid).toBe(0);
+  });
+
+  // Issue #330 AC2: --glob seeds watch.paths verbatim for incoming-changes
+  // (a different underlying frontmatter field than file-fingerprint's
+  // `globs:`, per spec 001 §2 / spec 003 §6), and still passes validate.
+  it('--glob seeds watch.paths verbatim for incoming-changes (AC2)', () => {
+    const dir = path.join(tempDir, 'init-glob-incoming');
+    mkdirSync(dir, { recursive: true });
+    const monitorsDir = path.join(dir, 'monitors');
+    const created = run(
+      [
+        'init',
+        'glob-inc-mon',
+        '--dir',
+        monitorsDir,
+        '--type',
+        'incoming-changes',
+        '--glob',
+        'docs/**',
+      ],
+      dir,
+    );
+    expect(created.exitCode).toBe(0);
+    const monitor = readFileSync(
+      path.join(monitorsDir, 'glob-inc-mon', 'MONITOR.md'),
+      'utf-8',
+    );
+    expect(monitor).toContain("    - 'docs/**'");
+    expect(monitor).not.toContain("    - 'docs/specs/**'");
+
+    const validated = run(['validate', monitorsDir, '--format', 'json'], dir);
+    expect(validated.exitCode).toBe(0);
+    const parsed = JSON.parse(validated.stdout) as {
+      valid: number;
+      invalid: number;
+    };
+    expect(parsed.valid).toBe(1);
+    expect(parsed.invalid).toBe(0);
+  });
+
+  // Issue #330 AC2: --glob has nowhere to go for a type with no path-pattern
+  // list (e.g. command-poll's `command:` is an argv array, not globs) — this
+  // must fail loudly with a clear message, not silently drop the flag.
+  it('--glob is rejected with a clear error for a type with no path-pattern list (AC2)', () => {
+    const dir = path.join(tempDir, 'init-glob-unsupported');
+    mkdirSync(dir, { recursive: true });
+    const monitorsDir = path.join(dir, 'monitors');
+    const result = run(
+      [
+        'init',
+        'bad-glob-mon',
+        '--dir',
+        monitorsDir,
+        '--type',
+        'command-poll',
+        '--glob',
+        'src/**',
+      ],
+      dir,
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain(
+      '--glob is not supported for --type command-poll',
+    );
+    expect(existsSync(path.join(monitorsDir, 'bad-glob-mon'))).toBe(false);
+  });
+
+  // Regression (PR #343 review): a multi-line seed value would emit an
+  // invalid single-quoted YAML scalar spanning lines — reject it loudly
+  // instead of scaffolding a monitor that fails its own validate step.
+  it('rejects a --name containing a newline instead of emitting invalid YAML', () => {
+    const dir = path.join(tempDir, 'init-newline-name');
+    const monitorsDir = path.join(dir, 'monitors');
+    mkdirSync(dir, { recursive: true });
+    const result = run(
+      [
+        'init',
+        'newline-mon',
+        '--dir',
+        monitorsDir,
+        '--type',
+        'file-fingerprint',
+        '--name',
+        'first line\nsecond line',
+      ],
+      dir,
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('must be single-line');
+    expect(existsSync(path.join(monitorsDir, 'newline-mon'))).toBe(false);
+  });
+
+  // Issue #330 AC2: --name seeds the frontmatter name: field verbatim,
+  // including a value that needs YAML single-quote escaping, and the result
+  // still passes validate (proving the escaping round-trips correctly).
+  it('--name seeds the frontmatter name field verbatim, including quote-escaping (AC2)', () => {
+    const dir = path.join(tempDir, 'init-name-seed');
+    mkdirSync(dir, { recursive: true });
+    const monitorsDir = path.join(dir, 'monitors');
+    const created = run(
+      [
+        'init',
+        'name-mon',
+        '--dir',
+        monitorsDir,
+        '--type',
+        'file-fingerprint',
+        '--name',
+        "Mike's monitor",
+      ],
+      dir,
+    );
+    expect(created.exitCode).toBe(0);
+    const monitor = readFileSync(
+      path.join(monitorsDir, 'name-mon', 'MONITOR.md'),
+      'utf-8',
+    );
+    expect(monitor).toContain("name: 'Mike''s monitor'");
+
+    const validated = run(['validate', monitorsDir, '--format', 'json'], dir);
+    expect(validated.exitCode).toBe(0);
+    const parsed = JSON.parse(validated.stdout) as {
+      valid: number;
+      invalid: number;
+      monitors: { name: string }[];
+    };
+    expect(parsed.valid).toBe(1);
+    expect(parsed.monitors[0]?.name).toBe("Mike's monitor");
+  });
+
+  // Issue #330 AC2: --urgency seeds the frontmatter urgency: field verbatim
+  // and still passes validate; an out-of-band value is rejected by
+  // Commander's --choices before scaffolding runs.
+  it('--urgency seeds the frontmatter urgency field verbatim (AC2)', () => {
+    const dir = path.join(tempDir, 'init-urgency-seed');
+    mkdirSync(dir, { recursive: true });
+    const monitorsDir = path.join(dir, 'monitors');
+    const created = run(
+      [
+        'init',
+        'urgency-mon',
+        '--dir',
+        monitorsDir,
+        '--type',
+        'schedule',
+        '--urgency',
+        'high',
+      ],
+      dir,
+    );
+    expect(created.exitCode).toBe(0);
+    const monitor = readFileSync(
+      path.join(monitorsDir, 'urgency-mon', 'MONITOR.md'),
+      'utf-8',
+    );
+    expect(monitor).toContain('urgency: high');
+
+    const validated = run(['validate', monitorsDir, '--format', 'json'], dir);
+    expect(validated.exitCode).toBe(0);
+    const parsed = JSON.parse(validated.stdout) as {
+      valid: number;
+      invalid: number;
+    };
+    expect(parsed.valid).toBe(1);
+  });
+
+  it('rejects an invalid --urgency value', () => {
+    const dir = path.join(tempDir, 'init-urgency-invalid');
+    mkdirSync(dir, { recursive: true });
+    const result = run(
+      [
+        'init',
+        'bad-urgency-mon',
+        '--dir',
+        path.join(dir, 'monitors'),
+        '--urgency',
+        'urgent',
+      ],
+      dir,
+    );
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("'urgent'");
+  });
+
+  // Issue #330 AC2: all three seed flags combine cleanly on a single
+  // scaffold.
+  it('combines --glob, --name, and --urgency on a single scaffold (AC2)', () => {
+    const dir = path.join(tempDir, 'init-seed-combo');
+    mkdirSync(dir, { recursive: true });
+    const monitorsDir = path.join(dir, 'monitors');
+    const created = run(
+      [
+        'init',
+        'combo-mon',
+        '--dir',
+        monitorsDir,
+        '--type',
+        'file-fingerprint',
+        '--glob',
+        'lib/**/*.ts',
+        '--name',
+        'TS source watcher',
+        '--urgency',
+        'low',
+      ],
+      dir,
+    );
+    expect(created.exitCode).toBe(0);
+    const monitor = readFileSync(
+      path.join(monitorsDir, 'combo-mon', 'MONITOR.md'),
+      'utf-8',
+    );
+    expect(monitor).toContain("name: 'TS source watcher'");
+    expect(monitor).toContain("    - 'lib/**/*.ts'");
+    expect(monitor).toContain('urgency: low');
+
+    const validated = run(['validate', monitorsDir, '--format', 'json'], dir);
+    expect(validated.exitCode).toBe(0);
+    const parsed = JSON.parse(validated.stdout) as {
+      valid: number;
+      invalid: number;
+      monitors: { name: string }[];
+    };
+    expect(parsed.valid).toBe(1);
+    expect(parsed.monitors[0]?.name).toBe('TS source watcher');
+  });
 });
 
 // Issue #268: bare `agentmonitors init` (no name) is a one-shot project
