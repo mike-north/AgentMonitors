@@ -8,6 +8,8 @@
     "start": "next start",
     "test": "vitest run",
     "check": "tsc --noEmit",
+    "check:links": "start-server-and-test start http://localhost:3000 link-check",
+    "link-check": "linkinator http://localhost:3000 --recurse --check-fragments --skip \"^(?!http://localhost)\"",
     "clean": "rm -rf .next"
   },
   "dependencies": {
@@ -21,6 +23,8 @@
     "@types/node": "^22.15.0",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
+    "linkinator": "^7.6.1",
+    "start-server-and-test": "^3.0.11",
     "typescript": "^5.9.0"
   }
 }

@@ -27,17 +27,35 @@ pnpm build
 Next.js outputs to `.next/`. This is excluded from the monorepo root `pnpm build` / `check`
 targets by design — the website is a private app that has its own build cycle.
 
+## Link checking
+
+```bash
+pnpm --filter @agentmonitors/website build      # check:links runs against the production build
+pnpm --filter @agentmonitors/website run check:links
+```
+
+`check:links` starts the built site (`next start`) and crawls it with
+[linkinator](https://github.com/JustinBeckwith/linkinator), following every internal link and
+validating `#fragment` anchors against the rendered HTML (`--check-fragments`) — no hand-built
+approximation of route or anchor resolution. External links are excluded from the hard-failure
+path (`--skip`), per this check's scope: internal link/anchor rot only. CI runs this on every PR
+that touches `apps/website/**` (see `.github/workflows/ci.yml`, job `website-link-check`).
+
 ## Raw-Markdown serving
 
 Every doc page is available as plain `.md` at its URL plus the `.md` extension:
 
 | HTML | Raw Markdown |
 |---|---|
+| `/` | `/index.md` |
 | `/docs/getting-started` | `/docs/getting-started.md` |
 | `/docs/authoring-monitors` | `/docs/authoring-monitors.md` |
 | `/docs/use-cases` | `/docs/use-cases.md` |
 | `/docs/monitor-standard` | `/docs/monitor-standard.md` |
-| `/` | `/index.md` |
+| `/docs/concepts` | `/docs/concepts.md` |
+| `/docs/notify-when-a-file-changes` | `/docs/notify-when-a-file-changes.md` |
+| `/docs/agent-integration` | `/docs/agent-integration.md` |
+| `/docs/troubleshooting` | `/docs/troubleshooting.md` |
 
 The raw endpoint returns `Content-Type: text/markdown` — usable from `curl`, LLM agents,
 or any HTTP client that wants the plain source.
@@ -58,48 +76,30 @@ or any HTTP client that wants the plain source.
 | `/docs/use-cases` | `src/pages/docs/use-cases.md` | Use cases & journeys |
 | `/docs/monitor-standard` | `src/pages/docs/monitor-standard.md` | The open Monitor Standard |
 | `/docs/concepts` | `src/pages/docs/concepts.md` | Core concepts overview |
+| `/docs/notify-when-a-file-changes` | `src/pages/docs/notify-when-a-file-changes.md` | End-to-end: notified mid-session when a file changes |
+| `/docs/agent-integration` | `src/pages/docs/agent-integration.md` | Delivery transports, urgency timing, running without MCP |
+| `/docs/troubleshooting` | `src/pages/docs/troubleshooting.md` | Symptom-first fixes for monitors that don't fire or notify |
 
-## Deploy to Vercel (manual steps for the owner)
+`public/skill.md` (served at `/skill.md`, linked from the landing page and Getting Started) is a
+separate, static, agent-readable setup guide — it has no paired HTML route, so it isn't a "page"
+in the table above, but it is part of the site's served surface.
 
-### 1. Import the project
+## Deploy
 
-1. Go to [vercel.com/new](https://vercel.com/new) and click **Add New… → Project**
-2. Import the `mike-north/AgentMonitors` GitHub repository
-3. Vercel will detect Next.js automatically
+Production deploys are driven entirely by `.github/workflows/deploy-website.yml` — **not**
+Vercel's own "deploy every commit" git integration, which is deliberately disabled for this
+project so a broken site never reaches production.
 
-### 2. Configure the root directory
+- **Trigger:** push to `main` touching `apps/website/**` or the workflow file itself, or a manual
+  `workflow_dispatch`.
+- **Validate gate:** the `validate` job (`pnpm --filter @agentmonitors/website check`, i.e.
+  `tsc --noEmit`) must pass before the `deploy` job — which `needs: validate` — is allowed to run.
+- **Deploy:** the `deploy` job runs `vercel deploy --prod --yes --cwd apps/website` against the
+  `site` Vercel project (`agentmonitors.io`). The only secret involved is `VERCEL_TOKEN`; the org
+  and project IDs are non-sensitive and inlined in the workflow.
+- **Concurrency:** deploys are queued (`cancel-in-progress: false`) so two production deploys
+  never race.
 
-The monorepo root is `AgentMonitors/`. The website lives in `apps/website/`. In Vercel's
-project settings:
-
-- **Framework Preset:** Next.js (auto-detected)
-- **Root Directory:** `apps/website`
-- **Build Command:** `pnpm build` (or leave as Next.js default — Vercel runs `next build`)
-- **Output Directory:** `.next` (default)
-- **Install Command:** `pnpm install` (or leave blank — Vercel detects pnpm)
-
-### 3. Set the domain to agentmonitors.io
-
-1. In your Vercel project → **Settings → Domains**
-2. Add `agentmonitors.io` and `www.agentmonitors.io`
-3. Vercel will show you the DNS records to add
-
-### 4. DNS configuration at your registrar
-
-Add these records at your domain registrar (exact values shown in Vercel after step 3):
-
-| Type | Name | Value |
-|---|---|---|
-| `A` | `@` | `76.76.21.21` (Vercel's IP — confirm in dashboard) |
-| `CNAME` | `www` | `cname.vercel-dns.com` |
-
-Propagation typically takes a few minutes but can take up to 48 hours.
-
-### 5. Verify
-
-Once DNS propagates:
-- `https://agentmonitors.io/docs/getting-started` renders HTML
-- `https://agentmonitors.io/docs/getting-started.md` returns raw Markdown
-
-The `vercel.json` at the root of `apps/website/` handles the `.md` rewrite on Vercel's edge
-automatically — no additional configuration needed.
+The domain, DNS, and Vercel project itself are one-time setup already completed for
+`agentmonitors.io` — this section only covers how *changes* reach production. To re-run a deploy
+without a new commit, use the workflow's `workflow_dispatch` trigger from the Actions tab.
