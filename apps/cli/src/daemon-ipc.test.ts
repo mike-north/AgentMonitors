@@ -8,12 +8,13 @@ import {
   existsSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   callDaemon,
   createDaemonServer,
   daemonAvailable,
   DaemonConnectionError,
+  resolveSocketPath,
 } from './daemon-ipc.js';
 import { createRuntime } from './runtime.js';
 
@@ -131,6 +132,101 @@ describe('callDaemon', () => {
         resolve();
       });
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveSocketPath: explicit --socket substitution warning (issue #337)
+// ---------------------------------------------------------------------------
+
+/**
+ * A candidate string guaranteed to exceed MAX_UNIX_SOCKET_PATH_LENGTH (100),
+ * mirroring the DX study repro (a deeply-nested sandbox path over the AF_UNIX
+ * `sun_path` limit).
+ */
+const OVER_LIMIT_SOCKET_PATH = `/tmp/${'a'.repeat(120)}/agentmon.sock`;
+
+describe('resolveSocketPath — explicit substitution warning (issue #337)', () => {
+  const originalSocketEnv = process.env['AGENTMONITORS_SOCKET'];
+
+  afterEach(() => {
+    if (originalSocketEnv === undefined) {
+      delete process.env['AGENTMONITORS_SOCKET'];
+    } else {
+      process.env['AGENTMONITORS_SOCKET'] = originalSocketEnv;
+    }
+    vi.restoreAllMocks();
+  });
+
+  // Acceptance criterion 1: any command substituting a hashed path for an
+  // EXPLICITLY passed --socket must say so on stderr — requested path, the
+  // limit exceeded, and the substituted path.
+  //
+  // Regression: pre-fix, resolveSocketPath had no `explicit` concept at all and
+  // never wrote to stderr — this assertion set fails against that code, since
+  // `writeSpy` would never be called.
+  it('warns on stderr with the requested path, the limit, and the substituted path when an explicit --socket exceeds the limit', () => {
+    const writeSpy = vi
+      .spyOn(process.stderr, 'write')
+      .mockImplementation(() => true);
+
+    const resolved = resolveSocketPath(OVER_LIMIT_SOCKET_PATH, {
+      explicit: true,
+    });
+
+    // Criterion 2: the substitution itself is unchanged — still a short,
+    // hash-derived /tmp path.
+    expect(resolved).not.toBe(OVER_LIMIT_SOCKET_PATH);
+    expect(resolved.startsWith('/tmp/agentmonitors-')).toBe(true);
+    expect(resolved.length).toBeLessThanOrEqual(100);
+
+    expect(writeSpy).toHaveBeenCalledTimes(1);
+    const [message] = writeSpy.mock.calls[0] as [string];
+    expect(message).toContain(OVER_LIMIT_SOCKET_PATH); // requested path
+    expect(message).toContain('100'); // the limit exceeded
+    expect(message).toContain(String(OVER_LIMIT_SOCKET_PATH.length)); // by how much
+    expect(message).toContain(resolved); // the substituted path
+  });
+
+  it('does not warn when an explicit --socket path is within the limit', () => {
+    const writeSpy = vi
+      .spyOn(process.stderr, 'write')
+      .mockImplementation(() => true);
+    const shortPath = '/tmp/short.sock';
+
+    const resolved = resolveSocketPath(shortPath, { explicit: true });
+
+    expect(resolved).toBe(shortPath);
+    expect(writeSpy).not.toHaveBeenCalled();
+  });
+
+  // Acceptance criterion 4: env/default-derived candidates may hash silently,
+  // as today — an over-limit candidate that was NOT flagged `explicit` (the
+  // caller passed no --socket flag at all) must stay silent.
+  it('substitutes an over-limit path silently when not marked explicit', () => {
+    const writeSpy = vi
+      .spyOn(process.stderr, 'write')
+      .mockImplementation(() => true);
+
+    const resolved = resolveSocketPath(OVER_LIMIT_SOCKET_PATH);
+
+    expect(resolved).not.toBe(OVER_LIMIT_SOCKET_PATH);
+    expect(writeSpy).not.toHaveBeenCalled();
+  });
+
+  it('stays silent for an over-limit AGENTMONITORS_SOCKET value even when explicit:true is passed with no overridePath', () => {
+    // explicit:true only matters when overridePath itself is defined — an
+    // env-derived candidate must never be attributed to the caller as if they
+    // typed --socket themselves.
+    process.env['AGENTMONITORS_SOCKET'] = OVER_LIMIT_SOCKET_PATH;
+    const writeSpy = vi
+      .spyOn(process.stderr, 'write')
+      .mockImplementation(() => true);
+
+    const resolved = resolveSocketPath(undefined, { explicit: true });
+
+    expect(resolved).not.toBe(OVER_LIMIT_SOCKET_PATH);
+    expect(writeSpy).not.toHaveBeenCalled();
   });
 });
 

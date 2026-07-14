@@ -24,7 +24,8 @@ export function resolveManualDaemonSocketPath(
   explicitSocket?: string,
   workspacePath?: string,
 ): string | undefined {
-  if (explicitSocket) return resolveSocketPath(explicitSocket);
+  if (explicitSocket)
+    return resolveSocketPath(explicitSocket, { explicit: true });
   if (process.env['AGENTMONITORS_SOCKET']) return undefined;
 
   const workspace =

@@ -59,7 +59,9 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
   const hostSessionId =
     options.hostSessionId ?? process.env['CLAUDE_CODE_SESSION_ID'];
   const workspace = options.workspace ?? process.env['CLAUDE_PROJECT_DIR'];
-  const socketPath = resolveSocketPath(options.socket);
+  const socketPath = resolveSocketPath(options.socket, {
+    explicit: options.socket !== undefined,
+  });
   const pollMs = Number.parseInt(options.pollMs, 10) || DEFAULT_POLL_MS;
 
   // The low-level Server is the correct API for a channel: it exposes the custom

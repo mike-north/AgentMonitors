@@ -168,7 +168,12 @@ Output formats:
         // per-workspace isolation.
         const explicitSocket = options.socket ?? state.socket;
         if (!explicitSocket) return;
-        const socketPath = resolveSocketPath(explicitSocket);
+        // Only a literal --socket flag is "explicit" for the substitution
+        // warning (issue #337) — a socket read from .local.md is a derived
+        // value the daemon itself chose at boot, not a user-typed request.
+        const socketPath = resolveSocketPath(explicitSocket, {
+          explicit: options.socket !== undefined,
+        });
 
         if (!(await daemonAvailable(socketPath))) return;
 

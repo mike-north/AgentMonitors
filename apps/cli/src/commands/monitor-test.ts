@@ -16,7 +16,7 @@ import {
 import { registerCoreSources } from '../sources.js';
 import { reportError } from '../output.js';
 import { renderToon, resolveFormat } from '../toon-format.js';
-import { DaemonConnectionError } from '../daemon-ipc.js';
+import { DaemonConnectionError, resolveSocketPath } from '../daemon-ipc.js';
 import {
   explainMonitorClient,
   explainMonitorInProcess,
@@ -436,6 +436,9 @@ monitorTestCommand
       const workspacePath = path.resolve(options.workspace ?? process.cwd());
       const historyLimit = Number.parseInt(options.historyLimit, 10);
       const eventLimit = Number.parseInt(options.eventLimit, 10);
+      const socketPath = resolveSocketPath(options.socket, {
+        explicit: options.socket !== undefined,
+      });
       try {
         const report = await explainMonitorClient(
           {
@@ -449,7 +452,7 @@ monitorTestCommand
               ? { eventLimit }
               : {}),
           },
-          options.socket,
+          socketPath,
         );
 
         if (json) {
@@ -585,11 +588,11 @@ monitorTestCommand
         ...(monitorId ? { monitorId } : {}),
         ...(Number.isFinite(limit) && limit > 0 ? { limit } : {}),
       };
+      const socketPath = resolveSocketPath(options.socket, {
+        explicit: options.socket !== undefined,
+      });
       try {
-        const records = await listObservationHistoryClient(
-          query,
-          options.socket,
-        );
+        const records = await listObservationHistoryClient(query, socketPath);
 
         if (json) {
           console.log(JSON.stringify(records, null, 2));

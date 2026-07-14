@@ -166,7 +166,27 @@ function socketBaseDir(): string {
   return path.dirname(dbPath);
 }
 
-export function resolveSocketPath(overridePath?: string): string {
+export interface ResolveSocketPathOptions {
+  /**
+   * Set by a caller when `overridePath` came from a `--socket` flag the user
+   * typed explicitly on the command line — as opposed to `AGENTMONITORS_SOCKET`,
+   * a `.claude/agentmonitors.local.md`-derived value, or the computed default.
+   *
+   * When `true` and the resolved candidate exceeds
+   * {@link MAX_UNIX_SOCKET_PATH_LENGTH}, a warning naming the requested path,
+   * the limit, and the substituted path is printed to stderr before the hash
+   * fallback is returned (issue #337) — an explicit request silently landing
+   * on a different socket is a correctness trap, not just a length quirk.
+   * Non-explicit candidates (env var, local-state, default) keep hashing
+   * silently, as before.
+   */
+  explicit?: boolean;
+}
+
+export function resolveSocketPath(
+  overridePath?: string,
+  options: ResolveSocketPathOptions = {},
+): string {
   const candidate =
     overridePath ??
     process.env['AGENTMONITORS_SOCKET'] ??
@@ -180,7 +200,15 @@ export function resolveSocketPath(overridePath?: string): string {
     .update(candidate)
     .digest('hex')
     .slice(0, 16);
-  return path.join('/tmp', `agentmonitors-${hash}.sock`);
+  const substituted = path.join('/tmp', `agentmonitors-${hash}.sock`);
+
+  if (options.explicit && overridePath !== undefined) {
+    process.stderr.write(
+      `Warning: --socket path "${overridePath}" is ${String(overridePath.length)} characters, which exceeds the ${String(MAX_UNIX_SOCKET_PATH_LENGTH)}-character AF_UNIX socket path limit. Falling back to ${substituted}.\n`,
+    );
+  }
+
+  return substituted;
 }
 
 function cleanupSocket(socketPath: string): void {
