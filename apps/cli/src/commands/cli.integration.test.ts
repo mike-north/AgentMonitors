@@ -29,12 +29,12 @@ const CLI_PACKAGE_DIR = path.resolve(__dirname, '../..');
 // plugin's REAL hooks.json from here (no copies) so it breaks when that file
 // drifts. apps/cli → ../../ is the monorepo root.
 const REPO_ROOT = path.resolve(CLI_PACKAGE_DIR, '..', '..');
-const PLUGIN_HOOKS_JSON_PATH = path.join(
-  REPO_ROOT,
-  'agent-plugins',
-  'agentmonitors',
-  'hooks',
-  'hooks.json',
+const PLUGIN_DIR = path.join(REPO_ROOT, 'agent-plugins', 'agentmonitors');
+const PLUGIN_HOOKS_JSON_PATH = path.join(PLUGIN_DIR, 'hooks', 'hooks.json');
+const PLUGIN_MANIFEST_PATH = path.join(
+  PLUGIN_DIR,
+  '.claude-plugin',
+  'plugin.json',
 );
 
 interface RunResult {
@@ -5263,6 +5263,24 @@ describe('plugin hooks.json config-drift UAT', () => {
       rmSync(emptyPathDir, { recursive: true, force: true });
       rmSync(ws, { recursive: true, force: true });
     }
+  });
+
+  // Claude Code auto-loads the conventional hooks/hooks.json, and rejects a
+  // manifest `hooks` entry that resolves to that same file ("Duplicate hooks
+  // file detected"), which broke plugin install. `manifest.hooks` may only
+  // name ADDITIONAL hook files.
+  it('manifest does not re-reference the auto-discovered hooks/hooks.json (duplicate hooks file rejected at plugin load)', () => {
+    const manifest = JSON.parse(
+      readFileSync(PLUGIN_MANIFEST_PATH, 'utf-8'),
+    ) as { hooks?: string | string[] };
+    const refs =
+      manifest.hooks === undefined
+        ? []
+        : Array.isArray(manifest.hooks)
+          ? manifest.hooks
+          : [manifest.hooks];
+    const resolved = refs.map((ref) => path.resolve(PLUGIN_DIR, ref));
+    expect(resolved).not.toContain(PLUGIN_HOOKS_JSON_PATH);
   });
 });
 
