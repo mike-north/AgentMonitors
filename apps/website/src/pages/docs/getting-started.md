@@ -178,7 +178,9 @@ enabled: true
 EOF
 ```
 
-Make sure `.gitignore` contains `.claude/*.local.*`.
+Make sure `.gitignore` contains `.claude/*.local.*` and `/.agentmonitors/` (the daemon's
+per-session runtime-state directory, created the moment a session opens — it's regenerated on
+every run, so it's always safe to delete). `agentmonitors init` ignores both automatically.
 
 **b. Speed up the monitor and set it to `high` urgency, for this pass only.** This is what lets you
 see the real delivered content instead of just the mechanism firing (see the urgency note above).

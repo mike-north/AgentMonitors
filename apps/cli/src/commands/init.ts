@@ -237,6 +237,22 @@ enabled: true
 /** The single line the setup-monitors skill requires in `.gitignore`. */
 const GITIGNORE_LINE = '.claude/*.local.*';
 
+/**
+ * `.agentmonitors/` is the project-root runtime directory the core writes
+ * per-session hook state into (`<workspace>/.agentmonitors/sessions/<id>/hook-state.json`,
+ * see `libs/core/src/adapter/claude.ts#defaultHookStatePath` and
+ * docs/specs/002-runtime-delivery.md §11.3). It is created the moment a
+ * session opens — before any user opts into it — so it must be ignored
+ * alongside {@link GITIGNORE_LINE} rather than left for the user to discover
+ * in `git status` (issue #336). Every file under it is a materialized,
+ * regenerable projection of the runtime's SQLite store, never the source of
+ * truth, so it is safe to delete.
+ */
+const RUNTIME_DIR_GITIGNORE_LINE = '/.agentmonitors/';
+
+/** All lines `agentmonitors init` ensures are present in `.gitignore`. */
+const GITIGNORE_LINES = [GITIGNORE_LINE, RUNTIME_DIR_GITIGNORE_LINE] as const;
+
 function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
   return typeof error === 'object' && error !== null && 'code' in error;
 }
@@ -315,9 +331,12 @@ function ensureEnabled(cwd: string): 'created' | 'already-enabled' {
 }
 
 /**
- * Bootstrap step 2: ensure `.gitignore` ignores the local coordination file.
- * Appends the line if the file exists but lacks it, creates the file if absent,
- * and is a no-op if the line is already present.
+ * Bootstrap step 2: ensure `.gitignore` ignores the local coordination file
+ * and the `.agentmonitors/` runtime directory ({@link GITIGNORE_LINES}).
+ * Appends whichever lines are missing, creates the file if absent, and is a
+ * no-op if every line is already present. Each line is checked independently,
+ * so a `.gitignore` that already has one line but not the other only gets the
+ * missing one appended (same append-if-missing semantics as a single line).
  *
  * Only a missing file (`ENOENT`) is treated as "absent, create it". Any other
  * read error (e.g. `EACCES` on an unreadable file, `EISDIR` when `.gitignore`
@@ -331,17 +350,16 @@ function ensureGitignore(cwd: string): 'created' | 'appended' | 'present' {
     content = readFileSync(target, 'utf-8');
   } catch (err) {
     if (!isErrnoException(err) || err.code !== 'ENOENT') throw err;
-    writeFileSync(target, `${GITIGNORE_LINE}\n`, 'utf-8');
+    writeFileSync(target, `${GITIGNORE_LINES.join('\n')}\n`, 'utf-8');
     return 'created';
   }
-  const present = content
-    .split('\n')
-    .some((line) => line.trim() === GITIGNORE_LINE);
-  if (present) return 'present';
+  const existingLines = new Set(content.split('\n').map((line) => line.trim()));
+  const missing = GITIGNORE_LINES.filter((line) => !existingLines.has(line));
+  if (missing.length === 0) return 'present';
   const needsNewline = content.length > 0 && !content.endsWith('\n');
   writeFileSync(
     target,
-    `${content}${needsNewline ? '\n' : ''}${GITIGNORE_LINE}\n`,
+    `${content}${needsNewline ? '\n' : ''}${missing.join('\n')}\n`,
     'utf-8',
   );
   return 'appended';
@@ -453,7 +471,7 @@ async function runBootstrap(options: BootstrapOptions): Promise<void> {
       'AgentMon is already set up in this project — nothing to change.',
     );
     console.log(`  Monitoring enabled:  .claude/agentmonitors.local.md`);
-    console.log(`  .gitignore already ignores ${GITIGNORE_LINE}`);
+    console.log(`  .gitignore already ignores ${GITIGNORE_LINES.join(', ')}`);
     console.log(
       `\nAdd another monitor with:  agentmonitors init <name> --type <type>`,
     );
@@ -469,8 +487,8 @@ async function runBootstrap(options: BootstrapOptions): Promise<void> {
   );
   console.log(
     gitignoreStatus === 'present'
-      ? `  .gitignore already ignores  ${GITIGNORE_LINE}`
-      : `  Updated .gitignore          ${GITIGNORE_LINE}`,
+      ? `  .gitignore already ignores  ${GITIGNORE_LINES.join(', ')}`
+      : `  Updated .gitignore          ${GITIGNORE_LINES.join(', ')}`,
   );
 
   if (monitor.kind === 'created') {

@@ -839,6 +839,10 @@ describe('init', () => {
 describe('init bootstrap (bare init)', () => {
   const LOCAL_STATE_REL = path.join('.claude', 'agentmonitors.local.md');
   const GITIGNORE_LINE = '.claude/*.local.*';
+  // Issue #336: the undocumented `.agentmonitors/` runtime-state directory
+  // (per-session hook-state) must be gitignored by the same bootstrap step,
+  // not just the local-coordination file.
+  const RUNTIME_DIR_GITIGNORE_LINE = '/.agentmonitors/';
 
   // The exact minimal enable-file shape from the setup-monitors skill's
   // "Enable The Project" section (`agent-plugins/agentmonitors/skills/setup-monitors/SKILL.md`)
@@ -865,9 +869,14 @@ describe('init bootstrap (bare init)', () => {
     const localState = readFileSync(path.join(dir, LOCAL_STATE_REL), 'utf-8');
     expect(localState).toBe(EXPECTED_LOCAL_STATE_CONTENTS);
 
-    // Step 2 — `.gitignore` ignores the local coordination file.
-    const gitignore = readFileSync(path.join(dir, '.gitignore'), 'utf-8');
-    expect(gitignore.split('\n')).toContain(GITIGNORE_LINE);
+    // Step 2 — `.gitignore` ignores the local coordination file and the
+    // `.agentmonitors/` runtime directory (issue #336).
+    const gitignoreLines = readFileSync(
+      path.join(dir, '.gitignore'),
+      'utf-8',
+    ).split('\n');
+    expect(gitignoreLines).toContain(GITIGNORE_LINE);
+    expect(gitignoreLines).toContain(RUNTIME_DIR_GITIGNORE_LINE);
 
     // Step 3 — a starter monitor was scaffolded under the default dir.
     expect(
@@ -899,9 +908,12 @@ describe('init bootstrap (bare init)', () => {
     expect(readFileSync(path.join(dir, LOCAL_STATE_REL), 'utf-8')).toBe(
       EXPECTED_LOCAL_STATE_CONTENTS,
     );
-    expect(
-      readFileSync(path.join(dir, '.gitignore'), 'utf-8').split('\n'),
-    ).toContain(GITIGNORE_LINE);
+    const enableOnlyGitignoreLines = readFileSync(
+      path.join(dir, '.gitignore'),
+      'utf-8',
+    ).split('\n');
+    expect(enableOnlyGitignoreLines).toContain(GITIGNORE_LINE);
+    expect(enableOnlyGitignoreLines).toContain(RUNTIME_DIR_GITIGNORE_LINE);
     // No monitor scaffolding in enable-only mode.
     expect(existsSync(path.join(dir, '.claude', 'monitors'))).toBe(false);
   });
@@ -972,14 +984,39 @@ describe('init bootstrap (bare init)', () => {
     expect(gitignore).toContain('node_modules');
     expect(gitignore).toContain('dist');
     expect(gitignore.split('\n')).toContain(GITIGNORE_LINE);
+    expect(gitignore.split('\n')).toContain(RUNTIME_DIR_GITIGNORE_LINE);
 
-    // Re-running must not add a second copy of the line.
+    // Re-running must not add a second copy of either line.
     expect(run(['init', '--enable-only'], dir).exitCode).toBe(0);
     const after = readFileSync(path.join(dir, '.gitignore'), 'utf-8');
-    const occurrences = after
-      .split('\n')
-      .filter((line) => line.trim() === GITIGNORE_LINE).length;
-    expect(occurrences).toBe(1);
+    const afterLines = after.split('\n');
+    expect(
+      afterLines.filter((line) => line.trim() === GITIGNORE_LINE),
+    ).toHaveLength(1);
+    expect(
+      afterLines.filter((line) => line.trim() === RUNTIME_DIR_GITIGNORE_LINE),
+    ).toHaveLength(1);
+  });
+
+  // AC1 (issue #336): a `.gitignore` that already ignores the local
+  // coordination file but predates the `.agentmonitors/` fix must get only
+  // the missing line appended — the append-if-missing check is per-line, not
+  // all-or-nothing.
+  it('appends only the missing .agentmonitors/ line when .gitignore already has the local-state line', () => {
+    const dir = path.join(tempDir, 'bootstrap-gitignore-partial');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, '.gitignore'), `${GITIGNORE_LINE}\n`, 'utf-8');
+
+    expect(run(['init', '--enable-only'], dir).exitCode).toBe(0);
+
+    const gitignoreLines = readFileSync(
+      path.join(dir, '.gitignore'),
+      'utf-8',
+    ).split('\n');
+    expect(
+      gitignoreLines.filter((line) => line.trim() === GITIGNORE_LINE),
+    ).toHaveLength(1);
+    expect(gitignoreLines).toContain(RUNTIME_DIR_GITIGNORE_LINE);
   });
 
   // AC2 (agents/scripts): a non-interactive bare init (closed, non-TTY stdin)
@@ -4663,6 +4700,182 @@ Summarize what changed in the spec/standard docs and whether it affects current 
     }
   }, 30_000);
 });
+
+// ---------------------------------------------------------------------------
+// Issue #336: the undocumented `.agentmonitors/` runtime-state directory
+// (per-session hook-state, created the instant a session opens) must never
+// show up as an untracked entry in `git status` when a project follows the
+// documented bootstrap path exactly. Proves the fix end to end: a fresh git
+// repo, `agentmonitors init --enable-only` (the documented bootstrap step),
+// then a full daemon → session → file-change → hook-claim → ack cycle — the
+// same recipe skill.md and the notify-when-a-file-changes guide document.
+// ---------------------------------------------------------------------------
+describe.skipIf(!gitAvailable)(
+  'fresh project gitignore proof (issue #336)',
+  () => {
+    it('leaves no tool-generated untracked entries after init + a full daemon verify-cycle', async () => {
+      const dir = path.join(tempDir, 'gitignore-proof');
+      mkdirSync(dir, { recursive: true });
+      try {
+        gitIn(dir, ['init', '-b', 'main']);
+      } catch {
+        gitIn(dir, ['init']);
+        gitIn(dir, ['checkout', '-b', 'main']);
+      }
+      gitIn(dir, ['config', 'user.email', 'test@example.com']);
+      gitIn(dir, ['config', 'user.name', 'Test']);
+
+      // The documented bootstrap step (skill.md Phase 2 / the setup-monitors
+      // skill's "Enable The Project" section): enable the project and fix
+      // `.gitignore` — nothing else.
+      const bootstrap = run(['init', '--enable-only'], dir);
+      expect(bootstrap.exitCode).toBe(0);
+
+      const monitorsDir = path.join(dir, '.claude', 'monitors', 'watch-files');
+      mkdirSync(monitorsDir, { recursive: true });
+      const watchedFile = path.join(dir, 'watched.txt');
+      writeFileSync(watchedFile, 'hello', 'utf-8');
+      writeFileSync(
+        path.join(monitorsDir, 'MONITOR.md'),
+        `---
+name: Watch files
+watch:
+  type: file-fingerprint
+  globs:
+    - watched.txt
+  cwd: ${JSON.stringify(dir)}
+  interval: '1s'
+urgency: normal
+---
+When files change, review them.
+`,
+        'utf-8',
+      );
+
+      // The daemon's db/socket live OUTSIDE the project dir on purpose — in
+      // real usage they're rooted under the user's data dir
+      // (`workspacePaths()`), never the project root, so they must not
+      // factor into this proof either way.
+      const dbPath = path.join(tempDir, 'gitignore-proof.db');
+      const socketPath = path.join(
+        '/tmp',
+        `agentmon-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+      );
+      const env = {
+        AGENTMONITORS_DB: dbPath,
+        AGENTMONITORS_SOCKET: socketPath,
+      };
+      const daemon = await startDaemon(
+        path.join(dir, '.claude', 'monitors'),
+        dir,
+        env,
+        socketPath,
+      );
+
+      try {
+        const sessionOpen = runWithEnv(
+          [
+            'session',
+            'open',
+            '--host-session-id',
+            'gitignore-proof',
+            '--workspace',
+            dir,
+            '--format',
+            'json',
+          ],
+          env,
+          dir,
+        );
+        expect(sessionOpen.exitCode).toBe(0);
+        const session = JSON.parse(sessionOpen.stdout) as { id: string };
+
+        // Opening a session alone materializes the per-session hook-state
+        // file under `.agentmonitors/sessions/<id>/hook-state.json`
+        // (002 §11.3) — this is the exact directory the issue is about.
+        expect(existsSync(path.join(dir, '.agentmonitors'))).toBe(true);
+
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1100);
+        writeFileSync(watchedFile, 'hello world', 'utf-8');
+
+        const unread = () =>
+          runWithEnv(
+            [
+              'events',
+              'list',
+              '--session',
+              session.id,
+              '--unread',
+              '--format',
+              'json',
+            ],
+            env,
+            dir,
+          );
+        const deadline = Date.now() + 10_000;
+        while (Date.now() < deadline) {
+          const result = unread();
+          if (result.exitCode === 0 && JSON.parse(result.stdout).length === 1) {
+            break;
+          }
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+        }
+        expect(unread().exitCode).toBe(0);
+        expect(JSON.parse(unread().stdout)).toHaveLength(1);
+
+        const claim = runWithEnv(
+          [
+            'hook',
+            'claim',
+            '--session',
+            session.id,
+            '--lifecycle',
+            'turn-interruptible',
+            '--format',
+            'json',
+          ],
+          env,
+          dir,
+        );
+        expect(claim.exitCode).toBe(0);
+
+        const ack = runWithEnv(
+          ['events', 'ack', '--session', session.id],
+          env,
+          dir,
+        );
+        expect(ack.exitCode).toBe(0);
+
+        const stop = runWithEnv(['daemon', 'stop'], env, dir);
+        expect(stop.exitCode).toBe(0);
+        await daemon.waitForExit();
+      } finally {
+        daemon.stop();
+        await daemon.waitForExit();
+      }
+
+      const status = execFileSync('git', ['status', '--porcelain'], {
+        cwd: dir,
+        encoding: 'utf-8',
+      }) as string;
+      const untrackedPaths = status
+        .split('\n')
+        .filter((line) => line.length > 0)
+        .map((line) => line.slice(3));
+
+      // The point of the fix: none of the tool-generated runtime paths show
+      // up as untracked. `watched.txt` and the monitor definition are real,
+      // uncommitted project content and legitimately still show up — this
+      // only asserts the *tool-generated* paths are gitignored.
+      expect(untrackedPaths.some((p) => p.startsWith('.agentmonitors'))).toBe(
+        false,
+      );
+      expect(
+        untrackedPaths.some((p) => p.includes('agentmonitors.local.md')),
+      ).toBe(false);
+    }, 20_000);
+  },
+);
 
 // ---------------------------------------------------------------------------
 // Lazy-daemon lifecycle: session start / session end
