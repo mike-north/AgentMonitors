@@ -56,7 +56,7 @@ When changes are detected, review and take appropriate action.
 > **A quick note on `urgency` — it controls _when_ you're notified, not just how important the
 > change is:**
 >
-> - `high` surfaces **mid-session**, at the next turn boundary, after a short settle window — with
+> - `high` surfaces **mid-session**, at the next turn boundary, after a **15 s** settle window (deliberate — not instant) — with
 >   the full event content (title, summary, and body).
 > - `normal` (the default above) also surfaces mid-session, but only as a single generic reminder
 >   covering the whole unread batch, then stays quiet until you acknowledge it — no per-event
@@ -206,6 +206,8 @@ SOCKET="/tmp/agentmon-verify-$$.sock"
 # 1. A daemon pinned to this socket that never idle-reaps.
 agentmonitors daemon run .claude/monitors --socket "$SOCKET" --reap-after-ms 0 --poll-ms 5000 &
 DAEMON_PID=$!
+# Clean up the daemon even if a later step fails or you Ctrl-C out.
+trap 'kill "$DAEMON_PID" 2>/dev/null' EXIT
 sleep 1
 
 # 2. A lead session on the same socket — capture its id (it is NOT $HOST_ID).
