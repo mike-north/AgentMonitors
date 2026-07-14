@@ -188,25 +188,73 @@ describe('capped high-urgency claim + preview (issue #299)', () => {
     expect(h.store.pendingEventsForSession(session, 'high')).toHaveLength(1);
   });
 
-  it('defers a whole net object group intact: its newest still carries the full catch-up next claim', () => {
+  // (issue #299 review — Copilot 3581228300) The MUTATING net collapse (delta
+  // re-anchoring + `net_suppressed_at`) must run ONLY on the groups a capped
+  // claim actually surfaces. The pre-fix code ran `collapseNetForClaim` on the
+  // FULL settled set BEFORE applying the cap, so a DEFERRED object's older
+  // intermediates were marked net-suppressed while their group was never
+  // claimed — orphaning them: excluded from pending/unread (both filter
+  // `net_suppressed_at IS NULL`) yet lacking a `first_notified_at`. That
+  // contradicts the claimed-but-suppressed-AT-CLAIM-TIME contract (002 §1.1.7).
+  it('defers a whole net object group untouched: its intermediates stay unsuppressed & pending until the group is surfaced (#299 review)', () => {
     const h = setup();
     const session = openLead(h, 'sess-net');
-    // Object O: two net observations (o1 → o2). Object P: two net observations
-    // (p1 → p2). Delivered view (newest per object) = [o2, p2]; o1, p1 fold.
-    materializeHigh(h, 'mon', 'O', 'o1', 'net');
+    const suppressedIds = (): string[] =>
+      h.store
+        .listDeliveryProjectionsForMonitor('mon', h.workspace)
+        .filter((p) => p.sessionId === session && p.netSuppressed)
+        .map((p) => p.eventId);
+    const recipientDelta = (eventId: string): string | undefined =>
+      h.store.perRecipientDiffsForSession(session, [eventId]).get(eventId);
+
+    // Anchor each object's cursor at its baseline (o0, p0) with an uncapped
+    // claim, so a later collapse re-anchors against o0 / p0 (a real catch-up).
+    materializeHigh(h, 'mon', 'O', 'o0', 'net');
+    materializeHigh(h, 'mon', 'P', 'p0', 'net');
+    h.runtime.claimDelivery(session, 'turn-interruptible');
+    expect(h.store.pendingEventsForSession(session, 'high')).toHaveLength(0);
+
+    // Now, while the recipient is AWAY, two more net edits land on EACH object.
+    // Delivered view (newest per object) = [o2, p2]; o1, p1 fold within a claim.
+    const o1 = materializeHigh(h, 'mon', 'O', 'o1', 'net');
     const o2 = materializeHigh(h, 'mon', 'O', 'o2', 'net');
-    materializeHigh(h, 'mon', 'P', 'p1', 'net');
+    const p1 = materializeHigh(h, 'mon', 'P', 'p1', 'net');
     const p2 = materializeHigh(h, 'mon', 'P', 'p2', 'net');
 
-    // Cap to 1 delivered object: surfaces O's newest only, claims ONLY O's group.
+    // First claim, cap=1: surfaces O's newest only and claims ONLY O's group.
     const first = h.runtime.claimDelivery(session, 'turn-interruptible', 1);
     expect(first?.events.map((e) => e.eventId)).toEqual([o2]);
+    // O's delivered delta spans this recipient's cursor (o0) → endpoint (o2) —
+    // the re-anchored catch-up, not the last incremental step o1 → o2
+    // (002 §5.2 line format).
+    expect(recipientDelta(o2)).toBe('- 1: o0\n+ 1: o2');
 
-    // The deferred object P was left entirely unclaimed → its newest re-delivers
-    // (folding p1 into p2), so no observation is lost.
+    // Only O's intermediate (o1) is net-suppressed; the DEFERRED object P is
+    // byte-untouched — neither p1 nor p2 is suppressed.
+    expect(suppressedIds()).toEqual([o1]);
+    // Both of P's events remain PENDING and UNREAD (claiming ≠ acking): p1 was
+    // NOT orphaned. Pre-fix, p1 was net-suppressed here and this list was [p2].
+    expect(
+      h.store.pendingEventsForSession(session, 'high').map((e) => e.id),
+    ).toEqual([p1, p2]);
+    expect(
+      h.store.unreadEventsForSession(session, 'high').map((e) => e.id),
+    ).toEqual(expect.arrayContaining([p1, p2]));
+
+    // Second claim, cap=1: NOW surfaces P's newest, folding p1 → p2, and
+    // delivers the re-anchored catch-up p0 → p2. Pre-fix, p1 had already been
+    // suppressed (and cursor never advanced), so this delta was the wrong
+    // incremental step p1 → p2.
     const second = h.runtime.claimDelivery(session, 'turn-interruptible', 1);
     expect(second?.events.map((e) => e.eventId)).toEqual([p2]);
+    expect(recipientDelta(p2)).toBe('- 1: p0\n+ 1: p2');
 
+    // Only NOW is p1 suppressed (claimed-but-suppressed at the claim that
+    // actually surfaced its group), alongside the earlier o1.
+    expect(suppressedIds().sort()).toEqual([o1, p1].sort());
+    expect(h.store.pendingEventsForSession(session, 'high')).toHaveLength(0);
+
+    // Nothing left to deliver.
     expect(
       h.runtime.claimDelivery(session, 'turn-interruptible', 1),
     ).toBeNull();

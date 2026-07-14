@@ -1109,13 +1109,20 @@ export class AgentMonitorRuntime {
       if (settledHigh.length > 0) {
         // Per-recipient `net` collapse (G10 PR-B, 002 §1.1.7): deliver only the
         // newest event per object for a `net` monitor; record the older
-        // intermediates claimed-but-suppressed. Diffs are recomputed inside
-        // collapse, so this must run BEFORE the digest lookup reads the
-        // (re-anchored) deltas.
-        const deliveredHigh = this.store.collapseNetForClaim(
-          sessionId,
-          settledHigh,
-        );
+        // intermediates claimed-but-suppressed.
+        //
+        // DECIDE first, WITHOUT mutating: compute the per-object representatives
+        // a full claim would surface (the pure {@link computeNetCollapseView}),
+        // then apply the #299 cap to those representatives. The MUTATING collapse
+        // (delta re-anchoring + net-suppression) runs ONLY on the surfaced groups
+        // below. A DEFERRED group must stay byte-untouched — its intermediates
+        // UNSUPPRESSED and still pending — until the context event that actually
+        // surfaces it; otherwise those intermediates would be net-suppressed while
+        // never claimed (orphaned: excluded from pending/unread yet lacking a
+        // `first_notified_at`), breaking the claimed-but-suppressed-AT-CLAIM-TIME
+        // contract (002 §1.1.7). Running the mutation on the full set before the
+        // cap is exactly that bug.
+        const representatives = computeNetCollapseView(settledHigh).delivered;
 
         // Cap the surfaced set to what a length-bounded transport asked for
         // (issue #299). We CLAIM only the events actually rendered, never the
@@ -1124,27 +1131,42 @@ export class AgentMonitorRuntime {
         // at each subsequent context event instead of silently losing it.
         const limit =
           maxEvents === undefined
-            ? deliveredHigh.length
-            : Math.min(deliveredHigh.length, Math.max(1, maxEvents));
-        const surfacedHigh = deliveredHigh.slice(0, limit);
+            ? representatives.length
+            : Math.min(representatives.length, Math.max(1, maxEvents));
+        const surfacedReps = representatives.slice(0, limit);
 
-        // Claim the FULL group of each surfaced event, but leave DEFERRED
-        // objects entirely unclaimed so they re-deliver intact. `collapseNetForClaim`
-        // already recorded every `net` object's older intermediates as
-        // net-suppressed (harmless for a deferred object: its newest event stays
-        // pending and still carries the full cursor → endpoint catch-up when it
-        // finally delivers), but the intermediates must be marked CLAIMED only
-        // alongside the surviving event we are actually surfacing now.
-        const surfacedKeys = new Set(surfacedHigh.map(netCollapseGroupKey));
-        const claimIds = settledHigh
-          .filter((event) => surfacedKeys.has(netCollapseGroupKey(event)))
-          .map((event) => event.id);
+        // Restrict the mutating collapse + claim to ONLY the surfaced groups —
+        // each surfaced representative's full set of settled events (the
+        // representative plus that object's older intermediates). Deferred groups
+        // are excluded entirely, so nothing about them is re-anchored,
+        // suppressed, or claimed; they re-deliver intact next context event.
+        const surfacedKeys = new Set(surfacedReps.map(netCollapseGroupKey));
+        const surfacedCandidates = settledHigh.filter((event) =>
+          surfacedKeys.has(netCollapseGroupKey(event)),
+        );
+
+        // The delivered subset for the surfaced groups (equals `surfacedReps`,
+        // now with each surviving delta re-anchored to this recipient's cursor →
+        // endpoint and the surfaced groups' intermediates net-suppressed). Diffs
+        // are recomputed inside collapse, so this must run BEFORE the digest
+        // lookup reads the (re-anchored) deltas.
+        const surfacedHigh = this.store.collapseNetForClaim(
+          sessionId,
+          surfacedCandidates,
+        );
 
         const digests = this.store.interpretDigestsForSession(
           sessionId,
           surfacedHigh.map((event) => event.id),
         );
-        this.store.markClaimed(sessionId, claimIds, lifecycle);
+        // Claim the FULL surfaced-group candidate set (representatives + their
+        // now-suppressed intermediates) so the cursor advances to each surfaced
+        // object's endpoint and the suppressed rows are consumed.
+        this.store.markClaimed(
+          sessionId,
+          surfacedCandidates.map((event) => event.id),
+          lifecycle,
+        );
         this.refreshHookState(sessionId);
         return {
           sessionId,
