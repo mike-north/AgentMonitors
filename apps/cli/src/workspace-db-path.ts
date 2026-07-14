@@ -19,9 +19,15 @@ import { resolveDbPath } from './db-path.js';
  */
 export function resolveWorkspaceDbPath(
   workspace: string,
-  state: LocalState = readLocalState(workspace),
+  state?: LocalState,
 ): string {
+  // Env wins outright — checked before local state is even read, so the
+  // override path does no filesystem I/O (a default-parameter initializer
+  // would run first and defeat that).
   if (process.env['AGENTMONITORS_DB']) return process.env['AGENTMONITORS_DB'];
-  if (state.enabled) return state.db ?? workspacePaths(workspace).db;
+  const localState = state ?? readLocalState(workspace);
+  if (localState.enabled) {
+    return localState.db ?? workspacePaths(workspace).db;
+  }
   return resolveDbPath();
 }

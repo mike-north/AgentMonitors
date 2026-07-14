@@ -45,7 +45,7 @@ const DAEMON_REMEDIATION =
 // `agentmonitors session list`'s workspace column directly, rather than
 // guessing whether the two commands agree.
 function leadSessionRemediation(workspacePath: string): string {
-  return `Open a Claude Code session in this workspace (the SessionStart hook registers a lead session), or run \`agentmonitors session open --role lead --workspace ${workspacePath}\`. Doctor searched for a lead session registered to workspace "${workspacePath}" — compare against \`agentmonitors session list\`.`;
+  return `Open a Claude Code session in this workspace (the SessionStart hook registers a lead session), or run \`agentmonitors session open --role lead --workspace "${workspacePath}"\`. Doctor searched for a lead session registered to workspace "${workspacePath}" — compare against \`agentmonitors session list\`.`;
 }
 const NEVER_OBSERVED_REMEDIATION =
   'The daemon has not observed this monitor yet. Start it with `agentmonitors daemon run` (or wait for the next tick), then check `agentmonitors monitor history <id>`; `agentmonitors monitor test <path>` dry-runs it now.';
