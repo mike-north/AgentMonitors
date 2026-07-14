@@ -17,10 +17,15 @@ import type { AgentRuntimeAdapter } from '../adapter/types.js';
 import type { InterpretAdapter } from '../adapter/interpret.js';
 import { buildTextDiff } from './diff.js';
 import { shapeObservation } from './shape-stage.js';
-import { RuntimeStore } from './store.js';
+import {
+  RuntimeStore,
+  computeNetCollapseView,
+  netCollapseGroupKey,
+} from './store.js';
 import type {
   AgentSessionRecord,
   DeliveryClaim,
+  DeliveryEventSummary,
   DoctorDeliveryCounts,
   DoctorMonitorRollup,
   DoctorParseError,
@@ -351,6 +356,40 @@ function summarizeEvents(events: { title: string; summary: string }[]): string {
       return `${String(index + 1)}. ${detail}`;
     })
     .join('\n');
+}
+
+/**
+ * Build the recipient-visible summary for one event (G14, 002 §1.1.8): prefer
+ * the per-session Interpret digest when present (the agentic gate produced a
+ * cheap digest for this recipient), otherwise fall back to the deterministic
+ * `summary` → `body` → `title` chain. Shared by the claim and preview paths so
+ * a previewed event and its eventual claim render identically.
+ */
+function recipientSummary(
+  event: MonitorEventRecord,
+  digests: Map<string, string>,
+): string {
+  return digests.get(event.id) ?? (event.summary || event.body || event.title);
+}
+
+/**
+ * Map a delivered {@link MonitorEventRecord} into the {@link DeliveryEventSummary}
+ * a transport receives. Kept in one place so the claim path and the delivery
+ * preview (issue #299) emit byte-identical event summaries.
+ */
+function toDeliveryEventSummary(
+  event: MonitorEventRecord,
+  digests: Map<string, string>,
+): DeliveryEventSummary {
+  return {
+    eventId: event.id,
+    monitorId: event.monitorId,
+    title: event.title,
+    summary: recipientSummary(event, digests),
+    urgency: event.urgency,
+    createdAt: event.createdAt.toISOString(),
+    body: event.body,
+  };
 }
 
 export class AgentMonitorRuntime {
@@ -1024,9 +1063,25 @@ export class AgentMonitorRuntime {
     this.refreshHookState(sessionId);
   }
 
+  /**
+   * Claim the pending delivery for a session at a lifecycle point (002 §9).
+   *
+   * `maxEvents` bounds how many delivered events a **`turn-interruptible`
+   * high-urgency** claim actually surfaces AND claims (issue #299). A transport
+   * whose surface is length-bounded — the hook-deliver transport renders into a
+   * 4000-char `additionalContext` (006 §5.1) — first sizes how many whole event
+   * blocks fit (via {@link previewSettledHighDelivery}) and passes that count, so
+   * we claim ONLY the events it renders and leave the truncated-away remainder
+   * pending (`first_notified_at` NULL) to re-deliver at the next context event.
+   * `undefined` (the default, and every non-capped caller such as the channel
+   * transport) claims the full delivered set exactly as before. It has no effect
+   * on the reminder / low / recap branches, which inject no per-event bodies
+   * (reminders) or already self-heal by re-showing all unread (recap, 006 §5.5).
+   */
   claimDelivery(
     sessionId: string,
     lifecycle: DeliveryLifecycle,
+    maxEvents?: number,
   ): DeliveryClaim | null {
     const now = new Date();
     this.store.touchSession(sessionId);
@@ -1039,18 +1094,6 @@ export class AgentMonitorRuntime {
       ...unreadCounts,
       total: unreadCounts.low + unreadCounts.normal + unreadCounts.high,
     };
-
-    /**
-     * Build the recipient-visible summary for one event (G14, 002 §1.1.8):
-     * prefer the per-session Interpret digest when present (the agentic gate
-     * produced a cheap digest for this recipient), otherwise fall back to the
-     * deterministic `summary` → `body` → `title` chain.
-     */
-    const recipientSummary = (
-      event: MonitorEventRecord,
-      digests: Map<string, string>,
-    ): string =>
-      digests.get(event.id) ?? (event.summary || event.body || event.title);
 
     if (lifecycle === 'turn-interruptible') {
       const unreadNormal = this.store.unreadEventsForSession(
@@ -1066,22 +1109,62 @@ export class AgentMonitorRuntime {
       if (settledHigh.length > 0) {
         // Per-recipient `net` collapse (G10 PR-B, 002 §1.1.7): deliver only the
         // newest event per object for a `net` monitor; record the older
-        // intermediates claimed-but-suppressed. The FULL candidate set is still
-        // claimed (markClaimed) so the cursor advances to the newest artifact
-        // and the suppressed rows are consumed — only the delivered subset is
-        // surfaced to the recipient. Diffs are recomputed inside collapse, so
-        // this must run BEFORE the digest lookup reads the (re-anchored) deltas.
-        const deliveredHigh = this.store.collapseNetForClaim(
-          sessionId,
-          settledHigh,
+        // intermediates claimed-but-suppressed.
+        //
+        // DECIDE first, WITHOUT mutating: compute the per-object representatives
+        // a full claim would surface (the pure {@link computeNetCollapseView}),
+        // then apply the #299 cap to those representatives. The MUTATING collapse
+        // (delta re-anchoring + net-suppression) runs ONLY on the surfaced groups
+        // below. A DEFERRED group must stay byte-untouched — its intermediates
+        // UNSUPPRESSED and still pending — until the context event that actually
+        // surfaces it; otherwise those intermediates would be net-suppressed while
+        // never claimed (orphaned: excluded from pending/unread yet lacking a
+        // `first_notified_at`), breaking the claimed-but-suppressed-AT-CLAIM-TIME
+        // contract (002 §1.1.7). Running the mutation on the full set before the
+        // cap is exactly that bug.
+        const representatives = computeNetCollapseView(settledHigh).delivered;
+
+        // Cap the surfaced set to what a length-bounded transport asked for
+        // (issue #299). We CLAIM only the events actually rendered, never the
+        // truncated-away remainder — so a session with more pending high-urgency
+        // work than fits in one context injection keeps re-delivering the rest
+        // at each subsequent context event instead of silently losing it.
+        const limit =
+          maxEvents === undefined
+            ? representatives.length
+            : Math.min(representatives.length, Math.max(1, maxEvents));
+        const surfacedReps = representatives.slice(0, limit);
+
+        // Restrict the mutating collapse + claim to ONLY the surfaced groups —
+        // each surfaced representative's full set of settled events (the
+        // representative plus that object's older intermediates). Deferred groups
+        // are excluded entirely, so nothing about them is re-anchored,
+        // suppressed, or claimed; they re-deliver intact next context event.
+        const surfacedKeys = new Set(surfacedReps.map(netCollapseGroupKey));
+        const surfacedCandidates = settledHigh.filter((event) =>
+          surfacedKeys.has(netCollapseGroupKey(event)),
         );
+
+        // The delivered subset for the surfaced groups (equals `surfacedReps`,
+        // now with each surviving delta re-anchored to this recipient's cursor →
+        // endpoint and the surfaced groups' intermediates net-suppressed). Diffs
+        // are recomputed inside collapse, so this must run BEFORE the digest
+        // lookup reads the (re-anchored) deltas.
+        const surfacedHigh = this.store.collapseNetForClaim(
+          sessionId,
+          surfacedCandidates,
+        );
+
         const digests = this.store.interpretDigestsForSession(
           sessionId,
-          deliveredHigh.map((event) => event.id),
+          surfacedHigh.map((event) => event.id),
         );
+        // Claim the FULL surfaced-group candidate set (representatives + their
+        // now-suppressed intermediates) so the cursor advances to each surfaced
+        // object's endpoint and the suppressed rows are consumed.
         this.store.markClaimed(
           sessionId,
-          settledHigh.map((event) => event.id),
+          surfacedCandidates.map((event) => event.id),
           lifecycle,
         );
         this.refreshHookState(sessionId);
@@ -1092,20 +1175,14 @@ export class AgentMonitorRuntime {
           urgency: 'high',
           unreadCounts: sessionUnreadCounts,
           message: summarizeEvents(
-            deliveredHigh.map((event) => ({
+            surfacedHigh.map((event) => ({
               title: event.title,
               summary: recipientSummary(event, digests),
             })),
           ),
-          events: deliveredHigh.map((event) => ({
-            eventId: event.id,
-            monitorId: event.monitorId,
-            title: event.title,
-            summary: recipientSummary(event, digests),
-            urgency: event.urgency,
-            createdAt: event.createdAt.toISOString(),
-            body: event.body,
-          })),
+          events: surfacedHigh.map((event) =>
+            toDeliveryEventSummary(event, digests),
+          ),
         };
       }
 
@@ -1206,19 +1283,44 @@ export class AgentMonitorRuntime {
         mode: 'recap',
         unreadCounts: sessionUnreadCounts,
         message,
-        events: recapSlice.map((event) => ({
-          eventId: event.id,
-          monitorId: event.monitorId,
-          title: event.title,
-          summary: recipientSummary(event, digests),
-          urgency: event.urgency,
-          createdAt: event.createdAt.toISOString(),
-          body: event.body,
-        })),
+        events: recapSlice.map((event) =>
+          toDeliveryEventSummary(event, digests),
+        ),
       };
     }
 
     return null;
+  }
+
+  /**
+   * Non-mutating preview of the settled high-urgency events a
+   * `turn-interruptible` {@link claimDelivery} WOULD surface right now, in
+   * delivery order (issue #299). A length-bounded transport (the hook-deliver
+   * transport, 006 §5.1) calls this FIRST to size how many whole event blocks
+   * fit under its context cap, then passes that count back as `claimDelivery`'s
+   * `maxEvents` so it claims exactly the events it renders. Returns `[]` when no
+   * settled high delivery is pending (the caller then falls through to an
+   * ordinary claim for the reminder / low path). Reads only — it never claims,
+   * suppresses, re-anchors a delta, or refreshes hook state (contrast
+   * {@link claimDelivery}), so previewing does not consume a delivery.
+   */
+  previewSettledHighDelivery(sessionId: string): DeliveryEventSummary[] {
+    const now = new Date();
+    const highUnread = this.store.pendingEventsForSession(sessionId, 'high');
+    const settledHigh = highUnread.filter(
+      (event) =>
+        now.getTime() - event.createdAt.getTime() >=
+        DEFAULT_HIGH_URGENCY_SETTLE_MS,
+    );
+    if (settledHigh.length === 0) return [];
+    // Same pure collapse DECISION the claim uses, so the previewed set is exactly
+    // what a full claim would surface — only without persisting the collapse.
+    const { delivered } = computeNetCollapseView(settledHigh);
+    const digests = this.store.interpretDigestsForSession(
+      sessionId,
+      delivered.map((event) => event.id),
+    );
+    return delivered.map((event) => toDeliveryEventSummary(event, digests));
   }
 
   async tick(

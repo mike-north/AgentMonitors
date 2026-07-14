@@ -461,15 +461,40 @@ acknowledged (BP2 / SP4 — see §5.5), so the event stays unread and re-discove
 `agentmonitors events list --unread`. `renderHookDelivery` returns `null` (the command prints
 nothing) only when the claim is `null` or carries neither events nor a reminder message.
 
-### 5.5 Unread-recoverability (truncation never loses an event)
+### 5.5 Unread-recoverability & cap-bounded redelivery (truncation never loses an event)
 
-When the rendered context exceeds the 4000-char cap (§5.1) it is truncated and marked. Truncation
-operates only on the **visible text**, not on the durable delivery state. Claiming a delivery marks
-the underlying rows **claimed**, which is **not** acknowledgement (BP2 / SP4): `unreadEventsForSession`
-filters on `acknowledgedAt IS NULL` only. Therefore an event whose body was truncated away:
+A length-bounded transport (the hook-deliver 4000-char `additionalContext`, §5.1) may be unable to
+surface every settled high-urgency event in a single context injection. The delivery guarantee is
+that the events it cannot show **re-deliver at the next context event**, in order, until every item
+has surfaced — never silently lost.
 
-- **remains unread** and is still listed by `agentmonitors events list --unread`; and
-- **re-delivers** via the next context event (the truncation marker tells the agent to look there).
+**The claimed set MUST equal the rendered set.** A transport **MUST NOT** claim an event it does not
+surface. Concretely, the hook-deliver transport:
+
+1. **previews** the settled high-urgency delivery without mutating state
+   (`previewSettledHighDelivery` returns exactly the set a `turn-interruptible` claim would surface,
+   in delivery order, applying the same per-recipient `net` collapse decision but persisting nothing);
+2. **sizes** how many **whole** event blocks fit under the cap (never a partial block, which would be
+   a claimed-but-unread event with no clean re-delivery boundary), reserving room for the truncation
+   marker; then
+3. **claims** exactly that many (`claimDelivery`'s `maxEvents`), so the deferred remainder is left
+   **pending** (`first_notified_at` NULL) and re-delivers at the next context event.
+
+Because claiming marks the underlying rows **claimed**, which is **not** acknowledgement (BP2 / SP4;
+`unreadEventsForSession` filters on `acknowledgedAt IS NULL` only), every event — surfaced or
+deferred — also **remains unread** and listable via `agentmonitors events list --unread` until
+explicitly acknowledged.
+
+The truncation marker (§5.1) is appended whenever the render omits any pending event — because a
+whole block did not fit **or** because the transport deferred more high-urgency work — signposting
+that more updates are pending. The single pathological case where one event's own block alone exceeds
+the cap is shown partially (mid-truncated at a code-point boundary) to guarantee forward progress;
+its full body stays unread and re-delivers.
+
+The non-high branches need no sizing: `normal`/`low` reminders inject no per-event bodies, and the
+`post-compact` recap re-shows all unread each time, so both self-heal. Uncapped callers (e.g. the
+channel transport, whose surface is not length-bounded) omit `maxEvents` and claim the full delivered
+set exactly as before.
 
 No durable event is lost by truncation; the cap only bounds how much is injected into a single turn.
 
