@@ -18,6 +18,7 @@ import type {
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import { RuntimeStore } from './store.js';
 import type { MonitorEventRecord, RuntimeTickResult } from './types.js';
+import type { ReminderSuppressionFinding } from './reminder-diagnosis.js';
 import { AgentMonitorRuntime, cronMatchesDate } from './service.js';
 
 function createRuntime(
@@ -4144,5 +4145,166 @@ Daily digest.
         vi.useRealTimers();
       }
     });
+  });
+});
+
+// Issue #333: a blind study subject saw a durable, unread `urgency: normal`
+// event produce NO surfacing at any lifecycle — `hook claim --lifecycle
+// turn-interruptible` returned null, `turn-idle` returned "No pending
+// delivery." Per 002 §9.2 the normal reminder should surface at
+// turn-interruptible while all unread normal events are unclaimed. The verdict:
+// NOT a first-claim bug. The subject had ALREADY run a turn-interruptible claim
+// earlier (S3 phase 11), which surfaced the reminder AND CLAIMED the normal
+// event; the second identical claim was then correctly suppressed (the reminder
+// coalesces until acknowledgment, so a claimed-but-unacknowledged event holds it
+// back). The defect was the SILENCE — no way to discover why. This test pins the
+// refutation (first claim DOES surface the reminder) and proves the suppression
+// is now explainable via `monitor explain` (criterion 1 + 2).
+//
+// @see ../../../../docs/specs/002-runtime-delivery.md §9.2 (normal reminder,
+//   coalesced-until-unclaimed)
+// @see ../../../../docs/specs/002-runtime-delivery.md §10.7 (monitor explain
+//   projection-and-delivery diagnosis)
+describe('normal-urgency reminder suppression is explainable (issue #333)', () => {
+  // 002 §9.2: the generic reminder message for the normal band.
+  const NORMAL_INBOX_PROMPT =
+    'AgentMon messages are available. Read the inbox.';
+
+  function stubStatefulSource(name: string): ObservationSource {
+    return {
+      name,
+      scopeSchema: {
+        type: 'object',
+        properties: { filePath: { type: 'string' } },
+        required: ['filePath'],
+      },
+      stateful: true,
+      // Emits a single observation only once the watched file's content differs
+      // from the previously-persisted state (i.e. on the tick AFTER the baseline).
+      // eslint-disable-next-line @typescript-eslint/require-await
+      async observe(
+        config: Record<string, unknown>,
+        context: ObservationContext,
+      ): Promise<ObservationResult> {
+        const filePath = String(config['filePath']);
+        const content = readFileSync(filePath, 'utf-8');
+        const previous =
+          context.previousState &&
+          typeof context.previousState === 'object' &&
+          !Array.isArray(context.previousState)
+            ? (context.previousState as { content?: string })
+            : {};
+        return {
+          observations:
+            previous.content !== undefined && previous.content !== content
+              ? [
+                  {
+                    title: 'Watched file changed',
+                    summary: 'Watched file changed',
+                    snapshotText: content,
+                    objectKey: filePath,
+                    queryScope: { filePath },
+                  },
+                ]
+              : [],
+          nextState: { content },
+        };
+      },
+    };
+  }
+
+  it('first turn-interruptible claim surfaces the coalesced normal reminder; a prior claim then suppresses it, and monitor explain names why', async () => {
+    vi.useFakeTimers();
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-333-'));
+    tempDirs.push(rootDir);
+    try {
+      const T0 = new Date('2026-07-14T12:00:00.000Z').getTime();
+      vi.setSystemTime(T0);
+
+      const dbPath = path.join(rootDir, 'agentmon.db');
+      const watchedFile = path.join(rootDir, 'watched.txt');
+      writeFileSync(watchedFile, 'initial content', 'utf-8');
+      // The monitor folder name is the monitor id (`test-monitor`, from
+      // createMonitorFile); the `sourceName` arg only sets the watch `type`.
+      const monitorsDir = createMonitorFile(
+        rootDir,
+        'stateful-333',
+        'normal', // the guide's own default urgency — the study's exact case
+        'When files change, review them.',
+        "  interval: '1s'\n",
+      );
+      const runtime = createRuntime(dbPath, stubStatefulSource('stateful-333'));
+
+      const session = runtime.openSession(
+        claudeCodeAdapter.createSessionInput({
+          hostSessionId: 'claude-333',
+          workspacePath: rootDir,
+        }),
+      );
+
+      // A real daemon tick materializes the event (no prior ack): baseline tick,
+      // then a change + a due tick that emits exactly one durable normal event.
+      const baseline = await runtime.tick(monitorsDir, rootDir);
+      expect(baseline.emittedEventIds).toHaveLength(0);
+      writeFileSync(watchedFile, 'changed: added eval()', 'utf-8');
+      vi.setSystemTime(T0 + 1_100); // past the 1s interval → the monitor is due
+      const emit = await runtime.tick(monitorsDir, rootDir);
+      expect(emit.emittedEventIds).toHaveLength(1);
+
+      // Criterion 1 (refute the first-claim bug): with the normal event unread
+      // and UNCLAIMED, the FIRST turn-interruptible claim surfaces the coalesced
+      // generic reminder — exactly what 002 §9.2 requires.
+      const first = runtime.claimDelivery(session.id, 'turn-interruptible');
+      expect(first?.mode).toBe('delivery');
+      expect(first?.urgency).toBe('normal');
+      expect(first?.message).toBe(NORMAL_INBOX_PROMPT);
+      expect(first?.events).toEqual([]); // §9.2: no per-event payloads
+
+      // The divergent precondition from the study: that first claim marked the
+      // event CLAIMED (firstNotifiedAt) but NOT acknowledged. A second identical
+      // claim is now correctly suppressed — this reproduces the study's `null`.
+      expect(
+        runtime.claimDelivery(session.id, 'turn-interruptible'),
+      ).toBeNull();
+      // turn-idle likewise surfaces nothing (there is no low-urgency work).
+      expect(runtime.claimDelivery(session.id, 'turn-idle')).toBeNull();
+
+      // Claiming never acknowledges (BP2 / SP4): the event is still unread and
+      // re-discoverable, so no signal was lost — only the reminder is paused.
+      expect(
+        runtime.listEvents({ sessionId: session.id, unreadOnly: true }),
+      ).toHaveLength(1);
+
+      // Criterion 2: the silence is now discoverable. `monitor explain`'s
+      // projection-and-delivery stage NAMES the suppression reason rather than
+      // presenting a dead end.
+      const report = await runtime.explainMonitor({
+        monitorId: 'test-monitor',
+        monitorsDir,
+        workspacePath: rootDir,
+        now: new Date(T0 + 1_200),
+      });
+      const delivery = report.stages.find((stage) => stage.id === 'delivery');
+      expect(delivery).toBeDefined();
+      // Suppression is EXPECTED behavior, not a fault — the stage stays ok.
+      expect(delivery?.status).toBe('ok');
+      expect(delivery?.reason).toContain('already claimed');
+      expect(delivery?.reason).toContain('coalesced-until-ack');
+
+      const findings = delivery?.details?.['reminderSuppression'] as
+        | ReminderSuppressionFinding[]
+        | undefined;
+      expect(findings).toHaveLength(1);
+      expect(findings?.[0]).toMatchObject({
+        sessionId: session.id,
+        urgency: 'normal',
+        lifecycle: 'turn-interruptible',
+        unreadCount: 1,
+        claimedCount: 1,
+        reason: 'already-claimed',
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

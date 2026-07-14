@@ -16,6 +16,11 @@ import { claudeCodeAdapter } from '../adapter/claude.js';
 import type { AgentRuntimeAdapter } from '../adapter/types.js';
 import type { InterpretAdapter } from '../adapter/interpret.js';
 import { buildTextDiff } from './diff.js';
+import {
+  diagnoseReminderSuppression,
+  type ReminderSessionCounts,
+  type ReminderUrgency,
+} from './reminder-diagnosis.js';
 import { shapeObservation } from './shape-stage.js';
 import {
   RuntimeStore,
@@ -872,16 +877,60 @@ export class AgentMonitorRuntime {
         suppressedCount > 0
           ? ` Interpret suppressed ${String(suppressedCount)} as not substantive (recorded per-recipient).`
           : '';
+      // Coalesced-reminder suppression (issue #333, 002 §9.2–§9.3): when a
+      // session's unread normal/low events are already CLAIMED (but not yet
+      // acknowledged), the generic inbox reminder is suppressed — the exact trap
+      // where a second `hook claim --lifecycle turn-interruptible` returns null
+      // with no explanation. Name that reason here so the silence is inspectable
+      // (capability C12) rather than a dead end. The guard is SESSION-level and
+      // cross-monitor (it counts every unread event of the band for the session),
+      // so we read session-scoped store counts, restricted to the sessions this
+      // monitor actually projects a still-unread (unacknowledged, unsuppressed)
+      // event to.
+      const reminderSessionIds = new Set(
+        projections
+          .filter(
+            (projection) =>
+              projection.deliveryState !== 'acknowledged' &&
+              !projection.netSuppressed &&
+              projection.interpretDecision !== 'suppress',
+          )
+          .map((projection) => projection.sessionId),
+      );
+      const reminderCounts: ReminderSessionCounts[] = [];
+      const reminderBands: ReminderUrgency[] = ['normal', 'low'];
+      for (const sessionId of reminderSessionIds) {
+        for (const urgency of reminderBands) {
+          reminderCounts.push({
+            sessionId,
+            urgency,
+            unreadCount: this.store.unreadEventsForSession(sessionId, urgency)
+              .length,
+            pendingCount: this.store.pendingEventsForSession(sessionId, urgency)
+              .length,
+          });
+        }
+      }
+      const reminderSuppression = diagnoseReminderSuppression(reminderCounts);
+      const reminderSuffix =
+        reminderSuppression.length > 0
+          ? ` ${reminderSuppression.map((finding) => finding.message).join(' ')}`
+          : '';
+      const deliveryDetails: Record<string, unknown> = { ...counts };
+      if (interpretVerdicts.length > 0) {
+        deliveryDetails['interpret'] = interpretVerdicts;
+      }
+      if (reminderSuppression.length > 0) {
+        deliveryDetails['reminderSuppression'] = reminderSuppression;
+      }
       stages.push(
         explainStage(
           'delivery',
           'ok',
           `Events are projected to lead sessions (${Object.entries(counts)
             .map(([state, count]) => `${state}: ${String(count)}`)
-            .join(', ')}).${interpretSuffix}`,
-          interpretVerdicts.length > 0
-            ? { ...counts, interpret: interpretVerdicts }
-            : counts,
+            .join(', ')}).${interpretSuffix}${reminderSuffix}`,
+          deliveryDetails,
         ),
       );
     } else {
