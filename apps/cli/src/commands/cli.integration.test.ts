@@ -2025,6 +2025,156 @@ describe('daemon status', () => {
 });
 
 /**
+ * Issue #337 (DX study S4 F3): an explicit `--socket` path that exceeds the
+ * AF_UNIX `sun_path` length limit was silently replaced with a hashed `/tmp`
+ * path — the daemon bound and reported a DIFFERENT socket than the one the
+ * caller asked for, with no indication anything had been substituted.
+ *
+ * This reproduces the study's exact repro shape (`daemon run --socket
+ * <over-limit path>`) against the real CLI subprocess.
+ *
+ * @see https://github.com/mike-north/AgentMonitors/issues/337
+ */
+describe('daemon run — explicit --socket over the AF_UNIX limit (issue #337)', () => {
+  it('warns on stderr with the requested path, the limit, and the substituted socket, while stdout keeps reporting the socket it actually bound', async () => {
+    const dir = path.join(tempDir, 'socket-over-limit');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    mkdirSync(monitorsRoot, { recursive: true });
+
+    // A unique-per-run, deeply-nested path guaranteed to exceed the
+    // ~100-char AF_UNIX limit, mirroring the study's deep sandbox path.
+    const requestedSocketPath = path.join(
+      dir,
+      `run-${String(Date.now())}-${Math.random().toString(16).slice(2)}`,
+      'x'.repeat(120),
+      'agentmon.sock',
+    );
+    expect(requestedSocketPath.length).toBeGreaterThan(100);
+
+    const child = spawn(
+      'node',
+      [
+        CLI_PATH,
+        'daemon',
+        'run',
+        monitorsRoot,
+        '--workspace',
+        dir,
+        '--poll-ms',
+        '5000',
+        '--reap-after-ms',
+        '0',
+        '--socket',
+        requestedSocketPath,
+      ],
+      {
+        cwd: dir,
+        env: { ...process.env, AGENTMONITORS_DB: ':memory:' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    );
+
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf-8');
+    child.stderr.setEncoding('utf-8');
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+
+    try {
+      const deadline = Date.now() + 15_000;
+      while (
+        Date.now() < deadline &&
+        !stdout.includes('AgentMon daemon listening')
+      ) {
+        if (child.exitCode !== null) {
+          throw new Error(
+            `Daemon exited early with code ${child.exitCode}.\nSTDOUT:\n${stdout}\nSTDERR:\n${stderr}`,
+          );
+        }
+        // eslint-disable-next-line no-await-in-loop -- polling loop, not a batch
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      expect(stdout).toContain('AgentMon daemon listening');
+
+      // Give the (already-written, synchronous-before-listen) stderr warning
+      // a moment to land in our buffer before asserting on it.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      const listeningLine = stdout
+        .split('\n')
+        .find((line) => line.includes('AgentMon daemon listening'));
+      expect(listeningLine).toBeDefined();
+      const substitutedSocketPath = (listeningLine ?? '')
+        .replace('AgentMon daemon listening on ', '')
+        .trim();
+
+      // Criterion 2: the startup line (spec 002 §10.2) is unchanged — the
+      // daemon still reports whatever it actually bound (the substituted,
+      // hash-derived path), never the requested one.
+      expect(substitutedSocketPath).not.toBe(requestedSocketPath);
+      expect(substitutedSocketPath).toMatch(
+        /^\/tmp\/agentmonitors-[0-9a-f]{16}\.sock$/,
+      );
+
+      // Criterion 1 (regression): pre-fix, `resolveSocketPath` had no concept
+      // of an explicit caller-typed --socket and never wrote anything to
+      // stderr about the substitution — this assertion set fails against that
+      // code (stderr was empty).
+      expect(stderr).toContain(requestedSocketPath);
+      expect(stderr).toContain('100');
+      expect(stderr).toContain(substitutedSocketPath);
+    } finally {
+      child.kill('SIGTERM');
+      await new Promise<void>((resolve) => {
+        if (child.exitCode !== null) {
+          resolve();
+          return;
+        }
+        child.once('exit', () => resolve());
+      });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('does not warn when --socket is within the limit (no false positives)', async () => {
+    const socketPath = path.join(tempDir, 'socket-within-limit.sock');
+    const result = runWithEnv(
+      ['daemon', 'status', '--socket', socketPath, '--format', 'json'],
+      { AGENTMONITORS_DB: ':memory:' },
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe('');
+  });
+
+  it('substitutes silently (no stderr) when the over-limit socket is derived from AGENTMONITORS_SOCKET rather than an explicit --socket flag (criterion 4)', () => {
+    const overLimitSocketPath = path.join(
+      tempDir,
+      `env-${String(Date.now())}-${Math.random().toString(16).slice(2)}`,
+      'y'.repeat(120),
+      'agentmon.sock',
+    );
+    expect(overLimitSocketPath.length).toBeGreaterThan(100);
+
+    const result = runWithEnv(['daemon', 'status', '--format', 'json'], {
+      AGENTMONITORS_DB: ':memory:',
+      AGENTMONITORS_SOCKET: overLimitSocketPath,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe('');
+    const parsed = JSON.parse(result.stdout) as { socketPath: string };
+    expect(parsed.socketPath).not.toBe(overLimitSocketPath);
+    expect(parsed.socketPath).toMatch(
+      /^\/tmp\/agentmonitors-[0-9a-f]{16}\.sock$/,
+    );
+  });
+});
+
+/**
  * Issue #117: `daemon once` (and the `daemon run` periodic log) must stop
  * printing a clean `emitted 0 event(s)` when a monitor's `observe()` errored on
  * the tick — an author cannot otherwise distinguish a genuine no-change (not a

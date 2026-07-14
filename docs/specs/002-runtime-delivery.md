@@ -1072,7 +1072,34 @@ The socket path is resolved by `resolveSocketPath()`. Priority order:
 
 If the resolved path exceeds 100 characters (the Unix socket path length limit in use), the path is hashed (SHA-256, first 16 hex chars) and placed under `/tmp/agentmonitors-<hash>.sock`.
 
-Verified: `apps/cli/src/daemon-ipc.ts` — `resolveSocketPath()` (lines 124–139); `MAX_UNIX_SOCKET_PATH_LENGTH = 100` (line 17).
+**Explicit `--socket` substitution is announced (issue #337).** When `overridePath` came from a
+literal `--socket` flag the caller typed (not `AGENTMONITORS_SOCKET`, not a
+`.claude/agentmonitors.local.md`-derived value, and not the computed default) and that path exceeds
+the limit, the CLI prints one line to stderr naming the requested path, the limit it exceeded, and
+the substituted path before falling back to the hash — e.g. `daemon run --socket <144-char path>`
+still binds and reports the hashed path on stdout (§10.2's startup line is unchanged), but stderr now
+says so instead of substituting silently. Env-derived, local-state-derived, and default-derived
+candidates continue to hash silently, as before — they were never a value the caller typed on this
+invocation, so there is nothing to warn about a mismatch against.
+
+**Stale-daemon risk on the hash fallback (documented, not yet enforced).** Consistent hashing means
+repeated invocations with the _same_ over-limit candidate keep resolving to the same substituted
+socket, so same-argument commands still find "their" daemon. But the substituted path depends only on
+the candidate string, not on which workspace is asking: if a _different_ over-limit candidate happens
+to resolve to the same derived path — either a genuine hash collision (SHA-256 truncated to 16 hex
+chars; astronomically unlikely) or, far more plausibly, the _same_ shared/templated `--socket`
+value reused across otherwise-unrelated workspaces (same input, same hash — not a collision). If a
+stale daemon from an earlier, unrelated invocation of the same over-limit candidate is still listening on
+`/tmp/agentmonitors-<hash>.sock`, a caller can silently talk to the wrong daemon. The daemon IPC does
+not currently expose a single "this daemon's workspace" identity to check against — `session.list` is
+scoped per-session (`AgentSessionRecord.workspacePath`), and a daemon using the global default DB is
+explicitly allowed to serve sessions for multiple workspaces at once (§10.2), so "the reachable
+daemon's workspace differs from mine" cannot be decided from one scalar without breaking that
+multi-workspace case. Until a per-daemon workspace handshake exists, callers relying on an explicit
+over-limit `--socket` should treat the substituted path as workspace-identified only by the exact
+candidate string, not by the workspace it was invoked from.
+
+Verified: `apps/cli/src/daemon-ipc.ts` — `resolveSocketPath()`, `ResolveSocketPathOptions`.
 
 ### 10.4 IPC wire protocol
 

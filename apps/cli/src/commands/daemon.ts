@@ -288,7 +288,9 @@ daemonCommand
         );
         return;
       }
-      const socketPath = resolveSocketPath(options.socket);
+      const socketPath = resolveSocketPath(options.socket, {
+        explicit: options.socket !== undefined,
+      });
       if (await daemonAvailable(socketPath)) {
         reportError(
           `AgentMon daemon is already running at ${socketPath}.`,
@@ -317,13 +319,19 @@ daemonCommand
   )
   .action(async (options: { socket?: string; format: string }) => {
     try {
-      const running = await daemonAvailable(options.socket);
+      // Resolve once so an over-limit explicit --socket is only substituted
+      // (and warned about) a single time, then reused for every downstream
+      // call — resolving separately per call would print the warning twice.
+      const socketPath = resolveSocketPath(options.socket, {
+        explicit: options.socket !== undefined,
+      });
+      const running = await daemonAvailable(socketPath);
       const status = running
-        ? await daemonStatusClient(options.socket)
+        ? await daemonStatusClient(socketPath)
         : createRuntime().status();
       const payload = {
         running,
-        socketPath: resolveSocketPath(options.socket),
+        socketPath,
         ...status,
       };
       if (options.format === 'json') {
@@ -348,11 +356,10 @@ daemonCommand
   .option('--socket <path>', 'Unix domain socket path for the daemon')
   .action(async (options: { socket?: string }) => {
     try {
-      await callDaemon(
-        'stop',
-        {},
-        options.socket ? { socketPath: options.socket } : {},
-      );
+      const socketPath = resolveSocketPath(options.socket, {
+        explicit: options.socket !== undefined,
+      });
+      await callDaemon('stop', {}, { socketPath });
       console.log('AgentMon daemon stopping.');
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
