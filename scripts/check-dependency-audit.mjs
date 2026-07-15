@@ -23,6 +23,28 @@ const EXPIRES_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
  */
 
 /**
+ * Whether `expires` is not just YYYY-MM-DD-shaped but an actual calendar
+ * date. The regex alone lets through two dangerously-wrong cases: an
+ * out-of-range component (e.g. "2026-13-01", month 13) parses as `Invalid
+ * Date` — and since `NaN` compares `false` against everything, an exception
+ * with that `expires` would never be treated as expired (a permanent
+ * bypass). A rolled-over component (e.g. "2026-02-30") parses *successfully*
+ * as March 2nd instead of raising — silently moving the exception's real
+ * expiry later than written. Round-tripping through `toISOString` catches
+ * both: an invalid date fails the `NaN` check, and a rolled-over date's
+ * ISO date component no longer matches the input string.
+ *
+ * @param {string} expires
+ * @returns {boolean}
+ */
+function isValidCalendarDate(expires) {
+  if (!EXPIRES_DATE_PATTERN.test(expires)) return false;
+  const parsed = new Date(`${expires}T00:00:00.000Z`);
+  if (Number.isNaN(parsed.getTime())) return false;
+  return parsed.toISOString().slice(0, 10) === expires;
+}
+
+/**
  * Throws a descriptive error naming every missing/malformed field, rather
  * than a single generic complaint, so a bad allowlist entry is fixable from
  * the error message alone.
@@ -50,9 +72,9 @@ function assertValidAllowlistEntry(entry, path) {
   }
   if (
     typeof record.expires !== 'string' ||
-    !EXPIRES_DATE_PATTERN.test(record.expires)
+    !isValidCalendarDate(record.expires)
   ) {
-    problems.push('a string "expires" in YYYY-MM-DD format');
+    problems.push('a valid calendar date "expires" in YYYY-MM-DD format');
   }
 
   if (problems.length > 0) {
@@ -87,31 +109,81 @@ export function loadAllowlist(path = DEFAULT_ALLOWLIST_PATH) {
 }
 
 /**
- * Shells out to the real `pnpm audit` CLI and returns its parsed JSON report.
- * `pnpm audit` exits non-zero whenever it finds advisories at/above
- * `--audit-level`, so the report has to be read from the error too. `cwd` is
- * pinned to the repo root (rather than inherited from `process.cwd()`) so
- * running the gate from a subdirectory still audits this workspace, not
- * whatever pnpm project happens to be discoverable from the caller's cwd.
+ * `pnpm audit --json` reports a *tooling* failure (registry unreachable,
+ * auth failure, malformed response, etc.) by writing `{"error": {"code":
+ * ..., "message": ...}}` to stdout — with no `advisories` key at all, often
+ * alongside a non-zero exit. Without this check, `Object.values(report
+ * .advisories ?? {})` in `evaluateAuditReport` would treat that shape as
+ * "zero advisories" — a false "clean" result for a security gate, which is
+ * the opposite of what actually happened (the audit never ran). Throws
+ * instead, so a network/registry outage fails the gate loudly rather than
+ * silently reporting success.
+ *
+ * @param {unknown} report
+ * @returns {{ advisories: Record<string, unknown> }}
+ */
+export function assertValidAuditReport(report) {
+  const record =
+    typeof report === 'object' && report !== null
+      ? /** @type {Record<string, unknown>} */ (report)
+      : undefined;
+
+  if (record?.error !== undefined) {
+    const errorRecord =
+      typeof record.error === 'object' && record.error !== null
+        ? /** @type {Record<string, unknown>} */ (record.error)
+        : {};
+    throw new Error(
+      `audit tooling failed, not a clean result: ${errorRecord.message ?? JSON.stringify(record.error)}`,
+    );
+  }
+
+  if (
+    record === undefined ||
+    typeof record.advisories !== 'object' ||
+    record.advisories === null ||
+    Array.isArray(record.advisories)
+  ) {
+    throw new Error(
+      `audit tooling failed, not a clean result: unexpected \`pnpm audit\` report shape (no "advisories" object) — ${JSON.stringify(report)}`,
+    );
+  }
+
+  return /** @type {{ advisories: Record<string, unknown> }} */ (record);
+}
+
+/**
+ * Shells out to the real `pnpm audit` CLI and returns its parsed, validated
+ * JSON report. `pnpm audit` exits non-zero both when it finds advisories
+ * at/above `--audit-level` *and* on a tooling failure, so the report has to
+ * be read from the error too — `assertValidAuditReport` is what tells those
+ * two cases apart. `cwd` is pinned to the repo root (rather than inherited
+ * from `process.cwd()`) so running the gate from a subdirectory still
+ * audits this workspace, not whatever pnpm project happens to be
+ * discoverable from the caller's cwd.
  *
  * @param {{ cwd?: string }} [options]
  * @returns {{ advisories: Record<string, unknown> }}
  */
 export function runPnpmAudit({ cwd = REPO_ROOT } = {}) {
+  /** @type {unknown} */
+  let parsed;
   try {
     const stdout = execFileSync(
       'pnpm',
       ['audit', '--prod', '--audit-level', 'high', '--json'],
       { encoding: 'utf8', cwd },
     );
-    return JSON.parse(stdout);
+    parsed = JSON.parse(stdout);
   } catch (error) {
     const stdout = /** @type {{ stdout?: string }} */ (error).stdout;
     if (typeof stdout === 'string' && stdout.trim().length > 0) {
-      return JSON.parse(stdout);
+      parsed = JSON.parse(stdout);
+    } else {
+      throw error;
     }
-    throw error;
   }
+  return assertValidAuditReport(parsed);
 }
 
 /**
@@ -139,12 +211,21 @@ function startOfDayAfterExpiry(expires) {
 }
 
 /**
+ * Fails *closed*: an `expires` that can't be parsed into a real calendar
+ * date (see `isValidCalendarDate`) is treated as already expired, not as
+ * "never expires". `loadAllowlist` should already reject such an entry
+ * before it ever reaches here, but this is a security gate — a caller that
+ * bypasses that validation (e.g. constructing exceptions directly, as unit
+ * tests do) must not get a silent, permanent bypass out of it.
+ *
  * @param {{ expires: string }} exception
  * @param {Date} now
  * @returns {boolean}
  */
 function isExpired(exception, now) {
-  return now.getTime() >= startOfDayAfterExpiry(exception.expires).getTime();
+  const cutoff = startOfDayAfterExpiry(exception.expires).getTime();
+  if (Number.isNaN(cutoff)) return true;
+  return now.getTime() >= cutoff;
 }
 
 /**

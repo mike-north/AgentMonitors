@@ -23,6 +23,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   DEFAULT_ALLOWLIST_PATH,
+  assertValidAuditReport,
   evaluateAuditReport,
   loadAllowlist,
   resolvedVersions,
@@ -269,6 +270,74 @@ describe('evaluateAuditReport', () => {
     expect(blocking).toHaveLength(0);
     expect(expiredExceptions).toHaveLength(0);
   });
+
+  // Defense in depth for the permanent-bypass regression above: even if an
+  // invalid `expires` reaches `evaluateAuditReport` directly (bypassing
+  // `loadAllowlist`'s validation, as this test does), an unparseable expiry
+  // must fail *closed* (treated as already expired) rather than *open*
+  // (treated as never expiring).
+  it('treats an exception with an unparseable expires as already expired (fail closed)', () => {
+    const report = {
+      advisories: {
+        1: advisory({ github_advisory_id: 'GHSA-aaaa-bbbb-cccc' }),
+      },
+    };
+    const exceptions = [
+      {
+        id: 'GHSA-aaaa-bbbb-cccc',
+        package: 'example-pkg',
+        reason: 'bypassed validation',
+        expires: '2026-13-01',
+      },
+    ];
+
+    const { blocking, suppressed, expiredExceptions } = evaluateAuditReport(
+      report,
+      exceptions,
+      { now: new Date('2026-07-14') },
+    );
+
+    expect(blocking).toHaveLength(1);
+    expect(suppressed).toHaveLength(0);
+    expect(expiredExceptions).toHaveLength(1);
+  });
+});
+
+// Regression: `pnpm audit --json` reports a *tooling* failure (registry
+// unreachable, etc.) as `{"error": {...}}` on stdout, with no "advisories"
+// key. Before this check, `evaluateAuditReport`'s `Object.values(report
+// .advisories ?? {})` treated that shape as "zero advisories" — a false
+// "clean" result for a security gate. Reproduced live via
+// `pnpm audit --prod --audit-level high --json --registry=http://invalid.invalid.invalid/`.
+describe('assertValidAuditReport', () => {
+  it('accepts a well-formed report with an advisories object', () => {
+    const report = { advisories: {} };
+
+    expect(assertValidAuditReport(report)).toEqual(report);
+  });
+
+  it('throws on a real `pnpm audit` tooling-failure shape (registry unreachable)', () => {
+    const toolingFailure = { error: { code: 'pnpm', message: 'fetch failed' } };
+
+    expect(() => assertValidAuditReport(toolingFailure)).toThrow(
+      /audit tooling failed, not a clean result.*fetch failed/,
+    );
+  });
+
+  it('throws when the report has no "advisories" object at all', () => {
+    expect(() => assertValidAuditReport({ metadata: {} })).toThrow(
+      /audit tooling failed, not a clean result/,
+    );
+  });
+
+  it('throws on a non-object report', () => {
+    expect(() => assertValidAuditReport(null)).toThrow(
+      /audit tooling failed, not a clean result/,
+    );
+    expect(() => assertValidAuditReport('clean')).toThrow(
+      /audit tooling failed, not a clean result/,
+    );
+  });
 });
 
 describe('loadAllowlist', () => {
@@ -388,6 +457,55 @@ describe('loadAllowlist', () => {
     );
 
     expect(() => loadAllowlist(file)).toThrow(/YYYY-MM-DD/);
+  });
+
+  // Regression: "2026-13-01" (month 13) matches the YYYY-MM-DD *format*
+  // regex but parses to `Invalid Date`. Since `NaN` compares `false` against
+  // everything, evaluateAuditReport's old `now.getTime() >= new
+  // Date(exception.expires).getTime()` would never be true — the exception
+  // would never expire, a permanent bypass. Must be rejected at load time.
+  it('throws when "expires" has an out-of-range month (permanent-bypass regression)', () => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), 'audit-allowlist-'));
+    const file = path.join(tmpDir, 'allowlist.json');
+    writeFileSync(
+      file,
+      JSON.stringify({
+        exceptions: [
+          {
+            id: 'GHSA-aaaa-bbbb-cccc',
+            package: 'example-pkg',
+            reason: 'no fix available yet',
+            expires: '2026-13-01',
+          },
+        ],
+      }),
+    );
+
+    expect(() => loadAllowlist(file)).toThrow(/valid calendar date/);
+  });
+
+  // Regression: "2026-02-30" also matches the format regex, but
+  // `new Date(...)` silently rolls it over to March 2nd instead of raising —
+  // moving the real expiry later than what was written. Caught by
+  // round-tripping through `toISOString` and comparing back to the input.
+  it('throws when "expires" is a rolled-over calendar date (e.g. Feb 30)', () => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), 'audit-allowlist-'));
+    const file = path.join(tmpDir, 'allowlist.json');
+    writeFileSync(
+      file,
+      JSON.stringify({
+        exceptions: [
+          {
+            id: 'GHSA-aaaa-bbbb-cccc',
+            package: 'example-pkg',
+            reason: 'no fix available yet',
+            expires: '2026-02-30',
+          },
+        ],
+      }),
+    );
+
+    expect(() => loadAllowlist(file)).toThrow(/valid calendar date/);
   });
 
   it('loads the real shipped scripts/audit-allowlist.json without throwing', () => {
