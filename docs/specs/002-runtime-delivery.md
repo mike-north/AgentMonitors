@@ -728,6 +728,14 @@ Each monitor has persisted runtime state containing: `lastObservationAt`, `sourc
 
 This split is important: source plugins own change-detection state, while the runtime owns notification timing behavior.
 
+**Workspace scoping (issue #345 / #307):** this state is keyed by
+`(monitorId, workspacePath)`, never `monitorId` alone. The global database can
+hold the same monitor id in unrelated workspaces, so every runtime read/write of
+monitor state names its workspace scope (the tick loop, `ingest()`,
+`scheduleForMonitor()`, the watch path, and `explain`/`doctor` all thread it
+through). See the [`monitor_state` schema](#monitor_state) for the key, the
+NULL-safe uniqueness, and the one-time re-baseline migration.
+
 **Restart-safety / upgrade backfill (issue #109):** When a persisted `notifyState.pendingDebounce` or `notifyState.pendingRollup` batch is hydrated on daemon restart, envelopes written before the range-urgency upgrade may lack an `effectiveUrgency` field. The runtime **MUST** backfill it on hydration using `effectiveObservationUrgency(monitor, observation)` so that the materialized `monitor_events.urgency` row is never written with an undefined value. `effectiveObservationUrgency` degrades cleanly when the hydrated monitor snapshot itself lacks `urgencyMax` (old monitor): the `URGENCY_BY_RANK[NaN] ?? lo` fallback returns the monitor's base urgency. The `pendingRollup` batch survives daemon restarts and flushes on the next window opening (BP1; [§4.4](#44-scheduled-rollup-pace-mode-current)).
 
 Verified: `libs/core/src/runtime/types.ts` — `MonitorRuntimeState` (lines 131–135); `libs/core/src/inbox/schema.ts` — `monitorState` table (lines 98–105).
@@ -1480,16 +1488,38 @@ One row per known agent session. Upserted on open (via `hostSessionId` + `adapte
 
 ### `monitor_state`
 
-Stores the per-monitor polling and notification state. One row per monitor ID.
+Stores the per-monitor polling and notification state. **One row per
+`(monitor_id, workspace_path)` scope** — _not_ per monitor id alone. The database
+is global and the same monitor id can exist in unrelated workspaces (the
+getting-started default `my-first-monitor` is the common collision), so keying
+this row by id alone let one workspace's source baseline (`source_state`) leak
+into another: a second project reusing the id observed `descoped`/`deleted`
+changes for files that only ever existed in the first (issue #345 / #307). A
+surrogate `id` PK plus a UNIQUE index on `(monitor_id, COALESCE(workspace_path, ''))`
+keeps each scope single-rowed, including the global (`NULL`-workspace) scope — the
+same NULL-safe pattern as `session_object_cursor`.
 
 | Column                | Type             | Notes                                          |
 | --------------------- | ---------------- | ---------------------------------------------- |
-| `monitor_id`          | TEXT PK          |                                                |
+| `id`                  | TEXT PK          | ULID surrogate key                             |
+| `monitor_id`          | TEXT NOT NULL    | Unique with `workspace_path`                   |
+| `workspace_path`      | TEXT nullable    | `NULL` = global scope                          |
 | `last_observation_at` | INTEGER nullable | Used for due-interval computation              |
 | `last_fingerprint`    | TEXT nullable    | Reserved; not currently written by the runtime |
 | `source_state`        | TEXT NOT NULL    | JSON; owned by the source plugin               |
 | `notify_state`        | TEXT NOT NULL    | JSON; `NotifyRuntimeState` shape               |
 | `updated_at`          | INTEGER NOT NULL |                                                |
+
+**Migration — one-time re-baseline (issue #345 / #307).** A `monitor_state` table
+created before workspace namespacing keyed rows by `monitor_id` alone (it was the
+PRIMARY KEY, with no `workspace_path` column), so its persisted `source_state`
+cannot be attributed to any one workspace. On the first open after upgrade the
+runtime **drops** the legacy table rather than silently misattributing that state:
+every monitor then re-baselines cleanly on its first post-upgrade tick (a source
+seeing no prior state establishes a fresh baseline and emits no spurious
+created/deleted/descoped events), and diagnostic-only `notify_state` /
+`observation_history` reset with it. This is a documented one-time transition, not
+a per-tick behavior.
 
 ### `observation_history`
 
@@ -1509,10 +1539,20 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
 
 _current_. Per-monitor isolation and the `errored` outcome are guaranteed by the runtime for both the tick loop and the watch path (issue #46). The `rebaselined` and `no-files-matched` outcomes are supported via the optional `ObservationResult.outcome` diagnostic field (issues #56 and #193). Verified: `RuntimeStore.recordObservationHistory` / `listObservationHistory`, written from `service.ts` `tick()` (observe-error and ingest-error catches), `ingest()` per-observation materialization catch, `ingest()` `sourceOutcome` classification, and `consumeWatch()` inner catch. Read via `agentmonitors monitor history` ([005 §6](./005-cli-reference.md)).
 
+An observation tick always runs for one concrete workspace, so each row records
+its `workspace_path`. Workspace-scoped readers (`monitor explain`, `doctor`, and
+`monitor history --workspace`) filter by exact workspace so a same-id monitor in
+another workspace cannot leak its audit trail here (issue #345 / #307); an
+unscoped `monitor history` still tails across all workspaces. Rows written before
+the `workspace_path` column existed keep `NULL` and fall out of any
+workspace-scoped query (a soft one-time reset consistent with the `monitor_state`
+re-baseline above).
+
 | Column             | Type             | Notes                                                                                |
 | ------------------ | ---------------- | ------------------------------------------------------------------------------------ |
 | `id`               | TEXT PK          | ULID                                                                                 |
 | `monitor_id`       | TEXT NOT NULL    |                                                                                      |
+| `workspace_path`   | TEXT nullable    | Observing workspace; `NULL` on pre-namespacing legacy rows                           |
 | `source_name`      | TEXT NOT NULL    |                                                                                      |
 | `observation_data` | TEXT NOT NULL    | JSON                                                                                 |
 | `result`           | TEXT NOT NULL    | `triggered \| suppressed \| no-change \| no-files-matched \| errored \| rebaselined` |

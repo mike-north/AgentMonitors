@@ -566,6 +566,10 @@ monitorTestCommand
   )
   .argument('[monitorId]', 'Filter to a single monitor id')
   .option('--socket <path>', 'Unix domain socket path for the daemon')
+  .option(
+    '--workspace <path>',
+    'Scope history to one workspace (the same monitor id can exist in several)',
+  )
   .option('--limit <n>', 'Maximum rows to return', '50')
   .addOption(
     new Option('--format <format>', 'Output format')
@@ -576,7 +580,12 @@ monitorTestCommand
   .action(
     async (
       monitorId: string | undefined,
-      options: { socket?: string; limit: string; format: string | undefined },
+      options: {
+        socket?: string;
+        workspace?: string;
+        limit: string;
+        format: string | undefined;
+      },
     ) => {
       const format = resolveFormat(options.format);
       const json = format === 'json';
@@ -584,6 +593,12 @@ monitorTestCommand
       const limit = Number.parseInt(options.limit, 10);
       const query = {
         ...(monitorId ? { monitorId } : {}),
+        // Opt-in workspace scoping (issue #345 / #307). Omitted → list across
+        // all workspaces (a global audit tail); provided → only this workspace's
+        // ticks, so a reused monitor id can't mix another project's history in.
+        ...(options.workspace
+          ? { workspacePath: path.resolve(options.workspace) }
+          : {}),
         ...(Number.isFinite(limit) && limit > 0 ? { limit } : {}),
       };
       const socketPath = resolveSocketPath(options.socket, {

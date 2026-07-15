@@ -111,6 +111,7 @@ const hookDiagnoseParamsSchema = z.object({
 });
 const historyListParamsSchema = z.object({
   monitorId: z.string().optional(),
+  workspacePath: z.string().optional(),
   limit: z.number().int().positive().optional(),
 });
 const monitorExplainParamsSchema = z.object({
@@ -566,6 +567,9 @@ function handleRequest(
       return Promise.resolve(
         runtime.listObservationHistory({
           ...(params.monitorId ? { monitorId: params.monitorId } : {}),
+          ...(params.workspacePath
+            ? { workspacePath: params.workspacePath }
+            : {}),
           ...(params.limit ? { limit: params.limit } : {}),
         }),
       );

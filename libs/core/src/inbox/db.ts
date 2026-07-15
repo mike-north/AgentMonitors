@@ -38,6 +38,25 @@ function addColumnIfMissing(
   client.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
 }
 
+/** True if `table` exists in this database. */
+function tableExists(client: BetterSQLiteClient, table: string): boolean {
+  const row = client
+    .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`)
+    .get(table);
+  return row !== undefined;
+}
+
+/** True if `table` exists and has a column named `column`. */
+function tableHasColumn(
+  client: BetterSQLiteClient,
+  table: string,
+  column: string,
+): boolean {
+  if (!tableExists(client, table)) return false;
+  const columns = client.pragma(`table_info(${table})`) as { name: string }[];
+  return columns.some((c) => c.name === column);
+}
+
 /**
  * SQLite file suffixes whose modes we restrict alongside the main database
  * file. `-wal` / `-shm` are created by SQLite itself in WAL mode; `-journal`
@@ -173,9 +192,30 @@ function buildDb(dbPath: string): InboxDb {
     )
   `);
 
+  // One-time re-baseline migration (issue #345 / #307). A `monitor_state` table
+  // created before workspace namespacing keyed rows by `monitor_id` ALONE (it was
+  // the PRIMARY KEY, with no `workspace_path` column), so its persisted
+  // `source_state` (the source plugin's change-detection baseline) cannot be
+  // safely attributed to any one workspace — the same id may have been written by
+  // several workspaces sharing one global DB. Rather than silently misattribute
+  // that state (which is the bug), drop the legacy table so every monitor
+  // re-baselines cleanly on its first post-upgrade tick: a source seeing no prior
+  // state establishes a fresh baseline (no spurious created/deleted/descoped
+  // events) instead of diffing against another workspace's files. Diagnostic-only
+  // `notify_state`/`observation_history` are reset by the same one-time step. See
+  // 002 §3 (Persisted Monitor State) for the documented transition.
+  if (
+    tableExists(sqlite, 'monitor_state') &&
+    !tableHasColumn(sqlite, 'monitor_state', 'workspace_path')
+  ) {
+    sqlite.exec('DROP TABLE monitor_state');
+  }
+
   db.run(sql`
     CREATE TABLE IF NOT EXISTS monitor_state (
-      monitor_id TEXT PRIMARY KEY,
+      id TEXT PRIMARY KEY,
+      monitor_id TEXT NOT NULL,
+      workspace_path TEXT,
       last_observation_at INTEGER,
       last_fingerprint TEXT,
       source_state TEXT NOT NULL DEFAULT '{}',
@@ -184,16 +224,34 @@ function buildDb(dbPath: string): InboxDb {
     )
   `);
 
+  // Unique on the workspace-scoped state key. SQLite treats NULLs as DISTINCT in
+  // a UNIQUE index, which would let duplicate rows accumulate for global
+  // (NULL-workspace) monitors; `COALESCE(workspace_path, '')` collapses the NULL
+  // case so each `(monitor_id, workspace)` scope holds exactly one row. Mirrors
+  // `session_object_cursor` (issue #345 / #307).
+  db.run(sql`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_monitor_state_key
+      ON monitor_state (monitor_id, COALESCE(workspace_path, ''))
+  `);
+
   db.run(sql`
     CREATE TABLE IF NOT EXISTS observation_history (
       id TEXT PRIMARY KEY,
       monitor_id TEXT NOT NULL,
+      workspace_path TEXT,
       source_name TEXT NOT NULL,
       observation_data TEXT NOT NULL DEFAULT '{}',
       result TEXT NOT NULL,
       created_at INTEGER NOT NULL
     )
   `);
+
+  // Additive migration (issue #345 / #307): an `observation_history` table created
+  // before workspace namespacing lacks `workspace_path`. Add it if missing so
+  // post-upgrade rows are scoped; legacy rows keep NULL and simply fall out of any
+  // workspace-scoped history/explain query (a soft one-time reset of the audit
+  // trail, consistent with the monitor_state re-baseline above).
+  addColumnIfMissing(sqlite, 'observation_history', 'workspace_path', 'TEXT');
 
   db.run(sql`
     CREATE TABLE IF NOT EXISTS monitor_events (

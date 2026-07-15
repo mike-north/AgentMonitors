@@ -121,6 +121,22 @@ function deliveryStateForRow(row: {
 }
 
 /**
+ * The `(monitorId, workspacePath)` lookup predicate for a `monitor_state` row
+ * (issue #345 / #307). `NULL` `workspacePath` (global scope) is matched with
+ * `IS NULL`; a concrete workspace with equality — the same NULL-safe idiom the
+ * `session_object_cursor` reads use, and paired with the
+ * `COALESCE(workspace_path, '')` UNIQUE index so each scope holds one row.
+ */
+function monitorStateKey(monitorId: string, workspacePath: string | null) {
+  return and(
+    eq(monitorState.monitorId, monitorId),
+    workspacePath == null
+      ? isNull(monitorState.workspacePath)
+      : eq(monitorState.workspacePath, workspacePath),
+  );
+}
+
+/**
  * The per-recipient `net`-collapse grouping key for an event (002 §1.1.7): the
  * `(monitorId, objectKey, workspacePath)` 3-tuple — the SAME key used by
  * {@link RuntimeStore.advanceCursorsForClaimedEvents} and the
@@ -355,11 +371,22 @@ export class RuntimeStore {
       .run();
   }
 
-  getMonitorState(monitorId: string): MonitorRuntimeState {
+  /**
+   * Read a monitor's persisted runtime state for ONE workspace scope (issue
+   * #345 / #307). State is keyed by `(monitorId, workspacePath)`, so the caller
+   * MUST name the scope: the same monitor id can exist in unrelated workspaces
+   * sharing one global DB, and reading the wrong scope's `sourceState` leaks one
+   * workspace's file-fingerprint baseline into another. `NULL` `workspacePath`
+   * (global) is matched with `IS NULL`, mirroring `getSessionObjectCursor`.
+   */
+  getMonitorState(
+    monitorId: string,
+    workspacePath: string | null,
+  ): MonitorRuntimeState {
     const row = asInternalDb(this.db)
       .select()
       .from(monitorState)
-      .where(eq(monitorState.monitorId, monitorId))
+      .where(monitorStateKey(monitorId, workspacePath))
       .get();
     if (!row) {
       return {
@@ -377,6 +404,7 @@ export class RuntimeStore {
 
   setMonitorState(
     monitorId: string,
+    workspacePath: string | null,
     state: {
       sourceState?: unknown;
       notifyState?: unknown;
@@ -388,32 +416,35 @@ export class RuntimeStore {
     const existing = db
       .select()
       .from(monitorState)
-      .where(eq(monitorState.monitorId, monitorId))
+      .where(monitorStateKey(monitorId, workspacePath))
       .get();
-    const values = {
-      monitorId,
-      lastObservationAt: state.lastObservationAt ?? null,
-      lastFingerprint: null,
-      sourceState: JSON.stringify(state.sourceState ?? {}),
-      notifyState: JSON.stringify(state.notifyState ?? {}),
-      updatedAt: now,
-    };
 
     if (existing) {
       db.update(monitorState)
         .set({
-          lastObservationAt: values.lastObservationAt,
-          lastFingerprint: values.lastFingerprint,
-          sourceState: values.sourceState,
-          notifyState: values.notifyState,
-          updatedAt: values.updatedAt,
+          lastObservationAt: state.lastObservationAt ?? null,
+          lastFingerprint: null,
+          sourceState: JSON.stringify(state.sourceState ?? {}),
+          notifyState: JSON.stringify(state.notifyState ?? {}),
+          updatedAt: now,
         })
-        .where(eq(monitorState.monitorId, monitorId))
+        .where(eq(monitorState.id, existing.id))
         .run();
       return;
     }
 
-    db.insert(monitorState).values(values).run();
+    db.insert(monitorState)
+      .values({
+        id: ulid(),
+        monitorId,
+        workspacePath,
+        lastObservationAt: state.lastObservationAt ?? null,
+        lastFingerprint: null,
+        sourceState: JSON.stringify(state.sourceState ?? {}),
+        notifyState: JSON.stringify(state.notifyState ?? {}),
+        updatedAt: now,
+      })
+      .run();
   }
 
   /**
@@ -947,6 +978,7 @@ export class RuntimeStore {
 
   recordObservationHistory(input: {
     monitorId: string;
+    workspacePath: string | null;
     sourceName: string;
     result: ObservationOutcome;
     observationData: Record<string, unknown>;
@@ -956,6 +988,7 @@ export class RuntimeStore {
       .values({
         id: ulid(),
         monitorId: input.monitorId,
+        workspacePath: input.workspacePath,
         sourceName: input.sourceName,
         observationData: JSON.stringify(input.observationData),
         result: input.result,
@@ -964,23 +997,37 @@ export class RuntimeStore {
       .run();
   }
 
+  /**
+   * List observation-history rows, newest first. When `query.workspacePath` is
+   * provided the result is scoped to that exact workspace (issue #345 / #307) —
+   * an observation tick always runs for one concrete workspace, so (unlike
+   * `monitor_events`) there is no workspace-agnostic history to fold in, and a
+   * same-id monitor in another workspace must not leak its audit trail here.
+   * Omitting `workspacePath` returns rows across all workspaces (diagnostic
+   * listing), mirroring how `listEvents` leaves the scope open when unset.
+   */
   listObservationHistory(
     query: ObservationHistoryQuery = {},
   ): ObservationHistoryRecord[] {
+    const conditions = [
+      query.monitorId
+        ? eq(observationHistory.monitorId, query.monitorId)
+        : undefined,
+      query.workspacePath !== undefined
+        ? eq(observationHistory.workspacePath, query.workspacePath)
+        : undefined,
+    ].filter((condition) => condition !== undefined);
     const rows = asInternalDb(this.db)
       .select()
       .from(observationHistory)
-      .where(
-        query.monitorId
-          ? eq(observationHistory.monitorId, query.monitorId)
-          : undefined,
-      )
+      .where(conditions.length > 0 ? and(...conditions) : undefined)
       .orderBy(desc(observationHistory.createdAt))
       .limit(query.limit ?? 50)
       .all();
     return rows.map((row) => ({
       id: row.id,
       monitorId: row.monitorId,
+      workspacePath: row.workspacePath ?? null,
       sourceName: row.sourceName,
       observationData: parseJson<Record<string, unknown>>(
         row.observationData,

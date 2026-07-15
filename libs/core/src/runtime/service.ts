@@ -581,8 +581,15 @@ export class AgentMonitorRuntime {
       }),
     );
 
-    const runtimeState = this.store.getMonitorState(input.monitorId);
-    const schedule = this.scheduleForMonitor(monitor, now);
+    const runtimeState = this.store.getMonitorState(
+      input.monitorId,
+      input.workspacePath ?? null,
+    );
+    const schedule = this.scheduleForMonitor(
+      monitor,
+      now,
+      input.workspacePath ?? null,
+    );
     const lastObservationAt = runtimeState.lastObservationAt;
     const nextDueAt = schedule.due
       ? now
@@ -609,6 +616,12 @@ export class AgentMonitorRuntime {
 
     const observations = this.store.listObservationHistory({
       monitorId: input.monitorId,
+      // Scope to the explained workspace so a same-id monitor in another
+      // workspace cannot leak its observation history into this report
+      // (issue #345 / #307; mirrors the event/monitor-state scoping above).
+      ...(input.workspacePath !== undefined
+        ? { workspacePath: input.workspacePath }
+        : {}),
       limit: historyLimit,
     });
     const latestObservation = observations[0];
@@ -1020,10 +1033,17 @@ export class AgentMonitorRuntime {
       const valid = scopeErrors.length === 0;
       if (!valid) invalidCount += 1;
 
-      const runtimeState = this.store.getMonitorState(monitor.id);
-      const schedule = this.scheduleForMonitor(monitor, now);
+      const runtimeState = this.store.getMonitorState(
+        monitor.id,
+        workspacePath,
+      );
+      const schedule = this.scheduleForMonitor(monitor, now, workspacePath);
       const history = this.store.listObservationHistory({
         monitorId: monitor.id,
+        // Scope to this workspace (issue #345 / #307) so a same-id monitor in
+        // another workspace cannot leak its observation history here — mirrors
+        // the `monitor_events` scoping below and in explainMonitor.
+        workspacePath,
         limit: historyLimit,
       });
       // "Never observed" means no completed observation tick AND no recorded
@@ -1478,14 +1498,17 @@ export class AgentMonitorRuntime {
       // skip its one-shot observe() so it is not processed twice (G5).
       if (this.activeWatchers.has(monitor.id)) continue;
 
-      const schedule = this.scheduleForMonitor(monitor, now);
+      const schedule = this.scheduleForMonitor(monitor, now, workspacePath);
       if (!schedule.due) {
         // Record skipped monitors so callers can distinguish "not yet due" from
         // "no monitors found" (issue #152). nextDueAt is computed from the same
         // scheduling decision — single source of truth, never recomputed.
         // Fall back to `now` (not epoch 0) when lastObservationAt is absent so
         // the computed nextDueAt stays meaningful even under partial/missing state.
-        const monitorStateForSkip = this.store.getMonitorState(monitor.id);
+        const monitorStateForSkip = this.store.getMonitorState(
+          monitor.id,
+          workspacePath,
+        );
         const lastObservationAt =
           monitorStateForSkip.lastObservationAt?.getTime() ?? now.getTime();
         const nextDueAt = new Date(lastObservationAt + schedule.nextPollMs);
@@ -1507,7 +1530,7 @@ export class AgentMonitorRuntime {
             now,
             rollupNotifyState,
           );
-          this.store.setMonitorState(monitor.id, {
+          this.store.setMonitorState(monitor.id, workspacePath, {
             sourceState: monitorStateForSkip.sourceState,
             notifyState: rollupDispatch.nextState,
             lastObservationAt: monitorStateForSkip.lastObservationAt ?? null,
@@ -1550,7 +1573,10 @@ export class AgentMonitorRuntime {
       // diff spans from the last good baseline rather than an empty state.
       let observationResult;
       try {
-        const monitorState = this.store.getMonitorState(monitor.id);
+        const monitorState = this.store.getMonitorState(
+          monitor.id,
+          workspacePath,
+        );
         observationResult = await source.observe(
           watchConfig(monitor.frontmatter.watch),
           {
@@ -1574,6 +1600,7 @@ export class AgentMonitorRuntime {
         try {
           this.store.recordObservationHistory({
             monitorId: monitor.id,
+            workspacePath,
             sourceName,
             result: 'errored',
             observationData: {
@@ -1612,6 +1639,7 @@ export class AgentMonitorRuntime {
         try {
           this.store.recordObservationHistory({
             monitorId: monitor.id,
+            workspacePath,
             sourceName,
             result: 'errored',
             observationData: {
@@ -1679,7 +1707,10 @@ export class AgentMonitorRuntime {
       return !shaped.suppressed;
     });
 
-    const monitorState = this.store.getMonitorState(monitor.id);
+    const monitorState = this.store.getMonitorState(
+      monitor.id,
+      options.workspacePath,
+    );
     const dispatch = this.dispatchNotify(
       monitor,
       passedObservations,
@@ -1687,7 +1718,7 @@ export class AgentMonitorRuntime {
       monitorState.notifyState,
     );
 
-    this.store.setMonitorState(monitor.id, {
+    this.store.setMonitorState(monitor.id, options.workspacePath, {
       sourceState: options.nextSourceState
         ? options.nextSourceState.value
         : monitorState.sourceState,
@@ -1760,6 +1791,7 @@ export class AgentMonitorRuntime {
     const emittedCount = emitted.length;
     this.store.recordObservationHistory({
       monitorId: monitor.id,
+      workspacePath: options.workspacePath,
       sourceName: monitor.frontmatter.watch.type,
       result:
         emittedCount > 0
@@ -1806,6 +1838,7 @@ export class AgentMonitorRuntime {
         try {
           this.store.recordObservationHistory({
             monitorId: monitor.id,
+            workspacePath: options.workspacePath,
             sourceName: monitor.frontmatter.watch.type,
             result: 'errored',
             observationData: {
@@ -1929,7 +1962,7 @@ export class AgentMonitorRuntime {
     signal: AbortSignal,
     onError?: (monitorId: string, error: Error) => void,
   ): Promise<void> {
-    const monitorState = this.store.getMonitorState(monitor.id);
+    const monitorState = this.store.getMonitorState(monitor.id, workspacePath);
     const iterable = watch(watchConfig(monitor.frontmatter.watch), {
       previousState: monitorState.sourceState,
       now: new Date(),
@@ -1955,6 +1988,7 @@ export class AgentMonitorRuntime {
           try {
             this.store.recordObservationHistory({
               monitorId: monitor.id,
+              workspacePath,
               sourceName: monitor.frontmatter.watch.type,
               result: 'errored',
               observationData: {
@@ -2009,8 +2043,9 @@ export class AgentMonitorRuntime {
   private scheduleForMonitor(
     monitor: MonitorDefinition,
     now: Date,
+    workspacePath: string | null,
   ): PollingDecision {
-    const state = this.store.getMonitorState(monitor.id);
+    const state = this.store.getMonitorState(monitor.id, workspacePath);
     const lastObservationAt = state.lastObservationAt?.getTime() ?? 0;
     const elapsed = now.getTime() - lastObservationAt;
     const config = watchConfig(monitor.frontmatter.watch);

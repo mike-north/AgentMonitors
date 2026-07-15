@@ -1050,7 +1050,7 @@ Handle it.
         // `effectiveUrgency` intentionally absent — the key pre-upgrade condition.
       };
 
-      store.setMonitorState('test-monitor', {
+      store.setMonitorState('test-monitor', rootDir, {
         notifyState: {
           pendingDebounce: {
             observations: [preUpgradeEnvelope],
@@ -2195,7 +2195,7 @@ Handle it.
 
     // The persisted sourceState must still be { v: 1 } — not wiped to {}.
     const store = new RuntimeStore(createDb(dbPath));
-    const state = store.getMonitorState('test-monitor');
+    const state = store.getMonitorState('test-monitor', rootDir);
     expect(state.sourceState).toEqual({ v: 1 });
   });
 
@@ -3514,8 +3514,8 @@ Handle it.
         ).toHaveLength(0);
 
         // Both observations are held durably in notifyState.pendingRollup.
-        const held =
-          store.getMonitorState('test-monitor').notifyState.pendingRollup;
+        const held = store.getMonitorState('test-monitor', rootDir).notifyState
+          .pendingRollup;
         expect(held?.observations).toHaveLength(2);
         expect(held?.observations.map((o) => o.observation.title)).toEqual([
           'Change A',
@@ -3580,7 +3580,8 @@ Handle it.
 
         // The accumulation state is cleared after the flush.
         expect(
-          store.getMonitorState('test-monitor').notifyState.pendingRollup,
+          store.getMonitorState('test-monitor', rootDir).notifyState
+            .pendingRollup,
         ).toBeUndefined();
       } finally {
         vi.useRealTimers();
@@ -3620,7 +3621,8 @@ Handle it.
           runtime.listEvents({ sessionId: session.id, unreadOnly: true }),
         ).toHaveLength(0);
         expect(
-          store.getMonitorState('test-monitor').notifyState.pendingRollup,
+          store.getMonitorState('test-monitor', rootDir).notifyState
+            .pendingRollup,
         ).toBeUndefined();
       } finally {
         vi.useRealTimers();
@@ -3660,6 +3662,7 @@ Handle it.
         // Confirm the batch was persisted to disk before the restart.
         const persisted = new RuntimeStore(createDb(dbPath)).getMonitorState(
           'test-monitor',
+          rootDir,
         ).notifyState.pendingRollup;
         expect(persisted?.observations).toHaveLength(1);
 
@@ -3689,8 +3692,10 @@ Handle it.
 
         // The accumulation state is cleared after the post-restart flush.
         expect(
-          new RuntimeStore(createDb(dbPath)).getMonitorState('test-monitor')
-            .notifyState.pendingRollup,
+          new RuntimeStore(createDb(dbPath)).getMonitorState(
+            'test-monitor',
+            rootDir,
+          ).notifyState.pendingRollup,
         ).toBeUndefined();
       } finally {
         vi.useRealTimers();
@@ -3751,7 +3756,7 @@ Handle it.
         expect(tick3.emittedEventIds).toHaveLength(0);
 
         // rollupLastFiredMinute is persisted so it survives to guard tick 3.
-        const state = store.getMonitorState('test-monitor');
+        const state = store.getMonitorState('test-monitor', rootDir);
         expect(state.notifyState.rollupLastFiredMinute).toBe(
           Math.floor(AT_WINDOW.getTime() / 60_000),
         );
@@ -3985,17 +3990,19 @@ Daily digest.
       }
 
       // Confirm the full 3-observation span is held durably before the flush.
-      const held =
-        ctx.store.getMonitorState('test-monitor').notifyState.pendingRollup;
+      const held = ctx.store.getMonitorState('test-monitor', ctx.rootDir)
+        .notifyState.pendingRollup;
       expect(held?.observations).toHaveLength(STATES.length);
 
       // Force the NOT-DUE condition at the window: lastObservationAt = window −
       // 1s. The integer 'timestamp' column truncates to whole seconds, so
       // elapsed = 1000ms < 2000ms (interval 2s) → the monitor is NOT due, yet
       // the 09:00 window opens. This is the not-due rollup branch (the bug).
-      ctx.store.setMonitorState('test-monitor', {
-        sourceState: ctx.store.getMonitorState('test-monitor').sourceState,
-        notifyState: ctx.store.getMonitorState('test-monitor').notifyState,
+      ctx.store.setMonitorState('test-monitor', ctx.rootDir, {
+        sourceState: ctx.store.getMonitorState('test-monitor', ctx.rootDir)
+          .sourceState,
+        notifyState: ctx.store.getMonitorState('test-monitor', ctx.rootDir)
+          .notifyState,
         lastObservationAt: new Date(WINDOW_AT.getTime() - 1_000),
       });
 
@@ -4204,9 +4211,11 @@ Daily digest.
         // Force NOT-DUE but window still CLOSED (08:00:00 + 1s lastObservationAt,
         // tick at 08:00:00.5 → elapsed < 2s, window not open). Several not-due
         // ticks must not append audit rows.
-        ctx.store.setMonitorState('test-monitor', {
-          sourceState: ctx.store.getMonitorState('test-monitor').sourceState,
-          notifyState: ctx.store.getMonitorState('test-monitor').notifyState,
+        ctx.store.setMonitorState('test-monitor', ctx.rootDir, {
+          sourceState: ctx.store.getMonitorState('test-monitor', ctx.rootDir)
+            .sourceState,
+          notifyState: ctx.store.getMonitorState('test-monitor', ctx.rootDir)
+            .notifyState,
           lastObservationAt: ACCUM_BASE,
         });
         vi.setSystemTime(new Date(ACCUM_BASE.getTime() + 500));
