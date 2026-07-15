@@ -416,7 +416,13 @@ against a session that will never deliver. So step 6 ALWAYS writes one line to s
 hook deliver: no session registered for host session id "<id>"
 ```
 
-Stdout and the exit code are completely unaffected — only stderr gains this one line. Every other
+Stdout and the exit code are completely unaffected — only stderr gains this one line. Because
+`session_id` is untrusted stdin input, `<id>` is rendered control-safe and bounded: it is
+JSON-string-escaped (embedded quotes, newlines, and all other control characters appear as escape
+sequences, never raw — including DEL, the C1 controls U+0080–U+009F, and the U+2028/U+2029
+line/paragraph separators, which plain `JSON.stringify` would pass through) and truncated at 128
+characters — cut at a Unicode code-point boundary — with a trailing `…`, so the warning is always
+exactly one line of bounded length. Every other
 quiet-return branch (disabled workspace, unreachable daemon, settle-window hold, nothing pending,
 …) remains silent by default; diagnose those with `--debug` below.
 

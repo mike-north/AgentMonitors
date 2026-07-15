@@ -37,11 +37,57 @@ describe('describeUnknownHostSessionWarning', () => {
     expect(msg).toContain('\\u001b');
   });
 
+  // Regression: JSON.stringify only escapes C0 controls (< U+0020) — DEL,
+  // the C1 controls (U+0080–U+009F, e.g. U+009B CSI), and the U+2028/U+2029
+  // line/paragraph separators passed through raw, undermining the
+  // "control-safe one line" contract (005 §12.2.1 / 006 §5.2.1).
+  it('escapes DEL, C1 controls, and U+2028/U+2029 that JSON.stringify leaves raw', () => {
+    const hostile = 'a\u007fb\u009bc\u0085d\u2028e\u2029f';
+    const msg = describeUnknownHostSessionWarning(hostile);
+    const rawSurvivors = [...msg].filter((ch) => {
+      const code = ch.codePointAt(0) ?? 0;
+      return (
+        (code >= 0x7f && code <= 0x9f) || code === 0x2028 || code === 0x2029
+      );
+    });
+    expect(rawSurvivors).toEqual([]);
+    expect(msg).toContain('\\u007f');
+    expect(msg).toContain('\\u009b');
+    expect(msg).toContain('\\u0085');
+    expect(msg).toContain('\\u2028');
+    expect(msg).toContain('\\u2029');
+  });
+
+  // The escaping must stay a faithful JSON string: parsing the quoted portion
+  // recovers the original id exactly (escaped, not stripped).
+  it('keeps the rendered id a round-trippable JSON string', () => {
+    const hostile = 'a\u009b\u2028\x1b[31m"quoted"';
+    const msg = describeUnknownHostSessionWarning(hostile);
+    const quoted = msg.slice(msg.indexOf('"'));
+    expect(JSON.parse(quoted)).toBe(hostile);
+  });
+
   it('truncates a pathologically long id instead of flooding stderr', () => {
     const long = 'x'.repeat(10_000);
     const msg = describeUnknownHostSessionWarning(long);
     expect(msg.length).toBeLessThan(200);
     expect(msg).toContain('…');
+  });
+
+  // Regression: a raw slice(0, 128) splits a surrogate pair straddling the
+  // boundary, leaving a lone surrogate that JSON.stringify renders as a
+  // garbled \ud83d escape.
+  it('never splits a surrogate pair at the truncation boundary', () => {
+    const straddling = `${'x'.repeat(127)}😀${'y'.repeat(50)}`;
+    const msg = describeUnknownHostSessionWarning(straddling);
+    // The emoji did not fit whole within the cap, so it is dropped wholesale.
+    expect(msg).not.toContain('😀');
+    expect(msg).not.toMatch(/\\ud83d/i);
+    expect(msg).toContain('x…');
+
+    // An emoji that fits entirely within the cap survives intact.
+    const fitting = `${'x'.repeat(20)}😀${'y'.repeat(200)}`;
+    expect(describeUnknownHostSessionWarning(fitting)).toContain('😀');
   });
 
   it('does not include a trailing newline — the caller owns line termination', () => {
