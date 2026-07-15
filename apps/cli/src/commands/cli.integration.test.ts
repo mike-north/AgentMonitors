@@ -6540,7 +6540,17 @@ describe('channel serve workspace-socket resolution (issue #358)', () => {
       //    it: no `--socket`, no `AGENTMONITORS_SOCKET` -- only the
       //    CLAUDE_PROJECT_DIR / CLAUDE_CODE_SESSION_ID a real Claude Code
       //    MCP-server spawn provides (`experiments/channel-probe`'s
-      //    confirmed contract, 006 §4.4).
+      //    confirmed contract, 006 §4.4). Inherit the rest of the real
+      //    baseline env (HOME, XDG_DATA_HOME, locale, ...) rather than a
+      //    hand-picked allowlist: `workspacePaths`/`resolveSocketPath` read
+      //    HOME/XDG_DATA_HOME to derive the per-workspace socket, and step 1
+      //    above (`session start`, via `runWithStdin`) resolves that SAME
+      //    socket from the full inherited `process.env` -- an allowlisted
+      //    subset here would let the two steps compute different sockets on
+      //    a host with a non-default HOME/XDG_DATA_HOME, silently proving
+      //    nothing. `AGENTMONITORS_SOCKET`/`AGENTMONITORS_DB` are still
+      //    explicitly stripped so no ambient override can substitute for the
+      //    derivation this test exists to exercise.
       let received: unknown = null;
       client = new Client(
         { name: 'channel-358-regression', version: '0.0.0' },
@@ -6556,7 +6566,14 @@ describe('channel serve workspace-socket resolution (issue #358)', () => {
         args: [CLI_PATH, 'channel', 'serve', '--poll-ms', '300'],
         cwd: ws,
         env: {
-          PATH: process.env['PATH'] ?? '',
+          ...Object.fromEntries(
+            Object.entries(process.env).filter(
+              ([key, value]) =>
+                value !== undefined &&
+                key !== 'AGENTMONITORS_SOCKET' &&
+                key !== 'AGENTMONITORS_DB',
+            ) as [string, string][],
+          ),
           CLAUDE_PROJECT_DIR: ws,
           CLAUDE_CODE_SESSION_ID: hostSessionId,
         },
