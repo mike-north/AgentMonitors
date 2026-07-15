@@ -167,7 +167,16 @@ in a real session, using an explicit socket so nothing here depends on a live Cl
 Run every command from the project root.
 
 **a. Enable the project.** This one-time, gitignored opt-in file is required — without it,
-`hook deliver` always emits nothing, even with `--socket`:
+`hook deliver` always emits nothing, even with `--socket`. Check `agentmonitors init --help` for
+an `--enable-only` flag first — if it's listed, it's the one-command way to do this:
+
+```bash
+agentmonitors init --enable-only
+```
+
+This creates `.claude/agentmonitors.local.md` and updates `.gitignore` for you, with no monitor
+and no prompts. **If `--enable-only` isn't listed** (older CLI version), create the same files by
+hand:
 
 ```bash
 mkdir -p .claude
@@ -180,7 +189,7 @@ EOF
 
 Make sure `.gitignore` contains `.claude/*.local.*` and `/.agentmonitors/` (the daemon's
 per-session runtime-state directory, created the moment a session opens — it's regenerated on
-every run, so it's always safe to delete). `agentmonitors init` ignores both automatically.
+every run, so it's always safe to delete).
 
 **b. Speed up the monitor and set it to `high` urgency, for this pass only.** This is what lets you
 see the real delivered content instead of just the mechanism firing (see the urgency note above).
