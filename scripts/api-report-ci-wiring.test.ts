@@ -109,6 +109,42 @@ jobs:
     ).toThrow(/must run unconditionally/);
   });
 
+  // Regression guard: `if: false` and `if: 0` parse as a boolean/number,
+  // not a string, so a `typeof job.if === 'string'` guard silently let them
+  // through even though both are GitHub-Actions-falsy and would make this
+  // job — and the API report check with it — never run at all.
+  it('rejects the required job when its "if" is the boolean false', () => {
+    const workflow: unknown = parse(`
+jobs:
+  test:
+    name: Check And Test
+    if: false
+    steps:
+      - run: pnpm check:api-report
+`);
+    expect(() =>
+      assertApiReportCheckRuns(
+        workflow as Parameters<typeof assertApiReportCheckRuns>[0],
+      ),
+    ).toThrow(/must run unconditionally/);
+  });
+
+  it('rejects the required job when its "if" is the number 0', () => {
+    const workflow: unknown = parse(`
+jobs:
+  test:
+    name: Check And Test
+    if: 0
+    steps:
+      - run: pnpm check:api-report
+`);
+    expect(() =>
+      assertApiReportCheckRuns(
+        workflow as Parameters<typeof assertApiReportCheckRuns>[0],
+      ),
+    ).toThrow(/must run unconditionally/);
+  });
+
   // Regression guard for the same class of gap as #353 (website
   // deploy-workflow guard): a `\b` boundary also matches before `:`, so a
   // differently-named script sharing the `check:api-report` prefix would
@@ -191,6 +227,46 @@ describe('assertApiReportRunManyIsSerial', () => {
         scripts: {
           'check:api-report':
             'nx run-many --target=check:api-report --parallel=3',
+          'fix:api-report': 'nx run-many --target=fix:api-report --parallel=1',
+        },
+      }),
+    ).toThrow(/"check:api-report"/);
+  });
+
+  // Regression guard: the pre-fix regex matched a bare `--parallel=1`
+  // ANYWHERE in the script string, so an unrelated command chained into the
+  // same line — one that never even touches `--target=check:api-report` —
+  // could satisfy the guard while the actual `check:api-report` invocation
+  // stayed unserialized.
+  it('rejects --parallel=1 on an unrelated chained command, not the guarded invocation', () => {
+    expect(() =>
+      assertApiReportRunManyIsSerial({
+        scripts: {
+          'check:api-report':
+            'nx run-many --target=check:api-report --exclude=x && nx run-many --target=irrelevant --parallel=1',
+          'fix:api-report': 'nx run-many --target=fix:api-report --parallel=1',
+        },
+      }),
+    ).toThrow(/"check:api-report"/);
+  });
+
+  it('accepts --parallel=1 on the guarded invocation even alongside an unrelated chained command', () => {
+    expect(() =>
+      assertApiReportRunManyIsSerial({
+        scripts: {
+          'check:api-report':
+            'nx run-many --target=check:api-report --parallel=1 && nx run-many --target=irrelevant',
+          'fix:api-report': 'nx run-many --target=fix:api-report --parallel=1',
+        },
+      }),
+    ).not.toThrow();
+  });
+
+  it('rejects a script that never invokes --target=<name> at all', () => {
+    expect(() =>
+      assertApiReportRunManyIsSerial({
+        scripts: {
+          'check:api-report': 'echo "not an nx invocation"',
           'fix:api-report': 'nx run-many --target=fix:api-report --parallel=1',
         },
       }),

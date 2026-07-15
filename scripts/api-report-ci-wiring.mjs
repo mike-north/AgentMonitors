@@ -42,7 +42,7 @@ export const REQUIRED_JOB_ID = 'test';
 
 /**
  * @typedef {{ run?: string; uses?: string; name?: string }} WorkflowStep
- * @typedef {{ if?: string; steps?: WorkflowStep[] }} WorkflowJob
+ * @typedef {{ if?: unknown; steps?: WorkflowStep[] }} WorkflowJob
  * @typedef {{ jobs?: Record<string, WorkflowJob> }} CiWorkflow
  */
 
@@ -76,8 +76,34 @@ export const API_REPORT_RUN_MANY_SCRIPTS = [
  */
 
 /**
- * Validate that the root `check:api-report`/`fix:api-report` npm scripts run
- * `nx run-many` with `--parallel=1`.
+ * Split a shell script string into its individual chained commands (on
+ * `&&`, `||`, `;`, or a newline). Used so `--parallel=1` can be verified as
+ * part of the SAME `nx run-many --target=...` invocation it's meant to
+ * guard, rather than matching anywhere in the whole script string — a bare
+ * `/--parallel(?:=|\s+)1\b/.test(script)` over the entire script would be
+ * satisfied by an unrelated `--parallel=1` on a totally different command
+ * chained into the same line, without the actual `--target=check:api-report`
+ * (or `fix:api-report`) invocation being serialized at all.
+ *
+ * @param {string} script
+ * @returns {string[]}
+ */
+function splitChainedCommands(script) {
+  return script.split(/&&|\|\||;|\n/);
+}
+
+/**
+ * @param {string} value
+ * @returns {string}
+ */
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Validate that the root `check:api-report`/`fix:api-report` npm scripts
+ * invoke `nx run-many --target=<name>` with `--parallel=1` on that SAME
+ * invocation (not merely present somewhere else in the script string).
  *
  * These scripts fan an api-report target out across every published package.
  * Each package's `check:api-report`/`fix:api-report` script independently
@@ -99,16 +125,32 @@ export function assertApiReportRunManyIsSerial(pkg) {
     throw new Error('package.json has no top-level "scripts" section');
   }
 
-  const missingParallelFlag = API_REPORT_RUN_MANY_SCRIPTS.filter((name) => {
+  const problems = API_REPORT_RUN_MANY_SCRIPTS.filter((name) => {
     const script = scripts[name];
-    return typeof script !== 'string' || !/--parallel(?:=|\s+)1\b/.test(script);
+    if (typeof script !== 'string') {
+      return true;
+    }
+    const targetPattern = new RegExp(`--target=${escapeRegExp(name)}(?:\\s|$)`);
+    const invocations = splitChainedCommands(script).filter((command) =>
+      targetPattern.test(command),
+    );
+    if (invocations.length === 0) {
+      // The script never even invokes `nx run-many --target=<name>` — a
+      // different, more specific failure than a missing `--parallel=1`,
+      // but still a reason to reject this script.
+      return true;
+    }
+    return !invocations.every((command) =>
+      /--parallel(?:=|\s+)1\b/.test(command),
+    );
   });
-  if (missingParallelFlag.length > 0) {
+  if (problems.length > 0) {
     throw new Error(
-      `package.json script(s) ${missingParallelFlag.map((n) => `"${n}"`).join(', ')} ` +
-        "must pass `--parallel=1` to `nx run-many` — without it, a package's " +
-        "own api-report check races that same package's `build` target " +
-        'when a sibling package pulls it in via `^build` (issue #285)',
+      `package.json script(s) ${problems.map((n) => `"${n}"`).join(', ')} ` +
+        'must invoke `nx run-many --target=<name>` with `--parallel=1` on ' +
+        "that same invocation — without it, a package's own api-report " +
+        "check races that same package's `build` target when a sibling " +
+        'package pulls it in via `^build` (issue #285)',
     );
   }
 }
@@ -132,11 +174,16 @@ export function assertApiReportCheckRuns(workflow) {
     throw new Error(`ci.yml is missing the "${REQUIRED_JOB_ID}" job`);
   }
 
-  if (typeof job.if === 'string' && job.if.length > 0) {
+  // Reject the mere PRESENCE of an `if` key, not just a non-empty string
+  // value. YAML `if: false` / `if: 0` parse as a boolean/number rather than
+  // a string — a `typeof job.if === 'string'` guard would silently let
+  // those through, even though both are GitHub-Actions-falsy and would make
+  // this job (and the API report check with it) never run at all.
+  if ('if' in job) {
     throw new Error(
-      `ci.yml "${REQUIRED_JOB_ID}" job must run unconditionally (no "if:"), ` +
-        'so the API report check can never be skipped by a path filter ' +
-        '(issue #285)',
+      `ci.yml "${REQUIRED_JOB_ID}" job must run unconditionally (no "if:" ` +
+        'key at all), so the API report check can never be skipped by any ' +
+        'condition (issue #285)',
     );
   }
 
