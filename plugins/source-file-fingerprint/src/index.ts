@@ -268,13 +268,24 @@ function resolveGlobCwd(
   return workspacePath !== undefined ? path.resolve(workspacePath, cwd) : cwd;
 }
 
+/**
+ * Expand a glob pattern to absolute file paths, excluding directory entries.
+ *
+ * A globstar like `docs/**` matches the directory `docs/` itself in addition to
+ * everything under it (`glob`'s documented globstar behavior). A directory is
+ * not a file to hash — `nodir: true` filters those entries out at the glob
+ * layer so `docs/**` behaves as "every file under docs", matching the natural
+ * reading of the pattern. Without this, the observe loop below would try to
+ * `readFile` a directory and crash with `EISDIR` (issue #377).
+ */
 function expandGlob(pattern: string, cwd: string | undefined): string[] {
   if (path.isAbsolute(pattern)) {
-    return globSync(pattern, { absolute: true });
+    return globSync(pattern, { absolute: true, nodir: true });
   }
   return globSync(pattern, {
     ...(cwd !== undefined ? { cwd } : {}),
     absolute: true,
+    nodir: true,
   });
 }
 

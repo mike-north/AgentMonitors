@@ -4613,6 +4613,10 @@ describe('monitor test', () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('No files matched');
     expect(result.stderr).toContain('globs');
+    // Issue #377: the message must name the configured glob so an author can
+    // tell "bad glob" from "no changes" without opening MONITOR.md. The
+    // scaffolded template's default pattern is `**/*.ts`.
+    expect(result.stderr).toContain('**/*.ts');
     expect(result.stdout).not.toContain('Baseline established');
   });
 
@@ -4639,6 +4643,8 @@ describe('monitor test', () => {
       observations: [],
     });
     expect(parsed.error).toContain('watch.globs');
+    // Issue #377: the message must name the configured glob.
+    expect(parsed.error).toContain('**/*.ts');
   });
 
   it('errors on invalid MONITOR.md content', () => {

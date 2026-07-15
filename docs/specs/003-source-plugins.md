@@ -379,14 +379,31 @@ how often the daemon checks whether any monitor is due.
 
 ### 3.2 Behavior
 
-The source expands each glob pattern using `globSync` with `absolute: true`, so matched paths are
-always absolute, then removes any paths matched by `ignore`. For each remaining matched file, it
+The source expands each glob pattern using `globSync` with `absolute: true` and **`nodir: true`**,
+so matched paths are always absolute files (never directory entries), then removes any paths
+matched by `ignore` (expanded with the same `nodir: true`). For each remaining matched file, it
 computes a SHA-256 hash using Node.js `crypto.createHash('sha256')`.
 
-If a run matches zero files, the source returns no observations and sets
-`ObservationResult.outcome: "no-files-matched"`. The runtime records that as a distinct
-`observation_history` outcome instead of ordinary `no-change`, so CLI diagnostics can distinguish
-a broken glob/cwd from a matched file set with no content changes.
+**Directory entries are excluded from the matched set.** A globstar pattern such as `docs/**`
+matches the directory entry `docs/` itself, in addition to every path under it — this is `glob`'s
+documented globstar behavior, not a bug in the pattern. Without `nodir: true`, the source would
+attempt to `fs.readFile` that directory entry and crash with `EISDIR`. `nodir: true` filters
+directory entries out before fingerprinting, so `docs/**` behaves as "every file under `docs/`,
+recursively" — the natural reading of the pattern — and never crashes. This applies identically to
+`ignore` patterns. Verified: `plugins/source-file-fingerprint/src/index.ts` (`expandGlob`) and
+`plugins/source-file-fingerprint/src/index.test.ts` ("directory entries in glob matches (issue
+#377)").
+
+If a run matches zero files — including a glob that matches **only** directory entries, e.g.
+`empty-dir/**` on a directory with no files in it — the source returns no observations and sets
+`ObservationResult.outcome: "no-files-matched"`. This is a healthy, non-error outcome: the runtime
+records it as a distinct `observation_history` outcome instead of ordinary `no-change`, so CLI
+diagnostics can distinguish a broken glob/cwd from a matched file set with no content changes. Where
+the CLI surfaces this outcome (`agentmonitors monitor test`), the message names the configured
+`watch.globs` value so an author can tell "the glob matched nothing" from "the glob is fine but
+nothing changed" without opening `MONITOR.md`. Verified: `apps/cli/src/commands/monitor-test.ts`
+(`reportNoFilesMatched`, `formatGlobsForMessage`) and
+`apps/cli/src/commands/cli.integration.test.ts` ("reports zero-match file-fingerprint scopes").
 
 Current fingerprints are stored in `nextState.fingerprints` (a `Record<string, string>` keyed by absolute file path). On each call, the source compares each file's current hash against `context.previousState.fingerprints[filePath]`.
 
