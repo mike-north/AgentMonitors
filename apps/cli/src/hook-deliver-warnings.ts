@@ -30,9 +30,20 @@
  * The hook payload's `session_id` did not match any AgentMon session tracked
  * by the daemon at this socket. Returned WITHOUT a trailing newline; the
  * caller (`hook deliver`) appends one when writing to `process.stderr`.
+ *
+ * `session_id` comes from untrusted stdin JSON, and this line is emitted
+ * unconditionally — so the id is forced into a single-line, control-safe
+ * form: `JSON.stringify` escapes newlines, tabs, ESC, and every other
+ * control character (terminal/log injection), and the length bound keeps a
+ * pathological payload from flooding stderr.
  */
 export function describeUnknownHostSessionWarning(
   hostSessionId: string,
 ): string {
-  return `hook deliver: no session registered for host session id "${hostSessionId}"`;
+  const MAX_ID_LENGTH = 128;
+  const truncated =
+    hostSessionId.length > MAX_ID_LENGTH
+      ? `${hostSessionId.slice(0, MAX_ID_LENGTH)}…`
+      : hostSessionId;
+  return `hook deliver: no session registered for host session id ${JSON.stringify(truncated)}`;
 }
