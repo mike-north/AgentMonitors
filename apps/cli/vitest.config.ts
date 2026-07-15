@@ -2,7 +2,9 @@ import { defineConfig, configDefaults } from 'vitest/config';
 
 export default defineConfig({
   test: {
-    passWithNoTests: true,
+    // A suite that discovers zero test files MUST fail rather than report a
+    // false green (issue #288) — see scripts/vitest-pass-with-no-tests.test.ts.
+    passWithNoTests: false,
     // Exclude daemon-spawn tests from the default parallel run.  They spawn
     // real child processes that bind Unix sockets; under nx run-many (up to
     // 3 concurrent projects) the children are CPU-starved and can't bind

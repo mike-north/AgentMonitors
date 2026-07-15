@@ -91,6 +91,31 @@ indirection under a real global install.
 wired into CI per-PR). The MCP/channel transport ([006 §4](./006-agent-integration.md)) has no
 equivalent fresh-environment proof yet — tracked as a follow-up, not this surface's scope.
 
+### 2.8 Suite-discovery integrity (zero-test guard)
+
+A package-level test suite is only useful evidence if it can fail. Every test-bearing package's
+vitest config MUST reject an empty/misconfigured run — vitest's own default,
+`passWithNoTests: false` — rather than opting into `passWithNoTests: true`. Deleting, renaming, or
+accidentally excluding an entire package's test files MUST fail that package's Nx `test` target,
+never report a false green. This applies to every `libs/core`, `apps/*`, and `plugins/source-*`
+package's default `vitest.config.ts`, plus any additional named config wired into a CI test step
+(currently `apps/cli/vitest.serial.config.ts`, the serial daemon-spawn suite, which already sets
+this correctly and is the reference pattern the others follow).
+
+Because `apps/cli` splits its tests across two suites (a default parallel run and a serial run for
+daemon-spawn tests that need CPU isolation — [§2.6](#26-cli-integration-tests)), those two suites
+MUST also partition the package's test files without overlap (a file run by both wastes CI time
+and can reintroduce the CPU-starvation flakiness the serial suite exists to avoid) or gaps (a file
+run by neither is silently never executed).
+
+**Verified in:** `scripts/vitest-pass-with-no-tests.test.ts` (dynamically imports every guarded
+vitest config — the real module `vitest run` loads — and asserts none resolve to
+`passWithNoTests: true`; the guarded set is derived from the authoritative `PACKAGE_DIRS` list in
+`scripts/publish-release-packages.mjs` so a newly added publishable package is covered
+automatically) and `scripts/cli-suite-partition.test.ts` (runs the real `vitest list` resolution
+against both `apps/cli` configs and asserts the result partitions the package's git-tracked test
+files with no overlap or gaps). Both run under `pnpm test:scripts`, wired into CI per-PR.
+
 ## 3. Required Test Scenarios
 
 The spec set is incomplete unless each major rule has at least one concrete testable scenario. The table below maps each scenario to the test file that covers it, or flags it as a gap.
