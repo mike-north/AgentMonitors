@@ -116,7 +116,9 @@ the baseline every environment can use.
 > ship. `DeliveryEventSummary` now also carries `body` (the raw
 > monitor instructions — see [002 §9.1](./002-runtime-delivery.md)), available to transports that
 > want to surface the body alongside the title/summary. Remaining is an end-to-end **manual UAT**
-> (channels are research-preview, so not CI-able) and optional fuller meta (§4.2 `object_key`).
+> (channels are research-preview, so not CI-able) and optional fuller meta (§4.2 `object_key`). The
+> UAT recipe lives at [`docs/uat/channel-transport.md`](../uat/channel-transport.md) — run it before
+> treating this transport as regression-safe, and record the run there.
 > See [roadmap.md](./roadmap.md) (G7, shipped).
 
 A channel is an MCP server Claude Code spawns over stdio that pushes events into the session as
