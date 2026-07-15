@@ -35,7 +35,13 @@ jobs:
       # Issue #285: validates every published TS package's checked-in API report
       # (api-report/*.api.md) against its actual compiled surface. Runs without
       # `--local`, so an unintentional public-type change fails this step until
-      # the report is regenerated (`pnpm fix:api-report`) and reviewed.
+      # the report is regenerated (`pnpm fix:api-report`) and reviewed. The
+      # `check:api-report`/`fix:api-report` npm scripts pass `--parallel=1` to
+      # `nx run-many`: each package's script independently re-emits its own
+      # declarations before invoking API Extractor, and `@agentmonitors/core`'s
+      # `build` target (which every plugin's `^build` dependency pulls in) writes
+      # into the same `dist/` folder — running both concurrently raced and
+      # produced a transient `ENOENT` on `dist/index.d.ts.map`.
       - name: Check (API report drift)
         run: pnpm check:api-report
 

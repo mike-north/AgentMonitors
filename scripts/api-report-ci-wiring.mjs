@@ -27,6 +27,9 @@ export const CI_WORKFLOW_PATH = join(
   'ci.yml',
 );
 
+/** Absolute path to the real, on-disk root `package.json` this module guards. */
+export const ROOT_PACKAGE_JSON_PATH = join(scriptDir, '..', 'package.json');
+
 /**
  * The job in `ci.yml` that must run `check:api-report`. This must be the
  * always-runs "Check And Test" job (no `pull_request`-path filter, no
@@ -56,6 +59,58 @@ function jobRunLines(job) {
   return steps
     .map((step) => (typeof step.run === 'string' ? step.run : ''))
     .join('\n');
+}
+
+/**
+ * Root npm scripts that fan an api-report target out across every published
+ * package via `nx run-many`. Both MUST run serially — see
+ * `assertApiReportRunManyIsSerial` for why.
+ */
+export const API_REPORT_RUN_MANY_SCRIPTS = [
+  'check:api-report',
+  'fix:api-report',
+];
+
+/**
+ * @typedef {{ scripts?: Record<string, string> }} RootPackageJson
+ */
+
+/**
+ * Validate that the root `check:api-report`/`fix:api-report` npm scripts run
+ * `nx run-many` with `--parallel=1`.
+ *
+ * These scripts fan an api-report target out across every published package.
+ * Each package's `check:api-report`/`fix:api-report` script independently
+ * re-emits its own declarations (`tsup && tsc -p tsconfig.build.json`) before
+ * invoking API Extractor — and `@agentmonitors/core`'s `build` target (which
+ * every plugin's `^build` dependency pulls in, since a plugin's
+ * declarations import core's `dist/rollup.d.ts`) writes into that same
+ * project's `dist/` folder. Without `--parallel=1`, nx schedules
+ * `core:build` (needed transitively for the plugins) concurrently with
+ * `core:check:api-report` (requested directly) — two independent processes
+ * racing to write `libs/core/dist/*`, observed as a transient `ENOENT:
+ * no such file or directory, unlink '.../dist/index.d.ts.map'` (issue #285).
+ *
+ * @param {RootPackageJson} pkg
+ */
+export function assertApiReportRunManyIsSerial(pkg) {
+  const scripts = pkg.scripts;
+  if (!scripts || typeof scripts !== 'object') {
+    throw new Error('package.json has no top-level "scripts" section');
+  }
+
+  const missingParallelFlag = API_REPORT_RUN_MANY_SCRIPTS.filter((name) => {
+    const script = scripts[name];
+    return typeof script !== 'string' || !/--parallel(?:=|\s+)1\b/.test(script);
+  });
+  if (missingParallelFlag.length > 0) {
+    throw new Error(
+      `package.json script(s) ${missingParallelFlag.map((n) => `"${n}"`).join(', ')} ` +
+        "must pass `--parallel=1` to `nx run-many` — without it, a package's " +
+        "own api-report check races that same package's `build` target " +
+        'when a sibling package pulls it in via `^build` (issue #285)',
+    );
+  }
 }
 
 /**

@@ -16,9 +16,12 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
 import {
+  API_REPORT_RUN_MANY_SCRIPTS,
   CI_WORKFLOW_PATH,
+  ROOT_PACKAGE_JSON_PATH,
   REQUIRED_JOB_ID,
   assertApiReportCheckRuns,
+  assertApiReportRunManyIsSerial,
 } from './api-report-ci-wiring.mjs';
 
 // Reconstruction of ci.yml's "Check And Test" job as it existed immediately
@@ -154,5 +157,74 @@ jobs:
         workflow as Parameters<typeof assertApiReportCheckRuns>[0],
       ),
     ).not.toThrow();
+  });
+});
+
+/**
+ * Regression tests for a race discovered while building this gate (issue
+ * #285): `nx run-many --target=check:api-report` (the default, no
+ * `--parallel` override) scheduled `@agentmonitors/core`'s `build` target
+ * (pulled in transitively by every plugin's `^build` dependency) concurrently
+ * with `@agentmonitors/core`'s own `check:api-report` target — two
+ * independent processes racing to write `libs/core/dist/*` — and failed with
+ * a transient `ENOENT: no such file or directory, unlink
+ * '.../dist/index.d.ts.map'`. Reproduced 1-in-a-few-runs locally; fixed by
+ * adding `--parallel=1` to both `nx run-many` invocations.
+ */
+describe('assertApiReportRunManyIsSerial', () => {
+  it('rejects the pre-fix shape: nx run-many with no --parallel override', () => {
+    expect(() =>
+      assertApiReportRunManyIsSerial({
+        scripts: {
+          'check:api-report':
+            'NX_TUI=false nx run-many --target=check:api-report --exclude=agentmonitors-workspace',
+          'fix:api-report':
+            'NX_TUI=false nx run-many --target=fix:api-report --exclude=agentmonitors-workspace',
+        },
+      }),
+    ).toThrow(/"check:api-report", "fix:api-report"/);
+  });
+
+  it('rejects a --parallel value greater than 1 (still races)', () => {
+    expect(() =>
+      assertApiReportRunManyIsSerial({
+        scripts: {
+          'check:api-report':
+            'nx run-many --target=check:api-report --parallel=3',
+          'fix:api-report': 'nx run-many --target=fix:api-report --parallel=1',
+        },
+      }),
+    ).toThrow(/"check:api-report"/);
+  });
+
+  it('accepts either `--parallel=1` or `--parallel 1` spelling (positive control)', () => {
+    expect(() =>
+      assertApiReportRunManyIsSerial({
+        scripts: {
+          'check:api-report':
+            'nx run-many --target=check:api-report --parallel=1',
+          'fix:api-report': 'nx run-many --target=fix:api-report --parallel 1',
+        },
+      }),
+    ).not.toThrow();
+  });
+
+  // The real proof: the actual, on-disk root package.json.
+  it('accepts the real, on-disk package.json', () => {
+    const pkg: unknown = JSON.parse(
+      readFileSync(ROOT_PACKAGE_JSON_PATH, 'utf8'),
+    );
+    expect(() =>
+      assertApiReportRunManyIsSerial(
+        pkg as Parameters<typeof assertApiReportRunManyIsSerial>[0],
+      ),
+    ).not.toThrow();
+  });
+
+  it('exercises both tracked scripts (sanity on the fixture list itself)', () => {
+    expect(API_REPORT_RUN_MANY_SCRIPTS).toEqual([
+      'check:api-report',
+      'fix:api-report',
+    ]);
   });
 });
