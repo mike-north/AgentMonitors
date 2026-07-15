@@ -24,6 +24,7 @@
     "test:scripts": "vitest run --config scripts/vitest.config.ts",
     "test:serial": "NX_TUI=false nx run @agentmonitors/cli:test:serial",
     "test:standalone-consumer": "node scripts/test-standalone-consumer.mjs",
+    "test:e2e-fresh-install-hooks": "node scripts/test-e2e-fresh-install-hooks.mjs",
     "clean": "NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace",
     "check:api-report": "NX_TUI=false nx run-many --target=check:api-report --exclude=agentmonitors-workspace",
     "version:packages": "changeset version"

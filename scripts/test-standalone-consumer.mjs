@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readdirSync } from 'node:fs';
+import { mkdirSync, mkdtempSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Project } from 'fixturify-project';
+import { packPackage } from './lib/pack-helpers.mjs';
 import { PACKAGE_DIRS } from './publish-release-packages.mjs';
 import { assertSourceCoverage } from './source-coverage.mjs';
 
@@ -96,48 +97,6 @@ function run(command, args, cwd) {
       `Command failed (${result.status ?? 'unknown'}): ${command} ${args.join(' ')}`,
     );
   }
-}
-
-function runCapture(command, args, cwd) {
-  const result = spawnSync(command, args, {
-    cwd,
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  if (result.status !== 0) {
-    if (typeof result.stderr === 'string' && result.stderr.length > 0) {
-      process.stderr.write(result.stderr);
-    }
-    const errorMessageParts = [
-      `Command failed (${result.status ?? 'unknown'}): ${command} ${args.join(' ')}`,
-    ];
-    if (result.error?.message) {
-      errorMessageParts.push(`Spawn error: ${result.error.message}`);
-    }
-    throw new Error(errorMessageParts.join('\n'));
-  }
-  return (result.stdout ?? '').trim();
-}
-
-function packPackage(packageDir, packDir) {
-  const before = new Set(readdirSync(packDir));
-  const output = runCapture(
-    PNPM_BIN,
-    ['pack', '--pack-destination', packDir],
-    packageDir,
-  );
-  const after = readdirSync(packDir);
-  const created = after.find(
-    (entry) => !before.has(entry) && entry.endsWith('.tgz'),
-  );
-
-  if (!created) {
-    throw new Error(
-      `Could not determine packed tarball for ${packageDir}. pnpm output: ${output}`,
-    );
-  }
-
-  return path.join(packDir, created);
 }
 
 const SMOKE_SCRIPT = `import assert from 'node:assert/strict';
