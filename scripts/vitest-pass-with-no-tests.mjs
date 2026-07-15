@@ -23,19 +23,24 @@ import { PACKAGE_DIRS } from './publish-release-packages.mjs';
  * @returns {string[]} config paths relative to the repo root
  */
 export function defaultVitestConfigPaths(packageDirs = PACKAGE_DIRS) {
-  return packageDirs.map((dir) => path.join(dir, 'vitest.config.ts'));
+  // Forward slashes only: these paths are compared against and returned
+  // alongside ADDITIONAL_VITEST_CONFIG_PATHS' string literals below, and
+  // `path.join` would emit backslashes on win32.
+  return packageDirs.map((dir) => `${dir}/vitest.config.ts`);
 }
 
 /**
  * Named vitest configs, beyond each package's default `vitest.config.ts`,
  * that are wired into a CI test step and so must also be covered by this
- * audit. Today this is only the CLI's serial daemon-spawn suite
- * (`pnpm test:serial`) — it already correctly sets `passWithNoTests: false`
- * (the reference pattern this guard generalizes) — listed explicitly here so
- * it can never be silently dropped from the audit if it's ever loosened.
+ * audit: the CLI's serial daemon-spawn suite (`pnpm test:serial`) and this
+ * guard's own home config (`pnpm test:scripts`, `scripts/vitest.config.ts`)
+ * — both already correctly omit `passWithNoTests: true` (the reference
+ * pattern this guard generalizes) — listed explicitly here so neither can be
+ * silently dropped from the audit if either is ever loosened.
  */
 export const ADDITIONAL_VITEST_CONFIG_PATHS = [
   'apps/cli/vitest.serial.config.ts',
+  'scripts/vitest.config.ts',
 ];
 
 /**

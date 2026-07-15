@@ -97,10 +97,11 @@ A package-level test suite is only useful evidence if it can fail. Every test-be
 vitest config MUST reject an empty/misconfigured run — vitest's own default,
 `passWithNoTests: false` — rather than opting into `passWithNoTests: true`. Deleting, renaming, or
 accidentally excluding an entire package's test files MUST fail that package's Nx `test` target,
-never report a false green. This applies to every `libs/core`, `apps/*`, and `plugins/source-*`
-package's default `vitest.config.ts`, plus any additional named config wired into a CI test step
-(currently `apps/cli/vitest.serial.config.ts`, the serial daemon-spawn suite, which already sets
-this correctly and is the reference pattern the others follow).
+never report a false green. This applies to the default `vitest.config.ts` of every publishable
+package in the authoritative `PACKAGE_DIRS` inventory (`scripts/publish-release-packages.mjs`),
+plus every named config wired into a CI test step — `apps/cli/vitest.serial.config.ts` (the serial
+daemon-spawn suite) and `scripts/vitest.config.ts` (this guard's own home config) — both of which
+already set this correctly and are the reference pattern the rest follow.
 
 Because `apps/cli` splits its tests across two suites (a default parallel run and a serial run for
 daemon-spawn tests that need CPU isolation — [§2.6](#26-cli-integration-tests)), those two suites
