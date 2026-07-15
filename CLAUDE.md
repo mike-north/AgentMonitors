@@ -34,6 +34,8 @@ pnpm build          # build all publishable packages (excludes workspace root + 
 pnpm test           # run all package test suites (vitest), build deps first
 pnpm check          # check:packages (tsc --noEmit per package) + check:workspace (eslint + prettier)
 pnpm check:api-report   # validate api-extractor rollups are current (run --local to update in dev)
+pnpm audit:prod             # pnpm audit --prod --audit-level high (raw report)
+pnpm check:dependency-audit # same audit, gated by scripts/audit-allowlist.json (CI: .github/workflows/dependency-audit.yml)
 pnpm fix:lint-ts    # eslint --fix
 pnpm fix:format     # prettier --write
 pnpm clean          # remove all dist/ dirs
@@ -137,5 +139,13 @@ tick) and a couple of fallbacks run **in-process without the socket** — see
   — on the PR that introduces them, not at release time. Every published package declares
   `engines.node` consistent with the CI-tested Node version (currently `>=24`, with Node 24 the version CI runs) — see
   `scripts/publish-release-packages.test.ts` for the assertion that keeps the two in sync.
+- **Dependency audit**: `pnpm audit --prod --audit-level high` must stay clean. Fix by upgrading a
+  direct dependency (`libs/core`, `apps/cli`, `plugins/*` package.json) or, for a transitive
+  advisory, a `pnpm-workspace.yaml` `overrides` pin — never a major bump without an issue explicitly
+  authorizing it. A narrowly scoped, non-fixable advisory gets a reviewed, expiring entry in
+  `scripts/audit-allowlist.json` instead of a blanket ignore; `pnpm check:dependency-audit`
+  (`.github/workflows/dependency-audit.yml`, PR-path-filtered + scheduled) is the gate, and
+  `scripts/check-dependency-audit.test.ts` includes a lockfile regression check (`pnpm why --json`)
+  that the patched versions are actually resolved.
 - **Review priority** (per `.github/copilot-instructions.md`): durable-state bugs, session-isolation
   errors, and event loss during debounce/compaction/batching/restart come before style.

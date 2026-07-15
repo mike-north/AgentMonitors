@@ -7,3 +7,20 @@ allowBuilds:
   esbuild: true
   nx: true
   sharp: true
+# Transitive-dependency pins for high-severity advisories that can't be
+# cleared by bumping a direct dependency (Refs #290). Each entry documents
+# why it's needed; remove once the upstream direct dependency naturally picks
+# up a version that already satisfies it.
+overrides:
+  # cel-js -> chevrotain -> @chevrotain/{cst-dts-gen,gast} pull an unpatched
+  # lodash-es (GHSA-r5fr-rjxr-66jc); cel-js is already at its latest release.
+  lodash-es: ^4.17.24
+  # @modelcontextprotocol/sdk -> ajv/ajv-formats pull an unpatched fast-uri
+  # (GHSA-v39h-62p7-jpjc); the SDK's own ajv dependency range (^8.17.1) is
+  # already satisfied by the resolved ajv version, so only fast-uri needs
+  # pinning forward within ajv's own `^3.0.1` dependency range.
+  fast-uri: ^3.1.3
+  # @modelcontextprotocol/sdk and @hono/node-server both pull an unpatched
+  # hono (GHSA-88fw-hqm2-52qc); both declare `^4.x` ranges that a patched
+  # 4.12.x release satisfies.
+  hono: ^4.12.30

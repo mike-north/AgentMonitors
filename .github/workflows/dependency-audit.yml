@@ -1,0 +1,56 @@
+name: Dependency Audit
+
+# Production-dependency advisory gate (issue #290). A dedicated workflow
+# (rather than a job folded into ci.yml) because this is a security-cadence
+# concern, not a per-PR correctness check: it needs its own `schedule:`
+# trigger independent of PR/push activity. It is not a required status check
+# (only "Check And Test" in ci.yml is), so a plain `paths:`-filtered trigger
+# is enough — no need for ci.yml's job-level git-diff filtering.
+on:
+  pull_request:
+    paths:
+      - '**/package.json'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - 'scripts/audit-allowlist.json'
+      - 'scripts/check-dependency-audit.mjs'
+      - '.github/workflows/dependency-audit.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - '**/package.json'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - 'scripts/audit-allowlist.json'
+      - 'scripts/check-dependency-audit.mjs'
+  schedule:
+    # Daily, independent of any PR/push — catches newly disclosed advisories
+    # against dependencies that haven't otherwise changed.
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  dependency-audit:
+    name: Production Dependency Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Audit production dependencies (fails on unresolved high/critical advisories)
+        run: pnpm check:dependency-audit
