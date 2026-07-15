@@ -93,6 +93,13 @@ jobs:
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
 
+      # CAUTION: `vercel build` inlines resolved Production env-var values into
+      # this output, and this artifact is readable by anyone with actions:read
+      # on the repo (a wider audience than the Vercel dashboard) for its
+      # retention window. The site currently uses no server-side env vars; if
+      # one is ever added, stop uploading the built output and rethink the
+      # promotion flow (e.g. build inside the deploy job) before merging that
+      # change.
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
