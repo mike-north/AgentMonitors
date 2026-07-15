@@ -1,5 +1,6 @@
 import net from 'node:net';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import {
   chmodSync,
   lstatSync,
@@ -142,6 +143,40 @@ describe('callDaemon', () => {
 });
 
 // ---------------------------------------------------------------------------
+// createDaemonServer: one bad request must not crash the daemon (issue #292)
+// ---------------------------------------------------------------------------
+describe('createDaemonServer — request-handling resilience', () => {
+  it('answers an error response and stays alive when a request fails synchronous param validation', async () => {
+    const socketPath = tempSocketPath('bad-params');
+    const server = createDaemonServer({
+      runtime: createRuntime(':memory:'),
+      socketPath,
+    });
+    try {
+      await server.listen();
+
+      // `session.open` with empty params passes the request envelope schema but
+      // fails the per-method Zod parse *synchronously* inside handleRequest.
+      // Pre-fix that throw propagated out of the socket 'data' handler as an
+      // uncaught exception and killed the daemon; it must now come back as a
+      // clean error response instead.
+      const rejection = await callDaemon(
+        'session.open',
+        {},
+        { socketPath, timeoutMs: 1000 },
+      ).catch((error: unknown) => error);
+      expect(rejection).toBeInstanceOf(Error);
+      expect(rejection).not.toBeInstanceOf(DaemonConnectionError);
+
+      // Decisive assertion: the daemon survived and still answers.
+      await expect(daemonAvailable(socketPath)).resolves.toBe(true);
+    } finally {
+      await server.close().catch(() => undefined);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // resolveSocketPath: explicit --socket substitution warning (issue #337)
 // ---------------------------------------------------------------------------
 
@@ -250,6 +285,77 @@ describe('resolveSocketPath — explicit substitution warning (issue #337)', () 
     expect(writeSpy).not.toHaveBeenCalled();
   });
 });
+
+// ---------------------------------------------------------------------------
+// resolveSocketPath: legacy long-path fallback migration (issue #292 review)
+//
+// The over-limit fallback location moved from /tmp/agentmonitors-<hash>.sock to
+// the per-uid /tmp/agentmonitors-<uid>/agentmonitors-<hash>.sock. If a live
+// pre-upgrade daemon still answers at the legacy path, upgraded clients must
+// keep talking to it (no split-brain second daemon); otherwise they use the new
+// per-uid path.
+// ---------------------------------------------------------------------------
+
+/**
+ * A DISTINCT over-limit candidate (its own hash) so the live legacy socket we
+ * plant here never leaks into the other over-limit tests, which expect the new
+ * per-uid path.
+ */
+const MIGRATION_CANDIDATE = `/tmp/${'m'.repeat(130)}/agentmon.sock`;
+
+/** The legacy (pre-#292) fallback path for a candidate. Mirrors daemon-ipc. */
+function legacyFallbackPath(candidate: string): string {
+  const hash = createHash('sha256')
+    .update(candidate)
+    .digest('hex')
+    .slice(0, 16);
+  return path.join('/tmp', `agentmonitors-${hash}.sock`);
+}
+
+describe.skipIf(process.platform === 'win32')(
+  'resolveSocketPath — legacy fallback migration (issue #292)',
+  () => {
+    let liveLegacy: net.Server | undefined;
+
+    afterEach(async () => {
+      if (liveLegacy) {
+        await new Promise<void>((resolve) => {
+          liveLegacy?.close(() => {
+            resolve();
+          });
+        });
+        liveLegacy = undefined;
+      }
+      rmSync(legacyFallbackPath(MIGRATION_CANDIDATE), { force: true });
+    });
+
+    it('routes to the legacy path when a live daemon still answers there', async () => {
+      const legacy = legacyFallbackPath(MIGRATION_CANDIDATE);
+      rmSync(legacy, { force: true });
+      liveLegacy = net.createServer();
+      await new Promise<void>((resolve, reject) => {
+        liveLegacy?.once('error', reject);
+        liveLegacy?.listen(legacy, () => {
+          resolve();
+        });
+      });
+
+      // A pre-upgrade daemon is listening at the legacy path → keep using it.
+      expect(resolveSocketPath(MIGRATION_CANDIDATE)).toBe(legacy);
+    });
+
+    it('routes to the new per-uid path when no live legacy daemon is present', () => {
+      // No listener (also covers a stale socket file: a dead listener fails the
+      // liveness probe and we fall through to the new per-uid path).
+      rmSync(legacyFallbackPath(MIGRATION_CANDIDATE), { force: true });
+
+      const resolved = resolveSocketPath(MIGRATION_CANDIDATE);
+      expect(resolved).not.toBe(legacyFallbackPath(MIGRATION_CANDIDATE));
+      expect(path.dirname(resolved)).toBe(expectedFallbackDir());
+      expect(resolved.endsWith('.sock')).toBe(true);
+    });
+  },
+);
 
 // ---------------------------------------------------------------------------
 // createDaemonServer: startup lock (stale-lock recovery, live-lock rejection) (#68)
@@ -466,6 +572,37 @@ describe.skipIf(process.platform === 'win32')(
       // runs ensureSocketDir eagerly, so no bind is required.
       void server;
       expect(mode(shared)).toBe(0o755);
+    });
+
+    it('tightens a pre-existing Agent-Monitors-owned default socket directory for a :memory: db (issue #292 review)', () => {
+      // Root gap: a :memory: db never runs createDb's ensurePrivateDir, so a
+      // pre-existing world-readable default socket directory was never
+      // tightened. Point the XDG data root at a temp dir so socketBaseDir()
+      // (which ensureSocketDir compares against) resolves there.
+      const dataHome = tempDir();
+      const prevXdg = process.env['XDG_DATA_HOME'];
+      const prevDb = process.env['AGENTMONITORS_DB'];
+      process.env['XDG_DATA_HOME'] = dataHome;
+      process.env['AGENTMONITORS_DB'] = ':memory:';
+      try {
+        const baseDir = path.join(dataHome, 'agentmonitors');
+        mkdirSync(baseDir, { recursive: true });
+        chmodSync(baseDir, 0o755);
+        const socketPath = path.join(baseDir, 'agentmonitors.sock');
+
+        // ensureSocketDir runs eagerly in the factory; no bind needed.
+        void createDaemonServer({
+          runtime: createRuntime(':memory:'),
+          socketPath,
+        });
+
+        expect(mode(baseDir)).toBe(0o700);
+      } finally {
+        if (prevXdg === undefined) delete process.env['XDG_DATA_HOME'];
+        else process.env['XDG_DATA_HOME'] = prevXdg;
+        if (prevDb === undefined) delete process.env['AGENTMONITORS_DB'];
+        else process.env['AGENTMONITORS_DB'] = prevDb;
+      }
     });
 
     it('creates the startup lock directory 0700', () => {

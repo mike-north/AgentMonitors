@@ -8543,3 +8543,35 @@ describe.skipIf(process.platform === 'win32')(
     });
   },
 );
+
+// ---------------------------------------------------------------------------
+// Inbox commands fail cleanly (not with a raw stack trace) when the database
+// cannot be opened (issue #292 review). The six subcommands construct the db
+// via a bare `createDb`; a failure there must reach the CLI's error handling
+// and exit non-zero with a clean message, not crash with an unhandled throw.
+// ---------------------------------------------------------------------------
+describe('inbox commands fail cleanly on an unopenable database (issue #292)', () => {
+  it('inbox list exits 1 with a clean error and no raw stack trace', () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'agentmon-inbox-err-'));
+    try {
+      // A regular file sits where the db's parent directory should be, so the
+      // db's directory setup fails. Previously this surfaced as an uncaught
+      // throw with a raw stack; it must now be a clean `Error: …` + exit 1.
+      const blocker = path.join(root, 'blocker');
+      writeFileSync(blocker, 'x');
+      const dbPath = path.join(blocker, 'inbox.db');
+
+      const result = spawnSync('node', [CLI_PATH, 'inbox', 'list'], {
+        encoding: 'utf-8',
+        env: { ...process.env, AGENTMONITORS_DB: dbPath },
+      });
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('Error:');
+      // A clean reported error, not an unhandled exception stack trace.
+      expect(result.stderr).not.toMatch(/\n\s+at /);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

@@ -14,6 +14,13 @@
  * `0600`. Modes are meaningless on Windows, so the helpers degrade to no-ops
  * there (the callers still create the paths, just without POSIX mode
  * enforcement).
+ *
+ * **Degrade gracefully on artifacts we do not own.** Tightening is best-effort:
+ * where the artifact exists but is owned by another uid (e.g. a caller pointed a
+ * hook-state path into a shared, group-writable directory), the `chmod` fails
+ * with `EPERM`/`EACCES`. That is not fatal — the pre-hardening code needed only
+ * write permission — so the helpers emit one structured stderr warning per path
+ * per process and continue rather than throwing (spec 002 §3.1).
  */
 import {
   chmodSync,
@@ -38,6 +45,67 @@ export const PRIVATE_FILE_MODE = 0o600;
 const isWindows = process.platform === 'win32';
 
 /**
+ * Narrow an unknown thrown value to a Node `ErrnoException` (an error carrying a
+ * `code` string such as `ENOENT`/`EPERM`). Shared so every `code`-based catch in
+ * core and the CLI uses one type-safe guard instead of an unchecked cast.
+ */
+export function isErrnoException(
+  error: unknown,
+): error is NodeJS.ErrnoException {
+  return typeof error === 'object' && error !== null && 'code' in error;
+}
+
+/**
+ * `lstat` a path, returning `null` (not throwing) when it does not exist. Any
+ * other error propagates. Shared by the tighten helpers so the "missing path is
+ * a no-op" rule is expressed in exactly one place.
+ */
+function lstatOrNull(targetPath: string): Stats | null {
+  try {
+    return lstatSync(targetPath);
+  } catch (err) {
+    if (isErrnoException(err) && err.code === 'ENOENT') return null;
+    throw err;
+  }
+}
+
+/**
+ * Paths we have already warned about failing to tighten. Keeps the best-effort
+ * degrade path (below) to one stderr line per path per process, so a monitor
+ * that writes a not-ours artifact every tick does not spam the log.
+ */
+const bestEffortWarnedPaths = new Set<string>();
+
+/**
+ * Emit a single structured warning when we could not tighten a path we do not
+ * own (`EPERM`/`EACCES`), then remember it so we never warn about it again this
+ * process. The caller continues without throwing (issue #292 review).
+ */
+function warnBestEffortTightenFailure(
+  targetPath: string,
+  mode: number,
+  err: NodeJS.ErrnoException,
+): void {
+  if (bestEffortWarnedPaths.has(targetPath)) return;
+  bestEffortWarnedPaths.add(targetPath);
+  process.stderr.write(
+    `Warning: could not restrict permissions on ${targetPath} to 0${mode.toString(8)} (${String(err.code)}); ` +
+      `it is not owned by the current user, so its mode is left unchanged.\n`,
+  );
+}
+
+/**
+ * True for the errno codes that mean "the artifact is not ours to chmod" — the
+ * best-effort degrade path swallows these; anything else is a real fault and
+ * re-thrown.
+ */
+function isNotOwnedErrno(err: unknown): err is NodeJS.ErrnoException {
+  return (
+    isErrnoException(err) && (err.code === 'EPERM' || err.code === 'EACCES')
+  );
+}
+
+/**
  * Tighten the mode of an existing path to `mode`, refusing to follow a symlink.
  *
  * This is the "tighten existing artifacts on startup" path (issue #292): a
@@ -52,6 +120,11 @@ const isWindows = process.platform === 'win32';
  * an attacker who swaps the path for a symlink between the two steps cannot
  * redirect our chmod onto a file we do not own.
  *
+ * Best-effort: when the path exists but belongs to another user (`EPERM`/
+ * `EACCES`), it emits one warning per path per process and returns rather than
+ * throwing — tightening someone else's artifact is not our job, and failing to
+ * would be a functional regression (pre-#292 callers needed only write access).
+ *
  * No-ops (never throws) when the path is missing, is a symlink, is neither a
  * regular file nor a directory, or on Windows.
  */
@@ -61,13 +134,8 @@ export function restrictExistingPathMode(
 ): void {
   if (isWindows) return;
 
-  let linkStat: Stats;
-  try {
-    linkStat = lstatSync(targetPath);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
-    throw err;
-  }
+  const linkStat = lstatOrNull(targetPath);
+  if (linkStat === null) return;
 
   // Never chmod through a symlink — neither follow it nor "fix" it.
   if (linkStat.isSymbolicLink()) return;
@@ -79,19 +147,38 @@ export function restrictExistingPathMode(
   try {
     fd = openSync(targetPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
   } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
     // ELOOP → the final component became a symlink after our lstat; ENOENT → it
     // vanished. Either way there is nothing safe left to tighten.
-    if (code === 'ELOOP' || code === 'ENOENT') return;
+    if (
+      isErrnoException(err) &&
+      (err.code === 'ELOOP' || err.code === 'ENOENT')
+    )
+      return;
     throw err;
   }
 
   try {
     fchmodSync(fd, mode);
+  } catch (err) {
+    if (isNotOwnedErrno(err)) {
+      warnBestEffortTightenFailure(targetPath, mode, err);
+    } else {
+      throw err;
+    }
   } finally {
     closeSync(fd);
   }
 }
+
+/**
+ * Paths for which {@link ensurePrivateDir} has already created-and-tightened the
+ * directory this process. Spec 002 §3.1 requires tightening once per *startup*
+ * (a startup is one process); the daemon then writes hook state per lead session
+ * per tick, so re-running `lstat`/`open`/`fchmod` on the same session directory
+ * every write is wasted work. The cache collapses that to one verification per
+ * path per process.
+ */
+const verifiedPrivateDirs = new Set<string>();
 
 /**
  * Ensure `dirPath` exists as an owner-only (`0700`) directory, creating any
@@ -104,6 +191,12 @@ export function restrictExistingPathMode(
  * {@link restrictExistingPathMode} covers the already-exists case, which
  * `mkdirSync` leaves untouched.
  *
+ * The result is cached per process (see {@link verifiedPrivateDirs}) so
+ * steady-state writes into an already-verified directory skip the
+ * `lstat`/`open`/`fchmod` cycle. Tests that simulate a *second* startup in one
+ * process must call {@link resetVerifiedPathCachesForTest} to re-exercise the
+ * tighten-on-startup path.
+ *
  * Intended for Agent-Monitors-owned locations under the user's home/XDG data
  * root (the per-workspace data directory, session directories, socket
  * directory). Not for untrusted shared locations such as a world-writable
@@ -111,8 +204,10 @@ export function restrictExistingPathMode(
  * fallback in the CLI.
  */
 export function ensurePrivateDir(dirPath: string): void {
+  if (verifiedPrivateDirs.has(dirPath)) return;
   mkdirSync(dirPath, { recursive: true, mode: PRIVATE_DIR_MODE });
   restrictExistingPathMode(dirPath, PRIVATE_DIR_MODE);
+  verifiedPrivateDirs.add(dirPath);
 }
 
 /**
@@ -153,21 +248,18 @@ export function writePrivateFileAtomic(
     encoding: 'utf-8',
     mode: PRIVATE_FILE_MODE,
   });
+  // Re-tighten the *temp* file: `writeFileSync`'s `mode` only applies when it
+  // creates the file, so a stale `<file>.tmp` left by an earlier crash would
+  // otherwise keep its looser mode and rename would carry that onto the final
+  // path.
   restrictExistingPathMode(tmpPath, PRIVATE_FILE_MODE);
   renameSync(tmpPath, filePath);
-  restrictExistingPathMode(filePath, PRIVATE_FILE_MODE);
-}
-
-/**
- * Tighten the mode of a plain (already-created) file to owner-only (`0600`),
- * without managing its directory. Used where the containing directory is *not*
- * Agent-Monitors-owned and must keep its existing mode (e.g. the
- * `.claude/agentmonitors.local.md` coordination file, whose `.claude` parent
- * belongs to the host tool). Delegates to {@link restrictExistingPathMode}, so
- * it is symlink-safe and a no-op on Windows / missing paths.
- */
-export function restrictFileMode(filePath: string): void {
-  restrictExistingPathMode(filePath, PRIVATE_FILE_MODE);
+  // No post-rename re-tighten of `filePath`: `rename` preserves the source
+  // inode's mode, and the temp inode is guaranteed `0600` by the `writeFileSync`
+  // mode plus the re-tighten above (no realistic umask strips owner bits from
+  // `0600`). Tightening the final path would therefore be a provable no-op, so
+  // skipping it removes one `lstat`/`open`/`fchmod` cycle from a hot write path
+  // (per lead session per tick, plus per `hook deliver`).
 }
 
 /**
@@ -179,17 +271,37 @@ export function restrictFileMode(filePath: string): void {
  * A socket cannot be opened via `open(2)`, so we cannot use the `O_NOFOLLOW`
  * fd path {@link restrictExistingPathMode} uses. Instead we `lstat` and only
  * `chmod` when the path is genuinely a socket (never a symlink an attacker
- * swapped in). No-op on Windows / missing paths.
+ * swapped in) — the owner-only parent directory (guaranteed by the daemon's
+ * socket-dir setup) is what actually closes the residual chmod-follows-symlink
+ * window here. Best-effort on `EPERM`/`EACCES` (warns once, continues). No-op on
+ * Windows / missing paths.
  */
 export function restrictSocketMode(socketPath: string): void {
   if (isWindows) return;
-  let st: Stats;
+  const st = lstatOrNull(socketPath);
+  if (st === null) return;
+  if (!st.isSocket()) return;
   try {
-    st = lstatSync(socketPath);
+    chmodSync(socketPath, PRIVATE_FILE_MODE);
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+    if (isNotOwnedErrno(err)) {
+      warnBestEffortTightenFailure(socketPath, PRIVATE_FILE_MODE, err);
+      return;
+    }
     throw err;
   }
-  if (!st.isSocket()) return;
-  chmodSync(socketPath, PRIVATE_FILE_MODE);
+}
+
+/**
+ * Test-only: clear the per-process caches ({@link verifiedPrivateDirs} and the
+ * best-effort warning dedup set) so a test that simulates a *second* daemon
+ * startup within one process — real startups are separate processes, each with
+ * a fresh cache — re-exercises the tighten-on-startup migration and warning
+ * paths. Deliberately **not** re-exported from the package entry point, so it
+ * stays out of the public API surface; co-located tests import it from this
+ * module directly.
+ */
+export function resetVerifiedPathCachesForTest(): void {
+  verifiedPrivateDirs.clear();
+  bestEffortWarnedPaths.clear();
 }

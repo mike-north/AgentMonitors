@@ -748,9 +748,13 @@ artifacts on startup** (BP4, [000 §5](./000-principles.md)).
   hook-state files, the startup-lock pid file, and the `.claude/agentmonitors.local.md` coordination
   file. (The `.claude` directory itself belongs to the host tool and is **not** re-moded — only the
   coordination file we own is.)
-- **Sockets:** the Unix domain socket is chmod'd `0600` after bind and — decisively — lives inside an
-  owner-only directory, so other users cannot even traverse to it on platforms that ignore socket
-  permission bits for `connect(2)`.
+- **Sockets:** the Unix domain socket is **bound under a restricted (`0o077`) umask so it is born
+  `0600`** (Node binds a Unix socket synchronously inside `listen()`, so the umask window closes
+  before the socket is observable), then re-chmod'd `0600` after bind as defense-in-depth, and —
+  decisively — lives inside an owner-only directory, so other users cannot even traverse to it on
+  platforms that ignore socket permission bits for `connect(2)`. Because `chmod` follows symlinks
+  (there is no `fchmod` for a path that cannot be `open(2)`'d), the owner-only parent directory — not
+  the post-bind chmod — is the load-bearing guard against a swapped-symlink race.
 - **Creation invariant.** On-disk databases are opened under a restricted (`0o077`) process umask so
   the WAL/SHM files SQLite creates itself are private from birth; directories are created with an
   explicit `0700` mode (a permissive umask cannot re-add group/other bits to `0700`); files are
@@ -758,10 +762,23 @@ artifacts on startup** (BP4, [000 §5](./000-principles.md)).
 - **Migration — tighten on startup.** An artifact created by an earlier, pre-hardening version keeps
   its world-readable mode until re-moded. Each startup re-applies the owner-only mode to existing
   databases, sidecars, hook-state files, and Agent-Monitors-owned data/session/socket directories.
-  Tightening is **symlink-safe**: it `lstat`s first, refuses to act on a symlink, and re-opens with
-  `O_NOFOLLOW` before `fchmod`, so a planted symlink cannot redirect a `chmod` onto a file the user
-  does not own. A socket directory the user _explicitly chose_ (`--socket` / `AGENTMONITORS_SOCKET`)
-  or a shared system directory is **not** tightened — only Agent-Monitors-owned directories are.
+  This includes the Agent-Monitors-owned **default** socket directory even when the database is
+  `:memory:` (which has no on-disk file to tighten at `createDb`) — a pre-existing world-readable
+  default socket directory must not slip through. Re-application is idempotent and performed **once
+  per process** (a process is one startup), so the steady-state write path — hook state per lead
+  session per tick — does not re-`lstat`/`open`/`fchmod` an already-verified path. Tightening is
+  **symlink-safe**: it `lstat`s first, refuses to act on a symlink, and re-opens with `O_NOFOLLOW`
+  before `fchmod`, so a planted symlink cannot redirect a `chmod` onto a file the user does not own.
+  A socket directory the user _explicitly chose_ (`--socket` / `AGENTMONITORS_SOCKET`) or a shared
+  system directory is **not** tightened — only Agent-Monitors-owned directories are.
+- **Degrade gracefully where the artifact is not ours.** Tightening never _fails_ an operation that
+  only needs write access. When the target exists but is owned by another user (a caller pointed,
+  say, `--hook-state-path` into a shared group-writable directory), the `chmod` returns
+  `EPERM`/`EACCES`; the helpers emit **one structured stderr warning per path per process** and
+  continue, leaving the mode unchanged — they do **not** throw. The daemon must never die because an
+  artifact it was asked to write is not one it can chmod; correspondingly, a single malformed or
+  unexpected IPC request is answered with an error response, never allowed to crash the daemon
+  process ([§10.4](#104-ipc-wire-protocol)).
 - **Windows.** POSIX modes are not meaningful; the helpers create the paths without mode enforcement.
 
 Verified: `libs/core/src/security/local-permissions.ts` — `ensurePrivateDir`,
@@ -1112,6 +1129,8 @@ The socket path is resolved by `resolveSocketPath()`. Priority order:
 3. `<dbDir>/agentmonitors.sock` (where `<dbDir>` is the directory containing the SQLite file, or `~/.local/share/agentmonitors` for `:memory:` databases)
 
 If the resolved path exceeds 100 characters (the Unix socket path length limit in use), the path is hashed (SHA-256, first 16 hex chars) and placed at `/tmp/agentmonitors-<uid>/agentmonitors-<hash>.sock` — inside an **owner-only (`0700`) per-uid directory**, not directly under the shared, world-writable `/tmp` (issue #292; the pre-#292 fallback wrote a predictable `/tmp/agentmonitors-<hash>.sock` any local user could connect to). The per-uid directory is created with an atomic owner-only `mkdir` and, if it already exists, is refused unless it is a real (non-symlink) directory owned by the current user, so the daemon fails closed rather than binding inside a directory another user could have planted. The base is `/tmp` (not the platform temp root) deliberately: on macOS the per-user temp root (`/var/folders/…/T`) would push the substituted socket back over the 100-char limit — privacy comes from the owner-only per-uid subdirectory, not the shared base ([§3.1](#31-local-data-permission-model--the-local-trust-boundary-current)).
+
+**Legacy-fallback transition (no split-brain).** Because that fallback location _moved_ (from the pre-#292 `/tmp/agentmonitors-<hash>.sock` to the per-uid path), an upgrade could otherwise strand a running pre-upgrade daemon: it keeps listening at the old path while upgraded clients resolve to the new path and lazy-boot a **second** daemon on the same database — two daemons ticking one DB, which the startup lock cannot prevent because it is keyed per socket path. To avoid this, `resolveSocketPath`'s fallback branch first probes the legacy path: **if a live daemon still answers there, it returns the legacy path so clients keep talking to the existing daemon**; otherwise it returns the new per-uid path. A daemon only ever _binds_ the new path — a live legacy daemon makes `daemon run`'s "already running" check succeed, so no second bind happens — so **one restart of the legacy daemon completes the migration** (its clean shutdown removes the legacy socket; the next resolve returns the new path). The probe is a short-lived connect (the same liveness test the bind path uses), guarded by an existence check so the steady state — no legacy socket file — costs nothing.
 
 **Explicit `--socket` substitution is announced (issue #337).** When `overridePath` came from a
 literal `--socket` flag the caller typed (not `AGENTMONITORS_SOCKET`, not a

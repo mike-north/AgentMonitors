@@ -20,7 +20,7 @@ import {
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { createDb } from './db.js';
+import { createDb, resetSqliteArtifactModeCacheForTest } from './db.js';
 
 const isWindows = process.platform === 'win32';
 
@@ -69,6 +69,11 @@ describe.skipIf(isWindows)(
       chmodSync(path.dirname(dbPath), 0o755);
       chmodSync(dbPath, 0o644);
       expect(modeOf(dbPath)).toBe(0o644);
+
+      // A real second open is a fresh process with an empty verified-path cache;
+      // simulate that here so the tighten-on-startup path runs again (the
+      // per-process cache would otherwise short-circuit the re-open).
+      resetSqliteArtifactModeCacheForTest();
 
       // Re-opening must migrate the modes forward.
       createDb(dbPath);

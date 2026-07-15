@@ -5,6 +5,7 @@ import { sql } from 'drizzle-orm';
 import {
   ensurePrivateDir,
   PRIVATE_FILE_MODE,
+  resetVerifiedPathCachesForTest,
   restrictExistingPathMode,
   withRestrictedUmask,
 } from '../security/local-permissions.js';
@@ -46,15 +47,38 @@ function addColumnIfMissing(
 const SQLITE_ARTIFACT_SUFFIXES = ['', '-wal', '-shm', '-journal'] as const;
 
 /**
+ * Database paths whose artifact modes have already been tightened this process.
+ * Spec 002 §3.1 requires tightening once per *startup* (one process); caching
+ * lets a re-`createDb` on the same path in a long-lived process skip the
+ * per-suffix `lstat`/`open`/`fchmod` cycles. Tests simulating a second startup
+ * in one process clear it via {@link resetSqliteArtifactModeCacheForTest}.
+ */
+const verifiedSqlitePaths = new Set<string>();
+
+/**
  * Tighten the mode of the SQLite database and its sidecar files to owner-only
  * (`0600`). Called after schema setup to (a) migrate a database created by an
  * earlier version under a permissive umask (issue #292) and (b) belt-and-braces
  * cover any sidecar SQLite created outside the restricted-umask window.
  */
 function restrictSqliteArtifactModes(dbPath: string): void {
+  if (verifiedSqlitePaths.has(dbPath)) return;
   for (const suffix of SQLITE_ARTIFACT_SUFFIXES) {
     restrictExistingPathMode(`${dbPath}${suffix}`, PRIVATE_FILE_MODE);
   }
+  verifiedSqlitePaths.add(dbPath);
+}
+
+/**
+ * Test-only: clear the per-process verified-path caches (this module's SQLite
+ * cache and the shared directory cache in `local-permissions`) so a test that
+ * re-opens the same on-disk database to prove tighten-on-startup migration —
+ * something that is a fresh process in production — re-runs the tightening.
+ * Not re-exported from the package entry point; imported directly by tests.
+ */
+export function resetSqliteArtifactModeCacheForTest(): void {
+  verifiedSqlitePaths.clear();
+  resetVerifiedPathCachesForTest();
 }
 
 /**

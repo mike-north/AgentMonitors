@@ -44,8 +44,16 @@ inboxCommand
       until?: string;
       format: string;
     }) => {
-      const db = createDb(resolveDbPath());
-      const inbox = new InboxService(db);
+      let inbox: InboxService;
+      try {
+        inbox = new InboxService(createDb(resolveDbPath()));
+      } catch (err) {
+        reportError(
+          err instanceof Error ? err.message : String(err),
+          options.format === 'json',
+        );
+        return;
+      }
 
       const filter: InboxFilter = {};
       if (options.state) {
@@ -114,9 +122,8 @@ inboxCommand
   .description('Acknowledge an inbox item')
   .argument('<id>', 'Inbox item ID')
   .action((id: string) => {
-    const db = createDb(resolveDbPath());
-    const inbox = new InboxService(db);
     try {
+      const inbox = new InboxService(createDb(resolveDbPath()));
       inbox.ack(id);
       console.log(`Acknowledged: ${id}`);
     } catch (err) {
@@ -129,9 +136,8 @@ inboxCommand
   .description('Mark an inbox item as in-progress')
   .argument('<id>', 'Inbox item ID')
   .action((id: string) => {
-    const db = createDb(resolveDbPath());
-    const inbox = new InboxService(db);
     try {
+      const inbox = new InboxService(createDb(resolveDbPath()));
       inbox.start(id);
       console.log(`Started: ${id}`);
     } catch (err) {
@@ -144,9 +150,8 @@ inboxCommand
   .description('Mark an inbox item as completed')
   .argument('<id>', 'Inbox item ID')
   .action((id: string) => {
-    const db = createDb(resolveDbPath());
-    const inbox = new InboxService(db);
     try {
+      const inbox = new InboxService(createDb(resolveDbPath()));
       inbox.complete(id);
       console.log(`Completed: ${id}`);
     } catch (err) {
@@ -160,9 +165,8 @@ inboxCommand
   .argument('<id>', 'Inbox item ID')
   .option('--error <message>', 'Error message')
   .action((id: string, options: { error?: string }) => {
-    const db = createDb(resolveDbPath());
-    const inbox = new InboxService(db);
     try {
+      const inbox = new InboxService(createDb(resolveDbPath()));
       inbox.fail(id, options.error);
       console.log(`Failed: ${id}`);
     } catch (err) {
@@ -175,9 +179,8 @@ inboxCommand
   .description('Archive a completed or failed inbox item')
   .argument('<id>', 'Inbox item ID')
   .action((id: string) => {
-    const db = createDb(resolveDbPath());
-    const inbox = new InboxService(db);
     try {
+      const inbox = new InboxService(createDb(resolveDbPath()));
       inbox.archive(id);
       console.log(`Archived: ${id}`);
     } catch (err) {

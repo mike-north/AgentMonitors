@@ -1,6 +1,9 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { PRIVATE_FILE_MODE, restrictFileMode } from '@agentmonitors/core';
+import {
+  PRIVATE_FILE_MODE,
+  restrictExistingPathMode,
+} from '@agentmonitors/core';
 
 export interface LocalState {
   enabled: boolean;
@@ -98,5 +101,8 @@ export function writeLocalState(
     encoding: 'utf-8',
     mode: PRIVATE_FILE_MODE,
   });
-  restrictFileMode(target);
+  // `.claude/` belongs to the host tool, so only tighten the file we own; a
+  // stale looser file left by an earlier version is re-tightened here (the
+  // `writeFileSync` mode above only applies when it *creates* the file).
+  restrictExistingPathMode(target, PRIVATE_FILE_MODE);
 }

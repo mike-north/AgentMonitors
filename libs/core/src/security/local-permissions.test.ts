@@ -27,6 +27,7 @@ import {
   ensurePrivateDir,
   PRIVATE_DIR_MODE,
   PRIVATE_FILE_MODE,
+  resetVerifiedPathCachesForTest,
   restrictExistingPathMode,
   withRestrictedUmask,
   writePrivateFileAtomic,
@@ -49,6 +50,9 @@ describe.skipIf(isWindows)('local-permissions', () => {
     // produce world-readable 0755/0644 artifacts. Capture the previous value.
     originalUmask = process.umask(0o022);
     tmpDir = mkdtempSync(path.join(tmpdir(), 'am-perms-'));
+    // Each case simulates a fresh startup, so start with empty per-process
+    // caches (verified dirs + warning dedup).
+    resetVerifiedPathCachesForTest();
   });
 
   afterEach(() => {
@@ -78,6 +82,25 @@ describe.skipIf(isWindows)('local-permissions', () => {
     it('is idempotent', () => {
       const dir = path.join(tmpDir, 'idem');
       ensurePrivateDir(dir);
+      ensurePrivateDir(dir);
+      expect(modeOf(dir)).toBe(PRIVATE_DIR_MODE);
+    });
+
+    it('verifies a path once per process (steady-state writes skip re-tightening)', () => {
+      // Hot-path optimization (issue #292 review): after the first verification,
+      // a subsequent call must NOT re-run the lstat/open/fchmod cycle — proven
+      // here by loosening the dir behind the cache and observing it is left
+      // untouched. A real second startup is a fresh process, so the cache reset
+      // re-enables tightening.
+      const dir = path.join(tmpDir, 'cached');
+      ensurePrivateDir(dir);
+      expect(modeOf(dir)).toBe(PRIVATE_DIR_MODE);
+
+      chmodSync(dir, 0o755);
+      ensurePrivateDir(dir); // cache hit — no re-tighten
+      expect(modeOf(dir)).toBe(0o755);
+
+      resetVerifiedPathCachesForTest(); // simulate a fresh startup
       ensurePrivateDir(dir);
       expect(modeOf(dir)).toBe(PRIVATE_DIR_MODE);
     });

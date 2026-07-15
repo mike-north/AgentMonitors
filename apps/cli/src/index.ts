@@ -57,4 +57,13 @@ program.addCommand(eventsCommand);
 program.addCommand(hookCommand);
 program.addCommand(channelCommand);
 
-program.parse();
+// `parseAsync` (not `parse`): several command actions are `async`, and Commander
+// does not await an action passed to the synchronous `parse()` — an action that
+// rejects (e.g. `daemon run`'s loop) would surface as an unhandled promise
+// rejection with a noisy stack instead of a clean error + non-zero exit. CJS
+// bundles have no top-level `await`, so we handle the returned promise here.
+program.parseAsync().catch((error: unknown) => {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(`Error: ${message}`);
+  process.exitCode = 1;
+});
