@@ -13,12 +13,23 @@ import { writeLocalState } from '../local-state.js';
  * only an explicit `--socket`/`AGENTMONITORS_SOCKET`/the bare global default —
  * never an enabled workspace's persisted-or-derived per-workspace socket, the
  * resolution every other workspace-aware command uses
- * (`resolveManualDaemonSocketPath`, issue #335). These tests lock down parity
- * with that resolution, matching the exact formula `session start`'s lazy-boot
- * uses (`resolveSocketPath(state.socket ?? workspacePaths(workspace).socket)`,
+ * (`resolveManualDaemonSocketPath`, issue #335).
+ *
+ * Because `channel serve` is spawned *automatically* by the plugin's
+ * `.mcp.json` (no flags, like a hook), its precedence is deliberately
+ * different from `resolveManualDaemonSocketPath`'s env-first order: an
+ * **enabled** workspace's own socket must win over a stale
+ * `AGENTMONITORS_SOCKET` left over from a different workspace, or `channel
+ * serve` can cross-connect to another workspace's daemon (a session-isolation
+ * break) — see `resolveChannelSocketPath`'s doc comment in `channel.ts`. These
+ * tests lock down: explicit `--socket` beats everything; an enabled
+ * workspace's socket beats `AGENTMONITORS_SOCKET`; `AGENTMONITORS_SOCKET`
+ * still applies when the workspace is not enabled; and the resolved value
+ * matches the exact formula `session start`'s lazy-boot uses
+ * (`resolveSocketPath(state.socket ?? workspacePaths(workspace).socket)`,
  * `apps/cli/src/commands/session.ts`).
  *
- * @see ../../../../docs/specs/006-agent-integration.md §4.4
+ * @see ../../../../docs/specs/006-agent-integration.md §4.1
  * @see ../../../../docs/specs/005-cli-reference.md §13
  */
 describe('resolveChannelSocketPath (issue #358)', () => {
@@ -93,10 +104,24 @@ describe('resolveChannelSocketPath (issue #358)', () => {
     }
   });
 
-  it('AGENTMONITORS_SOCKET still wins over workspace-aware resolution when no --socket flag is given', () => {
+  it('an enabled workspace socket wins over AGENTMONITORS_SOCKET (the isolation fix): a stale env var must not cross workspaces for automatically-spawned channel serve', () => {
     const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-chansock-'));
     try {
       writeLocalState(ws, { enabled: true, socket: '/tmp/persisted.sock' });
+      process.env['AGENTMONITORS_SOCKET'] = '/tmp/env.sock';
+      expect(resolveChannelSocketPath(undefined, ws)).toBe(
+        resolveSocketPath('/tmp/persisted.sock'),
+      );
+      expect(resolveChannelSocketPath(undefined, ws)).not.toBe('/tmp/env.sock');
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it('AGENTMONITORS_SOCKET still wins when the workspace is NOT enabled (no per-workspace socket to prefer)', () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-chansock-'));
+    try {
+      // No local state file at all → readLocalState returns { enabled: false }.
       process.env['AGENTMONITORS_SOCKET'] = '/tmp/env.sock';
       expect(resolveChannelSocketPath(undefined, ws)).toBe('/tmp/env.sock');
     } finally {
@@ -110,6 +135,19 @@ describe('resolveChannelSocketPath (issue #358)', () => {
       // No local state file at all → readLocalState returns { enabled: false }.
       expect(resolveChannelSocketPath(undefined, ws)).toBe(
         resolveSocketPath(undefined),
+      );
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it('an explicit --socket flag still wins even when AGENTMONITORS_SOCKET and an enabled workspace socket are both set', () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-chansock-'));
+    try {
+      writeLocalState(ws, { enabled: true, socket: '/tmp/persisted.sock' });
+      process.env['AGENTMONITORS_SOCKET'] = '/tmp/env.sock';
+      expect(resolveChannelSocketPath('/tmp/explicit.sock', ws)).toBe(
+        '/tmp/explicit.sock',
       );
     } finally {
       rmSync(ws, { recursive: true, force: true });

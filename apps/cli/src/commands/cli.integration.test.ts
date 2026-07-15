@@ -22,7 +22,11 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { writeLocalState } from '../local-state.js';
-import { daemonAvailable, callDaemon } from '../daemon-ipc.js';
+import {
+  daemonAvailable,
+  callDaemon,
+  resolveSocketPath,
+} from '../daemon-ipc.js';
 import { decodeToon } from '../toon-format.js';
 
 const CLI_PATH = path.resolve(__dirname, '../../dist/index.cjs');
@@ -5993,6 +5997,15 @@ describe('lazy daemon lifecycle', () => {
     // Confirm the derivation yields distinct sockets (the acceptance criterion).
     expect(pathsA.socket).not.toBe(pathsB.socket);
 
+    // Wrap through resolveSocketPath, the SAME transform `session start`
+    // applies before binding: on hosts with a deep $HOME/XDG_DATA_HOME the raw
+    // derived path can exceed the AF_UNIX length limit, in which case the
+    // daemon actually binds a substituted short path. Checking availability
+    // and stopping via the un-resolved raw path would target the wrong socket
+    // on those hosts (leaked daemon, flake).
+    const resolvedSocketA = resolveSocketPath(pathsA.socket);
+    const resolvedSocketB = resolveSocketPath(pathsB.socket);
+
     // Scaffold monitors in both workspaces
     for (const ws of [wsA, wsB]) {
       const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-files');
@@ -6057,12 +6070,12 @@ describe('lazy daemon lifecycle', () => {
       expect(startB.exitCode).toBe(0);
 
       // Both daemons must be simultaneously reachable on their derived sockets
-      expect(await daemonAvailable(pathsA.socket)).toBe(true);
-      expect(await daemonAvailable(pathsB.socket)).toBe(true);
+      expect(await daemonAvailable(resolvedSocketA)).toBe(true);
+      expect(await daemonAvailable(resolvedSocketB)).toBe(true);
 
       // A's session list contains A's session, NOT B's
       const listA = runWithEnv(
-        ['session', 'list', '--socket', pathsA.socket, '--format', 'json'],
+        ['session', 'list', '--socket', resolvedSocketA, '--format', 'json'],
         envA,
         wsA,
       );
@@ -6075,7 +6088,7 @@ describe('lazy daemon lifecycle', () => {
 
       // B's session list contains B's session, NOT A's
       const listB = runWithEnv(
-        ['session', 'list', '--socket', pathsB.socket, '--format', 'json'],
+        ['session', 'list', '--socket', resolvedSocketB, '--format', 'json'],
         envB,
         wsB,
       );
@@ -6100,7 +6113,7 @@ describe('lazy daemon lifecycle', () => {
         wsB,
       );
     } finally {
-      for (const socket of [pathsA.socket, pathsB.socket]) {
+      for (const socket of [resolvedSocketA, resolvedSocketB]) {
         try {
           await callDaemon('stop', {}, { socketPath: socket });
         } catch {
@@ -6496,7 +6509,14 @@ describe('channel serve workspace-socket resolution (issue #358)', () => {
     writeLocalState(ws, { enabled: true, reapAfterMs: 60_000 });
 
     const { workspacePaths } = await import('../workspace-paths.js');
-    const derivedSocket = workspacePaths(ws).socket;
+    // Wrap through resolveSocketPath, the SAME transform `session start`
+    // applies before binding (session.ts's `resolveSocketPath(state.socket ??
+    // paths.socket)`): on hosts with a deep $HOME/XDG_DATA_HOME the raw
+    // derived path can exceed the AF_UNIX length limit, in which case the
+    // daemon actually binds a substituted short path. Checking availability
+    // and stopping via the un-resolved raw path would target the wrong
+    // socket on those hosts (leaked daemon, flake).
+    const derivedSocket = resolveSocketPath(workspacePaths(ws).socket);
 
     const hostSessionId = `chan-358-${String(Date.now())}`;
     // ONLY CLAUDE_PROJECT_DIR -- no AGENTMONITORS_SOCKET/AGENTMONITORS_DB

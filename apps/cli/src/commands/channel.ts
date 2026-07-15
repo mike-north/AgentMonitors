@@ -12,7 +12,8 @@ import {
   openSessionClient,
 } from '../runtime-client.js';
 import { resolveSocketPath } from '../daemon-ipc.js';
-import { resolveManualDaemonSocketPath } from '../manual-daemon.js';
+import { readLocalState } from '../local-state.js';
+import { workspacePaths } from '../workspace-paths.js';
 import { renderChannelEvent } from '../channel-render.js';
 import { ACK_TOOL, parseAckArgs } from '../channel-ack.js';
 
@@ -36,7 +37,7 @@ channelCommand
   )
   .option(
     '--socket <path>',
-    'Daemon Unix domain socket path (default: the same per-workspace socket `session start` binds to when the workspace is enabled; otherwise $AGENTMONITORS_SOCKET or the global default)',
+    'Daemon Unix domain socket path (default: the same per-workspace socket `session start` binds to when the workspace is enabled — this takes precedence over $AGENTMONITORS_SOCKET for `channel serve` specifically, since it is spawned automatically and a stale env var must not cross workspaces; otherwise $AGENTMONITORS_SOCKET or the global default)',
   )
   .option(
     '--poll-ms <ms>',
@@ -55,27 +56,55 @@ channelCommand
 /**
  * Resolve the socket `channel serve` connects to.
  *
- * Mirrors {@link resolveManualDaemonSocketPath} — the same per-workspace-aware
- * resolution `session`/`events`/`hook`/`daemon` already use (issue #335) — so a
- * `session start`-lazy-booted daemon for an **enabled** workspace is reachable
- * with no flags, exactly as the plugin's `.mcp.json` spawns `channel serve`
- * (no `--socket`, no `AGENTMONITORS_SOCKET`). Before this fix, `channel serve`
- * called {@link resolveSocketPath} directly and only ever considered an
- * explicit `--socket`/`AGENTMONITORS_SOCKET`/the bare global default — landing
- * on a socket with no daemon listening for the only supported activation flow
- * (issue #358).
+ * `channel serve` is spawned **automatically** by the plugin's `.mcp.json` —
+ * with no flags at all — exactly like a hook. That means its socket
+ * resolution needs the same isolation guarantee `hook deliver` documents and
+ * enforces (`apps/cli/src/commands/hook.ts`, "Require an EXPLICIT
+ * per-workspace socket..."): a stale `AGENTMONITORS_SOCKET` left over from a
+ * different workspace must never win over an **enabled** workspace's own
+ * persisted-or-derived socket, or `channel serve` silently binds to another
+ * workspace's daemon (a session-isolation break) or a dead socket
+ * (reproducing issue #358's symptom).
  *
- * Precedence, unchanged from before this fix: explicit `--socket` wins, then
- * `AGENTMONITORS_SOCKET`; only then does workspace-aware resolution (or the
- * global default) apply.
+ * This is deliberately a *different* precedence than
+ * {@link resolveManualDaemonSocketPath} (issue #335), which is correct for
+ * commands a user types by hand (`session close`/`list`, `events`, `doctor`,
+ * `daemon status`) — there, an explicitly-set env var is a deliberate,
+ * interactive override and should win. `channel serve` has no such
+ * interactive moment, so for it alone:
+ *
+ * 1. An explicit `--socket` flag (always wins).
+ * 2. The **enabled** workspace's persisted socket, or — if none has
+ *    persisted yet — the derived per-workspace socket
+ *    ({@link workspacePaths}), matching the exact formula `session start`
+ *    lazy-boots with (`resolveSocketPath(state.socket ?? workspacePaths(workspace).socket)`).
+ * 3. `AGENTMONITORS_SOCKET`, then the global default — both handled by
+ *    {@link resolveSocketPath}'s own fallback chain when neither 1 nor 2
+ *    apply (e.g. the workspace is not enabled).
+ *
+ * Do not change {@link resolveManualDaemonSocketPath} to match this — its
+ * env-first order for the manual commands is deliberate (issue #335).
  */
 export function resolveChannelSocketPath(
   socket: string | undefined,
   workspace: string | undefined,
 ): string {
-  return resolveSocketPath(
-    resolveManualDaemonSocketPath(socket, workspace) ?? socket,
-  );
+  if (socket) {
+    return resolveSocketPath(socket, { explicit: true });
+  }
+
+  const workspacePath =
+    workspace ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
+  const state = readLocalState(workspacePath);
+  if (state.enabled) {
+    return resolveSocketPath(
+      state.socket ?? workspacePaths(workspacePath).socket,
+    );
+  }
+
+  // Not enabled: no per-workspace socket to prefer, so fall back to the
+  // existing AGENTMONITORS_SOCKET / global-default chain.
+  return resolveSocketPath(undefined);
 }
 
 /**

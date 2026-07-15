@@ -1319,13 +1319,20 @@ channel plugin, not run by hand.
 
 **Usage:** `agentmonitors channel serve [--socket <path>] [--poll-ms <ms>] [--host-session-id <id>] [--workspace <path>]`
 
-- `--socket` — daemon Unix socket path. Resolved the same per-workspace-aware way `session`/
-  `events`/`hook`/`daemon` already resolve theirs (`resolveManualDaemonSocketPath`, issue #335): an
-  explicit `--socket` wins, then `$AGENTMONITORS_SOCKET`; otherwise an **enabled** `--workspace`
-  (see below) uses its persisted-or-derived per-workspace socket — the same socket `session start`
-  lazy-boots (issue #358, previously this fell back to the bare global default, so the plugin's
-  `.mcp.json` spawn, which passes no `--socket`, silently talked to a socket with no daemon
-  listening) — and a not-enabled workspace falls back to the standard global-default path.
+- `--socket` — daemon Unix socket path. `channel serve` is spawned **automatically** by the
+  plugin's `.mcp.json` (no flags at all — like a hook), so its precedence is _not_ the same as
+  `resolveManualDaemonSocketPath` (issue #335), which the manually-typed `session`/`events`/`hook`/
+  `daemon` commands use. Instead: an explicit `--socket` wins outright; otherwise an **enabled**
+  `--workspace` (see below) uses its persisted-or-derived per-workspace socket — the same socket
+  `session start` lazy-boots (issue #358) — **before** `$AGENTMONITORS_SOCKET`; only a not-enabled
+  workspace falls back to `$AGENTMONITORS_SOCKET`, then the standard global-default path. This
+  order is deliberately env-var-last for `channel serve`: because it has no interactive moment
+  where a user deliberately sets `AGENTMONITORS_SOCKET`, a value left over from a different
+  workspace must never win over the current, enabled workspace's own socket — doing so would
+  either cross-connect the channel to another workspace's daemon (a session-isolation break) or
+  land on a dead socket (reproducing issue #358's original symptom). This mirrors the isolation
+  guarantee `hook deliver` already enforces (§12) by refusing to fall back past an enabled
+  workspace's socket at all.
 - `--poll-ms` — delivery poll interval in milliseconds (default: `3000`).
 - `--host-session-id` — host session id (default: `$CLAUDE_CODE_SESSION_ID`).
 - `--workspace` — workspace path (default: `$CLAUDE_PROJECT_DIR`).

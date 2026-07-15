@@ -39,12 +39,15 @@ discovered while drafting this recipe (root cause, repro, and suggested fix: iss
 **not** a defect in the channel mechanism itself — a `channel serve` process pointed at the correct
 socket always behaved exactly as specified (confirmed with an explicit `--socket` control run).
 
-**As of this fix, `channel serve` resolves the same per-workspace socket `session start` binds to**
-(parity with `resolveManualDaemonSocketPath`, the resolution every other workspace-aware command
-already used — issue #335), so the plugin's real, unmodified `.mcp.json` (no `--socket` flag) works
-with zero extra configuration. **Step 3's pre-seed workaround is no longer required** — skip it for
-a clean run with the plugin's default configuration, which is the way to confirm the fix; per the
-recipe's own guidance it remains harmless to keep applied if you already have it scripted.
+**As of this fix, `channel serve` resolves the same per-workspace socket `session start` binds to**,
+for an **enabled** workspace — ahead of `AGENTMONITORS_SOCKET` too, since `channel serve` is spawned
+automatically (no flags) and must not let a stale env var from a different workspace cross-connect
+it to the wrong daemon (006 §4.1) — so the plugin's real, unmodified `.mcp.json` (no `--socket`
+flag) works with zero extra configuration. **Step 3's pre-seed workaround is no longer required** —
+skip it for a clean run with the plugin's default configuration, which is the way to confirm the
+fix; per the recipe's own guidance it remains harmless to keep applied if you already have it
+scripted (it sets `AGENTMONITORS_SOCKET` to the _same_ socket persisted in `.claude/agentmonitors.local.md`,
+so it does not exercise the new precedence one way or the other).
 
 ## What this recipe proves
 
