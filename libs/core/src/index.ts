@@ -31,6 +31,20 @@ export type {
 export { scanMonitors } from './parser/scan-monitors.js';
 export type { ScanResult, DuplicateMonitorId } from './parser/scan-monitors.js';
 
+// Local-data permission model (issue #292): owner-only enforcement shared by
+// core persistence and the CLI's socket/lock/coordination artifacts, so the
+// thin CLI (AP6) does not invent its own permission logic.
+export {
+  PRIVATE_DIR_MODE,
+  PRIVATE_FILE_MODE,
+  ensurePrivateDir,
+  isErrnoException,
+  restrictExistingPathMode,
+  restrictSocketMode,
+  withRestrictedUmask,
+  writePrivateFileAtomic,
+} from './security/local-permissions.js';
+
 // Inbox
 export { createDb } from './inbox/db.js';
 export type { InboxDb } from './inbox/db.js';

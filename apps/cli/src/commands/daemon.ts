@@ -327,14 +327,23 @@ daemonCommand
         );
         return;
       }
-      await runLoop(
-        monitorsDir,
-        workspace,
-        pollMs,
-        socketPath,
-        reapAfterMs,
-        dbPath,
-      );
+      // Mirror the `status`/`stop`/`once` siblings: a failure inside the loop
+      // (bind error, watch setup, tick crash that escapes) must print a clean
+      // error and set a non-zero exit code, not surface as an unhandled
+      // rejection now that the CLI drives actions with `parseAsync`.
+      try {
+        await runLoop(
+          monitorsDir,
+          workspace,
+          pollMs,
+          socketPath,
+          reapAfterMs,
+          dbPath,
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        reportError(message, false);
+      }
     },
   );
 

@@ -1,8 +1,14 @@
-import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import Database, { type Database as BetterSQLiteClient } from 'better-sqlite3';
 import { BetterSQLite3Database, drizzle } from 'drizzle-orm/better-sqlite3';
 import { sql } from 'drizzle-orm';
+import {
+  ensurePrivateDir,
+  PRIVATE_FILE_MODE,
+  resetVerifiedPathCachesForTest,
+  restrictExistingPathMode,
+  withRestrictedUmask,
+} from '../security/local-permissions.js';
 import * as schema from './schema.js';
 
 type InternalInboxDb = BetterSQLite3Database<typeof schema> & {
@@ -33,14 +39,80 @@ function addColumnIfMissing(
 }
 
 /**
+ * SQLite file suffixes whose modes we restrict alongside the main database
+ * file. `-wal` / `-shm` are created by SQLite itself in WAL mode; `-journal`
+ * appears if a connection ever falls back to rollback journaling. Each may
+ * contain the same private snapshot/event data as the main file.
+ */
+const SQLITE_ARTIFACT_SUFFIXES = ['', '-wal', '-shm', '-journal'] as const;
+
+/**
+ * Database paths whose artifact modes have already been tightened this process.
+ * Spec 002 §3.1 requires tightening once per *startup* (one process); caching
+ * lets a re-`createDb` on the same path in a long-lived process skip the
+ * per-suffix `lstat`/`open`/`fchmod` cycles. Tests simulating a second startup
+ * in one process clear it via {@link resetSqliteArtifactModeCacheForTest}.
+ */
+const verifiedSqlitePaths = new Set<string>();
+
+/**
+ * Tighten the mode of the SQLite database and its sidecar files to owner-only
+ * (`0600`). Called after schema setup to (a) migrate a database created by an
+ * earlier version under a permissive umask (issue #292) and (b) belt-and-braces
+ * cover any sidecar SQLite created outside the restricted-umask window.
+ */
+function restrictSqliteArtifactModes(dbPath: string): void {
+  if (verifiedSqlitePaths.has(dbPath)) return;
+  for (const suffix of SQLITE_ARTIFACT_SUFFIXES) {
+    restrictExistingPathMode(`${dbPath}${suffix}`, PRIVATE_FILE_MODE);
+  }
+  verifiedSqlitePaths.add(dbPath);
+}
+
+/**
+ * Test-only: clear the per-process verified-path caches (this module's SQLite
+ * cache and the shared directory cache in `local-permissions`) so a test that
+ * re-opens the same on-disk database to prove tighten-on-startup migration —
+ * something that is a fresh process in production — re-runs the tightening.
+ * Not re-exported from the package entry point; imported directly by tests.
+ */
+export function resetSqliteArtifactModeCacheForTest(): void {
+  verifiedSqlitePaths.clear();
+  resetVerifiedPathCachesForTest();
+}
+
+/**
  * Create a database connection and ensure tables exist.
+ *
+ * On-disk databases are created owner-only (issue #292): the containing
+ * directory is forced to `0700`, and the database file plus its WAL/SHM sidecars
+ * to `0600`. The open + schema build runs under a restricted (`0o077`) umask so
+ * files SQLite creates itself are private from birth, then existing artifacts are
+ * re-tightened so a database from an earlier, world-readable version is migrated
+ * forward on the next open.
  *
  * @param dbPath - Path to the SQLite database file, or ':memory:' for in-memory
  */
 export function createDb(dbPath: string): InboxDb {
-  if (dbPath !== ':memory:') {
-    mkdirSync(path.dirname(dbPath), { recursive: true });
+  const inMemory = dbPath === ':memory:';
+  if (!inMemory) {
+    ensurePrivateDir(path.dirname(dbPath));
   }
+  const db = inMemory
+    ? buildDb(dbPath)
+    : withRestrictedUmask(() => buildDb(dbPath));
+  if (!inMemory) {
+    restrictSqliteArtifactModes(dbPath);
+  }
+  return db;
+}
+
+/**
+ * Open the SQLite connection and materialize the schema. Extracted from
+ * {@link createDb} so the whole synchronous open+build can run inside a
+ * restricted-umask window for on-disk databases.
+ */
+function buildDb(dbPath: string): InboxDb {
   const sqlite = new Database(dbPath);
   sqlite.pragma('journal_mode = WAL');
   sqlite.pragma('foreign_keys = ON');

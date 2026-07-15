@@ -1,5 +1,5 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import path from 'node:path';
+import { readFileSync } from 'node:fs';
+import { writePrivateFileAtomic } from '../security/local-permissions.js';
 import type { InboxService } from '../inbox/inbox-service.js';
 import type { HookState, UrgentItem } from './types.js';
 
@@ -55,16 +55,14 @@ export function computeHookState(inbox: InboxService): HookState {
 /**
  * Write hook state atomically (write to temp file, then rename).
  *
+ * The state file may reveal pending-work titles, so it is written owner-only
+ * (`0600`) inside an owner-only (`0700`) session directory (issue #292).
+ *
  * @param statePath - Path to the hook-state.json file (e.g., `<project>/.agentmonitors/hook-state.json`)
  * @param state - The hook state to write
  */
 export function writeBridgeState(statePath: string, state: HookState): void {
-  const dir = path.dirname(statePath);
-  mkdirSync(dir, { recursive: true });
-
-  const tmpPath = `${statePath}.tmp`;
-  writeFileSync(tmpPath, JSON.stringify(state, null, 2), 'utf-8');
-  renameSync(tmpPath, statePath);
+  writePrivateFileAtomic(statePath, JSON.stringify(state, null, 2));
 }
 
 /**
