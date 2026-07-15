@@ -116,7 +116,9 @@ the baseline every environment can use.
 > ship. `DeliveryEventSummary` now also carries `body` (the raw
 > monitor instructions — see [002 §9.1](./002-runtime-delivery.md)), available to transports that
 > want to surface the body alongside the title/summary. Remaining is an end-to-end **manual UAT**
-> (channels are research-preview, so not CI-able) and optional fuller meta (§4.2 `object_key`).
+> (channels are research-preview, so not CI-able) and optional fuller meta (§4.2 `object_key`). The
+> UAT recipe lives at [`docs/uat/channel-transport.md`](../uat/channel-transport.md) — run it before
+> treating this transport as regression-safe, and record the run there.
 > See [roadmap.md](./roadmap.md) (G7, shipped).
 
 A channel is an MCP server Claude Code spawns over stdio that pushes events into the session as
@@ -377,8 +379,10 @@ empty stdout is the signal to Claude Code to proceed silently.
 5. Resolve the socket path via `resolveSocketPath` (flag → `.local.md` socket). Require an explicit
    per-workspace socket — do **not** fall back to the global default (that could cross workspaces).
    If the daemon is unreachable → exit 0, print nothing.
-6. Call `listSessionsClient(socket)`, find the session whose `hostSessionId` matches `sessionId`.
-   If not found → exit 0, print nothing.
+6. Call `listSessionsClient(socket)`, find the session whose `hostSessionId` matches `sessionId`. If
+   not found → exit 0, print nothing **on stdout**; ALSO write one line to **stderr**,
+   unconditionally (regardless of `--debug`), naming the unresolved id (issue #329) — see the exact
+   wording and rationale in §5.2.1.
 7. Call `claimDeliveryClient(sessionId, lifecycle, socket)`. If null → exit 0, print nothing.
 8. Render via `renderHookDelivery(claim, hookEventName)`. If null (no event bodies and no reminder
    message) → exit 0, print nothing.
@@ -390,13 +394,31 @@ empty stdout is the signal to Claude Code to proceed silently.
 unhandled error would interrupt the user's session. The wrapping try/catch ensures the command
 always exits 0 regardless of IPC failures, missing state, or unexpected errors.
 
-### 5.2.1 `--debug` diagnosis (issue #334)
+### 5.2.1 `--debug` diagnosis (issue #334) and the always-on unknown-session warning (issue #329)
 
-Every quiet-return step in §5.2 (steps 2–8) is, by design, indistinguishable from the outside: an
-unknown `session_id`, a disabled workspace, an unreachable daemon, and genuinely "nothing pending"
-all produce identical empty stdout + exit 0. That silence is the correct **stdout** contract (§5.1) —
-a real hook invocation must never inject diagnostic noise into the agent's context — but it leaves the
-operator with no way to tell "correctly idle" from "misconfigured" (blind DX study S3 F3).
+Every quiet-return step in §5.2 (steps 2–8) is, by design, indistinguishable **on stdout** from the
+outside: an unknown `session_id`, a disabled workspace, an unreachable daemon, and genuinely "nothing
+pending" all produce identical empty stdout + exit 0. That silence is the correct **stdout** contract
+(§5.1) — a real hook invocation must never inject diagnostic noise into the agent's context — but
+without a diagnostic it leaves the operator with no way to tell "correctly idle" from "misconfigured"
+(blind DX study S3 F3).
+
+**One branch is the exception (issue #329): step 6's unresolved `session_id`.** Every other
+quiet-return branch is diagnosable only via `--debug`, opt-in, because each one either resolves
+itself (the ~15s high-urgency claim-settle window, §9.1 of [002](./002-runtime-delivery.md)) or
+reflects a genuinely idle state that is not worth warning about by default. An unresolvable
+`session_id` is different: it can **never** resolve on its own, and its silent empty output was
+reported as indistinguishable from the legitimate settle window — an operator would poll forever
+against a session that will never deliver. So step 6 ALWAYS writes one line to stderr, regardless of
+`--debug`:
+
+```text
+hook deliver: no session registered for host session id "<id>"
+```
+
+Stdout and the exit code are completely unaffected — only stderr gains this one line. Every other
+quiet-return branch (disabled workspace, unreachable daemon, settle-window hold, nothing pending,
+…) remains silent by default; diagnose those with `--debug` below.
 
 `--debug` writes a parallel diagnosis to **stderr only**, one line per step of §5.2, naming which
 branch was hit and, once a session is resolved, the unread (unacknowledged) counts by urgency and a per-band
