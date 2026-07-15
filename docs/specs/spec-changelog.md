@@ -9,6 +9,18 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-07-14 — Fresh-environment install-to-first-signal E2E, hooks path (004 §2.7, §3.5) — Refs #276
+
+Added a new validation surface: a global-install, no-workspace-`node_modules` E2E proof
+(`scripts/test-e2e-fresh-install-hooks.mjs`) that packs every publishable package, installs the
+`agentmonitors` launcher from those tarballs into an isolated npm prefix, bootstraps a fresh
+project with `agentmonitors init`, fires a `file-fingerprint` monitor, and confirms delivery
+through the real `agentmonitors hook deliver` stdin/stdout contract ([006 §5](./006-agent-integration.md))
+with a genuine `UserPromptSubmit` payload. Not a behavior change — the runtime/CLI contract is
+unchanged; this closes a coverage gap (every other proof surface in 004 §2 runs inside the repo's
+own workspace). Wired into CI per-PR (`.github/workflows/ci.yml`); measured runtime ~50-70s, in
+line with the existing standalone-consumer and Docker smoke steps already gating every PR.
+
 ## 2026-07-14 — DX papercut sweep: `events list` delivery state, `session open --format id`, symmetric file/directory redirects, bootstrap wording (005 §2, §6, §10.1, §11.1) — Refs #338
 
 A blind DX study batch (S1 F3, S2 F4/F5, S5 F3/F4/F5/F7) found five small, independently-minor

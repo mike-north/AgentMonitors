@@ -44,6 +44,15 @@ jobs:
       - name: Test (standalone consumer)
         run: pnpm test:standalone-consumer
 
+      # Issue #276: proves the product works from a truly fresh environment —
+      # global npm install of the packed launcher, project setup, a monitor
+      # firing, delivered through the real Claude Code hook stdin/stdout
+      # contract (docs/specs/006-agent-integration.md §5). Runs per-PR: the
+      # measured runtime (~50-70s) is comparable to the standalone-consumer
+      # and Docker smoke steps already gating every PR in this job.
+      - name: Test (E2E fresh-environment install-to-first-signal, hooks path)
+        run: pnpm test:e2e-fresh-install-hooks
+
   # Guards the failure class in ENG_TEAM_INSTRUCTIONS.md rule 8: a package
   # missing CHANGELOG.md, publishConfig, or a built entry point has broken
   # the release pipeline at release time (crashing the changesets action)
