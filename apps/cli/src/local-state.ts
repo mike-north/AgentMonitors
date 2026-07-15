@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { PRIVATE_FILE_MODE, restrictFileMode } from '@agentmonitors/core';
 
 export interface LocalState {
   enabled: boolean;
@@ -77,6 +78,10 @@ export function writeLocalState(
   state: LocalState,
 ): void {
   const target = filePath(workspacePath);
+  // `.claude/` belongs to the host tool, so we do not force its mode; only the
+  // coordination file we own is made owner-only (issue #292). It records the
+  // per-workspace socket/db paths — not a secret, but part of the local trust
+  // boundary.
   mkdirSync(path.dirname(target), { recursive: true });
   const lines = [
     '---',
@@ -89,5 +94,9 @@ export function writeLocalState(
     '> Local AgentMon coordination state. Gitignored; safe to delete (it is regenerated).',
     '',
   ];
-  writeFileSync(target, lines.join('\n'), 'utf-8');
+  writeFileSync(target, lines.join('\n'), {
+    encoding: 'utf-8',
+    mode: PRIVATE_FILE_MODE,
+  });
+  restrictFileMode(target);
 }

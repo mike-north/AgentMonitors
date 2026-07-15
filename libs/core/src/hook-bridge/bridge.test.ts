@@ -1,4 +1,10 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import {
+  chmodSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -78,6 +84,47 @@ describe('bridge', () => {
       expect(readBridgeState(statePath)).toEqual(updated);
     });
   });
+
+  // Hook state can reveal pending-work titles, so it is written owner-only in an
+  // owner-only session directory (issue #292). Run under an explicit permissive
+  // umask so the mode assertions prove the hardening. POSIX-only.
+  describe.skipIf(process.platform === 'win32')(
+    'writeBridgeState owner-only modes (issue #292)',
+    () => {
+      let originalUmask: number;
+
+      beforeEach(() => {
+        originalUmask = process.umask(0o022);
+      });
+
+      afterEach(() => {
+        process.umask(originalUmask);
+      });
+
+      it('writes the hook-state file 0600 inside a 0700 session directory', () => {
+        const statePath = path.join(
+          tmpDir,
+          '.agentmonitors',
+          'sessions',
+          'sess-1',
+          'hook-state.json',
+        );
+        writeBridgeState(statePath, FIXED_STATE);
+
+        expect(statSync(statePath).mode & 0o777).toBe(0o600);
+        expect(statSync(path.dirname(statePath)).mode & 0o777).toBe(0o700);
+      });
+
+      it('re-tightens the file when overwriting a looser existing one (migration)', () => {
+        const statePath = path.join(tmpDir, 'hook-state.json');
+        writeBridgeState(statePath, FIXED_STATE);
+        chmodSync(statePath, 0o644);
+
+        writeBridgeState(statePath, FIXED_STATE);
+        expect(statSync(statePath).mode & 0o777).toBe(0o600);
+      });
+    },
+  );
 
   describe('computeHookState', () => {
     it('computes counts from inbox items', () => {

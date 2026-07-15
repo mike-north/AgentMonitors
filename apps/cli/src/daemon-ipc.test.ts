@@ -1,19 +1,25 @@
 import net from 'node:net';
 import path from 'node:path';
 import {
+  chmodSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   rmSync,
+  statSync,
   writeFileSync,
   existsSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  acquireStartupLock,
   callDaemon,
   createDaemonServer,
   daemonAvailable,
   DaemonConnectionError,
+  lockPath,
+  releaseStartupLock,
   resolveSocketPath,
 } from './daemon-ipc.js';
 import { createRuntime } from './runtime.js';
@@ -146,6 +152,18 @@ describe('callDaemon', () => {
  */
 const OVER_LIMIT_SOCKET_PATH = `/tmp/${'a'.repeat(120)}/agentmon.sock`;
 
+/**
+ * The owner-private per-uid directory the long-socket-path fallback now lives in
+ * (issue #292). Mirrors `socketFallbackDir()` in daemon-ipc.ts — kept in sync
+ * here on purpose so the test exercises the observable path contract. The base
+ * is `/tmp` (not `os.tmpdir()`) so the substituted socket stays under the
+ * ~100-char AF_UNIX limit even on macOS.
+ */
+function expectedFallbackDir(): string {
+  const uid = process.getuid?.() ?? 0;
+  return path.join('/tmp', `agentmonitors-${String(uid)}`);
+}
+
 describe('resolveSocketPath — explicit substitution warning (issue #337)', () => {
   const originalSocketEnv = process.env['AGENTMONITORS_SOCKET'];
 
@@ -174,10 +192,13 @@ describe('resolveSocketPath — explicit substitution warning (issue #337)', () 
       explicit: true,
     });
 
-    // Criterion 2: the substitution itself is unchanged — still a short,
-    // hash-derived /tmp path.
+    // Criterion 2: the substitution itself is still a short, hash-derived path —
+    // but now inside an owner-private per-uid directory rather than directly
+    // under a shared, world-writable /tmp (issue #292).
     expect(resolved).not.toBe(OVER_LIMIT_SOCKET_PATH);
-    expect(resolved.startsWith('/tmp/agentmonitors-')).toBe(true);
+    expect(path.dirname(resolved)).toBe(expectedFallbackDir());
+    expect(path.basename(resolved).startsWith('agentmonitors-')).toBe(true);
+    expect(resolved.endsWith('.sock')).toBe(true);
     expect(resolved.length).toBeLessThanOrEqual(100);
 
     expect(writeSpy).toHaveBeenCalledTimes(1);
@@ -383,3 +404,104 @@ describe('createDaemonServer listen() — stale socket recovery', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Owner-only IPC artifacts: socket, socket directory, startup lock, and the
+// long-socket-path fallback directory (issue #292).
+//
+// POSIX-only (modes are meaningless on win32). Each test runs under an explicit
+// permissive umask (0o022) so a raw bind/mkdir would otherwise leave
+// world-readable artifacts — the assertions therefore prove the hardening.
+// ---------------------------------------------------------------------------
+const mode = (p: string): number => statSync(p).mode & 0o777;
+
+describe.skipIf(process.platform === 'win32')(
+  'daemon IPC artifacts are owner-only (issue #292)',
+  () => {
+    let originalUmask: number;
+
+    beforeEach(() => {
+      originalUmask = process.umask(0o022);
+    });
+
+    afterEach(() => {
+      process.umask(originalUmask);
+    });
+
+    it('creates a missing socket directory 0700 and binds the socket 0600', async () => {
+      // A socket directory the daemon has to create (e.g. the default
+      // per-workspace data directory on first run) must be owner-only, and the
+      // bound socket itself owner-only, even under a permissive umask.
+      const dir = path.join(tempDir(), 'data');
+      const socketPath = path.join(dir, 'agentmonitors.sock');
+
+      const server = createDaemonServer({
+        runtime: createRuntime(':memory:'),
+        socketPath,
+      });
+      try {
+        await server.listen();
+        expect(mode(dir)).toBe(0o700);
+        expect(lstatSync(socketPath).isSocket()).toBe(true);
+        expect(mode(socketPath)).toBe(0o600);
+      } finally {
+        await server.close().catch(() => undefined);
+      }
+    });
+
+    it('does not chmod a pre-existing, shared socket directory (respects an explicit --socket)', () => {
+      // Regression guard: binding a socket the user pointed at a shared/system
+      // directory must NOT tighten that directory (tightening — or, as root,
+      // chmod-ing — /tmp or another user's dir would be wrong). Only the
+      // Agent-Monitors-owned data directory is tightened, at createDb time.
+      const shared = tempDir();
+      chmodSync(shared, 0o755);
+      const socketPath = path.join(shared, 'explicit.sock');
+
+      const server = createDaemonServer({
+        runtime: createRuntime(':memory:'),
+        socketPath,
+      });
+      // We only need the synchronous dir-preparation side effect; the factory
+      // runs ensureSocketDir eagerly, so no bind is required.
+      void server;
+      expect(mode(shared)).toBe(0o755);
+    });
+
+    it('creates the startup lock directory 0700', () => {
+      const socketPath = tempSocketPath('lock-mode');
+      const acquired = acquireStartupLock(socketPath);
+      try {
+        expect(acquired).toBe(true);
+        expect(mode(lockPath(socketPath))).toBe(0o700);
+      } finally {
+        releaseStartupLock(socketPath);
+      }
+    });
+
+    it('places the long-path fallback socket 0600 inside an owner-only per-uid directory', async () => {
+      // An over-limit candidate resolves to the private per-uid fallback dir,
+      // never a predictable /tmp/*.sock a peer could connect to.
+      const fallbackSocket = resolveSocketPath(OVER_LIMIT_SOCKET_PATH);
+      const fallbackDir = path.dirname(fallbackSocket);
+      expect(fallbackDir).toBe(expectedFallbackDir());
+
+      const server = createDaemonServer({
+        runtime: createRuntime(':memory:'),
+        socketPath: fallbackSocket,
+      });
+      try {
+        await server.listen();
+        // The per-uid fallback directory is owner-only, so a peer cannot even
+        // traverse into it to reach the socket.
+        expect(mode(fallbackDir)).toBe(0o700);
+        expect(mode(fallbackSocket)).toBe(0o600);
+      } finally {
+        await server.close().catch(() => undefined);
+        // Clean only the socket we created; the per-uid dir is shared and
+        // stays (owner-only) for any real daemon on this machine.
+        rmSync(fallbackSocket, { force: true });
+      }
+    });
+  },
+);

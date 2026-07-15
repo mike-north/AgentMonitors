@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import {
+  lstatSync,
   mkdirSync,
   rmdirSync,
   rmSync,
@@ -10,6 +11,12 @@ import {
 import { homedir } from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
+import {
+  PRIVATE_DIR_MODE,
+  PRIVATE_FILE_MODE,
+  restrictExistingPathMode,
+  restrictSocketMode,
+} from '@agentmonitors/core';
 import type {
   AgentMonitorRuntime,
   AgentSessionRole,
@@ -171,6 +178,31 @@ function socketBaseDir(): string {
   return path.dirname(dbPath);
 }
 
+/**
+ * Base directory for the long-socket-path fallback. `/tmp` is used (not
+ * `os.tmpdir()`) deliberately: the fallback exists precisely because a socket
+ * path exceeded the ~100-char AF_UNIX limit, and on macOS `os.tmpdir()` is a
+ * deep per-user path (`/var/folders/.../T`, ~48 chars) that would push the
+ * substituted socket back over the limit. `/tmp` is short and present on every
+ * POSIX host; privacy comes from the owner-only per-uid subdirectory below, not
+ * from the shared base.
+ */
+const SOCKET_FALLBACK_BASE = '/tmp';
+
+/**
+ * Owner-private directory that holds the long-socket-path fallback socket
+ * (issue #292). The pre-#292 fallback placed a predictable socket directly under
+ * a world-writable `/tmp`, where any local user could connect to the
+ * unauthenticated daemon. Instead we key an owner-only (`0700`) directory by the
+ * current uid, so the socket lives inside a directory other users cannot
+ * traverse. The directory itself is created/verified (and ownership-checked) at
+ * bind time by {@link ensureSocketDir}; this helper only computes its path.
+ */
+function socketFallbackDir(): string {
+  const uid = process.getuid?.() ?? 0;
+  return path.join(SOCKET_FALLBACK_BASE, `agentmonitors-${String(uid)}`);
+}
+
 export interface ResolveSocketPathOptions {
   /**
    * Set by a caller when `overridePath` came from a `--socket` flag the user
@@ -205,7 +237,14 @@ export function resolveSocketPath(
     .update(candidate)
     .digest('hex')
     .slice(0, 16);
-  const substituted = path.join('/tmp', `agentmonitors-${hash}.sock`);
+  // Owner-private per-uid directory rather than a predictable, shared
+  // `/tmp/agentmonitors-<hash>.sock` (issue #292). The containing directory is
+  // created owner-only at bind time so other local users cannot reach the
+  // socket even though the file itself lands in a shared temp root.
+  const substituted = path.join(
+    socketFallbackDir(),
+    `agentmonitors-${hash}.sock`,
+  );
 
   if (options.explicit && overridePath !== undefined) {
     process.stderr.write(
@@ -273,7 +312,7 @@ function probeSocket(socketPath: string, timeoutMs = 500): Promise<boolean> {
  * created with O_EXCL would work too, but the dir approach lets us recover
  * the holder PID without a separate read step.
  */
-function lockPath(socketPath: string): string {
+export function lockPath(socketPath: string): string {
   return `${socketPath}.lock.d`;
 }
 
@@ -290,15 +329,21 @@ function lockPath(socketPath: string): string {
  *
  * Returns true when the lock is held, false if a live peer holds it.
  */
-function acquireStartupLock(socketPath: string): boolean {
+export function acquireStartupLock(socketPath: string): boolean {
   const lock = lockPath(socketPath);
   const pidFile = path.join(lock, 'pid');
 
   const tryMkdir = (): boolean => {
     try {
-      mkdirSync(lock);
+      // Owner-only lock directory + pid file (issue #292): the lock lives beside
+      // the socket, so leaking it would expose the daemon's liveness/pid to
+      // other local users. mkdir is atomic and non-recursive here.
+      mkdirSync(lock, { mode: PRIVATE_DIR_MODE });
       // We own it — write our pid so a future caller can detect us as dead.
-      writeFileSync(pidFile, String(process.pid), 'utf-8');
+      writeFileSync(pidFile, String(process.pid), {
+        encoding: 'utf-8',
+        mode: PRIVATE_FILE_MODE,
+      });
       return true;
     } catch (err) {
       if (!isErrnoException(err) || err.code !== 'EEXIST') throw err;
@@ -360,7 +405,7 @@ function acquireStartupLock(socketPath: string): boolean {
  * Called immediately after `server.listen()` resolves (or rejects); from that
  * point on the bound socket itself is the liveness signal.
  */
-function releaseStartupLock(socketPath: string): void {
+export function releaseStartupLock(socketPath: string): void {
   const lock = lockPath(socketPath);
   const pidFile = path.join(lock, 'pid');
   try {
@@ -485,6 +530,64 @@ function handleRequest(
   }
 }
 
+/**
+ * Ensure the directory that will contain `socketPath` exists before the daemon
+ * binds, owner-only for any directory we create (issue #292).
+ *
+ * The long-socket-path fallback directory lives under a world-writable temp
+ * root, so it is created strictly: atomic `mkdir` with mode, and a refusal to
+ * bind inside a symlink or another user's directory a hostile peer could have
+ * planted to intercept the unauthenticated socket.
+ *
+ * For any other socket directory we only `mkdir` (owner-only) when it is
+ * missing; we deliberately do **not** chmod an already-existing directory. The
+ * directory may be a user-chosen or shared location (e.g. an explicit
+ * `--socket /tmp/x.sock`, or `AGENTMONITORS_SOCKET`), and silently tightening —
+ * or, as root, `chmod`-ing — someone else's or a system directory would be
+ * wrong. The Agent-Monitors-owned per-workspace data directory (the default
+ * socket location) is tightened at its own creation site instead
+ * (`createDb` → `ensurePrivateDir`).
+ */
+function ensureSocketDir(socketPath: string): void {
+  const dir = path.dirname(socketPath);
+  if (dir === socketFallbackDir()) {
+    ensureOwnerPrivateTmpDir(dir);
+    return;
+  }
+  mkdirSync(dir, { recursive: true, mode: PRIVATE_DIR_MODE });
+}
+
+/**
+ * Create-or-verify an owner-only directory in a potentially shared temp root.
+ * `mkdir` with an explicit mode is atomic; if the directory already exists we
+ * refuse it unless it is a real (non-symlink) directory we own, then tighten it
+ * to `0700`. Throws (fails closed) rather than binding the socket inside a
+ * directory another user controls.
+ */
+function ensureOwnerPrivateTmpDir(dir: string): void {
+  try {
+    mkdirSync(dir, { mode: PRIVATE_DIR_MODE });
+    return;
+  } catch (err) {
+    if (!isErrnoException(err) || err.code !== 'EEXIST') throw err;
+  }
+
+  const stat = lstatSync(dir);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error(
+      `Refusing to use socket directory ${dir}: it is not a real directory owned by this user.`,
+    );
+  }
+  const uid = process.getuid?.();
+  if (uid !== undefined && stat.uid !== uid) {
+    throw new Error(
+      `Refusing to use socket directory ${dir}: owned by uid ${String(stat.uid)}, not ${String(uid)}.`,
+    );
+  }
+  // Owned by us but possibly created with a looser mode — tighten it.
+  restrictExistingPathMode(dir, PRIVATE_DIR_MODE);
+}
+
 export function createDaemonServer({
   runtime,
   socketPath,
@@ -493,7 +596,7 @@ export function createDaemonServer({
   listen(): Promise<void>;
   close(): Promise<void>;
 } {
-  mkdirSync(path.dirname(socketPath), { recursive: true });
+  ensureSocketDir(socketPath);
 
   let serverClosed = false;
   const server = net.createServer((socket) => {
@@ -594,6 +697,11 @@ export function createDaemonServer({
             resolve();
           });
         });
+        // Tighten the just-bound socket to owner-only so other local users
+        // cannot connect to the unauthenticated daemon even where the platform
+        // enforces socket permission bits (issue #292). The owner-only
+        // containing directory is the primary guard; this is defense-in-depth.
+        restrictSocketMode(socketPath);
       } finally {
         // Release immediately — the bound socket is the liveness signal now.
         releaseStartupLock(socketPath);

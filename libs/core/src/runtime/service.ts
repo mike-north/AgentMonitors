@@ -1,11 +1,6 @@
-import {
-  existsSync,
-  mkdirSync,
-  renameSync,
-  statSync,
-  writeFileSync,
-} from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
+import { writePrivateFileAtomic } from '../security/local-permissions.js';
 import { scanMonitors } from '../parser/scan-monitors.js';
 import type { MonitorDefinition, Urgency } from '../schema/types.js';
 import { validateScope } from '../schema/validate-scope.js';
@@ -121,10 +116,9 @@ function fullHistoryCommand(sessionId: string): string {
 }
 
 function writeJsonAtomic(filePath: string, payload: unknown): void {
-  mkdirSync(path.dirname(filePath), { recursive: true });
-  const tmpPath = `${filePath}.tmp`;
-  writeFileSync(tmpPath, JSON.stringify(payload, null, 2), 'utf-8');
-  renameSync(tmpPath, filePath);
+  // Hook-state files may reveal pending-work titles, so they are written
+  // owner-only inside an owner-only session directory (issue #292).
+  writePrivateFileAtomic(filePath, JSON.stringify(payload, null, 2));
 }
 
 function monitorIdFromFilePath(filePath: string): string {

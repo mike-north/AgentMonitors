@@ -732,6 +732,47 @@ This split is important: source plugins own change-detection state, while the ru
 
 Verified: `libs/core/src/runtime/types.ts` — `MonitorRuntimeState` (lines 131–135); `libs/core/src/inbox/schema.ts` — `monitorState` table (lines 98–105).
 
+### 3.1 Local data permission model — the local trust boundary (_current_)
+
+Agent Monitors persists private snapshot, event, diff, and source-state data and serves an
+**unauthenticated** IPC socket entirely on the local machine (NP1; the daemon holds no network
+identity). The trust boundary is therefore the **current OS user**: no _other_ local user may read
+persisted data, read hook state, or reach the daemon socket to inspect/claim/ack events or stop the
+daemon. On multi-user hosts with permissive home/XDG directory modes this is not automatic, so the
+runtime and CLI **MUST** establish owner-only modes at creation time **and MUST tighten pre-existing
+artifacts on startup** (BP4, [000 §5](./000-principles.md)).
+
+- **Directories — `0700` (`rwx------`):** the per-workspace data directory, session directories
+  (which hold hook state), the socket directory the daemon creates, and the startup-lock directory.
+- **Files — `0600` (`rw-------`):** the SQLite database, its `-wal`/`-shm`/`-journal` sidecars,
+  hook-state files, the startup-lock pid file, and the `.claude/agentmonitors.local.md` coordination
+  file. (The `.claude` directory itself belongs to the host tool and is **not** re-moded — only the
+  coordination file we own is.)
+- **Sockets:** the Unix domain socket is chmod'd `0600` after bind and — decisively — lives inside an
+  owner-only directory, so other users cannot even traverse to it on platforms that ignore socket
+  permission bits for `connect(2)`.
+- **Creation invariant.** On-disk databases are opened under a restricted (`0o077`) process umask so
+  the WAL/SHM files SQLite creates itself are private from birth; directories are created with an
+  explicit `0700` mode (a permissive umask cannot re-add group/other bits to `0700`); files are
+  written `0600`.
+- **Migration — tighten on startup.** An artifact created by an earlier, pre-hardening version keeps
+  its world-readable mode until re-moded. Each startup re-applies the owner-only mode to existing
+  databases, sidecars, hook-state files, and Agent-Monitors-owned data/session/socket directories.
+  Tightening is **symlink-safe**: it `lstat`s first, refuses to act on a symlink, and re-opens with
+  `O_NOFOLLOW` before `fchmod`, so a planted symlink cannot redirect a `chmod` onto a file the user
+  does not own. A socket directory the user _explicitly chose_ (`--socket` / `AGENTMONITORS_SOCKET`)
+  or a shared system directory is **not** tightened — only Agent-Monitors-owned directories are.
+- **Windows.** POSIX modes are not meaningful; the helpers create the paths without mode enforcement.
+
+Verified: `libs/core/src/security/local-permissions.ts` — `ensurePrivateDir`,
+`restrictExistingPathMode`, `withRestrictedUmask`, `writePrivateFileAtomic`, `restrictSocketMode`;
+`libs/core/src/inbox/db.ts` — `createDb`; `libs/core/src/hook-bridge/bridge.ts` +
+`libs/core/src/runtime/service.ts` — hook-state writes; `apps/cli/src/daemon-ipc.ts` — socket,
+startup lock, and the long-socket-path fallback ([§10.3](#103-socket-path-resolution));
+`apps/cli/src/local-state.ts` — coordination file; tests: `local-permissions.test.ts`,
+`inbox/db-permissions.test.ts`, `hook-bridge/bridge.test.ts`, `daemon-ipc.test.ts`, and the
+real-binary UAT in `commands/cli.integration.test.ts`.
+
 ## 4. Notify Dispatch
 
 Notify dispatch converts observations returned by a source into emitted observations that should become durable events.
@@ -1044,7 +1085,7 @@ Verified: `apps/cli/src/runtime-client.ts` — `daemonTickClient()`: constructs 
 `agentmonitors daemon run [monitorsDir]` runs the full daemon mode:
 
 1. Creates a local `AgentMonitorRuntime`
-2. Starts a Unix domain socket server via `createDaemonServer()`
+2. Starts a Unix domain socket server via `createDaemonServer()` — the socket, its directory, and the startup-lock directory are owner-only ([§3.1](#31-local-data-permission-model--the-local-trust-boundary-current))
 3. Enters a `while (!stopping)` tick loop, calling `runtime.tick()` on each iteration
 4. Sleeps for `--poll-ms` milliseconds (default `30000`) between ticks using a cancellable timer
 5. Handles `SIGINT` and `SIGTERM` to stop cleanly
@@ -1070,7 +1111,7 @@ The socket path is resolved by `resolveSocketPath()`. Priority order:
 2. `AGENTMONITORS_SOCKET` environment variable
 3. `<dbDir>/agentmonitors.sock` (where `<dbDir>` is the directory containing the SQLite file, or `~/.local/share/agentmonitors` for `:memory:` databases)
 
-If the resolved path exceeds 100 characters (the Unix socket path length limit in use), the path is hashed (SHA-256, first 16 hex chars) and placed under `/tmp/agentmonitors-<hash>.sock`.
+If the resolved path exceeds 100 characters (the Unix socket path length limit in use), the path is hashed (SHA-256, first 16 hex chars) and placed at `/tmp/agentmonitors-<uid>/agentmonitors-<hash>.sock` — inside an **owner-only (`0700`) per-uid directory**, not directly under the shared, world-writable `/tmp` (issue #292; the pre-#292 fallback wrote a predictable `/tmp/agentmonitors-<hash>.sock` any local user could connect to). The per-uid directory is created with an atomic owner-only `mkdir` and, if it already exists, is refused unless it is a real (non-symlink) directory owned by the current user, so the daemon fails closed rather than binding inside a directory another user could have planted. The base is `/tmp` (not the platform temp root) deliberately: on macOS the per-user temp root (`/var/folders/…/T`) would push the substituted socket back over the 100-char limit — privacy comes from the owner-only per-uid subdirectory, not the shared base ([§3.1](#31-local-data-permission-model--the-local-trust-boundary-current)).
 
 **Explicit `--socket` substitution is announced (issue #337).** When `overridePath` came from a
 literal `--socket` flag the caller typed (not `AGENTMONITORS_SOCKET`, not a
@@ -1090,7 +1131,7 @@ to resolve to the same derived path — either a genuine hash collision (SHA-256
 chars; astronomically unlikely) or, far more plausibly, the _same_ shared/templated `--socket`
 value reused across otherwise-unrelated workspaces (same input, same hash — not a collision). If a
 stale daemon from an earlier, unrelated invocation of the same over-limit candidate is still listening on
-`/tmp/agentmonitors-<hash>.sock`, a caller can silently talk to the wrong daemon. The daemon IPC does
+`/tmp/agentmonitors-<uid>/agentmonitors-<hash>.sock`, a caller can silently talk to the wrong daemon. The daemon IPC does
 not currently expose a single "this daemon's workspace" identity to check against — `session.list` is
 scoped per-session (`AgentSessionRecord.workspacePath`), and a daemon using the global default DB is
 explicitly allowed to serve sessions for multiple workspaces at once (§10.2), so "the reachable

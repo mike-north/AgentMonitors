@@ -2284,8 +2284,10 @@ describe('daemon run — explicit --socket over the AF_UNIX limit (issue #337)',
       // daemon still reports whatever it actually bound (the substituted,
       // hash-derived path), never the requested one.
       expect(substitutedSocketPath).not.toBe(requestedSocketPath);
+      // The substituted socket lives inside an owner-only per-uid directory,
+      // never a predictable /tmp/*.sock a peer could connect to (issue #292).
       expect(substitutedSocketPath).toMatch(
-        /^\/tmp\/agentmonitors-[0-9a-f]{16}\.sock$/,
+        /^\/tmp\/agentmonitors-\d+\/agentmonitors-[0-9a-f]{16}\.sock$/,
       );
 
       // Criterion 1 (regression): pre-fix, `resolveSocketPath` had no concept
@@ -2335,8 +2337,9 @@ describe('daemon run — explicit --socket over the AF_UNIX limit (issue #337)',
     expect(result.stderr).toBe('');
     const parsed = JSON.parse(result.stdout) as { socketPath: string };
     expect(parsed.socketPath).not.toBe(overLimitSocketPath);
+    // Owner-only per-uid fallback directory, not a shared /tmp/*.sock (issue #292).
     expect(parsed.socketPath).toMatch(
-      /^\/tmp\/agentmonitors-[0-9a-f]{16}\.sock$/,
+      /^\/tmp\/agentmonitors-\d+\/agentmonitors-[0-9a-f]{16}\.sock$/,
     );
   });
 });
@@ -8489,3 +8492,54 @@ describe('hooks-only delivery parity (issue #270)', () => {
     }
   }, 30_000);
 });
+
+// ---------------------------------------------------------------------------
+// Owner-only local data through the real binary (issue #292)
+//
+// The unit/integration suites prove each helper forces owner-only modes; this
+// UAT drives the actual built `agentmonitors` binary under an explicit
+// permissive umask to prove nothing in the real wiring resets the umask or
+// bypasses the hardening before the database reaches disk. Uses `daemon once`
+// (single in-process tick, no socket, no long-running process) so there is no
+// orphan-daemon risk. `-wal`/`-shm` are checkpointed away when the one-shot
+// process exits, so their owner-only modes are asserted in-process against the
+// live connection in `libs/core/src/inbox/db-permissions.test.ts` instead.
+// ---------------------------------------------------------------------------
+describe.skipIf(process.platform === 'win32')(
+  'owner-only local data via the real binary (issue #292)',
+  () => {
+    it('creates the database 0600 in a 0700 directory under a permissive umask', () => {
+      const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-perms-uat-'));
+      try {
+        const dbPath = path.join(ws, 'data', 'inbox.db');
+        // `sh -c 'umask 0022; exec node "$0" "$@"' <CLI> daemon once ...` sets an
+        // explicit permissive umask for the child before it opens the database,
+        // so a raw create would otherwise yield world-readable 0644/0755.
+        const result = spawnSync(
+          'sh',
+          [
+            '-c',
+            'umask 0022; exec node "$0" "$@"',
+            CLI_PATH,
+            'daemon',
+            'once',
+            '--workspace',
+            ws,
+          ],
+          {
+            encoding: 'utf-8',
+            cwd: ws,
+            env: { ...process.env, AGENTMONITORS_DB: dbPath },
+          },
+        );
+        expect(result.status).toBe(0);
+
+        expect(existsSync(dbPath)).toBe(true);
+        expect(statSync(dbPath).mode & 0o777).toBe(0o600);
+        expect(statSync(path.dirname(dbPath)).mode & 0o777).toBe(0o700);
+      } finally {
+        rmSync(ws, { recursive: true, force: true });
+      }
+    });
+  },
+);
