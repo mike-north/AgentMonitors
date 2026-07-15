@@ -16,11 +16,57 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = join(__dirname, '..');
 export const DEFAULT_ALLOWLIST_PATH = join(__dirname, 'audit-allowlist.json');
 
+const EXPIRES_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
 /**
- * Loads and minimally validates the audit exception allowlist.
+ * @typedef {{ id: string, package: string, reason: string, expires: string }} AllowlistEntry
+ */
+
+/**
+ * Throws a descriptive error naming every missing/malformed field, rather
+ * than a single generic complaint, so a bad allowlist entry is fixable from
+ * the error message alone.
+ *
+ * @param {unknown} entry
+ * @param {string} path
+ * @returns {asserts entry is AllowlistEntry}
+ */
+function assertValidAllowlistEntry(entry, path) {
+  const record =
+    typeof entry === 'object' && entry !== null
+      ? /** @type {Record<string, unknown>} */ (entry)
+      : {};
+
+  /** @type {string[]} */
+  const problems = [];
+  if (typeof record.id !== 'string' || record.id.length === 0) {
+    problems.push('a non-empty string "id" (GitHub advisory id)');
+  }
+  if (typeof record.package !== 'string' || record.package.length === 0) {
+    problems.push('a non-empty string "package" (npm package name)');
+  }
+  if (typeof record.reason !== 'string' || record.reason.length === 0) {
+    problems.push('a non-empty string "reason"');
+  }
+  if (
+    typeof record.expires !== 'string' ||
+    !EXPIRES_DATE_PATTERN.test(record.expires)
+  ) {
+    problems.push('a string "expires" in YYYY-MM-DD format');
+  }
+
+  if (problems.length > 0) {
+    throw new Error(
+      `${path}: every exception needs ${problems.join(', ')} — got ${JSON.stringify(entry)}`,
+    );
+  }
+}
+
+/**
+ * Loads and validates the audit exception allowlist.
  *
  * @param {string} [path]
- * @returns {Array<{ id: string, package: string, reason: string, expires: string }>}
+ * @returns {AllowlistEntry[]}
  */
 export function loadAllowlist(path = DEFAULT_ALLOWLIST_PATH) {
   const raw = readFileSync(path, 'utf8');
@@ -35,36 +81,28 @@ export function loadAllowlist(path = DEFAULT_ALLOWLIST_PATH) {
   }
   const exceptions = /** @type {{ exceptions: unknown[] }} */ (data).exceptions;
   for (const entry of exceptions) {
-    if (
-      typeof entry !== 'object' ||
-      entry === null ||
-      typeof (/** @type {Record<string, unknown>} */ (entry).id) !== 'string' ||
-      typeof (/** @type {Record<string, unknown>} */ (entry).expires) !==
-        'string'
-    ) {
-      throw new Error(
-        `${path}: every exception needs at least a string "id" (GitHub advisory id) and a string "expires" (YYYY-MM-DD) — got ${JSON.stringify(entry)}`,
-      );
-    }
+    assertValidAllowlistEntry(entry, path);
   }
-  return /** @type {Array<{ id: string, package: string, reason: string, expires: string }>} */ (
-    exceptions
-  );
+  return /** @type {AllowlistEntry[]} */ (exceptions);
 }
 
 /**
  * Shells out to the real `pnpm audit` CLI and returns its parsed JSON report.
  * `pnpm audit` exits non-zero whenever it finds advisories at/above
- * `--audit-level`, so the report has to be read from the error too.
+ * `--audit-level`, so the report has to be read from the error too. `cwd` is
+ * pinned to the repo root (rather than inherited from `process.cwd()`) so
+ * running the gate from a subdirectory still audits this workspace, not
+ * whatever pnpm project happens to be discoverable from the caller's cwd.
  *
+ * @param {{ cwd?: string }} [options]
  * @returns {{ advisories: Record<string, unknown> }}
  */
-export function runPnpmAudit() {
+export function runPnpmAudit({ cwd = REPO_ROOT } = {}) {
   try {
     const stdout = execFileSync(
       'pnpm',
       ['audit', '--prod', '--audit-level', 'high', '--json'],
-      { encoding: 'utf8' },
+      { encoding: 'utf8', cwd },
     );
     return JSON.parse(stdout);
   } catch (error) {
@@ -87,15 +125,43 @@ export function runPnpmAudit() {
  */
 
 /**
+ * A date-only (YYYY-MM-DD) `expires` value is valid *through* that whole day
+ * (UTC) — it expires at the start of the *next* day, not at UTC midnight of
+ * the `expires` date itself. Without this, an exception dated "2026-07-14"
+ * would already read as expired at any time later that same day.
+ *
+ * @param {string} expires
+ * @returns {Date}
+ */
+function startOfDayAfterExpiry(expires) {
+  const startOfExpiryDay = new Date(`${expires}T00:00:00.000Z`);
+  return new Date(startOfExpiryDay.getTime() + 24 * 60 * 60 * 1000);
+}
+
+/**
+ * @param {{ expires: string }} exception
+ * @param {Date} now
+ * @returns {boolean}
+ */
+function isExpired(exception, now) {
+  return now.getTime() >= startOfDayAfterExpiry(exception.expires).getTime();
+}
+
+/**
  * Cross-references a `pnpm audit --json` report against the allowlist.
  *
- * An exception only suppresses its advisory while `now` is before its
- * `expires` date; an expired exception is reported separately (and always
- * counts as a failure) regardless of whether its advisory still appears in
- * the report, so stale entries can't silently persist forever.
+ * An exception only suppresses its advisory while both (a) `now` is on or
+ * before its `expires` date (see `isExpired`), and (b) its `package` matches
+ * the advisory's `module_name` — a mismatched package is treated as not
+ * suppressing at all, so a copy-paste error in the allowlist can't
+ * accidentally suppress an unrelated advisory that happens to share a GHSA
+ * id (vanishingly unlikely, but cheap to guard against explicitly). An
+ * expired exception is reported separately (and always counts as a failure)
+ * regardless of whether its advisory still appears in the report, so stale
+ * entries can't silently persist forever.
  *
  * @param {{ advisories?: Record<string, unknown> }} report
- * @param {Array<{ id: string, expires: string }>} exceptions
+ * @param {AllowlistEntry[]} exceptions
  * @param {{ now?: Date }} [options]
  */
 export function evaluateAuditReport(
@@ -110,8 +176,8 @@ export function evaluateAuditReport(
     exceptions.map((exception) => [exception.id, exception]),
   );
 
-  const expiredExceptions = exceptions.filter(
-    (exception) => new Date(exception.expires).getTime() < now.getTime(),
+  const expiredExceptions = exceptions.filter((exception) =>
+    isExpired(exception, now),
   );
   const expiredIds = new Set(
     expiredExceptions.map((exception) => exception.id),
@@ -119,7 +185,7 @@ export function evaluateAuditReport(
 
   /** @type {Advisory[]} */
   const blocking = [];
-  /** @type {Array<{ advisory: Advisory, exception: { id: string, expires: string } }>} */
+  /** @type {Array<{ advisory: Advisory, exception: AllowlistEntry }>} */
   const suppressed = [];
 
   for (const advisory of advisories) {
@@ -127,8 +193,15 @@ export function evaluateAuditReport(
       continue;
     }
     const exception = byId.get(advisory.github_advisory_id);
-    if (exception && !expiredIds.has(exception.id)) {
-      suppressed.push({ advisory, exception });
+    const covers =
+      exception !== undefined &&
+      exception.package === advisory.module_name &&
+      !expiredIds.has(exception.id);
+    if (covers) {
+      suppressed.push({
+        advisory,
+        exception: /** @type {AllowlistEntry} */ (exception),
+      });
     } else {
       blocking.push(advisory);
     }

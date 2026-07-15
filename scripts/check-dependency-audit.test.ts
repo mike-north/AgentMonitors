@@ -103,6 +103,35 @@ describe('evaluateAuditReport', () => {
     );
   });
 
+  // Guards against a copy-paste allowlist error: an entry whose `id` matches
+  // but whose `package` doesn't must not suppress — otherwise a mistyped or
+  // reused exception could silently cover an unrelated advisory.
+  it('does not suppress when the exception package does not match the advisory module', () => {
+    const report = {
+      advisories: {
+        1: advisory({
+          github_advisory_id: 'GHSA-aaaa-bbbb-cccc',
+          module_name: 'example-pkg',
+        }),
+      },
+    };
+    const exceptions = [
+      {
+        id: 'GHSA-aaaa-bbbb-cccc',
+        package: 'some-other-pkg',
+        reason: 'copy-pasted from a different exception',
+        expires: '2099-01-01',
+      },
+    ];
+
+    const { blocking, suppressed } = evaluateAuditReport(report, exceptions, {
+      now: new Date('2026-07-14'),
+    });
+
+    expect(blocking).toHaveLength(1);
+    expect(suppressed).toHaveLength(0);
+  });
+
   // Regression: before expiry enforcement existed, an exception could be
   // added once and silently suppress its advisory forever. This proves an
   // expired exception no longer excuses the advisory — the gate goes back to
@@ -128,6 +157,62 @@ describe('evaluateAuditReport', () => {
       {
         now: new Date('2026-07-14'),
       },
+    );
+
+    expect(blocking).toHaveLength(1);
+    expect(suppressed).toHaveLength(0);
+    expect(expiredExceptions).toHaveLength(1);
+  });
+
+  // Regression: a date-only `expires` (YYYY-MM-DD) must remain valid through
+  // the *entire* expires day (UTC) — not expire at its start. Before this
+  // fix, an exception dated "2026-07-14" would already read as expired at
+  // any time later that same day.
+  it('remains valid through the entire expires day (UTC), not just its start', () => {
+    const report = {
+      advisories: {
+        1: advisory({ github_advisory_id: 'GHSA-aaaa-bbbb-cccc' }),
+      },
+    };
+    const exceptions = [
+      {
+        id: 'GHSA-aaaa-bbbb-cccc',
+        package: 'example-pkg',
+        reason: 'no fix available yet',
+        expires: '2026-07-14',
+      },
+    ];
+
+    const { blocking, suppressed, expiredExceptions } = evaluateAuditReport(
+      report,
+      exceptions,
+      { now: new Date('2026-07-14T23:59:59.999Z') },
+    );
+
+    expect(blocking).toHaveLength(0);
+    expect(suppressed).toHaveLength(1);
+    expect(expiredExceptions).toHaveLength(0);
+  });
+
+  it('expires at the start of the day after the expires date', () => {
+    const report = {
+      advisories: {
+        1: advisory({ github_advisory_id: 'GHSA-aaaa-bbbb-cccc' }),
+      },
+    };
+    const exceptions = [
+      {
+        id: 'GHSA-aaaa-bbbb-cccc',
+        package: 'example-pkg',
+        reason: 'no fix available yet',
+        expires: '2026-07-14',
+      },
+    ];
+
+    const { blocking, suppressed, expiredExceptions } = evaluateAuditReport(
+      report,
+      exceptions,
+      { now: new Date('2026-07-15T00:00:00.000Z') },
     );
 
     expect(blocking).toHaveLength(1);
@@ -240,6 +325,69 @@ describe('loadAllowlist', () => {
     );
 
     expect(() => loadAllowlist(file)).toThrow(/expires/);
+  });
+
+  // Regression: validation previously only enforced "id" and "expires", so an
+  // entry with no "package"/"reason" loaded successfully and `main()` printed
+  // `undefined` for them — a malformed entry now fails loudly at load time.
+  it('throws when an entry is missing "package"', () => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), 'audit-allowlist-'));
+    const file = path.join(tmpDir, 'allowlist.json');
+    writeFileSync(
+      file,
+      JSON.stringify({
+        exceptions: [
+          {
+            id: 'GHSA-aaaa-bbbb-cccc',
+            reason: 'no fix available yet',
+            expires: '2099-01-01',
+            /* missing package */
+          },
+        ],
+      }),
+    );
+
+    expect(() => loadAllowlist(file)).toThrow(/"package"/);
+  });
+
+  it('throws when an entry is missing "reason"', () => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), 'audit-allowlist-'));
+    const file = path.join(tmpDir, 'allowlist.json');
+    writeFileSync(
+      file,
+      JSON.stringify({
+        exceptions: [
+          {
+            id: 'GHSA-aaaa-bbbb-cccc',
+            package: 'example-pkg',
+            expires: '2099-01-01',
+            /* missing reason */
+          },
+        ],
+      }),
+    );
+
+    expect(() => loadAllowlist(file)).toThrow(/"reason"/);
+  });
+
+  it('throws when "expires" is not in YYYY-MM-DD format', () => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), 'audit-allowlist-'));
+    const file = path.join(tmpDir, 'allowlist.json');
+    writeFileSync(
+      file,
+      JSON.stringify({
+        exceptions: [
+          {
+            id: 'GHSA-aaaa-bbbb-cccc',
+            package: 'example-pkg',
+            reason: 'no fix available yet',
+            expires: '01/01/2099',
+          },
+        ],
+      }),
+    );
+
+    expect(() => loadAllowlist(file)).toThrow(/YYYY-MM-DD/);
   });
 
   it('loads the real shipped scripts/audit-allowlist.json without throwing', () => {

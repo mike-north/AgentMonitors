@@ -1,4 +1,4 @@
 {
-  "$comment": "Reviewed exceptions for `pnpm audit --prod --audit-level high` (scripts/check-dependency-audit.mjs, Refs #290). Every entry MUST include an `expires` date (YYYY-MM-DD). An expired entry fails the gate until it is renewed (bump `expires`) or removed — this file is not a place for blanket/permanent ignores.",
+  "$comment": "Reviewed exceptions for `pnpm audit --prod --audit-level high` (scripts/check-dependency-audit.mjs, Refs #290). Each entry needs a non-empty string `id` (GitHub advisory id, e.g. GHSA-xxxx-xxxx-xxxx), `package` (npm package name — must match the advisory's module exactly, or the exception has no effect), `reason`, and `expires` (YYYY-MM-DD). An entry is valid THROUGH the end of its `expires` day (UTC) — it fails the gate starting the next day — until it is renewed (bump `expires`) or removed; this file is not a place for blanket/permanent ignores.",
   "exceptions": []
 }
