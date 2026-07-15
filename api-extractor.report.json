@@ -1,0 +1,13 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/api-extractor/v7/api-extractor.schema.json",
+  "extends": "./api-extractor.base.json",
+  // Issue #285: the real signature-drift gate. `check:api-report` runs this
+  // WITHOUT `--local` (fails on drift, never rewrites the checked-in file);
+  // `fix:api-report` runs it WITH `--local` (explicit, on-purpose
+  // regeneration). Never used by the `build` script — see
+  // api-extractor.build.json.
+  "apiReport": {
+    "enabled": true,
+    "reportFolder": "<projectFolder>/api-report/"
+  }
+}

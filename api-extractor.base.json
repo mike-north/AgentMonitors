@@ -1,10 +1,14 @@
 {
   "$schema": "https://developer.microsoft.com/json-schemas/api-extractor/v7/api-extractor.schema.json",
   "mainEntryPointFilePath": "<projectFolder>/dist/index.d.ts",
-  "apiReport": {
-    "enabled": true,
-    "reportFolder": "<projectFolder>/api-report/"
-  },
+  // Issue #285: `apiReport` is deliberately NOT configured here. `build` and
+  // `check:api-report`/`fix:api-report` need DIFFERENT apiReport settings —
+  // see api-extractor.build.json (apiReport disabled; `build` extends this)
+  // and api-extractor.report.json (apiReport enabled; the two api-report
+  // scripts extend this). A shared `apiReport.enabled: true` on this base
+  // file let `build`'s `--local` flag silently rewrite the checked-in report
+  // before the non-local `check:api-report` validation ever read it — see
+  // the PR that split these configs (Refs #285) for the reproduction.
   "docModel": {
     "enabled": false
   },

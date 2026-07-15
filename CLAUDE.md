@@ -56,10 +56,16 @@ The CLI binary is `agentmonitors` (from `@agentmonitors/cli`). Build, then run `
 ### Important build ordering
 
 `@agentmonitors/core`'s build is **three sequential steps**: `tsup` (bundle) → `tsc -p tsconfig.build.json`
-(emit `.d.ts`) → `api-extractor run --local` (roll up `dist/public.d.ts`, the file `package.json#types`
-points at, and — in `--local` mode — silently rewrite the checked-in `api-report/core.api.md` to match).
-Every published TypeScript package (`@agentmonitors/core`, `plugins/source-*`) has its own checked-in
-API report. If you change a package's **public** API surface, regenerate its report
+(emit `.d.ts`) → `api-extractor run --local -c api-extractor.build.json` (roll up `dist/public.d.ts`, the
+file `package.json#types` points at). `build` uses a dedicated, `apiReport`-**disabled** api-extractor
+config (`api-extractor.build.json`, which extends the shared `api-extractor.base.json`) — it never writes
+into `api-report/`, even with `--local`. `check:api-report`/`fix:api-report` use a separate,
+`apiReport`-**enabled** config (`api-extractor.report.json`) instead. This split exists because a single
+shared config previously let `build`'s `--local` rollup step (scheduled as a dependency of a sibling
+package's `check:api-report` via `^build`) silently rewrite the checked-in report before the non-local
+validation ever read it (issue #285) — see `api-extractor.build.json`/`api-extractor.report.json` for the
+per-package variants. Every published TypeScript package (`@agentmonitors/core`, `plugins/source-*`) has
+its own checked-in API report. If you change a package's **public** API surface, regenerate its report
 (`pnpm --filter <package> run fix:api-report`) and commit the diff, or CI's `check:api-report` step
 (non-`--local` — it fails on drift instead of silently fixing it) rejects the PR. Downstream packages
 (`apps/cli`, `plugins/*`) depend on `^build`, so build core first.
