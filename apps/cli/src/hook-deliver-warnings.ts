@@ -33,9 +33,12 @@
  *
  * `session_id` comes from untrusted stdin JSON, and this line is emitted
  * unconditionally — so the id is forced into a single-line, control-safe
- * form: `JSON.stringify` escapes newlines, tabs, ESC, and every other
- * control character (terminal/log injection), and the length bound keeps a
- * pathological payload from flooding stderr.
+ * form: `JSON.stringify` escapes newlines, tabs, ESC, and every other C0
+ * control character, and a follow-up pass escapes what `JSON.stringify`
+ * leaves raw — DEL, the C1 controls (U+0080–U+009F, e.g. CSI), and the
+ * U+2028/U+2029 line/paragraph separators (terminal/log injection; same
+ * C0/C1 concern as hook-deliver-render.ts's sanitize). The length bound
+ * keeps a pathological payload from flooding stderr.
  */
 export function describeUnknownHostSessionWarning(
   hostSessionId: string,
@@ -54,5 +57,17 @@ export function describeUnknownHostSessionWarning(
     }
     truncated = `${out}…`;
   }
-  return `hook deliver: no session registered for host session id ${JSON.stringify(truncated)}`;
+  // JSON.stringify only escapes C0 controls (< U+0020), quotes, and
+  // backslashes. DEL, the C1 controls, and U+2028/U+2029 pass through raw —
+  // and a raw CSI (U+009B) or line separator still breaks the "one
+  // control-safe line" contract. Escape them ourselves; none of these code
+  // points can appear inside an escape sequence JSON.stringify already
+  // produced, so a post-pass over the serialized string is safe and keeps
+  // the output a valid, round-trippable JSON string.
+  const escaped = JSON.stringify(truncated).replace(
+    // eslint-disable-next-line no-control-regex -- escaping controls is the point
+    /[\u007f-\u009f\u2028\u2029]/g,
+    (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`,
+  );
+  return `hook deliver: no session registered for host session id ${escaped}`;
 }
