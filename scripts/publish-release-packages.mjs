@@ -32,7 +32,7 @@ function run(command, args, options = {}) {
   }).trim();
 }
 
-function packageInfo(packageDir, repoRoot) {
+export function packageInfo(packageDir, repoRoot) {
   const packageJsonPath = path.join(repoRoot, packageDir, 'package.json');
   const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
   return {
@@ -54,11 +54,21 @@ function packageInfo(packageDir, repoRoot) {
 // longer HEAD and the missed packages could never publish). The registry is
 // the source of truth for "needs publishing"; alreadyPublished() makes the
 // whole run idempotent.
-function releaseCandidates(packageDirs, repoRoot, log) {
+//
+// `isPublished` is injectable so the release-work gate
+// (scripts/release-gate.mjs) can reuse this exact selection — deriving from
+// the same authoritative PACKAGE_DIRS inventory — and so tests can exercise
+// it without a network round-trip to the registry.
+export function releaseCandidates(
+  packageDirs,
+  repoRoot,
+  log,
+  isPublished = alreadyPublished,
+) {
   return packageDirs
     .map((packageDir) => packageInfo(packageDir, repoRoot))
     .filter((pkg) => {
-      if (alreadyPublished(pkg)) {
+      if (isPublished(pkg)) {
         log(`Skipping ${pkg.name}@${pkg.version}; version already exists.`);
         return false;
       }
@@ -66,7 +76,7 @@ function releaseCandidates(packageDirs, repoRoot, log) {
     });
 }
 
-function alreadyPublished(pkg) {
+export function alreadyPublished(pkg) {
   try {
     const publishedVersion = run(
       'npm',
