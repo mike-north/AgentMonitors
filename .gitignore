@@ -78,6 +78,10 @@ web_modules/
 .next
 out
 
+# Vercel CLI project link + build output (apps/website's `vercel build` /
+# `vercel deploy` steps; .env.production.local under here can hold secrets).
+.vercel
+
 # Nuxt.js build / generate output
 .nuxt
 dist

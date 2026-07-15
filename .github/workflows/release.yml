@@ -46,36 +46,18 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Registry-driven release-work gate. Derives entirely from the single
+      # authoritative publishable-package inventory (`PACKAGE_DIRS` in
+      # scripts/publish-release-packages.mjs) — no second, hand-maintained list
+      # of manifest paths to drift from it (issue #284). The gate is true when
+      # there are pending changesets OR any current workspace version is not yet
+      # on its registry, so a partial publish still reconciles on the next
+      # successful main CI run instead of being stranded by a later unrelated
+      # commit. Emits `should-run=<bool>` to $GITHUB_OUTPUT itself.
       - name: Detect release work
         id: release-work
         shell: bash
-        run: |
-          set -euo pipefail
-
-          if find .changeset -maxdepth 1 -name '*.md' ! -name 'README.md' | grep -q .; then
-            echo "should-run=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if ! base_sha="$(git rev-parse HEAD^ 2>/dev/null)"; then
-            echo "should-run=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if git diff "${base_sha}" HEAD -- \
-              libs/core/package.json \
-              plugins/source-api-poll/package.json \
-              plugins/source-file-fingerprint/package.json \
-              plugins/source-incoming-changes/package.json \
-              plugins/source-schedule/package.json \
-              apps/cli/package.json \
-              apps/agentmonitors/package.json | \
-            grep -Eq '^[+-][[:space:]]+"version":'; then
-            echo "should-run=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "should-run=false" >> "$GITHUB_OUTPUT"
+        run: node scripts/release-gate.mjs
 
       - name: Create Release Pull Request Or Publish
         id: changesets
