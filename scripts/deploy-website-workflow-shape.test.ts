@@ -112,6 +112,31 @@ jobs:
     ).toThrow(/production build/);
   });
 
+  // Regression test for the review finding on #353: `\b` after the script
+  // name also matches before `:`, so similarly-prefixed scripts would have
+  // satisfied the guard without running the real `check`/`test` scripts.
+  it('rejects check:lint / test:unit lookalikes standing in for the real check and test scripts', () => {
+    const workflow: unknown = parse(`
+jobs:
+  validate:
+    steps:
+      - run: pnpm --filter @agentmonitors/website check:lint
+      - run: pnpm --filter @agentmonitors/website test:unit
+      - run: vercel build --prod --yes --cwd apps/website
+  deploy:
+    needs: validate
+    steps:
+      - run: vercel deploy --prebuilt --prod --yes --cwd apps/website
+`);
+    expect(() =>
+      assertValidateGatesDeploy(
+        workflow as Parameters<typeof assertValidateGatesDeploy>[0],
+      ),
+    ).toThrow(
+      /website typecheck.*website test suite|website test suite.*website typecheck/s,
+    );
+  });
+
   it('accepts a minimal well-formed gate shape (positive control)', () => {
     const workflow: unknown = parse(`
 jobs:
@@ -154,12 +179,18 @@ describe('assertDeployPromotesArtifact', () => {
       assertDeployPromotesArtifact(
         workflow as Parameters<typeof assertDeployPromotesArtifact>[0],
       ),
-    ).toThrow(/download the build artifact/);
+    ).toThrow(/must upload the production build artifact/);
   });
 
   it('rejects a deploy job that downloads the artifact but deploys without --prebuilt', () => {
     const workflow: unknown = parse(`
 jobs:
+  validate:
+    steps:
+      - uses: actions/upload-artifact@v4
+        with:
+          name: website-vercel-build
+          path: apps/website/.vercel/output
   deploy:
     steps:
       - uses: actions/download-artifact@v4
@@ -175,9 +206,88 @@ jobs:
     ).toThrow(/--prebuilt/);
   });
 
-  it('accepts a deploy job that downloads the artifact and deploys it prebuilt (positive control)', () => {
+  // Regression tests for the review finding on #353: an existence-only
+  // download-artifact check false-passes when deploy downloads an unrelated
+  // artifact (or to the wrong path) — `vercel deploy --prebuilt` would then
+  // deploy something other than the validated build.
+  it('rejects a deploy job that downloads a DIFFERENT artifact than validate uploaded', () => {
     const workflow: unknown = parse(`
 jobs:
+  validate:
+    steps:
+      - uses: actions/upload-artifact@v4
+        with:
+          name: website-vercel-build
+          path: apps/website/.vercel/output
+  deploy:
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: some-unrelated-artifact
+          path: apps/website/.vercel/output
+      - run: vercel deploy --prebuilt --prod --yes --cwd apps/website
+`);
+    expect(() =>
+      assertDeployPromotesArtifact(
+        workflow as Parameters<typeof assertDeployPromotesArtifact>[0],
+      ),
+    ).toThrow(/"name" differs/);
+  });
+
+  it('rejects a deploy job that downloads the artifact to the WRONG path', () => {
+    const workflow: unknown = parse(`
+jobs:
+  validate:
+    steps:
+      - uses: actions/upload-artifact@v4
+        with:
+          name: website-vercel-build
+          path: apps/website/.vercel/output
+  deploy:
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: website-vercel-build
+          path: somewhere/else
+      - run: vercel deploy --prebuilt --prod --yes --cwd apps/website
+`);
+    expect(() =>
+      assertDeployPromotesArtifact(
+        workflow as Parameters<typeof assertDeployPromotesArtifact>[0],
+      ),
+    ).toThrow(/"path" differs/);
+  });
+
+  it('rejects a validate job that never uploads the build artifact', () => {
+    const workflow: unknown = parse(`
+jobs:
+  validate:
+    steps:
+      - run: vercel build --prod --yes --cwd apps/website
+  deploy:
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: website-vercel-build
+          path: apps/website/.vercel/output
+      - run: vercel deploy --prebuilt --prod --yes --cwd apps/website
+`);
+    expect(() =>
+      assertDeployPromotesArtifact(
+        workflow as Parameters<typeof assertDeployPromotesArtifact>[0],
+      ),
+    ).toThrow(/must upload/);
+  });
+
+  it('accepts a deploy job that downloads the artifact validate uploaded and deploys it prebuilt (positive control)', () => {
+    const workflow: unknown = parse(`
+jobs:
+  validate:
+    steps:
+      - uses: actions/upload-artifact@v4
+        with:
+          name: website-vercel-build
+          path: apps/website/.vercel/output
   deploy:
     steps:
       - uses: actions/download-artifact@v4

@@ -31,7 +31,7 @@ export const DEPLOY_WORKFLOW_PATH = join(
 );
 
 /**
- * @typedef {{ run?: string; uses?: string; name?: string }} WorkflowStep
+ * @typedef {{ run?: string; uses?: string; name?: string; with?: Record<string, unknown> }} WorkflowStep
  * @typedef {{ needs?: string | string[]; steps?: WorkflowStep[] }} WorkflowJob
  * @typedef {{
  *   on?: { push?: { paths?: string[] } };
@@ -94,10 +94,16 @@ export function assertValidateGatesDeploy(workflow) {
   /** @type {Array<{ name: string; pattern: RegExp }>} */
   const requiredGates = [
     {
+      // `(?:\s|$)` (not `\b`): a word boundary also matches before `:`, so
+      // `check:lint` / `test:unit` would satisfy a `\b` guard without ever
+      // running the actual `check` / `test` scripts.
       name: 'website typecheck',
-      pattern: /@agentmonitors\/website\s+check\b/,
+      pattern: /@agentmonitors\/website\s+check(?:\s|$)/m,
     },
-    { name: 'website test suite', pattern: /@agentmonitors\/website\s+test\b/ },
+    {
+      name: 'website test suite',
+      pattern: /@agentmonitors\/website\s+test(?:\s|$)/m,
+    },
     {
       name: 'production build of the exact commit',
       pattern: /vercel build\b[^\n]*--prod\b|--prod\b[^\n]*vercel build\b/,
@@ -114,10 +120,28 @@ export function assertValidateGatesDeploy(workflow) {
 }
 
 /**
+ * Find a job's first step whose `uses:` starts with the given action prefix.
+ *
+ * @param {WorkflowJob | undefined} job
+ * @param {string} actionPrefix
+ * @returns {WorkflowStep | undefined}
+ */
+function findActionStep(job, actionPrefix) {
+  const steps = Array.isArray(job?.steps) ? job.steps : [];
+  return steps.find(
+    (step) =>
+      typeof step.uses === 'string' && step.uses.startsWith(actionPrefix),
+  );
+}
+
+/**
  * Validate that `deploy` promotes the exact artifact `validate` already
  * built and validated, rather than triggering a second, independent remote
- * build against the same commit: it must download a build artifact and
- * deploy it with `vercel deploy --prebuilt`.
+ * build against the same commit: `validate` must upload a build artifact,
+ * `deploy` must download that same artifact (same `name`, same `path` — a
+ * download of some unrelated artifact, or to the wrong directory, would
+ * false-pass an existence-only check while `vercel deploy --prebuilt`
+ * silently deploys nothing), and deploy it with `vercel deploy --prebuilt`.
  *
  * @param {DeployWorkflow} workflow
  */
@@ -127,18 +151,42 @@ export function assertDeployPromotesArtifact(workflow) {
     throw new Error('deploy-website.yml is missing a "deploy" job');
   }
 
-  const steps = Array.isArray(deploy.steps) ? deploy.steps : [];
-  const downloadsArtifact = steps.some(
-    (step) =>
-      typeof step.uses === 'string' &&
-      step.uses.startsWith('actions/download-artifact@'),
+  const upload = findActionStep(
+    workflow.jobs?.validate,
+    'actions/upload-artifact@',
   );
-  if (!downloadsArtifact) {
+  if (!upload) {
+    throw new Error(
+      'validate job must upload the production build artifact ' +
+        '(actions/upload-artifact) so deploy can promote the exact ' +
+        'validated build (issue #286)',
+    );
+  }
+
+  const download = findActionStep(deploy, 'actions/download-artifact@');
+  if (!download) {
     throw new Error(
       'deploy job must download the build artifact validate uploaded ' +
         '(actions/download-artifact) to deploy the exact validated build, ' +
         'not rebuild from source (issue #286)',
     );
+  }
+
+  for (const key of ['name', 'path']) {
+    const uploaded = upload.with?.[key];
+    const downloaded = download.with?.[key];
+    if (
+      typeof uploaded !== 'string' ||
+      uploaded.length === 0 ||
+      uploaded !== downloaded
+    ) {
+      throw new Error(
+        `deploy must download the same artifact validate uploaded, but the ` +
+          `"${key}" differs (upload: ${JSON.stringify(uploaded)}, download: ` +
+          `${JSON.stringify(downloaded)}) — a mismatched ${key} deploys ` +
+          'something other than the validated build (issue #286)',
+      );
+    }
   }
 
   const runLines = jobRunLines(deploy);
