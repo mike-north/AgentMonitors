@@ -15,6 +15,7 @@ import { sessionCommand } from './commands/session.js';
 import { eventsCommand } from './commands/events.js';
 import { hookCommand } from './commands/hook.js';
 import { channelCommand } from './commands/channel.js';
+import { watchCommand } from './commands/watch.js';
 
 /**
  * Read the CLI's version from its own package.json. Both the TS source
@@ -56,6 +57,7 @@ program.addCommand(sessionCommand);
 program.addCommand(eventsCommand);
 program.addCommand(hookCommand);
 program.addCommand(channelCommand);
+program.addCommand(watchCommand);
 
 // `parseAsync` (not `parse`): several command actions are `async`, and Commander
 // does not await an action passed to the synchronous `parse()` — an action that

@@ -192,6 +192,55 @@ export const sessionObjectCursor = sqliteTable('session_object_cursor', {
   updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
 });
 
+/**
+ * The lifecycle status of an ephemeral (agent-declared, session-scoped) monitor
+ * (007 §4.4). `active` — declared and evaluated on the normal runtime tick;
+ * `reaped` — its declaring session ended/went dormant or it was cancelled, so it
+ * is no longer observed. A reaped record is retained (never resurrected) so a
+ * later restart cannot re-arm it (007 §4.4: "a restart after the session has
+ * ended does not resurrect it").
+ */
+export const ephemeralMonitorStatus = ['active', 'reaped'] as const;
+export type EphemeralMonitorStatus = (typeof ephemeralMonitorStatus)[number];
+
+/**
+ * An **ephemeral monitor** (007 §4): an agent-declared, session-scoped monitor
+ * handled by the SAME daemon and pipeline as a persistent `MONITOR.md` monitor
+ * (AP7). Unlike a persistent monitor it has no directory — its definition lives
+ * here, durably, keyed to the declaring session, so it survives a daemon restart
+ * while that session lives (007 §4.4, PP1). Its `id` is the namespaced runtime
+ * identity `ephemeral:<sessionId>/<ulid>` (007 §4.3): a directory-derived
+ * persistent id is a single path segment and cannot contain `/`, so an ephemeral
+ * id (which always does) can never collide with one.
+ */
+export const ephemeralMonitors = sqliteTable('ephemeral_monitors', {
+  id: text('id').primaryKey(),
+  sessionId: text('session_id').notNull(),
+  workspacePath: text('workspace_path'),
+  sourceName: text('source_name').notNull(),
+  // The source-`scopeSchema`-valid scope config (JSON), validated by the same
+  // `validateScope` path as `agentmonitors validate` at declaration time
+  // (007 §4.2) so an ephemeral monitor cannot express a config a persistent one
+  // could not.
+  scope: text('scope').notNull().default('{}'),
+  // The authored urgency band: `urgency` is the low bound (base) and
+  // `urgencyMax` the high bound — the same flattened representation
+  // `MonitorFrontmatter` carries (002 §4.1). Equal for a scalar urgency.
+  urgency: text('urgency', { enum: urgencyValues }).notNull(),
+  urgencyMax: text('urgency_max', { enum: urgencyValues }).notNull(),
+  // Free-text handling guidance that becomes the monitor's body, surfaced
+  // verbatim on delivery so the reminder arrives with the agent's own
+  // instruction attached (007 §4.2).
+  instruction: text('instruction').notNull().default(''),
+  displayName: text('display_name'),
+  status: text('status', { enum: ephemeralMonitorStatus })
+    .notNull()
+    .default('active'),
+  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+  updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
+  reapedAt: integer('reaped_at', { mode: 'timestamp' }),
+});
+
 export const observationHistory = sqliteTable('observation_history', {
   id: text('id').primaryKey(),
   monitorId: text('monitor_id').notNull(),

@@ -162,7 +162,28 @@ computes a textual diff of one observed object **between two stored points in ti
 - It is the cheapest act-on-signal read: an agent that only needs to decide _whether_ to look uses
   `summary`; one that needs the content uses `snapshot`/`diff`.
 
-## 4. Ephemeral Monitors (_target_)
+## 4. Ephemeral Monitors (_current_)
+
+> **Status: current** (Refs #312). The ephemeral-monitor model of §4 is implemented: agents declare
+> session-scoped monitors via `agentmonitors watch` (005 §14.4), the daemon persists them durably and
+> runs them on the same tick/notify/materialize/project pipeline as persistent monitors (AP7), their
+> events project into the declaring session only (§4.6 isolation), and they are reaped on session
+> close, on `watch cancel`, and on per-session dormancy (§4.4). Moved target → current when it shipped
+> (process: [004 §5–6](./004-validation-testing.md)); the §8 decisions are resolved below. The rest of
+> this document (§2, §3, §5) remains _target_.
+>
+> Verified:
+> `libs/core/src/inbox/schema.ts` (`ephemeral_monitors` table) ·
+> `libs/core/src/runtime/service.ts` (`declareEphemeralMonitor`, `listEphemeralMonitors`,
+> `cancelEphemeralMonitor`, `ephemeralRecordToMonitor`, `reapDormantSessions`, the ephemeral pass of
+> `tick()` via `evaluateMonitorOnTick`, and reap-on-`closeSession`) ·
+> `libs/core/src/runtime/store.ts` (`insertEphemeralMonitor`, `listActiveEphemeralMonitors`,
+> `listEphemeralMonitorsForSession`, `reapEphemeralMonitor(sForSession)`, `staleActiveSessions`, and
+> the `restrictToSessionId` projection gate in `insertEvent`) ·
+> `apps/cli/src/commands/watch.ts` + `apps/cli/src/daemon-ipc.ts` (`watch.declare|list|cancel`) ·
+> `libs/core/src/runtime/ephemeral-monitors.test.ts` and the
+> `describe('ephemeral monitors: watch declare/list/cancel (007 §4 / 005 §14.4)')` suite in
+> `apps/cli/src/commands/cli.integration.test.ts`.
 
 ### 4.1 Definition and scope
 
@@ -209,9 +230,13 @@ so it **MUST** be assigned a distinct, stable **runtime identity** that:
   `queryScope` filtering unambiguous;
 - is **stable for the monitor's lifetime** so its snapshots/cursors/events key correctly (SP5).
 
-> **Decision flagged (§8):** the exact ephemeral-id scheme (reserved prefix vs a separate id space)
-> is left to the implementing work; this section fixes only the uniqueness, namespacing, and
-> stability requirements.
+> **Decision resolved (§8, Refs #312):** the ephemeral-id scheme is the reserved prefix
+> **`ephemeral:<sessionId>/<ulid>`**. It is collision-proof against persistent ids by construction:
+> a directory-derived persistent monitor id (SP1) is a **single path segment** and therefore can
+> never contain a `/`, while every ephemeral id does — so no persistent id can equal one. The
+> `ephemeral:` prefix keeps `monitor_events.monitor_id`, `monitor explain`, and `queryScope`
+> filtering unambiguously namespaced; the `<ulid>` slug is unique (and, with `<sessionId>`, unique
+> within the daemon scope); the id is assigned once at declaration and never mutated (stable).
 
 ### 4.4 Lifecycle (bound to the declaring session)
 
@@ -222,20 +247,25 @@ An ephemeral monitor's lifetime is **bound to its declaring session's lifetime**
 - it **MUST** be **reaped** when its declaring session **ends** (explicit session close,
   [002 §6.1](./002-runtime-delivery.md)) — an ephemeral monitor **MUST NOT** outlive its session or
   leak into another session (session isolation). Reaping when the session transitions to **dormant**
-  (without an explicit close) is the intended behavior too, but **002 does not yet specify a
-  per-session dormancy trigger** — only explicit session close ([002 §6.1](./002-runtime-delivery.md)).
-  (The daemon's own idle self-termination, [002 §10.2](./002-runtime-delivery.md), is a **different**
-  concern: it reaps the _daemon_ after all active sessions for a workspace hit zero, not an
-  individual session.) The implementing work **MUST** define that per-session dormancy trigger (§8);
+  (without an explicit close) is required too, now defined by the **per-session dormancy trigger** of
+  [002 §6.2](./002-runtime-delivery.md) (Refs #312): a session that has not advanced its
+  `lastActiveAt` for at least `DEFAULT_SESSION_DORMANCY_MS` is treated as dormant, and the runtime
+  transitions it and reaps its ephemeral monitors at the start of the next tick — a backstop for a
+  session that vanished without an explicit close. (The daemon's own idle self-termination,
+  [002 §10.2](./002-runtime-delivery.md), is a **different** concern: it reaps the _daemon_ after all
+  active sessions for a workspace hit zero, not an individual session.)
 - an agent **MAY** cancel it earlier (`agentmonitors watch cancel <id>`), which reaps it immediately;
 - while the session lives, the ephemeral monitor and its durable state (source state, snapshots,
   per-recipient cursors, unread/claimed/acknowledged rows) **MUST survive a daemon restart and a
   reboot** (the same durability floor as persistent monitors, PP1) — a restart within the session's
   life re-hydrates it, a restart after the session has ended does not resurrect it.
 - reaping an ephemeral monitor **MUST** clean up its runtime registration and stop further
-  observation; whether its already-materialized `monitor_events` are retained for post-hoc
-  observability or pruned with the session is a decision flagged in §8 (default: retain unread
-  events until the session's records are reaped, so a late delivery is never silently dropped, PP1).
+  observation. **Decision resolved (§8, Refs #312):** its already-materialized `monitor_events` (and
+  their `session_event_state` projections) are **retained**, not pruned — reaping flips the ephemeral
+  record's status `active` → `reaped` (stamping `reaped_at`) but never deletes it or its events, and
+  the declaring session goes _dormant_ (not deleted), so an event materialized just before reap stays
+  unread/deliverable and inspectable (PP1). Retention also makes resurrection structurally
+  impossible: a reaped record is never re-armed on a later restart.
 
 ### 4.5 Deterministic work stays daemon-owned
 
@@ -383,18 +413,23 @@ reviewer can pin it before build:
   the semantics are fixed regardless.
 - **Snapshot retention floor (§3.2).** How far back historical `monitor_snapshots` are retained for
   arbitrary two-point diffs, and the error shape when a referenced point has been pruned.
-- **Per-session dormancy trigger (§4.4).** 002 specifies explicit session close
-  ([002 §6.1](./002-runtime-delivery.md)) but **not** an individual-session dormancy transition (the
-  daemon-level idle self-termination of [002 §10.2](./002-runtime-delivery.md) is a distinct,
-  daemon-wide concern). The implementing work **MUST** define when a session is considered dormant
-  so ephemeral monitors reap on dormancy, not only on explicit close — and 002 gains the matching
-  rule in the same change.
-- **Ephemeral-id scheme (§4.3).** Reserved-prefix vs separate id space; only the
-  uniqueness/namespacing/stability requirements are fixed here.
-- **Ephemeral event retention on reap (§4.4).** Whether already-materialized ephemeral events are
-  retained for post-hoc observability or pruned with the session (default proposed: retain unread
-  until the session's records are reaped).
+- **Per-session dormancy trigger (§4.4). RESOLVED (Refs #312).** Defined as inactivity:
+  [002 §6.2](./002-runtime-delivery.md) now specifies that an `active` session whose `lastActiveAt`
+  has not advanced for at least `DEFAULT_SESSION_DORMANCY_MS` (default 30 min) is transitioned to
+  `dormant` at the start of the next tick, and its ephemeral monitors are reaped — distinct from the
+  daemon-wide idle self-termination of [002 §10.2](./002-runtime-delivery.md).
+- **Ephemeral-id scheme (§4.3). RESOLVED (Refs #312).** Reserved prefix
+  `ephemeral:<sessionId>/<ulid>` — collision-proof against directory-derived persistent ids by the
+  mandatory `/` (see §4.3).
+- **Ephemeral event retention on reap (§4.4). RESOLVED (Refs #312).** Retained: reap flips the record
+  to `reaped` and stops observation, but never prunes its events or projections (the declaring
+  session goes dormant, not deleted), so a late delivery is never silently dropped and a reaped
+  record is never resurrected (see §4.4).
 - **Verb/flag names (§3, §4, §5).** `snapshot` / `diff` / `summary` / `watch` / `inspect` are the
   proposed names; final names are a PM/implementer call. `watch` is chosen for the agent's mental
   verb ("watch this for me") and does **not** collide with any existing CLI command (the internal
-  source `watch()` execution of [NP4](./000-principles.md) is not a CLI verb).
+  source `watch()` execution of [NP4](./000-principles.md) is not a CLI verb). The `watch` surface
+  ships as `watch <source>` (declare, the default action) / `watch list` / `watch cancel <id>`
+  (Refs #312); a **fire-condition / `--until`** flag (the seed of dependent chains, #124) is **not**
+  part of this primitive and remains _target_ (the earlier §14.4 signature listed it; it is deferred
+  to the chain-authoring work).

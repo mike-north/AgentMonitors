@@ -237,6 +237,28 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
   // `source_state`) is reset.
   migrateMonitorStateToWorkspaceScope(db, sqlite);
 
+  // Ephemeral (agent-declared, session-scoped) monitors (007 §4). Additive —
+  // a brand-new table, so a durable DB from an earlier version simply gains it
+  // on the next open. Keyed to the declaring session; survives a daemon restart
+  // while that session lives (007 §4.4, BP1).
+  db.run(sql`
+    CREATE TABLE IF NOT EXISTS ephemeral_monitors (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      workspace_path TEXT,
+      source_name TEXT NOT NULL,
+      scope TEXT NOT NULL DEFAULT '{}',
+      urgency TEXT NOT NULL,
+      urgency_max TEXT NOT NULL,
+      instruction TEXT NOT NULL DEFAULT '',
+      display_name TEXT,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      reaped_at INTEGER
+    )
+  `);
+
   db.run(sql`
     CREATE TABLE IF NOT EXISTS observation_history (
       id TEXT PRIMARY KEY,

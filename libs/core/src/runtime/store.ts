@@ -6,6 +6,7 @@ import {
   gt,
   inArray,
   isNull,
+  lte,
   ne,
   or,
   sql,
@@ -26,6 +27,7 @@ const eventUlid = monotonicFactory();
 import type { InboxDb } from '../inbox/db.js';
 import {
   agentSessions,
+  ephemeralMonitors,
   monitorEvents,
   monitorSnapshots,
   monitorState,
@@ -35,6 +37,7 @@ import {
 } from '../inbox/schema.js';
 import type {
   AgentSessionRecord,
+  EphemeralMonitorRecord,
   EventQuery,
   MonitorEventRecord,
   MonitorDeliveryProjection,
@@ -48,6 +51,7 @@ import type {
   SessionHookState,
   SessionObjectCursorRecord,
 } from './types.js';
+import type { Urgency } from '../schema/types.js';
 import { buildTextDiff } from './diff.js';
 
 type InternalInboxDb = BetterSQLite3Database<
@@ -108,6 +112,26 @@ function rowToEvent(
     queryScope: parseJson(row.queryScope, {}),
     tags: parseJson(row.tags, []),
     createdAt: row.createdAt,
+  };
+}
+
+function rowToEphemeralMonitor(
+  row: typeof ephemeralMonitors.$inferSelect,
+): EphemeralMonitorRecord {
+  return {
+    id: row.id,
+    sessionId: row.sessionId,
+    workspacePath: row.workspacePath ?? null,
+    sourceName: row.sourceName,
+    scope: parseJson<Record<string, unknown>>(row.scope, {}),
+    urgency: row.urgency,
+    urgencyMax: row.urgencyMax,
+    instruction: row.instruction,
+    ...(row.displayName ? { displayName: row.displayName } : {}),
+    status: row.status,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    ...(row.reapedAt ? { reapedAt: row.reapedAt } : {}),
   };
 }
 
@@ -338,6 +362,16 @@ export class RuntimeStore {
     return rowToSession(row);
   }
 
+  /** Look up one session by id, or `null` if it does not exist (non-throwing). */
+  findSessionById(id: string): AgentSessionRecord | null {
+    const row = asInternalDb(this.db)
+      .select()
+      .from(agentSessions)
+      .where(eq(agentSessions.id, id))
+      .get();
+    return row ? rowToSession(row) : null;
+  }
+
   listSessions(): AgentSessionRecord[] {
     return asInternalDb(this.db)
       .select()
@@ -369,6 +403,195 @@ export class RuntimeStore {
       .set({ lastActiveAt: now, updatedAt: now })
       .where(eq(agentSessions.id, sessionId))
       .run();
+  }
+
+  // ── Ephemeral monitors (007 §4) ─────────────────────────────────────────────
+
+  /**
+   * Persist a new ephemeral (agent-declared, session-scoped) monitor (007 §4).
+   * `id` is the caller-assigned namespaced runtime identity
+   * `ephemeral:<sessionId>/<ulid>` (007 §4.3). The record is durable so it
+   * survives a daemon restart while the declaring session lives (007 §4.4).
+   */
+  insertEphemeralMonitor(input: {
+    id: string;
+    sessionId: string;
+    workspacePath: string | null;
+    sourceName: string;
+    scope: Record<string, unknown>;
+    urgency: Urgency;
+    urgencyMax: Urgency;
+    instruction: string;
+    displayName?: string;
+  }): EphemeralMonitorRecord {
+    const now = new Date();
+    asInternalDb(this.db)
+      .insert(ephemeralMonitors)
+      .values({
+        id: input.id,
+        sessionId: input.sessionId,
+        workspacePath: input.workspacePath,
+        sourceName: input.sourceName,
+        scope: JSON.stringify(input.scope),
+        urgency: input.urgency,
+        urgencyMax: input.urgencyMax,
+        instruction: input.instruction,
+        displayName: input.displayName ?? null,
+        status: 'active',
+        createdAt: now,
+        updatedAt: now,
+      })
+      .run();
+    return this.getEphemeralMonitorById(input.id);
+  }
+
+  getEphemeralMonitorById(id: string): EphemeralMonitorRecord {
+    const row = asInternalDb(this.db)
+      .select()
+      .from(ephemeralMonitors)
+      .where(eq(ephemeralMonitors.id, id))
+      .get();
+    if (!row) {
+      throw new Error(`Ephemeral monitor not found: ${id}`);
+    }
+    return rowToEphemeralMonitor(row);
+  }
+
+  /** Look up one ephemeral monitor by id, or `null` if it does not exist. */
+  findEphemeralMonitorById(id: string): EphemeralMonitorRecord | null {
+    const row = asInternalDb(this.db)
+      .select()
+      .from(ephemeralMonitors)
+      .where(eq(ephemeralMonitors.id, id))
+      .get();
+    return row ? rowToEphemeralMonitor(row) : null;
+  }
+
+  /**
+   * The ACTIVE ephemeral monitors evaluated on a tick for `workspacePath`
+   * (007 §4.4). Only monitors whose declaring session is itself still `active`
+   * are returned — so a dormant/closed session's ephemeral monitors never fire,
+   * even in the window before the reap step flips their status (a structural
+   * guard for "reaped on session end / no resurrection", 007 §4.4). Scoped to the
+   * workspace plus workspace-agnostic (global) records, mirroring
+   * {@link sessionsForWorkspace}.
+   */
+  listActiveEphemeralMonitors(
+    workspacePath: string | null,
+  ): EphemeralMonitorRecord[] {
+    const rows = asInternalDb(this.db)
+      .select({ ephemeral: ephemeralMonitors })
+      .from(ephemeralMonitors)
+      .innerJoin(
+        agentSessions,
+        eq(ephemeralMonitors.sessionId, agentSessions.id),
+      )
+      .where(
+        and(
+          eq(ephemeralMonitors.status, 'active'),
+          eq(agentSessions.status, 'active'),
+          workspacePath == null
+            ? isNull(ephemeralMonitors.workspacePath)
+            : or(
+                eq(ephemeralMonitors.workspacePath, workspacePath),
+                isNull(ephemeralMonitors.workspacePath),
+              ),
+        ),
+      )
+      .orderBy(asc(ephemeralMonitors.createdAt))
+      .all();
+    return rows.map((row) => rowToEphemeralMonitor(row.ephemeral));
+  }
+
+  /**
+   * The ACTIVE ephemeral monitors declared by one session (007 §4), for
+   * `watch list`. Ordered oldest-first.
+   */
+  listEphemeralMonitorsForSession(sessionId: string): EphemeralMonitorRecord[] {
+    return asInternalDb(this.db)
+      .select()
+      .from(ephemeralMonitors)
+      .where(
+        and(
+          eq(ephemeralMonitors.sessionId, sessionId),
+          eq(ephemeralMonitors.status, 'active'),
+        ),
+      )
+      .orderBy(asc(ephemeralMonitors.createdAt))
+      .all()
+      .map(rowToEphemeralMonitor);
+  }
+
+  /**
+   * Reap ONE ephemeral monitor (007 §4.4): flip `active` → `reaped` and stamp
+   * `reaped_at`. Idempotent (already-reaped rows are untouched). Retains the row
+   * and its materialized events for post-hoc observability (007 §4.4 default:
+   * retain unread until the session's records are reaped) — the row is never
+   * deleted, so a restart can never resurrect it.
+   */
+  reapEphemeralMonitor(id: string): void {
+    const now = new Date();
+    asInternalDb(this.db)
+      .update(ephemeralMonitors)
+      .set({ status: 'reaped', reapedAt: now, updatedAt: now })
+      .where(
+        and(
+          eq(ephemeralMonitors.id, id),
+          eq(ephemeralMonitors.status, 'active'),
+        ),
+      )
+      .run();
+  }
+
+  /**
+   * Reap every ACTIVE ephemeral monitor declared by a session (007 §4.4) — used
+   * when the session ends (explicit close) or goes dormant. Returns the ids
+   * reaped.
+   */
+  reapEphemeralMonitorsForSession(sessionId: string): string[] {
+    const active = this.listEphemeralMonitorsForSession(sessionId);
+    if (active.length === 0) return [];
+    const now = new Date();
+    asInternalDb(this.db)
+      .update(ephemeralMonitors)
+      .set({ status: 'reaped', reapedAt: now, updatedAt: now })
+      .where(
+        and(
+          eq(ephemeralMonitors.sessionId, sessionId),
+          eq(ephemeralMonitors.status, 'active'),
+        ),
+      )
+      .run();
+    return active.map((record) => record.id);
+  }
+
+  /**
+   * The `active` sessions for `workspacePath` (plus global) whose `lastActiveAt`
+   * is at or before `staleBefore` — i.e. sessions that have gone dormant by
+   * inactivity (002 §6.2 / 007 §4.4 per-session dormancy trigger). Used by the
+   * runtime to transition them to `dormant` and reap their ephemeral monitors.
+   */
+  staleActiveSessions(
+    workspacePath: string | null,
+    staleBefore: Date,
+  ): AgentSessionRecord[] {
+    return asInternalDb(this.db)
+      .select()
+      .from(agentSessions)
+      .where(
+        and(
+          eq(agentSessions.status, 'active'),
+          workspacePath == null
+            ? isNull(agentSessions.workspacePath)
+            : or(
+                eq(agentSessions.workspacePath, workspacePath),
+                isNull(agentSessions.workspacePath),
+              ),
+          lte(agentSessions.lastActiveAt, staleBefore),
+        ),
+      )
+      .all()
+      .map(rowToSession);
   }
 
   /**
@@ -470,6 +693,7 @@ export class RuntimeStore {
   insertEvent(
     input: Omit<MonitorEventRecord, 'id'>,
     baseline?: { previousContent: string | null },
+    options?: { restrictToSessionId?: string },
   ): MonitorEventRecord {
     const db = asInternalDb(this.db);
     const id = eventUlid();
@@ -499,9 +723,23 @@ export class RuntimeStore {
     const artifact = event.snapshotText;
     const objectKey = event.objectKey;
     const projectedSessionIds: string[] = [];
-    for (const session of this.sessionsForWorkspace(event.workspacePath).filter(
-      (candidate) => candidate.role === 'lead',
-    )) {
+    // Projection target (002 §6). For a persistent monitor, every matching LEAD
+    // session (workspace match or global). For an EPHEMERAL monitor (007 §4.6),
+    // projection is restricted to the DECLARING session ONLY — its events must
+    // never reach a sibling lead session in the same workspace (the ephemeral
+    // isolation invariant). `restrictToSessionId` names that session; it is still
+    // filtered to a lead role (the declaring session is a lead by construction,
+    // 007 §4.6), so a stray non-lead binding projects to nobody rather than
+    // leaking.
+    const projectionTargets = this.sessionsForWorkspace(
+      event.workspacePath,
+    ).filter(
+      (candidate) =>
+        candidate.role === 'lead' &&
+        (options?.restrictToSessionId === undefined ||
+          candidate.id === options.restrictToSessionId),
+    );
+    for (const session of projectionTargets) {
       // ── Per-recipient Diff (G10, 002 §1.1.2) ──────────────────────────────
       // Compute this session's delta against ITS OWN baseline cursor, and seed
       // the cursor on first projection. Only meaningful for snapshot-bearing

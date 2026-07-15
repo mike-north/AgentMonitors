@@ -51,6 +51,57 @@ export interface AgentSessionRecord {
   updatedAt: Date;
 }
 
+export type EphemeralMonitorStatus = 'active' | 'reaped';
+
+/**
+ * A durable ephemeral-monitor record (007 §4): an agent-declared, session-scoped
+ * monitor stored in the daemon's durable store so it survives a restart while the
+ * declaring session lives (007 §4.4). `id` is the namespaced runtime identity
+ * `ephemeral:<sessionId>/<ulid>` (007 §4.3).
+ */
+export interface EphemeralMonitorRecord {
+  id: string;
+  sessionId: string;
+  workspacePath: string | null;
+  sourceName: string;
+  /** The source-`scopeSchema`-valid scope config (007 §4.2). */
+  scope: Record<string, unknown>;
+  /** The authored urgency band's low bound (base effective urgency). */
+  urgency: Urgency;
+  /** The authored urgency band's high bound (equals `urgency` for a scalar). */
+  urgencyMax: Urgency;
+  /** Free-text handling guidance surfaced verbatim on delivery as the body. */
+  instruction: string;
+  displayName?: string;
+  status: EphemeralMonitorStatus;
+  createdAt: Date;
+  updatedAt: Date;
+  reapedAt?: Date;
+}
+
+/**
+ * Input to {@link AgentMonitorRuntime.declareEphemeralMonitor} (007 §4.2). The
+ * declaration binds to the resolved AgentMon session `sessionId`; its scope is
+ * validated by the same `validateScope` path as `agentmonitors validate`.
+ */
+export interface DeclareEphemeralMonitorInput {
+  /** The declaring (bound) AgentMon session id (007 §4.2). */
+  sessionId: string;
+  /** A registered source name (003). */
+  source: string;
+  /** The source-specific scope config (validated against the source schema). */
+  scope: Record<string, unknown>;
+  /**
+   * Authored urgency — a scalar (`normal`) or a band (`normal..high`). Defaults
+   * to `normal`, matching persistent monitors (007 §4.2).
+   */
+  urgency?: string;
+  /** Free-text handling guidance that becomes the monitor's body (007 §4.2). */
+  instruction?: string;
+  /** Optional human-readable display name. */
+  displayName?: string;
+}
+
 export interface MonitorEventRecord {
   id: string;
   workspacePath: string | null;
@@ -473,6 +524,12 @@ export interface ProcessObservationInput {
    * the notify-timing decision agree (002 §5.1).
    */
   effectiveUrgency: Urgency;
+  /**
+   * Present only for an ephemeral monitor (007 §4): the declaring session id.
+   * When set, the materialized event projects into ONLY this session, never a
+   * sibling lead session in the same workspace (007 §4.6 isolation).
+   */
+  restrictToSessionId?: string;
 }
 
 export interface PollingDecision {
