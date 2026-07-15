@@ -4,6 +4,20 @@ name: Deploy Website
 # agentmonitors.io). Deliberately NOT Vercel's "deploy every commit on main" git
 # integration: validation runs first and gates the deploy (the `deploy` job
 # `needs:` the `validate` job), so a broken site never reaches production.
+#
+# The gate covers the website's typecheck, its own vitest suite (including
+# next.config.test.ts, which guards deployment-specific tracing behavior), and
+# a production build of the exact deployed commit — all on the critical path
+# before `deploy` is allowed to start (issue #286).
+#
+# Deploy promotes the artifact `validate` already built rather than triggering
+# a second, independent remote build: `validate` runs `vercel build`, which
+# produces a self-contained `.vercel/output` directory, uploads it as a
+# workflow artifact, and `deploy` downloads that exact artifact and runs
+# `vercel deploy --prebuilt`. This is Vercel's documented "build once, deploy
+# the prebuilt output" flow (`vercel build` + `vercel deploy --prebuilt`), so
+# the bits that get typechecked, tested, and built are the same bits that
+# reach production — not a repeat of the same steps against the same commit.
 
 on:
   push:
@@ -11,6 +25,15 @@ on:
       - main
     paths:
       - 'apps/website/**'
+      # Root/shared inputs that can change the resolved build even though they
+      # live outside apps/website: the lockfile pins every dependency version
+      # (next, react, markdoc, ...) the site is built with, pnpm-workspace.yaml
+      # defines the workspace apps/website participates in, and root
+      # package.json carries the pinned pnpm version (packageManager) and
+      # workspace-wide devDependency versions the install resolves against.
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - 'package.json'
       - '.github/workflows/deploy-website.yml'
   workflow_dispatch: {}
 
@@ -19,11 +42,18 @@ concurrency:
   group: deploy-website-production
   cancel-in-progress: false
 
+# Non-sensitive Vercel identifiers for the `site` project (agentmonitors.io).
+# The only secret is VERCEL_TOKEN. Shared at workflow level: `validate` now
+# needs them too (for `vercel build`), not just `deploy`.
+env:
+  VERCEL_ORG_ID: team_x4xCAqcSsXQ7yu4ojx1AzWFD
+  VERCEL_PROJECT_ID: prj_hazDwikwUblJE5G6ah5ZLFiVQNAR
+
 jobs:
   validate:
     name: Validate
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -40,24 +70,58 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # The validation gate. Add more here (lint, tests, full `pnpm check`) to put
-      # broader checks on the critical path — the deploy job won't run unless this passes.
+      # The validation gate. All three steps below run against the exact
+      # commit being deployed and must pass before `deploy` is allowed to
+      # start (`deploy` `needs: validate`).
       - name: Type-check website
         run: pnpm --filter @agentmonitors/website check
+
+      - name: Test website
+        run: pnpm --filter @agentmonitors/website test
+
+      - name: Install Vercel CLI
+        run: npm install --global vercel@53
+
+      # Production build of the exact commit, via Vercel's own build step so
+      # the artifact below is byte-for-byte what `deploy` promotes (not a
+      # separate `next build` whose output Vercel would have to rebuild from
+      # again). `--yes` skips the interactive confirmation for pulling project
+      # settings/env vars, matching the non-interactive pattern already used
+      # by the `deploy` job below.
+      - name: Build production website (exact commit)
+        run: vercel build --prod --yes --cwd apps/website
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+
+      # CAUTION: `vercel build` inlines resolved Production env-var values into
+      # this output, and this artifact is readable by anyone with actions:read
+      # on the repo (a wider audience than the Vercel dashboard) for its
+      # retention window. The site currently uses no server-side env vars; if
+      # one is ever added, stop uploading the built output and rethink the
+      # promotion flow (e.g. build inside the deploy job) before merging that
+      # change.
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: website-vercel-build
+          path: apps/website/.vercel/output
+          retention-days: 1
+          if-no-files-found: error
 
   deploy:
     name: Deploy to Vercel (production)
     needs: validate
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    # Non-sensitive Vercel identifiers for the `site` project (agentmonitors.io).
-    # The only secret is VERCEL_TOKEN.
-    env:
-      VERCEL_ORG_ID: team_x4xCAqcSsXQ7yu4ojx1AzWFD
-      VERCEL_PROJECT_ID: prj_hazDwikwUblJE5G6ah5ZLFiVQNAR
+    timeout-minutes: 10
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      # No checkout: `vercel deploy --prebuilt` only reads the downloaded
+      # `.vercel/output` artifact, not the source tree. This is the point of
+      # promoting the validated artifact rather than rebuilding here.
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: website-vercel-build
+          path: apps/website/.vercel/output
 
       - name: Setup Node.js
         uses: actions/setup-node@v5
@@ -71,11 +135,11 @@ jobs:
       - name: Install Vercel CLI
         run: npm install --global vercel@53
 
-      # Remote build + deploy (proven for this monorepo: the site builds standalone
-      # with root = apps/website). Matches the working manual `vercel --prod --cwd apps/website`.
-      # Token is read from the VERCEL_TOKEN env var (safer than a --token=… CLI arg,
-      # which can leak via process listings / logs).
-      - name: Deploy production
-        run: vercel deploy --prod --yes --cwd apps/website
+      # Deploy the exact artifact `validate` built and typechecked/tested
+      # against — no second remote build. Token is read from the VERCEL_TOKEN
+      # env var (safer than a --token=… CLI arg, which can leak via process
+      # listings / logs).
+      - name: Deploy production (prebuilt)
+        run: vercel deploy --prebuilt --prod --yes --cwd apps/website
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
