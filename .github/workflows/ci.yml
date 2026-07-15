@@ -49,7 +49,9 @@ jobs:
       # firing, delivered through the real Claude Code hook stdin/stdout
       # contract (docs/specs/006-agent-integration.md §5). Runs per-PR: the
       # measured runtime (~50-70s) is comparable to the standalone-consumer
-      # and Docker smoke steps already gating every PR in this job.
+      # step above, and to the Docker-backed daemon tests (`*.docker.test.ts`)
+      # that already run inside the generic "Test" step — there is no
+      # separate Docker smoke job in this workflow.
       - name: Test (E2E fresh-environment install-to-first-signal, hooks path)
         run: pnpm test:e2e-fresh-install-hooks
 

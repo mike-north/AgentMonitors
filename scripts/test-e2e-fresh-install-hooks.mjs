@@ -30,14 +30,30 @@
  * test lives entirely in the OS temp dir, outside the repo tree — nothing
  * here can observe or fall back to the workspace's own `node_modules`.
  *
+ * Both `@agentmonitors/cli` and the `agentmonitors` launcher package declare
+ * a `agentmonitors` bin — installing them together makes npm link the bin
+ * name to whichever package sorts first ("@" sorts before "a", so
+ * `@agentmonitors/cli` always wins). To actually exercise the launcher's own
+ * `require.resolve` indirection under a real global nested-node_modules
+ * layout — the whole reason this test exists — every CLI invocation below
+ * runs the launcher package's installed entry point directly (`node
+ * <prefix>/lib/node_modules/agentmonitors/bin/agentmonitors.cjs`) rather
+ * than the collided `<prefix>/bin/agentmonitors` symlink. See the
+ * "confirm the bin-name collision" step for the assertion that keeps this
+ * honest if npm's tie-break behavior ever changes.
+ *
  * Governing references: scripts/test-standalone-consumer.mjs (the
- * pack-and-install precedent this script follows for packing/hermeticity),
- * agent-plugins/agentmonitors/skills/setup-monitors/SKILL.md "Reliable
- * manual-test recipe" (explicit socket, `--reap-after-ms 0`, fast
+ * pack-and-install precedent this script follows for packing/hermeticity;
+ * `packPackage` itself now lives in scripts/lib/pack-helpers.mjs, shared by
+ * both scripts), agent-plugins/agentmonitors/skills/setup-monitors/SKILL.md
+ * "Reliable manual-test recipe" (explicit socket, `--reap-after-ms 0`, fast
  * `--poll-ms`, isolated `AGENTMONITORS_DB`, settle-window waits with
- * margin), docs/specs/006-agent-integration.md §5 (hook stdin/stdout
- * contract), docs/specs/002-runtime-delivery.md §9.1 (the 15s high-urgency
- * claim-time settle window this script polls through).
+ * margin).
+ *
+ * @see ../docs/specs/006-agent-integration.md §5 (hook stdin/stdout contract)
+ * @see ../docs/specs/002-runtime-delivery.md §9.1 (15s high-urgency claim-time settle window)
+ * @see ../docs/specs/002-runtime-delivery.md §10.4 (daemon IPC wire protocol)
+ * @see ../docs/specs/002-runtime-delivery.md §10.5 (the `daemon.tick` method used to force a deterministic baseline)
  */
 import { Buffer } from 'node:buffer';
 import { spawn, spawnSync } from 'node:child_process';
@@ -46,13 +62,15 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
+  readlinkSync,
   writeFileSync,
 } from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { setTimeout } from 'node:timers';
+import { clearTimeout, setTimeout } from 'node:timers';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { packPackage } from './lib/pack-helpers.mjs';
 import { PACKAGE_DIRS } from './publish-release-packages.mjs';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -74,34 +92,20 @@ function sleep(ms) {
 }
 
 /** Run a command to completion, throwing with full stdout/stderr on failure
- * so a broken step is diagnosable from CI logs alone (issue #276 AC2). */
+ * so a broken step is diagnosable from CI logs alone (issue #276 AC2).
+ * Pass `options.input` to feed stdin (used for the hook commands, which read
+ * their real Claude Code payload from stdin — never env vars); omitting it
+ * closes stdin instead, which is correct for every other command here. */
 function run(command, args, options = {}) {
+  const { input, ...spawnOptions } = options;
   const result = spawnSync(command, args, {
     encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-    ...options,
-  });
-  if (result.error) {
-    throw new Error(
-      `Spawn error running ${command} ${args.join(' ')}: ${result.error.message}`,
-    );
-  }
-  if (result.status !== 0) {
-    throw new Error(
-      `Command failed (exit ${String(result.status)}, signal ${String(result.signal)}): ${command} ${args.join(' ')}\n--- stdout ---\n${result.stdout}\n--- stderr ---\n${result.stderr}`,
-    );
-  }
-  return result;
-}
-
-/** Like {@link run}, but feeds `input` on stdin — used for the hook commands,
- * which read their real Claude Code payload from stdin (never env vars). */
-function runWithStdin(command, args, input, options = {}) {
-  const result = spawnSync(command, args, {
-    encoding: 'utf8',
-    input,
-    stdio: ['pipe', 'pipe', 'pipe'],
-    ...options,
+    stdio:
+      input === undefined
+        ? ['ignore', 'pipe', 'pipe']
+        : ['pipe', 'pipe', 'pipe'],
+    ...spawnOptions,
+    ...(input === undefined ? {} : { input }),
   });
   if (result.error) {
     throw new Error(
@@ -164,26 +168,6 @@ async function waitFor(description, checkFn, { timeoutMs, intervalMs = 1000 }) {
   }
 }
 
-/** Pack one workspace package with `pnpm pack`, mirroring
- * scripts/test-standalone-consumer.mjs's `packPackage` helper exactly (same
- * before/after tarball-diff technique) so both scripts stay consistent. */
-function packPackage(packageDir, packDestDir) {
-  const before = new Set(readdirSync(packDestDir));
-  const result = run(PNPM_BIN, ['pack', '--pack-destination', packDestDir], {
-    cwd: packageDir,
-  });
-  const after = readdirSync(packDestDir);
-  const created = after.find(
-    (entry) => !before.has(entry) && entry.endsWith('.tgz'),
-  );
-  if (!created) {
-    throw new Error(
-      `Could not determine packed tarball for ${packageDir}. pnpm output:\n${result.stdout}`,
-    );
-  }
-  return path.join(packDestDir, created);
-}
-
 /** Patch the scaffolded `file-fingerprint` MONITOR.md for a fast, bounded
  * test cycle: a 1s observe interval and a 3s debounce settle-for, per the
  * setup-monitors skill's "Fast-test setup: shorten intervals before
@@ -211,6 +195,161 @@ function speedUpMonitorForTesting(monitorPath) {
     );
   }
   writeFileSync(monitorPath, withNotify, 'utf-8');
+}
+
+/**
+ * Resolve a file inside a globally-`npm install`ed package, given the
+ * `--prefix` directory the install used. npm's global layout nests installed
+ * packages under `<prefix>/lib/node_modules/<name>` on POSIX and
+ * `<prefix>/node_modules/<name>` on win32 (no `lib/` there) — this is the
+ * real installed package directory, distinct from the `<prefix>/bin/*` bin
+ * shims/symlinks npm also generates (which, for a bin-name collision like
+ * this test's, may not point at the package you actually want).
+ */
+function resolveInstalledPackageFile(prefixDir, packageName, ...relativeParts) {
+  const nodeModulesDir =
+    process.platform === 'win32'
+      ? path.join(prefixDir, 'node_modules')
+      : path.join(prefixDir, 'lib', 'node_modules');
+  return path.join(nodeModulesDir, packageName, ...relativeParts);
+}
+
+/**
+ * Send a single request over the daemon's Unix-socket IPC and resolve with
+ * its `result` — the newline-delimited JSON protocol documented in
+ * docs/specs/002-runtime-delivery.md §10.4: "Each request/response is a
+ * single newline-delimited JSON object." `daemon.tick` (§10.5) is the only
+ * method this script ever calls this way; every other daemon interaction
+ * goes through the installed launcher binary, the real user-facing surface
+ * this test exists to prove. `daemon.tick` has no CLI-exposed passthrough —
+ * `agentmonitors daemon once` builds a *separate* in-process runtime against
+ * the same db file rather than ticking the already-running daemon
+ * (apps/cli/src/runtime-client.ts `daemonTickClient`), so it cannot force
+ * *this* daemon process's own tick. The daemon server dispatches
+ * `daemon.tick` against the exact same `runtime` instance its own poll loop
+ * uses (apps/cli/src/daemon-ipc.ts `handleRequest`), so awaiting this call
+ * is a hard guarantee that one real tick has run and completed before this
+ * function resolves.
+ */
+function callDaemonIpc(socketPath, method, params, timeoutMs = 10_000) {
+  return new Promise((resolve, reject) => {
+    const request = {
+      id: `e2e-${method}-${String(Date.now())}`,
+      method,
+      params,
+    };
+    let buffer = '';
+    let settled = false;
+    const socket = net.createConnection(socketPath);
+    const timer = setTimeout(() => {
+      finish(() => {
+        socket.destroy();
+        reject(
+          new Error(
+            `Timed out after ${String(timeoutMs)}ms waiting for a "${method}" response on ${socketPath}`,
+          ),
+        );
+      });
+    }, timeoutMs);
+    function finish(fn) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.removeAllListeners();
+      fn();
+    }
+    socket.on('connect', () => {
+      socket.write(`${JSON.stringify(request)}\n`);
+    });
+    socket.on('data', (chunk) => {
+      buffer += chunk.toString('utf-8');
+      const newline = buffer.indexOf('\n');
+      if (newline === -1) return;
+      const raw = buffer.slice(0, newline);
+      finish(() => {
+        socket.end();
+        let response;
+        try {
+          response = JSON.parse(raw);
+        } catch (error) {
+          reject(
+            new Error(
+              `Could not parse daemon IPC response to "${method}" as JSON: ${raw} (${error instanceof Error ? error.message : String(error)})`,
+            ),
+          );
+          return;
+        }
+        if (response.error) {
+          reject(
+            new Error(
+              `Daemon IPC method "${method}" failed: ${String(response.error)}`,
+            ),
+          );
+          return;
+        }
+        resolve(response.result);
+      });
+    });
+    socket.on('error', (error) => {
+      finish(() => {
+        reject(error instanceof Error ? error : new Error(String(error)));
+      });
+    });
+  });
+}
+
+/**
+ * Retry `fn` up to `attempts` times with `delayMs` between tries. Reserved
+ * for the FIRST CLI invocation that talks to the daemon over the socket
+ * (`session open`): `existsSync(socketPath)` only proves the socket *file*
+ * exists, not that the daemon has finished `listen()` and is ready to
+ * `accept()` a connection — bind-then-listen is not provably atomic across
+ * processes. Every socket call after the first one runs only once this call
+ * has already succeeded once, so it does not need its own retry.
+ */
+async function retryOnce(
+  description,
+  fn,
+  { attempts = 3, delayMs = 500 } = {},
+) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return fn();
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts) {
+        console.warn(
+          `${description}: attempt ${String(attempt)}/${String(attempts)} failed (${error instanceof Error ? error.message : String(error)}); retrying in ${String(delayMs)}ms...`,
+        );
+        await sleep(delayMs);
+      }
+    }
+  }
+  throw lastError;
+}
+
+/**
+ * Print the last `maxLines` of the daemon's captured stdout/stderr directly
+ * to this script's own stdout/stderr. The full log is also written to
+ * `daemonLogPath` for local reruns, but on an ephemeral CI runner the job's
+ * filesystem is gone once it ends — the path alone does not satisfy "a
+ * broken step is diagnosable from CI logs alone" (issue #276 AC2) unless the
+ * content itself is in the log.
+ */
+function printDaemonLogTail(daemonLogChunks, daemonLogPath, maxLines = 100) {
+  const fullLog = Buffer.concat(
+    daemonLogChunks.map((c) => (Buffer.isBuffer(c) ? c : Buffer.from(c))),
+  ).toString('utf-8');
+  const lines = fullLog.length > 0 ? fullLog.split('\n') : [];
+  const tail = lines.slice(-maxLines);
+  console.error(
+    `\n=== daemon log tail (last ${String(tail.length)} of ${String(lines.length)} line(s); full log at ${daemonLogPath}) ===`,
+  );
+  console.error(
+    tail.length > 0 ? tail.join('\n') : '(daemon produced no output)',
+  );
+  console.error('=== end daemon log tail ===\n');
 }
 
 async function main() {
@@ -300,15 +439,66 @@ async function main() {
     },
   );
 
-  const agentmonitorsBin = path.join(
+  // The bin symlink/shim npm generated for the "agentmonitors" name. Both
+  // `@agentmonitors/cli` and the `agentmonitors` launcher package declare
+  // this same bin name, so this path is NOT reliably the launcher — see the
+  // "confirm the bin-name collision" step below. Kept only for that
+  // assertion; every CLI invocation in this script instead goes through
+  // `launcherEntryPoint`.
+  const agentmonitorsBinSymlink = path.join(
     npmPrefixDir,
     process.platform === 'win32' ? 'agentmonitors.cmd' : 'bin/agentmonitors',
   );
-  if (!existsSync(agentmonitorsBin)) {
+  if (!existsSync(agentmonitorsBinSymlink)) {
     throw new Error(
-      `Expected the global install to produce a binary at ${agentmonitorsBin}, but it does not exist.`,
+      `Expected the global install to produce a binary at ${agentmonitorsBinSymlink}, but it does not exist.`,
     );
   }
+
+  // The `agentmonitors` launcher package's OWN installed entry point (its
+  // `bin/agentmonitors.cjs`, which does `require.resolve('@agentmonitors/cli/package.json')`
+  // and re-execs into it). Invoking this file directly — rather than the
+  // possibly-collided bin symlink above — is what actually exercises that
+  // require.resolve indirection under a real global nested-node_modules
+  // layout, which is the entire point of this test (issue #276).
+  const launcherEntryPoint = resolveInstalledPackageFile(
+    npmPrefixDir,
+    'agentmonitors',
+    'bin',
+    'agentmonitors.cjs',
+  );
+  if (!existsSync(launcherEntryPoint)) {
+    throw new Error(
+      `Expected the global install to place the agentmonitors launcher package's own entry point at ${launcherEntryPoint}, but it does not exist.`,
+    );
+  }
+
+  await step(
+    'confirm the bin-name collision this test routes around (both @agentmonitors/cli and the agentmonitors launcher declare a "agentmonitors" bin)',
+    () => {
+      if (process.platform === 'win32') {
+        console.log(
+          'Skipping the readlink assertion on win32: npm places a generated .cmd/.ps1 shim there instead of a symlink, so there is nothing to readlink. Every invocation below still runs the launcher entry point directly, independent of this platform difference.',
+        );
+        return;
+      }
+      const target = readlinkSync(agentmonitorsBinSymlink);
+      if (!target.includes(path.join('@agentmonitors', 'cli'))) {
+        throw new Error(
+          `Expected npm's global "agentmonitors" bin symlink to resolve into @agentmonitors/cli — installing both it and the "agentmonitors" launcher package in one "npm install --global" makes npm link the "agentmonitors" bin name to whichever package sorts first ("@" sorts before "a", so @agentmonitors/cli always wins) — but it points at: ${target}. This assertion exists so that if npm's tie-break behavior ever changes, this test fails loudly rather than silently going back to testing the CLI's own bin directly. Every invocation below deliberately runs the launcher package's own installed entry point (${launcherEntryPoint}) via \`node <path>\`, specifically to exercise the launcher's require.resolve indirection.`,
+        );
+      }
+      console.log(
+        `Confirmed: the global "agentmonitors" bin symlink resolves to @agentmonitors/cli (${target}), not the agentmonitors launcher package — exactly the collision this test routes around by invoking ${launcherEntryPoint} directly.`,
+      );
+    },
+  );
+
+  /** Run the installed launcher's own entry point (never the possibly-collided
+   * bin symlink) — see the module doc comment and the bin-collision step
+   * above for why. */
+  const runLauncher = (args, options = {}) =>
+    run(process.execPath, [launcherEntryPoint, ...args], options);
 
   await step(
     'sanity-check the installed CLI reports this build (not a stale global install)',
@@ -319,9 +509,7 @@ async function main() {
           'utf-8',
         ),
       );
-      const versionResult = run(agentmonitorsBin, ['--version'], {
-        env: installEnv,
-      });
+      const versionResult = runLauncher(['--version'], { env: installEnv });
       const installedVersion = versionResult.stdout.trim();
       if (installedVersion !== localCliPackageJson.version) {
         throw new Error(
@@ -333,8 +521,7 @@ async function main() {
   );
 
   const cliEnv = { ...process.env, HOME: fakeHome };
-  const runCli = (args) =>
-    run(agentmonitorsBin, args, { cwd: projectDir, env: cliEnv });
+  const runCli = (args) => runLauncher(args, { cwd: projectDir, env: cliEnv });
 
   await step('enable the project (agentmonitors init --enable-only)', () => {
     runCli(['init', '--enable-only']);
@@ -396,8 +583,9 @@ async function main() {
       'start the daemon (explicit socket, no idle reap, fast poll)',
       () => {
         const child = spawn(
-          agentmonitorsBin,
+          process.execPath,
           [
+            launcherEntryPoint,
             'daemon',
             'run',
             '.claude/monitors',
@@ -441,19 +629,27 @@ async function main() {
     );
 
     const hostSessionId = `e2e-fresh-install-hooks-${String(process.pid)}`;
-    const sessionId = await step('open a lead session', () => {
-      const result = runCli([
-        'session',
-        'open',
-        '--host-session-id',
-        hostSessionId,
-        '--workspace',
-        projectDir,
-        '--socket',
-        socketPath,
-        '--format',
-        'id',
-      ]);
+    // `existsSync(socketPath)` above only proves the socket *file* exists,
+    // not that the daemon has finished `listen()` and is ready to `accept()`
+    // — bind-then-listen is not provably atomic cross-process. This is the
+    // FIRST CLI call over the socket, so it gets a short retry; every later
+    // socket call in this script runs only after this one already
+    // succeeded, so none of them need their own retry.
+    const sessionId = await step('open a lead session', async () => {
+      const result = await retryOnce('session open', () =>
+        runCli([
+          'session',
+          'open',
+          '--host-session-id',
+          hostSessionId,
+          '--workspace',
+          projectDir,
+          '--socket',
+          socketPath,
+          '--format',
+          'id',
+        ]),
+      );
       const id = result.stdout.trim();
       if (id.length === 0) {
         throw new Error(
@@ -464,13 +660,27 @@ async function main() {
     });
     console.log(`AgentMon session id: ${sessionId}`);
 
-    await step('touch the watched file', async () => {
-      // Give the daemon at least one tick to baseline before the change, so
-      // the write is unambiguously observed as a *change* rather than racing
-      // the monitor's first observation.
-      await sleep(1_500);
-      writeFileSync(watchedFilePath, 'second\n', 'utf-8');
-    });
+    await step(
+      'force a deterministic baseline tick via daemon.tick, then touch the watched file',
+      async () => {
+        // Force a real tick on the already-running daemon through the
+        // `daemon.tick` IPC method (docs/specs/002-runtime-delivery.md
+        // §10.5) instead of sleeping and hoping the daemon's own --poll-ms
+        // interval baselines the file first. Awaiting this call is a hard
+        // guarantee the baseline fingerprint has been recorded before the
+        // file is mutated below — a fixed sleep instead races the daemon's
+        // poll loop and is flaky under a slow CI runner: if the write lands
+        // before the daemon's first tick, that write becomes the *baseline*
+        // rather than a *change*, no event is ever emitted, and the run
+        // times out 20s later with a misleading "no watch-file event yet"
+        // detail instead of a clear cause.
+        await callDaemonIpc(socketPath, 'daemon.tick', {
+          monitorsDir: '.claude/monitors',
+          workspacePath: projectDir,
+        });
+        writeFileSync(watchedFilePath, 'second\n', 'utf-8');
+      },
+    );
 
     const eventCreatedAt = Date.now();
     await step(
@@ -522,11 +732,13 @@ async function main() {
         waitFor(
           'hook deliver to return a non-empty hookSpecificOutput.additionalContext',
           () => {
-            const result = runWithStdin(
-              agentmonitorsBin,
+            const result = runLauncher(
               ['hook', 'deliver', '--socket', socketPath],
-              hookPayload,
-              { cwd: projectDir, env: cliEnv },
+              {
+                input: hookPayload,
+                cwd: projectDir,
+                env: cliEnv,
+              },
             );
             const stdout = result.stdout.trim();
             if (stdout.length === 0) {
@@ -602,10 +814,17 @@ async function main() {
         }
       },
     );
+  } catch (error) {
+    // Any failure between daemon start and here is only diagnosable from CI
+    // logs alone (issue #276 AC2) if the daemon's own captured output is
+    // actually printed — the daemonLogPath below is unrecoverable once an
+    // ephemeral CI runner's job ends.
+    printDaemonLogTail(daemonLogChunks, daemonLogPath);
+    throw error;
   } finally {
     if (daemon) {
       try {
-        run(agentmonitorsBin, ['daemon', 'stop', '--socket', socketPath], {
+        runLauncher(['daemon', 'stop', '--socket', socketPath], {
           cwd: projectDir,
           env: cliEnv,
         });

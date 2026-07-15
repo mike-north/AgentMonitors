@@ -80,7 +80,12 @@ real, documented delivery transport. This surface closes that gap for the **hook
 ([006 §5](./006-agent-integration.md)) — a global install of the packed `agentmonitors` launcher
 into an isolated npm prefix with no workspace `node_modules` access, project bootstrap via
 `agentmonitors init`, a `file-fingerprint` monitor firing, and `agentmonitors hook deliver` fed a
-real Claude Code `UserPromptSubmit` stdin payload.
+real Claude Code `UserPromptSubmit` stdin payload. Because `@agentmonitors/cli` and the
+`agentmonitors` launcher package both declare a `agentmonitors` bin, installing them together makes
+npm link that bin name to whichever package sorts first (`@agentmonitors/cli` always wins) — so
+every CLI invocation in this surface runs the launcher package's own installed entry point directly
+rather than that bin symlink, which is what actually exercises the launcher's `require.resolve`
+indirection under a real global install.
 
 **Verified in:** `scripts/test-e2e-fresh-install-hooks.mjs` (`pnpm test:e2e-fresh-install-hooks`,
 wired into CI per-PR). The MCP/channel transport ([006 §4](./006-agent-integration.md)) has no
