@@ -22,7 +22,7 @@ import type {
   ObservationResult,
   ObservationSource,
 } from '../observation/types.js';
-import { validateScope } from '../schema/validate-scope.js';
+import { validateScope, validateWatchScope } from '../schema/validate-scope.js';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import { RuntimeStore } from './store.js';
 import { AgentMonitorRuntime } from './service.js';
@@ -60,6 +60,43 @@ const ephemeralSource: ObservationSource = {
   },
 };
 
+/**
+ * A deterministic ephemeral source whose `observe()` runs a caller-supplied
+ * side-effect BEFORE returning its observation — used to inject a reap that
+ * races an in-flight tick (a `watch cancel` / session close arriving while the
+ * daemon is mid-`observe()`, 007 §4.4). `name` lets a test register several.
+ */
+function raceEphemeralSource(
+  name: string,
+  onObserve: () => void,
+): ObservationSource {
+  return {
+    name,
+    scopeSchema: {
+      type: 'object',
+      properties: { target: { type: 'string' } },
+      required: ['target'],
+    },
+    observe(
+      config: Record<string, unknown>,
+      context: ObservationContext,
+    ): Promise<ObservationResult> {
+      onObserve();
+      const target = String(config['target']);
+      return Promise.resolve({
+        observations: [
+          {
+            title: `changed: ${target}`,
+            summary: `changed: ${target}`,
+            snapshotText: `state@${context.now.toISOString()}`,
+            objectKey: target,
+          },
+        ],
+      });
+    },
+  };
+}
+
 const tempDirs: string[] = [];
 
 afterEach(() => {
@@ -72,6 +109,7 @@ afterEach(() => {
 interface Harness {
   runtime: AgentMonitorRuntime;
   store: RuntimeStore;
+  registry: SourceRegistry;
   workspace: string;
   monitorsDir: string;
 }
@@ -97,7 +135,22 @@ function makeHarness(
   // evaluated.
   const monitorsDir = path.join(workspace, '.claude', 'monitors');
   mkdirSync(monitorsDir, { recursive: true });
-  return { runtime, store, workspace, monitorsDir };
+  return { runtime, store, registry, workspace, monitorsDir };
+}
+
+/** Open a subagent (non-lead) session in `workspace`. */
+function openSubagent(
+  runtime: AgentMonitorRuntime,
+  workspace: string,
+  host: string,
+) {
+  return runtime.openSession(
+    claudeCodeAdapter.createSessionInput({
+      hostSessionId: host,
+      workspacePath: workspace,
+      role: 'subagent',
+    }),
+  );
 }
 
 function openLead(
@@ -197,6 +250,94 @@ describe('ephemeral monitors — declaration (007 §4.2)', () => {
         scope: { target: 'foo' },
       }),
     ).toThrow(/dormant/);
+  });
+
+  it('rejects a declaration bound to a non-lead (subagent) session, which could never deliver', () => {
+    const workspace = mkdtempSync(path.join(tmpdir(), 'am-eph-subagent-'));
+    tempDirs.push(workspace);
+    const { runtime } = makeHarness(':memory:', workspace);
+    // Projection is lead-only (007 §4.6); a subagent-bound monitor would observe
+    // forever but never deliver, so the declaration MUST be rejected up front.
+    const subagent = openSubagent(runtime, workspace, 'host-subagent');
+    expect(subagent.role).toBe('subagent');
+
+    expect(() =>
+      runtime.declareEphemeralMonitor({
+        sessionId: subagent.id,
+        source: 'test-ephemeral',
+        scope: { target: 'foo' },
+      }),
+    ).toThrow(/subagent|lead/);
+    expect(runtime.listEphemeralMonitors(subagent.id)).toHaveLength(0);
+  });
+
+  it('does not let a scope key named `type` override the resolved source (Copilot 3588930165)', async () => {
+    const workspace = mkdtempSync(path.join(tmpdir(), 'am-eph-scopetype-'));
+    tempDirs.push(workspace);
+    const { runtime, monitorsDir } = makeHarness(':memory:', workspace);
+    const session = openLead(runtime, workspace, 'host-scopetype');
+
+    // A stray `type: 'schedule'` in the scope must NOT hijack the source. If it
+    // did, the monitor's watch.type would become `schedule`, `scheduleForMonitor`
+    // would look for a never-supplied cron, and the monitor would starve (never
+    // fire). The declared source `test-ephemeral` must win.
+    const record = runtime.declareEphemeralMonitor({
+      sessionId: session.id,
+      source: 'test-ephemeral',
+      scope: { target: 'foo', type: 'schedule' },
+    });
+    expect(record.sourceName).toBe('test-ephemeral');
+
+    const result = await runtime.tick(monitorsDir, workspace);
+    // Fired on the normal tick (proving it was scheduled as `test-ephemeral`, not
+    // starved as a cron-less `schedule`).
+    expect(result.emittedEventIds).toHaveLength(1);
+    const [event] = runtime.listEvents({ sessionId: session.id });
+    expect(event?.sourceName).toBe('test-ephemeral');
+  });
+
+  it('rejects a keyed-collection scope identically to `validate` via the shared validateWatchScope path (Copilot: scope parity)', () => {
+    const workspace = mkdtempSync(path.join(tmpdir(), 'am-eph-collection-'));
+    tempDirs.push(workspace);
+    const { runtime } = makeHarness(':memory:', workspace);
+    const session = openLead(runtime, workspace, 'host-collection');
+
+    // A `change-detection.collection` block without `strategy: json-diff` is the
+    // BP3 (003 §12) case `agentmonitors validate` reports with a friendly wrapper.
+    // The ephemeral declare path MUST reject it with the IDENTICAL diagnosis — the
+    // shared `validateWatchScope` helper is what makes the 005 §14.4 parity claim
+    // true (a plain `validateScope` would miss this wrapper).
+    const collectionScope = {
+      target: 'foo',
+      'change-detection': { collection: { key: 'id' } },
+    };
+    const parityErrors = validateWatchScope(
+      collectionScope,
+      ephemeralSource.scopeSchema,
+    );
+    expect(
+      parityErrors.some((message) =>
+        message.includes(
+          'change-detection.collection requires strategy: json-diff',
+        ),
+      ),
+    ).toBe(true);
+
+    let thrown: Error | undefined;
+    try {
+      runtime.declareEphemeralMonitor({
+        sessionId: session.id,
+        source: 'test-ephemeral',
+        scope: collectionScope,
+      });
+    } catch (error) {
+      thrown = error as Error;
+    }
+    expect(thrown).toBeDefined();
+    for (const message of parityErrors) {
+      expect(thrown?.message).toContain(message);
+    }
+    expect(runtime.listEphemeralMonitors(session.id)).toHaveLength(0);
   });
 });
 
@@ -418,6 +559,113 @@ describe('ephemeral monitors — lifecycle (007 §4.4, criterion 3)', () => {
     expect(store.getSessionById(session.id).status).toBe('active');
     expect(runtime.listEphemeralMonitors(session.id)).toHaveLength(1);
   });
+
+  it('retains already-materialized events + projections after a post-tick reap (007 §4.4 retention)', async () => {
+    const workspace = mkdtempSync(path.join(tmpdir(), 'am-eph-retain-'));
+    tempDirs.push(workspace);
+    const { runtime, store, monitorsDir } = makeHarness(':memory:', workspace);
+    const session = openLead(runtime, workspace, 'host-retain');
+    const record = runtime.declareEphemeralMonitor({
+      sessionId: session.id,
+      source: 'test-ephemeral',
+      scope: { target: 'foo' },
+    });
+
+    // Tick FIRST so an event materializes and projects, THEN reap — unlike the
+    // reap-before-any-tick tests above, this exercises whether the retention
+    // guarantee actually holds for a real, materialized event.
+    const result = await runtime.tick(monitorsDir, workspace);
+    expect(result.emittedEventIds).toHaveLength(1);
+    const eventId = result.emittedEventIds[0];
+    // A scoped read joins session_event_state, so a hit proves BOTH the
+    // monitor_events row and its projection exist.
+    expect(runtime.listEvents({ sessionId: session.id })).toHaveLength(1);
+
+    runtime.closeSession(session.id);
+    expect(store.findEphemeralMonitorById(record.id)?.status).toBe('reaped');
+
+    // Retained (007 §4.4): the monitor_events row and the session_event_state
+    // projection both survive the reap — a late delivery is never dropped (PP1).
+    expect(store.getEventById(eventId).id).toBe(eventId);
+    expect(runtime.listEvents({ sessionId: session.id })).toHaveLength(1);
+  });
+
+  it('does NOT project when a session close races an in-flight tick (reap-during-observe)', async () => {
+    const workspace = mkdtempSync(path.join(tmpdir(), 'am-eph-race-close-'));
+    tempDirs.push(workspace);
+    const { runtime, store, registry, monitorsDir } = makeHarness(
+      ':memory:',
+      workspace,
+    );
+    const declaring = openLead(runtime, workspace, 'host-race-close');
+    // The source closes the declaring session DURING observe() — modelling a
+    // `session close` on another socket that arrives after the tick pre-fetched
+    // the active monitor but before the observation is materialized (007 §4.4).
+    let closed = false;
+    registry.register(
+      raceEphemeralSource('race-close', () => {
+        if (!closed) {
+          closed = true;
+          runtime.closeSession(declaring.id);
+        }
+      }),
+    );
+    runtime.declareEphemeralMonitor({
+      sessionId: declaring.id,
+      source: 'race-close',
+      scope: { target: 'foo' },
+    });
+
+    await runtime.tick(monitorsDir, workspace);
+
+    // The session went dormant and its monitor was reaped mid-tick, so the raced
+    // observation projects into NOBODY (no unread row for the closed session).
+    expect(store.getSessionById(declaring.id).status).toBe('dormant');
+    expect(runtime.listEvents({ sessionId: declaring.id })).toHaveLength(0);
+    expect(
+      runtime.listEvents({ sessionId: declaring.id, unreadOnly: true }),
+    ).toHaveLength(0);
+  });
+
+  it('does NOT project when a `watch cancel` races an in-flight tick, even though the session stays active', async () => {
+    const workspace = mkdtempSync(path.join(tmpdir(), 'am-eph-race-cancel-'));
+    tempDirs.push(workspace);
+    const { runtime, store, registry, monitorsDir } = makeHarness(
+      ':memory:',
+      workspace,
+    );
+    const owner = openLead(runtime, workspace, 'host-race-cancel');
+    // The source cancels the ephemeral monitor DURING observe() — the session
+    // stays active, so ONLY the insert-time monitor-status re-check (not a session
+    // filter) can stop delivery for this reaped watch (007 §4.4). The id is not
+    // known until after `declare` returns, but the source must be registered
+    // before `declare` validates it — a mutable holder bridges the two.
+    const raceCtx: { ephemeralId?: string; cancelled: boolean } = {
+      cancelled: false,
+    };
+    registry.register(
+      raceEphemeralSource('race-cancel', () => {
+        if (!raceCtx.cancelled && raceCtx.ephemeralId) {
+          raceCtx.cancelled = true;
+          runtime.cancelEphemeralMonitor(owner.id, raceCtx.ephemeralId);
+        }
+      }),
+    );
+    const record = runtime.declareEphemeralMonitor({
+      sessionId: owner.id,
+      source: 'race-cancel',
+      scope: { target: 'foo' },
+    });
+    raceCtx.ephemeralId = record.id;
+
+    await runtime.tick(monitorsDir, workspace);
+
+    // The session is still active, but the cancelled (reaped) watch must not
+    // deliver the observation that raced its cancel.
+    expect(store.getSessionById(owner.id).status).toBe('active');
+    expect(store.findEphemeralMonitorById(record.id)?.status).toBe('reaped');
+    expect(runtime.listEvents({ sessionId: owner.id })).toHaveLength(0);
+  });
 });
 
 describe('ephemeral monitors — projection isolation (007 §4.6, criterion 4)', () => {
@@ -446,6 +694,68 @@ describe('ephemeral monitors — projection isolation (007 §4.6, criterion 4)',
     expect(
       runtime.listEvents({ sessionId: sibling.id, unreadOnly: true }),
     ).toHaveLength(0);
+  });
+
+  it('never surfaces a session’s ephemeral event on a sibling’s UNSCOPED read (007 §4.6 read isolation)', async () => {
+    const workspace = mkdtempSync(path.join(tmpdir(), 'am-eph-unscoped-'));
+    tempDirs.push(workspace);
+    const { runtime, store, monitorsDir } = makeHarness(':memory:', workspace);
+    const declaring = openLead(runtime, workspace, 'host-unscoped-decl');
+    // A sibling lead session exists but must never see the private instruction.
+    openLead(runtime, workspace, 'host-unscoped-sibling');
+
+    runtime.declareEphemeralMonitor({
+      sessionId: declaring.id,
+      source: 'test-ephemeral',
+      scope: { target: 'secret' },
+      instruction:
+        'PRIVATE: rotate the leaked token before anyone else sees it',
+    });
+    const result = await runtime.tick(monitorsDir, workspace);
+    expect(result.emittedEventIds).toHaveLength(1);
+
+    // An UNSCOPED read (no sessionId — what `events list` without --session runs)
+    // bypasses the projection gate, so it MUST exclude ephemeral-monitor events:
+    // neither the ephemeral monitor id nor its private instruction body leaks.
+    const unscoped = runtime.listEvents({});
+    expect(
+      unscoped.some((event) => event.monitorId.startsWith('ephemeral:')),
+    ).toBe(false);
+    expect(unscoped.some((event) => event.body.includes('PRIVATE'))).toBe(
+      false,
+    );
+
+    // The declaring session STILL reads its own ephemeral event via its scoped
+    // read — the exclusion is unscoped-only, not a data loss.
+    expect(runtime.listEvents({ sessionId: declaring.id })).toHaveLength(1);
+
+    // Control: a PERSISTENT event is still returned on the same unscoped read, so
+    // the exclusion is ephemeral-scoped and does not hide ordinary events.
+    store.insertEvent({
+      workspacePath: workspace,
+      monitorId: 'persistent-monitor',
+      sourceName: 'test-ephemeral',
+      urgency: 'normal',
+      title: 'shared',
+      body: 'shared-body',
+      summary: 'shared',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey: 'shared',
+      baselineStrategy: null,
+      queryScope: {},
+      tags: [],
+      createdAt: new Date('2026-01-01T00:00:00.000Z'),
+    });
+    const unscopedAfter = runtime.listEvents({});
+    expect(
+      unscopedAfter.some((event) => event.monitorId === 'persistent-monitor'),
+    ).toBe(true);
+    expect(
+      unscopedAfter.some((event) => event.monitorId.startsWith('ephemeral:')),
+    ).toBe(false);
   });
 
   it('does not restrict a persistent (non-ephemeral) event, which still reaches every lead session', () => {

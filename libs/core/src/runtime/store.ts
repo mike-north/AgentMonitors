@@ -8,6 +8,7 @@ import {
   isNull,
   lte,
   ne,
+  notLike,
   or,
   sql,
 } from 'drizzle-orm';
@@ -35,6 +36,7 @@ import {
   sessionEventState,
   sessionObjectCursor,
 } from '../inbox/schema.js';
+import { EPHEMERAL_MONITOR_ID_PREFIX } from './types.js';
 import type {
   AgentSessionRecord,
   EphemeralMonitorRecord,
@@ -723,6 +725,17 @@ export class RuntimeStore {
     const artifact = event.snapshotText;
     const objectKey = event.objectKey;
     const projectedSessionIds: string[] = [];
+    // Reap race (007 §4.4): a tick pre-fetches the active ephemeral monitors, then
+    // `await source.observe()` yields; a concurrent `watch cancel` on another
+    // socket can reap THIS monitor while the session stays active (session-close
+    // dormancy is caught by the `status === 'active'` session filter below, but a
+    // bare cancel is not). Re-check the ephemeral monitor's status at insert time
+    // so an in-flight observation from a just-reaped watch projects to nobody —
+    // "reaping stops further observation / delivery." Only the ephemeral path
+    // (restrictToSessionId set) is re-checked; a persistent event is unaffected.
+    const ephemeralStillActive =
+      options?.restrictToSessionId === undefined ||
+      this.findEphemeralMonitorById(event.monitorId)?.status === 'active';
     // Projection target (002 §6). For a persistent monitor, every matching LEAD
     // session (workspace match or global). For an EPHEMERAL monitor (007 §4.6),
     // projection is restricted to the DECLARING session ONLY — its events must
@@ -730,15 +743,18 @@ export class RuntimeStore {
     // isolation invariant). `restrictToSessionId` names that session; it is still
     // filtered to a lead role (the declaring session is a lead by construction,
     // 007 §4.6), so a stray non-lead binding projects to nobody rather than
-    // leaking.
-    const projectionTargets = this.sessionsForWorkspace(
-      event.workspacePath,
-    ).filter(
-      (candidate) =>
-        candidate.role === 'lead' &&
-        (options?.restrictToSessionId === undefined ||
-          candidate.id === options.restrictToSessionId),
-    );
+    // leaking. The declaring session must also still be `active`: a session reaped
+    // mid-tick (its close raced this observation) must not receive a projection
+    // (007 §4.4). The event row itself is still retained for durability.
+    const projectionTargets = ephemeralStillActive
+      ? this.sessionsForWorkspace(event.workspacePath).filter(
+          (candidate) =>
+            candidate.role === 'lead' &&
+            (options?.restrictToSessionId === undefined ||
+              (candidate.id === options.restrictToSessionId &&
+                candidate.status === 'active')),
+        )
+      : [];
     for (const session of projectionTargets) {
       // ── Per-recipient Diff (G10, 002 §1.1.2) ──────────────────────────────
       // Compute this session's delta against ITS OWN baseline cursor, and seed
@@ -1018,7 +1034,24 @@ export class RuntimeStore {
       : asInternalDb(this.db)
           .select()
           .from(monitorEvents)
-          .where(conditions.length > 0 ? and(...conditions) : undefined)
+          // Ephemeral-monitor events (007 §4.6 isolation) must NEVER surface on an
+          // unscoped (session-less) read: their body is the declaring session's
+          // private free-text instruction, and this branch bypasses the
+          // per-session projection gate that keeps them scoped. A sibling session
+          // could otherwise read another session's ephemeral event. They remain
+          // fully readable via the declaring session's session-scoped path above
+          // (query.sessionId set). Persistent-monitor events are unaffected. The
+          // `ephemeral:` id prefix is reserved (007 §4.3) so a persistent id can
+          // never match this predicate.
+          .where(
+            and(
+              notLike(
+                monitorEvents.monitorId,
+                `${EPHEMERAL_MONITOR_ID_PREFIX}%`,
+              ),
+              ...conditions,
+            ),
+          )
           .orderBy(desc(monitorEvents.createdAt))
           .all()
           .map(rowToEvent);
@@ -1250,7 +1283,15 @@ export class RuntimeStore {
     const conditions = [
       query.monitorId
         ? eq(observationHistory.monitorId, query.monitorId)
-        : undefined,
+        : // Unscoped enumeration (no monitorId) must not leak another session's
+          // ephemeral-monitor audit rows — the ephemeral id embeds the declaring
+          // session and its observation counts would cross session boundaries
+          // (007 §4.6). A monitorId-targeted query (used by `monitor explain` /
+          // doctor / reminder diagnosis) is a deliberate lookup and is unaffected.
+          notLike(
+            observationHistory.monitorId,
+            `${EPHEMERAL_MONITOR_ID_PREFIX}%`,
+          ),
       query.workspacePath !== undefined
         ? eq(observationHistory.workspacePath, query.workspacePath)
         : undefined,

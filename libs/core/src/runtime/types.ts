@@ -54,6 +54,18 @@ export interface AgentSessionRecord {
 export type EphemeralMonitorStatus = 'active' | 'reaped';
 
 /**
+ * Reserved id prefix for ephemeral (agent-declared) monitors (007 §4.3). Every
+ * ephemeral id is `ephemeral:<sessionId>/<ulid>` — it always contains a `/`,
+ * which a directory-derived persistent monitor id (a single path segment) never
+ * can, so an ephemeral id is structurally incapable of colliding with a
+ * persistent one (SP2). The prefix keeps `monitor_events.monitor_id`,
+ * `monitor explain`, and `queryScope` filtering unambiguously namespaced, and
+ * lets a store-level query recognise an ephemeral event by its `monitor_id`
+ * alone (e.g. to keep an ephemeral event out of an unscoped read, 007 §4.6).
+ */
+export const EPHEMERAL_MONITOR_ID_PREFIX = 'ephemeral:';
+
+/**
  * A durable ephemeral-monitor record (007 §4): an agent-declared, session-scoped
  * monitor stored in the daemon's durable store so it survives a restart while the
  * declaring session lives (007 §4.4). `id` is the namespaced runtime identity
@@ -70,7 +82,14 @@ export interface EphemeralMonitorRecord {
   urgency: Urgency;
   /** The authored urgency band's high bound (equals `urgency` for a scalar). */
   urgencyMax: Urgency;
-  /** Free-text handling guidance surfaced verbatim on delivery as the body. */
+  /**
+   * Free-text handling guidance — the monitor's body-instructions (007 §4.2),
+   * mirroring a persistent monitor's markdown body. It is used as the delivered
+   * event body (`DeliveryEventSummary.body`, 002 §9.1) only as a **fallback**:
+   * an observation that carries its own `body` overrides it
+   * (`observation.body ?? monitor.instructions`), so it is not always what is
+   * surfaced on delivery.
+   */
   instruction: string;
   displayName?: string;
   status: EphemeralMonitorStatus;

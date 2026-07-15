@@ -1418,10 +1418,13 @@ Declares an **ephemeral, session-scoped** monitor on the same daemon/pipeline as
 `MONITOR.md` monitor (AP7, [007 §4](./007-agent-facing-interaction.md)) — "tell me when _X_, and
 remind me of _this instruction_ when it does." `<source>` is a registered source name; `--scope` is
 the source config as either `key=value,...` (scalar-valued) or a JSON object (for array/nested/typed
-scopes, e.g. `--scope '{"globs":["src/**"]}'`). The scope is validated by the **same** `validateScope`
-path as `agentmonitors validate` (§3), so an ephemeral monitor cannot express a config a persistent
-one could not (an invalid scope is rejected with the identical diagnosis). `--session` is the
-declaring AgentMon session id; an unbindable declaration is **rejected**, never silently made global.
+scopes, e.g. `--scope '{"globs":["src/**"]}'`). The scope is validated by the **same** shared core
+helper (`validateWatchScope` — the `validateScope` schema check plus the BP3
+`change-detection.collection` friendly wrapper) as `agentmonitors validate` (§3), so an ephemeral
+monitor cannot express a config a persistent one could not, and an invalid scope is rejected with the
+identical diagnosis (including the keyed-collection case). `--session` is the declaring AgentMon
+session id and **MUST** name a **lead** session; an unbindable or non-lead declaration is
+**rejected**, never silently made global (its events would never deliver — [007 §4.6](./007-agent-facing-interaction.md)).
 The declaration **performs no watching**: it registers intent and returns; the daemon does all
 observation/scheduling/notify/persist/project/deliver (PP9/PP10). Its events project into the
 **declaring session only**, never a sibling lead session in the same workspace

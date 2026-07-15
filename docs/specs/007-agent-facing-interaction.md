@@ -178,8 +178,10 @@ computes a textual diff of one observed object **between two stored points in ti
 > `cancelEphemeralMonitor`, `ephemeralRecordToMonitor`, `reapDormantSessions`, the ephemeral pass of
 > `tick()` via `evaluateMonitorOnTick`, and reap-on-`closeSession`) ·
 > `libs/core/src/runtime/store.ts` (`insertEphemeralMonitor`, `listActiveEphemeralMonitors`,
-> `listEphemeralMonitorsForSession`, `reapEphemeralMonitor(sForSession)`, `staleActiveSessions`, and
-> the `restrictToSessionId` projection gate in `insertEvent`) ·
+> `listEphemeralMonitorsForSession`, `reapEphemeralMonitor`, `reapEphemeralMonitorsForSession`,
+> `staleActiveSessions`, and the `restrictToSessionId` projection gate in `insertEvent` — which also
+> re-checks the ephemeral monitor is still `active` at insert so a `watch cancel`/close that races an
+> in-flight tick projects nothing, and keeps ephemeral events out of an unscoped `listEvents`) ·
 > `apps/cli/src/commands/watch.ts` + `apps/cli/src/daemon-ipc.ts` (`watch.declare|list|cancel`) ·
 > `libs/core/src/runtime/ephemeral-monitors.test.ts` and the
 > `describe('ephemeral monitors: watch declare/list/cancel (007 §4 / 005 §14.4)')` suite in
@@ -208,12 +210,19 @@ me when _X_, and remind me of _this instruction_ when it does."** A declaration:
 validate` ([004 §2.2](./004-validation-testing.md)), so an ephemeral monitor cannot express a config a
   persistent monitor could not (AP4, BP3);
 - **MAY** carry an `urgency` (default `normal`, matching persistent monitors) and an
-  **instruction** — free-text handling guidance that becomes the monitor's body, surfaced verbatim
-  on delivery as `DeliveryEventSummary.body` ([002 §9.1](./002-runtime-delivery.md)) so the reminder
-  arrives with the agent's own instruction attached;
+  **instruction** — free-text handling guidance that becomes the monitor's body (the ephemeral
+  equivalent of a persistent monitor's markdown body). It is surfaced on delivery as
+  `DeliveryEventSummary.body` ([002 §9.1](./002-runtime-delivery.md)) as a **fallback**: an
+  observation that carries its own `body` overrides it (`observation.body ?? monitor.instructions`),
+  so the reminder arrives with the agent's own instruction attached unless the source supplied a more
+  specific body;
 - **MUST** bind to a resolved AgentMon session (the declaring session, resolved by the adapter's
   session-identity mechanism, [006 §11](./006-agent-integration.md)); an unbindable declaration
-  **MUST** be rejected, not silently made global.
+  **MUST** be rejected, not silently made global. The bound session **MUST** be a **lead** session:
+  projection delivers to lead sessions only (§4.6, [002 §6](./002-runtime-delivery.md)), so a binding
+  to a subagent session would observe forever but never deliver — a silently-dead watch. A declaration
+  against a non-lead session **MUST** be rejected at declaration time with a clear error, not
+  registered.
 
 The declaration performs **no watching**: it registers intent and returns. The daemon does all
 subsequent observation, scheduling, notify timing, persistence, projection, and delivery (§4.5).
@@ -289,6 +298,21 @@ delivery path. Because the declaring session is (by construction) a lead session
 ([002 §6](./002-runtime-delivery.md)) delivers its events to that session; ephemeral events **MUST
 NOT** project into other sessions merely because they share a workspace (they are scoped to the
 declaring session).
+
+The isolation is a **read** invariant as well as a projection one: an ephemeral monitor's
+instruction is the declaring session's private free-text guidance, so its events **MUST NOT** be
+returned by an **unscoped** (session-less) read that bypasses the projection gate — `events list`
+without a session, and the equivalent observation-history enumeration. An unscoped read **MUST**
+exclude ephemeral-monitor rows (recognisable by the reserved `ephemeral:` id prefix, §4.3); the
+declaring session still reads its own ephemeral events through its **session-scoped** read.
+Persistent-monitor reads are unaffected.
+
+An in-flight tick **MUST NOT** deliver for a reaped watch: because a tick pre-fetches its active
+ephemeral monitors before `observe()` yields, a `watch cancel` (or session close/dormancy) that
+races the observation could otherwise still project into the (possibly still-active) declaring
+session. Delivery therefore re-checks, at materialization/insert time, that the ephemeral monitor is
+still `active` and its declaring session is still `active`; if either has been reaped, the observed
+event is retained (§4.4) but projected to **nobody**.
 
 ### 4.7 Composition with dependent chains and per-binding fan-out
 

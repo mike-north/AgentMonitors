@@ -5,7 +5,7 @@ import { writePrivateFileAtomic } from '../security/local-permissions.js';
 import { scanMonitors } from '../parser/scan-monitors.js';
 import type { MonitorDefinition, Urgency } from '../schema/types.js';
 import { monitorFrontmatterSchema } from '../schema/monitor-schema.js';
-import { validateScope } from '../schema/validate-scope.js';
+import { validateScope, validateWatchScope } from '../schema/validate-scope.js';
 import { parseDuration } from '../notify/notifier.js';
 import type {
   Observation,
@@ -64,6 +64,7 @@ import type {
 } from './types.js';
 import {
   defaultNotifyConfigForUrgency,
+  EPHEMERAL_MONITOR_ID_PREFIX,
   type NotifyDispatchResult,
   type NotifyRuntimeState,
   type DeliveryLifecycle,
@@ -74,16 +75,6 @@ const DEFAULT_FILE_FINGERPRINT_POLL_MS = 30_000;
 const DEFAULT_API_POLL_MS = 300_000;
 const DEFAULT_HIGH_URGENCY_SETTLE_MS = 15_000;
 const MAX_RECAP_EVENTS = 10;
-
-/**
- * Reserved id prefix for ephemeral (agent-declared) monitors (007 §4.3). Every
- * ephemeral id is `ephemeral:<sessionId>/<ulid>` — it always contains a `/`,
- * which a directory-derived persistent monitor id (a single path segment) never
- * can, so an ephemeral id is structurally incapable of colliding with a
- * persistent one (SP2). The prefix keeps `monitor_events.monitor_id`,
- * `monitor explain`, and `queryScope` filtering unambiguously namespaced.
- */
-const EPHEMERAL_ID_PREFIX = 'ephemeral:';
 
 /**
  * Per-session dormancy threshold (002 §6.2 / 007 §4.4). A session that has not
@@ -541,9 +532,24 @@ export class AgentMonitorRuntime {
           'A declaration must bind to an active session (007 §4.2).',
       );
     }
+    // An ephemeral monitor's events project into the declaring session ONLY, and
+    // projection is filtered to LEAD sessions (007 §4.6 / 002 §6). A monitor bound
+    // to a subagent session would therefore observe forever but never deliver a
+    // single event — a silently-dead watch. Reject it at declaration time rather
+    // than register something that can never fire.
+    if (session.role !== 'lead') {
+      throw new Error(
+        `Cannot declare an ephemeral monitor: session "${input.sessionId}" is a ${session.role} session. ` +
+          'Ephemeral-monitor events project into lead sessions only (007 §4.6), so a ' +
+          'non-lead binding would never deliver — declare from the lead session.',
+      );
+    }
 
     // 2. Validate the source name + scope via the SAME `validateScope` path as
-    //    `agentmonitors validate` (007 §4.2, AP4/BP3).
+    //    `agentmonitors validate` (007 §4.2, AP4/BP3). `validateWatchScope`
+    //    (schema check + the shared BP3 change-detection.collection friendly
+    //    error) is the exact path `agentmonitors validate` uses, so an invalid
+    //    scope is rejected with the IDENTICAL diagnosis (005 §14.4).
     const source = this.registry.get(input.source);
     if (!source) {
       throw new Error(
@@ -552,7 +558,7 @@ export class AgentMonitorRuntime {
           .join(', ')}`,
       );
     }
-    const scopeErrors = validateScope(input.scope, source.scopeSchema);
+    const scopeErrors = validateWatchScope(input.scope, source.scopeSchema);
     if (scopeErrors.length > 0) {
       throw new Error(
         `Invalid scope for source "${input.source}": ${scopeErrors.join('; ')}`,
@@ -562,8 +568,12 @@ export class AgentMonitorRuntime {
     // 3. Parse the urgency band + confirm the whole declaration through the SAME
     //    frontmatter schema a persistent monitor uses, so an ephemeral monitor's
     //    frontmatter is byte-identical in shape to a file-authored one (AP7).
+    //    Spread the scope FIRST so the real source name always wins `type` — a
+    //    scope key literally named `type` must never override the resolved source
+    //    (no bundled scopeSchema sets additionalProperties:false, so such a key
+    //    parses), which would desync the monitor from its source and starve it.
     const parsed = monitorFrontmatterSchema.safeParse({
-      watch: { type: input.source, ...input.scope },
+      watch: { ...input.scope, type: input.source },
       urgency: input.urgency ?? 'normal',
     });
     if (!parsed.success) {
@@ -575,7 +585,7 @@ export class AgentMonitorRuntime {
     }
 
     // 4. Assign the namespaced runtime identity (007 §4.3) and persist.
-    const id = `${EPHEMERAL_ID_PREFIX}${session.id}/${ulid()}`;
+    const id = `${EPHEMERAL_MONITOR_ID_PREFIX}${session.id}/${ulid()}`;
     return this.store.insertEphemeralMonitor({
       id,
       sessionId: session.id,
@@ -632,8 +642,12 @@ export class AgentMonitorRuntime {
       record.urgency === record.urgencyMax
         ? record.urgency
         : `${record.urgency}..${record.urgencyMax}`;
+    // Spread the persisted scope FIRST so `record.sourceName` always wins `type`:
+    // a persisted scope key named `type` must never override the source name the
+    // monitor is keyed and scheduled by (identity/scheduling stay consistent with
+    // `record.sourceName`). Mirrors the same guard at declaration time.
     const frontmatter = monitorFrontmatterSchema.parse({
-      watch: { type: record.sourceName, ...record.scope },
+      watch: { ...record.scope, type: record.sourceName },
       urgency: urgencyBand,
     });
     return {
