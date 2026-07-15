@@ -175,7 +175,7 @@ agentmonitors init --enable-only
 ```
 
 This creates `.claude/agentmonitors.local.md` and updates `.gitignore` for you, with no monitor
-and no prompts. **If `--enable-only` isn't listed** (older CLI version), create the same files by
+and no prompts. **If `--enable-only` isn't listed** (older CLI version), create an equivalent enable file by
 hand:
 
 ```bash

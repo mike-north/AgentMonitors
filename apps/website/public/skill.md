@@ -171,7 +171,7 @@ This creates `.claude/agentmonitors.local.md` (the per-developer opt-in file) an
 `.claude/*.local.*` and `/.agentmonitors/` to `.gitignore` — no manual file-editing needed. Skip
 straight to Phase 3.
 
-**If `--enable-only` is not listed** (older CLI version), create the same files by hand:
+**If `--enable-only` is not listed** (older CLI version), create an equivalent enable file by hand:
 
 ```bash
 mkdir -p .claude
