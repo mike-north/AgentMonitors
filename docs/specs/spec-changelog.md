@@ -57,6 +57,7 @@ _current_.
   the 100-char AF_UNIX limit on macOS.
 - **002 §10.2 — clarified (current).** `daemon run`'s socket, socket directory, and startup-lock
   directory are owner-only.
+
 ## 2026-07-14 — Fresh-environment install-to-first-signal E2E, hooks path (004 §2.7, §3.5) — Refs #276
 
 Added a new validation surface: a global-install, no-workspace-`node_modules` E2E proof
