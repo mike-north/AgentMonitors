@@ -788,7 +788,7 @@ Verified: `libs/core/src/security/local-permissions.ts` — `ensurePrivateDir`,
 startup lock, and the long-socket-path fallback ([§10.3](#103-socket-path-resolution));
 `apps/cli/src/local-state.ts` — coordination file; tests: `local-permissions.test.ts`,
 `inbox/db-permissions.test.ts`, `hook-bridge/bridge.test.ts`, `daemon-ipc.test.ts`, and the
-real-binary UAT in `commands/cli.integration.test.ts`.
+real-binary UAT in `apps/cli/src/commands/cli.integration.test.ts`.
 
 ## 4. Notify Dispatch
 
