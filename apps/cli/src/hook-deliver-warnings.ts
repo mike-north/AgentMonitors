@@ -65,7 +65,6 @@ export function describeUnknownHostSessionWarning(
   // produced, so a post-pass over the serialized string is safe and keeps
   // the output a valid, round-trippable JSON string.
   const escaped = JSON.stringify(truncated).replace(
-    // eslint-disable-next-line no-control-regex -- escaping controls is the point
     /[\u007f-\u009f\u2028\u2029]/g,
     (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`,
   );
