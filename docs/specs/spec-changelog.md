@@ -35,6 +35,7 @@ can never deliver.
   `--debug`-gated) `describeNoSessionMatch` diagnosis.
 - **No behavior change to stdout, exit codes, or the settle-window/holding branches** — those stay
   exactly as silent as before; only the never-resolvable unknown-session branch gained a signal.
+
 ## 2026-07-15 — Add the channel-transport manual UAT recipe (006 §4) — Refs #277
 
 The channel transport's "Status: implemented" note has named an outstanding manual UAT
