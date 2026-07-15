@@ -59,15 +59,29 @@ The base daemon socket path is resolved in this priority order (implemented in `
 If the resolved path exceeds 100 characters (Unix socket limit), it falls back to `/tmp/agentmonitors-<sha256-prefix>.sock`.
 
 Manual daemon commands that operate on the active project — `session open`, `session close`,
-`session list`, `events list`, `events ack`, `hook claim`, `doctor`, `daemon status`, and
-`daemon stop` — insert the enabled workspace's socket between steps 2 and 3 via
-`resolveManualDaemonSocketPath()` in `manual-daemon.ts`. With no `--socket` and no
-`AGENTMONITORS_SOCKET`, they read `.claude/agentmonitors.local.md` from the command workspace
-(`--workspace` for `session open`/`doctor`; otherwise `CLAUDE_PROJECT_DIR` when set, then the process
-cwd). If that file has `enabled: true`, the command uses **either** the persisted `socket:` value (if
-one has been written, e.g. by a lazily-booted daemon) **or**, when nothing has persisted one yet, the
-derived per-workspace socket (`workspacePaths()` — issue #335). Outside an enabled workspace, the
-global default in step 3 is unchanged.
+`session list`, `events list`, `events ack`, `hook claim`, `doctor`, `daemon status`, `daemon
+stop`, `monitor history`, and `monitor explain` — insert the enabled workspace's socket between
+steps 2 and 3 via `resolveManualDaemonSocketPath()` in `manual-daemon.ts`. With no `--socket` and
+no `AGENTMONITORS_SOCKET`, they read `.claude/agentmonitors.local.md` from the command workspace
+(`--workspace` for `session open`/`doctor`/`monitor explain`/`monitor history`; otherwise
+`CLAUDE_PROJECT_DIR` when set, then the process cwd). If that file has `enabled: true`, the command
+uses **either** the persisted `socket:` value (if one has been written, e.g. by a lazily-booted
+daemon) **or**, when nothing has persisted one yet, the derived per-workspace socket
+(`workspacePaths()` — issue #335). Outside an enabled workspace, the global default in step 3 is
+unchanged.
+
+**`monitor history` and `monitor explain` unified with `doctor`/`daemon status`/`session open`
+(issue #374):** before this fix, both commands resolved their socket via the bare `resolveSocketPath()`
+global default, bypassing `resolveManualDaemonSocketPath()` entirely — so a daemon booted for the
+current workspace (e.g. lazily by a Claude Code session) was invisible to `monitor history`/`monitor
+explain` unless `--socket` was passed explicitly, even though `doctor`/`daemon status` could see it
+flagless from the same directory. Both commands, and their no-daemon in-process SQLite fallback
+(`explainMonitorInProcess`/`listObservationHistoryInProcess` in `runtime-client.ts`), now resolve the
+same workspace-scoped socket and db (`resolveWorkspaceDbPath()` in `workspace-db-path.ts`) that
+`doctor` uses — keyed off `--workspace` (defaulting to the process cwd, same as `doctor`). For `monitor
+history`, `--workspace` already existed as an opt-in row filter (issue #345/#307); it now also
+selects which workspace's daemon/db to reach, since the workspace whose history you asked for is also
+the daemon you want to reach.
 
 **`daemon run`/`daemon once` themselves resolve their bind/read socket and db the same way** (issue
 #335): with no `--socket`/`AGENTMONITORS_DB`/`AGENTMONITORS_SOCKET` overrides, an enabled workspace
@@ -473,28 +487,36 @@ source matched its scope.
 
 Lists the per-tick outcomes the runtime records for each due monitor
 ([002 §"Persistence Schema"](./002-runtime-delivery.md)) — useful for answering "why didn't my
-monitor fire?". Round-trips through the daemon socket (`history.list`) when a daemon is reachable.
+monitor fire?". Round-trips through the daemon socket (`history.list`) when a daemon is reachable,
+auto-discovering the **same per-workspace socket** `doctor`/`daemon status`/`session open` use
+(issue #374, `resolveManualDaemonSocketPath()` — see "Socket path resolution" in §1) — no `--socket`
+flag is required to reach a daemon already running for the current workspace.
 
 **No-daemon fallback (#150):** observation history is read-only durable state, so if the daemon is
 unreachable (a genuine connection failure — socket refused/absent or request timeout) the command
-reads the persisted SQLite store **in-process** instead of erroring. When it returns rows, text
-output is prefixed with the banner _"No daemon running — showing persisted state from the last
-tick."_ (the `--format json` array is unchanged). When the daemon is down **and** there are no
-persisted rows, it prints an actionable remediation line — _"No daemon running and no persisted
-state to show. Start it with `agentmonitors daemon run`, or use `agentmonitors monitor test <path>`
-for a one-shot check."_ — and exits 1, rather than a raw Node `connect ENOENT …`. A daemon-side
-**application** error (the daemon answered with an error) is still surfaced verbatim as
-`History failed: <message>`, never masked as "daemon not running" (the #94/#98 distinction holds).
+reads the persisted SQLite store **in-process**, from the same workspace-resolved db (issue #374),
+instead of erroring. When it returns rows, text output is prefixed with the banner _"No daemon
+running — showing persisted state from the last tick."_ (the `--format json` array is unchanged).
+When the daemon is down **and** there are no persisted rows, it prints an actionable remediation
+line — _"No daemon running for this workspace and no persisted state to show. Start it with
+`agentmonitors daemon run` (or it starts automatically when a Claude Code session opens); if the
+daemon you want lives at a different socket, point at it with `--socket <path>`. Or use
+`agentmonitors monitor test <path>` for a one-shot check."_ — and exits 1, rather than a raw Node
+`connect ENOENT …`. A daemon-side **application** error (the daemon answered with an error) is still
+surfaced verbatim as `History failed: <message>`, never masked as "daemon not running" (the #94/#98
+distinction holds).
 
 ```
-agentmonitors monitor history [monitorId] [--socket <path>] [--limit <n>] [--format <toon|text|json>]
+agentmonitors monitor history [monitorId] [--socket <path>] [--workspace <path>] [--limit <n>] [--format <toon|text|json>]
 ```
 
-| Argument / Flag | Default       | Description                                  |
-| --------------- | ------------- | -------------------------------------------- |
-| `[monitorId]`   | —             | Filter to a single monitor id                |
-| `--limit <n>`   | `50`          | Maximum rows (newest first)                  |
-| `--format`      | auto (see §1) | `toon`, `text` (one row per line), or `json` |
+| Argument / Flag      | Default             | Description                                                                                                                     |
+| -------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `[monitorId]`        | —                   | Filter to a single monitor id                                                                                                   |
+| `--socket <path>`    | resolved default    | Unix domain socket path for the daemon                                                                                          |
+| `--workspace <path>` | current working dir | Opt-in row filter to one workspace's history (issue #345/#307) — also selects which workspace's daemon/db to reach (issue #374) |
+| `--limit <n>`        | `50`                | Maximum rows (newest first)                                                                                                     |
+| `--format`           | auto (see §1)       | `toon`, `text` (one row per line), or `json`                                                                                    |
 
 Each row reports `result` — `triggered` (≥1 observation became an event), `suppressed` (observations
 returned but none emitted this tick), `no-change` (the source returned nothing), `no-files-matched`
@@ -511,21 +533,24 @@ plus the monitor id, source name, and timestamp.
 Diagnoses where a single monitor's signal currently stops. The command asks the daemon for a
 read-only staged report (`monitor.explain`) built from the monitor definition, scheduling state,
 recent `observation_history`, `monitor_state.notify_state`, `monitor_events`, and
-`session_event_state` projection rows.
+`session_event_state` projection rows. Auto-discovers the **same per-workspace socket**
+`doctor`/`daemon status`/`session open` use (issue #374, `resolveManualDaemonSocketPath()` — see
+"Socket path resolution" in §1) — no `--socket` flag is required to reach a daemon already running
+for the current workspace.
 
 ```
 agentmonitors monitor explain <monitorId> [--dir <path>] [--workspace <path>] [--socket <path>] [--history-limit <n>] [--event-limit <n>] [--format <toon|text|json>]
 ```
 
-| Argument / Flag       | Default             | Description                                             |
-| --------------------- | ------------------- | ------------------------------------------------------- |
-| `<monitorId>`         | —                   | Monitor id to diagnose                                  |
-| `--dir <path>`        | `.claude/monitors`  | Directory containing monitor definitions                |
-| `--workspace <path>`  | current working dir | Workspace path used for session projection              |
-| `--socket <path>`     | resolved default    | Unix domain socket path for the daemon                  |
-| `--history-limit <n>` | `10`                | Observation history rows included in structured output  |
-| `--event-limit <n>`   | `10`                | Materialized event rows included in structured output   |
-| `--format`            | auto (see §1)       | `toon`, `text` (stage summary), or `json` (full report) |
+| Argument / Flag       | Default             | Description                                                                                       |
+| --------------------- | ------------------- | ------------------------------------------------------------------------------------------------- |
+| `<monitorId>`         | —                   | Monitor id to diagnose                                                                            |
+| `--dir <path>`        | `.claude/monitors`  | Directory containing monitor definitions                                                          |
+| `--workspace <path>`  | current working dir | Workspace path used for session projection, and (issue #374) which workspace's daemon/db to reach |
+| `--socket <path>`     | resolved default    | Unix domain socket path for the daemon                                                            |
+| `--history-limit <n>` | `10`                | Observation history rows included in structured output                                            |
+| `--event-limit <n>`   | `10`                | Materialized event rows included in structured output                                             |
+| `--format`            | auto (see §1)       | `toon`, `text` (stage summary), or `json` (full report)                                           |
 
 Text output prints one line per stage with a status glyph, followed by a verdict:
 
@@ -579,8 +604,9 @@ monitor (all stages `healthy`) reports a `healthy` verdict.
 
 **No-daemon fallback (#150):** if the daemon is not reachable (a genuine connection failure — socket
 refused/absent or request timeout), `monitor explain` runs the **same** `explainMonitor` in-process
-against the persisted SQLite store, exactly as `daemon once` runs a tick in-process. A read-only
-diagnosis tool must not require a live daemon: the data from the last tick is already in the DB.
+against the persisted SQLite store — the same workspace-resolved db (issue #374, `resolveWorkspaceDbPath()`)
+`doctor` reads — exactly as `daemon once` runs a tick in-process. A read-only diagnosis tool must not
+require a live daemon: the data from the last tick is already in the DB.
 **Crucially, a daemon connection failure is NOT itself reported as a stage `failure`** — unlike the
 pre-#150 behaviour which fabricated a `✗ Scheduling: failure` verdict, the in-process path runs the
 full pipeline read and produces real stage statuses from persisted state.
@@ -595,9 +621,11 @@ The report is rendered according to three cases:
   persisted state from the last tick."_ (text) or annotated with a `"notice"` field alongside the
   full report (JSON). Exits 0.
 - **Definition ok, nothing persisted** (no history, no events — the daemon never ran): an actionable
-  remediation line is printed — _"No daemon running and no persisted state to show. Start it with
-  `agentmonitors daemon run`, or use `agentmonitors monitor test <path>` for a one-shot check."_ —
-  rather than a raw Node `connect ENOENT …`. Exits 1.
+  remediation line is printed — _"No daemon running for this workspace and no persisted state to
+  show. Start it with `agentmonitors daemon run` (or it starts automatically when a Claude Code
+  session opens); if the daemon you want lives at a different socket, point at it with `--socket
+<path>`. Or use `agentmonitors monitor test <path>` for a one-shot check."_ — rather than a raw
+  Node `connect ENOENT …`. Exits 1.
 
 A daemon-side **application** error (the daemon answered with an error) is **not** masked as "daemon
 not running": it is surfaced verbatim as `Explain failed: <message>` with exit code 1. Malformed

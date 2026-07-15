@@ -3609,8 +3609,11 @@ This monitor fires on a schedule.
 
     expect(result.exitCode).toBe(1);
     // Actionable remediation, not a raw Node connect error.
+    expect(result.stderr).toContain('No daemon running for this workspace');
     expect(result.stderr).toContain('agentmonitors daemon run');
     expect(result.stderr).toContain('monitor test');
+    // Names --socket as the override for a socket mismatch (issue #374).
+    expect(result.stderr).toContain('--socket');
     expect(result.stderr).not.toContain('ENOENT');
     expect(result.stderr).not.toContain('.sock');
     // The remediation (not the no-daemon banner) is what appears.
@@ -3744,8 +3747,11 @@ This monitor fires on a schedule.
     );
 
     expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('No daemon running for this workspace');
     expect(result.stderr).toContain('agentmonitors daemon run');
     expect(result.stderr).toContain('monitor test');
+    // Names --socket as the override for a socket mismatch (issue #374).
+    expect(result.stderr).toContain('--socket');
     expect(result.stderr).not.toContain('ENOENT');
     expect(result.stderr).not.toContain('.sock');
   });
@@ -4332,6 +4338,125 @@ This monitor fires on a schedule.
         'No lead session is registered',
       );
       expect(doctorResult.exitCode).toBe(0);
+    } finally {
+      daemonChild?.kill('SIGTERM');
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  // Issue #374: `monitor history` and `monitor explain` previously resolved
+  // their socket via the bare global default instead of
+  // `resolveManualDaemonSocketPath()`, so a daemon booted for this workspace
+  // (exactly as above) was invisible to them without an explicit --socket —
+  // even though `doctor`/`daemon status`/`session open` could already see it
+  // flagless. This proves both commands now agree with those three.
+  it('monitor history and monitor explain auto-discover the same per-workspace socket as doctor/daemon status/session open, flagless', async () => {
+    const dir = path.join(tempDir, 'issue-374-unified-defaults');
+    const monitorId = 'heartbeat';
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    const monitorDir = path.join(monitorsRoot, monitorId);
+    mkdirSync(monitorDir, { recursive: true });
+    writeFileSync(
+      path.join(monitorDir, 'MONITOR.md'),
+      `---
+name: Heartbeat
+watch:
+  type: schedule
+  cron: '* * * * *'
+  timezone: UTC
+urgency: normal
+---
+This monitor fires on a schedule.
+`,
+      'utf-8',
+    );
+
+    const fakeHome = mkdtempSync(path.join(tmpdir(), 'agentmon-374-home-'));
+    // Deliberately NO AGENTMONITORS_DB / AGENTMONITORS_SOCKET / --socket
+    // anywhere below — that is the exact condition the issue reports.
+    const env = { HOME: fakeHome };
+
+    let daemonChild: ReturnType<typeof spawn> | undefined;
+    try {
+      const initResult = runWithEnv(['init', '--enable-only'], env, dir);
+      expect(initResult.exitCode).toBe(0);
+
+      // --poll-ms speeds up the tick loop for the test; it does not affect
+      // socket resolution, which is what this test is verifying.
+      const { child, socketPath } = await waitForDaemonListening(
+        ['daemon', 'run', monitorsRoot, '--poll-ms', '200'],
+        env,
+        dir,
+      );
+      daemonChild = child;
+
+      // Wait for a tick to materialize observation history (cron
+      // '* * * * *' is due every tick).
+      let historyResult = runWithEnv(
+        ['monitor', 'history', '--format', 'json'],
+        env,
+        dir,
+      );
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        if (historyResult.exitCode === 0) {
+          const rows = JSON.parse(historyResult.stdout) as {
+            monitorId: string;
+          }[];
+          if (rows.some((r) => r.monitorId === monitorId)) break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        historyResult = runWithEnv(
+          ['monitor', 'history', '--format', 'json'],
+          env,
+          dir,
+        );
+      }
+
+      // The actual regression: pre-fix, this failed with "No daemon running
+      // and no persisted state to show" despite `daemon status`/`doctor`
+      // seeing the same live daemon from this workspace with no flags.
+      expect(historyResult.exitCode).toBe(0);
+      expect(historyResult.stderr).not.toContain('No daemon running');
+      const records = JSON.parse(historyResult.stdout) as {
+        monitorId: string;
+      }[];
+      expect(records.some((r) => r.monitorId === monitorId)).toBe(true);
+
+      const explainResult = runWithEnv(
+        [
+          'monitor',
+          'explain',
+          monitorId,
+          '--dir',
+          monitorsRoot,
+          '--format',
+          'json',
+        ],
+        env,
+        dir,
+      );
+      expect(explainResult.exitCode).toBe(0);
+      expect(explainResult.stderr).not.toContain('No daemon running');
+      const report = JSON.parse(explainResult.stdout) as { notice?: string };
+      // A live daemon answered directly through the socket — no in-process
+      // fallback banner, unlike the no-daemon degraded path (issue #150).
+      expect(report.notice).toBeUndefined();
+
+      // Confirm `monitor history`/`monitor explain` are reaching the SAME
+      // daemon `daemon status` sees, not merely succeeding independently.
+      const statusResult = runWithEnv(
+        ['daemon', 'status', '--format', 'json'],
+        env,
+        dir,
+      );
+      expect(statusResult.exitCode).toBe(0);
+      const status = JSON.parse(statusResult.stdout) as {
+        running: boolean;
+        socketPath: string;
+      };
+      expect(status.running).toBe(true);
+      expect(status.socketPath).toBe(socketPath);
     } finally {
       daemonChild?.kill('SIGTERM');
       rmSync(fakeHome, { recursive: true, force: true });

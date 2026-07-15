@@ -17,7 +17,9 @@ import { registerCoreSources } from '../sources.js';
 import { reportError } from '../output.js';
 import { requireFile } from '../validation.js';
 import { renderToon, resolveFormat } from '../toon-format.js';
-import { DaemonConnectionError, resolveSocketPath } from '../daemon-ipc.js';
+import { DaemonConnectionError } from '../daemon-ipc.js';
+import { resolveManualDaemonSocketPath } from '../manual-daemon.js';
+import { resolveWorkspaceDbPath } from '../workspace-db-path.js';
 import {
   explainMonitorClient,
   explainMonitorInProcess,
@@ -37,9 +39,15 @@ const NO_DAEMON_BANNER =
  * nothing persisted to read (no DB rows for the monitor). Replaces the raw Node
  * `connect ENOENT …` error, which gave the author no next step. Issue #150,
  * PM decision (b)(i).
+ *
+ * Names the workspace explicitly and offers `--socket` as the override (issue
+ * #374): a bare "No daemon running" reads as "nothing is running anywhere",
+ * when the real diagnosis is narrower — no daemon was found *for this
+ * workspace's resolved socket*, and a different one may still be reachable at
+ * an explicit `--socket <path>`.
  */
 const NO_DAEMON_REMEDIATION =
-  'No daemon running and no persisted state to show. Start it with `agentmonitors daemon run`, or use `agentmonitors monitor test <path>` for a one-shot check.';
+  'No daemon running for this workspace and no persisted state to show. Start it with `agentmonitors daemon run` (or it starts automatically when a Claude Code session opens); if the daemon you want lives at a different socket, point at it with `--socket <path>`. Or use `agentmonitors monitor test <path>` for a one-shot check.';
 
 export const monitorTestCommand = new Command('monitor').description(
   'Monitor utilities',
@@ -464,9 +472,15 @@ monitorTestCommand
       const workspacePath = path.resolve(options.workspace ?? process.cwd());
       const historyLimit = Number.parseInt(options.historyLimit, 10);
       const eventLimit = Number.parseInt(options.eventLimit, 10);
-      const socketPath = resolveSocketPath(options.socket, {
-        explicit: options.socket !== undefined,
-      });
+      // Auto-discover the SAME per-workspace socket `doctor`/`daemon
+      // status`/`session open` use (issue #374) — previously this fell back to
+      // the bare global default, so a live daemon booted for this workspace
+      // (e.g. by a Claude Code session) was invisible to `monitor explain`
+      // unless `--socket` was passed explicitly.
+      const socketPath = resolveManualDaemonSocketPath(
+        options.socket,
+        workspacePath,
+      );
       try {
         const report = await explainMonitorClient(
           {
@@ -507,18 +521,23 @@ monitorTestCommand
         // a live daemon: read the persisted SQLite store in-process and run the
         // SAME explain the daemon would (issue #150, PM decision (a)). This gives
         // the real per-stage diagnosis from the last tick — NOT a false
-        // "✗ Scheduling: failure" for a monitor that actually fired.
-        const report = await explainMonitorInProcess({
-          monitorId,
-          monitorsDir,
-          workspacePath,
-          ...(Number.isFinite(historyLimit) && historyLimit > 0
-            ? { historyLimit }
-            : {}),
-          ...(Number.isFinite(eventLimit) && eventLimit > 0
-            ? { eventLimit }
-            : {}),
-        });
+        // "✗ Scheduling: failure" for a monitor that actually fired. Reads the
+        // SAME workspace-resolved db `doctor` reads (issue #374) — not the bare
+        // global default — so this fallback agrees with what `doctor` diagnoses.
+        const report = await explainMonitorInProcess(
+          {
+            monitorId,
+            monitorsDir,
+            workspacePath,
+            ...(Number.isFinite(historyLimit) && historyLimit > 0
+              ? { historyLimit }
+              : {}),
+            ...(Number.isFinite(eventLimit) && eventLimit > 0
+              ? { eventLimit }
+              : {}),
+          },
+          resolveWorkspaceDbPath(workspacePath),
+        );
 
         // Decide how to surface the in-process report based on what it contains.
         //
@@ -631,9 +650,18 @@ monitorTestCommand
           : {}),
         ...(Number.isFinite(limit) && limit > 0 ? { limit } : {}),
       };
-      const socketPath = resolveSocketPath(options.socket, {
-        explicit: options.socket !== undefined,
-      });
+      // Auto-discover the SAME per-workspace socket `doctor`/`daemon
+      // status`/`session open` use (issue #374) — previously this fell back to
+      // the bare global default, so a live daemon booted for this workspace
+      // was invisible to `monitor history` unless `--socket` was passed
+      // explicitly. Reuses `--workspace` (defaulting to cwd, same as
+      // `doctor`'s default) when given — the workspace whose history you asked
+      // for is also the daemon you want to reach.
+      const socketWorkspace = path.resolve(options.workspace ?? process.cwd());
+      const socketPath = resolveManualDaemonSocketPath(
+        options.socket,
+        socketWorkspace,
+      );
       try {
         const records = await listObservationHistoryClient(query, socketPath);
 
@@ -667,7 +695,12 @@ monitorTestCommand
         // The daemon is unreachable. Read observation history directly from the
         // persisted SQLite store in-process (issue #150, PM decision (a)) —
         // history is read-only durable state and shouldn't need a live daemon.
-        const records = listObservationHistoryInProcess(query);
+        // Reads the SAME workspace-resolved db `doctor` reads (issue #374) —
+        // not the bare global default — so this fallback agrees with `doctor`.
+        const records = listObservationHistoryInProcess(
+          query,
+          resolveWorkspaceDbPath(socketWorkspace),
+        );
         if (records.length === 0) {
           // Daemon down AND nothing persisted → actionable remediation, not a
           // raw ENOENT (issue #150, PM decision (b)(i)).
