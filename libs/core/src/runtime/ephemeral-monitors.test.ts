@@ -704,7 +704,7 @@ describe('ephemeral monitors — projection isolation (007 §4.6, criterion 4)',
     // A sibling lead session exists but must never see the private instruction.
     openLead(runtime, workspace, 'host-unscoped-sibling');
 
-    runtime.declareEphemeralMonitor({
+    const record = runtime.declareEphemeralMonitor({
       sessionId: declaring.id,
       source: 'test-ephemeral',
       scope: { target: 'secret' },
@@ -725,9 +725,19 @@ describe('ephemeral monitors — projection isolation (007 §4.6, criterion 4)',
       false,
     );
 
+    // The exclusion is by id-NAMESPACE, not merely "the query had no filter": a
+    // monitorId-TARGETED session-less read (a raw socket client naming the
+    // ephemeral id directly — daemon IPC lets a client omit sessionId on
+    // `events.list`) is gated exactly the same way and returns nothing.
+    expect(runtime.listEvents({ monitorId: record.id })).toHaveLength(0);
+
     // The declaring session STILL reads its own ephemeral event via its scoped
-    // read — the exclusion is unscoped-only, not a data loss.
+    // read — the exclusion is unscoped-only, not a data loss — and its own
+    // monitorId-targeted scoped read returns it too.
     expect(runtime.listEvents({ sessionId: declaring.id })).toHaveLength(1);
+    expect(
+      runtime.listEvents({ sessionId: declaring.id, monitorId: record.id }),
+    ).toHaveLength(1);
 
     // Control: a PERSISTENT event is still returned on the same unscoped read, so
     // the exclusion is ephemeral-scoped and does not hide ordinary events.
@@ -755,6 +765,58 @@ describe('ephemeral monitors — projection isolation (007 §4.6, criterion 4)',
     ).toBe(true);
     expect(
       unscopedAfter.some((event) => event.monitorId.startsWith('ephemeral:')),
+    ).toBe(false);
+  });
+
+  it('excludes an ephemeral monitor’s observation-history rows from an UNSCOPED history enumeration (007 §4.6)', async () => {
+    const workspace = mkdtempSync(path.join(tmpdir(), 'am-eph-hist-'));
+    tempDirs.push(workspace);
+    const { runtime, store, monitorsDir } = makeHarness(':memory:', workspace);
+    const declaring = openLead(runtime, workspace, 'host-hist-decl');
+
+    const record = runtime.declareEphemeralMonitor({
+      sessionId: declaring.id,
+      source: 'test-ephemeral',
+      scope: { target: 'secret' },
+      instruction: 'PRIVATE: history must not enumerate this watch',
+    });
+    // The tick runs the ephemeral monitor through the SAME evaluate path as a
+    // persistent one, so it records an observation-history audit row under the
+    // reserved `ephemeral:` id.
+    await runtime.tick(monitorsDir, workspace);
+
+    // An UNSCOPED history enumeration (no monitorId — `history list` without a
+    // target, and the equivalent daemon-IPC `history.list`, which has no session
+    // field) MUST NOT surface the ephemeral audit row: the id embeds the
+    // declaring session, so its observation counts would cross session
+    // boundaries (007 §4.6 read isolation).
+    const unscoped = store.listObservationHistory({});
+    expect(unscoped.some((row) => row.monitorId.startsWith('ephemeral:'))).toBe(
+      false,
+    );
+
+    // A monitorId-TARGETED lookup is a deliberate query (the `monitor explain` /
+    // doctor / reminder-diagnosis path) and is unaffected — the owner can still
+    // retrieve its own ephemeral history by naming the id.
+    expect(
+      store.listObservationHistory({ monitorId: record.id }).length,
+    ).toBeGreaterThanOrEqual(1);
+
+    // Control: a PERSISTENT monitor's audit row IS enumerated on the same
+    // unscoped read, so the exclusion is ephemeral-scoped, not a blanket hide.
+    store.recordObservationHistory({
+      monitorId: 'persistent-monitor',
+      workspacePath: workspace,
+      sourceName: 'test-ephemeral',
+      result: 'triggered',
+      observationData: {},
+    });
+    const unscopedAfter = store.listObservationHistory({});
+    expect(
+      unscopedAfter.some((row) => row.monitorId === 'persistent-monitor'),
+    ).toBe(true);
+    expect(
+      unscopedAfter.some((row) => row.monitorId.startsWith('ephemeral:')),
     ).toBe(false);
   });
 
