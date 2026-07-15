@@ -41,9 +41,18 @@ export function describeUnknownHostSessionWarning(
   hostSessionId: string,
 ): string {
   const MAX_ID_LENGTH = 128;
-  const truncated =
-    hostSessionId.length > MAX_ID_LENGTH
-      ? `${hostSessionId.slice(0, MAX_ID_LENGTH)}…`
-      : hostSessionId;
+  let truncated = hostSessionId;
+  if (hostSessionId.length > MAX_ID_LENGTH) {
+    // Cut at a code-point boundary, not a raw UTF-16 index: a `slice` can
+    // split a surrogate pair, leaving a lone surrogate that renders as a
+    // garbled \ud83d-style escape (same rationale as hook-deliver-render.ts's
+    // truncateForCap).
+    let out = '';
+    for (const ch of hostSessionId) {
+      if (out.length + ch.length > MAX_ID_LENGTH) break;
+      out += ch;
+    }
+    truncated = `${out}…`;
+  }
   return `hook deliver: no session registered for host session id ${JSON.stringify(truncated)}`;
 }

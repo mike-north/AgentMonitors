@@ -44,6 +44,22 @@ describe('describeUnknownHostSessionWarning', () => {
     expect(msg).toContain('…');
   });
 
+  // Regression: a raw slice(0, 128) splits a surrogate pair straddling the
+  // boundary, leaving a lone surrogate that JSON.stringify renders as a
+  // garbled \ud83d escape.
+  it('never splits a surrogate pair at the truncation boundary', () => {
+    const straddling = `${'x'.repeat(127)}😀${'y'.repeat(50)}`;
+    const msg = describeUnknownHostSessionWarning(straddling);
+    // The emoji did not fit whole within the cap, so it is dropped wholesale.
+    expect(msg).not.toContain('😀');
+    expect(msg).not.toMatch(/\\ud83d/i);
+    expect(msg).toContain('x…');
+
+    // An emoji that fits entirely within the cap survives intact.
+    const fitting = `${'x'.repeat(20)}😀${'y'.repeat(200)}`;
+    expect(describeUnknownHostSessionWarning(fitting)).toContain('😀');
+  });
+
   it('does not include a trailing newline — the caller owns line termination', () => {
     expect(describeUnknownHostSessionWarning('abc').endsWith('\n')).toBe(false);
   });

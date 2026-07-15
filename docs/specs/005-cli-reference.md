@@ -1203,8 +1203,10 @@ settle window. So step 5 always writes, unconditionally:
 hook deliver: no session registered for host session id "<id>"
 ```
 
-to stderr — stdout and the exit code are unaffected. Every other quiet-return branch stays silent
-by default; use `--debug` for those.
+to stderr — stdout and the exit code are unaffected. `<id>` comes from untrusted stdin, so it is
+JSON-string-escaped (control characters can never reach the terminal raw) and truncated at 128
+characters — at a code-point boundary, never splitting a surrogate pair — with a trailing `…`.
+Every other quiet-return branch stays silent by default; use `--debug` for those.
 
 Each `--debug` line is prefixed `agentmonitors hook deliver --debug:` for easy filtering (a
 distinct, unprefixed line format from the always-on warning above). The diagnosis reports, in order:
