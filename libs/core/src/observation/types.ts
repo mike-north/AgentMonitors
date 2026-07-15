@@ -115,6 +115,32 @@ export interface ObservationContext {
    * Unused by one-shot `observe()`.
    */
   signal?: AbortSignal;
+  /**
+   * Watch-mode source-state checkpoint (002 §2.4). Supplied **only** on the
+   * `watch()` path; `observe()` advances source state via
+   * {@link ObservationResult.nextState} instead and never receives this callback.
+   *
+   * A long-lived `watch()` source that keeps in-memory change-detection state
+   * (e.g. a file-fingerprint map) calls `checkpoint(updatedState)` to durably
+   * write that state back into the monitor's persisted `sourceState`,
+   * independent of yielding an observation. The returned promise resolves once
+   * the write is durable, so on a mid-watch daemon crash the restart reconciles
+   * from the checkpointed baseline rather than re-emitting already-delivered
+   * changes.
+   *
+   * The runtime serializes checkpoint writes with observation ingestion
+   * per-watcher: a checkpoint in flight when an observation arrives completes
+   * **before** that observation is ingested (the G14 durable-write-before-ingest
+   * ordering). A checkpoint is a state write only — it never materializes or
+   * delivers an observation. A checkpoint whose durable write fails does **not**
+   * abort the watcher (a transient durability gap, not a protocol violation): the
+   * runtime logs a warning and the promise still resolves, so a source that does
+   * not guard the call keeps watching. Sources **SHOULD** checkpoint roughly at
+   * their configured `interval` and **MAY** coalesce rapid requests.
+   *
+   * @see docs/specs/002-runtime-delivery.md §2.4
+   */
+  checkpoint?: (nextState: unknown) => Promise<void>;
 }
 
 export interface ObservationResult {

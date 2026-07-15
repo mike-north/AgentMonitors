@@ -627,7 +627,7 @@ Verified: `libs/core/src/runtime/service.ts` — `cronMatchesDate()` (lines 118�
 
 In addition to the one-shot `observe()` tick loop, the runtime drives continuous `watch()` for sources that implement it (NP4). `AgentMonitorRuntime.watchMonitors(monitorsDir, workspacePath)` scans the tree and, for each monitor whose source exposes `watch()`, consumes its `AsyncIterable<Observation>`, funnelling each yielded observation through the **same** notify dispatch → event materialization → session projection pipeline as `observe()` (the shared `ingest()` path). It returns a `WatchHandle` whose `stop()` aborts (via `context.signal`) and awaits every watcher. `daemon run` starts watchers at startup and stops them on shutdown.
 
-While a monitor has an active watcher, the tick loop **MUST** skip its `observe()`, so it is never driven twice. A watcher that throws (other than from the runtime's own abort) is reported via the `onError` callback and released, after which the tick loop resumes driving that monitor via `observe()`. A `watch()` source owns its change-detection state in memory; the runtime does not persist it, so watchers re-establish fresh on restart.
+While a monitor has an active watcher, the tick loop **MUST** skip its `observe()`, so it is never driven twice. A watcher **MUST** be released from the active-watcher set whenever it exits for **any** reason — the `watch()` iterable completing normally, an error (other than the runtime's own abort; that case is also reported via the `onError` callback), or `stop()`/abort — after which the tick loop resumes driving that monitor via `observe()` and a later `watchMonitors()` can re-establish it. A watcher that ends normally must therefore not remain pinned in the active-watcher set (which would permanently starve `observe()`). Each active-watcher slot carries a per-watcher identity token so a superseded watcher only ever releases its **own** slot, never a newer watcher's. A `watch()` source owns its change-detection state in memory; the runtime does not persist it automatically, so watchers otherwise re-establish fresh on restart — unless the source durably checkpoints its state via `context.checkpoint` ([§2.4](#24-watch-mode-source-state-checkpointing)), in which case a restart reconciles from the last checkpointed baseline.
 
 > **Example:** a source that opens an OS file-system watcher yields a `modified` observation the instant a file changes, rather than waiting for the next poll interval; `stop()` closes the OS watcher via the aborted signal.
 >
@@ -635,13 +635,39 @@ While a monitor has an active watcher, the tick loop **MUST** skip its `observe(
 
 Verified: `libs/core/src/runtime/service.ts` — `watchMonitors()`, `consumeWatch()`, the `activeWatchers` skip in `tick()`, and the shared `ingest()` helper; `apps/cli/src/commands/daemon.ts` — watcher start/stop in `runLoop()`.
 
-### 2.4 Watch-mode source-state checkpointing (TARGET)
+### 2.4 Watch-mode source-state checkpointing
 
-> **Status: target.** The current implementation leaves `sourceState` untouched while a watcher is
-> running — source state is only advanced when `observe()` returns `nextState`. This section defines
-> the new core contract addition that allows an active watcher to write back its updated source state
-> durably, required for mid-watch crash safety. This rule MUST be moved to _current_ status with
-> `verified:` references when it ships (process: [004 §5–6](./004-validation-testing.md)).
+> **Status: current** (Refs #278). The runtime supports the watch-checkpoint mechanism defined below:
+> an active `watch()` source durably advances its persisted `sourceState` out of band via
+> `context.checkpoint`, serialized with observation ingestion per-watcher so the durable write
+> completes before any subsequent observation is ingested (the G14 ordering). Moved target → current
+> when it shipped (process: [004 §5–6](./004-validation-testing.md)).
+>
+> Verified: the exported `ObservationContext.checkpoint` callback
+> (`libs/core/src/observation/types.ts`) is supplied only on the `watch()` path.
+> `AgentMonitorRuntime.consumeWatch` and its `writeCheckpoint` helper
+> (`libs/core/src/runtime/service.ts`) persist the checkpointed state into the watcher's own
+> `(monitorId, workspacePath)` `monitorState.sourceState` row ([§3](#3-persisted-monitor-state),
+> #345/#307; leaving notify state and `lastObservationAt` untouched) and enqueue
+> **both** checkpoint writes and `ingest()` on a single per-watcher promise chain — the G14
+> durable-write-before-ingest serialization; a failed checkpoint write logs a warning
+> (`process.stderr`) and resolves rather than aborting the watcher. A checkpoint delivered after the
+> watcher is torn down (its `AbortSignal` aborted, or it is no longer the current active watcher for
+> its id) is rejected — one warning, no write — and watcher shutdown flushes the serialization chain
+> to a stable reference so an in-flight checkpoint is still awaited. Proven by the
+> `watch-mode source-state checkpointing (002 §2.4)` suite in
+> `libs/core/src/runtime/service.test.ts`, whose cases cover: checkpoint supplied on the `watch()`
+> path and persisting the updated state before it resolves; the callback absent from the `observe()`
+> tick path; an in-flight, genuinely-delayed checkpoint ordered before a following ingest (the G14
+> serialization); a checkpoint materializing no `monitor_events`; a failing checkpoint warning and
+> leaving the watcher alive; a real-SQLite restart round-trip reconciling a re-established watcher
+> from the checkpointed baseline; a per-workspace checkpoint never mutating a same-id monitor's row
+> in another workspace; a post-stop checkpoint rejected with a warning and no write; a normally
+> completing `watch()` releasing its active-watcher slot so `observe()` resumes; a `watch()` that
+> throws synchronously before ever returning an iterable also releasing its active-watcher slot
+> (rather than leaking it forever) while still reporting the error via `onError`; and a superseded
+> (non-aborted) watcher's stale checkpoint being rejected by the per-watcher identity token alone,
+> without touching its successor's persisted baseline.
 
 A source whose `watch()` implementation maintains in-memory change-detection state (e.g.,
 `file-fingerprint`'s fingerprint map) faces a crash-safety gap: if the daemon is killed between
@@ -706,6 +732,30 @@ ingesting the observation.
 > observation, and (c) asserts that `checkpoint` was called with the updated state before
 > `context.checkpoint` resolved MUST pass. A test that forces `context.checkpoint` to throw MUST
 > confirm the watcher continues yielding subsequent observations and does NOT abort.
+
+#### Workspace scoping
+
+A checkpoint write MUST land in the watcher's **own** `(monitorId, workspacePath)` state row
+([§3](#3-persisted-monitor-state)), never a `monitorId`-only or global scope. The database is global
+and the same monitor id can exist in unrelated workspaces (#345/#307), so a checkpoint written to the
+wrong scope would either miss the watcher's own baseline or clobber another workspace's
+change-detection state. The runtime threads the watcher's `workspacePath` into both the read and the
+write.
+
+#### Teardown and post-stop rejection
+
+Once a watcher is torn down — its `AbortSignal` aborted by `stop()`, or it is no longer the current
+active watcher for its monitor id (it exited and was superseded) — the runtime **MUST reject** any
+further `checkpoint` call from that watcher: it writes nothing and logs a single warning, then
+resolves. This prevents a straggling `checkpoint(staleState)` (e.g. from a timer that fires after
+shutdown) from clobbering a newer baseline written by `observe()` or a re-established watcher. Because
+a rejected checkpoint is never enqueued, watcher shutdown — which flushes the per-watcher
+serialization chain until its reference stabilizes so an in-flight checkpoint enqueued as shutdown
+begins is still awaited — is guaranteed to terminate.
+
+> **Test implication.** A test that stops the watcher and then invokes the checkpoint callback
+> captured before `stop()` MUST observe no state write and exactly one warning
+> (`libs/core/src/runtime/service.test.ts`).
 
 ### 2.5 Tick result
 

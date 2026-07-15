@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDb } from '../inbox/db.js';
 import { SourceRegistry } from '../observation/registry.js';
 import type {
+  Observation,
   ObservationContext,
   ObservationResult,
   ObservationSource,
@@ -31,6 +32,23 @@ function createRuntime(
   return new AgentMonitorRuntime(new RuntimeStore(db), registry, [
     claudeCodeAdapter,
   ]);
+}
+
+/**
+ * Like {@link createRuntime} but also returns the underlying {@link RuntimeStore}
+ * so a test can read back persisted monitor state (e.g. the durably-written
+ * `sourceState` after a watch-mode checkpoint, 002 §2.4).
+ */
+function createRuntimeWithStore(
+  dbPath: string,
+  source: ObservationSource,
+): { runtime: AgentMonitorRuntime; store: RuntimeStore } {
+  const db = createDb(dbPath);
+  const registry = new SourceRegistry();
+  registry.register(source);
+  const store = new RuntimeStore(db);
+  const runtime = new AgentMonitorRuntime(store, registry, [claudeCodeAdapter]);
+  return { runtime, store };
 }
 
 function createMonitorFile(
@@ -4484,5 +4502,724 @@ describe('normal-urgency reminder suppression is explainable (issue #333)', () =
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// Watch-mode source-state checkpointing (002 §2.4). A long-lived watch() source
+// durably advances its persisted `sourceState` out of band via
+// `context.checkpoint`, serialized with observation ingestion per-watcher (the
+// G14 durable-write-before-ingest ordering) so a mid-watch crash reconciles from
+// the checkpointed baseline instead of re-emitting already-delivered changes.
+describe('watch-mode source-state checkpointing (002 §2.4)', () => {
+  const checkpointTmpDirs: string[] = [];
+
+  afterEach(() => {
+    while (checkpointTmpDirs.length > 0) {
+      const dir = checkpointTmpDirs.pop();
+      if (dir) rmSync(dir, { recursive: true, force: true });
+    }
+    vi.restoreAllMocks();
+  });
+
+  function scratch(): { rootDir: string; dbPath: string; monitorsDir: string } {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-checkpoint-'));
+    checkpointTmpDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'checkpoint-source',
+      'normal',
+    );
+    return { rootDir, dbPath, monitorsDir };
+  }
+
+  const sleep = (ms: number): Promise<void> =>
+    new Promise((resolve) => setTimeout(resolve, ms));
+
+  // Robust to an already-aborted signal: if stop() fired before the watcher
+  // reached this point, resolve immediately rather than registering a listener
+  // on a signal whose 'abort' event has already dispatched (which would never
+  // fire again). This is how a real watch() source must handle teardown.
+  const waitForAbort = (context: ObservationContext): Promise<void> =>
+    new Promise((resolve) => {
+      if (context.signal?.aborted) {
+        resolve();
+        return;
+      }
+      context.signal?.addEventListener('abort', () => resolve(), {
+        once: true,
+      });
+    });
+
+  async function waitUntil(
+    predicate: () => boolean,
+    timeoutMs = 1_000,
+  ): Promise<void> {
+    const start = Date.now();
+    while (!predicate()) {
+      if (Date.now() - start > timeoutMs) {
+        throw new Error('waitUntil: predicate never became true');
+      }
+      await sleep(5);
+    }
+  }
+
+  function openLeadSession(
+    runtime: AgentMonitorRuntime,
+    rootDir: string,
+    hostSessionId: string,
+  ): string {
+    return runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId,
+        workspacePath: rootDir,
+      }),
+    ).id;
+  }
+
+  // Criterion 2 (part a): the runtime supplies `context.checkpoint` on the
+  // watch() path (never observe()); awaiting it durably writes the updated source
+  // state into monitorState.sourceState BEFORE the promise resolves, and a
+  // subsequently-yielded observation still flows through the normal pipeline.
+  it('supplies checkpoint on watch() and persists the updated state before resolving', async () => {
+    const { rootDir, dbPath, monitorsDir } = scratch();
+
+    // Mutable holder so the watch() closure can read back the store the runtime
+    // was built with (assigned below, before the watcher starts).
+    const storeRef: { current?: RuntimeStore } = {};
+    let checkpointSupplied = false;
+    let stateVisibleWhenCheckpointResolved: unknown;
+    const source: ObservationSource = {
+      name: 'checkpoint-source',
+      scopeSchema: { type: 'object' },
+      observe: () => Promise.resolve({ observations: [] }),
+      async *watch(_config, context: ObservationContext) {
+        checkpointSupplied = typeof context.checkpoint === 'function';
+        await context.checkpoint?.({ fingerprint: 'v2' });
+        // The durable write MUST already be visible once the promise resolves.
+        stateVisibleWhenCheckpointResolved = storeRef.current?.getMonitorState(
+          'test-monitor',
+          rootDir,
+        ).sourceState;
+        yield { title: 'live', summary: 'live', objectKey: 'obj-live' };
+        await waitForAbort(context);
+      },
+    };
+
+    const { runtime, store } = createRuntimeWithStore(dbPath, source);
+    storeRef.current = store;
+    const sessionId = openLeadSession(runtime, rootDir, 'claude-ckpt-a');
+
+    const handle = await runtime.watchMonitors(monitorsDir, rootDir);
+    await waitUntil(
+      () => runtime.listEvents({ sessionId, unreadOnly: true }).length === 1,
+    );
+
+    expect(checkpointSupplied).toBe(true);
+    // checkpoint resolved only after the durable write landed:
+    expect(stateVisibleWhenCheckpointResolved).toEqual({ fingerprint: 'v2' });
+    // and it stayed persisted (the following ingest did not clobber it):
+    expect(store.getMonitorState('test-monitor', rootDir).sourceState).toEqual({
+      fingerprint: 'v2',
+    });
+
+    await handle.stop();
+  });
+
+  // Criterion 1: the checkpoint callback is supplied ONLY on the watch() path;
+  // the one-shot observe() tick path never receives it (observe() advances state
+  // via ObservationResult.nextState instead).
+  it('does not supply checkpoint to the observe() tick path', async () => {
+    const { rootDir, dbPath, monitorsDir } = scratch();
+
+    let observeContextHadCheckpoint: boolean | undefined;
+    const source: ObservationSource = {
+      name: 'checkpoint-source',
+      scopeSchema: { type: 'object' },
+      observe: (_config, context: ObservationContext) => {
+        observeContextHadCheckpoint = 'checkpoint' in context;
+        return Promise.resolve({ observations: [], nextState: { v: 1 } });
+      },
+    };
+
+    const { runtime } = createRuntimeWithStore(dbPath, source);
+    openLeadSession(runtime, rootDir, 'claude-ckpt-observe');
+
+    await runtime.tick(monitorsDir, rootDir);
+
+    expect(observeContextHadCheckpoint).toBe(false);
+  });
+
+  // Criterion 2 (part b): an in-flight (un-awaited) checkpoint immediately
+  // followed by a yielded observation asserts await-before-ingest — the runtime
+  // serializes the two per-watcher so the checkpoint's durable write completes
+  // before the observation is ingested, and the ingest observes (and preserves)
+  // the checkpointed baseline rather than a stale one.
+  //
+  // The checkpoint persistence is wrapped with a GENUINELY delayed async write
+  // (a timer) so this test detects a regression that splits checkpoint onto its
+  // own promise chain: with a synchronous store write, both an in-flight
+  // checkpoint and the following ingest would land in the same microtask turn and
+  // the checkpoint-first ordering could hold on scheduling luck even if the two
+  // were NOT serialized. By delaying the checkpoint's durable write and recording
+  // the observable order of the checkpoint vs. ingest writes, the ingest can only
+  // land after the delayed checkpoint if it is on the SAME per-watcher chain —
+  // an independent chain would let the (undelayed) ingest write run first and
+  // fail the assertion.
+  it('orders an in-flight, genuinely-delayed checkpoint before a following ingest (G14 serialization)', async () => {
+    const { rootDir, dbPath, monitorsDir } = scratch();
+
+    const source: ObservationSource = {
+      name: 'checkpoint-source',
+      scopeSchema: { type: 'object' },
+      observe: () => Promise.resolve({ observations: [] }),
+      async *watch(_config, context: ObservationContext) {
+        // Fire the checkpoint WITHOUT awaiting it, then immediately yield.
+        void context.checkpoint?.({ fingerprint: 'v2' });
+        yield { title: 'live', summary: 'live', objectKey: 'obj-live' };
+        await waitForAbort(context);
+      },
+    };
+
+    const { runtime, store } = createRuntimeWithStore(dbPath, source);
+    const sessionId = openLeadSession(runtime, rootDir, 'claude-ckpt-b');
+
+    // Record the observable order of durable writes, tagging each as a checkpoint
+    // write vs. an ingest write. The checkpoint write is distinguished by an
+    // `inCheckpoint` flag the delayed checkpoint wrapper sets around the real
+    // persistence, since the ingest PRESERVES the checkpointed sourceState (both
+    // write `{ fingerprint: 'v2' }`, so the value alone cannot tell them apart).
+    const writeOrder: ('checkpoint' | 'ingest')[] = [];
+    let inCheckpoint = false;
+    const originalSet = store.setMonitorState.bind(store);
+    vi.spyOn(store, 'setMonitorState').mockImplementation((id, ws, state) => {
+      writeOrder.push(inCheckpoint ? 'checkpoint' : 'ingest');
+      originalSet(id, ws, state);
+    });
+
+    // Wrap the checkpoint persistence with a genuine async delay BEFORE the
+    // durable write. An independent-chain regression would let the ingest's write
+    // run during this delay (ingest-before-checkpoint); the correct single-chain
+    // implementation forces the ingest to wait for this delayed write.
+    const runtimeInternals = runtime as unknown as {
+      writeCheckpoint: (
+        monitorId: string,
+        workspacePath: string,
+        nextState: unknown,
+      ) => Promise<void>;
+    };
+    const realWriteCheckpoint =
+      runtimeInternals.writeCheckpoint.bind(runtimeInternals);
+    vi.spyOn(runtimeInternals, 'writeCheckpoint').mockImplementation(
+      async (monitorId, workspacePath, nextState) => {
+        await sleep(40);
+        inCheckpoint = true;
+        try {
+          await realWriteCheckpoint(monitorId, workspacePath, nextState);
+        } finally {
+          inCheckpoint = false;
+        }
+      },
+    );
+
+    const handle = await runtime.watchMonitors(monitorsDir, rootDir);
+    await waitUntil(
+      () => runtime.listEvents({ sessionId, unreadOnly: true }).length === 1,
+    );
+
+    // The (delayed) checkpoint write is observably FIRST; the ingest's own
+    // read-modify-write only runs after it, proving the two share one chain and
+    // the ingest awaited the in-flight checkpoint rather than racing it.
+    const firstCheckpoint = writeOrder.indexOf('checkpoint');
+    const firstIngest = writeOrder.indexOf('ingest');
+    expect(firstCheckpoint).toBeGreaterThanOrEqual(0);
+    expect(firstIngest).toBeGreaterThanOrEqual(0);
+    expect(firstCheckpoint).toBeLessThan(firstIngest);
+    // And the ingest preserved the checkpointed baseline (never a stale {}).
+    expect(store.getMonitorState('test-monitor', rootDir).sourceState).toEqual({
+      fingerprint: 'v2',
+    });
+
+    await handle.stop();
+  });
+
+  // Criterion 3: a checkpoint is a state write ONLY — it never materializes or
+  // delivers an observation as a side effect (no new monitor_events rows).
+  it('writes state without materializing any monitor_events', async () => {
+    const { rootDir, dbPath, monitorsDir } = scratch();
+
+    const source: ObservationSource = {
+      name: 'checkpoint-source',
+      scopeSchema: { type: 'object' },
+      observe: () => Promise.resolve({ observations: [] }),
+      // eslint-disable-next-line require-yield -- checkpoint-only watcher never yields
+      async *watch(_config, context: ObservationContext) {
+        await context.checkpoint?.({ fingerprint: 'v3' });
+        // never yield an observation — this exercises the checkpoint-only path.
+        await waitForAbort(context);
+      },
+    };
+
+    const { runtime, store } = createRuntimeWithStore(dbPath, source);
+    const sessionId = openLeadSession(runtime, rootDir, 'claude-ckpt-c');
+
+    const handle = await runtime.watchMonitors(monitorsDir, rootDir);
+    await waitUntil(
+      () =>
+        store.getMonitorState('test-monitor', rootDir).sourceState !==
+          undefined &&
+        JSON.stringify(
+          store.getMonitorState('test-monitor', rootDir).sourceState,
+        ) === JSON.stringify({ fingerprint: 'v3' }),
+    );
+
+    // The state write happened, but no event was materialized or delivered.
+    expect(store.getMonitorState('test-monitor', rootDir).sourceState).toEqual({
+      fingerprint: 'v3',
+    });
+    expect(store.listEvents({ monitorId: 'test-monitor' })).toHaveLength(0);
+    expect(runtime.listEvents({ sessionId, unreadOnly: true })).toHaveLength(0);
+
+    await handle.stop();
+  });
+
+  // Criterion 4 (negative): a checkpoint whose durable write rejects MUST NOT
+  // abort the watcher — a warning is logged and subsequent observations still
+  // flow. Even a source that AWAITS the checkpoint keeps watching (the callback
+  // resolves rather than rejecting).
+  it('does not abort the watcher when a checkpoint write fails', async () => {
+    const { rootDir, dbPath, monitorsDir } = scratch();
+
+    const source: ObservationSource = {
+      name: 'checkpoint-source',
+      scopeSchema: { type: 'object' },
+      observe: () => Promise.resolve({ observations: [] }),
+      async *watch(_config, context: ObservationContext) {
+        // Awaiting a failing checkpoint MUST resolve (not reject) so an
+        // unguarded source keeps running.
+        await context.checkpoint?.({ fingerprint: 'boom' });
+        yield { title: 'after-1', summary: 'after-1', objectKey: 'obj-1' };
+        yield { title: 'after-2', summary: 'after-2', objectKey: 'obj-2' };
+        await waitForAbort(context);
+      },
+    };
+
+    const { runtime, store } = createRuntimeWithStore(dbPath, source);
+    const sessionId = openLeadSession(runtime, rootDir, 'claude-ckpt-d');
+
+    // Fail only the checkpoint write (tagged 'boom'); let ingest's own writes
+    // (which preserve the untouched default sourceState) succeed.
+    const originalSet = store.setMonitorState.bind(store);
+    vi.spyOn(store, 'setMonitorState').mockImplementation((id, ws, state) => {
+      const sourceState = state.sourceState as
+        | { fingerprint?: string }
+        | undefined;
+      if (sourceState?.fingerprint === 'boom') {
+        throw new Error('simulated disk failure');
+      }
+      originalSet(id, ws, state);
+    });
+    const stderrSpy = vi
+      .spyOn(process.stderr, 'write')
+      .mockImplementation(
+        (() => true) as unknown as typeof process.stderr.write,
+      );
+
+    const onError = vi.fn();
+    const handle = await runtime.watchMonitors(monitorsDir, rootDir, {
+      onError,
+    });
+    await waitUntil(
+      () => runtime.listEvents({ sessionId, unreadOnly: true }).length === 2,
+    );
+
+    // Both post-checkpoint observations were delivered — the watcher survived.
+    expect(store.listEvents({ monitorId: 'test-monitor' })).toHaveLength(2);
+    expect(onError).not.toHaveBeenCalled();
+    // A warning naming the monitor was logged for the failed checkpoint.
+    const warnings = stderrSpy.mock.calls.map((call) => String(call[0]));
+    expect(
+      warnings.some(
+        (line) => line.includes('checkpoint') && line.includes('test-monitor'),
+      ),
+    ).toBe(true);
+
+    await handle.stop();
+  });
+
+  // Criterion 5: restart-safety. A checkpointed baseline survives a daemon
+  // restart — a fresh runtime opened against the SAME on-disk database
+  // reconciles a re-established watcher from the checkpointed sourceState, not
+  // the stale pre-watch baseline (real SQLite round-trip).
+  it('reconciles a restarted watcher from the checkpointed baseline', async () => {
+    const { rootDir, dbPath, monitorsDir } = scratch();
+
+    // --- Daemon "A": establish and checkpoint a baseline, then shut down. ---
+    let checkpointedByA = false;
+    const sourceA: ObservationSource = {
+      name: 'checkpoint-source',
+      scopeSchema: { type: 'object' },
+      observe: () => Promise.resolve({ observations: [] }),
+      // eslint-disable-next-line require-yield -- checkpoint-then-idle, never yields
+      async *watch(_config, context: ObservationContext) {
+        await context.checkpoint?.({ fingerprint: 'persisted-v2' });
+        checkpointedByA = true;
+        await waitForAbort(context);
+      },
+    };
+    const daemonA = createRuntimeWithStore(dbPath, sourceA);
+    const handleA = await daemonA.runtime.watchMonitors(monitorsDir, rootDir);
+    await waitUntil(() => checkpointedByA);
+    await handleA.stop();
+
+    // The checkpointed state is durable in SQLite.
+    expect(
+      daemonA.store.getMonitorState('test-monitor', rootDir).sourceState,
+    ).toEqual({
+      fingerprint: 'persisted-v2',
+    });
+
+    // --- Daemon "B": a fresh runtime against the SAME db (a restart). ---
+    let previousStateSeenByB: unknown = 'unset';
+    const sourceB: ObservationSource = {
+      name: 'checkpoint-source',
+      scopeSchema: { type: 'object' },
+      observe: () => Promise.resolve({ observations: [] }),
+      // eslint-disable-next-line require-yield -- observes previousState only, never yields
+      async *watch(_config, context: ObservationContext) {
+        previousStateSeenByB = context.previousState;
+        await waitForAbort(context);
+      },
+    };
+    const daemonB = createRuntimeWithStore(dbPath, sourceB);
+    const handleB = await daemonB.runtime.watchMonitors(monitorsDir, rootDir);
+    await waitUntil(() => previousStateSeenByB !== 'unset');
+
+    // The re-established watcher reconciles from the checkpointed baseline,
+    // NOT the empty pre-watch state — no duplicate deliveries on restart.
+    expect(previousStateSeenByB).toEqual({ fingerprint: 'persisted-v2' });
+
+    await handleB.stop();
+  });
+
+  // A checkpoint must land in the watcher's OWN (monitorId, workspacePath) state
+  // row (002 §3, #345/#307): the persistence DB is global and the same monitor id
+  // can exist in unrelated workspaces, so a checkpoint written to the wrong scope
+  // would either miss the watcher's own row or clobber another workspace's
+  // change-detection baseline. This asserts both directions at once.
+  it("checkpoints only the watcher's own workspace row, never a same-id monitor in another workspace", async () => {
+    const { rootDir, dbPath, monitorsDir } = scratch();
+    const workspaceA = rootDir;
+    // A distinct workspace path string sharing the SAME monitor id.
+    const workspaceB = path.join(rootDir, 'other-workspace');
+
+    let checkpointedByA = false;
+    const source: ObservationSource = {
+      name: 'checkpoint-source',
+      scopeSchema: { type: 'object' },
+      observe: () => Promise.resolve({ observations: [] }),
+      // eslint-disable-next-line require-yield -- checkpoint-then-idle, never yields
+      async *watch(_config, context: ObservationContext) {
+        await context.checkpoint?.({ fingerprint: 'A2' });
+        checkpointedByA = true;
+        await waitForAbort(context);
+      },
+    };
+    const { runtime, store } = createRuntimeWithStore(dbPath, source);
+
+    // Pre-seed workspace B's row for the SAME monitor id with a distinct baseline
+    // the watcher (scoped to workspace A) must never touch.
+    store.setMonitorState('test-monitor', workspaceB, {
+      sourceState: { fingerprint: 'B1' },
+      notifyState: {},
+    });
+
+    const handle = await runtime.watchMonitors(monitorsDir, workspaceA);
+    // checkpoint() resolves only after its durable write lands, so this implies
+    // workspace A's row is written.
+    await waitUntil(() => checkpointedByA);
+
+    // Workspace A's row got the checkpoint; workspace B's row is untouched. If
+    // `writeCheckpoint` ignored workspace scope (e.g. wrote a global/null row),
+    // workspace A's row would be empty here — failing the first assertion.
+    expect(
+      store.getMonitorState('test-monitor', workspaceA).sourceState,
+    ).toEqual({ fingerprint: 'A2' });
+    expect(
+      store.getMonitorState('test-monitor', workspaceB).sourceState,
+    ).toEqual({ fingerprint: 'B1' });
+
+    await handle.stop();
+  });
+
+  // A checkpoint delivered AFTER the watcher is stopped (its AbortSignal aborted
+  // by stop(), and the watcher no longer the current active watcher for its id)
+  // must be REJECTED: it writes nothing and logs one warning, so a straggling
+  // `checkpoint(staleState)` can never clobber a newer baseline (002 §2.4).
+  it('rejects a checkpoint delivered after the watcher is stopped (no write, one warning)', async () => {
+    const { rootDir, dbPath, monitorsDir } = scratch();
+
+    let capturedCheckpoint: ((nextState: unknown) => Promise<void>) | undefined;
+    const source: ObservationSource = {
+      name: 'checkpoint-source',
+      scopeSchema: { type: 'object' },
+      observe: () => Promise.resolve({ observations: [] }),
+      // eslint-disable-next-line require-yield -- captures checkpoint, then idles
+      async *watch(_config, context: ObservationContext) {
+        capturedCheckpoint = context.checkpoint;
+        await waitForAbort(context);
+      },
+    };
+    const { runtime, store } = createRuntimeWithStore(dbPath, source);
+
+    const handle = await runtime.watchMonitors(monitorsDir, rootDir);
+    await waitUntil(() => capturedCheckpoint !== undefined);
+    await handle.stop();
+
+    // Only observe writes AFTER stop(), so the setup path can't pollute the count.
+    const postStopWrites: unknown[] = [];
+    const originalSet = store.setMonitorState.bind(store);
+    vi.spyOn(store, 'setMonitorState').mockImplementation((id, ws, state) => {
+      postStopWrites.push(state.sourceState);
+      originalSet(id, ws, state);
+    });
+    const stderrSpy = vi
+      .spyOn(process.stderr, 'write')
+      .mockImplementation(
+        (() => true) as unknown as typeof process.stderr.write,
+      );
+
+    // Invoke the stale checkpoint captured before stop(). It MUST resolve (never
+    // reject) but perform no write.
+    await capturedCheckpoint?.({ fingerprint: 'stale' });
+
+    expect(postStopWrites).toHaveLength(0);
+    expect(
+      store.getMonitorState('test-monitor', rootDir).sourceState,
+    ).toBeUndefined();
+    const warnings = stderrSpy.mock.calls.map((call) => String(call[0]));
+    expect(
+      warnings.some(
+        (line) => line.includes('checkpoint') && line.includes('test-monitor'),
+      ),
+    ).toBe(true);
+  });
+
+  // A watch() iterable that completes NORMALLY (not via stop()/abort or an error)
+  // must release its active-watcher slot so the tick loop resumes driving the
+  // monitor via observe(); otherwise the id stays pinned in `activeWatchers`
+  // forever, permanently starving observe() and blocking any watcher restart.
+  it('releases the active-watcher slot when watch() completes normally, so observe() resumes', async () => {
+    const { rootDir, dbPath, monitorsDir } = scratch();
+
+    let observeCalls = 0;
+    const source: ObservationSource = {
+      name: 'checkpoint-source',
+      scopeSchema: { type: 'object' },
+      observe: () => {
+        observeCalls += 1;
+        return Promise.resolve({ observations: [] });
+      },
+      // Completes immediately with no yield: a finite watch() that ends normally.
+      // (An empty generator body needs no require-yield disable — ESLint exempts it.)
+      async *watch() {
+        // no observations; the iterable finishes as soon as it is driven
+      },
+    };
+    const { runtime } = createRuntimeWithStore(dbPath, source);
+
+    const handle = await runtime.watchMonitors(monitorsDir, rootDir);
+
+    // Once the (finite) watcher has finished and released its slot, a tick drives
+    // observe() again. Poll: pre-fix, the id stays in activeWatchers and observe()
+    // is skipped forever, so observeCalls never advances and this times out.
+    let released = false;
+    for (let i = 0; i < 200 && !released; i += 1) {
+      await runtime.tick(monitorsDir, rootDir);
+      if (observeCalls > 0) {
+        released = true;
+        break;
+      }
+      await sleep(5);
+    }
+
+    expect(released).toBe(true);
+    expect(observeCalls).toBeGreaterThan(0);
+
+    await handle.stop();
+  });
+
+  // SEVERE regression test. `getMonitorState`, `watchConfig`, and the `watch()`
+  // invocation itself used to run BEFORE `consumeWatch`'s `try`, so a
+  // synchronous throw there (SQLITE_BUSY, or a source whose `watch()`
+  // validates its config and throws before ever returning an iterable — legal
+  // per the `ObservationSource.watch` type, which only constrains the
+  // RETURNED value to `AsyncIterable<Observation>`) rejected the watcher
+  // task's promise without ever reaching the `finally`. `watchMonitors`
+  // already recorded the active-watcher slot and never catches the task, so
+  // the slot leaked FOREVER: the tick loop and any future `watchMonitors()`
+  // would keep skipping the id, `onError` would never fire, and the monitor
+  // would go silently dark.
+  it('releases the active-watcher slot when watch() throws synchronously before returning an iterable', async () => {
+    const { rootDir, dbPath, monitorsDir } = scratch();
+
+    let observeCalls = 0;
+    const source: ObservationSource = {
+      name: 'checkpoint-source',
+      scopeSchema: { type: 'object' },
+      observe: () => {
+        observeCalls += 1;
+        return Promise.resolve({ observations: [] });
+      },
+      // A plain (non-generator) function is a legal `watch()` implementation
+      // — the type only constrains the RETURNED value. Throwing before ever
+      // returning simulates a source whose config validation fails
+      // synchronously (or a `getMonitorState` read hitting SQLITE_BUSY).
+      watch(): AsyncIterable<Observation> {
+        throw new Error('simulated synchronous config validation failure');
+      },
+    };
+    const { runtime } = createRuntimeWithStore(dbPath, source);
+
+    const onError = vi.fn();
+    const handle = await runtime.watchMonitors(monitorsDir, rootDir, {
+      onError,
+    });
+
+    // The synchronous throw is still reported via onError (the daemon does
+    // not crash)...
+    await waitUntil(() => onError.mock.calls.length > 0);
+    expect(onError).toHaveBeenCalledWith(
+      'test-monitor',
+      expect.objectContaining({
+        message: expect.stringContaining(
+          'simulated synchronous config validation failure',
+        ),
+      }),
+    );
+
+    // ...and, critically, the active-watcher slot is released rather than
+    // leaked: a subsequent tick drives observe() again. Pre-fix, the id
+    // stayed pinned forever and this polling loop would time out.
+    let released = false;
+    for (let i = 0; i < 200 && !released; i += 1) {
+      await runtime.tick(monitorsDir, rootDir);
+      if (observeCalls > 0) {
+        released = true;
+        break;
+      }
+      await sleep(5);
+    }
+
+    expect(released).toBe(true);
+    expect(observeCalls).toBeGreaterThan(0);
+
+    await handle.stop();
+  });
+
+  // Regression test for the token-supersession branch specifically (not the
+  // stop()/abort branch, which the earlier "rejects a checkpoint delivered
+  // after the watcher is stopped" test already covers): watcher A's watch()
+  // completes NORMALLY — signal never aborted — so its slot is released via
+  // the `finally`'s token match, not via `signal.aborted`. A leaked closure
+  // keeps A's own `checkpoint` reference. `watchMonitors()` then
+  // re-establishes watcher B (a NEW token) for the SAME monitor id. A's
+  // straggling `checkpoint(staleState)` must be REJECTED — by the token
+  // comparison alone, since `signal.aborted` is false for A — leaving B's
+  // persisted baseline untouched. Deleting the
+  // `this.activeWatchers.get(monitor.id) !== watcherToken` check (keeping
+  // only `signal.aborted`) would leave this suite red only here.
+  it("rejects a superseded (non-aborted) watcher's stale checkpoint without touching its successor's baseline (token supersession)", async () => {
+    const { rootDir, dbPath, monitorsDir } = scratch();
+
+    let watchCallCount = 0;
+    let capturedCheckpointA:
+      | ((nextState: unknown) => Promise<void>)
+      | undefined;
+    const source: ObservationSource = {
+      name: 'checkpoint-source',
+      scopeSchema: { type: 'object' },
+      observe: () => Promise.resolve({ observations: [] }),
+      watch(_config, context: ObservationContext): AsyncIterable<Observation> {
+        watchCallCount += 1;
+        if (watchCallCount === 1) {
+          // Watcher A: captures its OWN checkpoint reference, writes a
+          // baseline, then completes NORMALLY (no yield, no abort wait) — a
+          // finite watch() releasing its slot via the finally's token match.
+          // eslint-disable-next-line require-yield -- checkpoints once, then finishes
+          return (async function* (): AsyncGenerator<Observation> {
+            capturedCheckpointA = context.checkpoint;
+            await context.checkpoint?.({ fingerprint: 'A1' });
+          })();
+        }
+        // Watcher B: re-established for the SAME monitor id after A released
+        // its slot. Writes its own baseline, then idles until aborted.
+        // eslint-disable-next-line require-yield -- checkpoints once, then idles until aborted
+        return (async function* (): AsyncGenerator<Observation> {
+          await context.checkpoint?.({ fingerprint: 'B1' });
+          await waitForAbort(context);
+        })();
+      },
+    };
+    const { runtime, store } = createRuntimeWithStore(dbPath, source);
+
+    await runtime.watchMonitors(monitorsDir, rootDir);
+    // checkpoint() resolves only after its durable write lands, so this
+    // implies A's baseline is persisted (and, since the generator has no
+    // further statements after the checkpoint, that A's finally has run or is
+    // about to — the retry loop below tolerates the small remaining race).
+    await waitUntil(() => capturedCheckpointA !== undefined);
+    await waitUntil(
+      () =>
+        JSON.stringify(
+          store.getMonitorState('test-monitor', rootDir).sourceState,
+        ) === JSON.stringify({ fingerprint: 'A1' }),
+    );
+
+    // Re-establish watcher B for the SAME monitor id. Retry the establishment
+    // call itself: if A's `finally` has not yet deleted its slot, `
+    // watchMonitors` silently skips the id (by design — the tick loop must
+    // never double-drive a monitor), so `handleB.monitorIds` would omit it.
+    let handleB: Awaited<ReturnType<typeof runtime.watchMonitors>> | undefined;
+    for (let i = 0; i < 200; i += 1) {
+      const attempt = await runtime.watchMonitors(monitorsDir, rootDir);
+      if (attempt.monitorIds.includes('test-monitor')) {
+        handleB = attempt;
+        break;
+      }
+      await sleep(5);
+    }
+    if (!handleB) throw new Error('watcher B was never established');
+    await waitUntil(
+      () =>
+        JSON.stringify(
+          store.getMonitorState('test-monitor', rootDir).sourceState,
+        ) === JSON.stringify({ fingerprint: 'B1' }),
+    );
+
+    const stderrSpy = vi
+      .spyOn(process.stderr, 'write')
+      .mockImplementation(
+        (() => true) as unknown as typeof process.stderr.write,
+      );
+
+    // A's own captured checkpoint is now stale: A's signal was NEVER aborted
+    // (it completed normally, and we never called any `stop()` on it), so
+    // only the token-supersession comparison protects B's baseline here.
+    await capturedCheckpointA?.({ fingerprint: 'stale-from-A' });
+
+    // B's baseline must be intact — A's stale checkpoint must not have
+    // clobbered it.
+    expect(store.getMonitorState('test-monitor', rootDir).sourceState).toEqual({
+      fingerprint: 'B1',
+    });
+    const warnings = stderrSpy.mock.calls.map((call) => String(call[0]));
+    expect(
+      warnings.some(
+        (line) => line.includes('checkpoint') && line.includes('test-monitor'),
+      ),
+    ).toBe(true);
+
+    await handleB.stop();
   });
 });
