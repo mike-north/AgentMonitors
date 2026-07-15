@@ -38,6 +38,7 @@ import {
   describeWorkspace,
   describeWorkspaceDisabled,
 } from '../hook-deliver-debug.js';
+import { describeUnknownHostSessionWarning } from '../hook-deliver-warnings.js';
 
 export const hookCommand = new Command('hook').description(
   'Claim hook-delivery payloads from the runtime',
@@ -151,6 +152,13 @@ Output formats:
   default/json  Compact Claude Code hook wire JSON when something is pending.
   text          Rendered additionalContext only, for manual inspection.
 
+Unknown session_id (issue #329):
+  If the payload's session_id matches no tracked session, one line is ALWAYS written to
+  STDERR — even without --debug — since that failure can never resolve, unlike the
+  expected (and silent) ~15s high-urgency claim-settle window:
+    hook deliver: no session registered for host session id "<id>"
+  STDOUT and the exit code are unaffected.
+
 Diagnosis:
   --debug  Writes a step-by-step diagnosis to STDERR only (session resolution,
            workspace/socket state, unread (unacknowledged) event counts by urgency, and the hold
@@ -239,10 +247,19 @@ Diagnosis:
           return;
         }
 
-        // Resolve the host session id to an AgentMon session record.
+        // Resolve the host session id to an AgentMon session record. Unlike
+        // every other quiet-return branch above, an unresolvable session_id
+        // is otherwise indistinguishable from the expected high-urgency
+        // claim-settle window (up to ~15s of legitimately empty output,
+        // 002 §9.1) — so this ONE branch always writes a one-line stderr
+        // diagnostic, regardless of --debug (issue #329). STDOUT is
+        // untouched either way.
         const sessions = await listSessionsClient(socketPath);
         const match = sessions.find((s) => s.hostSessionId === hostSessionId);
         if (!match) {
+          process.stderr.write(
+            `${describeUnknownHostSessionWarning(hostSessionId)}\n`,
+          );
           debug(describeNoSessionMatch(hostSessionId, sessions));
           return;
         }

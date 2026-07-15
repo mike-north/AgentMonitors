@@ -8279,6 +8279,363 @@ describe('hook deliver --debug diagnosis (issue #334)', () => {
   }, 40_000);
 });
 
+// Issue #329: an unresolvable host session_id produced empty stdout + exit 0
+// — indistinguishable from the EXPECTED empty output during the ~15s
+// high-urgency claim-settle window (002 §9.1). Since a bad session_id can
+// never resolve (unlike the settle window, which resolves on its own), this
+// ONE quiet-return branch now ALWAYS writes a one-line stderr diagnostic,
+// regardless of `--debug` — while every other quiet-return branch (including
+// the settle window itself) stays silent by default, exactly as before.
+describe('hook deliver: always-on unknown-session stderr diagnostic (issue #329)', () => {
+  it('help documents the always-on unknown-session_id stderr warning', () => {
+    const result = run(['hook', 'deliver', '--help']);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('Unknown session_id');
+    expect(result.stdout).toContain('even without --debug');
+    expect(result.stdout).toContain(
+      'hook deliver: no session registered for host session id "<id>"',
+    );
+  });
+
+  // Acceptance: unknown session_id -> stderr warning + empty stdout + exit 0,
+  // WITHOUT --debug (the whole point: this is not gated behind the flag).
+  it('unknown session_id: warns on stderr even without --debug, stdout stays empty, exit 0', async () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-329-unknown-'));
+    mkdirSync(path.join(ws, '.claude', 'monitors'), { recursive: true });
+
+    const socket = path.join(
+      '/tmp',
+      `agentmon-329-unk-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const db = path.join(ws, 'unknown.db');
+    const hostSessionId = `known-${Date.now()}`;
+
+    writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 30_000 });
+
+    const env: Record<string, string> = {
+      CLAUDE_CODE_SESSION_ID: hostSessionId,
+      CLAUDE_PROJECT_DIR: ws,
+      AGENTMONITORS_DB: db,
+      AGENTMONITORS_SOCKET: socket,
+    };
+
+    const daemon = await startDaemon(
+      path.join(ws, '.claude', 'monitors'),
+      ws,
+      env,
+      socket,
+    );
+
+    try {
+      // One REAL tracked session exists, but the hook payload names a
+      // different, never-opened host session id — the exact repro from the
+      // issue (a stale/mistyped session_id can never resolve).
+      const sessionOpen = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          hostSessionId,
+          '--workspace',
+          ws,
+          '--format',
+          'json',
+        ],
+        env,
+        ws,
+      );
+      expect(sessionOpen.exitCode).toBe(0);
+
+      // NO --debug flag here — the whole point of #329 is that this warning
+      // fires unconditionally.
+      const result = runWithStdinCapture(
+        ['hook', 'deliver'],
+        env,
+        JSON.stringify({
+          session_id: 'verify-host',
+          hook_event_name: 'UserPromptSubmit',
+          cwd: ws,
+        }),
+        ws,
+      );
+
+      expect(result.exitCode).toBe(0);
+      // Contract unchanged: the Claude Code host must see byte-empty stdout.
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toBe(
+        'hook deliver: no session registered for host session id "verify-host"\n',
+      );
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  // Acceptance: a KNOWN session held by the (expected, self-resolving) 15s
+  // high-urgency claim-settle window must NOT warn — that would defeat the
+  // whole point of distinguishing "will never resolve" from "still settling".
+  it('known session held by the settle window: NO stderr warning (silent, as before)', async () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-329-settle-'));
+    const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-fast');
+    mkdirSync(monitorsDir, { recursive: true });
+
+    const watchedFile = path.join(ws, 'watched.txt');
+    writeFileSync(watchedFile, 'initial content', 'utf-8');
+
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      [
+        '---',
+        'name: Watch fast',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs:',
+        '    - "watched.txt"',
+        `  cwd: ${JSON.stringify(ws)}`,
+        '  interval: "1s"',
+        'urgency: high',
+        // Short notify debounce so the event materializes in ~1s, well
+        // short of the SEPARATE 15s claim-time settle window (002 §9.1) —
+        // an observably "held" state without a real-clock 15s wait.
+        'notify:',
+        '  strategy: debounce',
+        '  settle-for: "1s"',
+        '---',
+        'When files change, review them.',
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+
+    const socket = path.join(
+      '/tmp',
+      `agentmon-329-settle-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const db = path.join(ws, 'settle.db');
+    const hostSessionId = `settle-${Date.now()}`;
+
+    writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 30_000 });
+
+    const env: Record<string, string> = {
+      CLAUDE_CODE_SESSION_ID: hostSessionId,
+      CLAUDE_PROJECT_DIR: ws,
+      AGENTMONITORS_DB: db,
+      AGENTMONITORS_SOCKET: socket,
+    };
+
+    const daemon = await startDaemon(
+      path.join(ws, '.claude', 'monitors'),
+      ws,
+      env,
+      socket,
+    );
+
+    try {
+      const sessionOpen = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          hostSessionId,
+          '--workspace',
+          ws,
+          '--format',
+          'json',
+        ],
+        env,
+        ws,
+      );
+      expect(sessionOpen.exitCode).toBe(0);
+      const session = JSON.parse(sessionOpen.stdout) as { id: string };
+
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
+      writeFileSync(watchedFile, 'changed content', 'utf-8');
+
+      const unread = () =>
+        runWithEnv(
+          [
+            'events',
+            'list',
+            '--session',
+            session.id,
+            '--unread',
+            '--format',
+            'json',
+          ],
+          env,
+          ws,
+        );
+
+      const eventDeadline = Date.now() + 10_000;
+      while (Date.now() < eventDeadline) {
+        const result = unread();
+        if (result.exitCode === 0 && JSON.parse(result.stdout).length >= 1) {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      expect(JSON.parse(unread().stdout)).toHaveLength(1);
+
+      // Immediately deliver (NO --debug) — the event is materialized
+      // (unread) but still well short of the 15s claim-time settle window,
+      // so it is genuinely held, not lost. Empty stdout here is EXPECTED and
+      // must stay silent on stderr too — this is the exact ambiguity #329's
+      // repro flagged, and the fix must not turn it into false-positive noise.
+      const result = runWithStdinCapture(
+        ['hook', 'deliver'],
+        env,
+        JSON.stringify({
+          session_id: hostSessionId,
+          hook_event_name: 'PostToolUse',
+          cwd: ws,
+        }),
+        ws,
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toBe('');
+
+      // The event is genuinely held, not lost: still unread and re-discoverable.
+      expect(JSON.parse(unread().stdout)).toHaveLength(1);
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  // Acceptance: a KNOWN session with a genuinely claimable event delivers
+  // exactly as before — the fix touches only the unresolved-session branch.
+  it('known session with a claimable event: delivery is unchanged and produces no stderr output', async () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-329-claim-'));
+    const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-files');
+    mkdirSync(monitorsDir, { recursive: true });
+
+    const watchedFile = path.join(ws, 'watched.txt');
+    writeFileSync(watchedFile, 'initial content', 'utf-8');
+
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      [
+        '---',
+        'name: Watch files',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs:',
+        '    - "watched.txt"',
+        `  cwd: ${JSON.stringify(ws)}`,
+        '  interval: "1s"',
+        'urgency: high',
+        '---',
+        'When files change, review the diff and flag risky changes.',
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+
+    const socket = path.join(
+      '/tmp',
+      `agentmon-329-claim-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const db = path.join(ws, 'claim.db');
+    const hostSessionId = `claim-${Date.now()}`;
+
+    writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 30_000 });
+
+    const env: Record<string, string> = {
+      CLAUDE_CODE_SESSION_ID: hostSessionId,
+      CLAUDE_PROJECT_DIR: ws,
+      AGENTMONITORS_DB: db,
+      AGENTMONITORS_SOCKET: socket,
+    };
+
+    const daemon = await startDaemon(
+      path.join(ws, '.claude', 'monitors'),
+      ws,
+      env,
+      socket,
+    );
+
+    try {
+      const sessionOpen = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          hostSessionId,
+          '--workspace',
+          ws,
+          '--format',
+          'json',
+        ],
+        env,
+        ws,
+      );
+      expect(sessionOpen.exitCode).toBe(0);
+      const session = JSON.parse(sessionOpen.stdout) as { id: string };
+
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
+      writeFileSync(watchedFile, 'changed content', 'utf-8');
+
+      const unread = () =>
+        runWithEnv(
+          [
+            'events',
+            'list',
+            '--session',
+            session.id,
+            '--unread',
+            '--format',
+            'json',
+          ],
+          env,
+          ws,
+        );
+
+      // Poll for the unread event with a deadline covering the 15s
+      // high-urgency settle window plus headroom.
+      const eventDeadline = Date.now() + 20_000;
+      while (Date.now() < eventDeadline) {
+        const result = unread();
+        if (result.exitCode === 0 && JSON.parse(result.stdout).length >= 1) {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      expect(JSON.parse(unread().stdout)).toHaveLength(1);
+
+      const result = runWithStdinCapture(
+        ['hook', 'deliver'],
+        env,
+        JSON.stringify({
+          session_id: hostSessionId,
+          hook_event_name: 'PostToolUse',
+          cwd: ws,
+        }),
+        ws,
+      );
+
+      expect(result.exitCode).toBe(0);
+      // Delivery is unaffected by the #329 fix: the body is still emitted...
+      expect(result.stdout.trim()).not.toBe('');
+      const output = JSON.parse(result.stdout) as {
+        hookSpecificOutput: { additionalContext: string };
+      };
+      expect(output.hookSpecificOutput.additionalContext).toContain(
+        'watch-files',
+      );
+      // ...and a resolved session produces no stderr output whatsoever.
+      expect(result.stderr).toBe('');
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 40_000);
+});
+
 // Issue #270: prove hooks-only (no-MCP) operation is a complete, first-class
 // mode — not an implementation accident. Governing spec: docs/specs/006-
 // agent-integration.md, new subsection "Operating without MCP" (NP-CH). This

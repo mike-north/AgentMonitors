@@ -1142,7 +1142,9 @@ or the workspace/session is not configured.
 2. Derive the lifecycle from `hook_event_name` (unless `--lifecycle` is passed). Non-context events (`PreToolUse`, `Stop`) → exit 0, print nothing.
 3. Read `.claude/agentmonitors.local.md` via `payload.cwd ?? CLAUDE_PROJECT_DIR ?? cwd`. If `!enabled` or no explicit socket → exit 0, print nothing.
 4. Check daemon availability. If unreachable → exit 0, print nothing.
-5. List sessions, find the one matching `session_id`. If not found → exit 0, print nothing.
+5. List sessions, find the one matching `session_id`. If not found → exit 0, print nothing on
+   stdout; ALSO write `hook deliver: no session registered for host session id "<id>"` to
+   **stderr**, unconditionally — not gated behind `--debug` (issue #329; see §12.2.1).
 6. Call `claimDelivery(sessionId, lifecycle)`. If null → exit 0, print nothing.
 7. Render via `renderHookDelivery(claim, hookEventName)`. It returns `null` (→ exit 0, print nothing) **only** when the claim is `null` or carries neither event bodies nor a reminder message. A `normal`/`low` claim with `events: []` but a populated `message` renders that message as a reminder line (see Note below) — it is **not** silent.
 8. Print the selected output format to stdout and exit 0.
@@ -1182,7 +1184,7 @@ wire JSON. The example below is pretty-printed for readability; the command emit
 `hookSpecificOutput.additionalContext` string, with no JSON wrapper. This format is for manual
 inspection; hook configurations should use the default/json wire output.
 
-#### §12.2.1 `--debug` diagnosis (issue #334)
+#### §12.2.1 `--debug` diagnosis (issue #334) and the always-on unknown-session warning (issue #329)
 
 Empty stdout + exit 0 is the command's contract both when nothing is pending **and** when the stdin
 payload is misconfigured (unknown session, workspace not enabled, urgency held) — indistinguishable
@@ -1191,13 +1193,28 @@ a flag (blind DX study S3 F3). `--debug` writes a parallel, step-by-step diagnos
 **stdout's contract does not change in any mode** — a hook wired without `--debug` behaves exactly as
 before, and running the identical payload with and without `--debug` produces byte-identical stdout.
 
-Each line is prefixed `agentmonitors hook deliver --debug:` for easy filtering. The diagnosis reports,
-in order:
+**The unresolved-`session_id` branch (§12.2 step 5) is the one exception, and does NOT require
+`--debug`.** Every other branch below resolves itself (the ~15s high-urgency claim-settle window) or
+is a genuinely idle, non-actionable state; an unresolvable `session_id` can never resolve, and its
+silent empty output is exactly what issue #329 reported as indistinguishable from that legitimate
+settle window. So step 5 always writes, unconditionally:
+
+```text
+hook deliver: no session registered for host session id "<id>"
+```
+
+to stderr — stdout and the exit code are unaffected. Every other quiet-return branch stays silent
+by default; use `--debug` for those.
+
+Each `--debug` line is prefixed `agentmonitors hook deliver --debug:` for easy filtering (a
+distinct, unprefixed line format from the always-on warning above). The diagnosis reports, in order:
 
 1. The parsed stdin payload's `session_id` / `hook_event_name` / `cwd` (or `(none)` when absent).
 2. Why resolution stopped, if it did — no `session_id`; an unmapped `hook_event_name` (§12.2 step 2);
    a disabled/misconfigured workspace (§12.2 step 3, the "cwd mismatch" symptom); no socket configured;
-   an unreachable daemon; or no tracked session matching `session_id` (a workspace/session mismatch).
+   an unreachable daemon; or no tracked session matching `session_id` (a workspace/session mismatch;
+   this is the same branch that already warned on stderr unconditionally above — `--debug` adds the
+   known-session count for extra context).
 3. On successful resolution: the resolved AgentMon session id, workspace, and status.
 4. **Unread (unacknowledged) event counts by urgency** — includes claimed-but-unacknowledged events — for the resolved session at the resolved lifecycle (a read-only
    query; never claims).
