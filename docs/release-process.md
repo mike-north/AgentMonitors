@@ -47,6 +47,32 @@ The second arm is **registry-driven**, not git-diff-driven. It asks the registry
 the same `releaseCandidates()` selection the publisher uses. An already-published
 version is never selected, so the gate is safe to evaluate on every push.
 
+### Registry outages: default-closed on uncertainty
+
+Because the gate runs on _every_ push to `main`, a naive "any `npm view` failure
+means not-published" would make it **default-open during a registry outage**: a
+5xx, rate-limit, or DNS failure would report every package as unpublished and
+flip `should-run` true on unrelated pushes, driving repeated Release-job
+failures. So the registry check (`classifyPublication()`) distinguishes two
+failure modes:
+
+- **Definitive not-published** — npm reports `code E404` (the name/version is
+  genuinely absent). This is a real release candidate; the gate runs.
+- **Indeterminate** — any other failure (registry 5xx, rate limit, DNS/network).
+  The registry didn't answer, so we can't tell. The **gate treats it as
+  published** (default-closed): it emits a warning naming the package and the
+  error, and does _not_ trigger a release on uncertainty. Because the gate
+  re-evaluates on every push and the publisher is idempotent, a
+  genuinely-unpublished package self-heals on the next push once the registry is
+  reachable again.
+
+The **publisher** applies the same E404-vs-transient distinction but with the
+opposite bias (`alreadyPublishedOrThrow()`): an indeterminate result **fails the
+publish loudly** rather than silently skipping a package that might be
+unpublished (or blindly republishing one that might already exist). Publishing
+mutates the registry, so it demands certainty; the gate only decides whether to
+_attempt_ work, so it errs toward not disturbing a quiet `main`.
+
 ### Why not a git diff of the version-bump commit
 
 An earlier gate keyed off `git diff HEAD^..HEAD` of a hard-coded set of

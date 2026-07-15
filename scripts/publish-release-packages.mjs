@@ -76,25 +76,126 @@ export function releaseCandidates(
     });
 }
 
-export function alreadyPublished(pkg) {
+/** Coerce a child-process stdout/stderr field (string | Buffer | undefined) to a string. */
+function toUtf8(value) {
+  if (Buffer.isBuffer(value)) return value.toString('utf8');
+  return typeof value === 'string' ? value : '';
+}
+
+/** All text an npm child-process error carries — message plus captured stdio. */
+function npmErrorText(error) {
+  return [error?.message, toUtf8(error?.stdout), toUtf8(error?.stderr)]
+    .filter(Boolean)
+    .join('\n');
+}
+
+/** A concise one-line description of an npm failure, for logs and thrown errors. */
+function npmErrorSummary(error) {
+  return toUtf8(error?.stderr).trim() || error?.message || String(error);
+}
+
+/**
+ * npm reports a genuinely-absent package/version with `code E404`. Any other
+ * failure (registry 5xx, rate limit, DNS/network, auth) is NOT a definitive
+ * "not published" — we can't tell, so callers treat it as indeterminate.
+ */
+function isDefinitiveNotFound(error) {
+  return /\bE404\b/.test(npmErrorText(error));
+}
+
+/** Raw `npm view <name>@<version> version` probe; throws on any npm failure. */
+function runNpmView(pkg) {
+  return run(
+    'npm',
+    [
+      'view',
+      `${pkg.name}@${pkg.version}`,
+      'version',
+      '--registry',
+      pkg.registry,
+    ],
+    { env: process.env },
+  );
+}
+
+/**
+ * Classify pkg's registry publication status, distinguishing a DEFINITIVE
+ * not-published (npm E404 — the name/version is genuinely absent) from an
+ * INDETERMINATE failure (registry 5xx, rate limit, DNS/network) where the
+ * registry simply didn't answer. This distinction is what lets the release
+ * gate stay default-closed under uncertainty (see alreadyPublished) while the
+ * publisher refuses to act on it (see alreadyPublishedOrThrow). `view` is
+ * injectable so tests can exercise every failure mode without a network call.
+ *
+ * @param {{name: string, version: string, registry: string}} pkg
+ * @param {(pkg: object) => string} [view]
+ * @returns {{status: 'published' | 'not-published'} | {status: 'indeterminate', message: string}}
+ */
+export function classifyPublication(pkg, view = runNpmView) {
+  let publishedVersion;
   try {
-    const publishedVersion = run(
-      'npm',
-      [
-        'view',
-        `${pkg.name}@${pkg.version}`,
-        'version',
-        '--registry',
-        pkg.registry,
-      ],
-      {
-        env: process.env,
-      },
-    );
-    return publishedVersion === pkg.version;
-  } catch {
-    return false;
+    publishedVersion = view(pkg);
+  } catch (error) {
+    if (isDefinitiveNotFound(error)) {
+      return { status: 'not-published' };
+    }
+    return { status: 'indeterminate', message: npmErrorSummary(error) };
   }
+  return {
+    status: publishedVersion === pkg.version ? 'published' : 'not-published',
+  };
+}
+
+/**
+ * Gate-side publish check — the default `isPublished` used by
+ * releaseCandidates() and therefore by the release-work gate
+ * (scripts/release-gate.mjs). DEFAULT-CLOSED ON UNCERTAINTY: a definitive
+ * E404 means not-published (a real release candidate), but an INDETERMINATE
+ * registry failure is treated as "published" so a flaky or unreachable
+ * registry can't flip the gate open and drive repeated Release-job failures on
+ * every unrelated push to main. Because the gate re-evaluates on every push
+ * and the publisher is idempotent, a genuinely-unpublished package self-heals
+ * on the next push once the registry answers again.
+ *
+ * ASYMMETRY: the publisher must NOT reuse this lenient behavior — it is about
+ * to mutate the registry, so it needs certainty. See alreadyPublishedOrThrow.
+ *
+ * @param {{name: string, version: string, registry: string}} pkg
+ * @param {{warn?: (message: string) => void, view?: (pkg: object) => string}} [options]
+ * @returns {boolean}
+ */
+export function alreadyPublished(pkg, { warn = console.warn, view } = {}) {
+  const result = classifyPublication(pkg, view);
+  if (result.status === 'indeterminate') {
+    warn(
+      `Warning: could not determine whether ${pkg.name}@${pkg.version} is published (${result.message}); treating it as published so an unreachable registry does not trigger a release. It will be reconciled on a later push once the registry answers.`,
+    );
+    return true;
+  }
+  return result.status === 'published';
+}
+
+/**
+ * Publisher-side publish check. Same E404-vs-transient distinction as
+ * alreadyPublished, but FAILS LOUDLY on an indeterminate registry result
+ * instead of guessing: the publisher is about to publish, so it must not
+ * silently skip a package that might genuinely be unpublished, nor attempt to
+ * republish one that might already exist. The certain cases (published → skip,
+ * not-published → publish) behave exactly as before, so the publisher's
+ * idempotency is unchanged.
+ *
+ * @param {{name: string, version: string, registry: string}} pkg
+ * @param {{view?: (pkg: object) => string}} [options]
+ * @returns {boolean}
+ */
+export function alreadyPublishedOrThrow(pkg, { view } = {}) {
+  const result = classifyPublication(pkg, view);
+  if (result.status === 'indeterminate') {
+    throw new Error(
+      `Cannot determine whether ${pkg.name}@${pkg.version} is already published: ${result.message}. Refusing to publish under registry uncertainty; re-run once the registry is reachable.`,
+    );
+  }
+  return result.status === 'published';
 }
 
 function publishPackage(pkg) {
@@ -170,12 +271,8 @@ function packArtifactIssues(pkg) {
     // execFileSync's stdio is ['ignore', 'pipe', 'pipe'] with encoding set,
     // so stderr is normally a string — but a spawn failure (e.g. `npm` not
     // found) can throw before encoding applies, leaving stderr as a Buffer
-    // (or undefined). Handle both so the failure message is never mangled.
-    const stderr = Buffer.isBuffer(error.stderr)
-      ? error.stderr.toString('utf8')
-      : typeof error.stderr === 'string'
-        ? error.stderr
-        : '';
+    // (or undefined). `toUtf8` handles both so the message is never mangled.
+    const stderr = toUtf8(error.stderr);
     return [`npm pack --dry-run failed: ${stderr.trim() || error.message}`];
   }
 
@@ -307,7 +404,16 @@ export function main({
     return { ok: false };
   }
 
-  const candidates = releaseCandidates(packageDirs, repoRoot, log);
+  // Publisher path uses the STRICT check: an indeterminate registry result
+  // aborts loudly rather than silently skipping (or blindly republishing) a
+  // package under uncertainty. This is the deliberate asymmetry with the
+  // release-work gate, which uses the lenient default `alreadyPublished`.
+  const candidates = releaseCandidates(
+    packageDirs,
+    repoRoot,
+    log,
+    alreadyPublishedOrThrow,
+  );
   if (candidates.length === 0) {
     log('All package versions are already published.');
     return { ok: true };

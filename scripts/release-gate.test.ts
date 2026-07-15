@@ -17,7 +17,13 @@
  * @see https://github.com/mike-north/AgentMonitors/issues/284
  * @see .github/workflows/release.yml — the gate step this module drives
  */
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -28,7 +34,11 @@ import {
   hasPendingChangesets,
   main,
 } from './release-gate.mjs';
-import { PACKAGE_DIRS, REPO_ROOT } from './publish-release-packages.mjs';
+import {
+  PACKAGE_DIRS,
+  REPO_ROOT,
+  alreadyPublished,
+} from './publish-release-packages.mjs';
 
 const COMMAND_POLL = '@agentmonitors/source-command-poll';
 const SCHEDULE = '@agentmonitors/source-schedule';
@@ -49,6 +59,11 @@ function publishedExcept(
 ): (pkg: Pkg) => boolean {
   const missing = new Set(unpublished);
   return (pkg) => !missing.has(pkg.name);
+}
+
+/** Build a child-process-style npm error whose stderr carries `text`. */
+function makeNpmError(text: string): Error {
+  return Object.assign(new Error('Command failed'), { stderr: text });
 }
 
 /** Tracks temp dirs so afterEach can clean them all up. */
@@ -210,6 +225,58 @@ describe('computeReleaseGate — required release scenarios', () => {
   });
 });
 
+describe('computeReleaseGate — registry outage stays default-closed (real gate check)', () => {
+  // Wires the REAL gate-side check (alreadyPublished) into computeReleaseGate
+  // with only the npm-view probe mocked, proving end-to-end that a transient
+  // registry failure keeps the gate CLOSED (issue #284: an unreachable
+  // registry must not flip should-run open on every unrelated push), while a
+  // definitive E404 still opens it for a genuinely unpublished version.
+  function viewFor(
+    states: Record<string, 'published' | 'e404' | 'transient'>,
+  ): (pkg: Pkg) => string {
+    return (pkg) => {
+      const state = states[pkg.name] ?? 'published';
+      if (state === 'e404') {
+        throw makeNpmError('npm error code E404\nnpm error 404 Not Found');
+      }
+      if (state === 'transient') {
+        throw makeNpmError('npm error code E503 Service Unavailable');
+      }
+      return pkg.version;
+    };
+  }
+
+  it('stays closed when the only unpublished-looking package fails transiently', () => {
+    const decision = computeReleaseGate({
+      packageDirs: PACKAGE_DIRS,
+      repoRoot: REPO_ROOT,
+      isPublished: (pkg) =>
+        alreadyPublished(pkg, {
+          view: viewFor({ [COMMAND_POLL]: 'transient' }),
+          warn: () => undefined,
+        }),
+      changesetDir: emptyChangesetDir(),
+    });
+    expect(decision.shouldRun).toBe(false);
+    expect(decision.unpublishedNames).toEqual([]);
+  });
+
+  it('opens for a definitive E404 (a genuinely unpublished version)', () => {
+    const decision = computeReleaseGate({
+      packageDirs: PACKAGE_DIRS,
+      repoRoot: REPO_ROOT,
+      isPublished: (pkg) =>
+        alreadyPublished(pkg, {
+          view: viewFor({ [COMMAND_POLL]: 'e404' }),
+          warn: () => undefined,
+        }),
+      changesetDir: emptyChangesetDir(),
+    });
+    expect(decision.shouldRun).toBe(true);
+    expect(decision.unpublishedNames).toEqual([COMMAND_POLL]);
+  });
+});
+
 describe('discoverPublishablePackageDirs — inventory drift guard', () => {
   // DoD scenario 3: a newly added publishable package. The gate and publisher
   // share ONE inventory (PACKAGE_DIRS); this guard proves that inventory stays
@@ -263,6 +330,119 @@ describe('discoverPublishablePackageDirs — inventory drift guard', () => {
     const staleInventory = ['libs/core', 'plugins/source-existing'];
     const missing = discovered.filter((dir) => !staleInventory.includes(dir));
     expect(missing).toEqual(['plugins/source-new']);
+  });
+});
+
+describe('ci.yml release-collateral path filter — PACKAGE_DIRS drift guard', () => {
+  // The release-collateral-changed job in ci.yml hard-codes a path-filter
+  // regex; a workflow can't derive one at runtime, so it is a SECOND
+  // hand-maintained inventory that can drift from PACKAGE_DIRS — exactly the
+  // failure class issue #284 eliminates elsewhere. This cross-check parses the
+  // regex out of ci.yml and asserts it matches every PACKAGE_DIRS entry,
+  // naming any dir it misses (so adding a publishable package without updating
+  // the filter fails CI loudly).
+  function collateralPatternFromCi(): string {
+    const ciYaml = readFileSync(
+      path.join(REPO_ROOT, '.github/workflows/ci.yml'),
+      'utf8',
+    );
+    // ci.yml has two `pattern='...'` filters (release-collateral and website);
+    // select the release-collateral one by a publishable dir only it lists.
+    const patterns = [...ciYaml.matchAll(/pattern='([^']+)'/g)].map(
+      (match) => match[1],
+    );
+    const collateralPattern = patterns.find((pattern) =>
+      pattern.includes('libs/core/'),
+    );
+    if (collateralPattern === undefined) {
+      throw new Error(
+        'could not find the release-collateral path filter in .github/workflows/ci.yml',
+      );
+    }
+    return collateralPattern;
+  }
+
+  it('matches every PACKAGE_DIRS entry', () => {
+    const regex = new RegExp(collateralPatternFromCi());
+    const missing = PACKAGE_DIRS.filter(
+      (dir) => !regex.test(`${dir}/package.json`),
+    );
+    expect(
+      missing,
+      `ci.yml release-collateral path filter does not match PACKAGE_DIRS entr${
+        missing.length === 1 ? 'y' : 'ies'
+      }: ${missing.join(', ')}`,
+    ).toEqual([]);
+  });
+
+  // Proves the guard actually detects drift rather than passing vacuously: a
+  // stale filter that omits real publishable dirs surfaces exactly those dirs.
+  it('names the dirs a stale filter would miss', () => {
+    const staleRegex = new RegExp('^(libs/core/|apps/cli/)');
+    const missing = PACKAGE_DIRS.filter(
+      (dir) => !staleRegex.test(`${dir}/package.json`),
+    );
+    expect(missing).toContain('apps/agentmonitors');
+    expect(missing).toContain('plugins/source-schedule');
+    expect(missing).not.toContain('libs/core');
+  });
+});
+
+describe('main — real GITHUB_OUTPUT append path (the branch CI runs)', () => {
+  // Every other main() test injects writeOutput; this one exercises the actual
+  // appendFileSync-to-$GITHUB_OUTPUT branch the workflow step runs, by pointing
+  // GITHUB_OUTPUT at a temp file and asserting the file's exact contents.
+  const originalGithubOutput = process.env.GITHUB_OUTPUT;
+
+  afterEach(() => {
+    if (originalGithubOutput === undefined) {
+      delete process.env.GITHUB_OUTPUT;
+    } else {
+      process.env.GITHUB_OUTPUT = originalGithubOutput;
+    }
+  });
+
+  it('appends "should-run=true\\n" to $GITHUB_OUTPUT (append-only, no writeOutput)', () => {
+    const outputFile = path.join(
+      makeTmpDir('agentmonitors-ghoutput-'),
+      'github_output',
+    );
+    // GITHUB_OUTPUT accumulates across steps; seed a prior line to prove append.
+    writeFileSync(outputFile, 'prior-key=prior-value\n');
+    process.env.GITHUB_OUTPUT = outputFile;
+
+    const decision = main({
+      packageDirs: PACKAGE_DIRS,
+      repoRoot: REPO_ROOT,
+      isPublished: publishedExcept([COMMAND_POLL]),
+      changesetDir: emptyChangesetDir(),
+      log: () => undefined,
+      // No writeOutput and no githubOutput override: resolve the real
+      // process.env.GITHUB_OUTPUT default and hit appendFileSync.
+    });
+
+    expect(decision.shouldRun).toBe(true);
+    expect(readFileSync(outputFile, 'utf8')).toBe(
+      'prior-key=prior-value\nshould-run=true\n',
+    );
+  });
+
+  it('appends "should-run=false\\n" for a clean no-op', () => {
+    const outputFile = path.join(
+      makeTmpDir('agentmonitors-ghoutput-'),
+      'github_output',
+    );
+    process.env.GITHUB_OUTPUT = outputFile;
+
+    main({
+      packageDirs: PACKAGE_DIRS,
+      repoRoot: REPO_ROOT,
+      isPublished: publishedExcept([]),
+      changesetDir: emptyChangesetDir(),
+      log: () => undefined,
+    });
+
+    expect(readFileSync(outputFile, 'utf8')).toBe('should-run=false\n');
   });
 });
 
