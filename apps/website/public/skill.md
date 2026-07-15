@@ -153,7 +153,25 @@ Codex/other session does not yet.
 
 ## Phase 2 — Enable the project
 
-Monitoring is off by default per project. Create the gitignored opt-in file:
+Monitoring is off by default per project. Check whether your CLI has the one-shot bootstrap flag
+first — it's the newer, preferred path, but some installs predate it:
+
+```bash
+agentmonitors init --help
+```
+
+**If `--enable-only` is listed**, use it. It creates the gitignored opt-in file and updates
+`.gitignore` for you, with no monitor and no prompts:
+
+```bash
+agentmonitors init --enable-only
+```
+
+This creates `.claude/agentmonitors.local.md` (the per-developer opt-in file) and adds both
+`.claude/*.local.*` and `/.agentmonitors/` to `.gitignore` — no manual file-editing needed. Skip
+straight to Phase 3.
+
+**If `--enable-only` is not listed** (older CLI version), create an equivalent enable file by hand:
 
 ```bash
 mkdir -p .claude
@@ -173,13 +191,13 @@ Make sure `.gitignore` contains:
 /.agentmonitors/
 ```
 
-This file is per-developer, not committed. Without it, `agentmonitors session start` quick-exits
-and no automated monitoring runs during a session (a one-shot `agentmonitors daemon once` still
-works without it — the opt-in only gates the session-lifecycle hooks).
+Either way: this file is per-developer, not committed. Without it, `agentmonitors session start`
+quick-exits and no automated monitoring runs during a session (a one-shot `agentmonitors daemon
+once` still works without it — the opt-in only gates the session-lifecycle hooks).
 
 `.agentmonitors/` is a separate runtime-state directory (per-session hook state) the daemon
 creates the moment a session opens — it's regenerated on every run, so it's always safe to
-delete. `agentmonitors init` (bare or `--enable-only`) ignores both lines for you automatically.
+delete.
 
 Only add `.claude/monitors/*` to `.gitignore` if the user wants monitors to stay personal;
 otherwise commit monitor definitions so the team shares them.
