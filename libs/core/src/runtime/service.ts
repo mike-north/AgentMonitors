@@ -398,8 +398,16 @@ function toDeliveryEventSummary(
 }
 
 export class AgentMonitorRuntime {
-  /** Monitor ids currently driven by a continuous `watch()` (see `watchMonitors`). */
-  private readonly activeWatchers = new Set<string>();
+  /**
+   * Monitor ids currently driven by a continuous `watch()` (see `watchMonitors`),
+   * mapped to a per-watcher identity token. The token distinguishes the *current*
+   * watcher for an id from an earlier, torn-down one: a straggling checkpoint
+   * from a superseded watcher is rejected when its token no longer matches the
+   * live entry, and each watcher only releases its own slot on exit. The tick
+   * loop still uses membership (`has`) to skip `observe()` for actively-watched
+   * monitors.
+   */
+  private readonly activeWatchers = new Map<string, symbol>();
 
   constructor(
     private readonly store: RuntimeStore,
@@ -1673,8 +1681,10 @@ export class AgentMonitorRuntime {
    *
    * `nextSourceState` is provided only by `observe()` (which returns the next
    * source state); the watcher omits it, since a long-lived `watch()` owns its
-   * own in-memory state and the runtime leaves the persisted `sourceState`
-   * untouched.
+   * own in-memory state. The watcher advances the persisted `sourceState` out of
+   * band via the `context.checkpoint` callback (002 §2.4, `writeCheckpoint`),
+   * serialized with this `ingest()` on the per-watcher chain — not through this
+   * path.
    *
    * **Ordering guarantee (G14, 002 §1.1.8):** all durable monitor-state mutation
    * (notify state via `setMonitorState`, per-recipient event rows via
@@ -1919,7 +1929,11 @@ export class AgentMonitorRuntime {
 
       const controller = new AbortController();
       controllers.set(monitor.id, controller);
-      this.activeWatchers.add(monitor.id);
+      // Identity token for THIS watcher: `consumeWatch` releases the slot only
+      // while its own token is still current, and a superseded watcher's
+      // straggling checkpoint is rejected on token mismatch (002 §2.4).
+      const watcherToken = Symbol(monitor.id);
+      this.activeWatchers.set(monitor.id, watcherToken);
 
       const watch = source.watch.bind(source);
       tasks.push(
@@ -1928,6 +1942,7 @@ export class AgentMonitorRuntime {
           watch,
           workspacePath,
           controller.signal,
+          watcherToken,
           options.onError,
         ),
       );
@@ -1941,8 +1956,11 @@ export class AgentMonitorRuntime {
         if (stopped) return;
         stopped = true;
         for (const controller of controllers.values()) controller.abort();
+        // Each watcher task releases its OWN active-watcher slot in its `finally`
+        // (token-guarded), so by the time every task settles the slots are freed
+        // without an unconditional delete here that could evict a newer watcher
+        // that re-established the id after this one exited.
         await Promise.allSettled(tasks);
-        for (const id of monitorIds) this.activeWatchers.delete(id);
       },
     };
   }
@@ -1962,16 +1980,74 @@ export class AgentMonitorRuntime {
     ) => AsyncIterable<Observation>,
     workspacePath: string,
     signal: AbortSignal,
+    watcherToken: symbol,
     onError?: (monitorId: string, error: Error) => void,
   ): Promise<void> {
-    const monitorState = this.store.getMonitorState(monitor.id, workspacePath);
-    const iterable = watch(watchConfig(monitor.frontmatter.watch), {
-      previousState: monitorState.sourceState,
-      now: new Date(),
-      workspacePath,
-      signal,
-    });
+    // Per-watcher serialization chain (G14, 002 §2.4). Both watch-checkpoint
+    // writes and observation ingests append to this single chain, so:
+    //  - a checkpoint whose durable write is in flight when an observation
+    //    arrives ALWAYS completes before that observation is ingested (the G14
+    //    durable-write-before-ingest ordering), and
+    //  - an ingest's read-modify-write of `monitorState.sourceState` is never
+    //    interleaved with a checkpoint write of the same row (which would let a
+    //    stale-baseline ingest clobber a newer checkpoint, or vice versa).
+    // A task's rejection is isolated so it never poisons the chain for the next
+    // task (each caller handles its own failure).
+    let chain: Promise<unknown> = Promise.resolve();
+    const enqueue = <T>(task: () => Promise<T>): Promise<T> => {
+      const result = chain.then(task);
+      chain = result.then(
+        () => undefined,
+        () => undefined,
+      );
+      return result;
+    };
+
+    // A checkpoint delivered after this watcher is torn down — its AbortSignal
+    // aborted (stop()), or it is no longer the current active watcher for this
+    // monitor id (it exited and was superseded) — is REJECTED rather than
+    // enqueued (002 §2.4): a straggling `checkpoint(staleState)` must never
+    // clobber a newer baseline written by observe() or a re-established watcher.
+    // Rejecting at call time (not enqueuing) is also what keeps the shutdown
+    // flush below terminating — no new chain links appear once the watcher is
+    // torn down. The checkpoint is scoped to this watcher's own
+    // `(monitorId, workspacePath)` state row (002 §3, #345/#307).
+    const checkpoint = (nextState: unknown): Promise<void> => {
+      if (
+        signal.aborted ||
+        this.activeWatchers.get(monitor.id) !== watcherToken
+      ) {
+        process.stderr.write(
+          `Warning: watch checkpoint for monitor "${monitor.id}" ignored after ` +
+            `the watcher stopped; state not persisted.\n`,
+        );
+        return Promise.resolve();
+      }
+      return enqueue(() =>
+        this.writeCheckpoint(monitor.id, workspacePath, nextState),
+      );
+    };
+
     try {
+      // Hoisted INSIDE the try (not above it): `getMonitorState` can throw
+      // (e.g. SQLITE_BUSY) and `watch()` is a plain function that may validate
+      // its config and throw synchronously before ever returning an iterable —
+      // legal per the `ObservationSource.watch` type, which only constrains the
+      // RETURNED value to `AsyncIterable<Observation>`. Either throw must still
+      // hit the `finally` below so the active-watcher slot is released instead
+      // of leaking forever (the id would otherwise stay pinned, permanently
+      // skipped by the tick loop and unreachable by a future `watchMonitors()`).
+      const monitorState = this.store.getMonitorState(
+        monitor.id,
+        workspacePath,
+      );
+      const iterable = watch(watchConfig(monitor.frontmatter.watch), {
+        previousState: monitorState.sourceState,
+        now: new Date(),
+        workspacePath,
+        signal,
+        checkpoint,
+      });
       for await (const observation of iterable) {
         if (signal.aborted) break;
         // Per-observation isolation (issue #46): an ingest() failure on one
@@ -1981,10 +2057,14 @@ export class AgentMonitorRuntime {
         // iterator itself (the watch() generator rejecting).
         // The audit write is best-effort — if recordObservationHistory itself
         // throws we swallow it so a failed audit row never kills the watcher.
+        // Ingest runs through the same serialization chain as checkpoint so the
+        // G14 ordering (002 §2.4) holds against out-of-band checkpoint calls.
         try {
-          await this.ingest(monitor, [observation], new Date(), {
-            workspacePath,
-          });
+          await enqueue(() =>
+            this.ingest(monitor, [observation], new Date(), {
+              workspacePath,
+            }),
+          );
           this.refreshWorkspaceSessions(workspacePath);
         } catch (ingestError) {
           try {
@@ -2006,13 +2086,84 @@ export class AgentMonitorRuntime {
         }
       }
     } catch (error) {
-      if (signal.aborted) return;
-      this.activeWatchers.delete(monitor.id);
-      onError?.(
-        monitor.id,
-        error instanceof Error ? error : new Error(String(error)),
+      if (!signal.aborted) {
+        onError?.(
+          monitor.id,
+          error instanceof Error ? error : new Error(String(error)),
+        );
+      }
+    } finally {
+      // This watcher is done (normal completion, iterator error, or abort):
+      // release its active-watcher slot IF it is still the current watcher for
+      // this monitor id, so the tick loop resumes driving observe() (a watch()
+      // that completes normally must not permanently pin the id and starve
+      // observe()) and a future watchMonitors() can re-establish it. A watcher
+      // already superseded by a newer one leaves that newer entry untouched.
+      if (this.activeWatchers.get(monitor.id) === watcherToken) {
+        this.activeWatchers.delete(monitor.id);
+      }
+      // Flush every still-pending checkpoint/ingest before the watcher task
+      // resolves, so `stop()` (which awaits every watcher task) truly waits for
+      // in-flight durable writes rather than racing shutdown against them.
+      //
+      // Under the CURRENT invariants — the slot delete above always precedes
+      // this flush, `checkpoint()`'s post-teardown guard rejects (rather than
+      // enqueuing) once the slot is deleted/superseded, and `writeCheckpoint`'s
+      // persistence is synchronous better-sqlite3 work — no NEW link can be
+      // appended to `chain` once we start reading it here, so a single
+      // `await chain` would already be sufficient. The re-read loop below is
+      // deliberately kept anyway as a defensive guard against a future change
+      // to any of those three invariants (e.g. an async checkpoint backend, or
+      // a reordering of the delete relative to this flush) reintroducing a
+      // window where a link is enqueued between the read and its settle; it is
+      // not compensating for a race that exists today. Do not reorder the slot
+      // delete relative to this flush — that ordering is what the guarantee
+      // depends on.
+      let settled = chain;
+      await settled;
+      while (settled !== chain) {
+        settled = chain;
+        await settled;
+      }
+    }
+  }
+
+  /**
+   * Durably persist a watch-mode checkpoint (002 §2.4): write the watcher's
+   * updated source state into its own `(monitorId, workspacePath)` state row's
+   * `sourceState` (002 §3, #345/#307), leaving notify state and
+   * `lastObservationAt` untouched. A checkpoint is a **state write only** — it
+   * never materializes or delivers an observation, and it must land in the
+   * watcher's OWN workspace scope so a same-id monitor in another workspace is
+   * never clobbered.
+   *
+   * A checkpoint write failure MUST NOT abort the watcher: it is a transient
+   * durability gap, not a protocol violation (002 §2.4). We log a warning and
+   * resolve so even a source that does not guard `checkpoint()` keeps watching.
+   * The caller enqueues this on the per-watcher serialization chain, which is
+   * what gives it the G14 durable-write-before-ingest ordering.
+   */
+  private writeCheckpoint(
+    monitorId: string,
+    workspacePath: string,
+    nextState: unknown,
+  ): Promise<void> {
+    try {
+      const current = this.store.getMonitorState(monitorId, workspacePath);
+      this.store.setMonitorState(monitorId, workspacePath, {
+        sourceState: nextState,
+        notifyState: current.notifyState,
+        ...(current.lastObservationAt
+          ? { lastObservationAt: current.lastObservationAt }
+          : {}),
+      });
+    } catch (error) {
+      process.stderr.write(
+        `Warning: watch checkpoint for monitor "${monitorId}" failed to persist ` +
+          `(${error instanceof Error ? error.message : String(error)}); continuing to watch.\n`,
       );
     }
+    return Promise.resolve();
   }
 
   status() {
