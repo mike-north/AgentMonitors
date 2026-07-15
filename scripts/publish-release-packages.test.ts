@@ -27,6 +27,9 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   PACKAGE_DIRS,
   REPO_ROOT,
+  alreadyPublished,
+  alreadyPublishedOrThrow,
+  classifyPublication,
   collateralIssuesForPackage,
   main,
   validateReleaseCollateral,
@@ -488,6 +491,140 @@ describe('main({ dryRun: true })', () => {
     // collateral validation short-circuited before releaseCandidates()
     // (and therefore before any npm view network call).
     expect(logged).toEqual([]);
+  });
+});
+
+// Issue #284 (registry-outage hardening): the registry check must distinguish a
+// DEFINITIVE not-published (npm E404) from an INDETERMINATE failure (registry
+// 5xx, rate limit, DNS/network). Treating every `npm view` failure as "not
+// published" made the release-work gate default-OPEN during an outage, flipping
+// should-run true on every unrelated main push and driving repeated Release-job
+// failures. These tests mock the `npm view` probe's failure modes at both call
+// sites — the gate-side lenient check and the publisher-side strict check — so
+// no network round-trip is needed.
+//
+// @see https://github.com/mike-north/AgentMonitors/issues/284
+const PROBE_PKG = {
+  name: '@fixture/pkg',
+  version: '1.2.3',
+  registry: 'https://registry.npmjs.org',
+};
+
+/** Build a child-process-style npm error whose stderr carries `text`. */
+function makeNpmError(text: string): Error {
+  return Object.assign(new Error('Command failed'), { stderr: text });
+}
+
+const throwing =
+  (text: string): (() => string) =>
+  () => {
+    throw makeNpmError(text);
+  };
+
+const E404 = 'npm error code E404\nnpm error 404 Not Found - GET .../pkg';
+const E503 =
+  'npm error code E503\nnpm error 503 Service Unavailable - GET .../pkg';
+const ETIMEDOUT =
+  'npm error code ETIMEDOUT\nnpm error network request to registry failed';
+
+describe('classifyPublication — registry probe classification', () => {
+  it('is published when npm view returns the exact version', () => {
+    expect(classifyPublication(PROBE_PKG, () => '1.2.3')).toEqual({
+      status: 'published',
+    });
+  });
+
+  it('is not-published when npm view returns a different version', () => {
+    expect(classifyPublication(PROBE_PKG, () => '1.0.0')).toEqual({
+      status: 'not-published',
+    });
+  });
+
+  // A package that exists but not at this version: `npm view name@ver version`
+  // exits 0 with empty output — a definitive not-published, not an error.
+  it('is not-published when npm view returns empty output', () => {
+    expect(classifyPublication(PROBE_PKG, () => '')).toEqual({
+      status: 'not-published',
+    });
+  });
+
+  it('is not-published on a definitive E404 (name/version genuinely absent)', () => {
+    expect(classifyPublication(PROBE_PKG, throwing(E404))).toEqual({
+      status: 'not-published',
+    });
+  });
+
+  it('is indeterminate on a transient registry 5xx (no E404)', () => {
+    const result = classifyPublication(PROBE_PKG, throwing(E503));
+    expect(result.status).toBe('indeterminate');
+    expect(result).toMatchObject({ status: 'indeterminate' });
+    if (result.status === 'indeterminate') {
+      expect(result.message).toContain('E503');
+    }
+  });
+
+  it('is indeterminate on a network failure (ETIMEDOUT)', () => {
+    expect(classifyPublication(PROBE_PKG, throwing(ETIMEDOUT))).toMatchObject({
+      status: 'indeterminate',
+    });
+  });
+});
+
+describe('alreadyPublished — gate-side check (default-closed on uncertainty)', () => {
+  it('returns false for a definitive E404, so the version becomes a release candidate', () => {
+    expect(
+      alreadyPublished(PROBE_PKG, {
+        view: throwing(E404),
+        warn: () => undefined,
+      }),
+    ).toBe(false);
+  });
+
+  it('returns true for an already-published version', () => {
+    expect(
+      alreadyPublished(PROBE_PKG, {
+        view: () => '1.2.3',
+        warn: () => undefined,
+      }),
+    ).toBe(true);
+  });
+
+  // The core of #284: an unreachable/flaky registry must NOT flip the gate open.
+  it('treats a transient failure as published and warns, naming the package and the error', () => {
+    const warnings: string[] = [];
+    const result = alreadyPublished(PROBE_PKG, {
+      view: throwing(E503),
+      warn: (message) => warnings.push(message),
+    });
+    expect(result).toBe(true);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('@fixture/pkg@1.2.3');
+    expect(warnings[0]).toContain('E503');
+  });
+});
+
+describe('alreadyPublishedOrThrow — publisher-side check (fails loudly on uncertainty)', () => {
+  it('returns false for a definitive E404 (publish this version)', () => {
+    expect(alreadyPublishedOrThrow(PROBE_PKG, { view: throwing(E404) })).toBe(
+      false,
+    );
+  });
+
+  it('returns true for an already-published version (skip — preserves idempotency)', () => {
+    expect(alreadyPublishedOrThrow(PROBE_PKG, { view: () => '1.2.3' })).toBe(
+      true,
+    );
+  });
+
+  // Publishing needs certainty: an indeterminate result must abort loudly
+  // rather than silently skip (or blindly republish).
+  it('throws naming the package and the error on a transient failure', () => {
+    expect(() =>
+      alreadyPublishedOrThrow(PROBE_PKG, { view: throwing(E503) }),
+    ).toThrow(/@fixture\/pkg@1\.2\.3/);
+    expect(() =>
+      alreadyPublishedOrThrow(PROBE_PKG, { view: throwing(E503) }),
+    ).toThrow(/E503/);
   });
 });
 

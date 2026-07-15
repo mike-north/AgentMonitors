@@ -137,5 +137,10 @@ tick) and a couple of fallbacks run **in-process without the socket** — see
   — on the PR that introduces them, not at release time. Every published package declares
   `engines.node` consistent with the CI-tested Node version (currently `>=24`, with Node 24 the version CI runs) — see
   `scripts/publish-release-packages.test.ts` for the assertion that keeps the two in sync.
+  The Release workflow's "detect release work" gate is registry-driven (`scripts/release-gate.mjs`,
+  tested by `scripts/release-gate.test.ts`): it runs when there are pending changesets **or** any
+  current workspace version is still unpublished, deriving from the same `PACKAGE_DIRS` inventory as
+  the publisher so the two can't drift. Because the publisher is idempotent, a partial publish
+  reconciles on the next successful main CI run. See [`docs/release-process.md`](docs/release-process.md).
 - **Review priority** (per `.github/copilot-instructions.md`): durable-state bugs, session-isolation
   errors, and event loss during debounce/compaction/batching/restart come before style.
