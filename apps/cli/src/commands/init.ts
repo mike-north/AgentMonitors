@@ -50,8 +50,10 @@ name: Upstream branch monitor
 watch:
   type: command-poll
   # command is an argv array, run directly (no shell). This example watches the
-  # remote branch tip directly; local commands such as "git status" or
-  # "git rev-parse origin/main" can stay stale until you fetch.
+  # remote branch tip directly; remote-ref commands like this "git ls-remote"
+  # or "git rev-parse origin/main" only reflect your last fetch, so they can
+  # lag until you fetch again. That caveat is specific to remote refs — a
+  # local-state command such as "git status --porcelain" has no such lag.
   command:
     - git
     - ls-remote
@@ -152,6 +154,24 @@ function seedName(template: string, name: string): string {
   return template.replace(/^name: .*$/m, `name: ${yamlSingleQuoted(name)}`);
 }
 
+/**
+ * Derive a readable frontmatter `name:` from the positional `<name>`
+ * argument when `--name` is not given (issue #375): without this, the
+ * scaffold's literal template placeholder (e.g. `My monitor`) survives
+ * untouched, so a rushed author can commit a monitor that is never renamed.
+ * Splits on `-`/`_` and capitalizes the first word, e.g. `watch-docs` ->
+ * `Watch docs`. Falls back to the positional verbatim if it has no such
+ * separators (e.g. `watchdocs` -> `Watchdocs`).
+ */
+function deriveNameFromPositional(positional: string): string {
+  const words = positional.split(/[-_]+/).filter((word) => word.length > 0);
+  if (words.length === 0) return positional;
+  const [first, ...rest] = words;
+  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- `words.length > 0` guarantees `first` is defined.
+  const capitalized = `${first!.charAt(0).toUpperCase()}${first!.slice(1)}`;
+  return [capitalized, ...rest].join(' ');
+}
+
 /** Replace the template's `urgency:` frontmatter line with the seeded value.
  * `urgency` is Commander-`.choices()`-constrained to {@link VALID_URGENCIES},
  * so it's always a bare, unquoted YAML scalar. */
@@ -193,9 +213,13 @@ function seedGlobs(template: string, type: string, globs: string[]): string {
 /**
  * Apply `--glob`/`--name`/`--urgency` seed overrides to a template, in
  * frontmatter-field order. A `SeedOptions` with all fields `undefined`
- * (the default, zero-flags path) returns `template` unchanged — this keeps
- * `init <name>` byte-for-byte identical when no seed flags are passed
- * (AC3, issue #330).
+ * returns `template` unchanged. As of issue #375, the named scaffold path's
+ * caller always passes a `name` seed (the `--name` value, or one derived
+ * from the positional `<name>` when `--name` is omitted), so a zero-flag
+ * `init <name>` no longer returns the raw template byte-for-byte — only its
+ * `name:` line differs from the template default. The bare bootstrap path
+ * never calls this with a `name` seed, so its scaffolded templates are
+ * unaffected (non-goal, issue #330).
  */
 function applySeeds(
   template: string,
@@ -579,7 +603,7 @@ export const initCommand = new Command('init')
   )
   .option(
     '--name <name>',
-    'Seed the frontmatter name: field (distinct from the positional <name>, which sets the directory). Scaffold form only.',
+    'Seed the frontmatter name: field (distinct from the positional <name>, which sets the directory). Defaults to a readable form of the positional <name>. Scaffold form only.',
   )
   .addOption(
     new Option(
@@ -601,13 +625,17 @@ export const initCommand = new Command('init')
       },
     ) => {
       // Named form: `init <name> --type ...` — unchanged scaffold behavior
-      // when no seed flags are passed (AC3, issue #330).
+      // when no seed flags are passed (AC3, issue #330), except that the
+      // frontmatter `name:` now always derives from the positional `<name>`
+      // rather than surviving as the template's literal placeholder
+      // (issue #375). `--name` still overrides.
       if (name !== undefined) {
-        // Built conditionally (not `field: value ?? undefined`) because
-        // `exactOptionalPropertyTypes` treats an explicit `undefined` value
-        // differently from an absent key.
+        // `urgency`/`globs` are built conditionally (not `field: value ??
+        // undefined`) because `exactOptionalPropertyTypes` treats an
+        // explicit `undefined` value differently from an absent key; `name`
+        // always has a value now (seeded or derived) so it's set directly.
         const seeds: SeedOptions = {
-          ...(options.name !== undefined ? { name: options.name } : {}),
+          name: options.name ?? deriveNameFromPositional(name),
           ...(options.urgency !== undefined
             ? { urgency: options.urgency }
             : {}),

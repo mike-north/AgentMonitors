@@ -546,8 +546,8 @@ describe('init', () => {
     expect(parsed.monitors[0]?.source).toBe('command-poll');
 
     // Issue #244: the default command-poll scaffold should be safe for
-    // upstream-branch watching. `git status` only inspects local state, so it can
-    // stay stale until a fetch; `ls-remote` asks the remote directly.
+    // upstream-branch watching. `ls-remote` asks the remote directly, so its
+    // result can lag until the next fetch.
     const monitor = readFileSync(
       path.join(monitorsDir, 'cmd-watch', 'MONITOR.md'),
       'utf-8',
@@ -556,8 +556,44 @@ describe('init', () => {
     expect(monitor).toContain('ls-remote');
     expect(monitor).toContain('origin');
     expect(monitor).toContain('refs/heads/main');
-    expect(monitor).not.toContain('\n    - status\n');
-    expect(monitor).not.toContain('--porcelain');
+    // Scope the "not git status" check to the actual `command:` argv array —
+    // issue #375 intentionally names "git status --porcelain" inside the
+    // explanatory comment (contrasting it with the remote-ref caveat), so a
+    // whole-file substring check would false-positive on that comment.
+    const commandBlockMatch = /command:\n(?:( +)- .*\n)+/.exec(monitor);
+    expect(commandBlockMatch).not.toBeNull();
+    const commandBlock = commandBlockMatch?.[0] ?? '';
+    expect(commandBlock).not.toContain('- status');
+    expect(commandBlock).not.toContain('--porcelain');
+  });
+
+  // Issue #375 AC2: the command-poll scaffold's inline comment previously
+  // warned that local commands "such as \"git status\"" can stay stale until
+  // a fetch — backwards advice that contradicts skill.md's own recommended
+  // minimal command-poll example (`git status --porcelain`, Phase 3). The
+  // staleness caveat only applies to remote-ref commands (this scaffold's
+  // own `git ls-remote`, or `git rev-parse origin/...`); it must not mention
+  // "git status" as an example of something that goes stale.
+  it('command-poll scaffold comment no longer warns that local commands like git status can stay stale (AC2, AC3)', () => {
+    const dir = path.join(tempDir, 'init-command-poll-comment');
+    mkdirSync(dir, { recursive: true });
+    const monitorsDir = path.join(dir, 'monitors');
+    const created = run(
+      ['init', 'cmd-comment', '--dir', monitorsDir, '--type', 'command-poll'],
+      dir,
+    );
+    expect(created.exitCode).toBe(0);
+
+    const monitor = readFileSync(
+      path.join(monitorsDir, 'cmd-comment', 'MONITOR.md'),
+      'utf-8',
+    );
+    // The old, self-contradicting wording must be gone entirely.
+    expect(monitor).not.toContain('local commands such as "git status"');
+    expect(monitor).not.toContain('can stay stale until you fetch');
+    // The caveat must still exist, but scoped to remote-ref commands.
+    expect(monitor).toContain('remote-ref commands');
+    expect(monitor).toContain('git rev-parse origin/main');
   });
 
   it('rejects invalid --type value', () => {
@@ -801,6 +837,43 @@ describe('init', () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('must be single-line');
     expect(existsSync(path.join(monitorsDir, 'newline-mon'))).toBe(false);
+  });
+
+  // Issue #375 AC1: without --name, the scaffolded name: must derive from
+  // the positional <name> ("watch-docs" -> "Watch docs"), never survive as
+  // the template's literal placeholder ("My monitor") — a rushed author
+  // could otherwise commit a monitor that's never renamed.
+  it('derives the frontmatter name: from the positional <name> when --name is omitted (AC1)', () => {
+    const dir = path.join(tempDir, 'init-name-derived');
+    mkdirSync(dir, { recursive: true });
+    const monitorsDir = path.join(dir, 'monitors');
+    const created = run(
+      [
+        'init',
+        'watch-docs',
+        '--dir',
+        monitorsDir,
+        '--type',
+        'file-fingerprint',
+      ],
+      dir,
+    );
+    expect(created.exitCode).toBe(0);
+    const monitor = readFileSync(
+      path.join(monitorsDir, 'watch-docs', 'MONITOR.md'),
+      'utf-8',
+    );
+    expect(monitor).toContain("name: 'Watch docs'");
+    expect(monitor).not.toContain('name: My monitor');
+
+    const validated = run(['validate', monitorsDir, '--format', 'json'], dir);
+    expect(validated.exitCode).toBe(0);
+    const parsed = JSON.parse(validated.stdout) as {
+      valid: number;
+      monitors: { name: string }[];
+    };
+    expect(parsed.valid).toBe(1);
+    expect(parsed.monitors[0]?.name).toBe('Watch docs');
   });
 
   // Issue #330 AC2: --name seeds the frontmatter name: field verbatim,
@@ -4961,7 +5034,10 @@ describe('monitor test', () => {
     const result = run(['monitor', 'test', monitorFile, '--format', 'json']);
     expect(result.exitCode).toBe(0);
     const parsed = JSON.parse(result.stdout);
-    expect(parsed.monitor).toBe('My monitor');
+    // Issue #375: with no --name flag, the scaffolded name: derives from the
+    // positional <name> ("fp-json" -> "Fp json"), not the literal template
+    // placeholder "My monitor".
+    expect(parsed.monitor).toBe('Fp json');
     expect(parsed.source).toBe('file-fingerprint');
     expect(parsed.baseline).toBe(true);
     expect(parsed).toHaveProperty('observations');
@@ -5001,8 +5077,10 @@ describe('monitor test', () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toBe('');
     const parsed = JSON.parse(result.stdout);
+    // Issue #375: derived from the positional <name> ("fp-empty-json" ->
+    // "Fp empty json"), not the literal template placeholder "My monitor".
     expect(parsed).toMatchObject({
-      monitor: 'My monitor',
+      monitor: 'Fp empty json',
       source: 'file-fingerprint',
       baseline: false,
       outcome: 'no-files-matched',
