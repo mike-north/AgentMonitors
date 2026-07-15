@@ -9,8 +9,8 @@
 // passes, forcing someone to look at it again rather than letting it rot.
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = join(__dirname, '..');
@@ -317,6 +317,14 @@ export function main() {
   process.exitCode = failed ? 1 : 0;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// `file://${process.argv[1]}` string construction isn't portable (notably on
+// Windows, where a raw path isn't a valid file-URL segment — drive letters,
+// backslashes). Resolve `argv[1]` to an absolute path and convert it through
+// `pathToFileURL` instead, matching the same entrypoint-detection pattern
+// already used in scripts/test-standalone-consumer.mjs.
+const isMainModule =
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+if (isMainModule) {
   main();
 }
