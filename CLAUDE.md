@@ -33,7 +33,8 @@ pnpm + Nx monorepo (version pinned via package.json#packageManager). All targets
 pnpm build          # build all publishable packages (excludes workspace root + website)
 pnpm test           # run all package test suites (vitest), build deps first
 pnpm check          # check:packages (tsc --noEmit per package) + check:workspace (eslint + prettier)
-pnpm check:api-report   # validate api-extractor rollups are current (run --local to update in dev)
+pnpm check:api-report   # validate every checked-in api-report/*.api.md against the compiled surface (CI; no --local)
+pnpm fix:api-report     # regenerate api-report/*.api.md + dist rollups locally (--local; commit the diff)
 pnpm audit:prod             # pnpm audit --prod --audit-level high (raw report)
 pnpm check:dependency-audit # same audit, gated by scripts/audit-allowlist.json (CI: .github/workflows/dependency-audit.yml)
 pnpm fix:lint-ts    # eslint --fix
@@ -55,10 +56,13 @@ The CLI binary is `agentmonitors` (from `@agentmonitors/cli`). Build, then run `
 ### Important build ordering
 
 `@agentmonitors/core`'s build is **three sequential steps**: `tsup` (bundle) → `tsc -p tsconfig.build.json`
-(emit `.d.ts`) → `api-extractor run` (roll up `dist/public.d.ts`, the file `package.json#types` points
-at). If you change `@agentmonitors/core`'s **public** API surface, the api-extractor report must be
-regenerated (`pnpm --filter @agentmonitors/core run check:api-report` with `--local`) or CI `check:api-report`
-fails. Downstream packages (`apps/cli`, `plugins/*`) depend on `^build`, so build core first.
+(emit `.d.ts`) → `api-extractor run --local` (roll up `dist/public.d.ts`, the file `package.json#types`
+points at, and — in `--local` mode — silently rewrite the checked-in `api-report/core.api.md` to match).
+Every published TypeScript package (`@agentmonitors/core`, `plugins/source-*`) has its own checked-in
+API report. If you change a package's **public** API surface, regenerate its report
+(`pnpm --filter <package> run fix:api-report`) and commit the diff, or CI's `check:api-report` step
+(non-`--local` — it fails on drift instead of silently fixing it) rejects the PR. Downstream packages
+(`apps/cli`, `plugins/*`) depend on `^build`, so build core first.
 
 ## Architecture
 

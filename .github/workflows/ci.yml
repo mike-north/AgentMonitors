@@ -32,6 +32,13 @@ jobs:
       - name: Check
         run: pnpm check
 
+      # Issue #285: validates every published TS package's checked-in API report
+      # (api-report/*.api.md) against its actual compiled surface. Runs without
+      # `--local`, so an unintentional public-type change fails this step until
+      # the report is regenerated (`pnpm fix:api-report`) and reviewed.
+      - name: Check (API report drift)
+        run: pnpm check:api-report
+
       - name: Test
         run: pnpm test
 

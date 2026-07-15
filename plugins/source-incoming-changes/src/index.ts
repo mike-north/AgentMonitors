@@ -26,6 +26,20 @@ import type {
   ObservationSource,
 } from '@agentmonitors/core';
 
+// Re-exported so API Extractor can resolve the default export's type — and
+// the core types its interface shape transitively references — from this
+// package's own entry point, instead of flagging ae-forgotten-export
+// warnings in the checked-in API report.
+export type {
+  ChangeKind,
+  JsonSchema,
+  Observation,
+  ObservationContext,
+  ObservationResult,
+  ObservationSource,
+  Urgency,
+} from '@agentmonitors/core';
+
 // ---------------------------------------------------------------------------
 // Scope config parsing
 // ---------------------------------------------------------------------------

@@ -50,8 +50,10 @@ pnpm nx test @agentmonitors/core                                            # on
 pnpm --filter @agentmonitors/core exec vitest run src/runtime/service.test.ts   # one test file
 ```
 
-Note: changing `@agentmonitors/core`'s **public** API requires regenerating its api-extractor report
-(`pnpm --filter @agentmonitors/core run check:api-report` with `--local`) or CI fails.
+Note: every published TypeScript package (`@agentmonitors/core`, `plugins/source-*`) has a checked-in
+API report (`<package>/api-report/*.api.md`). Changing a package's **public** API requires
+regenerating its report (`pnpm --filter <package> run fix:api-report`) and committing the diff, or CI's
+`pnpm check:api-report` (no `--local`) fails.
 
 ## Invariants to respect
 

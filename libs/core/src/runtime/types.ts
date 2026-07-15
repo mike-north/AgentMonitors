@@ -359,10 +359,11 @@ export interface DoctorReportInput {
 }
 
 /**
- * The workspace-wide, durable-state health report behind the `agentmonitors
- * doctor` command (005 §"doctor", issue #267). It is a read-only diagnosis of
- * the core/daemon side; the CLI layers the project-enabled and daemon-reachable
- * checks (both CLI-only concerns) on top of it.
+ * The workspace-wide, durable-state health report behind the
+ * `agentmonitors doctor` command (005 §"doctor", issue #267). It is a
+ * read-only diagnosis of the core/daemon side; the CLI layers the
+ * project-enabled and daemon-reachable checks (both CLI-only concerns) on
+ * top of it.
  */
 export interface MonitorDoctorReport {
   generatedAt: Date;

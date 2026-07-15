@@ -29,6 +29,7 @@
     "test:e2e-fresh-install-hooks": "node scripts/test-e2e-fresh-install-hooks.mjs",
     "clean": "NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace",
     "check:api-report": "NX_TUI=false nx run-many --target=check:api-report --exclude=agentmonitors-workspace",
+    "fix:api-report": "NX_TUI=false nx run-many --target=fix:api-report --exclude=agentmonitors-workspace",
     "version:packages": "changeset version"
   },
   "lint-staged": {

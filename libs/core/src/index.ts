@@ -4,6 +4,10 @@ export {
   notifySchema,
   shapeSchema,
   payloadSchema,
+  // Backs the `BaselineStrategy` union below (`typeof baselineStrategyValues[number]`) —
+  // exported alongside it so API Extractor can resolve the type without an
+  // ae-forgotten-export warning in the checked-in API report.
+  baselineStrategyValues,
 } from './schema/monitor-schema.js';
 export { validateScope } from './schema/validate-scope.js';
 export type {
@@ -49,6 +53,10 @@ export {
 export { createDb } from './inbox/db.js';
 export type { InboxDb } from './inbox/db.js';
 export { InboxService } from './inbox/inbox-service.js';
+// Backs the `InboxItemState` union below (`typeof inboxItemState[number]`) —
+// exported alongside it so API Extractor can resolve the type without an
+// ae-forgotten-export warning in the checked-in API report.
+export { inboxItemState } from './inbox/schema.js';
 export type {
   InboxItem,
   InboxItemState,

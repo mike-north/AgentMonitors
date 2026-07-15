@@ -2,7 +2,7 @@
   "$schema": "https://developer.microsoft.com/json-schemas/api-extractor/v7/api-extractor.schema.json",
   "mainEntryPointFilePath": "<projectFolder>/dist/index.d.ts",
   "apiReport": {
-    "enabled": false,
+    "enabled": true,
     "reportFolder": "<projectFolder>/api-report/"
   },
   "docModel": {
@@ -24,6 +24,12 @@
     },
     "extractorMessageReporting": {
       "default": { "logLevel": "warning" },
+      // Issue #285: the packages published from this repo do not yet annotate every
+      // export with @public/@beta/@alpha/@internal release tags (~300 call sites as of
+      // this writing). Silencing this rule keeps the real signature-drift gate (the
+      // apiReport check below) from being drowned out by that pre-existing gap. The
+      // annotation sweep is tracked as a follow-up rather than done piecemeal here — see
+      // the PR that enabled apiReport (Refs #285) for the tracking issue link.
       "ae-missing-release-tag": { "logLevel": "none" },
       "ae-unresolved-link": { "logLevel": "none" }
     },

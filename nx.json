@@ -32,10 +32,14 @@
     "clean": {
       "cache": false
     },
-    "ci:api-report": {
-      "dependsOn": ["build"],
+    "check:api-report": {
+      "dependsOn": ["^build"],
       "cache": true,
       "inputs": ["production", "^production"]
+    },
+    "fix:api-report": {
+      "dependsOn": ["^build"],
+      "cache": false
     }
   }
 }
