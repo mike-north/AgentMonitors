@@ -146,6 +146,9 @@ tick) and a couple of fallbacks run **in-process without the socket** — see
   `scripts/audit-allowlist.json` instead of a blanket ignore; `pnpm check:dependency-audit`
   (`.github/workflows/dependency-audit.yml`, PR-path-filtered + scheduled) is the gate, and
   `scripts/check-dependency-audit.test.ts` includes a lockfile regression check (`pnpm why --json`)
-  that the patched versions are actually resolved.
+  that the patched versions are actually resolved. Note: a `pnpm-workspace.yaml` `overrides` pin only
+  fixes _this repo's own_ audit/build — it isn't carried into a published package's own dependency
+  tree, so it doesn't protect an external `npm install` of an unbundled (non-`noExternal`) dependency
+  path; only a direct package.json bump (or an upstream fix) does that.
 - **Review priority** (per `.github/copilot-instructions.md`): durable-state bugs, session-isolation
   errors, and event loss during debounce/compaction/batching/restart come before style.
