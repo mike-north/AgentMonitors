@@ -138,8 +138,22 @@ export const sessionEventState = sqliteTable('session_event_state', {
   updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
 });
 
+/**
+ * Per-monitor runtime state: the source plugin's change-detection baseline
+ * (`source_state`), notify/debounce/rollup timing (`notify_state`), and the last
+ * completed-tick timestamp. Keyed by `(monitor_id, workspace_path)` — NOT
+ * `monitor_id` alone — because the same monitor id can exist in unrelated
+ * workspaces sharing one global DB (issue #345 / #307): keying by id alone let
+ * one workspace's file-fingerprint baseline leak into another, so a second
+ * project reusing the default `my-first-monitor` id reported changes for files
+ * that only ever existed in the first. Uses a surrogate `id` PK plus a UNIQUE
+ * index on `(monitor_id, COALESCE(workspace_path, ''))` (db.ts) so the NULL
+ * (global) scope stays single-rowed — the same pattern as `session_object_cursor`.
+ */
 export const monitorState = sqliteTable('monitor_state', {
-  monitorId: text('monitor_id').primaryKey(),
+  id: text('id').primaryKey(),
+  monitorId: text('monitor_id').notNull(),
+  workspacePath: text('workspace_path'),
   lastObservationAt: integer('last_observation_at', { mode: 'timestamp' }),
   lastFingerprint: text('last_fingerprint'),
   sourceState: text('source_state').notNull().default('{}'),
@@ -181,6 +195,11 @@ export const sessionObjectCursor = sqliteTable('session_object_cursor', {
 export const observationHistory = sqliteTable('observation_history', {
   id: text('id').primaryKey(),
   monitorId: text('monitor_id').notNull(),
+  // The observing daemon's workspace (issue #345 / #307). NULL on legacy rows
+  // written before the column existed; scoped explain/history queries filter by
+  // exact workspace so a same-id monitor in another workspace cannot leak its
+  // audit trail into this one.
+  workspacePath: text('workspace_path'),
   sourceName: text('source_name').notNull(),
   observationData: text('observation_data').notNull().default('{}'),
   result: text('result', {

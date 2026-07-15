@@ -584,6 +584,8 @@ export type ObservationOutcome =
 export interface ObservationHistoryRecord {
   id: string;
   monitorId: string;
+  /** Observing daemon's workspace; `null` for global/legacy rows (issue #345). */
+  workspacePath: string | null;
   sourceName: string;
   observationData: Record<string, unknown>;
   result: ObservationOutcome;
@@ -592,6 +594,11 @@ export interface ObservationHistoryRecord {
 
 export interface ObservationHistoryQuery {
   monitorId?: string;
+  /**
+   * Scope to one workspace (issue #345 / #307). When set, only rows written by a
+   * tick for this exact workspace are returned; omit to list across workspaces.
+   */
+  workspacePath?: string;
   limit?: number;
 }
 

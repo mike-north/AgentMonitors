@@ -111,11 +111,16 @@ const hookDiagnoseParamsSchema = z.object({
 });
 const historyListParamsSchema = z.object({
   monitorId: z.string().optional(),
+  workspacePath: z.string().optional(),
   limit: z.number().int().positive().optional(),
 });
 const monitorExplainParamsSchema = z.object({
   monitorId: z.string(),
   monitorsDir: z.string(),
+  // Optional: when omitted, the runtime defaults the scope to `monitorsDir` (the
+  // same default `tick()` uses) so every stage of the report reads ONE
+  // consistent workspace scope (issue #345 / #307). See
+  // `AgentMonitorRuntime.explainMonitor`.
   workspacePath: z.string().optional(),
   historyLimit: z.number().int().positive().optional(),
   eventLimit: z.number().int().positive().optional(),
@@ -566,6 +571,9 @@ function handleRequest(
       return Promise.resolve(
         runtime.listObservationHistory({
           ...(params.monitorId ? { monitorId: params.monitorId } : {}),
+          ...(params.workspacePath
+            ? { workspacePath: params.workspacePath }
+            : {}),
           ...(params.limit ? { limit: params.limit } : {}),
         }),
       );
