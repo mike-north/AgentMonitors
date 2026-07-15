@@ -62,7 +62,7 @@ export function packageInfo(packageDir, repoRoot) {
 export function releaseCandidates(
   packageDirs,
   repoRoot,
-  log,
+  log = () => {},
   isPublished = alreadyPublished,
 ) {
   return packageDirs
