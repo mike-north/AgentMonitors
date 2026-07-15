@@ -1512,14 +1512,28 @@ same NULL-safe pattern as `session_object_cursor`.
 
 **Migration — one-time re-baseline (issue #345 / #307).** A `monitor_state` table
 created before workspace namespacing keyed rows by `monitor_id` alone (it was the
-PRIMARY KEY, with no `workspace_path` column), so its persisted `source_state`
-cannot be attributed to any one workspace. On the first open after upgrade the
-runtime **drops** the legacy table rather than silently misattributing that state:
-every monitor then re-baselines cleanly on its first post-upgrade tick (a source
-seeing no prior state establishes a fresh baseline and emits no spurious
-created/deleted/descoped events), and diagnostic-only `notify_state` /
-`observation_history` reset with it. This is a documented one-time transition, not
-a per-tick behavior.
+PRIMARY KEY, with no `workspace_path` column). SQLite cannot add the surrogate
+`id` PK the scoped schema needs in place, so on the first open after upgrade the
+runtime **rebuilds** the table. The rebuild is _not_ a blanket drop:
+
+- **`source_state` is reset.** The source plugin's change-detection baseline
+  cannot be attributed to one workspace (several workspaces sharing one global DB
+  clobbered each other on that id), so every monitor re-baselines cleanly on its
+  first post-upgrade tick — a source seeing no prior state establishes a fresh
+  baseline and emits no spurious created/deleted/descoped events.
+- **`notify_state` is preserved, not reset.** `notify_state` is operational
+  runtime state, not diagnostic: its `pendingDebounce` / `pendingRollup` batches
+  hold **already-detected** observations the runtime MUST redeliver after a
+  restart ([§4.4](#44-scheduled-rollup-pace-mode-current), issue #109). Dropping
+  them would be silent, permanent event loss (the reset baseline never re-detects
+  those changes). Each batched observation carries its monitor's `filePath`, so
+  the migration derives each observation's workspace and re-inserts the batch into
+  the correctly-scoped row(s), where the next tick of that workspace hydrates and
+  flushes it.
+- **`observation_history` is migrated additively** (see below), not reset by this
+  drop: its `workspace_path` column is added in place and legacy rows keep `NULL`.
+
+This is a documented one-time transition, not a per-tick behavior.
 
 ### `observation_history`
 

@@ -33,12 +33,17 @@ as #307).
   readers (`monitor explain`, `doctor`, `monitor history --workspace`) filter by exact workspace, so
   a same-id monitor elsewhere cannot leak its audit trail. An unscoped `monitor history` still tails
   across all workspaces.
-- **Migration — one-time re-baseline (documented).** A pre-namespacing `monitor_state` cannot have
-  its `source_state` safely attributed to a workspace, so the first open after upgrade drops the
-  legacy table (rather than silently misattributing it): every monitor re-baselines cleanly on its
-  first post-upgrade tick, emitting no spurious created/deleted/descoped events. Legacy
-  `observation_history` rows keep `NULL` and fall out of workspace-scoped queries. This resolves the
-  mechanism #307 tracks.
+- **Migration — one-time re-baseline (documented).** A pre-namespacing `monitor_state` was keyed by
+  `monitor_id` alone, so the first open after upgrade **rebuilds** the table under the surrogate
+  `id` PK (SQLite can't add it in place). The rebuild resets only `source_state` — which cannot be
+  safely attributed to a workspace — so every monitor re-baselines cleanly on its first post-upgrade
+  tick, emitting no spurious created/deleted/descoped events. The durable `notify_state` batch
+  (`pendingDebounce`/`pendingRollup` — already-detected observations the runtime MUST redeliver,
+  002 §4.4 / #109) is **preserved**, attributed to the workspace derived from each observation's
+  monitor `filePath`, so no pending batch is silently dropped. Legacy `observation_history` rows are
+  migrated additively (they keep `NULL` `workspace_path` and fall out of workspace-scoped queries),
+  not reset by the drop. The rebuild runs inside one immediate transaction so concurrent first-opens
+  serialize. This resolves the mechanism #307 tracks.
 
 ## 2026-07-14 — Local-data permission hardening: no split-brain, no daemon crash, degrade gracefully (002 §3.1, §10.3) — Refs #292
 

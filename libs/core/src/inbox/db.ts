@@ -2,6 +2,7 @@ import path from 'node:path';
 import Database, { type Database as BetterSQLiteClient } from 'better-sqlite3';
 import { BetterSQLite3Database, drizzle } from 'drizzle-orm/better-sqlite3';
 import { sql } from 'drizzle-orm';
+import { ulid } from 'ulid';
 import {
   ensurePrivateDir,
   PRIVATE_FILE_MODE,
@@ -23,9 +24,15 @@ export interface InboxDb {
 
 /**
  * Add `column` (`type`) to `table` if it does not already exist. SQLite has no
- * `ADD COLUMN IF NOT EXISTS`, so we probe `PRAGMA table_info` first. Used for
- * additive, backward-compatible schema evolution on durable DBs created by an
+ * `ADD COLUMN IF NOT EXISTS`, so we probe with {@link tableHasColumn} first. Used
+ * for additive, backward-compatible schema evolution on durable DBs created by an
  * earlier version (no destructive migration framework exists yet).
+ *
+ * The `ALTER` is guarded against a "duplicate column name" race: `createDb` is
+ * called unguarded from every CLI entry point, so a concurrent first-open could
+ * add the column between our check and the `ALTER`. We run inside an immediate
+ * transaction ({@link buildDb}) to serialize that, but treat the duplicate-column
+ * error as benign anyway — iff the column now exists.
  */
 function addColumnIfMissing(
   client: BetterSQLiteClient,
@@ -33,9 +40,14 @@ function addColumnIfMissing(
   column: string,
   type: string,
 ): void {
-  const columns = client.pragma(`table_info(${table})`) as { name: string }[];
-  if (columns.some((c) => c.name === column)) return;
-  client.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  if (tableHasColumn(client, table, column)) return;
+  try {
+    client.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  } catch (error) {
+    // A racing opener won the ALTER first; the column is present now, so our
+    // add is satisfied. Any other failure is real and must propagate.
+    if (!tableHasColumn(client, table, column)) throw error;
+  }
 }
 
 /** True if `table` exists in this database. */
@@ -135,6 +147,9 @@ function buildDb(dbPath: string): InboxDb {
   const sqlite = new Database(dbPath);
   sqlite.pragma('journal_mode = WAL');
   sqlite.pragma('foreign_keys = ON');
+  // Wait for a concurrent first-open's migration transaction to commit rather
+  // than failing with SQLITE_BUSY (see `buildSchema`'s immediate transaction).
+  sqlite.pragma('busy_timeout = 5000');
 
   /*
    * This cast is deliberate.
@@ -155,6 +170,29 @@ function buildDb(dbPath: string): InboxDb {
    */
   const db = drizzle(sqlite, { schema }) as unknown as InternalInboxDb;
 
+  // Serialize the whole schema build + migrations under a single immediate
+  // transaction. `createDb` runs unguarded from every CLI entry point against
+  // the same default DB, so two processes can first-open concurrently, and the
+  // check-then-DROP/ALTER migration sequences are individually non-atomic.
+  // `BEGIN IMMEDIATE` makes a second opener wait (up to the busy_timeout) for
+  // the first to commit and then observe the already-migrated schema — so it
+  // cannot double-DROP a just-migrated table or race an ALTER into a
+  // "duplicate column name" error.
+  sqlite
+    .transaction(() => {
+      buildSchema(db, sqlite);
+    })
+    .immediate();
+
+  return db as unknown as InboxDb;
+}
+
+/**
+ * Create every table and run the additive / re-baseline migrations. Invoked
+ * inside {@link buildDb}'s immediate transaction so the whole thing is atomic
+ * against a concurrent first-open.
+ */
+function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
   db.run(sql`
     CREATE TABLE IF NOT EXISTS inbox_items (
       id TEXT PRIMARY KEY,
@@ -192,47 +230,12 @@ function buildDb(dbPath: string): InboxDb {
     )
   `);
 
-  // One-time re-baseline migration (issue #345 / #307). A `monitor_state` table
-  // created before workspace namespacing keyed rows by `monitor_id` ALONE (it was
-  // the PRIMARY KEY, with no `workspace_path` column), so its persisted
-  // `source_state` (the source plugin's change-detection baseline) cannot be
-  // safely attributed to any one workspace — the same id may have been written by
-  // several workspaces sharing one global DB. Rather than silently misattribute
-  // that state (which is the bug), drop the legacy table so every monitor
-  // re-baselines cleanly on its first post-upgrade tick: a source seeing no prior
-  // state establishes a fresh baseline (no spurious created/deleted/descoped
-  // events) instead of diffing against another workspace's files. Diagnostic-only
-  // `notify_state`/`observation_history` are reset by the same one-time step. See
-  // 002 §3 (Persisted Monitor State) for the documented transition.
-  if (
-    tableExists(sqlite, 'monitor_state') &&
-    !tableHasColumn(sqlite, 'monitor_state', 'workspace_path')
-  ) {
-    sqlite.exec('DROP TABLE monitor_state');
-  }
-
-  db.run(sql`
-    CREATE TABLE IF NOT EXISTS monitor_state (
-      id TEXT PRIMARY KEY,
-      monitor_id TEXT NOT NULL,
-      workspace_path TEXT,
-      last_observation_at INTEGER,
-      last_fingerprint TEXT,
-      source_state TEXT NOT NULL DEFAULT '{}',
-      notify_state TEXT NOT NULL DEFAULT '{}',
-      updated_at INTEGER NOT NULL
-    )
-  `);
-
-  // Unique on the workspace-scoped state key. SQLite treats NULLs as DISTINCT in
-  // a UNIQUE index, which would let duplicate rows accumulate for global
-  // (NULL-workspace) monitors; `COALESCE(workspace_path, '')` collapses the NULL
-  // case so each `(monitor_id, workspace)` scope holds exactly one row. Mirrors
-  // `session_object_cursor` (issue #345 / #307).
-  db.run(sql`
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_monitor_state_key
-      ON monitor_state (monitor_id, COALESCE(workspace_path, ''))
-  `);
+  // Workspace-namespacing migration for `monitor_state` (issue #345 / #307).
+  // Rebuilds the table under the `(monitor_id, workspace_path)` key while
+  // preserving each row's durable `notify_state` batch — see
+  // `migrateMonitorStateToWorkspaceScope` for why `source_state` (and only
+  // `source_state`) is reset.
+  migrateMonitorStateToWorkspaceScope(db, sqlite);
 
   db.run(sql`
     CREATE TABLE IF NOT EXISTS observation_history (
@@ -364,6 +367,245 @@ function buildDb(dbPath: string): InboxDb {
     'net_suppressed_at',
     'INTEGER',
   );
+}
 
-  return db as unknown as InboxDb;
+/**
+ * A legacy `monitor_state` row (keyed by `monitor_id` ALONE — its PRIMARY KEY,
+ * no `workspace_path` column), read before the table is rebuilt so its durable
+ * `notify_state` batch can be carried forward.
+ */
+interface LegacyMonitorStateRow {
+  monitor_id: string;
+  last_observation_at: number | null;
+  notify_state: string;
+  updated_at: number;
+}
+
+/**
+ * Rebuild `monitor_state` under the `(monitor_id, workspace_path)` key
+ * (issue #345 / #307).
+ *
+ * A table created before workspace namespacing keyed rows by `monitor_id` alone,
+ * so SQLite cannot add the surrogate `id` PK the scoped schema needs without a
+ * table rebuild. The rebuild is NOT a blanket drop: legacy rows' durable
+ * `notify_state` batches are salvaged and re-inserted, attributed to their
+ * workspace (see {@link reinsertLegacyMonitorState}). Only `source_state` is
+ * reset. Runs inside {@link buildSchema}'s immediate transaction.
+ */
+function migrateMonitorStateToWorkspaceScope(
+  db: InternalInboxDb,
+  sqlite: BetterSQLiteClient,
+): void {
+  // Read every legacy row BEFORE any drop so nothing durable is lost. A legacy
+  // table is one that exists but lacks the `workspace_path` column.
+  const legacyRows =
+    tableExists(sqlite, 'monitor_state') &&
+    !tableHasColumn(sqlite, 'monitor_state', 'workspace_path')
+      ? (sqlite
+          .prepare(
+            `SELECT monitor_id, last_observation_at, notify_state, updated_at
+               FROM monitor_state`,
+          )
+          .all() as LegacyMonitorStateRow[])
+      : null;
+
+  if (legacyRows) {
+    sqlite.exec('DROP TABLE monitor_state');
+  }
+
+  db.run(sql`
+    CREATE TABLE IF NOT EXISTS monitor_state (
+      id TEXT PRIMARY KEY,
+      monitor_id TEXT NOT NULL,
+      workspace_path TEXT,
+      last_observation_at INTEGER,
+      last_fingerprint TEXT,
+      source_state TEXT NOT NULL DEFAULT '{}',
+      notify_state TEXT NOT NULL DEFAULT '{}',
+      updated_at INTEGER NOT NULL
+    )
+  `);
+
+  // Unique on the workspace-scoped state key. SQLite treats NULLs as DISTINCT in
+  // a UNIQUE index, which would let duplicate rows accumulate for global
+  // (NULL-workspace) monitors; `COALESCE(workspace_path, '')` collapses the NULL
+  // case so each `(monitor_id, workspace)` scope holds exactly one row. Mirrors
+  // `session_object_cursor` (issue #345 / #307).
+  db.run(sql`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_monitor_state_key
+      ON monitor_state (monitor_id, COALESCE(workspace_path, ''))
+  `);
+
+  if (legacyRows) {
+    reinsertLegacyMonitorState(sqlite, legacyRows);
+  }
+}
+
+/**
+ * Re-insert legacy `monitor_state` rows into the workspace-scoped table.
+ *
+ * `source_state` is RESET (`{}`): a pre-namespacing row keyed by `monitor_id`
+ * alone cannot have its source-plugin change-detection baseline safely
+ * attributed to one workspace (several workspaces sharing one global DB
+ * clobbered each other on that id), so every monitor re-baselines cleanly on its
+ * first post-upgrade tick — no spurious created/deleted/descoped events.
+ *
+ * The durable `notify_state` batch is NOT diagnostic and is NOT dropped:
+ * `pendingDebounce`/`pendingRollup` hold ALREADY-DETECTED observations the
+ * runtime MUST redeliver after a restart (002 §4.4, issue #109); dropping them
+ * is silent, permanent event loss (the next tick re-baselines and never
+ * re-detects those changes). Each batched observation carries its monitor's
+ * `filePath`, from which its workspace is derived, so a batch is split across
+ * correctly-scoped rows and hydrated by the next tick of each workspace. A row
+ * with no pending batch is simply not re-inserted — there is nothing durable to
+ * preserve, and the empty state re-baselines identically.
+ */
+function reinsertLegacyMonitorState(
+  sqlite: BetterSQLiteClient,
+  legacyRows: LegacyMonitorStateRow[],
+): void {
+  const insert = sqlite.prepare(
+    `INSERT INTO monitor_state
+       (id, monitor_id, workspace_path, last_observation_at,
+        last_fingerprint, source_state, notify_state, updated_at)
+     VALUES (?, ?, ?, ?, NULL, '{}', ?, ?)`,
+  );
+  for (const row of legacyRows) {
+    for (const [workspacePath, notifyState] of partitionNotifyStateByWorkspace(
+      row.notify_state,
+    )) {
+      insert.run(
+        ulid(),
+        row.monitor_id,
+        workspacePath,
+        row.last_observation_at,
+        JSON.stringify(notifyState),
+        row.updated_at,
+      );
+    }
+  }
+}
+
+/** A durable notify batch (subset of `NotifyRuntimeState`) after partitioning. */
+interface PartitionedNotifyState {
+  suppressedUntil?: string;
+  rollupLastFiredMinute?: number;
+  pendingDebounce?: { observations: unknown[]; dueAt: string };
+  pendingRollup?: { observations: unknown[] };
+}
+
+/**
+ * Split one legacy row's persisted `notify_state` into per-workspace batches.
+ * Returns a map keyed by the workspace each pending observation belongs to
+ * (`null` = the global/underivable scope). A row whose batch is empty yields an
+ * empty map (nothing to preserve). Row-level guards (`suppressedUntil`,
+ * `rollupLastFiredMinute`) are conservatively copied onto every resulting scope.
+ */
+function partitionNotifyStateByWorkspace(
+  raw: string,
+): Map<string | null, PartitionedNotifyState> {
+  const result = new Map<string | null, PartitionedNotifyState>();
+  const parsed = asRecord(safeJsonParse(raw));
+  if (!parsed) return result;
+
+  const debounce = asRecord(parsed['pendingDebounce']);
+  const rollup = asRecord(parsed['pendingRollup']);
+  const debounceObs = debounce ? asArray(debounce['observations']) : [];
+  const rollupObs = rollup ? asArray(rollup['observations']) : [];
+  if (debounceObs.length === 0 && rollupObs.length === 0) return result;
+
+  const dueAt =
+    debounce && typeof debounce['dueAt'] === 'string'
+      ? debounce['dueAt']
+      : new Date(0).toISOString();
+  const suppressedUntil =
+    typeof parsed['suppressedUntil'] === 'string'
+      ? parsed['suppressedUntil']
+      : undefined;
+  const rollupLastFiredMinute =
+    typeof parsed['rollupLastFiredMinute'] === 'number'
+      ? parsed['rollupLastFiredMinute']
+      : undefined;
+
+  const scopeFor = (ws: string | null): PartitionedNotifyState => {
+    let bucket = result.get(ws);
+    if (!bucket) {
+      bucket = {};
+      if (suppressedUntil !== undefined)
+        bucket.suppressedUntil = suppressedUntil;
+      if (rollupLastFiredMinute !== undefined) {
+        bucket.rollupLastFiredMinute = rollupLastFiredMinute;
+      }
+      result.set(ws, bucket);
+    }
+    return bucket;
+  };
+
+  for (const observation of debounceObs) {
+    const bucket = scopeFor(workspaceOfObservation(observation));
+    (bucket.pendingDebounce ??= { observations: [], dueAt }).observations.push(
+      observation,
+    );
+  }
+  for (const observation of rollupObs) {
+    const bucket = scopeFor(workspaceOfObservation(observation));
+    (bucket.pendingRollup ??= { observations: [] }).observations.push(
+      observation,
+    );
+  }
+  return result;
+}
+
+/** The workspace a persisted observation envelope belongs to, via its monitor's `filePath`. */
+function workspaceOfObservation(observation: unknown): string | null {
+  const record = asRecord(observation);
+  const monitor = record ? asRecord(record['monitor']) : null;
+  const filePath =
+    monitor && typeof monitor['filePath'] === 'string'
+      ? monitor['filePath']
+      : null;
+  return filePath ? workspaceForMonitorFilePath(filePath) : null;
+}
+
+/**
+ * Derive the workspace root a monitor belongs to from its `MONITOR.md` path.
+ * Project monitors live under `<root>/.claude/monitors/...` (or `.codex`), so the
+ * workspace is the parent of the nearest `.claude`/`.codex` ancestor — the same
+ * root the daemon's tick loop threads as its `workspacePath`. Falls back to the
+ * file's directory when no config dir is present. Mirrors the CLI's
+ * `configRootForMonitorFile`; kept local so this core migration takes no CLI dep.
+ */
+function workspaceForMonitorFilePath(filePath: string): string | null {
+  if (filePath.length === 0) return null;
+  const resolved = path.resolve(filePath);
+  const segments = resolved.split(path.sep);
+  for (let index = segments.length - 1; index >= 0; index -= 1) {
+    const segment = segments[index];
+    if (segment === '.claude' || segment === '.codex') {
+      if (index <= 0) return null;
+      return path.dirname(segments.slice(0, index + 1).join(path.sep));
+    }
+  }
+  return path.dirname(resolved);
+}
+
+/** Parse JSON, returning `undefined` (not throwing) on malformed input. */
+function safeJsonParse(raw: string): unknown {
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Narrow to a plain string-keyed record (rejects arrays and null). */
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+/** Narrow to an array, or `[]` for any non-array. */
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
 }

@@ -581,15 +581,21 @@ export class AgentMonitorRuntime {
       }),
     );
 
+    // Workspace-scope consistency (issue #345 / #307 review). Every stage of one
+    // report MUST read a single scope. `workspacePath` is optional on the
+    // `monitor.explain` wire; when omitted, default it to the SAME workspace the
+    // tick loop uses when it is called without one (`tick(monitorsDir)` defaults
+    // `workspacePath` to `monitorsDir`). Otherwise the scheduling/monitor-state
+    // stages would read a NULL scope no write path populates ("never ticked, due
+    // now") while the observation/event/history stages read unscoped across ALL
+    // workspaces — a self-contradictory report and a cross-workspace history leak.
+    const workspacePath = input.workspacePath ?? input.monitorsDir;
+
     const runtimeState = this.store.getMonitorState(
       input.monitorId,
-      input.workspacePath ?? null,
+      workspacePath,
     );
-    const schedule = this.scheduleForMonitor(
-      monitor,
-      now,
-      input.workspacePath ?? null,
-    );
+    const schedule = this.scheduleForMonitor(monitor, now, workspacePath);
     const lastObservationAt = runtimeState.lastObservationAt;
     const nextDueAt = schedule.due
       ? now
@@ -619,9 +625,7 @@ export class AgentMonitorRuntime {
       // Scope to the explained workspace so a same-id monitor in another
       // workspace cannot leak its observation history into this report
       // (issue #345 / #307; mirrors the event/monitor-state scoping above).
-      ...(input.workspacePath !== undefined
-        ? { workspacePath: input.workspacePath }
-        : {}),
+      workspacePath,
       limit: historyLimit,
     });
     const latestObservation = observations[0];
@@ -796,9 +800,7 @@ export class AgentMonitorRuntime {
         monitorId: input.monitorId,
         // Scope to the explained workspace so a same-id monitor in another
         // workspace cannot leak its events into this report (issue #94 review).
-        ...(input.workspacePath !== undefined
-          ? { workspacePath: input.workspacePath }
-          : {}),
+        workspacePath,
       })
       .slice(0, eventLimit);
     if (events.length === 0) {
@@ -842,10 +844,10 @@ export class AgentMonitorRuntime {
       input.monitorId,
       // Scope to the explained workspace's sessions (plus global sessions) so
       // projections from other workspaces are not overcounted (issue #94 review).
-      input.workspacePath,
+      workspacePath,
     );
     const leadSessions = this.store
-      .sessionsForWorkspace(input.workspacePath)
+      .sessionsForWorkspace(workspacePath)
       .filter((session) => session.role === 'lead');
     if (events.length > 0 && projections.length === 0) {
       stages.push(

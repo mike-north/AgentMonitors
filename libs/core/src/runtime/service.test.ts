@@ -1734,6 +1734,98 @@ Handle it.
     expect(explainA.projections).toHaveLength(1);
   });
 
+  it('defaults an omitted workspacePath to monitorsDir so every explain stage reads ONE consistent scope (issue #345 / #307 review)', async () => {
+    // `monitor.explain` leaves `workspacePath` optional on the wire. When it is
+    // omitted the report MUST default to the SAME workspace the tick loop uses
+    // when IT is called without one (`tick(monitorsDir)` defaults workspacePath
+    // to `monitorsDir`), so the scheduling/monitor-state stage and the
+    // observation/event stages agree. Pre-fix, scheduling read a NULL scope no
+    // write path populates ("never ticked") while events/history read UNSCOPED
+    // across all workspaces — a self-contradictory report plus a cross-workspace
+    // history leak.
+    const dbRoot = mkdtempSync(
+      path.join(tmpdir(), 'agentmon-explain-default-'),
+    );
+    tempDirs.push(dbRoot);
+    const dbPath = path.join(dbRoot, 'agentmon.db');
+
+    const writeSharedMonitor = (rootDir: string): string => {
+      const monitorDir = path.join(
+        rootDir,
+        '.claude',
+        'monitors',
+        'shared-monitor',
+      );
+      mkdirSync(monitorDir, { recursive: true });
+      writeFileSync(
+        path.join(monitorDir, 'MONITOR.md'),
+        `---
+name: Shared monitor
+watch:
+  type: shared-source
+  interval: '1s'
+urgency: normal
+---
+Handle it.
+`,
+        'utf-8',
+      );
+      return path.join(rootDir, '.claude', 'monitors');
+    };
+
+    const workspaceA = mkdtempSync(path.join(tmpdir(), 'agentmon-def-a-'));
+    const workspaceB = mkdtempSync(path.join(tmpdir(), 'agentmon-def-b-'));
+    tempDirs.push(workspaceA, workspaceB);
+    const monitorsDirA = writeSharedMonitor(workspaceA);
+    const monitorsDirB = writeSharedMonitor(workspaceB);
+
+    const source: ObservationSource = {
+      name: 'shared-source',
+      scopeSchema: { type: 'object' },
+      observe: () =>
+        Promise.resolve({
+          observations: [{ title: 'shared change', objectKey: 'obj-shared' }],
+        }),
+    };
+    const runtime = createRuntime(dbPath, source);
+
+    // Workspace A ticks WITHOUT an explicit workspacePath (defaults to
+    // monitorsDirA). Workspace B ticks under its own explicit workspace with the
+    // SAME monitor id — a foreign scope whose events/history must not leak into
+    // A's report.
+    await runtime.tick(monitorsDirA);
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    await runtime.tick(monitorsDirB, workspaceB);
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    await runtime.tick(monitorsDirB, workspaceB);
+
+    // Explain A WITHOUT a workspacePath — the regression surface.
+    const report = await runtime.explainMonitor({
+      monitorId: 'shared-monitor',
+      monitorsDir: monitorsDirA,
+    });
+
+    // Scheduling stage read the state the omitted-workspace tick wrote (NOT a
+    // NULL "never ticked" scope).
+    const scheduling = report.stages.find((stage) => stage.id === 'scheduling');
+    expect(scheduling?.reason).toContain('Last tick completed');
+    expect(scheduling?.reason).not.toContain('No completed tick');
+
+    // Observation stage found A's history — consistent with the scheduling stage
+    // (it did not report "No observation history").
+    const observation = report.stages.find(
+      (stage) => stage.id === 'observation',
+    );
+    expect(observation?.reason).not.toContain('No observation history');
+
+    // Events are scoped to A's workspace: exactly A's single event, never B's
+    // two — no cross-workspace leak through the omitted scope.
+    expect(report.events).toHaveLength(1);
+    expect(
+      report.events.every((event) => event.workspacePath === monitorsDirA),
+    ).toBe(true);
+  });
+
   // --- Regression tests for #149: verdict severity ranking ----------------
   //
   // Bug: explainVerdict() selected the *first* stage whose status !== 'ok',
