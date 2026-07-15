@@ -90,15 +90,26 @@ Production deploys are driven entirely by `.github/workflows/deploy-website.yml`
 Vercel's own "deploy every commit" git integration, which is deliberately disabled for this
 project so a broken site never reaches production.
 
-- **Trigger:** push to `main` touching `apps/website/**` or the workflow file itself, or a manual
-  `workflow_dispatch`.
-- **Validate gate:** the `validate` job (`pnpm --filter @agentmonitors/website check`, i.e.
-  `tsc --noEmit`) must pass before the `deploy` job — which `needs: validate` — is allowed to run.
-- **Deploy:** the `deploy` job runs `vercel deploy --prod --yes --cwd apps/website` against the
-  `site` Vercel project (`agentmonitors.io`). The only secret involved is `VERCEL_TOKEN`; the org
-  and project IDs are non-sensitive and inlined in the workflow.
+- **Trigger:** push to `main` touching `apps/website/**`, the workflow file itself, or a root/shared
+  input that can change the resolved site (`pnpm-lock.yaml`, `pnpm-workspace.yaml`, root
+  `package.json`) — or a manual `workflow_dispatch`.
+- **Validate gate:** the `validate` job must pass, against the exact commit being deployed, before
+  the `deploy` job — which `needs: validate` — is allowed to run:
+  - `pnpm --filter @agentmonitors/website check` (`tsc --noEmit`)
+  - `pnpm --filter @agentmonitors/website test` (the website's own vitest suite, including
+    `next.config.test.ts`, which guards deployment-specific tracing behavior)
+  - `vercel build --prod --yes --cwd apps/website` — a production build of the exact commit
+- **Deploy:** `validate` uploads its `vercel build` output (`.vercel/output`) as a workflow
+  artifact; the `deploy` job downloads that exact artifact and runs
+  `vercel deploy --prebuilt --prod --yes --cwd apps/website` against the `site` Vercel project
+  (`agentmonitors.io`) — promoting the already-typechecked-and-tested build rather than triggering
+  a second, independent remote build. The only secret involved is `VERCEL_TOKEN`; the org and
+  project IDs are non-sensitive and inlined in the workflow.
 - **Concurrency:** deploys are queued (`cancel-in-progress: false`) so two production deploys
   never race.
+- **Workflow-shape guard:** `scripts/deploy-website-workflow-shape.test.ts` parses the workflow
+  YAML and asserts `deploy` still `needs: validate` and `validate` still runs typecheck, test, and
+  a production build — so this gate can't be silently weakened without a failing test.
 
 The domain, DNS, and Vercel project itself are one-time setup already completed for
 `agentmonitors.io` — this section only covers how *changes* reach production. To re-run a deploy
