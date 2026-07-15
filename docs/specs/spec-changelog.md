@@ -16,7 +16,7 @@ The channel transport's "Status: implemented" note has named an outstanding manu
 "did the channel path regress" depended on whoever remembered how to test it by hand.
 
 - **006 §4 — clarified (current), one-line pointer added.** The UAT-gating note now links
-  [`docs/uat/channel-transport.md`](./channel-transport.md), a numbered, copy-runnable recipe
+  [`docs/uat/channel-transport.md`](../uat/channel-transport.md), a numbered, copy-runnable recipe
   covering setup, the `<channel>` push and its field schema (§4.2), cross-transport dedup (§4.5),
   in-session acknowledgement via `agentmon_ack` (§4.3) verified through `events list`, and a
   blocked-channel step proving hooks-only delivery with a silent no-op (§6/NP-CH). No behavior
