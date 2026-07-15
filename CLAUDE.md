@@ -34,6 +34,8 @@ pnpm build          # build all publishable packages (excludes workspace root + 
 pnpm test           # run all package test suites (vitest), build deps first
 pnpm check          # check:packages (tsc --noEmit per package) + check:workspace (eslint + prettier)
 pnpm check:api-report   # validate api-extractor rollups are current (run --local to update in dev)
+pnpm audit:prod             # pnpm audit --prod --audit-level high (raw report)
+pnpm check:dependency-audit # same audit, gated by scripts/audit-allowlist.json (CI: .github/workflows/dependency-audit.yml)
 pnpm fix:lint-ts    # eslint --fix
 pnpm fix:format     # prettier --write
 pnpm clean          # remove all dist/ dirs
@@ -142,5 +144,16 @@ tick) and a couple of fallbacks run **in-process without the socket** — see
   current workspace version is still unpublished, deriving from the same `PACKAGE_DIRS` inventory as
   the publisher so the two can't drift. Because the publisher is idempotent, a partial publish
   reconciles on the next successful main CI run. See [`docs/release-process.md`](docs/release-process.md).
+- **Dependency audit**: `pnpm audit --prod --audit-level high` must stay clean. Fix by upgrading a
+  direct dependency (`libs/core`, `apps/cli`, `plugins/*` package.json) or, for a transitive
+  advisory, a `pnpm-workspace.yaml` `overrides` pin — never a major bump without an issue explicitly
+  authorizing it. A narrowly scoped, non-fixable advisory gets a reviewed, expiring entry in
+  `scripts/audit-allowlist.json` instead of a blanket ignore; `pnpm check:dependency-audit`
+  (`.github/workflows/dependency-audit.yml`, PR-path-filtered + scheduled) is the gate, and
+  `scripts/check-dependency-audit.test.ts` includes a lockfile regression check (`pnpm why --json`)
+  that the patched versions are actually resolved. Note: a `pnpm-workspace.yaml` `overrides` pin only
+  fixes _this repo's own_ audit/build — it isn't carried into a published package's own dependency
+  tree, so it doesn't protect an external `npm install` of an unbundled (non-`noExternal`) dependency
+  path; only a direct package.json bump (or an upstream fix) does that.
 - **Review priority** (per `.github/copilot-instructions.md`): durable-state bugs, session-isolation
   errors, and event loss during debounce/compaction/batching/restart come before style.
