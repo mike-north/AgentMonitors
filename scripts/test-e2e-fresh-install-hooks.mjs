@@ -17,7 +17,7 @@
  *
  * Hermeticity (issue #276 AC1/AC4): every publishable package
  * (`PACKAGE_DIRS`, scripts/publish-release-packages.mjs — core, all bundled
- * `source-*` plugins, the CLI, and the launcher) is packed via `npm pack` and
+ * `source-*` plugins, the CLI, and the launcher) is packed via `pnpm pack` and
  * installed together in a single `npm install -g --prefix <isolated>`
  * invocation, so npm resolves every `@agentmonitors/*` inter-dependency
  * (declared in package.json even though tsup inlines them into the CLI's
@@ -75,6 +75,17 @@ import { PACKAGE_DIRS } from './publish-release-packages.mjs';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(SCRIPT_DIR, '..');
+
+// The proof depends on Unix-only mechanics (Unix domain sockets, SIGTERM
+// process teardown, `tar` extraction), so fail fast with a clear message
+// rather than in a confusing mid-run way. The win32-aware binary/path
+// selections below are inert until this guard is lifted.
+if (process.platform === 'win32') {
+  console.error(
+    'test-e2e-fresh-install-hooks: win32 is not supported (Unix sockets, signals, tar).',
+  );
+  process.exit(1);
+}
 const PNPM_BIN = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
 const NPM_BIN = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
@@ -392,7 +403,7 @@ async function main() {
   };
 
   const tarballs = await step(
-    'pack every publishable package (npm pack precedent)',
+    'pack every publishable package (pnpm pack, standalone-consumer precedent)',
     () =>
       PACKAGE_DIRS.map((dir) =>
         packPackage(path.join(REPO_ROOT, dir), packDir),
@@ -745,7 +756,7 @@ async function main() {
               const elapsed = Date.now() - eventCreatedAt;
               return {
                 ok: false,
-                detail: `empty stdout after ${(elapsed / 1000).toFixed(1)}s since event creation (waiting past the ${(HIGH_URGENCY_SETTLE_MS / 1000).toFixed(0)}s settle window)`,
+                detail: `empty stdout after ${(elapsed / 1000).toFixed(1)}s since the watched change was written (waiting past the ${(HIGH_URGENCY_SETTLE_MS / 1000).toFixed(0)}s settle window, which runs from the event's server-side createdAt)`,
               };
             }
             return { ok: true, value: stdout };
