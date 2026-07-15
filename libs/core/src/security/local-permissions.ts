@@ -31,6 +31,7 @@ import {
   mkdirSync,
   openSync,
   renameSync,
+  rmSync,
   type Stats,
   writeFileSync,
 } from 'node:fs';
@@ -233,10 +234,11 @@ export function withRestrictedUmask<T>(fn: () => T): T {
  * Atomically write `contents` to `filePath` with owner-only (`0600`) mode,
  * ensuring the containing directory is owner-only (`0700`) first.
  *
- * Writes to a sibling temp file (created `0600`, then re-tightened in case a
- * stale temp file predated this code) and renames it into place, so a reader
- * never observes a partial file. Used for hook-state files, which may reveal
- * pending-work titles.
+ * Writes to a sibling temp file (any pre-existing file or planted symlink at
+ * that deterministic path is removed first, then the temp is created `0600`
+ * with `O_EXCL` so a symlink is never followed) and renames it into place, so
+ * a reader never observes a partial file. Used for hook-state files, which may
+ * reveal pending-work titles.
  */
 export function writePrivateFileAtomic(
   filePath: string,
@@ -244,15 +246,24 @@ export function writePrivateFileAtomic(
 ): void {
   ensurePrivateDir(path.dirname(filePath));
   const tmpPath = `${filePath}.tmp`;
-  writeFileSync(tmpPath, contents, {
-    encoding: 'utf-8',
-    mode: PRIVATE_FILE_MODE,
-  });
-  // Re-tighten the *temp* file: `writeFileSync`'s `mode` only applies when it
-  // creates the file, so a stale `<file>.tmp` left by an earlier crash would
-  // otherwise keep its looser mode and rename would carry that onto the final
-  // path.
-  restrictExistingPathMode(tmpPath, PRIVATE_FILE_MODE);
+  // The temp path is deterministic, so treat whatever sits there as hostile:
+  // remove it (rm does not follow symlinks) and recreate with `O_EXCL`, which
+  // refuses to follow a symlink planted between the two calls. A plain
+  // `writeFileSync(tmpPath, ...)` would follow a symlink pre-planted while the
+  // directory was still permissive (pre-migration) and overwrite its target.
+  // `O_EXCL` creation also applies `mode` directly, so no stale-tmp re-tighten
+  // is needed.
+  rmSync(tmpPath, { force: true });
+  const fd = openSync(
+    tmpPath,
+    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL,
+    PRIVATE_FILE_MODE,
+  );
+  try {
+    writeFileSync(fd, contents, { encoding: 'utf-8' });
+  } finally {
+    closeSync(fd);
+  }
   renameSync(tmpPath, filePath);
   // No post-rename re-tighten of `filePath`: `rename` preserves the source
   // inode's mode, and the temp inode is guaranteed `0600` by the `writeFileSync`

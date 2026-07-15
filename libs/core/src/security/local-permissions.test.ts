@@ -167,6 +167,25 @@ describe.skipIf(isWindows)('local-permissions', () => {
       expect(readFileSync(file, 'utf-8')).toBe('b');
       expect(modeOf(file)).toBe(PRIVATE_FILE_MODE);
     });
+
+    // Regression test (#356 review): the temp path is deterministic, so a
+    // symlink planted at `<file>.tmp` while the directory was still permissive
+    // must not be followed — the write would otherwise land on the symlink's
+    // target instead of a fresh private temp file.
+    it('does not follow a symlink planted at the deterministic temp path', () => {
+      const victim = path.join(tmpDir, 'victim.txt');
+      writeFileSync(victim, 'untouched');
+      const file = path.join(tmpDir, 'state.json');
+      symlinkSync(victim, `${file}.tmp`);
+
+      writePrivateFileAtomic(file, 'secret');
+
+      expect(readFileSync(victim, 'utf-8')).toBe('untouched');
+      expect(readFileSync(file, 'utf-8')).toBe('secret');
+      expect(modeOf(file)).toBe(PRIVATE_FILE_MODE);
+      // The planted symlink was replaced, not preserved.
+      expect(() => lstatSync(`${file}.tmp`)).toThrow();
+    });
   });
 
   describe('withRestrictedUmask', () => {

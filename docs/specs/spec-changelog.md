@@ -38,7 +38,8 @@ clarifications keep 002 §3.1/§10.3 _current_.
 Agent Monitors persisted its database, WAL/SHM sidecars, hook state, and IPC socket with
 umask-derived default modes, and the long-socket-path fallback wrote a predictable
 `/tmp/agentmonitors-<hash>.sock`. On a multi-user host with permissive home/XDG modes another local
-user could read the database or connect to the unauthenticated socket. All three of _current_.
+user could read the database or connect to the unauthenticated socket. All entries below are
+_current_.
 
 - **000 §5 — new BP4 (current).** Added the boundary property "Local artifacts are owner-private":
   the single-user local trust boundary requires owner-only creation (dirs `0700`, files `0600`,
