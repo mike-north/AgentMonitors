@@ -140,6 +140,11 @@ The AgentMon channel server:
 - connects to the AgentMon daemon over its existing Unix-socket IPC
   ([002 §10](./002-runtime-delivery.md)) — it is a thin MCP front-end over the same surface that
   `hook claim` / `events` already use, not new core logic;
+- resolves that socket the same per-workspace-aware way every other workspace-aware command does
+  (`resolveManualDaemonSocketPath`, issue #335): an explicit `--socket` or `AGENTMONITORS_SOCKET`
+  still wins outright, but otherwise an **enabled** workspace's persisted-or-derived per-workspace
+  socket is used — not the bare global default (issue #358) — so a `session start`-lazy-booted
+  daemon is reachable with the plugin's real, unmodified `.mcp.json` (no `--socket` flag);
 - pushes each settled `DeliveryClaim` for its bound session as a `notifications/claude/channel`
   event.
 

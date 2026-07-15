@@ -19,6 +19,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { writeLocalState } from '../local-state.js';
 import { daemonAvailable, callDaemon } from '../daemon-ipc.js';
 import { decodeToon } from '../toon-format.js';
@@ -6437,6 +6439,147 @@ describe('lazy daemon lifecycle', () => {
       rmSync(ws, { recursive: true, force: true });
     }
   }, 40_000); // high-urgency settle = 15s + baseline + detection + headroom
+});
+
+// ---------------------------------------------------------------------------
+// `channel serve` workspace-socket resolution parity with `session start`
+// (issue #358)
+//
+// Promotes the `experiments/channel-uat` harness pattern into the real test
+// suite. Pre-fix, `channel serve` resolved its socket directly via
+// `resolveSocketPath` (explicit flag -> AGENTMONITORS_SOCKET -> bare global
+// default) and never consulted the enabled workspace's persisted-or-derived
+// per-workspace socket the way every other workspace-aware command does
+// (`resolveManualDaemonSocketPath`, issue #335). So a `channel serve` spawned
+// exactly as the plugin's `.mcp.json` spawns it -- no `--socket`, no
+// `AGENTMONITORS_SOCKET` -- silently talked to a socket with no daemon
+// listening, for the only supported activation flow. This test drives BOTH
+// halves through their real, unmodified production entry points -- the
+// `SessionStart` hook's stdin contract for the daemon side, and a real MCP
+// client speaking to a `channel serve` subprocess for the channel side -- and
+// fails against the pre-fix code (no push ever arrives).
+// ---------------------------------------------------------------------------
+describe('channel serve workspace-socket resolution (issue #358)', () => {
+  it('pushes a <channel> notification through the SAME per-workspace socket session start lazy-boots, with no --socket flag and no AGENTMONITORS_SOCKET env', async () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-chan-358-'));
+    const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-file');
+    mkdirSync(monitorsDir, { recursive: true });
+    const watchedFile = path.join(ws, 'watched.txt');
+    writeFileSync(watchedFile, 'hello', 'utf-8');
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      [
+        '---',
+        'name: Watch file',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs:',
+        '    - "watched.txt"',
+        `  cwd: ${JSON.stringify(ws)}`,
+        '  interval: "1s"',
+        // Normal urgency: claimDelivery returns as soon as the event
+        // materializes, with no 15s high-urgency settle window -- keeping
+        // this regression test fast (matches experiments/channel-uat's
+        // default `normal` run).
+        'urgency: normal',
+        '---',
+        'watched.txt changed.',
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+
+    // Enabled with NO persisted socket/db -- exactly the state a fresh
+    // `.claude/agentmonitors.local.md` with only `enabled: true` is in before
+    // any daemon has ever bound (the issue's own repro). `session start`
+    // derives (and persists) the per-workspace socket itself.
+    writeLocalState(ws, { enabled: true, reapAfterMs: 60_000 });
+
+    const { workspacePaths } = await import('../workspace-paths.js');
+    const derivedSocket = workspacePaths(ws).socket;
+
+    const hostSessionId = `chan-358-${String(Date.now())}`;
+    // ONLY CLAUDE_PROJECT_DIR -- no AGENTMONITORS_SOCKET/AGENTMONITORS_DB
+    // override -- so this reproduces the real activation path (the plugin's
+    // hooks.json invocation), not an explicit-flag control.
+    const hookEnv = { CLAUDE_PROJECT_DIR: ws };
+
+    let client: Client | undefined;
+    try {
+      // 1. Lazy-boot exactly like the SessionStart hook does.
+      const start = runWithStdin(
+        ['session', 'start'],
+        hookEnv,
+        sessionStartPayload(hostSessionId, ws),
+        ws,
+      );
+      expect(start.exitCode).toBe(0);
+      expect(await daemonAvailable(derivedSocket)).toBe(true);
+
+      // 2. Spawn `channel serve` EXACTLY as the plugin's `.mcp.json` spawns
+      //    it: no `--socket`, no `AGENTMONITORS_SOCKET` -- only the
+      //    CLAUDE_PROJECT_DIR / CLAUDE_CODE_SESSION_ID a real Claude Code
+      //    MCP-server spawn provides (`experiments/channel-probe`'s
+      //    confirmed contract, 006 §4.4).
+      let received: unknown = null;
+      client = new Client(
+        { name: 'channel-358-regression', version: '0.0.0' },
+        { capabilities: {} },
+      );
+      client.fallbackNotificationHandler = (notification) => {
+        if (notification.method === 'notifications/claude/channel') {
+          received = notification.params;
+        }
+      };
+      const transport = new StdioClientTransport({
+        command: 'node',
+        args: [CLI_PATH, 'channel', 'serve', '--poll-ms', '300'],
+        cwd: ws,
+        env: {
+          PATH: process.env['PATH'] ?? '',
+          CLAUDE_PROJECT_DIR: ws,
+          CLAUDE_CODE_SESSION_ID: hostSessionId,
+        },
+        stderr: 'ignore',
+      });
+      await client.connect(transport);
+
+      // Let it open its bound session and take a baseline poll before the
+      // watched file changes.
+      await new Promise((resolve) => setTimeout(resolve, 1_500));
+
+      // 3. Mutate the watched file -- the daemon's next tick materializes a
+      //    normal-urgency event and projects it into the bound session.
+      writeFileSync(watchedFile, 'hello world', 'utf-8');
+
+      // 4. Wait for the push. Pre-fix, this NEVER arrives: `channel serve`
+      //    is talking to the bare global-default socket, which has no
+      //    daemon listening (the derived per-workspace socket does).
+      const deadline = Date.now() + 15_000;
+      while (received === null && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+
+      expect(received).not.toBeNull();
+      expect(
+        (received as { meta?: Record<string, string> }).meta?.['lifecycle'],
+      ).toBe('turn-interruptible');
+    } finally {
+      if (client) {
+        try {
+          await client.close();
+        } catch {
+          // already closed -- ignore
+        }
+      }
+      try {
+        await callDaemon('stop', {}, { socketPath: derivedSocket });
+      } catch {
+        // already stopped -- ignore
+      }
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
 });
 
 // ---------------------------------------------------------------------------

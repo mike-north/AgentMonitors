@@ -103,6 +103,29 @@ fires") verification recipes:
   workspace isn't enabled) and never resolve the recipe's throwaway `--socket`/`AGENTMONITORS_DB`,
   though both still honor `AGENTMONITORS_DB` when it's set in their environment.
 
+## 2026-07-15 — `channel serve` resolves the per-workspace socket `session start` binds (006 §4.1, 005 §13) — Refs #358
+
+`channel serve` — the MCP server the `agentmonitors` plugin's `.mcp.json` spawns with no
+flags — previously resolved its daemon socket directly (explicit `--socket` → `AGENTMONITORS_SOCKET`
+→ the bare global default), never consulting an **enabled** workspace's persisted-or-derived
+per-workspace socket the way every other workspace-aware command does
+(`resolveManualDaemonSocketPath`, issue #335). So a `channel serve` process spawned exactly as the
+plugin spawns it silently talked to a socket with no daemon listening, for the only supported
+activation flow — the channel transport never pushed, though hook-state delivery (§3/§5) was
+unaffected. Fixed by routing `channel serve`'s socket resolution through the same
+`resolveManualDaemonSocketPath` every other workspace-aware command uses (factored into
+`resolveChannelSocketPath` in `apps/cli/src/commands/channel.ts`). No change to precedence: an
+explicit `--socket`/`AGENTMONITORS_SOCKET` still wins outright; a not-enabled workspace keeps the
+existing global-default fallback.
+
+- **006 §4.1 — current.** The channel-server mechanism bullets now document socket resolution
+  parity with `resolveManualDaemonSocketPath`.
+- **005 §13 — current.** `channel serve`'s `--socket` flag documentation now matches the actual
+  (fixed) resolution order instead of the previous (buggy) "`$AGENTMONITORS_SOCKET` or the standard
+  path" description.
+- **docs/uat/channel-transport.md** — the known-issue callout is updated to reflect the fix; step
+  3's pre-seed workaround remains documented (harmless to keep) per the recipe's own guidance.
+
 ## 2026-07-14 — Watch-mode source-state checkpointing implemented (002 §2.4 target → current) — Refs #278
 
 The watch-checkpoint core contract (002 §2.4, landed as _target_ via the #192 design pass) is now

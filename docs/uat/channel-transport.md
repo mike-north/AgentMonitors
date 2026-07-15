@@ -19,27 +19,32 @@ This complements, but does not replace, the automated coverage that already exis
   Claude Code host provides to a spawned channel server.
 - `apps/cli/src/commands/channel-hooks-ipc-parity.test.ts` proves (statically) that the channel's
   push/ack code paths call the exact same daemon-IPC client functions the hooks-only path uses.
+- `apps/cli/src/commands/cli.integration.test.ts`'s `channel serve workspace-socket resolution
+(issue #358)` suite promotes the `experiments/channel-uat` pattern into CI: it lazy-boots a daemon
+  via the real `session start` stdin contract, then spawns `channel serve` with no `--socket` flag
+  and no `AGENTMONITORS_SOCKET` — exactly as the plugin's `.mcp.json` does — and asserts the push
+  arrives, proving the socket-resolution fix itself (though still not a real Claude Code session).
 
 None of the above puts a real agent in a real session reading a real `<channel>` tag and calling a
 real tool — that gap is what this recipe covers.
 
-## Known issue affecting this recipe today (issue #358)
+## Historical issue, now fixed (issue #358)
 
-**As of 2026-07-15, `channel serve` — spawned exactly as the plugin's `.mcp.json` spawns it, with
-no `--socket` flag — does not resolve the same per-workspace socket a `session start`-lazy-booted
-daemon binds to for an enabled project.** It falls back to the stale global-default socket, finds
-no daemon there, and the `<channel>` push silently never arrives, even though the event is
-correctly materialized and delivered via the hook-state transport. This was discovered while
-drafting this recipe (root cause, repro, and suggested fix: issue #358) and is **not** a defect in
-the channel mechanism itself — a `channel serve` process pointed at the correct socket behaves
-exactly as specified (confirmed with an explicit `--socket` control run against the code on this
-branch).
+**Between 2026-07-15 and this fix, `channel serve` — spawned exactly as the plugin's `.mcp.json`
+spawns it, with no `--socket` flag — did not resolve the same per-workspace socket a `session
+start`-lazy-booted daemon binds to for an enabled project.** It fell back to the stale
+global-default socket, found no daemon there, and the `<channel>` push silently never arrived, even
+though the event was correctly materialized and delivered via the hook-state transport. This was
+discovered while drafting this recipe (root cause, repro, and suggested fix: issue #358) and was
+**not** a defect in the channel mechanism itself — a `channel serve` process pointed at the correct
+socket always behaved exactly as specified (confirmed with an explicit `--socket` control run).
 
-**Step 3 below carries a pre-seed workaround** that keeps `session start` and `channel serve`
-pointed at the same socket without touching the plugin's shipped `.mcp.json`. Apply it until #358
-ships; it remains harmless (a no-op deviation from the default derivation) after the fix lands, so
-there is no need to remove it once #358 is resolved — though a clean re-run without it is the way to
-confirm the fix.
+**As of this fix, `channel serve` resolves the same per-workspace socket `session start` binds to**
+(parity with `resolveManualDaemonSocketPath`, the resolution every other workspace-aware command
+already used — issue #335), so the plugin's real, unmodified `.mcp.json` (no `--socket` flag) works
+with zero extra configuration. **Step 3's pre-seed workaround is no longer required** — skip it for
+a clean run with the plugin's default configuration, which is the way to confirm the fix; per the
+recipe's own guidance it remains harmless to keep applied if you already have it scripted.
 
 ## What this recipe proves
 
@@ -120,8 +125,10 @@ agentmonitors validate .claude/monitors
 
 Expect `Valid monitors: 1`.
 
-**3. Apply the #358 workaround** (skip this step once #358 ships and you want to confirm the fix
-with zero configuration; leaving it in place afterward is harmless):
+**3. (Optional, historical) Apply the now-unneeded #358 workaround** — #358 has shipped, so
+`channel serve` resolves the correct socket by default; skip this step for a clean run that
+confirms the fix with zero configuration. Leaving it in place is still harmless if you already have
+it scripted:
 
 ```bash
 SOCK="/tmp/agentmon-channel-uat-$$.sock"
@@ -228,8 +235,10 @@ Note the `event_id` — you need it for step 11 (or omit it there to ack all unr
 re-check step 7's `events list` output — if the event is not even `unread` there, this is a
 materialization/delivery problem, not a channel problem (see [Failure capture](#failure-capture)
 below). If the event **is** unread but no `<channel>` tag ever appears well past the ~25–30s total
-window, this is the known issue #358 — confirm you applied step 3's workaround and that you
-launched `claude` from the same shell that exported `AGENTMONITORS_SOCKET`.
+window, and step 3's workaround is applied, first confirm you launched `claude` from the same shell
+that exported `AGENTMONITORS_SOCKET`; if the workaround is **not** applied and this still happens,
+that is a genuine channel-transport regression (not the fixed #358) — capture the diagnostics in
+[Failure capture](#failure-capture) before filing.
 
 **9. Confirm the underlying rows are `claimed`, not `acknowledged`, by the push alone (BP2).** From
 the project directory:
@@ -381,11 +390,11 @@ When a step doesn't match its expected observation, capture these before filing:
 
 _Pending first manual execution._ No Claude Code session was available in the environment that
 authored this recipe (issue #277); the mechanism underneath each step was individually verified
-against the real code and a live daemon while drafting it (see issue #358, filed from that
-verification work), but the recipe as a whole — run inside an actual Claude Code session, end to
-end — has not yet been executed. Whoever runs it first should expect step 8 (the raw `<channel>`
-push) to fail until issue #358 ships, **unless** step 3's workaround is applied; every other step
-is independent of #358 and should pass as documented.
+against the real code and a live daemon while drafting it (see issue #358, discovered — and since
+fixed — from that verification work), but the recipe as a whole — run inside an actual Claude Code
+session, end to end — has not yet been executed. With #358 fixed, whoever runs it first should
+expect every step, including step 8's raw `<channel>` push, to pass as documented **without**
+applying step 3's now-optional workaround — that is the clean run that confirms the fix.
 
 | Date | Claude Code version | `agentmonitors` CLI version | Plugin version | Step 1–4 (setup) | Step 5–9 (push) | Step 10 (dedup) | Step 11–12 (ack) | Step 13–16 (blocked channel) | Notes |
 | ---- | ------------------- | --------------------------- | -------------- | ---------------- | --------------- | --------------- | ---------------- | ---------------------------- | ----- |

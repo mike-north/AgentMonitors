@@ -12,6 +12,7 @@ import {
   openSessionClient,
 } from '../runtime-client.js';
 import { resolveSocketPath } from '../daemon-ipc.js';
+import { resolveManualDaemonSocketPath } from '../manual-daemon.js';
 import { renderChannelEvent } from '../channel-render.js';
 import { ACK_TOOL, parseAckArgs } from '../channel-ack.js';
 
@@ -33,7 +34,10 @@ channelCommand
   .description(
     'Run the AgentMon channel: push pending turn-interruptible deliveries into the Claude Code session as channel events',
   )
-  .option('--socket <path>', 'Daemon Unix domain socket path')
+  .option(
+    '--socket <path>',
+    'Daemon Unix domain socket path (default: the same per-workspace socket `session start` binds to when the workspace is enabled; otherwise $AGENTMONITORS_SOCKET or the global default)',
+  )
   .option(
     '--poll-ms <ms>',
     'Delivery poll interval in milliseconds',
@@ -49,6 +53,32 @@ channelCommand
   });
 
 /**
+ * Resolve the socket `channel serve` connects to.
+ *
+ * Mirrors {@link resolveManualDaemonSocketPath} — the same per-workspace-aware
+ * resolution `session`/`events`/`hook`/`daemon` already use (issue #335) — so a
+ * `session start`-lazy-booted daemon for an **enabled** workspace is reachable
+ * with no flags, exactly as the plugin's `.mcp.json` spawns `channel serve`
+ * (no `--socket`, no `AGENTMONITORS_SOCKET`). Before this fix, `channel serve`
+ * called {@link resolveSocketPath} directly and only ever considered an
+ * explicit `--socket`/`AGENTMONITORS_SOCKET`/the bare global default — landing
+ * on a socket with no daemon listening for the only supported activation flow
+ * (issue #358).
+ *
+ * Precedence, unchanged from before this fix: explicit `--socket` wins, then
+ * `AGENTMONITORS_SOCKET`; only then does workspace-aware resolution (or the
+ * global default) apply.
+ */
+export function resolveChannelSocketPath(
+  socket: string | undefined,
+  workspace: string | undefined,
+): string {
+  return resolveSocketPath(
+    resolveManualDaemonSocketPath(socket, workspace) ?? socket,
+  );
+}
+
+/**
  * Run the channel as a two-way MCP server. Outbound: poll the daemon for settled
  * `turn-interruptible` deliveries and push each into the session as a `<channel>`
  * event (reusing `claimDelivery`, so claimed-state and cross-transport dedup come
@@ -59,9 +89,7 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
   const hostSessionId =
     options.hostSessionId ?? process.env['CLAUDE_CODE_SESSION_ID'];
   const workspace = options.workspace ?? process.env['CLAUDE_PROJECT_DIR'];
-  const socketPath = resolveSocketPath(options.socket, {
-    explicit: options.socket !== undefined,
-  });
+  const socketPath = resolveChannelSocketPath(options.socket, workspace);
   const pollMs = Number.parseInt(options.pollMs, 10) || DEFAULT_POLL_MS;
 
   // The low-level Server is the correct API for a channel: it exposes the custom

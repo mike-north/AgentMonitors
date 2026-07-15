@@ -1319,7 +1319,13 @@ channel plugin, not run by hand.
 
 **Usage:** `agentmonitors channel serve [--socket <path>] [--poll-ms <ms>] [--host-session-id <id>] [--workspace <path>]`
 
-- `--socket` — daemon Unix socket path (default: `$AGENTMONITORS_SOCKET` or the standard path).
+- `--socket` — daemon Unix socket path. Resolved the same per-workspace-aware way `session`/
+  `events`/`hook`/`daemon` already resolve theirs (`resolveManualDaemonSocketPath`, issue #335): an
+  explicit `--socket` wins, then `$AGENTMONITORS_SOCKET`; otherwise an **enabled** `--workspace`
+  (see below) uses its persisted-or-derived per-workspace socket — the same socket `session start`
+  lazy-boots (issue #358, previously this fell back to the bare global default, so the plugin's
+  `.mcp.json` spawn, which passes no `--socket`, silently talked to a socket with no daemon
+  listening) — and a not-enabled workspace falls back to the standard global-default path.
 - `--poll-ms` — delivery poll interval in milliseconds (default: `3000`).
 - `--host-session-id` — host session id (default: `$CLAUDE_CODE_SESSION_ID`).
 - `--workspace` — workspace path (default: `$CLAUDE_PROJECT_DIR`).
