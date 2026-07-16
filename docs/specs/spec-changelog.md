@@ -21,7 +21,7 @@ monitor (usability evidence, #413).
 
 Resolved by adding a third **trigger mode** to §16 (`auto` | `command` | `manual`). The new
 **command** mode, `--trigger-cmd '<shell>'`, has `verify` run the given shell command itself (via
-`/bin/sh -c`, `cwd` = the workspace) after baseline to cause the watched change, then
+the OS default shell — `/bin/sh -c` on POSIX — `cwd` = the workspace) after baseline to cause the watched change, then
 observes/materializes/delivers — so any non-auto-triggerable source is verifiable in a single,
 self-contained, non-interactive invocation, exactly like file-fingerprint's auto-trigger. A
 `--trigger-cmd` that exits non-zero is a `setup` failure on the `trigger` stage (fix the command),

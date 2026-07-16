@@ -227,20 +227,54 @@ function buildAutoTrigger(
 }
 
 /**
- * Raised when a `--trigger-cmd` shell command exits non-zero (or can't be
- * spawned). Distinct from `no-change` (the command ran but nothing the monitor
- * watches changed) — this is a broken trigger command, reported as a `setup`
- * failure so the operator fixes the command, not the monitor.
+ * Raised when a `--trigger-cmd` shell command fails to run to completion —
+ * a non-zero exit, a spawn failure, or a timeout. Distinct from `no-change`
+ * (the command ran but nothing the monitor watches changed) — this is a
+ * broken trigger command, reported as a `setup` failure so the operator
+ * fixes the command, not the monitor.
  */
 class TriggerCommandFailed extends Error {
   constructor(
     readonly command: string,
     readonly cause: unknown,
+    message: string,
   ) {
-    const detail = cause instanceof Error ? cause.message : String(cause);
-    super(`--trigger-cmd exited non-zero: ${detail}`);
+    super(message);
     this.name = 'TriggerCommandFailed';
   }
+
+  /** A `--trigger-cmd` that exited non-zero or otherwise failed to spawn. */
+  static forError(command: string, cause: unknown): TriggerCommandFailed {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    return new TriggerCommandFailed(
+      command,
+      cause,
+      `--trigger-cmd failed: ${detail}`,
+    );
+  }
+
+  /** A `--trigger-cmd` that was killed for exceeding its `timeoutMs` budget. */
+  static forTimeout(
+    command: string,
+    cause: unknown,
+    timeoutMs: number,
+  ): TriggerCommandFailed {
+    return new TriggerCommandFailed(
+      command,
+      cause,
+      `--trigger-cmd timed out after ${String(timeoutMs)}ms`,
+    );
+  }
+}
+
+/** `true` when `error` is a Node `execSync` error raised because the child was killed for exceeding its `timeout` option (`error.code === 'ETIMEDOUT'`). */
+function isExecTimeout(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    (error as { code?: unknown }).code === 'ETIMEDOUT'
+  );
 }
 
 /**
@@ -251,14 +285,23 @@ class TriggerCommandFailed extends Error {
  * non-interactive invocation — the call-and-return agent harness that can't
  * interleave a second command during a blocking `--manual` wait (issue #413).
  *
- * The command runs through a shell (`execSync`, so `/bin/sh -c` on POSIX) with
- * `cwd` = the workspace, so a pattern like `touch new-file.txt` lands where the
- * monitor watches. Its effects are **not reverted**: unlike the fabricated
- * file-fingerprint scratch file, an arbitrary shell command has no known
- * inverse, so cleanup (if any) is the operator's own — pick a command whose
- * residue is acceptable. A non-zero exit throws `TriggerCommandFailed`.
+ * The command runs through a shell (`execSync`, so the OS default shell —
+ * `/bin/sh -c` on POSIX) with `cwd` = the workspace, so a pattern like
+ * `touch new-file.txt` lands where the monitor watches. Its effects are **not
+ * reverted**: unlike the fabricated file-fingerprint scratch file, an
+ * arbitrary shell command has no known inverse, so cleanup (if any) is the
+ * operator's own — pick a command whose residue is acceptable. A non-zero
+ * exit throws `TriggerCommandFailed`. `timeoutMs` bounds how long the command
+ * may run: without it, a never-exiting command (e.g. a stuck server, a typo'd
+ * `sleep` with no end) would hang `verify` forever, before any of its other
+ * budgets ever get a chance to apply — the command is killed with `SIGKILL`
+ * and the timeout is reported as a `TriggerCommandFailed`, not left to hang.
  */
-function buildCommandTrigger(command: string, workspace: string): Trigger {
+function buildCommandTrigger(
+  command: string,
+  workspace: string,
+  timeoutMs: number,
+): Trigger {
   return {
     // A `--trigger-cmd` run's effects are real changes the operator's own
     // command caused — not a verify-fabricated scratch object. `synthetic:
@@ -275,9 +318,14 @@ function buildCommandTrigger(command: string, workspace: string): Trigger {
         execSync(command, {
           cwd: workspace,
           stdio: ['ignore', 'ignore', 'pipe'],
+          timeout: timeoutMs,
+          killSignal: 'SIGKILL',
         });
       } catch (error) {
-        throw new TriggerCommandFailed(command, error);
+        if (isExecTimeout(error)) {
+          throw TriggerCommandFailed.forTimeout(command, error, timeoutMs);
+        }
+        throw TriggerCommandFailed.forError(command, error);
       }
     },
     // No-op: an arbitrary shell command's effects are the operator's to undo.
@@ -688,9 +736,17 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
       detail: 'first observation recorded',
     });
 
-    // Trigger the change.
-    const triggerAt = Date.now();
+    // Trigger the change. `observeFrom` marks the start of the observe window
+    // and is captured AFTER `fire()` returns for non-manual modes: in
+    // `--trigger-cmd` mode, `fire()` is a blocking `execSync` that can run for
+    // seconds, and a timestamp taken before it returns would (a) wrongly
+    // exclude a same-window daemon observation whose `createdAt` falls between
+    // the two timestamps from the post-trigger filter below, and (b) shorten
+    // the detect deadline by however long the command itself took to run.
+    // Manual mode has no `fire()` to wait on, so its semantics are unchanged.
+    let observeFrom: number;
     if (mode === 'manual') {
+      observeFrom = Date.now();
       progress(
         `make a REAL change now to something this monitor watches — waiting up to ${String(Math.round(detectCapMs / 1000))}s… ` +
           `(this blocks and does NOT read stdin; a call-and-return agent should use --trigger-cmd '<shell>' instead)`,
@@ -703,7 +759,7 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
       });
     } else if (mode === 'command') {
       // triggerCmd is defined whenever mode === 'command'.
-      trigger = buildCommandTrigger(triggerCmd ?? '', workspace);
+      trigger = buildCommandTrigger(triggerCmd ?? '', workspace, detectCapMs);
       try {
         trigger.fire();
       } catch (error) {
@@ -721,6 +777,7 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
         }
         throw error;
       }
+      observeFrom = Date.now();
       stages.push({
         name: 'trigger',
         status: 'pass',
@@ -745,6 +802,7 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
       }
       registerRevert(trigger);
       trigger.fire();
+      observeFrom = Date.now();
       stages.push({
         name: 'trigger',
         status: 'pass',
@@ -757,7 +815,7 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
     // branch below reads a plain value — 'triggered' (success) or a definitive
     // fail-fast 'no-change'/'no-files-matched' (the trigger did nothing).
     inFlightStage = 'observe';
-    const detectDeadline = triggerAt + detectCapMs;
+    const detectDeadline = observeFrom + detectCapMs;
     const observed = await pollUntil<
       'triggered' | 'no-change' | 'no-files-matched'
     >(
@@ -768,7 +826,7 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
           { monitorId: monitor.id, workspacePath: workspace, limit: 10 },
           daemon.socketPath,
         );
-        const post = rows.filter((r) => toMs(r.createdAt) > triggerAt);
+        const post = rows.filter((r) => toMs(r.createdAt) > observeFrom);
         if (post.some((r) => r.result === 'triggered')) return 'triggered';
         // A post-trigger `no-files-matched` is always definitive: the glob
         // scope resolved to zero files, so nothing could ever be observed.
@@ -797,7 +855,7 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
       },
       () => {
         progress(
-          `waiting for the change to be observed… ${String(Math.round((Date.now() - triggerAt) / 1000))}s / ~${String(Math.round(detectCapMs / 1000))}s`,
+          `waiting for the change to be observed… ${String(Math.round((Date.now() - observeFrom) / 1000))}s / ~${String(Math.round(detectCapMs / 1000))}s`,
         );
       },
     );
@@ -813,7 +871,7 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
       });
       const noChangeGuidance =
         mode === 'command'
-          ? `the --trigger-cmd ran but did not change what this monitor observes. Make sure the command causes a change the monitor detects (e.g. for a command-poll watching \`git status --porcelain\`, a \`--trigger-cmd\` that actually creates/edits a tracked file).`
+          ? `the --trigger-cmd ran but did not change what this monitor observes. Make sure the command causes a change the monitor detects (e.g. for a command-poll watching \`git status --porcelain\`, a \`--trigger-cmd\` that actually creates or edits a file).`
           : `the trigger did not change what this monitor observes (the scratch file may not match watch.globs). Re-run with --manual and edit a matching file yourself, or pass --trigger-cmd '<shell>' to have verify make the change itself.`;
       const guidance =
         observed === 'no-files-matched'

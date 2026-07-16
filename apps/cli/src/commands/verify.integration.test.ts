@@ -332,6 +332,96 @@ describe('agentmonitors verify', () => {
     );
   }, 60_000);
 
+  it('reaches PASS when --trigger-cmd blocks well past the poll interval before making its change (issue #416: observeFrom must start after fire() returns)', () => {
+    const ws = path.join(tempDir, 'trigger-cmd-slow');
+    mkdirSync(ws, { recursive: true });
+    const watched = path.join(ws, 'watched.txt');
+    writeMonitor(
+      ws,
+      'cmd-watch-slow',
+      `name: Cmd watch slow\nwatch:\n  type: command-poll\n  command:\n    - cat\n    - ${JSON.stringify(watched)}\n  interval: '1s'\nurgency: normal`,
+    );
+    writeFileSync(watched, 'baseline contents\n', 'utf-8');
+
+    // `fire()` for --trigger-cmd is a synchronous, blocking execSync — the
+    // isolated daemon (a separate process) keeps polling on its own 1s
+    // interval while it blocks, and will very likely record a `no-change`
+    // observation timestamped mid-sleep (the file hasn't been rewritten yet).
+    // The post-trigger filter must exclude that stray tick — if it instead
+    // used a timestamp captured BEFORE fire() started (as it did pre-fix),
+    // that mid-sleep `no-change` row would be counted as "post-trigger" and
+    // fail verify fast, even though the real change is still coming.
+    const result = run(
+      [
+        'verify',
+        'cmd-watch-slow',
+        '--workspace',
+        ws,
+        '--trigger-cmd',
+        `sleep 2 && printf 'changed by slow trigger\\n' > ${JSON.stringify(watched)}`,
+        '--timeout-ms',
+        '10000',
+        '--format',
+        'json',
+      ],
+      ws,
+    );
+    expect(result.exitCode).toBe(0);
+    const report = JSON.parse(result.stdout) as {
+      ok: boolean;
+      failure: { kind: string; message: string } | null;
+      stages: { name: string; status: string }[];
+    };
+    expect(report.ok).toBe(true);
+    expect(report.stages.find((s) => s.name === 'observe')?.status).toBe(
+      'pass',
+    );
+  }, 30_000);
+
+  it('FAILs bounded (does not hang) when --trigger-cmd never exits, honoring --timeout-ms (issue #416: execSync needs a timeout)', () => {
+    const ws = path.join(tempDir, 'trigger-cmd-timeout');
+    mkdirSync(ws, { recursive: true });
+    const watched = path.join(ws, 'watched.txt');
+    writeMonitor(
+      ws,
+      'cmd-watch-timeout',
+      `name: Cmd watch timeout\nwatch:\n  type: command-poll\n  command:\n    - cat\n    - ${JSON.stringify(watched)}\n  interval: '1s'\nurgency: normal`,
+    );
+    writeFileSync(watched, 'baseline contents\n', 'utf-8');
+
+    // Without an execSync timeout, `sleep 60` would block the whole `verify`
+    // process for a minute regardless of any other budget. The 15s vitest
+    // timeout on this test is itself part of the proof: pre-fix, this test
+    // hangs past that timeout instead of failing fast.
+    const result = run(
+      [
+        'verify',
+        'cmd-watch-timeout',
+        '--workspace',
+        ws,
+        '--trigger-cmd',
+        'sleep 60',
+        '--timeout-ms',
+        '1000',
+        '--format',
+        'json',
+      ],
+      ws,
+    );
+    expect(result.exitCode).toBe(1);
+    const report = JSON.parse(result.stdout) as {
+      ok: boolean;
+      failure: { kind: string; message: string } | null;
+      stages: { name: string; status: string }[];
+    };
+    expect(report.ok).toBe(false);
+    expect(report.failure?.kind).toBe('setup');
+    expect(report.failure?.message).toContain('timed out');
+    expect(report.stages.find((s) => s.name === 'trigger')?.status).toBe(
+      'fail',
+    );
+  }, 15_000);
+
   it('the --manual budget-exceeded FAIL names the --trigger-cmd decoupled mode and the workaround (issue #413 AC3)', () => {
     const ws = path.join(tempDir, 'manual-hint');
     mkdirSync(ws, { recursive: true });
