@@ -184,13 +184,37 @@ export function configRootForMonitorFile(
   return pathApi.dirname(resolvedPath);
 }
 
+/**
+ * Render the configured `watch.globs` value for the no-files-matched message
+ * so an author can tell "bad glob" from "no changes" without opening
+ * MONITOR.md (issue #377). Returns undefined for sources/configs where
+ * `globs` isn't a recognizable string/string[] shape — the message degrades
+ * gracefully rather than guessing.
+ */
+function formatGlobsForMessage(
+  watchConfig: Record<string, unknown>,
+): string | undefined {
+  const raw = watchConfig['globs'];
+  if (typeof raw === 'string') return raw;
+  if (
+    Array.isArray(raw) &&
+    raw.every((g): g is string => typeof g === 'string')
+  ) {
+    return raw.join(', ');
+  }
+  return undefined;
+}
+
 function reportNoFilesMatched(
   monitorName: string,
   sourceName: string,
   workspacePath: string,
   json: boolean,
+  globsDescription: string | undefined,
 ): void {
-  const message = `No files matched this monitor's globs. Check watch.globs and watch.cwd relative to workspace: ${workspacePath}`;
+  const globsPart =
+    globsDescription !== undefined ? ` (globs: ${globsDescription})` : '';
+  const message = `No files matched this monitor's globs${globsPart}. Check watch.globs and watch.cwd relative to workspace: ${workspacePath}`;
   if (json) {
     console.log(
       JSON.stringify(
@@ -366,7 +390,13 @@ monitorTestCommand
       if (firstResult.outcome === 'no-files-matched') {
         // A zero-match scope is an authoring diagnostic, not a valid baseline;
         // stop here so text and JSON output cannot imply quiet success.
-        reportNoFilesMatched(monitorName, source.name, workspacePath, json);
+        reportNoFilesMatched(
+          monitorName,
+          source.name,
+          workspacePath,
+          json,
+          formatGlobsForMessage(monitorWatchConfig),
+        );
       } else if (observations.length === 0 && source.stateful) {
         await handleStatefulSource(
           source,

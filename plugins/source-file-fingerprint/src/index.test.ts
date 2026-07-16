@@ -1,4 +1,10 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -176,6 +182,117 @@ describe('source-file-fingerprint', () => {
       expect(result.observations).toHaveLength(0);
       expect(result.outcome).toBe('no-files-matched');
       expect(result.nextState).toEqual({ fingerprints: {} });
+    });
+  });
+
+  // Issue #377: a globstar like `docs/**` matches the directory entry `docs/`
+  // itself (glob's documented globstar behavior), and the pre-fix source
+  // called fs.readFile on it, crashing with an unhandled EISDIR. Directory
+  // entries must be filtered out before fingerprinting.
+  describe('directory entries in glob matches (issue #377)', () => {
+    it('fingerprints only files under docs/**, never the directory itself', async () => {
+      const workspacePath = makeTempDir();
+      mkdirSync(path.join(workspacePath, 'docs', 'sub'), { recursive: true });
+      const topFile = path.join(workspacePath, 'docs', 'readme.md');
+      const nestedFile = path.join(workspacePath, 'docs', 'sub', 'nested.md');
+      writeFileSync(topFile, 'top');
+      writeFileSync(nestedFile, 'nested');
+
+      // The exact repro from the issue: `docs/**` (not `docs/**/*` or
+      // `docs/**/*.md`), which is the pattern that matches the `docs/` and
+      // `docs/sub/` directory entries in addition to the files.
+      const result = await source.observe(
+        { globs: ['docs/**'] },
+        { now: new Date(), workspacePath },
+      );
+
+      const next = result.nextState as { fingerprints: Record<string, string> };
+      expect(Object.keys(next.fingerprints).sort()).toEqual(
+        [topFile, nestedFile].sort(),
+      );
+      // Directory paths must never appear as fingerprinted "files".
+      expect(next.fingerprints).not.toHaveProperty(
+        path.join(workspacePath, 'docs'),
+      );
+      expect(next.fingerprints).not.toHaveProperty(
+        path.join(workspacePath, 'docs', 'sub'),
+      );
+      expect(result.outcome).toBeUndefined();
+    });
+
+    it('reports no-files-matched (not a crash) when a glob matches only a directory', async () => {
+      const workspacePath = makeTempDir();
+      mkdirSync(path.join(workspacePath, 'empty-dir'), { recursive: true });
+
+      const result = await source.observe(
+        { globs: ['empty-dir/**'] },
+        { now: new Date(), workspacePath },
+      );
+
+      expect(result.observations).toHaveLength(0);
+      expect(result.outcome).toBe('no-files-matched');
+      expect(result.nextState).toEqual({ fingerprints: {} });
+    });
+
+    it('ignores directory entries matched by an ignore glob the same way', async () => {
+      const workspacePath = makeTempDir();
+      mkdirSync(path.join(workspacePath, 'docs', 'generated'), {
+        recursive: true,
+      });
+      const keptFile = path.join(workspacePath, 'docs', 'readme.md');
+      const ignoredFile = path.join(
+        workspacePath,
+        'docs',
+        'generated',
+        'out.md',
+      );
+      writeFileSync(keptFile, 'top');
+      writeFileSync(ignoredFile, 'generated');
+
+      const result = await source.observe(
+        { globs: ['docs/**'], ignore: ['docs/generated/**'] },
+        { now: new Date(), workspacePath },
+      );
+
+      const next = result.nextState as { fingerprints: Record<string, string> };
+      expect(Object.keys(next.fingerprints)).toEqual([keptFile]);
+    });
+
+    // `nodir: true` on globSync is `lstat`-based: a symlink whose target is a
+    // directory reports as a symlink (not a directory), so it survives the
+    // `nodir` filter and reaches the observe loop, which then `readFile`s the
+    // real (directory) target and crashes with EISDIR — the same crash as a
+    // plain directory entry, via a different path (e.g. `docs/generated ->
+    // ../build/docs`, a common pattern). This must fail before the fix and
+    // pass after it.
+    it('skips a symlink whose target is a directory, without crashing', async () => {
+      const workspacePath = makeTempDir();
+      const realDir = path.join(workspacePath, 'real-dir');
+      mkdirSync(realDir, { recursive: true });
+      const realFile = path.join(realDir, 'nested.md');
+      writeFileSync(realFile, 'nested');
+
+      const linkPath = path.join(workspacePath, 'docs', 'link-to-dir');
+      mkdirSync(path.join(workspacePath, 'docs'), { recursive: true });
+      const topFile = path.join(workspacePath, 'docs', 'readme.md');
+      writeFileSync(topFile, 'top');
+      symlinkSync(realDir, linkPath, 'dir');
+
+      const result = await source.observe(
+        { globs: ['docs/**'] },
+        { now: new Date(), workspacePath },
+      );
+
+      const next = result.nextState as { fingerprints: Record<string, string> };
+      // Only the real file directly under docs/ is fingerprinted; the
+      // symlinked directory itself is skipped (glob's `nodir` does not
+      // recurse through a symlink-to-directory without `follow: true`, so
+      // `real-dir`'s contents are never matched by `docs/**` in the first
+      // place — this test asserts observe() doesn't crash on the symlink
+      // entry, not that it traverses through it).
+      expect(Object.keys(next.fingerprints)).toEqual([topFile]);
+      expect(next.fingerprints).not.toHaveProperty(linkPath);
+      expect(result.outcome).toBeUndefined();
     });
   });
 

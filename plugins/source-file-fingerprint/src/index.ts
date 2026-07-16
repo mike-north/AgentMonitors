@@ -99,6 +99,29 @@ async function fileExists(filePath: string): Promise<boolean> {
   }
 }
 
+/**
+ * True if `filePath` resolves — following symlinks — to a directory. Catches
+ * the case `nodir: true` on `globSync` cannot: glob's `nodir` filter is
+ * `lstat`-based, so a symlink whose target is a directory still reports as a
+ * symlink (not a directory) and passes the filter unfiltered. `stat` (unlike
+ * `lstat`) follows the symlink to its real target, so a matched entry that is
+ * really a directory is caught here before `hashFile` would `readFile` it and
+ * crash with `EISDIR` (issue #377). A path that vanished between glob and
+ * this check is treated as "not a directory" — `hashFile` will surface the
+ * more specific error for that race.
+ */
+async function isDirectory(filePath: string): Promise<boolean> {
+  try {
+    const stats = await stat(filePath);
+    return stats.isDirectory();
+  } catch (err) {
+    if (isNotFoundError(err)) {
+      return false;
+    }
+    throw err;
+  }
+}
+
 const CHANGE_TITLES: Record<ChangeKind, string> = {
   created: 'File created',
   modified: 'File changed',
@@ -268,13 +291,27 @@ function resolveGlobCwd(
   return workspacePath !== undefined ? path.resolve(workspacePath, cwd) : cwd;
 }
 
+/**
+ * Expand a glob pattern to absolute file paths, excluding directory entries.
+ *
+ * A globstar like `docs/**` matches the directory `docs/` itself in addition to
+ * everything under it (`glob`'s documented globstar behavior). A directory is
+ * not a file to hash — `nodir: true` filters most of those entries out at the
+ * glob layer so `docs/**` behaves as "every file under docs", matching the
+ * natural reading of the pattern. This is a cheap first pass, not a complete
+ * filter: `nodir` is `lstat`-based, so a symlink whose target is a directory
+ * still passes through here and must be caught separately (see
+ * `isDirectory`) before the observe loop hashes it and crashes with `EISDIR`
+ * (issue #377).
+ */
 function expandGlob(pattern: string, cwd: string | undefined): string[] {
   if (path.isAbsolute(pattern)) {
-    return globSync(pattern, { absolute: true });
+    return globSync(pattern, { absolute: true, nodir: true });
   }
   return globSync(pattern, {
     ...(cwd !== undefined ? { cwd } : {}),
     absolute: true,
+    nodir: true,
   });
 }
 
@@ -312,9 +349,9 @@ const source: ObservationSource = {
       const files = expandGlob(pattern, globCwd);
       for (const filePath of files) {
         if (ignoredFiles.has(filePath)) continue;
-        if (!currentHashes.has(filePath)) {
-          currentHashes.set(filePath, await hashFile(filePath));
-        }
+        if (currentHashes.has(filePath)) continue;
+        if (await isDirectory(filePath)) continue;
+        currentHashes.set(filePath, await hashFile(filePath));
       }
     }
 
