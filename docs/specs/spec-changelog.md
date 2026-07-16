@@ -28,10 +28,8 @@ independent usability-evaluation subjects hit this as their top blocker.
   directory entries are filtered — this was already specified as a healthy non-error outcome, and no
   contract change was needed there.
 - **CLI diagnosability (`apps/cli/src/commands/monitor-test.ts`).** `agentmonitors monitor test`'s
-  `no-files-matched` message now names the configured `watch.globs` value (e.g. `No files matched
-this monitor's globs (globs: **/*.ts). Check watch.globs and watch.cwd relative to workspace:
-<path>`), so an author can tell "bad glob" from "no changes since baseline" without opening
-  `MONITOR.md`.
+  `no-files-matched` message now names the configured `watch.globs` value (e.g. `No files matched this monitor's globs (globs: **/*.ts). Check watch.globs and watch.cwd relative to workspace: <path>`),
+  so an author can tell "bad glob" from "no changes since baseline" without opening `MONITOR.md`.
 
 ## 2026-07-14 — Watch-mode source-state checkpointing implemented (002 §2.4 target → current) — Refs #278
 
