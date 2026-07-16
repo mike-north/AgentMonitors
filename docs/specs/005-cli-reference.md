@@ -1729,13 +1729,16 @@ daemon's captured output — never an ambiguous empty result.
 The poll budget is derived from the monitor's **own** declared timing (issue #399 criterion 2), not
 a fixed 40s: `interval` (an explicit `watch.interval`, else the source default — file-fingerprint
 30s, api-poll 300s, schedule's 60s tick) plus the notify **settle** (`debounce`'s `settle-for`; 0
-for `throttle`) plus, for `high` urgency, the **15s claim-settle** window (002 §9.1), plus a margin
-of `max(5s, 25% of interval)`. Two phases are budgeted separately — **baseline** (`interval +
-margin`) and **detect** (`interval + settle + high-claim-settle + margin`). Elapsed/ETA progress is
-printed to **stderr** so the operator is never left staring at empty output; `--timeout-ms` overrides
-the detect-phase budget. (These interval/settle defaults are sourced from the runtime's canonical
-`schedulingDefaults` export in `@agentmonitors/core` — the same values the daemon schedules against,
-not a hand-mirrored copy — so the budget estimate cannot drift from real scheduling.)
+for `throttle`; and, for `high` urgency with **no** explicit `notify` block, the runtime's default
+15s debounce settle — 002 §9, issue #406) plus, for `high` urgency, the **15s claim-settle** window
+(002 §9.1), plus a margin of `max(5s, 25% of interval)`. Two phases are budgeted separately —
+**baseline** (`interval + margin`) and **detect** (`interval + settle + high-claim-settle +
+margin`). Elapsed/ETA progress is printed to **stderr** so the operator is never left staring at
+empty output; `--timeout-ms` overrides the detect-phase budget. (These interval/settle defaults are
+sourced from the runtime's canonical `schedulingDefaults` export in `@agentmonitors/core` — the same
+values the daemon schedules against, not a hand-mirrored copy — and the settle resolution itself
+calls the same `defaultNotifyConfigForUrgency` function the runtime tick uses, so the budget estimate
+cannot drift from real scheduling or notify defaults.)
 
 ### Output
 

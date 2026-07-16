@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { hasMagic } from 'glob';
 import {
+  defaultNotifyConfigForUrgency,
   parseDuration,
   schedulingDefaults,
   type MonitorDefinition,
@@ -69,11 +70,20 @@ export function resolvePollIntervalMs(monitor: MonitorDefinition): number {
  * Resolve the materialization settle delay in ms — the time the notify stage
  * holds a detected change before it is emitted as an event. A `debounce`
  * strategy holds for its `settle-for`; `throttle` emits the first change
- * immediately (0); `rollup` is window-driven and not modeled here (0). This is
- * independent of urgency — it delays when the event appears in unread at all.
+ * immediately (0); `rollup` is window-driven and not modeled here (0).
+ *
+ * This is NOT independent of urgency: a `high`-urgency monitor with no
+ * explicit `notify` block still gets a default debounce settle at runtime
+ * (`defaultNotifyConfigForUrgency`, `highUrgencyDefaultDebounceSettleMs`) —
+ * delegating to that same function (rather than re-deriving the default here)
+ * keeps this budget from drifting out of sync with the engine's actual notify
+ * timing (issue #406).
  */
 export function resolveSettleMs(monitor: MonitorDefinition): number {
-  const notify = monitor.frontmatter.notify;
+  const notify = defaultNotifyConfigForUrgency(
+    monitor.frontmatter.urgency,
+    monitor.frontmatter.notify,
+  );
   if (!notify) return 0;
   if (notify.strategy === 'debounce') {
     return parseDurationSafe(notify['settle-for']) ?? 0;

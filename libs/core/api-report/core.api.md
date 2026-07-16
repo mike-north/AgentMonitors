@@ -178,6 +178,9 @@ export interface DeclareEphemeralMonitorInput {
     urgency?: string;
 }
 
+// @public
+export function defaultNotifyConfigForUrgency(urgency: Urgency, notify?: NotifyConfig): NotifyConfig | undefined;
+
 // @public (undocumented)
 export interface DeliveryClaim {
     // (undocumented)
@@ -1440,6 +1443,7 @@ export const schedulingDefaults: {
     readonly apiPollMs: 300000;
     readonly scheduleTickMs: 60000;
     readonly highUrgencyClaimSettleMs: 15000;
+    readonly highUrgencyDefaultDebounceSettleMs: 15000;
 };
 
 // @public (undocumented)

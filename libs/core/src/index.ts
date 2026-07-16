@@ -201,6 +201,7 @@ export type {
   WatchHandle,
   UrgencyCounts,
 } from './runtime/types.js';
+export { defaultNotifyConfigForUrgency } from './runtime/types.js';
 
 // Adapters
 export { claudeCodeAdapter } from './adapter/claude.js';

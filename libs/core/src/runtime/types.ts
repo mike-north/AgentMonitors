@@ -6,6 +6,7 @@ import type {
 import type { ephemeralMonitorStatus } from '../inbox/schema.js';
 import type { Observation } from '../observation/types.js';
 import type { DuplicateMonitorId } from '../parser/scan-monitors.js';
+import { schedulingDefaults } from './scheduling-defaults.js';
 
 export type AgentLifecycleEvent =
   | 'session-opened'
@@ -703,13 +704,25 @@ export interface MonitorSchedulingMetadata {
   nextPollMs: number;
 }
 
+/**
+ * Resolve the effective notify config for an observation: an authored
+ * `notify` block always wins; otherwise `high`-urgency gets a default
+ * debounce settle (`schedulingDefaults.highUrgencyDefaultDebounceSettleMs`)
+ * so it isn't materialized instantly, and `normal`/`low` get none. This is
+ * the single source of truth the runtime tick uses (`service.ts`) — anything
+ * that needs to *reason about* notify timing (e.g. the CLI `verify` budget)
+ * should call this rather than re-deriving the default.
+ */
 export function defaultNotifyConfigForUrgency(
   urgency: Urgency,
   notify?: NotifyConfig,
 ): NotifyConfig | undefined {
   if (notify) return notify;
   if (urgency === 'high') {
-    return { strategy: 'debounce', 'settle-for': '15s' };
+    return {
+      strategy: 'debounce',
+      'settle-for': `${String(schedulingDefaults.highUrgencyDefaultDebounceSettleMs / 1000)}s`,
+    };
   }
   return undefined;
 }
