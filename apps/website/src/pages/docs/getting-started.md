@@ -171,6 +171,11 @@ This drives the exact daemon → session → event → delivery pipeline the plu
 in a real session, using an explicit socket so nothing here depends on a live Claude Code session.
 Run every command from the project root.
 
+> **One command instead of this recipe:** `agentmonitors verify` performs this whole
+> boot → trigger → deliver proof automatically (see the `verify` command reference, spec 005 §16).
+> This manual, socket-level walkthrough is the host-agnostic fallback that mirrors it — reach for it
+> when you want to see each pipeline stage by hand or `verify` isn't available.
+
 **a. Enable the project.** This one-time, gitignored opt-in file is required — without it,
 `hook deliver` always emits nothing, even with `--socket`. Check `agentmonitors init --help` for
 an `--enable-only` flag first — if it's listed, it's the one-command way to do this:

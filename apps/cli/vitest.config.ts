@@ -9,11 +9,13 @@ export default defineConfig({
     // real child processes that bind Unix sockets; under nx run-many (up to
     // 3 concurrent projects) the children are CPU-starved and can't bind
     // within any reasonable timeout.  They run in isolation via the
-    // test:serial script (vitest.serial.config.ts).
+    // test:serial script (vitest.serial.config.ts).  `verify.integration`
+    // boots a supervised isolated daemon per case, so it belongs here too.
     exclude: [
       ...configDefaults.exclude,
       '**/concurrent-spawn.test.ts',
       '**/detached-spawn.test.ts',
+      '**/verify.integration.test.ts',
     ],
   },
 });

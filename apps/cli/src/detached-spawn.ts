@@ -22,7 +22,7 @@ export interface SpawnDaemonOptions {
  * source file at `src/detached-spawn.ts`, so we walk up one directory from
  * `src/` to reach the package root and then into `dist/index.cjs`.
  */
-function cliEntry(): string {
+export function cliEntry(): string {
   const thisFile = fileURLToPath(import.meta.url);
   // Distinguish bundled context (file is in dist/) from source context (in src/)
   const isBundle = path.basename(path.dirname(thisFile)) === 'dist';
