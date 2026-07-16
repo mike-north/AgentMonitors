@@ -402,19 +402,31 @@ kill "$DAEMON_PID"
 }
 ```
 
-**If step 5's loop keeps retrying for a `high`-urgency monitor, that can be expected, not a
-bug.** `events list` (step 4) surfaces an event as soon as it materializes. `hook deliver`
-at the `turn-interruptible` lifecycle applies a *separate*, fixed ~15s "claim settle" window
-measured from the event's own creation time before it will surface the event's body — independent
-of your monitor's `notify.settle-for`. So for `high` urgency, budget roughly
-`interval + settle-for + 15s` before step 5's loop returns content — the 20 × 2s retry window above
-comfortably covers that. **Do not** change any files or re-open the session while you wait — that
-resets the condition you're trying to observe. A `normal`-urgency monitor doesn't have this extra
-wait: `hook deliver` surfaces a reminder (not the full body) as soon as the event is unread (002
-§9.2). `low` urgency is delivered only at the `turn-idle` lifecycle (002 §9.3, §13.2) — this
-recipe's step 5 sends `UserPromptSubmit`, which maps to `turn-interruptible` only, so it never
-exercises low-urgency delivery; expect step 5 to keep returning empty for a `low`-urgency
-monitor regardless of how long you wait.
+**If step 4 or step 5's loop keeps retrying, don't assume it's just a settle window — check what
+the daemon actually recorded first:**
+
+```bash
+agentmonitors monitor history <id> --socket "$SOCKET"
+```
+
+A row whose result column shows `no-change` means the trigger in step 3 didn't actually alter
+anything the source could detect (e.g. a `touch` on a file whose content didn't change under
+`file-fingerprint`'s content-hash comparison) — fix the trigger, don't keep waiting.
+
+Only once the result column shows `triggered` — or step 4 has already printed an event row — is a
+still-empty step 5 loop for a `high`-urgency monitor expected, not a bug. `events list` (step 4)
+surfaces an event as soon as it materializes. `hook deliver` at the `turn-interruptible` lifecycle
+applies a *separate*, fixed ~15s "claim settle" window measured from the event's own creation time
+before it will surface the event's body — independent of your monitor's `notify.settle-for`. So for
+`high` urgency, budget roughly `interval + settle-for + 15s` before step 5's loop returns content —
+the 20 × 2s retry window above comfortably covers that. **Do not** change any files or re-open the
+session while you wait for step 5 once the event already exists — that resets the condition you're
+trying to observe. A `normal`-urgency monitor doesn't have this extra wait: `hook deliver` surfaces
+a reminder (not the full body) as soon as the event is unread (002 §9.2). `low` urgency is delivered
+only at the `turn-idle` lifecycle (002 §9.3, §13.2) — this recipe's step 5 sends
+`UserPromptSubmit`, which maps to `turn-interruptible` only, so it never exercises low-urgency
+delivery; expect step 5 to keep returning empty for a `low`-urgency monitor regardless of how long
+you wait.
 
 **This recipe's daemon is invisible to `doctor`.** Everything above runs against the explicit
 `$SOCKET` / `$AGENTMONITORS_DB`. `agentmonitors doctor` and `monitor explain` auto-discover the
@@ -444,10 +456,12 @@ any tick where its cron matches, from the first eligible tick onward. Step 2b's 
 precisely to dodge this race — by the time you reach step 3, the baselining first tick has already
 completed, so whatever you trigger next is guaranteed to be detected on a subsequent tick.
 
-**`file-fingerprint`** — touch any file matched by `watch.globs`:
+**`file-fingerprint`** — change the *content* of a file matched by `watch.globs`. This source
+detects changes by content hash, not mtime or existence, so a bare `touch` on an existing file
+leaves the hash unchanged and is silently ignored — append real content instead:
 
 ```bash
-touch path/to/monitored/file.txt
+echo "// verify $(date)" >> path/to/monitored/file.txt
 ```
 
 **`command-poll`** — change the command's output between two ticks. Example, watching
