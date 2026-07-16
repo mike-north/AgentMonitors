@@ -53,13 +53,43 @@ const ENABLE_REMEDIATION =
   'Run `agentmonitors init --enable-only`, or create `.claude/agentmonitors.local.md` in this project with `enabled: true` yourself.';
 const DAEMON_REMEDIATION =
   'Start it with `agentmonitors daemon run`, or it starts automatically when a Claude Code session opens.';
-// The lead-session remediation names the exact workspace path doctor searched
-// (issue #335) so a future db/socket-derivation mismatch between doctor and
-// `session open`/`session list` is self-diagnosing: compare this value against
+// The lead-session remediation points at `session start` — the flagless
+// lazy-boot path that matches real usage (the SessionStart hook runs exactly
+// this command): it boots the project daemon if needed and registers a lead
+// session in one shot. It deliberately does NOT recommend `session open`, whose
+// `--host-session-id` is a required option with no meaningful value for a
+// manual, no-plugin CLI user (issue #387) — copy-pasting a `session open`
+// invocation hits `error: required option '--host-session-id' not specified`,
+// a reproducible dead end reached by following doctor's own advice. For the
+// manual case we print the exact stdin payload `session start` reads
+// (`session_id` + `cwd`, delivered as JSON on stdin like a real hook), using an
+// explicit `manual-cli-session` placeholder so the printed command runs verbatim.
+//
+// It also names the exact workspace path doctor searched (issue #335) so a
+// future db/socket-derivation mismatch between doctor and `session start`/
+// `session list` is self-diagnosing: compare this value against
 // `agentmonitors session list`'s workspace column directly, rather than
 // guessing whether the two commands agree.
+//
+// The printed command wraps the JSON payload in shell single-quotes for
+// `echo`. `JSON.stringify` never emits an unescaped `'`, but the workspace
+// path it embeds can legitimately contain one (e.g. a macOS "Mike's Mac"
+// home directory) — so the payload itself can. `shellSingleQuote` closes the
+// quote, escapes the embedded `'`, and reopens it (the standard POSIX idiom)
+// so the printed command stays runnable verbatim regardless of the path.
+function shellSingleQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
 function leadSessionRemediation(workspacePath: string): string {
-  return `Open a Claude Code session in this workspace (the SessionStart hook registers a lead session), or run \`agentmonitors session open --role lead --workspace "${workspacePath}"\`. Doctor searched for a lead session registered to workspace "${workspacePath}" — compare against \`agentmonitors session list\`.`;
+  // Build the manual stdin payload with JSON.stringify so the embedded path is
+  // correctly quoted as JSON; shellSingleQuote then makes the whole payload
+  // safe to embed in the single-quoted shell string below.
+  const manualPayload = JSON.stringify({
+    session_id: 'manual-cli-session',
+    cwd: workspacePath,
+  });
+  return `Open a Claude Code session in this workspace — the SessionStart hook runs \`agentmonitors session start\`, which lazy-boots the daemon and registers a lead session automatically. To register one by hand (no plugin), pipe a hook payload to that same command: \`echo ${shellSingleQuote(manualPayload)} | agentmonitors session start\`. Doctor searched for a lead session registered to workspace "${workspacePath}" — compare against \`agentmonitors session list\`.`;
 }
 const NEVER_OBSERVED_REMEDIATION =
   'The daemon has not observed this monitor yet. Start it with `agentmonitors daemon run` (or wait for the next tick), then check `agentmonitors monitor history <id>`; `agentmonitors monitor test <path>` dry-runs it now.';
