@@ -1,7 +1,7 @@
 {
   "name": "@agentmonitors/source-schedule",
   "description": "Cron-based schedule triggers for Agent Monitors",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "engines": {
     "node": ">=24"
   },

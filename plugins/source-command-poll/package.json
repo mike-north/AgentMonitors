@@ -1,7 +1,7 @@
 {
   "name": "@agentmonitors/source-command-poll",
   "description": "Local-command polling and change detection for Agent Monitors",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "engines": {
     "node": ">=24"
   },

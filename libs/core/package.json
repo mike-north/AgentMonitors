@@ -1,7 +1,7 @@
 {
   "name": "@agentmonitors/core",
   "description": "Core library for Agent Monitors — schema, parser, inbox, plugin interface, and notification engine",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "engines": {
     "node": ">=24"
   },
