@@ -1,7 +1,6 @@
 ---
 '@agentmonitors/core': minor
-'@agentmonitors/cli': minor
-'agentmonitors': minor
+'@agentmonitors/cli': patch
 ---
 
 Fix `agentmonitors verify` spuriously FAILing on the recommended default monitor configuration
