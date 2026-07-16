@@ -107,6 +107,34 @@ export async function retractObjectEventsClient(
   return result.removed;
 }
 
+/**
+ * Install a durable, self-expiring suppression over a synthetic object key on the
+ * LIVE daemon and retract what that key already has (issue #414). `verify
+ * --use-workspace-daemon` calls this the instant it has proven delivery: it
+ * erases the create event now and leaves the daemon to auto-retract the scratch
+ * file's pending deletion on the tick it materializes — so verify need not block
+ * a full poll interval for that deletion (the #407 wait that doubled its
+ * runtime), while a later session still never sees the scratch event. MUST only
+ * target verify's own `…/agentmonitors-verify-<token>` scratch path. Returns the
+ * number of already-materialized events retracted immediately.
+ */
+export async function suppressObjectEventsClient(
+  input: {
+    monitorId: string;
+    objectKey: string;
+    ttlMs: number;
+    workspacePath?: string;
+  },
+  socketPath?: string,
+): Promise<number> {
+  const result = await callDaemon<{ removed: number }>(
+    'events.suppressObject',
+    input,
+    socketPath ? { socketPath } : {},
+  );
+  return result.removed;
+}
+
 export async function claimDeliveryClient(
   sessionId: string,
   lifecycle: DeliveryLifecycle,

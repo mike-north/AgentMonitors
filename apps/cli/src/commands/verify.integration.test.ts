@@ -736,4 +736,176 @@ describe('agentmonitors verify --use-workspace-daemon (issue #407)', () => {
       rmSync(socketDir, { recursive: true, force: true });
     }
   }, 90_000);
+
+  // Issue #414 criterion 2 (interruption-safety): a `--use-workspace-daemon` run
+  // interrupted (e.g. by a command/CI timeout) must NOT leave permanent stray
+  // state — no `active` verify session, no dangling scratch event/file. We SIGTERM
+  // verify once its throwaway session is open, then assert the workspace converges
+  // clean (verify's signal handler tears down + the daemon's backstops finish).
+  it('an interrupted run leaves no active verify session and no dangling scratch event/file', async () => {
+    const ws = mkdtempSync(path.join(tempDir, 'interrupt-'));
+    const socketDir = mkdtempSync(path.join(tmpdir(), 'ami-'));
+    const env: Record<string, string> = {
+      ...(Object.fromEntries(
+        Object.entries(process.env).filter(([, v]) => v !== undefined),
+      ) as Record<string, string>),
+      AGENTMONITORS_SOCKET: path.join(socketDir, 'd.sock'),
+      AGENTMONITORS_DB: path.join(socketDir, 'verify.db'),
+    };
+    expect(runWs(['init', '--enable-only'], ws, env).exitCode).toBe(0);
+    writeMonitor(
+      ws,
+      'docs-watch',
+      `name: Docs watch\nwatch:\n  type: file-fingerprint\n  globs:\n    - '*.md'\n  cwd: ${JSON.stringify(ws)}\n  interval: '1s'\nurgency: normal`,
+    );
+    writeFileSync(path.join(ws, 'readme.md'), 'hello', 'utf-8');
+
+    const monitorsDir = path.join(ws, '.claude', 'monitors');
+    const daemon: ChildProcess = spawn(
+      CLI[0],
+      [
+        CLI[1],
+        'daemon',
+        'run',
+        monitorsDir,
+        '--workspace',
+        ws,
+        '--poll-ms',
+        '500',
+        '--reap-after-ms',
+        '0',
+      ],
+      { cwd: ws, env, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+
+    try {
+      let dstdout = '';
+      daemon.stdout?.setEncoding('utf-8');
+      daemon.stdout?.on('data', (c: string) => (dstdout += c));
+      const bootDeadline = Date.now() + 15_000;
+      while (
+        Date.now() < bootDeadline &&
+        !dstdout.includes('AgentMon daemon listening')
+      ) {
+        if (daemon.exitCode !== null) throw new Error('daemon exited early');
+        await delay(100);
+      }
+      expect(dstdout).toContain('AgentMon daemon listening');
+
+      // A persistent lead session that outlives verify, so we can query for any
+      // stray scratch event a later session would see (events list is
+      // session-scoped) and confirm none survive the interruption.
+      const userSession = runWs(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          'user-session',
+          '--workspace',
+          ws,
+          '--format',
+          'id',
+        ],
+        ws,
+        env,
+      );
+      expect(userSession.exitCode).toBe(0);
+      const userSessionId = userSession.stdout.trim();
+
+      // Spawn verify as a signalable child (not execFileSync).
+      const verify: ChildProcess = spawn(
+        CLI[0],
+        [
+          CLI[1],
+          'verify',
+          'docs-watch',
+          '--use-workspace-daemon',
+          '--workspace',
+          ws,
+          '--format',
+          'json',
+        ],
+        { cwd: ws, env, stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      let exited = false;
+      verify.once('exit', () => (exited = true));
+
+      // Wait until verify has fired its trigger (the scratch file is on disk and
+      // its create event is materializing), then interrupt it mid-run — the exact
+      // shape of a timeout-killed run, so the interruption hits with real scratch
+      // state present, not before it exists.
+      const armedDeadline = Date.now() + 15_000;
+      let armed = false;
+      while (Date.now() < armedDeadline && !armed && !exited) {
+        if (scratchFiles(ws).length > 0) {
+          armed = true;
+          break;
+        }
+        await delay(150);
+      }
+      expect(armed).toBe(true);
+      verify.kill('SIGTERM');
+
+      // Wait for verify to exit (its signal handler runs teardown first).
+      const exitDeadline = Date.now() + 10_000;
+      while (Date.now() < exitDeadline && !exited) await delay(100);
+      expect(exited).toBe(true);
+
+      // Converge-clean assertion: no ACTIVE agentmonitors-verify-* session and no
+      // scratch event/file survive. Poll a few daemon ticks so the daemon's
+      // suppression sweep / reap backstop can finish alongside the signal handler.
+      let clean = false;
+      const cleanDeadline = Date.now() + 20_000;
+      while (Date.now() < cleanDeadline && !clean) {
+        const sessions = runWs(
+          ['session', 'list', '--format', 'json'],
+          ws,
+          env,
+        );
+        const events = runWs(
+          ['events', 'list', '--session', userSessionId, '--format', 'json'],
+          ws,
+          env,
+        );
+        const parsedSessions = JSON.parse(sessions.stdout) as {
+          hostSessionId: string;
+          status: string;
+        }[];
+        const strayActiveVerify = parsedSessions.some(
+          (s) =>
+            s.hostSessionId.startsWith('agentmonitors-verify-') &&
+            s.status === 'active',
+        );
+        const strayScratchEvent = events.stdout.includes(
+          'agentmonitors-verify-',
+        );
+        if (
+          !strayActiveVerify &&
+          !strayScratchEvent &&
+          scratchFiles(ws).length === 0
+        ) {
+          clean = true;
+          break;
+        }
+        await delay(500);
+      }
+      expect(clean).toBe(true);
+    } finally {
+      runWs(['daemon', 'stop'], ws, env);
+      if (daemon.exitCode === null) {
+        daemon.kill('SIGTERM');
+        await new Promise<void>((resolve) => {
+          const t = globalThis.setTimeout(() => {
+            daemon.kill('SIGKILL');
+            resolve();
+          }, 3_000);
+          daemon.once('exit', () => {
+            globalThis.clearTimeout(t);
+            resolve();
+          });
+        });
+      }
+      rmSync(socketDir, { recursive: true, force: true });
+    }
+  }, 90_000);
 });
