@@ -3,6 +3,7 @@ import type {
   NotifyConfig,
   Urgency,
 } from '../schema/types.js';
+import type { ephemeralMonitorStatus } from '../inbox/schema.js';
 import type { Observation } from '../observation/types.js';
 import type { DuplicateMonitorId } from '../parser/scan-monitors.js';
 
@@ -51,7 +52,12 @@ export interface AgentSessionRecord {
   updatedAt: Date;
 }
 
-export type EphemeralMonitorStatus = 'active' | 'reaped';
+/**
+ * The lifecycle status of an ephemeral monitor (007 §4.4), derived from the
+ * single source of truth — the drizzle column enum {@link ephemeralMonitorStatus}
+ * — so the persisted values and this public type cannot drift.
+ */
+export type EphemeralMonitorStatus = (typeof ephemeralMonitorStatus)[number];
 
 /**
  * Reserved id prefix for ephemeral (agent-declared) monitors (007 §4.3). Every

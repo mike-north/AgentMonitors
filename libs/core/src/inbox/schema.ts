@@ -201,7 +201,6 @@ export const sessionObjectCursor = sqliteTable('session_object_cursor', {
  * ended does not resurrect it").
  */
 export const ephemeralMonitorStatus = ['active', 'reaped'] as const;
-export type EphemeralMonitorStatus = (typeof ephemeralMonitorStatus)[number];
 
 /**
  * An **ephemeral monitor** (007 §4): an agent-declared, session-scoped monitor

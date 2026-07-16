@@ -307,6 +307,21 @@ exclude ephemeral-monitor rows (recognisable by the reserved `ephemeral:` id pre
 declaring session still reads its own ephemeral events through its **session-scoped** read.
 Persistent-monitor reads are unaffected.
 
+**Scope of the isolation invariant (decision, Refs #312).** The isolation above binds **unscoped
+enumeration** — a session-less read that would fold ephemeral rows into a cross-session listing.
+It does **not** extend to a **`monitorId`-targeted** read that names a specific ephemeral id. Such a
+read is an **operator-level diagnostic**, not a session-isolated surface: naming the full
+`ephemeral:<sessionId>/<ulid>` id (§4.3) is itself operator knowledge, and doing so **MAY** return
+that monitor's **observation-history** audit rows (observe outcomes and counts) even from another
+session's binding. The rationale is the **local single-operator trust model**: the daemon serves one
+human operator's machine (PP10), so the observation audit trail is a diagnostic aid (`monitor
+explain` / `doctor` / reminder diagnosis), not a cross-tenant boundary. The **events** surface is
+**stricter by design**: because an ephemeral event body carries the declaring session's private
+free-text instruction, `events list` **MUST** exclude ephemeral rows on **any** session-less read —
+including one that names the ephemeral id — so the private instruction is never returned except
+through the declaring session's session-scoped read. In short: a `monitorId`-targeted
+observation-history read is diagnostic and permitted; the instruction-bearing event body is not.
+
 An in-flight tick **MUST NOT** deliver for a reaped watch: because a tick pre-fetches its active
 ephemeral monitors before `observe()` yields, a `watch cancel` (or session close/dormancy) that
 races the observation could otherwise still project into the (possibly still-active) declaring

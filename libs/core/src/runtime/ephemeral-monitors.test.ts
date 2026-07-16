@@ -15,7 +15,10 @@ import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { createDb } from '../inbox/db.js';
+import { eq } from 'drizzle-orm';
+import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
+import { createDb, type InboxDb } from '../inbox/db.js';
+import { agentSessions } from '../inbox/schema.js';
 import { SourceRegistry } from '../observation/registry.js';
 import type {
   ObservationContext,
@@ -112,6 +115,7 @@ interface Harness {
   registry: SourceRegistry;
   workspace: string;
   monitorsDir: string;
+  db: InboxDb;
 }
 
 function makeHarness(
@@ -135,7 +139,21 @@ function makeHarness(
   // evaluated.
   const monitorsDir = path.join(workspace, '.claude', 'monitors');
   mkdirSync(monitorsDir, { recursive: true });
-  return { runtime, store, registry, workspace, monitorsDir };
+  return { runtime, store, registry, workspace, monitorsDir, db };
+}
+
+/**
+ * Backdate a session's `lastActiveAt` to a fixed time, simulating prior
+ * inactivity so a dormancy test is deterministic (the runtime's tick clock is
+ * wall time, not injectable). Writes directly through the same drizzle handle
+ * the store uses internally.
+ */
+function backdateLastActive(db: InboxDb, sessionId: string, when: Date): void {
+  (db as unknown as BetterSQLite3Database)
+    .update(agentSessions)
+    .set({ lastActiveAt: when, updatedAt: when })
+    .where(eq(agentSessions.id, sessionId))
+    .run();
 }
 
 /** Open a subagent (non-lead) session in `workspace`. */
@@ -560,6 +578,97 @@ describe('ephemeral monitors — lifecycle (007 §4.4, criterion 3)', () => {
     expect(runtime.listEphemeralMonitors(session.id)).toHaveLength(1);
   });
 
+  // ── Declaring is activity: dormancy must not reap a session that just declared
+  //    a watch (regression for the long-quiet-live-session event-loss bug). ─────
+
+  it('advances the declaring session lastActiveAt — declaring a watch is session activity (007 §4.4)', () => {
+    const workspace = mkdtempSync(path.join(tmpdir(), 'am-eph-bump-'));
+    tempDirs.push(workspace);
+    const { runtime, store, db } = makeHarness(':memory:', workspace);
+    const session = openLead(runtime, workspace, 'host-bump');
+
+    // Simulate a session that has been quiet for a while (no hook-driven
+    // activity advancing lastActiveAt): backdate it well into the past.
+    backdateLastActive(db, session.id, new Date(Date.now() - 10 * 60_000));
+    const before = store.getSessionById(session.id).lastActiveAt.getTime();
+
+    runtime.declareEphemeralMonitor({
+      sessionId: session.id,
+      source: 'test-ephemeral',
+      scope: { target: 'foo' },
+    });
+
+    // The declaration itself counts as activity and resets the dormancy clock.
+    const after = store.getSessionById(session.id).lastActiveAt.getTime();
+    expect(after).toBeGreaterThan(before);
+  });
+
+  it('does NOT reap a long-quiet live session that declared a watch within the dormancy window; the watch stays armed and fires (007 §4.4)', async () => {
+    const workspace = mkdtempSync(path.join(tmpdir(), 'am-eph-declare-wait-'));
+    tempDirs.push(workspace);
+    // 60s window; the session's prior activity is 90s stale — beyond it.
+    const { runtime, store, monitorsDir, db } = makeHarness(
+      ':memory:',
+      workspace,
+      { sessionDormancyMs: 60_000 },
+    );
+    const session = openLead(runtime, workspace, 'host-declare-wait');
+
+    // The session did its last hook-driven activity 90s ago (e.g. it then began
+    // one long blocking tool call that emits no hooks), so lastActiveAt is stale.
+    backdateLastActive(db, session.id, new Date(Date.now() - 90_000));
+
+    // It declares a watch NOW — exactly the scenario a watch exists for. This
+    // must reset the dormancy clock; before the fix, declaring left lastActiveAt
+    // stale and the very next tick reaped the just-declared watch (event loss).
+    const record = runtime.declareEphemeralMonitor({
+      sessionId: session.id,
+      source: 'test-ephemeral',
+      scope: { target: 'foo' },
+    });
+
+    const result = await runtime.tick(monitorsDir, workspace);
+
+    // The session is still active, the watch survives, and its event fires.
+    expect(store.getSessionById(session.id).status).toBe('active');
+    expect(store.findEphemeralMonitorById(record.id)?.status).toBe('active');
+    expect(result.emittedEventIds).toHaveLength(1);
+  });
+
+  it('staleActiveSessions exempts a session with an active ephemeral declared within the window (declaredAt guard, 007 §4.4)', () => {
+    const workspace = mkdtempSync(
+      path.join(tmpdir(), 'am-eph-declared-guard-'),
+    );
+    tempDirs.push(workspace);
+    const { runtime, store, db } = makeHarness(':memory:', workspace);
+    const session = openLead(runtime, workspace, 'host-declared-guard');
+    const record = runtime.declareEphemeralMonitor({
+      sessionId: session.id,
+      source: 'test-ephemeral',
+      scope: { target: 'foo' },
+    });
+
+    // Force the divergence the production bump alone cannot produce: a
+    // lastActiveAt older than the (fresh) declaration. This isolates the
+    // independent declaredAt exemption — the durable "a watch was declared
+    // recently" signal — from the lastActiveAt bump, so removing the guard is
+    // caught even if the bump still runs.
+    backdateLastActive(db, session.id, new Date(Date.now() - 90_000));
+    const staleBefore = new Date(Date.now() - 60_000);
+
+    // The fresh declaration (createdAt ~ now, > staleBefore) exempts the session
+    // even though its lastActiveAt (90s ago) is before the cutoff.
+    const stale = store.staleActiveSessions(workspace, staleBefore);
+    expect(stale.some((s) => s.id === session.id)).toBe(false);
+
+    // Remove the only active ephemeral: with no recent declaration, the stale
+    // lastActiveAt now makes the session dormant — proving the exemption above
+    // came from the declaration, not something else.
+    runtime.cancelEphemeralMonitor(session.id, record.id);
+    const staleAfter = store.staleActiveSessions(workspace, staleBefore);
+    expect(staleAfter.some((s) => s.id === session.id)).toBe(true);
+  });
+
   it('retains already-materialized events + projections after a post-tick reap (007 §4.4 retention)', async () => {
     const workspace = mkdtempSync(path.join(tmpdir(), 'am-eph-retain-'));
     tempDirs.push(workspace);
@@ -845,7 +954,7 @@ describe('ephemeral monitors — projection isolation (007 §4.6, criterion 4)',
       baselineStrategy: null,
       queryScope: {},
       tags: [],
-      createdAt: new Date(),
+      createdAt: new Date('2026-01-01T00:00:00.000Z'),
     });
 
     expect(runtime.listEvents({ sessionId: a.id })).toHaveLength(1);

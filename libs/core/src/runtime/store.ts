@@ -8,6 +8,7 @@ import {
   isNull,
   lte,
   ne,
+  notExists,
   notLike,
   or,
   sql,
@@ -568,16 +569,33 @@ export class RuntimeStore {
   }
 
   /**
-   * The `active` sessions for `workspacePath` (plus global) whose `lastActiveAt`
-   * is at or before `staleBefore` — i.e. sessions that have gone dormant by
-   * inactivity (002 §6.2 / 007 §4.4 per-session dormancy trigger). Used by the
-   * runtime to transition them to `dormant` and reap their ephemeral monitors.
+   * The `active` sessions for `workspacePath` (plus global) that have gone
+   * dormant by inactivity (002 §6.2 / 007 §4.4 per-session dormancy trigger).
+   * Used by the runtime to transition them to `dormant` and reap their ephemeral
+   * monitors.
+   *
+   * A session's effective last-activity is the later of its `lastActiveAt` and
+   * its newest active ephemeral monitor's declaration time: declaring a watch is
+   * itself activity, so a session with an ephemeral monitor declared **after**
+   * `staleBefore` is NOT stale even if `lastActiveAt` is older. Concretely, a
+   * session that declares a watch and
+   * then blocks on one long tool call (emitting no hooks) keeps its watches for
+   * at least one dormancy window past the declaration, instead of being reaped
+   * mid-wait and silently losing the finishing event. A crashed session stops
+   * declaring, so its newest declaration ages out and cleanup still bounds.
+   *
+   * TODO(dormancy vs long-running-wait): this only extends coverage by one
+   * dormancy window past the newest declaration; a wait longer than the window
+   * is still reaped. Whether a live session should hold its watches for an
+   * arbitrarily long blocking wait is an open spec decision — see follow-up
+   * issue (placeholder, to be updated).
    */
   staleActiveSessions(
     workspacePath: string | null,
     staleBefore: Date,
   ): AgentSessionRecord[] {
-    return asInternalDb(this.db)
+    const internalDb = asInternalDb(this.db);
+    return internalDb
       .select()
       .from(agentSessions)
       .where(
@@ -590,6 +608,22 @@ export class RuntimeStore {
                 isNull(agentSessions.workspacePath),
               ),
           lte(agentSessions.lastActiveAt, staleBefore),
+          // Exempt a session that declared a watch within the dormancy window:
+          // an active ephemeral monitor with `created_at > staleBefore` means the
+          // session was active (declared) more recently than `lastActiveAt`
+          // records, so it is not yet dormant (see method doc).
+          notExists(
+            internalDb
+              .select({ one: sql`1` })
+              .from(ephemeralMonitors)
+              .where(
+                and(
+                  eq(ephemeralMonitors.sessionId, agentSessions.id),
+                  eq(ephemeralMonitors.status, 'active'),
+                  gt(ephemeralMonitors.createdAt, staleBefore),
+                ),
+              ),
+          ),
         ),
       )
       .all()

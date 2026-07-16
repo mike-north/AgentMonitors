@@ -586,7 +586,7 @@ export class AgentMonitorRuntime {
 
     // 4. Assign the namespaced runtime identity (007 §4.3) and persist.
     const id = `${EPHEMERAL_MONITOR_ID_PREFIX}${session.id}/${ulid()}`;
-    return this.store.insertEphemeralMonitor({
+    const record = this.store.insertEphemeralMonitor({
       id,
       sessionId: session.id,
       workspacePath: session.workspacePath ?? null,
@@ -597,6 +597,14 @@ export class AgentMonitorRuntime {
       instruction: input.instruction ?? '',
       ...(input.displayName ? { displayName: input.displayName } : {}),
     });
+    // Declaring a watch IS session activity: bump the session's `lastActiveAt`
+    // so a declaration on its own resets the per-session dormancy clock (002
+    // §6.2 / 007 §4.4). Without this, only `claimDelivery`/recap advance it, so a
+    // session that declares a watch and then blocks on one long tool call (no
+    // hooks) would be reaped mid-wait and lose its watches — exactly the case a
+    // watch exists for. See also the declaredAt guard in `staleActiveSessions`.
+    this.store.touchSession(session.id);
+    return record;
   }
 
   /** List the active ephemeral monitors declared by a session (007 §4, `watch list`). */
