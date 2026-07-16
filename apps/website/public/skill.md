@@ -300,7 +300,20 @@ recipe below instead, which pins everything to one daemon on one socket that nev
 
 Default poll interval is 30s (`file-fingerprint`, `command-poll`) or 5min (`api-poll`). For a
 verification pass only, shorten it in the `MONITOR.md` frontmatter, and restore the real value
-afterward:
+afterward. `file-fingerprint` takes the same `watch.interval` knob as `command-poll` — it isn't
+command-poll-only:
+
+```yaml
+watch:
+  type: file-fingerprint
+  globs:
+    - '**/*.ts'
+  interval: 5s # shorten for testing only
+notify:
+  strategy: debounce
+  settle-for: 5s # shorten for testing only
+urgency: high
+```
 
 ```yaml
 watch:
@@ -314,7 +327,11 @@ urgency: high
 ```
 
 You can also pass `--poll-ms <ms>` to `daemon run` (default 30000) to shorten the daemon's own
-tick rate.
+tick rate — but that only controls the daemon's tick granularity, not any individual monitor's due
+time; `watch.interval` above (or the `api-poll`/`schedule` equivalents) is what actually governs
+when a specific monitor comes due. Budget step 4's poll loop below (event materialization) the same
+way step 5 budgets `hook deliver`: roughly `interval + settle-for`, before assuming nothing
+happened.
 
 ### The recipe
 
@@ -360,7 +377,12 @@ sleep 5
 
 # 4. Poll `events list` until the materialized event shows up. --unread always
 #    talks to the live daemon over the socket (it errors if the daemon isn't
-#    reachable — start it first, as above).
+#    reachable — start it first, as above). This loop's 20 x 2s = 40s budget
+#    assumes the shortened `interval` + `settle-for` from "Speed it up for the
+#    test" above (5s + 5s here); at default/unshortened values (e.g.
+#    file-fingerprint's 30s default interval with no override), widen the
+#    retry count to cover `interval + settle-for` — the same formula step 5
+#    budgets for `hook deliver`, one stage later.
 for i in $(seq 1 20); do
   OUT=$(agentmonitors events list --socket "$SOCKET" --session "$AGENTMON_SESSION_ID" --unread --format json)
   [ "$(node -e "console.log(JSON.parse(process.argv[1]).length)" "$OUT")" -ge 1 ] && break
@@ -413,6 +435,11 @@ A row whose result column shows `no-change` means the trigger in step 3 didn't a
 anything the source could detect (e.g. a `touch` on a file whose content didn't change under
 `file-fingerprint`'s content-hash comparison) — fix the trigger, don't keep waiting.
 
+A row showing `suppressed` means the opposite: the source detected a real change (the trigger
+worked), but a debounce/throttle hold in `notify:` is delaying it from becoming an event this tick
+— expected mid-settle, not a broken trigger. Wait for the next tick, or check `monitor explain`'s
+notify stage.
+
 Only once the result column shows `triggered` — or step 4 has already printed an event row — is a
 still-empty step 5 loop for a `high`-urgency monitor expected, not a bug. `events list` (step 4)
 surfaces an event as soon as it materializes. `hook deliver` at the `turn-interruptible` lifecycle
@@ -438,6 +465,12 @@ the daemon unreachable — that's a different daemon than the one `doctor` resol
 regression. To check the setup a real agent session would actually use, start a daemon on the
 workspace's own socket (`agentmonitors daemon run` — no `--socket`) or open a live session, then
 re-run `doctor`.
+
+**For a stakeholder-presentable proof** (e.g. showing a security reviewer that monitoring is
+actually wired up), don't screenshot the isolated-socket recipe's output — it's throwaway and
+proves the mechanism, not the live setup. Instead, start the workspace's own daemon
+(`agentmonitors daemon run`, no `--socket`) and screenshot `doctor`'s all-green summary alongside
+the `hook deliver` JSON from step 5 above.
 
 ### Per-source trigger recipes (step 3)
 
@@ -476,6 +509,13 @@ comparison), so once the baseline tick has run, whichever tick executes after yo
 will detect it. This assumes a fresh baseline, which is why the recipe isolates
 `$AGENTMONITORS_DB` above — reusing a database from a prior run of this same recipe means the
 daemon's first tick already has a baseline from that earlier run.
+
+**Gotcha, `git status --porcelain` monitors specifically:** this is `command-poll`'s analog of the
+`file-fingerprint` `touch` no-op above. `git status --porcelain` reports an already-untracked file
+as `?? path` regardless of its content — appending to it again doesn't change that line, so
+re-touching an existing untracked file is a silent no-op trigger here too. The trigger must add,
+remove, or modify a *tracked* file, or introduce a genuinely *new* untracked path — not write again
+to a file that's already untracked.
 
 **`api-poll`** — the response from `watch.url` must change between two ticks. Point it at a
 controllable local server, or a source that changes every poll. Without a controllable endpoint,
