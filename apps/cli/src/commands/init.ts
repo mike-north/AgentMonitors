@@ -162,13 +162,16 @@ function seedName(template: string, name: string): string {
  * untouched, so a rushed author can commit a monitor that is never renamed.
  * Splits on `-`/`_` and capitalizes the first word, e.g. `watch-docs` ->
  * `Watch docs`. A separator-free positional is still capitalized (a single
- * word, e.g. `watchdocs` -> `Watchdocs`). Only a positional that is empty or
- * consists solely of separators (e.g. `---`) is returned verbatim, since there
- * is no word to capitalize.
+ * word, e.g. `watchdocs` -> `Watchdocs`). A positional that is empty or
+ * consists solely of separators (e.g. `---`) has no word to capitalize and
+ * returns `undefined`, leaving the `name:` seed unset so the template's own
+ * (non-empty) default name survives — returning it verbatim would otherwise
+ * scaffold `name: ''`, which fails `monitorFrontmatterSchema`'s `.min(1)` on
+ * `validate`.
  */
-function deriveNameFromPositional(positional: string): string {
+function deriveNameFromPositional(positional: string): string | undefined {
   const words = positional.split(/[-_]+/).filter((word) => word.length > 0);
-  if (words.length === 0) return positional;
+  if (words.length === 0) return undefined;
   const [first, ...rest] = words;
   // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- `words.length > 0` guarantees `first` is defined.
   const capitalized = `${first!.charAt(0).toUpperCase()}${first!.slice(1)}`;
@@ -629,16 +632,20 @@ export const initCommand = new Command('init')
     ) => {
       // Named form: `init <name> --type ...` — unchanged scaffold behavior
       // when no seed flags are passed (AC3, issue #330), except that the
-      // frontmatter `name:` now always derives from the positional `<name>`
-      // rather than surviving as the template's literal placeholder
-      // (issue #375). `--name` still overrides.
+      // frontmatter `name:` now derives from the positional `<name>` rather
+      // than surviving as the template's literal placeholder (issue #375).
+      // `--name` still overrides.
       if (name !== undefined) {
-        // `urgency`/`globs` are built conditionally (not `field: value ??
-        // undefined`) because `exactOptionalPropertyTypes` treats an
-        // explicit `undefined` value differently from an absent key; `name`
-        // always has a value now (seeded or derived) so it's set directly.
+        // `urgency`/`globs`/`name` are all built conditionally (not `field:
+        // value ?? undefined`) because `exactOptionalPropertyTypes` treats an
+        // explicit `undefined` value differently from an absent key.
+        // `deriveNameFromPositional` returns `undefined` for a positional
+        // with no word to capitalize (empty or separators-only, e.g. `---`),
+        // so `name` is omitted from the seed in that case and the template's
+        // own default name: line survives untouched.
+        const derivedName = options.name ?? deriveNameFromPositional(name);
         const seeds: SeedOptions = {
-          name: options.name ?? deriveNameFromPositional(name),
+          ...(derivedName !== undefined ? { name: derivedName } : {}),
           ...(options.urgency !== undefined
             ? { urgency: options.urgency }
             : {}),

@@ -900,6 +900,77 @@ describe('init', () => {
     expect(monitor).not.toContain('name: My monitor');
   });
 
+  // Regression (PR #379 follow-up): an empty positional <name> has no words
+  // to capitalize, so deriveNameFromPositional's separators-only fallback
+  // must not emit the empty string verbatim as the seeded name — that would
+  // scaffold `name: ''`, which fails monitorFrontmatterSchema's .min(1) on
+  // `validate` (a regression versus pre-#375, when the template's own
+  // non-empty placeholder always survived untouched). Leaving the name seed
+  // unset instead falls through to the template's own default name.
+  //
+  // An empty `name` also makes `path.join(dir, name)` resolve to `dir`
+  // itself, so the scaffolded MONITOR.md lands at depth-0 under `monitorsDir`
+  // — which scanMonitors deliberately never treats as a monitor (folder id
+  // must come from an actual parent directory, per scan-monitors.ts). That
+  // placement quirk is unrelated to this bug and out of scope here, so
+  // `validate` is run one level up (`dir`, the parent of `monitorsDir`),
+  // putting the file at depth-1 (`monitors/MONITOR.md`) like every other
+  // scaffolded monitor in this suite.
+  it('falls back to the template default name for an empty positional <name>', () => {
+    const dir = path.join(tempDir, 'init-name-empty-positional');
+    mkdirSync(dir, { recursive: true });
+    const monitorsDir = path.join(dir, 'monitors');
+    const created = run(
+      ['init', '', '--dir', monitorsDir, '--type', 'file-fingerprint'],
+      dir,
+    );
+    expect(created.exitCode).toBe(0);
+    const monitor = readFileSync(path.join(monitorsDir, 'MONITOR.md'), 'utf-8');
+    expect(monitor).toContain('name: My monitor');
+
+    const validated = run(['validate', dir, '--format', 'json'], dir);
+    expect(validated.exitCode).toBe(0);
+    const parsed = JSON.parse(validated.stdout) as {
+      valid: number;
+      monitors: { name: string }[];
+    };
+    expect(parsed.valid).toBe(1);
+    expect(parsed.monitors[0]?.name).toBe('My monitor');
+  });
+
+  // Regression sibling: a positional consisting solely of separators (e.g.
+  // `---`) hits the same "no words" branch as an empty positional and must
+  // behave identically — fall back to the template default, not
+  // `name: '---'` (the pre-fix verbatim behavior) or `name: ''`. `--` must
+  // come after the options (and before the dash-leading positional) so
+  // Commander treats `---` as the literal positional value rather than an
+  // unknown option or, if `--` led the whole arg list, swallowing `--dir`/
+  // `--type` as positionals too.
+  it('falls back to the template default name for a separators-only positional <name>', () => {
+    const dir = path.join(tempDir, 'init-name-separators-only');
+    mkdirSync(dir, { recursive: true });
+    const monitorsDir = path.join(dir, 'monitors');
+    const created = run(
+      ['init', '--dir', monitorsDir, '--type', 'file-fingerprint', '--', '---'],
+      dir,
+    );
+    expect(created.exitCode).toBe(0);
+    const monitor = readFileSync(
+      path.join(monitorsDir, '---', 'MONITOR.md'),
+      'utf-8',
+    );
+    expect(monitor).toContain('name: My monitor');
+
+    const validated = run(['validate', monitorsDir, '--format', 'json'], dir);
+    expect(validated.exitCode).toBe(0);
+    const parsed = JSON.parse(validated.stdout) as {
+      valid: number;
+      monitors: { name: string }[];
+    };
+    expect(parsed.valid).toBe(1);
+    expect(parsed.monitors[0]?.name).toBe('My monitor');
+  });
+
   // Issue #330 AC2: --name seeds the frontmatter name: field verbatim,
   // including a value that needs YAML single-quote escaping, and the result
   // still passes validate (proving the escaping round-trips correctly).
