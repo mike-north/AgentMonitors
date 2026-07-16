@@ -1,4 +1,10 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -250,6 +256,43 @@ describe('source-file-fingerprint', () => {
 
       const next = result.nextState as { fingerprints: Record<string, string> };
       expect(Object.keys(next.fingerprints)).toEqual([keptFile]);
+    });
+
+    // `nodir: true` on globSync is `lstat`-based: a symlink whose target is a
+    // directory reports as a symlink (not a directory), so it survives the
+    // `nodir` filter and reaches the observe loop, which then `readFile`s the
+    // real (directory) target and crashes with EISDIR — the same crash as a
+    // plain directory entry, via a different path (e.g. `docs/generated ->
+    // ../build/docs`, a common pattern). This must fail before the fix and
+    // pass after it.
+    it('skips a symlink whose target is a directory, without crashing', async () => {
+      const workspacePath = makeTempDir();
+      const realDir = path.join(workspacePath, 'real-dir');
+      mkdirSync(realDir, { recursive: true });
+      const realFile = path.join(realDir, 'nested.md');
+      writeFileSync(realFile, 'nested');
+
+      const linkPath = path.join(workspacePath, 'docs', 'link-to-dir');
+      mkdirSync(path.join(workspacePath, 'docs'), { recursive: true });
+      const topFile = path.join(workspacePath, 'docs', 'readme.md');
+      writeFileSync(topFile, 'top');
+      symlinkSync(realDir, linkPath, 'dir');
+
+      const result = await source.observe(
+        { globs: ['docs/**'] },
+        { now: new Date(), workspacePath },
+      );
+
+      const next = result.nextState as { fingerprints: Record<string, string> };
+      // Only the real file directly under docs/ is fingerprinted; the
+      // symlinked directory itself is skipped (glob's `nodir` does not
+      // recurse through a symlink-to-directory without `follow: true`, so
+      // `real-dir`'s contents are never matched by `docs/**` in the first
+      // place — this test asserts observe() doesn't crash on the symlink
+      // entry, not that it traverses through it).
+      expect(Object.keys(next.fingerprints)).toEqual([topFile]);
+      expect(next.fingerprints).not.toHaveProperty(linkPath);
+      expect(result.outcome).toBeUndefined();
     });
   });
 
