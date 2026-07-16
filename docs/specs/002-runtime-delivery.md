@@ -1071,6 +1071,42 @@ Opening a session with the same `(adapter, hostSessionId)` pair resumes the exis
 
 Verified: `libs/core/src/runtime/store.ts` — `openSession()` (lines 102–152): checks for an existing row by `(adapter, hostSessionId)`; if found, sets `status = 'active'` and clears `dormantAt`. `closeSession()` (lines 175–188) sets `status = 'dormant'`.
 
+### 6.2 Per-session dormancy (_current_)
+
+> **Status: current** (Refs #312). Added so [007 §4.4](./007-agent-facing-interaction.md)'s
+> ephemeral monitors reap on a session going dormant, not only on an explicit close.
+
+§6.1 makes a session dormant on an **explicit** close (the `session close` verb, driven by the host's
+session-end hook). A session can also go away **without** an explicit close — the host crashes, the
+tab is killed, or the end hook never fires. For those cases the runtime defines a **per-session
+dormancy trigger by inactivity**:
+
+- A session's `lastActiveAt` advances whenever it is opened/resumed ([§6.1](#61-session-identity)) or
+  touched by a delivery claim (`touchSession`, [§9](#9-delivery-lifecycles)).
+- On each tick, **before** evaluating monitors, the runtime transitions every `active` session in the
+  ticked workspace whose `lastActiveAt` is at or before `now − DEFAULT_SESSION_DORMANCY_MS`
+  (default **30 minutes**) to `status = 'dormant'` (setting `dormantAt`), via the same path as an
+  explicit close. This releases the session's session-scoped resources — notably its **ephemeral
+  monitors**, which are reaped ([007 §4.4](./007-agent-facing-interaction.md)) — so a vanished
+  session cannot keep firing watches indefinitely.
+- This is a **per-session** transition and **MUST NOT** be conflated with the daemon-wide idle
+  self-termination of [§10.2](#102-daemon-run--continuous-loop--unix-socket-server), which stops the
+  whole daemon only after **all** of a workspace's sessions are inactive for `--reap-after-ms`. One
+  session going dormant by inactivity does not stop the daemon; it only releases that session's
+  session-scoped state. A resuming session (`openSession` with the same `(adapter, hostSessionId)`)
+  becomes `active` again with a fresh `lastActiveAt`, but ephemeral monitors reaped during dormancy
+  are **not** resurrected ([007 §4.4](./007-agent-facing-interaction.md)).
+
+The threshold is generous by default (a live-but-thinking session is not reaped) and is a backstop:
+the primary reap path stays the explicit close. It is overridable in-process (the
+`AgentMonitorRuntime` constructor's `sessionDormancyMs` option) for deterministic tests.
+
+Verified: `libs/core/src/runtime/service.ts` — `reapDormantSessions()` (called at the top of
+`tick()`), the `DEFAULT_SESSION_DORMANCY_MS` constant and the `sessionDormancyMs` constructor option;
+`libs/core/src/runtime/store.ts` — `staleActiveSessions()`. Proven by the
+`reaps on per-session dormancy by inactivity` and `does NOT reap a session that is still within the
+dormancy window` cases in `libs/core/src/runtime/ephemeral-monitors.test.ts`.
+
 ## 7. Unread, Claimed, and Acknowledged
 
 For each projected event, the runtime tracks session-specific delivery state via `session_event_state`. These concepts are distinct (SP4):

@@ -9,7 +9,11 @@ export {
   // ae-forgotten-export warning in the checked-in API report.
   baselineStrategyValues,
 } from './schema/monitor-schema.js';
-export { validateScope } from './schema/validate-scope.js';
+export {
+  validateScope,
+  validateWatchScope,
+  changeDetectionCollectionError,
+} from './schema/validate-scope.js';
 export type {
   MonitorFrontmatter,
   NotifyConfig,
@@ -151,11 +155,14 @@ export type {
   AgentSessionRole,
   AgentSessionStatus,
   AgentSessionRecord,
+  DeclareEphemeralMonitorInput,
   DeliveryClaim,
   DeliveryEventSummary,
   DeliveryLifecycle,
   DeliveryMode,
   DoctorDeliveryCounts,
+  EphemeralMonitorRecord,
+  EphemeralMonitorStatus,
   DoctorMonitorRollup,
   DoctorParseError,
   DoctorReportInput,

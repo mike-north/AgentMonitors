@@ -38,6 +38,34 @@ daemon-spawn suite (`vitest.serial.config.ts`) already had this correctly
   confirmed pre-fix behavior by temporarily emptying a plugin's test directory and observing
   `vitest run` exit 0 with `passWithNoTests: true`, then exit 1 once flipped to `false`.
 
+## 2026-07-15 — Declaring a watch is session activity; ephemeral read-isolation scoped to unscoped enumeration (002 §6.2 / 007 §4.4, §4.6) — Refs #312
+
+Two clarifications to the ephemeral-monitor contract, both surfaced while hardening the
+per-session dormancy path against event loss.
+
+- **002 §6.2 / 007 §4.4 — declaring a watch resets the dormancy clock (behavior change).**
+  Per-session dormancy previously advanced a session's `lastActiveAt` only on `claimDelivery` and
+  recap. A session that declared an ephemeral monitor and then blocked on one long, hook-silent
+  tool call (exactly what a watch is declared to wait for) could therefore cross the dormancy
+  window with no activity signal and have its just-declared watch reaped mid-wait — silently
+  losing the finishing event. Declaring an ephemeral monitor is now itself session activity and
+  advances `lastActiveAt`. Additionally, the dormancy trigger considers a session's effective
+  last-activity to be `max(lastActiveAt, newest active ephemeral declaredAt)`: a session with an
+  ephemeral monitor declared **within** the dormancy window is not treated as dormant, so its
+  watches survive at least one window past the declaration. A crashed session stops declaring, so
+  its newest declaration ages out and cleanup still bounds. **Open (deferred):** whether a live
+  session should hold its watches for an arbitrarily long blocking wait — longer than one dormancy
+  window — is an unresolved spec decision, tracked as a follow-up to #312.
+- **007 §4.6 — ephemeral read-isolation binds unscoped enumeration only (decision).** The read
+  half of ephemeral isolation applies to **unscoped** (session-less) enumeration, not to a
+  `monitorId`-targeted read that names a specific ephemeral id. A `monitorId`-targeted
+  observation-history read is an operator-level diagnostic (`monitor explain` / `doctor`), not a
+  session-isolated surface: knowing the full `ephemeral:<sessionId>/<ulid>` id is itself operator
+  knowledge, and under the local single-operator trust model (PP10) it MAY return that monitor's
+  observation-history audit rows across session boundaries. The **events** surface is stricter by
+  design — an ephemeral event body carries the declaring session's private free-text instruction,
+  so `events list` excludes ephemeral rows on any session-less read, including one naming the id.
+
 ## 2026-07-15 — `monitor history`/`monitor explain` unified with `doctor`/`daemon status`/`session open` socket auto-discovery (005 §1, §6) — Refs #374
 
 `monitor history` and `monitor explain` previously resolved their daemon socket via the bare
@@ -164,6 +192,97 @@ enabled workspace's own socket at all.
   the actual (fixed) resolution order, including the isolation rationale.
 - **docs/uat/channel-transport.md** — the known-issue callout is updated to reflect the fix; step
   3's pre-seed workaround remains documented (harmless to keep) per the recipe's own guidance.
+
+## 2026-07-15 — Ephemeral-monitor isolation + reap-race hardening (007 §4.2/§4.6, 005 §14.4) — Refs #312, #259
+
+Follow-up hardening of the ephemeral-monitor primitive (below). Behavior changes, all _current_:
+
+- **007 §4.6 — isolation is now a read invariant, not only a projection one.** An ephemeral
+  monitor's instruction is the declaring session's private free-text guidance, so its events **MUST
+  NOT** be returned by an **unscoped** (session-less) read that bypasses the projection gate. The
+  runtime store now excludes ephemeral-monitor rows (recognised by the reserved `ephemeral:` id
+  prefix, §4.3) from an unscoped `listEvents` and from the unscoped observation-history enumeration;
+  the declaring session still reads its own ephemeral events via its session-scoped read.
+  Persistent-monitor reads are unchanged. (Previously an unscoped `events list` could return a
+  sibling session's ephemeral event body.)
+- **007 §4.6 — reap-race: an in-flight tick must not deliver for a reaped watch.** A tick pre-fetches
+  its active ephemeral monitors before `observe()` yields, so a `watch cancel` (or session
+  close/dormancy) that races the observation could still project. Materialization now re-checks, at
+  insert time, that the ephemeral monitor is still `active` and its declaring session is still
+  `active`; if either was reaped, the observed event is retained (§4.4) but projected to **nobody**.
+- **007 §4.2 — lead-only binding.** Projection delivers to lead sessions only, so a binding to a
+  subagent session would observe forever but never deliver. A declaration against a non-lead session
+  is now **rejected** at declaration time with a clear error (previously registered as a silently-dead
+  watch).
+- **005 §14.4 / 007 §4.2 — scope-parity claim made true by sharing the wrapper.** `watch declare`
+  previously called `validateScope` directly and skipped the CLI `validate` command's BP3
+  `change-detection.collection` friendly-error wrapper, so the "rejected with the identical diagnosis"
+  claim was untrue for the keyed-collection case. Both paths now call one shared core helper,
+  `validateWatchScope` (schema check + the collection wrapper), so the diagnosis is genuinely
+  identical.
+- **007 §4.2 — doc correction.** The `EphemeralMonitorRecord.instruction` / §4.2 "surfaced verbatim
+  as the body" wording overclaimed: the instruction is a **fallback** body
+  (`observation.body ?? monitor.instructions`), overridden when a source supplies its own body.
+- **Verified by** the new cases in `libs/core/src/runtime/ephemeral-monitors.test.ts` (unscoped-read
+  isolation, close-during-tick and cancel-during-tick reap races, retention-after-tick-then-reap,
+  non-lead rejection, scope key `type` cannot override the source, and the keyed-collection parity
+  diagnosis).
+
+## 2026-07-15 — Ephemeral (agent-declared, session-scoped) monitors implemented (007 §4 target → current; 002 §6.2 added) — Refs #312, #259
+
+The ephemeral-monitor model of 007 §4 (landed as _target_ via #282, the foundational primitive of
+Epic #259) is now implemented. Agents declare session-scoped monitors that flow the **same** pipeline
+as persistent `MONITOR.md` monitors (AP7). All entries below are _current_.
+
+- **007 §4 — target → current.** A new `agentmonitors watch <source> --session <id> --scope <spec>
+[--urgency] [--instruction] [--display-name]` declares an ephemeral monitor; `watch list` /
+  `watch cancel <id>` (both session-scoped) manage them. The declaration binds to a resolved AgentMon
+  session, is persisted in a durable `ephemeral_monitors` table, and returns — the daemon does all
+  observation/scheduling/notify/persist/project/deliver (PP9/PP10). The CLI is thin over the daemon
+  IPC (`watch.declare|list|cancel`, Zod at the boundary; AP6).
+- **007 §4.2 — current, scope parity.** An ephemeral declaration is validated by the **same** core
+  `validateScope` path as `agentmonitors validate`, so it cannot express a config a persistent
+  monitor could not; an invalid scope is rejected with the identical diagnosis (proven in both paths).
+  An **unbindable** declaration (unknown or non-active session) is **rejected**, never silently made
+  global.
+- **007 §4.3 — decision resolved (ephemeral-id scheme).** Reserved prefix
+  `ephemeral:<sessionId>/<ulid>`. Collision with a persistent id is **impossible by construction**: a
+  directory-derived persistent id (SP1) is a single path segment and can never contain a `/`, while
+  every ephemeral id does. The prefix keeps `monitor_events.monitor_id` / `monitor explain` /
+  `queryScope` unambiguous; the id is assigned once and never mutated (stable, SP5).
+- **007 §4.4 — current, lifecycle + retention decision.** Active on declaration and evaluated on the
+  normal tick. Reaped on explicit session close, on `watch cancel`, and on **per-session dormancy**
+  (below). Reaping flips the record `active → reaped` (stamping `reaped_at`) and stops observation but
+  **retains** its already-materialized events and projections (the declaring session goes dormant, not
+  deleted) — so a late delivery is never dropped (PP1) and a reaped record is **never resurrected** on
+  a later restart. While the session lives, the definition + durable state **survive a daemon
+  restart** and re-hydrate on the next tick.
+- **002 §6.2 — new rule (per-session dormancy trigger).** 002 previously specified only an explicit
+  session close (§6.1). §6.2 adds an **inactivity** trigger: an `active` session whose `lastActiveAt`
+  has not advanced for at least `DEFAULT_SESSION_DORMANCY_MS` (default 30 min) is transitioned to
+  `dormant` at the start of the next tick (and its ephemeral monitors reaped) — a backstop for a
+  session that vanished without an explicit close. This is a **per-session** transition, distinct from
+  the daemon-wide idle self-termination of 002 §10.2. Overridable in-process for tests.
+- **007 §4.6 — current, projection isolation.** An ephemeral monitor's events project into the
+  **declaring session only**, never a sibling lead session in the same workspace — the runtime threads
+  the declaring session id through materialization to a `restrictToSessionId` projection gate in
+  `insertEvent`. This deliberately differs from persistent monitors' all-lead-session projection. Same
+  pipeline stages and delivery transports (hook-state, `hook claim`) otherwise.
+- **005 §14.4 — target → current.** The `watch` command section is now current; its earlier signature
+  listed a `--until <cond>` fire-condition flag, which is deferred to the dependent-chain work (#124)
+  and dropped from the current signature (the flag remains _target_).
+- **007 §8 — decisions resolved.** The ephemeral-id scheme, per-session dormancy trigger, and event
+  retention on reap are all resolved (above); `--until`/fire-conditions and the `snapshot`/`diff`/
+  `summary`/`inspect` verbs remain _target_.
+- **Verified by** `libs/core/src/runtime/ephemeral-monitors.test.ts` (declaration validity + scope
+  parity, namespaced/unique/stable identity with impossible persistent collision, lifecycle —
+  active-on-declare, reap-on-close, `watch cancel` immediate reap, restart survival while active, no
+  resurrection after session end, dormancy reap and the non-reap of a live session — and projection
+  isolation) and the real-daemon-IPC + real-CLI-contract
+  `describe('ephemeral monitors: watch declare/list/cancel (007 §4 / 005 §14.4)')` suite in
+  `apps/cli/src/commands/cli.integration.test.ts` (declare → tick → declaring-session-only event →
+  hook-state + `hook claim` delivery → cancel; plus invalid-scope parity with `validate`).
+- **Roadmap:** G17 retired to a shipped blockquote.
 
 ## 2026-07-14 — Watch-mode source-state checkpointing implemented (002 §2.4 target → current) — Refs #278
 

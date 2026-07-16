@@ -55,6 +55,9 @@ const daemonMethodSchema = z.enum([
   'history.list',
   'monitor.explain',
   'daemon.tick',
+  'watch.declare',
+  'watch.list',
+  'watch.cancel',
 ]);
 const daemonResponseSchema = z.object({
   id: z.string(),
@@ -128,6 +131,26 @@ const monitorExplainParamsSchema = z.object({
 const daemonTickParamsSchema = z.object({
   monitorsDir: z.string(),
   workspacePath: z.string().optional(),
+});
+// Ephemeral-monitor declaration (007 §4.2 / 005 §14.4). The scope is a
+// source-specific object validated by the runtime against the SAME
+// `validateScope` path as `agentmonitors validate`, so it stays `unknown`-valued
+// here at the IPC boundary — the source schema, not this Zod schema, is the
+// authority on scope validity (AP4/BP3).
+const watchDeclareParamsSchema = z.object({
+  sessionId: z.string(),
+  source: z.string(),
+  scope: z.record(z.string(), z.unknown()),
+  urgency: z.string().optional(),
+  instruction: z.string().optional(),
+  displayName: z.string().optional(),
+});
+const watchListParamsSchema = z.object({
+  sessionId: z.string(),
+});
+const watchCancelParamsSchema = z.object({
+  sessionId: z.string(),
+  ephemeralId: z.string(),
 });
 const daemonRequestSchema = z.object({
   id: z.string(),
@@ -593,6 +616,29 @@ function handleRequest(
     case 'daemon.tick': {
       const params = daemonTickParamsSchema.parse(request.params);
       return runtime.tick(params.monitorsDir, params.workspacePath);
+    }
+    case 'watch.declare': {
+      const params = watchDeclareParamsSchema.parse(request.params);
+      return Promise.resolve(
+        runtime.declareEphemeralMonitor({
+          sessionId: params.sessionId,
+          source: params.source,
+          scope: params.scope,
+          ...(params.urgency ? { urgency: params.urgency } : {}),
+          ...(params.instruction ? { instruction: params.instruction } : {}),
+          ...(params.displayName ? { displayName: params.displayName } : {}),
+        }),
+      );
+    }
+    case 'watch.list': {
+      const params = watchListParamsSchema.parse(request.params);
+      return Promise.resolve(runtime.listEphemeralMonitors(params.sessionId));
+    }
+    case 'watch.cancel': {
+      const params = watchCancelParamsSchema.parse(request.params);
+      return Promise.resolve(
+        runtime.cancelEphemeralMonitor(params.sessionId, params.ephemeralId),
+      );
     }
   }
 }

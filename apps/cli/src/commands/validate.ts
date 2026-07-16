@@ -4,7 +4,7 @@ import path from 'node:path';
 import {
   scanMonitors,
   SourceRegistry,
-  validateScope,
+  validateWatchScope,
 } from '@agentmonitors/core';
 import { registerCoreSources } from '../sources.js';
 import { requireDirectory } from '../validation.js';
@@ -24,24 +24,6 @@ function monitorIdFromPath(filePath: string): string {
   // Mirror parseMonitor's guard: reject empty or dot-prefixed ids (e.g. '.foo').
   if (!id || id.startsWith('.')) return '';
   return id;
-}
-
-/**
- * Returns the actionable BP3 error when a `change-detection.collection` block is
- * present without `strategy: json-diff` (003 §12), or `undefined` otherwise. Mirrors
- * the schema's `if/then` rule with a clearer, author-facing message.
- */
-function changeDetectionCollectionError(
-  watchConfig: Record<string, unknown>,
-): string | undefined {
-  const cd = watchConfig['change-detection'];
-  if (cd === null || typeof cd !== 'object' || Array.isArray(cd))
-    return undefined;
-  const cdObj = cd as Record<string, unknown>;
-  if (cdObj['collection'] === undefined) return undefined;
-  const strategy = cdObj['strategy'];
-  if (strategy === 'json-diff') return undefined;
-  return 'change-detection.collection requires strategy: json-diff';
 }
 
 // Old public docs used top-level `source:` + `scope:` before the current
@@ -112,20 +94,16 @@ export const validateCommand = new Command('validate')
         return false;
       }
 
-      // Extract per-source config (watch block minus `type`) for schema validation
+      // Extract per-source config (watch block minus `type`) for schema
+      // validation. `validateWatchScope` is the shared core helper — schema
+      // check plus the BP3 `change-detection.collection` friendly wrapper (003
+      // §12) — so `validate` and the ephemeral `watch declare` path (007 §4.2)
+      // reject an invalid scope with the identical diagnosis (005 §14.4).
       const { type: _type, ...watchConfig } = m.monitor.frontmatter.watch;
-      const errors = validateScope(watchConfig, source.scopeSchema);
-
-      // BP3 (003 §12): a keyed-collection block is only valid under json-diff. The
-      // generated schema already rejects it, but cfworker's generic message
-      // ("Instance does not match json-diff") is opaque -- surface the actionable
-      // wording instead. This rule is source-agnostic (any source exposing
-      // `change-detection`), so it lives in the shared validate path rather than a
-      // per-source schema.
-      const collectionError = changeDetectionCollectionError(watchConfig);
-      const allScopeErrors = collectionError
-        ? [collectionError, ...errors.filter((e) => !e.includes('then'))]
-        : errors;
+      const allScopeErrors = validateWatchScope(
+        watchConfig,
+        source.scopeSchema,
+      );
 
       if (allScopeErrors.length > 0) {
         scopeErrors.push({ id: m.monitor.id, errors: allScopeErrors });

@@ -9478,3 +9478,309 @@ describe('inbox commands fail cleanly on an unopenable database (issue #292)', (
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Ephemeral monitors — `watch` verbs (007 §4 / 005 §14.4), issue #312.
+//
+// Drives the REAL daemon IPC and the REAL CLI contract (not a hand-built
+// approximation): `session open` → `watch declare` → the daemon ticks the
+// ephemeral monitor on the SAME pipeline → it materializes an event that
+// projects into the DECLARING session only → hook-state + `hook claim`
+// delivery surfaces it → `watch cancel` reaps it.
+// ---------------------------------------------------------------------------
+describe('ephemeral monitors: watch declare/list/cancel (007 §4 / 005 §14.4)', () => {
+  it('declares, fires into the declaring session ONLY, delivers, and cancels', async () => {
+    const dir = path.join(tempDir, 'watch-declare');
+    const monitorsDir = path.join(dir, '.claude', 'monitors');
+    mkdirSync(monitorsDir, { recursive: true });
+
+    const dbPath = path.join(dir, 'agentmon.db');
+    const socketPath = path.join(
+      '/tmp',
+      `am-watch-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const env = {
+      AGENTMONITORS_DB: dbPath,
+      AGENTMONITORS_SOCKET: socketPath,
+    };
+    const daemon = await startDaemon(monitorsDir, dir, env, socketPath);
+
+    try {
+      // Two lead sessions in the SAME workspace: the declaring one and a sibling.
+      const openSession = (host: string) => {
+        const result = runWithEnv(
+          [
+            'session',
+            'open',
+            '--host-session-id',
+            host,
+            '--workspace',
+            dir,
+            '--format',
+            'json',
+          ],
+          env,
+          dir,
+        );
+        expect(result.exitCode).toBe(0);
+        return JSON.parse(result.stdout) as {
+          id: string;
+          hookStatePath: string;
+        };
+      };
+      const declaring = openSession('claude-watch-declaring');
+      const sibling = openSession('claude-watch-sibling');
+
+      // Declare an ephemeral monitor bound to the declaring session. The
+      // `schedule` source fires on the daemon's next due tick.
+      const declare = runWithEnv(
+        [
+          'watch',
+          'declare',
+          'schedule',
+          '--session',
+          declaring.id,
+          '--scope',
+          'cron=* * * * *',
+          '--instruction',
+          'Ephemeral schedule tick — review it.',
+          '--format',
+          'json',
+        ],
+        env,
+        dir,
+      );
+      expect(declare.exitCode).toBe(0);
+      const record = JSON.parse(declare.stdout) as {
+        id: string;
+        status: string;
+        sessionId: string;
+        sourceName: string;
+      };
+      // Namespaced runtime identity (007 §4.3).
+      expect(record.id.startsWith('ephemeral:')).toBe(true);
+      expect(record.id).toContain(declaring.id);
+      expect(record.status).toBe('active');
+      expect(record.sessionId).toBe(declaring.id);
+      expect(record.sourceName).toBe('schedule');
+
+      // `watch list` is session-scoped (isolation): the declaring session sees
+      // it; the sibling does not.
+      const listDeclaring = runWithEnv(
+        ['watch', 'list', '--session', declaring.id, '--format', 'json'],
+        env,
+        dir,
+      );
+      expect(listDeclaring.exitCode).toBe(0);
+      expect(JSON.parse(listDeclaring.stdout)).toHaveLength(1);
+      const listSibling = runWithEnv(
+        ['watch', 'list', '--session', sibling.id, '--format', 'json'],
+        env,
+        dir,
+      );
+      expect(listSibling.exitCode).toBe(0);
+      expect(JSON.parse(listSibling.stdout)).toHaveLength(0);
+
+      // Wait for the daemon to tick the ephemeral monitor and materialize an
+      // event for the declaring session.
+      const unreadFor = (id: string) =>
+        runWithEnv(
+          ['events', 'list', '--session', id, '--unread', '--format', 'json'],
+          env,
+          dir,
+        );
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        const result = unreadFor(declaring.id);
+        if (result.exitCode === 0 && JSON.parse(result.stdout).length >= 1) {
+          break;
+        }
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+      }
+      const declaringEvents = JSON.parse(unreadFor(declaring.id).stdout) as {
+        monitorId: string;
+      }[];
+      expect(declaringEvents.length).toBeGreaterThanOrEqual(1);
+      // The event belongs to the EPHEMERAL monitor — it flowed the identical
+      // pipeline as a persistent monitor (007 §4.6).
+      expect(declaringEvents[0]?.monitorId).toBe(record.id);
+
+      // Projection isolation (007 §4.6, criterion 4): the sibling lead session in
+      // the SAME workspace receives NOTHING from the ephemeral monitor.
+      expect(JSON.parse(unreadFor(sibling.id).stdout)).toHaveLength(0);
+
+      // Same transports (007 §4.6, criterion 5): the hook-state file reflects the
+      // unread event for the declaring session, and NOT for the sibling.
+      const declaringHookState = JSON.parse(
+        readFileSync(declaring.hookStatePath, 'utf-8'),
+      ) as { unread: { normal: number; total: number } };
+      expect(declaringHookState.unread.total).toBeGreaterThanOrEqual(1);
+      expect(declaringHookState.unread.normal).toBeGreaterThanOrEqual(1);
+      const siblingHookState = JSON.parse(
+        readFileSync(sibling.hookStatePath, 'utf-8'),
+      ) as { unread: { total: number } };
+      expect(siblingHookState.unread.total).toBe(0);
+
+      // Delivery transport: `hook claim` surfaces the ephemeral event to the
+      // declaring session (normal-urgency coalesced reminder), and returns null
+      // for the sibling.
+      const claimDeclaring = runWithEnv(
+        [
+          'hook',
+          'claim',
+          '--session',
+          declaring.id,
+          '--lifecycle',
+          'turn-interruptible',
+          '--format',
+          'json',
+        ],
+        env,
+        dir,
+      );
+      expect(claimDeclaring.exitCode).toBe(0);
+      const claim = JSON.parse(claimDeclaring.stdout) as {
+        mode: string;
+        urgency: string;
+      } | null;
+      expect(claim?.mode).toBe('delivery');
+      expect(claim?.urgency).toBe('normal');
+
+      const claimSibling = runWithEnv(
+        [
+          'hook',
+          'claim',
+          '--session',
+          sibling.id,
+          '--lifecycle',
+          'turn-interruptible',
+          '--format',
+          'json',
+        ],
+        env,
+        dir,
+      );
+      expect(claimSibling.exitCode).toBe(0);
+      expect(JSON.parse(claimSibling.stdout)).toBeNull();
+
+      // `watch cancel` immediately reaps the monitor (007 §4.4).
+      const cancel = runWithEnv(
+        [
+          'watch',
+          'cancel',
+          record.id,
+          '--session',
+          declaring.id,
+          '--format',
+          'json',
+        ],
+        env,
+        dir,
+      );
+      expect(cancel.exitCode).toBe(0);
+      expect(JSON.parse(cancel.stdout).status).toBe('reaped');
+      const listAfterCancel = runWithEnv(
+        ['watch', 'list', '--session', declaring.id, '--format', 'json'],
+        env,
+        dir,
+      );
+      expect(JSON.parse(listAfterCancel.stdout)).toHaveLength(0);
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+    }
+  }, 30_000);
+
+  it('rejects an invalid scope identically to `validate` (criterion 1)', async () => {
+    const dir = path.join(tempDir, 'watch-scope-parity');
+    const monitorsDir = path.join(dir, '.claude', 'monitors', 'bad-schedule');
+    mkdirSync(monitorsDir, { recursive: true });
+    // A schedule monitor missing the required `cron` — invalid scope.
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      `---
+watch:
+  type: schedule
+  timezone: UTC
+urgency: normal
+---
+Bad schedule scope.
+`,
+      'utf-8',
+    );
+
+    // Path 1: `validate` rejects the file and reports the scope error.
+    const validate = run(
+      ['validate', path.join(dir, '.claude', 'monitors'), '--format', 'json'],
+      dir,
+    );
+    expect(validate.exitCode).toBe(1);
+    const validateOutput = JSON.parse(validate.stdout) as {
+      errors: { error: string }[];
+    };
+    const scopeError = validateOutput.errors[0]?.error;
+    expect(scopeError).toBeTruthy();
+    expect(scopeError).toContain('cron');
+
+    // Path 2: `watch declare` rejects the SAME bad scope through the SAME
+    // validateScope path — the error message contains the identical scope
+    // diagnosis.
+    const dbPath = path.join(dir, 'agentmon.db');
+    const socketPath = path.join(
+      '/tmp',
+      `am-parity-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const env = {
+      AGENTMONITORS_DB: dbPath,
+      AGENTMONITORS_SOCKET: socketPath,
+    };
+    const daemon = await startDaemon(
+      path.join(dir, '.claude', 'monitors'),
+      dir,
+      env,
+      socketPath,
+    );
+    try {
+      const open = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          'claude-parity',
+          '--workspace',
+          dir,
+          '--format',
+          'json',
+        ],
+        env,
+        dir,
+      );
+      expect(open.exitCode).toBe(0);
+      const session = JSON.parse(open.stdout) as { id: string };
+
+      const declare = runWithEnv(
+        [
+          'watch',
+          'declare',
+          'schedule',
+          '--session',
+          session.id,
+          '--scope',
+          'timezone=UTC',
+          '--format',
+          'text',
+        ],
+        env,
+        dir,
+      );
+      expect(declare.exitCode).toBe(1);
+      // The SAME validateScope diagnosis surfaces in both paths.
+      expect(`${declare.stdout}${declare.stderr}`).toContain(
+        scopeError as string,
+      );
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+    }
+  }, 30_000);
+});

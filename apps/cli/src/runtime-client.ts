@@ -1,9 +1,11 @@
 import type {
   AgentSessionRecord,
+  DeclareEphemeralMonitorInput,
   DeliveryClaim,
   DeliveryEventSummary,
   DeliveryLifecycle,
   DoctorReportInput,
+  EphemeralMonitorRecord,
   EventQuery,
   HookDeliveryDiagnosis,
   MonitorDoctorReport,
@@ -147,6 +149,48 @@ export async function explainMonitorClient(
   return await callDaemon<MonitorExplainReport>(
     'monitor.explain',
     input as unknown as Record<string, unknown>,
+    socketPath ? { socketPath } : {},
+  );
+}
+
+/**
+ * Declare an ephemeral (agent-declared, session-scoped) monitor through the
+ * daemon (007 §4.2 / 005 §14.4). Thin over the socket IPC (AP6); the runtime
+ * validates the scope with the same `validateScope` path as `agentmonitors
+ * validate`.
+ */
+export async function declareWatchClient(
+  input: DeclareEphemeralMonitorInput,
+  socketPath?: string,
+): Promise<EphemeralMonitorRecord> {
+  return await callDaemon<EphemeralMonitorRecord>(
+    'watch.declare',
+    input as unknown as Record<string, unknown>,
+    socketPath ? { socketPath } : {},
+  );
+}
+
+/** List a session's active ephemeral monitors (007 §4, `watch list`). */
+export async function listWatchClient(
+  sessionId: string,
+  socketPath?: string,
+): Promise<EphemeralMonitorRecord[]> {
+  return await callDaemon<EphemeralMonitorRecord[]>(
+    'watch.list',
+    { sessionId },
+    socketPath ? { socketPath } : {},
+  );
+}
+
+/** Cancel (immediately reap) one of a session's ephemeral monitors (007 §4.4). */
+export async function cancelWatchClient(
+  sessionId: string,
+  ephemeralId: string,
+  socketPath?: string,
+): Promise<EphemeralMonitorRecord> {
+  return await callDaemon<EphemeralMonitorRecord>(
+    'watch.cancel',
+    { sessionId, ephemeralId },
     socketPath ? { socketPath } : {},
   );
 }

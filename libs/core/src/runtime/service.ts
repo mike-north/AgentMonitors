@@ -1,11 +1,17 @@
 import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
+import { ulid } from 'ulid';
 import { writePrivateFileAtomic } from '../security/local-permissions.js';
 import { scanMonitors } from '../parser/scan-monitors.js';
 import type { MonitorDefinition, Urgency } from '../schema/types.js';
-import { validateScope } from '../schema/validate-scope.js';
+import { monitorFrontmatterSchema } from '../schema/monitor-schema.js';
+import { validateScope, validateWatchScope } from '../schema/validate-scope.js';
 import { parseDuration } from '../notify/notifier.js';
-import type { Observation, ObservationContext } from '../observation/types.js';
+import type {
+  Observation,
+  ObservationContext,
+  ObservationSource,
+} from '../observation/types.js';
 import type { SourceRegistry } from '../observation/registry.js';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import type { AgentRuntimeAdapter } from '../adapter/types.js';
@@ -30,8 +36,10 @@ import {
 } from './store.js';
 import type {
   AgentSessionRecord,
+  DeclareEphemeralMonitorInput,
   DeliveryClaim,
   DeliveryEventSummary,
+  EphemeralMonitorRecord,
   DoctorDeliveryCounts,
   DoctorMonitorRollup,
   DoctorParseError,
@@ -56,6 +64,7 @@ import type {
 } from './types.js';
 import {
   defaultNotifyConfigForUrgency,
+  EPHEMERAL_MONITOR_ID_PREFIX,
   type NotifyDispatchResult,
   type NotifyRuntimeState,
   type DeliveryLifecycle,
@@ -66,6 +75,18 @@ const DEFAULT_FILE_FINGERPRINT_POLL_MS = 30_000;
 const DEFAULT_API_POLL_MS = 300_000;
 const DEFAULT_HIGH_URGENCY_SETTLE_MS = 15_000;
 const MAX_RECAP_EVENTS = 10;
+
+/**
+ * Per-session dormancy threshold (002 §6.2 / 007 §4.4). A session that has not
+ * advanced its `lastActiveAt` for at least this long is treated as **dormant by
+ * inactivity** — a backstop for a session that vanished without an explicit
+ * close ([002 §6.1](../../../docs/specs/002-runtime-delivery.md)) — so its
+ * ephemeral monitors are reaped even though it never called `session close`.
+ * This is a per-session transition, distinct from the daemon-wide idle
+ * self-termination (002 §10.2). Overridable via the runtime constructor for
+ * deterministic tests.
+ */
+const DEFAULT_SESSION_DORMANCY_MS = 30 * 60 * 1_000;
 const EXPLAIN_STAGE_LABELS: Record<MonitorExplainStageId, string> = {
   definition: 'Definition',
   scheduling: 'Scheduling',
@@ -397,6 +418,18 @@ function toDeliveryEventSummary(
   };
 }
 
+/**
+ * Mutable per-tick accumulator shared by {@link AgentMonitorRuntime.tick} and its
+ * per-monitor helper `evaluateMonitorOnTick`, mirroring the four arrays a
+ * {@link RuntimeTickResult} is built from.
+ */
+interface TickAccumulator {
+  evaluated: string[];
+  emittedEventIds: string[];
+  erroredObservations: ErroredObservation[];
+  skippedMonitors: { monitorId: string; nextDueAt: Date }[];
+}
+
 export class AgentMonitorRuntime {
   /**
    * Monitor ids currently driven by a continuous `watch()` (see `watchMonitors`),
@@ -408,6 +441,12 @@ export class AgentMonitorRuntime {
    * monitors.
    */
   private readonly activeWatchers = new Map<string, symbol>();
+
+  /**
+   * The per-session dormancy threshold in ms (002 §6.2 / 007 §4.4). Defaults to
+   * {@link DEFAULT_SESSION_DORMANCY_MS}; overridable for deterministic tests.
+   */
+  private readonly sessionDormancyMs: number;
 
   constructor(
     private readonly store: RuntimeStore,
@@ -423,7 +462,16 @@ export class AgentMonitorRuntime {
      * behind this adapter (002 §11.1, 006 §2.1, AP3).
      */
     private readonly interpretAdapter?: InterpretAdapter,
-  ) {}
+    /**
+     * Optional runtime tuning. `sessionDormancyMs` overrides the per-session
+     * dormancy threshold (002 §6.2 / 007 §4.4) — used by tests to exercise
+     * inactivity-triggered ephemeral-monitor reaping deterministically.
+     */
+    options: { sessionDormancyMs?: number } = {},
+  ) {
+    this.sessionDormancyMs =
+      options.sessionDormancyMs ?? DEFAULT_SESSION_DORMANCY_MS;
+  }
 
   adapter(name: string): AgentRuntimeAdapter {
     const adapter = this.adapters.find((candidate) => candidate.name === name);
@@ -441,8 +489,204 @@ export class AgentMonitorRuntime {
 
   closeSession(sessionId: string): AgentSessionRecord {
     const session = this.store.closeSession(sessionId);
+    // Reap the session's ephemeral monitors (007 §4.4): a session that ends or
+    // goes dormant MUST release its session-scoped watches immediately — they
+    // must not outlive the session, leak into another session, or resurrect
+    // after a daemon restart. Reaping retains their already-materialized events
+    // (the session record goes dormant, not deleted) so a late delivery is never
+    // silently dropped (007 §4.4 default retention, PP1).
+    this.store.reapEphemeralMonitorsForSession(sessionId);
     this.refreshHookState(session.id);
     return session;
+  }
+
+  /**
+   * Declare an ephemeral (agent-declared, session-scoped) monitor (007 §4.2):
+   * "tell me when _X_, and remind me of _this instruction_ when it does." The
+   * declaration binds to the resolved AgentMon session, is validated by the
+   * **same** {@link validateScope} path as `agentmonitors validate` (so an
+   * ephemeral monitor cannot express a config a persistent one could not), is
+   * assigned a namespaced runtime identity (007 §4.3), and is persisted durably
+   * so it survives a daemon restart while the session lives (007 §4.4). The
+   * declaration performs **no** watching: it registers intent and returns; the
+   * daemon does all subsequent observation on the normal tick (PP9, 007 §4.5).
+   *
+   * @throws if the bound session is unknown or not active (an unbindable
+   *   declaration is rejected, never silently made global — 007 §4.2), the source
+   *   is unknown, or the scope/urgency is invalid.
+   */
+  declareEphemeralMonitor(
+    input: DeclareEphemeralMonitorInput,
+  ): EphemeralMonitorRecord {
+    // 1. Resolve + validate the binding session (007 §4.2).
+    const session = this.store.findSessionById(input.sessionId);
+    if (!session) {
+      throw new Error(
+        `Cannot declare an ephemeral monitor: session "${input.sessionId}" was not found. ` +
+          'A declaration must bind to a live AgentMon session (007 §4.2).',
+      );
+    }
+    if (session.status !== 'active') {
+      throw new Error(
+        `Cannot declare an ephemeral monitor: session "${input.sessionId}" is ${session.status}. ` +
+          'A declaration must bind to an active session (007 §4.2).',
+      );
+    }
+    // An ephemeral monitor's events project into the declaring session ONLY, and
+    // projection is filtered to LEAD sessions (007 §4.6 / 002 §6). A monitor bound
+    // to a subagent session would therefore observe forever but never deliver a
+    // single event — a silently-dead watch. Reject it at declaration time rather
+    // than register something that can never fire.
+    if (session.role !== 'lead') {
+      throw new Error(
+        `Cannot declare an ephemeral monitor: session "${input.sessionId}" is a ${session.role} session. ` +
+          'Ephemeral-monitor events project into lead sessions only (007 §4.6), so a ' +
+          'non-lead binding would never deliver — declare from the lead session.',
+      );
+    }
+
+    // 2. Validate the source name + scope via the SAME `validateScope` path as
+    //    `agentmonitors validate` (007 §4.2, AP4/BP3). `validateWatchScope`
+    //    (schema check + the shared BP3 change-detection.collection friendly
+    //    error) is the exact path `agentmonitors validate` uses, so an invalid
+    //    scope is rejected with the IDENTICAL diagnosis (005 §14.4).
+    const source = this.registry.get(input.source);
+    if (!source) {
+      throw new Error(
+        `Unknown source "${input.source}". Available sources: ${this.registry
+          .names()
+          .join(', ')}`,
+      );
+    }
+    const scopeErrors = validateWatchScope(input.scope, source.scopeSchema);
+    if (scopeErrors.length > 0) {
+      throw new Error(
+        `Invalid scope for source "${input.source}": ${scopeErrors.join('; ')}`,
+      );
+    }
+
+    // 3. Parse the urgency band + confirm the whole declaration through the SAME
+    //    frontmatter schema a persistent monitor uses, so an ephemeral monitor's
+    //    frontmatter is byte-identical in shape to a file-authored one (AP7).
+    //    Spread the scope FIRST so the real source name always wins `type` — a
+    //    scope key literally named `type` must never override the resolved source
+    //    (no bundled scopeSchema sets additionalProperties:false, so such a key
+    //    parses), which would desync the monitor from its source and starve it.
+    const parsed = monitorFrontmatterSchema.safeParse({
+      watch: { ...input.scope, type: input.source },
+      urgency: input.urgency ?? 'normal',
+    });
+    if (!parsed.success) {
+      throw new Error(
+        `Invalid ephemeral monitor declaration: ${parsed.error.issues
+          .map((issue) => issue.message)
+          .join('; ')}`,
+      );
+    }
+
+    // 4. Assign the namespaced runtime identity (007 §4.3) and persist.
+    const id = `${EPHEMERAL_MONITOR_ID_PREFIX}${session.id}/${ulid()}`;
+    const record = this.store.insertEphemeralMonitor({
+      id,
+      sessionId: session.id,
+      workspacePath: session.workspacePath ?? null,
+      sourceName: input.source,
+      scope: input.scope,
+      urgency: parsed.data.urgency,
+      urgencyMax: parsed.data.urgencyMax,
+      instruction: input.instruction ?? '',
+      ...(input.displayName ? { displayName: input.displayName } : {}),
+    });
+    // Declaring a watch IS session activity: bump the session's `lastActiveAt`
+    // so a declaration on its own resets the per-session dormancy clock (002
+    // §6.2 / 007 §4.4). Without this, only `claimDelivery`/recap advance it, so a
+    // session that declares a watch and then blocks on one long tool call (no
+    // hooks) would be reaped mid-wait and lose its watches — exactly the case a
+    // watch exists for. See also the declaredAt guard in `staleActiveSessions`.
+    this.store.touchSession(session.id);
+    return record;
+  }
+
+  /** List the active ephemeral monitors declared by a session (007 §4, `watch list`). */
+  listEphemeralMonitors(sessionId: string): EphemeralMonitorRecord[] {
+    return this.store.listEphemeralMonitorsForSession(sessionId);
+  }
+
+  /**
+   * Cancel an ephemeral monitor (007 §4.4, `watch cancel`), reaping it
+   * immediately. The `sessionId` MUST own the monitor — a session can only
+   * cancel its own watches (session isolation) — so a cancel targeting another
+   * session's id, or an unknown id, is rejected.
+   *
+   * @returns the reaped record.
+   */
+  cancelEphemeralMonitor(
+    sessionId: string,
+    ephemeralId: string,
+  ): EphemeralMonitorRecord {
+    const record = this.store.findEphemeralMonitorById(ephemeralId);
+    if (record?.sessionId !== sessionId) {
+      throw new Error(
+        `Ephemeral monitor "${ephemeralId}" was not found for session "${sessionId}".`,
+      );
+    }
+    this.store.reapEphemeralMonitor(ephemeralId);
+    return this.store.getEphemeralMonitorById(ephemeralId);
+  }
+
+  /**
+   * Rebuild the pipeline-facing {@link MonitorDefinition} from a durable
+   * ephemeral declaration (007 §4.6). Reconstructed on every tick (and after a
+   * daemon restart) so an ephemeral monitor flows the identical pipeline as a
+   * persistent one (AP7). The urgency band is restored to its `lo..hi` string
+   * form so the frontmatter schema reproduces the same flattened
+   * `{ urgency, urgencyMax }`. `filePath` is empty — an ephemeral monitor has no
+   * file — which is never used on the tick path (the id is its identity).
+   */
+  private ephemeralRecordToMonitor(
+    record: EphemeralMonitorRecord,
+  ): MonitorDefinition {
+    const urgencyBand =
+      record.urgency === record.urgencyMax
+        ? record.urgency
+        : `${record.urgency}..${record.urgencyMax}`;
+    // Spread the persisted scope FIRST so `record.sourceName` always wins `type`:
+    // a persisted scope key named `type` must never override the source name the
+    // monitor is keyed and scheduled by (identity/scheduling stay consistent with
+    // `record.sourceName`). Mirrors the same guard at declaration time.
+    const frontmatter = monitorFrontmatterSchema.parse({
+      watch: { ...record.scope, type: record.sourceName },
+      urgency: urgencyBand,
+    });
+    return {
+      id: record.id,
+      displayName: record.displayName ?? record.id,
+      frontmatter,
+      instructions: record.instruction,
+      filePath: '',
+    };
+  }
+
+  /**
+   * Per-session dormancy transition (002 §6.2 / 007 §4.4). Before evaluating
+   * monitors on a tick, move any `active` session in `workspacePath` that has
+   * been inactive for at least {@link sessionDormancyMs} to `dormant` and reap
+   * its ephemeral monitors — a backstop for a session that vanished without an
+   * explicit `session close`. Distinct from the daemon-wide idle self-termination
+   * (002 §10.2), which stops the whole daemon once ALL a workspace's sessions are
+   * inactive.
+   */
+  private reapDormantSessions(now: Date, workspacePath: string): void {
+    const staleBefore = new Date(now.getTime() - this.sessionDormancyMs);
+    for (const session of this.store.staleActiveSessions(
+      workspacePath,
+      staleBefore,
+    )) {
+      // Reuse closeSession so the dormancy transition and an explicit close
+      // share ONE path (status → dormant, ephemeral monitors reaped, hook state
+      // refreshed).
+      this.closeSession(session.id);
+    }
   }
 
   listSessions(): AgentSessionRecord[] {
@@ -1489,11 +1733,21 @@ export class AgentMonitorRuntime {
     this.assertNoDuplicateIds(result, monitorsDir);
 
     const now = new Date();
-    const emittedEventIds: string[] = [];
-    const evaluated: string[] = [];
-    const erroredObservations: ErroredObservation[] = [];
-    const skippedMonitors: { monitorId: string; nextDueAt: Date }[] = [];
+    const acc: TickAccumulator = {
+      evaluated: [],
+      emittedEventIds: [],
+      erroredObservations: [],
+      skippedMonitors: [],
+    };
 
+    // Per-session dormancy (002 §6.2 / 007 §4.4): before evaluating anything,
+    // transition stale active sessions to dormant and reap their ephemeral
+    // monitors, so a session that vanished without an explicit close still
+    // releases its session-scoped watches this tick (and they never fire below).
+    this.reapDormantSessions(now, workspacePath);
+
+    // Persistent monitors (directory-authored). An unknown source is a hard tick
+    // failure — the author can fix the file.
     for (const parsed of result.monitors) {
       const monitor = parsed.monitor;
       const sourceName = monitor.frontmatter.watch.type;
@@ -1503,173 +1757,241 @@ export class AgentMonitorRuntime {
           `Monitor "${monitor.id}" references unknown source "${sourceName}".`,
         );
       }
+      await this.evaluateMonitorOnTick(
+        monitor,
+        source,
+        now,
+        workspacePath,
+        acc,
+      );
+    }
 
-      // A monitor with an active continuous watcher is driven by that watcher;
-      // skip its one-shot observe() so it is not processed twice (G5).
-      if (this.activeWatchers.has(monitor.id)) continue;
-
-      const schedule = this.scheduleForMonitor(monitor, now, workspacePath);
-      if (!schedule.due) {
-        // Record skipped monitors so callers can distinguish "not yet due" from
-        // "no monitors found" (issue #152). nextDueAt is computed from the same
-        // scheduling decision — single source of truth, never recomputed.
-        // Fall back to `now` (not epoch 0) when lastObservationAt is absent so
-        // the computed nextDueAt stays meaningful even under partial/missing state.
-        const monitorStateForSkip = this.store.getMonitorState(
-          monitor.id,
-          workspacePath,
-        );
-        const lastObservationAt =
-          monitorStateForSkip.lastObservationAt?.getTime() ?? now.getTime();
-        const nextDueAt = new Date(lastObservationAt + schedule.nextPollMs);
-        skippedMonitors.push({ monitorId: monitor.id, nextDueAt });
-
-        // Special case for scheduled-rollup (002 §4.4): the rollup window must
-        // be evaluated on every tick regardless of the source polling interval.
-        // A monitor whose interval has not yet elapsed must still flush its
-        // accumulated batch when the delivery window opens, so we dispatch
-        // `dispatchRollup` with zero new observations to trigger a window check.
-        if (monitor.frontmatter.notify?.strategy === 'rollup') {
-          // dispatchRollup mutates nextState in-place, so we pass the spread
-          // state and always persist the result — `rollupLastFiredMinute` may
-          // have been updated even when no observations were flushed.
-          const rollupNotifyState = { ...monitorStateForSkip.notifyState };
-          const rollupDispatch = this.dispatchRollup(
-            monitor,
-            [],
-            now,
-            rollupNotifyState,
-          );
-          this.store.setMonitorState(monitor.id, workspacePath, {
-            sourceState: monitorStateForSkip.sourceState,
-            notifyState: rollupDispatch.nextState,
-            lastObservationAt: monitorStateForSkip.lastObservationAt ?? null,
-          });
-          // Route the flushed batch through the SAME span materialization as
-          // `ingest()` (issue #180) so the not-due path records the `triggered`
-          // observation_history row (002 §10.7) and writes every emitted
-          // observation onto the shared chain — the due path already does both.
-          // (The `net` collapse is per-recipient at claim time; G10 PR-B.)
-          // Only invoke it when the window actually flushed something: an empty
-          // window check runs every not-due tick and must NOT flood the audit
-          // trail with `no-change` rows. `observed: 0` because this path
-          // dispatches no NEW observations — only the already-accumulated batch.
-          if (rollupDispatch.emitted.length > 0) {
-            try {
-              emittedEventIds.push(
-                ...(await this.materializeSpan(
-                  monitor,
-                  rollupDispatch.emitted,
-                  { observed: 0, workspacePath },
-                )),
-              );
-            } catch {
-              // best-effort: materialization failure must not abort the tick
-            }
-          }
-        }
-
-        continue;
-      }
-
-      evaluated.push(monitor.id);
-
-      // Two separate try/catch blocks so observe() failures and ingest()
-      // failures are handled independently (issue #46):
-      //
-      // Block 1 — observe(): if observe() throws, we skip ingest() entirely.
-      // Skipping ingest() means setMonitorState() is never called, which is
-      // what preserves the previously-persisted sourceState so the next tick's
-      // diff spans from the last good baseline rather than an empty state.
-      let observationResult;
+    // Ephemeral monitors (agent-declared, session-scoped) flow the IDENTICAL
+    // pipeline (007 §4.6, AP7): each is rebuilt into a MonitorDefinition and run
+    // through the SAME `evaluateMonitorOnTick`, threading its declaring session
+    // id so materialized events project ONLY to that session (007 §4.6 isolation).
+    // Only monitors whose declaring session is still active are returned.
+    for (const record of this.store.listActiveEphemeralMonitors(
+      workspacePath,
+    )) {
+      // A single bad ephemeral record must never abort the tick for every other
+      // session's monitors. Unlike a scanned monitor (whose unknown source /
+      // parse failure is an author-fixable, tick-aborting error), an ephemeral
+      // monitor cannot be edited — so any failure resolving its source or
+      // rebuilding its definition is recorded as errored and skipped.
       try {
-        const monitorState = this.store.getMonitorState(
-          monitor.id,
+        const source = this.registry.get(record.sourceName);
+        if (!source) {
+          acc.erroredObservations.push({
+            monitorId: record.id,
+            message: `references unknown source "${record.sourceName}".`,
+          });
+          continue;
+        }
+        const monitor = this.ephemeralRecordToMonitor(record);
+        await this.evaluateMonitorOnTick(
+          monitor,
+          source,
+          now,
           workspacePath,
+          acc,
+          record.sessionId,
         );
-        observationResult = await source.observe(
-          watchConfig(monitor.frontmatter.watch),
-          {
-            previousState: monitorState.sourceState,
-            now,
-            workspacePath,
-          },
-        );
-      } catch (observeError) {
-        // observe() failed: record errored outcome (best-effort) and skip
-        // this monitor entirely for this tick. ingest() is NOT called, which
-        // preserves sourceState as described above.
-        const message =
-          observeError instanceof Error
-            ? observeError.message
-            : String(observeError);
-        // Same source as the audit row below: surface it on the tick result so
-        // `daemon once`/`daemon run` can report the failure instead of a bare
-        // `emitted 0`.
-        erroredObservations.push({ monitorId: monitor.id, message });
-        try {
-          this.store.recordObservationHistory({
-            monitorId: monitor.id,
-            workspacePath,
-            sourceName,
-            result: 'errored',
-            observationData: {
-              error: message,
-            },
-          });
-        } catch {
-          // best-effort audit — ignore write failures
-        }
-        continue;
-      }
-
-      // Block 2 — ingest(): ingest() now isolates per-observation materialization
-      // failures internally (see ingest()), so it should not normally throw.
-      // This outer catch is a defence-in-depth safety net: if ingest() itself
-      // throws (e.g. setMonitorState fails), record errored best-effort and
-      // continue so the tick is not aborted.
-      try {
-        emittedEventIds.push(
-          ...(await this.ingest(monitor, observationResult.observations, now, {
-            workspacePath,
-            ...(observationResult.nextState !== undefined
-              ? { nextSourceState: { value: observationResult.nextState } }
-              : {}),
-            ...(observationResult.outcome
-              ? { sourceOutcome: observationResult.outcome }
-              : {}),
-          })),
-        );
-      } catch (ingestError) {
-        const message =
-          ingestError instanceof Error
-            ? ingestError.message
-            : String(ingestError);
-        erroredObservations.push({ monitorId: monitor.id, message });
-        try {
-          this.store.recordObservationHistory({
-            monitorId: monitor.id,
-            workspacePath,
-            sourceName,
-            result: 'errored',
-            observationData: {
-              error: message,
-            },
-          });
-        } catch {
-          // best-effort audit — ignore write failures
-        }
+      } catch (error) {
+        acc.erroredObservations.push({
+          monitorId: record.id,
+          message: error instanceof Error ? error.message : String(error),
+        });
       }
     }
 
     this.refreshWorkspaceSessions(workspacePath);
 
     return {
-      evaluatedMonitors: evaluated,
-      emittedEventIds,
-      erroredObservations,
-      skippedMonitors,
+      evaluatedMonitors: acc.evaluated,
+      emittedEventIds: acc.emittedEventIds,
+      erroredObservations: acc.erroredObservations,
+      skippedMonitors: acc.skippedMonitors,
     };
+  }
+
+  /**
+   * Evaluate ONE monitor on a tick — shared by the persistent (directory) and
+   * ephemeral (007 §4) paths so both flow the IDENTICAL scheduling → observe →
+   * notify → materialize logic (AP7). Mutates the passed {@link TickAccumulator}
+   * exactly as the old inlined loop did. `ephemeralSessionId`, when present,
+   * restricts materialized events to that declaring session (007 §4.6 isolation);
+   * it is `undefined` for persistent monitors (project into all lead sessions).
+   */
+  private async evaluateMonitorOnTick(
+    monitor: MonitorDefinition,
+    source: ObservationSource,
+    now: Date,
+    workspacePath: string,
+    acc: TickAccumulator,
+    ephemeralSessionId?: string,
+  ): Promise<void> {
+    const sourceName = monitor.frontmatter.watch.type;
+
+    // A monitor with an active continuous watcher is driven by that watcher;
+    // skip its one-shot observe() so it is not processed twice (G5).
+    if (this.activeWatchers.has(monitor.id)) return;
+
+    const schedule = this.scheduleForMonitor(monitor, now, workspacePath);
+    if (!schedule.due) {
+      // Record skipped monitors so callers can distinguish "not yet due" from
+      // "no monitors found" (issue #152). nextDueAt is computed from the same
+      // scheduling decision — single source of truth, never recomputed.
+      // Fall back to `now` (not epoch 0) when lastObservationAt is absent so
+      // the computed nextDueAt stays meaningful even under partial/missing state.
+      const monitorStateForSkip = this.store.getMonitorState(
+        monitor.id,
+        workspacePath,
+      );
+      const lastObservationAt =
+        monitorStateForSkip.lastObservationAt?.getTime() ?? now.getTime();
+      const nextDueAt = new Date(lastObservationAt + schedule.nextPollMs);
+      acc.skippedMonitors.push({ monitorId: monitor.id, nextDueAt });
+
+      // Special case for scheduled-rollup (002 §4.4): the rollup window must
+      // be evaluated on every tick regardless of the source polling interval.
+      // A monitor whose interval has not yet elapsed must still flush its
+      // accumulated batch when the delivery window opens, so we dispatch
+      // `dispatchRollup` with zero new observations to trigger a window check.
+      if (monitor.frontmatter.notify?.strategy === 'rollup') {
+        // dispatchRollup mutates nextState in-place, so we pass the spread
+        // state and always persist the result — `rollupLastFiredMinute` may
+        // have been updated even when no observations were flushed.
+        const rollupNotifyState = { ...monitorStateForSkip.notifyState };
+        const rollupDispatch = this.dispatchRollup(
+          monitor,
+          [],
+          now,
+          rollupNotifyState,
+        );
+        this.store.setMonitorState(monitor.id, workspacePath, {
+          sourceState: monitorStateForSkip.sourceState,
+          notifyState: rollupDispatch.nextState,
+          lastObservationAt: monitorStateForSkip.lastObservationAt ?? null,
+        });
+        // Route the flushed batch through the SAME span materialization as
+        // `ingest()` (issue #180) so the not-due path records the `triggered`
+        // observation_history row (002 §10.7) and writes every emitted
+        // observation onto the shared chain — the due path already does both.
+        // (The `net` collapse is per-recipient at claim time; G10 PR-B.)
+        // Only invoke it when the window actually flushed something: an empty
+        // window check runs every not-due tick and must NOT flood the audit
+        // trail with `no-change` rows. `observed: 0` because this path
+        // dispatches no NEW observations — only the already-accumulated batch.
+        if (rollupDispatch.emitted.length > 0) {
+          try {
+            acc.emittedEventIds.push(
+              ...(await this.materializeSpan(monitor, rollupDispatch.emitted, {
+                observed: 0,
+                workspacePath,
+                ...(ephemeralSessionId !== undefined
+                  ? { ephemeralSessionId }
+                  : {}),
+              })),
+            );
+          } catch {
+            // best-effort: materialization failure must not abort the tick
+          }
+        }
+      }
+
+      return;
+    }
+
+    acc.evaluated.push(monitor.id);
+
+    // Two separate try/catch blocks so observe() failures and ingest()
+    // failures are handled independently (issue #46):
+    //
+    // Block 1 — observe(): if observe() throws, we skip ingest() entirely.
+    // Skipping ingest() means setMonitorState() is never called, which is
+    // what preserves the previously-persisted sourceState so the next tick's
+    // diff spans from the last good baseline rather than an empty state.
+    let observationResult;
+    try {
+      const monitorState = this.store.getMonitorState(
+        monitor.id,
+        workspacePath,
+      );
+      observationResult = await source.observe(
+        watchConfig(monitor.frontmatter.watch),
+        {
+          previousState: monitorState.sourceState,
+          now,
+          workspacePath,
+        },
+      );
+    } catch (observeError) {
+      // observe() failed: record errored outcome (best-effort) and skip
+      // this monitor entirely for this tick. ingest() is NOT called, which
+      // preserves sourceState as described above.
+      const message =
+        observeError instanceof Error
+          ? observeError.message
+          : String(observeError);
+      // Same source as the audit row below: surface it on the tick result so
+      // `daemon once`/`daemon run` can report the failure instead of a bare
+      // `emitted 0`.
+      acc.erroredObservations.push({ monitorId: monitor.id, message });
+      try {
+        this.store.recordObservationHistory({
+          monitorId: monitor.id,
+          workspacePath,
+          sourceName,
+          result: 'errored',
+          observationData: {
+            error: message,
+          },
+        });
+      } catch {
+        // best-effort audit — ignore write failures
+      }
+      return;
+    }
+
+    // Block 2 — ingest(): ingest() now isolates per-observation materialization
+    // failures internally (see ingest()), so it should not normally throw.
+    // This outer catch is a defence-in-depth safety net: if ingest() itself
+    // throws (e.g. setMonitorState fails), record errored best-effort and
+    // continue so the tick is not aborted.
+    try {
+      acc.emittedEventIds.push(
+        ...(await this.ingest(monitor, observationResult.observations, now, {
+          workspacePath,
+          ...(observationResult.nextState !== undefined
+            ? { nextSourceState: { value: observationResult.nextState } }
+            : {}),
+          ...(observationResult.outcome
+            ? { sourceOutcome: observationResult.outcome }
+            : {}),
+          ...(ephemeralSessionId !== undefined ? { ephemeralSessionId } : {}),
+        })),
+      );
+    } catch (ingestError) {
+      const message =
+        ingestError instanceof Error
+          ? ingestError.message
+          : String(ingestError);
+      acc.erroredObservations.push({ monitorId: monitor.id, message });
+      try {
+        this.store.recordObservationHistory({
+          monitorId: monitor.id,
+          workspacePath,
+          sourceName,
+          result: 'errored',
+          observationData: {
+            error: message,
+          },
+        });
+      } catch {
+        // best-effort audit — ignore write failures
+      }
+    }
   }
 
   /**
@@ -1703,6 +2025,12 @@ export class AgentMonitorRuntime {
       workspacePath: string;
       nextSourceState?: { value: unknown };
       sourceOutcome?: 'rebaselined' | 'no-files-matched';
+      /**
+       * Present only for an ephemeral monitor (007 §4): materialized events
+       * project into ONLY this declaring session, never a sibling lead session
+       * in the same workspace (007 §4.6 isolation).
+       */
+      ephemeralSessionId?: string;
     },
   ): Promise<string[]> {
     // Pre-filter: a `payload.form: structured` CEL gate that evaluates `false`
@@ -1751,6 +2079,9 @@ export class AgentMonitorRuntime {
       ...(options.sourceOutcome
         ? { sourceOutcome: options.sourceOutcome }
         : {}),
+      ...(options.ephemeralSessionId !== undefined
+        ? { ephemeralSessionId: options.ephemeralSessionId }
+        : {}),
     });
   }
 
@@ -1797,6 +2128,8 @@ export class AgentMonitorRuntime {
       observed: number;
       workspacePath: string;
       sourceOutcome?: 'rebaselined' | 'no-files-matched';
+      /** Ephemeral-monitor declaring session (007 §4.6) — see {@link ingest}. */
+      ephemeralSessionId?: string;
     },
   ): Promise<string[]> {
     const observed = options.observed;
@@ -1844,6 +2177,9 @@ export class AgentMonitorRuntime {
           observedAt: envelope.observedAt,
           workspacePath: options.workspacePath,
           effectiveUrgency: envelope.effectiveUrgency,
+          ...(options.ephemeralSessionId !== undefined
+            ? { restrictToSessionId: options.ephemeralSessionId }
+            : {}),
         });
         if (event) emittedEventIds.push(event.id);
       } catch (materializeError) {
@@ -2518,6 +2854,11 @@ export class AgentMonitorRuntime {
       // registered (decided semantics Q1; backward-compat with the single-baseline
       // diff above when there is one recipient at the shared baseline).
       { previousContent: previousSnapshot?.content ?? null },
+      // Ephemeral-monitor projection isolation (007 §4.6): restrict projection to
+      // the declaring session so its events never reach a sibling lead session.
+      input.restrictToSessionId !== undefined
+        ? { restrictToSessionId: input.restrictToSessionId }
+        : undefined,
     );
 
     // TODO(#46 follow-up): make insertEvent+saveSnapshot atomic via a

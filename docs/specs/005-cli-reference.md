@@ -1353,9 +1353,10 @@ session id it stays connected (the ack tool reports an error if called) but does
 
 ## §14 Agent-facing interaction & ephemeral monitors (_target_)
 
-**Status:** **target** — the whole of §14 specifies the agent-facing verbs greenlit in Epic #259.
-None ship today; each **MUST** be moved to _current_, with `verified:` references, when it ships (the
-semantic contract is [007](./007-agent-facing-interaction.md); retire the matching
+**Status:** **mostly target** — §14 specifies the agent-facing verbs greenlit in Epic #259. As of
+Refs #312, **§14.4 `watch` is _current_** (see its own status line); §14.1–§14.3 and §14.5 remain
+_target_ and do not ship today. Each **MUST** be moved to _current_, with `verified:` references, when
+it ships (the semantic contract is [007](./007-agent-facing-interaction.md); retire the matching
 [roadmap.md](./roadmap.md) gap at that time). These commands are **read-only or declaration-only** —
 they never claim, acknowledge, advance a cursor, or trigger a fresh source observation
 ([007 §2.1](./007-agent-facing-interaction.md)). They round-trip the daemon (transport — loopback
@@ -1400,20 +1401,40 @@ event `title`/`summary` — **without** the full snapshot or diff
 
 ### §14.4 `watch` — declare / list / cancel an ephemeral monitor
 
+**Status:** **current** (Refs #312). Implemented on the same daemon/pipeline as a persistent monitor.
+Verified: `apps/cli/src/commands/watch.ts` + `apps/cli/src/daemon-ipc.ts` (`watch.declare|list|cancel`)
+→ `AgentMonitorRuntime.declareEphemeralMonitor`/`listEphemeralMonitors`/`cancelEphemeralMonitor`
+([007 §4](./007-agent-facing-interaction.md)); the
+`describe('ephemeral monitors: watch declare/list/cancel (007 §4 / 005 §14.4)')` suite in
+`apps/cli/src/commands/cli.integration.test.ts`.
+
 ```
-agentmonitors watch <source> --scope <k=v,...> [--urgency <u>] [--instruction <text>] [--until <cond>] [--session <id>] [--socket <path>]
-agentmonitors watch list [--session <id>] [--socket <path>] [--format <format>]
-agentmonitors watch cancel <ephemeralId> [--session <id>] [--socket <path>]
+agentmonitors watch <source> --session <id> --scope <spec> [--urgency <u>] [--instruction <text>] [--display-name <name>] [--socket <path>] [--format <format>]
+agentmonitors watch list --session <id> [--socket <path>] [--format <format>]
+agentmonitors watch cancel <ephemeralId> --session <id> [--socket <path>] [--format <format>]
 ```
 
 Declares an **ephemeral, session-scoped** monitor on the same daemon/pipeline as a persistent
 `MONITOR.md` monitor (AP7, [007 §4](./007-agent-facing-interaction.md)) — "tell me when _X_, and
-remind me of _this instruction_ when it does." The scope is validated by the **same** `validateScope`
-path as `agentmonitors validate` (§3), so an ephemeral monitor cannot express a config a persistent
-one could not. The declaration **performs no watching**: it registers intent and returns; the daemon
-does all observation/scheduling/notify/persist/project/deliver (PP9/PP10). The monitor is **reaped
-when its declaring session ends or goes dormant** and survives a daemon restart while the session
-lives ([007 §4.4](./007-agent-facing-interaction.md)); `watch cancel` reaps it immediately.
+remind me of _this instruction_ when it does." `<source>` is a registered source name; `--scope` is
+the source config as either `key=value,...` (scalar-valued) or a JSON object (for array/nested/typed
+scopes, e.g. `--scope '{"globs":["src/**"]}'`). The scope is validated by the **same** shared core
+helper (`validateWatchScope` — the `validateScope` schema check plus the BP3
+`change-detection.collection` friendly wrapper) as `agentmonitors validate` (§3), so an ephemeral
+monitor cannot express a config a persistent one could not, and an invalid scope is rejected with the
+identical diagnosis (including the keyed-collection case). `--session` is the declaring AgentMon
+session id and **MUST** name a **lead** session; an unbindable or non-lead declaration is
+**rejected**, never silently made global (its events would never deliver — [007 §4.6](./007-agent-facing-interaction.md)).
+The declaration **performs no watching**: it registers intent and returns; the daemon does all
+observation/scheduling/notify/persist/project/deliver (PP9/PP10). Its events project into the
+**declaring session only**, never a sibling lead session in the same workspace
+([007 §4.6](./007-agent-facing-interaction.md)). The monitor is **reaped when its declaring session
+ends or goes dormant** ([002 §6.2](./002-runtime-delivery.md)) and survives a daemon restart while the
+session lives ([007 §4.4](./007-agent-facing-interaction.md)); `watch cancel` reaps it immediately and
+only the owning session may cancel it. `watch <source>` is the default action, so `agentmonitors watch
+schedule --session … --scope …` and `agentmonitors watch declare schedule …` are equivalent. (A
+fire-condition `--until` flag — the seed of dependent chains, #124 — is **not** part of this primitive
+and remains _target_; see [007 §8](./007-agent-facing-interaction.md).)
 
 ### §14.5 `inspect` — observability (received / pending / armed)
 

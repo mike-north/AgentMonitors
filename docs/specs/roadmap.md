@@ -239,24 +239,19 @@ Interpret → Deliver → [React]`:
   `session_event_state` / `session_object_cursor` unchanged and invokes no source `observe()`
   ([007 §6](./007-agent-facing-interaction.md)).
 
-### G17 — Ephemeral (session-scoped, agent-declared) monitors (P2)
-
-- **Current:** monitors exist only as persistent `MONITOR.md` files; there is no runtime,
-  session-scoped authoring path.
-- **Target:** the ephemeral-monitor model of [007 §4](./007-agent-facing-interaction.md) /
-  [005 §14.4](./005-cli-reference.md) — declared via `agentmonitors watch`, validated by the same
-  `validateScope` path, on the same pipeline (AP7), bound to and reaped with the declaring session,
-  durable across restart while the session lives, all deterministic work daemon-owned.
-- **Governs:** AP7, PP9, PP10, SP1–SP2, BP1 ([000](./000-principles.md)),
-  [007 §4](./007-agent-facing-interaction.md).
-- **Files (anticipated):** `libs/core/src/runtime/service.ts` + `store.ts` (register/reap +
-  durable state), `libs/core/src/inbox/schema.ts` (ephemeral registration table),
-  `apps/cli/src/commands/watch.ts`.
-- **Proof:** integration tests for declare→tick→deliver, reap-on-session-end, restart survival while
-  active, session-isolation, and invalid-scope rejection ([007 §6](./007-agent-facing-interaction.md)).
-- **Composes with:** #124 (dependent chains build on this primitive) and #258 (shared per-binding
-  durable-state primitive) — design so the primitives compose, not diverge
-  ([007 §4.7](./007-agent-facing-interaction.md)).
+> G17 (ephemeral, session-scoped, agent-declared monitors) **shipped** (Refs #312) — agents declare
+> session-scoped monitors via `agentmonitors watch` (declare/list/cancel, [005 §14.4](./005-cli-reference.md)),
+> validated by the same `validateScope` path as `validate`; they run on the same
+> tick/notify/materialize/project pipeline as persistent monitors (AP7), their events project into the
+> **declaring session only** ([007 §4.6](./007-agent-facing-interaction.md)), and they are reaped on
+> session close, on `watch cancel`, and on **per-session dormancy** — a new inactivity trigger added to
+> [002 §6.2](./002-runtime-delivery.md). Ephemeral ids are the reserved-prefix `ephemeral:<sessionId>/<ulid>`
+> (collision-proof by the mandatory `/`), the definitions are durable and survive a daemon restart while
+> the session lives (no resurrection after it ends), and reaped events are retained. See
+> [007 §4](./007-agent-facing-interaction.md), [002 §6.2](./002-runtime-delivery.md),
+> [005 §14.4](./005-cli-reference.md), and [spec-changelog.md](./spec-changelog.md). Still **composes with**
+> #124 (dependent chains build on this primitive) and #258 (shared per-binding durable-state primitive),
+> per [007 §4.7](./007-agent-facing-interaction.md).
 
 ### G18 — Observability surface: received / pending / armed-but-not-yet-fired (P2)
 
