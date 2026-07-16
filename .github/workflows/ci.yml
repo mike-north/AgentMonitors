@@ -32,6 +32,25 @@ jobs:
       - name: Check
         run: pnpm check
 
+      # Issue #285: validates every published TS package's checked-in API report
+      # (api-report/*.api.md) against its actual compiled surface, using the
+      # report-enabled `api-extractor.report.json` (see api-extractor.build.json
+      # for the separate, apiReport-disabled config `build` uses — the two are
+      # deliberately different configs so `build`'s `--local` rollup step can
+      # never touch `api-report/`). Runs without `--local`, so an unintentional
+      # public-type change fails this step until the report is regenerated
+      # (`pnpm fix:api-report`) and reviewed. The `check:api-report`/
+      # `fix:api-report` npm scripts also pass `--parallel=1` to `nx run-many`:
+      # each package's script independently re-emits its own declarations
+      # (`tsup && tsc`) before invoking API Extractor, and `@agentmonitors/core`'s
+      # `build` target (which every plugin's `^build` dependency pulls in) writes
+      # into that same `dist/` folder — running both concurrently raced and
+      # produced a transient `ENOENT` on `dist/index.d.ts.map`. This is a `dist/`
+      # write race, independent of the apiReport config split above, so
+      # `--parallel=1` stays regardless.
+      - name: Check (API report drift)
+        run: pnpm check:api-report
+
       - name: Test
         run: pnpm test
 

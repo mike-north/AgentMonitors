@@ -52,8 +52,10 @@ Conventions for the engineering fleet working this repo. The PM agent maintains 
    contract untested is this repo's signature bug class — test the real input contract
    (stdin payloads, hooks.json command strings), not a hand-built approximation.
 10. **Quality gate before opening a PR:** `pnpm check` and the affected test suites green;
-    api-extractor report regenerated if core's public surface changed; `pnpm check:aipm` if
-    you touched `agent-plugins/`.
+    `pnpm check:api-report` green — regenerate the affected package's checked-in
+    `api-report/*.api.md` with `pnpm --filter <package> run fix:api-report` and commit the diff
+    if you changed any published package's (`@agentmonitors/core`, `plugins/source-*`) public
+    API surface; `pnpm check:aipm` if you touched `agent-plugins/`.
 
 ## PRs, review, and merging
 

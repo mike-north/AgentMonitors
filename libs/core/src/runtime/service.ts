@@ -1788,7 +1788,7 @@ export class AgentMonitorRuntime {
    * something but dispatch held it) from `no-change` (source returned nothing).
    * The not-due rollup flush passes `observed: 0` because no source `observe()`
    * call was made on that tick — only the already-accumulated batch is emitted —
-   * so a non-empty flush there correctly classifies as `triggered` (emitted > 0).
+   * so a non-empty flush there correctly classifies as `triggered` (emitted \> 0).
    */
   private async materializeSpan(
     monitor: MonitorDefinition,

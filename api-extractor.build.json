@@ -1,0 +1,10 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/api-extractor/v7/api-extractor.schema.json",
+  "extends": "./api-extractor.base.json",
+  // Issue #285: explicit (defensive) even though the base config also omits
+  // `apiReport` — the `build` pipeline must NEVER write into `api-report/`,
+  // only into `dist/` (dtsRollup, inherited unchanged from the base config).
+  "apiReport": {
+    "enabled": false
+  }
+}

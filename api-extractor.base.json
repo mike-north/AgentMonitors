@@ -1,10 +1,14 @@
 {
   "$schema": "https://developer.microsoft.com/json-schemas/api-extractor/v7/api-extractor.schema.json",
   "mainEntryPointFilePath": "<projectFolder>/dist/index.d.ts",
-  "apiReport": {
-    "enabled": false,
-    "reportFolder": "<projectFolder>/api-report/"
-  },
+  // Issue #285: `apiReport` is deliberately NOT configured here. `build` and
+  // `check:api-report`/`fix:api-report` need DIFFERENT apiReport settings —
+  // see api-extractor.build.json (apiReport disabled; `build` extends this)
+  // and api-extractor.report.json (apiReport enabled; the two api-report
+  // scripts extend this). A shared `apiReport.enabled: true` on this base
+  // file let `build`'s `--local` flag silently rewrite the checked-in report
+  // before the non-local `check:api-report` validation ever read it — see
+  // the PR that split these configs (Refs #285) for the reproduction.
   "docModel": {
     "enabled": false
   },
@@ -24,6 +28,12 @@
     },
     "extractorMessageReporting": {
       "default": { "logLevel": "warning" },
+      // Issue #285: the packages published from this repo do not yet annotate every
+      // export with @public/@beta/@alpha/@internal release tags (~300 call sites as of
+      // this writing). Silencing this rule keeps the real signature-drift gate (the
+      // apiReport check below) from being drowned out by that pre-existing gap. The
+      // annotation sweep is tracked as a follow-up rather than done piecemeal here — see
+      // the PR that enabled apiReport (Refs #285) for the tracking issue link.
       "ae-missing-release-tag": { "logLevel": "none" },
       "ae-unresolved-link": { "logLevel": "none" }
     },

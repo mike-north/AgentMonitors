@@ -23,12 +23,12 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsup && tsc -p tsconfig.build.json && api-extractor run --local --verbose",
+    "build": "tsup && tsc -p tsconfig.build.json && api-extractor run --local --verbose -c api-extractor.build.json",
     "check": "tsc --noEmit",
     "test": "vitest run",
     "clean": "rm -rf dist",
-    "check:api-report": "api-extractor run --local --verbose",
-    "ci:api-report": "api-extractor run --verbose"
+    "check:api-report": "tsup && tsc -p tsconfig.build.json && api-extractor run --verbose -c api-extractor.report.json",
+    "fix:api-report": "tsup && tsc -p tsconfig.build.json && api-extractor run --local --verbose -c api-extractor.report.json"
   },
   "license": "MIT",
   "dependencies": {

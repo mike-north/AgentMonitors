@@ -94,7 +94,7 @@ const notifySchema = z.discriminatedUnion('strategy', [
  * @see docs/specs/001-monitor-definition.md §3.7
  * @see docs/specs/002-runtime-delivery.md §1.1.7
  */
-const baselineStrategyValues = ['incremental', 'net'] as const;
+export const baselineStrategyValues = ['incremental', 'net'] as const;
 
 const baselineStrategySchema = z.enum(baselineStrategyValues).default('net');
 
