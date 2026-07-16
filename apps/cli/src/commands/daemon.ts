@@ -57,7 +57,13 @@ function appendSkippedSuffix(
   return `${summary} (${String(skipped.length)} not yet due — next due in ${String(soonestSec)}s)`;
 }
 
-async function runLoop(
+/**
+ * Exported for unit testing (issue #398): a test spies on
+ * `AgentMonitorRuntime.prototype.listSessions` to force a transient error out
+ * of the idle-reaping block and asserts the loop survives it, mirroring the
+ * existing tick-error-continues behavior. Not part of the CLI's public API.
+ */
+export async function runLoop(
   monitorsDir: string,
   workspacePath: string,
   pollMs: number,
@@ -147,7 +153,12 @@ async function runLoop(
       // the case where a session is registered and closed between tick intervals
       // (tick only observes the closed/dormant state but must not apply the
       // boot-grace period as if no session was ever registered).
-      {
+      //
+      // Wrapped in its own try/catch (issue #398): a transient error here
+      // (e.g. a brief schema-visibility gap on `listSessions()`) must be
+      // logged and skipped, not left to escape the loop and kill the daemon
+      // the way the protected tick above already handles its own errors.
+      try {
         const workspaceSessions = runtime
           .listSessions()
           .filter((s) => s.workspacePath === workspacePath);
@@ -168,6 +179,9 @@ async function runLoop(
         if (decision.reap) {
           stop();
         }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`AgentMon reaping check failed: ${message}`);
       }
 
       await new Promise<void>((resolve) => {
