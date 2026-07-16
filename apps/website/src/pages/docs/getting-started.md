@@ -213,7 +213,20 @@ A few flags worth knowing:
 - **`--manual`** — today only `file-fingerprint` gets a fabricated trigger, and only when its
   glob has a derivable matching path. For any other source (or a `file-fingerprint` glob whose
   filename segment is itself a wildcard, e.g. `file-?.md`), pass `--manual` and `verify` prompts
-  you to make the change yourself, then watches for it.
+  you to make the change yourself, then watches for it. **`--manual` blocks for the wait window and
+  does _not_ read stdin** — it is not an interactive prompt. A human switches windows and edits a
+  file; an agent with a persistent shell backgrounds the run and makes the change in a separate
+  step. An agent whose harness runs one shell command per step (call-and-return) can't do either, so
+  it should use `--trigger-cmd` (next) instead.
+- **`--trigger-cmd '<shell>'`** — the **recommended path for non-interactive / call-and-return
+  agents** and for any source `verify` can't auto-trigger (`command-poll`, `api-poll`, `schedule`,
+  `incoming-changes`). Instead of waiting for you, `verify` runs this shell command itself (after
+  baseline, from the workspace directory) to cause the watched change, then observes and delivers —
+  a single self-contained command, just like the file-fingerprint auto-trigger. For a `command-poll`
+  watching `git status --porcelain`, for example, pass `--trigger-cmd 'touch new-file.txt'`. The
+  command's effects are _not_ reverted (an arbitrary command has no known inverse), so pick one whose
+  residue is acceptable; a non-zero exit is reported as a `setup` failure so you fix the command, not
+  the monitor. `--manual` and `--trigger-cmd` are mutually exclusive.
 - **`--use-workspace-daemon`** — for a proof you can screenshot for a stakeholder (e.g. showing a
   reviewer that monitoring is actually wired up), add this flag. It runs `verify` against your
   project's real daemon/database instead of a throwaway one, and leaves it running afterward, so a

@@ -243,6 +243,240 @@ describe('agentmonitors verify', () => {
     );
   }, 60_000);
 
+  it('reaches PASS on a non-auto-triggerable command-poll monitor via --trigger-cmd in a single self-contained call (issue #413)', () => {
+    const ws = path.join(tempDir, 'trigger-cmd');
+    mkdirSync(ws, { recursive: true });
+    // command-poll cannot be auto-triggered — verify has no way to fabricate a
+    // change for it. Pre-#413 the only path was --manual, which BLOCKS waiting
+    // for an out-of-band change and can't be driven by a call-and-return agent
+    // (one shell command per tool call). --trigger-cmd makes verify run the
+    // change itself: the monitor `cat`s an absolute watched file, and the
+    // trigger rewrites that file's contents, so the whole
+    // daemon→observe→materialize→deliver pipeline completes in ONE invocation.
+    // Absolute paths keep the command output independent of any daemon cwd. A 1s
+    // interval keeps the budget small.
+    const watched = path.join(ws, 'watched.txt');
+    writeMonitor(
+      ws,
+      'cmd-watch',
+      `name: Cmd watch\nwatch:\n  type: command-poll\n  command:\n    - cat\n    - ${JSON.stringify(watched)}\n  interval: '1s'\nurgency: normal`,
+    );
+    writeFileSync(watched, 'baseline contents\n', 'utf-8');
+
+    const result = run(
+      [
+        'verify',
+        'cmd-watch',
+        '--workspace',
+        ws,
+        '--trigger-cmd',
+        `printf 'changed by trigger\\n' > ${JSON.stringify(watched)}`,
+        '--format',
+        'json',
+      ],
+      ws,
+    );
+    expect(result.exitCode).toBe(0);
+    const report = JSON.parse(result.stdout) as {
+      ok: boolean;
+      stages: { name: string; status: string; detail: string }[];
+      additionalContext: string | null;
+    };
+    expect(report.ok).toBe(true);
+    // The trigger stage ran the command itself (not the file-fingerprint scratch
+    // path), and delivery completed end-to-end.
+    const trigger = report.stages.find((s) => s.name === 'trigger');
+    expect(trigger?.status).toBe('pass');
+    expect(trigger?.detail).toContain('printf');
+    expect(report.stages.find((s) => s.name === 'deliver')?.status).toBe(
+      'pass',
+    );
+    expect(report.additionalContext).toContain('review it');
+  }, 60_000);
+
+  it('FAILs with a `setup` verdict when --trigger-cmd exits non-zero (a broken trigger command, not a monitor problem)', () => {
+    const ws = path.join(tempDir, 'trigger-cmd-fail');
+    mkdirSync(ws, { recursive: true });
+    const watched = path.join(ws, 'watched.txt');
+    writeMonitor(
+      ws,
+      'cmd-watch',
+      `name: Cmd watch\nwatch:\n  type: command-poll\n  command:\n    - cat\n    - ${JSON.stringify(watched)}\n  interval: '1s'\nurgency: normal`,
+    );
+    writeFileSync(watched, 'baseline contents\n', 'utf-8');
+
+    const result = run(
+      [
+        'verify',
+        'cmd-watch',
+        '--workspace',
+        ws,
+        '--trigger-cmd',
+        'exit 3',
+        '--format',
+        'json',
+      ],
+      ws,
+    );
+    expect(result.exitCode).toBe(1);
+    const report = JSON.parse(result.stdout) as {
+      ok: boolean;
+      failure: { kind: string; message: string } | null;
+      stages: { name: string; status: string }[];
+    };
+    expect(report.ok).toBe(false);
+    expect(report.failure?.kind).toBe('setup');
+    expect(report.failure?.message).toContain('--trigger-cmd');
+    expect(report.stages.find((s) => s.name === 'trigger')?.status).toBe(
+      'fail',
+    );
+  }, 60_000);
+
+  it('reaches PASS when --trigger-cmd blocks well past the poll interval before making its change (issue #416: observeFrom must start after fire() returns)', () => {
+    const ws = path.join(tempDir, 'trigger-cmd-slow');
+    mkdirSync(ws, { recursive: true });
+    const watched = path.join(ws, 'watched.txt');
+    writeMonitor(
+      ws,
+      'cmd-watch-slow',
+      `name: Cmd watch slow\nwatch:\n  type: command-poll\n  command:\n    - cat\n    - ${JSON.stringify(watched)}\n  interval: '1s'\nurgency: normal`,
+    );
+    writeFileSync(watched, 'baseline contents\n', 'utf-8');
+
+    // `fire()` for --trigger-cmd is a synchronous, blocking execSync — the
+    // isolated daemon (a separate process) keeps polling on its own 1s
+    // interval while it blocks, and will very likely record a `no-change`
+    // observation timestamped mid-sleep (the file hasn't been rewritten yet).
+    // The post-trigger filter must exclude that stray tick — if it instead
+    // used a timestamp captured BEFORE fire() started (as it did pre-fix),
+    // that mid-sleep `no-change` row would be counted as "post-trigger" and
+    // fail verify fast, even though the real change is still coming.
+    const result = run(
+      [
+        'verify',
+        'cmd-watch-slow',
+        '--workspace',
+        ws,
+        '--trigger-cmd',
+        `sleep 2 && printf 'changed by slow trigger\\n' > ${JSON.stringify(watched)}`,
+        '--timeout-ms',
+        '10000',
+        '--format',
+        'json',
+      ],
+      ws,
+    );
+    expect(result.exitCode).toBe(0);
+    const report = JSON.parse(result.stdout) as {
+      ok: boolean;
+      failure: { kind: string; message: string } | null;
+      stages: { name: string; status: string }[];
+    };
+    expect(report.ok).toBe(true);
+    expect(report.stages.find((s) => s.name === 'observe')?.status).toBe(
+      'pass',
+    );
+  }, 30_000);
+
+  it('FAILs bounded (does not hang) when --trigger-cmd never exits, honoring --timeout-ms (issue #416: execSync needs a timeout)', () => {
+    const ws = path.join(tempDir, 'trigger-cmd-timeout');
+    mkdirSync(ws, { recursive: true });
+    const watched = path.join(ws, 'watched.txt');
+    writeMonitor(
+      ws,
+      'cmd-watch-timeout',
+      `name: Cmd watch timeout\nwatch:\n  type: command-poll\n  command:\n    - cat\n    - ${JSON.stringify(watched)}\n  interval: '1s'\nurgency: normal`,
+    );
+    writeFileSync(watched, 'baseline contents\n', 'utf-8');
+
+    // Without an execSync timeout, `sleep 60` would block the whole `verify`
+    // process for a minute regardless of any other budget. The 15s vitest
+    // timeout on this test is itself part of the proof: pre-fix, this test
+    // hangs past that timeout instead of failing fast.
+    const result = run(
+      [
+        'verify',
+        'cmd-watch-timeout',
+        '--workspace',
+        ws,
+        '--trigger-cmd',
+        'sleep 60',
+        '--timeout-ms',
+        '1000',
+        '--format',
+        'json',
+      ],
+      ws,
+    );
+    expect(result.exitCode).toBe(1);
+    const report = JSON.parse(result.stdout) as {
+      ok: boolean;
+      failure: { kind: string; message: string } | null;
+      stages: { name: string; status: string }[];
+    };
+    expect(report.ok).toBe(false);
+    expect(report.failure?.kind).toBe('setup');
+    expect(report.failure?.message).toContain('timed out');
+    expect(report.stages.find((s) => s.name === 'trigger')?.status).toBe(
+      'fail',
+    );
+  }, 15_000);
+
+  it('the --manual budget-exceeded FAIL names the --trigger-cmd decoupled mode and the workaround (issue #413 AC3)', () => {
+    const ws = path.join(tempDir, 'manual-hint');
+    mkdirSync(ws, { recursive: true });
+    writeMonitor(
+      ws,
+      'm',
+      `name: M\nwatch:\n  type: file-fingerprint\n  globs:\n    - '*.md'\n  cwd: ${JSON.stringify(ws)}\n  interval: '1s'\nurgency: normal`,
+    );
+    writeFileSync(path.join(ws, 'readme.md'), 'hello', 'utf-8');
+
+    // --manual with no out-of-band change → budget-exceeded. The FAIL message
+    // must now point a stuck (call-and-return) caller at --trigger-cmd and the
+    // background workaround, not a bare "did you make a change?".
+    const result = run(
+      [
+        'verify',
+        'm',
+        '--workspace',
+        ws,
+        '--manual',
+        '--timeout-ms',
+        '2000',
+        '--format',
+        'json',
+      ],
+      ws,
+    );
+    expect(result.exitCode).toBe(1);
+    const report = JSON.parse(result.stdout) as {
+      ok: boolean;
+      failure: { kind: string; message: string } | null;
+    };
+    expect(report.ok).toBe(false);
+    expect(report.failure?.kind).toBe('budget-exceeded');
+    expect(report.failure?.message).toContain('--trigger-cmd');
+    expect(report.failure?.message).toContain('stdin');
+  }, 60_000);
+
+  it('rejects --manual together with --trigger-cmd (mutually exclusive)', () => {
+    const ws = path.join(tempDir, 'both-flags');
+    mkdirSync(ws, { recursive: true });
+    writeMonitor(
+      ws,
+      'm',
+      `name: M\nwatch:\n  type: file-fingerprint\n  globs:\n    - '*.md'\n  cwd: ${JSON.stringify(ws)}`,
+    );
+
+    const result = run(
+      ['verify', 'm', '--workspace', ws, '--manual', '--trigger-cmd', 'true'],
+      ws,
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('either --manual or --trigger-cmd');
+  });
+
   it('errors clearly when the named monitor does not exist (setup)', () => {
     const ws = path.join(tempDir, 'missing');
     mkdirSync(ws, { recursive: true });

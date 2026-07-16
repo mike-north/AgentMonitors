@@ -307,18 +307,36 @@ exit code: `0` means PASS, non-zero means FAIL with the failing stage named dire
 writes a scratch sibling that reuses the glob's static directory prefix and extension — but that
 placement can't fabricate a match for a glob whose filename segment is itself a wildcard (e.g.
 `file-?.md`) or whose only variability is a wildcard directory with a literal filename (e.g.
-`data-*/report.md`); those have no derivable sibling and need `--manual`. For every other source —
-`api-poll`, `command-poll`, `schedule`, `incoming-changes` — pass `--manual`:
+`data-*/report.md`); those have no derivable sibling. For every other source — `api-poll`,
+`command-poll`, `schedule`, `incoming-changes` — and those un-fabricatable file-fingerprint globs,
+have `verify` run the change itself with `--trigger-cmd`:
+
+```bash
+agentmonitors verify <monitor-id> --trigger-cmd '<shell command that causes the change>'
+```
+
+`--trigger-cmd` is the **decoupled trigger**: after baseline, `verify` runs your shell command
+(from the workspace directory) to cause the watched change, then observes and delivers — one
+self-contained, non-interactive command. **This is the mode to use as an agent**, because
+`--manual` (below) blocks and does not read stdin, so a call-and-return harness (one shell command
+per tool call) cannot make the change while it waits. For a `command-poll` watching
+`git status --porcelain`, that's e.g. `--trigger-cmd 'touch new-file.txt'`; **you still have to know
+what change actually registers for that source** — see "Per-source trigger recipes" in the appendix
+(e.g. `file-fingerprint` needs a content change, not just a `touch`; `command-poll` diffs command
+output between ticks; `schedule` needs a cron that fires soon). The command's effects are not
+reverted, and a non-zero exit is a `setup` failure (fix the command, not the monitor).
+
+`--manual` is the alternative when you'd rather make the change out-of-band yourself:
 
 ```bash
 agentmonitors verify <monitor-id> --manual
 ```
 
-`--manual` makes `verify` prompt you to make the watched change yourself, then watch for it. **You
-still have to know what change actually registers as a change for that source** — see "Per-source
-trigger recipes" in the appendix below for the per-source-type gotchas (e.g. `file-fingerprint`
-needs a content change, not just a `touch`; `command-poll` diffs output between ticks; `schedule`
-needs a cron that fires soon).
+It **blocks** for the detect budget and watches for a change you make in a _separate_ step — it is
+_not_ an interactive stdin prompt. With a persistent shell you can background the run
+(`verify … --manual --timeout-ms <generous> &`), make the change, then read the result; a
+call-and-return harness can't, and should use `--trigger-cmd` instead. `--manual` and
+`--trigger-cmd` are mutually exclusive.
 
 **If the user wants a stakeholder-presentable proof**, or you want the real workspace daemon left
 running afterward so a follow-up `agentmonitors doctor` also goes green, add
