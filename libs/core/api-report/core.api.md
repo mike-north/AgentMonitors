@@ -12,18 +12,24 @@ export type AgentLifecycleEvent = 'session-opened' | 'session-dormant' | 'turn-i
 // @public (undocumented)
 export class AgentMonitorRuntime {
     constructor(store: RuntimeStore, registry: SourceRegistry, adapters?: AgentRuntimeAdapter[],
-    interpretAdapter?: InterpretAdapter | undefined);
+    interpretAdapter?: InterpretAdapter | undefined,
+    options?: {
+        sessionDormancyMs?: number;
+    });
     // (undocumented)
     acknowledgeSession(sessionId: string, eventIds?: string[]): void;
     // (undocumented)
     adapter(name: string): AgentRuntimeAdapter;
+    cancelEphemeralMonitor(sessionId: string, ephemeralId: string): EphemeralMonitorRecord;
     claimDelivery(sessionId: string, lifecycle: DeliveryLifecycle, maxEvents?: number): DeliveryClaim | null;
     // (undocumented)
     closeSession(sessionId: string): AgentSessionRecord;
+    declareEphemeralMonitor(input: DeclareEphemeralMonitorInput): EphemeralMonitorRecord;
     diagnoseHookDelivery(sessionId: string, lifecycle: DeliveryLifecycle): HookDeliveryDiagnosis;
     doctorReport(input: DoctorReportInput): Promise<MonitorDoctorReport>;
     // (undocumented)
     explainMonitor(input: MonitorExplainInput): Promise<MonitorExplainReport>;
+    listEphemeralMonitors(sessionId: string): EphemeralMonitorRecord[];
     // (undocumented)
     listEvents(query?: EventQuery): MonitorEventRecord[];
     // (undocumented)
@@ -118,6 +124,9 @@ export const baselineStrategyValues: readonly ["incremental", "net"];
 export function buildTextDiff(previous: string, current: string): string;
 
 // @public
+export function changeDetectionCollectionError(watchConfig: Record<string, unknown>): string | undefined;
+
+// @public
 export type ChangeKind = 'created' | 'modified' | 'deleted' | 'descoped';
 
 // @public
@@ -158,6 +167,16 @@ export function createImmediateNotifier(callback: NotifyCallback): Notifier;
 
 // @public
 export function createThrottleNotifier(callback: NotifyCallback, suppressMs: number): Notifier;
+
+// @public
+export interface DeclareEphemeralMonitorInput {
+    displayName?: string;
+    instruction?: string;
+    scope: Record<string, unknown>;
+    sessionId: string;
+    source: string;
+    urgency?: string;
+}
 
 // @public (undocumented)
 export interface DeliveryClaim {
@@ -287,6 +306,37 @@ export interface EnqueuePayload {
 
 // @public
 export function ensurePrivateDir(dirPath: string): void;
+
+// @public
+export interface EphemeralMonitorRecord {
+    // (undocumented)
+    createdAt: Date;
+    // (undocumented)
+    displayName?: string;
+    // (undocumented)
+    id: string;
+    instruction: string;
+    // (undocumented)
+    reapedAt?: Date;
+    scope: Record<string, unknown>;
+    // (undocumented)
+    sessionId: string;
+    // (undocumented)
+    sourceName: string;
+    // (undocumented)
+    status: EphemeralMonitorStatus;
+    // (undocumented)
+    updatedAt: Date;
+    urgency: Urgency;
+    urgencyMax: Urgency;
+    // (undocumented)
+    workspacePath: string | null;
+}
+
+// Warning: (ae-forgotten-export) The symbol "ephemeralMonitorStatus" needs to be exported by the entry point index.d.ts
+//
+// @public
+export type EphemeralMonitorStatus = (typeof ephemeralMonitorStatus)[number];
 
 // @public
 export interface ErroredObservation {
@@ -1253,22 +1303,41 @@ export class RuntimeStore {
     // (undocumented)
     closeSession(sessionId: string): AgentSessionRecord;
     collapseNetForClaim(sessionId: string, candidates: MonitorEventRecord[]): MonitorEventRecord[];
+    findEphemeralMonitorById(id: string): EphemeralMonitorRecord | null;
+    findSessionById(id: string): AgentSessionRecord | null;
+    // (undocumented)
+    getEphemeralMonitorById(id: string): EphemeralMonitorRecord;
     // (undocumented)
     getEventById(id: string): MonitorEventRecord;
     getMonitorState(monitorId: string, workspacePath: string | null): MonitorRuntimeState;
     // (undocumented)
     getSessionById(id: string): AgentSessionRecord;
     getSessionObjectCursor(sessionId: string, monitorId: string, objectKey: string, workspacePath?: string | null): SessionObjectCursorRecord | null;
+    insertEphemeralMonitor(input: {
+        id: string;
+        sessionId: string;
+        workspacePath: string | null;
+        sourceName: string;
+        scope: Record<string, unknown>;
+        urgency: Urgency;
+        urgencyMax: Urgency;
+        instruction: string;
+        displayName?: string;
+    }): EphemeralMonitorRecord;
     insertEvent(input: Omit<MonitorEventRecord, 'id'>, baseline?: {
         previousContent: string | null;
+    }, options?: {
+        restrictToSessionId?: string;
     }): MonitorEventRecord;
     interpretDigestsForSession(sessionId: string, eventIds: string[]): Map<string, string>;
     // (undocumented)
     latestSnapshot(monitorId: string, objectKey: string, workspacePath?: string | null): {
         content: string;
     } | null;
+    listActiveEphemeralMonitors(workspacePath: string | null): EphemeralMonitorRecord[];
     // (undocumented)
     listDeliveryProjectionsForMonitor(monitorId: string, workspacePath?: string): MonitorDeliveryProjection[];
+    listEphemeralMonitorsForSession(sessionId: string): EphemeralMonitorRecord[];
     // (undocumented)
     listEvents(query?: EventQuery): MonitorEventRecord[];
     listObservationHistory(query?: ObservationHistoryQuery): ObservationHistoryRecord[];
@@ -1284,6 +1353,8 @@ export class RuntimeStore {
     perRecipientDiffsForSession(sessionId: string, eventIds: string[]): Map<string, string>;
     // (undocumented)
     projectedSessionIdsForLastEvent(): string[];
+    reapEphemeralMonitor(id: string): void;
+    reapEphemeralMonitorsForSession(sessionId: string): string[];
     recordInterpretDecision(sessionId: string, eventId: string, decision: {
         decision: 'deliver' | 'suppress' | 'failed';
         reason?: string | undefined;
@@ -1328,6 +1399,7 @@ export class RuntimeStore {
         notifyState?: unknown;
         lastObservationAt?: Date | null;
     }): void;
+    staleActiveSessions(workspacePath: string | null, staleBefore: Date): AgentSessionRecord[];
     // (undocumented)
     status(): RuntimeStatus;
     // (undocumented)
@@ -1555,6 +1627,9 @@ export function validatePayloadTransform(transform: PayloadTransform): string | 
 
 // @public
 export function validateScope(scope: Record<string, unknown>, scopeSchema: JsonSchema): string[];
+
+// @public
+export function validateWatchScope(scope: Record<string, unknown>, scopeSchema: JsonSchema): string[];
 
 // @public
 export interface WatchHandle {
