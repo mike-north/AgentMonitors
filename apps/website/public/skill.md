@@ -299,12 +299,16 @@ registers a throwaway session, triggers a real change, waits for the event to ma
 claims it through the same delivery path a live hook uses — then tears everything down. Check the
 exit code: `0` means PASS, non-zero means FAIL with the failing stage named directly. Prefer
 `--format json` if you want to branch on the result programmatically instead of parsing text (spec
-005 §16 documents the stable JSON shape: `ok`, `stages`, `failure`, `additionalContext`).
+005 §16 documents the stable JSON shape: `ok`, `monitorId`, `stages`, `failure`, `additionalContext`,
+`daemonStderr`, `elapsedMs`).
 
-**Auto-trigger only covers `file-fingerprint`** — and even then, only globs with a derivable
-matching sibling path (a glob whose filename segment is itself a wildcard, e.g. `file-?.md`, has
-none). For every other source — `api-poll`, `command-poll`, `schedule`, `incoming-changes` — pass
-`--manual`:
+**Auto-trigger only covers `file-fingerprint`.** For a literal single-file glob (e.g.
+`docs/notes.md`), it edits the watched file itself and restores it on exit. For a pattern glob, it
+writes a scratch sibling that reuses the glob's static directory prefix and extension — but that
+placement can't fabricate a match for a glob whose filename segment is itself a wildcard (e.g.
+`file-?.md`) or whose only variability is a wildcard directory with a literal filename (e.g.
+`data-*/report.md`); those have no derivable sibling and need `--manual`. For every other source —
+`api-poll`, `command-poll`, `schedule`, `incoming-changes` — pass `--manual`:
 
 ```bash
 agentmonitors verify <monitor-id> --manual
@@ -322,9 +326,10 @@ running afterward so a follow-up `agentmonitors doctor` also goes green, add
 `verify` against the real workspace daemon/database instead of a throwaway one and leaves it
 running rather than tearing it down.
 
-**Success looks like** a `PASS` line, with a `deliver` stage reporting `claimed at
-turn-interruptible` (for `urgency: high`) or `claimed at post-compact` (`normal`/`low`), followed
-by the delivered `additionalContext` — that's exactly what a live hook would inject into the
+**Success looks like** a `PASS` line, with a `deliver` stage reporting
+`claimed at turn-interruptible` (for `urgency: high`) or `claimed at post-compact`
+(`normal`/`low`), followed by the delivered `additionalContext` — that's exactly what a live hook
+would inject into the
 agent's next turn:
 
 ```json

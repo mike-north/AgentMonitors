@@ -186,10 +186,10 @@ elapsed/ETA progress to stderr, so you're never left staring at silence (spec 00
 ```
 agentmonitors verify: my-first-monitor
 
-  ✓ daemon      booted on /tmp/agentmon-verify-xxxx.sock
+  ✓ daemon      booted on /tmp/agentmon-verify-xxxxxx/d.sock
   ✓ session     registered lead session <id>
   ✓ baseline    first observation recorded
-  ✓ trigger     wrote scratch file example.ts
+  ✓ trigger     wrote scratch file agentmonitors-verify-xxxxxx.ts
   ✓ observe     change detected (triggered)
   ✓ materialize 1 unread event(s)
   ✓ deliver     claimed at post-compact
@@ -391,9 +391,9 @@ the real setup an actual agent session would use, start a daemon on the workspac
 `doctor`.
 
 **For a stakeholder-presentable proof**, don't screenshot this appendix's isolated-socket output —
-it's throwaway and proves the mechanism, not the live setup. Use `agentmonitors verify
---use-workspace-daemon` instead (see "Prove it, right now" above) and screenshot its PASS output
-alongside `doctor`'s all-green summary.
+it's throwaway and proves the mechanism, not the live setup. Use
+`agentmonitors verify --use-workspace-daemon` instead (see "Prove it, right now" above) and
+screenshot its PASS output alongside `doctor`'s all-green summary.
 
 For the same proof wired through the real Claude Code plugin instead of a manual socket, see
 [Notify your agent when a file changes](/docs/notify-when-a-file-changes).
