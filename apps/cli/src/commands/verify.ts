@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { randomBytes } from 'node:crypto';
-import { spawn, type ChildProcess } from 'node:child_process';
+import { execSync, spawn, type ChildProcess } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Command, Option } from 'commander';
 import {
@@ -224,6 +224,100 @@ function buildAutoTrigger(
       mutated = false;
     },
   };
+}
+
+/**
+ * Raised when a `--trigger-cmd` shell command exits non-zero (or can't be
+ * spawned). Distinct from `no-change` (the command ran but nothing the monitor
+ * watches changed) — this is a broken trigger command, reported as a `setup`
+ * failure so the operator fixes the command, not the monitor.
+ */
+class TriggerCommandFailed extends Error {
+  constructor(
+    readonly command: string,
+    readonly cause: unknown,
+  ) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    super(`--trigger-cmd exited non-zero: ${detail}`);
+    this.name = 'TriggerCommandFailed';
+  }
+}
+
+/**
+ * Build the **decoupled trigger** for `--trigger-cmd`: `verify` itself runs the
+ * given shell command (after baseline) to cause the change the monitor should
+ * observe. This makes a non-auto-triggerable source (`command-poll`, `api-poll`,
+ * `schedule`, `incoming-changes`) verifiable in ONE self-contained,
+ * non-interactive invocation — the call-and-return agent harness that can't
+ * interleave a second command during a blocking `--manual` wait (issue #413).
+ *
+ * The command runs through a shell (`execSync`, so `/bin/sh -c` on POSIX) with
+ * `cwd` = the workspace, so a pattern like `touch new-file.txt` lands where the
+ * monitor watches. Its effects are **not reverted**: unlike the fabricated
+ * file-fingerprint scratch file, an arbitrary shell command has no known
+ * inverse, so cleanup (if any) is the operator's own — pick a command whose
+ * residue is acceptable. A non-zero exit throws `TriggerCommandFailed`.
+ */
+function buildCommandTrigger(command: string, workspace: string): Trigger {
+  return {
+    // A `--trigger-cmd` run's effects are real changes the operator's own
+    // command caused — not a verify-fabricated scratch object. `synthetic:
+    // false` keeps it out of the `--use-workspace-daemon` retraction path
+    // (issue #407): its events reference genuine changes and must never be
+    // retracted, and it never trips the scratch-events teardown. Because it is
+    // never retracted, `objectKey` is unused for this mode (the command may
+    // touch anything, so there is no single file-fingerprint key to record).
+    objectKey: '',
+    synthetic: false,
+    describe: `ran trigger command: ${command}`,
+    fire: () => {
+      try {
+        execSync(command, {
+          cwd: workspace,
+          stdio: ['ignore', 'ignore', 'pipe'],
+        });
+      } catch (error) {
+        throw new TriggerCommandFailed(command, error);
+      }
+    },
+    // No-op: an arbitrary shell command's effects are the operator's to undo.
+    revert: () => {
+      /* intentionally empty */
+    },
+  };
+}
+
+/**
+ * The trailing guidance appended to a `budget-exceeded` observe FAIL, tailored
+ * to how the change was (or wasn't) triggered. The `manual` variant is the
+ * important one (issue #413): it names the decoupled `--trigger-cmd` mode and
+ * the background-and-interleave workaround, because a call-and-return agent
+ * harness (one shell command per tool call) can't make the change during the
+ * blocking, stdin-less `--manual` wait, and a bare "did you make a change?"
+ * gives it nowhere to go.
+ */
+function budgetExceededHint(mode: TriggerMode): string {
+  switch (mode) {
+    case 'manual':
+      return (
+        '`--manual` blocks and does NOT read stdin, so a call-and-return agent ' +
+        "(one shell command per step) can't make the change while it waits. " +
+        "Re-run with `--trigger-cmd '<shell>'` to have verify make the change " +
+        'itself in one self-contained command, or background the `--manual` run ' +
+        'and make the change in a separate step (see the getting-started docs).'
+      );
+    case 'command':
+      return (
+        'The --trigger-cmd ran but the change was not observed in time — ' +
+        'increase --timeout-ms if the interval is long, or check the monitor ' +
+        'with `agentmonitors monitor explain`.'
+      );
+    case 'auto':
+      return (
+        'Increase --timeout-ms if the interval is long, or check the monitor ' +
+        'with `agentmonitors monitor explain`.'
+      );
+  }
 }
 
 interface IsolatedDaemon {
@@ -474,6 +568,14 @@ async function resolveMonitor(
   );
 }
 
+/**
+ * How `verify` produces the observable change:
+ * - `auto` — fabricate one (file-fingerprint scratch file / edit).
+ * - `command` — run the operator's `--trigger-cmd` shell command.
+ * - `manual` — block and wait for the operator to make the change out-of-band.
+ */
+type TriggerMode = 'auto' | 'command' | 'manual';
+
 interface RunOptions {
   monitor: MonitorDefinition;
   workspace: string;
@@ -489,12 +591,19 @@ interface RunOptions {
    * needed.
    */
   useWorkspaceDaemon: boolean;
+  /** The `--trigger-cmd` shell command, when the decoupled mode is used. */
+  triggerCmd?: string | undefined;
 }
 
 /** The core orchestration once a monitor is resolved and a daemon is reachable. */
 async function runVerification(opts: RunOptions): Promise<VerifyResult> {
   const { monitor, workspace, daemon, budget, detectCapMs, manual } = opts;
-  const { useWorkspaceDaemon } = opts;
+  const { useWorkspaceDaemon, triggerCmd } = opts;
+  const mode: TriggerMode = manual
+    ? 'manual'
+    : triggerCmd !== undefined
+      ? 'command'
+      : 'auto';
   const startedAt = Date.now();
   const stages: Stage[] = [];
   const token = randomBytes(6).toString('hex');
@@ -581,15 +690,41 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
 
     // Trigger the change.
     const triggerAt = Date.now();
-    if (manual) {
+    if (mode === 'manual') {
       progress(
-        `make a REAL change now to something this monitor watches — waiting up to ${String(Math.round(detectCapMs / 1000))}s…`,
+        `make a REAL change now to something this monitor watches — waiting up to ${String(Math.round(detectCapMs / 1000))}s… ` +
+          `(this blocks and does NOT read stdin; a call-and-return agent should use --trigger-cmd '<shell>' instead)`,
       );
       trigger = null;
       stages.push({
         name: 'trigger',
         status: 'skip',
         detail: 'manual — waiting for your change',
+      });
+    } else if (mode === 'command') {
+      // triggerCmd is defined whenever mode === 'command'.
+      trigger = buildCommandTrigger(triggerCmd ?? '', workspace);
+      try {
+        trigger.fire();
+      } catch (error) {
+        if (error instanceof TriggerCommandFailed) {
+          stages.push({
+            name: 'trigger',
+            status: 'fail',
+            detail: 'trigger command failed',
+          });
+          return finalize({
+            ok: false,
+            stages,
+            failure: { kind: 'setup', message: error.message },
+          });
+        }
+        throw error;
+      }
+      stages.push({
+        name: 'trigger',
+        status: 'pass',
+        detail: trigger.describe,
       });
     } else {
       trigger = buildAutoTrigger(monitor, workspace, token);
@@ -637,7 +772,10 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
         if (post.some((r) => r.result === 'triggered')) return 'triggered';
         // A post-trigger `no-files-matched` is always definitive: the glob
         // scope resolved to zero files, so nothing could ever be observed.
-        if (!manual && post.some((r) => r.result === 'no-files-matched')) {
+        if (
+          mode !== 'manual' &&
+          post.some((r) => r.result === 'no-files-matched')
+        ) {
           return 'no-files-matched';
         }
         // A post-trigger `no-change` normally means the change wasn't
@@ -649,7 +787,7 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
         // post-trigger `suppressed` row is present; otherwise keep polling
         // until the flush (or the budget) — 002 §9.2/§9.3.
         if (
-          !manual &&
+          mode !== 'manual' &&
           post.some((r) => r.result === 'no-change') &&
           !post.some((r) => r.result === 'suppressed')
         ) {
@@ -673,10 +811,14 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
             ? 'no files matched the glob'
             : 'no change detected',
       });
+      const noChangeGuidance =
+        mode === 'command'
+          ? `the --trigger-cmd ran but did not change what this monitor observes. Make sure the command causes a change the monitor detects (e.g. for a command-poll watching \`git status --porcelain\`, a \`--trigger-cmd\` that actually creates/edits a tracked file).`
+          : `the trigger did not change what this monitor observes (the scratch file may not match watch.globs). Re-run with --manual and edit a matching file yourself, or pass --trigger-cmd '<shell>' to have verify make the change itself.`;
       const guidance =
         observed === 'no-files-matched'
           ? `the monitor's globs matched no files. Check watch.globs / watch.cwd, or re-run with --manual.`
-          : `the trigger did not change what this monitor observes (the scratch file may not match watch.globs). Re-run with --manual and edit a matching file yourself.`;
+          : noChangeGuidance;
       return finalize({
         ok: false,
         stages,
@@ -694,7 +836,7 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
         stages,
         failure: {
           kind: 'budget-exceeded',
-          message: `no change was observed within the budget (${String(Math.round(detectCapMs / 1000))}s). ${manual ? 'Did you make a change the monitor watches?' : 'Increase --timeout-ms if the interval is long, or check the monitor with `agentmonitors monitor explain`.'}`,
+          message: `no change was observed within the budget (${String(Math.round(detectCapMs / 1000))}s). ${budgetExceededHint(mode)}`,
         },
       });
     }
@@ -989,7 +1131,11 @@ export const verifyCommand = new Command('verify')
   )
   .option(
     '--manual',
-    'Skip auto-trigger; prompt you to make the change and watch for it',
+    'Skip auto-trigger; prompt you to make the change and watch for it (blocks; does not read stdin)',
+  )
+  .option(
+    '--trigger-cmd <shell>',
+    "Decoupled trigger: after baseline, verify runs this shell command itself to cause the watched change, then observes/materializes/delivers — a single self-contained run for a source it can't auto-trigger (command-poll, api-poll, schedule, incoming-changes)",
   )
   .option(
     '--use-workspace-daemon',
@@ -1011,6 +1157,7 @@ export const verifyCommand = new Command('verify')
         dir?: string;
         workspace: string;
         manual?: boolean;
+        triggerCmd?: string;
         useWorkspaceDaemon?: boolean;
         timeoutMs?: string;
         format: string;
@@ -1021,6 +1168,21 @@ export const verifyCommand = new Command('verify')
       const monitorsDir = options.dir
         ? path.resolve(options.dir)
         : path.join(workspace, '.claude', 'monitors');
+
+      // --manual and --trigger-cmd are mutually exclusive: one waits for an
+      // out-of-band change, the other makes the change itself. An empty
+      // --trigger-cmd is a mistake, not a no-op trigger.
+      if (options.manual === true && options.triggerCmd !== undefined) {
+        reportError(
+          'Pass either --manual or --trigger-cmd, not both: --manual waits for you to make the change, --trigger-cmd makes it for you.',
+          json,
+        );
+        return;
+      }
+      if (options.triggerCmd?.trim().length === 0) {
+        reportError('--trigger-cmd requires a non-empty shell command.', json);
+        return;
+      }
 
       let daemon: IsolatedDaemon | undefined;
       try {
@@ -1058,6 +1220,7 @@ export const verifyCommand = new Command('verify')
           detectCapMs,
           manual: options.manual === true,
           useWorkspaceDaemon: options.useWorkspaceDaemon === true,
+          triggerCmd: options.triggerCmd,
         });
 
         console.log(json ? renderVerifyJson(result) : renderVerifyText(result));
