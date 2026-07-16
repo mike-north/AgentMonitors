@@ -3,12 +3,65 @@ import path from 'node:path';
 import * as readline from 'node:readline/promises';
 import { Command, Option } from 'commander';
 import { readLocalState } from '../local-state.js';
+import { COMMAND_POLL_SCAFFOLD_DEFAULT_COMMAND } from './scaffold-defaults.js';
 import { validateCommand } from './validate.js';
 
 const yaml = String.raw;
 const md = String.raw;
 
-const TEMPLATES: Record<string, string> = {
+/**
+ * The `command-poll` template's advisory comment above its illustrative
+ * `command:` block. Shared with {@link COMMAND_POLL_CONTRACT_COMMENT} (both
+ * used by {@link TEMPLATES} and by `seedCommand` below) so the two can never
+ * drift apart: when `--command` replaces the scaffolded command, the
+ * example-specific narrative (which explains the fetch-lag semantics of the
+ * illustrative `git ls-remote` default) no longer describes what's seeded, so
+ * `seedCommand` swaps this exact text for the generalized contract-only
+ * comment.
+ */
+const COMMAND_POLL_EXAMPLE_COMMENT =
+  '  # command is an argv array, run directly (no shell). This example queries the\n' +
+  '  # remote branch tip live: "git ls-remote" hits the network on every run, so it\n' +
+  '  # is always current — no prior fetch needed. Only a LOCAL read of a\n' +
+  '  # remote-tracking ref, such as "git rev-parse origin/main", reflects just your\n' +
+  '  # last fetch and can lag until you fetch again. A local working-tree command\n' +
+  '  # such as "git status --porcelain" has no fetch lag either.\n';
+
+/**
+ * The generalized replacement for {@link COMMAND_POLL_EXAMPLE_COMMENT} once a
+ * `--command` seed has overwritten the illustrative default: only the
+ * source-contract clause applies to an arbitrary seeded command.
+ */
+const COMMAND_POLL_CONTRACT_COMMENT =
+  '  # command is an argv array, run directly (no shell).\n';
+
+/**
+ * The `command-poll` template's illustrative `command:` list, rendered
+ * directly from {@link COMMAND_POLL_SCAFFOLD_DEFAULT_COMMAND} (in
+ * `scaffold-defaults.ts`) rather than duplicated as a second literal. This
+ * makes that module's "used by the scaffolder" claim structurally true: the
+ * template's default argv and `isUntouchedCommandPollDefault`'s comparison
+ * target are the same array, so they cannot silently diverge. Every token in
+ * {@link COMMAND_POLL_SCAFFOLD_DEFAULT_COMMAND} is a plain, unquoted-safe YAML
+ * scalar (no `'`, `#`, `:`, or leading `-`), so plain scalars are correct
+ * here — this is not the general seeding path and does not call
+ * `yamlSingleQuoted`.
+ */
+const COMMAND_POLL_DEFAULT_COMMAND_BLOCK =
+  COMMAND_POLL_SCAFFOLD_DEFAULT_COMMAND.map((token) => `    - ${token}`).join(
+    '\n',
+  );
+
+/**
+ * The scaffold body for each `--type`. Exported (test-only use) so
+ * `scaffold-defaults.test.ts` can assert the `command-poll` entry's parsed
+ * `command:` block still equals {@link COMMAND_POLL_SCAFFOLD_DEFAULT_COMMAND}
+ * in `scaffold-defaults.ts` — kept as a direct regression test even though
+ * the two are now structurally linked via
+ * {@link COMMAND_POLL_DEFAULT_COMMAND_BLOCK}, so a future refactor that
+ * breaks that link still fails loudly.
+ */
+export const TEMPLATES: Record<string, string> = {
   'file-fingerprint': yaml`
 ---
 name: My monitor
@@ -49,17 +102,8 @@ When the page changes, review the differences and take appropriate action.
 name: Upstream branch monitor
 watch:
   type: command-poll
-  # command is an argv array, run directly (no shell). This example queries the
-  # remote branch tip live: "git ls-remote" hits the network on every run, so it
-  # is always current — no prior fetch needed. Only a LOCAL read of a
-  # remote-tracking ref, such as "git rev-parse origin/main", reflects just your
-  # last fetch and can lag until you fetch again. A local working-tree command
-  # such as "git status --porcelain" has no fetch lag either.
-  command:
-    - git
-    - ls-remote
-    - origin
-    - refs/heads/main
+${COMMAND_POLL_EXAMPLE_COMMENT}  command:
+${COMMAND_POLL_DEFAULT_COMMAND_BLOCK}
   interval: 5m
   change-detection:
     strategy: text-diff
@@ -120,14 +164,15 @@ const GLOB_FIELD_BY_TYPE: Partial<Record<string, 'globs' | 'paths'>> = {
  * normal CLI error (message + exit code 1), not a stack trace. */
 class InitSeedError extends Error {}
 
-/** Seed values from `--glob`/`--name`/`--urgency`, threaded into the
- * generated frontmatter value-preserving (issue #330). Only the named `init <name>`
- * scaffold path consumes these; the bare bootstrap form ignores them
- * (non-goal). */
+/** Seed values from `--glob`/`--name`/`--urgency`/`--command`, threaded into
+ * the generated frontmatter value-preserving (issues #330, #388). Only the named
+ * `init <name>` scaffold path consumes these; the bare bootstrap form ignores
+ * them (non-goal). */
 interface SeedOptions {
   name?: string;
   urgency?: string;
   globs?: string[];
+  command?: string[];
 }
 
 /**
@@ -217,15 +262,76 @@ function seedGlobs(template: string, type: string, globs: string[]): string {
 }
 
 /**
- * Apply `--glob`/`--name`/`--urgency` seed overrides to a template, in
- * frontmatter-field order. A `SeedOptions` with all fields `undefined`
- * returns `template` unchanged. As of issue #375, the named scaffold path's
- * caller always passes a `name` seed (the `--name` value, or one derived
- * from the positional `<name>` when `--name` is omitted), so a zero-flag
- * `init <name>` no longer returns the raw template byte-for-byte — only its
- * `name:` line differs from the template default. The bare bootstrap path
- * never calls this with a `name` seed, so its scaffolded templates are
- * unaffected (non-goal, issue #330).
+ * Replace the command-poll template's `command:` argv list with the seeded
+ * tokens. Throws {@link InitSeedError} for any type other than `command-poll`
+ * (only that template has a `command:` argv block), mirroring {@link seedGlobs}.
+ *
+ * Each token is emitted as a single-quoted YAML scalar so argv tokens that are
+ * not plain scalars — a leading `-`/`--` like `--porcelain`, embedded spaces,
+ * `#`, `:` — round-trip verbatim. Quoting also means seeding never invents shell
+ * semantics: each `--command` token is one argv element, matching the
+ * "argv array, run directly (no shell)" contract (spec 003 §"command-poll").
+ *
+ * If the template's `command:` block ever drifts out of the shape
+ * `blockPattern` expects, `String.replace` would otherwise return the
+ * template unchanged with no error — silently shipping the untouched
+ * `ls-remote` default under a `--command` seed that looks like it applied.
+ * That is exactly the wrong-intent trap this flag exists to prevent (issue
+ * #388), so a non-matching template throws {@link InitSeedError} instead of
+ * silently no-op'ing.
+ *
+ * Exported (test-only use) so `init.test.ts` can exercise the no-match
+ * (drift-guard) path directly with a hand-crafted, deliberately non-matching
+ * template — that shape can't be reached through the real, currently-correct
+ * template via the CLI's public surface.
+ */
+export function seedCommand(
+  template: string,
+  type: string,
+  command: string[],
+): string {
+  if (type !== 'command-poll') {
+    throw new InitSeedError(
+      `--command is not supported for --type ${type} (only command-poll has a command: argv array)`,
+    );
+  }
+  // The seeded command is no longer the illustrative upstream-tip example, so
+  // its comment must stop describing that example (see
+  // COMMAND_POLL_EXAMPLE_COMMENT's doc comment).
+  const withGeneralizedComment = template.replace(
+    COMMAND_POLL_EXAMPLE_COMMENT,
+    COMMAND_POLL_CONTRACT_COMMENT,
+  );
+  // Same block-replacement shape as seedGlobs: match the `command:` key line,
+  // capture its indent and the list-item indent from the template's own first
+  // item, then replace the whole item run with the seeded tokens.
+  const blockPattern = /^( *)command:\n(( +)- .*\n)(?:\3- .*\n)*/m;
+  if (!blockPattern.test(withGeneralizedComment)) {
+    throw new InitSeedError(
+      'Could not find a command: argv block in the command-poll template to seed (the template may have changed shape) — refusing to silently ship the untouched default; please report this as a bug.',
+    );
+  }
+  return withGeneralizedComment.replace(
+    blockPattern,
+    (_match, indent: string, _first: string, itemIndent: string) => {
+      const listBlock = command
+        .map((token) => `${itemIndent}- ${yamlSingleQuoted(token)}`)
+        .join('\n');
+      return `${indent}command:\n${listBlock}\n`;
+    },
+  );
+}
+
+/**
+ * Apply `--glob`/`--name`/`--urgency`/`--command` seed overrides to a
+ * template, in frontmatter-field order. A `SeedOptions` with all fields
+ * `undefined` returns `template` unchanged. As of issue #375, the named
+ * scaffold path's caller always passes a `name` seed (the `--name` value, or
+ * one derived from the positional `<name>` when `--name` is omitted), so a
+ * zero-flag `init <name>` no longer returns the raw template byte-for-byte —
+ * only its `name:` line differs from the template default. The bare
+ * bootstrap path never calls this with a `name` seed, so its scaffolded
+ * templates are unaffected (non-goal, issue #330).
  */
 function applySeeds(
   template: string,
@@ -238,11 +344,20 @@ function applySeeds(
   if (seeds.globs !== undefined && seeds.globs.length > 0) {
     result = seedGlobs(result, type, seeds.globs);
   }
+  if (seeds.command !== undefined && seeds.command.length > 0) {
+    result = seedCommand(result, type, seeds.command);
+  }
   return result;
 }
 
 /** Commander `.option()` collector for repeatable `--glob <pattern>`. */
 function collectGlob(value: string, previous: string[]): string[] {
+  return [...previous, value];
+}
+
+/** Commander `.option()` collector for repeatable `--command <token>`; each
+ * occurrence appends one argv token to `watch.command` (order-preserving). */
+function collectCommand(value: string, previous: string[]): string[] {
   return [...previous, value];
 }
 
@@ -608,6 +723,12 @@ export const initCommand = new Command('init')
     [],
   )
   .option(
+    '--command <token>',
+    'Seed watch.command (command-poll) argv, one token per flag; repeatable. Scaffold form only.',
+    collectCommand,
+    [],
+  )
+  .option(
     '--name <name>',
     'Seed the frontmatter name: field (distinct from the positional <name>, which sets the directory). Defaults to a readable form of the positional <name>. Scaffold form only.',
   )
@@ -626,6 +747,7 @@ export const initCommand = new Command('init')
         enableOnly?: boolean;
         yes?: boolean;
         glob: string[];
+        command: string[];
         name?: string;
         urgency?: string;
       },
@@ -650,6 +772,7 @@ export const initCommand = new Command('init')
             ? { urgency: options.urgency }
             : {}),
           ...(options.glob.length > 0 ? { globs: options.glob } : {}),
+          ...(options.command.length > 0 ? { command: options.command } : {}),
         };
         let result: ScaffoldResult;
         try {

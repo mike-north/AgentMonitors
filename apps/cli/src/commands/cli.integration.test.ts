@@ -1105,6 +1105,215 @@ describe('init', () => {
     expect(parsed.valid).toBe(1);
     expect(parsed.monitors[0]?.name).toBe('TS source watcher');
   });
+
+  // Issue #388 AC (a): --command seeds watch.command verbatim for command-poll,
+  // one argv token per flag (including a leading-dash token like --porcelain,
+  // which the collector must preserve, not swallow as another flag). The seeded
+  // scaffold still validates and, being the author's intended command rather
+  // than the untouched default, emits no soft warning.
+  it('--command seeds watch.command verbatim for command-poll (AC a)', () => {
+    const dir = path.join(tempDir, 'init-command-seed');
+    mkdirSync(dir, { recursive: true });
+    const monitorsDir = path.join(dir, 'monitors');
+    const created = run(
+      [
+        'init',
+        'dirty-worktree',
+        '--dir',
+        monitorsDir,
+        '--type',
+        'command-poll',
+        '--command',
+        'git',
+        '--command',
+        'status',
+        '--command',
+        '--porcelain',
+      ],
+      dir,
+    );
+    expect(created.exitCode).toBe(0);
+    const monitor = readFileSync(
+      path.join(monitorsDir, 'dirty-worktree', 'MONITOR.md'),
+      'utf-8',
+    );
+    // The whole seeded argv is emitted as single-quoted YAML scalars, in order.
+    expect(monitor).toContain(
+      "  command:\n    - 'git'\n    - 'status'\n    - '--porcelain'\n",
+    );
+    // The stock ls-remote default must be replaced, not appended alongside.
+    expect(monitor).not.toContain('    - ls-remote');
+    expect(monitor).not.toContain('    - refs/heads/main');
+    // The comment's source-contract clause survives seeding, but its
+    // example-specific narrative (which described the untouched ls-remote
+    // default, not the seeded git-status command) must not.
+    expect(monitor).toContain(
+      '  # command is an argv array, run directly (no shell).\n',
+    );
+    expect(monitor).not.toContain('This example watches the');
+
+    const validated = run(['validate', monitorsDir, '--format', 'json'], dir);
+    expect(validated.exitCode).toBe(0);
+    const parsed = JSON.parse(validated.stdout) as {
+      valid: number;
+      invalid: number;
+      monitors: { id: string; source: string }[];
+      warnings: { id: string; warning: string }[];
+    };
+    expect(parsed.valid).toBe(1);
+    expect(parsed.invalid).toBe(0);
+    expect(parsed.monitors[0]?.source).toBe('command-poll');
+    // The author supplied their own command, so no untouched-default warning.
+    expect(parsed.warnings).toEqual([]);
+  });
+
+  // Issue #388: --command has nowhere to go for a type with no command: argv
+  // array (only command-poll has one) — it must fail loudly with a clear
+  // message and leave no partial directory behind, mirroring --glob's guard.
+  it('--command is rejected with a clear error for a non-command-poll type', () => {
+    const dir = path.join(tempDir, 'init-command-unsupported');
+    mkdirSync(dir, { recursive: true });
+    const monitorsDir = path.join(dir, 'monitors');
+    const result = run(
+      [
+        'init',
+        'bad-command-mon',
+        '--dir',
+        monitorsDir,
+        '--type',
+        'file-fingerprint',
+        '--command',
+        'git',
+        '--command',
+        'status',
+      ],
+      dir,
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain(
+      '--command is not supported for --type file-fingerprint',
+    );
+    expect(existsSync(path.join(monitorsDir, 'bad-command-mon'))).toBe(false);
+  });
+
+  // Issue #388: a --command token containing a literal single quote must be
+  // emitted as the doubled-quote YAML escape ('it''s'), mirroring --name's
+  // quote-escaping coverage above (AC2/AC803), and the escaped scaffold must
+  // still round-trip through validate.
+  it('--command seeds a token with a single quote using doubled-quote YAML escaping (hostile input)', () => {
+    const dir = path.join(tempDir, 'init-command-quote');
+    mkdirSync(dir, { recursive: true });
+    const monitorsDir = path.join(dir, 'monitors');
+    const created = run(
+      [
+        'init',
+        'quote-command-mon',
+        '--dir',
+        monitorsDir,
+        '--type',
+        'command-poll',
+        '--command',
+        'echo',
+        '--command',
+        "it's",
+      ],
+      dir,
+    );
+    expect(created.exitCode).toBe(0);
+    const monitor = readFileSync(
+      path.join(monitorsDir, 'quote-command-mon', 'MONITOR.md'),
+      'utf-8',
+    );
+    expect(monitor).toContain("    - 'it''s'");
+
+    const validated = run(['validate', monitorsDir, '--format', 'json'], dir);
+    expect(validated.exitCode).toBe(0);
+    const parsed = JSON.parse(validated.stdout) as {
+      valid: number;
+      invalid: number;
+    };
+    expect(parsed.valid).toBe(1);
+    expect(parsed.invalid).toBe(0);
+  });
+
+  // Issue #388: --command tokens containing YAML-significant characters
+  // (#, :, an embedded space) must round-trip verbatim through the
+  // single-quoted scalar form (none of these require escaping inside single
+  // quotes — only a literal `'` does), and the scaffold must still validate.
+  it('--command seeds tokens with #, :, and an embedded space verbatim (hostile input)', () => {
+    const dir = path.join(tempDir, 'init-command-special-chars');
+    mkdirSync(dir, { recursive: true });
+    const monitorsDir = path.join(dir, 'monitors');
+    const created = run(
+      [
+        'init',
+        'special-chars-command-mon',
+        '--dir',
+        monitorsDir,
+        '--type',
+        'command-poll',
+        '--command',
+        'echo',
+        '--command',
+        'a#b',
+        '--command',
+        'a:b',
+        '--command',
+        'a b',
+      ],
+      dir,
+    );
+    expect(created.exitCode).toBe(0);
+    const monitor = readFileSync(
+      path.join(monitorsDir, 'special-chars-command-mon', 'MONITOR.md'),
+      'utf-8',
+    );
+    expect(monitor).toContain(
+      "  command:\n    - 'echo'\n    - 'a#b'\n    - 'a:b'\n    - 'a b'\n",
+    );
+
+    const validated = run(['validate', monitorsDir, '--format', 'json'], dir);
+    expect(validated.exitCode).toBe(0);
+    const parsed = JSON.parse(validated.stdout) as {
+      valid: number;
+      invalid: number;
+      monitors: { id: string }[];
+    };
+    expect(parsed.valid).toBe(1);
+    expect(parsed.invalid).toBe(0);
+    expect(parsed.monitors[0]?.id).toBe('special-chars-command-mon');
+  });
+
+  // Issue #388: a --command token containing a newline cannot be represented
+  // as a single-quoted YAML scalar (mirrors --name's newline rejection at
+  // "rejects a --name containing a newline" above) — it must fail loudly with
+  // exit 1 and the same "single-line" message, and leave no partial directory
+  // behind.
+  it('rejects a --command containing a newline instead of emitting invalid YAML', () => {
+    const dir = path.join(tempDir, 'init-command-newline');
+    const monitorsDir = path.join(dir, 'monitors');
+    mkdirSync(dir, { recursive: true });
+    const result = run(
+      [
+        'init',
+        'newline-command-mon',
+        '--dir',
+        monitorsDir,
+        '--type',
+        'command-poll',
+        '--command',
+        'echo',
+        '--command',
+        'first line\nsecond line',
+      ],
+      dir,
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('must be single-line');
+    expect(existsSync(path.join(monitorsDir, 'newline-command-mon'))).toBe(
+      false,
+    );
+  });
 });
 
 // Issue #268: bare `agentmonitors init` (no name) is a one-shot project
@@ -1983,6 +2192,87 @@ describe('validate', () => {
     const result = run(['validate', path.join(dir, 'monitors')]);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain('Valid monitors: 1');
+  });
+
+  // Issue #388 AC (b)/(c): a command-poll monitor scaffolded WITHOUT --command
+  // is left at the untouched `init` default (`git ls-remote origin
+  // refs/heads/main`). It still validates and runs, so before this fix it
+  // silently passed as if configured for the author's actual intent. It must now
+  // emit a soft, non-fatal warning (exit 0, still counted valid) so a
+  // wrong-intent ship is caught. Scaffolded via `init` so the template and the
+  // validator's sentinel cannot silently drift apart.
+  it('warns (soft, non-fatal) when a command-poll scaffold is left at the untouched default (AC b/c)', () => {
+    const dir = path.join(tempDir, 'validate-command-poll-untouched');
+    mkdirSync(dir, { recursive: true });
+    const monitorsDir = path.join(dir, 'monitors');
+    const created = run(
+      ['init', 'upstream', '--dir', monitorsDir, '--type', 'command-poll'],
+      dir,
+    );
+    expect(created.exitCode).toBe(0);
+
+    // Text: warning surfaces but the monitor stays valid and the exit is 0.
+    const text = run(['validate', monitorsDir], dir);
+    expect(text.exitCode).toBe(0);
+    expect(text.stdout).toContain('Valid monitors: 1');
+    expect(text.stdout).toContain('Warnings: 1');
+    expect(text.stdout).toContain('watch.command is still the untouched');
+
+    // JSON: the additive `warnings` array carries the advisory; `valid`/`invalid`
+    // are unchanged (the monitor is not marked invalid).
+    const json = run(['validate', monitorsDir, '--format', 'json'], dir);
+    expect(json.exitCode).toBe(0);
+    const parsed = JSON.parse(json.stdout) as {
+      valid: number;
+      invalid: number;
+      warnings: { id: string; warning: string }[];
+    };
+    expect(parsed.valid).toBe(1);
+    expect(parsed.invalid).toBe(0);
+    expect(parsed.warnings).toHaveLength(1);
+    expect(parsed.warnings[0]?.id).toBe('upstream');
+    expect(parsed.warnings[0]?.warning).toContain(
+      'git ls-remote origin refs/heads/main',
+    );
+  });
+
+  // Issue #388: the warning is scoped precisely to the untouched default — a
+  // command-poll monitor whose `command:` has been edited to the author's real
+  // intent must NOT be flagged (no false positives).
+  it('does not warn when the command-poll command has been edited', () => {
+    const dir = path.join(tempDir, 'validate-command-poll-edited');
+    const monitorDir = path.join(dir, 'monitors', 'edited-cmd');
+    mkdirSync(monitorDir, { recursive: true });
+    const body = [
+      '---',
+      'name: Dirty worktree',
+      'watch:',
+      '  type: command-poll',
+      '  command:',
+      '    - git',
+      '    - status',
+      '    - --porcelain',
+      '  interval: 5m',
+      'urgency: normal',
+      '---',
+      'Review the working-tree changes.',
+      '',
+    ].join('\n');
+    writeFileSync(path.join(monitorDir, 'MONITOR.md'), body, 'utf-8');
+
+    const text = run(['validate', path.join(dir, 'monitors')], dir);
+    expect(text.exitCode).toBe(0);
+    expect(text.stdout).toContain('Valid monitors: 1');
+    expect(text.stdout).not.toContain('Warnings:');
+
+    const json = run(
+      ['validate', path.join(dir, 'monitors'), '--format', 'json'],
+      dir,
+    );
+    const parsed = JSON.parse(json.stdout) as {
+      warnings: { id: string; warning: string }[];
+    };
+    expect(parsed.warnings).toEqual([]);
   });
 
   it('rejects unknown command-poll change-detection keys', () => {

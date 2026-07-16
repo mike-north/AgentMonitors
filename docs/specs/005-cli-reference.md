@@ -148,10 +148,11 @@ agentmonitors init [name] [options]
 | `--enable-only`     | boolean               | —                     | Bootstrap only: enable the project and fix `.gitignore`, then stop (no monitor, no prompts)                                                                                                                                                        |
 | `--yes`             | boolean               | —                     | Bootstrap non-interactively: accept defaults and scaffold a starter monitor without prompting                                                                                                                                                      |
 | `--glob <pattern>`  | option (repeatable)   | —                     | Scaffold form only. Seeds `watch.globs` (`file-fingerprint`) or `watch.paths` (`incoming-changes`), value-preserving; rejected for any other `--type`                                                                                              |
+| `--command <token>` | option (repeatable)   | —                     | Scaffold form only. Seeds `watch.command` argv for `--type command-poll`, **one argv token per flag** (order-preserving, no shell/whitespace splitting); rejected for any other `--type`                                                           |
 | `--name <name>`     | option                | derived from `[name]` | Scaffold form only. Seeds the frontmatter `name:` field, value-preserving (distinct from the positional `[name]`, which sets the directory). Omit to derive a readable form of `[name]` (see below) instead of the template's literal placeholder. |
 | `--urgency <level>` | option (choices)      | —                     | Scaffold form only. Seeds the frontmatter `urgency:` field: `low`, `normal`, `high`                                                                                                                                                                |
 
-`--enable-only` and `--yes` are only meaningful for the bootstrap form; when a `<name>` is given, `init` takes the scaffold path and those two flags are ignored. `--type` applies to both forms: it selects the scaffolded monitor's source type in the scaffold path, and (when `--yes` scaffolds a starter monitor) overrides the bootstrap form's default source type. `--glob`/`--name`/`--urgency` are consumed only by the scaffold form; the bootstrap form accepts but ignores them (non-goal — bootstrap behavior is unchanged, issue #330).
+`--enable-only` and `--yes` are only meaningful for the bootstrap form; when a `<name>` is given, `init` takes the scaffold path and those two flags are ignored. `--type` applies to both forms: it selects the scaffolded monitor's source type in the scaffold path, and (when `--yes` scaffolds a starter monitor) overrides the bootstrap form's default source type. `--glob`/`--command`/`--name`/`--urgency` are consumed only by the scaffold form; the bootstrap form accepts but ignores them (non-goal — bootstrap behavior is unchanged, issues #330, #388).
 
 ### Scaffold form (`init <name>`)
 
@@ -159,11 +160,17 @@ Human-readable only (no `--format` flag). Byte-for-byte unchanged by the bootstr
 
 - **Success:** prints `Created monitor: <dir>/<name>/MONITOR.md` followed by a hint to run `agentmonitors validate <dir>` and `agentmonitors doctor`.
 - **Failure (duplicate):** prints to stderr `Monitor already exists: <dir>/<name>/MONITOR.md`; exits with code 1.
-- **Failure (unsupported seed):** `--glob` on a `--type` with no path-pattern list in its template (`api-poll`, `command-poll`, `schedule`) prints to stderr `--glob is not supported for --type <type> (only file-fingerprint and incoming-changes have a path-pattern list)`; exits with code 1. No directory is created.
+- **Failure (unsupported seed):** `--glob` on a `--type` with no path-pattern list in its template (`api-poll`, `command-poll`, `schedule`) prints to stderr `--glob is not supported for --type <type> (only file-fingerprint and incoming-changes have a path-pattern list)`; exits with code 1. No directory is created. `--command` on any `--type` other than `command-poll` prints to stderr `--command is not supported for --type <type> (only command-poll has a command: argv array)`; exits with code 1. No directory is created.
 
-#### Seed flags (`--glob`, `--name`, `--urgency`)
+#### Seed flags (`--glob`, `--command`, `--name`, `--urgency`)
 
-Each seed flag, when passed, replaces the corresponding field in the chosen `--type`'s template with the value given — value-preserving, not byte-for-byte: `--name`/`--glob` values are re-emitted as single-quoted YAML scalars. The rest of the template (comments, other fields, body) is unchanged. `--glob` is repeatable (`--glob a --glob b` seeds a two-entry list) and is only meaningful for the two source types whose template has a path-pattern list: it writes `watch.globs` for `file-fingerprint` and `watch.paths` for `incoming-changes` (the field name differs per source; see [001 §2](./001-monitor-definition.md)). Values are re-emitted as single-quoted YAML scalars (`'` doubles to `''`), so arbitrary text — including embedded quotes, colons, or `#` — round-trips safely through `validate`. A scaffold with seed flags applied still passes `agentmonitors validate` (same as the zero-flag template).
+Each seed flag, when passed, replaces the corresponding field in the chosen `--type`'s template with the value given — value-preserving, not byte-for-byte: `--name`/`--glob`/`--command` values are re-emitted as single-quoted YAML scalars. The rest of the template (comments, other fields, body) is unchanged. `--glob` is repeatable (`--glob a --glob b` seeds a two-entry list) and is only meaningful for the two source types whose template has a path-pattern list: it writes `watch.globs` for `file-fingerprint` and `watch.paths` for `incoming-changes` (the field name differs per source; see [001 §2](./001-monitor-definition.md)). Values are re-emitted as single-quoted YAML scalars (`'` doubles to `''`), so arbitrary text — including embedded quotes, colons, or `#` — round-trips safely through `validate`. A scaffold with seed flags applied still passes `agentmonitors validate` (same as the zero-flag template).
+
+#### Command-poll scaffold (`--command` and the untouched-default warning)
+
+`command-poll`'s `watch.command` is an argv array run directly with **no shell** (spec [003 §"command-poll"](./003-source-plugins.md)); it is the entire intent of the monitor, and — unlike `file-fingerprint`'s `globs:` — there is no universally-sensible default. `--command` is repeatable and seeds that argv **one token per flag, order-preserving**: `--command git --command status --command --porcelain` yields `command: [git, status, --porcelain]`. Each token is emitted as a single-quoted YAML scalar, so a leading-dash token (`--porcelain`), embedded spaces, `#`, or `:` round-trip verbatim; the CLI never whitespace-splits a value, so it never invents shell semantics the source doesn't have. For a pipeline, seed a shell explicitly (`--command sh --command -c --command 'git status -sb | grep ahead'`). `--command` is rejected for any other `--type` (see the unsupported-seed failure above).
+
+When `--command` is **omitted**, the scaffold keeps its illustrative upstream-tip default (`git ls-remote origin refs/heads/main`) so the monitor still validates and runs. Because that default validates and runs, a scaffold left untouched silently watches the wrong thing for any other intent (issue #388). To keep that from passing as if configured, **`validate` emits a soft, non-fatal warning** for a `command-poll` monitor whose `watch.command` still equals the exact untouched default (see [§3](#3-validate--validate-monitor-files)). The warning does not mark the monitor invalid or change the exit code; if polling the upstream branch tip is the real intent, it is safe to ignore.
 
 **`--name` default (issue #375).** Unlike `--glob`/`--urgency`, `name:` is _always_ seeded on the scaffold path — never left as the template's literal placeholder. When `--name` is omitted, the value derives from the positional `[name]`: its `-`/`_`-separated segments are joined with spaces and the first segment is capitalized (e.g. `watch-docs` → `Watch docs`; `watchdocs` → `Watchdocs`). `--name` overrides this derivation with its own value, verbatim.
 
@@ -227,10 +234,25 @@ Valid monitors: <n>
 Invalid monitors: <n>
   <id>: <error message>
 ...
+
+Warnings: <n>
+  <id>: <warning message>
+...
 ```
 
 Both valid and invalid monitor lines use the monitor ID (the folder/stem name) as the identifier.
 If the ID cannot be derived from the path (unusual), the full file path is used as a fallback.
+
+The optional **Warnings** section carries soft, non-fatal advisories about monitors that are
+otherwise **valid** — it never changes the valid/invalid counts or the exit code, and is omitted when
+there are none. Current warnings:
+
+- **Untouched command-poll scaffold (issue #388):** a `command-poll` monitor whose `watch.command`
+  still equals the exact `init --type command-poll` default (`git ls-remote origin refs/heads/main`)
+  is flagged, because it validates and runs but silently watches the wrong thing for any intent other
+  than upstream-tip polling. Seed the intended command with `init … --command …`, or edit
+  `watch.command`; the warning is safe to ignore when the upstream-tip probe is intentional. See
+  [§2](#2-init--bootstrap-the-project-or-scaffold-a-monitor).
 
 If no monitors are found: prints `No monitors found.`
 
@@ -250,9 +272,14 @@ If a file path (rather than a directory) is passed: prints an error to stderr na
   "duplicateIds": [{ "id": "<string>", "filePaths": ["<string>"] }],
   "errors": [
     { "filePath": "<string>", "error": "<string>" }
-  ]
+  ],
+  "warnings": [{ "id": "<string>", "warning": "<string>" }]
 }
 ```
+
+`warnings` is additive (issue #388): an array of `{ id, warning }` for otherwise-valid monitors, `[]`
+when none apply. It never affects `valid`/`invalid` or the exit code. Consumers that ignore unknown
+keys are unaffected.
 
 (In text output, each invalid monitor is labelled by its monitor ID. In JSON output, the
 `errors[].filePath` field carries the monitor ID as its value; the key name `filePath` is
