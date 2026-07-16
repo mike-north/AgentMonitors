@@ -444,10 +444,12 @@ any tick where its cron matches, from the first eligible tick onward. Step 2b's 
 precisely to dodge this race — by the time you reach step 3, the baselining first tick has already
 completed, so whatever you trigger next is guaranteed to be detected on a subsequent tick.
 
-**`file-fingerprint`** — touch any file matched by `watch.globs`:
+**`file-fingerprint`** — change the *content* of a file matched by `watch.globs`. This source
+detects changes by content hash, not mtime or existence, so a bare `touch` on an existing file
+leaves the hash unchanged and is silently ignored — append real content instead:
 
 ```bash
-touch path/to/monitored/file.txt
+echo "// verify $(date)" >> path/to/monitored/file.txt
 ```
 
 **`command-poll`** — change the command's output between two ticks. Example, watching

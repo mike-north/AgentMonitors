@@ -214,10 +214,13 @@ urgency: high
 
 **c. Run the recipe.** `file-fingerprint` baselines silently on its first-ever tick: whatever files
 exist at that moment become the reference point, and nothing is reported as changed. That first
-tick runs immediately when the daemon starts (before waiting `--poll-ms` at all), so a `touch` that
+tick runs immediately when the daemon starts (before waiting `--poll-ms` at all), so a change that
 lands before it finishes gets folded into the baseline and is never detected — the recipe below
-waits a full poll interval after starting the daemon, before touching `example.ts`, to guarantee
-the trigger lands after the baseline instead of racing it:
+waits a full poll interval after starting the daemon, before writing to `example.ts`, to guarantee
+the trigger lands after the baseline instead of racing it. **`file-fingerprint` detects changes by
+content hash, not mtime or existence** — a bare `touch` on a file whose content doesn't change
+leaves the hash unchanged and is silently ignored, so the trigger below appends real content
+instead:
 
 ```bash
 CWD=$(pwd)
@@ -243,8 +246,9 @@ AGENTMON_SESSION_ID=$(agentmonitors session open --socket "$SOCKET" --host-sessi
 # first, baselining tick has definitely already run before we touch anything.
 sleep 5
 
-# 3. Trigger the watched change.
-touch example.ts
+# 3. Trigger the watched change. A bare `touch` is a silent no-op under
+#    file-fingerprint's content-hash comparison — append real content instead.
+echo "// verify $(date)" >> example.ts
 
 # 4. Poll until the event materializes (events list needs a reachable daemon).
 for i in $(seq 1 20); do
@@ -277,9 +281,19 @@ kill "$DAEMON_PID"
 whose `hookSpecificOutput.additionalContext` is non-empty and names your monitor — that's exactly
 what a live Claude Code turn would receive.
 
-If step 5's loop keeps retrying for a while, that's expected for `high` urgency, not a bug: `hook
-deliver` applies its own fixed ~15s "claim settle" window measured from the event's creation time,
-separate from `notify.settle-for`. The 20 × 2s retry window above comfortably covers that.
+If step 4 or step 5's loop keeps retrying, don't assume it's just a settle window — check what the
+daemon actually recorded first:
+
+```bash
+agentmonitors monitor history my-first-monitor --socket "$SOCKET"
+```
+
+A `result: no-change` row means the trigger in step 3 didn't actually alter anything the source
+could detect (e.g. a `touch` on a file whose content didn't change) — fix the trigger, don't keep
+waiting. Only once history shows `result: triggered` is a still-empty step 5 loop expected for
+`high` urgency, not a bug: `hook deliver` applies its own fixed ~15s "claim settle" window measured
+from the event's creation time, separate from `notify.settle-for`. The 20 × 2s retry window above
+comfortably covers that once the event actually exists.
 
 Once you're done, revert the `interval` / `settle-for` / `urgency` edits from step (b) to whatever
 fits your real use case.
