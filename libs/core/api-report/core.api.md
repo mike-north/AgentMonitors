@@ -1434,6 +1434,14 @@ export interface ScanResult {
     monitors: ParseResult[];
 }
 
+// @public
+export const schedulingDefaults: {
+    readonly fileFingerprintPollMs: 30000;
+    readonly apiPollMs: 300000;
+    readonly scheduleTickMs: 60000;
+    readonly highUrgencyClaimSettleMs: 15000;
+};
+
 // @public (undocumented)
 export interface SessionEventFilter {
     // (undocumented)

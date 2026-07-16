@@ -70,10 +70,13 @@ import {
   type DeliveryLifecycle,
   type SessionHookState,
 } from './types.js';
+import { schedulingDefaults } from './scheduling-defaults.js';
 
-const DEFAULT_FILE_FINGERPRINT_POLL_MS = 30_000;
-const DEFAULT_API_POLL_MS = 300_000;
-const DEFAULT_HIGH_URGENCY_SETTLE_MS = 15_000;
+const DEFAULT_FILE_FINGERPRINT_POLL_MS =
+  schedulingDefaults.fileFingerprintPollMs;
+const DEFAULT_API_POLL_MS = schedulingDefaults.apiPollMs;
+const DEFAULT_HIGH_URGENCY_SETTLE_MS =
+  schedulingDefaults.highUrgencyClaimSettleMs;
 const MAX_RECAP_EVENTS = 10;
 
 /**
@@ -2541,14 +2544,15 @@ export class AgentMonitorRuntime {
     if (monitor.frontmatter.watch.type === 'schedule') {
       const cron = config['cron'];
       const timezone = config['timezone'];
-      if (typeof cron !== 'string') return { due: false, nextPollMs: 60_000 };
+      if (typeof cron !== 'string')
+        return { due: false, nextPollMs: schedulingDefaults.scheduleTickMs };
       const due =
         cronMatchesDate(
           cron,
           now,
           typeof timezone === 'string' ? timezone : 'UTC',
-        ) && elapsed >= 60_000;
-      return { due, nextPollMs: 60_000 };
+        ) && elapsed >= schedulingDefaults.scheduleTickMs;
+      return { due, nextPollMs: schedulingDefaults.scheduleTickMs };
     }
 
     if (monitor.frontmatter.watch.type === 'api-poll') {
