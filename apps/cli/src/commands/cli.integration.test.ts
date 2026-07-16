@@ -4808,7 +4808,11 @@ Handle it.
       expect(result.stdout).toContain('◇ lead-session');
       expect(result.stdout).not.toContain('✗ lead-session');
       expect(result.stdout).toMatch(/lead-session.*No lead session/);
-      expect(result.stdout).toContain('agentmonitors session open');
+      // Issue #387: the remediation points at the runnable `session start`
+      // primitive, never the flag-heavy `session open` that fails without
+      // `--host-session-id`.
+      expect(result.stdout).toContain('agentmonitors session start');
+      expect(result.stdout).not.toMatch(/session open --role lead/);
       // Criterion 2 (issues #331, #373): the idle line still names the
       // expected-state context — no live agent session open is a normal
       // reason for this, not evidence of a broken setup.
@@ -4818,6 +4822,71 @@ Handle it.
     } finally {
       daemon.stop();
       await daemon.waitForExit();
+    }
+  }, 30_000);
+
+  // --- Issue #387: doctor's lead-session remediation must be runnable --------
+  // The pre-fix hint recommended `session open --role lead --workspace <path>`,
+  // which fails immediately with `error: required option '--host-session-id'
+  // not specified` — a reproducible dead end reached by following doctor's own
+  // advice. The fix points the hint at `session start` (the flagless lazy-boot
+  // path that matches real usage) and documents the manual `manual-cli-session`
+  // stdin-payload invocation. This test asserts against the real command
+  // surface: (2) the exact pre-fix shape still errors, and (3) the command
+  // doctor now recommends actually runs and registers a lead session.
+  it('recommends a runnable lead-session command (session start), not one that fails with a missing required option', async () => {
+    const dir = path.join(tempDir, 'doctor-remediation-runnable');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    writeDoctorMonitor(monitorsRoot, 'heartbeat', FIRING_SCHEDULE);
+
+    const dbPath = path.join(dir, 'agentmon.db');
+    const socketPath = doctorSocket('remediation-runnable');
+    const env = { AGENTMONITORS_DB: dbPath, AGENTMONITORS_SOCKET: socketPath };
+    // Enable with the resolved socket/db so `session start`'s lazy boot binds the
+    // SAME socket doctor searches (the #335 self-diagnosing invariant).
+    writeLocalState(dir, { enabled: true, socket: socketPath, db: dbPath });
+
+    try {
+      // 1. doctor's lead-session remediation recommends the runnable primitive.
+      const before = runWithEnv(['doctor', '--workspace', dir], env, dir);
+      expect(before.stdout).toContain('agentmonitors session start');
+      expect(before.stdout).not.toMatch(/session open --role lead/);
+
+      // 2. Regression guard: the PRE-FIX recommended shape genuinely fails with
+      // the exact missing-required-option error #387 reports — proving the old
+      // hint was a dead end and that the check below is meaningful.
+      const preFix = runWithEnv(
+        ['session', 'open', '--role', 'lead', '--workspace', dir],
+        env,
+        dir,
+      );
+      expect(preFix.exitCode).not.toBe(0);
+      expect(preFix.stderr).toContain(
+        "required option '--host-session-id <id>' not specified",
+      );
+
+      // 3. The command doctor now recommends, run as printed (with the documented
+      // `manual-cli-session` placeholder payload on stdin), is actually runnable:
+      // it does NOT fail with a missing-required-option error and exits 0.
+      const start = runWithStdinCapture(
+        ['session', 'start'],
+        env,
+        JSON.stringify({ session_id: 'manual-cli-session', cwd: dir }),
+        dir,
+      );
+      expect(start.stderr).not.toContain('required option');
+      expect(start.exitCode).toBe(0);
+
+      // 4. Proof it did the real thing: doctor's lead-session check now passes.
+      const after = runWithEnv(['doctor', '--workspace', dir], env, dir);
+      expect(after.stdout).toContain('✓ lead-session');
+    } finally {
+      try {
+        await callDaemon('stop', {}, { socketPath });
+      } catch {
+        // daemon never booted or already stopped — ignore.
+      }
+      rmSync(dir, { recursive: true, force: true });
     }
   }, 30_000);
 
