@@ -9,6 +9,24 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-07-16 — `verify --use-workspace-daemon` retracts its own scratch-file events (005 §16) — Refs #407
+
+`verify --use-workspace-daemon` targets the persistent workspace daemon and leaves it running. Its
+teardown deletes its own scratch trigger file, which the live daemon observed as a real change and
+queued as an event — so a later session's `hook deliver`/`events list` saw a spurious `File deleted:
+…/agentmonitors-verify-….md` **first**, ahead of the user's real change. (Default isolated mode is
+unaffected: its throwaway daemon/db are torn down.)
+
+- Added **step 9 "Retract"** to §16: under `--use-workspace-daemon`, verify now deletes the scratch
+  file, waits for the daemon to materialize the resulting deletion event, then retracts every event
+  its own scratch object produced (create AND delete) across all sessions, scoped strictly to that
+  synthetic path. Real monitored changes — and any pre-existing watched file verify merely edited and
+  restored — are never retracted.
+- Behavioral, not just clarifying: a new runtime capability `retractObjectEvents` (core service +
+  store) removes the shared `monitor_events` rows, their per-recipient `session_event_state`
+  projections, snapshots, and seeded cursors for one `(monitorId, objectKey)`, exposed over the
+  daemon socket as the `events.retractObject` IPC verb.
+
 ## 2026-07-16 — `init`'s post-scaffold guidance points at `agentmonitors verify`, not the unavailable `setup-monitors` skill (005 §2) — Refs #408
 
 `init`'s "Verify the monitor fires" summary (both the named `init <name>` scaffold path and the

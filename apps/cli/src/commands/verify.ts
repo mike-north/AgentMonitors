@@ -36,6 +36,7 @@ import {
   listObservationHistoryClient,
   openSessionClient,
   previewSettledHighDeliveryClient,
+  retractObjectEventsClient,
 } from '../runtime-client.js';
 import {
   packEventsUnderCap,
@@ -78,6 +79,20 @@ interface Trigger {
   fire: () => void;
   /** Restore/clean up. Idempotent — safe to call from `finally` and signals. */
   revert: () => void;
+  /**
+   * The file-fingerprint `objectKey` (an absolute path) this trigger acts on —
+   * the key its create/delete events carry. Used by the `--use-workspace-daemon`
+   * retraction to erase those events after the run (issue #407).
+   */
+  objectKey: string;
+  /**
+   * True when verify itself brought this file into existence (a scratch sibling,
+   * or a literal watched file that did not exist) and removes it on revert — so
+   * BOTH its create and its delete events are pure verify artifacts, safe to
+   * retract wholesale. False when editing a pre-existing watched file, whose
+   * events reference real user content and must never be retracted.
+   */
+  synthetic: boolean;
 }
 
 const PROGRESS_INTERVAL_MS = 2_500;
@@ -147,6 +162,8 @@ function buildAutoTrigger(
     const target = deriveScratchTriggerPath(patternGlob, baseDir, token);
     let created = false;
     return {
+      objectKey: target,
+      synthetic: true,
       describe: `wrote scratch file ${path.relative(workspace, target) || target}`,
       fire: () => {
         // The glob's static directory prefix normally already exists; create it
@@ -172,6 +189,11 @@ function buildAutoTrigger(
   const original = existed ? readFileSync(target) : null;
   let mutated = false;
   return {
+    objectKey: target,
+    // A file verify *created* (did not exist before) is a pure artifact — safe
+    // to retract. A pre-existing file that verify edits and restores is real
+    // user content; its events must not be retracted.
+    synthetic: !existed,
     describe: existed
       ? `edited watched file ${path.relative(workspace, target) || target} (restored on exit)`
       : `created watched file ${path.relative(workspace, target) || target}`,
@@ -453,11 +475,20 @@ interface RunOptions {
   budget: VerifyBudget;
   detectCapMs: number;
   manual: boolean;
+  /**
+   * When true the run targets the persistent workspace daemon (which outlives
+   * verify), so verify must retract the events its own scratch file generated —
+   * otherwise its teardown deletion surfaces to a later session (issue #407). In
+   * the default isolated mode the daemon + db are torn down, so no retraction is
+   * needed.
+   */
+  useWorkspaceDaemon: boolean;
 }
 
 /** The core orchestration once a monitor is resolved and a daemon is reachable. */
 async function runVerification(opts: RunOptions): Promise<VerifyResult> {
   const { monitor, workspace, daemon, budget, detectCapMs, manual } = opts;
+  const { useWorkspaceDaemon } = opts;
   const startedAt = Date.now();
   const stages: Stage[] = [];
   const token = randomBytes(6).toString('hex');
@@ -744,6 +775,23 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
       status: 'pass',
       detail: `claimed at ${lifecycle}`,
     });
+
+    // #407: the workspace daemon outlives this run, so the scratch file's
+    // create/delete events would otherwise reach a later session — its teardown
+    // deletion is observed as a real change and delivered first, ahead of the
+    // user's actual change. Retract both events now, scoped to verify's OWN
+    // synthetic object. Isolated mode needs none of this: its daemon + db are
+    // torn down. A non-synthetic trigger (verify editing a real watched file) is
+    // never retracted — those events reference real user content.
+    if (useWorkspaceDaemon && trigger?.synthetic) {
+      await retractScratchEvents(
+        trigger,
+        monitor.id,
+        workspace,
+        daemon,
+        Date.now() + detectCapMs,
+      );
+    }
     return finalize({ ok: true, stages, additionalContext });
   } catch (error) {
     if (error instanceof DaemonDied) {
@@ -804,6 +852,46 @@ async function claimAndRender(
   }
   const output = renderHookDelivery(claim, hookEventName, { moreDeferred });
   return output?.hookSpecificOutput.additionalContext ?? null;
+}
+
+/**
+ * Retract the events verify's own scratch file produced against a PERSISTENT
+ * workspace daemon (issue #407). Deletes the scratch file now, waits (bounded by
+ * `deadline`) for the daemon to materialize the resulting deletion event — the
+ * object's second event, after the create — then retracts every event keyed to
+ * the scratch path across all sessions, so no later session sees a spurious
+ * `File deleted: agentmonitors-verify-…` ahead of the user's real change.
+ *
+ * Best-effort on the wait: if the deletion is not observed within the budget the
+ * create event is still retracted (so at minimum the create never lingers). The
+ * count-based signal (a second event for this object) is decoupled from the
+ * source's event title/payload shape and immune to timestamp granularity.
+ */
+async function retractScratchEvents(
+  trigger: Trigger,
+  monitorId: string,
+  workspace: string,
+  daemon: IsolatedDaemon,
+  deadline: number,
+): Promise<void> {
+  const { objectKey } = trigger;
+  // Delete the scratch file (idempotent — the `finally` revert becomes a no-op).
+  trigger.revert();
+  progress('cleaning up the verify artifact and retracting its events…');
+  // Wait until the daemon has observed the deletion and materialized its event
+  // (the object now has both a create and a delete row), so the retract erases
+  // both. On timeout, fall through and retract whatever exists.
+  await pollUntil(deadline, daemon, async () => {
+    const events = await listEventsClient(
+      { objectKey, workspacePath: workspace },
+      daemon.socketPath,
+    );
+    return events.length >= 2 ? true : null;
+  });
+  await retractObjectEventsClient(
+    { monitorId, objectKey, workspacePath: workspace },
+    daemon.socketPath,
+  );
 }
 
 /** Reverts registered for crash-safe cleanup (SIGINT/SIGTERM). */
@@ -914,6 +1002,7 @@ export const verifyCommand = new Command('verify')
           budget,
           detectCapMs,
           manual: options.manual === true,
+          useWorkspaceDaemon: options.useWorkspaceDaemon === true,
         });
 
         console.log(json ? renderVerifyJson(result) : renderVerifyText(result));

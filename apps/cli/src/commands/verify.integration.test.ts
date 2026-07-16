@@ -9,8 +9,14 @@
  *
  * @see docs/specs/005-cli-reference.md §16
  */
-import { execFileSync, type ExecFileSyncOptions } from 'node:child_process';
 import {
+  execFileSync,
+  spawn,
+  type ChildProcess,
+  type ExecFileSyncOptions,
+} from 'node:child_process';
+import {
+  appendFileSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -19,6 +25,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 
 const CLI_PATH = path.resolve(__dirname, '../../dist/index.cjs');
@@ -271,4 +278,228 @@ describe('agentmonitors verify', () => {
     expect(result.stderr).toContain('one');
     expect(result.stderr).toContain('two');
   });
+});
+
+/**
+ * Issue #407: `verify --use-workspace-daemon` targets the persistent workspace
+ * daemon and leaves it running, so — unlike the isolated default — its own
+ * scratch trigger file lives on the daemon's watched tree. Pre-fix, verify's
+ * teardown DELETED that scratch file, the daemon observed the deletion as a real
+ * change, and a later session's `hook deliver`/`events list` saw a spurious
+ * `File deleted: …/agentmonitors-verify-….md` FIRST, ahead of the user's real
+ * change. The fix retracts every event verify's own scratch file produced
+ * (create AND delete), scoped to that synthetic path only.
+ *
+ * This test drives the REAL failure shape: a persistent daemon, a lead session
+ * open across the whole run (so verify's scratch events project into it), then
+ * an assertion that after the run no event references the scratch path — while a
+ * genuine change made afterward IS still delivered (no over-suppression).
+ */
+describe('agentmonitors verify --use-workspace-daemon (issue #407)', () => {
+  let tempDir: string;
+
+  const CLI = ['node', CLI_PATH] as const;
+
+  /** Run a CLI command with the given socket/db env against a workspace daemon. */
+  function runWs(
+    args: string[],
+    cwd: string,
+    env: Record<string, string>,
+  ): RunResult {
+    const opts: ExecFileSyncOptions = { encoding: 'utf-8', env, cwd };
+    try {
+      const stdout = execFileSync(CLI[0], [CLI[1], ...args], opts) as string;
+      return { stdout, stderr: '', exitCode: 0 };
+    } catch (err) {
+      const e = err as { stdout: string; stderr: string; status: number };
+      return {
+        stdout: (e.stdout ?? '') as string,
+        stderr: (e.stderr ?? '') as string,
+        exitCode: e.status ?? 1,
+      };
+    }
+  }
+
+  beforeAll(() => {
+    tempDir = mkdtempSync(path.join(tmpdir(), 'verify-ws-'));
+  });
+
+  afterAll(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('leaves NO scratch-file event for a later session, but still delivers a real change afterward', async () => {
+    // Per-attempt isolation: a unique workspace + socket dir so a retry never
+    // collides with a leaked socket/db from a prior attempt.
+    const ws = mkdtempSync(path.join(tempDir, 'proof-'));
+    // A dedicated short dir for the Unix socket keeps it well under the AF_UNIX
+    // ~104-char path limit regardless of the OS temp root's depth.
+    const socketDir = mkdtempSync(path.join(tmpdir(), 'amw-'));
+    // Pin BOTH the socket and db so the spawned daemon and every CLI call —
+    // including verify's `--use-workspace-daemon` resolution — agree on one
+    // persistent daemon we control and tear down.
+    const env: Record<string, string> = {
+      ...(Object.fromEntries(
+        Object.entries(process.env).filter(([, v]) => v !== undefined),
+      ) as Record<string, string>),
+      AGENTMONITORS_SOCKET: path.join(socketDir, 'd.sock'),
+      AGENTMONITORS_DB: path.join(socketDir, 'verify.db'),
+    };
+
+    // Enable the workspace so `--use-workspace-daemon` targets its daemon.
+    expect(runWs(['init', '--enable-only'], ws, env).exitCode).toBe(0);
+    // A normal-urgency 1s file-fingerprint monitor: fast, and delivery via the
+    // post-compact recap avoids the 15s high-urgency claim-settle window.
+    writeMonitor(
+      ws,
+      'docs-watch',
+      `name: Docs watch\nwatch:\n  type: file-fingerprint\n  globs:\n    - '*.md'\n  cwd: ${JSON.stringify(ws)}\n  interval: '1s'\nurgency: normal`,
+    );
+    writeFileSync(path.join(ws, 'readme.md'), 'hello', 'utf-8');
+
+    const monitorsDir = path.join(ws, '.claude', 'monitors');
+    // Start the persistent workspace daemon ourselves so a lead session can be
+    // open BEFORE verify's scratch events materialize (the real pollution shape)
+    // and so we control teardown. --reap-after-ms 0 keeps our session alive.
+    const daemon: ChildProcess = spawn(
+      CLI[0],
+      [
+        CLI[1],
+        'daemon',
+        'run',
+        monitorsDir,
+        '--workspace',
+        ws,
+        '--poll-ms',
+        '500',
+        '--reap-after-ms',
+        '0',
+      ],
+      { cwd: ws, env, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+
+    try {
+      let dstdout = '';
+      let dstderr = '';
+      daemon.stdout?.setEncoding('utf-8');
+      daemon.stderr?.setEncoding('utf-8');
+      daemon.stdout?.on('data', (c: string) => (dstdout += c));
+      daemon.stderr?.on('data', (c: string) => (dstderr += c));
+      const bootDeadline = Date.now() + 15_000;
+      while (
+        Date.now() < bootDeadline &&
+        !dstdout.includes('AgentMon daemon listening')
+      ) {
+        if (daemon.exitCode !== null) {
+          throw new Error(
+            `daemon exited early (${String(daemon.exitCode)}).\n${dstdout}\n${dstderr}`,
+          );
+        }
+        await delay(100);
+      }
+      expect(dstdout).toContain('AgentMon daemon listening');
+
+      // A lead session open for the whole run — verify's scratch create/delete
+      // events project into it, exactly as a user's session would receive them.
+      const sessionResult = runWs(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          'user-session',
+          '--workspace',
+          ws,
+          '--format',
+          'id',
+        ],
+        ws,
+        env,
+      );
+      expect(sessionResult.exitCode).toBe(0);
+      const sessionId = sessionResult.stdout.trim();
+      expect(sessionId).toBeTruthy();
+
+      // Run verify against the running workspace daemon (reused, not re-spawned).
+      const verifyResult = runWs(
+        [
+          'verify',
+          'docs-watch',
+          '--use-workspace-daemon',
+          '--workspace',
+          ws,
+          '--format',
+          'json',
+        ],
+        ws,
+        env,
+      );
+      const verifyReport = JSON.parse(verifyResult.stdout) as {
+        ok: boolean;
+        stages: { name: string; status: string }[];
+      };
+      expect(verifyReport.ok).toBe(true);
+      expect(verifyResult.exitCode).toBe(0);
+      // The scratch file itself is gone from disk (unchanged cleanup contract).
+      expect(scratchFiles(ws)).toHaveLength(0);
+
+      // ── Criterion 1 & 4: no scratch-file event survives for the session ────
+      // Retraction deletes the shared `monitor_events` rows, so ALL views (not
+      // just --unread) are clean. Pre-fix, this listing contained a
+      // `File deleted: …/agentmonitors-verify-….md` (and a create) event.
+      const afterVerify = runWs(
+        ['events', 'list', '--session', sessionId, '--format', 'json'],
+        ws,
+        env,
+      );
+      expect(afterVerify.exitCode).toBe(0);
+      expect(afterVerify.stdout).not.toContain('agentmonitors-verify-');
+      const eventsAfterVerify = JSON.parse(afterVerify.stdout) as unknown[];
+      expect(eventsAfterVerify).toHaveLength(0);
+
+      // ── Non-over-suppression: a REAL change afterward IS still delivered ───
+      appendFileSync(path.join(ws, 'readme.md'), '\na genuine edit\n', 'utf-8');
+      let realDelivered = false;
+      const realDeadline = Date.now() + 20_000;
+      while (Date.now() < realDeadline) {
+        const unread = runWs(
+          [
+            'events',
+            'list',
+            '--session',
+            sessionId,
+            '--unread',
+            '--format',
+            'json',
+          ],
+          ws,
+          env,
+        );
+        if (unread.exitCode === 0 && unread.stdout.includes('readme.md')) {
+          // The real change is delivered, and STILL no scratch artifact rode in.
+          expect(unread.stdout).not.toContain('agentmonitors-verify-');
+          realDelivered = true;
+          break;
+        }
+        await delay(400);
+      }
+      expect(realDelivered).toBe(true);
+    } finally {
+      // Tear the daemon down within the test so a retry starts clean.
+      runWs(['daemon', 'stop'], ws, env);
+      if (daemon.exitCode === null) {
+        daemon.kill('SIGTERM');
+        await new Promise<void>((resolve) => {
+          const t = globalThis.setTimeout(() => {
+            daemon.kill('SIGKILL');
+            resolve();
+          }, 3_000);
+          daemon.once('exit', () => {
+            globalThis.clearTimeout(t);
+            resolve();
+          });
+        });
+      }
+      rmSync(socketDir, { recursive: true, force: true });
+    }
+  }, 90_000);
 });

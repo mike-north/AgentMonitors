@@ -1507,6 +1507,85 @@ export class RuntimeStore {
   }
 
   /**
+   * Retract every durable trace of ONE object's events from a monitor: the
+   * shared `monitor_events` rows, their per-recipient `session_event_state`
+   * projections (across ALL sessions, not one), any `monitor_snapshots` captured
+   * for the object, and any `session_object_cursor` seeded for it. Scoped to a
+   * single `(monitorId, objectKey)` — and, when supplied, the caller's workspace,
+   * matched the same workspace-or-null way {@link listEvents} scopes.
+   *
+   * This is the retraction path `verify --use-workspace-daemon` uses to erase the
+   * create/delete events its OWN throwaway scratch file produced against the LIVE
+   * workspace daemon, so they never surface to a later session (issue #407). It
+   * is a targeted retraction of a KNOWN-synthetic object — a file verify itself
+   * created and deleted — NOT a general delivery-suppression path; never point it
+   * at a real monitored object.
+   *
+   * @returns the removed event ids and the (deduped) lead-session ids whose
+   *   projections were deleted, so the caller can refresh their hook-state.
+   */
+  retractObjectEvents(input: {
+    workspacePath?: string | null;
+    monitorId: string;
+    objectKey: string;
+  }): { removedEventIds: string[]; affectedSessionIds: string[] } {
+    const db = asInternalDb(this.db);
+    const conditions = [
+      eq(monitorEvents.monitorId, input.monitorId),
+      eq(monitorEvents.objectKey, input.objectKey),
+    ];
+    if (input.workspacePath !== undefined) {
+      const workspaceCondition =
+        input.workspacePath === null
+          ? isNull(monitorEvents.workspacePath)
+          : or(
+              eq(monitorEvents.workspacePath, input.workspacePath),
+              isNull(monitorEvents.workspacePath),
+            );
+      if (workspaceCondition) conditions.push(workspaceCondition);
+    }
+    const removedEventIds = db
+      .select({ id: monitorEvents.id })
+      .from(monitorEvents)
+      .where(and(...conditions))
+      .all()
+      .map((row) => row.id);
+    if (removedEventIds.length === 0) {
+      return { removedEventIds, affectedSessionIds: [] };
+    }
+    const affectedSessionIds = [
+      ...new Set(
+        db
+          .select({ sessionId: sessionEventState.sessionId })
+          .from(sessionEventState)
+          .where(inArray(sessionEventState.eventId, removedEventIds))
+          .all()
+          .map((row) => row.sessionId),
+      ),
+    ];
+    db.delete(sessionEventState)
+      .where(inArray(sessionEventState.eventId, removedEventIds))
+      .run();
+    db.delete(monitorSnapshots)
+      .where(inArray(monitorSnapshots.eventId, removedEventIds))
+      .run();
+    db.delete(monitorEvents)
+      .where(inArray(monitorEvents.id, removedEventIds))
+      .run();
+    // Cursors are keyed by object (not event id): drop any the projection seeded
+    // for this synthetic object so no stale baseline lingers for its path.
+    db.delete(sessionObjectCursor)
+      .where(
+        and(
+          eq(sessionObjectCursor.monitorId, input.monitorId),
+          eq(sessionObjectCursor.objectKey, input.objectKey),
+        ),
+      )
+      .run();
+    return { removedEventIds, affectedSessionIds };
+  }
+
+  /**
    * Apply the per-recipient `net` collapse to a recipient's candidate delivery
    * set at claim time (G10 PR-B, 002 §1.1.7).
    *

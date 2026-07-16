@@ -1390,6 +1390,34 @@ export class AgentMonitorRuntime {
   }
 
   /**
+   * Retract all durable events a single synthetic object produced, across every
+   * session they projected into (issue #407): removes the shared `monitor_events`
+   * rows, their per-recipient projections, snapshots, and seeded cursors, then
+   * refreshes each affected session's hook-state so its cached unread counts drop
+   * the retracted events.
+   *
+   * Used by `verify --use-workspace-daemon` to erase the create/delete events its
+   * own throwaway scratch file generated against the live workspace daemon, so a
+   * later session never sees a spurious `File deleted: agentmonitors-verify-…`.
+   * The caller MUST scope this to a file it itself created and deleted — never a
+   * real monitored object.
+   *
+   * @returns the number of `monitor_events` rows removed.
+   */
+  retractObjectEvents(input: {
+    workspacePath?: string | null;
+    monitorId: string;
+    objectKey: string;
+  }): number {
+    const { removedEventIds, affectedSessionIds } =
+      this.store.retractObjectEvents(input);
+    for (const sessionId of affectedSessionIds) {
+      this.refreshHookState(sessionId);
+    }
+    return removedEventIds.length;
+  }
+
+  /**
    * Claim the pending delivery for a session at a lifecycle point (002 §9).
    *
    * `maxEvents` bounds how many delivered events a **`turn-interruptible`

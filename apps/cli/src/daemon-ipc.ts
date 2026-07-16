@@ -49,6 +49,7 @@ const daemonMethodSchema = z.enum([
   'session.list',
   'events.list',
   'events.ack',
+  'events.retractObject',
   'hook.claim',
   'hook.preview',
   'hook.diagnose',
@@ -102,6 +103,11 @@ const eventsListParamsSchema = z.object({
 const eventsAckParamsSchema = z.object({
   sessionId: z.string(),
   eventIds: z.array(z.string()).optional(),
+});
+const eventsRetractObjectParamsSchema = z.object({
+  monitorId: z.string(),
+  objectKey: z.string(),
+  workspacePath: z.string().optional(),
 });
 const hookClaimParamsSchema = z.object({
   sessionId: z.string(),
@@ -658,6 +664,18 @@ function handleRequest(
         runtime.acknowledgeSession(params.sessionId, params.eventIds);
       }
       return Promise.resolve({ ok: true });
+    case 'events.retractObject': {
+      const params = eventsRetractObjectParamsSchema.parse(request.params);
+      return Promise.resolve({
+        removed: runtime.retractObjectEvents({
+          monitorId: params.monitorId,
+          objectKey: params.objectKey,
+          ...(params.workspacePath
+            ? { workspacePath: params.workspacePath }
+            : {}),
+        }),
+      });
+    }
     case 'hook.claim': {
       const params = hookClaimParamsSchema.parse(request.params);
       return Promise.resolve(

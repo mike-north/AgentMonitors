@@ -1720,6 +1720,15 @@ agentmonitors verify [monitor] [--dir <path>] [--workspace <path>] [--manual]
    `turn-interruptible` (previewing settled high events and packing them under the 4000-char cap
    exactly as `hook deliver` does), otherwise the `post-compact` recap — and render the same
    `additionalContext` a hook would inject.
+9. **Retract (`--use-workspace-daemon` only).** In the default isolated mode the throwaway daemon +
+   db are torn down, so verify's scratch file leaves no trace. Under `--use-workspace-daemon` the
+   daemon **persists**, so the scratch file's teardown deletion would otherwise be observed as a real
+   change and delivered to a later session as a spurious `File deleted: …/agentmonitors-verify-….md`
+   ahead of the user's real change (issue #407). To prevent that, verify deletes the scratch file,
+   waits for the daemon to materialize the resulting deletion event, then **retracts every event its
+   own scratch object produced** (the create AND the delete) across all sessions — scoped strictly to
+   that synthetic path. It never touches a real monitored change, and — because the scratch object is
+   a file verify itself created and deleted — never a pre-existing watched file it merely edited.
 
 If the daemon exits at any point, `verify` fails fast with a **`daemon-died`** verdict and prints the
 daemon's captured output — never an ambiguous empty result.

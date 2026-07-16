@@ -260,6 +260,167 @@ Handle it.
     expect(hookState.unread.high).toBe(1);
   });
 
+  // Issue #407: `verify --use-workspace-daemon` must retract the events its own
+  // scratch file produced against the persistent workspace daemon (a create AND
+  // a delete), so a later session never sees them. The retraction removes ONE
+  // object's events across EVERY session they projected into, and leaves every
+  // OTHER object's events untouched.
+  it('retractObjectEvents removes only the target object, across all sessions', () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const db = createDb(':memory:');
+    const runtime = new AgentMonitorRuntime(
+      new RuntimeStore(db),
+      new SourceRegistry(),
+      [claudeCodeAdapter],
+    );
+
+    const sessionA = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'retract-a',
+        workspacePath: rootDir,
+      }),
+    );
+    const sessionB = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'retract-b',
+        workspacePath: rootDir,
+      }),
+    );
+
+    const store = new RuntimeStore(db);
+    const scratchKey = path.join(rootDir, 'agentmonitors-verify-abc123.md');
+    const realKey = path.join(rootDir, 'readme.md');
+    const base = {
+      workspacePath: rootDir,
+      monitorId: 'docs-watch',
+      sourceName: 'file-fingerprint',
+      urgency: 'normal' as const,
+      body: '',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      queryScope: {},
+      tags: [],
+    };
+    // The synthetic scratch object: a create THEN a delete event (the exact
+    // pair verify's own trigger produces), both projecting to A and B.
+    store.insertEvent({
+      ...base,
+      title: `File created: ${scratchKey}`,
+      summary: `File created: ${scratchKey}`,
+      objectKey: scratchKey,
+      createdAt: new Date(Date.now() - 3_000),
+    });
+    store.insertEvent({
+      ...base,
+      title: `File deleted: ${scratchKey}`,
+      summary: `File deleted: ${scratchKey}`,
+      objectKey: scratchKey,
+      createdAt: new Date(Date.now() - 2_000),
+    });
+    // A real object's event that must SURVIVE the retraction.
+    store.insertEvent({
+      ...base,
+      title: `File changed: ${realKey}`,
+      summary: `File changed: ${realKey}`,
+      objectKey: realKey,
+      createdAt: new Date(Date.now() - 1_000),
+    });
+
+    // Both sessions see all three before retraction.
+    expect(runtime.listEvents({ sessionId: sessionA.id })).toHaveLength(3);
+    expect(runtime.listEvents({ sessionId: sessionB.id })).toHaveLength(3);
+
+    const removed = runtime.retractObjectEvents({
+      workspacePath: rootDir,
+      monitorId: 'docs-watch',
+      objectKey: scratchKey,
+    });
+    // Exactly the create + the delete were removed.
+    expect(removed).toBe(2);
+
+    // Both sessions now see ONLY the real object's event — no scratch events.
+    for (const session of [sessionA, sessionB]) {
+      const events = runtime.listEvents({ sessionId: session.id });
+      expect(events).toHaveLength(1);
+      expect(events[0]?.objectKey).toBe(realKey);
+      expect(events.some((e) => e.objectKey === scratchKey)).toBe(false);
+    }
+
+    // The session-less shared stream has no scratch events left either.
+    expect(
+      runtime.listEvents({
+        monitorId: 'docs-watch',
+        objectKey: scratchKey,
+        workspacePath: rootDir,
+      }),
+    ).toHaveLength(0);
+  });
+
+  // Negative: retraction is keyed by (monitorId, objectKey). A DIFFERENT monitor
+  // whose object happens to share the same key must be left completely intact —
+  // retraction must never over-reach across monitors.
+  it('retractObjectEvents is scoped to the monitor id (does not touch a namesake object of another monitor)', () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const db = createDb(':memory:');
+    const runtime = new AgentMonitorRuntime(
+      new RuntimeStore(db),
+      new SourceRegistry(),
+      [claudeCodeAdapter],
+    );
+
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'retract-scope',
+        workspacePath: rootDir,
+      }),
+    );
+
+    const store = new RuntimeStore(db);
+    const sharedKey = path.join(rootDir, 'shared.md');
+    const base = {
+      workspacePath: rootDir,
+      sourceName: 'file-fingerprint',
+      urgency: 'normal' as const,
+      body: '',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey: sharedKey,
+      queryScope: {},
+      tags: [],
+      createdAt: new Date(),
+    };
+    store.insertEvent({
+      ...base,
+      monitorId: 'monitor-one',
+      title: `File changed: ${sharedKey} (one)`,
+      summary: `File changed: ${sharedKey} (one)`,
+    });
+    store.insertEvent({
+      ...base,
+      monitorId: 'monitor-two',
+      title: `File changed: ${sharedKey} (two)`,
+      summary: `File changed: ${sharedKey} (two)`,
+    });
+
+    const removed = runtime.retractObjectEvents({
+      workspacePath: rootDir,
+      monitorId: 'monitor-one',
+      objectKey: sharedKey,
+    });
+    expect(removed).toBe(1);
+
+    // monitor-two's event with the SAME object key survives.
+    const survivors = runtime.listEvents({ sessionId: session.id });
+    expect(survivors).toHaveLength(1);
+    expect(survivors[0]?.monitorId).toBe('monitor-two');
+  });
+
   // Issue #338 (item 1): `events list --unread` filters on `acknowledgedAt IS
   // NULL` (002 §7), so it INCLUDES claimed-but-unacknowledged events — a
   // surprise for a debugger reading "unread" as "never seen". `listEvents()`
