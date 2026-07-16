@@ -70,14 +70,26 @@ const DAEMON_REMEDIATION =
 // `session list` is self-diagnosing: compare this value against
 // `agentmonitors session list`'s workspace column directly, rather than
 // guessing whether the two commands agree.
+//
+// The printed command wraps the JSON payload in shell single-quotes for
+// `echo`. `JSON.stringify` never emits an unescaped `'`, but the workspace
+// path it embeds can legitimately contain one (e.g. a macOS "Mike's Mac"
+// home directory) — so the payload itself can. `shellSingleQuote` closes the
+// quote, escapes the embedded `'`, and reopens it (the standard POSIX idiom)
+// so the printed command stays runnable verbatim regardless of the path.
+function shellSingleQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
 function leadSessionRemediation(workspacePath: string): string {
   // Build the manual stdin payload with JSON.stringify so the embedded path is
-  // correctly quoted; wrapped in shell single-quotes for `echo`.
+  // correctly quoted as JSON; shellSingleQuote then makes the whole payload
+  // safe to embed in the single-quoted shell string below.
   const manualPayload = JSON.stringify({
     session_id: 'manual-cli-session',
     cwd: workspacePath,
   });
-  return `Open a Claude Code session in this workspace — the SessionStart hook runs \`agentmonitors session start\`, which lazy-boots the daemon and registers a lead session automatically. To register one by hand (no plugin), pipe a hook payload to that same command: \`echo '${manualPayload}' | agentmonitors session start\`. Doctor searched for a lead session registered to workspace "${workspacePath}" — compare against \`agentmonitors session list\`.`;
+  return `Open a Claude Code session in this workspace — the SessionStart hook runs \`agentmonitors session start\`, which lazy-boots the daemon and registers a lead session automatically. To register one by hand (no plugin), pipe a hook payload to that same command: \`echo ${shellSingleQuote(manualPayload)} | agentmonitors session start\`. Doctor searched for a lead session registered to workspace "${workspacePath}" — compare against \`agentmonitors session list\`.`;
 }
 const NEVER_OBSERVED_REMEDIATION =
   'The daemon has not observed this monitor yet. Start it with `agentmonitors daemon run` (or wait for the next tick), then check `agentmonitors monitor history <id>`; `agentmonitors monitor test <path>` dry-runs it now.';

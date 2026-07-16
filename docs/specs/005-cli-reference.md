@@ -1505,12 +1505,12 @@ installed is the host's side), and performs no MCP/channel checks. It never fold
 agentmonitors doctor [--dir <path>] [--workspace <path>] [--socket <path>] [--format <text|json>]
 ```
 
-| Flag                 | Default                        | Description                                                                              |
-| -------------------- | ------------------------------ | ---------------------------------------------------------------------------------------- |
-| `--dir <path>`       | `<workspace>/.claude/monitors` | Directory containing monitor definitions                                                 |
-| `--workspace <path>` | current working dir            | Workspace to diagnose (session projection + event scoping); resolved to an absolute path |
-| `--socket <path>`    | resolved default               | Unix domain socket path for the daemon-reachability ping                                 |
-| `--format <format>`  | `text`                         | Output format: `text`, `json`                                                            |
+| Flag                 | Default                        | Description                                                                                         |
+| -------------------- | ------------------------------ | --------------------------------------------------------------------------------------------------- |
+| `--dir <path>`       | `<workspace>/.claude/monitors` | Directory containing monitor definitions                                                            |
+| `--workspace <path>` | current working dir            | Workspace to diagnose (session projection + event scoping); resolved to an absolute path            |
+| `--socket <path>`    | resolved default               | Unix domain socket path for the `doctor.report` RPC (also doubles as the daemon-reachability check) |
+| `--format <format>`  | `text`                         | Output format: `text`, `json`                                                                       |
 
 ### Transport and data source
 

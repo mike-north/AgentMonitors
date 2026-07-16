@@ -4890,6 +4890,73 @@ Handle it.
     }
   }, 30_000);
 
+  // --- Regression: printed remediation must be runnable even when the -------
+  // --- workspace path contains a single quote --------------------------------
+  // The pre-fix hint built its `echo '<payload>' | agentmonitors session start`
+  // command by interpolating `JSON.stringify(...)` directly between hard-coded
+  // shell single-quotes. `JSON.stringify` never escapes an embedded `'` (it's
+  // not special in JSON), so a workspace path containing one — e.g. a real
+  // macOS "Mike's Mac" home directory — closes the shell's quote early,
+  // producing a broken command a user could copy-paste straight into a syntax
+  // error. This test extracts the command doctor ACTUALLY PRINTS (not a
+  // hand-rebuilt copy of the fix) and executes it verbatim through `sh -c`,
+  // proving it is real, runnable shell.
+  it('prints a runnable remediation command even when the workspace path contains a single quote', async () => {
+    const dir = path.join(tempDir, "doctor-remediation-quote's-workspace");
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    writeDoctorMonitor(monitorsRoot, 'heartbeat', FIRING_SCHEDULE);
+
+    const dbPath = path.join(dir, 'agentmon.db');
+    const socketPath = doctorSocket('remediation-quote');
+    const env = { AGENTMONITORS_DB: dbPath, AGENTMONITORS_SOCKET: socketPath };
+    writeLocalState(dir, { enabled: true, socket: socketPath, db: dbPath });
+
+    const shimDir = makeAgentmonitorsShimDir();
+    try {
+      const before = runWithEnv(['doctor', '--workspace', dir], env, dir);
+
+      // Extract the printed `echo '...' | agentmonitors session start` span
+      // verbatim from doctor's remediation text.
+      const match = /`(echo .*?session start)`/.exec(before.stdout);
+      expect(match).not.toBeNull();
+      const printedCommand = match?.[1] ?? '';
+      // Sanity: doctor really is operating on this apostrophe-containing
+      // workspace — this occurrence is plain unescaped text (outside the
+      // shell-quoted echo span), so `dir` appears verbatim here.
+      expect(before.stdout).toContain(dir);
+      // The printed command must escape the embedded `'` via the POSIX
+      // close-escape-reopen idiom (`'\''`) rather than surfacing it raw and
+      // breaking the shell's quoting.
+      expect(printedCommand).toContain(`'\\''`);
+
+      const shellEnv = {
+        ...env,
+        PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ''}`,
+      };
+      const result = runPluginHookCommand(printedCommand, shellEnv, '', dir);
+
+      // Pre-fix, the extra unescaped `'` breaks the shell's quoting, which
+      // bash/sh reports as an unterminated-quote parse error rather than
+      // running `session start` at all.
+      expect(result.stderr).not.toMatch(
+        /unexpected EOF|unterminated quoted string/,
+      );
+      expect(result.exitCode).toBe(0);
+
+      // Proof it did the real thing: doctor's lead-session check now passes.
+      const after = runWithEnv(['doctor', '--workspace', dir], env, dir);
+      expect(after.stdout).toContain('✓ lead-session');
+    } finally {
+      try {
+        await callDaemon('stop', {}, { socketPath });
+      } catch {
+        // daemon never booted or already stopped — ignore.
+      }
+      rmSync(shimDir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   // --- Negative: a never-observed monitor (daemon + session present) --------
   it('fails the per-monitor check with a never-observed remediation for a monitor that has never been observed', async () => {
     const dir = path.join(tempDir, 'doctor-never-observed');
