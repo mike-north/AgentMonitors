@@ -354,7 +354,13 @@ Note: `tags` defaults to `[]` when absent; `notify` defaults to `null` when abse
 
 ### Exit codes
 
-Always exits 0 (parse errors are reported informatively, not as failures).
+Exits **0** on a clean scan — any number of valid monitors, or none — with an empty `errors` and
+empty `duplicateIds`, regardless of `--format` (issue #420). Exits **1** when the scan surfaces a
+genuine problem: a `MONITOR.md` that failed to parse (`errors` non-empty) or a duplicate monitor id
+(`duplicateIds` non-empty). This makes `scan && <next-step>` scripts meaningful — a non-zero exit
+signals a real config defect, not "scan ran." A missing or non-directory `[dir]` argument is caught
+earlier by the shared directory check and also exits 1. The parse/duplicate details are still
+printed informatively (not just as an exit code) so the specific offending file or id is visible.
 
 ---
 
@@ -556,6 +562,14 @@ agentmonitors monitor history [monitorId] [--socket <path>] [--workspace <path>]
 | `--workspace <path>` | current working dir | Opt-in row filter to one workspace's history (issue #345/#307) — also selects which workspace's daemon/db to reach (issue #374) |
 | `--limit <n>`        | `50`                | Maximum rows (newest first)                                                                                                     |
 | `--format`           | auto (see §1)       | `toon`, `text` (one row per line), or `json`                                                                                    |
+
+**`--dir` is intentionally NOT accepted here (issue #420 P5).** `init`, `validate`, and `monitor
+explain` take `--dir` for the **monitors directory** (`.claude/monitors`), whereas history scopes by
+`--workspace` (the **project root**) — two different directories. Rather than silently alias `--dir`
+to `--workspace` (which would resolve the wrong workspace, and thus the wrong socket/db, for a user
+who passes `--dir .claude/monitors` out of habit), the bare `error: unknown option '--dir'` gets a
+second stderr line pointing at the right flag: `monitor history scopes by --workspace (the project
+directory), not --dir.` The default error line and non-zero exit are unchanged.
 
 Each row reports `result` — `triggered` (≥1 observation became an event), `suppressed` (observations
 returned but none emitted this tick), `no-change` (the source returned nothing), `no-files-matched`
@@ -1060,8 +1074,16 @@ Code hook payload on stdin** (a JSON object — there is **no `CLAUDE_CODE_SESSI
 
 **Output:**
 
-- **Nothing pending** (a fresh start with no unread events) → **no output**.
-- **Compact-resume with unread events** → the `SessionStart` recap JSON on stdout (the `additionalContext` carries the unread events' bodies). This is the only `session …` subcommand that emits hook-wire JSON, so its stdout MUST stay clean (wire JSON only).
+- **stdout** — **Nothing pending** (a fresh start with no unread events) → **no stdout**.
+  **Compact-resume with unread events** → the `SessionStart` recap JSON on stdout (the
+  `additionalContext` carries the unread events' bodies). This is the only `session …` subcommand
+  that emits hook-wire JSON, so its stdout MUST stay clean (wire JSON only).
+- **stderr** — on successful registration, a one-line ack `AgentMon: session <id> registered;
+daemon at <socket>` (issue #420 P3). Silent success was a dead end that forced a hand-wiring user
+  to run a second `session list` just to confirm it worked. stderr keeps stdout wire-clean (the
+  Claude Code host never reads hook stderr), so this never disturbs the recap JSON. Not emitted on
+  the quick-exit paths (no `session_id`, monitoring not enabled) — only when a session is actually
+  registered.
 
 **Exit code (two layers):**
 
@@ -1085,6 +1107,11 @@ vars).
 1. Reads `.claude/agentmonitors.local.md`. If absent, `enabled: false`, or no `socket` field, exits silently.
 2. If the daemon is unreachable, exits silently.
 3. Calls `session.list` to find the runtime session whose `hostSessionId` matches the payload's `session_id`, then calls `session.close` on it.
+
+**Output:** stdout is always empty (this command has no wire output). On a successful close, a
+one-line ack `AgentMon: session <id> ended` is written to **stderr** (issue #420 P3), symmetric with
+`session start`'s registration ack. The quiet-return paths above (no `session_id`, not enabled, no
+socket, unreachable daemon, or no matching session) stay fully silent.
 
 After all sessions for a workspace are closed, the daemon's idle reaper will stop it within `reap-after-ms`.
 
@@ -1114,6 +1141,12 @@ agentmonitors events list --session <id> [options]
 | `--unread`            | boolean flag        | —                | Only unread events (unacknowledged — see note below) |
 | `--since-baseline`    | boolean flag        | —                | Only events since the session baseline               |
 | `--format <format>`   | choices             | auto (see §1)    | `toon`, `json`, `text`                               |
+
+**`--session` discovery (issue #420 P2).** `--session` is required, but a manual/no-docs user has
+no obvious way to find an id from the bare `error: required option '--session <id>' not specified`
+line. Both `events list` and `events ack` therefore append a second stderr line to that error —
+`Run \`agentmonitors session list\` to find a session id.`— and repeat the same pointer in`--help`'s trailing text. The default `error:` line and the non-zero exit are unchanged; the hint
+is strictly additive.
 
 **`--unread` matches "unacknowledged," not "never seen" (002 §7; issue #338 item 1).** It filters
 on `acknowledgedAt IS NULL`, which **includes** events already claimed at a delivery lifecycle but
@@ -1211,8 +1244,8 @@ or the workspace/session is not configured.
 
 **Behavior:**
 
-1. Read stdin as a JSON hook payload (TTY/empty/unparseable → `{}`; never hangs). If `session_id` is absent → exit 0, print nothing.
-2. Derive the lifecycle from `hook_event_name` (unless `--lifecycle` is passed). Non-context events (`PreToolUse`, `Stop`) → exit 0, print nothing.
+1. Read stdin as a JSON hook payload (TTY/empty/unparseable → `{}`; never hangs). If `session_id` is absent → exit 0, print nothing on stdout; ALSO write a one-line malformed-payload diagnostic to **stderr**, unconditionally (issue #420 P1; see §12.2.1).
+2. Derive the lifecycle from `hook_event_name` (unless `--lifecycle` is passed). If it maps to no delivery lifecycle (e.g. `PreToolUse`, `Stop`, a missing/unknown event) → exit 0, print nothing on stdout; ALSO write a one-line unmapped-lifecycle diagnostic to **stderr**, unconditionally (issue #420 P1; see §12.2.1).
 3. Read `.claude/agentmonitors.local.md` via `payload.cwd ?? CLAUDE_PROJECT_DIR ?? cwd`. If `!enabled` or no explicit socket → exit 0, print nothing.
 4. Check daemon availability. If unreachable → exit 0, print nothing.
 5. List sessions, find the one matching `session_id`. If not found → exit 0, print nothing on
@@ -1257,7 +1290,7 @@ wire JSON. The example below is pretty-printed for readability; the command emit
 `hookSpecificOutput.additionalContext` string, with no JSON wrapper. This format is for manual
 inspection; hook configurations should use the default/json wire output.
 
-#### §12.2.1 `--debug` diagnosis (issue #334) and the always-on unknown-session warning (issue #329)
+#### §12.2.1 `--debug` diagnosis (issue #334) and the always-on stderr diagnostics (issues #329, #420)
 
 Empty stdout + exit 0 is the command's contract both when nothing is pending **and** when the stdin
 payload is misconfigured (unknown session, workspace not enabled, urgency held) — indistinguishable
@@ -1266,21 +1299,37 @@ a flag (blind DX study S3 F3). `--debug` writes a parallel, step-by-step diagnos
 **stdout's contract does not change in any mode** — a hook wired without `--debug` behaves exactly as
 before, and running the identical payload with and without `--debug` produces byte-identical stdout.
 
-**The unresolved-`session_id` branch (§12.2 step 5) is the one exception, and does NOT require
-`--debug`.** Every other branch below resolves itself (the ~15s high-urgency claim-settle window) or
-is a genuinely idle, non-actionable state; an unresolvable `session_id` can never resolve, and its
-silent empty output is exactly what issue #329 reported as indistinguishable from that legitimate
-settle window. So step 5 always writes, unconditionally:
+**Three branches also write to stderr WITHOUT `--debug`.** Every other quiet-return branch resolves
+itself (the ~15s high-urgency claim-settle window) or is a genuinely idle, non-actionable state.
+These three cannot: they can never resolve on their own, and their silent empty output is
+indistinguishable from "nothing pending." So each writes exactly one line to stderr, unconditionally
+— **stdout and the exit code are unaffected in all three**:
 
-```text
-hook deliver: no session registered for host session id "<id>"
-```
+- **Malformed / non-hook payload** (step 1 — no `session_id`; issue #420 P1):
 
-to stderr — stdout and the exit code are unaffected. `<id>` comes from untrusted stdin, so it is
-JSON-string-escaped — including DEL, the C1 controls (U+0080–U+009F), and the U+2028/U+2029
-line/paragraph separators, which `JSON.stringify` alone leaves raw — so no control or
-line-breaking code point can reach the terminal raw, and truncated at 128 characters — at a
-code-point boundary, never splitting a surrogate pair — with a trailing `…`.
+  ```text
+  hook deliver: no session_id in the stdin payload — expected a Claude Code hook JSON payload on stdin; nothing delivered.
+  ```
+
+- **Unmapped lifecycle** (step 2 — `hook_event_name` maps to no delivery lifecycle; issue #420 P1):
+
+  ```text
+  hook deliver: hook_event_name "<name>" does not map to a delivery lifecycle (only UserPromptSubmit, PostToolUse, and SessionStart do); nothing delivered.
+  ```
+
+- **Unresolvable `session_id`** (step 5; issue #329):
+
+  ```text
+  hook deliver: no session registered for host session id "<id>"
+  ```
+
+The plugin only wires `hook deliver` into `UserPromptSubmit` with a well-formed payload, so none of
+these fire in normal operation — only on the manual/no-docs path these diagnostics exist to unblock.
+Untrusted stdin values in these lines (`<name>`, `<id>`) are JSON-string-escaped — including DEL,
+the C1 controls (U+0080–U+009F), and the U+2028/U+2029 line/paragraph separators, which
+`JSON.stringify` alone leaves raw — so no control or line-breaking code point can reach the terminal
+raw, and truncated at 128 characters — at a code-point boundary, never splitting a surrogate pair —
+with a trailing `…`.
 Every other quiet-return branch stays silent by default; use `--debug` for those.
 
 Each `--debug` line is prefixed `agentmonitors hook deliver --debug:` for easy filtering (a

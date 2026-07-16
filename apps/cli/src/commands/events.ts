@@ -10,6 +10,20 @@ import {
   manualDaemonErrorMessage,
   resolveManualDaemonSocketPath,
 } from '../manual-daemon.js';
+import { appendErrorHints } from '../command-hints.js';
+
+/**
+ * Both `events list` and `events ack` require `--session`, an id the user has
+ * no obvious way to discover from the bare `error: required option ...` line
+ * (issue #420 P2). Point them at `session list`, and note the same in
+ * `--help`.
+ */
+const SESSION_DISCOVERY_HINT =
+  'Run `agentmonitors session list` to find a session id.';
+const REQUIRED_SESSION_ERROR_HINT = {
+  pattern: /required option '--session/,
+  hint: SESSION_DISCOVERY_HINT,
+} as const;
 
 function parseScope(scope?: string): Record<string, string> | undefined {
   if (!scope) return undefined;
@@ -33,7 +47,7 @@ export const eventsCommand = new Command('events').description(
   'Query or acknowledge runtime events',
 );
 
-eventsCommand
+const eventsListCommand = eventsCommand
   .command('list')
   .description('List events for a session')
   .requiredOption('--session <id>', 'AgentMon session id (required)')
@@ -113,9 +127,11 @@ eventsCommand
         );
       }
     },
-  );
+  )
+  .addHelpText('after', `\n${SESSION_DISCOVERY_HINT}`);
+appendErrorHints(eventsListCommand, [REQUIRED_SESSION_ERROR_HINT]);
 
-eventsCommand
+const eventsAckCommand = eventsCommand
   .command('ack')
   .description('Acknowledge one or more events for a session')
   .requiredOption('--session <id>', 'AgentMon session id (required)')
@@ -145,4 +161,6 @@ eventsCommand
         reportError(manualDaemonErrorMessage(error), false);
       }
     },
-  );
+  )
+  .addHelpText('after', `\n${SESSION_DISCOVERY_HINT}`);
+appendErrorHints(eventsAckCommand, [REQUIRED_SESSION_ERROR_HINT]);

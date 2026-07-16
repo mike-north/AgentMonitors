@@ -18,6 +18,15 @@ export const scanCommand = new Command('scan')
 
     const result = await scanMonitors(dir);
 
+    // Make the exit code meaningful for `scan && next-step` scripts (issue #420
+    // P4): non-zero ONLY for a genuine scan problem — a file that failed to
+    // parse or a duplicate monitor id. A clean scan (any number of valid
+    // monitors, or none) exits 0, regardless of output format. Missing/invalid
+    // scan directories are already handled above by `requireDirectory`.
+    if (result.errors.length > 0 || result.duplicateIds.length > 0) {
+      process.exitCode = 1;
+    }
+
     if (format === 'json' || format === 'toon') {
       const output = {
         monitors: result.monitors.map((m) => ({

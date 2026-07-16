@@ -16,6 +16,7 @@ import {
 import { registerCoreSources } from '../sources.js';
 import { reportError } from '../output.js';
 import { requireFile } from '../validation.js';
+import { appendErrorHints } from '../command-hints.js';
 import { renderToon, resolveFormat } from '../toon-format.js';
 import { DaemonConnectionError } from '../daemon-ipc.js';
 import { resolveManualDaemonSocketPath } from '../manual-daemon.js';
@@ -637,7 +638,7 @@ monitorTestCommand
     },
   );
 
-monitorTestCommand
+const monitorHistoryCommand = monitorTestCommand
   .command('history')
   .description(
     'Show recent observation outcomes per tick (triggered / suppressed / no-change / no-files-matched / errored / rebaselined)',
@@ -764,3 +765,17 @@ monitorTestCommand
       }
     },
   );
+// `monitor history` scopes by workspace, not by a monitors directory, so it has
+// no `--dir` flag — but `init`/`validate`/`monitor explain` all take `--dir` for
+// the (different) monitors directory, so a user reasonably reaches for `--dir`
+// here and hits a bare `unknown option` error (issue #420 P5). We deliberately
+// do NOT alias `--dir` to `--workspace`: `--dir` means the `.claude/monitors`
+// directory elsewhere, while `--workspace` is the project root, so a silent
+// alias would resolve the wrong workspace (and wrong socket/db) for a user who
+// passes `--dir .claude/monitors`. Instead, point them at the right flag.
+appendErrorHints(monitorHistoryCommand, [
+  {
+    pattern: /unknown option '--dir'/,
+    hint: 'monitor history scopes by --workspace (the project directory), not --dir.',
+  },
+]);

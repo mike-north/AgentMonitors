@@ -235,7 +235,14 @@ A few flags worth knowing:
   appendix below for the one-time opt-in. Because that daemon persists, `verify` cleans up its own
   scratch file so the throwaway change never surfaces to a real session; it does this without
   waiting, so this mode finishes in about the same time as a plain `verify`, and an interrupted run
-  leaves nothing stray behind.
+  leaves nothing stray behind. **Note:** `verify`'s own synthetic trigger is a scratch
+  probe — its PASS is _not_ persisted as a durable event, so it will not appear in
+  `agentmonitors events list` or `agentmonitors doctor`'s event counts. `verify` proves delivery
+  end-to-end (that's what the PASS line and the printed `additionalContext` demonstrate), but if
+  you want a durable, queryable artifact a reviewer can inspect _after_ the run, make one **real**
+  edit to a watched file and let a live session deliver it — or run `agentmonitors hook deliver`
+  yourself (see the appendix) — and screenshot the resulting `events list` entry alongside the
+  `verify` PASS.
 - **`--timeout-ms`** — overrides the derived post-trigger detection budget, if you need more time
   than what `verify` estimates.
 
@@ -409,7 +416,11 @@ the real setup an actual agent session would use, start a daemon on the workspac
 **For a stakeholder-presentable proof**, don't screenshot this appendix's isolated-socket output —
 it's throwaway and proves the mechanism, not the live setup. Use
 `agentmonitors verify --use-workspace-daemon` instead (see "Prove it, right now" above) and
-screenshot its PASS output alongside `doctor`'s all-green summary.
+screenshot its PASS output alongside `doctor`'s all-green summary. If the reviewer wants a
+_durable, queryable_ artifact rather than the transient PASS — `verify`'s synthetic trigger is a
+scratch probe and is not persisted as an event — make one real edit to a watched file and deliver
+it (step (c) above, or a live session), then screenshot the resulting `agentmonitors events list
+--session <id>` entry too.
 
 For the same proof wired through the real Claude Code plugin instead of a manual socket, see
 [Notify your agent when a file changes](/docs/notify-when-a-file-changes).
