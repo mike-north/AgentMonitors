@@ -90,6 +90,33 @@ const MAX_RECAP_EVENTS = 10;
  * deterministic tests.
  */
 const DEFAULT_SESSION_DORMANCY_MS = 30 * 60 * 1_000;
+
+/**
+ * The `hostSessionId` prefix `verify` gives its throwaway lead session
+ * (`agentmonitors-verify-<token>`). The reap backstop (issue #414) uses it to
+ * recognize an orphaned verify session left by an uncatchably-killed
+ * `--use-workspace-daemon` run and clean up its scratch events.
+ */
+const VERIFY_SESSION_ID_PREFIX = 'agentmonitors-verify-';
+
+/**
+ * TTL (issue #414) for the tombstone the reap backstop installs over an orphaned
+ * verify run's scratch object — long enough for a not-yet-materialized deletion
+ * to appear and be swept, short enough to leave nothing lingering.
+ */
+const ORPHANED_VERIFY_SUPPRESSION_TTL_MS = 5 * 60 * 1_000;
+
+/**
+ * True when `objectKey`'s basename is a `verify` scratch file
+ * (`agentmonitors-verify-<token>[.ext]`) — a synthetic path verify created and
+ * deleted, which no real monitored object ever carries (issue #414). Gates the
+ * reap backstop's by-key retraction so it can only ever erase verify's own
+ * artifacts, never a real event at a genuine watched path.
+ */
+function isVerifyScratchObjectKey(objectKey: string): boolean {
+  const basename = objectKey.split('/').pop() ?? objectKey;
+  return /^agentmonitors-verify-[0-9a-f]{12}(\..*)?$/.test(basename);
+}
 const EXPLAIN_STAGE_LABELS: Record<MonitorExplainStageId, string> = {
   definition: 'Definition',
   scheduling: 'Scheduling',
@@ -242,7 +269,7 @@ function effectiveObservationUrgency(
   // The cast to `Urgency | undefined` is intentional: at compile time
   // `MonitorFrontmatter.urgencyMax` is always `Urgency`, but pre-upgrade
   // deserialized JSON may lack the field entirely.
-  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+
   const hi = (monitor.frontmatter.urgencyMax as Urgency | undefined) ?? lo;
   const desired = observation.salience ?? lo;
   const rank = Math.min(
@@ -285,7 +312,7 @@ function hydrateStoredObservationEnvelope(
     // The cast to `Urgency | undefined` is intentional: at compile time
     // `StoredObservationEnvelope.effectiveUrgency` is always `Urgency`, but
     // pre-upgrade deserialized JSON may lack the field entirely.
-    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+
     effectiveUrgency:
       (envelope.effectiveUrgency as Urgency | undefined) ??
       effectiveObservationUrgency(envelope.monitor, envelope.observation),
@@ -685,11 +712,67 @@ export class AgentMonitorRuntime {
       workspacePath,
       staleBefore,
     )) {
+      // #414 backstop: a `verify --use-workspace-daemon` run killed uncatchably
+      // (SIGKILL/crash) before it could clean up leaves an `active` verify
+      // session AND its scratch file's create/delete events — the exact stray
+      // state issue #414 forbids. When we reap such a session, tombstone + retract
+      // its synthetic scratch objects too, so nothing it left reaches a later
+      // session. Captured BEFORE the close (projections persist, but read first).
+      const scratchObjects = session.hostSessionId.startsWith(
+        VERIFY_SESSION_ID_PREFIX,
+      )
+        ? this.verifyScratchObjectsForSession(session.id)
+        : [];
       // Reuse closeSession so the dormancy transition and an explicit close
       // share ONE path (status → dormant, ephemeral monitors reaped, hook state
       // refreshed).
       this.closeSession(session.id);
+      for (const object of scratchObjects) {
+        this.suppressObjectEvents({
+          monitorId: object.monitorId,
+          objectKey: object.objectKey,
+          workspacePath: object.workspacePath,
+          ttlMs: ORPHANED_VERIFY_SUPPRESSION_TTL_MS,
+          now,
+        });
+      }
     }
+  }
+
+  /**
+   * The distinct synthetic scratch objects (`agentmonitors-verify-<token>…`) an
+   * orphaned verify session projected events for (issue #414). Used by the reap
+   * backstop above to tombstone+retract them. Matching is by the well-known
+   * scratch-file basename, which no real monitored object ever carries, so the
+   * subsequent by-key retraction can never touch real events.
+   */
+  private verifyScratchObjectsForSession(sessionId: string): {
+    monitorId: string;
+    objectKey: string;
+    workspacePath: string | null;
+  }[] {
+    const seen = new Set<string>();
+    const objects: {
+      monitorId: string;
+      objectKey: string;
+      workspacePath: string | null;
+    }[] = [];
+    for (const event of this.store.listEvents({ sessionId })) {
+      if (
+        event.objectKey === null ||
+        !isVerifyScratchObjectKey(event.objectKey)
+      )
+        continue;
+      const key = `${event.monitorId}::${event.objectKey}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      objects.push({
+        monitorId: event.monitorId,
+        objectKey: event.objectKey,
+        workspacePath: event.workspacePath ?? null,
+      });
+    }
+    return objects;
   }
 
   listSessions(): AgentSessionRecord[] {
@@ -1420,6 +1503,82 @@ export class AgentMonitorRuntime {
   }
 
   /**
+   * Install a durable, self-expiring tombstone for a synthetic object key and
+   * retract any events it already has, so a `verify --use-workspace-daemon` run
+   * can prove delivery and then clean up its OWN scratch file WITHOUT blocking a
+   * full poll interval for the file's deletion to re-materialize (issue #414 —
+   * the #407 wait doubled verify's runtime). verify calls this the instant it has
+   * proven delivery: the create event is retracted now, and the tombstone makes
+   * the daemon auto-retract the pending `File deleted: agentmonitors-verify-…` on
+   * the very tick it appears (see {@link applyObjectSuppressions}), before any
+   * later session can observe it — preserving #407's no-leak guarantee.
+   *
+   * MUST only target a synthetic object key no real monitored file shares
+   * (verify's `…/agentmonitors-verify-<token><ext>` scratch path): the retraction
+   * and the daemon-side sweep both delete BY KEY, so a real event at a genuine
+   * watched path must never be passed here.
+   *
+   * @returns the number of already-materialized events retracted immediately.
+   */
+  suppressObjectEvents(input: {
+    workspacePath?: string | null;
+    monitorId: string;
+    objectKey: string;
+    /** How long the tombstone stays active (ms) before the daemon purges it. */
+    ttlMs: number;
+    now?: Date;
+  }): number {
+    const now = input.now ?? new Date();
+    this.store.upsertObjectSuppression({
+      monitorId: input.monitorId,
+      objectKey: input.objectKey,
+      ...(input.workspacePath !== undefined
+        ? { workspacePath: input.workspacePath }
+        : {}),
+      createdAt: now,
+      expiresAt: new Date(now.getTime() + input.ttlMs),
+    });
+    const { removedEventIds, affectedSessionIds } =
+      this.store.retractObjectEventsByKey({
+        monitorId: input.monitorId,
+        objectKey: input.objectKey,
+        ...(input.workspacePath !== undefined
+          ? { workspacePath: input.workspacePath }
+          : {}),
+      });
+    for (const sessionId of affectedSessionIds) {
+      this.refreshHookState(sessionId);
+    }
+    return removedEventIds.length;
+  }
+
+  /**
+   * Runtime-tick sweep (issue #414): retract any events whose object key is under
+   * an active {@link objectEventSuppressions} tombstone, then purge expired
+   * tombstones. Runs at the END of every {@link tick}, so a scratch file's
+   * deletion event — materialized earlier in the SAME tick — is erased before the
+   * tick returns and thus before any later session can claim it. Purging on the
+   * same pass means an interrupted verify run (or a delete that never came)
+   * leaves nothing permanent once its short TTL lapses.
+   */
+  private applyObjectSuppressions(now: Date, workspacePath: string): void {
+    for (const suppression of this.store.activeObjectSuppressions(
+      workspacePath,
+      now,
+    )) {
+      const { affectedSessionIds } = this.store.retractObjectEventsByKey({
+        monitorId: suppression.monitorId,
+        objectKey: suppression.objectKey,
+        workspacePath: suppression.workspacePath,
+      });
+      for (const sessionId of affectedSessionIds) {
+        this.refreshHookState(sessionId);
+      }
+    }
+    this.store.purgeExpiredObjectSuppressions(now);
+  }
+
+  /**
    * Claim the pending delivery for a session at a lifecycle point (002 §9).
    *
    * `maxEvents` bounds how many delivered events a **`turn-interruptible`
@@ -1837,6 +1996,13 @@ export class AgentMonitorRuntime {
         });
       }
     }
+
+    // Object-event suppression sweep (issue #414): retract any events whose key
+    // is under an active tombstone — crucially a scratch file's deletion event,
+    // materialized above in THIS tick, is erased before the tick returns (so no
+    // later session ever claims it) — then purge expired tombstones. Runs after
+    // evaluation but before session refresh so the refresh reflects the removals.
+    this.applyObjectSuppressions(now, workspacePath);
 
     this.refreshWorkspaceSessions(workspacePath);
 
