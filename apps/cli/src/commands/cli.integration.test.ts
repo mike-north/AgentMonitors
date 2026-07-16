@@ -16,6 +16,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
+import net from 'node:net';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
@@ -351,6 +352,43 @@ async function startDaemon(
   throw new Error(
     `Timed out waiting for daemon startup.\nSTDOUT:\n${stdout}\nSTDERR:\n${stderr}`,
   );
+}
+
+/**
+ * Stands in for an OLD daemon build that predates a method the CLI now sends
+ * (e.g. `doctor.report`, issue #382): its own request schema rejects the
+ * request, so it can only reply with the legacy unparseable-request sentinel
+ * `{ id: 'invalid', error: 'Invalid JSON request.' }` for EVERY request,
+ * regardless of what was actually sent. Used to prove `doctor` falls back to
+ * reading persisted state instead of crashing on this exact string.
+ */
+function startLegacyUnsupportedDaemon(socketPath: string): {
+  close: () => Promise<void>;
+} {
+  const server = net.createServer((socket) => {
+    let buffer = '';
+    socket.setEncoding('utf-8');
+    socket.on('data', (chunk) => {
+      buffer += chunk;
+      if (!buffer.includes('\n')) return;
+      socket.end(
+        `${JSON.stringify({ id: 'invalid', error: 'Invalid JSON request.' })}\n`,
+      );
+    });
+  });
+  server.listen(socketPath);
+  return {
+    close: () =>
+      new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      }),
+  };
 }
 
 let tempDir: string;
@@ -4629,6 +4667,118 @@ Handle it.
     expect(result.stdout).toMatch(
       /Summary: \d+ passed, 0 failed, 0 skipped, 2 idle\./,
     );
+  });
+
+  // --- Negative: version-skew daemon (issue #382) ---------------------------
+  // A still-running OLDER daemon build predates `doctor.report` (or any method
+  // added after it shipped): its own request schema rejects the request, so it
+  // can only ever answer with the legacy unparseable-request sentinel
+  // (`{ id: 'invalid', error: 'Invalid JSON request.' }`). Pre-fix, `doctor`
+  // rethrew that string as a fatal crash instead of falling back to reading
+  // persisted state — this proves the fallback now works and the raw sentinel
+  // text never reaches the user.
+  it('falls back to persisted state without crashing when the daemon rejects doctor.report as unsupported (version skew)', async () => {
+    const dir = path.join(tempDir, 'doctor-version-skew');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    writeDoctorMonitor(monitorsRoot, 'heartbeat', FIRING_SCHEDULE);
+    writeLocalState(dir, { enabled: true });
+
+    const dbPath = path.join(dir, 'agentmon.db');
+    const socketPath = doctorSocket('version-skew');
+    const env = { AGENTMONITORS_DB: dbPath, AGENTMONITORS_SOCKET: socketPath };
+
+    // Materialize an observation + event into the file DB in-process, exactly
+    // like the "daemon down" test above — this is the persisted state the
+    // fallback must read once it gives up on the (fake, old) live daemon.
+    const once = runWithEnv(
+      ['daemon', 'once', monitorsRoot, '--workspace', dir],
+      env,
+      dir,
+    );
+    expect(once.exitCode).toBe(0);
+
+    const legacyDaemon = startLegacyUnsupportedDaemon(socketPath);
+    try {
+      const result = runWithEnv(['doctor', '--workspace', dir], env, dir);
+
+      // The literal string a pre-fix `doctor` crashed with must never reach
+      // the user — it must be caught and classified, not rethrown verbatim.
+      expect(result.stdout).not.toContain('Invalid JSON request.');
+      expect(result.stderr).not.toContain('Invalid JSON request.');
+      expect(result.exitCode).toBe(0);
+      // No lead session was opened, so daemon-reachable and lead-session are
+      // both `idle`, same as the "daemon down" scenario above — an old,
+      // incompatible daemon is treated the same as an unreachable one.
+      expect(result.stdout).toContain('◇ daemon-reachable');
+      expect(result.stdout).not.toContain('✗ daemon-reachable');
+      expect(result.stdout).toContain('showing persisted state');
+      // The rollup is still shown from the last tick, proving the fallback
+      // actually read real persisted state rather than failing silently.
+      expect(result.stdout).toContain('monitor:heartbeat');
+      expect(result.stdout).not.toContain('last-observed=never');
+    } finally {
+      await legacyDaemon.close();
+    }
+  });
+
+  // --- Negative: daemon down while a lead session is registered (issue #382) -
+  // A registered lead session means an agent session IS open, so "no daemon
+  // reachable" here is NOT the expected idle state (unlike the plain
+  // "daemon down" test above, which has no lead session) — it means the
+  // daemon most likely crashed or was killed mid-session. This must be a real
+  // failure (non-zero exit), not silently reported as idle.
+  it('fails daemon-reachable (non-zero exit) when the daemon is down but a lead session is still registered for this workspace', async () => {
+    const dir = path.join(tempDir, 'doctor-daemon-down-with-session');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    writeDoctorMonitor(monitorsRoot, 'heartbeat', FIRING_SCHEDULE);
+    writeLocalState(dir, { enabled: true });
+
+    const dbPath = path.join(dir, 'agentmon.db');
+    const socketPath = doctorSocket('down-with-session');
+    const env = { AGENTMONITORS_DB: dbPath, AGENTMONITORS_SOCKET: socketPath };
+
+    runWithEnv(['daemon', 'once', monitorsRoot, '--workspace', dir], env, dir);
+
+    // Register a lead session while a real daemon is up, then kill the daemon
+    // — leaving a lead session registered with no daemon actually serving it,
+    // simulating a mid-session crash.
+    const daemon = await startDaemon(monitorsRoot, dir, env, socketPath);
+    const open = runWithEnv(
+      [
+        'session',
+        'open',
+        '--host-session-id',
+        'doctor-down-with-session',
+        '--role',
+        'lead',
+        '--workspace',
+        dir,
+        '--format',
+        'json',
+      ],
+      env,
+      dir,
+    );
+    expect(open.exitCode).toBe(0);
+    daemon.stop();
+    await daemon.waitForExit();
+
+    const result = runWithEnv(['doctor', '--workspace', dir], env, dir);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain('✗ daemon-reachable');
+    expect(result.stdout).not.toContain('◇ daemon-reachable');
+    // Names the real problem — a lead session IS registered — rather than the
+    // "expected when no agent session is currently open" wording, which would
+    // be false here.
+    expect(result.stdout).toContain('lead session is registered');
+    expect(result.stdout).not.toContain(
+      'expected when no agent session is currently open',
+    );
+    expect(result.stdout).toContain('agentmonitors daemon run');
+    // lead-session itself still passes (a session IS registered) — isolating
+    // daemon-reachable as the sole failure.
+    expect(result.stdout).toContain('✓ lead-session');
   });
 
   // --- Negative: no lead session (daemon reachable to isolate the failure) ---

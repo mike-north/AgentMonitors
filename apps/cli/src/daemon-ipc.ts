@@ -64,6 +64,11 @@ const daemonResponseSchema = z.object({
   id: z.string(),
   result: z.unknown().optional(),
   error: z.string().optional(),
+  // Optional machine-distinguishable error code (issue #382). Additive: an
+  // older client's schema simply ignores an unrecognized field, so a NEW
+  // daemon emitting this never breaks an OLD client. See
+  // `UNSUPPORTED_REQUEST_ERROR_CODE` and `DaemonUnsupportedRequestError`.
+  code: z.string().optional(),
 });
 const sessionRoleSchema = z.enum(
   sessionRoleValues satisfies readonly AgentSessionRole[],
@@ -182,6 +187,8 @@ export interface DaemonResponse<T = unknown> {
   id: string;
   result?: T;
   error?: string;
+  /** See {@link DaemonUnsupportedRequestError} for what this signals. */
+  code?: string;
 }
 
 export interface DaemonServerOptions {
@@ -209,6 +216,78 @@ export class DaemonConnectionError extends Error {
   ) {
     super(message);
   }
+}
+
+/**
+ * The `id` a daemon uses when it could not parse or validate a request at all
+ * (malformed JSON, or a shape `daemonRequestSchema` rejects — e.g. an unknown
+ * `method`) — never a real request's id, so it never collides with a genuine
+ * per-request response.
+ */
+const UNPARSEABLE_REQUEST_ID = 'invalid';
+
+/**
+ * The exact `error` message a daemon has used for the `id: 'invalid'`
+ * sentinel since the socket protocol became public (see the `catch` in
+ * {@link createDaemonServer}'s request handler). A **new** build must keep
+ * emitting this text verbatim: a still-running **older** daemon (long-lived,
+ * auto-booted, no version handshake) that predates {@link
+ * UNSUPPORTED_REQUEST_ERROR_CODE} can only ever produce this exact
+ * id+message pair, so {@link callDaemon} matches on it to recognize "the
+ * daemon rejected this as unsupported" from an old peer (issue #382) — as
+ * opposed to a genuine daemon-side application error, which always uses a
+ * request's real id.
+ */
+const LEGACY_UNPARSEABLE_REQUEST_MESSAGE = 'Invalid JSON request.';
+
+/**
+ * Machine-distinguishable `code` a daemon attaches (in addition to the
+ * legacy `id`/`error` pair above, unchanged) to an unparseable-request
+ * response going forward (issue #382). Preferred over string-matching
+ * {@link LEGACY_UNPARSEABLE_REQUEST_MESSAGE} because it does not depend on
+ * the human-readable message staying byte-for-byte stable across future
+ * daemon builds; the legacy match remains only to recognize a daemon old
+ * enough to predate this field.
+ */
+const UNSUPPORTED_REQUEST_ERROR_CODE = 'unsupported_request';
+
+/**
+ * Thrown by {@link callDaemon} when the daemon answered — it was reachable —
+ * but rejected the request outright as one it does not understand: either an
+ * older daemon build (missing a method the client's schema knows about, e.g.
+ * `doctor.report` added after that build shipped — issue #382) or, going
+ * forward, a daemon that flags the rejection with {@link
+ * UNSUPPORTED_REQUEST_ERROR_CODE}.
+ *
+ * Deliberately distinct from both {@link DaemonConnectionError} (the daemon
+ * could not be *reached* at all) and a plain `Error` carrying a genuine
+ * daemon-side application error (`response.error` for a real request id) —
+ * conflating "reached an incompatible daemon" with either of those would
+ * either mask a real unreachable-daemon diagnosis or make a caller's
+ * "fall back and keep going" guard swallow an actual application bug.
+ */
+export class DaemonUnsupportedRequestError extends Error {
+  override readonly name = 'DaemonUnsupportedRequestError';
+}
+
+/**
+ * True when `response` is the sentinel a daemon sends for a request it could
+ * not parse/validate at all — either the long-standing legacy id+message pair
+ * (an old daemon, issue #382) or the newer explicit `code` (a current
+ * daemon). Matched precisely (never a substring/prefix check) so a genuine
+ * daemon-side application error that merely happens to reuse the word
+ * "invalid" is never misclassified as this sentinel.
+ */
+function isUnsupportedRequestResponse(response: {
+  id: string;
+  error?: string | undefined;
+  code?: string | undefined;
+}): boolean {
+  if (response.code === UNSUPPORTED_REQUEST_ERROR_CODE) return true;
+  return (
+    response.id === UNPARSEABLE_REQUEST_ID &&
+    response.error === LEGACY_UNPARSEABLE_REQUEST_MESSAGE
+  );
 }
 
 function socketBaseDir(): string {
@@ -778,7 +857,16 @@ export function createDaemonServer({
       try {
         request = daemonRequestSchema.parse(JSON.parse(raw));
       } catch {
-        respond({ id: 'invalid', error: 'Invalid JSON request.' });
+        // `error` stays byte-for-byte the legacy text (see
+        // `LEGACY_UNPARSEABLE_REQUEST_MESSAGE`) so an old client sees the same
+        // message as before; `code` is purely additive — an old client's
+        // `daemonResponseSchema` ignores an unrecognized field, so this never
+        // breaks it (issue #382).
+        respond({
+          id: UNPARSEABLE_REQUEST_ID,
+          error: LEGACY_UNPARSEABLE_REQUEST_MESSAGE,
+          code: UNSUPPORTED_REQUEST_ERROR_CODE,
+        });
         return;
       }
 
@@ -977,6 +1065,14 @@ export async function callDaemon<T = unknown>(
       try {
         const response = daemonResponseSchema.parse(JSON.parse(raw));
         if (response.error) {
+          if (isUnsupportedRequestResponse(response)) {
+            fail(
+              new DaemonUnsupportedRequestError(
+                `AgentMon daemon at ${socketPath} does not support the "${method}" request (it may be running an older, incompatible build). Daemon replied: ${response.error}`,
+              ),
+            );
+            return;
+          }
           fail(new Error(response.error));
           return;
         }

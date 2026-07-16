@@ -19,6 +19,7 @@ import {
   createDaemonServer,
   daemonAvailable,
   DaemonConnectionError,
+  DaemonUnsupportedRequestError,
   lockPath,
   releaseStartupLock,
   resolveSocketPath,
@@ -105,6 +106,112 @@ describe('callDaemon', () => {
     expect(rejection).toBeInstanceOf(DaemonConnectionError);
   });
 
+  // Issue #382: an old, still-running daemon build predates a method the
+  // client's schema knows about (e.g. `doctor.report`) — its own
+  // `daemonRequestSchema.parse()` rejects the request and it can only ever
+  // reply with the legacy `{ id: 'invalid', error: 'Invalid JSON request.' }`
+  // sentinel (no `code` field, since that build predates it). A client must
+  // recognize this exact legacy pair and raise a distinct, dedicated error so
+  // a caller with a "fall back and keep going" guard (like `doctor`) can tell
+  // "reached an incompatible daemon" apart from both a genuine connection
+  // failure and a genuine daemon-side application error.
+  //
+  // Pre-fix, this failed: `callDaemon` had no sentinel detection at all, so
+  // the daemon's `error` string surfaced as a plain `Error` — indistinguishable
+  // from a real application error, which is exactly what broke `doctor`
+  // (issue #382's root cause).
+  it('rejects with a DaemonUnsupportedRequestError when an old daemon answers with the legacy unparseable-request sentinel', async () => {
+    const socketPath = tempSocketPath('legacy-sentinel');
+    const server = net.createServer((socket) => {
+      let buffer = '';
+      socket.setEncoding('utf-8');
+      socket.on('data', (chunk) => {
+        buffer += chunk;
+        if (!buffer.includes('\n')) return;
+        // Exactly what a pre-#382 daemon build sends for ANY request its
+        // schema rejects — no `code` field, since that build predates it.
+        socket.end(
+          `${JSON.stringify({ id: 'invalid', error: 'Invalid JSON request.' })}\n`,
+        );
+      });
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(socketPath, () => resolve());
+    });
+
+    const rejection = await callDaemon(
+      'doctor.report',
+      { monitorsDir: '/tmp/monitors', workspacePath: '/tmp/workspace' },
+      { socketPath, timeoutMs: 200 },
+    ).catch((error: unknown) => error);
+
+    expect(rejection).toBeInstanceOf(DaemonUnsupportedRequestError);
+    // Never a plain Error nor a connection failure — a caller must be able to
+    // branch on the class alone (issue #94 review precedent).
+    expect(rejection).not.toBeInstanceOf(DaemonConnectionError);
+
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+    });
+  });
+
+  // A genuine daemon-side application error that happens to reply with a
+  // DIFFERENT request id than 'invalid' must never be misclassified as the
+  // unsupported-request sentinel — the match is precise (id AND message),
+  // not a loose substring/prefix check.
+  it('does NOT classify a real application error as unsupported-request merely because its message contains similar words', async () => {
+    const socketPath = tempSocketPath('real-app-error');
+    const server = net.createServer((socket) => {
+      let buffer = '';
+      socket.setEncoding('utf-8');
+      socket.on('data', (chunk) => {
+        buffer += chunk;
+        if (!buffer.includes('\n')) return;
+        const request = JSON.parse(buffer.slice(0, buffer.indexOf('\n'))) as {
+          id: string;
+        };
+        // Real request id (not the 'invalid' sentinel id), genuine app error.
+        socket.end(
+          `${JSON.stringify({ id: request.id, error: 'Invalid workspace path.' })}\n`,
+        );
+      });
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(socketPath, () => resolve());
+    });
+
+    const rejection = await callDaemon(
+      'doctor.report',
+      { monitorsDir: '/tmp/monitors', workspacePath: '/tmp/workspace' },
+      { socketPath, timeoutMs: 200 },
+    ).catch((error: unknown) => error);
+
+    expect(rejection).toBeInstanceOf(Error);
+    expect(rejection).not.toBeInstanceOf(DaemonUnsupportedRequestError);
+    expect(rejection).not.toBeInstanceOf(DaemonConnectionError);
+    expect((rejection as Error).message).toBe('Invalid workspace path.');
+
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+    });
+  });
+
   it('rejects cleanly on invalid daemon payloads without double-settlement noise', async () => {
     const socketPath = tempSocketPath('invalid-response');
     const server = net.createServer((socket) => {
@@ -170,6 +277,55 @@ describe('createDaemonServer — request-handling resilience', () => {
 
       // Decisive assertion: the daemon survived and still answers.
       await expect(daemonAvailable(socketPath)).resolves.toBe(true);
+    } finally {
+      await server.close().catch(() => undefined);
+    }
+  });
+
+  // Issue #382: going forward, a schema-rejected request (e.g. an unknown
+  // `method` — what a NEW client sends an OLD daemon build that predates it,
+  // or vice versa) must carry a `code` a client can match on WITHOUT relying
+  // on the human-readable `error` text staying byte-for-byte stable — while
+  // the legacy `id`/`error` pair stays unchanged so an old client (whose
+  // schema simply ignores the added `code` field) sees no behavior change.
+  it('answers a schema-rejected request with the legacy id/message pair PLUS a machine-distinguishable code', async () => {
+    const socketPath = tempSocketPath('unsupported-request-code');
+    const server = createDaemonServer({
+      runtime: createRuntime(':memory:'),
+      socketPath,
+    });
+    try {
+      await server.listen();
+
+      const raw = await new Promise<string>((resolve, reject) => {
+        const socket = net.connect(socketPath);
+        let buffer = '';
+        socket.setEncoding('utf-8');
+        socket.on('connect', () => {
+          // A method the daemon's own schema doesn't recognize — same shape
+          // an old daemon receives from a newer client (or vice versa).
+          socket.write(
+            `${JSON.stringify({ id: '1', method: 'not-a-real-method', params: {} })}\n`,
+          );
+        });
+        socket.on('data', (chunk) => {
+          buffer += chunk;
+          if (buffer.includes('\n')) {
+            socket.end();
+            resolve(buffer);
+          }
+        });
+        socket.on('error', reject);
+      });
+
+      const response = JSON.parse(raw.trimEnd()) as {
+        id: string;
+        error?: string;
+        code?: string;
+      };
+      expect(response.id).toBe('invalid');
+      expect(response.error).toBe('Invalid JSON request.');
+      expect(response.code).toBe('unsupported_request');
     } finally {
       await server.close().catch(() => undefined);
     }

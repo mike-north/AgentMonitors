@@ -6,7 +6,11 @@ import type {
 } from '@agentmonitors/core';
 import { reportError } from '../output.js';
 import { readLocalState } from '../local-state.js';
-import { DaemonConnectionError, resolveSocketPath } from '../daemon-ipc.js';
+import {
+  DaemonConnectionError,
+  DaemonUnsupportedRequestError,
+  resolveSocketPath,
+} from '../daemon-ipc.js';
 import { resolveManualDaemonSocketPath } from '../manual-daemon.js';
 import {
   doctorReportClient,
@@ -102,6 +106,7 @@ function buildChecks(
   enabled: boolean,
   daemonRunning: boolean,
   socketPath: string,
+  daemonErrorMessage?: string,
 ): DoctorCheck[] {
   const checks: DoctorCheck[] = [];
 
@@ -173,6 +178,23 @@ function buildChecks(
   // `fail` (issue #373): the doc comment on DAEMON_REMEDIATION's detail text
   // already calls this "expected when no agent session is currently open" —
   // that framing means it must not force a non-zero exit on its own.
+  //
+  // But that framing is only true when no agent session is actually open
+  // (issue #382): a *registered* lead session for this workspace means an
+  // agent session IS (or very recently was) open, so an unreachable daemon
+  // then is not "expected" — it means the daemon most likely crashed or was
+  // killed out from under a live session. That must be a genuine `fail` (and
+  // drive a non-zero exit), not the idle wording, which would be actively
+  // misleading here.
+  // The underlying connection failure's own message (timeout vs. ECONNREFUSED
+  // vs. a version-skewed daemon's rejection — see `DaemonConnectionError` and
+  // `DaemonUnsupportedRequestError`) is threaded through verbatim so a reader
+  // can tell "nothing is listening yet" apart from "something answered but
+  // wasn't a compatible daemon" instead of collapsing both to one generic
+  // sentence.
+  const daemonErrorClause = daemonErrorMessage
+    ? ` (${daemonErrorMessage})`
+    : '';
   checks.push(
     daemonRunning
       ? {
@@ -180,12 +202,19 @@ function buildChecks(
           status: 'pass',
           detail: `Daemon is running (socket: ${socketPath}).`,
         }
-      : {
-          name: 'daemon-reachable',
-          status: 'idle',
-          detail: `No daemon reachable at ${socketPath} — showing persisted state from the last tick (expected when no agent session is currently open; the daemon starts automatically once one is).`,
-          remediation: DAEMON_REMEDIATION,
-        },
+      : report.hasLeadSession
+        ? {
+            name: 'daemon-reachable',
+            status: 'fail',
+            detail: `No daemon reachable at ${socketPath}${daemonErrorClause}, but a lead session is registered for workspace "${report.workspacePath}" — an agent session is open with no daemon serving it (it may have crashed or been killed).`,
+            remediation: DAEMON_REMEDIATION,
+          }
+        : {
+            name: 'daemon-reachable',
+            status: 'idle',
+            detail: `No daemon reachable at ${socketPath}${daemonErrorClause} — showing persisted state from the last tick (expected when no agent session is currently open; the daemon starts automatically once one is).`,
+            remediation: DAEMON_REMEDIATION,
+          },
   );
 
   // 5. lead session present for this workspace. Same `idle` treatment as
@@ -368,6 +397,10 @@ export const doctorCommand = new Command('doctor')
         // application error must still surface verbatim, not be masked as
         // "daemon not running".
         let daemonRunning: boolean;
+        // Captured only on the fallback path, so it can be threaded into the
+        // `daemon-reachable` detail (issue #382) — undefined on the happy
+        // path where there is nothing to report.
+        let daemonErrorMessage: string | undefined;
         let report: MonitorDoctorReport;
         try {
           report = await doctorReportClient(
@@ -376,8 +409,20 @@ export const doctorCommand = new Command('doctor')
           );
           daemonRunning = true;
         } catch (error) {
-          if (!(error instanceof DaemonConnectionError)) throw error;
+          // A `DaemonUnsupportedRequestError` (issue #382) means a daemon
+          // answered but is an older build that predates `doctor.report` —
+          // version skew, not a genuine "daemon is down" — but the fallback
+          // path is identical either way: neither call produced a usable
+          // report, so read the same persisted state `monitor
+          // explain`/`history` fall back to.
+          if (
+            !(error instanceof DaemonConnectionError) &&
+            !(error instanceof DaemonUnsupportedRequestError)
+          ) {
+            throw error;
+          }
           daemonRunning = false;
+          daemonErrorMessage = error.message;
           report = await doctorReportInProcess(
             { monitorsDir, workspacePath: workspace },
             dbPath,
@@ -389,6 +434,7 @@ export const doctorCommand = new Command('doctor')
           state.enabled,
           daemonRunning,
           socketPath,
+          daemonErrorMessage,
         );
 
         console.log(
