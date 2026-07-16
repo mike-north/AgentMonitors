@@ -45,6 +45,7 @@ export class AgentMonitorRuntime {
         workspacePath?: string | null;
         monitorId: string;
         objectKey: string;
+        eventIds: string[];
     }): number;
     // (undocumented)
     status(): RuntimeStatus;
@@ -1380,6 +1381,7 @@ export class RuntimeStore {
         workspacePath?: string | null;
         monitorId: string;
         objectKey: string;
+        eventIds: string[];
     }): {
         removedEventIds: string[];
         affectedSessionIds: string[];

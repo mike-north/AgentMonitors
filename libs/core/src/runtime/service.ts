@@ -1390,17 +1390,18 @@ export class AgentMonitorRuntime {
   }
 
   /**
-   * Retract all durable events a single synthetic object produced, across every
-   * session they projected into (issue #407): removes the shared `monitor_events`
-   * rows, their per-recipient projections, snapshots, and seeded cursors, then
-   * refreshes each affected session's hook-state so its cached unread counts drop
-   * the retracted events.
+   * Retract a caller-supplied SET of a synthetic object's events by id, across
+   * every session they projected into (issue #407): removes the shared
+   * `monitor_events` rows, their per-recipient projections, snapshots, and the
+   * affected sessions' seeded cursors, then refreshes each affected session's
+   * hook-state so its cached unread counts drop the retracted events.
    *
    * Used by `verify --use-workspace-daemon` to erase the create/delete events its
    * own throwaway scratch file generated against the live workspace daemon, so a
    * later session never sees a spurious `File deleted: agentmonitors-verify-…`.
-   * The caller MUST scope this to a file it itself created and deleted — never a
-   * real monitored object.
+   * The caller passes the exact event ids it observed for that file (it created
+   * and deleted it), so a real event sharing the same watched path is never
+   * swept. Never point this at real monitored events.
    *
    * @returns the number of `monitor_events` rows removed.
    */
@@ -1408,6 +1409,7 @@ export class AgentMonitorRuntime {
     workspacePath?: string | null;
     monitorId: string;
     objectKey: string;
+    eventIds: string[];
   }): number {
     const { removedEventIds, affectedSessionIds } =
       this.store.retractObjectEvents(input);

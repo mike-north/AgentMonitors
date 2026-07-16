@@ -305,15 +305,16 @@ Handle it.
       tags: [],
     };
     // The synthetic scratch object: a create THEN a delete event (the exact
-    // pair verify's own trigger produces), both projecting to A and B.
-    store.insertEvent({
+    // pair verify's own trigger produces), both projecting to A and B. Capture
+    // their ids — retraction deletes by the exact ids verify observed.
+    const created = store.insertEvent({
       ...base,
       title: `File created: ${scratchKey}`,
       summary: `File created: ${scratchKey}`,
       objectKey: scratchKey,
       createdAt: new Date(Date.now() - 3_000),
     });
-    store.insertEvent({
+    const deleted = store.insertEvent({
       ...base,
       title: `File deleted: ${scratchKey}`,
       summary: `File deleted: ${scratchKey}`,
@@ -337,6 +338,7 @@ Handle it.
       workspacePath: rootDir,
       monitorId: 'docs-watch',
       objectKey: scratchKey,
+      eventIds: [created.id, deleted.id],
     });
     // Exactly the create + the delete were removed.
     expect(removed).toBe(2);
@@ -359,10 +361,11 @@ Handle it.
     ).toHaveLength(0);
   });
 
-  // Negative: retraction is keyed by (monitorId, objectKey). A DIFFERENT monitor
-  // whose object happens to share the same key must be left completely intact —
-  // retraction must never over-reach across monitors.
-  it('retractObjectEvents is scoped to the monitor id (does not touch a namesake object of another monitor)', () => {
+  // Negative: `monitorId` is a defense-in-depth guard on the id set. Even when a
+  // DIFFERENT monitor's event id is passed alongside the target's — and its
+  // object shares the same key — retraction must delete ONLY the ids that belong
+  // to the named monitor, never over-reaching across monitors.
+  it('retractObjectEvents is scoped to the monitor id (a namesake object of another monitor is untouched even if its id is passed)', () => {
     const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
     tempDirs.push(rootDir);
     const db = createDb(':memory:');
@@ -395,23 +398,26 @@ Handle it.
       tags: [],
       createdAt: new Date(),
     };
-    store.insertEvent({
+    const one = store.insertEvent({
       ...base,
       monitorId: 'monitor-one',
       title: `File changed: ${sharedKey} (one)`,
       summary: `File changed: ${sharedKey} (one)`,
     });
-    store.insertEvent({
+    const two = store.insertEvent({
       ...base,
       monitorId: 'monitor-two',
       title: `File changed: ${sharedKey} (two)`,
       summary: `File changed: ${sharedKey} (two)`,
     });
 
+    // Pass BOTH ids but name only monitor-one: the guard must drop monitor-two's
+    // id, deleting exactly one row.
     const removed = runtime.retractObjectEvents({
       workspacePath: rootDir,
       monitorId: 'monitor-one',
       objectKey: sharedKey,
+      eventIds: [one.id, two.id],
     });
     expect(removed).toBe(1);
 
@@ -419,6 +425,266 @@ Handle it.
     const survivors = runtime.listEvents({ sessionId: session.id });
     expect(survivors).toHaveLength(1);
     expect(survivors[0]?.monitorId).toBe('monitor-two');
+  });
+
+  // Issue #407 review (event-loss): the literal-glob branch of verify's trigger
+  // watches a REAL path, and `synthetic` there means only "the file did not
+  // exist when verify started" — that path can still carry PRIOR history, e.g. an
+  // earlier unacked delete event a user has not yet seen. A `(monitorId,
+  // objectKey)` sweep would take that real event down with verify's own pair.
+  // Deleting by the exact ids verify observed must leave the pre-existing event
+  // intact. (Pre-fix: the sweep deletes all three, so `historical` vanishes.)
+  it('retractObjectEvents by id leaves a pre-existing event at the same watched path intact (literal-glob)', () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const db = createDb(':memory:');
+    const runtime = new AgentMonitorRuntime(
+      new RuntimeStore(db),
+      new SourceRegistry(),
+      [claudeCodeAdapter],
+    );
+
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'retract-literal',
+        workspacePath: rootDir,
+      }),
+    );
+
+    const store = new RuntimeStore(db);
+    // A literal watched file (the objectKey the literal-glob branch acts on).
+    const watchedKey = path.join(rootDir, 'notes.md');
+    const base = {
+      workspacePath: rootDir,
+      monitorId: 'notes-watch',
+      sourceName: 'file-fingerprint',
+      urgency: 'normal' as const,
+      body: '',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey: watchedKey,
+      queryScope: {},
+      tags: [],
+    };
+    // Prior REAL history at that path: an earlier delete the user has not acked.
+    const historical = store.insertEvent({
+      ...base,
+      title: `File deleted: ${watchedKey}`,
+      summary: `File deleted: ${watchedKey}`,
+      createdAt: new Date(Date.now() - 5_000),
+    });
+    // verify then creates the (now-absent) file and deletes it again on teardown.
+    const verifyCreate = store.insertEvent({
+      ...base,
+      title: `File created: ${watchedKey}`,
+      summary: `File created: ${watchedKey}`,
+      createdAt: new Date(Date.now() - 2_000),
+    });
+    const verifyDelete = store.insertEvent({
+      ...base,
+      title: `File deleted: ${watchedKey}`,
+      summary: `File deleted: ${watchedKey}`,
+      createdAt: new Date(Date.now() - 1_000),
+    });
+
+    // Retract ONLY the two ids verify itself observed for its own create/delete.
+    const removed = runtime.retractObjectEvents({
+      workspacePath: rootDir,
+      monitorId: 'notes-watch',
+      objectKey: watchedKey,
+      eventIds: [verifyCreate.id, verifyDelete.id],
+    });
+    expect(removed).toBe(2);
+
+    // The pre-existing historical event SURVIVES; verify's pair is gone.
+    const survivors = runtime.listEvents({ sessionId: session.id });
+    expect(survivors).toHaveLength(1);
+    expect(survivors[0]?.id).toBe(historical.id);
+  });
+
+  // Issue #407 review (session isolation): the cursor cleanup must not wipe
+  // OTHER sessions' baselines for a literal path. A second session (here, in a
+  // different workspace) holding a cursor at the SAME objectKey — but which never
+  // received the retracted events — must keep its cursor, or its next observation
+  // spuriously re-fires from a lost baseline. (Pre-fix: the cursor delete filters
+  // only `(monitorId, objectKey)`, so session B's cursor is wiped too.)
+  it('retractObjectEvents preserves an unaffected session cursor at the same object key', () => {
+    const workspaceA = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-a-'));
+    const workspaceB = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-b-'));
+    tempDirs.push(workspaceA, workspaceB);
+    const db = createDb(':memory:');
+    const runtime = new AgentMonitorRuntime(
+      new RuntimeStore(db),
+      new SourceRegistry(),
+      [claudeCodeAdapter],
+    );
+
+    const sessionA = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'retract-cursor-a',
+        workspacePath: workspaceA,
+      }),
+    );
+    const sessionB = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'retract-cursor-b',
+        workspacePath: workspaceB,
+      }),
+    );
+
+    const store = new RuntimeStore(db);
+    // The same literal path watched by 'watch' in two workspaces (an absolute
+    // glob target is identical across them).
+    const literalKey = '/etc/agentmonitors-literal.md';
+    // Session B's real baseline for that path, in ITS workspace — must survive.
+    store.seedSessionObjectCursor({
+      sessionId: sessionB.id,
+      monitorId: 'watch',
+      objectKey: literalKey,
+      workspacePath: workspaceB,
+      baselineSnapshotId: null,
+      baselineContent: 'B real baseline',
+    });
+
+    // verify's synthetic create+delete land in workspace A only (they project to
+    // session A and seed A's cursor there).
+    const base = {
+      monitorId: 'watch',
+      sourceName: 'file-fingerprint',
+      urgency: 'normal' as const,
+      body: '',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: 'artifact',
+      diffText: null,
+      objectKey: literalKey,
+      queryScope: {},
+      tags: [],
+    };
+    const createA = store.insertEvent({
+      ...base,
+      workspacePath: workspaceA,
+      title: `File created: ${literalKey}`,
+      summary: `File created: ${literalKey}`,
+      createdAt: new Date(Date.now() - 2_000),
+    });
+    const deleteA = store.insertEvent({
+      ...base,
+      workspacePath: workspaceA,
+      title: `File deleted: ${literalKey}`,
+      summary: `File deleted: ${literalKey}`,
+      createdAt: new Date(Date.now() - 1_000),
+    });
+    // Sanity: A now has a seeded cursor for the object, B has its own.
+    expect(
+      store.getSessionObjectCursor(
+        sessionA.id,
+        'watch',
+        literalKey,
+        workspaceA,
+      ),
+    ).not.toBeNull();
+    expect(
+      store.getSessionObjectCursor(
+        sessionB.id,
+        'watch',
+        literalKey,
+        workspaceB,
+      ),
+    ).not.toBeNull();
+
+    runtime.retractObjectEvents({
+      workspacePath: workspaceA,
+      monitorId: 'watch',
+      objectKey: literalKey,
+      eventIds: [createA.id, deleteA.id],
+    });
+
+    // Session B (unaffected — it never received the retracted events) keeps its
+    // baseline; session A's seeded cursor is cleaned up.
+    expect(
+      store.getSessionObjectCursor(
+        sessionB.id,
+        'watch',
+        literalKey,
+        workspaceB,
+      ),
+    ).not.toBeNull();
+    expect(
+      store.getSessionObjectCursor(
+        sessionA.id,
+        'watch',
+        literalKey,
+        workspaceA,
+      ),
+    ).toBeNull();
+  });
+
+  // Issue #407 review (Copilot thread 3596229810): verify's retraction wait loop
+  // decides the scratch object's delete has landed by counting its events (create
+  // THEN delete => 2). That count MUST be scoped to verify's own monitor: a
+  // second, broader monitor watching the same path also produces a create for it,
+  // so an unscoped count reaches 2 from two CREATES (both monitors) before
+  // verify's own delete lands — retracting early and stranding verify's delete
+  // event. This proves the scoping the wait loop relies on: an objectKey listing
+  // scoped by monitorId counts only that monitor's events. (Pre-fix the wait
+  // query omitted monitorId, so the equivalent listing returned both monitors'.)
+  it('listEvents scoped by monitorId does not count a second monitor’s event at the same object key', () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const db = createDb(':memory:');
+    const runtime = new AgentMonitorRuntime(
+      new RuntimeStore(db),
+      new SourceRegistry(),
+      [claudeCodeAdapter],
+    );
+    const store = new RuntimeStore(db);
+    const scratchKey = path.join(rootDir, 'agentmonitors-verify-deadbeef.md');
+    const base = {
+      workspacePath: rootDir,
+      sourceName: 'file-fingerprint',
+      urgency: 'normal' as const,
+      body: '',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey: scratchKey,
+      queryScope: {},
+      tags: [],
+    };
+    // verify's own monitor has ONLY produced its create so far (delete pending).
+    store.insertEvent({
+      ...base,
+      monitorId: 'verify-target',
+      title: `File created: ${scratchKey}`,
+      summary: `File created: ${scratchKey}`,
+      createdAt: new Date(Date.now() - 2_000),
+    });
+    // A second broad monitor watching the same path also saw the create.
+    store.insertEvent({
+      ...base,
+      monitorId: 'broad-watch',
+      title: `File created: ${scratchKey}`,
+      summary: `File created: ${scratchKey}`,
+      createdAt: new Date(Date.now() - 1_500),
+    });
+
+    // Unscoped, two events exist for the path — the trap the wait loop must avoid.
+    expect(
+      runtime.listEvents({ objectKey: scratchKey, workspacePath: rootDir }),
+    ).toHaveLength(2);
+    // Scoped to verify's monitor, only its single (create) event counts, so the
+    // wait loop keeps waiting for verify's own delete rather than retracting now.
+    expect(
+      runtime.listEvents({
+        monitorId: 'verify-target',
+        objectKey: scratchKey,
+        workspacePath: rootDir,
+      }),
+    ).toHaveLength(1);
   });
 
   // Issue #338 (item 1): `events list --unread` filters on `acknowledgedAt IS

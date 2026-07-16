@@ -107,6 +107,7 @@ const eventsAckParamsSchema = z.object({
 const eventsRetractObjectParamsSchema = z.object({
   monitorId: z.string(),
   objectKey: z.string(),
+  eventIds: z.array(z.string()),
   workspacePath: z.string().optional(),
 });
 const hookClaimParamsSchema = z.object({
@@ -670,6 +671,7 @@ function handleRequest(
         removed: runtime.retractObjectEvents({
           monitorId: params.monitorId,
           objectKey: params.objectKey,
+          eventIds: params.eventIds,
           ...(params.workspacePath
             ? { workspacePath: params.workspacePath }
             : {}),

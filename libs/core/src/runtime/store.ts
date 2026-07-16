@@ -1507,47 +1507,51 @@ export class RuntimeStore {
   }
 
   /**
-   * Retract every durable trace of ONE object's events from a monitor: the
-   * shared `monitor_events` rows, their per-recipient `session_event_state`
-   * projections (across ALL sessions, not one), any `monitor_snapshots` captured
-   * for the object, and any `session_object_cursor` seeded for it. Scoped to a
-   * single `(monitorId, objectKey)` — and, when supplied, the caller's workspace,
-   * matched the same workspace-or-null way {@link listEvents} scopes.
+   * Retract a caller-supplied SET of a monitor's events by id — the create AND
+   * delete rows `verify --use-workspace-daemon` captured for its OWN scratch file
+   * — plus every durable trace they left: their per-recipient
+   * `session_event_state` projections (across ALL sessions, not one), any
+   * `monitor_snapshots` captured for them, and the `session_object_cursor` the
+   * projection seeded for that object in each affected session.
    *
-   * This is the retraction path `verify --use-workspace-daemon` uses to erase the
-   * create/delete events its OWN throwaway scratch file produced against the LIVE
-   * workspace daemon, so they never surface to a later session (issue #407). It
-   * is a targeted retraction of a KNOWN-synthetic object — a file verify itself
-   * created and deleted — NOT a general delivery-suppression path; never point it
-   * at a real monitored object.
+   * Deletion is BY EVENT ID (not a `(monitorId, objectKey)` sweep): the caller —
+   * verify's wait loop — already lists the exact events its synthetic file
+   * produced, so it threads their ids here (issue #407 review). This bounds the
+   * blast radius to those rows and CANNOT touch a real, pre-existing event that
+   * merely shares the same watched path (e.g. an earlier unacked delete on a
+   * literal-glob monitor). `monitorId` is applied as a defense-in-depth guard so
+   * a stray id belonging to another monitor is ignored rather than deleted.
    *
-   * @returns the removed event ids and the (deduped) lead-session ids whose
-   *   projections were deleted, so the caller can refresh their hook-state.
+   * This is a targeted retraction of KNOWN-synthetic events — a file verify
+   * itself created and deleted — NOT a general delivery-suppression path; never
+   * point it at real monitored events.
+   *
+   * @returns the removed event ids (only those that existed and matched
+   *   `monitorId`) and the (deduped) lead-session ids whose projections were
+   *   deleted, so the caller can refresh their hook-state.
    */
   retractObjectEvents(input: {
     workspacePath?: string | null;
     monitorId: string;
     objectKey: string;
+    eventIds: string[];
   }): { removedEventIds: string[]; affectedSessionIds: string[] } {
     const db = asInternalDb(this.db);
-    const conditions = [
-      eq(monitorEvents.monitorId, input.monitorId),
-      eq(monitorEvents.objectKey, input.objectKey),
-    ];
-    if (input.workspacePath !== undefined) {
-      const workspaceCondition =
-        input.workspacePath === null
-          ? isNull(monitorEvents.workspacePath)
-          : or(
-              eq(monitorEvents.workspacePath, input.workspacePath),
-              isNull(monitorEvents.workspacePath),
-            );
-      if (workspaceCondition) conditions.push(workspaceCondition);
+    if (input.eventIds.length === 0) {
+      return { removedEventIds: [], affectedSessionIds: [] };
     }
+    // Resolve the caller's candidate ids to the rows that actually exist AND
+    // belong to this monitor. Deleting only these (never a broad key sweep) is
+    // what keeps a real historical event at the same path from being swept.
     const removedEventIds = db
       .select({ id: monitorEvents.id })
       .from(monitorEvents)
-      .where(and(...conditions))
+      .where(
+        and(
+          eq(monitorEvents.monitorId, input.monitorId),
+          inArray(monitorEvents.id, input.eventIds),
+        ),
+      )
       .all()
       .map((row) => row.id);
     if (removedEventIds.length === 0) {
@@ -1572,16 +1576,32 @@ export class RuntimeStore {
     db.delete(monitorEvents)
       .where(inArray(monitorEvents.id, removedEventIds))
       .run();
-    // Cursors are keyed by object (not event id): drop any the projection seeded
-    // for this synthetic object so no stale baseline lingers for its path.
-    db.delete(sessionObjectCursor)
-      .where(
-        and(
-          eq(sessionObjectCursor.monitorId, input.monitorId),
-          eq(sessionObjectCursor.objectKey, input.objectKey),
-        ),
-      )
-      .run();
+    // Cursors are keyed by object, not event id: drop only the cursors the
+    // retracted events' projection seeded — i.e. those of the AFFECTED sessions
+    // (never every session at this path), matched the same workspace-or-null way
+    // {@link listEvents} scopes. Without this scoping a retraction at a literal
+    // path would wipe an UNAFFECTED session's real baseline for that path and
+    // trigger a spurious re-fire (issue #407 review).
+    if (affectedSessionIds.length > 0) {
+      const cursorConditions = [
+        eq(sessionObjectCursor.monitorId, input.monitorId),
+        eq(sessionObjectCursor.objectKey, input.objectKey),
+        inArray(sessionObjectCursor.sessionId, affectedSessionIds),
+      ];
+      if (input.workspacePath !== undefined) {
+        const workspaceCondition =
+          input.workspacePath === null
+            ? isNull(sessionObjectCursor.workspacePath)
+            : or(
+                eq(sessionObjectCursor.workspacePath, input.workspacePath),
+                isNull(sessionObjectCursor.workspacePath),
+              );
+        if (workspaceCondition) cursorConditions.push(workspaceCondition);
+      }
+      db.delete(sessionObjectCursor)
+        .where(and(...cursorConditions))
+        .run();
+    }
     return { removedEventIds, affectedSessionIds };
   }
 

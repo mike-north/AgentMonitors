@@ -81,16 +81,22 @@ export async function acknowledgeEventsClient(
 }
 
 /**
- * Retract (delete) every durable event a single synthetic object produced —
- * across all sessions — from the LIVE daemon over its socket. `verify
+ * Retract (delete) a specific SET of a synthetic object's events by id — across
+ * all sessions — from the LIVE daemon over its socket. `verify
  * --use-workspace-daemon` calls this to erase the create/delete events its own
  * throwaway scratch file generated against the workspace daemon, so a later
  * session never sees a spurious `File deleted: agentmonitors-verify-…` (issue
- * #407). Must be scoped to a file verify itself created and deleted. Returns the
- * number of events removed.
+ * #407). The caller passes the exact ids it observed for that file, so a real
+ * event sharing the same watched path is never swept; `monitorId` scopes the
+ * deletion as defense in depth. Returns the number of events removed.
  */
 export async function retractObjectEventsClient(
-  input: { monitorId: string; objectKey: string; workspacePath?: string },
+  input: {
+    monitorId: string;
+    objectKey: string;
+    eventIds: string[];
+    workspacePath?: string;
+  },
   socketPath?: string,
 ): Promise<number> {
   const result = await callDaemon<{ removed: number }>(
