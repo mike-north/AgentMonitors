@@ -1,5 +1,42 @@
 # @agentmonitors/source-file-fingerprint
 
+## 0.4.0
+
+### Minor Changes
+
+- 24e7685: Re-export `ChangeKind`, `JsonSchema`, `Observation`, `ObservationContext`, `ObservationResult`,
+  `ObservationSource`, and `Urgency` (all from `@agentmonitors/core`) from each package's own entry
+  point.
+
+  Every bundled source's default export is typed `ObservationSource`, but that type — and the core
+  types its interface shape transitively references — were previously reachable only via
+  `@agentmonitors/core` directly, not from the source package itself. Enabling API Extractor's report
+  generation (issue #285) surfaced this as `ae-forgotten-export` warnings embedded in each package's
+  checked-in API report; re-exporting resolves it with a clean signature. No runtime behavior changes.
+
+### Patch Changes
+
+- d519192: Fix a crash in `file-fingerprint` when a `watch.globs` pattern matches a directory entry.
+  Globstar patterns like `docs/**` match the directory `docs/` itself, in addition to every file
+  under it; the source previously tried to `fs.readFile` that directory entry and crashed with an
+  unhandled `EISDIR`. Directory entries are now filtered out before fingerprinting, so `docs/**`
+  behaves as "every file under `docs/`, recursively" and no longer crashes.
+
+  `agentmonitors monitor test`'s "no files matched" message now names the configured `watch.globs`
+  value, so authors can tell a genuinely bad glob apart from a glob that matched files with no
+  changes since baseline.
+
+- Updated dependencies [24e7685]
+- Updated dependencies [a7b5729]
+- Updated dependencies [8638936]
+- Updated dependencies [e201c48]
+- Updated dependencies [89e705f]
+- Updated dependencies [36a2e48]
+- Updated dependencies [9f141bb]
+- Updated dependencies [720d072]
+- Updated dependencies [4e46c41]
+  - @agentmonitors/core@0.11.0
+
 ## 0.3.1
 
 ### Patch Changes
