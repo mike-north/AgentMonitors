@@ -1648,7 +1648,129 @@ monitor). When `leadSession` is `false`, each monitor's `delivery` counts are al
 
 ---
 
-## §16 Exit codes & diagnostics
+## §16 `verify` — Prove a monitor delivers end-to-end
+
+**Source:** `apps/cli/src/commands/verify.ts` (+ `verify-budget.ts`, `verify-report.ts`)
+**Status:** Fully implemented (spawns and supervises an isolated daemon; falls back to the workspace daemon under a flag).
+
+### Purpose
+
+Answers "does this monitor actually deliver, right now?" in **one command**. It replaces the manual
+Phase-5 "prove it" recipe (a custom `--socket`, a scratch `AGENTMONITORS_DB`, a backgrounded daemon
+with `trap` cleanup, hand-built hook JSON payloads, two poll loops with two different budgets, and
+two session-id concepts) — the single most concentrated DX liability across four usability studies
+(issue #399). `verify` runs that whole recipe internally and prints one clean **PASS** (with the
+delivered `additionalContext` as a proof artifact) or **FAIL** (naming the stage that failed).
+
+**Verb/placement.** `verify` is a **top-level** command, a sibling of `doctor` — not a `monitor`
+subcommand. `monitor test`/`history`/`explain` are read-only inspectors that never mutate state or
+boot a daemon; `verify` is an **active, stateful end-to-end proof** that boots a daemon, registers a
+session, triggers a real change, and confirms delivery. Modeling it as a `monitor` inspector would
+wrongly attract future read-only-inspector behavior; its true kin is the workspace-level `doctor`.
+
+### Usage
+
+```
+agentmonitors verify [monitor] [--dir <path>] [--workspace <path>] [--manual]
+                      [--use-workspace-daemon] [--timeout <ms>] [--format <text|json>]
+```
+
+| Flag                     | Default                        | Description                                                                                                                                                                           |
+| ------------------------ | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `[monitor]`              | the sole monitor, if exactly 1 | Monitor id to verify. Omitting it with 0 or >1 monitors is a setup error naming the choices.                                                                                          |
+| `--dir <path>`           | `<workspace>/.claude/monitors` | Directory containing monitor definitions.                                                                                                                                             |
+| `--workspace <path>`     | current working dir            | Workspace path; resolved to an absolute path (same as `doctor`).                                                                                                                      |
+| `--manual`               | off (auto-trigger)             | Skip the auto-trigger; prompt the operator to make the change and watch for it (for sources `verify` can't fabricate a change for).                                                   |
+| `--use-workspace-daemon` | off (isolated)                 | Run against the workspace's real daemon/db (booting a detached one if needed) and **leave it running**, so a follow-up `doctor` reflects the delivery. Requires an enabled workspace. |
+| `--timeout <ms>`         | derived (see Budget)           | Override the **post-trigger** detection budget.                                                                                                                                       |
+| `--format <format>`      | `text`                         | Output format: `text`, `json`.                                                                                                                                                        |
+
+### What it does
+
+1. **Resolve** the monitor and confirm its `watch.type` source is registered.
+2. **Boot a daemon.** By default an **isolated** daemon on a temp socket + db, spawned as a
+   _supervised child_ (piped stderr, reaping disabled) so `verify` can both fully tear it down and
+   observe a crash with the daemon's own error (issue #398). `--use-workspace-daemon` reuses (or
+   detaches-boots) the workspace daemon instead and never tears it down.
+3. **Register** a throwaway lead session (closed on exit).
+4. **Baseline.** Wait for the monitor's first observation to land (no event on the first tick).
+5. **Trigger.** For file-fingerprint, auto-trigger by creating a **scratch file** placed to match
+   the first pattern glob (its static directory prefix + extension), or — for a literal single-file
+   glob — a brief, restored-on-exit edit of the watched file itself. `--manual` (and any source
+   `verify` can't fabricate a change for) prints a "make your change now" prompt and watches. The
+   scratch file / edit is reverted on exit **and** on SIGINT/SIGTERM.
+6. **Observe.** Poll observation history for a **post-trigger** outcome, distinguishing
+   (issue #399 criterion 4): `triggered` (success) · `suppressed` (settling — keep waiting) ·
+   `no-change` / `no-files-matched` (the trigger did nothing — **fail fast**, point at `--manual`).
+7. **Materialize.** Confirm an unread event exists for the session.
+8. **Deliver.** Claim via the **real `hook deliver` path** — for `high` urgency at
+   `turn-interruptible` (previewing settled high events and packing them under the 4000-char cap
+   exactly as `hook deliver` does), otherwise the `post-compact` recap — and render the same
+   `additionalContext` a hook would inject.
+
+If the daemon exits at any point, `verify` fails fast with a **`daemon-died`** verdict and prints the
+daemon's captured output — never an ambiguous empty result.
+
+### Budget (interval-aware)
+
+The poll budget is derived from the monitor's **own** declared timing (issue #399 criterion 2), not
+a fixed 40s: `interval` (an explicit `watch.interval`, else the source default — file-fingerprint
+30s, api-poll 300s, schedule's 60s tick) plus the notify **settle** (`debounce`'s `settle-for`; 0
+for `throttle`) plus, for `high` urgency, the **15s claim-settle** window (002 §9.1), plus a margin
+of `max(5s, 25% of interval)`. Two phases are budgeted separately — **baseline** (`interval +
+margin`) and **detect** (`interval + settle + high-claim-settle + margin`). Elapsed/ETA progress is
+printed to **stderr** so the operator is never left staring at empty output; `--timeout` overrides
+the detect-phase budget. (These mirrored core defaults are budget estimates only — the daemon owns
+authoritative scheduling — and must be kept in sync with `libs/core/src/runtime/service.ts`.)
+
+### Output
+
+**Text (default):** a per-stage checklist (`daemon`, `session`, `baseline`, `trigger`, `observe`,
+`materialize`, `deliver`), then a `PASS` line echoing the delivered `additionalContext`, or a `FAIL`
+line naming the failing stage (and, for `daemon-died`, the daemon's own output). Progress lines go to
+stderr; the report goes to stdout.
+
+**JSON (`--format json`):** a stable machine shape.
+
+```json
+{
+  "ok": true,
+  "monitorId": "docs-watch",
+  "stages": [
+    {
+      "name": "deliver",
+      "status": "pass|fail|pending|skip",
+      "detail": "<string>"
+    }
+  ],
+  "failure": {
+    "kind": "no-change|no-files-matched|budget-exceeded|daemon-died|delivery-empty|setup",
+    "message": "<string>"
+  },
+  "additionalContext": "<string | null>",
+  "daemonStderr": "<string | null>",
+  "elapsedMs": 3200
+}
+```
+
+`failure` is `null` on success; `additionalContext` is the delivered proof on success and `null` on
+failure.
+
+### Exit codes
+
+`0` on **PASS**; `1` on any genuine **FAIL** (`no-change`, `no-files-matched`, `budget-exceeded`,
+`daemon-died`, `delivery-empty`) or setup error (monitor not found/ambiguous, unknown source, boot
+failure). A non-zero exit therefore always means the setup does **not** currently deliver.
+
+### Non-goals
+
+`verify` does not change runtime notify/debounce timing, and does not remove the manual recipe (kept
+as a debug/host-agnostic appendix in the getting-started docs). It is not a substitute for `doctor`'s
+static health checks — it proves the _dynamic_ delivery path the checks can't exercise.
+
+---
+
+## §17 Exit codes & diagnostics
 
 ### General conventions
 
@@ -1708,6 +1830,7 @@ All commands set `process.exitCode = 1` rather than calling `process.exit(1)`. T
 | `daemon`   | `status`   | socket (with in-process fallback) | Fully implemented                                                 |
 | `daemon`   | `stop`     | socket                            | Fully implemented                                                 |
 | `doctor`   | —          | socket (with in-process fallback) | Fully implemented                                                 |
+| `verify`   | —          | supervised isolated daemon (or workspace daemon under a flag) | Fully implemented (§16)                       |
 | `session`  | `open`     | socket                            | Fully implemented                                                 |
 | `session`  | `close`    | socket                            | Fully implemented                                                 |
 | `session`  | `list`     | socket                            | Fully implemented                                                 |
