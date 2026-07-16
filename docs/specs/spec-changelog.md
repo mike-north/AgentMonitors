@@ -24,9 +24,11 @@ rushed author could commit a monitor that was never renamed to describe what it 
 - **005 §2 — current.** The `command-poll` template's inline comment previously warned that local
   commands "such as `git status`" can stay stale until a fetch — backwards advice that
   contradicted the `skill.md` authoring guide's own recommended minimal `command-poll` example,
-  `git status --porcelain`. The comment now scopes that staleness caveat to remote-ref commands
-  only (the scaffold's own `git ls-remote`, or `git rev-parse origin/...`), so it no longer
-  discourages a correct, guide-recommended setup.
+  `git status --porcelain`. The comment now scopes that staleness caveat to a local read of a
+  remote-tracking ref (e.g. `git rev-parse origin/main`); the scaffold's own `git ls-remote`
+  queries the remote live and is always current, and `git status --porcelain` is local
+  working-tree state with no fetch lag — so the comment no longer discourages a correct,
+  guide-recommended setup.
 
 ## 2026-07-15 — Test-bearing packages must fail on a zero-test suite (004 §2.8, new) — Refs #288
 

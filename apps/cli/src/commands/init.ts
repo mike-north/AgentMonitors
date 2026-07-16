@@ -49,11 +49,12 @@ When the page changes, review the differences and take appropriate action.
 name: Upstream branch monitor
 watch:
   type: command-poll
-  # command is an argv array, run directly (no shell). This example watches the
-  # remote branch tip directly; remote-ref commands like this "git ls-remote"
-  # or "git rev-parse origin/main" only reflect your last fetch, so they can
-  # lag until you fetch again. That caveat is specific to remote refs — a
-  # local-state command such as "git status --porcelain" has no such lag.
+  # command is an argv array, run directly (no shell). This example queries the
+  # remote branch tip live: "git ls-remote" hits the network on every run, so it
+  # is always current — no prior fetch needed. Only a LOCAL read of a
+  # remote-tracking ref, such as "git rev-parse origin/main", reflects just your
+  # last fetch and can lag until you fetch again. A local working-tree command
+  # such as "git status --porcelain" has no fetch lag either.
   command:
     - git
     - ls-remote

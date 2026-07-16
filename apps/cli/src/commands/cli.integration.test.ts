@@ -546,8 +546,8 @@ describe('init', () => {
     expect(parsed.monitors[0]?.source).toBe('command-poll');
 
     // Issue #244: the default command-poll scaffold should be safe for
-    // upstream-branch watching. `ls-remote` asks the remote directly, so its
-    // result can lag until the next fetch.
+    // upstream-branch watching. `ls-remote` asks the remote directly, so it is
+    // always current — no prior fetch needed.
     const monitor = readFileSync(
       path.join(monitorsDir, 'cmd-watch', 'MONITOR.md'),
       'utf-8',
@@ -571,10 +571,11 @@ describe('init', () => {
   // warned that local commands "such as \"git status\"" can stay stale until
   // a fetch — backwards advice that contradicts skill.md's own recommended
   // minimal command-poll example (`git status --porcelain`, Phase 3). The
-  // staleness caveat only applies to remote-ref commands (this scaffold's
-  // own `git ls-remote`, or `git rev-parse origin/...`); it must not mention
-  // "git status" as an example of something that goes stale.
-  it('command-poll scaffold comment no longer warns that local commands like git status can stay stale (AC2, AC3)', () => {
+  // fetch-staleness caveat applies ONLY to a local read of a remote-tracking
+  // ref (e.g. `git rev-parse origin/main`); the scaffold's own `git ls-remote`
+  // queries the remote live and is always current, and a local working-tree
+  // command like `git status --porcelain` has no fetch lag either.
+  it('command-poll scaffold comment describes ls-remote as live and scopes the staleness caveat to local remote-tracking refs (AC2, AC3)', () => {
     const dir = path.join(tempDir, 'init-command-poll-comment');
     mkdirSync(dir, { recursive: true });
     const monitorsDir = path.join(dir, 'monitors');
@@ -591,8 +592,11 @@ describe('init', () => {
     // The old, self-contradicting wording must be gone entirely.
     expect(monitor).not.toContain('local commands such as "git status"');
     expect(monitor).not.toContain('can stay stale until you fetch');
-    // The caveat must still exist, but scoped to remote-ref commands.
-    expect(monitor).toContain('remote-ref commands');
+    // ls-remote must be described as live/always-current, NOT fetch-stale
+    // (the earlier fix attempt wrongly grouped it with rev-parse as lagging).
+    expect(monitor).toContain('always current');
+    expect(monitor).not.toMatch(/ls-remote[^\n]*lag/);
+    // The staleness caveat must still exist, scoped to the local remote-ref read.
     expect(monitor).toContain('git rev-parse origin/main');
   });
 
