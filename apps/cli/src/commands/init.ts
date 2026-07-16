@@ -3,6 +3,7 @@ import path from 'node:path';
 import * as readline from 'node:readline/promises';
 import { Command, Option } from 'commander';
 import { readLocalState } from '../local-state.js';
+import { COMMAND_POLL_SCAFFOLD_DEFAULT_COMMAND } from './scaffold-defaults.js';
 import { validateCommand } from './validate.js';
 
 const yaml = String.raw;
@@ -35,11 +36,30 @@ const COMMAND_POLL_CONTRACT_COMMENT =
   '  # command is an argv array, run directly (no shell).\n';
 
 /**
+ * The `command-poll` template's illustrative `command:` list, rendered
+ * directly from {@link COMMAND_POLL_SCAFFOLD_DEFAULT_COMMAND} (in
+ * `scaffold-defaults.ts`) rather than duplicated as a second literal. This
+ * makes that module's "used by the scaffolder" claim structurally true: the
+ * template's default argv and `isUntouchedCommandPollDefault`'s comparison
+ * target are the same array, so they cannot silently diverge. Every token in
+ * {@link COMMAND_POLL_SCAFFOLD_DEFAULT_COMMAND} is a plain, unquoted-safe YAML
+ * scalar (no `'`, `#`, `:`, or leading `-`), so plain scalars are correct
+ * here — this is not the general seeding path and does not call
+ * `yamlSingleQuoted`.
+ */
+const COMMAND_POLL_DEFAULT_COMMAND_BLOCK =
+  COMMAND_POLL_SCAFFOLD_DEFAULT_COMMAND.map((token) => `    - ${token}`).join(
+    '\n',
+  );
+
+/**
  * The scaffold body for each `--type`. Exported (test-only use) so
  * `scaffold-defaults.test.ts` can assert the `command-poll` entry's parsed
  * `command:` block still equals {@link COMMAND_POLL_SCAFFOLD_DEFAULT_COMMAND}
- * in `scaffold-defaults.ts` — the two are otherwise independent literals with
- * no type-level link.
+ * in `scaffold-defaults.ts` — kept as a direct regression test even though
+ * the two are now structurally linked via
+ * {@link COMMAND_POLL_DEFAULT_COMMAND_BLOCK}, so a future refactor that
+ * breaks that link still fails loudly.
  */
 export const TEMPLATES: Record<string, string> = {
   'file-fingerprint': yaml`
@@ -83,10 +103,7 @@ name: Upstream branch monitor
 watch:
   type: command-poll
 ${COMMAND_POLL_EXAMPLE_COMMENT}  command:
-    - git
-    - ls-remote
-    - origin
-    - refs/heads/main
+${COMMAND_POLL_DEFAULT_COMMAND_BLOCK}
   interval: 5m
   change-detection:
     strategy: text-diff
@@ -254,8 +271,21 @@ function seedGlobs(template: string, type: string, globs: string[]): string {
  * `#`, `:` — round-trip verbatim. Quoting also means seeding never invents shell
  * semantics: each `--command` token is one argv element, matching the
  * "argv array, run directly (no shell)" contract (spec 003 §"command-poll").
+ *
+ * If the template's `command:` block ever drifts out of the shape
+ * `blockPattern` expects, `String.replace` would otherwise return the
+ * template unchanged with no error — silently shipping the untouched
+ * `ls-remote` default under a `--command` seed that looks like it applied.
+ * That is exactly the wrong-intent trap this flag exists to prevent (issue
+ * #388), so a non-matching template throws {@link InitSeedError} instead of
+ * silently no-op'ing.
+ *
+ * Exported (test-only use) so `init.test.ts` can exercise the no-match
+ * (drift-guard) path directly with a hand-crafted, deliberately non-matching
+ * template — that shape can't be reached through the real, currently-correct
+ * template via the CLI's public surface.
  */
-function seedCommand(
+export function seedCommand(
   template: string,
   type: string,
   command: string[],
@@ -276,6 +306,11 @@ function seedCommand(
   // capture its indent and the list-item indent from the template's own first
   // item, then replace the whole item run with the seeded tokens.
   const blockPattern = /^( *)command:\n(( +)- .*\n)(?:\3- .*\n)*/m;
+  if (!blockPattern.test(withGeneralizedComment)) {
+    throw new InitSeedError(
+      'Could not find a command: argv block in the command-poll template to seed (the template may have changed shape) — refusing to silently ship the untouched default; please report this as a bug.',
+    );
+  }
   return withGeneralizedComment.replace(
     blockPattern,
     (_match, indent: string, _first: string, itemIndent: string) => {
