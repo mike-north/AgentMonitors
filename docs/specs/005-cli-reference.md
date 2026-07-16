@@ -1484,7 +1484,8 @@ read: `inspect` never claims, acks, or advances a cursor.
 ## §15 `doctor` — Unified workspace health check
 
 **Source:** `apps/cli/src/commands/doctor.ts`
-**Status:** Fully implemented (in-process durable-state read + a socket ping for the daemon-reachable check).
+**Status:** Fully implemented (daemon-served report when reachable, in-process durable-state
+fallback otherwise — issue #373).
 
 ### Purpose
 
@@ -1513,45 +1514,79 @@ agentmonitors doctor [--dir <path>] [--workspace <path>] [--socket <path>] [--fo
 
 ### Transport and data source
 
-`doctor` reads its diagnosis **in-process from the persisted SQLite store** — the daemon writes the
-same store, so the report is accurate whether or not a daemon is running (the same principle as
-`daemon status`'s in-process fallback and `monitor explain`'s #150 no-daemon read). The **only** use
-of the socket is the `daemon-reachable` check's ping. The database and socket are resolved for the
-workspace the same way the daemon resolves them: `AGENTMONITORS_DB` / `AGENTMONITORS_SOCKET` win, then
-an enabled workspace's persisted `.claude/agentmonitors.local.md` `db:` / `socket:` (or the derived
-per-workspace paths), then the global defaults. As of issue #335, this is enforced symmetrically:
-`daemon run`/`daemon once` — including a directly-invoked one with no flags beyond `[monitorsDir]`,
-exactly as the Getting Started guide instructs — apply the identical resolution when binding, so
-`doctor`'s guess is never a _guess_ against a workspace-enabled project; it is guaranteed to be the
-daemon's actual db/socket.
+`doctor` prefers the **live daemon's own connection** when one is reachable: it calls `doctor.report`
+over the daemon socket (the same transport `monitor explain`/`monitor history` use), falling back to
+an **in-process** read of the persisted SQLite store when the daemon is unreachable
+(`DaemonConnectionError`) **or** when a reachable daemon answers that it does not understand the
+request at all (`DaemonUnsupportedRequestError`) — mirroring `monitor explain`'s #150 no-daemon read
+and `daemon status`'s in-process fallback. The latter case (issue #382) covers version skew: a still-
+running daemon build that predates `doctor.report` (or any request method added after it shipped)
+can only answer with the socket protocol's legacy unparseable-request sentinel
+(`{ id: "invalid", error: "Invalid JSON request." }`, optionally paired with a newer daemon's
+`code: "unsupported_request"`); `doctor` recognizes that sentinel precisely — never a loose
+substring match, so a genuine daemon-side application error is never misclassified — and falls back
+the same way it would for an unreachable daemon, rather than surfacing the raw sentinel text as a
+fatal crash. This ordering is deliberate (issue #373): a separate reader connection opened
+fresh against the same on-disk SQLite file as a live writer's connection can observe that writer's
+commits with a lag — WAL visibility across processes is not the same immediacy guarantee as reads on
+the writer's own connection — so an in-process-always read could freeze the per-monitor rollup
+(`last-observed`, `last-event`, delivery counts) at a stale snapshot even while `events list`/`monitor
+history`, served straight from the live daemon, already showed the current state. Routing through the
+daemon when one is reachable means `doctor`'s rollup is read from the exact same connection that
+materialized the data, eliminating that cross-connection lag; the in-process fallback remains correct
+for the case there genuinely is no live daemon to ask (its own report is then read from the last
+committed state, same as before). The database and socket are resolved for the workspace the same way
+the daemon resolves them: `AGENTMONITORS_DB` / `AGENTMONITORS_SOCKET` win, then an enabled workspace's
+persisted `.claude/agentmonitors.local.md` `db:` / `socket:` (or the derived per-workspace paths), then
+the global defaults. As of issue #335, this is enforced symmetrically: `daemon run`/`daemon once` —
+including a directly-invoked one with no flags beyond `[monitorsDir]`, exactly as the Getting Started
+guide instructs — apply the identical resolution when binding, so `doctor`'s guess is never a _guess_
+against a workspace-enabled project; it is guaranteed to be the daemon's actual db/socket. The
+`daemon-reachable` check's pass/fail is now derived from whether the `doctor.report` call itself
+reached the daemon (not a separate ping), so the check and the report source can never disagree about
+whether the daemon was actually live.
 
 ### Checks
 
 `doctor` runs this ordered sequence, printing one line per check with a `pass` (`✓`), `fail` (`✗`),
-or `skip` (`○`) status and, on failure, an actionable remediation:
+`skip` (`○`), or `idle` (`◇`) status and, on `fail`/`idle`, an actionable remediation:
 
-| Check                | Passes when                                                    | Remediation on failure                                                                                                                                                                                                                                                                                                                                                           |
-| -------------------- | -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `project-enabled`    | `.claude/agentmonitors.local.md` has `enabled: true`           | Run `agentmonitors init --enable-only`, or create `.claude/agentmonitors.local.md` with `enabled: true` yourself — the **same** enable step the `SessionStart` monitors-found-but-disabled advisory names (006 §5.6, §2), so all three surfaces agree                                                                                                                            |
-| `monitors-directory` | the monitors directory exists                                  | Create the directory and scaffold a monitor with `agentmonitors init`                                                                                                                                                                                                                                                                                                            |
-| `monitors-valid`     | every discovered monitor validates (no scope/parse/dup errors) | Run `agentmonitors validate <dir>` and fix the reported errors (`skip` when there are no monitors)                                                                                                                                                                                                                                                                               |
-| `daemon-reachable`   | the daemon answers a socket ping (path shown either way)       | Start it with `agentmonitors daemon run`, or let a Claude Code session start it automatically                                                                                                                                                                                                                                                                                    |
-| `lead-session`       | a lead session is registered for this workspace                | Open a Claude Code session (the `SessionStart` hook registers one) or `agentmonitors session open --role lead --workspace <path>` — the failure `detail` and remediation both **name the exact workspace path searched** (issue #335), so a future db/socket-derivation mismatch is self-diagnosing: compare it directly against `agentmonitors session list`'s workspace column |
-| `monitor:<id>`       | the monitor is valid and has been observed at least once       | Start the daemon (or wait for the next tick), then check `agentmonitors monitor history <id>`; `monitor test` dry-runs it (`skip` for an invalid monitor — see `monitors-valid`)                                                                                                                                                                                                 |
+| Check                | Passes when                                                    | Remediation on failure                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| -------------------- | -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `project-enabled`    | `.claude/agentmonitors.local.md` has `enabled: true`           | Run `agentmonitors init --enable-only`, or create `.claude/agentmonitors.local.md` with `enabled: true` yourself — the **same** enable step the `SessionStart` monitors-found-but-disabled advisory names (006 §5.6, §2), so all three surfaces agree                                                                                                                                                                                               |
+| `monitors-directory` | the monitors directory exists                                  | Create the directory and scaffold a monitor with `agentmonitors init`                                                                                                                                                                                                                                                                                                                                                                               |
+| `monitors-valid`     | every discovered monitor validates (no scope/parse/dup errors) | Run `agentmonitors validate <dir>` and fix the reported errors (`skip` when there are no monitors)                                                                                                                                                                                                                                                                                                                                                  |
+| `daemon-reachable`   | the `doctor.report` call reached a live daemon                 | Start it with `agentmonitors daemon run`, or let a Claude Code session start it automatically — `idle` when it doesn't and no lead session is registered (nothing is actually broken); **`fail`** when it doesn't but a lead session IS registered (issue #382 — an agent session is open with no daemon serving it, almost certainly a mid-session crash), see below                                                                               |
+| `lead-session`       | a lead session is registered for this workspace                | Open a Claude Code session (the `SessionStart` hook registers one) or `agentmonitors session open --role lead --workspace <path>` — the failure `detail` and remediation both **name the exact workspace path searched** (issue #335), so a future db/socket-derivation mismatch is self-diagnosing: compare it directly against `agentmonitors session list`'s workspace column; `idle` (not `fail`) when no lead session is registered, see below |
+| `monitor:<id>`       | the monitor is valid and has been observed at least once       | Start the daemon (or wait for the next tick), then check `agentmonitors monitor history <id>`; `monitor test` dry-runs it (`skip` for an invalid monitor — see `monitors-valid`)                                                                                                                                                                                                                                                                    |
 
-Each `monitor:<id>` line embeds the per-monitor rollup (below). **Exit 0 when every check passes;
-non-zero when any check fails.** A down daemon fails `daemon-reachable` but does not stop the rest of
-the diagnosis — the per-monitor rollup is still produced from persisted state and the line explicitly
-says the daemon is down.
+Each `monitor:<id>` line embeds the per-monitor rollup (below).
 
-**Expected-state context (issue #331).** `daemon-reachable` and `lead-session` both legitimately
-fail whenever no agent session is currently open for the workspace — e.g. right after the
-`setup-monitors` skill's manual-test recipe tears down its throwaway daemon and session (§"Verify It
-Fires"). That combination previously read as a broken setup with no cue otherwise. Both checks' fail
-`detail` text now appends a clause naming this: "expected when no agent session is currently open"
-(`daemon-reachable` additionally notes the daemon starts automatically once one is). The exit-code
-contract is unchanged — both checks still fail and `doctor` still exits 1 — only the wording gains
-context.
+**Exit-code contract (issue #373, refined by #382).** `doctor` exits **0** when every check is `pass`,
+`skip`, or `idle`, and **non-zero** when any check is `fail`. `idle` is distinct from `fail`: it names
+a check that legitimately does not apply right now, not a genuine problem, so an idle-only report
+never forces a non-zero exit. `lead-session` is `idle` (never `fail`) whenever no agent session is
+currently open for the workspace (e.g. right after the `setup-monitors` skill's manual-test recipe
+tears down its throwaway daemon and session, §"Verify It Fires"); its `detail` text names this
+explicitly — "expected when no agent session is currently open" — and its remediation is still shown,
+since opening a session is still a useful next step for a user who wants one.
+
+`daemon-reachable` is more nuanced (issue #382 item 2): a down daemon is `idle` **only when no lead
+session is registered for the workspace** — the same "nothing is actually open yet" state as above.
+When a lead session IS registered but the daemon is unreachable, that combination means an agent
+session is actively open with no daemon behind it — almost always a mid-session crash or a daemon
+someone killed — so `daemon-reachable` is `fail` (non-zero exit) instead, and its `detail` names the
+registered lead session rather than using the "expected when no agent session is currently open"
+wording (which would be actively misleading in that case). Where the underlying connection error is
+available, `detail` also distinguishes _why_ the daemon looks unreachable — a timeout ("daemon
+present but not answering") reads differently from no daemon process at all, and a version-skewed
+daemon that answered but rejected the request as unsupported (see "Transport and data source" above)
+is called out by name rather than folded into either. Only the exit-code weight and status glyph
+changed for the idle case (prior to issue #373, both checks were unconditionally classified `fail` and
+forced a non-zero exit even when nothing was actually broken — issue #331 had fixed the wording but
+not the exit code). A down daemon does not stop the rest of the diagnosis either way — the per-monitor
+rollup is still produced (from the in-process fallback) and the line explicitly says the daemon is
+down. Text and JSON summaries report a fourth `idle` count alongside `passed`/`failed`/`skipped`.
 
 ### Per-monitor rollup
 
@@ -1581,7 +1616,7 @@ remediation on failures), and a closing `Summary: <n> passed, <n> failed, <n> sk
   "checks": [
     {
       "name": "project-enabled",
-      "status": "pass|fail|skip",
+      "status": "pass|fail|skip|idle",
       "detail": "<string>",
       "remediation": "<string | null>"
     }
@@ -1601,7 +1636,7 @@ remediation on failures), and a closing `Summary: <n> passed, <n> failed, <n> sk
       "delivery": { "unread": 0, "claimed": 0, "acknowledged": 0 }
     }
   ],
-  "summary": { "passed": 0, "failed": 0, "skipped": 0 }
+  "summary": { "passed": 0, "failed": 0, "skipped": 0, "idle": 0 }
 }
 ```
 
@@ -1672,7 +1707,7 @@ All commands set `process.exitCode = 1` rather than calling `process.exit(1)`. T
 | `daemon`   | `run`      | creates socket server             | Fully implemented (`--reap-after-ms` added)                       |
 | `daemon`   | `status`   | socket (with in-process fallback) | Fully implemented                                                 |
 | `daemon`   | `stop`     | socket                            | Fully implemented                                                 |
-| `doctor`   | —          | in-process (+ socket ping)        | Fully implemented                                                 |
+| `doctor`   | —          | socket (with in-process fallback) | Fully implemented                                                 |
 | `session`  | `open`     | socket                            | Fully implemented                                                 |
 | `session`  | `close`    | socket                            | Fully implemented                                                 |
 | `session`  | `list`     | socket                            | Fully implemented                                                 |
