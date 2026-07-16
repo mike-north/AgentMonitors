@@ -13,16 +13,21 @@
  * @see https://eemeli.org/yaml/ (YAML 1.2 core schema: `on:` stays a string key)
  */
 import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
 import {
   API_REPORT_RUN_MANY_SCRIPTS,
   CI_WORKFLOW_PATH,
+  REPO_ROOT,
   ROOT_PACKAGE_JSON_PATH,
   REQUIRED_JOB_ID,
   assertApiReportCheckRuns,
   assertApiReportRunManyIsSerial,
+  assertApiReportScriptConfigSplit,
+  hasApiExtractorConfigs,
 } from './api-report-ci-wiring.mjs';
+import { PACKAGE_DIRS } from './publish-release-packages.mjs';
 
 // Reconstruction of ci.yml's "Check And Test" job as it existed immediately
 // before issue #285's fix: `check:api-report` was defined in package.json
@@ -164,6 +169,51 @@ jobs:
     ).toThrow(/never runs `pnpm check:api-report`/);
   });
 
+  // Regression guard: the job-level `if` check alone doesn't stop a
+  // step-level `if:` from silently disabling just the `check:api-report`
+  // step while the job (and every other step in it) stays unconditional and
+  // green.
+  it('rejects a step-level "if" on the check:api-report step, even in an unconditional job', () => {
+    const workflow: unknown = parse(`
+jobs:
+  test:
+    name: Check And Test
+    steps:
+      - run: pnpm check
+      - name: Check (API report drift)
+        if: github.event_name == 'push'
+        run: pnpm check:api-report
+      - run: pnpm test
+`);
+    expect(() =>
+      assertApiReportCheckRuns(
+        workflow as Parameters<typeof assertApiReportCheckRuns>[0],
+      ),
+    ).toThrow(/step-level "if:"/);
+  });
+
+  // Regression guard: `continue-on-error: true` on just the
+  // `check:api-report` step lets that step fail without failing the job —
+  // the gate would stay green even while API report drift goes undetected.
+  it('rejects "continue-on-error" on the check:api-report step', () => {
+    const workflow: unknown = parse(`
+jobs:
+  test:
+    name: Check And Test
+    steps:
+      - run: pnpm check
+      - name: Check (API report drift)
+        continue-on-error: true
+        run: pnpm check:api-report
+      - run: pnpm test
+`);
+    expect(() =>
+      assertApiReportCheckRuns(
+        workflow as Parameters<typeof assertApiReportCheckRuns>[0],
+      ),
+    ).toThrow(/must not set "continue-on-error"/);
+  });
+
   it('accepts a minimal well-formed shape (positive control)', () => {
     const workflow: unknown = parse(`
 jobs:
@@ -302,5 +352,140 @@ describe('assertApiReportRunManyIsSerial', () => {
       'check:api-report',
       'fix:api-report',
     ]);
+  });
+});
+
+/**
+ * Regression guard for issue #285's actual root cause, not just the CI-side
+ * symptom the rest of this file covers: a single shared api-extractor
+ * config let `build`'s `--local` rollup step silently rewrite the
+ * checked-in api-report before `check:api-report`'s non-local validation
+ * ever read it. The fix split every published package's config in two
+ * (`api-extractor.build.json` / `api-extractor.report.json`); nothing else
+ * in CI would fail if one package's `package.json` scripts quietly drifted
+ * back to sharing a config or regained a stray `--local`, so this is the
+ * forward pin.
+ */
+describe('assertApiReportScriptConfigSplit', () => {
+  it('rejects "check:api-report" passing --local (would silently rewrite the checked-in report)', () => {
+    expect(() =>
+      assertApiReportScriptConfigSplit(
+        {
+          scripts: {
+            'check:api-report':
+              'tsup && tsc -p tsconfig.build.json && api-extractor run --local --verbose -c api-extractor.report.json',
+            'fix:api-report':
+              'tsup && tsc -p tsconfig.build.json && api-extractor run --local --verbose -c api-extractor.report.json',
+            build:
+              'tsup && tsc -p tsconfig.build.json && api-extractor run --local --verbose -c api-extractor.build.json',
+          },
+        },
+        'test-package',
+      ),
+    ).toThrow(/"check:api-report" script must not pass --local/);
+  });
+
+  it('rejects "check:api-report" not referencing api-extractor.report.json', () => {
+    expect(() =>
+      assertApiReportScriptConfigSplit(
+        {
+          scripts: {
+            'check:api-report':
+              'tsup && tsc -p tsconfig.build.json && api-extractor run --verbose -c api-extractor.build.json',
+            'fix:api-report':
+              'tsup && tsc -p tsconfig.build.json && api-extractor run --local --verbose -c api-extractor.report.json',
+            build:
+              'tsup && tsc -p tsconfig.build.json && api-extractor run --local --verbose -c api-extractor.build.json',
+          },
+        },
+        'test-package',
+      ),
+    ).toThrow(/"check:api-report" script must invoke api-extractor/);
+  });
+
+  it('rejects "fix:api-report" missing --local (would only validate, never regenerate)', () => {
+    expect(() =>
+      assertApiReportScriptConfigSplit(
+        {
+          scripts: {
+            'check:api-report':
+              'tsup && tsc -p tsconfig.build.json && api-extractor run --verbose -c api-extractor.report.json',
+            'fix:api-report':
+              'tsup && tsc -p tsconfig.build.json && api-extractor run --verbose -c api-extractor.report.json',
+            build:
+              'tsup && tsc -p tsconfig.build.json && api-extractor run --local --verbose -c api-extractor.build.json',
+          },
+        },
+        'test-package',
+      ),
+    ).toThrow(/"fix:api-report" script must pass --local/);
+  });
+
+  it('rejects "build" referencing api-extractor.report.json instead of api-extractor.build.json', () => {
+    expect(() =>
+      assertApiReportScriptConfigSplit(
+        {
+          scripts: {
+            'check:api-report':
+              'tsup && tsc -p tsconfig.build.json && api-extractor run --verbose -c api-extractor.report.json',
+            'fix:api-report':
+              'tsup && tsc -p tsconfig.build.json && api-extractor run --local --verbose -c api-extractor.report.json',
+            build:
+              'tsup && tsc -p tsconfig.build.json && api-extractor run --local --verbose -c api-extractor.report.json',
+          },
+        },
+        'test-package',
+      ),
+    ).toThrow(/"build" script must invoke api-extractor/);
+  });
+
+  it('accepts a correctly split shape (positive control)', () => {
+    expect(() =>
+      assertApiReportScriptConfigSplit(
+        {
+          scripts: {
+            'check:api-report':
+              'tsup && tsc -p tsconfig.build.json && api-extractor run --verbose -c api-extractor.report.json',
+            'fix:api-report':
+              'tsup && tsc -p tsconfig.build.json && api-extractor run --local --verbose -c api-extractor.report.json',
+            build:
+              'tsup && tsc -p tsconfig.build.json && api-extractor run --local --verbose -c api-extractor.build.json',
+          },
+        },
+        'test-package',
+      ),
+    ).not.toThrow();
+  });
+
+  // The real proof: every actual, on-disk publishable package (from
+  // `PACKAGE_DIRS`, the single source of truth used by the publisher and
+  // the standalone-consumer smoke test) that has its own api-extractor
+  // configs must satisfy the split. If any future package's scripts drift
+  // back to a shared config or a stray `--local`, this fails — closing the
+  // exact gap #285 shipped without: nothing else in CI pins this per
+  // package.
+  it.each(PACKAGE_DIRS.filter(hasApiExtractorConfigs))(
+    'accepts the real, on-disk package.json for %s',
+    (packageDir) => {
+      const pkg: unknown = JSON.parse(
+        readFileSync(join(REPO_ROOT, packageDir, 'package.json'), 'utf8'),
+      );
+      expect(() =>
+        assertApiReportScriptConfigSplit(
+          pkg as Parameters<typeof assertApiReportScriptConfigSplit>[0],
+          packageDir,
+        ),
+      ).not.toThrow();
+    },
+  );
+
+  // Sanity check on the fixture selection itself: at least one real package
+  // must actually have api-extractor configs, or the `it.each` above would
+  // silently run zero cases and this whole describe block would give false
+  // confidence.
+  it('finds at least one package with api-extractor configs (sanity on PACKAGE_DIRS filtering)', () => {
+    expect(PACKAGE_DIRS.filter(hasApiExtractorConfigs).length).toBeGreaterThan(
+      0,
+    );
   });
 });
