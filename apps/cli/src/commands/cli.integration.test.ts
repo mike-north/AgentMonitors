@@ -468,6 +468,73 @@ describe('CLI --help marks required options as required (issue #338 item 2)', ()
   });
 });
 
+// Issue #420 P2: `events list`/`events ack` require --session, but the bare
+// commander error gives a manual/no-docs user no way to discover an id. The
+// error now appends a pointer to `session list`, and --help repeats it. The
+// default error line and non-zero exit are unchanged (additive only).
+describe('events --session discovery hint (issue #420 P2)', () => {
+  const HINT = 'Run `agentmonitors session list` to find a session id.';
+
+  it('events list without --session: error line unchanged, hint appended, exit 1', () => {
+    const result = run(['events', 'list']);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain(
+      "error: required option '--session <id>' not specified",
+    );
+    expect(result.stderr).toContain(HINT);
+  });
+
+  it('events ack without --session: error line unchanged, hint appended, exit 1', () => {
+    const result = run(['events', 'ack']);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain(
+      "error: required option '--session <id>' not specified",
+    );
+    expect(result.stderr).toContain(HINT);
+  });
+
+  it('events list --help documents how to find a session id', () => {
+    const result = run(['events', 'list', '--help']);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain(HINT);
+  });
+
+  it('events ack --help documents how to find a session id', () => {
+    const result = run(['events', 'ack', '--help']);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain(HINT);
+  });
+});
+
+// Issue #420 P5: `monitor history` scopes by --workspace, not --dir (which
+// means the monitors directory elsewhere). Rather than silently alias --dir to
+// --workspace (wrong-workspace resolution), the unknown-option error points at
+// the right flag. Additive: the default error and exit code are unchanged.
+describe('monitor history --dir remediation hint (issue #420 P5)', () => {
+  it('unknown --dir: commander error unchanged, hint appended, exit 1', () => {
+    const result = run(['monitor', 'history', '--dir', 'foo']);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("error: unknown option '--dir'");
+    expect(result.stderr).toContain(
+      'monitor history scopes by --workspace (the project directory), not --dir.',
+    );
+  });
+
+  it('a valid --workspace flag is still accepted (does not trigger the hint)', () => {
+    // No daemon and an empty/absent store → the command reports "No observation
+    // history." or a no-daemon remediation, but never the --dir hint.
+    const result = run([
+      'monitor',
+      'history',
+      '--workspace',
+      tempDir,
+      '--format',
+      'json',
+    ]);
+    expect(result.stderr).not.toContain('not --dir');
+  });
+});
+
 describe('CLI --version', () => {
   // Regression: index.ts shipped with a hardcoded `.version('0.0.0')`, so the
   // published 0.3.0 CLI reported 0.0.0 — making it impossible to tell which
@@ -2531,6 +2598,77 @@ describe('scan', () => {
     const result = run(['scan', '/tmp/nonexistent-agentmonitors-test-dir']);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('does not exist');
+  });
+
+  // Issue #420 P4: exit code must be meaningful for `scan && <next-step>`.
+  it('exits 0 for a clean scan (valid monitors, no errors/duplicates)', () => {
+    const dir = path.join(tempDir, 'scan-clean-exit');
+    const monitorsDir = path.join(dir, 'monitors');
+    mkdirSync(monitorsDir, { recursive: true });
+    run(['init', 'clean-mon', '--dir', monitorsDir], dir);
+    const result = run(['scan', monitorsDir, '--format', 'json']);
+    const parsed = JSON.parse(result.stdout) as {
+      errors: unknown[];
+      duplicateIds: unknown[];
+    };
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.duplicateIds).toEqual([]);
+    expect(result.exitCode).toBe(0);
+  });
+
+  it('exits 0 for an empty (but valid) monitors directory', () => {
+    const emptyDir = path.join(tempDir, 'scan-empty-exit');
+    mkdirSync(emptyDir, { recursive: true });
+    const result = run(['scan', emptyDir, '--format', 'json']);
+    expect(result.exitCode).toBe(0);
+  });
+
+  it('exits 1 when a MONITOR.md fails to parse (errors non-empty)', () => {
+    const monitorsDir = path.join(tempDir, 'scan-parse-error', 'broken');
+    mkdirSync(monitorsDir, { recursive: true });
+    // Invalid YAML frontmatter → scanMonitors records a parse error.
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      ['---', 'watch: {{{', 'not: valid', '---', '# broken', ''].join('\n'),
+      'utf-8',
+    );
+    const result = run([
+      'scan',
+      path.join(tempDir, 'scan-parse-error'),
+      '--format',
+      'json',
+    ]);
+    const parsed = JSON.parse(result.stdout) as { errors: unknown[] };
+    expect(parsed.errors.length).toBeGreaterThan(0);
+    expect(result.exitCode).toBe(1);
+  });
+
+  it('exits 1 when two monitors share a duplicate id (duplicateIds non-empty)', () => {
+    const root = path.join(tempDir, 'scan-dup', 'monitors');
+    // Same leaf folder name in two subtrees → duplicate monitor id (the id is
+    // the parent directory name, 001 §4).
+    for (const grp of ['grp1', 'grp2']) {
+      const dir = path.join(root, grp, 'dupe');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        path.join(dir, 'MONITOR.md'),
+        [
+          '---',
+          'watch:',
+          '  type: schedule',
+          '  every: 1h',
+          'urgency: normal',
+          '---',
+          '# dup',
+          '',
+        ].join('\n'),
+        'utf-8',
+      );
+    }
+    const result = run(['scan', root, '--format', 'json']);
+    const parsed = JSON.parse(result.stdout) as { duplicateIds: unknown[] };
+    expect(parsed.duplicateIds.length).toBeGreaterThan(0);
+    expect(result.exitCode).toBe(1);
   });
 });
 
@@ -6965,6 +7103,70 @@ describe('lazy daemon lifecycle', () => {
     }
   }, 30_000);
 
+  // Issue #420 P3: `session start`/`session end` succeeded silently on stdout,
+  // so a hand-wiring user couldn't tell registration/deregistration happened
+  // without a second `session list`. They now print a one-line ack on STDERR
+  // — while stdout stays wire-clean (the SessionStart recap channel), so the
+  // hook wire format is unaffected.
+  it('session start and session end print a one-line success ack on stderr; stdout stays wire-clean', async () => {
+    const { ws, socket, env, hostSessionId } = bootLazyWorkspace(5_000);
+
+    try {
+      // A fresh start has no unread events → the recap render is null → stdout
+      // MUST be byte-empty. The ack goes to stderr only.
+      const start = runWithStdinCapture(
+        ['session', 'start'],
+        env,
+        sessionStartPayload(hostSessionId, ws),
+        ws,
+      );
+      expect(start.exitCode).toBe(0);
+      expect(start.stdout).toBe('');
+      // AgentMon: session <id> registered; daemon at <socket>
+      expect(start.stderr).toMatch(
+        /^AgentMon: session .+ registered; daemon at .+$/m,
+      );
+      expect(start.stderr).toContain(socket);
+      expect(await daemonAvailable(socket)).toBe(true);
+
+      // The registered AgentMon session id in the ack matches `session list`.
+      const list = runWithEnv(
+        ['session', 'list', '--socket', socket, '--format', 'json'],
+        env,
+        ws,
+      );
+      const sessions = JSON.parse(list.stdout) as {
+        id: string;
+        hostSessionId: string;
+      }[];
+      const registered = sessions.find(
+        (s) => s.hostSessionId === hostSessionId,
+      );
+      expect(registered).toBeDefined();
+      expect(start.stderr).toContain(`session ${registered?.id ?? ''} `);
+
+      // session end acks on stderr too, with the SAME AgentMon session id.
+      const end = runWithStdinCapture(
+        ['session', 'end'],
+        env,
+        sessionEndPayload(hostSessionId, ws),
+        ws,
+      );
+      expect(end.exitCode).toBe(0);
+      expect(end.stdout).toBe('');
+      expect(end.stderr).toContain(
+        `AgentMon: session ${registered?.id ?? ''} ended`,
+      );
+    } finally {
+      try {
+        await callDaemon('stop', {}, { socketPath: socket });
+      } catch {
+        // already stopped or never started — ignore
+      }
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it('the daemon idle-reaps itself after the last session ends', async () => {
     // reapAfterMs = 1500 ms, daemon pollMs = 1000 ms (hardcoded in session.ts)
     // latest reap fires at: reapAfterMs + 1 poll = 1500 + 1000 = 2500 ms
@@ -9873,11 +10075,20 @@ describe('hook deliver: always-on unknown-session stderr diagnostic (issue #329)
   it('help documents the always-on unknown-session_id stderr warning', () => {
     const result = run(['hook', 'deliver', '--help']);
     expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain('Unknown session_id');
+    expect(result.stdout).toContain('Always-on STDERR diagnostics');
     expect(result.stdout).toContain('even without --debug');
     expect(result.stdout).toContain(
       'hook deliver: no session registered for host session id "<id>"',
     );
+  });
+
+  // Issue #420 P1: the malformed-payload and unmapped-lifecycle branches are
+  // also documented as always-on stderr diagnostics.
+  it('help documents the always-on malformed-payload and unmapped-lifecycle stderr diagnostics (issue #420 P1)', () => {
+    const result = run(['hook', 'deliver', '--help']);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('no session_id in the stdin payload');
+    expect(result.stdout).toContain('does not map to a delivery lifecycle');
   });
 
   // Acceptance: unknown session_id -> stderr warning + empty stdout + exit 0,
@@ -10217,6 +10428,64 @@ describe('hook deliver: always-on unknown-session stderr diagnostic (issue #329)
       rmSync(ws, { recursive: true, force: true });
     }
   }, 40_000);
+});
+
+// Issue #420 P1: the two earliest quiet-return branches (malformed / non-hook
+// payload, and an event that maps to no delivery lifecycle) previously printed
+// nothing and exited 0 — indistinguishable from "nothing pending," the single
+// most-repeated "looks broken, user gives up" moment on the manual path. Both
+// now write ONE line to stderr, unconditionally (no --debug), while STDOUT
+// stays byte-empty (hook wire compat) and the exit code stays 0. These branches
+// return before any socket/daemon work, so no daemon is needed.
+describe('hook deliver: always-on malformed-payload / unmapped-lifecycle stderr (issue #420 P1)', () => {
+  it('malformed payload (no session_id): stderr warns, stdout stays byte-empty, exit 0', () => {
+    const result = runWithStdinCapture(['hook', 'deliver'], {}, '');
+    expect(result.exitCode).toBe(0);
+    // STDOUT wire contract: byte-empty (the Claude Code host parses stdout).
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toBe(
+      'hook deliver: no session_id in the stdin payload — expected a Claude Code ' +
+        'hook JSON payload on stdin; nothing delivered.\n',
+    );
+  });
+
+  it('empty JSON object payload also hits the malformed branch', () => {
+    const result = runWithStdinCapture(['hook', 'deliver'], {}, '{}');
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('no session_id in the stdin payload');
+  });
+
+  it('unmapped hook_event_name: stderr names the event, stdout stays byte-empty, exit 0', () => {
+    const result = runWithStdinCapture(
+      ['hook', 'deliver'],
+      {},
+      JSON.stringify({
+        session_id: 'some-host',
+        hook_event_name: 'PreToolUse',
+        cwd: '/tmp',
+      }),
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toBe(
+      'hook deliver: hook_event_name "PreToolUse" does not map to a delivery ' +
+        'lifecycle (only UserPromptSubmit, PostToolUse, and SessionStart do); ' +
+        'nothing delivered.\n',
+    );
+  });
+
+  it('missing hook_event_name renders as (none), not the literal "undefined"', () => {
+    const result = runWithStdinCapture(
+      ['hook', 'deliver'],
+      {},
+      JSON.stringify({ session_id: 'some-host', cwd: '/tmp' }),
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('hook_event_name (none) does not map');
+    expect(result.stderr).not.toContain('undefined');
+  });
 });
 
 // Issue #270: prove hooks-only (no-MCP) operation is a complete, first-class

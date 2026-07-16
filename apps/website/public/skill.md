@@ -346,7 +346,12 @@ running rather than tearing it down. Because that daemon persists, `verify` clea
 by retracting its scratch file's create event and leaving a short-lived **suppression** so the
 daemon erases the scratch file's later deletion event on its own — so the scratch change never
 reaches a real session and the run finishes in about the same time as a plain `verify`. An
-interrupted run (e.g. a command timeout) leaves no permanent stray session or event behind.
+interrupted run (e.g. a command timeout) leaves no permanent stray session or event behind. Note
+that `verify`'s own synthetic trigger is a scratch probe: its PASS is not persisted as a durable
+event, so it will **not** show up in `agentmonitors events list` or `agentmonitors doctor`'s event
+counts. The PASS proves delivery end-to-end; if the user also wants a durable, queryable artifact to
+inspect after the run, have them make one real edit to a watched file and deliver it (a live
+session, or `agentmonitors hook deliver`), then inspect `agentmonitors events list --session <id>`.
 
 **Success looks like** a `PASS` line, with a `deliver` stage reporting
 `claimed at turn-interruptible` (for `urgency: high`) or `claimed at post-compact`

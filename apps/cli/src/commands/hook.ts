@@ -38,7 +38,11 @@ import {
   describeWorkspace,
   describeWorkspaceDisabled,
 } from '../hook-deliver-debug.js';
-import { describeUnknownHostSessionWarning } from '../hook-deliver-warnings.js';
+import {
+  describeMalformedPayloadWarning,
+  describeUnknownHostSessionWarning,
+  describeUnmappedLifecycleWarning,
+} from '../hook-deliver-warnings.js';
 
 export const hookCommand = new Command('hook').description(
   'Claim hook-delivery payloads from the runtime',
@@ -152,12 +156,17 @@ Output formats:
   default/json  Compact Claude Code hook wire JSON when something is pending.
   text          Rendered additionalContext only, for manual inspection.
 
-Unknown session_id (issue #329):
-  If the payload's session_id matches no tracked session, one line is ALWAYS written to
-  STDERR — even without --debug — since that failure can never resolve, unlike the
-  expected (and silent) ~15s high-urgency claim-settle window:
-    hook deliver: no session registered for host session id "<id>"
-  STDOUT and the exit code are unaffected.
+Always-on STDERR diagnostics (issues #329, #420):
+  Three failure branches whose empty STDOUT is otherwise indistinguishable from
+  "nothing pending" — and which never resolve on their own — ALWAYS write one line to
+  STDERR, even without --debug. STDOUT and the exit code are unaffected:
+    - malformed / non-hook payload (no session_id):
+        hook deliver: no session_id in the stdin payload — ...
+    - hook_event_name that maps to no delivery lifecycle:
+        hook deliver: hook_event_name "<name>" does not map to a delivery lifecycle ...
+    - session_id that matches no tracked session:
+        hook deliver: no session registered for host session id "<id>"
+  The expected (and silent) ~15s high-urgency claim-settle window still writes nothing.
 
 Diagnosis:
   --debug  Writes a step-by-step diagnosis to STDERR only (session resolution,
@@ -188,10 +197,16 @@ Diagnosis:
         const payload = await readHookPayload();
         debug(describePayload(payload));
 
-        // Not a Claude Code session — quiet no-op. There is NO session-id env
-        // var; the only source is the stdin payload.
+        // No session_id in the payload means this is not a real Claude Code
+        // hook call, or the payload is malformed/empty. Emit a one-line stderr
+        // diagnostic ALWAYS (issue #420 P1) — like the unknown-session branch
+        // below (#329), the empty stdout is otherwise indistinguishable from
+        // "nothing pending," and this failure never self-resolves. STDOUT and
+        // the exit code are untouched. The plugin only wires this command into
+        // events that carry a session_id, so this fires only on the manual path.
         const hostSessionId = payload.session_id;
         if (!hostSessionId) {
+          process.stderr.write(`${describeMalformedPayloadWarning()}\n`);
           debug(describeNoSessionId());
           return;
         }
@@ -202,6 +217,14 @@ Diagnosis:
         const hookEventName = payload.hook_event_name;
         const lifecycle = options.lifecycle ?? lifecycleForEvent(hookEventName);
         if (!lifecycle) {
+          // additionalContext at an unmapped event would be silently ignored by
+          // the host, so empty stdout is mistaken for "nothing pending." Emit a
+          // one-line stderr diagnostic ALWAYS (issue #420 P1); STDOUT and the
+          // exit code are untouched. Only reachable on the manual path — the
+          // plugin wires this into UserPromptSubmit, which maps.
+          process.stderr.write(
+            `${describeUnmappedLifecycleWarning(hookEventName)}\n`,
+          );
           debug(describeUnmappedLifecycle(hookEventName));
           return;
         }

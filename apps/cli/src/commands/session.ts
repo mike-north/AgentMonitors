@@ -276,6 +276,16 @@ sessionCommand
         socket,
       );
 
+      // One-line success ack on STDERR (issue #420 P3). stdout is this
+      // command's hook wire channel and MUST stay clean (it carries only the
+      // post-compact recap JSON below, if any) — so a hand-wiring user who
+      // needs to confirm the session registered gets it on stderr, which the
+      // Claude Code host never reads. Silent success was a dead end that forced
+      // a second `session list` just to tell it worked.
+      console.error(
+        `AgentMon: session ${opened.id} registered; daemon at ${socket}`,
+      );
+
       // SessionStart is a context event, so this command ALSO surfaces the
       // post-compact recap — from the SAME stdin payload we already read.
       // The plugin runs `session start` as ONE hook command; a separately
@@ -325,7 +335,14 @@ sessionCommand
     try {
       const sessions = await listSessionsClient(socket);
       const match = sessions.find((s) => s.hostSessionId === hostSessionId);
-      if (match) await closeSessionClient(match.id, socket);
+      if (match) {
+        await closeSessionClient(match.id, socket);
+        // One-line success ack on STDERR (issue #420 P3). This command has no
+        // stdout wire output, but stderr keeps the symmetry with `session
+        // start` and gives a hand-wiring user a durable signal that the session
+        // deregistered. The Claude Code host never reads hook stderr.
+        console.error(`AgentMon: session ${match.id} ended`);
+      }
     } catch {
       // daemon went away mid-deregister — the idle reaper is the backstop; no-op.
     }
