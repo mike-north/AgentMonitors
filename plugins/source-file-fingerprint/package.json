@@ -1,7 +1,7 @@
 {
   "name": "@agentmonitors/source-file-fingerprint",
   "description": "File change detection via SHA-256 fingerprinting for Agent Monitors",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "engines": {
     "node": ">=24"
   },

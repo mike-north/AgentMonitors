@@ -1,5 +1,184 @@
 # @agentmonitors/core
 
+## 0.11.0
+
+### Minor Changes
+
+- 24e7685: Export `baselineStrategyValues` (backing `BaselineStrategy`) and `inboxItemState` (backing
+  `InboxItemState`) from the package entry point.
+
+  These consts already backed already-public types via `typeof X[number]`, but were not themselves
+  reachable from `index.ts` — a real "forgotten export" gap surfaced by enabling API Extractor's
+  report generation (issue #285), which otherwise embeds an `ae-forgotten-export` warning banner
+  into the checked-in API report instead of a clean signature. No runtime behavior changes.
+
+- a7b5729: Add ephemeral (agent-declared, session-scoped) monitors — the `agentmonitors watch` verb (spec 007
+  §4 / 005 §14.4).
+
+  An agent can now declare a session-scoped monitor at runtime — "tell me when _X_, and remind me of
+  _this instruction_ when it does" — without authoring a `MONITOR.md` file:
+  - `agentmonitors watch <source> --session <id> --scope <spec> [--urgency] [--instruction]` declares
+    one; `watch list --session <id>` and `watch cancel <ephemeralId> --session <id>` manage them.
+    `--scope` accepts `key=value,...` or a JSON object.
+  - Ephemeral monitors flow the **same** daemon pipeline as persistent monitors (AP7):
+    tick → notify → materialize → project → deliver. Their scope is validated by the **same** shared
+    `validateWatchScope` path as `agentmonitors validate` (schema check plus the BP3
+    `change-detection.collection` friendly wrapper), so an invalid scope is rejected with the identical
+    diagnosis and they cannot express a config a persistent monitor could not.
+  - **Binding:** a declaration must bind to a **lead** session; because projection is lead-only, a
+    binding to a subagent session (which could never deliver) is rejected at declaration time.
+  - **Projection isolation:** an ephemeral monitor's events project into the **declaring session
+    only**, never a sibling lead session in the same workspace — and its private free-text instruction
+    is never surfaced by an **unscoped** (session-less) read (`events list` without `--session`, or the
+    unscoped observation-history enumeration); it is readable only through the declaring session's
+    session-scoped read.
+  - **Reap safety:** a `watch cancel` (or session close/dormancy) that races an in-flight tick never
+    delivers for the reaped watch — delivery re-checks, at materialization time, that the monitor and
+    its declaring session are still active; otherwise the observed event is retained but projected to
+    nobody.
+  - **Lifecycle:** active on declaration; reaped on session close, on `watch cancel`, and on a new
+    per-session dormancy trigger (a session inactive past `DEFAULT_SESSION_DORMANCY_MS`). The
+    definition and its durable state survive a daemon restart while the session lives, and a reaped
+    monitor is never resurrected after the session ends. Already-materialized events are retained.
+  - Ephemeral ids are the reserved-prefix form `ephemeral:<sessionId>/<ulid>`, structurally unable to
+    collide with a directory-derived persistent monitor id.
+
+  Public core surface: `AgentMonitorRuntime` gains `declareEphemeralMonitor`, `listEphemeralMonitors`,
+  and `cancelEphemeralMonitor`, plus the exported `EphemeralMonitorRecord`, `EphemeralMonitorStatus`,
+  and `DeclareEphemeralMonitorInput` types and an optional `sessionDormancyMs` constructor option. The
+  scope-validation helpers `validateWatchScope` and `changeDetectionCollectionError` are exported so
+  the CLI and the ephemeral declare path share one validation path.
+
+- 89e705f: Export `schedulingDefaults` — the runtime's canonical scheduling and notify default timings
+  (file-fingerprint poll, api-poll interval, schedule tick cadence, and the high-urgency claim-settle
+  window) as a single frozen constant. The daemon's scheduler (`service.ts`) now reads these instead of
+  its own local literals, and timing-aware consumers (the CLI `verify` command sizing its end-to-end
+  delivery budget) can import the real values rather than re-declaring hand-mirrored copies that
+  silently drift when a default changes.
+- 36a2e48: Fix `agentmonitors verify` spuriously FAILing on the recommended default monitor configuration
+  (`file-fingerprint` + `urgency: high`, no `notify:` block) on its very first invocation.
+
+  `resolveSettleMs` (`apps/cli/src/verify-budget.ts`) returned `0` whenever a monitor declared no
+  `notify` block, but the runtime still applies a default 15s debounce settle to a `high`-urgency
+  observation with no explicit `notify` override before it materializes
+  (`defaultNotifyConfigForUrgency`, `service.ts`). For the recommended default's 30s
+  `file-fingerprint` interval, the auto-derived budget undershot real end-to-end delivery (~60s) by
+  exactly that omitted 15s, FAILing at ~53s even though the same monitor passes with a larger
+  `--timeout-ms`.
+
+  `resolveSettleMs` now delegates to `defaultNotifyConfigForUrgency` (newly exported from
+  `@agentmonitors/core`) instead of reading `monitor.frontmatter.notify` directly, so the budget can
+  never drift from the engine's own notify-default resolution. The default settle value is now the
+  named constant `schedulingDefaults.highUrgencyDefaultDebounceSettleMs` (15s) rather than a
+  hand-mirrored literal. An explicit `notify.settle-for` still overrides the default outright; a
+  non-high-urgency monitor with no `notify` still resolves `settleMs` to `0`.
+
+- 9f141bb: `verify --use-workspace-daemon` no longer pollutes the workspace's event stream with a spurious
+  event from its own teardown.
+
+  That mode targets the persistent workspace daemon and leaves it running. Previously, verify's cleanup
+  deleted its own scratch trigger file (`agentmonitors-verify-<hash>.<ext>`), the live daemon observed
+  that deletion as a real change, and a later session's `hook deliver`/`events list` surfaced a spurious
+  `File deleted: …/agentmonitors-verify-….md` **first**, ahead of the user's real change — a bad look
+  for the "stakeholder-presentable proof" this mode targets (issue #407). The default isolated mode was
+  never affected (its throwaway daemon/db are torn down).
+
+  Verify now deletes the scratch file, waits for its own monitor to materialize the resulting deletion
+  event, then retracts the exact events its own scratch file produced (the create AND the delete) across
+  all sessions. The wait and retraction are scoped to the verified monitor, and the retraction deletes by
+  the observed event ids — never a `(monitor, path)` sweep — so a real, pre-existing event at the same
+  watched path survives and a second monitor also watching it is unaffected. Real monitored changes, and
+  any pre-existing watched file verify merely edits and restores, are never touched.
+
+  This adds a new runtime capability, `AgentMonitorRuntime.retractObjectEvents` (backed by the store),
+  which removes a caller-supplied set of a monitor's events by id — plus their per-recipient
+  `session_event_state` projections, snapshots, and the affected sessions' seeded cursors; it is exposed
+  over the daemon socket as the `events.retractObject` IPC verb.
+
+- 720d072: Add the watch-mode source-state checkpoint contract (spec 002 §2.4). `ObservationContext` gains an
+  optional `checkpoint?: (nextState: unknown) => Promise<void>` callback, supplied only on the
+  `watch()` path (never `observe()`). A long-lived `watch()` source calls it to durably write back its
+  advancing change-detection state into the monitor's persisted `sourceState`, so a mid-watch daemon
+  crash reconciles from the last checkpointed baseline rather than re-emitting already-delivered
+  changes.
+
+  The runtime serializes checkpoint writes with observation ingestion per-watcher: a checkpoint whose
+  durable write is in flight when an observation arrives completes before that observation is ingested
+  (the G14 durable-write-before-ingest ordering). A checkpoint is a state write only — it never
+  materializes or delivers an observation — and a checkpoint whose write fails logs a warning and does
+  not abort the watcher.
+
+- 4e46c41: Namespace persisted monitor runtime state and observation history by workspace (P1
+  durable-state / workspace-isolation fix).
+
+  `monitor_state` was keyed by `monitorId` alone (its PRIMARY KEY, with no workspace column), and
+  `observation_history` had no workspace column. Because the database is global and the same monitor
+  id can exist in unrelated workspaces on one machine — the getting-started default `my-first-monitor`
+  is the common collision — a second project reusing the id read the first project's `file-fingerprint`
+  baseline and reported `descoped`/`deleted` changes for files that only ever existed in the other
+  workspace.
+  - **State is now keyed by `(monitorId, workspacePath)`.** A surrogate `id` primary key plus a UNIQUE
+    index on `(monitor_id, COALESCE(workspace_path, ''))` keeps each scope single-rowed, including the
+    global (`NULL`) scope. `RuntimeStore.getMonitorState`/`setMonitorState` now take the workspace
+    scope, and `recordObservationHistory` records it; `ObservationHistoryRecord`/`ObservationHistoryQuery`
+    carry `workspacePath`.
+  - **Scoped diagnostics.** `monitor explain` and `doctor` scope observation history to their workspace;
+    `agentmonitors monitor history` gains an opt-in `--workspace <path>` filter (unscoped still tails
+    across all workspaces).
+  - **Migration — one-time re-baseline.** A pre-namespacing `monitor_state` (keyed by `monitor_id`
+    alone) is rebuilt under the surrogate `id` PK on the first daemon open after upgrade. Only
+    `source_state` is reset — it cannot be safely attributed to a workspace — so every monitor
+    re-baselines cleanly on its first post-upgrade tick (no spurious created/deleted/descoped events).
+    The durable `notify_state` batch (`pendingDebounce`/`pendingRollup` — already-detected observations
+    the runtime must redeliver) is preserved and attributed to its workspace, so no pending delivery is
+    silently dropped. Legacy observation-history rows are migrated additively (they keep `NULL` and fall
+    out of workspace-scoped queries). The rebuild runs in one immediate transaction so concurrent
+    first-opens can't double-migrate.
+
+### Patch Changes
+
+- 8638936: Persist local data owner-only (P1 security/privacy). Agent Monitors stores private snapshot, event,
+  diff, and source-state data — plus hook state and an unauthenticated IPC socket — on the local
+  machine, previously created with umask-derived default modes. On a multi-user host with permissive
+  home/XDG directory modes, another local user could read the database or connect to the socket to
+  inspect/claim/ack events or stop the daemon.
+  - The SQLite database and its WAL/SHM sidecars, hook-state files, the startup-lock pid file, and the
+    `.claude/agentmonitors.local.md` coordination file are now owner-only (`0600`); the per-workspace
+    data directory, session directories, socket directory, and startup-lock directory are owner-only
+    (`0700`); the Unix domain socket is chmod'd `0600` and lives inside an owner-only directory.
+  - The long-socket-path fallback now binds inside an owner-only per-uid directory
+    (`/tmp/agentmonitors-<uid>/…`) instead of a predictable `/tmp/agentmonitors-<hash>.sock` other
+    local users could connect to. During an in-flight upgrade, clients keep talking to a pre-upgrade
+    daemon still listening at the old path (detected by a liveness probe) rather than starting a second
+    daemon on the same database; one daemon restart completes the move.
+  - Tightening is best-effort: if an artifact exists but is owned by another user (e.g. a hook-state
+    path aimed into a shared directory), permission tightening logs one warning and continues instead
+    of failing the write or crashing the daemon.
+  - **Migration:** existing world-readable artifacts from an earlier version are tightened on the next
+    daemon start. Tightening is symlink-safe (it never `chmod`s through an attacker-controlled
+    symlink) and never re-modes a user-chosen (`--socket`/`AGENTMONITORS_SOCKET`) or shared system
+    socket directory.
+  - POSIX-only; on Windows the paths are created without mode enforcement.
+
+- e201c48: Clear this repo's own `pnpm audit --prod` findings (13 high-severity advisories,
+  down to 0). `@agentmonitors/core` now declares `drizzle-orm@^0.45.2` (previously
+  `^0.45.1`, below the patched release). `@agentmonitors/cli`'s published bundle now
+  embeds a patched `fast-uri` and `hono` (pinned forward via a workspace
+  `pnpm-workspace.yaml` override on the `@modelcontextprotocol/sdk` dependency tree,
+  since both were bundled at their previously-resolved, vulnerable versions). No
+  public API or behavior changes.
+
+  **Caveat:** the `lodash-es` advisory (GHSA-r5fr-rjxr-66jc, via `cel-js` ->
+  `chevrotain`) is cleared for this repo's own audit/build, but **not** for an
+  external `npm install @agentmonitors/core`: `cel-js` is a real, unbundled
+  dependency of `@agentmonitors/core`, and its latest release (`0.8.2`) pins an
+  exact `chevrotain@11.0.3`, whose own dependency on `lodash-es` stays below the
+  patched `4.17.24` even at chevrotain's latest 11.x patch — only `chevrotain@12`
+  (a breaking upstream release that drops `lodash-es` entirely) clears it for real
+  consumers. That's outside what a workspace-level `pnpm` override can fix (it only
+  affects this monorepo's own install), and is tracked as a known upstream-only
+  gap rather than force-fixed here.
+
 ## 0.10.0
 
 ### Minor Changes

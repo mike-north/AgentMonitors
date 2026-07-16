@@ -1,5 +1,32 @@
 # @agentmonitors/source-command-poll
 
+## 0.3.0
+
+### Minor Changes
+
+- 24e7685: Re-export `ChangeKind`, `JsonSchema`, `Observation`, `ObservationContext`, `ObservationResult`,
+  `ObservationSource`, and `Urgency` (all from `@agentmonitors/core`) from each package's own entry
+  point.
+
+  Every bundled source's default export is typed `ObservationSource`, but that type — and the core
+  types its interface shape transitively references — were previously reachable only via
+  `@agentmonitors/core` directly, not from the source package itself. Enabling API Extractor's report
+  generation (issue #285) surfaced this as `ae-forgotten-export` warnings embedded in each package's
+  checked-in API report; re-exporting resolves it with a clean signature. No runtime behavior changes.
+
+### Patch Changes
+
+- Updated dependencies [24e7685]
+- Updated dependencies [a7b5729]
+- Updated dependencies [8638936]
+- Updated dependencies [e201c48]
+- Updated dependencies [89e705f]
+- Updated dependencies [36a2e48]
+- Updated dependencies [9f141bb]
+- Updated dependencies [720d072]
+- Updated dependencies [4e46c41]
+  - @agentmonitors/core@0.11.0
+
 ## 0.2.5
 
 ### Patch Changes
