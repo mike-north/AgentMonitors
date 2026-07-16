@@ -81,7 +81,9 @@ describe('resolvePollIntervalMs', () => {
 });
 
 describe('resolveSettleMs', () => {
-  it('is 0 when no notify strategy is declared', () => {
+  it('is 0 for normal urgency when no notify strategy is declared', () => {
+    // An omitted `urgency` defaults to the `normal` band (001 §3.2) — no
+    // default debounce settle applies, unlike `high` below.
     const monitor = monitorFrom(
       'watch:\n  type: file-fingerprint\n  globs:\n    - "*.md"',
     );
@@ -100,6 +102,45 @@ describe('resolveSettleMs', () => {
       "watch:\n  type: file-fingerprint\n  globs:\n    - '*.md'\nnotify:\n  strategy: throttle\n  suppress-for: '10m'",
     );
     expect(resolveSettleMs(monitor)).toBe(0);
+  });
+
+  // Regression (issue #406): a `high`-urgency monitor with NO explicit
+  // `notify` block still gets a default debounce settle at runtime
+  // (`defaultNotifyConfigForUrgency`, service.ts) before an event
+  // materializes. Pre-fix, `resolveSettleMs` only read `monitor.frontmatter
+  // .notify` directly and returned 0 for this case, undershooting the real
+  // budget by exactly this window (~53s computed vs. ~60s actual end-to-end).
+  it('applies the high-urgency default debounce settle when no notify block is declared', () => {
+    const monitor = monitorFrom(
+      "watch:\n  type: file-fingerprint\n  globs:\n    - '*.md'\nurgency: high",
+    );
+    expect(resolveSettleMs(monitor)).toBe(
+      schedulingDefaults.highUrgencyDefaultDebounceSettleMs,
+    );
+  });
+
+  it('lets an explicit notify.settle-for override the high-urgency default (not double-counted)', () => {
+    const monitor = monitorFrom(
+      "watch:\n  type: file-fingerprint\n  globs:\n    - '*.md'\nurgency: high\nnotify:\n  strategy: debounce\n  settle-for: '2m'",
+    );
+    // The authored settle-for wins outright — it is not added on top of the
+    // default, and does not equal the default (2m !== 15s) — proving the
+    // override path, not the default path, was taken.
+    expect(resolveSettleMs(monitor)).toBe(2 * 60 * 1000);
+    expect(resolveSettleMs(monitor)).not.toBe(
+      schedulingDefaults.highUrgencyDefaultDebounceSettleMs,
+    );
+  });
+
+  it('is 0 for a non-high urgency band even with no notify block', () => {
+    const lowMonitor = monitorFrom(
+      "watch:\n  type: file-fingerprint\n  globs:\n    - '*.md'\nurgency: low",
+    );
+    const normalMonitor = monitorFrom(
+      "watch:\n  type: file-fingerprint\n  globs:\n    - '*.md'\nurgency: normal",
+    );
+    expect(resolveSettleMs(lowMonitor)).toBe(0);
+    expect(resolveSettleMs(normalMonitor)).toBe(0);
   });
 });
 
@@ -130,18 +171,27 @@ describe('computeVerifyBudget', () => {
     expect(budget.totalMs).toBe(budget.baselineMs + budget.detectMs);
   });
 
-  it('adds the 15s high-urgency claim-settle window to the detect phase', () => {
+  it('adds both the default debounce settle and the claim-settle window to the detect phase (issue #406)', () => {
     const monitor = monitorFrom(
       "watch:\n  type: file-fingerprint\n  globs:\n    - '*.md'\n  interval: '4s'\nurgency: high",
     );
     const budget = computeVerifyBudget(monitor);
-    // 002 §9.1: DEFAULT_HIGH_URGENCY_SETTLE_MS applies only to detect (claim), not baseline.
+    // 002 §9.1: high urgency with no explicit notify still gets a default
+    // debounce settle before materialization (issue #406) PLUS the
+    // claim-settle window before hook-surfacing — both apply only to detect
+    // (claim), not baseline.
+    expect(budget.settleMs).toBe(
+      schedulingDefaults.highUrgencyDefaultDebounceSettleMs,
+    );
     expect(budget.highClaimSettleMs).toBe(
       schedulingDefaults.highUrgencyClaimSettleMs,
     );
     expect(budget.baselineMs).toBe(4_000 + 5_000);
     expect(budget.detectMs).toBe(
-      4_000 + schedulingDefaults.highUrgencyClaimSettleMs + 5_000,
+      4_000 +
+        schedulingDefaults.highUrgencyDefaultDebounceSettleMs +
+        schedulingDefaults.highUrgencyClaimSettleMs +
+        5_000,
     );
   });
 
@@ -153,6 +203,31 @@ describe('computeVerifyBudget', () => {
     const budget = computeVerifyBudget(monitor);
     expect(budget.marginMs).toBe(75_000);
     expect(budget.intervalMs).toBe(schedulingDefaults.apiPollMs);
+  });
+
+  // Regression (issue #406): the recommended default config — file-fingerprint
+  // + urgency: high + no notify block — was spuriously FAILing verify because
+  // detectMs omitted the high-urgency default debounce settle. Real
+  // end-to-end delivery for this config is interval (30s) + default debounce
+  // settle (15s) + claim-settle (15s) = 60s; the pre-fix budget only reached
+  // 30s + 0 + 15s + margin(7.5s) = 52.5s.
+  it('covers the real ~60s end-to-end time for the recommended default config (file-fingerprint + high urgency, no notify)', () => {
+    const monitor = monitorFrom(
+      "watch:\n  type: file-fingerprint\n  globs:\n    - '*.md'\nurgency: high",
+    );
+    const budget = computeVerifyBudget(monitor);
+    expect(budget.intervalMs).toBe(schedulingDefaults.fileFingerprintPollMs); // 30_000
+    expect(budget.settleMs).toBe(
+      schedulingDefaults.highUrgencyDefaultDebounceSettleMs,
+    ); // 15_000 — the previously-omitted term
+    expect(budget.highClaimSettleMs).toBe(
+      schedulingDefaults.highUrgencyClaimSettleMs,
+    ); // 15_000
+    expect(budget.marginMs).toBe(7_500); // max(5000, 30_000 * 0.25)
+    expect(budget.detectMs).toBe(30_000 + 15_000 + 15_000 + 7_500); // 67_500
+    // The real end-to-end delivery (interval + default settle + claim-settle)
+    // is 60_000ms; the budget must be at least that, with margin to spare.
+    expect(budget.detectMs).toBeGreaterThanOrEqual(60_000);
   });
 });
 
