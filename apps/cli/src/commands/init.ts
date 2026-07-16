@@ -8,7 +8,40 @@ import { validateCommand } from './validate.js';
 const yaml = String.raw;
 const md = String.raw;
 
-const TEMPLATES: Record<string, string> = {
+/**
+ * The `command-poll` template's advisory comment above its illustrative
+ * `command:` block. Shared with {@link COMMAND_POLL_CONTRACT_COMMENT} (both
+ * used by {@link TEMPLATES} and by `seedCommand` below) so the two can never
+ * drift apart: when `--command` replaces the scaffolded command, the
+ * example-specific narrative (which explains the fetch-lag semantics of the
+ * illustrative `git ls-remote` default) no longer describes what's seeded, so
+ * `seedCommand` swaps this exact text for the generalized contract-only
+ * comment.
+ */
+const COMMAND_POLL_EXAMPLE_COMMENT =
+  '  # command is an argv array, run directly (no shell). This example queries the\n' +
+  '  # remote branch tip live: "git ls-remote" hits the network on every run, so it\n' +
+  '  # is always current — no prior fetch needed. Only a LOCAL read of a\n' +
+  '  # remote-tracking ref, such as "git rev-parse origin/main", reflects just your\n' +
+  '  # last fetch and can lag until you fetch again. A local working-tree command\n' +
+  '  # such as "git status --porcelain" has no fetch lag either.\n';
+
+/**
+ * The generalized replacement for {@link COMMAND_POLL_EXAMPLE_COMMENT} once a
+ * `--command` seed has overwritten the illustrative default: only the
+ * source-contract clause applies to an arbitrary seeded command.
+ */
+const COMMAND_POLL_CONTRACT_COMMENT =
+  '  # command is an argv array, run directly (no shell).\n';
+
+/**
+ * The scaffold body for each `--type`. Exported (test-only use) so
+ * `scaffold-defaults.test.ts` can assert the `command-poll` entry's parsed
+ * `command:` block still equals {@link COMMAND_POLL_SCAFFOLD_DEFAULT_COMMAND}
+ * in `scaffold-defaults.ts` — the two are otherwise independent literals with
+ * no type-level link.
+ */
+export const TEMPLATES: Record<string, string> = {
   'file-fingerprint': yaml`
 ---
 name: My monitor
@@ -49,13 +82,7 @@ When the page changes, review the differences and take appropriate action.
 name: Upstream branch monitor
 watch:
   type: command-poll
-  # command is an argv array, run directly (no shell). This example queries the
-  # remote branch tip live: "git ls-remote" hits the network on every run, so it
-  # is always current — no prior fetch needed. Only a LOCAL read of a
-  # remote-tracking ref, such as "git rev-parse origin/main", reflects just your
-  # last fetch and can lag until you fetch again. A local working-tree command
-  # such as "git status --porcelain" has no fetch lag either.
-  command:
+${COMMAND_POLL_EXAMPLE_COMMENT}  command:
     - git
     - ls-remote
     - origin
@@ -238,11 +265,18 @@ function seedCommand(
       `--command is not supported for --type ${type} (only command-poll has a command: argv array)`,
     );
   }
+  // The seeded command is no longer the illustrative upstream-tip example, so
+  // its comment must stop describing that example (see
+  // COMMAND_POLL_EXAMPLE_COMMENT's doc comment).
+  const withGeneralizedComment = template.replace(
+    COMMAND_POLL_EXAMPLE_COMMENT,
+    COMMAND_POLL_CONTRACT_COMMENT,
+  );
   // Same block-replacement shape as seedGlobs: match the `command:` key line,
   // capture its indent and the list-item indent from the template's own first
   // item, then replace the whole item run with the seeded tokens.
   const blockPattern = /^( *)command:\n(( +)- .*\n)(?:\3- .*\n)*/m;
-  return template.replace(
+  return withGeneralizedComment.replace(
     blockPattern,
     (_match, indent: string, _first: string, itemIndent: string) => {
       const listBlock = command

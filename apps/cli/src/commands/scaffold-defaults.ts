@@ -17,6 +17,8 @@
  * The exact argv the command-poll template scaffolds when `--command` is
  * omitted. A drift-guard test asserts the template's `command:` block still
  * equals this array so the two cannot silently diverge.
+ *
+ * @see scaffold-defaults.test.ts for the direct assertion.
  */
 export const COMMAND_POLL_SCAFFOLD_DEFAULT_COMMAND: readonly string[] = [
   'git',

@@ -1144,6 +1144,13 @@ describe('init', () => {
     // The stock ls-remote default must be replaced, not appended alongside.
     expect(monitor).not.toContain('    - ls-remote');
     expect(monitor).not.toContain('    - refs/heads/main');
+    // The comment's source-contract clause survives seeding, but its
+    // example-specific narrative (which described the untouched ls-remote
+    // default, not the seeded git-status command) must not.
+    expect(monitor).toContain(
+      '  # command is an argv array, run directly (no shell).\n',
+    );
+    expect(monitor).not.toContain('This example watches the');
 
     const validated = run(['validate', monitorsDir, '--format', 'json'], dir);
     expect(validated.exitCode).toBe(0);
@@ -1187,6 +1194,125 @@ describe('init', () => {
       '--command is not supported for --type file-fingerprint',
     );
     expect(existsSync(path.join(monitorsDir, 'bad-command-mon'))).toBe(false);
+  });
+
+  // Issue #388: a --command token containing a literal single quote must be
+  // emitted as the doubled-quote YAML escape ('it''s'), mirroring --name's
+  // quote-escaping coverage above (AC2/AC803), and the escaped scaffold must
+  // still round-trip through validate.
+  it('--command seeds a token with a single quote using doubled-quote YAML escaping (hostile input)', () => {
+    const dir = path.join(tempDir, 'init-command-quote');
+    mkdirSync(dir, { recursive: true });
+    const monitorsDir = path.join(dir, 'monitors');
+    const created = run(
+      [
+        'init',
+        'quote-command-mon',
+        '--dir',
+        monitorsDir,
+        '--type',
+        'command-poll',
+        '--command',
+        'echo',
+        '--command',
+        "it's",
+      ],
+      dir,
+    );
+    expect(created.exitCode).toBe(0);
+    const monitor = readFileSync(
+      path.join(monitorsDir, 'quote-command-mon', 'MONITOR.md'),
+      'utf-8',
+    );
+    expect(monitor).toContain("    - 'it''s'");
+
+    const validated = run(['validate', monitorsDir, '--format', 'json'], dir);
+    expect(validated.exitCode).toBe(0);
+    const parsed = JSON.parse(validated.stdout) as {
+      valid: number;
+      invalid: number;
+    };
+    expect(parsed.valid).toBe(1);
+    expect(parsed.invalid).toBe(0);
+  });
+
+  // Issue #388: --command tokens containing YAML-significant characters
+  // (#, :, an embedded space) must round-trip verbatim through the
+  // single-quoted scalar form (none of these require escaping inside single
+  // quotes — only a literal `'` does), and the scaffold must still validate.
+  it('--command seeds tokens with #, :, and an embedded space verbatim (hostile input)', () => {
+    const dir = path.join(tempDir, 'init-command-special-chars');
+    mkdirSync(dir, { recursive: true });
+    const monitorsDir = path.join(dir, 'monitors');
+    const created = run(
+      [
+        'init',
+        'special-chars-command-mon',
+        '--dir',
+        monitorsDir,
+        '--type',
+        'command-poll',
+        '--command',
+        'echo',
+        '--command',
+        'a#b',
+        '--command',
+        'a:b',
+        '--command',
+        'a b',
+      ],
+      dir,
+    );
+    expect(created.exitCode).toBe(0);
+    const monitor = readFileSync(
+      path.join(monitorsDir, 'special-chars-command-mon', 'MONITOR.md'),
+      'utf-8',
+    );
+    expect(monitor).toContain(
+      "  command:\n    - 'echo'\n    - 'a#b'\n    - 'a:b'\n    - 'a b'\n",
+    );
+
+    const validated = run(['validate', monitorsDir, '--format', 'json'], dir);
+    expect(validated.exitCode).toBe(0);
+    const parsed = JSON.parse(validated.stdout) as {
+      valid: number;
+      invalid: number;
+      monitors: { id: string }[];
+    };
+    expect(parsed.valid).toBe(1);
+    expect(parsed.invalid).toBe(0);
+    expect(parsed.monitors[0]?.id).toBe('special-chars-command-mon');
+  });
+
+  // Issue #388: a --command token containing a newline cannot be represented
+  // as a single-quoted YAML scalar (mirrors --name's newline rejection at
+  // "rejects a --name containing a newline" above) — it must fail loudly with
+  // exit 1 and the same "single-line" message, and leave no partial directory
+  // behind.
+  it('rejects a --command containing a newline instead of emitting invalid YAML', () => {
+    const dir = path.join(tempDir, 'init-command-newline');
+    const monitorsDir = path.join(dir, 'monitors');
+    mkdirSync(dir, { recursive: true });
+    const result = run(
+      [
+        'init',
+        'newline-command-mon',
+        '--dir',
+        monitorsDir,
+        '--type',
+        'command-poll',
+        '--command',
+        'echo',
+        '--command',
+        'first line\nsecond line',
+      ],
+      dir,
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('must be single-line');
+    expect(existsSync(path.join(monitorsDir, 'newline-command-mon'))).toBe(
+      false,
+    );
   });
 });
 
