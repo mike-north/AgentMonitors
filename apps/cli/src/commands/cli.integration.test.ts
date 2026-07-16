@@ -509,6 +509,39 @@ describe('init', () => {
     expect(result.stdout).toContain('Created monitor');
   });
 
+  // Issue #408: the named-scaffold path used to leave the user with no
+  // verify guidance at all. It must now route to `agentmonitors verify`, the
+  // CLI's own real command, with a monitor id and --dir that actually work.
+  // file-fingerprint can auto-trigger a change, so --manual is not suggested.
+  it('points the named-scaffold summary at `agentmonitors verify` (auto-trigger, no --manual)', () => {
+    const dir = path.join(tempDir, 'init-verify-guidance-ff');
+    mkdirSync(dir, { recursive: true });
+    const monitorsDir = path.join(dir, 'monitors');
+    const result = run(['init', 'watch-docs', '--dir', monitorsDir], dir);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain(
+      `agentmonitors verify watch-docs --dir ${monitorsDir}`,
+    );
+    expect(result.stdout).not.toContain('--manual');
+  });
+
+  // Issue #408 AC2: `verify` can only auto-trigger a file-fingerprint change
+  // today (its `buildAutoTrigger` only reads `watch.globs`) — every other
+  // scaffolded type must point at `--manual` instead of silently omitting it.
+  it('points the named-scaffold summary at `agentmonitors verify --manual` for a command-poll monitor', () => {
+    const dir = path.join(tempDir, 'init-verify-guidance-cmd');
+    mkdirSync(dir, { recursive: true });
+    const monitorsDir = path.join(dir, 'monitors');
+    const result = run(
+      ['init', 'cmd-watch', '--dir', monitorsDir, '--type', 'command-poll'],
+      dir,
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain(
+      `agentmonitors verify cmd-watch --dir ${monitorsDir} --manual`,
+    );
+  });
+
   it('scaffolds an api-poll monitor with --type', () => {
     const dir = path.join(tempDir, 'init-test-2');
     mkdirSync(dir, { recursive: true });
@@ -682,6 +715,10 @@ describe('init', () => {
   // #338 item 8): the old title implied a gold-master/snapshot comparison,
   // but `expected` is hand-derived from the spec, not from a prior run — the
   // `doctor` line was an intentional addition, not preserved legacy output.
+  //
+  // Updated for issue #408: the output now also recommends `agentmonitors
+  // verify` (no `--manual`, since `file-fingerprint` can auto-trigger) as the
+  // real, CLI-only proof that the monitor delivers end-to-end.
   it('init <name> --type output matches the spec-documented next-steps text (AC4 regression)', () => {
     const dir = path.join(tempDir, 'init-byte-for-byte');
     mkdirSync(dir, { recursive: true });
@@ -697,7 +734,9 @@ describe('init', () => {
       `\n` +
       `Edit the file to configure your monitor, then run:\n` +
       `  agentmonitors validate ${monitorsDir}\n` +
-      `  agentmonitors doctor\n`;
+      `  agentmonitors doctor\n` +
+      `\n` +
+      `Prove it delivers end-to-end:  agentmonitors verify my-mon --dir ${monitorsDir}\n`;
     expect(result.stdout).toBe(expected);
     expect(result.stderr).toBe('');
   });
@@ -1417,6 +1456,21 @@ describe('init bootstrap (bare init)', () => {
     // Step 5 — the summary points at how to verify the monitor fires.
     expect(result.stdout).toContain('Verify the monitor fires');
     expect(result.stdout).toContain('monitor test');
+
+    // Issue #408: the CLI-only path must route to the real `agentmonitors
+    // verify` command (not dead-end at an unavailable "setup-monitors
+    // skill"). The default scaffold is file-fingerprint, which can
+    // auto-trigger a change, so no --manual is suggested here.
+    expect(result.stdout).toContain(
+      'agentmonitors verify my-monitor --dir .claude/monitors',
+    );
+    expect(result.stdout).not.toContain(
+      'Full fire-and-deliver recipe: see the setup-monitors skill',
+    );
+    // The setup-monitors skill reference is kept only as a clearly-labeled,
+    // plugin-only supplement alongside `verify` — never the sole pointer.
+    expect(result.stdout).toContain('AgentMon Claude Code plugin');
+    expect(result.stdout).toContain('setup-monitors skill');
 
     // Criterion 1 (issue #331): the closing summary also points at
     // `agentmonitors doctor` as the health-check next step.

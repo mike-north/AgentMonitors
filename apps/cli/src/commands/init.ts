@@ -582,6 +582,11 @@ async function runBootstrap(options: BootstrapOptions): Promise<void> {
   const gitignoreStatus = ensureGitignore(cwd);
 
   let monitor: MonitorOutcome = { kind: 'enable-only' };
+  // Tracked alongside `monitor` (rather than added to `MonitorOutcome`) so the
+  // closing "Verify the monitor fires" summary can decide whether to suggest
+  // `verify --manual`: only `file-fingerprint` can auto-trigger a change
+  // (verify.ts's `buildAutoTrigger` only reads `watch.globs`).
+  let scaffoldedType: string | undefined;
   if (!options.enableOnly) {
     // `isTTY` is typed `boolean` but is `undefined` for a non-TTY stdin at
     // runtime; either way, a falsy value means we must not prompt.
@@ -603,6 +608,7 @@ async function runBootstrap(options: BootstrapOptions): Promise<void> {
         monitorDir: result.monitorDir,
         name: choice.name,
       };
+      scaffoldedType = choice.type;
     }
   }
 
@@ -669,12 +675,18 @@ async function runBootstrap(options: BootstrapOptions): Promise<void> {
   console.log('  • Check overall health any time:  agentmonitors doctor');
 
   if (monitor.kind === 'created') {
+    // Only file-fingerprint can auto-trigger a change today (see
+    // `scaffoldedType` above), so every other type needs `--manual`.
+    const manualFlag = scaffoldedType === 'file-fingerprint' ? '' : ' --manual';
     console.log('\nVerify the monitor fires');
     console.log(
       `  • Dry-run its source:  agentmonitors monitor test ${monitor.monitorDir}/MONITOR.md`,
     );
     console.log(
-      '  • Full fire-and-deliver recipe: see the setup-monitors skill, "Verify It Fires".',
+      `  • Prove it delivers end-to-end:  agentmonitors verify ${monitor.name} --dir ${options.dir}${manualFlag}`,
+    );
+    console.log(
+      `  • Using the AgentMon Claude Code plugin? The setup-monitors skill's "Verify It Fires" section walks through the same proof by hand.`,
     );
     console.log(
       `\nEdit ${monitor.monitorDir}/MONITOR.md to configure what it watches.`,
@@ -795,6 +807,14 @@ export const initCommand = new Command('init')
         console.log(`\nEdit the file to configure your monitor, then run:`);
         console.log(`  agentmonitors validate ${options.dir}`);
         console.log(`  agentmonitors doctor`);
+        // Only file-fingerprint can auto-trigger a change today (verify.ts's
+        // `buildAutoTrigger` only reads `watch.globs`); every other type
+        // needs `--manual`.
+        const manualFlag =
+          options.type === 'file-fingerprint' ? '' : ' --manual';
+        console.log(
+          `\nProve it delivers end-to-end:  agentmonitors verify ${name} --dir ${options.dir}${manualFlag}`,
+        );
         return;
       }
 
