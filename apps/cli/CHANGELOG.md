@@ -1,5 +1,100 @@
 # @agentmonitors/cli
 
+## 0.10.0
+
+### Minor Changes
+
+- 2c31f10: `agentmonitors verify` gains a decoupled `--trigger-cmd '<shell>'` mode so a source it can't
+  auto-trigger (`command-poll`, `api-poll`, `schedule`, `incoming-changes`) can be verified in a
+  single, self-contained, non-interactive invocation. After establishing baseline, `verify` runs the
+  given shell command itself (via `/bin/sh -c`, `cwd` = the workspace) to cause the watched change,
+  then observes/materializes/delivers — exactly like file-fingerprint's auto-trigger, but for any
+  source. For a `command-poll` watching `git status --porcelain`, that's e.g.
+  `--trigger-cmd 'touch new-file.txt'`.
+
+  This closes a real gap for agent harnesses that run one shell command per tool call
+  (call-and-return): `--manual` blocks for the detect budget and does **not** read stdin, so such a
+  harness had no way to make the change while `verify` waited and its honest first attempt FAILed
+  `budget-exceeded` on a correctly-configured monitor. `--trigger-cmd` needs no second interleaved
+  command.
+
+  Also: the `--manual` `budget-exceeded` FAIL message now names `--trigger-cmd` and the
+  background-and-interleave workaround instead of a bare "did you make a change?"; `--manual` and
+  `--trigger-cmd` are mutually exclusive; and a `--trigger-cmd` that exits non-zero is a `setup`
+  failure on the `trigger` stage (fix the command), distinct from a `no-change` verdict (the command
+  ran but changed nothing observed). The command's effects are not reverted (an arbitrary command has
+  no known inverse). The file-fingerprint auto-trigger happy path and runtime notify/debounce timing
+  are unchanged.
+
+### Patch Changes
+
+- bc3e8b2: Close the final DX gap on the manual / no-docs CLI path with six small,
+  thematically-unified ergonomics fixes. No change to runtime notify/debounce timing, delivery
+  semantics, or any hook **stdout** wire format.
+  - **`hook deliver`** now writes a one-line diagnostic to **stderr** (without `--debug`) when the
+    stdin payload is malformed (no `session_id`) or `hook_event_name` maps to no delivery lifecycle.
+    Both previously printed nothing and exited 0 — indistinguishable from "nothing pending." stdout
+    stays byte-identical for hook wire compatibility; untrusted payload values are control-safe-escaped.
+  - **`events list` / `events ack`** — the missing-`--session` error now points at
+    `agentmonitors session list` to discover an id, and `--help` repeats the pointer.
+  - **`session start` / `session end`** now print a one-line success ack on **stderr**
+    (`AgentMon: session <id> registered; daemon at <socket>` / `session <id> ended`); stdout stays
+    wire-clean.
+  - **`scan`** now exits **0** for a clean scan and **1** when it surfaces a real problem (a parse
+    error or a duplicate monitor id), so `scan && <next-step>` scripts are meaningful. Previously it
+    always exited 0.
+  - **`monitor history`** — passing `--dir` (a flag that means the monitors directory elsewhere, but
+    is not history's `--workspace`) now yields a remediation hint pointing at `--workspace` instead of
+    a bare `unknown option` error.
+  - Docs: the `verify --use-workspace-daemon` "presentable proof" recipe now notes that the synthetic
+    PASS is not a durable, queryable event and directs a security-proof user to make a real edit +
+    deliver it for a persistent artifact.
+
+- 2f0a9d3: `verify --use-workspace-daemon` no longer runs ~2× as long as plain `verify` (with a wrong ETA), and
+  an interrupted run no longer leaves permanent stray state.
+
+  The scratch-event cleanup added in the previous release WAITED a full extra poll interval + settle for
+  the scratch file's deletion event to re-materialize before retracting it, so `--use-workspace-daemon`
+  ran ~120s vs plain `verify`'s ~59s while still showing plain `verify`'s `~68s` ETA — reading as a hang
+  and overrunning default 2-minute command/CI timeouts. A run killed mid-cleanup left a permanently
+  `active` verify session plus dangling scratch events that `doctor` never flagged (issue #414).
+
+  Verify now cleans up its own events using one of **two mechanisms with non-overlapping safe domains**,
+  chosen by whether its trigger's object key is synthetic or a real watched path:
+  - **Synthetic scratch file** (`…/agentmonitors-verify-<token><ext>`, a path no real object shares):
+    verify deletes it and, in one **non-blocking** call, retracts the create event it already delivered
+    AND installs a durable, self-expiring **object-event suppression** (tombstone). The daemon's tick
+    sweeps the pending `File deleted: …/agentmonitors-verify-…` by object key on the tick it
+    materializes — before any later session can see it — so the mode finishes in about the same time as
+    plain `verify` and its ETA is honest. Safe precisely because the key is synthetic.
+  - **Real watched path** (a literal single-file glob whose file verify created): a by-key sweep here
+    would eat a **later genuine event at that same path** within the window, silently losing the user's
+    change, so verify instead retracts **only its own observed event ids** (the id-scoped path). A
+    literal file that pre-existed is only edited and restored, never erased.
+
+  To keep this a defect-resistant invariant, `AgentMonitorRuntime.suppressObjectEvents` and the
+  `events.suppressObject` IPC verb **reject a non-synthetic object key** outright — a real path can
+  never reach the by-key sweep. An omitted `workspacePath` is normalized to the NULL scope for both the
+  tombstone and its retraction, so it can no longer sweep other workspaces' events.
+
+  An interrupted run leaves no permanent stray state: verify's `SIGINT`/`SIGTERM` handler runs the same
+  object-appropriate cleanup best-effort before exiting, and — even on an uncatchable kill — the daemon
+  tombstones + retracts a stale `agentmonitors-verify-*` session's scratch objects when it reaps that
+  session to dormant (with a tombstone lifetime derived from the monitor's own cadence).
+
+  This adds a new runtime capability, `AgentMonitorRuntime.suppressObjectEvents` (backed by a durable
+  `object_event_suppressions` table, a key-scoped `retractObjectEventsByKey`, and a per-tick suppression
+  sweep), exposed over the daemon socket as the `events.suppressObject` IPC verb; `isVerifyScratchObjectKey`
+  is exported so the daemon boundary can enforce the synthetic-key invariant.
+
+- Updated dependencies [2f0a9d3]
+  - @agentmonitors/core@0.12.0
+  - @agentmonitors/source-api-poll@0.4.1
+  - @agentmonitors/source-command-poll@0.3.1
+  - @agentmonitors/source-file-fingerprint@0.4.1
+  - @agentmonitors/source-incoming-changes@0.3.1
+  - @agentmonitors/source-schedule@0.2.1
+
 ## 0.9.0
 
 ### Minor Changes

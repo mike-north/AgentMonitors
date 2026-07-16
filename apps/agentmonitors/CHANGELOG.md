@@ -1,5 +1,60 @@
 # agentmonitors
 
+## 0.11.0
+
+### Minor Changes
+
+- 2c31f10: `agentmonitors verify` gains a decoupled `--trigger-cmd '<shell>'` mode so a source it can't
+  auto-trigger (`command-poll`, `api-poll`, `schedule`, `incoming-changes`) can be verified in a
+  single, self-contained, non-interactive invocation. After establishing baseline, `verify` runs the
+  given shell command itself (via `/bin/sh -c`, `cwd` = the workspace) to cause the watched change,
+  then observes/materializes/delivers — exactly like file-fingerprint's auto-trigger, but for any
+  source. For a `command-poll` watching `git status --porcelain`, that's e.g.
+  `--trigger-cmd 'touch new-file.txt'`.
+
+  This closes a real gap for agent harnesses that run one shell command per tool call
+  (call-and-return): `--manual` blocks for the detect budget and does **not** read stdin, so such a
+  harness had no way to make the change while `verify` waited and its honest first attempt FAILed
+  `budget-exceeded` on a correctly-configured monitor. `--trigger-cmd` needs no second interleaved
+  command.
+
+  Also: the `--manual` `budget-exceeded` FAIL message now names `--trigger-cmd` and the
+  background-and-interleave workaround instead of a bare "did you make a change?"; `--manual` and
+  `--trigger-cmd` are mutually exclusive; and a `--trigger-cmd` that exits non-zero is a `setup`
+  failure on the `trigger` stage (fix the command), distinct from a `no-change` verdict (the command
+  ran but changed nothing observed). The command's effects are not reverted (an arbitrary command has
+  no known inverse). The file-fingerprint auto-trigger happy path and runtime notify/debounce timing
+  are unchanged.
+
+### Patch Changes
+
+- bc3e8b2: Close the final DX gap on the manual / no-docs CLI path with six small,
+  thematically-unified ergonomics fixes. No change to runtime notify/debounce timing, delivery
+  semantics, or any hook **stdout** wire format.
+  - **`hook deliver`** now writes a one-line diagnostic to **stderr** (without `--debug`) when the
+    stdin payload is malformed (no `session_id`) or `hook_event_name` maps to no delivery lifecycle.
+    Both previously printed nothing and exited 0 — indistinguishable from "nothing pending." stdout
+    stays byte-identical for hook wire compatibility; untrusted payload values are control-safe-escaped.
+  - **`events list` / `events ack`** — the missing-`--session` error now points at
+    `agentmonitors session list` to discover an id, and `--help` repeats the pointer.
+  - **`session start` / `session end`** now print a one-line success ack on **stderr**
+    (`AgentMon: session <id> registered; daemon at <socket>` / `session <id> ended`); stdout stays
+    wire-clean.
+  - **`scan`** now exits **0** for a clean scan and **1** when it surfaces a real problem (a parse
+    error or a duplicate monitor id), so `scan && <next-step>` scripts are meaningful. Previously it
+    always exited 0.
+  - **`monitor history`** — passing `--dir` (a flag that means the monitors directory elsewhere, but
+    is not history's `--workspace`) now yields a remediation hint pointing at `--workspace` instead of
+    a bare `unknown option` error.
+  - Docs: the `verify --use-workspace-daemon` "presentable proof" recipe now notes that the synthetic
+    PASS is not a durable, queryable event and directs a security-proof user to make a real edit +
+    deliver it for a persistent artifact.
+
+- Updated dependencies [bc3e8b2]
+- Updated dependencies [2c31f10]
+- Updated dependencies [2f0a9d3]
+  - @agentmonitors/cli@0.10.0
+
 ## 0.10.0
 
 ### Minor Changes
