@@ -14,14 +14,22 @@ daemon was live (issue #374).
 
 Their no-daemon in-process fallback now also reads the same workspace-resolved SQLite database
 `doctor` reads, instead of the bare global default. When genuinely nothing is reachable and
-nothing is persisted, the remediation message now names the workspace explicitly and points at
-`--socket <path>` as the override:
+nothing is persisted, an actionable remediation message is printed, worded according to whether the
+workspace is actually enabled — i.e. whether a workspace-scoped socket was really derived, or the
+probe fell through to the bare global default:
 
 ```
 No daemon running for this workspace and no persisted state to show. Start it with `agentmonitors
 daemon run` (or it starts automatically when a Claude Code session opens); if the daemon you want
 lives at a different socket, point at it with `--socket <path>`. Or use `agentmonitors monitor
 test <path>` for a one-shot check.
+```
+
+```
+No daemon running at the default socket and no persisted state to show. Start it with
+`agentmonitors daemon run`, enable this workspace so its socket is auto-discovered
+(`agentmonitors init --enable-only`), or point at the daemon you want with `--socket <path>`. Or
+use `agentmonitors monitor test <path>` for a one-shot check.
 ```
 
 `monitor history --workspace <path>` (an existing opt-in row filter) now also selects which

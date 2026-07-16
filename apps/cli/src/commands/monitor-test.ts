@@ -19,6 +19,7 @@ import { requireFile } from '../validation.js';
 import { renderToon, resolveFormat } from '../toon-format.js';
 import { DaemonConnectionError } from '../daemon-ipc.js';
 import { resolveManualDaemonSocketPath } from '../manual-daemon.js';
+import { readLocalState } from '../local-state.js';
 import { resolveWorkspaceDbPath } from '../workspace-db-path.js';
 import {
   explainMonitorClient,
@@ -36,18 +37,37 @@ const NO_DAEMON_BANNER =
 
 /**
  * Actionable remediation shown when the daemon is down AND there is genuinely
- * nothing persisted to read (no DB rows for the monitor). Replaces the raw Node
- * `connect ENOENT …` error, which gave the author no next step. Issue #150,
- * PM decision (b)(i).
- *
- * Names the workspace explicitly and offers `--socket` as the override (issue
- * #374): a bare "No daemon running" reads as "nothing is running anywhere",
- * when the real diagnosis is narrower — no daemon was found *for this
- * workspace's resolved socket*, and a different one may still be reachable at
- * an explicit `--socket <path>`.
+ * nothing persisted to read (no DB rows for the monitor), for a workspace that
+ * IS enabled (issue #374) — so the socket that was actually probed really was
+ * this workspace's own resolved socket, and "for this workspace" is accurate.
+ * Replaces the raw Node `connect ENOENT …` error, which gave the author no
+ * next step. Issue #150, PM decision (b)(i).
  */
-const NO_DAEMON_REMEDIATION =
+const NO_DAEMON_REMEDIATION_WORKSPACE =
   'No daemon running for this workspace and no persisted state to show. Start it with `agentmonitors daemon run` (or it starts automatically when a Claude Code session opens); if the daemon you want lives at a different socket, point at it with `--socket <path>`. Or use `agentmonitors monitor test <path>` for a one-shot check.';
+
+/**
+ * Same actionable remediation as {@link NO_DAEMON_REMEDIATION_WORKSPACE}, for
+ * when the workspace is NOT enabled — `resolveManualDaemonSocketPath` never
+ * derived a workspace-scoped socket, so the probe actually used the bare
+ * global default. "No daemon running for this workspace" would overclaim
+ * workspace scoping that never happened; this wording says only what's true
+ * in that case (issue #374 review follow-up).
+ */
+const NO_DAEMON_REMEDIATION_DEFAULT =
+  'No daemon running at the default socket and no persisted state to show. Start it with `agentmonitors daemon run`, enable this workspace so its socket is auto-discovered (`agentmonitors init --enable-only`), or point at the daemon you want with `--socket <path>`. Or use `agentmonitors monitor test <path>` for a one-shot check.';
+
+/**
+ * Pick the accurate no-daemon remediation message. `workspaceEnabled` should
+ * be the same {@link readLocalState}`.enabled` value used to resolve the
+ * socket for this invocation — see {@link resolveManualDaemonSocketPath},
+ * which only derives a workspace-scoped socket when the workspace is enabled.
+ */
+function noDaemonRemediation(workspaceEnabled: boolean): string {
+  return workspaceEnabled
+    ? NO_DAEMON_REMEDIATION_WORKSPACE
+    : NO_DAEMON_REMEDIATION_DEFAULT;
+}
 
 export const monitorTestCommand = new Command('monitor').description(
   'Monitor utilities',
@@ -524,6 +544,15 @@ monitorTestCommand
         // "✗ Scheduling: failure" for a monitor that actually fired. Reads the
         // SAME workspace-resolved db `doctor` reads (issue #374) — not the bare
         // global default — so this fallback agrees with what `doctor` diagnoses.
+        //
+        // Read local state once and thread it through (mirrors doctor.ts) —
+        // `resolveManualDaemonSocketPath` above already read it once to resolve
+        // the socket; reading it again here (rather than letting
+        // `resolveWorkspaceDbPath` do its own internal read) avoids a second,
+        // uncoordinated parse of `.claude/agentmonitors.local.md`, and its
+        // `enabled` flag also tells us whether the socket resolved above was
+        // truly workspace-scoped (used below to pick the remediation message).
+        const state = readLocalState(workspacePath);
         const report = await explainMonitorInProcess(
           {
             monitorId,
@@ -536,7 +565,7 @@ monitorTestCommand
               ? { eventLimit }
               : {}),
           },
-          resolveWorkspaceDbPath(workspacePath),
+          resolveWorkspaceDbPath(workspacePath, state),
         );
 
         // Decide how to surface the in-process report based on what it contains.
@@ -583,7 +612,7 @@ monitorTestCommand
 
         if (!hasPersistedState) {
           // Case (C): definition ok, nothing persisted — remediation only.
-          reportError(NO_DAEMON_REMEDIATION, json);
+          reportError(noDaemonRemediation(state.enabled), json);
           return;
         }
 
@@ -697,14 +726,22 @@ monitorTestCommand
         // history is read-only durable state and shouldn't need a live daemon.
         // Reads the SAME workspace-resolved db `doctor` reads (issue #374) —
         // not the bare global default — so this fallback agrees with `doctor`.
+        //
+        // Read local state once and thread it through (mirrors doctor.ts) —
+        // avoids a second, uncoordinated read of
+        // `.claude/agentmonitors.local.md` alongside the one
+        // `resolveManualDaemonSocketPath` already did above, and its `enabled`
+        // flag tells us whether that socket resolution was truly
+        // workspace-scoped (used below to pick the remediation message).
+        const state = readLocalState(socketWorkspace);
         const records = listObservationHistoryInProcess(
           query,
-          resolveWorkspaceDbPath(socketWorkspace),
+          resolveWorkspaceDbPath(socketWorkspace, state),
         );
         if (records.length === 0) {
           // Daemon down AND nothing persisted → actionable remediation, not a
           // raw ENOENT (issue #150, PM decision (b)(i)).
-          reportError(NO_DAEMON_REMEDIATION, json);
+          reportError(noDaemonRemediation(state.enabled), json);
           return;
         }
         if (json) {

@@ -183,12 +183,15 @@ export async function daemonTickClient(
  *
  * `dbPath` is the workspace-resolved database path ({@link
  * resolveWorkspaceDbPath} in `workspace-db-path.ts`) — the SAME db `doctor`
- * reads (issue #374). Omitting it falls back to the bare global default via
- * {@link createRuntime}'s own default parameter.
+ * reads (issue #374). Required (not optional, matching {@link
+ * doctorReportInProcess}): every caller already has a workspace to resolve
+ * against, so an optional default here would only invite a caller to skip
+ * that resolution and silently fall back to the bare global default,
+ * disagreeing with `doctor`'s diagnosis of the same workspace.
  */
 export async function explainMonitorInProcess(
   input: MonitorExplainInput,
-  dbPath?: string,
+  dbPath: string,
 ): Promise<MonitorExplainReport> {
   const runtime = createRuntime(dbPath);
   return await runtime.explainMonitor(input);
@@ -201,12 +204,15 @@ export async function explainMonitorInProcess(
  *
  * `dbPath` is the workspace-resolved database path ({@link
  * resolveWorkspaceDbPath} in `workspace-db-path.ts`) — the SAME db `doctor`
- * reads (issue #374). Omitting it falls back to the bare global default via
- * {@link createRuntime}'s own default parameter.
+ * reads (issue #374). Required (not optional, matching {@link
+ * doctorReportInProcess}): every caller already has a workspace to resolve
+ * against, so an optional default here would only invite a caller to skip
+ * that resolution and silently fall back to the bare global default,
+ * disagreeing with `doctor`'s diagnosis of the same workspace.
  */
 export function listObservationHistoryInProcess(
   query: ObservationHistoryQuery,
-  dbPath?: string,
+  dbPath: string,
 ): ObservationHistoryRecord[] {
   const runtime = createRuntime(dbPath);
   return runtime.listObservationHistory(query);

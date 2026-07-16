@@ -498,13 +498,23 @@ reads the persisted SQLite store **in-process**, from the same workspace-resolve
 instead of erroring. When it returns rows, text output is prefixed with the banner _"No daemon
 running — showing persisted state from the last tick."_ (the `--format json` array is unchanged).
 When the daemon is down **and** there are no persisted rows, it prints an actionable remediation
-line — _"No daemon running for this workspace and no persisted state to show. Start it with
-`agentmonitors daemon run` (or it starts automatically when a Claude Code session opens); if the
-daemon you want lives at a different socket, point at it with `--socket <path>`. Or use
-`agentmonitors monitor test <path>` for a one-shot check."_ — and exits 1, rather than a raw Node
-`connect ENOENT …`. A daemon-side **application** error (the daemon answered with an error) is still
-surfaced verbatim as `History failed: <message>`, never masked as "daemon not running" (the #94/#98
-distinction holds).
+line, exits 1, rather than a raw Node `connect ENOENT …`. The wording depends on whether the
+workspace is actually enabled — i.e. whether `resolveManualDaemonSocketPath()` really derived a
+workspace-scoped socket, or the probe fell through to the bare global default (issue #374 review
+follow-up: the message must not claim workspace scoping that never happened):
+
+- **Enabled workspace:** _"No daemon running for this workspace and no persisted state to show.
+  Start it with `agentmonitors daemon run` (or it starts automatically when a Claude Code session
+  opens); if the daemon you want lives at a different socket, point at it with `--socket <path>`.
+  Or use `agentmonitors monitor test <path>` for a one-shot check."_
+- **Not enabled** (no workspace scoping occurred): _"No daemon running at the default socket and no
+  persisted state to show. Start it with `agentmonitors daemon run`, enable this workspace so its
+  socket is auto-discovered (`agentmonitors init --enable-only`), or point at the daemon you want
+  with `--socket <path>`. Or use `agentmonitors monitor test <path>` for a one-shot check."_
+
+A daemon-side **application** error (the daemon answered with an error) is still surfaced verbatim
+as `History failed: <message>`, never masked as "daemon not running" (the #94/#98 distinction
+holds).
 
 ```
 agentmonitors monitor history [monitorId] [--socket <path>] [--workspace <path>] [--limit <n>] [--format <toon|text|json>]
@@ -621,11 +631,17 @@ The report is rendered according to three cases:
   persisted state from the last tick."_ (text) or annotated with a `"notice"` field alongside the
   full report (JSON). Exits 0.
 - **Definition ok, nothing persisted** (no history, no events — the daemon never ran): an actionable
-  remediation line is printed — _"No daemon running for this workspace and no persisted state to
-  show. Start it with `agentmonitors daemon run` (or it starts automatically when a Claude Code
-  session opens); if the daemon you want lives at a different socket, point at it with
-  `--socket <path>`. Or use `agentmonitors monitor test <path>` for a one-shot check."_ — rather
-  than a raw Node `connect ENOENT …`. Exits 1.
+  remediation line is printed instead of a raw Node `connect ENOENT …`, and exits 1. As with
+  `monitor history` above, the wording depends on whether the workspace is actually enabled (issue
+  #374 review follow-up):
+  - **Enabled workspace:** _"No daemon running for this workspace and no persisted state to show.
+    Start it with `agentmonitors daemon run` (or it starts automatically when a Claude Code session
+    opens); if the daemon you want lives at a different socket, point at it with `--socket <path>`.
+    Or use `agentmonitors monitor test <path>` for a one-shot check."_
+  - **Not enabled:** _"No daemon running at the default socket and no persisted state to show. Start
+    it with `agentmonitors daemon run`, enable this workspace so its socket is auto-discovered
+    (`agentmonitors init --enable-only`), or point at the daemon you want with `--socket <path>`. Or
+    use `agentmonitors monitor test <path>` for a one-shot check."_
 
 A daemon-side **application** error (the daemon answered with an error) is **not** masked as "daemon
 not running": it is surfaced verbatim as `Explain failed: <message>` with exit code 1. Malformed
