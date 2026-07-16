@@ -4585,7 +4585,7 @@ Handle it.
   });
 
   // --- Negative: daemon down (still works from persisted state) --------------
-  it('fails daemon-reachable but still shows the per-monitor rollup from persisted state when the daemon is down', () => {
+  it('marks daemon-reachable idle (exit 0) but still shows the per-monitor rollup from persisted state when the daemon is down', () => {
     const dir = path.join(tempDir, 'doctor-daemon-down');
     const monitorsRoot = path.join(dir, '.claude', 'monitors');
     writeDoctorMonitor(monitorsRoot, 'heartbeat', FIRING_SCHEDULE);
@@ -4606,14 +4606,18 @@ Handle it.
 
     const result = runWithEnv(['doctor', '--workspace', dir], env, dir);
 
-    expect(result.exitCode).toBe(1);
-    expect(result.stdout).toContain('daemon-reachable');
+    // Issue #373 criterion 2: daemon-reachable and lead-session are the ONLY
+    // failing checks here, and both are expected-when-idle — doctor must exit
+    // 0, not treat "no agent session currently open" as a broken setup.
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('◇ daemon-reachable');
+    expect(result.stdout).not.toContain('✗ daemon-reachable');
     // States the daemon is down and that the data came from persisted state.
     expect(result.stdout).toContain('showing persisted state');
     expect(result.stdout).toContain('agentmonitors daemon run');
-    // Criterion 3 (issue #331): the fail line names the expected-state context
-    // — no live agent session open is a normal reason for this to fail, not
-    // evidence of a broken setup.
+    // Criterion 2 (issues #331, #373): the idle line still names the
+    // expected-state context — no live agent session open is a normal reason
+    // for this, not evidence of a broken setup.
     expect(result.stdout).toContain(
       'expected when no agent session is currently open',
     );
@@ -4622,10 +4626,13 @@ Handle it.
     expect(result.stdout).toContain('monitor:heartbeat');
     expect(result.stdout).toContain('source=schedule');
     expect(result.stdout).not.toContain('last-observed=never');
+    expect(result.stdout).toMatch(
+      /Summary: \d+ passed, 0 failed, 0 skipped, 2 idle\./,
+    );
   });
 
   // --- Negative: no lead session (daemon reachable to isolate the failure) ---
-  it('fails lead-session with an actionable remediation when no lead session is registered', async () => {
+  it('marks lead-session idle (exit 0) with an actionable remediation when no lead session is registered', async () => {
     const dir = path.join(tempDir, 'doctor-no-lead-session');
     const monitorsRoot = path.join(dir, '.claude', 'monitors');
     writeDoctorMonitor(monitorsRoot, 'heartbeat', FIRING_SCHEDULE);
@@ -4643,15 +4650,18 @@ Handle it.
     try {
       const result = runWithEnv(['doctor', '--workspace', dir], env, dir);
 
-      expect(result.exitCode).toBe(1);
+      // Issue #373 criterion 2: lead-session is the ONLY failing check here
+      // (the daemon IS live), and it is expected-when-idle — exit 0.
+      expect(result.exitCode).toBe(0);
       // daemon-reachable passes (the daemon is live), isolating the failure.
       expect(result.stdout).toContain('✓ daemon-reachable');
-      expect(result.stdout).toContain('lead-session');
+      expect(result.stdout).toContain('◇ lead-session');
+      expect(result.stdout).not.toContain('✗ lead-session');
       expect(result.stdout).toMatch(/lead-session.*No lead session/);
       expect(result.stdout).toContain('agentmonitors session open');
-      // Criterion 3 (issue #331): the fail line names the expected-state
-      // context — no live agent session open is a normal reason for this to
-      // fail, not evidence of a broken setup.
+      // Criterion 2 (issues #331, #373): the idle line still names the
+      // expected-state context — no live agent session open is a normal
+      // reason for this, not evidence of a broken setup.
       expect(result.stdout).toContain(
         'expected when no agent session is currently open',
       );
@@ -4781,8 +4791,10 @@ Handle it.
       env,
       dir,
     );
-    // Daemon is down → at least one check fails → exit 1, but JSON must be clean.
-    expect(result.exitCode).toBe(1);
+    // Issue #373 criterion 2: daemon-reachable and lead-session are the ONLY
+    // checks that don't pass here, and both are idle (expected-when-idle) —
+    // doctor exits 0, but the JSON must still be clean and stable.
+    expect(result.exitCode).toBe(0);
     const report = JSON.parse(result.stdout) as {
       ok: boolean;
       generatedAt: string;
@@ -4808,10 +4820,15 @@ Handle it.
         lastEventAt: string | null;
         delivery: { unread: number; claimed: number; acknowledged: number };
       }[];
-      summary: { passed: number; failed: number; skipped: number };
+      summary: {
+        passed: number;
+        failed: number;
+        skipped: number;
+        idle: number;
+      };
     };
 
-    expect(report.ok).toBe(false);
+    expect(report.ok).toBe(true);
     expect(report.daemon.running).toBe(false);
     expect(report.daemon.socketPath).toBe(deadSocket);
     expect(report.leadSession).toBe(false);
@@ -4824,12 +4841,15 @@ Handle it.
       'lead-session',
       'monitor:heartbeat',
     ]);
-    // The daemon-reachable check failed and carries a non-null remediation.
+    // The daemon-reachable check is idle (not fail — issue #373) and still
+    // carries a non-null remediation.
     const daemonCheck = report.checks.find(
       (check) => check.name === 'daemon-reachable',
     );
-    expect(daemonCheck?.status).toBe('fail');
+    expect(daemonCheck?.status).toBe('idle');
     expect(daemonCheck?.remediation).toContain('agentmonitors daemon run');
+    expect(report.summary.idle).toBe(2);
+    expect(report.summary.failed).toBe(0);
 
     // The per-monitor rollup shape is complete and read from persisted state.
     const monitor = report.monitors[0];
@@ -4847,6 +4867,220 @@ Handle it.
     });
     expect(report.summary.passed + report.summary.failed).toBeGreaterThan(0);
   });
+
+  // --- Issue #373 criterion 1/3: rollup matches ground truth against a LIVE
+  // daemon after a real delivery (not just the persisted-state fallback) -----
+  //
+  // Root cause: `doctor` used to build its report by opening a FRESH SQLite
+  // connection in-process (`doctorReportInProcess`), always — even when a
+  // daemon was reachable. A separate reader connection opened against the
+  // same on-disk file as a live writer's connection can observe that writer's
+  // commits with a lag (WAL visibility across processes is not the same
+  // guarantee as same-connection reads), so the rollup would freeze at
+  // whatever state existed when the reader connection was first opened, while
+  // `events list`/`monitor history` — served straight from the live daemon's
+  // OWN connection — already showed the current, real state. The fix routes
+  // the report through the live daemon (`doctor.report` over the socket) when
+  // one is reachable, falling back to the in-process read only when it is not.
+  it('rollup last-observed/last-event/delivery counts equal `events list`/`monitor history` after a real delivery against a live daemon', async () => {
+    const dir = path.join(tempDir, 'doctor-live-rollup-matches-ground-truth');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    const watchedFile = path.join(dir, 'watched.txt');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(watchedFile, 'hello', 'utf-8');
+    writeDoctorMonitor(
+      monitorsRoot,
+      'watch-file',
+      `---
+name: Watch file
+watch:
+  type: file-fingerprint
+  globs:
+    - watched.txt
+  cwd: ${JSON.stringify(dir)}
+  interval: '5s'
+urgency: normal
+---
+When the file changes, review it.
+`,
+    );
+    writeLocalState(dir, { enabled: true });
+
+    const dbPath = path.join(dir, 'agentmon.db');
+    const socketPath = doctorSocket('live-rollup');
+    const env = { AGENTMONITORS_DB: dbPath, AGENTMONITORS_SOCKET: socketPath };
+
+    const daemon = await startDaemon(monitorsRoot, dir, env, socketPath);
+    try {
+      const sessionOpen = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          'doctor-live-rollup',
+          '--workspace',
+          dir,
+          '--format',
+          'json',
+        ],
+        env,
+        dir,
+      );
+      expect(sessionOpen.exitCode).toBe(0);
+      const session = JSON.parse(sessionOpen.stdout) as { id: string };
+
+      const waitForHistoryCount = (
+        n: number,
+      ): { id: string; createdAt: string }[] => {
+        const deadline = Date.now() + 10_000;
+        while (Date.now() < deadline) {
+          const result = runWithEnv(
+            [
+              'monitor',
+              'history',
+              '--workspace',
+              dir,
+              '--socket',
+              socketPath,
+              '--format',
+              'json',
+            ],
+            env,
+            dir,
+          );
+          if (result.exitCode === 0) {
+            const rows = JSON.parse(result.stdout) as {
+              id: string;
+              createdAt: string;
+            }[];
+            if (rows.length >= n) return rows;
+          }
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+        }
+        throw new Error(
+          `Timed out waiting for >= ${String(n)} monitor history row(s).`,
+        );
+      };
+
+      // Baseline observation: the file already exists when the daemon starts.
+      waitForHistoryCount(1);
+
+      // Fire a REAL second change so a NEW event materializes on the live
+      // daemon's own connection AFTER doctor's report source already had an
+      // established baseline — the exact sequence issue #373 reported. Wait
+      // past the monitor's own 5s interval (not just a short beat) so the
+      // change is picked up on its own due tick rather than being coalesced
+      // into the baseline, and so the trailing comparison below has a wide
+      // window before the source is due again and could add a further
+      // no-change re-observation (which would legitimately advance
+      // `lastObservedAt` past what `history`'s newest EVENT-producing row
+      // shows — a real, unrelated effect this test must not trip over).
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5200);
+      writeFileSync(watchedFile, 'hello world', 'utf-8');
+      waitForHistoryCount(2);
+
+      // Poll `events list` too: session projection is a separate write from
+      // the observation-history row `waitForHistoryCount` confirmed, and a
+      // session opened concurrently with the daemon's very first (baseline)
+      // tick can race it — only events materialized AFTER the session existed
+      // get a projection. At least the SECOND (real, post-session) event must
+      // show up; that is the one this test's regression is about.
+      const waitForEventsCount = (
+        n: number,
+      ): { id: string; createdAt: string }[] => {
+        const deadline = Date.now() + 10_000;
+        while (Date.now() < deadline) {
+          const result = runWithEnv(
+            [
+              'events',
+              'list',
+              '--session',
+              session.id,
+              '--socket',
+              socketPath,
+              '--format',
+              'json',
+            ],
+            env,
+            dir,
+          );
+          if (result.exitCode === 0) {
+            const rows = JSON.parse(result.stdout) as {
+              id: string;
+              createdAt: string;
+            }[];
+            if (rows.length >= n) return rows;
+          }
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+        }
+        throw new Error(
+          `Timed out waiting for >= ${String(n)} projected event(s).`,
+        );
+      };
+      const events = waitForEventsCount(1);
+
+      // Fetch `history` fresh and immediately adjacent to the `doctor` call
+      // (rather than reusing the earlier `waitForHistoryCount(2)` snapshot):
+      // the monitor's 5s interval means no further re-observation is due for
+      // several seconds yet, so this pair of back-to-back reads is a stable,
+      // tight comparison of the SAME ground truth doctor's rollup must match.
+      const freshHistoryResult = runWithEnv(
+        [
+          'monitor',
+          'history',
+          '--workspace',
+          dir,
+          '--socket',
+          socketPath,
+          '--format',
+          'json',
+        ],
+        env,
+        dir,
+      );
+      expect(freshHistoryResult.exitCode).toBe(0);
+      const history = JSON.parse(freshHistoryResult.stdout) as {
+        id: string;
+        createdAt: string;
+      }[];
+
+      const doctorResult = runWithEnv(
+        ['doctor', '--workspace', dir, '--format', 'json'],
+        env,
+        dir,
+      );
+      expect(doctorResult.exitCode).toBe(0);
+      const report = JSON.parse(doctorResult.stdout) as {
+        daemon: { running: boolean };
+        monitors: {
+          id: string;
+          lastObservedAt: string | null;
+          lastEventAt: string | null;
+          delivery: { unread: number; claimed: number; acknowledged: number };
+        }[];
+      };
+      // The report was actually served by the live daemon, not the
+      // persisted-state fallback.
+      expect(report.daemon.running).toBe(true);
+      const monitor = report.monitors.find((m) => m.id === 'watch-file');
+
+      const newestHistoryCreatedAt = [...history]
+        .map((row) => row.createdAt)
+        .sort()
+        .at(-1);
+      const newestEventCreatedAt = [...events]
+        .map((event) => event.createdAt)
+        .sort()
+        .at(-1);
+
+      expect(monitor?.lastObservedAt).toBe(newestHistoryCreatedAt);
+      expect(monitor?.lastEventAt).toBe(newestEventCreatedAt);
+      expect(monitor?.delivery.unread).toBe(events.length);
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+    }
+  }, 30_000);
 });
 
 // Regression for issue #335 (DX study S3 F5): a daemon started *directly* via

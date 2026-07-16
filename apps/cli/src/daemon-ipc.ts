@@ -54,6 +54,7 @@ const daemonMethodSchema = z.enum([
   'hook.diagnose',
   'history.list',
   'monitor.explain',
+  'doctor.report',
   'daemon.tick',
   'watch.declare',
   'watch.list',
@@ -151,6 +152,15 @@ const watchListParamsSchema = z.object({
 const watchCancelParamsSchema = z.object({
   sessionId: z.string(),
   ephemeralId: z.string(),
+});
+const doctorReportParamsSchema = z.object({
+  monitorsDir: z.string(),
+  // Required (mirrors `DoctorReportInput.workspacePath`): a doctor report is
+  // never workspace-unscoped (issue #373 — reading the live daemon's own
+  // connection is the whole point of this method, so the caller must name the
+  // exact scope it wants, same as `monitor.explain`).
+  workspacePath: z.string(),
+  historyLimit: z.number().int().positive().optional(),
 });
 const daemonRequestSchema = z.object({
   id: z.string(),
@@ -639,6 +649,14 @@ function handleRequest(
       return Promise.resolve(
         runtime.cancelEphemeralMonitor(params.sessionId, params.ephemeralId),
       );
+    }
+    case 'doctor.report': {
+      const params = doctorReportParamsSchema.parse(request.params);
+      return runtime.doctorReport({
+        monitorsDir: params.monitorsDir,
+        workspacePath: params.workspacePath,
+        ...(params.historyLimit ? { historyLimit: params.historyLimit } : {}),
+      });
     }
   }
 }

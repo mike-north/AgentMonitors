@@ -6,13 +6,23 @@ import type {
 } from '@agentmonitors/core';
 import { reportError } from '../output.js';
 import { readLocalState } from '../local-state.js';
-import { daemonAvailable, resolveSocketPath } from '../daemon-ipc.js';
+import { DaemonConnectionError, resolveSocketPath } from '../daemon-ipc.js';
 import { resolveManualDaemonSocketPath } from '../manual-daemon.js';
-import { doctorReportInProcess } from '../runtime-client.js';
+import {
+  doctorReportClient,
+  doctorReportInProcess,
+} from '../runtime-client.js';
 import { resolveWorkspaceDbPath } from '../workspace-db-path.js';
 
-/** A single named health check with an actionable remediation on failure. */
-type DoctorCheckStatus = 'pass' | 'fail' | 'skip';
+/**
+ * A single named health check with an actionable remediation on failure.
+ *
+ * `idle` (issue #373) is distinct from `fail`: it names a check that legitimately
+ * does not apply right now (no agent session currently open for this workspace)
+ * rather than a genuine problem. Only `fail` drives a non-zero exit code — an
+ * idle-only report exits 0, same as an all-`pass` one.
+ */
+type DoctorCheckStatus = 'pass' | 'fail' | 'skip' | 'idle';
 
 interface DoctorCheck {
   name: string;
@@ -54,6 +64,10 @@ const STATUS_GLYPH: Record<DoctorCheckStatus, string> = {
   pass: '✓',
   fail: '✗',
   skip: '○',
+  // Distinct from both `fail` (✗) and `skip` (○): the check ran and found the
+  // expected-when-idle state described in its `detail`, not a genuine problem
+  // (issue #373).
+  idle: '◇',
 };
 
 /**
@@ -155,7 +169,10 @@ function buildChecks(
     );
   }
 
-  // 4. daemon reachable (with socket path)
+  // 4. daemon reachable (with socket path). A down daemon is `idle`, not
+  // `fail` (issue #373): the doc comment on DAEMON_REMEDIATION's detail text
+  // already calls this "expected when no agent session is currently open" —
+  // that framing means it must not force a non-zero exit on its own.
   checks.push(
     daemonRunning
       ? {
@@ -165,13 +182,14 @@ function buildChecks(
         }
       : {
           name: 'daemon-reachable',
-          status: 'fail',
+          status: 'idle',
           detail: `No daemon reachable at ${socketPath} — showing persisted state from the last tick (expected when no agent session is currently open; the daemon starts automatically once one is).`,
           remediation: DAEMON_REMEDIATION,
         },
   );
 
-  // 5. lead session present for this workspace
+  // 5. lead session present for this workspace. Same `idle` treatment as
+  // `daemon-reachable` above and for the same reason (issue #373).
   checks.push(
     report.hasLeadSession
       ? {
@@ -181,7 +199,7 @@ function buildChecks(
         }
       : {
           name: 'lead-session',
-          status: 'fail',
+          status: 'idle',
           detail: `No lead session is registered for workspace "${report.workspacePath}" (expected when no agent session is currently open).`,
           remediation: leadSessionRemediation(report.workspacePath),
         },
@@ -238,9 +256,10 @@ function renderText(
   const passed = checks.filter((check) => check.status === 'pass').length;
   const failed = checks.filter((check) => check.status === 'fail').length;
   const skipped = checks.filter((check) => check.status === 'skip').length;
+  const idle = checks.filter((check) => check.status === 'idle').length;
   lines.push('');
   lines.push(
-    `Summary: ${String(passed)} passed, ${String(failed)} failed, ${String(skipped)} skipped.`,
+    `Summary: ${String(passed)} passed, ${String(failed)} failed, ${String(skipped)} skipped, ${String(idle)} idle.`,
   );
   return lines.join('\n');
 }
@@ -259,6 +278,7 @@ function toJson(
   const passed = checks.filter((check) => check.status === 'pass').length;
   const failed = checks.filter((check) => check.status === 'fail').length;
   const skipped = checks.filter((check) => check.status === 'skip').length;
+  const idle = checks.filter((check) => check.status === 'idle').length;
   const payload = {
     ok: failed === 0,
     generatedAt: report.generatedAt.toISOString(),
@@ -289,7 +309,7 @@ function toJson(
         : null,
       delivery: monitor.delivery,
     })),
-    summary: { passed, failed, skipped },
+    summary: { passed, failed, skipped, idle },
   };
   return JSON.stringify(payload, null, 2);
 }
@@ -331,17 +351,38 @@ export const doctorCommand = new Command('doctor')
         const dbPath = resolveWorkspaceDbPath(workspace, state);
         // Resolve the socket the same way manual daemon commands do — an enabled
         // workspace's persisted socket reaches the same daemon the plugin uses —
-        // then a concrete path for the reachability ping and display.
+        // then a concrete path used both for the report call and for display.
         const socketPath = resolveSocketPath(
           resolveManualDaemonSocketPath(options.socket, workspace) ??
             options.socket,
         );
-        const daemonRunning = await daemonAvailable(socketPath);
 
-        const report = await doctorReportInProcess(
-          { monitorsDir, workspacePath: workspace },
-          dbPath,
-        );
+        // Prefer the LIVE daemon's own connection when one is reachable
+        // (issue #373): a separate reader connection opened fresh against the
+        // same SQLite file can lag behind a live writer connection's commits
+        // (WAL visibility across processes is not instantaneous the way
+        // same-connection reads are), which under-reported `last-observed`/
+        // `last-event`/delivery counts after a real delivery. Only fall back
+        // to the in-process read — mirroring `monitor explain`/`monitor
+        // history` — when the daemon is genuinely unreachable; a daemon-side
+        // application error must still surface verbatim, not be masked as
+        // "daemon not running".
+        let daemonRunning: boolean;
+        let report: MonitorDoctorReport;
+        try {
+          report = await doctorReportClient(
+            { monitorsDir, workspacePath: workspace },
+            socketPath,
+          );
+          daemonRunning = true;
+        } catch (error) {
+          if (!(error instanceof DaemonConnectionError)) throw error;
+          daemonRunning = false;
+          report = await doctorReportInProcess(
+            { monitorsDir, workspacePath: workspace },
+            dbPath,
+          );
+        }
 
         const checks = buildChecks(
           report,

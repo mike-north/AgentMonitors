@@ -264,11 +264,17 @@ export function listObservationHistoryInProcess(
 
 /**
  * Build the `agentmonitors doctor` health report *in-process* against the
- * persisted SQLite store (issue #267). Doctor is a read-only diagnosis, so it
- * always reads the store directly rather than round-tripping the daemon socket —
- * the daemon writes the same DB, so the report is accurate whether or not a
- * daemon is running (mirrors `daemon status`'s in-process read). `dbPath` is the
- * workspace-resolved database path.
+ * persisted SQLite store (issue #267).
+ *
+ * Fallback for {@link doctorReportClient} when the daemon is unreachable
+ * (issue #373 — a genuinely live daemon holds its own connection open on the
+ * SAME SQLite file, and a separate reader connection opened here can observe
+ * that connection's commits with a lag: WAL visibility across processes is
+ * NOT instantaneous the way same-connection reads are. Preferring the live
+ * daemon's own connection when one is reachable is what makes the rollup
+ * match `events list`/`monitor history`'s ground truth; this in-process path
+ * is only correct as a last resort when there is no live connection to ask).
+ * `dbPath` is the workspace-resolved database path.
  */
 export async function doctorReportInProcess(
   input: DoctorReportInput,
@@ -276,4 +282,74 @@ export async function doctorReportInProcess(
 ): Promise<MonitorDoctorReport> {
   const runtime = createRuntime(dbPath);
   return await runtime.doctorReport(input);
+}
+
+/** `AgentSessionRecord` fields serialized as ISO strings over the wire. */
+const SESSION_DATE_FIELDS = [
+  'baselineAt',
+  'lastActiveAt',
+  'lastRecapAt',
+  'dormantAt',
+  'createdAt',
+  'updatedAt',
+] as const satisfies readonly (keyof AgentSessionRecord)[];
+
+/** `DoctorMonitorRollup` fields serialized as ISO strings over the wire. */
+const MONITOR_ROLLUP_DATE_FIELDS = [
+  'lastObservedAt',
+  'nextDueAt',
+  'lastEventAt',
+] as const;
+
+/**
+ * Reconstruct the `Date` fields {@link MonitorDoctorReport} promises, lost to
+ * plain ISO strings by the JSON round trip over the daemon socket (issue
+ * #373). `doctorReportInProcess` returns real `Date` objects straight from
+ * the store; `doctor.ts` calls `.toISOString()` on report dates unconditionally
+ * (unlike sibling commands, which only re-serialize their reports), so
+ * `doctorReportClient` must uphold the same contract or that call throws.
+ */
+function reviveDoctorReportDates(
+  report: MonitorDoctorReport,
+): MonitorDoctorReport {
+  return {
+    ...report,
+    generatedAt: new Date(report.generatedAt),
+    monitors: report.monitors.map((monitor) => {
+      const revived = { ...monitor };
+      for (const field of MONITOR_ROLLUP_DATE_FIELDS) {
+        const value = revived[field];
+        if (value !== undefined) revived[field] = new Date(value);
+      }
+      return revived;
+    }),
+    leadSessions: report.leadSessions.map((session) => {
+      const revived = { ...session };
+      for (const field of SESSION_DATE_FIELDS) {
+        const value = revived[field];
+        if (value !== undefined) revived[field] = new Date(value);
+      }
+      return revived;
+    }),
+  };
+}
+
+/**
+ * Build the `agentmonitors doctor` health report from the LIVE daemon over
+ * its socket (issue #373). Preferred over {@link doctorReportInProcess}
+ * whenever a daemon is reachable: reading through the daemon's own
+ * connection is what guarantees the rollup reflects the same ground truth
+ * `events list`/`monitor history` (also daemon-served) report, rather than a
+ * separate reader connection's lagged view of the same SQLite file.
+ */
+export async function doctorReportClient(
+  input: DoctorReportInput,
+  socketPath?: string,
+): Promise<MonitorDoctorReport> {
+  const report = await callDaemon<MonitorDoctorReport>(
+    'doctor.report',
+    input as unknown as Record<string, unknown>,
+    socketPath ? { socketPath } : {},
+  );
+  return reviveDoctorReportDates(report);
 }
