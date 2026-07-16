@@ -282,6 +282,53 @@ describe('createDaemonServer — request-handling resilience', () => {
     }
   });
 
+  // Issue #418 trust boundary: `events.suppressObject` installs a durable by-KEY
+  // tombstone that is safe ONLY for a synthetic verify scratch key. The IPC schema
+  // must reject a real watched path at the boundary (before it reaches the runtime),
+  // and — like any param-validation failure — answer a clean error while staying
+  // alive. A synthetic scratch key is accepted.
+  it('rejects an events.suppressObject with a non-synthetic objectKey and accepts a synthetic scratch key', async () => {
+    const socketPath = tempSocketPath('suppress-guard');
+    const server = createDaemonServer({
+      runtime: createRuntime(':memory:'),
+      socketPath,
+    });
+    try {
+      await server.listen();
+
+      // A REAL watched path — the by-key tombstone would be unsafe here.
+      const rejection = await callDaemon(
+        'events.suppressObject',
+        {
+          monitorId: 'm',
+          objectKey: '/ws/src/app.ts',
+          ttlMs: 1000,
+          workspacePath: '/ws',
+        },
+        { socketPath, timeoutMs: 1000 },
+      ).catch((error: unknown) => error);
+      expect(rejection).toBeInstanceOf(Error);
+      expect(rejection).not.toBeInstanceOf(DaemonConnectionError);
+
+      // The daemon survived, and a SYNTHETIC scratch key is accepted (no events to
+      // remove in a fresh runtime → 0).
+      const removed = await callDaemon<{ removed: number }>(
+        'events.suppressObject',
+        {
+          monitorId: 'm',
+          objectKey: '/ws/agentmonitors-verify-0a1b2c3d4e5f.md',
+          ttlMs: 1000,
+          workspacePath: '/ws',
+        },
+        { socketPath, timeoutMs: 1000 },
+      );
+      expect(removed).toEqual({ removed: 0 });
+      await expect(daemonAvailable(socketPath)).resolves.toBe(true);
+    } finally {
+      await server.close().catch(() => undefined);
+    }
+  });
+
   // Issue #382: going forward, a schema-rejected request (e.g. an unknown
   // `method` — what a NEW client sends an OLD daemon build that predates it,
   // or vice versa) must carry a `code` a client can match on WITHOUT relying

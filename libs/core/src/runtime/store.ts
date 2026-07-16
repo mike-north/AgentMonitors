@@ -1722,6 +1722,7 @@ export class RuntimeStore {
         eq(objectEventSuppressions.workspacePath, workspacePath),
         isNull(objectEventSuppressions.workspacePath),
       );
+      // `or(...)` is typed `SQL | undefined` (undefined only if ALL args are, which they never are here), so this is a type-narrowing to push into the `SQL[]`, not a runtime branch — matching the same idiom used elsewhere in this file.
       if (workspaceCondition) conditions.push(workspaceCondition);
     }
     return db

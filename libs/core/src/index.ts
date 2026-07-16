@@ -109,7 +109,10 @@ export {
 export type { HookState, UrgentItem } from './hook-bridge/types.js';
 
 // Runtime
-export { AgentMonitorRuntime } from './runtime/service.js';
+export {
+  AgentMonitorRuntime,
+  isVerifyScratchObjectKey,
+} from './runtime/service.js';
 export { RuntimeStore } from './runtime/store.js';
 // Canonical runtime scheduling/notify default timings — the single source of
 // truth the daemon schedules against, exported so timing-aware consumers (the

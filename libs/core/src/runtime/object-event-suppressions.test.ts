@@ -9,19 +9,48 @@
  * scratch object; the daemon then sweeps the pending deletion on the tick it
  * materializes. These tests exercise that mechanism at the runtime/store layer.
  *
- * @see docs/specs/005-cli-reference.md §16 (step 9, "Suppress")
- * @see docs/specs/spec-changelog.md 2026-07-16 (Refs #414)
+ * The two-mechanism split the by-KEY tombstone is HALF of (issue #418): it is safe
+ * ONLY for a synthetic scratch key no real file shares. `suppressObjectEvents`
+ * therefore rejects a non-synthetic key at the trust boundary, and a literal watched
+ * file verify created is cleaned up by the id-scoped `retractObjectEvents` instead.
+ *
+ * @see docs/specs/005-cli-reference.md §16 (step 9, "Clean up")
+ * @see docs/specs/spec-changelog.md 2026-07-16 (Refs #414, #418)
  */
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDb } from '../inbox/db.js';
 import { SourceRegistry } from '../observation/registry.js';
+import type {
+  ObservationResult,
+  ObservationSource,
+} from '../observation/types.js';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import { RuntimeStore } from './store.js';
 import type { MonitorEventRecord } from './types.js';
-import { AgentMonitorRuntime } from './service.js';
+import { AgentMonitorRuntime, isVerifyScratchObjectKey } from './service.js';
+
+/**
+ * A no-op source registered under `file-fingerprint` so `tick()` can scan and
+ * evaluate an authored monitor without pulling in the real source plugin (which
+ * depends on core — a circular import). It observes nothing; these tests drive
+ * events into the store directly.
+ */
+const noopFileFingerprintSource: ObservationSource = {
+  name: 'file-fingerprint',
+  scopeSchema: { type: 'object', properties: {} },
+  async observe(): Promise<ObservationResult> {
+    return { observations: [] };
+  },
+};
+
+function registryWithNoopSource(): SourceRegistry {
+  const registry = new SourceRegistry();
+  registry.register(noopFileFingerprintSource);
+  return registry;
+}
 
 const tempDirs: string[] = [];
 
@@ -350,6 +379,204 @@ describe('object-event suppressions (issue #414)', () => {
         objectKey: scratchKey,
         workspacePath: rootDir,
       }),
+    ).toHaveLength(0);
+  });
+});
+
+describe('object-event suppression safety guards (issue #418)', () => {
+  it('isVerifyScratchObjectKey accepts synthetic scratch keys (POSIX AND Windows) and rejects real paths', () => {
+    // POSIX absolute scratch key.
+    expect(
+      isVerifyScratchObjectKey('/ws/logs/agentmonitors-verify-0a1b2c3d4e5f.md'),
+    ).toBe(true);
+    // Windows absolute scratch key (backslash separators) — the reviewed bug:
+    // `verify` builds objectKey with `path.join`, so on Windows the separators are
+    // `\`; a split on `/` alone failed to find the basename (issue #418 review).
+    expect(
+      isVerifyScratchObjectKey(
+        'C:\\ws\\logs\\agentmonitors-verify-0a1b2c3d4e5f.md',
+      ),
+    ).toBe(true);
+    // Extensionless scratch key still matches.
+    expect(
+      isVerifyScratchObjectKey('/ws/agentmonitors-verify-aabbccddeeff'),
+    ).toBe(true);
+    // A real watched file never matches — even one that merely mentions the token.
+    expect(isVerifyScratchObjectKey('/ws/src/app.ts')).toBe(false);
+    expect(
+      isVerifyScratchObjectKey('/ws/notes-agentmonitors-verify-notes.md'),
+    ).toBe(false);
+    // A wrong-length / non-hex token is rejected.
+    expect(isVerifyScratchObjectKey('/ws/agentmonitors-verify-xyz.md')).toBe(
+      false,
+    );
+  });
+
+  it('suppressObjectEvents REFUSES a non-synthetic object key and leaves its real event intact', () => {
+    const { rootDir } = makeWorkspace();
+    const db = createDb(':memory:');
+    const runtime = new AgentMonitorRuntime(
+      new RuntimeStore(db),
+      new SourceRegistry(),
+      [claudeCodeAdapter],
+    );
+    const store = new RuntimeStore(db);
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'guard-real-key',
+        workspacePath: rootDir,
+      }),
+    );
+    // A REAL watched file (a literal single-file glob verify created). Tombstoning
+    // it by key would eat a later genuine create at this same path — exactly the
+    // event loss #418 forbids — so the runtime must reject it outright.
+    const realKey = path.join(rootDir, 'watched.txt');
+    store.insertEvent({
+      ...eventBase(rootDir),
+      title: `File created: ${realKey}`,
+      summary: `File created: ${realKey}`,
+      objectKey: realKey,
+      createdAt: new Date(),
+    });
+
+    expect(() =>
+      runtime.suppressObjectEvents({
+        workspacePath: rootDir,
+        monitorId: MONITOR_ID,
+        objectKey: realKey,
+        ttlMs: 60_000,
+      }),
+    ).toThrow(/non-synthetic object key/i);
+
+    // The real event is untouched — the guard fires before any deletion.
+    const events = runtime.listEvents({ sessionId: session.id });
+    expect(events).toHaveLength(1);
+    expect(events[0]?.objectKey).toBe(realKey);
+  });
+
+  it('suppressObjectEvents with an omitted workspacePath does NOT sweep another workspace’s events at the same scratch key', () => {
+    // Copilot review (r3597013923): pre-fix, an omitted workspacePath normalized
+    // the tombstone to the NULL scope but retracted UNSCOPED (across every
+    // workspace), so the initial deletion was broader than the tombstone and could
+    // erase another workspace's events. Post-fix, the omitted scope normalizes to
+    // NULL for BOTH the upsert and the retraction, so only NULL-scoped events are
+    // swept — never a workspace-scoped event.
+    const db = createDb(':memory:');
+    const runtime = new AgentMonitorRuntime(
+      new RuntimeStore(db),
+      new SourceRegistry(),
+      [claudeCodeAdapter],
+    );
+    const store = new RuntimeStore(db);
+    // The same scratch key materialized under two distinct workspaces.
+    const scratchKey = '/shared/agentmonitors-verify-abcdef012345.md';
+    for (const ws of ['/ws-a', '/ws-b']) {
+      store.insertEvent({
+        ...eventBase(ws),
+        workspacePath: ws,
+        title: `File deleted: ${scratchKey}`,
+        summary: `File deleted: ${scratchKey}`,
+        objectKey: scratchKey,
+        createdAt: new Date(),
+      });
+    }
+
+    // Omit workspacePath entirely → the NULL scope. Neither workspace-scoped event
+    // is touched (removed count is 0); pre-fix this swept BOTH.
+    const removed = runtime.suppressObjectEvents({
+      monitorId: MONITOR_ID,
+      objectKey: scratchKey,
+      ttlMs: 60_000,
+    });
+    expect(removed).toBe(0);
+    for (const ws of ['/ws-a', '/ws-b']) {
+      expect(
+        runtime.listEvents({
+          monitorId: MONITOR_ID,
+          objectKey: scratchKey,
+          workspacePath: ws,
+        }),
+      ).toHaveLength(1);
+    }
+
+    // A workspace-scoped suppress still cleans up exactly its own workspace.
+    const removedA = runtime.suppressObjectEvents({
+      workspacePath: '/ws-a',
+      monitorId: MONITOR_ID,
+      objectKey: scratchKey,
+      ttlMs: 60_000,
+    });
+    expect(removedA).toBe(1);
+    expect(
+      runtime.listEvents({
+        monitorId: MONITOR_ID,
+        objectKey: scratchKey,
+        workspacePath: '/ws-b',
+      }),
+    ).toHaveLength(1);
+  });
+
+  it('the reap backstop sizes the orphan tombstone from the monitor cadence, so a long-interval monitor outlives the 5-min floor', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-16T00:00:00.000Z'));
+    const { rootDir, monitorsDir } = makeWorkspace();
+    // Author a long-interval + long-settle monitor so its derived tombstone TTL
+    // (max(5min, interval + settle + 1min margin) = max(5min, 10+2+1min) = 13min)
+    // exceeds the fixed 5-minute floor. Pre-fix the reap used the flat floor, so a
+    // deletion re-materializing after 5min would linger.
+    const monitorDir = path.join(monitorsDir, MONITOR_ID);
+    mkdirSync(monitorDir, { recursive: true });
+    writeFileSync(
+      path.join(monitorDir, 'MONITOR.md'),
+      `---\nname: Docs watch\nwatch:\n  type: file-fingerprint\n  globs:\n    - '*.md'\n  interval: '10m'\nnotify:\n  strategy: debounce\n  settle-for: '2m'\nurgency: normal\n---\nReview it.\n`,
+      'utf-8',
+    );
+    const db = createDb(':memory:');
+    const runtime = new AgentMonitorRuntime(
+      new RuntimeStore(db),
+      registryWithNoopSource(),
+      [claudeCodeAdapter],
+      undefined,
+      { sessionDormancyMs: 60_000 },
+    );
+    const store = new RuntimeStore(db);
+    // Open the orphaned verify session (its presence is what the reap acts on).
+    runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'agentmonitors-verify-fedcba987654',
+        workspacePath: rootDir,
+      }),
+    );
+    const scratchKey = path.join(
+      rootDir,
+      'agentmonitors-verify-fedcba987654.md',
+    );
+    store.insertEvent({
+      ...eventBase(rootDir),
+      title: `File created: ${scratchKey}`,
+      summary: `File created: ${scratchKey}`,
+      objectKey: scratchKey,
+      createdAt: new Date(),
+    });
+
+    // Advance past dormancy and tick: the reap installs the tombstone now (00:02).
+    vi.setSystemTime(new Date('2026-07-16T00:02:00.000Z'));
+    await runtime.tick(monitorsDir, rootDir);
+
+    // At 00:08 the flat 5-min floor (would expire ~00:07) is already gone, but the
+    // cadence-derived 13-min window is still active — the tombstone survives.
+    expect(
+      store.activeObjectSuppressions(
+        rootDir,
+        new Date('2026-07-16T00:08:00.000Z'),
+      ),
+    ).toHaveLength(1);
+    // And it does eventually expire (past 00:15).
+    expect(
+      store.activeObjectSuppressions(
+        rootDir,
+        new Date('2026-07-16T00:16:00.000Z'),
+      ),
     ).toHaveLength(0);
   });
 });

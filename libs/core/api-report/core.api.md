@@ -543,6 +543,9 @@ export type InterpretResult = {
 // @public
 export function isErrnoException(error: unknown): error is NodeJS.ErrnoException;
 
+// @public
+export function isVerifyScratchObjectKey(objectKey: string): boolean;
+
 // @public (undocumented)
 export type JsonSchema = Record<string, unknown>;
 
