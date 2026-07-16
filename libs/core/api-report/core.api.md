@@ -49,6 +49,13 @@ export class AgentMonitorRuntime {
     }): number;
     // (undocumented)
     status(): RuntimeStatus;
+    suppressObjectEvents(input: {
+        workspacePath?: string | null;
+        monitorId: string;
+        objectKey: string;
+        ttlMs: number;
+        now?: Date;
+    }): number;
     // (undocumented)
     tick(monitorsDir: string, workspacePath?: string): Promise<RuntimeTickResult>;
     watchMonitors(monitorsDir: string, workspacePath?: string, options?: {
@@ -535,6 +542,9 @@ export type InterpretResult = {
 
 // @public
 export function isErrnoException(error: unknown): error is NodeJS.ErrnoException;
+
+// @public
+export function isVerifyScratchObjectKey(objectKey: string): boolean;
 
 // @public (undocumented)
 export type JsonSchema = Record<string, unknown>;
@@ -1301,6 +1311,11 @@ export class RuntimeStore {
     constructor(db: InboxDb);
     // (undocumented)
     acknowledgeEvents(sessionId: string, eventIds: string[]): void;
+    activeObjectSuppressions(workspacePath: string | undefined, now: Date): {
+        monitorId: string;
+        objectKey: string;
+        workspacePath: string | null;
+    }[];
     advanceSessionObjectCursor(input: {
         sessionId: string;
         monitorId: string;
@@ -1362,6 +1377,7 @@ export class RuntimeStore {
     perRecipientDiffsForSession(sessionId: string, eventIds: string[]): Map<string, string>;
     // (undocumented)
     projectedSessionIdsForLastEvent(): string[];
+    purgeExpiredObjectSuppressions(now: Date): void;
     reapEphemeralMonitor(id: string): void;
     reapEphemeralMonitorsForSession(sessionId: string): string[];
     recordInterpretDecision(sessionId: string, eventId: string, decision: {
@@ -1382,6 +1398,14 @@ export class RuntimeStore {
         monitorId: string;
         objectKey: string;
         eventIds: string[];
+    }): {
+        removedEventIds: string[];
+        affectedSessionIds: string[];
+    };
+    retractObjectEventsByKey(input: {
+        workspacePath?: string | null;
+        monitorId: string;
+        objectKey: string;
     }): {
         removedEventIds: string[];
         affectedSessionIds: string[];
@@ -1426,6 +1450,14 @@ export class RuntimeStore {
     unreadEventsForSession(sessionId: string, urgency?: 'low' | 'normal' | 'high'): MonitorEventRecord[];
     // (undocumented)
     updateSessionRecap(sessionId: string): void;
+    upsertObjectSuppression(input: {
+        monitorId: string;
+        objectKey: string;
+        workspacePath?: string | null;
+        reason?: string;
+        createdAt: Date;
+        expiresAt: Date;
+    }): void;
 }
 
 // @public

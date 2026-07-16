@@ -232,7 +232,10 @@ A few flags worth knowing:
   project's real daemon/database instead of a throwaway one, and leaves it running afterward, so a
   follow-up `agentmonitors doctor` reflects the delivery directly instead of resolving a throwaway
   isolated daemon. This requires the project to already be enabled — see **step (a)** in the
-  appendix below for the one-time opt-in.
+  appendix below for the one-time opt-in. Because that daemon persists, `verify` cleans up its own
+  scratch file so the throwaway change never surfaces to a real session; it does this without
+  waiting, so this mode finishes in about the same time as a plain `verify`, and an interrupted run
+  leaves nothing stray behind.
 - **`--timeout-ms`** — overrides the derived post-trigger detection budget, if you need more time
   than what `verify` estimates.
 

@@ -16,6 +16,7 @@ import path from 'node:path';
 import net from 'node:net';
 import {
   isErrnoException,
+  isVerifyScratchObjectKey,
   PRIVATE_DIR_MODE,
   PRIVATE_FILE_MODE,
   restrictExistingPathMode,
@@ -50,6 +51,7 @@ const daemonMethodSchema = z.enum([
   'events.list',
   'events.ack',
   'events.retractObject',
+  'events.suppressObject',
   'hook.claim',
   'hook.preview',
   'hook.diagnose',
@@ -108,6 +110,23 @@ const eventsRetractObjectParamsSchema = z.object({
   monitorId: z.string(),
   objectKey: z.string(),
   eventIds: z.array(z.string()),
+  workspacePath: z.string().optional(),
+});
+// verify --use-workspace-daemon's durable scratch-cleanup tombstone (issue #414):
+// install a self-expiring suppression over its synthetic object key and retract
+// what that key already has, so the pending deletion is swept by the daemon
+// without verify blocking a poll interval. `ttlMs` bounds the tombstone's life.
+// `objectKey` is rejected at this trust boundary unless it is a synthetic verify
+// scratch path (issue #418): the tombstone drives a by-KEY sweep that is only safe
+// for a key no real monitored file shares, so a real watched path must never reach
+// the runtime here (it would eat a later genuine event at that path).
+const eventsSuppressObjectParamsSchema = z.object({
+  monitorId: z.string(),
+  objectKey: z.string().refine(isVerifyScratchObjectKey, {
+    message:
+      'objectKey must be a verify scratch path (agentmonitors-verify-<token>); the durable tombstone + by-key sweep is unsafe for a real watched path. Retract a real object by id instead.',
+  }),
+  ttlMs: z.number().int().positive(),
   workspacePath: z.string().optional(),
 });
 const hookClaimParamsSchema = z.object({
@@ -672,6 +691,19 @@ function handleRequest(
           monitorId: params.monitorId,
           objectKey: params.objectKey,
           eventIds: params.eventIds,
+          ...(params.workspacePath
+            ? { workspacePath: params.workspacePath }
+            : {}),
+        }),
+      });
+    }
+    case 'events.suppressObject': {
+      const params = eventsSuppressObjectParamsSchema.parse(request.params);
+      return Promise.resolve({
+        removed: runtime.suppressObjectEvents({
+          monitorId: params.monitorId,
+          objectKey: params.objectKey,
+          ttlMs: params.ttlMs,
           ...(params.workspacePath
             ? { workspacePath: params.workspacePath }
             : {}),

@@ -33,6 +33,7 @@ import {
   monitorEvents,
   monitorSnapshots,
   monitorState,
+  objectEventSuppressions,
   observationHistory,
   sessionEventState,
   sessionObjectCursor,
@@ -1554,6 +1555,61 @@ export class RuntimeStore {
       )
       .all()
       .map((row) => row.id);
+    return this.deleteResolvedObjectEvents(removedEventIds, input);
+  }
+
+  /**
+   * Retract every event a monitor has materialized for one `object_key` (issue
+   * #414) — the by-KEY companion to {@link retractObjectEvents} (which deletes by
+   * explicit id). This IS a `(monitorId, objectKey)` sweep, so it must ONLY be
+   * pointed at a synthetic object key that no real monitored file ever shares —
+   * `verify`'s per-run scratch path (`…/agentmonitors-verify-<token><ext>`). It
+   * powers the durable {@link objectEventSuppressions} tombstone: when verify has
+   * proven delivery it retracts the create and leaves a tombstone, and the daemon
+   * calls this on the tick the file's deletion event materializes, erasing it
+   * before any later session sees it — without verify blocking a poll interval.
+   */
+  retractObjectEventsByKey(input: {
+    workspacePath?: string | null;
+    monitorId: string;
+    objectKey: string;
+  }): { removedEventIds: string[]; affectedSessionIds: string[] } {
+    const db = asInternalDb(this.db);
+    const conditions = [
+      eq(monitorEvents.monitorId, input.monitorId),
+      eq(monitorEvents.objectKey, input.objectKey),
+    ];
+    if (input.workspacePath !== undefined) {
+      conditions.push(
+        input.workspacePath === null
+          ? isNull(monitorEvents.workspacePath)
+          : eq(monitorEvents.workspacePath, input.workspacePath),
+      );
+    }
+    const removedEventIds = db
+      .select({ id: monitorEvents.id })
+      .from(monitorEvents)
+      .where(and(...conditions))
+      .all()
+      .map((row) => row.id);
+    return this.deleteResolvedObjectEvents(removedEventIds, input);
+  }
+
+  /**
+   * Delete a resolved set of a monitor object's event rows and every durable
+   * trace they left — shared by {@link retractObjectEvents} (id-scoped) and
+   * {@link retractObjectEventsByKey} (key-scoped). The caller is responsible for
+   * resolving `removedEventIds` safely; this just performs the cascade.
+   */
+  private deleteResolvedObjectEvents(
+    removedEventIds: string[],
+    input: {
+      workspacePath?: string | null;
+      monitorId: string;
+      objectKey: string;
+    },
+  ): { removedEventIds: string[]; affectedSessionIds: string[] } {
+    const db = asInternalDb(this.db);
     if (removedEventIds.length === 0) {
       return { removedEventIds, affectedSessionIds: [] };
     }
@@ -1603,6 +1659,93 @@ export class RuntimeStore {
         .run();
     }
     return { removedEventIds, affectedSessionIds };
+  }
+
+  /**
+   * Install (or refresh) a durable {@link objectEventSuppressions} tombstone for
+   * a `(monitorId, objectKey, workspacePath)` (issue #414), upserting on that
+   * triple so a re-run of verify against the same path never accumulates stale
+   * rows. `expiresAt` bounds its life so nothing lingers permanently.
+   */
+  upsertObjectSuppression(input: {
+    monitorId: string;
+    objectKey: string;
+    workspacePath?: string | null;
+    reason?: string;
+    createdAt: Date;
+    expiresAt: Date;
+  }): void {
+    const db = asInternalDb(this.db);
+    const workspacePath = input.workspacePath ?? null;
+    db.delete(objectEventSuppressions)
+      .where(
+        and(
+          eq(objectEventSuppressions.monitorId, input.monitorId),
+          eq(objectEventSuppressions.objectKey, input.objectKey),
+          workspacePath === null
+            ? isNull(objectEventSuppressions.workspacePath)
+            : eq(objectEventSuppressions.workspacePath, workspacePath),
+        ),
+      )
+      .run();
+    db.insert(objectEventSuppressions)
+      .values({
+        id: ulid(),
+        monitorId: input.monitorId,
+        objectKey: input.objectKey,
+        workspacePath,
+        reason: input.reason ?? 'verify-scratch',
+        createdAt: input.createdAt,
+        expiresAt: input.expiresAt,
+      })
+      .run();
+  }
+
+  /**
+   * List the currently-active (non-expired at `now`) object-event suppressions
+   * for a workspace — both workspace-scoped and workspace-agnostic rows, matching
+   * how {@link listEvents} scopes — so the runtime tick can retract any events
+   * their tombstoned object keys have (re-)materialized (issue #414).
+   */
+  activeObjectSuppressions(
+    workspacePath: string | undefined,
+    now: Date,
+  ): {
+    monitorId: string;
+    objectKey: string;
+    workspacePath: string | null;
+  }[] {
+    const db = asInternalDb(this.db);
+    const conditions = [gt(objectEventSuppressions.expiresAt, now)];
+    if (workspacePath !== undefined) {
+      const workspaceCondition = or(
+        eq(objectEventSuppressions.workspacePath, workspacePath),
+        isNull(objectEventSuppressions.workspacePath),
+      );
+      // `or(...)` is typed `SQL | undefined` (undefined only if ALL args are, which they never are here), so this is a type-narrowing to push into the `SQL[]`, not a runtime branch — matching the same idiom used elsewhere in this file.
+      if (workspaceCondition) conditions.push(workspaceCondition);
+    }
+    return db
+      .select({
+        monitorId: objectEventSuppressions.monitorId,
+        objectKey: objectEventSuppressions.objectKey,
+        workspacePath: objectEventSuppressions.workspacePath,
+      })
+      .from(objectEventSuppressions)
+      .where(and(...conditions))
+      .all();
+  }
+
+  /**
+   * Delete every object-event suppression whose `expiresAt` is at or before
+   * `now` (issue #414), so an interrupted verify run — or a scratch deletion that
+   * never re-materialized — leaves nothing permanent in the tombstone table.
+   */
+  purgeExpiredObjectSuppressions(now: Date): void {
+    const db = asInternalDb(this.db);
+    db.delete(objectEventSuppressions)
+      .where(lte(objectEventSuppressions.expiresAt, now))
+      .run();
   }
 
   /**

@@ -1727,8 +1727,11 @@ agentmonitors verify [monitor] [--dir <path>] [--workspace <path>]
 4. **Baseline.** Wait for the monitor's first observation to land (no event on the first tick).
 5. **Trigger.** For file-fingerprint, auto-trigger by creating a **scratch file** that _attempts_ to
    match the first pattern glob — reusing its static directory prefix (segments before the first
-   glob-magic segment) and its extension — or, for a literal single-file glob, a brief,
-   restored-on-exit edit of the watched file itself. This best-effort placement cannot fabricate a
+   glob-magic segment) and its extension — or, for a literal single-file glob, the watched file
+   itself: **created** if it did not exist (removed on exit), or a brief, restored-on-exit **edit**
+   of its bytes if it already existed. The synthetic scratch file and the literal-created file differ
+   only at cleanup (step 9): the scratch path is a synthetic key no real object shares, while the
+   literal-created file is a **real** watched path. This best-effort placement cannot fabricate a
    match for every pattern: a glob whose **filename segment itself is a wildcard** (`file-?.md`,
    `data-[0-9].json`) or whose only variability is a **wildcard directory with a literal filename**
    has no derivable sibling the scratch file would match, so the trigger produces no observable
@@ -1750,27 +1753,54 @@ agentmonitors verify [monitor] [--dir <path>] [--workspace <path>]
    `turn-interruptible` (previewing settled high events and packing them under the 4000-char cap
    exactly as `hook deliver` does), otherwise the `post-compact` recap — and render the same
    `additionalContext` a hook would inject.
-9. **Retract (`--use-workspace-daemon` only).** In the default isolated mode the throwaway daemon +
-   db are torn down, so verify's scratch file leaves no trace. Under `--use-workspace-daemon` the
-   daemon **persists**, so the scratch file's teardown deletion would otherwise be observed as a real
-   change and delivered to a later session as a spurious `File deleted: …/agentmonitors-verify-….md`
-   ahead of the user's real change (issue #407). To prevent that, verify deletes the scratch file,
-   waits for **its own monitor** to materialize the resulting deletion event, then **retracts the
-   exact events its own scratch file produced** (the create AND the delete) across all sessions. The
-   wait and the retraction are scoped to the verified monitor's id, and the retraction deletes **by
-   the event ids verify observed** — never a `(monitor, path)` sweep — so a real, pre-existing event
-   at the same watched path (e.g. an earlier unacked delete on a literal-glob monitor) is left intact,
-   and a second monitor also watching that path can neither satisfy the wait early nor have its events
-   swept. Retracting an event also drops the per-recipient cursor its projection seeded, scoped to the
-   sessions that actually received it (never another session's baseline for the same path). It never
-   touches a real monitored change, and — because the scratch object is a file verify itself created
-   and deleted — never a pre-existing watched file it merely edited.
+9. **Clean up (`--use-workspace-daemon` only).** In the default isolated mode the throwaway daemon +
+   db are torn down, so verify's trigger file leaves no trace. Under `--use-workspace-daemon` the
+   daemon **persists**, so the trigger file's teardown deletion would otherwise be observed as a real
+   change and delivered to a later session as a spurious `File deleted: …` ahead of the user's real
+   change (issue #407). Verify erases its own events using one of **two mechanisms with deliberately
+   non-overlapping safe domains** (issue #418), chosen by whether the trigger's object key is
+   synthetic or a real watched path:
+   - **Synthetic scratch key → durable tombstone (the non-blocking path, issue #414).** For a scratch
+     sibling (`…/agentmonitors-verify-<token><ext>`, a path no real monitored object ever shares),
+     verify deletes the file and, in one **non-blocking** call, **retracts the create event it already
+     delivered AND installs a durable, self-expiring _object-event suppression_** (a tombstone) keyed
+     to that object. It does **not** wait for the deletion to re-materialize (the #407 approach cost a
+     whole extra interval + settle cycle and ran ~2× as long as plain `verify` while still showing
+     plain `verify`'s ETA — reading as a hang and overrunning default 2-minute timeouts). Instead the
+     daemon's tick **sweeps** the pending `File deleted: …/agentmonitors-verify-…` on the very tick it
+     materializes — before any later session can observe it. The sweep deletes **by object key**,
+     which is safe **only** because the key is synthetic, so it can never touch a real event at a
+     genuine path. The tombstone's TTL is derived from the monitor's own detect budget
+     (`detect + interval + settle`, min 60s).
 
-   **Residual (crash window).** The retraction runs on the run's normal completion, plus a
-   best-effort second attempt in teardown if an error interrupts the run after the scratch events
-   materialized. Both go over the live daemon socket, so a daemon **death** between materialization
-   and retraction leaves the scratch events in place until a later observation reconciles them; this
-   narrow window is accepted rather than made crash-atomic.
+   - **Real watched path → id-scoped retraction (issue #407).** For a **literal single-file glob whose
+     file verify created** (a real monitored path), a by-key tombstone would be unsafe: a later
+     genuine event at that same path within the TTL window would be swept, silently losing the user's
+     real change. So verify instead **waits** for its own create + delete to materialize and retracts
+     **only those exact observed event ids** — bounding the deletion to verify's two events and never
+     a real event that merely shares the path. This pays one poll interval, but only for this rare
+     literal-created case. A literal file that **pre-existed** (verify only edits and restores it) is
+     never erased at all — those events reference real user content.
+
+   To keep this a defect-resistant invariant, the durable-tombstone entry point
+   (`AgentMonitorRuntime.suppressObjectEvents`, and the `events.suppressObject` IPC verb) **rejects a
+   non-synthetic object key outright** — a real watched path can never reach the by-key sweep. In
+   either mechanism, retracting an event also drops the per-recipient cursor its projection seeded,
+   scoped to the sessions that actually received it (never another session's baseline for the same
+   path).
+
+   **Interruption-safety (issue #414).** An interrupted `--use-workspace-daemon` run leaves **no
+   permanent stray state**: (a) on `SIGINT`/`SIGTERM` (e.g. a command/CI timeout) verify's signal
+   handler runs the same object-appropriate cleanup best-effort — reverts the file, then tombstones
+   (synthetic key) or id-retracts (real created file), and ends the throwaway verify session — before
+   exiting; (b) even on an uncatchable kill (`SIGKILL`/crash) that leaves an `active` verify session
+   and its scratch events, the daemon's session-reap backstop, when it later transitions that stale
+   `agentmonitors-verify-*` session to dormant, tombstones and retracts its scratch objects too (only
+   the synthetic scratch keys the session projected — matched by the well-known basename). That
+   backstop's tombstone TTL is derived from the object's **own monitor cadence**
+   (`max(5min, interval + settle + margin)`) so a long-interval monitor's deletion still lands inside
+   the window. The only residual is a daemon **death** between materialization and the sweep; the
+   tombstone (or the reap backstop on the next tick) still reconciles it, so it is never permanent.
 
 If the daemon exits at any point, `verify` fails fast with a **`daemon-died`** verdict and prints the
 daemon's captured output — never an ambiguous empty result.

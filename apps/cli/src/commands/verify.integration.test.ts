@@ -529,7 +529,7 @@ describe('agentmonitors verify', () => {
  * an assertion that after the run no event references the scratch path — while a
  * genuine change made afterward IS still delivered (no over-suppression).
  */
-describe('agentmonitors verify --use-workspace-daemon (issue #407)', () => {
+describe('agentmonitors verify --use-workspace-daemon (issues #407/#418)', () => {
   let tempDir: string;
 
   const CLI = ['node', CLI_PATH] as const;
@@ -719,6 +719,350 @@ describe('agentmonitors verify --use-workspace-daemon (issue #407)', () => {
       expect(realDelivered).toBe(true);
     } finally {
       // Tear the daemon down within the test so a retry starts clean.
+      runWs(['daemon', 'stop'], ws, env);
+      if (daemon.exitCode === null) {
+        daemon.kill('SIGTERM');
+        await new Promise<void>((resolve) => {
+          const t = globalThis.setTimeout(() => {
+            daemon.kill('SIGKILL');
+            resolve();
+          }, 3_000);
+          daemon.once('exit', () => {
+            globalThis.clearTimeout(t);
+            resolve();
+          });
+        });
+      }
+      rmSync(socketDir, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  // Issue #418 (HIGH): a LITERAL single-file glob whose watched file did not exist
+  // is a case verify triggers by creating the REAL watched file — its objectKey is
+  // a genuine monitored path, NOT a synthetic scratch key. Cleaning it up with the
+  // durable by-KEY tombstone (safe only for synthetic keys) would sweep a LATER
+  // genuine event at that same path within the TTL window, silently losing the
+  // user's real change. verify must instead retract only its OWN observed event ids
+  // (issue #407's id-scoped path), leaving a real create afterward intact. This
+  // drives the real failure: run verify against a literal-file monitor, then create
+  // the watched file for real and assert that event DOES materialize and survive.
+  // Pre-fix, the tombstone at the real path ate it (it never appeared).
+  it('a real create at a literal-glob monitor’s path AFTER verify still materializes and survives (no tombstone at a real path)', async () => {
+    const ws = mkdtempSync(path.join(tempDir, 'literal-'));
+    const socketDir = mkdtempSync(path.join(tmpdir(), 'aml-'));
+    const env: Record<string, string> = {
+      ...(Object.fromEntries(
+        Object.entries(process.env).filter(([, v]) => v !== undefined),
+      ) as Record<string, string>),
+      AGENTMONITORS_SOCKET: path.join(socketDir, 'd.sock'),
+      AGENTMONITORS_DB: path.join(socketDir, 'verify.db'),
+    };
+    expect(runWs(['init', '--enable-only'], ws, env).exitCode).toBe(0);
+    // A LITERAL single-file glob (`watched.txt`, no glob magic) whose file does NOT
+    // exist yet: verify's auto-trigger CREATES the real watched file, so its events
+    // reference a genuine monitored path.
+    writeMonitor(
+      ws,
+      'file-watch',
+      `name: File watch\nwatch:\n  type: file-fingerprint\n  globs:\n    - 'watched.txt'\n  cwd: ${JSON.stringify(ws)}\n  interval: '1s'\nurgency: normal`,
+    );
+
+    const monitorsDir = path.join(ws, '.claude', 'monitors');
+    const daemon: ChildProcess = spawn(
+      CLI[0],
+      [
+        CLI[1],
+        'daemon',
+        'run',
+        monitorsDir,
+        '--workspace',
+        ws,
+        '--poll-ms',
+        '500',
+        '--reap-after-ms',
+        '0',
+      ],
+      { cwd: ws, env, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+
+    try {
+      let dstdout = '';
+      let dstderr = '';
+      daemon.stdout?.setEncoding('utf-8');
+      daemon.stderr?.setEncoding('utf-8');
+      daemon.stdout?.on('data', (c: string) => (dstdout += c));
+      daemon.stderr?.on('data', (c: string) => (dstderr += c));
+      const bootDeadline = Date.now() + 15_000;
+      while (
+        Date.now() < bootDeadline &&
+        !dstdout.includes('AgentMon daemon listening')
+      ) {
+        if (daemon.exitCode !== null) {
+          throw new Error(
+            `daemon exited early (${String(daemon.exitCode)}).\n${dstdout}\n${dstderr}`,
+          );
+        }
+        await delay(100);
+      }
+      expect(dstdout).toContain('AgentMon daemon listening');
+
+      const sessionResult = runWs(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          'user-session',
+          '--workspace',
+          ws,
+          '--format',
+          'id',
+        ],
+        ws,
+        env,
+      );
+      expect(sessionResult.exitCode).toBe(0);
+      const sessionId = sessionResult.stdout.trim();
+      expect(sessionId).toBeTruthy();
+
+      // Run verify: it creates `watched.txt`, proves delivery, then cleans up via
+      // the id-scoped retract (NOT a tombstone) because the path is real.
+      const verifyResult = runWs(
+        [
+          'verify',
+          'file-watch',
+          '--use-workspace-daemon',
+          '--workspace',
+          ws,
+          '--format',
+          'json',
+        ],
+        ws,
+        env,
+      );
+      const verifyReport = JSON.parse(verifyResult.stdout) as {
+        ok: boolean;
+        stages: { name: string; status: string }[];
+      };
+      expect(verifyReport.ok).toBe(true);
+      expect(verifyResult.exitCode).toBe(0);
+      // verify's own trigger file is gone from disk again (it created + removed it).
+      expect(scratchFiles(ws)).toHaveLength(0);
+
+      // ── The finding: a REAL create at the watched path AFTER verify must be
+      // delivered and SURVIVE. Pre-fix, a durable tombstone keyed to this real path
+      // swept it on the tick it materialized, so it never appeared. Post-fix there
+      // is no tombstone at a real path, so it lands and stays.
+      writeFileSync(
+        path.join(ws, 'watched.txt'),
+        'a genuine change\n',
+        'utf-8',
+      );
+      let realDelivered = false;
+      const realDeadline = Date.now() + 20_000;
+      while (Date.now() < realDeadline && !realDelivered) {
+        const unread = runWs(
+          [
+            'events',
+            'list',
+            '--session',
+            sessionId,
+            '--unread',
+            '--format',
+            'json',
+          ],
+          ws,
+          env,
+        );
+        if (unread.exitCode === 0 && unread.stdout.includes('watched.txt')) {
+          realDelivered = true;
+          break;
+        }
+        await delay(400);
+      }
+      expect(realDelivered).toBe(true);
+
+      // And it SURVIVES subsequent ticks (a tombstone would have swept it by now).
+      await delay(2_000);
+      const stillThere = runWs(
+        ['events', 'list', '--session', sessionId, '--format', 'json'],
+        ws,
+        env,
+      );
+      expect(stillThere.exitCode).toBe(0);
+      expect(stillThere.stdout).toContain('watched.txt');
+    } finally {
+      runWs(['daemon', 'stop'], ws, env);
+      if (daemon.exitCode === null) {
+        daemon.kill('SIGTERM');
+        await new Promise<void>((resolve) => {
+          const t = globalThis.setTimeout(() => {
+            daemon.kill('SIGKILL');
+            resolve();
+          }, 3_000);
+          daemon.once('exit', () => {
+            globalThis.clearTimeout(t);
+            resolve();
+          });
+        });
+      }
+      rmSync(socketDir, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  // Issue #414 criterion 2 (interruption-safety): a `--use-workspace-daemon` run
+  // interrupted (e.g. by a command/CI timeout) must NOT leave permanent stray
+  // state — no `active` verify session, no dangling scratch event/file. We SIGTERM
+  // verify once its throwaway session is open, then assert the workspace converges
+  // clean (verify's signal handler tears down + the daemon's backstops finish).
+  it('an interrupted run leaves no active verify session and no dangling scratch event/file', async () => {
+    const ws = mkdtempSync(path.join(tempDir, 'interrupt-'));
+    const socketDir = mkdtempSync(path.join(tmpdir(), 'ami-'));
+    const env: Record<string, string> = {
+      ...(Object.fromEntries(
+        Object.entries(process.env).filter(([, v]) => v !== undefined),
+      ) as Record<string, string>),
+      AGENTMONITORS_SOCKET: path.join(socketDir, 'd.sock'),
+      AGENTMONITORS_DB: path.join(socketDir, 'verify.db'),
+    };
+    expect(runWs(['init', '--enable-only'], ws, env).exitCode).toBe(0);
+    writeMonitor(
+      ws,
+      'docs-watch',
+      `name: Docs watch\nwatch:\n  type: file-fingerprint\n  globs:\n    - '*.md'\n  cwd: ${JSON.stringify(ws)}\n  interval: '1s'\nurgency: normal`,
+    );
+    writeFileSync(path.join(ws, 'readme.md'), 'hello', 'utf-8');
+
+    const monitorsDir = path.join(ws, '.claude', 'monitors');
+    const daemon: ChildProcess = spawn(
+      CLI[0],
+      [
+        CLI[1],
+        'daemon',
+        'run',
+        monitorsDir,
+        '--workspace',
+        ws,
+        '--poll-ms',
+        '500',
+        '--reap-after-ms',
+        '0',
+      ],
+      { cwd: ws, env, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+
+    try {
+      let dstdout = '';
+      daemon.stdout?.setEncoding('utf-8');
+      daemon.stdout?.on('data', (c: string) => (dstdout += c));
+      const bootDeadline = Date.now() + 15_000;
+      while (
+        Date.now() < bootDeadline &&
+        !dstdout.includes('AgentMon daemon listening')
+      ) {
+        if (daemon.exitCode !== null) throw new Error('daemon exited early');
+        await delay(100);
+      }
+      expect(dstdout).toContain('AgentMon daemon listening');
+
+      // A persistent lead session that outlives verify, so we can query for any
+      // stray scratch event a later session would see (events list is
+      // session-scoped) and confirm none survive the interruption.
+      const userSession = runWs(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          'user-session',
+          '--workspace',
+          ws,
+          '--format',
+          'id',
+        ],
+        ws,
+        env,
+      );
+      expect(userSession.exitCode).toBe(0);
+      const userSessionId = userSession.stdout.trim();
+
+      // Spawn verify as a signalable child (not execFileSync).
+      const verify: ChildProcess = spawn(
+        CLI[0],
+        [
+          CLI[1],
+          'verify',
+          'docs-watch',
+          '--use-workspace-daemon',
+          '--workspace',
+          ws,
+          '--format',
+          'json',
+        ],
+        { cwd: ws, env, stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      let exited = false;
+      verify.once('exit', () => (exited = true));
+
+      // Wait until verify has fired its trigger (the scratch file is on disk and
+      // its create event is materializing), then interrupt it mid-run — the exact
+      // shape of a timeout-killed run, so the interruption hits with real scratch
+      // state present, not before it exists.
+      const armedDeadline = Date.now() + 15_000;
+      let armed = false;
+      while (Date.now() < armedDeadline && !armed && !exited) {
+        if (scratchFiles(ws).length > 0) {
+          armed = true;
+          break;
+        }
+        await delay(150);
+      }
+      expect(armed).toBe(true);
+      verify.kill('SIGTERM');
+
+      // Wait for verify to exit (its signal handler runs teardown first).
+      const exitDeadline = Date.now() + 10_000;
+      while (Date.now() < exitDeadline && !exited) await delay(100);
+      expect(exited).toBe(true);
+
+      // Converge-clean assertion: no ACTIVE agentmonitors-verify-* session and no
+      // scratch event/file survive. Poll a few daemon ticks so the daemon's
+      // suppression sweep / reap backstop can finish alongside the signal handler.
+      let clean = false;
+      const cleanDeadline = Date.now() + 20_000;
+      while (Date.now() < cleanDeadline && !clean) {
+        const sessions = runWs(
+          ['session', 'list', '--format', 'json'],
+          ws,
+          env,
+        );
+        const events = runWs(
+          ['events', 'list', '--session', userSessionId, '--format', 'json'],
+          ws,
+          env,
+        );
+        const parsedSessions = JSON.parse(sessions.stdout) as {
+          hostSessionId: string;
+          status: string;
+        }[];
+        const strayActiveVerify = parsedSessions.some(
+          (s) =>
+            s.hostSessionId.startsWith('agentmonitors-verify-') &&
+            s.status === 'active',
+        );
+        const strayScratchEvent = events.stdout.includes(
+          'agentmonitors-verify-',
+        );
+        if (
+          !strayActiveVerify &&
+          !strayScratchEvent &&
+          scratchFiles(ws).length === 0
+        ) {
+          clean = true;
+          break;
+        }
+        await delay(500);
+      }
+      expect(clean).toBe(true);
+    } finally {
       runWs(['daemon', 'stop'], ws, env);
       if (daemon.exitCode === null) {
         daemon.kill('SIGTERM');

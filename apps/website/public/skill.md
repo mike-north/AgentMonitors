@@ -342,7 +342,11 @@ call-and-return harness can't, and should use `--trigger-cmd` instead. `--manual
 running afterward so a follow-up `agentmonitors doctor` also goes green, add
 `--use-workspace-daemon`. This requires the project to already be enabled (Phase 2) — it runs
 `verify` against the real workspace daemon/database instead of a throwaway one and leaves it
-running rather than tearing it down.
+running rather than tearing it down. Because that daemon persists, `verify` cleans up after itself
+by retracting its scratch file's create event and leaving a short-lived **suppression** so the
+daemon erases the scratch file's later deletion event on its own — so the scratch change never
+reaches a real session and the run finishes in about the same time as a plain `verify`. An
+interrupted run (e.g. a command timeout) leaves no permanent stray session or event behind.
 
 **Success looks like** a `PASS` line, with a `deliver` stage reporting
 `claimed at turn-interruptible` (for `urgency: high`) or `claimed at post-compact`

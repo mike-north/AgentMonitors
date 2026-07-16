@@ -271,6 +271,23 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
     )
   `);
 
+  // Durable, self-expiring per-object event suppressions (issue #414). Additive —
+  // a brand-new table, so a durable DB from an earlier version simply gains it on
+  // the next open. `verify --use-workspace-daemon` installs a tombstone here so
+  // the daemon retracts its scratch file's pending deletion event without verify
+  // blocking a whole poll interval for it (see the schema doc).
+  db.run(sql`
+    CREATE TABLE IF NOT EXISTS object_event_suppressions (
+      id TEXT PRIMARY KEY,
+      monitor_id TEXT NOT NULL,
+      object_key TEXT NOT NULL,
+      workspace_path TEXT,
+      reason TEXT NOT NULL DEFAULT 'verify-scratch',
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL
+    )
+  `);
+
   // Additive migration (issue #345 / #307): an `observation_history` table created
   // before workspace namespacing lacks `workspace_path`. Add it if missing so
   // post-upgrade rows are scoped; legacy rows keep NULL and simply fall out of any

@@ -26,7 +26,11 @@ import { reportError } from '../output.js';
 import { registerCoreSources } from '../sources.js';
 import { cliEntry } from '../detached-spawn.js';
 import { spawnDetachedDaemon } from '../detached-spawn.js';
-import { daemonAvailable, resolveSocketPath } from '../daemon-ipc.js';
+import {
+  daemonAvailable,
+  DaemonUnsupportedRequestError,
+  resolveSocketPath,
+} from '../daemon-ipc.js';
 import { readLocalState } from '../local-state.js';
 import { resolveManualDaemonSocketPath } from '../manual-daemon.js';
 import { resolveWorkspaceDbPath } from '../workspace-db-path.js';
@@ -38,6 +42,7 @@ import {
   openSessionClient,
   previewSettledHighDeliveryClient,
   retractObjectEventsClient,
+  suppressObjectEventsClient,
 } from '../runtime-client.js';
 import {
   packEventsUnderCap,
@@ -72,6 +77,27 @@ export function appendDaemonCrashStage(
   stages.push({ name: inFlightStage, status: 'fail', detail: 'daemon exited' });
 }
 
+/**
+ * How verify erases the events a trigger produced against a PERSISTENT
+ * (`--use-workspace-daemon`) daemon after proving delivery — the two mechanisms
+ * have deliberately non-overlapping safe domains (issue #418):
+ *
+ * - `'tombstone'`: the `objectKey` is a synthetic scratch path
+ *   (`…/agentmonitors-verify-<token><ext>`) that no real monitored file ever
+ *   shares. A durable, self-expiring by-KEY suppression retracts the create now
+ *   and lets the daemon sweep the pending deletion on the tick it materializes —
+ *   WITHOUT verify blocking a poll interval (issue #414). Safe precisely because
+ *   the key is synthetic: a by-key sweep can never eat a real event.
+ * - `'retract-by-id'`: the `objectKey` is a REAL watched path verify created (a
+ *   literal single-file glob whose file was absent). A by-key sweep here WOULD
+ *   eat a later genuine event at that same path, so verify instead waits for its
+ *   own create+delete to materialize and retracts ONLY those exact event ids
+ *   (issue #407). Costs a poll interval, but only for this rare literal case.
+ * - `'none'`: verify edited pre-existing user content (restored on revert) or the
+ *   run is manual — the events reference real content and are never erased.
+ */
+type TriggerCleanup = 'tombstone' | 'retract-by-id' | 'none';
+
 /** A trigger verify performs (and reverts) to produce a real observable change. */
 interface Trigger {
   /** Human description shown on the `trigger` stage. */
@@ -83,26 +109,22 @@ interface Trigger {
   /**
    * The file-fingerprint `objectKey` (an absolute path) this trigger acts on —
    * the key its create/delete events carry. Used by the `--use-workspace-daemon`
-   * retraction to erase those events after the run (issue #407).
+   * cleanup to erase those events after the run (issues #407/#414).
    */
   objectKey: string;
-  /**
-   * True when verify itself brought this file into existence (a scratch sibling,
-   * or a literal watched file that did not exist) and removes it on revert — so
-   * BOTH its create and its delete events are pure verify artifacts, safe to
-   * retract wholesale. False when editing a pre-existing watched file, whose
-   * events reference real user content and must never be retracted.
-   */
-  synthetic: boolean;
+  /** Which post-delivery cleanup mechanism this trigger's events require. */
+  cleanup: TriggerCleanup;
 }
 
 const PROGRESS_INTERVAL_MS = 2_500;
 const POLL_INTERVAL_MS = 300;
 const BOOT_TIMEOUT_MS = 15_000;
-// Short budget for the crash-safety retraction in `finally` (#407): unlike the
-// happy-path retraction (which waits the full detect cap to catch the delete
-// event), the teardown pass only tries briefly to catch whatever materialized
-// before retracting it, so a failed run's cleanup never blocks for long.
+/**
+ * How long the crash-safety teardown (and the tombstone→retract version-skew
+ * fallback) waits for a literal-created file's deletion event to materialize
+ * before retracting whatever exists (issue #407/#418). Short: the delete follows
+ * verify's own `revert` within a poll interval, and teardown must not hang exit.
+ */
 const TEARDOWN_RETRACT_WAIT_MS = 3_000;
 
 /** Emit a progress line to stderr so `--format json` stdout stays a single clean doc. */
@@ -169,7 +191,10 @@ function buildAutoTrigger(
     let created = false;
     return {
       objectKey: target,
-      synthetic: true,
+      // A synthetic scratch sibling — `agentmonitors-verify-<token><ext>`, a path
+      // no real monitored file shares — so its events are erased with the durable
+      // by-key tombstone (issue #414).
+      cleanup: 'tombstone',
       describe: `wrote scratch file ${path.relative(workspace, target) || target}`,
       fire: () => {
         // The glob's static directory prefix normally already exists; create it
@@ -196,10 +221,13 @@ function buildAutoTrigger(
   let mutated = false;
   return {
     objectKey: target,
-    // A file verify *created* (did not exist before) is a pure artifact — safe
-    // to retract. A pre-existing file that verify edits and restores is real
-    // user content; its events must not be retracted.
-    synthetic: !existed,
+    // The `objectKey` here is the REAL watched path (a literal single-file glob).
+    // If verify created it (absent before), its create+delete are pure artifacts —
+    // but a durable by-key tombstone at a real path would eat a later genuine event
+    // there, so we retract by the exact observed ids instead (issue #418). If the
+    // file pre-existed, verify only edits and restores it: real user content, never
+    // erased.
+    cleanup: existed ? 'none' : 'retract-by-id',
     describe: existed
       ? `edited watched file ${path.relative(workspace, target) || target} (restored on exit)`
       : `created watched file ${path.relative(workspace, target) || target}`,
@@ -304,14 +332,14 @@ function buildCommandTrigger(
 ): Trigger {
   return {
     // A `--trigger-cmd` run's effects are real changes the operator's own
-    // command caused — not a verify-fabricated scratch object. `synthetic:
-    // false` keeps it out of the `--use-workspace-daemon` retraction path
-    // (issue #407): its events reference genuine changes and must never be
-    // retracted, and it never trips the scratch-events teardown. Because it is
-    // never retracted, `objectKey` is unused for this mode (the command may
-    // touch anything, so there is no single file-fingerprint key to record).
+    // command caused — not a verify-fabricated scratch object. `cleanup: 'none'`
+    // keeps it out of the `--use-workspace-daemon` cleanup path entirely (issues
+    // #407/#414): its events reference genuine changes and must never be erased,
+    // and it never trips the scratch-events teardown. Because it is never
+    // cleaned up, `objectKey` is unused for this mode (the command may touch
+    // anything, so there is no single file-fingerprint key to record).
     objectKey: '',
-    synthetic: false,
+    cleanup: 'none',
     describe: `ran trigger command: ${command}`,
     fire: () => {
       try {
@@ -657,10 +685,19 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
   const token = randomBytes(6).toString('hex');
   let session: AgentSessionRecord | undefined;
   let trigger: Trigger | null = null;
-  // #407: set once the scratch object's events have been retracted, so the
-  // crash-safety pass in `finally` skips the work (and its wait) on the happy
-  // path and only runs when an error interrupted the run before retraction.
+  // #407: set once the scratch object's events have been retracted/suppressed, so
+  // the crash-safety pass in `finally` (and the signal handler) skips the work on
+  // the happy path and only runs when an interruption hit before cleanup.
   let scratchEventsRetracted = false;
+  // #414: TTL for the scratch tombstone — long enough for the file's deletion to
+  // re-materialize and be swept by the daemon AFTER verify has exited, short
+  // enough that an interrupted run leaves nothing lingering. Derived from the
+  // monitor's own detect budget so a long-interval monitor gets a proportionally
+  // longer window.
+  const suppressTtlMs = Math.max(
+    detectCapMs + budget.intervalMs + budget.settleMs,
+    60_000,
+  );
   // The stage currently being polled, so a mid-flight daemon crash blames the
   // stage that was actually in progress — not the last COMPLETED stage (an
   // off-by-one that also duplicated that stage's name). Advanced before each
@@ -674,6 +711,43 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
     monitorId: monitor.id,
     elapsedMs: Date.now() - startedAt,
   });
+
+  // The single teardown for the workspace-daemon artifacts (issue #414), shared
+  // by the normal `finally` AND the signal handler so an interrupted run cleans
+  // up identically: erase verify's scratch events (retract the create + tombstone
+  // the pending deletion) and end the throwaway verify session. Reads `trigger`,
+  // `session`, and `scratchEventsRetracted` LIVE so it does the right thing at
+  // whatever point it fires. Idempotent and best-effort — safe to call twice, and
+  // never throws (the daemon may already be gone).
+  const teardownWorkspaceArtifacts = async (): Promise<void> => {
+    if (
+      useWorkspaceDaemon &&
+      trigger &&
+      trigger.cleanup !== 'none' &&
+      !scratchEventsRetracted
+    ) {
+      try {
+        await cleanupScratchEvents(trigger, monitor.id, workspace, daemon, {
+          ttlMs: suppressTtlMs,
+          retractWaitMs: TEARDOWN_RETRACT_WAIT_MS,
+        });
+        scratchEventsRetracted = true;
+      } catch {
+        /* best-effort: daemon may already be gone */
+      }
+    }
+    if (session) {
+      try {
+        await closeSessionClient(session.id, daemon.socketPath);
+      } catch {
+        /* daemon may already be gone; best-effort cleanup */
+      }
+    }
+  };
+  // Arm the async signal cleanup as soon as this run owns a session, so a
+  // SIGINT/SIGTERM mid-run (e.g. a command/CI timeout) still tombstones the
+  // scratch events and closes the session before exit — no permanent stray state.
+  registerSignalCleanup(teardownWorkspaceArtifacts);
 
   try {
     stages.push({
@@ -986,21 +1060,20 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
       detail: `claimed at ${lifecycle}`,
     });
 
-    // #407: the workspace daemon outlives this run, so the scratch file's
-    // create/delete events would otherwise reach a later session — its teardown
-    // deletion is observed as a real change and delivered first, ahead of the
-    // user's actual change. Retract both events now, scoped to verify's OWN
-    // synthetic object. Isolated mode needs none of this: its daemon + db are
-    // torn down. A non-synthetic trigger (verify editing a real watched file) is
-    // never retracted — those events reference real user content.
-    if (useWorkspaceDaemon && trigger?.synthetic) {
-      await retractScratchEvents(
-        trigger,
-        monitor.id,
-        workspace,
-        daemon,
-        Date.now() + detectCapMs,
-      );
+    // #407/#414: the workspace daemon outlives this run, so verify's own trigger
+    // file's create/delete events would otherwise reach a later session — its
+    // teardown deletion is observed as a real change and delivered first, ahead of
+    // the user's actual change. Erase them NOW, scoped to verify's OWN object, via
+    // whichever mechanism is safe for that object (see {@link TriggerCleanup}): the
+    // synthetic scratch sibling uses the non-blocking durable tombstone (#414); a
+    // real watched file verify created uses the id-scoped retract (#407). Isolated
+    // mode needs none of this (its daemon + db are torn down); a pre-existing file
+    // verify merely edits is `cleanup: 'none'` and never touched.
+    if (useWorkspaceDaemon && trigger && trigger.cleanup !== 'none') {
+      await cleanupScratchEvents(trigger, monitor.id, workspace, daemon, {
+        ttlMs: suppressTtlMs,
+        retractWaitMs: detectCapMs,
+      });
       scratchEventsRetracted = true;
     }
     return finalize({ ok: true, stages, additionalContext });
@@ -1022,34 +1095,18 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
     throw error;
   } finally {
     if (trigger) trigger.revert();
-    // #407 crash-safety: the happy-path retraction above runs only once the run
-    // reaches delivery. If an error interrupted the run AFTER the scratch object's
-    // events materialized on the PERSISTENT daemon but before that retraction,
-    // they would otherwise linger for a later session. Best-effort clean them up
-    // here too, on a short budget. This closes the common interruption window but
-    // NOT a daemon death after materialization: with the daemon gone the socket
-    // call fails and the artifact persists until the next observation reconciles
-    // it — a residual documented in 005 §16.
-    if (useWorkspaceDaemon && trigger?.synthetic && !scratchEventsRetracted) {
-      try {
-        await retractScratchEvents(
-          trigger,
-          monitor.id,
-          workspace,
-          daemon,
-          Date.now() + TEARDOWN_RETRACT_WAIT_MS,
-        );
-      } catch {
-        /* best-effort: daemon may already be gone */
-      }
-    }
-    if (session) {
-      try {
-        await closeSessionClient(session.id, daemon.socketPath);
-      } catch {
-        /* daemon may already be gone; best-effort cleanup */
-      }
-    }
+    // #407/#414 crash-safety: on the happy path the cleanup above already ran
+    // (scratchEventsRetracted); if an error interrupted the run AFTER the scratch
+    // events materialized on the PERSISTENT daemon but before that, teardown runs
+    // the same object-appropriate cleanup now (tombstone for the synthetic scratch
+    // key; id-scoped retract for a real created file) so they never linger for a
+    // later session. The one residual is a daemon death after materialization (the
+    // socket call fails); the daemon's own reap backstop then cleans it up on the
+    // next tick — documented in 005 §16.
+    await teardownWorkspaceArtifacts();
+    // Disarm the module-level signal cleanup so a later run (or a stray signal
+    // after this run returns) never acts on this run's now-closed session.
+    clearSignalCleanup();
   }
 }
 
@@ -1087,29 +1144,106 @@ async function claimAndRender(
 }
 
 /**
- * Retract the events verify's own scratch file produced against a PERSISTENT
- * workspace daemon (issue #407). Deletes the scratch file now, waits (bounded by
- * `deadline`) for the daemon to materialize the resulting deletion event — the
- * object's second event, after the create — then retracts the EXACT events it
- * observed for the scratch path (by their ids), across all sessions, so no later
- * session sees a spurious `File deleted: agentmonitors-verify-…` ahead of the
- * user's real change.
+ * Route verify's trigger to the cleanup mechanism that is SAFE for its object
+ * (issue #418), the single seam that keeps the two mechanisms' domains from
+ * overlapping (see {@link TriggerCleanup}):
  *
- * Two scoping guards keep this from over-reaching (issue #407 review):
- *  - The wait query and the retraction are scoped to `monitorId`, so a second,
- *    broader monitor also watching this path can't satisfy the `>= 2` signal
- *    early (retracting before the target's own delete has landed), nor have its
- *    events swept.
- *  - The retraction deletes by the observed event IDS, never a `(monitor, path)`
- *    sweep, so a real, pre-existing event at the same watched path (e.g. an
- *    earlier unacked delete on a literal-glob monitor) is left intact.
+ * - `'tombstone'` → {@link suppressScratchEvents} (synthetic scratch key,
+ *   non-blocking). If the daemon predates the `events.suppressObject` verb (a
+ *   version-skewed `--use-workspace-daemon` target), it answers "unsupported"; we
+ *   degrade to the id-scoped retract rather than failing an otherwise-successful
+ *   run — cheap now that the daemon stays alive (issue #418). Any OTHER error
+ *   propagates.
+ * - `'retract-by-id'` → {@link retractScratchEventsById} (real watched path verify
+ *   created; retract only the exact observed ids).
+ */
+async function cleanupScratchEvents(
+  trigger: Trigger,
+  monitorId: string,
+  workspace: string,
+  daemon: IsolatedDaemon,
+  opts: { ttlMs: number; retractWaitMs: number },
+): Promise<void> {
+  if (trigger.cleanup === 'tombstone') {
+    try {
+      await suppressScratchEvents(
+        trigger,
+        monitorId,
+        workspace,
+        daemon,
+        opts.ttlMs,
+      );
+      return;
+    } catch (error) {
+      if (!(error instanceof DaemonUnsupportedRequestError)) throw error;
+      progress(
+        'daemon predates suppressObject; retracting scratch events by id…',
+      );
+      // Fall through to the id-scoped retract below (the file is already deleted).
+    }
+  }
+  await retractScratchEventsById(
+    trigger,
+    monitorId,
+    workspace,
+    daemon,
+    Date.now() + opts.retractWaitMs,
+  );
+}
+
+/**
+ * Erase the events verify's own SYNTHETIC scratch file produced against a
+ * PERSISTENT workspace daemon (issue #407/#414). Deletes the scratch file, then in
+ * ONE non-blocking IPC call retracts the (already-delivered) create event AND
+ * installs a durable, self-expiring tombstone so the daemon auto-retracts the
+ * file's pending `File deleted: agentmonitors-verify-…` on the very tick it
+ * materializes — before any later session can observe it.
+ *
+ * This deliberately does NOT wait for the deletion to re-materialize (the #407
+ * approach, which cost a whole extra poll interval + settle and doubled verify's
+ * `--use-workspace-daemon` runtime — issue #414). The tombstone is scoped to
+ * verify's OWN synthetic scratch key (`…/agentmonitors-verify-<token><ext>`),
+ * which no real monitored object ever shares, so the daemon-side by-key sweep can
+ * only ever erase verify's artifacts, never a real event at a genuine path. It is
+ * therefore used ONLY for a `cleanup: 'tombstone'` trigger — a literal watched
+ * file verify created goes through {@link retractScratchEventsById} instead.
+ */
+async function suppressScratchEvents(
+  trigger: Trigger,
+  monitorId: string,
+  workspace: string,
+  daemon: IsolatedDaemon,
+  ttlMs: number,
+): Promise<void> {
+  const { objectKey } = trigger;
+  // Delete the scratch file (idempotent — the `finally` revert becomes a no-op).
+  trigger.revert();
+  progress('cleaning up the verify artifact and suppressing its events…');
+  await suppressObjectEventsClient(
+    { monitorId, objectKey, ttlMs, workspacePath: workspace },
+    daemon.socketPath,
+  );
+}
+
+/**
+ * Erase the events verify's own trigger produced when its `objectKey` is a REAL
+ * watched path (a literal single-file glob whose file verify created — issue
+ * #407/#418). Deletes the file, WAITS for the daemon to materialize the deletion
+ * event (so this monitor's rows for the object now number both a create and a
+ * delete), then retracts by those exact observed ids.
+ *
+ * The wait costs a poll interval — the very cost #414's tombstone avoids — but it
+ * is unavoidable here: a by-key sweep at a real path would eat a LATER genuine
+ * event at that same path within the tombstone window, so a durable tombstone is
+ * unsafe. Deleting only the observed ids bounds the blast radius to verify's own
+ * two events and can never touch a real event that merely shares the path. This
+ * rare case (verify creating a literal watched file that didn't exist) is the only
+ * one that pays the wait; the common scratch-sibling case stays non-blocking.
  *
  * Best-effort on the wait: if the deletion is not observed within the budget the
- * create event is still retracted (so at minimum the create never lingers). The
- * count-based signal (a second event for this object) is decoupled from the
- * source's event title/payload shape and immune to timestamp granularity.
+ * create event is still retracted, so at minimum the create never lingers.
  */
-async function retractScratchEvents(
+async function retractScratchEventsById(
   trigger: Trigger,
   monitorId: string,
   workspace: string,
@@ -1117,13 +1251,9 @@ async function retractScratchEvents(
   deadline: number,
 ): Promise<void> {
   const { objectKey } = trigger;
-  // Delete the scratch file (idempotent — the `finally` revert becomes a no-op).
+  // Delete the file (idempotent — the `finally` revert becomes a no-op).
   trigger.revert();
   progress('cleaning up the verify artifact and retracting its events…');
-  // Wait until the daemon has observed the deletion and materialized its event
-  // (this monitor's rows for the object now number both a create and a delete),
-  // so the retract erases both. Capture the observed events so we retract by
-  // their exact ids. On timeout, fall through and retract whatever exists now.
   const settled = await pollUntil<MonitorEventRecord[]>(
     deadline,
     daemon,
@@ -1151,12 +1281,20 @@ async function retractScratchEvents(
 
 /** Reverts registered for crash-safe cleanup (SIGINT/SIGTERM). */
 const pendingReverts = new Set<Trigger>();
+// The current run's async teardown (retract+tombstone scratch events, close the
+// verify session), run best-effort on a caught signal before exit (issue #414).
+let asyncSignalCleanup: (() => Promise<void>) | null = null;
 let signalsInstalled = false;
-function registerRevert(trigger: Trigger): void {
-  pendingReverts.add(trigger);
+// Cap how long a caught signal waits on the async daemon cleanup, so a wedged
+// daemon can never hang process exit.
+const SIGNAL_CLEANUP_TIMEOUT_MS = 4_000;
+
+function installSignalHandlers(): void {
   if (signalsInstalled) return;
   signalsInstalled = true;
   const handler = (): void => {
+    // Sync file reverts first — guaranteed fast, so the scratch file is gone even
+    // if the daemon IPC below hangs or the process is force-killed next.
     for (const t of pendingReverts) {
       try {
         t.revert();
@@ -1164,10 +1302,40 @@ function registerRevert(trigger: Trigger): void {
         /* best-effort */
       }
     }
-    process.exit(130);
+    const cleanup = asyncSignalCleanup;
+    if (!cleanup) {
+      process.exit(130);
+      return;
+    }
+    // Best-effort async cleanup (tombstone scratch events, close the verify
+    // session) so a signal-killed --use-workspace-daemon run leaves no permanent
+    // stray state (issue #414), bounded so it can never hang exit.
+    void Promise.race([
+      cleanup().catch(() => undefined),
+      delay(SIGNAL_CLEANUP_TIMEOUT_MS),
+    ]).finally(() => {
+      process.exit(130);
+    });
   };
   process.once('SIGINT', handler);
   process.once('SIGTERM', handler);
+}
+
+function registerRevert(trigger: Trigger): void {
+  pendingReverts.add(trigger);
+  installSignalHandlers();
+}
+
+/** Arm the run's async signal teardown (issue #414). */
+function registerSignalCleanup(cleanup: () => Promise<void>): void {
+  asyncSignalCleanup = cleanup;
+  installSignalHandlers();
+}
+
+/** Disarm the async signal teardown once a run has cleaned up (issue #414). */
+function clearSignalCleanup(): void {
+  asyncSignalCleanup = null;
+  pendingReverts.clear();
 }
 
 export const verifyCommand = new Command('verify')

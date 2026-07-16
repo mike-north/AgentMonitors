@@ -240,6 +240,40 @@ export const ephemeralMonitors = sqliteTable('ephemeral_monitors', {
   reapedAt: integer('reaped_at', { mode: 'timestamp' }),
 });
 
+/**
+ * A durable, self-expiring instruction to erase every event a given
+ * `(monitor_id, object_key)` materializes — now or on any later tick — until
+ * `expires_at` (issue #414). `verify --use-workspace-daemon` installs one for
+ * its OWN throwaway scratch file the instant it has proven delivery: it retracts
+ * the create event immediately and, rather than BLOCKING a full poll interval
+ * for the file's deletion to re-materialize (the #407 approach that doubled
+ * verify's runtime), leaves this tombstone so the daemon auto-retracts the
+ * pending `File deleted: agentmonitors-verify-…` on the very tick it appears —
+ * before any later session can observe it (preserving #407's no-leak guarantee).
+ *
+ * Safe to sweep BY KEY (unlike {@link monitorEvents} retraction, which deletes
+ * by explicit id) because the `object_key` is verify's unique per-run scratch
+ * path (`…/agentmonitors-verify-<token><ext>`) — a synthetic file no real
+ * monitored object ever shares — so a key-scoped retraction can never touch a
+ * real event. `expires_at` bounds the tombstone's life so an interrupted run
+ * (or a delete that never comes) leaves nothing permanent: the daemon purges it
+ * once expired.
+ */
+export const objectEventSuppressions = sqliteTable(
+  'object_event_suppressions',
+  {
+    id: text('id').primaryKey(),
+    monitorId: text('monitor_id').notNull(),
+    objectKey: text('object_key').notNull(),
+    workspacePath: text('workspace_path'),
+    // Why the tombstone exists — currently only verify's scratch cleanup. A named
+    // reason keeps a future diagnostic (`doctor`) able to explain a stray entry.
+    reason: text('reason').notNull().default('verify-scratch'),
+    createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+    expiresAt: integer('expires_at', { mode: 'timestamp' }).notNull(),
+  },
+);
+
 export const observationHistory = sqliteTable('observation_history', {
   id: text('id').primaryKey(),
   monitorId: text('monitor_id').notNull(),
