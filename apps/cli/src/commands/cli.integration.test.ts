@@ -880,6 +880,26 @@ describe('init', () => {
     expect(parsed.monitors[0]?.name).toBe('Watch docs');
   });
 
+  // Issue #375 AC1 edge case: a separator-free positional is still capitalized
+  // (a single word), matching deriveNameFromPositional's documented behavior —
+  // it is NOT returned verbatim (only empty/separators-only inputs are).
+  it('capitalizes a separator-free positional <name> (watchdocs -> Watchdocs) (AC1)', () => {
+    const dir = path.join(tempDir, 'init-name-single-word');
+    mkdirSync(dir, { recursive: true });
+    const monitorsDir = path.join(dir, 'monitors');
+    const created = run(
+      ['init', 'watchdocs', '--dir', monitorsDir, '--type', 'file-fingerprint'],
+      dir,
+    );
+    expect(created.exitCode).toBe(0);
+    const monitor = readFileSync(
+      path.join(monitorsDir, 'watchdocs', 'MONITOR.md'),
+      'utf-8',
+    );
+    expect(monitor).toContain("name: 'Watchdocs'");
+    expect(monitor).not.toContain('name: My monitor');
+  });
+
   // Issue #330 AC2: --name seeds the frontmatter name: field verbatim,
   // including a value that needs YAML single-quote escaping, and the result
   // still passes validate (proving the escaping round-trips correctly).

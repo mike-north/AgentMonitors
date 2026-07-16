@@ -161,8 +161,10 @@ function seedName(template: string, name: string): string {
  * scaffold's literal template placeholder (e.g. `My monitor`) survives
  * untouched, so a rushed author can commit a monitor that is never renamed.
  * Splits on `-`/`_` and capitalizes the first word, e.g. `watch-docs` ->
- * `Watch docs`. Falls back to the positional verbatim if it has no such
- * separators (e.g. `watchdocs` -> `Watchdocs`).
+ * `Watch docs`. A separator-free positional is still capitalized (a single
+ * word, e.g. `watchdocs` -> `Watchdocs`). Only a positional that is empty or
+ * consists solely of separators (e.g. `---`) is returned verbatim, since there
+ * is no word to capitalize.
  */
 function deriveNameFromPositional(positional: string): string {
   const words = positional.split(/[-_]+/).filter((word) => word.length > 0);
