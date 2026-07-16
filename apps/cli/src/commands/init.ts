@@ -49,9 +49,12 @@ When the page changes, review the differences and take appropriate action.
 name: Upstream branch monitor
 watch:
   type: command-poll
-  # command is an argv array, run directly (no shell). This example watches the
-  # remote branch tip directly; local commands such as "git status" or
-  # "git rev-parse origin/main" can stay stale until you fetch.
+  # command is an argv array, run directly (no shell). This example queries the
+  # remote branch tip live: "git ls-remote" hits the network on every run, so it
+  # is always current — no prior fetch needed. Only a LOCAL read of a
+  # remote-tracking ref, such as "git rev-parse origin/main", reflects just your
+  # last fetch and can lag until you fetch again. A local working-tree command
+  # such as "git status --porcelain" has no fetch lag either.
   command:
     - git
     - ls-remote
@@ -152,6 +155,29 @@ function seedName(template: string, name: string): string {
   return template.replace(/^name: .*$/m, `name: ${yamlSingleQuoted(name)}`);
 }
 
+/**
+ * Derive a readable frontmatter `name:` from the positional `<name>`
+ * argument when `--name` is not given (issue #375): without this, the
+ * scaffold's literal template placeholder (e.g. `My monitor`) survives
+ * untouched, so a rushed author can commit a monitor that is never renamed.
+ * Splits on `-`/`_` and capitalizes the first word, e.g. `watch-docs` ->
+ * `Watch docs`. A separator-free positional is still capitalized (a single
+ * word, e.g. `watchdocs` -> `Watchdocs`). A positional that is empty or
+ * consists solely of separators (e.g. `---`) has no word to capitalize and
+ * returns `undefined`, leaving the `name:` seed unset so the template's own
+ * (non-empty) default name survives — returning it verbatim would otherwise
+ * scaffold `name: ''`, which fails `monitorFrontmatterSchema`'s `.min(1)` on
+ * `validate`.
+ */
+function deriveNameFromPositional(positional: string): string | undefined {
+  const words = positional.split(/[-_]+/).filter((word) => word.length > 0);
+  if (words.length === 0) return undefined;
+  const [first, ...rest] = words;
+  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- `words.length > 0` guarantees `first` is defined.
+  const capitalized = `${first!.charAt(0).toUpperCase()}${first!.slice(1)}`;
+  return [capitalized, ...rest].join(' ');
+}
+
 /** Replace the template's `urgency:` frontmatter line with the seeded value.
  * `urgency` is Commander-`.choices()`-constrained to {@link VALID_URGENCIES},
  * so it's always a bare, unquoted YAML scalar. */
@@ -193,9 +219,13 @@ function seedGlobs(template: string, type: string, globs: string[]): string {
 /**
  * Apply `--glob`/`--name`/`--urgency` seed overrides to a template, in
  * frontmatter-field order. A `SeedOptions` with all fields `undefined`
- * (the default, zero-flags path) returns `template` unchanged — this keeps
- * `init <name>` byte-for-byte identical when no seed flags are passed
- * (AC3, issue #330).
+ * returns `template` unchanged. As of issue #375, the named scaffold path's
+ * caller always passes a `name` seed (the `--name` value, or one derived
+ * from the positional `<name>` when `--name` is omitted), so a zero-flag
+ * `init <name>` no longer returns the raw template byte-for-byte — only its
+ * `name:` line differs from the template default. The bare bootstrap path
+ * never calls this with a `name` seed, so its scaffolded templates are
+ * unaffected (non-goal, issue #330).
  */
 function applySeeds(
   template: string,
@@ -579,7 +609,7 @@ export const initCommand = new Command('init')
   )
   .option(
     '--name <name>',
-    'Seed the frontmatter name: field (distinct from the positional <name>, which sets the directory). Scaffold form only.',
+    'Seed the frontmatter name: field (distinct from the positional <name>, which sets the directory). Defaults to a readable form of the positional <name>. Scaffold form only.',
   )
   .addOption(
     new Option(
@@ -601,13 +631,21 @@ export const initCommand = new Command('init')
       },
     ) => {
       // Named form: `init <name> --type ...` — unchanged scaffold behavior
-      // when no seed flags are passed (AC3, issue #330).
+      // when no seed flags are passed (AC3, issue #330), except that the
+      // frontmatter `name:` now derives from the positional `<name>` rather
+      // than surviving as the template's literal placeholder (issue #375).
+      // `--name` still overrides.
       if (name !== undefined) {
-        // Built conditionally (not `field: value ?? undefined`) because
-        // `exactOptionalPropertyTypes` treats an explicit `undefined` value
-        // differently from an absent key.
+        // `urgency`/`globs`/`name` are all built conditionally (not `field:
+        // value ?? undefined`) because `exactOptionalPropertyTypes` treats an
+        // explicit `undefined` value differently from an absent key.
+        // `deriveNameFromPositional` returns `undefined` for a positional
+        // with no word to capitalize (empty or separators-only, e.g. `---`),
+        // so `name` is omitted from the seed in that case and the template's
+        // own default name: line survives untouched.
+        const derivedName = options.name ?? deriveNameFromPositional(name);
         const seeds: SeedOptions = {
-          ...(options.name !== undefined ? { name: options.name } : {}),
+          ...(derivedName !== undefined ? { name: derivedName } : {}),
           ...(options.urgency !== undefined
             ? { urgency: options.urgency }
             : {}),
