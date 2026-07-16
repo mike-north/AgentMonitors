@@ -13,13 +13,17 @@
  *
  * @see https://vitest.dev/guide/cli.html#vitest-list
  */
+import { existsSync } from 'node:fs';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   CLI_DEFAULT_CONFIG,
+  CLI_PACKAGE_DIR,
   CLI_SERIAL_CONFIG,
   partitionIssues,
   realCliSuitePartitionIssues,
 } from './cli-suite-partition.mjs';
+import { REPO_ROOT } from './publish-release-packages.mjs';
 
 describe('partitionIssues', () => {
   it('reports no issues for a clean partition', () => {
@@ -104,8 +108,13 @@ describe('apps/cli suite partition (real repo)', () => {
     expect(realCliSuitePartitionIssues()).toEqual([]);
   }, 30_000);
 
-  it('config file names match the real, on-disk apps/cli vitest configs', () => {
-    expect(CLI_DEFAULT_CONFIG).toBe('vitest.config.ts');
-    expect(CLI_SERIAL_CONFIG).toBe('vitest.serial.config.ts');
+  // CLI_DEFAULT_CONFIG / CLI_SERIAL_CONFIG are passed straight to `vitest
+  // list --config <file>` above, resolved relative to apps/cli — so this
+  // proves the two names this suite audits are real, on-disk config files,
+  // not a comparison of the constants against their own literal values.
+  it('CLI_DEFAULT_CONFIG and CLI_SERIAL_CONFIG name real, on-disk apps/cli vitest configs', () => {
+    const packageAbsDir = path.join(REPO_ROOT, CLI_PACKAGE_DIR);
+    expect(existsSync(path.join(packageAbsDir, CLI_DEFAULT_CONFIG))).toBe(true);
+    expect(existsSync(path.join(packageAbsDir, CLI_SERIAL_CONFIG))).toBe(true);
   });
 });

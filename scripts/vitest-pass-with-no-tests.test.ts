@@ -9,15 +9,33 @@
  * @see https://vitest.dev/config/#passwithnotests
  */
 import { describe, expect, it } from 'vitest';
-import { PACKAGE_DIRS, REPO_ROOT } from './publish-release-packages.mjs';
+import {
+  PACKAGE_DIRS,
+  packageInfo,
+  REPO_ROOT,
+} from './publish-release-packages.mjs';
 import {
   ADDITIONAL_VITEST_CONFIG_PATHS,
   allGuardedVitestConfigPaths,
   assertNoneOptIntoPassWithNoTests,
+  assertPackageTestScriptsMatchAudit,
   defaultVitestConfigPaths,
   importVitestConfig,
   optsIntoPassWithNoTests,
+  REQUIRED_TEST_SCRIPT,
+  TEST_SCRIPT_EXCEPTIONS,
 } from './vitest-pass-with-no-tests.mjs';
+
+/**
+ * Builds a stub `getPackageInfo` for `assertPackageTestScriptsMatchAudit`
+ * tests: `packageDir -> test script` in, `packageInfo`-shaped object out, so
+ * no real package.json is read.
+ */
+function stubPackageInfo(testScriptsByDir: Record<string, string>) {
+  return (packageDir: string) => ({
+    packageJson: { scripts: { test: testScriptsByDir[packageDir] } },
+  });
+}
 
 describe('optsIntoPassWithNoTests', () => {
   it('flags an explicit passWithNoTests: true', () => {
@@ -104,6 +122,111 @@ describe('assertNoneOptIntoPassWithNoTests', () => {
     expect((thrown as Error).message).not.toContain(
       'apps/cli/vitest.serial.config.ts',
     );
+  });
+});
+
+describe('assertPackageTestScriptsMatchAudit', () => {
+  it('does not throw when every package uses the required script', () => {
+    expect(() =>
+      assertPackageTestScriptsMatchAudit(
+        ['a', 'b'],
+        REPO_ROOT,
+        stubPackageInfo({ a: 'vitest run', b: 'vitest run' }),
+      ),
+    ).not.toThrow();
+  });
+
+  // Regression fixture: reproduces a package.json rewritten to point at a
+  // different config file. `defaultVitestConfigPaths` would keep auditing
+  // the untouched `vitest.config.ts`, silently missing the config that
+  // `pnpm test` (and therefore CI) actually resolves.
+  it('throws when a package overrides --config', () => {
+    expect(() =>
+      assertPackageTestScriptsMatchAudit(
+        ['libs/core'],
+        REPO_ROOT,
+        stubPackageInfo({ 'libs/core': 'vitest run --config other.ts' }),
+      ),
+    ).toThrow(/libs\/core/);
+  });
+
+  // Regression fixture: reproduces a package.json rewritten to pass
+  // --passWithNoTests on the command line, which overrides the config
+  // file's own passWithNoTests: false and defeats
+  // assertNoneOptIntoPassWithNoTests entirely without ever touching the
+  // config file this audit inspects.
+  it('throws when a package overrides --passWithNoTests', () => {
+    expect(() =>
+      assertPackageTestScriptsMatchAudit(
+        ['apps/cli'],
+        REPO_ROOT,
+        stubPackageInfo({ 'apps/cli': 'vitest run --passWithNoTests' }),
+      ),
+    ).toThrow(/apps\/cli/);
+  });
+
+  it('names every offender, not just the first', () => {
+    let thrown: unknown;
+    try {
+      assertPackageTestScriptsMatchAudit(
+        ['a', 'b', 'c'],
+        REPO_ROOT,
+        stubPackageInfo({
+          a: 'vitest run --passWithNoTests',
+          b: 'vitest run',
+          c: 'vitest run --config other.ts',
+        }),
+      );
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toMatch(/a \(test:/);
+    expect((thrown as Error).message).not.toMatch(/b \(test:/);
+    expect((thrown as Error).message).toMatch(/c \(test:/);
+  });
+
+  it('rejects a deviating script with no matching exception', () => {
+    expect(() =>
+      assertPackageTestScriptsMatchAudit(
+        ['exceptional'],
+        REPO_ROOT,
+        stubPackageInfo({ exceptional: 'vitest run --reporter=dot' }),
+        {},
+      ),
+    ).toThrow(/exceptional/);
+  });
+
+  // Proves the exception mechanism itself (an injectable `exceptions` map,
+  // separate from the real, empty TEST_SCRIPT_EXCEPTIONS export) honors a
+  // documented deviation instead of flagging it.
+  it('does not throw for a script matching its documented exception', () => {
+    expect(() =>
+      assertPackageTestScriptsMatchAudit(
+        ['exceptional'],
+        REPO_ROOT,
+        stubPackageInfo({ exceptional: 'vitest run --reporter=dot' }),
+        { exceptional: 'vitest run --reporter=dot' },
+      ),
+    ).not.toThrow();
+  });
+
+  // Drift guard + regression proof: every real, on-disk PACKAGE_DIRS
+  // package.json must declare exactly REQUIRED_TEST_SCRIPT today (see
+  // TEST_SCRIPT_EXCEPTIONS' doc comment for why that list is deliberately
+  // empty). This is the real proof that PR #371's implementer-review gap —
+  // a package.json silently rewritten to `vitest run --config other.ts` or
+  // `vitest run --passWithNoTests` escaping defaultVitestConfigPaths' by-
+  // filename lookup — is now caught.
+  it('every real PACKAGE_DIRS package.json declares the required test script', () => {
+    expect(() =>
+      assertPackageTestScriptsMatchAudit(PACKAGE_DIRS, REPO_ROOT, packageInfo),
+    ).not.toThrow();
+  });
+
+  it("REQUIRED_TEST_SCRIPT and TEST_SCRIPT_EXCEPTIONS are the values this file's fixtures assume", () => {
+    expect(REQUIRED_TEST_SCRIPT).toBe('vitest run');
+    expect(TEST_SCRIPT_EXCEPTIONS).toEqual({});
   });
 });
 

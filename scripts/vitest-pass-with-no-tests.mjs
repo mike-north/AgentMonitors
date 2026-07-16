@@ -11,7 +11,28 @@
 // config's real, resolved value.
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { PACKAGE_DIRS } from './publish-release-packages.mjs';
+import { PACKAGE_DIRS, packageInfo } from './publish-release-packages.mjs';
+
+/**
+ * The exact `test` script `assertPackageTestScriptsMatchAudit` requires of
+ * every `PACKAGE_DIRS` package (absent a documented
+ * `TEST_SCRIPT_EXCEPTIONS` entry). `defaultVitestConfigPaths` assumes every
+ * such package's default config lives at `<dir>/vitest.config.ts` and is
+ * invoked with no flags that change discovery — this is the script value
+ * that assumption depends on.
+ */
+export const REQUIRED_TEST_SCRIPT = 'vitest run';
+
+/**
+ * Documented, reviewed exceptions to `REQUIRED_TEST_SCRIPT`, keyed by
+ * `PACKAGE_DIRS` entry. Every entry here is a gap in the zero-test audit for
+ * that package, so keep this empty unless a package has a genuine, reviewed
+ * need to invoke vitest differently for its default `test` script — no
+ * package needs one today.
+ *
+ * @type {Record<string, string>}
+ */
+export const TEST_SCRIPT_EXCEPTIONS = {};
 
 /**
  * Default vitest config path for every publishable package in `packageDirs`.
@@ -89,6 +110,55 @@ export function assertNoneOptIntoPassWithNoTests(resolvedConfigs) {
         `result instead of failing: ${offenders.join(', ')}. Remove ` +
         'passWithNoTests (vitest 4 already defaults to false) or set it to ' +
         'false explicitly.',
+    );
+  }
+}
+
+/**
+ * Validate that every `packageDirs` entry's package.json `test` script is
+ * exactly `REQUIRED_TEST_SCRIPT` (or matches its documented
+ * `TEST_SCRIPT_EXCEPTIONS` entry), throwing a single, loud error naming
+ * every offender.
+ *
+ * `defaultVitestConfigPaths` and the `passWithNoTests` check above only
+ * inspect each package's `<dir>/vitest.config.ts` by filename — they never
+ * verify that `pnpm test` (the command CI and Nx actually invoke) resolves
+ * that exact file with no overriding flags. A `test` script rewritten to
+ * `vitest run --config other.ts` would point Nx at an unaudited config, and
+ * one rewritten to `vitest run --passWithNoTests` would defeat the audit's
+ * whole purpose via a CLI flag, which overrides the config file's own
+ * `passWithNoTests: false`. This closes that gap.
+ *
+ * @param {readonly string[]} packageDirs
+ * @param {string} repoRoot
+ * @param {(packageDir: string, repoRoot: string) => { packageJson: { scripts?: Record<string, string> } }} [getPackageInfo]
+ * @param {Record<string, string>} [exceptions]
+ */
+export function assertPackageTestScriptsMatchAudit(
+  packageDirs,
+  repoRoot,
+  getPackageInfo = packageInfo,
+  exceptions = TEST_SCRIPT_EXCEPTIONS,
+) {
+  const offenders = packageDirs
+    .map((packageDir) => {
+      const { packageJson } = getPackageInfo(packageDir, repoRoot);
+      const script = packageJson.scripts?.test;
+      const required = exceptions[packageDir] ?? REQUIRED_TEST_SCRIPT;
+      return script === required
+        ? undefined
+        : `${packageDir} (test: ${JSON.stringify(script)})`;
+    })
+    .filter((offender) => offender !== undefined);
+  if (offenders.length > 0) {
+    throw new Error(
+      `The following package(s)' "test" script does not exactly match the ` +
+        `required "${REQUIRED_TEST_SCRIPT}" (or a documented ` +
+        `TEST_SCRIPT_EXCEPTIONS entry): ${offenders.join(', ')}. A "test" ` +
+        'script with an extra --config, --passWithNoTests, or other flag ' +
+        'that changes test discovery can silently escape the vitest ' +
+        'zero-test audit above; add a reviewed TEST_SCRIPT_EXCEPTIONS entry ' +
+        'only if the package genuinely needs to invoke vitest differently.',
     );
   }
 }
