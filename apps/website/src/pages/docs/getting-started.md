@@ -160,6 +160,11 @@ session registered, plus a per-monitor rollup — and tells you exactly which st
 normal to see several checks fail right now (you haven't enabled the project or started a daemon
 yet); re-run it after each step below to watch them turn green.
 
+That holds through steps (a) and (b) below, but not through step (c): the recipe's daemon runs on
+an isolated, throwaway socket and database that `doctor` never looks at, so it won't turn green
+from step (c) succeeding. See the note at the end of "Prove it, right now" for how to check the
+real, default-socket setup.
+
 ### Prove it, right now
 
 This drives the exact daemon → session → event → delivery pipeline the plugin drives automatically
@@ -207,7 +212,12 @@ notify:
 urgency: high
 ```
 
-**c. Run the recipe:**
+**c. Run the recipe.** `file-fingerprint` baselines silently on its first-ever tick: whatever files
+exist at that moment become the reference point, and nothing is reported as changed. That first
+tick runs immediately when the daemon starts (before waiting `--poll-ms` at all), so a `touch` that
+lands before it finishes gets folded into the baseline and is never detected — the recipe below
+waits a full poll interval after starting the daemon, before touching `example.ts`, to guarantee
+the trigger lands after the baseline instead of racing it:
 
 ```bash
 CWD=$(pwd)
@@ -229,6 +239,10 @@ sleep 1
 AGENTMON_SESSION_ID=$(agentmonitors session open --socket "$SOCKET" --host-session-id "$HOST_ID" \
   --role lead --workspace "$CWD" --format id)
 
+# 2b. Wait a full poll interval (matching --poll-ms above) so the daemon's
+# first, baselining tick has definitely already run before we touch anything.
+sleep 5
+
 # 3. Trigger the watched change.
 touch example.ts
 
@@ -240,9 +254,20 @@ for i in $(seq 1 20); do
 done
 echo "$OUT"
 
-# 5. Simulate the UserPromptSubmit hook Claude Code sends on every turn.
-echo "{\"session_id\":\"$HOST_ID\",\"cwd\":\"$CWD\",\"hook_event_name\":\"UserPromptSubmit\"}" \
-  | agentmonitors hook deliver --socket "$SOCKET"
+# 5. Simulate the UserPromptSubmit hook Claude Code sends on every turn. Empty
+# stdout usually means nothing was claimable yet — poll like step 4 does. But
+# empty stdout is also how several misconfigurations look (workspace not
+# enabled, daemon unreachable, ...), so if the loop never returns content, run
+# `agentmonitors hook deliver --debug` (writes a step-by-step diagnosis to
+# stderr) to tell the two apart.
+for i in $(seq 1 20); do
+  OUT5=$(echo "{\"session_id\":\"$HOST_ID\",\"cwd\":\"$CWD\",\"hook_event_name\":\"UserPromptSubmit\"}" \
+    | agentmonitors hook deliver --socket "$SOCKET")
+  [ -n "$OUT5" ] && break
+  echo "(hook deliver: nothing claimable yet, retrying...)" >&2
+  sleep 2
+done
+echo "$OUT5"
 
 # 6. Clean up.
 kill "$DAEMON_PID"
@@ -252,12 +277,21 @@ kill "$DAEMON_PID"
 whose `hookSpecificOutput.additionalContext` is non-empty and names your monitor — that's exactly
 what a live Claude Code turn would receive.
 
-If step 5 comes back empty at first, that's expected for `high` urgency, not a bug: `hook deliver`
-applies its own fixed ~15s "claim settle" window measured from the event's creation time, separate
-from `notify.settle-for`. Re-run command 5 every few seconds until it returns content.
+If step 5's loop keeps retrying for a while, that's expected for `high` urgency, not a bug: `hook
+deliver` applies its own fixed ~15s "claim settle" window measured from the event's creation time,
+separate from `notify.settle-for`. The 20 × 2s retry window above comfortably covers that.
 
 Once you're done, revert the `interval` / `settle-for` / `urgency` edits from step (b) to whatever
 fits your real use case.
+
+**A red `doctor` right after this succeeds is expected, not a bug.** Steps (a)–(c) ran entirely
+against the isolated `$SOCKET` / `$AGENTMONITORS_DB` above; `agentmonitors doctor` (and `monitor
+explain`) auto-discover the *workspace's own* socket and database — falling back to the shared
+global default only when the workspace isn't enabled — so neither ever resolves this recipe's
+throwaway `$SOCKET` (both still honor `AGENTMONITORS_DB` if it's set in their environment). To see
+the real setup an actual agent session would use, start a daemon on the workspace's own socket
+(`agentmonitors daemon run` — no `--socket`) or open a live Claude Code session, then re-run
+`doctor`.
 
 For the same proof wired through the real Claude Code plugin instead of a manual socket, see
 [Notify your agent when a file changes](/docs/notify-when-a-file-changes).

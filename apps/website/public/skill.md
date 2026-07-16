@@ -343,6 +343,19 @@ sleep 1
 AGENTMON_SESSION_ID=$(agentmonitors session open --socket "$SOCKET" --host-session-id "$HOST_ID" --role lead --workspace "$CWD" --format id)
 echo "AgentMon session: $AGENTMON_SESSION_ID"
 
+# 2b. Wait a full poll interval (matching --poll-ms above) before triggering
+#     anything. A monitor with no prior observation is always "due," so the
+#     daemon's first tick for it runs immediately at startup — before waiting
+#     --poll-ms, and independent of step 2's session-open, which only
+#     registers a delivery recipient and does not affect tick timing — and
+#     every bundled source except `schedule` treats that first tick as a
+#     silent baseline for *change* observations (see "Per-source trigger
+#     recipes" below; `command-poll` is a partial exception — a first-ever
+#     command that fails still surfaces a health observation on that tick).
+#     This wait guarantees the baseline tick has already completed before
+#     step 3.
+sleep 5
+
 # 3. Trigger the monitored condition (per-source recipes below).
 
 # 4. Poll `events list` until the materialized event shows up. --unread always
@@ -356,9 +369,20 @@ done
 echo "$OUT"
 
 # 5. Simulate the UserPromptSubmit hook: claim any pending deliveries and
-#    confirm the agent would actually be notified.
-echo "{\"session_id\":\"$HOST_ID\",\"cwd\":\"$CWD\",\"hook_event_name\":\"UserPromptSubmit\"}" \
-  | agentmonitors hook deliver --socket "$SOCKET"
+#    confirm the agent would actually be notified. Empty stdout usually means
+#    nothing was claimable yet — poll the same way step 4 does. But empty
+#    stdout is also how several misconfigurations look (workspace not
+#    enabled, daemon unreachable, ...), so if the loop never returns content,
+#    run `agentmonitors hook deliver --debug` (writes a step-by-step
+#    diagnosis to stderr) to tell the two apart.
+for i in $(seq 1 20); do
+  OUT5=$(echo "{\"session_id\":\"$HOST_ID\",\"cwd\":\"$CWD\",\"hook_event_name\":\"UserPromptSubmit\"}" \
+    | agentmonitors hook deliver --socket "$SOCKET")
+  [ -n "$OUT5" ] && break
+  echo "(hook deliver: nothing claimable yet, retrying...)" >&2
+  sleep 2
+done
+echo "$OUT5"
 
 # 6. Clean up.
 kill "$DAEMON_PID"
@@ -378,17 +402,47 @@ kill "$DAEMON_PID"
 }
 ```
 
-**If step 5 prints nothing for a `high`-urgency monitor, that can be expected, not a bug — keep
-polling.** `events list` (step 4) surfaces an event as soon as it materializes. `hook deliver`
+**If step 5's loop keeps retrying for a `high`-urgency monitor, that can be expected, not a
+bug.** `events list` (step 4) surfaces an event as soon as it materializes. `hook deliver`
 at the `turn-interruptible` lifecycle applies a *separate*, fixed ~15s "claim settle" window
 measured from the event's own creation time before it will surface the event's body — independent
 of your monitor's `notify.settle-for`. So for `high` urgency, budget roughly
-`interval + settle-for + 15s` before step 5 returns content, and re-run it every few seconds
-until it does. **Do not** change any files or re-open the session while you wait — that resets the
-condition you're trying to observe. A `normal`- or `low`-urgency monitor doesn't have this extra
-wait: `hook deliver` surfaces a reminder (not the full body) as soon as the event is unread.
+`interval + settle-for + 15s` before step 5's loop returns content — the 20 × 2s retry window above
+comfortably covers that. **Do not** change any files or re-open the session while you wait — that
+resets the condition you're trying to observe. A `normal`-urgency monitor doesn't have this extra
+wait: `hook deliver` surfaces a reminder (not the full body) as soon as the event is unread (002
+§9.2). `low` urgency is delivered only at the `turn-idle` lifecycle (002 §9.3, §13.2) — this
+recipe's step 5 sends `UserPromptSubmit`, which maps to `turn-interruptible` only, so it never
+exercises low-urgency delivery; expect step 5 to keep returning empty for a `low`-urgency
+monitor regardless of how long you wait.
+
+**This recipe's daemon is invisible to `doctor`.** Everything above runs against the explicit
+`$SOCKET` / `$AGENTMONITORS_DB`. `agentmonitors doctor` and `monitor explain` auto-discover the
+*workspace's own* socket — falling back to the shared global default only when the workspace isn't
+enabled — so neither ever resolves this recipe's throwaway `$SOCKET` (both still honor
+`AGENTMONITORS_DB` if it's set in their environment). Running plain `agentmonitors doctor` right
+after a successful run of this recipe is expected to still report the monitor "never observed" or
+the daemon unreachable — that's a different daemon than the one `doctor` resolved, not a
+regression. To check the setup a real agent session would actually use, start a daemon on the
+workspace's own socket (`agentmonitors daemon run` — no `--socket`) or open a live session, then
+re-run `doctor`.
 
 ### Per-source trigger recipes (step 3)
+
+A monitor with no prior observation is always "due," so the daemon's very first tick for it runs
+immediately at startup — before waiting `--poll-ms` at all. `file-fingerprint`, `api-poll`,
+`command-poll`, and `incoming-changes` all treat that first tick as a **silent baseline**: whatever
+state exists at that moment becomes the reference point, and no *change* observation is ever
+emitted for it. A change that lands *before* this first tick finishes is folded straight into the
+baseline and is never detected — not on that tick, not on any later one, because later ticks diff
+against the state the *previous* tick captured, not against "what changed since the daemon
+started." The one exception is `command-poll`'s health tracking: if the command's first-ever
+execution *fails*, that failure isn't folded into a silent baseline — it still surfaces a
+`Command failing: …` health observation on tick 1, because there is no prior "ok" state for the
+failure to be silently reconciled against. `schedule` has no baseline: it emits an observation on
+any tick where its cron matches, from the first eligible tick onward. Step 2b's wait exists
+precisely to dodge this race — by the time you reach step 3, the baselining first tick has already
+completed, so whatever you trigger next is guaranteed to be detected on a subsequent tick.
 
 **`file-fingerprint`** — touch any file matched by `watch.globs`:
 
@@ -403,14 +457,11 @@ touch path/to/monitored/file.txt
 echo "changed" >> tracked/state.txt
 ```
 
-`command-poll` baselines silently on its first-ever tick and detects on any later tick where the
-output differs from that baseline. The first tick fires immediately when `daemon run` starts (step
-1 above) — **before** step 2 (session-open), which only registers a delivery recipient and does not
-affect tick timing. So trigger the change (step 3) any time after step 1; it just needs to land
-before the daemon's *next* tick (`--poll-ms`, 5000ms in this recipe) to be detected on that tick.
-This assumes a fresh baseline, which is why the recipe isolates `$AGENTMONITORS_DB` above — reusing
-a database from a prior run of this same recipe means the daemon's first tick already has a
-baseline from that earlier run, and can detect a change immediately instead of on the next tick.
+Each tick after the baseline diffs against the *previous* tick's captured output (a rolling
+comparison), so once the baseline tick has run, whichever tick executes after you make the change
+will detect it. This assumes a fresh baseline, which is why the recipe isolates
+`$AGENTMONITORS_DB` above — reusing a database from a prior run of this same recipe means the
+daemon's first tick already has a baseline from that earlier run.
 
 **`api-poll`** — the response from `watch.url` must change between two ticks. Point it at a
 controllable local server, or a source that changes every poll. Without a controllable endpoint,
@@ -419,7 +470,8 @@ and reachable, but an actual fire needs the remote resource to change on its own
 
 **`schedule`** — set a cron that fires within the next minute while testing (e.g. `'* * * * *'`),
 then restore the real cron afterward. `agentmonitors monitor test <path>` confirms the cron
-parses.
+parses. No baseline race here — just make sure the cron is set *before* starting the daemon, so
+its first eligible tick can catch the matching minute.
 
 **`incoming-changes`** — advance the tracked ref by committing to a watched path, then trigger a
 fetch/merge that advances it (or simulate with `git pull`):
@@ -433,6 +485,18 @@ git commit -m "verify incoming-changes monitor" --no-gpg-sign
 ---
 
 ## Phase 6 — Debug loop
+
+If you just ran the Phase 5 isolated-socket recipe, `monitor explain` and `doctor` below
+auto-discover the *workspace's own* socket — falling back to the shared global default only when
+the workspace isn't enabled — so neither ever resolves the recipe's throwaway `$SOCKET`; that
+daemon is dead anyway once the recipe's step 6 (`kill "$DAEMON_PID"`) runs. A successful Phase 5
+run does not make these commands see anything live. What does survive is the SQLite file
+`AGENTMONITORS_DB` pointed at (`/tmp/agentmon-verify-<pid>.db`): both commands resolve their
+database via the `AGENTMONITORS_DB` environment variable, so pointing it at that same file — e.g.
+`AGENTMONITORS_DB=/tmp/agentmon-verify-<pid>.db agentmonitors monitor explain <id> --dir
+.claude/monitors` (or `monitor history`) — reads the persisted state from that run **in-process,
+no live daemon required.** Or move on to a real daemon on the workspace's own socket, before
+treating either command's output as evidence of a problem.
 
 When the user says "it didn't fire," don't guess — run:
 
