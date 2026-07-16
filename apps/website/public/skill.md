@@ -409,11 +409,11 @@ the daemon actually recorded first:**
 agentmonitors monitor history <id> --socket "$SOCKET"
 ```
 
-A `result: no-change` row means the trigger in step 3 didn't actually alter anything the source
-could detect (e.g. a `touch` on a file whose content didn't change under `file-fingerprint`'s
-content-hash comparison) — fix the trigger, don't keep waiting.
+A row whose result column shows `no-change` means the trigger in step 3 didn't actually alter
+anything the source could detect (e.g. a `touch` on a file whose content didn't change under
+`file-fingerprint`'s content-hash comparison) — fix the trigger, don't keep waiting.
 
-Only once history shows `result: triggered` — or step 4 has already printed an event row — is a
+Only once the result column shows `triggered` — or step 4 has already printed an event row — is a
 still-empty step 5 loop for a `high`-urgency monitor expected, not a bug. `events list` (step 4)
 surfaces an event as soon as it materializes. `hook deliver` at the `turn-interruptible` lifecycle
 applies a *separate*, fixed ~15s "claim settle" window measured from the event's own creation time

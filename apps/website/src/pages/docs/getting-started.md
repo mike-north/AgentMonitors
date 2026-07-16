@@ -214,13 +214,13 @@ urgency: high
 
 **c. Run the recipe.** `file-fingerprint` baselines silently on its first-ever tick: whatever files
 exist at that moment become the reference point, and nothing is reported as changed. That first
-tick runs immediately when the daemon starts (before waiting `--poll-ms` at all), so a change that
-lands before it finishes gets folded into the baseline and is never detected — the recipe below
-waits a full poll interval after starting the daemon, before writing to `example.ts`, to guarantee
-the trigger lands after the baseline instead of racing it. **`file-fingerprint` detects changes by
-content hash, not mtime or existence** — a bare `touch` on a file whose content doesn't change
-leaves the hash unchanged and is silently ignored, so the trigger below appends real content
-instead:
+tick runs immediately when the daemon starts (before waiting `--poll-ms` at all), so the recipe
+below first seeds `example.ts` with placeholder content, *then* starts the daemon so that first
+tick baselines the file as already existing, and only *then* waits a full poll interval before
+changing it — that ordering guarantees the trigger is a genuine content change of an
+already-baselined file, not a first-time creation. **`file-fingerprint` detects changes by content
+hash, not mtime or existence** — a bare `touch` on a file whose content doesn't change leaves the
+hash unchanged and is silently ignored, so the trigger below appends real content instead:
 
 ```bash
 CWD=$(pwd)
@@ -230,27 +230,31 @@ SOCKET="/tmp/agentmon-verify-$$.sock"
 # (and from a previous run of this same recipe).
 export AGENTMONITORS_DB="/tmp/agentmon-verify-$$.db"
 
-# 1. A daemon pinned to this socket that never idle-reaps.
+# 1. Seed the file the monitor's `**/*.ts` glob watches, so it already exists
+#    (with stable content) before the daemon's baselining first tick runs.
+echo "// baseline" > example.ts
+
+# 2. A daemon pinned to this socket that never idle-reaps.
 agentmonitors daemon run .claude/monitors --socket "$SOCKET" --reap-after-ms 0 --poll-ms 5000 &
 DAEMON_PID=$!
 # Clean up the daemon even if a later step fails or you Ctrl-C out.
 trap 'kill "$DAEMON_PID" 2>/dev/null' EXIT
 sleep 1
 
-# 2. A lead session on the same socket — capture its id (it is NOT $HOST_ID).
+# 3. A lead session on the same socket — capture its id (it is NOT $HOST_ID).
 # --format id prints just the bare id, no JSON parsing needed.
 AGENTMON_SESSION_ID=$(agentmonitors session open --socket "$SOCKET" --host-session-id "$HOST_ID" \
   --role lead --workspace "$CWD" --format id)
 
-# 2b. Wait a full poll interval (matching --poll-ms above) so the daemon's
-# first, baselining tick has definitely already run before we touch anything.
+# 3b. Wait a full poll interval (matching --poll-ms above) so the daemon's
+# first, baselining tick has definitely already run before we change example.ts.
 sleep 5
 
-# 3. Trigger the watched change. A bare `touch` is a silent no-op under
+# 4. Trigger the watched change. A bare `touch` is a silent no-op under
 #    file-fingerprint's content-hash comparison — append real content instead.
 echo "// verify $(date)" >> example.ts
 
-# 4. Poll until the event materializes (events list needs a reachable daemon).
+# 5. Poll until the event materializes (events list needs a reachable daemon).
 for i in $(seq 1 20); do
   OUT=$(agentmonitors events list --socket "$SOCKET" --session "$AGENTMON_SESSION_ID" --unread --format json)
   [ "$(node -e "console.log(JSON.parse(process.argv[1]).length)" "$OUT")" -ge 1 ] && break
@@ -258,8 +262,8 @@ for i in $(seq 1 20); do
 done
 echo "$OUT"
 
-# 5. Simulate the UserPromptSubmit hook Claude Code sends on every turn. Empty
-# stdout usually means nothing was claimable yet — poll like step 4 does. But
+# 6. Simulate the UserPromptSubmit hook Claude Code sends on every turn. Empty
+# stdout usually means nothing was claimable yet — poll like step 5 does. But
 # empty stdout is also how several misconfigurations look (workspace not
 # enabled, daemon unreachable, ...), so if the loop never returns content, run
 # `agentmonitors hook deliver --debug` (writes a step-by-step diagnosis to
@@ -273,27 +277,27 @@ for i in $(seq 1 20); do
 done
 echo "$OUT5"
 
-# 6. Clean up.
+# 7. Clean up.
 kill "$DAEMON_PID"
 ```
 
-**Success looks like:** step 4 prints an event row for `example.ts`, and step 5 prints a JSON object
+**Success looks like:** step 5 prints an event row for `example.ts`, and step 6 prints a JSON object
 whose `hookSpecificOutput.additionalContext` is non-empty and names your monitor — that's exactly
 what a live Claude Code turn would receive.
 
-If step 4 or step 5's loop keeps retrying, don't assume it's just a settle window — check what the
+If step 5 or step 6's loop keeps retrying, don't assume it's just a settle window — check what the
 daemon actually recorded first:
 
 ```bash
 agentmonitors monitor history my-first-monitor --socket "$SOCKET"
 ```
 
-A `result: no-change` row means the trigger in step 3 didn't actually alter anything the source
-could detect (e.g. a `touch` on a file whose content didn't change) — fix the trigger, don't keep
-waiting. Only once history shows `result: triggered` is a still-empty step 5 loop expected for
-`high` urgency, not a bug: `hook deliver` applies its own fixed ~15s "claim settle" window measured
-from the event's creation time, separate from `notify.settle-for`. The 20 × 2s retry window above
-comfortably covers that once the event actually exists.
+A row whose result column shows `no-change` means the trigger in step 4 didn't actually alter
+anything the source could detect (e.g. a `touch` on a file whose content didn't change) — fix the
+trigger, don't keep waiting. Only once the result column shows `triggered` is a still-empty step 6
+loop expected for `high` urgency, not a bug: `hook deliver` applies its own fixed ~15s "claim
+settle" window measured from the event's creation time, separate from `notify.settle-for`. The
+20 × 2s retry window above comfortably covers that once the event actually exists.
 
 Once you're done, revert the `interval` / `settle-for` / `urgency` edits from step (b) to whatever
 fits your real use case.
