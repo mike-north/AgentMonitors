@@ -41,6 +41,12 @@ export class AgentMonitorRuntime {
     previewSettledHighDelivery(sessionId: string): DeliveryEventSummary[];
     // (undocumented)
     refreshHookState(sessionId: string): SessionHookState;
+    retractObjectEvents(input: {
+        workspacePath?: string | null;
+        monitorId: string;
+        objectKey: string;
+        eventIds: string[];
+    }): number;
     // (undocumented)
     status(): RuntimeStatus;
     // (undocumented)
@@ -1371,6 +1377,15 @@ export class RuntimeStore {
         result: ObservationOutcome;
         observationData: Record<string, unknown>;
     }): void;
+    retractObjectEvents(input: {
+        workspacePath?: string | null;
+        monitorId: string;
+        objectKey: string;
+        eventIds: string[];
+    }): {
+        removedEventIds: string[];
+        affectedSessionIds: string[];
+    };
     // (undocumented)
     saveSnapshot(input: {
         workspacePath?: string | null;

@@ -1720,6 +1720,27 @@ agentmonitors verify [monitor] [--dir <path>] [--workspace <path>] [--manual]
    `turn-interruptible` (previewing settled high events and packing them under the 4000-char cap
    exactly as `hook deliver` does), otherwise the `post-compact` recap — and render the same
    `additionalContext` a hook would inject.
+9. **Retract (`--use-workspace-daemon` only).** In the default isolated mode the throwaway daemon +
+   db are torn down, so verify's scratch file leaves no trace. Under `--use-workspace-daemon` the
+   daemon **persists**, so the scratch file's teardown deletion would otherwise be observed as a real
+   change and delivered to a later session as a spurious `File deleted: …/agentmonitors-verify-….md`
+   ahead of the user's real change (issue #407). To prevent that, verify deletes the scratch file,
+   waits for **its own monitor** to materialize the resulting deletion event, then **retracts the
+   exact events its own scratch file produced** (the create AND the delete) across all sessions. The
+   wait and the retraction are scoped to the verified monitor's id, and the retraction deletes **by
+   the event ids verify observed** — never a `(monitor, path)` sweep — so a real, pre-existing event
+   at the same watched path (e.g. an earlier unacked delete on a literal-glob monitor) is left intact,
+   and a second monitor also watching that path can neither satisfy the wait early nor have its events
+   swept. Retracting an event also drops the per-recipient cursor its projection seeded, scoped to the
+   sessions that actually received it (never another session's baseline for the same path). It never
+   touches a real monitored change, and — because the scratch object is a file verify itself created
+   and deleted — never a pre-existing watched file it merely edited.
+
+   **Residual (crash window).** The retraction runs on the run's normal completion, plus a
+   best-effort second attempt in teardown if an error interrupts the run after the scratch events
+   materialized. Both go over the live daemon socket, so a daemon **death** between materialization
+   and retraction leaves the scratch events in place until a later observation reconciles them; this
+   narrow window is accepted rather than made crash-atomic.
 
 If the daemon exits at any point, `verify` fails fast with a **`daemon-died`** verdict and prints the
 daemon's captured output — never an ambiguous empty result.

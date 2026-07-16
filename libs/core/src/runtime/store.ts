@@ -1507,6 +1507,105 @@ export class RuntimeStore {
   }
 
   /**
+   * Retract a caller-supplied SET of a monitor's events by id — the create AND
+   * delete rows `verify --use-workspace-daemon` captured for its OWN scratch file
+   * — plus every durable trace they left: their per-recipient
+   * `session_event_state` projections (across ALL sessions, not one), any
+   * `monitor_snapshots` captured for them, and the `session_object_cursor` the
+   * projection seeded for that object in each affected session.
+   *
+   * Deletion is BY EVENT ID (not a `(monitorId, objectKey)` sweep): the caller —
+   * verify's wait loop — already lists the exact events its synthetic file
+   * produced, so it threads their ids here (issue #407 review). This bounds the
+   * blast radius to those rows and CANNOT touch a real, pre-existing event that
+   * merely shares the same watched path (e.g. an earlier unacked delete on a
+   * literal-glob monitor). `monitorId` is applied as a defense-in-depth guard so
+   * a stray id belonging to another monitor is ignored rather than deleted.
+   *
+   * This is a targeted retraction of KNOWN-synthetic events — a file verify
+   * itself created and deleted — NOT a general delivery-suppression path; never
+   * point it at real monitored events.
+   *
+   * @returns the removed event ids (only those that existed and matched
+   *   `monitorId`) and the (deduped) lead-session ids whose projections were
+   *   deleted, so the caller can refresh their hook-state.
+   */
+  retractObjectEvents(input: {
+    workspacePath?: string | null;
+    monitorId: string;
+    objectKey: string;
+    eventIds: string[];
+  }): { removedEventIds: string[]; affectedSessionIds: string[] } {
+    const db = asInternalDb(this.db);
+    if (input.eventIds.length === 0) {
+      return { removedEventIds: [], affectedSessionIds: [] };
+    }
+    // Resolve the caller's candidate ids to the rows that actually exist AND
+    // belong to this monitor. Deleting only these (never a broad key sweep) is
+    // what keeps a real historical event at the same path from being swept.
+    const removedEventIds = db
+      .select({ id: monitorEvents.id })
+      .from(monitorEvents)
+      .where(
+        and(
+          eq(monitorEvents.monitorId, input.monitorId),
+          inArray(monitorEvents.id, input.eventIds),
+        ),
+      )
+      .all()
+      .map((row) => row.id);
+    if (removedEventIds.length === 0) {
+      return { removedEventIds, affectedSessionIds: [] };
+    }
+    const affectedSessionIds = [
+      ...new Set(
+        db
+          .select({ sessionId: sessionEventState.sessionId })
+          .from(sessionEventState)
+          .where(inArray(sessionEventState.eventId, removedEventIds))
+          .all()
+          .map((row) => row.sessionId),
+      ),
+    ];
+    db.delete(sessionEventState)
+      .where(inArray(sessionEventState.eventId, removedEventIds))
+      .run();
+    db.delete(monitorSnapshots)
+      .where(inArray(monitorSnapshots.eventId, removedEventIds))
+      .run();
+    db.delete(monitorEvents)
+      .where(inArray(monitorEvents.id, removedEventIds))
+      .run();
+    // Cursors are keyed by object, not event id: drop only the cursors the
+    // retracted events' projection seeded — i.e. those of the AFFECTED sessions
+    // (never every session at this path), matched the same workspace-or-null way
+    // {@link listEvents} scopes. Without this scoping a retraction at a literal
+    // path would wipe an UNAFFECTED session's real baseline for that path and
+    // trigger a spurious re-fire (issue #407 review).
+    if (affectedSessionIds.length > 0) {
+      const cursorConditions = [
+        eq(sessionObjectCursor.monitorId, input.monitorId),
+        eq(sessionObjectCursor.objectKey, input.objectKey),
+        inArray(sessionObjectCursor.sessionId, affectedSessionIds),
+      ];
+      if (input.workspacePath !== undefined) {
+        const workspaceCondition =
+          input.workspacePath === null
+            ? isNull(sessionObjectCursor.workspacePath)
+            : or(
+                eq(sessionObjectCursor.workspacePath, input.workspacePath),
+                isNull(sessionObjectCursor.workspacePath),
+              );
+        if (workspaceCondition) cursorConditions.push(workspaceCondition);
+      }
+      db.delete(sessionObjectCursor)
+        .where(and(...cursorConditions))
+        .run();
+    }
+    return { removedEventIds, affectedSessionIds };
+  }
+
+  /**
    * Apply the per-recipient `net` collapse to a recipient's candidate delivery
    * set at claim time (G10 PR-B, 002 §1.1.7).
    *

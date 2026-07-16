@@ -19,6 +19,7 @@ import {
   type AgentSessionRecord,
   type DeliveryClaim,
   type MonitorDefinition,
+  type MonitorEventRecord,
   type Urgency,
 } from '@agentmonitors/core';
 import { reportError } from '../output.js';
@@ -36,6 +37,7 @@ import {
   listObservationHistoryClient,
   openSessionClient,
   previewSettledHighDeliveryClient,
+  retractObjectEventsClient,
 } from '../runtime-client.js';
 import {
   packEventsUnderCap,
@@ -78,11 +80,30 @@ interface Trigger {
   fire: () => void;
   /** Restore/clean up. Idempotent — safe to call from `finally` and signals. */
   revert: () => void;
+  /**
+   * The file-fingerprint `objectKey` (an absolute path) this trigger acts on —
+   * the key its create/delete events carry. Used by the `--use-workspace-daemon`
+   * retraction to erase those events after the run (issue #407).
+   */
+  objectKey: string;
+  /**
+   * True when verify itself brought this file into existence (a scratch sibling,
+   * or a literal watched file that did not exist) and removes it on revert — so
+   * BOTH its create and its delete events are pure verify artifacts, safe to
+   * retract wholesale. False when editing a pre-existing watched file, whose
+   * events reference real user content and must never be retracted.
+   */
+  synthetic: boolean;
 }
 
 const PROGRESS_INTERVAL_MS = 2_500;
 const POLL_INTERVAL_MS = 300;
 const BOOT_TIMEOUT_MS = 15_000;
+// Short budget for the crash-safety retraction in `finally` (#407): unlike the
+// happy-path retraction (which waits the full detect cap to catch the delete
+// event), the teardown pass only tries briefly to catch whatever materialized
+// before retracting it, so a failed run's cleanup never blocks for long.
+const TEARDOWN_RETRACT_WAIT_MS = 3_000;
 
 /** Emit a progress line to stderr so `--format json` stdout stays a single clean doc. */
 function progress(message: string): void {
@@ -147,6 +168,8 @@ function buildAutoTrigger(
     const target = deriveScratchTriggerPath(patternGlob, baseDir, token);
     let created = false;
     return {
+      objectKey: target,
+      synthetic: true,
       describe: `wrote scratch file ${path.relative(workspace, target) || target}`,
       fire: () => {
         // The glob's static directory prefix normally already exists; create it
@@ -172,6 +195,11 @@ function buildAutoTrigger(
   const original = existed ? readFileSync(target) : null;
   let mutated = false;
   return {
+    objectKey: target,
+    // A file verify *created* (did not exist before) is a pure artifact — safe
+    // to retract. A pre-existing file that verify edits and restores is real
+    // user content; its events must not be retracted.
+    synthetic: !existed,
     describe: existed
       ? `edited watched file ${path.relative(workspace, target) || target} (restored on exit)`
       : `created watched file ${path.relative(workspace, target) || target}`,
@@ -453,16 +481,29 @@ interface RunOptions {
   budget: VerifyBudget;
   detectCapMs: number;
   manual: boolean;
+  /**
+   * When true the run targets the persistent workspace daemon (which outlives
+   * verify), so verify must retract the events its own scratch file generated —
+   * otherwise its teardown deletion surfaces to a later session (issue #407). In
+   * the default isolated mode the daemon + db are torn down, so no retraction is
+   * needed.
+   */
+  useWorkspaceDaemon: boolean;
 }
 
 /** The core orchestration once a monitor is resolved and a daemon is reachable. */
 async function runVerification(opts: RunOptions): Promise<VerifyResult> {
   const { monitor, workspace, daemon, budget, detectCapMs, manual } = opts;
+  const { useWorkspaceDaemon } = opts;
   const startedAt = Date.now();
   const stages: Stage[] = [];
   const token = randomBytes(6).toString('hex');
   let session: AgentSessionRecord | undefined;
   let trigger: Trigger | null = null;
+  // #407: set once the scratch object's events have been retracted, so the
+  // crash-safety pass in `finally` skips the work (and its wait) on the happy
+  // path and only runs when an error interrupted the run before retraction.
+  let scratchEventsRetracted = false;
   // The stage currently being polled, so a mid-flight daemon crash blames the
   // stage that was actually in progress — not the last COMPLETED stage (an
   // off-by-one that also duplicated that stage's name). Advanced before each
@@ -744,6 +785,24 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
       status: 'pass',
       detail: `claimed at ${lifecycle}`,
     });
+
+    // #407: the workspace daemon outlives this run, so the scratch file's
+    // create/delete events would otherwise reach a later session — its teardown
+    // deletion is observed as a real change and delivered first, ahead of the
+    // user's actual change. Retract both events now, scoped to verify's OWN
+    // synthetic object. Isolated mode needs none of this: its daemon + db are
+    // torn down. A non-synthetic trigger (verify editing a real watched file) is
+    // never retracted — those events reference real user content.
+    if (useWorkspaceDaemon && trigger?.synthetic) {
+      await retractScratchEvents(
+        trigger,
+        monitor.id,
+        workspace,
+        daemon,
+        Date.now() + detectCapMs,
+      );
+      scratchEventsRetracted = true;
+    }
     return finalize({ ok: true, stages, additionalContext });
   } catch (error) {
     if (error instanceof DaemonDied) {
@@ -763,6 +822,27 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
     throw error;
   } finally {
     if (trigger) trigger.revert();
+    // #407 crash-safety: the happy-path retraction above runs only once the run
+    // reaches delivery. If an error interrupted the run AFTER the scratch object's
+    // events materialized on the PERSISTENT daemon but before that retraction,
+    // they would otherwise linger for a later session. Best-effort clean them up
+    // here too, on a short budget. This closes the common interruption window but
+    // NOT a daemon death after materialization: with the daemon gone the socket
+    // call fails and the artifact persists until the next observation reconciles
+    // it — a residual documented in 005 §16.
+    if (useWorkspaceDaemon && trigger?.synthetic && !scratchEventsRetracted) {
+      try {
+        await retractScratchEvents(
+          trigger,
+          monitor.id,
+          workspace,
+          daemon,
+          Date.now() + TEARDOWN_RETRACT_WAIT_MS,
+        );
+      } catch {
+        /* best-effort: daemon may already be gone */
+      }
+    }
     if (session) {
       try {
         await closeSessionClient(session.id, daemon.socketPath);
@@ -804,6 +884,69 @@ async function claimAndRender(
   }
   const output = renderHookDelivery(claim, hookEventName, { moreDeferred });
   return output?.hookSpecificOutput.additionalContext ?? null;
+}
+
+/**
+ * Retract the events verify's own scratch file produced against a PERSISTENT
+ * workspace daemon (issue #407). Deletes the scratch file now, waits (bounded by
+ * `deadline`) for the daemon to materialize the resulting deletion event — the
+ * object's second event, after the create — then retracts the EXACT events it
+ * observed for the scratch path (by their ids), across all sessions, so no later
+ * session sees a spurious `File deleted: agentmonitors-verify-…` ahead of the
+ * user's real change.
+ *
+ * Two scoping guards keep this from over-reaching (issue #407 review):
+ *  - The wait query and the retraction are scoped to `monitorId`, so a second,
+ *    broader monitor also watching this path can't satisfy the `>= 2` signal
+ *    early (retracting before the target's own delete has landed), nor have its
+ *    events swept.
+ *  - The retraction deletes by the observed event IDS, never a `(monitor, path)`
+ *    sweep, so a real, pre-existing event at the same watched path (e.g. an
+ *    earlier unacked delete on a literal-glob monitor) is left intact.
+ *
+ * Best-effort on the wait: if the deletion is not observed within the budget the
+ * create event is still retracted (so at minimum the create never lingers). The
+ * count-based signal (a second event for this object) is decoupled from the
+ * source's event title/payload shape and immune to timestamp granularity.
+ */
+async function retractScratchEvents(
+  trigger: Trigger,
+  monitorId: string,
+  workspace: string,
+  daemon: IsolatedDaemon,
+  deadline: number,
+): Promise<void> {
+  const { objectKey } = trigger;
+  // Delete the scratch file (idempotent — the `finally` revert becomes a no-op).
+  trigger.revert();
+  progress('cleaning up the verify artifact and retracting its events…');
+  // Wait until the daemon has observed the deletion and materialized its event
+  // (this monitor's rows for the object now number both a create and a delete),
+  // so the retract erases both. Capture the observed events so we retract by
+  // their exact ids. On timeout, fall through and retract whatever exists now.
+  const settled = await pollUntil<MonitorEventRecord[]>(
+    deadline,
+    daemon,
+    async () => {
+      const events = await listEventsClient(
+        { monitorId, objectKey, workspacePath: workspace },
+        daemon.socketPath,
+      );
+      return events.length >= 2 ? events : null;
+    },
+  );
+  const observed =
+    settled ??
+    (await listEventsClient(
+      { monitorId, objectKey, workspacePath: workspace },
+      daemon.socketPath,
+    ));
+  const eventIds = observed.map((event) => event.id);
+  if (eventIds.length === 0) return;
+  await retractObjectEventsClient(
+    { monitorId, objectKey, eventIds, workspacePath: workspace },
+    daemon.socketPath,
+  );
 }
 
 /** Reverts registered for crash-safe cleanup (SIGINT/SIGTERM). */
@@ -914,6 +1057,7 @@ export const verifyCommand = new Command('verify')
           budget,
           detectCapMs,
           manual: options.manual === true,
+          useWorkspaceDaemon: options.useWorkspaceDaemon === true,
         });
 
         console.log(json ? renderVerifyJson(result) : renderVerifyText(result));
