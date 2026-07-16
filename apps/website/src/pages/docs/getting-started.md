@@ -286,9 +286,12 @@ fits your real use case.
 
 **A red `doctor` right after this succeeds is expected, not a bug.** Steps (a)–(c) ran entirely
 against the isolated `$SOCKET` / `$AGENTMONITORS_DB` above; `agentmonitors doctor` (and `monitor
-explain`) check the *default* socket and database, which this recipe never touched. To see the
-real, default-socket setup an actual agent session would use, start a daemon without `--socket`
-(`agentmonitors daemon run`) or open a live Claude Code session, then re-run `doctor`.
+explain`) auto-discover the *workspace's own* socket and database — falling back to the shared
+global default only when the workspace isn't enabled — so neither ever resolves this recipe's
+throwaway `$SOCKET` (both still honor `AGENTMONITORS_DB` if it's set in their environment). To see
+the real setup an actual agent session would use, start a daemon on the workspace's own socket
+(`agentmonitors daemon run` — no `--socket`) or open a live Claude Code session, then re-run
+`doctor`.
 
 For the same proof wired through the real Claude Code plugin instead of a manual socket, see
 [Notify your agent when a file changes](/docs/notify-when-a-file-changes).

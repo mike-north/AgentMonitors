@@ -60,8 +60,10 @@ fires") verification recipes:
   Phase 5 / "Prove it, right now" recipes run against an explicit `--socket`/`AGENTMONITORS_DB`, so
   a plain `agentmonitors doctor` right after a successful verify is expected to still report the
   monitor unobserved — confirmed against `apps/cli/src/commands/doctor.ts` and
-  `apps/cli/src/commands/monitor-test.ts`'s `explain` subcommand, both of which resolve the default
-  socket/database unless pointed at the same `--socket`/`AGENTMONITORS_DB` used to verify.
+  `apps/cli/src/commands/monitor-test.ts`'s `explain` subcommand, both of which auto-discover the
+  workspace's own socket/database (falling back to the shared global default only when the
+  workspace isn't enabled) and never resolve the recipe's throwaway `--socket`/`AGENTMONITORS_DB`,
+  though both still honor `AGENTMONITORS_DB` when it's set in their environment.
 
 ## 2026-07-14 — Watch-mode source-state checkpointing implemented (002 §2.4 target → current) — Refs #278
 

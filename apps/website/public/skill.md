@@ -346,12 +346,14 @@ echo "AgentMon session: $AGENTMON_SESSION_ID"
 # 2b. Wait a full poll interval (matching --poll-ms above) before triggering
 #     anything. A monitor with no prior observation is always "due," so the
 #     daemon's first tick for it runs immediately at startup — before waiting
-#     --poll-ms — and every bundled source except `schedule` treats that first
-#     tick as a silent baseline for *change* observations (see "Per-source
-#     trigger recipes" below; `command-poll` is a partial exception — a
-#     first-ever command that fails still surfaces a health observation on
-#     that tick). This wait guarantees the baseline tick has already
-#     completed before step 3.
+#     --poll-ms, and independent of step 2's session-open, which only
+#     registers a delivery recipient and does not affect tick timing — and
+#     every bundled source except `schedule` treats that first tick as a
+#     silent baseline for *change* observations (see "Per-source trigger
+#     recipes" below; `command-poll` is a partial exception — a first-ever
+#     command that fails still surfaces a health observation on that tick).
+#     This wait guarantees the baseline tick has already completed before
+#     step 3.
 sleep 5
 
 # 3. Trigger the monitored condition (per-source recipes below).
@@ -415,12 +417,15 @@ exercises low-urgency delivery; expect step 5 to keep returning empty for a `low
 monitor regardless of how long you wait.
 
 **This recipe's daemon is invisible to `doctor`.** Everything above runs against the explicit
-`$SOCKET` / `$AGENTMONITORS_DB`, never the *default* socket or database that `agentmonitors doctor`
-and `monitor explain` read from. Running plain `agentmonitors doctor` right after a successful run
-of this recipe is expected to still report the monitor "never observed" or the daemon
-unreachable — that's a different daemon than the one `doctor` checks, not a regression. To check
-the setup a real agent session would actually use, start a daemon on the default socket
-(`agentmonitors daemon run` — no `--socket`) or open a live session, then re-run `doctor`.
+`$SOCKET` / `$AGENTMONITORS_DB`. `agentmonitors doctor` and `monitor explain` auto-discover the
+*workspace's own* socket — falling back to the shared global default only when the workspace isn't
+enabled — so neither ever resolves this recipe's throwaway `$SOCKET` (both still honor
+`AGENTMONITORS_DB` if it's set in their environment). Running plain `agentmonitors doctor` right
+after a successful run of this recipe is expected to still report the monitor "never observed" or
+the daemon unreachable — that's a different daemon than the one `doctor` resolved, not a
+regression. To check the setup a real agent session would actually use, start a daemon on the
+workspace's own socket (`agentmonitors daemon run` — no `--socket`) or open a live session, then
+re-run `doctor`.
 
 ### Per-source trigger recipes (step 3)
 
@@ -481,13 +486,17 @@ git commit -m "verify incoming-changes monitor" --no-gpg-sign
 
 ## Phase 6 — Debug loop
 
-If you just ran the Phase 5 isolated-socket recipe, `monitor explain` and `doctor` below still
-target the *default* socket/database, not the `$SOCKET` / `$AGENTMONITORS_DB` from that recipe — a
-successful Phase 5 run does not make these commands see anything. Both accept `--socket`, and both
-resolve their database via the `AGENTMONITORS_DB` environment variable, so re-running with the same
-`--socket "$SOCKET"` and `AGENTMONITORS_DB="$AGENTMONITORS_DB"` you used to verify will see it —
-or move on to a real daemon on the default socket, before treating either command's output as
-evidence of a problem.
+If you just ran the Phase 5 isolated-socket recipe, `monitor explain` and `doctor` below
+auto-discover the *workspace's own* socket — falling back to the shared global default only when
+the workspace isn't enabled — so neither ever resolves the recipe's throwaway `$SOCKET`; that
+daemon is dead anyway once the recipe's step 6 (`kill "$DAEMON_PID"`) runs. A successful Phase 5
+run does not make these commands see anything live. What does survive is the SQLite file
+`AGENTMONITORS_DB` pointed at (`/tmp/agentmon-verify-<pid>.db`): both commands resolve their
+database via the `AGENTMONITORS_DB` environment variable, so pointing it at that same file — e.g.
+`AGENTMONITORS_DB=/tmp/agentmon-verify-<pid>.db agentmonitors monitor explain <id> --dir
+.claude/monitors` (or `monitor history`) — reads the persisted state from that run **in-process,
+no live daemon required.** Or move on to a real daemon on the workspace's own socket, before
+treating either command's output as evidence of a problem.
 
 When the user says "it didn't fire," don't guess — run:
 
