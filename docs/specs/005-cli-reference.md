@@ -623,9 +623,9 @@ The report is rendered according to three cases:
 - **Definition ok, nothing persisted** (no history, no events — the daemon never ran): an actionable
   remediation line is printed — _"No daemon running for this workspace and no persisted state to
   show. Start it with `agentmonitors daemon run` (or it starts automatically when a Claude Code
-  session opens); if the daemon you want lives at a different socket, point at it with `--socket
-<path>`. Or use `agentmonitors monitor test <path>` for a one-shot check."_ — rather than a raw
-  Node `connect ENOENT …`. Exits 1.
+  session opens); if the daemon you want lives at a different socket, point at it with
+  `--socket <path>`. Or use `agentmonitors monitor test <path>` for a one-shot check."_ — rather
+  than a raw Node `connect ENOENT …`. Exits 1.
 
 A daemon-side **application** error (the daemon answered with an error) is **not** masked as "daemon
 not running": it is surfaced verbatim as `Explain failed: <message>` with exit code 1. Malformed
