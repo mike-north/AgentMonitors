@@ -8,6 +8,10 @@ import {
 } from '@agentmonitors/core';
 import { registerCoreSources } from '../sources.js';
 import { requireDirectory } from '../validation.js';
+import {
+  COMMAND_POLL_SCAFFOLD_WARNING,
+  isUntouchedCommandPollDefault,
+} from './scaffold-defaults.js';
 
 /**
  * Derive the monitor ID from a file path, mirroring the logic in parseMonitor
@@ -81,6 +85,10 @@ export const validateCommand = new Command('validate')
 
     // Validate watch.type names and per-source config against source-specific schemas
     const scopeErrors: { id: string; errors: string[] }[] = [];
+    // Soft warnings: advisory notes on a *valid* monitor (they never mark it
+    // invalid or change the exit code). Currently: a command-poll scaffold left
+    // at its untouched default `command:` (issue #388).
+    const warnings: { id: string; warning: string }[] = [];
     const validMonitors = result.monitors.filter((m) => {
       const sourceName = m.monitor.frontmatter.watch.type;
       const source = registry.get(sourceName);
@@ -108,6 +116,20 @@ export const validateCommand = new Command('validate')
       if (allScopeErrors.length > 0) {
         scopeErrors.push({ id: m.monitor.id, errors: allScopeErrors });
         return false;
+      }
+
+      // The monitor is valid, but a command-poll scaffold whose `command:` is
+      // still the untouched `init` default watches the wrong thing for any
+      // intent other than upstream-tip polling — flag it so a wrong-intent ship
+      // is caught instead of silently passing as configured (issue #388).
+      if (
+        sourceName === 'command-poll' &&
+        isUntouchedCommandPollDefault(watchConfig['command'])
+      ) {
+        warnings.push({
+          id: m.monitor.id,
+          warning: COMMAND_POLL_SCAFFOLD_WARNING,
+        });
       }
       return true;
     });
@@ -148,6 +170,9 @@ export const validateCommand = new Command('validate')
         })),
         duplicateIds: result.duplicateIds,
         errors: allErrors,
+        // Additive, non-fatal advisories (issue #388). Empty when none apply;
+        // existing consumers that ignore unknown keys are unaffected.
+        warnings,
       };
       console.log(JSON.stringify(output, null, 2));
     } else {
@@ -162,6 +187,13 @@ export const validateCommand = new Command('validate')
         console.log(`\nInvalid monitors: ${String(allErrors.length)}`);
         for (const e of allErrors) {
           console.log(`  ${e.filePath}: ${e.error}`);
+        }
+      }
+
+      if (warnings.length > 0) {
+        console.log(`\nWarnings: ${String(warnings.length)}`);
+        for (const w of warnings) {
+          console.log(`  ${w.id}: ${w.warning}`);
         }
       }
 

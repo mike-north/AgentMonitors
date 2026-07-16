@@ -120,14 +120,15 @@ const GLOB_FIELD_BY_TYPE: Partial<Record<string, 'globs' | 'paths'>> = {
  * normal CLI error (message + exit code 1), not a stack trace. */
 class InitSeedError extends Error {}
 
-/** Seed values from `--glob`/`--name`/`--urgency`, threaded into the
- * generated frontmatter value-preserving (issue #330). Only the named `init <name>`
- * scaffold path consumes these; the bare bootstrap form ignores them
- * (non-goal). */
+/** Seed values from `--glob`/`--name`/`--urgency`/`--command`, threaded into
+ * the generated frontmatter value-preserving (issues #330, #388). Only the named
+ * `init <name>` scaffold path consumes these; the bare bootstrap form ignores
+ * them (non-goal). */
 interface SeedOptions {
   name?: string;
   urgency?: string;
   globs?: string[];
+  command?: string[];
 }
 
 /**
@@ -217,15 +218,51 @@ function seedGlobs(template: string, type: string, globs: string[]): string {
 }
 
 /**
- * Apply `--glob`/`--name`/`--urgency` seed overrides to a template, in
- * frontmatter-field order. A `SeedOptions` with all fields `undefined`
- * returns `template` unchanged. As of issue #375, the named scaffold path's
- * caller always passes a `name` seed (the `--name` value, or one derived
- * from the positional `<name>` when `--name` is omitted), so a zero-flag
- * `init <name>` no longer returns the raw template byte-for-byte — only its
- * `name:` line differs from the template default. The bare bootstrap path
- * never calls this with a `name` seed, so its scaffolded templates are
- * unaffected (non-goal, issue #330).
+ * Replace the command-poll template's `command:` argv list with the seeded
+ * tokens. Throws {@link InitSeedError} for any type other than `command-poll`
+ * (only that template has a `command:` argv block), mirroring {@link seedGlobs}.
+ *
+ * Each token is emitted as a single-quoted YAML scalar so argv tokens that are
+ * not plain scalars — a leading `-`/`--` like `--porcelain`, embedded spaces,
+ * `#`, `:` — round-trip verbatim. Quoting also means seeding never invents shell
+ * semantics: each `--command` token is one argv element, matching the
+ * "argv array, run directly (no shell)" contract (spec 003 §"command-poll").
+ */
+function seedCommand(
+  template: string,
+  type: string,
+  command: string[],
+): string {
+  if (type !== 'command-poll') {
+    throw new InitSeedError(
+      `--command is not supported for --type ${type} (only command-poll has a command: argv array)`,
+    );
+  }
+  // Same block-replacement shape as seedGlobs: match the `command:` key line,
+  // capture its indent and the list-item indent from the template's own first
+  // item, then replace the whole item run with the seeded tokens.
+  const blockPattern = /^( *)command:\n(( +)- .*\n)(?:\3- .*\n)*/m;
+  return template.replace(
+    blockPattern,
+    (_match, indent: string, _first: string, itemIndent: string) => {
+      const listBlock = command
+        .map((token) => `${itemIndent}- ${yamlSingleQuoted(token)}`)
+        .join('\n');
+      return `${indent}command:\n${listBlock}\n`;
+    },
+  );
+}
+
+/**
+ * Apply `--glob`/`--name`/`--urgency`/`--command` seed overrides to a
+ * template, in frontmatter-field order. A `SeedOptions` with all fields
+ * `undefined` returns `template` unchanged. As of issue #375, the named
+ * scaffold path's caller always passes a `name` seed (the `--name` value, or
+ * one derived from the positional `<name>` when `--name` is omitted), so a
+ * zero-flag `init <name>` no longer returns the raw template byte-for-byte —
+ * only its `name:` line differs from the template default. The bare
+ * bootstrap path never calls this with a `name` seed, so its scaffolded
+ * templates are unaffected (non-goal, issue #330).
  */
 function applySeeds(
   template: string,
@@ -238,11 +275,20 @@ function applySeeds(
   if (seeds.globs !== undefined && seeds.globs.length > 0) {
     result = seedGlobs(result, type, seeds.globs);
   }
+  if (seeds.command !== undefined && seeds.command.length > 0) {
+    result = seedCommand(result, type, seeds.command);
+  }
   return result;
 }
 
 /** Commander `.option()` collector for repeatable `--glob <pattern>`. */
 function collectGlob(value: string, previous: string[]): string[] {
+  return [...previous, value];
+}
+
+/** Commander `.option()` collector for repeatable `--command <token>`; each
+ * occurrence appends one argv token to `watch.command` (order-preserving). */
+function collectCommand(value: string, previous: string[]): string[] {
   return [...previous, value];
 }
 
@@ -608,6 +654,12 @@ export const initCommand = new Command('init')
     [],
   )
   .option(
+    '--command <token>',
+    'Seed watch.command (command-poll) argv, one token per flag; repeatable. Scaffold form only.',
+    collectCommand,
+    [],
+  )
+  .option(
     '--name <name>',
     'Seed the frontmatter name: field (distinct from the positional <name>, which sets the directory). Defaults to a readable form of the positional <name>. Scaffold form only.',
   )
@@ -626,6 +678,7 @@ export const initCommand = new Command('init')
         enableOnly?: boolean;
         yes?: boolean;
         glob: string[];
+        command: string[];
         name?: string;
         urgency?: string;
       },
@@ -650,6 +703,7 @@ export const initCommand = new Command('init')
             ? { urgency: options.urgency }
             : {}),
           ...(options.glob.length > 0 ? { globs: options.glob } : {}),
+          ...(options.command.length > 0 ? { command: options.command } : {}),
         };
         let result: ScaffoldResult;
         try {
