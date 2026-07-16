@@ -1674,19 +1674,47 @@ wrongly attract future read-only-inspector behavior; its true kin is the workspa
 ### Usage
 
 ```
-agentmonitors verify [monitor] [--dir <path>] [--workspace <path>] [--manual]
+agentmonitors verify [monitor] [--dir <path>] [--workspace <path>]
+                      [--manual | --trigger-cmd <shell>]
                       [--use-workspace-daemon] [--timeout-ms <ms>] [--format <text|json>]
 ```
 
-| Flag                     | Default                        | Description                                                                                                                                                                           |
-| ------------------------ | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `[monitor]`              | the sole monitor, if exactly 1 | Monitor id to verify. Omitting it with 0 or >1 monitors is a setup error naming the choices.                                                                                          |
-| `--dir <path>`           | `<workspace>/.claude/monitors` | Directory containing monitor definitions.                                                                                                                                             |
-| `--workspace <path>`     | current working dir            | Workspace path; resolved to an absolute path (same as `doctor`).                                                                                                                      |
-| `--manual`               | off (auto-trigger)             | Skip the auto-trigger; prompt the operator to make the change and watch for it (for sources `verify` can't fabricate a change for).                                                   |
-| `--use-workspace-daemon` | off (isolated)                 | Run against the workspace's real daemon/db (booting a detached one if needed) and **leave it running**, so a follow-up `doctor` reflects the delivery. Requires an enabled workspace. |
-| `--timeout-ms <ms>`      | derived (see Budget)           | Override the **post-trigger** detection budget, in milliseconds (matches the `--poll-ms` / `--reap-after-ms` unit-suffixed convention).                                               |
-| `--format <format>`      | `text`                         | Output format: `text`, `json`.                                                                                                                                                        |
+| Flag                     | Default                        | Description                                                                                                                                                                                                                                                                                                      |
+| ------------------------ | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `[monitor]`              | the sole monitor, if exactly 1 | Monitor id to verify. Omitting it with 0 or >1 monitors is a setup error naming the choices.                                                                                                                                                                                                                     |
+| `--dir <path>`           | `<workspace>/.claude/monitors` | Directory containing monitor definitions.                                                                                                                                                                                                                                                                        |
+| `--workspace <path>`     | current working dir            | Workspace path; resolved to an absolute path (same as `doctor`).                                                                                                                                                                                                                                                 |
+| `--manual`               | off (auto-trigger)             | Skip the auto-trigger; prompt the operator to make the change and watch for it (for sources `verify` can't fabricate a change for). **Blocks and does not read stdin** — see "Trigger modes". Mutually exclusive with `--trigger-cmd`.                                                                           |
+| `--trigger-cmd <shell>`  | off (auto-trigger)             | **Decoupled trigger.** After baseline, `verify` runs this shell command itself (via `/bin/sh -c`, `cwd` = the workspace) to cause the watched change, then observes/materializes/delivers. One self-contained, non-interactive run for a source `verify` can't auto-trigger. Mutually exclusive with `--manual`. |
+| `--use-workspace-daemon` | off (isolated)                 | Run against the workspace's real daemon/db (booting a detached one if needed) and **leave it running**, so a follow-up `doctor` reflects the delivery. Requires an enabled workspace.                                                                                                                            |
+| `--timeout-ms <ms>`      | derived (see Budget)           | Override the **post-trigger** detection budget, in milliseconds (matches the `--poll-ms` / `--reap-after-ms` unit-suffixed convention).                                                                                                                                                                          |
+| `--format <format>`      | `text`                         | Output format: `text`, `json`.                                                                                                                                                                                                                                                                                   |
+
+### Trigger modes
+
+`verify` produces the observable change in exactly one of three ways, resolved from the flags:
+
+- **`auto`** (default) — `verify` fabricates the change (file-fingerprint scratch file / restored
+  edit; step 5 below). Only file-fingerprint can be auto-triggered.
+- **`command`** (`--trigger-cmd '<shell>'`) — `verify` runs the operator's shell command itself,
+  after baseline, to cause the change. This makes a **non-auto-triggerable** source
+  (`command-poll`, `api-poll`, `schedule`, `incoming-changes`) verifiable in a **single,
+  self-contained, non-interactive invocation** — the case an agent harness that runs one shell
+  command per tool call (call-and-return) cannot drive with `--manual`, since `--manual` blocks and
+  has no stdin for a second interleaved command. The command runs through a shell with `cwd` = the
+  workspace (so e.g. `--trigger-cmd 'touch new-file.txt'` lands where the monitor watches). Its
+  effects are **not reverted** (an arbitrary command has no known inverse — unlike the fabricated
+  auto-trigger scratch file); pick a command whose residue is acceptable. A non-zero exit is a
+  **`setup`** failure on the `trigger` stage (fix the command, not the monitor), distinct from a
+  `no-change` verdict (the command ran but changed nothing the monitor observes).
+- **`manual`** (`--manual`) — `verify` **blocks** for the detect budget while the operator makes the
+  change out-of-band, then watches for it. It is **not** an interactive stdin prompt (no readline):
+  a human switches windows and edits a file; a persistent-shell agent backgrounds the run and makes
+  the change in a separate step. A call-and-return agent that runs `--manual` in the foreground has
+  no way to make the change while it blocks, so it should use `--trigger-cmd` instead (the
+  `budget-exceeded` FAIL message says as much).
+
+`--manual` and `--trigger-cmd` are mutually exclusive; passing both is a setup error.
 
 ### What it does
 
@@ -1704,9 +1732,11 @@ agentmonitors verify [monitor] [--dir <path>] [--workspace <path>] [--manual]
    match for every pattern: a glob whose **filename segment itself is a wildcard** (`file-?.md`,
    `data-[0-9].json`) or whose only variability is a **wildcard directory with a literal filename**
    has no derivable sibling the scratch file would match, so the trigger produces no observable
-   change and `verify` fails fast (`no-change` / `no-files-matched`) pointing at `--manual`. `--manual`
-   (and any source `verify` can't fabricate a change for) prints a "make your change now" prompt and
-   watches instead. The scratch file / edit is reverted on exit **and** on SIGINT/SIGTERM.
+   change and `verify` fails fast (`no-change` / `no-files-matched`) pointing at `--manual`. For a
+   source `verify` can't fabricate a change for, `--trigger-cmd '<shell>'` has `verify` run the
+   change itself (the **command** trigger mode above), and `--manual` blocks and watches for an
+   out-of-band change instead. The scratch file / edit is reverted on exit **and** on SIGINT/SIGTERM;
+   a `--trigger-cmd`'s effects are not (an arbitrary command has no known inverse).
 6. **Observe.** Poll observation history for a **post-trigger** outcome. A `triggered` row is
    success. A `no-files-matched` row (glob matched zero files) is always a **fail-fast**. A
    `no-change` row normally means the trigger did nothing (**fail fast**, point at `--manual`) —
