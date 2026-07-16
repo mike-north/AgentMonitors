@@ -584,11 +584,10 @@ export class RuntimeStore {
    * mid-wait and silently losing the finishing event. A crashed session stops
    * declaring, so its newest declaration ages out and cleanup still bounds.
    *
-   * TODO(dormancy vs long-running-wait): this only extends coverage by one
-   * dormancy window past the newest declaration; a wait longer than the window
-   * is still reaped. Whether a live session should hold its watches for an
-   * arbitrarily long blocking wait is an open spec decision — see follow-up
-   * issue (placeholder, to be updated).
+   * TODO(#396): this only extends coverage by one dormancy window past the
+   * newest declaration; a wait longer than the window is still reaped. Whether a
+   * live session should hold its watches for an arbitrarily long blocking wait is
+   * an open spec decision — tracked by issue #396 (dormancy vs long-running-wait).
    */
   staleActiveSessions(
     workspacePath: string | null,
