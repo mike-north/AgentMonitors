@@ -1492,9 +1492,16 @@ h3 {
 }
 .quick-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  /* minmax(0, 1fr) — a bare 1fr floors at min-content, so the terminal
+     column's long lines would starve the prose column and collapse it to
+     one-word-per-line. Letting both tracks shrink below content keeps the
+     50/50 split honest. Same fix as the before/after cards (#197). */
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: clamp(24px, 4vw, 56px);
   align-items: center;
+}
+.quick-grid > * {
+  min-width: 0;
 }
 @media (max-width: 860px) {
   .quick-grid {
