@@ -285,9 +285,137 @@ agentmonitors validate .claude/monitors
 
 Validation proves the file parses. It does **not** prove you'll be notified. Those are different
 claims — `monitor explain` can show a materialized event that was never delivered to a session.
-**The monitor is not done until you've proven a delivered event, end to end.** Use the recipe
-below; it works even outside a live Claude Code session, and it's host-agnostic (Phase 1c hosts
-can use it too, minus the automatic hook wiring).
+**The monitor is not done until you've proven a delivered event, end to end.**
+
+### Run `agentmonitors verify`
+
+```bash
+agentmonitors verify <monitor-id>
+```
+
+This is the whole proof in one command, and it's host-agnostic (Phase 1c hosts can use it too,
+minus the automatic hook wiring): it boots an isolated daemon on a throwaway socket and database,
+registers a throwaway session, triggers a real change, waits for the event to materialize, and
+claims it through the same delivery path a live hook uses — then tears everything down. Check the
+exit code: `0` means PASS, non-zero means FAIL with the failing stage named directly. Prefer
+`--format json` if you want to branch on the result programmatically instead of parsing text (spec
+005 §16 documents the stable JSON shape: `ok`, `stages`, `failure`, `additionalContext`).
+
+**Auto-trigger only covers `file-fingerprint`** — and even then, only globs with a derivable
+matching sibling path (a glob whose filename segment is itself a wildcard, e.g. `file-?.md`, has
+none). For every other source — `api-poll`, `command-poll`, `schedule`, `incoming-changes` — pass
+`--manual`:
+
+```bash
+agentmonitors verify <monitor-id> --manual
+```
+
+`--manual` makes `verify` prompt you to make the watched change yourself, then watch for it. **You
+still have to know what change actually registers as a change for that source** — see "Per-source
+trigger recipes" in the appendix below for the per-source-type gotchas (e.g. `file-fingerprint`
+needs a content change, not just a `touch`; `command-poll` diffs output between ticks; `schedule`
+needs a cron that fires soon).
+
+**If the user wants a stakeholder-presentable proof**, or you want the real workspace daemon left
+running afterward so a follow-up `agentmonitors doctor` also goes green, add
+`--use-workspace-daemon`. This requires the project to already be enabled (Phase 2) — it runs
+`verify` against the real workspace daemon/database instead of a throwaway one and leaves it
+running rather than tearing it down.
+
+**Success looks like** a `PASS` line, with a `deliver` stage reporting `claimed at
+turn-interruptible` (for `urgency: high`) or `claimed at post-compact` (`normal`/`low`), followed
+by the delivered `additionalContext` — that's exactly what a live hook would inject into the
+agent's next turn:
+
+```json
+{
+  "continue": true,
+  "hookSpecificOutput": {
+    "hookEventName": "UserPromptSubmit",
+    "additionalContext": "AgentMon: monitored changes are pending — consider handling them before continuing.\n\n### <your-monitor-id> (high)\n..."
+  }
+}
+```
+
+(That's the shape a live `UserPromptSubmit` hook receives; `verify`'s own PASS output prints the
+raw `additionalContext` text, not this wrapper.)
+
+If `verify` fails, the `FAIL` line names the stage and reason directly — don't guess from empty
+output the way the fully-manual recipe below forces you to:
+
+- `no-change` / `no-files-matched` means the trigger didn't do anything the source could detect
+  (e.g. a `touch` on a file whose content didn't change) — fix the trigger, don't retry hoping it
+  resolves itself.
+- `budget-exceeded` means the change was never detected within the derived wait budget —
+  `--timeout-ms` to extend it, or run `agentmonitors monitor explain <id>` to see where the
+  pipeline actually stalled.
+- `daemon-died` prints the daemon's own captured stderr — that's the real crash reason, not an
+  ambiguous timeout.
+
+For debugging an individual pipeline stage by hand, or a host without `agentmonitors verify`
+available, see "Appendix: Advanced — manual, host-agnostic verification" at the end of this
+document.
+
+---
+
+## Phase 6 — Debug loop
+
+If `agentmonitors verify` failed, its `FAIL` line and `--format json` output already name the
+stage and reason — that's usually enough. Its daemon and database are temporary and deleted on
+exit (unless you passed `--use-workspace-daemon`, in which case they're the real workspace ones
+and `monitor explain`/`doctor` already see them with no extra flags), so there's no state to
+inspect after a plain `verify` run beyond what it already printed. If you ran the appendix's fully
+manual recipe instead (which pins `AGENTMONITORS_DB` by hand), see that appendix's own debug notes
+for reading back its persisted state.
+
+When the user says "it didn't fire," don't guess — run:
+
+```bash
+agentmonitors monitor explain <id> --dir .claude/monitors
+```
+
+This reads persisted runtime state (recent observations, materialized events, session state)
+**directly from disk — no live daemon required.** It prints a status per pipeline stage, then a
+**Verdict** naming where the signal stopped:
+
+- `definition` — parse/schema/source config problem; edit `MONITOR.md`, then re-run `validate`.
+- `scheduling` — the daemon isn't running or the monitor isn't due yet; enable the project, start
+  a session, or check the interval/cron.
+- `observation` — the source ran but errored, rebaselined, or saw no change; inspect the
+  source-specific config and state.
+- `notify` — a debounce/throttle hold is in effect; wait, or adjust `notify:`.
+- `materialization` — the source observed a change but no event was written; inspect the
+  runtime error details in the output.
+- `delivery` — an event exists but no lead session is available, or it's already
+  unread/claimed/acknowledged.
+
+If `monitor explain`'s delivery verdict disagrees with what you expect, the authoritative check is
+`events list` — but note that **`events list` needs a reachable daemon** (unlike `monitor
+explain`, it has no offline fallback and errors if none is running):
+
+```bash
+agentmonitors session list                                            # find the AgentMon session id
+agentmonitors events list --session <agentmon-session-id> --unread    # requires a live daemon
+```
+
+Non-empty output confirms the event reached the session and is pending delivery — the `monitor
+explain` delivery verdict may simply be stale. If `events list` is also empty (once the daemon is
+confirmed running), the event never reached the session; work backward through the Verdict stages
+above.
+
+**`--unread` means unacknowledged, not "never seen."** It matches every event this session hasn't
+run `events ack` on yet — including one already surfaced once at a delivery lifecycle. Each row's
+`deliveryState` field (`unread`, `claimed`, or `acknowledged`) tells you which: `claimed` means the
+event already reached a hook delivery and is waiting on `events ack`, not stuck undelivered.
+
+---
+
+## Appendix: Advanced — manual, host-agnostic verification
+
+`agentmonitors verify` above covers the common case. This appendix drives the exact same
+daemon → session → event → delivery pipeline **by hand, one step at a time** — useful for
+debugging an individual pipeline stage, or a host without `agentmonitors verify` available. It
+works even outside a live Claude Code session.
 
 ### Why not just use `agentmonitors session start`?
 
@@ -298,7 +426,9 @@ recipe below instead, which pins everything to one daemon on one socket that nev
 
 ### Speed it up for the test
 
-Default poll interval is 30s (`file-fingerprint`, `command-poll`) or 5min (`api-poll`). For a
+`agentmonitors verify` derives its own poll budget automatically — this shortening step is only
+useful for the manual recipe below, which needs its poll loops sized by hand. Default poll
+interval is 30s (`file-fingerprint`, `command-poll`) or 5min (`api-poll`). For a
 verification pass only, shorten it in the `MONITOR.md` frontmatter, and restore the real value
 afterward. `file-fingerprint` takes the same `watch.interval` knob as `command-poll` — it isn't
 command-poll-only:
@@ -538,56 +668,16 @@ git commit -m "verify incoming-changes monitor" --no-gpg-sign
 
 ---
 
-## Phase 6 — Debug loop
+### Reading back the manual recipe's state
 
-If you just ran the Phase 5 isolated-socket recipe, `monitor explain` and `doctor` below
-auto-discover the *workspace's own* socket — falling back to the shared global default only when
-the workspace isn't enabled — so neither ever resolves the recipe's throwaway `$SOCKET`; that
-daemon is dead anyway once the recipe's step 6 (`kill "$DAEMON_PID"`) runs. A successful Phase 5
-run does not make these commands see anything live. What does survive is the SQLite file
-`AGENTMONITORS_DB` pointed at (`/tmp/agentmon-verify-<pid>.db`): both commands resolve their
-database via the `AGENTMONITORS_DB` environment variable, so pointing it at that same file — e.g.
-`AGENTMONITORS_DB=/tmp/agentmon-verify-<pid>.db agentmonitors monitor explain <id> --dir
-.claude/monitors` (or `monitor history`) — reads the persisted state from that run **in-process,
-no live daemon required.** Or move on to a real daemon on the workspace's own socket, before
-treating either command's output as evidence of a problem.
-
-When the user says "it didn't fire," don't guess — run:
-
-```bash
-agentmonitors monitor explain <id> --dir .claude/monitors
-```
-
-This reads persisted runtime state (recent observations, materialized events, session state)
-**directly from disk — no live daemon required.** It prints a status per pipeline stage, then a
-**Verdict** naming where the signal stopped:
-
-- `definition` — parse/schema/source config problem; edit `MONITOR.md`, then re-run `validate`.
-- `scheduling` — the daemon isn't running or the monitor isn't due yet; enable the project, start
-  a session, or check the interval/cron.
-- `observation` — the source ran but errored, rebaselined, or saw no change; inspect the
-  source-specific config and state.
-- `notify` — a debounce/throttle hold is in effect; wait, or adjust `notify:`.
-- `materialization` — the source observed a change but no event was written; inspect the
-  runtime error details in the output.
-- `delivery` — an event exists but no lead session is available, or it's already
-  unread/claimed/acknowledged.
-
-If `monitor explain`'s delivery verdict disagrees with what you expect, the authoritative check is
-`events list` — but note that **`events list` needs a reachable daemon** (unlike `monitor
-explain`, it has no offline fallback and errors if none is running):
-
-```bash
-agentmonitors session list                                            # find the AgentMon session id
-agentmonitors events list --session <agentmon-session-id> --unread    # requires a live daemon
-```
-
-Non-empty output confirms the event reached the session and is pending delivery — the `monitor
-explain` delivery verdict may simply be stale. If `events list` is also empty (once the daemon is
-confirmed running), the event never reached the session; work backward through the Verdict stages
-above.
-
-**`--unread` means unacknowledged, not "never seen."** It matches every event this session hasn't
-run `events ack` on yet — including one already surfaced once at a delivery lifecycle. Each row's
-`deliveryState` field (`unread`, `claimed`, or `acknowledged`) tells you which: `claimed` means the
-event already reached a hook delivery and is waiting on `events ack`, not stuck undelivered.
+This recipe's daemon is dead once its step 6 (`kill "$DAEMON_PID"`) runs, and its socket is
+invisible to `doctor`/`monitor explain` even while it's alive — those auto-discover the
+*workspace's own* socket (falling back to the shared global default only when the workspace isn't
+enabled), never this recipe's throwaway `$SOCKET`. What does survive is the SQLite file
+`AGENTMONITORS_DB` pointed at (`/tmp/agentmon-verify-<pid>.db`): `monitor explain` and `monitor
+history` both resolve their database via the `AGENTMONITORS_DB` environment variable, so pointing
+it at that same file — e.g. `AGENTMONITORS_DB=/tmp/agentmon-verify-<pid>.db agentmonitors monitor
+explain <id> --dir .claude/monitors` — reads the persisted state from that run **in-process, no
+live daemon required.** (`agentmonitors verify`'s own isolated daemon, by contrast, deletes its
+temp database on exit — there's nothing to read back after a plain `verify` run; its own PASS/FAIL
+output is the full record. See Phase 6 above for the general debug loop.)

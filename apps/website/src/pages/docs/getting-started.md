@@ -149,7 +149,7 @@ that wiring for you:
 
 ### First checkpoint: `agentmonitors doctor`
 
-Before running the full verification below, get a fast read on what's wired up and what isn't:
+Before verifying end-to-end delivery, get a fast read on what's wired up and what isn't:
 
 ```bash
 agentmonitors doctor
@@ -158,23 +158,86 @@ agentmonitors doctor
 It runs a handful of named checks — project enabled, monitors valid, daemon reachable, a lead
 session registered, plus a per-monitor rollup — and tells you exactly which stage is missing. It's
 normal to see several checks fail right now (you haven't enabled the project or started a daemon
-yet); re-run it after each step below to watch them turn green.
-
-That holds through steps (a) and (b) below, but not through step (c): the recipe's daemon runs on
-an isolated, throwaway socket and database that `doctor` never looks at, so it won't turn green
-from step (c) succeeding. See the note at the end of "Prove it, right now" for how to check the
-real, default-socket setup.
+yet). The next section's default `agentmonitors verify` run won't turn these green either — by
+design it boots and tears down its own throwaway daemon that `doctor` never looks at. Pass
+`--use-workspace-daemon` (see below) if you want a `verify` run that also leaves `doctor` green
+afterward.
 
 ### Prove it, right now
 
-This drives the exact daemon → session → event → delivery pipeline the plugin drives automatically
-in a real session, using an explicit socket so nothing here depends on a live Claude Code session.
-Run every command from the project root.
+This is the check that actually matters: not "does the config parse" but "does my agent get
+notified." `agentmonitors verify` runs the whole daemon → session → trigger → event → delivery
+pipeline in one command and prints a single PASS or FAIL:
 
-> **One command instead of this recipe:** `agentmonitors verify` performs this whole
-> boot → trigger → deliver proof automatically (see the `verify` command reference, spec 005 §16).
-> This manual, socket-level walkthrough is the host-agnostic fallback that mirrors it — reach for it
-> when you want to see each pipeline stage by hand or `verify` isn't available.
+```bash
+agentmonitors verify my-first-monitor
+```
+
+`verify` boots an isolated daemon on a throwaway socket and database, registers a throwaway
+session, triggers a real change (for `file-fingerprint`, by writing a scratch file that matches
+the monitor's `watch.globs`), waits for the event to materialize, and claims it through the same
+delivery path a live hook would use — then tears everything down. There's no socket to pick, no
+database to scratch-isolate, no `trap` cleanup, and no poll loop to size by hand: `verify` derives
+its own wait budget from the monitor's own `watch.interval` and `notify.settle-for` and prints
+elapsed/ETA progress to stderr, so you're never left staring at silence (spec 005 §16, "Budget").
+
+**Success looks like:**
+
+```
+agentmonitors verify: my-first-monitor
+
+  ✓ daemon      booted on /tmp/agentmon-verify-xxxx.sock
+  ✓ session     registered lead session <id>
+  ✓ baseline    first observation recorded
+  ✓ trigger     wrote scratch file example.ts
+  ✓ observe     change detected (triggered)
+  ✓ materialize 1 unread event(s)
+  ✓ deliver     claimed at post-compact
+
+PASS  my-first-monitor delivers end-to-end (34.2s)
+
+Delivered additionalContext:
+  AgentMon: monitored changes are pending — consider handling them before continuing.
+
+  ### my-first-monitor
+  ...
+```
+
+Exit code `0` means PASS; a non-zero exit and a `FAIL` line name the exact stage that failed
+(`daemon`, `session`, `baseline`, `trigger`, `observe`, `materialize`, or `deliver`) instead of
+leaving you to guess from empty output. `--format json` prints the same result as a stable machine
+shape.
+
+A few flags worth knowing:
+
+- **`--manual`** — today only `file-fingerprint` gets a fabricated trigger, and only when its
+  glob has a derivable matching path. For any other source (or a `file-fingerprint` glob whose
+  filename segment is itself a wildcard, e.g. `file-?.md`), pass `--manual` and `verify` prompts
+  you to make the change yourself, then watches for it.
+- **`--use-workspace-daemon`** — for a proof you can screenshot for a stakeholder (e.g. showing a
+  reviewer that monitoring is actually wired up), add this flag. It runs `verify` against your
+  project's real daemon/database instead of a throwaway one, and leaves it running afterward, so a
+  follow-up `agentmonitors doctor` reflects the delivery directly instead of resolving a throwaway
+  isolated daemon. This requires the project to already be enabled — see **step (a)** in the
+  appendix below for the one-time opt-in.
+- **`--timeout-ms`** — overrides the derived post-trigger detection budget, if you need more time
+  than what `verify` estimates.
+
+See the `verify` command reference (spec 005 §16) for the full flag table.
+
+Once you're satisfied a monitor delivers, revert any `interval` / `settle-for` shortcuts you made
+just to speed up testing.
+
+---
+
+## Appendix: Advanced — manual, host-agnostic verification
+
+`agentmonitors verify` above covers the common case. This appendix drives the exact same
+daemon → session → event → delivery pipeline **by hand, one step at a time**, with an explicit
+socket so nothing here depends on a live Claude Code session or the workspace's own daemon. Reach
+for it when you want to inspect an individual pipeline stage, debug a `verify` failure at the
+protocol level, or work against a source `verify` can't auto-trigger without `--manual`. Run every
+command from the project root.
 
 **a. Enable the project.** This one-time, gitignored opt-in file is required — without it,
 `hook deliver` always emits nothing, even with `--socket`. Check `agentmonitors init --help` for
@@ -327,11 +390,10 @@ the real setup an actual agent session would use, start a daemon on the workspac
 (`agentmonitors daemon run` — no `--socket`) or open a live Claude Code session, then re-run
 `doctor`.
 
-**For a stakeholder-presentable proof** (e.g. showing a security reviewer that monitoring is
-actually wired up), don't screenshot the isolated-socket recipe's output — it's throwaway and
-proves the mechanism, not the live setup. Instead, start the workspace's own daemon
-(`agentmonitors daemon run`, no `--socket`) and screenshot `doctor`'s all-green summary alongside
-the `hook deliver` JSON from step 6 above.
+**For a stakeholder-presentable proof**, don't screenshot this appendix's isolated-socket output —
+it's throwaway and proves the mechanism, not the live setup. Use `agentmonitors verify
+--use-workspace-daemon` instead (see "Prove it, right now" above) and screenshot its PASS output
+alongside `doctor`'s all-green summary.
 
 For the same proof wired through the real Claude Code plugin instead of a manual socket, see
 [Notify your agent when a file changes](/docs/notify-when-a-file-changes).
@@ -344,9 +406,9 @@ Event inspection is session-scoped. After a session exists, pass its id explicit
 agentmonitors events list --session <session-id> --unread
 ```
 
-Step (c) above shows the session setup path. Use this command any time you want to inspect what a
-registered session still has unread; use `hook deliver` when you want to verify what the agent
-actually receives.
+The appendix's step (c) shows the session setup path. Use this command any time you want to
+inspect what a registered session still has unread; use `hook deliver` when you want to verify
+what the agent actually receives.
 
 ## Next steps
 
