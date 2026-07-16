@@ -22,7 +22,10 @@ independent usability-evaluation subjects hit this as their top blocker.
   entries never enter the matched-files set, so `docs/**` behaves as "every file under `docs/`,
   recursively" and no longer crashes. This is a **fix**, not a new contract: the intended behavior
   was always "hash the files a glob matches," and a directory was never meant to be treated as a
-  file to hash.
+  file to hash. `nodir` alone is incomplete: it is `lstat`-based, so a symlink whose target is a
+  directory survives it unfiltered. A second, `stat`-based (symlink-following) directory check
+  (`isDirectory`) now runs immediately before hashing each matched path, closing that gap so the
+  same `EISDIR` can't recur via a symlinked directory.
 - **003 §3.2 — clarification (current).** A glob that matches only directory entries (e.g. an empty
   directory watched with `**`) already fell into the existing `no-files-matched` outcome path once
   directory entries are filtered — this was already specified as a healthy non-error outcome, and no

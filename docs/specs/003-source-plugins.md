@@ -380,19 +380,28 @@ how often the daemon checks whether any monitor is due.
 ### 3.2 Behavior
 
 The source expands each glob pattern using `globSync` with `absolute: true` and **`nodir: true`**,
-so matched paths are always absolute files (never directory entries), then removes any paths
-matched by `ignore` (expanded with the same `nodir: true`). For each remaining matched file, it
-computes a SHA-256 hash using Node.js `crypto.createHash('sha256')`.
+then removes any paths matched by `ignore` (expanded with the same `nodir: true`). For each
+remaining matched path, it confirms the path is not a directory before computing a SHA-256 hash
+using Node.js `crypto.createHash('sha256')` — see below for why a second, stat-based check is
+needed in addition to `nodir: true`.
 
-**Directory entries are excluded from the matched set.** A globstar pattern such as `docs/**`
-matches the directory entry `docs/` itself, in addition to every path under it — this is `glob`'s
-documented globstar behavior, not a bug in the pattern. Without `nodir: true`, the source would
-attempt to `fs.readFile` that directory entry and crash with `EISDIR`. `nodir: true` filters
-directory entries out before fingerprinting, so `docs/**` behaves as "every file under `docs/`,
-recursively" — the natural reading of the pattern — and never crashes. This applies identically to
-`ignore` patterns. Verified: `plugins/source-file-fingerprint/src/index.ts` (`expandGlob`) and
-`plugins/source-file-fingerprint/src/index.test.ts` ("directory entries in glob matches (issue
-#377)").
+**Directory entries are excluded from the matched set, via two layers.** A globstar pattern such as
+`docs/**` matches the directory entry `docs/` itself, in addition to every path under it — this is
+`glob`'s documented globstar behavior, not a bug in the pattern. Without any filtering, the source
+would attempt to `fs.readFile` that directory entry and crash with `EISDIR`. The first layer,
+`nodir: true`, filters plain directory entries out at glob-expansion time, so `docs/**` behaves as
+"every file under `docs/`, recursively" — the natural reading of the pattern — for the common case.
+This applies identically to `ignore` patterns. However, `nodir` is `lstat`-based: a symlink whose
+target is a directory (e.g. `docs/generated -> ../build/docs`) reports as a symlink, not a
+directory, so it survives `nodir` and would still reach `fs.readFile` and crash with the same
+`EISDIR`. The second layer, a `stat`-based (i.e. symlink-following) directory check, runs
+immediately before hashing each surviving path and skips it if the real target is a directory. Only
+with both layers does the source never crash with `EISDIR` on a directory-shaped glob match.
+Verified: `plugins/source-file-fingerprint/src/index.ts` (`expandGlob` for the `nodir` layer;
+`isDirectory` for the follow-symlink layer) and `plugins/source-file-fingerprint/src/index.test.ts`,
+describe block "directory entries in glob matches (issue #377)" — tests "fingerprints only files
+under docs/\*\*, never the directory itself", "ignores directory entries matched by an ignore glob
+the same way", and "skips a symlink whose target is a directory, without crashing".
 
 If a run matches zero files — including a glob that matches **only** directory entries, e.g.
 `empty-dir/**` on a directory with no files in it — the source returns no observations and sets
