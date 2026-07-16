@@ -90,22 +90,43 @@ function runWithEnv(
   }
 }
 
+// Ambient environment keys stripped by `cleanEnv` before a caller's own
+// overrides are layered on top. Both vars can short-circuit the per-workspace
+// auto-discovery this CLI resolves by default (`resolveManualDaemonSocketPath`
+// / `resolveWorkspaceDbPath`) — a value inherited from the developer's shell
+// would make a "no explicit overrides" test silently exercise the override
+// path instead, or point a "isolated fakeHome" test at real on-disk state.
+const AMBIENT_KEYS_TO_STRIP = new Set([
+  'AGENTMONITORS_SOCKET',
+  'AGENTMONITORS_DB',
+]);
+
+/**
+ * Build a subprocess env with `AMBIENT_KEYS_TO_STRIP` removed from the
+ * inherited `process.env` before `env` (the caller's explicit overrides, if
+ * any) is layered on top. A caller that wants one of those keys set can still
+ * do so via `env` — only the *ambient/inherited* value is stripped.
+ */
+function cleanEnv(env: Record<string, string>): Record<string, string> {
+  return {
+    ...Object.fromEntries(
+      Object.entries(process.env).filter(
+        ([key, value]) =>
+          value !== undefined && !AMBIENT_KEYS_TO_STRIP.has(key),
+      ) as [string, string][],
+    ),
+    ...env,
+  };
+}
+
 function runWithCleanEnv(
   args: string[],
   env: Record<string, string>,
   cwd?: string,
 ): RunResult {
-  const strippedKeys = new Set(['AGENTMONITORS_SOCKET']);
   const opts: ExecFileSyncOptions = {
     encoding: 'utf-8',
-    env: {
-      ...Object.fromEntries(
-        Object.entries(process.env).filter(
-          ([key, value]) => value !== undefined && !strippedKeys.has(key),
-        ) as [string, string][],
-      ),
-      ...env,
-    },
+    env: cleanEnv(env),
     cwd,
   };
   try {
@@ -3608,15 +3629,75 @@ This monitor fires on a schedule.
     );
 
     expect(result.exitCode).toBe(1);
-    // Actionable remediation, not a raw Node connect error.
+    // Actionable remediation, not a raw Node connect error. `dir` is never
+    // enabled (no `.claude/agentmonitors.local.md`), so
+    // `resolveManualDaemonSocketPath` never derived a workspace-scoped
+    // socket — the neutral "default socket" wording is the accurate one here
+    // (issue #374 review follow-up); see the sibling "IS enabled" test below
+    // for the "for this workspace" wording.
+    expect(result.stderr).toContain('No daemon running at the default socket');
+    expect(result.stderr).not.toContain('No daemon running for this workspace');
     expect(result.stderr).toContain('agentmonitors daemon run');
     expect(result.stderr).toContain('monitor test');
+    // Names --socket as the override for a socket mismatch (issue #374).
+    expect(result.stderr).toContain('--socket');
     expect(result.stderr).not.toContain('ENOENT');
     expect(result.stderr).not.toContain('.sock');
     // The remediation (not the no-daemon banner) is what appears.
     expect(result.stdout).not.toContain(
       'No daemon running — showing persisted state',
     );
+  });
+
+  it('explain with the daemon down and NOTHING persisted names the workspace when it IS enabled (case C, issue #374 review follow-up)', () => {
+    const dir = path.join(tempDir, 'explain-nodaemon-empty-enabled');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    const monitorsDir = path.join(monitorsRoot, 'fires');
+    mkdirSync(monitorsDir, { recursive: true });
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      FIRING_MONITOR,
+      'utf-8',
+    );
+
+    const dbPath = path.join(dir, 'empty.db');
+    const socketPath = deadSocketPath('explain-empty-enabled');
+    // Enable the workspace and let its persisted socket be used FLAGLESS (no
+    // --socket flag) — this is the one case where
+    // `resolveManualDaemonSocketPath` really did derive a workspace-scoped
+    // socket, so "for this workspace" is accurate.
+    writeLocalState(dir, {
+      enabled: true,
+      socket: socketPath,
+      db: dbPath,
+      reapAfterMs: 5_000,
+    });
+    const env = { AGENTMONITORS_DB: dbPath };
+
+    const result = runWithCleanEnv(
+      [
+        'monitor',
+        'explain',
+        'fires',
+        '--dir',
+        monitorsRoot,
+        '--workspace',
+        dir,
+      ],
+      env,
+      dir,
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('No daemon running for this workspace');
+    expect(result.stderr).not.toContain(
+      'No daemon running at the default socket',
+    );
+    expect(result.stderr).toContain('agentmonitors daemon run');
+    expect(result.stderr).toContain('monitor test');
+    expect(result.stderr).toContain('--socket');
+    expect(result.stderr).not.toContain('ENOENT');
+    expect(result.stderr).not.toContain('.sock');
   });
 
   it('explain with the daemon down surfaces a definition failure directly (no banner, no remediation) when the monitor is not found (case A, Copilot review id=3415776081)', () => {
@@ -3744,10 +3825,155 @@ This monitor fires on a schedule.
     );
 
     expect(result.exitCode).toBe(1);
+    // `dir` is never enabled (no `.claude/agentmonitors.local.md`), so the
+    // neutral "default socket" wording is accurate here (issue #374 review
+    // follow-up); see the sibling "IS enabled" test below for the
+    // "for this workspace" wording.
+    expect(result.stderr).toContain('No daemon running at the default socket');
+    expect(result.stderr).not.toContain('No daemon running for this workspace');
     expect(result.stderr).toContain('agentmonitors daemon run');
     expect(result.stderr).toContain('monitor test');
+    // Names --socket as the override for a socket mismatch (issue #374).
+    expect(result.stderr).toContain('--socket');
     expect(result.stderr).not.toContain('ENOENT');
     expect(result.stderr).not.toContain('.sock');
+  });
+
+  it('history with the daemon down and NOTHING persisted names the workspace when it IS enabled (issue #374 review follow-up)', () => {
+    const dir = path.join(tempDir, 'history-nodaemon-empty-enabled');
+    mkdirSync(dir, { recursive: true });
+    const dbPath = path.join(dir, 'empty.db');
+    const socketPath = deadSocketPath('history-empty-enabled');
+    // Enable the workspace and let its persisted socket be used FLAGLESS (no
+    // --socket flag) — the one case where `resolveManualDaemonSocketPath`
+    // really did derive a workspace-scoped socket.
+    writeLocalState(dir, {
+      enabled: true,
+      socket: socketPath,
+      db: dbPath,
+      reapAfterMs: 5_000,
+    });
+    const env = { AGENTMONITORS_DB: dbPath };
+
+    const result = runWithCleanEnv(
+      ['monitor', 'history', '--workspace', dir],
+      env,
+      dir,
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('No daemon running for this workspace');
+    expect(result.stderr).not.toContain(
+      'No daemon running at the default socket',
+    );
+    expect(result.stderr).toContain('agentmonitors daemon run');
+    expect(result.stderr).toContain('monitor test');
+    expect(result.stderr).toContain('--socket');
+    expect(result.stderr).not.toContain('ENOENT');
+    expect(result.stderr).not.toContain('.sock');
+  });
+
+  // Issue #374 review follow-up: every fallback test above sets
+  // AGENTMONITORS_DB, which resolveWorkspaceDbPath short-circuits on before
+  // ever consulting workspace state (workspace-db-path.ts) — so none of them
+  // would fail if the workspace-resolved dbPath argument threaded into
+  // explainMonitorInProcess/listObservationHistoryInProcess were reverted to
+  // the bare global default. This test enables the workspace WITHOUT an
+  // explicit `db:`, persists real state into the DERIVED per-workspace db via
+  // `daemon once`, kills any daemon, and reads it back with NO
+  // AGENTMONITORS_DB anywhere — which only succeeds if the fallback resolves
+  // dbPath from the workspace.
+  it('history and explain fallback reads the WORKSPACE-resolved db (not the bare global default) with no AGENTMONITORS_DB set', () => {
+    const dir = path.join(tempDir, 'fallback-workspace-db-threading');
+    const monitorId = 'fires';
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    const monitorsDir = path.join(monitorsRoot, monitorId);
+    mkdirSync(monitorsDir, { recursive: true });
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      FIRING_MONITOR,
+      'utf-8',
+    );
+
+    // Isolated fake HOME + pinned XDG_DATA_HOME (workspacePaths() prefers it
+    // over HOME) so the derived per-workspace db lands under a directory this
+    // test controls and cleans up, never the developer's real data dir.
+    const fakeHome = mkdtempSync(
+      path.join(tmpdir(), 'agentmon-374-fallback-home-'),
+    );
+    const xdgDataHome = path.join(fakeHome, '.local', 'share');
+    // Enabled, but deliberately NO `db:` value — resolveWorkspaceDbPath must
+    // fall to the DERIVED per-workspace db (workspacePaths(dir).db), the exact
+    // path this test proves the fallback actually reads.
+    const socketPath = deadSocketPath('fallback-workspace-db');
+    writeLocalState(dir, {
+      enabled: true,
+      socket: socketPath,
+      reapAfterMs: 5_000,
+    });
+    // Deliberately NO AGENTMONITORS_DB anywhere below — resolveWorkspaceDbPath
+    // short-circuits on it before ever consulting workspace state, which is
+    // exactly what let the bug this test guards against hide behind every
+    // other fallback test.
+    const env = { HOME: fakeHome, XDG_DATA_HOME: xdgDataHome };
+
+    try {
+      // Persist real state into the workspace-derived db via `daemon once`,
+      // which resolves its own dbPath the identical way (daemon.ts).
+      const once = runWithCleanEnv(
+        ['daemon', 'once', monitorsRoot, '--workspace', dir],
+        env,
+        dir,
+      );
+      expect(once.exitCode).toBe(0);
+      expect(once.stdout).toContain('emitted 1 event(s)');
+
+      // `socketPath` above was never bound to anything — no live daemon.
+      const historyResult = runWithCleanEnv(
+        [
+          'monitor',
+          'history',
+          monitorId,
+          '--workspace',
+          dir,
+          '--format',
+          'json',
+        ],
+        env,
+        dir,
+      );
+      expect(historyResult.exitCode).toBe(0);
+      expect(historyResult.stderr).not.toContain('No daemon running');
+      const rows = JSON.parse(historyResult.stdout) as { monitorId: string }[];
+      expect(rows.some((r) => r.monitorId === monitorId)).toBe(true);
+
+      const explainResult = runWithCleanEnv(
+        [
+          'monitor',
+          'explain',
+          monitorId,
+          '--dir',
+          monitorsRoot,
+          '--workspace',
+          dir,
+          '--format',
+          'json',
+        ],
+        env,
+        dir,
+      );
+      expect(explainResult.exitCode).toBe(0);
+      const report = JSON.parse(explainResult.stdout) as {
+        notice?: string;
+        events: unknown[];
+      };
+      // The persisted-state fallback banner, not the "nothing persisted"
+      // remediation — proves it found the real event `daemon once` recorded.
+      expect(report.notice).toContain('No daemon running');
+      expect(report.events.length).toBeGreaterThan(0);
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
   });
 });
 
@@ -4184,7 +4410,7 @@ describe('daemon run/once workspace-scoped defaulting (issue #335)', () => {
     return new Promise((resolve, reject) => {
       const child = spawn('node', [CLI_PATH, ...args], {
         cwd,
-        env: { ...process.env, ...env },
+        env: cleanEnv(env),
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       let stdout = '';
@@ -4244,12 +4470,17 @@ This monitor fires on a schedule.
 
     const fakeHome = mkdtempSync(path.join(tmpdir(), 'agentmon-335-home-'));
     // Deliberately NO AGENTMONITORS_DB / AGENTMONITORS_SOCKET anywhere below —
-    // that is the exact condition that reproduces the study's finding.
-    const env = { HOME: fakeHome };
+    // that is the exact condition that reproduces the study's finding. Pinning
+    // XDG_DATA_HOME under fakeHome (rather than leaving it to whatever the
+    // ambient shell has set, which `workspacePaths()` prefers over HOME) keeps
+    // every derived path — and this cleanup — confined to fakeHome regardless
+    // of the developer's real environment.
+    const xdgDataHome = path.join(fakeHome, '.local', 'share');
+    const env = { HOME: fakeHome, XDG_DATA_HOME: xdgDataHome };
 
     let daemonChild: ReturnType<typeof spawn> | undefined;
     try {
-      const initResult = runWithEnv(['init', '--enable-only'], env, dir);
+      const initResult = runWithCleanEnv(['init', '--enable-only'], env, dir);
       expect(initResult.exitCode).toBe(0);
 
       const { child, socketPath } = await waitForDaemonListening(
@@ -4262,16 +4493,10 @@ This monitor fires on a schedule.
       // `daemon run` actually adopted the per-workspace convention rather than
       // merely happening to still work.
       expect(socketPath).not.toBe(
-        path.join(
-          fakeHome,
-          '.local',
-          'share',
-          'agentmonitors',
-          'agentmonitors.sock',
-        ),
+        path.join(xdgDataHome, 'agentmonitors', 'agentmonitors.sock'),
       );
 
-      const open = runWithEnv(
+      const open = runWithCleanEnv(
         [
           'session',
           'open',
@@ -4292,7 +4517,7 @@ This monitor fires on a schedule.
       };
       expect(session.status).toBe('active');
 
-      const list = runWithEnv(
+      const list = runWithCleanEnv(
         ['session', 'list', '--format', 'json'],
         env,
         dir,
@@ -4310,7 +4535,7 @@ This monitor fires on a schedule.
         ),
       ).toBe(true);
 
-      const status = runWithEnv(
+      const status = runWithCleanEnv(
         ['daemon', 'status', '--format', 'json'],
         env,
         dir,
@@ -4326,12 +4551,140 @@ This monitor fires on a schedule.
       // The actual regression: pre-fix, this reported "No lead session is
       // registered for this workspace" despite the three commands above all
       // agreeing the session is active.
-      const doctorResult = runWithEnv(['doctor'], env, dir);
+      const doctorResult = runWithCleanEnv(['doctor'], env, dir);
       expect(doctorResult.stdout).toContain('✓ lead-session');
       expect(doctorResult.stdout).not.toContain(
         'No lead session is registered',
       );
       expect(doctorResult.exitCode).toBe(0);
+    } finally {
+      daemonChild?.kill('SIGTERM');
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  // Issue #374: `monitor history` and `monitor explain` previously resolved
+  // their socket via the bare global default instead of
+  // `resolveManualDaemonSocketPath()`, so a daemon booted for this workspace
+  // (exactly as above) was invisible to them without an explicit --socket —
+  // even though `doctor`/`daemon status`/`session open` could already see it
+  // flagless. This proves both commands now agree with those three.
+  it('monitor history and monitor explain auto-discover the same per-workspace socket as doctor/daemon status/session open, flagless', async () => {
+    const dir = path.join(tempDir, 'issue-374-unified-defaults');
+    const monitorId = 'heartbeat';
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    const monitorDir = path.join(monitorsRoot, monitorId);
+    mkdirSync(monitorDir, { recursive: true });
+    writeFileSync(
+      path.join(monitorDir, 'MONITOR.md'),
+      `---
+name: Heartbeat
+watch:
+  type: schedule
+  cron: '* * * * *'
+  timezone: UTC
+urgency: normal
+---
+This monitor fires on a schedule.
+`,
+      'utf-8',
+    );
+
+    const fakeHome = mkdtempSync(path.join(tmpdir(), 'agentmon-374-home-'));
+    // Deliberately NO AGENTMONITORS_DB / AGENTMONITORS_SOCKET / --socket
+    // anywhere below — that is the exact condition the issue reports. Pinning
+    // XDG_DATA_HOME under fakeHome (which `workspacePaths()` prefers over
+    // HOME) and using `runWithCleanEnv`/a cleaned daemon spawn env for every
+    // process keeps this test hermetic: without both, an ambient
+    // AGENTMONITORS_SOCKET/AGENTMONITORS_DB or XDG_DATA_HOME in the developer's
+    // own shell would be inherited by the daemon *and* every client command
+    // alike, making the socket cross-check below pass via that shared
+    // override without ever exercising per-workspace auto-discovery, and
+    // could leak real daemon state outside fakeHome.
+    const xdgDataHome = path.join(fakeHome, '.local', 'share');
+    const env = { HOME: fakeHome, XDG_DATA_HOME: xdgDataHome };
+
+    let daemonChild: ReturnType<typeof spawn> | undefined;
+    try {
+      const initResult = runWithCleanEnv(['init', '--enable-only'], env, dir);
+      expect(initResult.exitCode).toBe(0);
+
+      // --poll-ms speeds up the tick loop for the test; it does not affect
+      // socket resolution, which is what this test is verifying.
+      const { child, socketPath } = await waitForDaemonListening(
+        ['daemon', 'run', monitorsRoot, '--poll-ms', '200'],
+        env,
+        dir,
+      );
+      daemonChild = child;
+
+      // Wait for a tick to materialize observation history (cron
+      // '* * * * *' is due every tick).
+      let historyResult = runWithCleanEnv(
+        ['monitor', 'history', '--format', 'json'],
+        env,
+        dir,
+      );
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        if (historyResult.exitCode === 0) {
+          const rows = JSON.parse(historyResult.stdout) as {
+            monitorId: string;
+          }[];
+          if (rows.some((r) => r.monitorId === monitorId)) break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        historyResult = runWithCleanEnv(
+          ['monitor', 'history', '--format', 'json'],
+          env,
+          dir,
+        );
+      }
+
+      // The actual regression: pre-fix, this failed with "No daemon running
+      // and no persisted state to show" despite `daemon status`/`doctor`
+      // seeing the same live daemon from this workspace with no flags.
+      expect(historyResult.exitCode).toBe(0);
+      expect(historyResult.stderr).not.toContain('No daemon running');
+      const records = JSON.parse(historyResult.stdout) as {
+        monitorId: string;
+      }[];
+      expect(records.some((r) => r.monitorId === monitorId)).toBe(true);
+
+      const explainResult = runWithCleanEnv(
+        [
+          'monitor',
+          'explain',
+          monitorId,
+          '--dir',
+          monitorsRoot,
+          '--format',
+          'json',
+        ],
+        env,
+        dir,
+      );
+      expect(explainResult.exitCode).toBe(0);
+      expect(explainResult.stderr).not.toContain('No daemon running');
+      const report = JSON.parse(explainResult.stdout) as { notice?: string };
+      // A live daemon answered directly through the socket — no in-process
+      // fallback banner, unlike the no-daemon degraded path (issue #150).
+      expect(report.notice).toBeUndefined();
+
+      // Confirm `monitor history`/`monitor explain` are reaching the SAME
+      // daemon `daemon status` sees, not merely succeeding independently.
+      const statusResult = runWithCleanEnv(
+        ['daemon', 'status', '--format', 'json'],
+        env,
+        dir,
+      );
+      expect(statusResult.exitCode).toBe(0);
+      const status = JSON.parse(statusResult.stdout) as {
+        running: boolean;
+        socketPath: string;
+      };
+      expect(status.running).toBe(true);
+      expect(status.socketPath).toBe(socketPath);
     } finally {
       daemonChild?.kill('SIGTERM');
       rmSync(fakeHome, { recursive: true, force: true });
@@ -4360,13 +4713,20 @@ This monitor fires on a schedule.
     const fakeHome = mkdtempSync(
       path.join(tmpdir(), 'agentmon-335-once-home-'),
     );
-    const env = { HOME: fakeHome };
+    // Pin XDG_DATA_HOME under fakeHome (it takes priority over HOME in
+    // `workspacePaths()`) and use `runWithCleanEnv` so an ambient
+    // AGENTMONITORS_DB/AGENTMONITORS_SOCKET/XDG_DATA_HOME in the developer's
+    // own shell can't be inherited by either subprocess below.
+    const env = {
+      HOME: fakeHome,
+      XDG_DATA_HOME: path.join(fakeHome, '.local', 'share'),
+    };
 
     try {
-      const initResult = runWithEnv(['init', '--enable-only'], env, dir);
+      const initResult = runWithCleanEnv(['init', '--enable-only'], env, dir);
       expect(initResult.exitCode).toBe(0);
 
-      const once = runWithEnv(
+      const once = runWithCleanEnv(
         ['daemon', 'once', path.join(dir, '.claude', 'monitors')],
         env,
         dir,
@@ -4384,7 +4744,7 @@ This monitor fires on a schedule.
       // `os.tmpdir()`-derived string built in this process, so the two would
       // hash differently despite naming the same directory — doctor's own
       // subprocess is the correct oracle here, not a path built by this test.)
-      const doctorResult = runWithEnv(['doctor'], env, dir);
+      const doctorResult = runWithCleanEnv(['doctor'], env, dir);
       expect(doctorResult.stdout).toContain('✓ monitor:heartbeat');
       expect(doctorResult.stdout).not.toContain('never observed');
     } finally {

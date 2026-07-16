@@ -180,11 +180,20 @@ export async function daemonTickClient(
  * data is already in the DB (e.g. right after `daemon once`). This is the same
  * in-process pattern `daemon once` uses (see {@link daemonTickClient}): build a
  * runtime over the real store and call the core method directly. Issue #150.
+ *
+ * `dbPath` is the workspace-resolved database path ({@link
+ * resolveWorkspaceDbPath} in `workspace-db-path.ts`) — the SAME db `doctor`
+ * reads (issue #374). Required (not optional, matching {@link
+ * doctorReportInProcess}): every caller already has a workspace to resolve
+ * against, so an optional default here would only invite a caller to skip
+ * that resolution and silently fall back to the bare global default,
+ * disagreeing with `doctor`'s diagnosis of the same workspace.
  */
 export async function explainMonitorInProcess(
   input: MonitorExplainInput,
+  dbPath: string,
 ): Promise<MonitorExplainReport> {
-  const runtime = createRuntime();
+  const runtime = createRuntime(dbPath);
   return await runtime.explainMonitor(input);
 }
 
@@ -192,11 +201,20 @@ export async function explainMonitorInProcess(
  * Read observation history *in-process* from the persisted SQLite store,
  * bypassing the daemon socket. Fallback for {@link listObservationHistoryClient}
  * when the daemon is unreachable. Issue #150.
+ *
+ * `dbPath` is the workspace-resolved database path ({@link
+ * resolveWorkspaceDbPath} in `workspace-db-path.ts`) — the SAME db `doctor`
+ * reads (issue #374). Required (not optional, matching {@link
+ * doctorReportInProcess}): every caller already has a workspace to resolve
+ * against, so an optional default here would only invite a caller to skip
+ * that resolution and silently fall back to the bare global default,
+ * disagreeing with `doctor`'s diagnosis of the same workspace.
  */
 export function listObservationHistoryInProcess(
   query: ObservationHistoryQuery,
+  dbPath: string,
 ): ObservationHistoryRecord[] {
-  const runtime = createRuntime();
+  const runtime = createRuntime(dbPath);
   return runtime.listObservationHistory(query);
 }
 
