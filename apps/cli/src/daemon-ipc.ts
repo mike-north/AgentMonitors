@@ -158,7 +158,9 @@ const doctorReportParamsSchema = z.object({
   // Required (mirrors `DoctorReportInput.workspacePath`): a doctor report is
   // never workspace-unscoped (issue #373 — reading the live daemon's own
   // connection is the whole point of this method, so the caller must name the
-  // exact scope it wants, same as `monitor.explain`).
+  // exact scope it wants). Unlike `monitorExplainParamsSchema.workspacePath`
+  // above, which is optional and defaults internally, a live-daemon doctor
+  // read requires the caller to be explicit.
   workspacePath: z.string(),
   historyLimit: z.number().int().positive().optional(),
 });

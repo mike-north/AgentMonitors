@@ -4,6 +4,7 @@ import type {
   DeliveryClaim,
   DeliveryEventSummary,
   DeliveryLifecycle,
+  DoctorMonitorRollup,
   DoctorReportInput,
   EphemeralMonitorRecord,
   EventQuery,
@@ -299,7 +300,7 @@ const MONITOR_ROLLUP_DATE_FIELDS = [
   'lastObservedAt',
   'nextDueAt',
   'lastEventAt',
-] as const;
+] as const satisfies readonly (keyof DoctorMonitorRollup)[];
 
 /**
  * Reconstruct the `Date` fields {@link MonitorDoctorReport} promises, lost to
