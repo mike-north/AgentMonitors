@@ -40,6 +40,12 @@ export const schedulingDefaults = {
    * than `highUrgencyClaimSettleMs` (that one delays hook-surfacing after
    * materialization; this one delays materialization itself) — both happen to
    * default to 15s today, but they are independent knobs.
+   *
+   * MUST remain an exact multiple of 1000: `defaultNotifyConfigForUrgency`
+   * formats this value as a whole-second `settle-for` string (`${ms / 1000}s`)
+   * because `parseDuration`'s grammar (`notifier.ts`) has no sub-second unit —
+   * a non-multiple would format as e.g. `"15.5s"`, which `parseDuration` cannot
+   * parse and throws on. Pinned by `types.test.ts`.
    */
   highUrgencyDefaultDebounceSettleMs: 15_000,
 } as const;
