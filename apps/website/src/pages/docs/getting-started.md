@@ -255,7 +255,11 @@ done
 echo "$OUT"
 
 # 5. Simulate the UserPromptSubmit hook Claude Code sends on every turn. Empty
-# stdout means nothing was claimable yet, not an error — poll like step 4 does.
+# stdout usually means nothing was claimable yet — poll like step 4 does. But
+# empty stdout is also how several misconfigurations look (workspace not
+# enabled, daemon unreachable, ...), so if the loop never returns content, run
+# `agentmonitors hook deliver --debug` (writes a step-by-step diagnosis to
+# stderr) to tell the two apart.
 for i in $(seq 1 20); do
   OUT5=$(echo "{\"session_id\":\"$HOST_ID\",\"cwd\":\"$CWD\",\"hook_event_name\":\"UserPromptSubmit\"}" \
     | agentmonitors hook deliver --socket "$SOCKET")

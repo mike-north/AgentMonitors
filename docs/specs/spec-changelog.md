@@ -45,12 +45,14 @@ fires") verification recipes:
   `libs/core/src/runtime/service.ts`'s `scheduleForMonitor` (a monitor with no prior observation is
   always "due," so a source's very first tick runs immediately when the daemon starts, before
   waiting `--poll-ms`) and each bundled source's `observe()`: `file-fingerprint`, `api-poll`, and
-  `incoming-changes` — like `command-poll` — treat that first tick as a silent baseline (no
-  observation emitted); a change that lands before it completes is folded into the baseline and
-  never detected. `schedule` has no baseline concept. Both docs now state this per source and the
-  verify recipes wait one full poll interval after daemon start before triggering, for every source.
+  `incoming-changes` — like `command-poll` — treat that first tick as a silent baseline (no _change_
+  observation emitted; `command-poll` is a partial exception — a first-ever command that fails still
+  surfaces a health observation on that tick); a change that lands before it completes is folded
+  into the baseline and never detected. `schedule` has no baseline concept. Both docs now state this
+  per source and the verify recipes wait one full poll interval after daemon start before
+  triggering, for every source.
 - **The `hook deliver` step in the "Prove it" recipe was a single invocation**, not a retry loop,
-  even though a `high`-urgency monitor's ~15s claim-settle window (006, delivery lifecycle) makes an
+  even though a `high`-urgency monitor's ~15s claim-settle window (002 §9.1) makes an
   empty first result expected. It's now a retry loop mirroring the `events list` poll loop above it,
   confirmed against `apps/cli/src/commands/hook.ts` (`hook deliver` prints nothing at all —
   zero-byte stdout, not an empty JSON object — when nothing is yet claimable).

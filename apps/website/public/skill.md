@@ -347,8 +347,11 @@ echo "AgentMon session: $AGENTMON_SESSION_ID"
 #     anything. A monitor with no prior observation is always "due," so the
 #     daemon's first tick for it runs immediately at startup — before waiting
 #     --poll-ms — and every bundled source except `schedule` treats that first
-#     tick as a silent baseline (see "Per-source trigger recipes" below). This
-#     wait guarantees the baseline tick has already completed before step 3.
+#     tick as a silent baseline for *change* observations (see "Per-source
+#     trigger recipes" below; `command-poll` is a partial exception — a
+#     first-ever command that fails still surfaces a health observation on
+#     that tick). This wait guarantees the baseline tick has already
+#     completed before step 3.
 sleep 5
 
 # 3. Trigger the monitored condition (per-source recipes below).
@@ -364,8 +367,12 @@ done
 echo "$OUT"
 
 # 5. Simulate the UserPromptSubmit hook: claim any pending deliveries and
-#    confirm the agent would actually be notified. Empty stdout means nothing
-#    was claimable yet, not an error — poll the same way step 4 does.
+#    confirm the agent would actually be notified. Empty stdout usually means
+#    nothing was claimable yet — poll the same way step 4 does. But empty
+#    stdout is also how several misconfigurations look (workspace not
+#    enabled, daemon unreachable, ...), so if the loop never returns content,
+#    run `agentmonitors hook deliver --debug` (writes a step-by-step
+#    diagnosis to stderr) to tell the two apart.
 for i in $(seq 1 20); do
   OUT5=$(echo "{\"session_id\":\"$HOST_ID\",\"cwd\":\"$CWD\",\"hook_event_name\":\"UserPromptSubmit\"}" \
     | agentmonitors hook deliver --socket "$SOCKET")
@@ -400,9 +407,12 @@ measured from the event's own creation time before it will surface the event's b
 of your monitor's `notify.settle-for`. So for `high` urgency, budget roughly
 `interval + settle-for + 15s` before step 5's loop returns content — the 20 × 2s retry window above
 comfortably covers that. **Do not** change any files or re-open the session while you wait — that
-resets the condition you're trying to observe. A `normal`- or `low`-urgency monitor doesn't have
-this extra wait: `hook deliver` surfaces a reminder (not the full body) as soon as the event is
-unread.
+resets the condition you're trying to observe. A `normal`-urgency monitor doesn't have this extra
+wait: `hook deliver` surfaces a reminder (not the full body) as soon as the event is unread (002
+§9.2). `low` urgency is delivered only at the `turn-idle` lifecycle (002 §9.3, §13.2) — this
+recipe's step 5 sends `UserPromptSubmit`, which maps to `turn-interruptible` only, so it never
+exercises low-urgency delivery; expect step 5 to keep returning empty for a `low`-urgency
+monitor regardless of how long you wait.
 
 **This recipe's daemon is invisible to `doctor`.** Everything above runs against the explicit
 `$SOCKET` / `$AGENTMONITORS_DB`, never the *default* socket or database that `agentmonitors doctor`
@@ -417,14 +427,17 @@ the setup a real agent session would actually use, start a daemon on the default
 A monitor with no prior observation is always "due," so the daemon's very first tick for it runs
 immediately at startup — before waiting `--poll-ms` at all. `file-fingerprint`, `api-poll`,
 `command-poll`, and `incoming-changes` all treat that first tick as a **silent baseline**: whatever
-state exists at that moment becomes the reference point, and no observation is ever emitted for it.
-A change that lands *before* this first tick finishes is folded straight into the baseline and is
-never detected — not on that tick, not on any later one, because later ticks diff against the state
-the *previous* tick captured, not against "what changed since the daemon started." `schedule` has no
-baseline: it emits an observation on any tick where its cron matches, from the first eligible tick
-onward. Step 2b's wait exists precisely to dodge this race — by the time you reach step 3, the
-baselining first tick has already completed, so whatever you trigger next is guaranteed to be
-detected on a subsequent tick.
+state exists at that moment becomes the reference point, and no *change* observation is ever
+emitted for it. A change that lands *before* this first tick finishes is folded straight into the
+baseline and is never detected — not on that tick, not on any later one, because later ticks diff
+against the state the *previous* tick captured, not against "what changed since the daemon
+started." The one exception is `command-poll`'s health tracking: if the command's first-ever
+execution *fails*, that failure isn't folded into a silent baseline — it still surfaces a
+`Command failing: …` health observation on tick 1, because there is no prior "ok" state for the
+failure to be silently reconciled against. `schedule` has no baseline: it emits an observation on
+any tick where its cron matches, from the first eligible tick onward. Step 2b's wait exists
+precisely to dodge this race — by the time you reach step 3, the baselining first tick has already
+completed, so whatever you trigger next is guaranteed to be detected on a subsequent tick.
 
 **`file-fingerprint`** — touch any file matched by `watch.globs`:
 
