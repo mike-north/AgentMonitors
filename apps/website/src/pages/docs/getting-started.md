@@ -255,6 +255,13 @@ sleep 5
 echo "// verify $(date)" >> example.ts
 
 # 5. Poll until the event materializes (events list needs a reachable daemon).
+# This loop's 20 x 2s = 40s budget assumes step (b)'s shortened `interval: 5s`
+# and `settle-for: 5s`. Size it to `interval + settle-for` for whatever values
+# you're actually running with — the same formula step 6 budgets for
+# `hook deliver`, one stage later (+ its own fixed ~15s claim-settle). At
+# file-fingerprint's unshortened 30s default interval, a fixed 40s loop can
+# run out before the event ever materializes, with no error — just an empty
+# `[]`; widen the retry count instead of assuming something's broken.
 for i in $(seq 1 20); do
   OUT=$(agentmonitors events list --socket "$SOCKET" --session "$AGENTMON_SESSION_ID" --unread --format json)
   [ "$(node -e "console.log(JSON.parse(process.argv[1]).length)" "$OUT")" -ge 1 ] && break
@@ -294,10 +301,14 @@ agentmonitors monitor history my-first-monitor --socket "$SOCKET"
 
 A row whose result column shows `no-change` means the trigger in step 4 didn't actually alter
 anything the source could detect (e.g. a `touch` on a file whose content didn't change) — fix the
-trigger, don't keep waiting. Only once the result column shows `triggered` is a still-empty step 6
-loop expected for `high` urgency, not a bug: `hook deliver` applies its own fixed ~15s "claim
-settle" window measured from the event's creation time, separate from `notify.settle-for`. The
-20 × 2s retry window above comfortably covers that once the event actually exists.
+trigger, don't keep waiting. A row showing `suppressed` means the opposite: the trigger worked and
+the source detected a real change, but a debounce/settle (or rollup) hold in `notify:` is delaying
+it from becoming an event yet — that's expected mid-settle, not a broken trigger; wait for the
+next tick, or check `monitor explain`'s notify stage. Only once the result column shows `triggered`
+is a still-empty step 6 loop expected for `high` urgency, not a bug: `hook deliver` applies its own
+fixed ~15s "claim settle" window measured from the event's creation time, separate from
+`notify.settle-for`. The 20 × 2s retry window above comfortably covers that once the event actually
+exists.
 
 Once you're done, revert the `interval` / `settle-for` / `urgency` edits from step (b) to whatever
 fits your real use case.
@@ -310,6 +321,12 @@ throwaway `$SOCKET` (both still honor `AGENTMONITORS_DB` if it's set in their en
 the real setup an actual agent session would use, start a daemon on the workspace's own socket
 (`agentmonitors daemon run` — no `--socket`) or open a live Claude Code session, then re-run
 `doctor`.
+
+**For a stakeholder-presentable proof** (e.g. showing a security reviewer that monitoring is
+actually wired up), don't screenshot the isolated-socket recipe's output — it's throwaway and
+proves the mechanism, not the live setup. Instead, start the workspace's own daemon
+(`agentmonitors daemon run`, no `--socket`) and screenshot `doctor`'s all-green summary alongside
+the `hook deliver` JSON from step 6 above.
 
 For the same proof wired through the real Claude Code plugin instead of a manual socket, see
 [Notify your agent when a file changes](/docs/notify-when-a-file-changes).
