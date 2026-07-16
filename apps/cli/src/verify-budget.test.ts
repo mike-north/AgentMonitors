@@ -2,21 +2,21 @@
  * Unit tests for the verify budget + scratch-trigger helpers (issue #399).
  *
  * The budget math is spec-derived (interval + settle + margin), NOT captured
- * from output: each assertion traces to the runtime defaults in
- * `libs/core/src/runtime/service.ts` (mirrored in verify-budget.ts) and
- * 002 §4.4 / §9.1.
+ * from output: each assertion traces to the runtime's canonical
+ * `schedulingDefaults` (exported from `@agentmonitors/core`, consumed by both
+ * the daemon in `service.ts` and verify-budget) and 002 §4.4 / §9.1.
  *
  * @see docs/specs/002-runtime-delivery.md
  * @see docs/specs/005-cli-reference.md §16
  */
 import path from 'node:path';
 import { describe, it, expect } from 'vitest';
-import { parseMonitor, type MonitorDefinition } from '@agentmonitors/core';
 import {
-  DEFAULT_API_POLL_INTERVAL_MS,
-  DEFAULT_FILE_FINGERPRINT_INTERVAL_MS,
-  DEFAULT_SCHEDULE_TICK_MS,
-  HIGH_URGENCY_CLAIM_SETTLE_MS,
+  parseMonitor,
+  schedulingDefaults,
+  type MonitorDefinition,
+} from '@agentmonitors/core';
+import {
   computeVerifyBudget,
   deliveryLifecycleForUrgency,
   deriveScratchTriggerPath,
@@ -41,7 +41,7 @@ describe('resolvePollIntervalMs', () => {
     );
     // service.ts DEFAULT_FILE_FINGERPRINT_POLL_MS = 30_000
     expect(resolvePollIntervalMs(monitor)).toBe(
-      DEFAULT_FILE_FINGERPRINT_INTERVAL_MS,
+      schedulingDefaults.fileFingerprintPollMs,
     );
   });
 
@@ -57,14 +57,16 @@ describe('resolvePollIntervalMs', () => {
       "watch:\n  type: api-poll\n  url: 'https://example.com'",
     );
     // service.ts DEFAULT_API_POLL_MS = 300_000
-    expect(resolvePollIntervalMs(monitor)).toBe(DEFAULT_API_POLL_INTERVAL_MS);
+    expect(resolvePollIntervalMs(monitor)).toBe(schedulingDefaults.apiPollMs);
   });
 
   it('uses the 60s tick cadence for cron-driven schedule sources', () => {
     const monitor = monitorFrom(
       "watch:\n  type: schedule\n  cron: '*/5 * * * *'",
     );
-    expect(resolvePollIntervalMs(monitor)).toBe(DEFAULT_SCHEDULE_TICK_MS);
+    expect(resolvePollIntervalMs(monitor)).toBe(
+      schedulingDefaults.scheduleTickMs,
+    );
   });
 
   it('falls back to the default for a malformed interval rather than throwing', () => {
@@ -73,7 +75,7 @@ describe('resolvePollIntervalMs', () => {
       "watch:\n  type: file-fingerprint\n  globs:\n    - '*.md'\n  interval: 'not-a-duration'",
     );
     expect(resolvePollIntervalMs(monitor)).toBe(
-      DEFAULT_FILE_FINGERPRINT_INTERVAL_MS,
+      schedulingDefaults.fileFingerprintPollMs,
     );
   });
 });
@@ -134,9 +136,13 @@ describe('computeVerifyBudget', () => {
     );
     const budget = computeVerifyBudget(monitor);
     // 002 §9.1: DEFAULT_HIGH_URGENCY_SETTLE_MS applies only to detect (claim), not baseline.
-    expect(budget.highClaimSettleMs).toBe(HIGH_URGENCY_CLAIM_SETTLE_MS);
+    expect(budget.highClaimSettleMs).toBe(
+      schedulingDefaults.highUrgencyClaimSettleMs,
+    );
     expect(budget.baselineMs).toBe(4_000 + 5_000);
-    expect(budget.detectMs).toBe(4_000 + HIGH_URGENCY_CLAIM_SETTLE_MS + 5_000);
+    expect(budget.detectMs).toBe(
+      4_000 + schedulingDefaults.highUrgencyClaimSettleMs + 5_000,
+    );
   });
 
   it('scales the margin to 25% of a long interval', () => {
@@ -146,7 +152,7 @@ describe('computeVerifyBudget', () => {
     );
     const budget = computeVerifyBudget(monitor);
     expect(budget.marginMs).toBe(75_000);
-    expect(budget.intervalMs).toBe(DEFAULT_API_POLL_INTERVAL_MS);
+    expect(budget.intervalMs).toBe(schedulingDefaults.apiPollMs);
   });
 });
 
@@ -156,10 +162,24 @@ describe('isLiteralGlob', () => {
     expect(isLiteralGlob('docs/readme.md')).toBe(true);
   });
 
-  it('is false for any wildcard pattern', () => {
+  it('is false for a `*` wildcard pattern', () => {
     expect(isLiteralGlob('*.md')).toBe(false);
     expect(isLiteralGlob('src/**')).toBe(false);
     expect(isLiteralGlob('data-*/report.md')).toBe(false);
+  });
+
+  // Regression: pre-fix `isLiteralGlob` only tested `includes('*')`, so these
+  // non-`*` glob-magic patterns were wrongly classified as literal single files
+  // — sending the auto-trigger down the "edit the watched file itself" path
+  // against a bogus filename that never matches. file-fingerprint uses `glob`
+  // (minimatch), where `?`, `[…]`, and `{…}` are all wildcards, so verify must
+  // treat them as patterns too.
+  it('is false for non-`*` glob magic (`?`, char class, brace alternation)', () => {
+    expect(isLiteralGlob('file-?.md')).toBe(false);
+    expect(isLiteralGlob('file-[ab].md')).toBe(false);
+    expect(isLiteralGlob('logs/[0-9]*.txt')).toBe(false);
+    expect(isLiteralGlob('file-{a,b}.md')).toBe(false);
+    expect(isLiteralGlob('src/{a,b}/notes.md')).toBe(false);
   });
 });
 
@@ -188,6 +208,35 @@ describe('deriveScratchTriggerPath', () => {
 
   it('yields no extension for a directory-only recursive glob', () => {
     expect(deriveScratchTriggerPath('src/**', base, token)).toBe(
+      path.join(base, 'src', 'agentmonitors-verify-abc123'),
+    );
+  });
+
+  // Regression: the static-prefix and extension logic pre-fix only broke on
+  // `*`, so a directory segment carrying `?`/`[…]`/`{…}` magic was wrongly
+  // folded into the "static" prefix, and a wildcard extension slipped through.
+  it('stops the prefix at a non-`*` magic directory segment', () => {
+    // `data-?` is a wildcard segment → prefix stops before it (root sibling).
+    expect(deriveScratchTriggerPath('data-?/notes.md', base, token)).toBe(
+      path.join(base, 'agentmonitors-verify-abc123.md'),
+    );
+    // A char-class directory segment likewise ends the static prefix.
+    expect(deriveScratchTriggerPath('logs/[0-9]/out.txt', base, token)).toBe(
+      path.join(base, 'logs', 'agentmonitors-verify-abc123.txt'),
+    );
+    // A brace-alternation directory segment ends the static prefix.
+    expect(deriveScratchTriggerPath('src/{a,b}/notes.md', base, token)).toBe(
+      path.join(base, 'src', 'agentmonitors-verify-abc123.md'),
+    );
+  });
+
+  it('yields no extension when the suffix itself is glob magic', () => {
+    // `*.{md,txt}` — the brace-alternation suffix is not a real extension.
+    expect(deriveScratchTriggerPath('docs/*.{md,txt}', base, token)).toBe(
+      path.join(base, 'docs', 'agentmonitors-verify-abc123'),
+    );
+    // `*.[jt]s` — a char-class suffix is likewise not a real extension.
+    expect(deriveScratchTriggerPath('src/*.[jt]s', base, token)).toBe(
       path.join(base, 'src', 'agentmonitors-verify-abc123'),
     );
   });

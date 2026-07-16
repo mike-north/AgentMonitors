@@ -1,29 +1,34 @@
 import path from 'node:path';
+import { hasMagic } from 'glob';
 import {
   parseDuration,
+  schedulingDefaults,
   type MonitorDefinition,
   type Urgency,
 } from '@agentmonitors/core';
 
 /**
- * Interval/settle constants that MIRROR the runtime's scheduling and notify
- * defaults in `libs/core/src/runtime/service.ts`
- * (`DEFAULT_FILE_FINGERPRINT_POLL_MS`, `DEFAULT_API_POLL_MS`,
- * `DEFAULT_HIGH_URGENCY_SETTLE_MS`) and the schedule source's 60s tick cadence.
- *
  * `verify` derives a *poll budget* — an upper bound on how long a real change
  * legitimately takes to reach a session — from the monitor's own declared
  * timing, so it never silently under-shoots the way a fixed 40s loop did
- * (issue #399). These values are only used to size that budget and its ETA
- * display; they are NOT authoritative scheduling (the daemon owns that), so a
- * small duplication of the core defaults here is an acceptable estimate. If the
- * core defaults change, update these to match (002 §4.4 / §9.1).
+ * (issue #399). The interval/settle inputs to that budget come straight from
+ * the runtime's canonical `schedulingDefaults` (002 §4.4 / §9.1), so this
+ * estimate can never drift from the daemon's real cadences the way a
+ * hand-mirrored copy would.
  */
-export const DEFAULT_FILE_FINGERPRINT_INTERVAL_MS = 30_000;
-export const DEFAULT_API_POLL_INTERVAL_MS = 300_000;
-export const DEFAULT_SCHEDULE_TICK_MS = 60_000;
-/** The high-urgency claim-settle window (002 §9.1) applied before a `high` event surfaces at `turn-interruptible`. */
-export const HIGH_URGENCY_CLAIM_SETTLE_MS = 15_000;
+
+/**
+ * True when a `watch.globs` entry contains any glob magic (wildcard) character
+ * — `*`, `?`, a `[…]` class, or a `{…}` brace alternation — under the *same*
+ * matcher `file-fingerprint` uses (`glob`). `magicalBraces` is enabled so a
+ * brace pattern like `file-{a,b}.md` is treated as magic, matching how
+ * file-fingerprint's default-options `globSync` expands braces. Using the real
+ * library (not a hand-rolled `includes('*')`) keeps verify's literal/pattern
+ * decision consistent with what the daemon will actually match.
+ */
+function globHasMagic(glob: string): boolean {
+  return hasMagic(glob, { magicalBraces: true });
+}
 
 /** Read the flat per-source `watch` config (everything but `type`). */
 function watchConfig(watch: MonitorDefinition['frontmatter']['watch']): {
@@ -50,14 +55,14 @@ export function resolvePollIntervalMs(monitor: MonitorDefinition): number {
       : undefined;
 
   if (type === 'schedule') {
-    return DEFAULT_SCHEDULE_TICK_MS;
+    return schedulingDefaults.scheduleTickMs;
   }
   if (type === 'api-poll') {
-    return explicit ?? DEFAULT_API_POLL_INTERVAL_MS;
+    return explicit ?? schedulingDefaults.apiPollMs;
   }
   // file-fingerprint and any other interval-style source share the
   // file-fingerprint default when no explicit interval is declared.
-  return explicit ?? DEFAULT_FILE_FINGERPRINT_INTERVAL_MS;
+  return explicit ?? schedulingDefaults.fileFingerprintPollMs;
 }
 
 /**
@@ -121,13 +126,15 @@ export interface VerifyBudget {
  *
  * The margin is `max(5s, 25% of interval)` — it absorbs daemon poll granularity
  * and clock skew without dwarfing a short interval. Callers may override the
- * total with an explicit `--timeout`.
+ * total with an explicit `--timeout-ms`.
  */
 export function computeVerifyBudget(monitor: MonitorDefinition): VerifyBudget {
   const intervalMs = resolvePollIntervalMs(monitor);
   const settleMs = resolveSettleMs(monitor);
   const highClaimSettleMs =
-    monitor.frontmatter.urgency === 'high' ? HIGH_URGENCY_CLAIM_SETTLE_MS : 0;
+    monitor.frontmatter.urgency === 'high'
+      ? schedulingDefaults.highUrgencyClaimSettleMs
+      : 0;
   const marginMs = Math.max(5_000, Math.ceil(intervalMs * 0.25));
   const baselineMs = intervalMs + marginMs;
   const detectMs = intervalMs + settleMs + highClaimSettleMs + marginMs;
@@ -179,20 +186,21 @@ export function deriveScratchTriggerPath(
   const segments = glob.split('/').filter((segment) => segment.length > 0);
   const fileSegment = segments[segments.length - 1] ?? '';
 
-  // Extension from the filename segment, only when it is a real suffix (a `.`
-  // after the last `*`, e.g. `*.md` → `.md`). A wildcard-only segment (`**`)
-  // yields no extension.
+  // Extension from the filename segment, only when the suffix after the last
+  // `.` is a real, magic-free extension (e.g. `*.md` → `.md`). A suffix that is
+  // itself a wildcard (`*.{md,txt}`, `*.[jt]s`) or a wildcard-only segment
+  // (`**`) yields no extension.
   let ext = '';
   const dotIndex = fileSegment.lastIndexOf('.');
-  if (dotIndex > 0 && !fileSegment.slice(dotIndex).includes('*')) {
+  if (dotIndex > 0 && !globHasMagic(fileSegment.slice(dotIndex))) {
     ext = fileSegment.slice(dotIndex);
   }
 
   // Static directory prefix: leading segments (excluding the filename segment)
-  // up to the first one containing a wildcard.
+  // up to the first one containing any glob magic (`*`, `?`, `[…]`, `{…}`).
   const dirSegments: string[] = [];
   for (const segment of segments.slice(0, -1)) {
-    if (segment.includes('*')) break;
+    if (globHasMagic(segment)) break;
     dirSegments.push(segment);
   }
 
@@ -201,10 +209,12 @@ export function deriveScratchTriggerPath(
 }
 
 /**
- * True when a `watch.globs` entry is a literal single file (no wildcard), for
- * which `verify` cannot place a matching scratch sibling and must fall back to
- * `--manual` guidance.
+ * True when a `watch.globs` entry is a literal single file (no glob magic — not
+ * just no `*`, but also no `?`, `[…]`, or `{…}`), for which `verify` cannot
+ * place a matching scratch sibling and must fall back to editing the file
+ * itself or to `--manual` guidance. Backed by the real `glob` matcher so this
+ * agrees with what `file-fingerprint` treats as a pattern.
  */
 export function isLiteralGlob(glob: string): boolean {
-  return !glob.includes('*');
+  return !globHasMagic(glob);
 }

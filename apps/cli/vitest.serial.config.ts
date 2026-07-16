@@ -8,13 +8,18 @@ import { defineConfig } from 'vitest/config';
  * with up to 3 concurrent projects + vitest file-parallelism) starves the child
  * processes of CPU, causing intermittent bind timeouts.
  *
- * This config runs the two spawn files alone in a single fork, sequentially,
+ * This config runs the daemon-spawn files alone in a single fork, sequentially,
  * after the parallel suite finishes (see .github/workflows/ci.yml and the
- * root test:serial script).
+ * root test:serial script). `verify.integration` is here too: each `verify`
+ * case boots and supervises its own isolated daemon.
  */
 export default defineConfig({
   test: {
-    include: ['src/concurrent-spawn.test.ts', 'src/detached-spawn.test.ts'],
+    include: [
+      'src/concurrent-spawn.test.ts',
+      'src/detached-spawn.test.ts',
+      'src/commands/verify.integration.test.ts',
+    ],
     // No file-level parallelism — each file must complete before the next
     // starts so the daemon processes are never competing for CPU.
     fileParallelism: false,

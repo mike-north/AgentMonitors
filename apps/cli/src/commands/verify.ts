@@ -52,8 +52,23 @@ import {
   renderVerifyJson,
   renderVerifyText,
   type Stage,
+  type StageName,
   type VerifyResult,
 } from '../verify-report.js';
+
+/**
+ * Append the failure stage for a mid-run daemon crash. It names the stage that
+ * was actually *in flight* when the daemon died — not the last COMPLETED stage.
+ * Reading the last completed stage (a prior `stages[stages.length - 1]`) blamed
+ * the wrong phase and duplicated that phase's name in the report; this takes the
+ * tracked in-flight stage instead.
+ */
+export function appendDaemonCrashStage(
+  stages: Stage[],
+  inFlightStage: StageName,
+): void {
+  stages.push({ name: inFlightStage, status: 'fail', detail: 'daemon exited' });
+}
 
 /** A trigger verify performs (and reverts) to produce a real observable change. */
 interface Trigger {
@@ -448,6 +463,11 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
   const token = randomBytes(6).toString('hex');
   let session: AgentSessionRecord | undefined;
   let trigger: Trigger | null = null;
+  // The stage currently being polled, so a mid-flight daemon crash blames the
+  // stage that was actually in progress — not the last COMPLETED stage (an
+  // off-by-one that also duplicated that stage's name). Advanced before each
+  // poll phase below and read by the `DaemonDied` catch.
+  let inFlightStage: StageName = 'daemon';
 
   const finalize = (
     partial: Omit<VerifyResult, 'elapsedMs' | 'monitorId'>,
@@ -479,6 +499,7 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
     });
 
     // Baseline: wait for the monitor's first observation to land.
+    inFlightStage = 'baseline';
     const baselineDeadline = Date.now() + budget.baselineMs;
     const baseline = await pollUntil(
       baselineDeadline,
@@ -559,6 +580,7 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
     // decisive outcome (rather than setting a side-effect variable) so the
     // branch below reads a plain value — 'triggered' (success) or a definitive
     // fail-fast 'no-change'/'no-files-matched' (the trigger did nothing).
+    inFlightStage = 'observe';
     const detectDeadline = triggerAt + detectCapMs;
     const observed = await pollUntil<
       'triggered' | 'no-change' | 'no-files-matched'
@@ -572,11 +594,24 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
         );
         const post = rows.filter((r) => toMs(r.createdAt) > triggerAt);
         if (post.some((r) => r.result === 'triggered')) return 'triggered';
-        // A definitive post-trigger no-change means the change wasn't observable.
+        // A post-trigger `no-files-matched` is always definitive: the glob
+        // scope resolved to zero files, so nothing could ever be observed.
         if (!manual && post.some((r) => r.result === 'no-files-matched')) {
           return 'no-files-matched';
         }
-        if (!manual && post.some((r) => r.result === 'no-change')) {
+        // A post-trigger `no-change` normally means the change wasn't
+        // observable — but NOT while a debounce/throttle notify window is
+        // settling. There the change WAS observed (recorded as a `suppressed`
+        // row that holds the batch) and the emitting `triggered` row only
+        // appears at flush; the intervening `no-change` ticks are settling
+        // noise, not a verdict. So only fail-fast on `no-change` when no
+        // post-trigger `suppressed` row is present; otherwise keep polling
+        // until the flush (or the budget) — 002 §9.2/§9.3.
+        if (
+          !manual &&
+          post.some((r) => r.result === 'no-change') &&
+          !post.some((r) => r.result === 'suppressed')
+        ) {
           return 'no-change';
         }
         return null;
@@ -618,7 +653,7 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
         stages,
         failure: {
           kind: 'budget-exceeded',
-          message: `no change was observed within the budget (${String(Math.round(detectCapMs / 1000))}s). ${manual ? 'Did you make a change the monitor watches?' : 'Increase --timeout if the interval is long, or check the monitor with `agentmonitors monitor explain`.'}`,
+          message: `no change was observed within the budget (${String(Math.round(detectCapMs / 1000))}s). ${manual ? 'Did you make a change the monitor watches?' : 'Increase --timeout-ms if the interval is long, or check the monitor with `agentmonitors monitor explain`.'}`,
         },
       });
     }
@@ -629,6 +664,7 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
     });
 
     // Materialize: confirm an unread event exists for the session.
+    inFlightStage = 'materialize';
     const event = await pollUntil(detectDeadline, daemon, async () => {
       const events = await listEventsClient(
         {
@@ -667,6 +703,7 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
     );
     const hookEventName =
       lifecycle === 'turn-interruptible' ? 'UserPromptSubmit' : 'SessionStart';
+    inFlightStage = 'deliver';
     const additionalContext = await pollUntil(
       detectDeadline,
       daemon,
@@ -710,12 +747,9 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
     return finalize({ ok: true, stages, additionalContext });
   } catch (error) {
     if (error instanceof DaemonDied) {
-      // Mark the in-flight stage failed, then report the daemon's own error.
-      stages.push({
-        name: stages[stages.length - 1]?.name ?? 'daemon',
-        status: 'fail',
-        detail: 'daemon exited',
-      });
+      // Mark the stage that was actually in flight when the daemon died (not the
+      // last completed one), then report the daemon's own error.
+      appendDaemonCrashStage(stages, inFlightStage);
       return finalize({
         ok: false,
         stages,
@@ -819,8 +853,8 @@ export const verifyCommand = new Command('verify')
     "Run against the workspace's real daemon/db (leaves it running so a follow-up `doctor` is green) instead of an isolated one",
   )
   .option(
-    '--timeout <ms>',
-    'Override the post-trigger detection budget (ms); default is derived from the monitor interval + settle',
+    '--timeout-ms <ms>',
+    'Override the post-trigger detection budget in milliseconds; default is derived from the monitor interval + settle',
   )
   .addOption(
     new Option('--format <format>', 'Output format')
@@ -835,7 +869,7 @@ export const verifyCommand = new Command('verify')
         workspace: string;
         manual?: boolean;
         useWorkspaceDaemon?: boolean;
-        timeout?: string;
+        timeoutMs?: string;
         format: string;
       },
     ) => {
@@ -859,8 +893,8 @@ export const verifyCommand = new Command('verify')
         }
 
         const budget = computeVerifyBudget(monitor);
-        const overrideMs = options.timeout
-          ? Number(options.timeout)
+        const overrideMs = options.timeoutMs
+          ? Number(options.timeoutMs)
           : undefined;
         const detectCapMs =
           overrideMs !== undefined &&

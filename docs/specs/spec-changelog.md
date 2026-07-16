@@ -113,24 +113,35 @@ single command.
   restored-on-exit edit for literal globs, or `--manual` watch mode), polls with an
   **interval-aware budget derived from the monitor's own `interval` + notify settle (+ high-urgency
   15s claim-settle) + margin** (not a fixed 40s) while printing elapsed/ETA to stderr, interprets
-  the pipeline state in plain language (`triggered` / `suppressed` / `no-change` /
-  `no-files-matched` / **`daemon-died`** with the daemon's own error), confirms delivery via the
-  **real `hook deliver` claim path**, and prints one clean **PASS** (echoing the delivered
-  `additionalContext`) or **FAIL** (naming the failing stage). It tears down everything it created;
-  `--use-workspace-daemon` instead targets and leaves running the real workspace daemon so a
-  follow-up `doctor` reflects the delivery.
+  the observation pipeline in plain language (`triggered` = success; `no-files-matched` = fail-fast;
+  `no-change` = fail-fast **unless** a `debounce`/`throttle` settle is holding the change, in which
+  case a `suppressed` row keeps the wait alive until the flush `triggered` rather than being a
+  distinct reported outcome; **`daemon-died`** surfaces the daemon's own error), confirms delivery
+  via the **real `hook deliver` claim path**, and prints one clean **PASS** (echoing the delivered
+  `additionalContext`) or **FAIL** (naming the failing stage — the stage that was actually in flight
+  on a mid-run daemon crash). It tears down everything it created; `--use-workspace-daemon` instead
+  targets and leaves running the real workspace daemon so a follow-up `doctor` reflects the delivery.
+  The detection-budget override flag is `--timeout-ms` (milliseconds, matching the `--poll-ms` /
+  `--reap-after-ms` convention).
 - **005 §16 → §17 renumber.** The former "Exit codes & diagnostics" section is now §17 (no other
   doc references it by number; mirrors the earlier §15/§16 renumber when `doctor` was added).
 - **Fix (current).** Implemented in `apps/cli/src/commands/verify.ts` with pure helpers in
   `verify-budget.ts` (interval/settle budget, scratch-path derivation) and `verify-report.ts`
-  (PASS/FAIL renderers), wired into the CLI command tree next to `doctor`. The getting-started /
-  skill.md recipe replacement (demoting the manual recipe to an appendix) is a deliberate follow-up,
-  not part of this change.
+  (PASS/FAIL renderers), wired into the CLI command tree next to `doctor`. The budget's interval /
+  settle inputs come from a new canonical `schedulingDefaults` export in `@agentmonitors/core` (the
+  same values `service.ts` schedules against), so the estimate can't drift from real scheduling;
+  literal-vs-pattern glob classification and scratch-path derivation use the real `glob` matcher's
+  `hasMagic` (so `?`, `[…]`, and `{…}` are recognized as wildcards, not just `*`). The
+  getting-started / skill.md recipe replacement (demoting the manual recipe to an appendix) is a
+  deliberate follow-up, not part of this change.
 - **Verified by** `apps/cli/src/verify-budget.test.ts` (spec-derived budget math + glob→scratch-path
-  derivation), `apps/cli/src/verify-report.test.ts` (PASS / stage-named FAIL / distinct
-  `daemon-died` rendering), and `apps/cli/src/commands/verify.integration.test.ts` (real
-  file-fingerprint change → PASS with delivered `additionalContext` and scratch cleanup; `no-change`
-  and `budget-exceeded` FAILs naming the correct stage; monitor-not-found / ambiguous setup errors).
+  derivation, including non-`*` glob magic), `apps/cli/src/verify-report.test.ts` (PASS / stage-named
+  FAIL / distinct `daemon-died` rendering), `apps/cli/src/commands/verify.test.ts` (mid-run crash
+  blames the in-flight stage), `libs/core/src/runtime/scheduling-defaults.test.ts` (defaults pinned
+  to 002 §4.4/§9.1), and `apps/cli/src/commands/verify.integration.test.ts` (real file-fingerprint
+  change → PASS with delivered `additionalContext` and scratch cleanup; a `debounce` monitor still
+  reaching PASS despite `no-change` ticks while it settles; `no-change` and `budget-exceeded` FAILs
+  naming the correct stage; monitor-not-found / ambiguous setup errors).
 
 ## 2026-07-15 — Test-bearing packages must fail on a zero-test suite (004 §2.8, new) — Refs #288
 

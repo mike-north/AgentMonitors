@@ -35,6 +35,7 @@
     "@toon-format/toon": "^2.3.0",
     "better-sqlite3": "^11.9.1",
     "commander": "^14.0.3",
+    "glob": "^11.0.1",
     "is-agentic-tui": "^0.2.0",
     "zod": "^3.25.76"
   },

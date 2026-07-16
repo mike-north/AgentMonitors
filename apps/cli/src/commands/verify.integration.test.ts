@@ -123,6 +123,47 @@ describe('agentmonitors verify', () => {
     expect(scratchFiles(ws)).toHaveLength(0);
   }, 60_000);
 
+  it('reaches PASS on a debounce monitor even though `no-change` ticks occur while it settles (regression)', () => {
+    const ws = path.join(tempDir, 'debounce');
+    mkdirSync(ws, { recursive: true });
+    // A debounce notify holds the observed change for `settle-for` before it
+    // emits. The post-trigger observation history is therefore
+    // [suppressed, no-change, …, triggered@flush]: a genuine `no-change` row
+    // appears WHILE the batch settles, before the emitting `triggered` row.
+    // Pre-fix, verify fail-fast on that first `no-change` and reported a false
+    // "no change detected"; post-fix it recognizes the `suppressed` row as
+    // "settling" and keeps polling until the flush. 1s interval + 2s settle
+    // keeps the budget comfortably under the test timeout.
+    writeMonitor(
+      ws,
+      'debounced',
+      `name: Debounced\nwatch:\n  type: file-fingerprint\n  globs:\n    - '*.md'\n  cwd: ${JSON.stringify(ws)}\n  interval: '1s'\nnotify:\n  strategy: debounce\n  settle-for: '2s'\nurgency: normal`,
+    );
+    writeFileSync(path.join(ws, 'readme.md'), 'hello', 'utf-8');
+
+    const result = run(
+      ['verify', 'debounced', '--workspace', ws, '--format', 'json'],
+      ws,
+    );
+    expect(result.exitCode).toBe(0);
+    const report = JSON.parse(result.stdout) as {
+      ok: boolean;
+      failure: { kind: string } | null;
+      stages: { name: string; status: string }[];
+      additionalContext: string | null;
+    };
+    expect(report.ok).toBe(true);
+    // Crucially, the observe stage passed rather than false-failing no-change.
+    expect(report.stages.find((s) => s.name === 'observe')?.status).toBe(
+      'pass',
+    );
+    expect(report.stages.find((s) => s.name === 'deliver')?.status).toBe(
+      'pass',
+    );
+    expect(report.additionalContext).toContain('review it');
+    expect(scratchFiles(ws)).toHaveLength(0);
+  }, 60_000);
+
   it('FAILs with the observe stage when the trigger changes nothing observable (no-change)', () => {
     const ws = path.join(tempDir, 'nochange');
     mkdirSync(path.join(ws, 'data-1'), { recursive: true });
@@ -166,7 +207,7 @@ describe('agentmonitors verify', () => {
     );
     writeFileSync(path.join(ws, 'readme.md'), 'hello', 'utf-8');
 
-    // --manual + a short --timeout, and we make NO change → the detect phase
+    // --manual + a short --timeout-ms, and we make NO change → the detect phase
     // exhausts its budget and reports budget-exceeded on the observe stage.
     const result = run(
       [
@@ -175,7 +216,7 @@ describe('agentmonitors verify', () => {
         '--workspace',
         ws,
         '--manual',
-        '--timeout',
+        '--timeout-ms',
         '3000',
         '--format',
         'json',
