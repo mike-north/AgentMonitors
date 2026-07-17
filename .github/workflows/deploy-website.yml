@@ -5,24 +5,29 @@ name: Deploy Website
 # integration: validation runs first and gates the deploy, so a broken site
 # never reaches production.
 #
-# The gate covers the website's typecheck, its own vitest suite (including
-# next.config.test.ts, which guards deployment-specific tracing behavior), and
-# a production build of the exact deployed commit — all on the critical path
-# before the deploy step is allowed to run (issue #286).
+# The gate covers the website's typecheck and its own vitest suite (including
+# next.config.test.ts, which guards deployment-specific tracing behavior),
+# both on the critical path before the deploy step can run (issue #286).
 #
-# Validation and deploy run as sequential steps of ONE job so that
-# `vercel deploy --prebuilt` promotes the exact `.vercel/output` that
-# `vercel build` produced on the same machine — Vercel's documented
-# "build once, deploy the prebuilt output" flow. The earlier design that
-# split build and deploy into two jobs bridged by a workflow artifact never
-# worked and cannot: in this pnpm monorepo the build output is not
-# self-contained — each function's .vc-config.json `filePathMap` references
-# dependency files outside `.vercel/output` (../../node_modules/.pnpm/...),
-# which the CLI reads from disk at deploy time, so the deploying job needs
-# the full installed workspace regardless. The artifact round-trip also
-# silently dropped the hidden .vc-config.json files (upload-artifact@v4
-# excludes dot-files by default) and exposed env-inlined build output to
-# anyone with actions:read. Single-job promotion has none of these hazards.
+# The deploy is a REMOTE Vercel build (`vercel deploy --prod`, no --prebuilt),
+# matching how the `site` project is configured: Vercel builds apps/website
+# standalone (root directory = the app), installing its dependencies inside
+# the deploy root. Do not reintroduce `vercel build` + `vercel deploy
+# --prebuilt` here: in this pnpm monorepo a local `vercel build` traces
+# dependencies through workspace symlinks into the repo-root .pnpm store, so
+# every function's .vc-config.json filePathMap references files outside
+# `.vercel/output` (../../node_modules/.pnpm/...). That output is not
+# portable — deploying it fails with "Please ensure project dependencies
+# have been installed" without the installed workspace on disk, and with the
+# workspace present the references still escape the deploy root and fail
+# Vercel-side with ENOENT on /node_modules/... (verified by dispatch runs of
+# both variants). A build failure in the remote deploy still cannot break
+# production: Vercel only switches the production domain after a successful
+# build.
+#
+# Also for the archaeologists: the two-job artifact-promotion variant of the
+# prebuilt flow additionally dropped every hidden .vc-config.json, because
+# upload-artifact@v4 excludes dot-files unless include-hidden-files is set.
 
 on:
   push:
@@ -57,7 +62,7 @@ jobs:
   deploy:
     name: Validate and deploy to Vercel (production)
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -74,8 +79,8 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # The validation gate. All steps below run against the exact commit
-      # being deployed and must pass before the deploy step can run.
+      # The validation gate. Both steps run against the exact commit being
+      # deployed and must pass before the deploy step can run.
       - name: Type-check website
         run: pnpm --filter @agentmonitors/website check
 
@@ -85,19 +90,11 @@ jobs:
       - name: Install Vercel CLI
         run: npm install --global vercel@53
 
-      # Production build of the exact commit, via Vercel's own build step, so
-      # the deploy below promotes byte-for-byte what was just validated (not a
-      # separate remote build Vercel would run from source again). `--yes`
-      # skips the interactive confirmation for pulling project settings.
-      - name: Build production website (exact commit)
-        run: vercel build --prod --yes --cwd apps/website
-        env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-
-      # Deploy the `.vercel/output` built above — no second remote build.
-      # Token is read from the VERCEL_TOKEN env var (safer than a --token=…
-      # CLI arg, which can leak via process listings / logs).
-      - name: Deploy production (prebuilt)
-        run: vercel deploy --prebuilt --prod --yes --cwd apps/website
+      # Remote build + deploy (proven for this monorepo: the site builds
+      # standalone with root = apps/website). Token is read from the
+      # VERCEL_TOKEN env var (safer than a --token=… CLI arg, which can leak
+      # via process listings / logs).
+      - name: Deploy production
+        run: vercel deploy --prod --yes --cwd apps/website
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
