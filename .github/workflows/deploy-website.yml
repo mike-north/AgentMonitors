@@ -107,6 +107,12 @@ jobs:
           path: apps/website/.vercel/output
           retention-days: 1
           if-no-files-found: error
+          # upload-artifact@v4 excludes dot-files by default, but the Build
+          # Output API depends on them (every functions/*.func directory is
+          # configured by a hidden .vc-config.json). Without this, the deploy
+          # job's `vercel deploy --prebuilt` fails with "Could not load
+          # function config: .../.vc-config.json".
+          include-hidden-files: true
 
   deploy:
     name: Deploy to Vercel (production)
