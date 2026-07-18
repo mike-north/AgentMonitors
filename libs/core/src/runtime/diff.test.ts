@@ -167,10 +167,55 @@ describe('buildJsonDiff — array of objects', () => {
     );
   });
 
-  it('AC2: deep-equality matching is order-insensitive', () => {
+  // REGRESSION (issue #437 follow-up, Copilot review thread 3608676215):
+  // identity-based array matching (both diffJsonArrayByKey and
+  // diffJsonArrayByDeepEquality) is itself order-insensitive — it matches by
+  // key/content, not position — but json-diff's `hasChanged` (003 §4.2/§11.3)
+  // is array-ORDER-sensitive (it sorts object keys, never array elements), so
+  // a pure reorder WOULD have fired a real observation. Before this fix,
+  // buildJsonDiff rendered '' for a pure reorder (no removed/added/changed
+  // entries found), which violates "change detected ⟺ non-empty diffText":
+  // an agent reading an empty diffText for a materialized event would
+  // wrongly conclude nothing changed. The chosen semantic is (b): a reorder
+  // with no other content change renders an explicit `reordered` entry
+  // rather than treating it as a non-change end-to-end — because making
+  // detection itself order-insensitive would be a much larger, riskier
+  // change to two source plugins' `hasChanged` and would silently drop
+  // genuinely meaningful reorders (e.g. a priority-ordered queue).
+  it('REGRESSION: a pure reorder of a DEEP-EQUALITY-matched array (no identity key) is a real change and must not render an empty diff', () => {
     const prev = JSON.stringify([{ a: 1 }, { a: 2 }]);
     const curr = JSON.stringify([{ a: 2 }, { a: 1 }]);
-    expect(buildJsonDiff(prev, curr)).toBe('');
+    const diff = buildJsonDiff(prev, curr);
+    expect(diff).not.toBe('');
+    expect(diff).toBe('~ reordered: [{"a":2},{"a":1}]');
+  });
+
+  it('REGRESSION: a pure reorder of a KEYED array (stable identity key) is a real change and must not render an empty diff', () => {
+    const prev = JSON.stringify([
+      { id: 1, name: 'alpha' },
+      { id: 2, name: 'beta' },
+    ]);
+    const curr = JSON.stringify([
+      { id: 2, name: 'beta' },
+      { id: 1, name: 'alpha' },
+    ]);
+    const diff = buildJsonDiff(prev, curr);
+    expect(diff).not.toBe('');
+    expect(diff).toBe('~ reordered: ["2","1"]');
+  });
+
+  it('a reorder alongside a real content change reports the content change, not a spurious reorder entry', () => {
+    const prev = JSON.stringify([
+      { id: 1, name: 'alpha' },
+      { id: 2, name: 'beta' },
+    ]);
+    // Reordered AND element id=2's name changed.
+    const curr = JSON.stringify([
+      { id: 2, name: 'BETA' },
+      { id: 1, name: 'alpha' },
+    ]);
+    const diff = buildJsonDiff(prev, curr);
+    expect(diff).toBe('~ changed[id=2].name: "beta" -> "BETA"');
   });
 
   it('AC2: index-based fallback for an array of primitives', () => {
@@ -229,6 +274,28 @@ describe('buildJsonDiff — nested key paths', () => {
     const curr = JSON.stringify({ a: 'flat' });
     expect(buildJsonDiff(prev, curr)).toBe(
       '~ changed a: {"nested":true} -> "flat"',
+    );
+  });
+
+  // Copilot review thread 3608676211: diffJsonArrayByDeepEquality previously
+  // hardcoded path: '' regardless of where the array appeared, so a nested
+  // array's removed/added entries silently lost their field location. A
+  // top-level array (path === '') is unaffected — `- removed: {...}` stays
+  // exactly as AC1's example — but a NESTED array (no stable identity key)
+  // must carry its field path so the reader knows which array changed.
+  it('a nested array with no identity key carries its field path on removed/added entries', () => {
+    const prev = JSON.stringify({
+      items: [{ color: 'red' }, { color: 'blue' }],
+    });
+    const curr = JSON.stringify({
+      items: [{ color: 'blue' }, { color: 'green' }],
+    });
+    const diff = buildJsonDiff(prev, curr);
+    expect(diff).toBe(
+      [
+        '- removed items: {"color":"red"}',
+        '+ added items: {"color":"green"}',
+      ].join('\n'),
     );
   });
 });

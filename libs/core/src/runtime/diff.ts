@@ -104,7 +104,8 @@ const IDENTITY_KEY_CANDIDATES = [
 type JsonDiffEntry =
   | { kind: 'removed'; path: string; value: unknown }
   | { kind: 'added'; path: string; value: unknown }
-  | { kind: 'changed'; path: string; previous: unknown; current: unknown };
+  | { kind: 'changed'; path: string; previous: unknown; current: unknown }
+  | { kind: 'reordered'; path: string; current: unknown };
 
 /**
  * Render a **structural** diff between two JSON texts: added/removed/changed
@@ -176,7 +177,18 @@ function diffJsonObject(
  * (issue #437 AC2): arrays of objects try a stable-key heuristic first
  * ({@link findIdentityKey}), then fall back to whole-element deep-equality
  * matching (added/removed only — no reliable identity to report a `changed`
- * element against); arrays of anything else diff positionally by index.
+ * element against); arrays of anything else diff positionally by index
+ * ({@link diffJsonArrayByIndex}, inherently order-sensitive, so a reorder
+ * there always yields ordinary `changed`/`added`/`removed` entries).
+ *
+ * Both identity-based matchers ({@link diffJsonArrayByKey},
+ * {@link diffJsonArrayByDeepEquality}) are themselves order-INsensitive by
+ * construction (they match by key/content, not position) — but `hasChanged`
+ * (003 §4.2/§11.3, each `json-diff` source) is array-order-SENSITIVE (it
+ * sorts object keys, never array elements), so a pure element reorder is a
+ * real detected change. Both matchers therefore fall back to an explicit
+ * `reordered` entry when they find no other diff, preserving the invariant
+ * "change detected ⟺ non-empty diffText" (issue #437 follow-up).
  */
 function diffJsonArray(
   path: string,
@@ -191,7 +203,7 @@ function diffJsonArray(
     if (identityKey !== undefined) {
       return diffJsonArrayByKey(path, identityKey, prevObjects, currObjects);
     }
-    return diffJsonArrayByDeepEquality(prevObjects, currObjects);
+    return diffJsonArrayByDeepEquality(path, prevObjects, currObjects);
   }
 
   return diffJsonArrayByIndex(path, prev, curr);
@@ -274,6 +286,21 @@ function diffJsonArrayByKey(
       );
     }
   }
+
+  // Same key set, same content per key — but json-diff's `hasChanged` (003
+  // §4.2/§11.3) is array-ORDER-sensitive (it sorts object keys, never array
+  // elements), so a pure reorder is a real detected change. The invariant
+  // "change detected ⟺ non-empty diffText" must hold even though identity-key
+  // matching is itself order-insensitive, so surface the reorder explicitly
+  // instead of silently rendering an empty diff (issue #437 follow-up).
+  if (entries.length === 0) {
+    const prevOrder = prev.map((el) => String(el[key]));
+    const currOrder = curr.map((el) => String(el[key]));
+    if (!arraysEqualByValue(prevOrder, currOrder)) {
+      entries.push({ kind: 'reordered', path, current: currOrder });
+    }
+  }
+
   return entries;
 }
 
@@ -282,9 +309,13 @@ function diffJsonArrayByKey(
  * (a multiset match) rather than position — this is order-insensitive, unlike
  * {@link diffJsonArrayByIndex}. There is no element identity to attach a
  * `changed` entry to, so an element whose content changed renders as one
- * `removed` (old content) plus one `added` (new content) entry.
+ * `removed` (old content) plus one `added` (new content) entry. `path` is the
+ * caller's location (empty at the array's own top level, a dotted/bracketed
+ * field path when this array is nested — e.g. `items` — so a removed/added
+ * entry never loses which field it came from, issue #437 review).
  */
 function diffJsonArrayByDeepEquality(
+  path: string,
   prev: Record<string, unknown>[],
   curr: Record<string, unknown>[],
 ): JsonDiffEntry[] {
@@ -302,12 +333,22 @@ function diffJsonArrayByDeepEquality(
   }
   const entries: JsonDiffEntry[] = removed.map((value) => ({
     kind: 'removed' as const,
-    path: '',
+    path,
     value,
   }));
   for (const value of unmatchedCurr) {
-    entries.push({ kind: 'added', path: '', value });
+    entries.push({ kind: 'added', path, value });
   }
+
+  // Every element matched (a perfect multiset match) but the raw arrays are
+  // not byte-identical — the only way that happens is a pure reorder, which
+  // is a real change under json-diff's order-sensitive `hasChanged` (see the
+  // matching note in diffJsonArrayByKey above). Surface it rather than
+  // silently rendering an empty diff (issue #437 follow-up).
+  if (entries.length === 0 && !arraysPositionallyEqual(prev, curr)) {
+    entries.push({ kind: 'reordered', path, current: curr });
+  }
+
   return entries;
 }
 
@@ -365,6 +406,18 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/** Elementwise string-array equality, used to detect an identity-key reorder. */
+function arraysEqualByValue(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((value, i) => value === b[i]);
+}
+
+/** Elementwise deep-JSON-equality, used to detect a deep-equality-match reorder. */
+function arraysPositionallyEqual(a: unknown[], b: unknown[]): boolean {
+  return (
+    a.length === b.length && a.every((value, i) => deepEqualJson(value, b[i]))
+  );
+}
+
 function renderJsonDiffEntries(entries: JsonDiffEntry[]): string {
   const capped = entries.slice(0, MAX_JSON_DIFF_ENTRIES);
   const lines = capped.map(renderJsonDiffEntry);
@@ -396,6 +449,8 @@ function renderJsonDiffEntry(entry: JsonDiffEntry): string {
       return `+ added${formatPathSuffix(entry.path)}: ${renderJsonValue(entry.value)}`;
     case 'changed':
       return `~ changed${formatPathSuffix(entry.path)}: ${renderJsonValue(entry.previous)} -> ${renderJsonValue(entry.current)}`;
+    case 'reordered':
+      return `~ reordered${formatPathSuffix(entry.path)}: ${renderJsonValue(entry.current)}`;
   }
 }
 
