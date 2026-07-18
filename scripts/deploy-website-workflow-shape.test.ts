@@ -1,11 +1,20 @@
 /**
- * Tests for the production-deploy workflow-shape guard (issue #286):
- * `.github/workflows/deploy-website.yml`'s `deploy` job must `needs:
- * validate`, and `validate` must run the website's typecheck, test suite,
- * and a production build of the exact commit before `deploy` is allowed to
- * start. These assertions parse the *real* workflow file with the `yaml`
- * package — the same GitHub-Actions-YAML input contract CI itself consumes —
- * not a hand-built approximation of its shape.
+ * Tests for the production-deploy workflow-shape guard
+ * (`.github/workflows/deploy-website.yml`). Three invariants, each proved
+ * against the *real* on-disk workflow parsed with the `yaml` package — the
+ * same GitHub-Actions-YAML input contract CI itself consumes — plus
+ * negative-proof fixtures showing each guard rejects the shape it exists to
+ * catch:
+ *
+ *   1. Validation gates the deploy (issue #286): the website typecheck and
+ *      test run before the `vercel deploy` step, on the critical path.
+ *   2. The deploy is a remote Vercel build, never a `--prebuilt` promotion —
+ *      `vercel build` output is not portable in this pnpm workspace (its
+ *      per-function filePathMap references ../../node_modules/.pnpm/… outside
+ *      .vercel/output), which broke every production deploy between PR #353
+ *      and this fix.
+ *   3. The push `paths` filter includes the root/shared inputs (lockfile,
+ *      workspace file, root package.json) that can change the resolved site.
  *
  * @see https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions
  * @see https://eemeli.org/yaml/ (YAML 1.2 core schema: `on:` stays a string key)
@@ -18,172 +27,139 @@ import { parse } from 'yaml';
 import {
   DEPLOY_WORKFLOW_PATH,
   REQUIRED_SHARED_PATH_TRIGGERS,
-  assertDeployPromotesArtifact,
+  assertDeployUsesRemoteBuild,
   assertPathTriggersIncludeSharedInputs,
-  assertValidateGatesDeploy,
+  assertValidationGatesDeploy,
 } from './deploy-website-workflow-shape.mjs';
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 
-// Reconstruction of deploy-website.yml as it existed immediately before issue
-// #286's fix: `validate` ran only the website's typecheck (no test, no
-// build), and the push `paths` filter did not include any root/shared
-// inputs. This is the negative-proof fixture — these guard functions MUST
-// reject this shape, proving they would have caught the exact gap the issue
-// reported, not just validated whatever the fixed file happens to contain.
-const PRE_FIX_WORKFLOW_YAML = `
+/** Parse a workflow fixture into the loosely-typed shape the guards accept. */
+function workflow(
+  yaml: string,
+): Parameters<typeof assertValidationGatesDeploy>[0] {
+  return parse(yaml) as Parameters<typeof assertValidationGatesDeploy>[0];
+}
+
+/** The real, on-disk workflow, parsed exactly as CI would parse it. */
+function onDiskWorkflow(): Parameters<typeof assertValidationGatesDeploy>[0] {
+  return workflow(readFileSync(DEPLOY_WORKFLOW_PATH, 'utf8'));
+}
+
+// A well-formed single-job deploy pipeline: install → typecheck → test →
+// deploy (remote build). The positive control the guards must accept.
+const GOOD_PIPELINE = `
 on:
   push:
-    branches:
-      - main
     paths:
       - 'apps/website/**'
-      - '.github/workflows/deploy-website.yml'
-  workflow_dispatch: {}
-
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - 'package.json'
 jobs:
-  validate:
-    name: Validate
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-      - name: Type-check website
-        run: pnpm --filter @agentmonitors/website check
-
   deploy:
-    name: Deploy to Vercel (production)
-    needs: validate
-    runs-on: ubuntu-latest
     steps:
-      - name: Deploy production
-        run: vercel deploy --prod --yes --cwd apps/website
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @agentmonitors/website check
+      - run: pnpm --filter @agentmonitors/website test
+      - run: vercel deploy --prod --yes --cwd apps/website
 `;
 
-describe('assertValidateGatesDeploy', () => {
-  it('rejects the pre-#286 shape: validate only typechecks, never tests or builds', () => {
-    const workflow: unknown = parse(PRE_FIX_WORKFLOW_YAML);
+describe('assertValidationGatesDeploy', () => {
+  it('rejects a deploy step that runs before the typecheck and test', () => {
     expect(() =>
-      assertValidateGatesDeploy(
-        workflow as Parameters<typeof assertValidateGatesDeploy>[0],
+      assertValidationGatesDeploy(
+        workflow(`
+jobs:
+  deploy:
+    steps:
+      - run: vercel deploy --prod --yes --cwd apps/website
+      - run: pnpm --filter @agentmonitors/website check
+      - run: pnpm --filter @agentmonitors/website test
+`),
       ),
-    ).toThrow(
-      /website test suite.*production build|production build.*website test suite/s,
-    );
+    ).toThrow(/BEFORE the .*vercel deploy.* step/);
   });
 
-  it('rejects a deploy job that silently drops `needs: validate`', () => {
-    const workflow: unknown = parse(`
+  it('rejects a deploy pipeline missing the test step', () => {
+    expect(() =>
+      assertValidationGatesDeploy(
+        workflow(`
 jobs:
-  validate:
+  deploy:
+    steps:
+      - run: pnpm --filter @agentmonitors/website check
+      - run: vercel deploy --prod --yes --cwd apps/website
+`),
+      ),
+    ).toThrow(/website test suite/);
+  });
+
+  it('rejects a pipeline with no `vercel deploy` step at all', () => {
+    expect(() =>
+      assertValidationGatesDeploy(
+        workflow(`
+jobs:
+  deploy:
     steps:
       - run: pnpm --filter @agentmonitors/website check
       - run: pnpm --filter @agentmonitors/website test
-      - run: vercel build --prod --yes --cwd apps/website
-  deploy:
-    steps:
-      - run: vercel deploy --prebuilt --prod --yes --cwd apps/website
-`);
-    expect(() =>
-      assertValidateGatesDeploy(
-        workflow as Parameters<typeof assertValidateGatesDeploy>[0],
+`),
       ),
-    ).toThrow(/needs: validate/);
-  });
-
-  it('rejects a validate job missing only the production build step', () => {
-    const workflow: unknown = parse(`
-jobs:
-  validate:
-    steps:
-      - run: pnpm --filter @agentmonitors/website check
-      - run: pnpm --filter @agentmonitors/website test
-  deploy:
-    needs: validate
-    steps:
-      - run: vercel deploy --prebuilt --prod --yes --cwd apps/website
-`);
-    expect(() =>
-      assertValidateGatesDeploy(
-        workflow as Parameters<typeof assertValidateGatesDeploy>[0],
-      ),
-    ).toThrow(/production build/);
+    ).toThrow(/no job running .*vercel deploy/);
   });
 
   // Regression test for the review finding on #353: `\b` after the script
-  // name also matches before `:`, so similarly-prefixed scripts would have
-  // satisfied the guard without running the real `check`/`test` scripts.
-  it('rejects check:lint / test:unit lookalikes standing in for the real check and test scripts', () => {
-    const workflow: unknown = parse(`
+  // name also matches before `:`, so `check:lint` / `test:unit` lookalikes
+  // must NOT satisfy the guard in place of the real `check` / `test` scripts.
+  it('rejects check:lint / test:unit lookalikes standing in for the real scripts', () => {
+    expect(() =>
+      assertValidationGatesDeploy(
+        workflow(`
 jobs:
-  validate:
+  deploy:
     steps:
       - run: pnpm --filter @agentmonitors/website check:lint
       - run: pnpm --filter @agentmonitors/website test:unit
-      - run: vercel build --prod --yes --cwd apps/website
-  deploy:
-    needs: validate
-    steps:
-      - run: vercel deploy --prebuilt --prod --yes --cwd apps/website
-`);
-    expect(() =>
-      assertValidateGatesDeploy(
-        workflow as Parameters<typeof assertValidateGatesDeploy>[0],
+      - run: vercel deploy --prod --yes --cwd apps/website
+`),
       ),
-    ).toThrow(
-      /website typecheck.*website test suite|website test suite.*website typecheck/s,
-    );
+    ).toThrow(/website typecheck.*website test suite/s);
   });
 
-  it('accepts a minimal well-formed gate shape (positive control)', () => {
-    const workflow: unknown = parse(`
-jobs:
-  validate:
-    steps:
-      - run: pnpm --filter @agentmonitors/website check
-      - run: pnpm --filter @agentmonitors/website test
-      - run: vercel build --prod --yes --cwd apps/website
-  deploy:
-    needs: validate
-    steps:
-      - run: vercel deploy --prebuilt --prod --yes --cwd apps/website
-`);
+  it('accepts a well-formed single-job pipeline (positive control)', () => {
     expect(() =>
-      assertValidateGatesDeploy(
-        workflow as Parameters<typeof assertValidateGatesDeploy>[0],
-      ),
+      assertValidationGatesDeploy(workflow(GOOD_PIPELINE)),
     ).not.toThrow();
   });
 
-  // The real proof: the actual, on-disk workflow file — parsed exactly as CI
-  // would parse it — must satisfy the gate. If a future edit silently drops
-  // the `needs: validate` link or one of the three validate steps, this test
-  // fails.
+  // The real proof: the actual, on-disk workflow — parsed exactly as CI
+  // would parse it — must satisfy the gate. If a future edit reorders the
+  // deploy ahead of validation, or drops the typecheck/test steps, this fails.
   it('accepts the real, on-disk deploy-website.yml', () => {
-    const raw = readFileSync(DEPLOY_WORKFLOW_PATH, 'utf8');
-    const workflow: unknown = parse(raw);
-    expect(() =>
-      assertValidateGatesDeploy(
-        workflow as Parameters<typeof assertValidateGatesDeploy>[0],
-      ),
-    ).not.toThrow();
+    expect(() => assertValidationGatesDeploy(onDiskWorkflow())).not.toThrow();
   });
 });
 
-describe('assertDeployPromotesArtifact', () => {
-  it('rejects the pre-#286 shape: deploy triggers a second remote build instead of promoting an artifact', () => {
-    const workflow: unknown = parse(PRE_FIX_WORKFLOW_YAML);
+describe('assertDeployUsesRemoteBuild', () => {
+  it('rejects `vercel deploy --prebuilt` (prebuilt output is not portable here)', () => {
     expect(() =>
-      assertDeployPromotesArtifact(
-        workflow as Parameters<typeof assertDeployPromotesArtifact>[0],
+      assertDeployUsesRemoteBuild(
+        workflow(`
+jobs:
+  deploy:
+    steps:
+      - run: vercel build --prod --yes --cwd apps/website
+      - run: vercel deploy --prebuilt --prod --yes --cwd apps/website
+`),
       ),
-    ).toThrow(/must upload the production build artifact/);
+    ).toThrow(/--prebuilt.* is incompatible/);
   });
 
-  it('rejects a deploy job that downloads the artifact but deploys without --prebuilt', () => {
-    const workflow: unknown = parse(`
+  it('rejects reintroducing the two-job .vercel/output upload promotion', () => {
+    expect(() =>
+      assertDeployUsesRemoteBuild(
+        workflow(`
 jobs:
   validate:
     steps:
@@ -191,6 +167,19 @@ jobs:
         with:
           name: website-vercel-build
           path: apps/website/.vercel/output
+  deploy:
+    steps:
+      - run: vercel deploy --prod --yes --cwd apps/website
+`),
+      ),
+    ).toThrow(/uploads the Vercel build output/);
+  });
+
+  it('rejects reintroducing the .vercel/output download promotion', () => {
+    expect(() =>
+      assertDeployUsesRemoteBuild(
+        workflow(`
+jobs:
   deploy:
     steps:
       - uses: actions/download-artifact@v4
@@ -198,169 +187,66 @@ jobs:
           name: website-vercel-build
           path: apps/website/.vercel/output
       - run: vercel deploy --prod --yes --cwd apps/website
-`);
-    expect(() =>
-      assertDeployPromotesArtifact(
-        workflow as Parameters<typeof assertDeployPromotesArtifact>[0],
+`),
       ),
-    ).toThrow(/--prebuilt/);
+    ).toThrow(/downloads the Vercel build output/);
   });
 
-  // Regression tests for the review finding on #353: an existence-only
-  // download-artifact check false-passes when deploy downloads an unrelated
-  // artifact (or to the wrong path) — `vercel deploy --prebuilt` would then
-  // deploy something other than the validated build.
-  it('rejects a deploy job that downloads a DIFFERENT artifact than validate uploaded', () => {
-    const workflow: unknown = parse(`
+  it('rejects a pipeline with no `vercel deploy --prod` step', () => {
+    expect(() =>
+      assertDeployUsesRemoteBuild(
+        workflow(`
 jobs:
-  validate:
-    steps:
-      - uses: actions/upload-artifact@v4
-        with:
-          name: website-vercel-build
-          path: apps/website/.vercel/output
   deploy:
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: some-unrelated-artifact
-          path: apps/website/.vercel/output
-      - run: vercel deploy --prebuilt --prod --yes --cwd apps/website
-`);
-    expect(() =>
-      assertDeployPromotesArtifact(
-        workflow as Parameters<typeof assertDeployPromotesArtifact>[0],
+      - run: pnpm --filter @agentmonitors/website check
+`),
       ),
-    ).toThrow(/"name" differs/);
+    ).toThrow(/must run .*vercel deploy --prod/);
   });
 
-  it('rejects a deploy job that downloads the artifact to the WRONG path', () => {
-    const workflow: unknown = parse(`
-jobs:
-  validate:
-    steps:
-      - uses: actions/upload-artifact@v4
-        with:
-          name: website-vercel-build
-          path: apps/website/.vercel/output
-  deploy:
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: website-vercel-build
-          path: somewhere/else
-      - run: vercel deploy --prebuilt --prod --yes --cwd apps/website
-`);
+  it('accepts a remote-build deploy (positive control)', () => {
     expect(() =>
-      assertDeployPromotesArtifact(
-        workflow as Parameters<typeof assertDeployPromotesArtifact>[0],
-      ),
-    ).toThrow(/"path" differs/);
-  });
-
-  it('rejects a validate job that never uploads the build artifact', () => {
-    const workflow: unknown = parse(`
-jobs:
-  validate:
-    steps:
-      - run: vercel build --prod --yes --cwd apps/website
-  deploy:
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: website-vercel-build
-          path: apps/website/.vercel/output
-      - run: vercel deploy --prebuilt --prod --yes --cwd apps/website
-`);
-    expect(() =>
-      assertDeployPromotesArtifact(
-        workflow as Parameters<typeof assertDeployPromotesArtifact>[0],
-      ),
-    ).toThrow(/must upload/);
-  });
-
-  it('accepts a deploy job that downloads the artifact validate uploaded and deploys it prebuilt (positive control)', () => {
-    const workflow: unknown = parse(`
-jobs:
-  validate:
-    steps:
-      - uses: actions/upload-artifact@v4
-        with:
-          name: website-vercel-build
-          path: apps/website/.vercel/output
-  deploy:
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: website-vercel-build
-          path: apps/website/.vercel/output
-      - run: vercel deploy --prebuilt --prod --yes --cwd apps/website
-`);
-    expect(() =>
-      assertDeployPromotesArtifact(
-        workflow as Parameters<typeof assertDeployPromotesArtifact>[0],
-      ),
+      assertDeployUsesRemoteBuild(workflow(GOOD_PIPELINE)),
     ).not.toThrow();
   });
 
-  // The real proof: if a future edit reverts `deploy` back to an independent
-  // `vercel deploy --prod` remote build, this test fails against the actual
-  // on-disk workflow.
+  // The real proof: if a future edit reverts `deploy` back to the broken
+  // `vercel deploy --prebuilt` promotion, this fails against the on-disk file.
   it('accepts the real, on-disk deploy-website.yml', () => {
-    const raw = readFileSync(DEPLOY_WORKFLOW_PATH, 'utf8');
-    const workflow: unknown = parse(raw);
-    expect(() =>
-      assertDeployPromotesArtifact(
-        workflow as Parameters<typeof assertDeployPromotesArtifact>[0],
-      ),
-    ).not.toThrow();
+    expect(() => assertDeployUsesRemoteBuild(onDiskWorkflow())).not.toThrow();
   });
 });
 
 describe('assertPathTriggersIncludeSharedInputs', () => {
-  it('rejects the pre-#286 shape: no root/shared inputs in the paths filter', () => {
-    const workflow: unknown = parse(PRE_FIX_WORKFLOW_YAML);
+  it('rejects a paths filter with no root/shared inputs', () => {
     expect(() =>
       assertPathTriggersIncludeSharedInputs(
-        workflow as Parameters<typeof assertPathTriggersIncludeSharedInputs>[0],
-      ),
-    ).toThrow(/pnpm-lock\.yaml/);
-  });
-
-  it('names every missing required path, not just the first', () => {
-    const workflow: unknown = parse(`
+        workflow(`
 on:
   push:
     paths:
       - 'apps/website/**'
-`);
-    expect(() =>
-      assertPathTriggersIncludeSharedInputs(
-        workflow as Parameters<typeof assertPathTriggersIncludeSharedInputs>[0],
+`),
       ),
     ).toThrow(/pnpm-lock\.yaml.*pnpm-workspace\.yaml.*package\.json/s);
   });
 
   it('rejects a push trigger with no paths filter at all', () => {
-    const workflow: unknown = parse(`
+    expect(() =>
+      assertPathTriggersIncludeSharedInputs(
+        workflow(`
 on:
   push:
     branches: [main]
-`);
-    expect(() =>
-      assertPathTriggersIncludeSharedInputs(
-        workflow as Parameters<typeof assertPathTriggersIncludeSharedInputs>[0],
+`),
       ),
     ).toThrow(/no "paths" filter/);
   });
 
   it('accepts the real, on-disk deploy-website.yml', () => {
-    const raw = readFileSync(DEPLOY_WORKFLOW_PATH, 'utf8');
-    const workflow: unknown = parse(raw);
     expect(() =>
-      assertPathTriggersIncludeSharedInputs(
-        workflow as Parameters<typeof assertPathTriggersIncludeSharedInputs>[0],
-      ),
+      assertPathTriggersIncludeSharedInputs(onDiskWorkflow()),
     ).not.toThrow();
   });
 
