@@ -1733,6 +1733,70 @@ Handle it.
     expect(withDiff[0]?.diffText).toContain('changed');
   });
 
+  // REGRESSION (issue #437 review, comment 3609314737): the json-diff wiring
+  // suite (json-diff-wiring.test.ts) drives RuntimeStore.insertEvent directly
+  // with an already-rendered structural diffText — it never routes through
+  // AgentMonitorRuntime.processObservation, so reverting service.ts's
+  // buildDiff(..., strategy) call back to a bare buildTextDiff would leave
+  // every existing test green. This drives a REAL observation through the
+  // actual runtime tick (source -> processObservation -> materialized shared
+  // event), with the object's `snapshot.strategy` declared as `json-diff`,
+  // and asserts the persisted diffText is structural (a `~ changed` entry),
+  // not the line-diff `-/+ 1:` output buildTextDiff would produce for a
+  // single-line compact-JSON snapshot.
+  it('renders a structural json-diff diffText for a real observation routed through processObservation', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    const monitorsDir = createMonitorFile(
+      rootDir,
+      'json-snap-source',
+      'normal',
+      'Handle it.',
+      "  interval: '1s'\n",
+    );
+
+    let content = JSON.stringify({ id: 1, status: 'open' });
+    const source: ObservationSource = {
+      name: 'json-snap-source',
+      scopeSchema: { type: 'object' },
+      observe: () =>
+        Promise.resolve({
+          observations: [
+            {
+              title: 'snapshot',
+              objectKey: 'obj-1',
+              snapshotText: content,
+              snapshot: { strategy: 'json-diff' },
+            },
+          ],
+        }),
+    };
+
+    const runtime = createRuntime(dbPath, source);
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-json-snap',
+        workspacePath: rootDir,
+      }),
+    );
+
+    await runtime.tick(monitorsDir, rootDir); // v1 — no prior snapshot, no diff
+    content = JSON.stringify({ id: 1, status: 'closed' });
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    await runtime.tick(monitorsDir, rootDir); // v2 — diffs against v1
+
+    const events = runtime.listEvents({ sessionId: session.id });
+    expect(events).toHaveLength(2);
+    const withDiff = events.filter((event) => event.diffText);
+    expect(withDiff).toHaveLength(1);
+    // Structural json-diff rendering (`~ changed`), never a line-diff
+    // `-/+ 1:` remove-all/add-all of the single-line compact JSON.
+    expect(withDiff[0]?.diffText).toContain('~ changed');
+    expect(withDiff[0]?.diffText).not.toMatch(/^- 1:/m);
+    expect(withDiff[0]?.diffText).not.toMatch(/^\+ 1:/m);
+  });
+
   // G6: each due monitor's outcome is recorded to observation_history per tick.
   it('records observation history (triggered, then no-change) per tick', async () => {
     const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));

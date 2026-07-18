@@ -425,6 +425,14 @@ function diffJsonArrayByKey(
  * `findIndex` + full re-stringify per comparison — the earlier version diffed
  * a reversed 5,000-element array in roughly 1.5s of synchronous daemon-tick
  * time; this is `O(N+M)` (issue #437 review).
+ *
+ * Each bucket is consumed with `pop()`, not `shift()`: `shift()` re-indexes
+ * every remaining element in the bucket, so a large duplicate-value bucket
+ * (many elements canonicalizing to the same string) degenerates to `O(M^2)`
+ * on its own — a daemon-tick stall proportional to duplicate count, not just
+ * array length (issue #437 follow-up review). Since every element in a
+ * bucket is deep-equal by construction (same canonical string), which
+ * physical element is matched first is immaterial to the emitted diff.
  */
 function diffJsonArrayByDeepEquality(
   sink: DiffEntrySink,
@@ -448,7 +456,7 @@ function diffJsonArrayByDeepEquality(
     const canon = prevCanon[i] ?? '';
     const bucket = remainingByCanon.get(canon);
     if (bucket && bucket.length > 0) {
-      bucket.shift();
+      bucket.pop();
     } else {
       sink.push({ kind: 'removed', path, value: prev[i] });
     }
@@ -632,11 +640,18 @@ function renderJsonDiffEntries(sink: DiffEntrySink): string {
  * deep object graph (many nested field paths, each near its own length cap)
  * could still add up to an oversized string. Truncates at a code-point
  * boundary with an explicit elision marker (issue #437 review).
+ *
+ * The marker's own length is reserved from the truncation budget FIRST, then
+ * appended — truncating to `MAX_JSON_DIFF_OUTPUT_LENGTH` and appending the
+ * marker afterward would let the marker push the final string past the
+ * documented hard cap (issue #437 follow-up review).
  */
 function boundTotalOutput(rendered: string): string {
   if (rendered.length <= MAX_JSON_DIFF_OUTPUT_LENGTH) return rendered;
-  const { text } = truncateAtCodePoint(rendered, MAX_JSON_DIFF_OUTPUT_LENGTH);
-  return `${text}\n… output truncated at ${String(MAX_JSON_DIFF_OUTPUT_LENGTH)} characters`;
+  const marker = `\n… output truncated at ${String(MAX_JSON_DIFF_OUTPUT_LENGTH)} characters`;
+  const budget = Math.max(0, MAX_JSON_DIFF_OUTPUT_LENGTH - marker.length);
+  const { text } = truncateAtCodePoint(rendered, budget);
+  return `${text}${marker}`;
 }
 
 /**

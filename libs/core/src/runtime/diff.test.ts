@@ -423,7 +423,11 @@ describe('buildJsonDiff — untrusted path escaping and bounding (issue #437 rev
       JSON.stringify(currObj),
     );
     expect(diff).toBeDefined();
-    expect(diff?.length).toBeLessThanOrEqual(20_100);
+    // Hard cap: the rendered diffText, INCLUDING the elision marker itself,
+    // must never exceed MAX_JSON_DIFF_OUTPUT_LENGTH (issue #437 follow-up
+    // review — a prior version truncated to the cap and then appended the
+    // marker afterward, so the final string exceeded the documented bound).
+    expect(diff?.length).toBeLessThanOrEqual(20_000);
     expect(diff).toContain('output truncated at 20000 characters');
   });
 });
@@ -452,6 +456,43 @@ describe('buildJsonDiff — performance (issue #437 review)', () => {
     // 5,000 remove/add pairs.
     expect(diff).toContain('reordered');
     expect(elapsedMs).toBeLessThan(300);
+  });
+
+  // REGRESSION: the reversed-unique fixture above only ever produces
+  // multiset buckets of length 1 (every element is distinct), so it cannot
+  // catch a bucket-internal quadratic blowup. Each successful match used to
+  // call `bucket.shift()`, which re-indexes every remaining element in that
+  // bucket — with one large duplicate-value bucket this degenerates to
+  // `O(M^2)` in the bucket size alone, independent of overall array length.
+  // Measured on the pre-fix code: ~3ms at 5k, 28ms at 20k, 162ms at 50k,
+  // 601ms at 100k, 2.3s at 200k duplicate elements — clearly superlinear. A
+  // single distinguishable "moved" element plus a large duplicate bucket
+  // reproduces this without relying on identity-key matching.
+  it('diffs a large duplicate-value bucket plus one moved element well under a bounded time', () => {
+    const DUPLICATE_COUNT = 200_000;
+    const duplicate = { a: 'same', b: 'same' };
+    const moved = { a: 'unique', b: 'unique' };
+
+    const prev = [
+      ...Array.from({ length: DUPLICATE_COUNT }, () => duplicate),
+      moved,
+    ];
+    // `moved` relocates to the front; every duplicate stays a duplicate.
+    const curr = [
+      moved,
+      ...Array.from({ length: DUPLICATE_COUNT }, () => duplicate),
+    ];
+
+    const start = performance.now();
+    const diff = buildJsonDiff(JSON.stringify(prev), JSON.stringify(curr));
+    const elapsedMs = performance.now() - start;
+
+    expect(diff).toBeDefined();
+    expect(diff).toContain('reordered');
+    // Generous enough for a slow CI runner under linear (O(N+M)) behavior,
+    // but well under the ~2.3s the quadratic `shift()`-based implementation
+    // took at this same duplicate-bucket size.
+    expect(elapsedMs).toBeLessThan(1000);
   });
 });
 
