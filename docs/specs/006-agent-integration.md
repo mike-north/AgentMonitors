@@ -162,29 +162,71 @@ The runtime's existing `DeliveryClaim` renders into the channel notification's t
 conventions follow the bundled reference channels (snake_case identifier keys, string-only values,
 multi-values flattened):
 
-- **`content`** (string): the rendered delivery summary — the concrete events for a high-urgency
-  claim, or the coalesced reminder text for normal/low — exactly what `claimDelivery` already
-  produces. AgentMon authored/observed text is **untrusted** (see §4.6).
+- **`content`** (string): the rendered delivery — see the content contract in §4.2.1. AgentMon
+  authored/observed text is **untrusted** (see §4.6).
 - **`meta`** (`Record<string,string>`): routing/context attributes. Keys **MUST** be identifiers
   (`[A-Za-z0-9_]`); hyphens are silently dropped by the host, so kebab fields are converted:
 
-  | meta key      | value                                                 | notes                              |
-  | ------------- | ----------------------------------------------------- | ---------------------------------- |
-  | `monitor_id`  | the monitor's ID                                      |                                    |
-  | `urgency`     | `low` \| `normal` \| `high`                           |                                    |
-  | `object_key`  | the event `objectKey`                                 | sanitized (§4.6)                   |
-  | `event_id`    | the durable event ID                                  | passed back by the ack tool (§4.3) |
-  | `event_count` | number of coalesced events, stringified               |                                    |
-  | `lifecycle`   | `turn-interruptible` \| `turn-idle` \| `post-compact` |                                    |
+  | meta key      | value                                                 | notes                                                                                                                 |
+  | ------------- | ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+  | `monitor_id`  | the monitor's ID                                      | single-event claims only                                                                                              |
+  | `urgency`     | `low` \| `normal` \| `high`                           |                                                                                                                       |
+  | `object_key`  | the event `objectKey`                                 | sanitized (§4.6)                                                                                                      |
+  | `event_id`    | the durable event ID                                  | passed back by the ack tool (§4.3); single-event claims only                                                          |
+  | `event_count` | number of pending events, stringified                 | coalesced events for a body-injection claim; the session's **unread total** for a reminder claim (§4.2.1) — never `0` |
+  | `lifecycle`   | `turn-interruptible` \| `turn-idle` \| `post-compact` |                                                                                                                       |
 
 The `source` attribute on the rendered `<channel>` tag is set by the host from the MCP server name
 (e.g. `agentmonitors`), not by `meta`.
 
 > **Stage-1 coverage.** The one-way server renders from a `DeliveryClaim`, whose
 > `DeliveryEventSummary` carries `eventId`, `monitorId`, `urgency`, `body` (the raw monitor
-> instructions), etc. but **not** `objectKey`. So stage 1 emits `lifecycle`, `mode`, `event_count`,
-> `urgency`, and (for a single event) `monitor_id` and `event_id`. `object_key` is target and
-> requires further enrichment; it is not yet emitted.
+> instructions), `diffText` (the change summary; optional), etc. but **not** `objectKey`. So stage 1
+> emits `lifecycle`, `mode`, `event_count`, `urgency`, and (for a single event) `monitor_id` and
+> `event_id`. `object_key` is target and requires further enrichment; it is not yet emitted.
+
+#### 4.2.1 `content` rendering contract
+
+> **Status: implemented.** `apps/cli/src/channel-render.ts`, sharing the per-event block builder
+> `apps/cli/src/delivery-event-render.ts` with the hook-deliver transport (§5.1).
+
+The channel is a **rendering surface over the same semantics** as the hook-deliver transport — "same
+events, same urgency … only the surface" (§6). The tag body therefore carries the **same event
+content the hook path injects**, not a lesser summary. Two claim shapes render differently:
+
+- **Body-injection claim** (a settled high-urgency delivery, or a `post-compact` recap — `events` is
+  populated): `content` renders **one block per event**, joined by a blank line. Each block is the
+  transport-shared per-event block:
+
+  ```text
+  ### <monitor_id> (<urgency>)
+  <title>
+
+  <body — the monitor author's instructions for this event>
+
+  Changes:
+  <bounded diffText — the change summary>
+  ```
+
+  The `Changes:` section appears only when the event carries a non-empty `diffText`. The change
+  summary is **bounded** per event (currently 800 chars) with an explicit elision marker
+  (`… (change summary truncated)`) — a raw diff can be arbitrarily large and the tag body lands in
+  the agent's context window (§4.6). This is exactly the block the hook-deliver transport renders
+  into `additionalContext` (§5.1); the only per-transport difference is content sanitization (the
+  channel strips `<>[]` for tag safety, §4.6; the hook path preserves them) and the overall cap.
+
+- **Reminder claim** (`normal`/`low` — no event bodies, only a coalesced advisory `message`):
+  `content` renders that generic message verbatim (002 §9.2), with **no** body injection.
+
+The full `content` is capped at 4000 chars; when truncation occurs an explicit marker is appended
+pointing at the durable, re-discoverable rest (`agentmonitors events list --unread`). Truncation
+never loses an event: surfacing marks rows **claimed, not acknowledged** (BP2), so anything cut here
+stays unread (§4.5, §5.5).
+
+A body-injection claim that rendered only its **title** — dropping the monitor body and the change
+summary — is a **defect on this surface**, not a lighter rendering: the receiving agent would have to
+already know what the monitor meant and separately run `events list` to see what changed, defeating
+push delivery.
 
 ### 4.3 Two-way: acknowledgement tool
 
@@ -793,12 +835,20 @@ A settled high-urgency `file-fingerprint` claim surfaces as:
 <channel source="agentmonitors" monitor_id="build-config-drift" urgency="high"
          object_key="/repo/package.json" event_id="01J…"
          event_count="1" lifecycle="turn-interruptible">
-package.json changed — review whether build behavior or dependency state needs updating.
+### build-config-drift (high)
+package.json changed
+
+Review whether build behavior or dependency state needs updating.
+
+Changes:
+- "version": "1.0.0"
++ "version": "1.1.0"
 </channel>
 ```
 
 **What this proves:** the same `DeliveryClaim` the hook path would surface is rendered into the
-channel field schema; `event_id` is available for the ack tool.
+channel field schema, carrying the same event content (title + monitor body + bounded change
+summary, §4.2.1) — not the title alone; `event_id` is available for the ack tool.
 
 ### 9.2 Acknowledgement round-trip
 

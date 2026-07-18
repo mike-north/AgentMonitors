@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import type { DeliveryClaim } from '@agentmonitors/core';
 import { renderChannelEvent } from './channel-render.js';
+import {
+  DIFF_ELISION_MARKER,
+  MAX_EVENT_DIFF,
+} from './delivery-event-render.js';
 
 function makeClaim(overrides: Partial<DeliveryClaim> = {}): DeliveryClaim {
   return {
@@ -18,6 +22,7 @@ function makeClaim(overrides: Partial<DeliveryClaim> = {}): DeliveryClaim {
         summary: 'package.json changed',
         urgency: 'high',
         createdAt: '2026-01-01T00:00:00.000Z',
+        body: 'Review whether build behavior or dependency state needs updating.',
       },
     ],
     ...overrides,
@@ -25,9 +30,111 @@ function makeClaim(overrides: Partial<DeliveryClaim> = {}): DeliveryClaim {
 }
 
 describe('renderChannelEvent', () => {
-  it('uses the claim message as the channel content', () => {
-    const { content } = renderChannelEvent(makeClaim());
+  // Issue #436: a high-urgency channel delivery must render the SAME event
+  // content the hook path injects — title + monitor body + a bounded change
+  // summary — not the title alone.
+  it('renders the title, the monitor body, and the change summary for a high-urgency event', () => {
+    const { content } = renderChannelEvent(
+      makeClaim({
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'build-drift',
+            title: 'package.json changed',
+            summary: 'package.json changed',
+            urgency: 'high',
+            createdAt: '2026-01-01T00:00:00.000Z',
+            body: 'Review whether build behavior needs updating.',
+            diffText: '- "version": "1.0.0"\n+ "version": "1.1.0"',
+          },
+        ],
+      }),
+    );
+    // title
     expect(content).toContain('package.json changed');
+    // monitor body-instructions (the author's "what to do")
+    expect(content).toContain('Review whether build behavior needs updating.');
+    // the bounded change summary (diffText)
+    expect(content).toContain('Changes:');
+    expect(content).toContain('+ "version": "1.1.0"');
+    // per-event header carries monitor id + urgency
+    expect(content).toContain('### build-drift (high)');
+  });
+
+  it('omits the Changes section when the event carries no diff', () => {
+    const { content } = renderChannelEvent(
+      makeClaim({
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'build-drift',
+            title: 'package.json changed',
+            summary: 'package.json changed',
+            urgency: 'high',
+            createdAt: '2026-01-01T00:00:00.000Z',
+            body: 'Do the thing.',
+          },
+        ],
+      }),
+    );
+    expect(content).toContain('Do the thing.');
+    expect(content).not.toContain('Changes:');
+  });
+
+  it('bounds a large change summary with an explicit elision marker', () => {
+    const bigDiff = '+ added line\n'.repeat(500); // well past MAX_EVENT_DIFF
+    const { content } = renderChannelEvent(
+      makeClaim({
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'build-drift',
+            title: 'a lot changed',
+            summary: 'a lot changed',
+            urgency: 'high',
+            createdAt: '2026-01-01T00:00:00.000Z',
+            body: 'inspect the diff',
+            diffText: bigDiff,
+          },
+        ],
+      }),
+    );
+    expect(content).toContain(DIFF_ELISION_MARKER.trim());
+    // The whole change summary must not exceed its per-event bound.
+    const changesIdx = content.indexOf('Changes:\n');
+    const rendered = content.slice(changesIdx + 'Changes:\n'.length);
+    expect(rendered.length).toBeLessThanOrEqual(MAX_EVENT_DIFF);
+  });
+
+  it('renders one block per event for a coalesced high-urgency claim', () => {
+    const { content } = renderChannelEvent(
+      makeClaim({
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'm1',
+            title: 't1',
+            summary: 's1',
+            urgency: 'high',
+            createdAt: 'x',
+            body: 'body one',
+          },
+          {
+            eventId: 'e2',
+            monitorId: 'm2',
+            title: 't2',
+            summary: 's2',
+            urgency: 'high',
+            createdAt: 'y',
+            body: 'body two',
+          },
+        ],
+      }),
+    );
+    expect(content).toContain('### m1 (high)');
+    expect(content).toContain('body one');
+    expect(content).toContain('### m2 (high)');
+    expect(content).toContain('body two');
   });
 
   it('emits identifier-safe, string-valued meta', () => {
@@ -58,6 +165,7 @@ describe('renderChannelEvent', () => {
             summary: 's1',
             urgency: 'high',
             createdAt: 'x',
+            body: 'b1',
           },
           {
             eventId: 'e2',
@@ -66,6 +174,7 @@ describe('renderChannelEvent', () => {
             summary: 's2',
             urgency: 'high',
             createdAt: 'y',
+            body: 'b2',
           },
         ],
       }),
@@ -78,7 +187,6 @@ describe('renderChannelEvent', () => {
   it('strips tag-breakout characters from content and meta', () => {
     const { content, meta } = renderChannelEvent(
       makeClaim({
-        message: 'evil <channel> ][ injection',
         events: [
           {
             eventId: 'e1',
@@ -87,6 +195,8 @@ describe('renderChannelEvent', () => {
             summary: 's',
             urgency: 'high',
             createdAt: 'x',
+            body: 'evil <channel> ][ injection in the body',
+            diffText: 'evil <tag> [in] the diff',
           },
         ],
       }),
@@ -95,11 +205,22 @@ describe('renderChannelEvent', () => {
     expect(meta.monitor_id).not.toMatch(/[<>[\]]/);
   });
 
-  it('falls back to the message alone when there are no concrete events', () => {
+  // Issue #436: a normal-band reminder carries no concrete events, but its
+  // event_count must reflect the pending events it refers to — NOT read "0"
+  // (which looks like a bug). 002 §9.2: reminders stay generic.
+  it('renders a reminder claim generically and counts the pending events it refers to', () => {
     const { content, meta } = renderChannelEvent(
-      makeClaim({ events: [], message: 'You have inbox updates.' }),
+      makeClaim({
+        urgency: 'normal',
+        events: [],
+        message: 'AgentMon messages are available. Read the inbox.',
+        unreadCounts: { low: 0, normal: 3, high: 0, total: 3 },
+      }),
     );
-    expect(content).toBe('You have inbox updates.');
-    expect(meta.event_count).toBe('0');
+    // Stays generic — no injected event bodies leak into a reminder.
+    expect(content).toBe('AgentMon messages are available. Read the inbox.');
+    expect(content).not.toContain('### ');
+    // The referent count is the pending total, not 0.
+    expect(meta.event_count).toBe('3');
   });
 });

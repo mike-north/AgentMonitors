@@ -460,6 +460,10 @@ function toDeliveryEventSummary(
     urgency: event.urgency,
     createdAt: event.createdAt.toISOString(),
     body: event.body,
+    // Surface the change summary when the event carried one; a transport bounds
+    // it before rendering (issue #436). Prefer `undefined` over `null` on the
+    // delivery summary (optional-field convention), so omit it for a null diff.
+    ...(event.diffText ? { diffText: event.diffText } : {}),
   };
 }
 

@@ -181,6 +181,17 @@ export interface DeliveryEventSummary {
    * instructions, not just the title/summary.
    */
   body: string;
+  /**
+   * The change summary for this event (from `MonitorEventRecord.diffText`) —
+   * what actually changed at the observed source (a file diff, an API-body diff,
+   * a command-output diff). Carries the concrete evidence the monitor fired on,
+   * so a delivery transport can surface *what changed*, not just the title and
+   * the author's instructions. Optional: absent when the event carried no diff
+   * (`MonitorEventRecord.diffText` was `null`). Transports that surface it MUST
+   * bound it — a raw diff can be arbitrarily large and the render lands in the
+   * agent's context window.
+   */
+  diffText?: string;
 }
 
 export interface DeliveryClaim {

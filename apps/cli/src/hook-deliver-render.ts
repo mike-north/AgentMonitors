@@ -1,4 +1,5 @@
 import type { DeliveryClaim, DeliveryEventSummary } from '@agentmonitors/core';
+import { buildEventBlock as buildSharedEventBlock } from './delivery-event-render.js';
 
 const MAX_ADDITIONAL_CONTEXT = 4000;
 
@@ -110,13 +111,14 @@ function appendMarkerWithinCap(body: string, cap: number): string {
 /** The fixed prefix of a body-injection payload: lead line + blank line. */
 const HEADER = `${LEAD_LINE}\n\n`;
 
-/** Render one event as its `additionalContext` block (sanitized). */
+/**
+ * Render one event as its `additionalContext` block, using the transport-shared
+ * block builder so this path and the channel path render the same event
+ * equivalently (issue #436, 006 §6). The hook `sanitize` preserves `<>[]` — the
+ * `additionalContext` is a JSON string, not tag-delimited (see {@link sanitize}).
+ */
 function buildEventBlock(event: DeliveryEventSummary): string {
-  const id = sanitize(event.monitorId);
-  const urgency = sanitize(event.urgency);
-  const title = sanitize(event.title);
-  const body = sanitize(event.body);
-  return `### ${id} (${urgency})\n${title}\n\n${body}`;
+  return buildSharedEventBlock(event, sanitize);
 }
 
 /**

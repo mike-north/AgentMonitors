@@ -221,6 +221,7 @@ export interface DeliveryEventSummary {
     body: string;
     // (undocumented)
     createdAt: string;
+    diffText?: string;
     // (undocumented)
     eventId: string;
     // (undocumented)
