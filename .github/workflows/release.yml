@@ -11,6 +11,11 @@ permissions:
   actions: write
   contents: write
   pull-requests: write
+  # Lets the publish step exchange a GitHub Actions OIDC token for a
+  # short-lived npm publish token (npm trusted publishing), which pnpm
+  # prefers over the NPM_TOKEN fallback passed to the publish step below;
+  # see the "Create Release Pull Request Or Publish" step below.
+  id-token: write
 
 jobs:
   release:
@@ -23,6 +28,13 @@ jobs:
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.head_branch == 'main'
     runs-on: ubuntu-latest
+    # Matches the npm trusted-publisher record identity tuple for each
+    # published package — see docs/release-process.md for the exact values.
+    # GitHub auto-creates this environment on first use. This job also
+    # creates/updates the Version PR and runs a no-op gate on every push to
+    # main, so an environment protection rule here would gate ALL of those
+    # runs, not just publish — split publishing into its own job first.
+    environment: npm-publish
     timeout-minutes: 30
 
     steps:
@@ -62,7 +74,7 @@ jobs:
       - name: Create Release Pull Request Or Publish
         id: changesets
         if: steps.release-work.outputs.should-run == 'true'
-        uses: changesets/action@v1
+        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
         with:
           version: pnpm version:packages
           publish: pnpm release
@@ -71,9 +83,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          # NOTE: npm provenance (NPM_CONFIG_PROVENANCE + id-token: write) requires a
-          # PUBLIC source repository — the registry rejects private-repo attestations
-          # with E422. Re-enable both if/when this repo goes public.
+          # pnpm >=11.0.7 prefers OIDC trusted publishing over this token, so
+          # once a package's trusted-publisher record exists this token goes
+          # unused for it. It stays here as a fallback so publishes keep
+          # working for packages whose records aren't registered yet. Remove
+          # it (and revoke NPM_TOKEN) only after an OIDC publish + provenance
+          # has been verified for every package — see docs/release-process.md.
 
       - name: Trigger CI For Release Pull Request
         if: |

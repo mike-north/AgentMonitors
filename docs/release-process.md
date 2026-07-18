@@ -14,7 +14,10 @@ release-work gate, the standalone-consumer coverage check, and the collateral
 dry-run all derive from it — there is no second hand-maintained list to drift
 out of sync. `scripts/release-gate.test.ts` asserts `PACKAGE_DIRS` still matches
 the non-private packages actually present in the workspace, so a newly added
-publishable package that isn't added to `PACKAGE_DIRS` fails CI.
+publishable package that isn't added to `PACKAGE_DIRS` fails CI. Adding a
+package to `PACKAGE_DIRS` also means registering its npm trusted-publisher
+record (see "Authentication" below) — until that's done it publishes through
+the `NODE_AUTH_TOKEN` fallback instead of OIDC.
 
 ## Normal flow
 
@@ -102,6 +105,110 @@ means:
 
 To force a reconciliation attempt without a new commit, re-run the CI workflow on
 `main` (`workflow_dispatch`); its success re-triggers the Release workflow.
+
+## Authentication: npm trusted publishing (OIDC), with a token fallback
+
+The publish step (`pnpm publish`, invoked by `pnpm release` inside
+[`scripts/publish-release-packages.mjs`](../scripts/publish-release-packages.mjs))
+authenticates to npm via [trusted publishing](https://docs.npmjs.com/trusted-publishers/)
+whenever it can, falling back to a long-lived token only when it can't:
+
+1. The Release workflow's `id-token: write` permission lets GitHub issue the
+   job a short-lived OIDC identity token.
+2. pnpm `>=11.0.7` gives that OIDC exchange **precedence** over any
+   configured static token: `pnpm publish` tries the OIDC exchange first and
+   only falls back to a token if the exchange fails (no trusted-publisher
+   record for that package, etc.). The pinned version (see
+   `package.json#packageManager` for the exact value) is well past this
+   floor. Provenance attestation is automatic under trusted publishing; no
+   `--provenance` flag or `NPM_CONFIG_PROVENANCE` is needed.
+   - A separate, unrelated pnpm bug ([pnpm/pnpm#11513](https://github.com/pnpm/pnpm/issues/11513),
+     an unresolved `${NODE_AUTH_TOKEN}` placeholder breaking OIDC publish
+     outright) was fixed in pnpm `v11.1.3` (via [pnpm/pnpm#11526](https://github.com/pnpm/pnpm/pull/11526)).
+     The pinned version is well past `v11.1.3` too.
+3. npm authorizes the OIDC exchange only if a **trusted publisher record**
+   exists for the package that exactly matches this workflow's identity:
+
+   | Field             | Value                                                             |
+   | ----------------- | ----------------------------------------------------------------- |
+   | Owner/repository  | `mike-north/AgentMonitors` (exact case)                           |
+   | Workflow filename | `release.yml` (filename only)                                     |
+   | Environment       | `npm-publish`                                                     |
+   | Permissions       | `publish` (add `createPackage` too for a package's first release) |
+
+   Every package in `PACKAGE_DIRS` needs its own record — trusted publishing
+   is configured per package on npmjs.com, not per repository. This
+   registration requires an authenticated human (browser + 2FA) and cannot be
+   automated from CI; see the npm trusted-publishers docs linked above.
+   `npm trust list <package> --json` reports a registered record's fields
+   above as a `permissions` array (see "Verifying a trusted-publisher
+   record" below).
+
+### Transition: the `NODE_AUTH_TOKEN` fallback
+
+The Release workflow still passes `NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}`
+to the publish step. Because OIDC takes precedence whenever a
+trusted-publisher record exists (point 2 above), this token is **unused**
+for any package that already has one — it only matters for a package that
+doesn't yet. The intended order of operations:
+
+1. Register a trusted-publisher record for every package in `PACKAGE_DIRS`.
+2. Verify each one actually publishes via OIDC with provenance attached (see
+   "Verifying a trusted-publisher record" and "Post-canary hardening"
+   below).
+3. Only then remove `NODE_AUTH_TOKEN` from the workflow and revoke the
+   `NPM_TOKEN` secret.
+
+Until step 1 is complete for every package, a single release run can publish
+some packages via OIDC (with provenance) and others via the token fallback
+(without it) — this mixed mode is **expected and fine** during the
+transition, not a bug. Recovery stays safe either way: the publisher is
+sequential and idempotent (`releaseCandidates()` skips anything already on
+the registry), so a run that fails partway through — regardless of which
+auth path a given package used — reconciles cleanly on the next successful
+main CI run.
+
+### Verifying a trusted-publisher record
+
+To confirm a package's trusted-publisher record is registered and matches
+this workflow's identity:
+
+```bash
+npm exec --yes --package=npm@11.18.0 -- npm trust list <package-name> --json
+```
+
+Confirm the output shows:
+
+- `file`: `release.yml`
+- `repository`: `mike-north/AgentMonitors`
+- `environment`: `npm-publish`
+- `permissions` includes `publish` (and `createPackage` for a package that
+  hasn't published its first version yet)
+
+### Post-canary hardening
+
+Once the **first** OIDC publish for a package succeeds, verify provenance
+was actually attached before relying on it:
+
+```bash
+npm view <package-name> dist.attestations --json
+```
+
+Only after that verification should the long-lived token be retired:
+
+1. Remove `NODE_AUTH_TOKEN` from [`.github/workflows/release.yml`](../.github/workflows/release.yml).
+2. Restrict token-based publishing for the package on npmjs.com.
+3. Revoke the granular `NPM_TOKEN` secret.
+
+Until all three of these are done, the long-lived token remains live and
+must not be forgotten — it's the only thing keeping releases green for
+packages that don't have a trusted-publisher record registered yet.
+
+Trusted publishing requires the source repository to be public — this
+repository is. Read-only registry checks elsewhere in the pipeline (the
+release-work gate's and publisher's `npm view` calls, and CI's
+`publish:packages:dry-run`) don't need authentication at all and are
+unaffected by this.
 
 ## Pre-release safety checks (on PRs)
 
