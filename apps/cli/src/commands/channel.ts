@@ -5,7 +5,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import type { DeliveryClaim } from '@agentmonitors/core';
+import type { DeliveryClaim, DeliveryReservation } from '@agentmonitors/core';
 import { claudeCodeAdapter } from '@agentmonitors/core';
 import {
   acknowledgeEventsClient,
@@ -135,6 +135,115 @@ export type ChannelDeliveryOutcome =
   | 'surfaced-uncommitted';
 
 /**
+ * Upper bound on how many times {@link reserveSizedChannelDelivery} will
+ * reserve → discover a size mismatch → release → retry before giving up on
+ * sizing and forcing a single-event reservation (issue #442). Sizing and
+ * reservation are two separate IPC calls (preview, then reserve), so the
+ * candidate set can change between them; this bounds how long we chase a
+ * moving target before falling back to the one reservation shape that is
+ * ALWAYS safe (one event, whose own block `renderChannelEvent` mid-truncates
+ * if it still exceeds the ceiling — `channel-render.ts`).
+ */
+const MAX_CHANNEL_RESERVE_ATTEMPTS = 3;
+
+/**
+ * Reserve a `turn-interruptible` delivery sized to fit under the channel's
+ * content ceiling, tolerating the preview↔reserve race (006 §5.5, issue #442).
+ *
+ * Sizing (`previewSettledHighDeliveryClient` + `packChannelEventsUnderCap`) and
+ * reservation (`reserveDeliveryClient`) are two SEPARATE IPC round-trips, so the
+ * candidate set can change in between — either direction:
+ *
+ * - The preview was empty (no settled-high events yet), so `maxEvents` was
+ *   omitted — but an event crosses the 15s settle boundary before `reserve`
+ *   runs, and the reservation comes back carrying an unbounded, unsized claim.
+ * - The previewed rows get leased/claimed by another transport (the hook path)
+ *   before `reserve` runs, so `reserveDelivery` fills the requested COUNT from
+ *   DIFFERENT pending events — events whose block sizes were never measured by
+ *   the preview that produced `maxEvents`.
+ *
+ * Either way, `reserveDelivery`'s `maxEvents` bounds only the CANDIDATE
+ * *count*, not the actually-claimed content size. This re-derives the fit from
+ * the REAL claimed events (`packChannelEventsUnderCap(reservation.claim.events)`)
+ * after every reserve, never trusting the earlier preview once a reservation
+ * exists: if the actual claim doesn't fit, the reservation is released (so the
+ * rows return to pending — no delivery is lost) and retried, tightening the
+ * requested `maxEvents` to what was just measured. Bounded by
+ * {@link MAX_CHANNEL_RESERVE_ATTEMPTS}; the final attempt forces `maxEvents: 1`,
+ * which always terminates (`packChannelEventsUnderCap` of a single-event claim
+ * is always ≥ its own length), so this never loops forever and always makes
+ * forward progress. `renderChannelEvent`'s own defense-in-depth truncation
+ * (`channel-render.ts`) is the last-resort backstop if even that single event's
+ * own block exceeds the ceiling.
+ *
+ * Returns `null` when nothing is pending to reserve (mirrors `reserveDelivery`
+ * returning `null`).
+ */
+export async function reserveSizedChannelDelivery(
+  boundSession: string,
+  socketPath: string,
+): Promise<{ reservation: DeliveryReservation; moreDeferred: boolean } | null> {
+  let forcedCap: number | undefined;
+  for (let attempt = 1; attempt <= MAX_CHANNEL_RESERVE_ATTEMPTS; attempt++) {
+    const isLastAttempt = attempt === MAX_CHANNEL_RESERVE_ATTEMPTS;
+    const highPreview = await previewSettledHighDeliveryClient(
+      boundSession,
+      socketPath,
+    );
+
+    let maxEvents: number | undefined;
+    let moreDeferred = false;
+    if (isLastAttempt) {
+      // Forward-progress fallback: repeated mismatches mean sizing keeps
+      // racing with reservation. Force a single event so THIS attempt cannot
+      // fail to make progress — a claim this small always fits (or is
+      // mid-truncated by `renderChannelEvent` as the final backstop).
+      maxEvents = 1;
+      moreDeferred = highPreview.length > 1;
+    } else if (highPreview.length > 0) {
+      let fit = packChannelEventsUnderCap(highPreview);
+      if (forcedCap !== undefined) fit = Math.min(fit, forcedCap);
+      fit = Math.max(1, fit);
+      maxEvents = fit;
+      moreDeferred = fit < highPreview.length;
+    } else if (forcedCap !== undefined) {
+      // A prior attempt proved a smaller cap was needed, but this preview
+      // raced empty (the oversized set already got reserved/claimed
+      // elsewhere in between) — still force the known-safe cap so a freshly
+      // settled event can't slip back in unbounded.
+      maxEvents = forcedCap;
+    }
+
+    const reservation = await reserveDeliveryClient(
+      boundSession,
+      'turn-interruptible',
+      socketPath,
+      maxEvents,
+    );
+    if (!reservation) return null;
+
+    // Trust only the ACTUAL claimed events from here — never the preview that
+    // produced `maxEvents`, which can already be stale (see doc comment).
+    const fitActual = packChannelEventsUnderCap(reservation.claim.events);
+    if (fitActual >= reservation.claim.events.length) {
+      return { reservation, moreDeferred };
+    }
+
+    // Mismatch: the actually-claimed set does not fit. Release it (the rows
+    // return to pending — nothing is lost) and retry, tightening the cap to
+    // what was just measured.
+    await releaseDeliveryClient(reservation.reservationId, socketPath).catch(
+      () => undefined,
+    );
+    forcedCap = Math.max(1, fitActual);
+  }
+  // Unreachable: the final (`isLastAttempt`) iteration above always returns,
+  // since a single-event claim's fit is always ≥ its own length. Kept only to
+  // satisfy the return type.
+  return null;
+}
+
+/**
  * One reserve → push → commit/release delivery cycle for a bound session (006
  * §4, issue #300).
  *
@@ -146,19 +255,14 @@ export type ChannelDeliveryOutcome =
  * transient failure never consumes the delivery. The rows are never
  * acknowledged by this path (BP2); a committed claim only means "was surfaced".
  *
- * **Bounded reservation (006 §5.5, issue #442).** Before reserving, this
- * PREVIEWS the settled high-urgency delivery (`previewSettledHighDeliveryClient`,
- * without mutating state) and sizes how many WHOLE event blocks fit under the
- * channel's content ceiling (`packChannelEventsUnderCap`,
- * `channel-render.ts`) — mirroring exactly how the hook-deliver transport sizes
- * its `additionalContext` cap (`hook-deliver-render.ts`'s `packEventsUnderCap`,
- * issue #299). The computed count becomes `reserveDelivery`'s `maxEvents`, so
- * the reserved/claimed set is sized to what `push` will actually render — the
+ * **Bounded reservation (006 §5.5, issue #442).** {@link
+ * reserveSizedChannelDelivery} sizes (and, if the preview↔reserve race leaves
+ * an oversized or mismatched claim, re-sizes) the reservation so the
+ * reserved/claimed set is sized to what `push` will actually render — the
  * claimed set still equals the rendered set (006 §5.5) — and any settled-high
  * events that do not fit stay pending, re-delivering on a later poll. `push`
  * receives a second `moreDeferred` flag so the renderer can signpost that more
- * is pending. A reminder claim (no settled-high events; `events: []`) needs no
- * sizing, so `maxEvents` is simply omitted for it, exactly as before.
+ * is pending.
  *
  * Reserve/commit/release IPC errors propagate to the caller (the poll loop maps
  * them to "daemon unreachable → drop the cached session"); a `push` rejection is
@@ -171,25 +275,9 @@ export async function runChannelDeliveryCycle(
   socketPath: string,
   push: (claim: DeliveryClaim, moreDeferred: boolean) => Promise<void>,
 ): Promise<ChannelDeliveryOutcome> {
-  const highPreview = await previewSettledHighDeliveryClient(
-    boundSession,
-    socketPath,
-  );
-  let maxEvents: number | undefined;
-  let moreDeferred = false;
-  if (highPreview.length > 0) {
-    const fit = packChannelEventsUnderCap(highPreview);
-    maxEvents = fit;
-    moreDeferred = fit < highPreview.length;
-  }
-
-  const reservation = await reserveDeliveryClient(
-    boundSession,
-    'turn-interruptible',
-    socketPath,
-    maxEvents,
-  );
-  if (!reservation) return 'idle';
+  const sized = await reserveSizedChannelDelivery(boundSession, socketPath);
+  if (!sized) return 'idle';
+  const { reservation, moreDeferred } = sized;
   try {
     await push(reservation.claim, moreDeferred);
   } catch {

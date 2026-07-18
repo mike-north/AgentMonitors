@@ -27,8 +27,11 @@ vi.mock('../runtime-client.js', () => ({
   previewSettledHighDeliveryClient: vi.fn(),
 }));
 
-import { runChannelDeliveryCycle } from './channel.js';
-import { MAX_CHANNEL_CONTENT } from '../channel-render.js';
+import {
+  reserveSizedChannelDelivery,
+  runChannelDeliveryCycle,
+} from './channel.js';
+import { MAX_CHANNEL_CONTENT, renderChannelEvent } from '../channel-render.js';
 import {
   reserveDeliveryClient,
   commitDeliveryClient,
@@ -264,5 +267,202 @@ describe('runChannelDeliveryCycle bounded reservation (006 §5.5, issue #442)', 
       '/sock',
       undefined,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR #442 review comment 3609314772: preview and reservation are separate IPC
+// operations, so `maxEvents` does not guarantee the reserved claim is the
+// sized set. `reserveSizedChannelDelivery` must detect a mismatch between what
+// was sized and what was actually reserved, release, and retry — in BOTH
+// failure directions — so the pushed content never exceeds the ceiling.
+// ---------------------------------------------------------------------------
+describe('reserveSizedChannelDelivery race handling (issue #442)', () => {
+  const BIG_BODY = 'z'.repeat(Math.floor(MAX_CHANNEL_CONTENT / 2.2));
+
+  function claimWith(surfaced: DeliveryEventSummary[]): DeliveryClaim {
+    return {
+      sessionId: 'session-1',
+      mode: 'delivery',
+      urgency: 'high',
+      lifecycle: 'turn-interruptible',
+      message: `${String(surfaced.length)} monitor(s) fired`,
+      unreadCounts: {
+        low: 0,
+        normal: 0,
+        high: surfaced.length,
+        total: surfaced.length,
+      },
+      events: surfaced,
+    };
+  }
+
+  // Race (a): the preview raced empty (no settled-high events had crossed the
+  // 15s settle boundary yet), so `maxEvents` was omitted — but by the time
+  // `reserve` actually runs, three large events HAVE settled, and the
+  // reservation comes back carrying the full, unbounded, unsized claim.
+  it('releases and re-sizes when an empty preview is followed by an unbounded claim (race a)', async () => {
+    const bigEvents = [
+      makeEvent({ eventId: 'e1', monitorId: 'm1', body: BIG_BODY }),
+      makeEvent({ eventId: 'e2', monitorId: 'm2', body: BIG_BODY }),
+      makeEvent({ eventId: 'e3', monitorId: 'm3', body: BIG_BODY }),
+    ];
+    // Attempt 1: preview races empty → maxEvents omitted → the daemon still
+    // returns the full, now-settled, three-event claim (unsized/oversized).
+    previewMock.mockResolvedValueOnce([]);
+    const oversizedClaim = claimWith(bigEvents);
+    reserveMock.mockResolvedValueOnce({
+      reservationId: 'r-oversized',
+      claim: oversizedClaim,
+    });
+    releaseMock.mockResolvedValueOnce(undefined);
+
+    // Attempt 2: the retry previews again (the rows are still pending — they
+    // were released, not claimed) and sizes/reserves correctly this time.
+    previewMock.mockResolvedValueOnce(bigEvents);
+    const sizedClaim = claimWith(bigEvents.slice(0, 2));
+    reserveMock.mockResolvedValueOnce({
+      reservationId: 'r-sized',
+      claim: sizedClaim,
+    });
+
+    const result = await reserveSizedChannelDelivery('session-1', '/sock');
+
+    expect(result).not.toBeNull();
+    // The oversized reservation was released — never pushed, never committed.
+    expect(releaseMock).toHaveBeenCalledWith('r-oversized', '/sock');
+    expect(reserveMock).toHaveBeenNthCalledWith(
+      1,
+      'session-1',
+      'turn-interruptible',
+      '/sock',
+      undefined,
+    );
+    // Retry is bounded to what was actually measured on the mismatch.
+    expect(reserveMock).toHaveBeenNthCalledWith(
+      2,
+      'session-1',
+      'turn-interruptible',
+      '/sock',
+      2,
+    );
+    expect(result?.reservation.reservationId).toBe('r-sized');
+    expect(result?.moreDeferred).toBe(true);
+    // End-to-end: the ACTUAL rendered/pushed content for the retried
+    // reservation never exceeds the ceiling.
+    const { content } = renderChannelEvent(
+      result?.reservation.claim as DeliveryClaim,
+      {
+        moreDeferred: result?.moreDeferred ?? false,
+      },
+    );
+    expect(content.length).toBeLessThanOrEqual(MAX_CHANNEL_CONTENT);
+  });
+
+  // Race (b): the previewed rows get leased/claimed by another transport (the
+  // hook path) before `reserve` runs, so `reserveDelivery` fills the requested
+  // COUNT (2) from DIFFERENT pending events — events whose sizes were never
+  // measured by the preview that produced `maxEvents`, and which together
+  // overflow the ceiling.
+  it('releases and re-sizes when the reserved claim differs from the sized preview (race b)', async () => {
+    const smallEvents = [
+      makeEvent({ eventId: 's1', monitorId: 'sm1', body: 'tiny' }),
+      makeEvent({ eventId: 's2', monitorId: 'sm2', body: 'tiny' }),
+    ];
+    // Sized so ONE alone fits under the ceiling but TWO together overflow it —
+    // unlike the shared `BIG_BODY` (calibrated so three overflow but two fit,
+    // for the "reserves only as many whole blocks as fit" test above).
+    const HALF_BODY = 'w'.repeat(Math.floor(MAX_CHANNEL_CONTENT * 0.6));
+    const substitutedBigEvents = [
+      makeEvent({ eventId: 'b1', monitorId: 'bm1', body: HALF_BODY }),
+      makeEvent({ eventId: 'b2', monitorId: 'bm2', body: HALF_BODY }),
+    ];
+    // Attempt 1: the preview sizes off the small events (both fit → maxEvents
+    // = 2), but the actual reservation substitutes the DIFFERENT, oversized
+    // events (they were leased elsewhere and the daemon filled the count from
+    // whatever else was pending).
+    previewMock.mockResolvedValueOnce(smallEvents);
+    const substitutedClaim = claimWith(substitutedBigEvents);
+    reserveMock.mockResolvedValueOnce({
+      reservationId: 'r-substituted',
+      claim: substitutedClaim,
+    });
+    releaseMock.mockResolvedValueOnce(undefined);
+
+    // Attempt 2: retry, now correctly bounded to 1 of the (still pending)
+    // substituted events.
+    previewMock.mockResolvedValueOnce(substitutedBigEvents);
+    const fixedClaim = claimWith([
+      substitutedBigEvents[0] as DeliveryEventSummary,
+    ]);
+    reserveMock.mockResolvedValueOnce({
+      reservationId: 'r-fixed',
+      claim: fixedClaim,
+    });
+
+    const result = await reserveSizedChannelDelivery('session-1', '/sock');
+
+    expect(result).not.toBeNull();
+    expect(releaseMock).toHaveBeenCalledWith('r-substituted', '/sock');
+    expect(result?.reservation.reservationId).toBe('r-fixed');
+    const { content } = renderChannelEvent(
+      result?.reservation.claim as DeliveryClaim,
+      {
+        moreDeferred: result?.moreDeferred ?? false,
+      },
+    );
+    expect(content.length).toBeLessThanOrEqual(MAX_CHANNEL_CONTENT);
+  });
+
+  // Forward-progress guarantee: repeated mismatches (the race keeps
+  // reproducing on every retry) must not loop forever — the final attempt
+  // forces a single-event reservation, which always terminates.
+  it('falls back to a single-event reservation after repeated mismatches, and never pushes past the ceiling', async () => {
+    const bigEvents = [
+      makeEvent({ eventId: 'p1', monitorId: 'pm1', body: BIG_BODY }),
+      makeEvent({ eventId: 'p2', monitorId: 'pm2', body: BIG_BODY }),
+      makeEvent({ eventId: 'p3', monitorId: 'pm3', body: BIG_BODY }),
+    ];
+    // Every attempt keeps coming back oversized relative to what was sized,
+    // simulating a persistently racing set of transports.
+    previewMock.mockResolvedValue(bigEvents);
+    reserveMock
+      .mockResolvedValueOnce({
+        reservationId: 'r-1',
+        claim: claimWith(bigEvents),
+      })
+      .mockResolvedValueOnce({
+        reservationId: 'r-2',
+        claim: claimWith(bigEvents),
+      })
+      .mockResolvedValueOnce({
+        // Final (forced maxEvents: 1) attempt: a single event, which always
+        // fits `packChannelEventsUnderCap`'s own-length check.
+        reservationId: 'r-3',
+        claim: claimWith([bigEvents[0] as DeliveryEventSummary]),
+      });
+    releaseMock.mockResolvedValue(undefined);
+
+    const result = await reserveSizedChannelDelivery('session-1', '/sock');
+
+    expect(result).not.toBeNull();
+    expect(reserveMock).toHaveBeenCalledTimes(3);
+    expect(releaseMock).toHaveBeenCalledTimes(2);
+    // The final attempt forced maxEvents: 1.
+    expect(reserveMock).toHaveBeenNthCalledWith(
+      3,
+      'session-1',
+      'turn-interruptible',
+      '/sock',
+      1,
+    );
+    expect(result?.reservation.reservationId).toBe('r-3');
+    const { content } = renderChannelEvent(
+      result?.reservation.claim as DeliveryClaim,
+      {
+        moreDeferred: result?.moreDeferred ?? false,
+      },
+    );
+    expect(content.length).toBeLessThanOrEqual(MAX_CHANNEL_CONTENT);
   });
 });
