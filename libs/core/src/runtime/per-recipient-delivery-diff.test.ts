@@ -26,6 +26,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createDb } from '../inbox/db.js';
 import { SourceRegistry } from '../observation/registry.js';
@@ -61,14 +62,43 @@ interface Harness {
   store: RuntimeStore;
   /** A REAL temp dir — the claim path writes each session's hook-state file here. */
   workspace: string;
+  /** On-disk DB path — needed to force a legacy NULL row (see {@link nullOutPerRecipientDiff}). */
+  dbPath: string;
 }
 
 function freshRuntime(): Harness {
   const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-prdeliv-'));
   tempDirs.push(rootDir);
-  const store = new RuntimeStore(createDb(path.join(rootDir, 'agentmon.db')));
+  const dbPath = path.join(rootDir, 'agentmon.db');
+  const store = new RuntimeStore(createDb(dbPath));
   const runtime = new AgentMonitorRuntime(store, new SourceRegistry());
-  return { runtime, store, workspace: rootDir };
+  return { runtime, store, workspace: rootDir, dbPath };
+}
+
+/**
+ * Force a `session_event_state` row back to the pre-G10 shape (NULL
+ * per-recipient `diff_text`) to exercise the legacy fallback path. The store
+ * only ever WRITES this column at projection time, so a regression test for
+ * the legacy migration case must produce the NULL directly — done over a
+ * second raw better-sqlite3 connection to the same on-disk DB (WAL mode
+ * allows concurrent readers/writers). Mirrors the identical helper in
+ * `per-recipient-diff.test.ts`.
+ */
+function nullOutPerRecipientDiff(
+  dbPath: string,
+  sessionId: string,
+  eventId: string,
+): void {
+  const raw = new Database(dbPath);
+  try {
+    raw
+      .prepare(
+        'UPDATE session_event_state SET diff_text = NULL WHERE session_id = ? AND event_id = ?',
+      )
+      .run(sessionId, eventId);
+  } finally {
+    raw.close();
+  }
 }
 
 function openLead(h: Harness, hostSessionId: string): string {
@@ -178,27 +208,48 @@ describe('per-recipient change summary on the delivery surface (issue #436)', ()
   });
 
   /**
-   * Legacy fallback: a row whose per-recipient `diff_text` is NULL (pre-G10)
-   * MUST fall back to the shared `MonitorEventRecord.diffText`, so an existing
-   * install keeps surfacing a change summary rather than dropping it.
+   * Legacy fallback: a row whose per-recipient `diff_text` is genuinely NULL
+   * (pre-G10, forced via {@link nullOutPerRecipientDiff} — the store only ever
+   * WRITES this column at projection time, so no in-band call produces a NULL
+   * row today) MUST fall back to the shared `MonitorEventRecord.diffText`, so
+   * an existing install keeps surfacing a change summary rather than dropping
+   * it.
+   *
+   * Regression note (issue #442 review): the prior version of this test never
+   * actually nulled the row — a single co-registered session's per-recipient
+   * delta happens to equal the shared diff BY COINCIDENCE (pre-G10 parity), so
+   * `perRecipientDiffsForSession(...) ?? event.diffText` never executed its
+   * fallback branch. Deleting the fallback would have left that version green.
    */
   it('falls back to the shared diff when the per-recipient delta is NULL (legacy row)', () => {
     const h = freshRuntime();
-    const { runtime, store } = h;
+    const { runtime, store, dbPath } = h;
     const onlyId = openLead(h, 'sess-only');
 
     materializeHigh(h, 'a1'); // baseline
     const e2 = materializeHigh(h, 'a2');
 
-    // A single co-registered session's per-recipient delta equals the shared
-    // object-level diff exactly (pre-G10 parity), so the surfaced diffText must
-    // match the shared row's diff.
     const shared = store.getEventById(e2).diffText;
     expect(shared).toBe('- 1: a1\n+ 1: a2');
 
-    const surfaced = runtime
+    // Force the projected per-recipient row back to the pre-G10 NULL shape.
+    nullOutPerRecipientDiff(dbPath, onlyId, e2);
+
+    // The batch reader MUST omit a NULL per-recipient row entirely (its own
+    // contract — see `perRecipientDiffsForSession`'s doc comment), not surface
+    // it as an empty string.
+    expect(store.perRecipientDiffsForSession(onlyId, [e2]).has(e2)).toBe(false);
+
+    // Both the preview (read-only) and claim (mutating) delivery paths go
+    // through the SAME mapper, so both must fall back to the shared diff.
+    const previewDiff = runtime
       .previewSettledHighDelivery(onlyId)
       .find((event) => event.eventId === e2)?.diffText;
-    expect(surfaced).toBe(shared ?? undefined);
+    expect(previewDiff).toBe(shared ?? undefined);
+
+    const claimDiff = runtime
+      .claimDelivery(onlyId, 'turn-interruptible')
+      ?.events.find((event) => event.eventId === e2)?.diffText;
+    expect(claimDiff).toBe(shared ?? undefined);
   });
 });
