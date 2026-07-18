@@ -4,6 +4,7 @@ import {
   validatePayloadTransform,
   type TransformLanguage,
 } from '../runtime/transform.js';
+import { isValidIanaTimeZone } from './validate-scope.js';
 
 const durationPattern = /^\d+[smhd]$/;
 
@@ -52,20 +53,10 @@ const rollupNotifySchema = z.object({
   timezone: z
     .string()
     .min(1)
-    .refine(
-      (tz) => {
-        try {
-          Intl.DateTimeFormat(undefined, { timeZone: tz });
-          return true;
-        } catch {
-          return false;
-        }
-      },
-      {
-        message:
-          'Must be a valid IANA time zone name (e.g., "America/New_York", "UTC")',
-      },
-    )
+    .refine(isValidIanaTimeZone, {
+      message:
+        'Must be a valid IANA time zone name (e.g., "America/New_York", "UTC")',
+    })
     .optional(),
 });
 

@@ -179,6 +179,60 @@ describe('AgentMonitorRuntime.doctorReport', () => {
     expect(monitor?.validationError).toContain('not-a-real-source');
   });
 
+  // Issue #297: scheduleForMonitor() never throws — an invalid IANA timezone
+  // surfaces as `PollingDecision.error` instead. `doctor` is a diagnostic
+  // surface like `explain`; it must never crash on one bad monitor's config,
+  // and must report the timezone failure through the SAME valid/validationError
+  // shape as any other authoring error, alongside an unaffected sibling.
+  it('reports an invalid schedule timezone as invalid without crashing, isolated from a healthy sibling (issue #297)', async () => {
+    const root = scratch();
+    const monitorsDir = path.join(root, '.claude', 'monitors');
+    writeMonitor(monitorsDir, 'aaa-bad-timezone', [
+      'name: Bad timezone',
+      'watch:',
+      '  type: schedule',
+      "  cron: '* * * * *'",
+      '  timezone: Not/AZone',
+      'urgency: normal',
+    ]);
+    writeMonitor(monitorsDir, 'zzz-works', [
+      'name: Works fine',
+      'watch:',
+      '  type: test-firing',
+      'urgency: normal',
+    ]);
+
+    const registry = new SourceRegistry();
+    registry.register(firingSource);
+    registry.register({
+      name: 'schedule',
+      scopeSchema: { type: 'object', properties: {} },
+      observe: () => Promise.resolve({ observations: [] }),
+    });
+    const runtime = new AgentMonitorRuntime(
+      new RuntimeStore(createDb(':memory:')),
+      registry,
+      [claudeCodeAdapter],
+    );
+
+    const report = await runtime.doctorReport({
+      monitorsDir,
+      workspacePath: root,
+      now: NOW,
+    });
+
+    expect(report.invalidCount).toBe(1);
+    const byId = new Map(report.monitors.map((m) => [m.id, m]));
+    const badTimezone = byId.get('aaa-bad-timezone');
+    expect(badTimezone?.valid).toBe(false);
+    expect(badTimezone?.validationError).toContain('Not/AZone');
+
+    // The healthy sibling is unaffected — reported valid, with its own cadence.
+    const works = byId.get('zzz-works');
+    expect(works?.valid).toBe(true);
+    expect(works?.validationError).toBeUndefined();
+  });
+
   it('describes cadence from the cron for schedule monitors and the interval otherwise', async () => {
     const root = scratch();
     const monitorsDir = path.join(root, '.claude', 'monitors');

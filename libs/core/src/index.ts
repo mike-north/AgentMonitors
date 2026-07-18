@@ -13,6 +13,8 @@ export {
   validateScope,
   validateWatchScope,
   changeDetectionCollectionError,
+  invalidTimezoneError,
+  isValidIanaTimeZone,
 } from './schema/validate-scope.js';
 export type {
   MonitorFrontmatter,

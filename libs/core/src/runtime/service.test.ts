@@ -1920,6 +1920,77 @@ Handle unchanged.
     ).toBe('healthy');
   });
 
+  // Issue #297: scheduleForMonitor() never throws — an invalid IANA timezone on
+  // a `schedule` monitor surfaces as `PollingDecision.error` instead. explain
+  // MUST NOT crash (it is a read-only diagnostic surface, 002 §10.7) and must
+  // report the failure as an OBSERVATION-stage diagnostic — the same shape a
+  // real observe() error would produce — rather than a raw thrown RangeError.
+  it('explains an invalid schedule timezone as an observation-stage failure, not a crash (issue #297)', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    const monitorsDir = path.join(rootDir, '.claude', 'monitors');
+    const monitorDir = path.join(monitorsDir, 'bad-timezone-monitor');
+    mkdirSync(monitorDir, { recursive: true });
+    writeFileSync(
+      path.join(monitorDir, 'MONITOR.md'),
+      `---
+name: Bad timezone monitor
+watch:
+  type: schedule
+  cron: '* * * * *'
+  timezone: Not/AZone
+urgency: normal
+---
+This monitor has a typo'd timezone.
+`,
+      'utf-8',
+    );
+
+    const runtime = createRuntime(dbPath, {
+      name: 'schedule',
+      scopeSchema: { type: 'object', properties: {} },
+      observe: () => Promise.resolve({ observations: [] }),
+    });
+
+    // No prior tick — explain is exercised cold, proving it never depends on the
+    // tick loop's own isolation to avoid crashing.
+    const report = await runtime.explainMonitor({
+      monitorId: 'bad-timezone-monitor',
+      monitorsDir,
+      workspacePath: rootDir,
+    });
+
+    expect(report.verdict).toMatchObject({
+      stage: 'observation',
+      status: 'failure',
+    });
+    const observationStage = report.stages.find(
+      (stage) => stage.id === 'observation',
+    );
+    expect(observationStage?.status).toBe('failure');
+    // The message must state the TRUE cause — scheduling/timezone evaluation
+    // failed, not "the source observation errored" (PR #433 review,
+    // discussion_r3608549689) — and surface the bad value inline, since text
+    // output only renders `reason`, never `details`.
+    expect(observationStage?.reason).toContain(
+      'schedule could not be evaluated',
+    );
+    expect(observationStage?.reason).toContain('Not/AZone');
+    expect(String(observationStage?.details?.['error'] ?? '')).toContain(
+      'Not/AZone',
+    );
+    // No 'scheduling' stage output — the decision itself could not be computed.
+    expect(report.stages.some((stage) => stage.id === 'scheduling')).toBe(
+      false,
+    );
+    // explainMonitor MUST NOT mutate runtime state (002 §10.7): asking again
+    // must not have written an observation_history row as a side effect.
+    expect(
+      runtime.listObservationHistory({ monitorId: 'bad-timezone-monitor' }),
+    ).toHaveLength(0);
+  });
+
   it('explains a rebaselined source as healthy/idle (not a bug, issue #94)', async () => {
     const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
     tempDirs.push(rootDir);
@@ -3033,6 +3104,121 @@ Handle it.
     // same String()-fallback message that lands in the history row.
     expect(result.erroredObservations).toEqual([
       { monitorId: 'test-monitor', message: 'string failure value' },
+    ]);
+  });
+
+  // Issue #297: an invalid IANA timezone on a `schedule` monitor made
+  // Intl.DateTimeFormat throw inside cronFieldValuesForDate(), and
+  // scheduleForMonitor() was called OUTSIDE the per-monitor observe/ingest
+  // try/catches — so the throw escaped evaluateMonitorOnTick() and aborted the
+  // ENTIRE tick, preventing every other (valid) monitor from running. This is a
+  // two-monitor regression test that must FAIL pre-fix (the second monitor never
+  // gets a chance to emit because tick() rejects before reaching it).
+  //
+  // `watch: { type: 'schedule' }` scope is NOT validated by parseMonitor/scan —
+  // only `validateWatchScope` (called by `validate`/`watch declare`/`monitor
+  // test`, never by the tick loop itself) catches a bad timezone at authoring
+  // time — so a hand-edited MONITOR.md with a bad timezone reaches tick()
+  // unfiltered, exactly like this test constructs it.
+  it('isolates an invalid schedule timezone so a sibling monitor still emits (issue #297)', async () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const dbPath = path.join(rootDir, 'agentmon.db');
+    const monitorsDir = path.join(rootDir, '.claude', 'monitors');
+
+    // aaa-bad-timezone sorts first: proves the failure doesn't even need to be
+    // the last monitor evaluated to isolate correctly.
+    const badTimezoneDir = path.join(monitorsDir, 'aaa-bad-timezone');
+    mkdirSync(badTimezoneDir, { recursive: true });
+    writeFileSync(
+      path.join(badTimezoneDir, 'MONITOR.md'),
+      `---
+name: Bad timezone
+watch:
+  type: schedule
+  cron: '* * * * *'
+  timezone: Not/AZone
+urgency: normal
+---
+This monitor has a typo'd timezone.
+`,
+      'utf-8',
+    );
+
+    // zzz-works sorts last: a schedule monitor with a valid timezone that fires
+    // on every tick (cron '* * * * *').
+    const workingDir = path.join(monitorsDir, 'zzz-works');
+    mkdirSync(workingDir, { recursive: true });
+    writeFileSync(
+      path.join(workingDir, 'MONITOR.md'),
+      `---
+name: Works fine
+watch:
+  type: schedule
+  cron: '* * * * *'
+  timezone: UTC
+urgency: normal
+---
+This monitor fires on a schedule.
+`,
+      'utf-8',
+    );
+
+    const scheduleSource: ObservationSource = {
+      name: 'schedule',
+      scopeSchema: { type: 'object', properties: {} },
+      observe: (): Promise<ObservationResult> =>
+        Promise.resolve({
+          observations: [
+            {
+              title: 'Scheduled trigger',
+              summary: 'Scheduled trigger',
+              objectKey: 'sched-trigger',
+            },
+          ],
+        }),
+    };
+
+    const runtime = createRuntime(dbPath, scheduleSource);
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-session-297',
+        workspacePath: rootDir,
+      }),
+    );
+
+    // The tick must resolve, NOT reject, even though aaa-bad-timezone's
+    // scheduling computation throws internally.
+    const result = await runtime.tick(monitorsDir, rootDir);
+
+    // The valid sibling monitor still emitted its event.
+    expect(result.emittedEventIds.length).toBeGreaterThan(0);
+    const events = runtime.listEvents({ sessionId: session.id });
+    expect(events.some((e) => e.monitorId === 'zzz-works')).toBe(true);
+    expect(
+      runtime.listObservationHistory({ monitorId: 'zzz-works' })[0]?.result,
+    ).toBe('triggered');
+
+    // The invalid monitor is isolated: no event, an 'errored' history row
+    // naming the timezone, and it never appears in evaluatedMonitors (it failed
+    // before reaching observe()).
+    expect(events.some((e) => e.monitorId === 'aaa-bad-timezone')).toBe(false);
+    const badHistory = runtime.listObservationHistory({
+      monitorId: 'aaa-bad-timezone',
+    });
+    expect(badHistory).toHaveLength(1);
+    expect(badHistory[0]?.result).toBe('errored');
+    expect(String(badHistory[0]?.observationData?.['error'])).toContain(
+      'Not/AZone',
+    );
+
+    // The tick result surfaces the failure by monitor id + message (same
+    // mechanism as an observe() error, issue #117).
+    expect(result.erroredObservations).toEqual([
+      {
+        monitorId: 'aaa-bad-timezone',
+        message: expect.stringContaining('Not/AZone') as unknown as string,
+      },
     ]);
   });
 

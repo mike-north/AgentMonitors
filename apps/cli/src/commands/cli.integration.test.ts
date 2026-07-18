@@ -1784,6 +1784,42 @@ describe('validate', () => {
     expect(result.stderr).toContain('does not exist');
   });
 
+  // Issue #297: a schedule monitor's invalid IANA timezone must be rejected at
+  // authoring time by `validate`, with the sibling valid monitor still passing.
+  it('rejects a schedule monitor with an invalid IANA timezone, alongside a valid sibling', () => {
+    const dir = path.join(tempDir, 'validate-bad-timezone');
+    const monitorsDir = path.join(dir, 'monitors');
+    mkdirSync(path.join(monitorsDir, 'bad-tz'), { recursive: true });
+    writeFileSync(
+      path.join(monitorsDir, 'bad-tz', 'MONITOR.md'),
+      `---
+name: Bad timezone
+watch:
+  type: schedule
+  cron: '* * * * *'
+  timezone: Not/AZone
+urgency: normal
+---
+This monitor has a typo'd timezone.
+`,
+      'utf-8',
+    );
+    run(['init', 'good-monitor', '--dir', monitorsDir], dir);
+
+    const result = run(['validate', monitorsDir, '--format', 'json']);
+    expect(result.exitCode).toBe(1);
+    const parsed = JSON.parse(result.stdout) as {
+      valid: number;
+      invalid: number;
+      errors: { filePath: string; error: string }[];
+    };
+    expect(parsed.valid).toBe(1);
+    expect(parsed.invalid).toBe(1);
+    const badTzError = parsed.errors.find((e) => e.filePath === 'bad-tz');
+    expect(badTzError?.error).toContain('Not/AZone');
+    expect(badTzError?.error).toContain('valid IANA time zone name');
+  });
+
   it('returns JSON error when --format json and path missing', () => {
     const result = run([
       'validate',
@@ -3347,6 +3383,39 @@ This monitor fires on a schedule.
     expect(result.stdout).toContain('breaks-on-observe:');
     expect(result.stdout).not.toContain('quiet:');
   });
+
+  // Issue #297: a schedule monitor with an invalid IANA timezone made
+  // Intl.DateTimeFormat throw OUTSIDE the per-monitor observe/ingest try/catches
+  // — aborting the whole tick before any other monitor ran. This proves the
+  // fix at the `daemon once` surface: the bad monitor is isolated (errored, not
+  // a crash) and a sibling schedule monitor with a valid timezone still fires.
+  it('isolates an invalid schedule timezone instead of aborting the whole tick, so a sibling monitor still emits', () => {
+    const dir = path.join(tempDir, 'once-bad-timezone');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    writeMonitor(
+      monitorsRoot,
+      'aaa-bad-timezone',
+      `---
+name: Bad timezone
+watch:
+  type: schedule
+  cron: '* * * * *'
+  timezone: Not/AZone
+urgency: normal
+---
+This monitor has a typo'd timezone.
+`,
+    );
+    writeMonitor(monitorsRoot, 'zzz-fires', emittingMonitorBody);
+
+    const result = run(['daemon', 'once', monitorsRoot, '--workspace', dir]);
+    expect(result.exitCode).toBe(0);
+    // The valid sibling still fires — the tick was NOT aborted.
+    expect(result.stdout).toContain('emitted 1 event(s)');
+    expect(result.stdout).toContain('1 errored:');
+    expect(result.stdout).toContain('aaa-bad-timezone:');
+    expect(result.stdout).toContain('Not/AZone');
+  });
 });
 
 /**
@@ -4394,6 +4463,61 @@ This monitor fires on a schedule.
     // an event, so materialization is reported as OK (a real per-stage result).
     expect(result.stdout).toContain('Monitor fires');
     expect(result.stdout).toMatch(/Materialization:.*monitor_events row/);
+  });
+
+  // Issue #297: `monitor explain` MUST NOT crash for a monitor whose schedule
+  // timezone is invalid — it must render the failure as an actionable
+  // observation-stage diagnostic instead of a raw thrown RangeError.
+  it('explains an invalid schedule timezone as an observation-stage failure instead of crashing', () => {
+    const dir = path.join(tempDir, 'explain-bad-timezone');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    const monitorsDir = path.join(monitorsRoot, 'bad-tz');
+    mkdirSync(monitorsDir, { recursive: true });
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      `---
+name: Bad timezone
+watch:
+  type: schedule
+  cron: '* * * * *'
+  timezone: Not/AZone
+urgency: normal
+---
+This monitor has a typo'd timezone.
+`,
+      'utf-8',
+    );
+
+    const dbPath = path.join(dir, 'agentmon.db');
+    const socketPath = deadSocketPath('explain-bad-timezone');
+    const env = { AGENTMONITORS_DB: dbPath, AGENTMONITORS_SOCKET: socketPath };
+
+    const result = runWithEnv(
+      [
+        'monitor',
+        'explain',
+        'bad-tz',
+        '--dir',
+        monitorsRoot,
+        '--workspace',
+        dir,
+        '--socket',
+        socketPath,
+        '--format',
+        'text',
+      ],
+      env,
+      dir,
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('✗ Observation:');
+    expect(result.stdout).toContain('Verdict: failure at Observation');
+    // The message must name the true cause (scheduling/timezone), not imply a
+    // source observation ran and errored — text output only renders `reason`,
+    // so the bad value must be inline (PR #433 review, discussion_r3608549689).
+    expect(result.stdout).toContain('schedule could not be evaluated');
+    expect(result.stdout).toContain('Not/AZone');
   });
 
   it('reads persisted state in --format json (no false scheduling failure) and annotates the no-daemon notice', () => {
@@ -6319,6 +6443,51 @@ describe('monitor test', () => {
     // scaffolded template's default pattern is `**/*.ts`.
     expect(result.stderr).toContain('**/*.ts');
     expect(result.stdout).not.toContain('Baseline established');
+  });
+
+  // Issue #297: an invalid IANA timezone on a schedule monitor's scope must be
+  // rejected with an actionable diagnosis (the SAME validateWatchScope error
+  // `validate`/`watch declare` give, 005 §14.4), not silently echoed back or
+  // left to crash deep inside runtime cron matching.
+  it('rejects a schedule monitor with an invalid IANA timezone', () => {
+    const dir = path.join(tempDir, 'monitor-test-bad-timezone');
+    const monitorsDir = path.join(dir, '.claude', 'monitors', 'bad-tz');
+    mkdirSync(monitorsDir, { recursive: true });
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      `---
+name: Bad timezone
+watch:
+  type: schedule
+  cron: '* * * * *'
+  timezone: Not/AZone
+urgency: normal
+---
+This monitor has a typo'd timezone.
+`,
+      'utf-8',
+    );
+
+    const result = run([
+      'monitor',
+      'test',
+      path.join(monitorsDir, 'MONITOR.md'),
+    ]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('Invalid monitor scope');
+    expect(result.stderr).toContain('Not/AZone');
+    expect(result.stderr).toContain('valid IANA time zone name');
+
+    const jsonResult = run([
+      'monitor',
+      'test',
+      path.join(monitorsDir, 'MONITOR.md'),
+      '--format',
+      'json',
+    ]);
+    expect(jsonResult.exitCode).toBe(1);
+    const parsed = JSON.parse(jsonResult.stdout) as { error: string };
+    expect(parsed.error).toContain('Not/AZone');
   });
 
   it('reports zero-match file-fingerprint scopes as structured JSON', () => {

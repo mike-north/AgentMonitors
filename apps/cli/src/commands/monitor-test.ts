@@ -5,6 +5,7 @@ import { Command, Option } from 'commander';
 import {
   parseMonitor,
   SourceRegistry,
+  validateWatchScope,
   type MonitorExplainReport,
   type MonitorExplainStageId,
   type MonitorExplainStageStatus,
@@ -399,6 +400,20 @@ monitorTestCommand
     const { type: _type, ...monitorWatchConfig } =
       result.monitor.frontmatter.watch;
 
+    // Reject an invalid scope (e.g. a non-IANA schedule `timezone`, issue #297)
+    // with the SAME actionable diagnosis `validate` and `watch declare` give
+    // (`validateWatchScope` is the shared core helper, 005 §14.4) instead of
+    // letting a one-shot dry-run silently echo back a bad value or crash deep
+    // inside source-specific logic.
+    const scopeErrors = validateWatchScope(
+      monitorWatchConfig,
+      source.scopeSchema,
+    );
+    if (scopeErrors.length > 0) {
+      reportError(`Invalid monitor scope: ${scopeErrors.join('; ')}`, json);
+      return;
+    }
+
     if (!json) {
       console.log(
         `Testing monitor "${monitorName}" (source: ${source.name})...`,
@@ -574,31 +589,55 @@ monitorTestCommand
         // Three cases:
         //
         // (A) Definition stage is not 'ok' (parse error, monitor not found,
-        //     duplicate ID, unknown source, …). The report carries the exact
-        //     failure the author needs. Show it WITHOUT the no-daemon banner —
-        //     there is no persisted state involved; the banner would be
-        //     misleading. Exit 0 (mirrors the live-daemon path).
+        //     duplicate ID, unknown source, …), OR any stage reports a genuine
+        //     'failure' with nothing persisted to explain it (issue #297: an
+        //     invalid schedule timezone renders an 'observation'-stage failure
+        //     computed purely in-memory — explainMonitor MUST NOT mutate state,
+        //     so no observation_history row backs it, yet it is real actionable
+        //     content, not "nothing has ever ticked"). The report carries the
+        //     exact failure the author needs. Show it WITHOUT the no-daemon
+        //     banner — the banner would be misleading (for a definition
+        //     failure, no persisted state is involved at all; for the #297
+        //     case, the failure is a fresh in-memory computation, not a stale
+        //     persisted diagnosis). Exit 0 (mirrors the live-daemon path).
         //
-        // (B) Definition stage is 'ok' AND there IS persisted state (observation
-        //     history or materialized events). The report is a real diagnosis from
-        //     the last tick. Show it WITH the no-daemon banner so the author knows
-        //     it came from the store, not a live daemon. Exit 0.
+        //     IMPORTANT: this is NOT "any stage is 'failure'" — a never-ticked
+        //     monitor's 'observation' stage is ALSO reported 'failure' ("No
+        //     observation history has been recorded for this monitor.") and
+        //     that case belongs in (C), not (A). The distinguishing signal is
+        //     the ABSENCE of a 'scheduling' stage: explainMonitor() always
+        //     pushes one once it starts computing due/nextDueAt, so a report
+        //     missing it can only be the #297 early-return (schedule.error hit
+        //     before scheduling could be evaluated at all).
         //
-        // (C) Definition stage is 'ok' AND nothing has been persisted (no
-        //     observations, no events). The daemon is down and nothing has ever
-        //     ticked. Show the actionable remediation line (issue #150, PM
-        //     decision (b)(i)) — not a raw ENOENT. Exit 1.
-        //     NOTE: a definition-failure report must never be replaced by the
-        //     remediation message; definition failures reach case (A).
+        // (B) Definition stage is 'ok', a 'scheduling' stage IS present, AND
+        //     there IS persisted state (observation history or materialized
+        //     events). The report is a real diagnosis from the last tick. Show
+        //     it WITH the no-daemon banner so the author knows it came from the
+        //     store, not a live daemon. Exit 0.
+        //
+        // (C) Definition stage is 'ok', a 'scheduling' stage IS present, AND
+        //     nothing has been persisted (no observations, no events). The
+        //     daemon is down and nothing has ever ticked. Show the actionable
+        //     remediation line (issue #150, PM decision (b)(i)) — not a raw
+        //     ENOENT. Exit 1.
+        //     NOTE: a definition-failure (or #297-style unschedulable) report
+        //     must never be replaced by the remediation message; those reach
+        //     case (A).
         const definitionStage = report.stages.find(
           (stage) => stage.id === 'definition',
         );
         const definitionOk = definitionStage?.status === 'ok';
         const hasPersistedState =
           report.observations.length > 0 || report.events.length > 0;
+        const isUnschedulable = !report.stages.some(
+          (stage) => stage.id === 'scheduling',
+        );
 
-        if (!definitionOk) {
-          // Case (A): definition failure — show report, no banner.
+        if (!definitionOk || isUnschedulable) {
+          // Case (A): definition failure, or the #297 unschedulable early
+          // return (definition ok, but scheduling itself never ran) — show
+          // report, no banner.
           if (json) {
             console.log(JSON.stringify(report, null, 2));
             return;

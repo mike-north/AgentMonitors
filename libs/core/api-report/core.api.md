@@ -541,7 +541,13 @@ export type InterpretResult = {
 };
 
 // @public
+export function invalidTimezoneError(watchConfig: Record<string, unknown>, scopeSchema: JsonSchema): string | undefined;
+
+// @public
 export function isErrnoException(error: unknown): error is NodeJS.ErrnoException;
+
+// @public
+export function isValidIanaTimeZone(timeZone: string): boolean;
 
 // @public
 export function isVerifyScratchObjectKey(objectKey: string): boolean;
@@ -866,17 +872,17 @@ export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
         [k: string]: unknown;
     };
     'baseline-strategy': "incremental" | "net";
+    name?: string | undefined;
+    urgency?: {
+        lo: "low" | "normal" | "high";
+        hi: "low" | "normal" | "high";
+    } | undefined;
     shape?: {
         derive?: {
             name: string;
             when: string;
         }[] | undefined;
         render?: "rendered" | undefined;
-    } | undefined;
-    name?: string | undefined;
-    urgency?: {
-        lo: "low" | "normal" | "high";
-        hi: "low" | "normal" | "high";
     } | undefined;
     notify?: {
         strategy: "debounce";
@@ -904,6 +910,8 @@ export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
     } & {
         [k: string]: unknown;
     };
+    name?: string | undefined;
+    urgency?: string | undefined;
     shape?: {
         derive?: {
             name: string;
@@ -911,8 +919,6 @@ export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
         }[] | undefined;
         render?: "rendered" | undefined;
     } | undefined;
-    name?: string | undefined;
-    urgency?: string | undefined;
     notify?: {
         strategy: "debounce";
         'settle-for': string;
@@ -943,6 +949,7 @@ export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
     } & {
         [k: string]: unknown;
     };
+    name?: string | undefined;
     shape?: {
         derive?: {
             name: string;
@@ -950,7 +957,6 @@ export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
         }[] | undefined;
         render?: "rendered" | undefined;
     } | undefined;
-    name?: string | undefined;
     notify?: {
         strategy: "debounce";
         'settle-for': string;
@@ -977,6 +983,8 @@ export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
     } & {
         [k: string]: unknown;
     };
+    name?: string | undefined;
+    urgency?: string | undefined;
     shape?: {
         derive?: {
             name: string;
@@ -984,8 +992,6 @@ export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
         }[] | undefined;
         render?: "rendered" | undefined;
     } | undefined;
-    name?: string | undefined;
-    urgency?: string | undefined;
     notify?: {
         strategy: "debounce";
         'settle-for': string;

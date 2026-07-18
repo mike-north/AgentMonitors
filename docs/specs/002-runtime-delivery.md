@@ -621,7 +621,37 @@ If a non-schedule monitor provides a string `scope.interval`, the runtime **MUST
 
 For schedule monitors: `scope.cron` is interpreted as a five-field cron expression; `scope.timezone` defaults to `UTC` if omitted; malformed cron fields are treated as non-matching (the entire `cronMatchesDate` call returns `false`); a schedule monitor cannot fire more than once in the same minute because the elapsed guard `elapsed >= 60_000` is required in addition to cron-field matching; missed cron windows are not backfilled (BP1). The schedule source itself does not decide whether it is due. The runtime does.
 
-Verified: `libs/core/src/runtime/service.ts` — `cronMatchesDate()` (lines 118–132), `scheduleForMonitor()` schedule branch (lines 456–467).
+Verified: `libs/core/src/runtime/service.ts` — `cronMatchesDate()`, `scheduleForMonitor()` schedule branch.
+
+**An invalid `scope.timezone` MUST NOT abort the tick (issue #297).** `scope.timezone` is
+authoring-time validated (003 §5.2), but the tick loop itself does not call that validator (§2, step
+1–4 above only reject an unknown `source` name, not an invalid scope value) — so a hand-edited
+`MONITOR.md` that skipped `validate` can still reach `scheduleForMonitor()` with a timezone
+`Intl.DateTimeFormat` rejects. `scheduleForMonitor()` **MUST** catch that failure internally and
+return a `PollingDecision` with `due: false` and an `error` message rather than throw — this is a
+defensive backstop, not the primary defense (authoring-time validation is). Every caller **MUST**
+treat a present `PollingDecision.error` as "this monitor cannot be scheduled right now" and isolate
+the failure to that monitor:
+
+- The tick loop (`evaluateMonitorOnTick()`) records it exactly like an `observe()` failure (§2.5, AP
+  per-monitor isolation): pushed onto the tick result's `erroredObservations` and written as an
+  `errored` `observation_history` row, then that monitor is skipped for the tick — every other
+  monitor still runs. Same isolation applies to a `rollup` monitor's `notify.timezone` on the
+  not-due window-flush path (§4.4), which evaluates `notify.window`/`notify.timezone` independently
+  of `scope.timezone`.
+- `monitor.explain` (§10.7) — which **MUST NOT** mutate runtime state — renders the failure as an
+  `observation`-stage `failure` (the same shape a real `observe()` error produces), computed purely
+  in-memory, WITHOUT writing an `observation_history` row.
+- `doctor` (005 §14) folds it into the monitor's `valid`/`validationError` reporting, alongside any
+  scope-schema error.
+
+Verified: `libs/core/src/runtime/service.ts` — `PollingDecision.error` (`runtime/types.ts`),
+`scheduleForMonitor()`'s try/catch around `cronMatchesDate()`, the `schedule.error` branch in
+`evaluateMonitorOnTick()`, the `dispatchRollup()` try/catch in the not-due rollup-flush path,
+`explainMonitor()`'s `schedule.error` branch, `doctorReport()`'s `schedule.error` fold into
+`validationErrors`. Proven by the two-monitor regression tests in `service.test.ts` ("isolates an
+invalid schedule timezone so a sibling monitor still emits", "explains an invalid schedule timezone
+as an observation-stage failure, not a crash") and `doctor-report.test.ts`.
 
 ### 2.3 Watch-mode execution
 
