@@ -1357,6 +1357,13 @@ distinct, unprefixed line format from the always-on warning above). The diagnosi
 6. The actual `claimDelivery` result (mode/urgency/event count, or `null`).
 7. Whether anything was emitted to stdout, and in which format.
 
+Every untrusted stdin field interpolated into a `--debug` line — `session_id`, `hook_event_name`, and
+`cwd` (including the workspace path derived from `cwd`) — gets the identical control-safe rendering as
+the always-on warnings above (issue #365): JSON-string-escaped, including DEL, the C1 controls
+(U+0080–U+009F), and the U+2028/U+2029 line/paragraph separators, and truncated at 128 characters at a
+code-point boundary with a trailing `…`. `--debug` is opt-in, but a hostile payload must not reach the
+operator's terminal/logs raw merely because the operator chose to diagnose it.
+
 Any internal error is still swallowed on stdout (the always-exit-0 contract, unchanged); in `--debug`
 mode it is additionally named on stderr rather than silently disappearing.
 

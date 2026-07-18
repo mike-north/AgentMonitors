@@ -456,6 +456,13 @@ mutates state itself, and every diagnosis write targets `process.stderr`, never 
 internal error is still swallowed on stdout (the always-exit-0 contract is unchanged); `--debug`
 additionally names it on stderr instead of disappearing silently.
 
+Every untrusted stdin field a `--debug` line interpolates — `session_id`, `hook_event_name`, and `cwd`
+(including the workspace path derived from it) — gets the SAME control-safe rendering as the always-on
+warning above (issue #365): JSON-string-escaped (DEL, the C1 controls, and U+2028/U+2029 included) and
+truncated at 128 characters — cut at a Unicode code-point boundary — with a trailing `…`. `--debug` is
+opt-in, but that must not make it acceptable to leak a hostile payload to the operator's terminal/logs
+raw — both paths share one rendering function so they cannot drift.
+
 See [005 §12.2.1](./005-cli-reference.md) for the exact line-by-line diagnosis contract.
 
 ### 5.3 Usage
