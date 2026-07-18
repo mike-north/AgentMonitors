@@ -29,6 +29,15 @@ urgency bands, or the unread/claimed/acknowledged model; the hook transport is u
   pushes fall back to the hook path or retry; successful sends stay deduplicated; rows stay
   unacknowledged throughout. The reservation registry is in-memory and daemon-local, and a lost or
   self-expired lease safely returns rows to `pending` (PP1).
+- **At-least-once boundary:** if a push succeeds but the commit does not land (the lease lapsed
+  mid-push, or the daemon restarted), the rows were never claimed and re-deliver — a possible
+  duplicate surface, never a lost delivery. The transport reports this distinctly and never treats an
+  uncommitted push as a successful claim.
+- **Lease-aware diagnostics:** while a reservation is in flight, the `hook deliver --debug` diagnosis,
+  the reminder-suppression diagnosis, and the per-session hook-state projection all exclude leased
+  rows from "pending claimable work" (routed through the same lease-aware accessor the claim decision
+  uses), so they never advertise a row the reservation makes momentarily unclaimable. Reserve/release
+  refresh the hook-state projection so it tracks the lease.
 - **Realization:** core `reserveDelivery` / `commitDelivery` / `releaseDelivery` (backed by an
   in-memory `DeliveryReservationRegistry`) + `hook.reserve` / `hook.commit` / `hook.release` daemon
   IPC; the channel drives them via `runChannelDeliveryCycle`. `claimDelivery` is refactored into a

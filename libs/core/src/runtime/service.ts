@@ -1406,8 +1406,11 @@ export class AgentMonitorRuntime {
             urgency,
             unreadCount: this.store.unreadEventsForSession(sessionId, urgency)
               .length,
-            pendingCount: this.store.pendingEventsForSession(sessionId, urgency)
-              .length,
+            // Lease-aware (issue #300): a row reserved by an in-flight channel
+            // push is not independently claimable, so it must not count as
+            // pending here or the reminder-suppression diagnosis would disagree
+            // with what a real claim would decide.
+            pendingCount: this.pendingForClaim(sessionId, urgency).length,
           });
         }
       }
@@ -1814,6 +1817,11 @@ export class AgentMonitorRuntime {
       isRecap: decision.isRecap,
       claim: decision.claim,
     });
+    // Refresh the hook-state projection so it reflects the lease immediately: the
+    // reserved rows are now hidden from `pendingForClaim`, so the file stops
+    // advertising them as claimable while the push is in flight (issue #300).
+    // This writes only the derived hook-state cache — it does NOT claim the rows.
+    this.refreshHookState(decision.sessionId);
     return { reservationId, claim: decision.claim };
   }
 
@@ -1839,7 +1847,11 @@ export class AgentMonitorRuntime {
    * re-delivers them. A no-op for an unknown/expired reservation.
    */
   releaseDelivery(reservationId: string): void {
-    this.reservations.remove(reservationId);
+    const plan = this.reservations.remove(reservationId);
+    // Refresh the hook-state projection so the released rows are advertised as
+    // pending again immediately (they returned to the hook path) — the mirror of
+    // the refresh `reserveDelivery` does when the lease is taken (issue #300).
+    if (plan) this.refreshHookState(plan.sessionId);
   }
 
   /**
@@ -2147,7 +2159,9 @@ export class AgentMonitorRuntime {
 
     const holds: HookDeliveryHold[] = [];
     if (lifecycle === 'turn-interruptible') {
-      const pendingHigh = this.store.pendingEventsForSession(sessionId, 'high');
+      // Lease-aware (issue #300): exclude rows reserved by an in-flight channel
+      // push so this diagnosis matches what a real claim would surface.
+      const pendingHigh = this.pendingForClaim(sessionId, 'high');
       const settleHold = classifySettleWindowHold(
         pendingHigh.map((event) => event.createdAt),
         unreadCounts.high,
@@ -2164,10 +2178,7 @@ export class AgentMonitorRuntime {
           DEFAULT_HIGH_URGENCY_SETTLE_MS,
       ).length;
       if (settledHighCount === 0) {
-        const pendingNormal = this.store.pendingEventsForSession(
-          sessionId,
-          'normal',
-        ).length;
+        const pendingNormal = this.pendingForClaim(sessionId, 'normal').length;
         const normalHold = classifyReminderHold(
           'normal',
           unreadCounts.normal,
@@ -2176,10 +2187,7 @@ export class AgentMonitorRuntime {
         if (normalHold) holds.push(normalHold);
       }
     } else if (lifecycle === 'turn-idle') {
-      const pendingLow = this.store.pendingEventsForSession(
-        sessionId,
-        'low',
-      ).length;
+      const pendingLow = this.pendingForClaim(sessionId, 'low').length;
       const lowHold = classifyReminderHold('low', unreadCounts.low, pendingLow);
       if (lowHold) holds.push(lowHold);
     }
@@ -3034,16 +3042,20 @@ export class AgentMonitorRuntime {
   }
 
   refreshHookState(sessionId: string): SessionHookState {
-    const highUnread = this.store.pendingEventsForSession(sessionId, 'high');
+    // Lease-aware pending (issue #300): a row reserved by an in-flight channel
+    // push is not independently claimable, so it must not be advertised as
+    // pending work in the hook-state projection — otherwise the file would
+    // disagree with the (lease-aware) claim decision during a reservation.
+    // `reserveDelivery`/`releaseDelivery` re-run this so the file tracks the
+    // lease as it is taken and dropped.
+    const highUnread = this.pendingForClaim(sessionId, 'high');
     const pendingHigh = highUnread.some(
       (event) =>
         Date.now() - event.createdAt.getTime() >=
         DEFAULT_HIGH_URGENCY_SETTLE_MS,
     );
-    const pendingNormal =
-      this.store.pendingEventsForSession(sessionId, 'normal').length > 0;
-    const pendingLow =
-      this.store.pendingEventsForSession(sessionId, 'low').length > 0;
+    const pendingNormal = this.pendingForClaim(sessionId, 'normal').length > 0;
+    const pendingLow = this.pendingForClaim(sessionId, 'low').length > 0;
     const state = this.store.sessionHookState(sessionId, {
       high: pendingHigh,
       normal: pendingNormal,

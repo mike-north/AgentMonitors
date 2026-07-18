@@ -117,7 +117,18 @@ export type ChannelDeliveryOutcome =
   /** A claim was pushed and committed (surfaced, deduped from the hook path). */
   | 'surfaced'
   /** A claim was reserved but the push rejected; the reservation was released. */
-  | 'push-failed';
+  | 'push-failed'
+  /**
+   * The push was delivered, but the commit did not land: the reservation was
+   * already gone (its lease expired during a slow/hung push, or the daemon
+   * restarted and dropped its in-memory lease). The rows were never marked
+   * claimed, so they stay eligible for re-delivery via the hook path or the next
+   * poll. This makes channel delivery **at-least-once** in this rare window (a
+   * possible duplicate surface) — never at-most-once (a lost delivery), which is
+   * the safe direction. Distinct from `surfaced` so a caller never mistakes it
+   * for a committed claim.
+   */
+  | 'surfaced-uncommitted';
 
 /**
  * One reserve → push → commit/release delivery cycle for a bound session (006
@@ -163,8 +174,16 @@ export async function runChannelDeliveryCycle(
   }
   // Surfaced successfully: commit the claim now (the rows become claimed / "was
   // surfaced", deduped from the hook transport — 006 §4.5). Claim is not ack (BP2).
-  await commitDeliveryClient(reservation.reservationId, socketPath);
-  return 'surfaced';
+  // commit returns null when the reservation was already gone (lease expired
+  // during a slow/hung push, or the daemon restarted): the push already
+  // happened, but the rows were never claimed, so they stay eligible for
+  // re-delivery (at-least-once). Report that honestly rather than a false
+  // 'surfaced' — we must NOT claim success for a delivery that was not committed.
+  const committed = await commitDeliveryClient(
+    reservation.reservationId,
+    socketPath,
+  );
+  return committed === null ? 'surfaced-uncommitted' : 'surfaced';
 }
 
 /**
@@ -275,13 +294,25 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
   const poll = async (): Promise<void> => {
     try {
       const boundSession = await resolveSession();
-      await runChannelDeliveryCycle(boundSession, socketPath, (claim) => {
-        const { content, meta } = renderChannelEvent(claim);
-        return mcp.notification({
-          method: 'notifications/claude/channel',
-          params: { content, meta },
-        });
-      });
+      const outcome = await runChannelDeliveryCycle(
+        boundSession,
+        socketPath,
+        (claim) => {
+          const { content, meta } = renderChannelEvent(claim);
+          return mcp.notification({
+            method: 'notifications/claude/channel',
+            params: { content, meta },
+          });
+        },
+      );
+      if (outcome === 'surfaced-uncommitted') {
+        // Rare: the push landed but the reservation lapsed before commit, so the
+        // rows stay eligible for re-delivery (at-least-once). Note it on stderr;
+        // stdout is the JSON-RPC channel and must not be written to.
+        process.stderr.write(
+          'agentmonitors channel: push delivered but commit did not land; rows remain eligible for re-delivery.\n',
+        );
+      }
     } catch {
       // Reserve/commit/release IPC failed → daemon unreachable / socket missing:
       // the hook-state transport still delivers durably (006 §7), and any

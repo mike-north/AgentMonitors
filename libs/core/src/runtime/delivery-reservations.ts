@@ -95,9 +95,15 @@ export class DeliveryReservationRegistry {
     return plan;
   }
 
-  /** Drop a reservation without committing it (a failed/abandoned push). */
-  remove(reservationId: string): void {
+  /**
+   * Drop a reservation without committing it (a failed/abandoned push). Returns
+   * the removed plan (so the caller can refresh the affected session's
+   * hook-state as the lease is dropped), or `undefined` if it was already gone.
+   */
+  remove(reservationId: string): DeliveryReservationPlan | undefined {
+    const plan = this.reservations.get(reservationId);
     this.reservations.delete(reservationId);
+    return plan;
   }
 
   /**

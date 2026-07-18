@@ -12,7 +12,7 @@
  * @see docs/specs/006-agent-integration.md §4 (channel transport), §4.5 (cross-transport dedup)
  * @see docs/specs/002-runtime-delivery.md §7 (unread / claimed / acknowledged states)
  */
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -35,15 +35,20 @@ interface Harness {
   store: RuntimeStore;
   sessionId: string;
   workspacePath: string;
+  hookStatePath: string;
 }
 
 /**
- * A runtime with one lead session and one settled (20s-old) high-urgency event
- * projected into it — the minimal state a `turn-interruptible` delivery
- * surfaces. `reservationTtlMs` overrides the uncommitted-reservation lifetime so
- * expiry can be exercised deterministically.
+ * A runtime with one lead session and one pending event projected into it — the
+ * minimal state a `turn-interruptible` delivery surfaces. A `high` event is aged
+ * 20s so it is past the 15s settle window (002 §9.1); a `normal` event surfaces
+ * as the coalesced reminder. `reservationTtlMs` overrides the uncommitted-
+ * reservation lifetime so expiry can be exercised deterministically.
  */
-function makeHarness(reservationTtlMs?: number): Harness {
+function makeHarness({
+  urgency = 'high',
+  reservationTtlMs,
+}: { urgency?: 'high' | 'normal'; reservationTtlMs?: number } = {}): Harness {
   const workspacePath = mkdtempSync(path.join(tmpdir(), 'agentmon-reserve-'));
   tempDirs.push(workspacePath);
   const db = createDb(':memory:');
@@ -67,7 +72,7 @@ function makeHarness(reservationTtlMs?: number): Harness {
     workspacePath,
     monitorId: 'urgent-monitor',
     sourceName: 'manual',
-    urgency: 'high',
+    urgency,
     title: 'CI failed',
     body: 'CI failed on the default branch',
     summary: 'CI failed on the default branch',
@@ -78,10 +83,17 @@ function makeHarness(reservationTtlMs?: number): Harness {
     objectKey: 'ci/default',
     queryScope: { pipeline: 'default' },
     tags: ['ci'],
-    // 20s old → past the 15s high-urgency settle window (002 §9.1).
-    createdAt: new Date(Date.now() - 20_000),
+    // A high event must be past the 15s settle window to be deliverable (002
+    // §9.1); a normal event surfaces immediately as a reminder.
+    createdAt: new Date(Date.now() - (urgency === 'high' ? 20_000 : 1_000)),
   });
-  return { runtime, store, sessionId: session.id, workspacePath };
+  return {
+    runtime,
+    store,
+    sessionId: session.id,
+    workspacePath,
+    hookStatePath: session.hookStatePath,
+  };
 }
 
 /** The single event's delivery state as `events list` would report it. */
@@ -196,7 +208,7 @@ describe('reserve → commit/release delivery semantics (issue #300)', () => {
 
   it('an expired reservation self-heals: rows return to pending, commit is a no-op', () => {
     // TTL 0 → the lease is void the instant it is taken.
-    const h = makeHarness(0);
+    const h = makeHarness({ reservationTtlMs: 0 });
 
     const reservation = h.runtime.reserveDelivery(
       h.sessionId,
@@ -234,5 +246,72 @@ describe('reserve → commit/release delivery semantics (issue #300)', () => {
     expect(
       h.runtime.reserveDelivery(h.sessionId, 'turn-interruptible'),
     ).toBeNull();
+  });
+});
+
+describe('diagnostics and hook-state are lease-aware (issue #300)', () => {
+  it('refreshHookState hides a leased row from hasPendingHigh, and restores it on release', () => {
+    const h = makeHarness(); // settled high event
+
+    // Before any reservation the settled high row is pending.
+    expect(h.runtime.refreshHookState(h.sessionId).hasPendingHigh).toBe(true);
+
+    const reservation = h.runtime.reserveDelivery(
+      h.sessionId,
+      'turn-interruptible',
+    );
+    if (!reservation) throw new Error('expected a reservation');
+
+    // While leased, the row is not independently claimable, so the hook-state
+    // projection must not advertise it as pending — otherwise the file would
+    // disagree with the (lease-aware) claim decision.
+    expect(h.runtime.refreshHookState(h.sessionId).hasPendingHigh).toBe(false);
+    // reserveDelivery refreshed the persisted projection too.
+    const persisted = JSON.parse(readFileSync(h.hookStatePath, 'utf-8')) as {
+      hasPendingHigh: boolean;
+    };
+    expect(persisted.hasPendingHigh).toBe(false);
+
+    // Releasing returns the row to pending and refreshes the projection back.
+    h.runtime.releaseDelivery(reservation.reservationId);
+    expect(h.runtime.refreshHookState(h.sessionId).hasPendingHigh).toBe(true);
+    const restored = JSON.parse(readFileSync(h.hookStatePath, 'utf-8')) as {
+      hasPendingHigh: boolean;
+    };
+    expect(restored.hasPendingHigh).toBe(true);
+  });
+
+  it('diagnoseHookDelivery reports the leased reminder as suppressed, consistent with the claim decision', () => {
+    const h = makeHarness({ urgency: 'normal' });
+
+    // Nothing claimed yet: the normal reminder would fire, so no hold.
+    expect(
+      h.runtime.diagnoseHookDelivery(h.sessionId, 'turn-interruptible').holds,
+    ).toHaveLength(0);
+
+    const reservation = h.runtime.reserveDelivery(
+      h.sessionId,
+      'turn-interruptible',
+    );
+    if (!reservation) throw new Error('expected a reservation');
+
+    // Leased → pendingForClaim excludes it, so the diagnosis reports the reminder
+    // as held (the channel is surfacing it) rather than claiming it would fire —
+    // matching what claimDelivery would now decide (null).
+    const holds = h.runtime.diagnoseHookDelivery(
+      h.sessionId,
+      'turn-interruptible',
+    ).holds;
+    expect(holds).toHaveLength(1);
+    expect(holds[0]?.urgency).toBe('normal');
+    expect(
+      h.runtime.claimDelivery(h.sessionId, 'turn-interruptible'),
+    ).toBeNull();
+
+    // Released → the reminder would fire again, so the hold clears.
+    h.runtime.releaseDelivery(reservation.reservationId);
+    expect(
+      h.runtime.diagnoseHookDelivery(h.sessionId, 'turn-interruptible').holds,
+    ).toHaveLength(0);
   });
 });

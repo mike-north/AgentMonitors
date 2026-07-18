@@ -16,6 +16,11 @@ left claimed and the hook path suppressed them as cross-transport duplicates.
   the rows so a concurrent hook claim can't double-surface them; committing marks them claimed ("was
   surfaced") — never acknowledged. `claimDelivery` is refactored into a shared decide + apply, leaving
   the hook transport's behavior unchanged.
+- If a push succeeds but the commit can't land (the lease lapsed mid-push, or the daemon restarted),
+  the rows re-deliver rather than being lost — at-least-once, never at-most-once — and the transport
+  reports that outcome distinctly instead of claiming success.
+- Diagnostics and the hook-state projection are lease-aware: while a push is in flight they exclude
+  the reserved rows from "pending claimable work", staying consistent with the claim decision.
 - No change to notify/debounce timing, urgency bands, or the unread/claimed/acknowledged model.
 
 See docs/specs/006-agent-integration.md §4.5.1.

@@ -320,6 +320,20 @@ Guarantees this establishes (issue #300):
   it) both hide the rows from the hook transport, so a surfaced event is never double-surfaced (§4.5).
 - **Rows stay unacknowledged throughout.** Neither reserve, commit, nor release acknowledges;
   acknowledgement remains the separate, explicit `agentmon_ack` / `events ack` act (§4.3, SP4).
+- **At-least-once, never at-most-once.** If the push succeeds but the commit does not land — the
+  reservation lapsed during a slow/hung push, or the daemon restarted and dropped its in-memory lease
+  — the rows were never marked claimed, so they re-deliver via the hook path or the next poll. This
+  is a possible **duplicate** surface in that rare window, never a **lost** delivery (the safe
+  direction, PP1). The transport reports this outcome distinctly and **MUST NOT** treat an
+  uncommitted push as a successful claim.
+
+While a reservation is in flight, the **diagnostic and hook-state projections are lease-aware too**:
+the `hook deliver --debug` diagnosis (§5.2.1) and the per-session hook-state file
+([002 §8](./002-runtime-delivery.md)) exclude leased rows from "pending claimable work", so they never
+advertise a row the reservation makes momentarily unclaimable — staying consistent with what a claim
+would decide. Reserving and releasing refresh the hook-state projection so it tracks the lease as it
+is taken and dropped. (Leased rows remain **unread** — a lease is not an acknowledgement — so recap
+and `events list --unread` still show them.)
 
 The reservation registry is **in-memory and daemon-local**: both transports drive the one daemon
 runtime (§6.1), and losing a lease (daemon restart, or a crashed/hung reserve that never commits or
