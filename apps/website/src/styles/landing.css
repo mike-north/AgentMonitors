@@ -1549,15 +1549,12 @@ h3 {
 }
 .quick ol li {
   counter-increment: q;
-  /* The step's content is bare inline children of the <li> (text runs, <b>,
-     inline <code>) straight from markdown. A grid/flex container here would
-     "blockify" each of those into a separate auto-placed item — scattering
-     text fragments and code pills across cells and collapsing prose to
-     one-word-per-line. So keep the <li> a normal block and float the counter
-     badge into a left gutter via absolute positioning; the content then flows
-     as ordinary wrapped text. */
+  /* Must stay a plain block — a grid/flex container would blockify the
+     inline markdown children (text runs, <strong>, <code>) and shatter the
+     prose. Guarded by quickstart-steps.test.ts. */
   position: relative;
   padding-left: 40px;
+  min-height: 26px;
   color: var(--text-2);
   font-size: 15px;
   line-height: 1.55;
