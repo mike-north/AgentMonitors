@@ -193,6 +193,21 @@ export interface DeliveryClaim {
   events: DeliveryEventSummary[];
 }
 
+/**
+ * An uncommitted delivery reservation (006 §4, issue #300): the {@link
+ * DeliveryClaim} a transport should surface, plus an opaque `reservationId` it
+ * commits (after a successful surface) or releases (on a failed/disconnected
+ * push). Reserving leases the underlying rows — hiding them from the hook
+ * transport's claim so the two do not double-surface (006 §4.5) — WITHOUT
+ * marking them claimed. The claim (`firstNotifiedAt`, "was surfaced") is written
+ * only at commit; a release returns the rows to the hook path. The rows stay
+ * unacknowledged throughout (BP2).
+ */
+export interface DeliveryReservation {
+  reservationId: string;
+  claim: DeliveryClaim;
+}
+
 export interface SessionEventFilter {
   sessionId: string;
   monitorId?: string;

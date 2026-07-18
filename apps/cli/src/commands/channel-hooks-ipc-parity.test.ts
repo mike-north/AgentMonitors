@@ -58,14 +58,34 @@ describe('agentmon_ack MCP tool vs. hooks-only CLI: shared daemon-IPC plumbing (
     expect(EVENTS_SOURCE).toMatch(/await\s+acknowledgeEventsClient\s*\(/);
   });
 
-  it('the channel push loop (channel.ts) and `hook deliver`/`hook claim` (hook.ts) both call claimDeliveryClient from the same module', () => {
+  it('the channel push loop (channel.ts) reserves/commits and `hook deliver`/`hook claim` (hook.ts) claims — both from the same module, both the same core delivery decision (issue #300)', () => {
+    // The channel no longer claims BEFORE it pushes (that was the delivery-loss
+    // bug, issue #300): it RESERVES, pushes, then COMMITS on success (or
+    // RELEASES on a failed push). reserve/commit are the deferred form of the
+    // hook's `hook.claim` — both reduce to the one core decide/apply — so
+    // capability parity (006 §6.1) still holds: same daemon, same delivery
+    // decision, different surface.
     expect(
-      importsFromRuntimeClient(CHANNEL_SOURCE, 'claimDeliveryClient'),
+      importsFromRuntimeClient(CHANNEL_SOURCE, 'reserveDeliveryClient'),
     ).toBe(true);
+    expect(
+      importsFromRuntimeClient(CHANNEL_SOURCE, 'commitDeliveryClient'),
+    ).toBe(true);
+    expect(
+      importsFromRuntimeClient(CHANNEL_SOURCE, 'releaseDeliveryClient'),
+    ).toBe(true);
+    expect(CHANNEL_SOURCE).toMatch(/await\s+reserveDeliveryClient\s*\(/);
+    expect(CHANNEL_SOURCE).toMatch(/await\s+commitDeliveryClient\s*\(/);
+    expect(CHANNEL_SOURCE).toMatch(/releaseDeliveryClient\s*\(/);
+
+    // The channel MUST NOT claim before surfacing — the removed bug.
+    expect(CHANNEL_SOURCE).not.toMatch(/claimDeliveryClient/);
+
+    // The hook transport still claims directly (its additionalContext injection
+    // is synchronous — there is no fallible push to defer behind).
     expect(importsFromRuntimeClient(HOOK_SOURCE, 'claimDeliveryClient')).toBe(
       true,
     );
-    expect(CHANNEL_SOURCE).toMatch(/await\s+claimDeliveryClient\s*\(/);
     expect(HOOK_SOURCE).toMatch(/await\s+claimDeliveryClient\s*\(/);
   });
 });

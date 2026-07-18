@@ -9,6 +9,33 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-07-18 — Channel transport commits claims only after a successful push: reserve → commit/release (006 §4.5.1) — Refs #300
+
+Fixes a P1 delivery-loss defect in the channel transport. The channel marked a delivery **claimed
+before** it knew the MCP push succeeded (`claimDelivery` then `await mcp.notification()`), so a
+rejected or disconnected push permanently consumed the delivery: the rows stayed claimed and the hook
+transport suppressed them as cross-transport duplicates (§4.5) even though nothing ever surfaced them
+— violating the additive/fallback guarantee (§6 / NP-CH). No change to runtime notify/debounce timing,
+urgency bands, or the unread/claimed/acknowledged model; the hook transport is unaffected.
+
+- **New §4.5.1 (transport-state semantics: reserve → commit/release).** A transport surfacing claims
+  over a fallible channel MUST NOT stamp `first_notified_at` ("was surfaced") before it actually
+  surfaces the claim. The channel now **reserves** the delivery (renders the claim and **leases** its
+  rows without any durable state change), **pushes**, and then **commits** on success (marks claimed,
+  BP2 — still not acknowledged) or **releases** on failure (drops the lease, returning the rows to
+  `pending` for the hook path or the next poll). Leased rows are hidden from a concurrent hook claim,
+  so the in-flight window preserves cross-transport dedup (§4.5).
+- **Guarantees:** no claim before surfacing (claim timestamps stay truthful); failed/disconnected
+  pushes fall back to the hook path or retry; successful sends stay deduplicated; rows stay
+  unacknowledged throughout. The reservation registry is in-memory and daemon-local, and a lost or
+  self-expired lease safely returns rows to `pending` (PP1).
+- **Realization:** core `reserveDelivery` / `commitDelivery` / `releaseDelivery` (backed by an
+  in-memory `DeliveryReservationRegistry`) + `hook.reserve` / `hook.commit` / `hook.release` daemon
+  IPC; the channel drives them via `runChannelDeliveryCycle`. `claimDelivery` is refactored into a
+  pure decide + a mutating apply that both paths share (behavior-preserving for the hook path).
+- **UAT:** [`docs/uat/channel-transport.md`](../uat/channel-transport.md) Part A-2 (steps 12a–12c)
+  adds the transient-push-failure recipe (issue #277).
+
 ## 2026-07-18 — Invalid schedule/rollup timezones are validated at authoring time and isolated at runtime (001 §3.6, 002 §2.2, 003 §5.2) — Refs #297
 
 An invalid IANA `timezone` (e.g. `America/New_Yrok`) on a `schedule` monitor made

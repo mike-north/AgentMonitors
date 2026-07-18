@@ -57,6 +57,7 @@ so it does not exercise the new precedence one way or the other).
 | 7–9 (channel push)      | The channel server pushes a `<channel source="agentmonitors" ...>` event carrying the field schema in [006 §4.2](../specs/006-agent-integration.md#42-notification-field-schema) | 006 §4.1–§4.2                                 |
 | 10 (dedup)              | The same event is **not** re-delivered via the hook path after the channel already claimed it                                                                                    | 006 §4.5                                      |
 | 11–12 (ack)             | `agentmon_ack` acknowledges the event in-session and `events list` reflects the acknowledged state                                                                               | 006 §4.3                                      |
+| 12a–12c (push failure)  | A transient channel disconnect does **not** consume the delivery: the event stays `unread`/unclaimed and the hook path still surfaces it (reserve → release fallback)            | 006 §4.5.1 (issue #300)                       |
 | 13–16 (blocked channel) | With the MCP server disabled, hook delivery still occurs and the channel's absence is a silent no-op                                                                             | 006 §6 / NP-CH                                |
 
 ## Prerequisites
@@ -300,6 +301,47 @@ session-id mismatch causing the daemon's "outbound gate" re-authorization to sil
 006 §4.3 — are the two most likely causes) alongside `agentmonitors monitor explain watch-file
 --dir .claude/monitors --format text`.
 
+## Part A-2 — transient push failure (reserve → release fallback, 006 §4.5.1, issue #300)
+
+This part proves the fix for issue #300: the channel reserves a delivery and commits the claim
+**only after** a successful push, so a transient MCP disconnect **releases** the reservation rather
+than permanently consuming the delivery. Run it on a **fresh** unacknowledged event (repeat steps
+6–8 to produce one, or use a second monitor), before any successful channel push has claimed it.
+
+**12a. Arrange a fresh unread event, then break the channel push mid-flight.** With a pending
+unacknowledged event for the session, disrupt the channel's outbound push transiently — the most
+practical trigger is to **kill or disable the channel MCP server** so its next `notifications/claude/channel`
+push cannot be delivered (e.g. toggle the MCP server off in the running session, or terminate the
+`agentmonitors channel serve` process the host spawned), while leaving the daemon and the hooks half
+running. This reproduces a rejected/disconnected push without needing to instrument the host.
+
+**12b. Confirm the delivery was NOT consumed.** From a terminal (authoritative CLI check):
+
+```bash
+agentmonitors events list --session <agentmon-session-id> --unread
+# the event is still listed
+agentmonitors events list --session <agentmon-session-id>
+# the event's "deliveryState" is still "unread" — NOT "claimed"
+```
+
+**Expected observation:** the event is still `unread` **and** its `deliveryState` is `unread`
+(unclaimed). A `first_notified_at`/`"claimed"` state here would mean the channel consumed the
+delivery without surfacing it — the exact issue #300 regression. The release (or the reservation's
+self-expiry) returned the row to `pending`.
+
+**12c. Confirm the hook path still delivers it (fallback).** Submit a prompt so a `UserPromptSubmit`
+hook fires (or run `agentmonitors hook deliver` with a real `UserPromptSubmit` stdin payload).
+
+**Expected observation:** the event is surfaced via the hook transport's `additionalContext` — the
+durable delivery survived the failed channel push (006 §6/§6.1). After this hook delivery the event's
+`deliveryState` becomes `claimed` (still `unread` until acknowledged, BP2/§4.3). Re-enable the channel
+MCP server before continuing.
+
+**Failure mode:** if step 12b shows the event already `claimed` immediately after the broken push (no
+hook delivery yet), the channel consumed the delivery before surfacing it — capture `events list
+--session ... --format json` and `agentmonitors monitor explain watch-file --dir .claude/monitors
+--format text`, and note the Claude Code version and how the push was broken.
+
 ## Part B — blocked channel (hooks-only fallback, 006 §6 / NP-CH)
 
 This part proves that disabling the MCP server changes only the delivery **surface**, never the
@@ -399,9 +441,9 @@ session, end to end — has not yet been executed. With #358 fixed, whoever runs
 expect every step, including step 8's raw `<channel>` push, to pass as documented **without**
 applying step 3's now-optional workaround — that is the clean run that confirms the fix.
 
-| Date | Claude Code version | `agentmonitors` CLI version | Plugin version | Step 1–4 (setup) | Step 5–9 (push) | Step 10 (dedup) | Step 11–12 (ack) | Step 13–16 (blocked channel) | Notes |
-| ---- | ------------------- | --------------------------- | -------------- | ---------------- | --------------- | --------------- | ---------------- | ---------------------------- | ----- |
-|      |                     |                             |                |                  |                 |                 |                  |                              |       |
+| Date | Claude Code version | `agentmonitors` CLI version | Plugin version | Step 1–4 (setup) | Step 5–9 (push) | Step 10 (dedup) | Step 11–12 (ack) | Step 12a–12c (push failure) | Step 13–16 (blocked channel) | Notes |
+| ---- | ------------------- | --------------------------- | -------------- | ---------------- | --------------- | --------------- | ---------------- | --------------------------- | ---------------------------- | ----- |
+|      |                     |                             |                |                  |                 |                 |                  |                             |                              |       |
 
 Fill one row per run. Record pass/fail per step group (not just overall), the exact
 `agentmonitors --version` and Claude Code version, and the plugin version from
