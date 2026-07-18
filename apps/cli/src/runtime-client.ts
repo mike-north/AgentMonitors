@@ -4,6 +4,7 @@ import type {
   DeliveryClaim,
   DeliveryEventSummary,
   DeliveryLifecycle,
+  DeliveryReservation,
   DoctorMonitorRollup,
   DoctorReportInput,
   EphemeralMonitorRecord,
@@ -148,6 +149,67 @@ export async function claimDeliveryClient(
       lifecycle,
       ...(maxEvents !== undefined ? { maxEvents } : {}),
     },
+    socketPath ? { socketPath } : {},
+  );
+}
+
+/**
+ * Reserve — but do not yet claim — the pending `turn-interruptible` delivery for
+ * a session (006 §4, issue #300). Returns the {@link DeliveryReservation}
+ * (claim + opaque `reservationId`) a transport surfaces then {@link
+ * commitDeliveryClient commits} (on success) or {@link releaseDeliveryClient
+ * releases} (on a failed push), or `null` when nothing is pending. Reserving
+ * leases the rows so the hook transport will not double-surface them (006 §4.5),
+ * WITHOUT marking them claimed — the claim is deferred to commit so a transient
+ * push failure never consumes the delivery.
+ */
+export async function reserveDeliveryClient(
+  sessionId: string,
+  lifecycle: DeliveryLifecycle,
+  socketPath?: string,
+  maxEvents?: number,
+): Promise<DeliveryReservation | null> {
+  return await callDaemon<DeliveryReservation | null>(
+    'hook.reserve',
+    {
+      sessionId,
+      lifecycle,
+      ...(maxEvents !== undefined ? { maxEvents } : {}),
+    },
+    socketPath ? { socketPath } : {},
+  );
+}
+
+/**
+ * Commit a reservation from {@link reserveDeliveryClient} after its claim was
+ * surfaced (006 §4, issue #300): the reserved rows become claimed ("was
+ * surfaced", BP2 — not acknowledged). Returns the committed {@link
+ * DeliveryClaim}, or `null` if the reservation was unknown/expired (a safe
+ * no-op — the rows were never permanently consumed).
+ */
+export async function commitDeliveryClient(
+  reservationId: string,
+  socketPath?: string,
+): Promise<DeliveryClaim | null> {
+  return await callDaemon<DeliveryClaim | null>(
+    'hook.commit',
+    { reservationId },
+    socketPath ? { socketPath } : {},
+  );
+}
+
+/**
+ * Release a reservation from {@link reserveDeliveryClient} WITHOUT claiming (006
+ * §4, issue #300): the push failed/disconnected, so the leased rows return to
+ * `pending` for the hook transport (or the next poll) to re-deliver.
+ */
+export async function releaseDeliveryClient(
+  reservationId: string,
+  socketPath?: string,
+): Promise<void> {
+  await callDaemon(
+    'hook.release',
+    { reservationId },
     socketPath ? { socketPath } : {},
   );
 }

@@ -53,6 +53,9 @@ const daemonMethodSchema = z.enum([
   'events.retractObject',
   'events.suppressObject',
   'hook.claim',
+  'hook.reserve',
+  'hook.commit',
+  'hook.release',
   'hook.preview',
   'hook.diagnose',
   'history.list',
@@ -139,6 +142,14 @@ const hookClaimParamsSchema = z.object({
 });
 const hookPreviewParamsSchema = z.object({
   sessionId: z.string(),
+});
+// Reserve → commit/release: the atomic surfacing protocol (006 §4, issue #300).
+// `hook.reserve` shares `hook.claim`'s params (it renders the same claim but
+// defers marking it claimed); `hook.commit`/`hook.release` carry the opaque
+// reservation id the reserve returned.
+const hookReserveParamsSchema = hookClaimParamsSchema;
+const hookReservationParamsSchema = z.object({
+  reservationId: z.string(),
 });
 const hookDiagnoseParamsSchema = z.object({
   sessionId: z.string(),
@@ -719,6 +730,25 @@ function handleRequest(
           params.maxEvents,
         ),
       );
+    }
+    case 'hook.reserve': {
+      const params = hookReserveParamsSchema.parse(request.params);
+      return Promise.resolve(
+        runtime.reserveDelivery(
+          params.sessionId,
+          params.lifecycle,
+          params.maxEvents,
+        ),
+      );
+    }
+    case 'hook.commit': {
+      const params = hookReservationParamsSchema.parse(request.params);
+      return Promise.resolve(runtime.commitDelivery(params.reservationId));
+    }
+    case 'hook.release': {
+      const params = hookReservationParamsSchema.parse(request.params);
+      runtime.releaseDelivery(params.reservationId);
+      return Promise.resolve({ ok: true });
     }
     case 'hook.preview': {
       const params = hookPreviewParamsSchema.parse(request.params);

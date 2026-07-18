@@ -140,6 +140,9 @@ The AgentMon channel server:
 - connects to the AgentMon daemon over its existing Unix-socket IPC
   ([002 §10](./002-runtime-delivery.md)) — it is a thin MCP front-end over the same surface that
   `hook claim` / `events` already use, not new core logic;
+- surfaces each settled `DeliveryClaim` with **reserve → commit/release**
+  semantics (§4.5.1), so a rejected or disconnected push never permanently
+  consumes the delivery;
 - resolves that socket with a precedence deliberately **different** from
   `resolveManualDaemonSocketPath` (issue #335, used by the manually-typed `session`/`events`/`hook`/
   `daemon` commands): an explicit `--socket` still wins outright, but an **enabled** workspace's
@@ -273,6 +276,70 @@ Both transports key off the same `session_event_state`. When the channel transpo
 delivery it marks the underlying rows **claimed** (BP2), so the hook-state transport sees them
 already claimed and suppresses the duplicate reminder. No new dedup mechanism is required — the
 existing claimed state ([002 §7](./002-runtime-delivery.md)) is the dedup boundary across transports.
+
+While a channel push is **in flight** — reserved but not yet committed (§4.5.1) — its rows are
+**leased**: hidden from the hook transport's claim decision exactly as a claimed row would be, so the
+two transports still cannot double-surface the same event during the push window. A lease is neither
+a claim nor an acknowledgement; committing the reservation is what durably marks the rows claimed.
+
+### 4.5.1 Transport-state semantics: reserve → commit / release
+
+> **Status: implemented** (issue #300). Verified: the core `reserveDelivery` / `commitDelivery` /
+> `releaseDelivery` methods (`libs/core/src/runtime/service.ts`, backed by the in-memory
+> `DeliveryReservationRegistry`), their `hook.reserve` / `hook.commit` / `hook.release` daemon IPC
+> methods, the channel's `runChannelDeliveryCycle` (`apps/cli/src/commands/channel.ts`), and the tests
+> in `libs/core/src/runtime/delivery-reservations.test.ts` and `apps/cli/src/commands/cli.integration.test.ts`
+> ("channel reserve → commit/release delivery cycle").
+
+A transport that surfaces claims over a **fallible** channel (the channel MCP push can reject or the
+transport can disconnect) **MUST NOT** mark a delivery claimed **before** it has actually surfaced it
+— a claim timestamp (`first_notified_at`) means "**was surfaced**". Marking claimed first means a
+transient push failure permanently consumes the delivery: the rows stay claimed, and the hook
+transport suppresses them as cross-transport duplicates (§4.5) even though nothing ever surfaced them
+(a P1 delivery-loss violation of the additive/fallback guarantee, §6/NP-CH).
+
+The channel therefore surfaces each claim in three steps, per poll:
+
+1. **Reserve** (`reserveDelivery` → `hook.reserve`): compute and render the same `DeliveryClaim` a
+   direct claim would, and **lease** its rows (§4.5) — but perform **no** durable state change. The
+   rows stay `unread` and **unclaimed**.
+2. **Push** the claim as the `notifications/claude/channel` event.
+3. On a **successful** push, **commit** (`commitDelivery` → `hook.commit`): now mark the reserved rows
+   claimed ("was surfaced", BP2 — still **not** acknowledged, SP4). On a **failed / disconnected**
+   push, **release** (`releaseDelivery` → `hook.release`): drop the lease so the rows return to
+   `pending`, where the hook transport (or the next poll) re-delivers them.
+
+Guarantees this establishes (issue #300):
+
+- **No claim before surfacing.** `first_notified_at` is written only at commit, so a claim timestamp
+  is always truthful ("was surfaced").
+- **Failed pushes fall back.** A released (or self-expired) reservation leaves the rows `pending`, so
+  a transient MCP disconnect costs at most one poll — the hook transport delivers durably regardless
+  (§6/§6.1), and the next channel poll retries.
+- **Successful sends stay deduplicated.** The lease (during the push) and the committed claim (after
+  it) both hide the rows from the hook transport, so a surfaced event is never double-surfaced (§4.5).
+- **Rows stay unacknowledged throughout.** Neither reserve, commit, nor release acknowledges;
+  acknowledgement remains the separate, explicit `agentmon_ack` / `events ack` act (§4.3, SP4).
+- **At-least-once, never at-most-once.** If the push succeeds but the commit does not land — the
+  reservation lapsed during a slow/hung push, or the daemon restarted and dropped its in-memory lease
+  — the rows were never marked claimed, so they re-deliver via the hook path or the next poll. This
+  is a possible **duplicate** surface in that rare window, never a **lost** delivery (the safe
+  direction, PP1). The transport reports this outcome distinctly and **MUST NOT** treat an
+  uncommitted push as a successful claim.
+
+While a reservation is in flight, the **diagnostic and hook-state projections are lease-aware too**:
+the `hook deliver --debug` diagnosis (§5.2.1) and the per-session hook-state file
+([002 §8](./002-runtime-delivery.md)) exclude leased rows from "pending claimable work", so they never
+advertise a row the reservation makes momentarily unclaimable — staying consistent with what a claim
+would decide. Reserving and releasing refresh the hook-state projection so it tracks the lease as it
+is taken and dropped. (Leased rows remain **unread** — a lease is not an acknowledgement — so recap
+and `events list --unread` still show them.)
+
+The reservation registry is **in-memory and daemon-local**: both transports drive the one daemon
+runtime (§6.1), and losing a lease (daemon restart, or a crashed/hung reserve that never commits or
+releases) is the **safe** direction — the rows simply return to `pending` for the hook path (PP1).
+A reservation self-expires after a short ceiling so a holder that neither commits nor releases cannot
+hide rows from the hook transport indefinitely.
 
 ### 4.6 Content safety
 
@@ -752,7 +819,11 @@ Transport and integration tests should be able to prove:
 - a transport renders a `DeliveryClaim` without re-deriving delivery decisions (same events as the
   runtime emitted);
 - surfacing via any transport marks rows claimed but not acknowledged (BP2);
-- a channel push and the hook path do not double-surface the same event (cross-transport dedup, §4.5);
+- a fallible transport does not mark a delivery claimed before it surfaces it: a rejected/disconnected
+  push leaves the rows unclaimed and eligible for hook fallback, a successful push commits the claim,
+  and neither path acknowledges (reserve → commit/release, §4.5.1, issue #300);
+- a channel push and the hook path do not double-surface the same event (cross-transport dedup, §4.5),
+  including while a reservation is in flight (leased rows are hidden from a concurrent hook claim);
 - meta keys are identifier-safe and values are tag-breakout-sanitized (§4.6);
 - with the channel transport disabled/blocked, delivery still completes via the hook path with no
   error (§5);

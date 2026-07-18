@@ -15,6 +15,7 @@ export class AgentMonitorRuntime {
     interpretAdapter?: InterpretAdapter | undefined,
     options?: {
         sessionDormancyMs?: number;
+        deliveryReservationTtlMs?: number;
     });
     // (undocumented)
     acknowledgeSession(sessionId: string, eventIds?: string[]): void;
@@ -24,6 +25,7 @@ export class AgentMonitorRuntime {
     claimDelivery(sessionId: string, lifecycle: DeliveryLifecycle, maxEvents?: number): DeliveryClaim | null;
     // (undocumented)
     closeSession(sessionId: string): AgentSessionRecord;
+    commitDelivery(reservationId: string): DeliveryClaim | null;
     declareEphemeralMonitor(input: DeclareEphemeralMonitorInput): EphemeralMonitorRecord;
     diagnoseHookDelivery(sessionId: string, lifecycle: DeliveryLifecycle): HookDeliveryDiagnosis;
     doctorReport(input: DoctorReportInput): Promise<MonitorDoctorReport>;
@@ -41,6 +43,8 @@ export class AgentMonitorRuntime {
     previewSettledHighDelivery(sessionId: string): DeliveryEventSummary[];
     // (undocumented)
     refreshHookState(sessionId: string): SessionHookState;
+    releaseDelivery(reservationId: string): void;
+    reserveDelivery(sessionId: string, lifecycle: DeliveryLifecycle, maxEvents?: number): DeliveryReservation | null;
     retractObjectEvents(input: {
         workspacePath?: string | null;
         monitorId: string;
@@ -234,6 +238,14 @@ export type DeliveryLifecycle = 'turn-interruptible' | 'turn-idle' | 'post-compa
 
 // @public (undocumented)
 export type DeliveryMode = 'delivery' | 'recap';
+
+// @public
+export interface DeliveryReservation {
+    // (undocumented)
+    claim: DeliveryClaim;
+    // (undocumented)
+    reservationId: string;
+}
 
 // @public
 export interface DerivedFact {

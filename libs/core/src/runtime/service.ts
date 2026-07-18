@@ -34,11 +34,13 @@ import {
   computeNetCollapseView,
   netCollapseGroupKey,
 } from './store.js';
+import { DeliveryReservationRegistry } from './delivery-reservations.js';
 import type {
   AgentSessionRecord,
   DeclareEphemeralMonitorInput,
   DeliveryClaim,
   DeliveryEventSummary,
+  DeliveryReservation,
   EphemeralMonitorRecord,
   DoctorDeliveryCounts,
   DoctorMonitorRollup,
@@ -473,6 +475,25 @@ interface TickAccumulator {
   skippedMonitors: { monitorId: string; nextDueAt: Date }[];
 }
 
+/**
+ * The pure decision a delivery makes (issue #300): the rendered {@link
+ * DeliveryClaim} plus the candidate rows a commit must mark claimed. Produced by
+ * `decideDelivery` WITHOUT touching the store, so it can back either an
+ * immediate `claimDelivery` (decide → apply) or a deferred `reserveDelivery`
+ * (decide → lease → …push… → commit applies). The rendered claim reads only
+ * event fields + interpret digests, never the re-anchored per-recipient delta
+ * the commit persists, so a reserved claim renders identically to a directly
+ * claimed one.
+ */
+interface DeliveryDecision {
+  sessionId: string;
+  /** Representatives plus the older `net` intermediates of each surfaced group. */
+  candidates: MonitorEventRecord[];
+  /** True for the post-compact recap branch (commit also advances the recap cursor). */
+  isRecap: boolean;
+  claim: DeliveryClaim;
+}
+
 export class AgentMonitorRuntime {
   /**
    * Monitor ids currently driven by a continuous `watch()` (see `watchMonitors`),
@@ -490,6 +511,13 @@ export class AgentMonitorRuntime {
    * {@link DEFAULT_SESSION_DORMANCY_MS}; overridable for deterministic tests.
    */
   private readonly sessionDormancyMs: number;
+
+  /**
+   * In-memory reservations for the reserve → commit/release surfacing protocol
+   * (006 §4, issue #300). Daemon-local by design — both transports drive the one
+   * runtime, and a lost lease safely returns its rows to the hook path.
+   */
+  private readonly reservations: DeliveryReservationRegistry;
 
   constructor(
     private readonly store: RuntimeStore,
@@ -509,11 +537,20 @@ export class AgentMonitorRuntime {
      * Optional runtime tuning. `sessionDormancyMs` overrides the per-session
      * dormancy threshold (002 §6.2 / 007 §4.4) — used by tests to exercise
      * inactivity-triggered ephemeral-monitor reaping deterministically.
+     * `deliveryReservationTtlMs` overrides the uncommitted-reservation lifetime
+     * (006 §4, issue #300) — used by tests to exercise lease expiry
+     * deterministically.
      */
-    options: { sessionDormancyMs?: number } = {},
+    options: {
+      sessionDormancyMs?: number;
+      deliveryReservationTtlMs?: number;
+    } = {},
   ) {
     this.sessionDormancyMs =
       options.sessionDormancyMs ?? DEFAULT_SESSION_DORMANCY_MS;
+    this.reservations = new DeliveryReservationRegistry(
+      options.deliveryReservationTtlMs,
+    );
   }
 
   adapter(name: string): AgentRuntimeAdapter {
@@ -1369,8 +1406,11 @@ export class AgentMonitorRuntime {
             urgency,
             unreadCount: this.store.unreadEventsForSession(sessionId, urgency)
               .length,
-            pendingCount: this.store.pendingEventsForSession(sessionId, urgency)
-              .length,
+            // Lease-aware (issue #300): a row reserved by an in-flight channel
+            // push is not independently claimable, so it must not count as
+            // pending here or the reminder-suppression diagnosis would disagree
+            // with what a real claim would decide.
+            pendingCount: this.pendingForClaim(sessionId, urgency).length,
           });
         }
       }
@@ -1715,7 +1755,14 @@ export class AgentMonitorRuntime {
   }
 
   /**
-   * Claim the pending delivery for a session at a lifecycle point (002 §9).
+   * Claim the pending delivery for a session at a lifecycle point (002 §9) —
+   * decide the delivery and apply it (mark claimed) in one atomic step. This is
+   * the immediate, single-call path the hook transport uses.
+   *
+   * The reserve → commit path ({@link reserveDelivery}/{@link commitDelivery})
+   * splits the same decision from its persistence, so a transport that must
+   * surface the claim over a fallible channel can defer the claim until the push
+   * succeeds (006 §4, issue #300); this method is exactly `decide → apply`.
    *
    * `maxEvents` bounds how many delivered events a **`turn-interruptible`
    * high-urgency** claim actually surfaces AND claims (issue #299). A transport
@@ -1734,8 +1781,114 @@ export class AgentMonitorRuntime {
     lifecycle: DeliveryLifecycle,
     maxEvents?: number,
   ): DeliveryClaim | null {
-    const now = new Date();
     this.store.touchSession(sessionId);
+    const decision = this.decideDelivery(sessionId, lifecycle, maxEvents);
+    if (!decision) return null;
+    this.applyDelivery(decision);
+    return decision.claim;
+  }
+
+  /**
+   * Reserve — but do NOT yet claim — the pending delivery for a session at a
+   * lifecycle point (006 §4, issue #300). Returns the SAME {@link DeliveryClaim}
+   * a {@link claimDelivery} would (rendered from the identical decision) plus an
+   * opaque `reservationId`, and LEASES the underlying rows so the hook transport
+   * will not double-surface them (the cross-transport dedup boundary of 006 §4.5,
+   * now enforced from reserve time). Crucially it performs **no** store mutation:
+   * `first_notified_at` ("was surfaced") is stamped only when the caller
+   * {@link commitDelivery} after a successful surface. On a failed/disconnected
+   * push the caller {@link releaseDelivery}, returning the rows to the hook path.
+   * If the caller does neither, the lease self-expires and the rows re-deliver.
+   *
+   * This is what lets the channel transport avoid consuming a delivery on a
+   * transient MCP disconnect: it reserves, pushes, and only then commits.
+   */
+  reserveDelivery(
+    sessionId: string,
+    lifecycle: DeliveryLifecycle,
+    maxEvents?: number,
+  ): DeliveryReservation | null {
+    this.store.touchSession(sessionId);
+    const decision = this.decideDelivery(sessionId, lifecycle, maxEvents);
+    if (!decision) return null;
+    const reservationId = this.reservations.add({
+      sessionId: decision.sessionId,
+      candidates: decision.candidates,
+      isRecap: decision.isRecap,
+      claim: decision.claim,
+    });
+    // Refresh the hook-state projection so it reflects the lease immediately: the
+    // reserved rows are now hidden from `pendingForClaim`, so the file stops
+    // advertising them as claimable while the push is in flight (issue #300).
+    // This writes only the derived hook-state cache — it does NOT claim the rows.
+    this.refreshHookState(decision.sessionId);
+    return { reservationId, claim: decision.claim };
+  }
+
+  /**
+   * Commit a reservation from {@link reserveDelivery} after its claim was
+   * surfaced (006 §4, issue #300): apply the deferred claim (mark the reserved
+   * rows claimed, "was surfaced" — BP2, not acknowledged), returning the claim.
+   * Returns `null` if the reservation is unknown or already expired — the rows
+   * were never permanently consumed, so a stale commit is a safe no-op (they may
+   * have already re-delivered via the hook path).
+   */
+  commitDelivery(reservationId: string): DeliveryClaim | null {
+    const plan = this.reservations.take(reservationId);
+    if (!plan) return null;
+    this.applyDelivery(plan);
+    return plan.claim;
+  }
+
+  /**
+   * Release a reservation from {@link reserveDelivery} WITHOUT claiming (006 §4,
+   * issue #300): the push failed or disconnected, so drop the lease and return
+   * the rows to `pending`, where the hook transport (or the next channel poll)
+   * re-delivers them. A no-op for an unknown/expired reservation.
+   */
+  releaseDelivery(reservationId: string): void {
+    const plan = this.reservations.remove(reservationId);
+    // Refresh the hook-state projection so the released rows are advertised as
+    // pending again immediately (they returned to the hook path) — the mirror of
+    // the refresh `reserveDelivery` does when the lease is taken (issue #300).
+    if (plan) this.refreshHookState(plan.sessionId);
+  }
+
+  /**
+   * Pending (not-yet-claimed) events for a session's claim decision, MINUS any
+   * currently leased by an outstanding reservation (006 §4, issue #300). Leased
+   * rows are hidden from the claim decision so a concurrent hook claim does not
+   * surface an event the channel is mid-surfacing (cross-transport dedup, 006
+   * §4.5). A released/expired lease restores them on the next call.
+   */
+  private pendingForClaim(
+    sessionId: string,
+    urgency?: Urgency,
+  ): MonitorEventRecord[] {
+    const pending = this.store.pendingEventsForSession(sessionId, urgency);
+    const reserved = this.reservations.reservedEventIds(sessionId);
+    if (reserved.size === 0) return pending;
+    return pending.filter((event) => !reserved.has(event.id));
+  }
+
+  /**
+   * Decide the pending delivery for a session at a lifecycle point WITHOUT
+   * mutating the store (issue #300). Mirrors the prior `claimDelivery` branch
+   * logic exactly, but (a) reads pending sets through {@link pendingForClaim} so
+   * leased rows are excluded, and (b) renders the claim from the PURE
+   * {@link computeNetCollapseView} decision — never the mutating collapse. The
+   * rendered `message`/`events` read only event fields + interpret digests, which
+   * the collapse mutation does not touch (it re-anchors `diff_text` for later
+   * `events list`/`monitor explain` only), so this renders byte-identically to
+   * the previous in-place claim. {@link applyDelivery} performs the deferred
+   * mutation.
+   */
+  private decideDelivery(
+    sessionId: string,
+    lifecycle: DeliveryLifecycle,
+    maxEvents?: number,
+  ): DeliveryDecision | null {
+    const now = new Date();
     const unreadCounts = {
       low: this.store.unreadEventsForSession(sessionId, 'low').length,
       normal: this.store.unreadEventsForSession(sessionId, 'normal').length,
@@ -1751,7 +1904,7 @@ export class AgentMonitorRuntime {
         sessionId,
         'normal',
       );
-      const highUnread = this.store.pendingEventsForSession(sessionId, 'high');
+      const highUnread = this.pendingForClaim(sessionId, 'high');
       const settledHigh = highUnread.filter(
         (event) =>
           now.getTime() - event.createdAt.getTime() >=
@@ -1759,20 +1912,10 @@ export class AgentMonitorRuntime {
       );
       if (settledHigh.length > 0) {
         // Per-recipient `net` collapse (G10 PR-B, 002 §1.1.7): deliver only the
-        // newest event per object for a `net` monitor; record the older
-        // intermediates claimed-but-suppressed.
-        //
-        // DECIDE first, WITHOUT mutating: compute the per-object representatives
-        // a full claim would surface (the pure {@link computeNetCollapseView}),
-        // then apply the #299 cap to those representatives. The MUTATING collapse
-        // (delta re-anchoring + net-suppression) runs ONLY on the surfaced groups
-        // below. A DEFERRED group must stay byte-untouched — its intermediates
-        // UNSUPPRESSED and still pending — until the context event that actually
-        // surfaces it; otherwise those intermediates would be net-suppressed while
-        // never claimed (orphaned: excluded from pending/unread yet lacking a
-        // `first_notified_at`), breaking the claimed-but-suppressed-AT-CLAIM-TIME
-        // contract (002 §1.1.7). Running the mutation on the full set before the
-        // cap is exactly that bug.
+        // newest event per object for a `net` monitor; the older intermediates
+        // are folded away and (at apply time) recorded claimed-but-suppressed.
+        // The decision is the pure {@link computeNetCollapseView}; the mutating
+        // collapse runs only in {@link applyDelivery} over the surfaced groups.
         const representatives = computeNetCollapseView(settledHigh).delivered;
 
         // Cap the surfaced set to what a length-bounded transport asked for
@@ -1786,85 +1929,68 @@ export class AgentMonitorRuntime {
             : Math.min(representatives.length, Math.max(1, maxEvents));
         const surfacedReps = representatives.slice(0, limit);
 
-        // Restrict the mutating collapse + claim to ONLY the surfaced groups —
-        // each surfaced representative's full set of settled events (the
-        // representative plus that object's older intermediates). Deferred groups
-        // are excluded entirely, so nothing about them is re-anchored,
-        // suppressed, or claimed; they re-deliver intact next context event.
+        // Restrict the surfaced set to ONLY the surfaced groups — each surfaced
+        // representative's full set of settled events (the representative plus
+        // that object's older intermediates). Deferred groups are excluded
+        // entirely, so nothing about them is re-anchored, suppressed, or claimed
+        // at apply time; they re-deliver intact next context event.
         const surfacedKeys = new Set(surfacedReps.map(netCollapseGroupKey));
         const surfacedCandidates = settledHigh.filter((event) =>
           surfacedKeys.has(netCollapseGroupKey(event)),
         );
 
-        // The delivered subset for the surfaced groups (equals `surfacedReps`,
-        // now with each surviving delta re-anchored to this recipient's cursor →
-        // endpoint and the surfaced groups' intermediates net-suppressed). Diffs
-        // are recomputed inside collapse, so this must run BEFORE the digest
-        // lookup reads the (re-anchored) deltas.
-        const surfacedHigh = this.store.collapseNetForClaim(
-          sessionId,
-          surfacedCandidates,
-        );
+        // The delivered subset — identical to what the mutating collapse would
+        // return (its return value IS `computeNetCollapseView(...).delivered`).
+        // Rendering from this pure view keeps decide side-effect-free while
+        // producing the same content the eventual claim surfaces.
+        const surfacedHigh =
+          computeNetCollapseView(surfacedCandidates).delivered;
 
         const digests = this.store.interpretDigestsForSession(
           sessionId,
           surfacedHigh.map((event) => event.id),
         );
-        // Claim the FULL surfaced-group candidate set (representatives + their
-        // now-suppressed intermediates) so the cursor advances to each surfaced
-        // object's endpoint and the suppressed rows are consumed.
-        this.store.markClaimed(
-          sessionId,
-          surfacedCandidates.map((event) => event.id),
-          lifecycle,
-        );
-        this.refreshHookState(sessionId);
         return {
           sessionId,
-          lifecycle,
-          mode: 'delivery',
-          urgency: 'high',
-          unreadCounts: sessionUnreadCounts,
-          message: summarizeEvents(
-            surfacedHigh.map((event) => ({
-              title: event.title,
-              summary: recipientSummary(event, digests),
-            })),
-          ),
-          events: surfacedHigh.map((event) =>
-            toDeliveryEventSummary(event, digests),
-          ),
+          candidates: surfacedCandidates,
+          isRecap: false,
+          claim: {
+            sessionId,
+            lifecycle,
+            mode: 'delivery',
+            urgency: 'high',
+            unreadCounts: sessionUnreadCounts,
+            message: summarizeEvents(
+              surfacedHigh.map((event) => ({
+                title: event.title,
+                summary: recipientSummary(event, digests),
+              })),
+            ),
+            events: surfacedHigh.map((event) =>
+              toDeliveryEventSummary(event, digests),
+            ),
+          },
         };
       }
 
-      const normalPending = this.store.pendingEventsForSession(
-        sessionId,
-        'normal',
-      );
+      const normalPending = this.pendingForClaim(sessionId, 'normal');
       if (
         normalPending.length > 0 &&
         normalPending.length === unreadNormal.length
       ) {
-        // Record per-recipient `net` suppression for the intermediates of this
-        // claimed batch (G10 PR-B, 002 §1.1.7). This branch surfaces only the
-        // generic inbox prompt (no event payloads), but the collapse must still
-        // run so suppressed intermediates are recorded/explainable and the
-        // cursor advances correctly via the full-set markClaimed below.
-        this.store.collapseNetForClaim(sessionId, normalPending);
-        this.store.markClaimed(
-          sessionId,
-          normalPending.map((event) => event.id),
-          lifecycle,
-        );
-        this.refreshHookState(sessionId);
         return {
           sessionId,
-          lifecycle,
-          mode: 'delivery',
-          urgency: 'normal',
-          unreadCounts: sessionUnreadCounts,
-          message: NORMAL_INBOX_PROMPT,
-          events: [],
+          candidates: normalPending,
+          isRecap: false,
+          claim: {
+            sessionId,
+            lifecycle,
+            mode: 'delivery',
+            urgency: 'normal',
+            unreadCounts: sessionUnreadCounts,
+            message: NORMAL_INBOX_PROMPT,
+            events: [],
+          },
         };
       }
 
@@ -1872,28 +1998,24 @@ export class AgentMonitorRuntime {
     }
 
     const unreadLow = this.store.unreadEventsForSession(sessionId, 'low');
-    const lowUnread = this.store.pendingEventsForSession(sessionId, 'low');
+    const lowUnread = this.pendingForClaim(sessionId, 'low');
     const shouldSendLow =
       lowUnread.length > 0 && lowUnread.length === unreadLow.length;
 
     if (lifecycle === 'turn-idle' && shouldSendLow) {
-      // Record per-recipient `net` suppression for this claimed batch's
-      // intermediates (G10 PR-B, 002 §1.1.7); see the normal branch above.
-      this.store.collapseNetForClaim(sessionId, lowUnread);
-      this.store.markClaimed(
-        sessionId,
-        lowUnread.map((event) => event.id),
-        lifecycle,
-      );
-      this.refreshHookState(sessionId);
       return {
         sessionId,
-        lifecycle,
-        mode: 'delivery',
-        urgency: 'low',
-        unreadCounts: sessionUnreadCounts,
-        message: IDLE_INBOX_PROMPT,
-        events: [],
+        candidates: lowUnread,
+        isRecap: false,
+        claim: {
+          sessionId,
+          lifecycle,
+          mode: 'delivery',
+          urgency: 'low',
+          unreadCounts: sessionUnreadCounts,
+          message: IDLE_INBOX_PROMPT,
+          events: [],
+        },
       };
     }
 
@@ -1901,10 +2023,11 @@ export class AgentMonitorRuntime {
     if (lifecycle === 'post-compact' && unread.length > 0) {
       // Per-recipient `net` collapse (G10 PR-B, 002 §1.1.7) over the FULL unread
       // set, then recap only the delivered (post-collapse) tail. The full set is
-      // still claimed below so the cursor advances and suppressed intermediates
-      // are consumed. Collapse re-anchors the surviving delta, so it must run
-      // before the digest lookup.
-      const deliveredUnread = this.store.collapseNetForClaim(sessionId, unread);
+      // claimed at apply time so the cursor advances and suppressed intermediates
+      // are consumed. Recap reads all UNREAD (not pending), so a leased row is
+      // still recapped — a lease is not acknowledgement, and recap re-shows unread
+      // until acked (006 §5.5).
+      const deliveredUnread = computeNetCollapseView(unread).delivered;
       const recapSlice = deliveredUnread.slice(-MAX_RECAP_EVENTS);
       const digests = this.store.interpretDigestsForSession(
         sessionId,
@@ -1921,26 +2044,51 @@ export class AgentMonitorRuntime {
         `Run \`${fullHistoryCommand(sessionId)}\` for recent history.`,
         `Run \`${unreadDetailsCommand(sessionId)}\` for unread details.`,
       ].join('\n');
-      this.store.markClaimed(
-        sessionId,
-        unread.map((event) => event.id),
-        lifecycle,
-      );
-      this.store.updateSessionRecap(sessionId);
-      this.refreshHookState(sessionId);
       return {
         sessionId,
-        lifecycle,
-        mode: 'recap',
-        unreadCounts: sessionUnreadCounts,
-        message,
-        events: recapSlice.map((event) =>
-          toDeliveryEventSummary(event, digests),
-        ),
+        candidates: unread,
+        isRecap: true,
+        claim: {
+          sessionId,
+          lifecycle,
+          mode: 'recap',
+          unreadCounts: sessionUnreadCounts,
+          message,
+          events: recapSlice.map((event) =>
+            toDeliveryEventSummary(event, digests),
+          ),
+        },
       };
     }
 
     return null;
+  }
+
+  /**
+   * Persist the mutation a {@link DeliveryDecision} deferred (issue #300): the
+   * per-recipient `net` collapse (re-anchor the surviving delta + record
+   * net-suppression for the intermediates) over the full candidate set, then mark
+   * that set claimed (`first_notified_at` = "was surfaced", BP2 — NOT
+   * acknowledged), advance the recap cursor for a recap, and refresh hook state.
+   * Called by {@link claimDelivery} immediately and by {@link commitDelivery}
+   * after a successful surface. The decision already rendered from the pure
+   * collapse view, so this ignores `collapseNetForClaim`'s return.
+   */
+  private applyDelivery(decision: {
+    sessionId: string;
+    candidates: MonitorEventRecord[];
+    isRecap: boolean;
+    claim: DeliveryClaim;
+  }): void {
+    const { sessionId, candidates, claim } = decision;
+    this.store.collapseNetForClaim(sessionId, candidates);
+    this.store.markClaimed(
+      sessionId,
+      candidates.map((event) => event.id),
+      claim.lifecycle,
+    );
+    if (decision.isRecap) this.store.updateSessionRecap(sessionId);
+    this.refreshHookState(sessionId);
   }
 
   /**
@@ -1957,7 +2105,10 @@ export class AgentMonitorRuntime {
    */
   previewSettledHighDelivery(sessionId: string): DeliveryEventSummary[] {
     const now = new Date();
-    const highUnread = this.store.pendingEventsForSession(sessionId, 'high');
+    // Exclude rows leased by an outstanding reservation (issue #300) so the
+    // hook transport sizes and claims exactly what a real claim would decide —
+    // never an event the channel is mid-surfacing.
+    const highUnread = this.pendingForClaim(sessionId, 'high');
     const settledHigh = highUnread.filter(
       (event) =>
         now.getTime() - event.createdAt.getTime() >=
@@ -2008,7 +2159,9 @@ export class AgentMonitorRuntime {
 
     const holds: HookDeliveryHold[] = [];
     if (lifecycle === 'turn-interruptible') {
-      const pendingHigh = this.store.pendingEventsForSession(sessionId, 'high');
+      // Lease-aware (issue #300): exclude rows reserved by an in-flight channel
+      // push so this diagnosis matches what a real claim would surface.
+      const pendingHigh = this.pendingForClaim(sessionId, 'high');
       const settleHold = classifySettleWindowHold(
         pendingHigh.map((event) => event.createdAt),
         unreadCounts.high,
@@ -2025,10 +2178,7 @@ export class AgentMonitorRuntime {
           DEFAULT_HIGH_URGENCY_SETTLE_MS,
       ).length;
       if (settledHighCount === 0) {
-        const pendingNormal = this.store.pendingEventsForSession(
-          sessionId,
-          'normal',
-        ).length;
+        const pendingNormal = this.pendingForClaim(sessionId, 'normal').length;
         const normalHold = classifyReminderHold(
           'normal',
           unreadCounts.normal,
@@ -2037,10 +2187,7 @@ export class AgentMonitorRuntime {
         if (normalHold) holds.push(normalHold);
       }
     } else if (lifecycle === 'turn-idle') {
-      const pendingLow = this.store.pendingEventsForSession(
-        sessionId,
-        'low',
-      ).length;
+      const pendingLow = this.pendingForClaim(sessionId, 'low').length;
       const lowHold = classifyReminderHold('low', unreadCounts.low, pendingLow);
       if (lowHold) holds.push(lowHold);
     }
@@ -2895,16 +3042,20 @@ export class AgentMonitorRuntime {
   }
 
   refreshHookState(sessionId: string): SessionHookState {
-    const highUnread = this.store.pendingEventsForSession(sessionId, 'high');
+    // Lease-aware pending (issue #300): a row reserved by an in-flight channel
+    // push is not independently claimable, so it must not be advertised as
+    // pending work in the hook-state projection — otherwise the file would
+    // disagree with the (lease-aware) claim decision during a reservation.
+    // `reserveDelivery`/`releaseDelivery` re-run this so the file tracks the
+    // lease as it is taken and dropped.
+    const highUnread = this.pendingForClaim(sessionId, 'high');
     const pendingHigh = highUnread.some(
       (event) =>
         Date.now() - event.createdAt.getTime() >=
         DEFAULT_HIGH_URGENCY_SETTLE_MS,
     );
-    const pendingNormal =
-      this.store.pendingEventsForSession(sessionId, 'normal').length > 0;
-    const pendingLow =
-      this.store.pendingEventsForSession(sessionId, 'low').length > 0;
+    const pendingNormal = this.pendingForClaim(sessionId, 'normal').length > 0;
+    const pendingLow = this.pendingForClaim(sessionId, 'low').length > 0;
     const state = this.store.sessionHookState(sessionId, {
       high: pendingHigh,
       normal: pendingNormal,

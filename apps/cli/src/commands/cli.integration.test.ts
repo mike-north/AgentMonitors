@@ -29,6 +29,8 @@ import {
   resolveSocketPath,
 } from '../daemon-ipc.js';
 import { decodeToon } from '../toon-format.js';
+import { runChannelDeliveryCycle } from './channel.js';
+import { claimDeliveryClient } from '../runtime-client.js';
 
 const CLI_PATH = path.resolve(__dirname, '../../dist/index.cjs');
 const CLI_PACKAGE_DIR = path.resolve(__dirname, '../..');
@@ -11029,6 +11031,293 @@ describe('hooks-only delivery parity (issue #270)', () => {
         // already stopped — ignore
       }
       rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// Channel reserve → commit/release delivery cycle (issue #300)
+//
+// Drives the REAL channel delivery cycle (`runChannelDeliveryCycle` from
+// channel.ts) against a REAL daemon over its socket, injecting only the one
+// thing that cannot run in CI — the MCP `notifications/claude/channel` push
+// (channels are research-preview, 006 §4/§6). Everything else is the production
+// path: the daemon's `hook.reserve`/`hook.commit`/`hook.release` IPC and the
+// core reserve/commit/release state machine.
+//
+// The bug (issue #300): the channel claimed the delivery BEFORE it knew the push
+// succeeded, so a rejected/disconnected push permanently consumed the delivery —
+// the hook transport then suppressed it as a cross-transport duplicate. The fix
+// reserves (leases without claiming), pushes, and commits only on success; a
+// failed push releases the lease so the hook path re-delivers. The
+// "rejected push → hook fallback still surfaces it" test below FAILS against the
+// pre-fix claim-before-push ordering (the row would already be claimed) and
+// passes with the fix.
+// ---------------------------------------------------------------------------
+describe('channel reserve → commit/release delivery cycle (issue #300)', () => {
+  interface ChannelCycleFixture {
+    ws: string;
+    socket: string;
+    sessionId: string;
+    env: Record<string, string>;
+    eventId: string;
+  }
+
+  // Boot a real daemon with ONE settled normal-urgency event projected into a
+  // registered lead session, ready for a `turn-interruptible` delivery. Normal
+  // urgency (not high) so there is no 15s settle wait — the reserve/commit/
+  // release orchestration under test is identical across urgency branches.
+  async function setupChannelCycle(
+    label: string,
+  ): Promise<ChannelCycleFixture> {
+    const ws = mkdtempSync(path.join(tmpdir(), `agentmon-chcycle-${label}-`));
+    const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-files');
+    mkdirSync(monitorsDir, { recursive: true });
+    const watchedFile = path.join(ws, 'watched.txt');
+    writeFileSync(watchedFile, 'initial content', 'utf-8');
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      [
+        '---',
+        'name: Watch files',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs:',
+        '    - "watched.txt"',
+        `  cwd: ${JSON.stringify(ws)}`,
+        '  interval: "1s"',
+        'urgency: normal',
+        '---',
+        'When files change, review them.',
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+
+    const socket = path.join(
+      '/tmp',
+      `agentmon-cc-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const db = path.join(ws, 'channel-cycle.db');
+    const hostSessionId = `chcycle-${label}-${Date.now()}`;
+    writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 30_000 });
+    const env: Record<string, string> = {
+      CLAUDE_PROJECT_DIR: ws,
+      AGENTMONITORS_DB: db,
+      AGENTMONITORS_SOCKET: socket,
+    };
+
+    const start = runWithStdin(
+      ['session', 'start'],
+      env,
+      JSON.stringify({
+        session_id: hostSessionId,
+        hook_event_name: 'SessionStart',
+        cwd: ws,
+      }),
+      ws,
+    );
+    expect(start.exitCode).toBe(0);
+    expect(await daemonAvailable(socket)).toBe(true);
+
+    const sessions = JSON.parse(
+      runWithEnv(
+        ['session', 'list', '--socket', socket, '--format', 'json'],
+        env,
+        ws,
+      ).stdout,
+    ) as { id: string; hostSessionId: string }[];
+    const sessionId =
+      sessions.find((s) => s.hostSessionId === hostSessionId)?.id ?? '';
+    expect(sessionId).not.toBe('');
+
+    // Fire the monitor exactly once after the baseline tick.
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
+    writeFileSync(watchedFile, 'changed content', 'utf-8');
+
+    const unreadJson = () =>
+      runWithEnv(
+        [
+          'events',
+          'list',
+          '--session',
+          sessionId,
+          '--unread',
+          '--format',
+          'json',
+          '--socket',
+          socket,
+        ],
+        env,
+        ws,
+      ).stdout;
+    const deadline = Date.now() + 10_000;
+    let eventId = '';
+    while (Date.now() < deadline) {
+      const events = JSON.parse(unreadJson()) as { id: string }[];
+      if (events.length >= 1) {
+        eventId = events[0]?.id ?? '';
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    expect(eventId).not.toBe('');
+
+    return { ws, socket, sessionId, env, eventId };
+  }
+
+  function deliveryStateOf(f: ChannelCycleFixture): string | undefined {
+    const events = JSON.parse(
+      runWithEnv(
+        [
+          'events',
+          'list',
+          '--session',
+          f.sessionId,
+          '--format',
+          'json',
+          '--socket',
+          f.socket,
+        ],
+        f.env,
+        f.ws,
+      ).stdout,
+    ) as { id: string; deliveryState?: string }[];
+    return events.find((e) => e.id === f.eventId)?.deliveryState;
+  }
+
+  function unreadCount(f: ChannelCycleFixture): number {
+    return (
+      JSON.parse(
+        runWithEnv(
+          [
+            'events',
+            'list',
+            '--session',
+            f.sessionId,
+            '--unread',
+            '--format',
+            'json',
+            '--socket',
+            f.socket,
+          ],
+          f.env,
+          f.ws,
+        ).stdout,
+      ) as unknown[]
+    ).length;
+  }
+
+  async function teardown(f: ChannelCycleFixture): Promise<void> {
+    try {
+      await callDaemon('stop', {}, { socketPath: f.socket });
+    } catch {
+      // already stopped
+    }
+    rmSync(f.ws, { recursive: true, force: true });
+  }
+
+  it('successful push commits the claim: rows become claimed (surfaced), deduped from the hook path, still unacknowledged', async () => {
+    const f = await setupChannelCycle('ok');
+    try {
+      let pushed: unknown;
+      const outcome = await runChannelDeliveryCycle(
+        f.sessionId,
+        f.socket,
+        (claim) => {
+          pushed = claim;
+          return Promise.resolve();
+        },
+      );
+
+      expect(outcome).toBe('surfaced');
+      expect(pushed).toBeDefined();
+      // Claimed ("was surfaced"), and the hook transport now sees nothing to
+      // claim (cross-transport dedup, 006 §4.5).
+      expect(deliveryStateOf(f)).toBe('claimed');
+      expect(
+        await claimDeliveryClient(f.sessionId, 'turn-interruptible', f.socket),
+      ).toBeNull();
+      // Claim is never acknowledgement (BP2): still unread.
+      expect(unreadCount(f)).toBe(1);
+    } finally {
+      await teardown(f);
+    }
+  }, 30_000);
+
+  it('rejected push releases the reservation: the event stays unclaimed and the hook path still surfaces it (regression: pre-fix this was permanently consumed)', async () => {
+    const f = await setupChannelCycle('reject');
+    try {
+      const outcome = await runChannelDeliveryCycle(f.sessionId, f.socket, () =>
+        Promise.reject(new Error('MCP transport disconnected')),
+      );
+
+      expect(outcome).toBe('push-failed');
+      // The row was NEVER claimed — a transient disconnect must not consume the
+      // only delivery opportunity (criterion 2 + 5).
+      expect(deliveryStateOf(f)).toBe('unread');
+      expect(unreadCount(f)).toBe(1);
+
+      // Fallback: the hook transport claims and surfaces it. Against the pre-fix
+      // claim-before-push ordering the row would already be claimed and this
+      // claim would return null — this assertion is the regression guard.
+      const fallback = await claimDeliveryClient(
+        f.sessionId,
+        'turn-interruptible',
+        f.socket,
+      );
+      expect(fallback).not.toBeNull();
+      expect(deliveryStateOf(f)).toBe('claimed');
+    } finally {
+      await teardown(f);
+    }
+  }, 30_000);
+
+  it('retry after a rejected push: the next cycle re-reserves and commits the same delivery', async () => {
+    const f = await setupChannelCycle('retry');
+    try {
+      const failed = await runChannelDeliveryCycle(f.sessionId, f.socket, () =>
+        Promise.reject(new Error('MCP transport disconnected')),
+      );
+      expect(failed).toBe('push-failed');
+      expect(deliveryStateOf(f)).toBe('unread');
+
+      const retried = await runChannelDeliveryCycle(f.sessionId, f.socket, () =>
+        Promise.resolve(),
+      );
+      expect(retried).toBe('surfaced');
+      expect(deliveryStateOf(f)).toBe('claimed');
+    } finally {
+      await teardown(f);
+    }
+  }, 30_000);
+
+  it('hook/channel race: a concurrent hook claim during the push finds the leased row hidden (no double-surface)', async () => {
+    const f = await setupChannelCycle('race');
+    try {
+      // Run a concurrent hook claim WHILE the reservation is held (inside the
+      // push, before commit). It must find nothing — the row is leased, so the
+      // two transports cannot both surface it (006 §4.5).
+      let concurrentClaim: unknown = 'unset';
+      const outcome = await runChannelDeliveryCycle(
+        f.sessionId,
+        f.socket,
+        async () => {
+          concurrentClaim = await claimDeliveryClient(
+            f.sessionId,
+            'turn-interruptible',
+            f.socket,
+          );
+        },
+      );
+
+      expect(outcome).toBe('surfaced');
+      expect(concurrentClaim).toBeNull();
+      // Surfaced exactly once (by the channel), and now claimed.
+      expect(deliveryStateOf(f)).toBe('claimed');
+      expect(unreadCount(f)).toBe(1);
+    } finally {
+      await teardown(f);
     }
   }, 30_000);
 });

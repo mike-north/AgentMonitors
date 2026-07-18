@@ -169,6 +169,7 @@ export type {
   DeliveryEventSummary,
   DeliveryLifecycle,
   DeliveryMode,
+  DeliveryReservation,
   DoctorDeliveryCounts,
   EphemeralMonitorRecord,
   EphemeralMonitorStatus,
