@@ -1004,14 +1004,25 @@ export class AgentMonitorRuntime {
       // Defensive isolation (issue #297): scheduleForMonitor() never throws —
       // an invalid IANA timezone surfaces here as `schedule.error` instead.
       // explainMonitor() MUST NOT mutate runtime state (002 §10.7), so — unlike
-      // the tick path — this does NOT write an observation_history row; it
-      // renders the SAME diagnostic shape a real observe() failure would land
-      // in the 'observation' stage, purely from the in-memory error.
+      // the tick path — this does NOT write an observation_history row.
+      //
+      // Stage placement: the failure is in cron/timezone evaluation (002 §10.7
+      // stage 2, "Scheduling"), not observe() (stage 3, "Observation") — the
+      // source was never even called. It is nonetheless rendered as an
+      // 'observation'-stage failure, DELIBERATELY, for consistency with the
+      // tick loop: a live daemon isolates this exact failure into an 'errored'
+      // observation_history row (evaluateMonitorOnTick()'s schedule.error
+      // branch), which the normal history-based rendering below always surfaces
+      // as an 'observation' failure. Placing it in 'scheduling' here would make
+      // the SAME root cause render in different stages depending on whether a
+      // tick had already run — confusing. The MESSAGE states the true cause
+      // (scheduling/timezone, not "the source") so the stage location doesn't
+      // read as a misdiagnosis (PR #433 review, discussion_r3608549689).
       stages.push(
         explainStage(
           'observation',
           'failure',
-          'The most recent source observation errored.',
+          `This monitor's schedule could not be evaluated, so its source was never observed: ${schedule.error}`,
           { error: schedule.error },
         ),
       );

@@ -89,23 +89,31 @@ describe('isValidIanaTimeZone', () => {
 
 describe('invalidTimezoneError', () => {
   it('returns undefined when timezone is absent', () => {
-    expect(invalidTimezoneError({ cron: '* * * * *' })).toBeUndefined();
+    expect(
+      invalidTimezoneError({ cron: '* * * * *' }, scheduleScope),
+    ).toBeUndefined();
   });
 
   it('returns undefined for a valid IANA timezone', () => {
     expect(
-      invalidTimezoneError({
-        cron: '* * * * *',
-        timezone: 'America/Los_Angeles',
-      }),
+      invalidTimezoneError(
+        {
+          cron: '* * * * *',
+          timezone: 'America/Los_Angeles',
+        },
+        scheduleScope,
+      ),
     ).toBeUndefined();
   });
 
   it('returns an actionable error for an invalid timezone', () => {
-    const error = invalidTimezoneError({
-      cron: '* * * * *',
-      timezone: 'Not/AZone',
-    });
+    const error = invalidTimezoneError(
+      {
+        cron: '* * * * *',
+        timezone: 'Not/AZone',
+      },
+      scheduleScope,
+    );
     expect(error).toContain('Not/AZone');
     expect(error).toMatch(/valid IANA time zone name/);
   });
@@ -114,7 +122,21 @@ describe('invalidTimezoneError', () => {
     // A wrong-typed value is validateScope()'s job to report; this helper must
     // not double-report it under a different message.
     expect(
-      invalidTimezoneError({ cron: '* * * * *', timezone: 42 }),
+      invalidTimezoneError({ cron: '* * * * *', timezone: 42 }, scheduleScope),
+    ).toBeUndefined();
+  });
+
+  // PR #433 review: a source whose scopeSchema does NOT declare a `timezone`
+  // property must never have an unrelated extra `timezone` key rejected as an
+  // invalid IANA name — that key isn't governed by this source's contract at
+  // all, and most scopeSchemas don't set `additionalProperties: false` (AP4),
+  // so JSON Schema itself silently accepts it.
+  it('returns undefined when scopeSchema does not declare a timezone property, even for a bogus value', () => {
+    expect(
+      invalidTimezoneError(
+        { globs: ['*.ts'], timezone: 'not even a real value' },
+        fileFingerprintScope,
+      ),
     ).toBeUndefined();
   });
 });
@@ -146,5 +168,23 @@ describe('validateWatchScope — schedule timezone (issue #297)', () => {
     );
     expect(errors.length).toBeGreaterThan(0);
     expect(errors.join(' ')).toContain('Not/AZone');
+  });
+
+  // Regression test for PR #433 review (discussion_r3608549682): the
+  // supplemental timezone check must be gated on the SOURCE'S OWN scopeSchema
+  // declaring a `timezone` property — not applied unconditionally to every
+  // source. Without the gate, a monitor for an unrelated source (here
+  // file-fingerprint, whose scopeSchema has no `timezone` field) that happens
+  // to carry an extra `timezone` key — previously silently accepted, since
+  // most scopeSchemas don't set `additionalProperties: false` — would be
+  // wrongly rejected with a schedule-specific "not a valid IANA time zone
+  // name" error. This test must FAIL pre-fix.
+  it('accepts a non-schedule source scope with a bogus extra `timezone` field (PR #433 review)', () => {
+    expect(
+      validateWatchScope(
+        { globs: ['*.ts'], timezone: 'not even a real value' },
+        fileFingerprintScope,
+      ),
+    ).toEqual([]);
   });
 });

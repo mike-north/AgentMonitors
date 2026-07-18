@@ -4513,6 +4513,11 @@ This monitor has a typo'd timezone.
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain('✗ Observation:');
     expect(result.stdout).toContain('Verdict: failure at Observation');
+    // The message must name the true cause (scheduling/timezone), not imply a
+    // source observation ran and errored — text output only renders `reason`,
+    // so the bad value must be inline (PR #433 review, discussion_r3608549689).
+    expect(result.stdout).toContain('schedule could not be evaluated');
+    expect(result.stdout).toContain('Not/AZone');
   });
 
   it('reads persisted state in --format json (no false scheduling failure) and annotates the no-daemon notice', () => {

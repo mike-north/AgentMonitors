@@ -541,7 +541,7 @@ export type InterpretResult = {
 };
 
 // @public
-export function invalidTimezoneError(watchConfig: Record<string, unknown>): string | undefined;
+export function invalidTimezoneError(watchConfig: Record<string, unknown>, scopeSchema: JsonSchema): string | undefined;
 
 // @public
 export function isErrnoException(error: unknown): error is NodeJS.ErrnoException;

@@ -1969,7 +1969,14 @@ This monitor has a typo'd timezone.
       (stage) => stage.id === 'observation',
     );
     expect(observationStage?.status).toBe('failure');
-    expect(observationStage?.reason).toContain('errored');
+    // The message must state the TRUE cause — scheduling/timezone evaluation
+    // failed, not "the source observation errored" (PR #433 review,
+    // discussion_r3608549689) — and surface the bad value inline, since text
+    // output only renders `reason`, never `details`.
+    expect(observationStage?.reason).toContain(
+      'schedule could not be evaluated',
+    );
+    expect(observationStage?.reason).toContain('Not/AZone');
     expect(String(observationStage?.details?.['error'] ?? '')).toContain(
       'Not/AZone',
     );
