@@ -898,12 +898,19 @@ Supported strategies (verified: `plugins/source-api-poll/src/index.ts`, `ChangeS
 
 **`json-diff` renders a structural `diffText`, not a text line diff (issue #437).** This `strategy`
 value is read by the runtime's diff renderer (the source-agnostic `change-detection.strategy` this
-row and §11.3 describe, carried on every emitted observation's `snapshot.strategy`) to choose how
-`diffText` is rendered, not only whether a change occurred: `strategy: json-diff` produces
+row and §11.3 describe) to choose how `diffText` is rendered, not only whether a change occurred:
+`strategy: json-diff` produces
 added/removed/changed elements or key paths (`buildJsonDiff`) instead of `buildTextDiff`'s line-level
 diff, which degrades to a whole-line remove-all/add-all on compact single-line JSON. See
 [002 §5.2](./002-runtime-delivery.md#52-snapshots-and-diffs) for the renderer's full behavior
 (identity heuristics, bounded output, and the parse-failure fallback to `buildTextDiff`).
+
+Setting `snapshot.strategy` is a **bundled-source convention** (`source-api-poll`, `source-command-poll`
+both set it), not a requirement of the [§2 source contract](#2-source-contract) — a third-party source
+MAY opt into it the same way to get the structural renderer, but the contract does not mandate every
+`Observation`'s `snapshot` carry a `strategy` field. A source that omits it (or emits `snapshot` at all)
+simply always renders via `buildTextDiff` (`changeDetectionStrategyOf` returns `undefined` for anything
+that isn't a metadata object with a string `strategy` field).
 
 **`change-detection.strategy` is optional (issue #230).** When the author **omits** it, the strategy is
 **inferred from the response `Content-Type`**: a JSON media type (`application/json` or any
