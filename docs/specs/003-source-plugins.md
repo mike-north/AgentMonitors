@@ -1051,6 +1051,17 @@ The source does not decide when it is due — that is the runtime's responsibili
 
 `timezone` resolves to `'UTC'` when not provided in config. There is no IANA timezone validation in the plugin itself — the scheduling engine owns timezone interpretation.
 
+**Authoring-time IANA validation (issue #297).** A present `timezone` MUST be a name
+`Intl.DateTimeFormat` accepts (e.g. `America/New_York`, `UTC`) — checked by core's
+`invalidTimezoneError()`, wired into `validateWatchScope()` (verified:
+`libs/core/src/schema/validate-scope.ts`), the same source-agnostic supplemental check
+`change-detection.collection` uses (§12). `agentmonitors validate`, `monitor test`, and `watch
+declare` (007 §4.2) all call `validateWatchScope()` and therefore reject an invalid `scope.timezone`
+with an actionable error before a monitor is ever ticked. `tick()` itself does **not** call
+`validateWatchScope()` (it scans and evaluates monitors directly), so a hand-edited `MONITOR.md`
+with a bad timezone that skipped `validate` still reaches the runtime — see 002 §2.2's defensive
+isolation, which is the last line of defense for that case.
+
 ## 6. Bundled Source: `incoming-changes`
 
 Source name: `"incoming-changes"` (verified: `plugins/source-incoming-changes/src/index.ts`).

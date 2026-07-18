@@ -438,6 +438,27 @@ describe('monitorFrontmatterSchema', () => {
       });
     });
 
+    // Regression test for issue #297: an invalid IANA timezone must be rejected
+    // at authoring time (`validate`/`parseMonitor`), before it can ever reach
+    // `dispatchRollup()`'s runtime `cronMatchesDate` call and throw.
+    it('rejects a rollup monitor with an invalid IANA timezone', () => {
+      const result = monitorFrontmatterSchema.safeParse({
+        ...validMinimal,
+        notify: {
+          strategy: 'rollup',
+          window: '0 9 * * 1-5',
+          timezone: 'Not/AZone',
+        },
+      });
+      expect(result.success).toBe(false);
+      if (result.success) return;
+      expect(
+        result.error.issues.some((issue) =>
+          issue.message.includes('valid IANA time zone name'),
+        ),
+      ).toBe(true);
+    });
+
     it('rejects a rollup monitor missing the required window', () => {
       const result = monitorFrontmatterSchema.safeParse({
         ...validMinimal,

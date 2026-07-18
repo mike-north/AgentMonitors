@@ -561,6 +561,19 @@ export interface ProcessObservationInput {
 export interface PollingDecision {
   due: boolean;
   nextPollMs: number;
+  /**
+   * Present when the scheduling decision itself could not be computed — e.g. an
+   * invalid IANA `timezone` on a `schedule` monitor makes `Intl.DateTimeFormat`
+   * throw inside cron matching (issue #297). `due` is `false` and `nextPollMs`
+   * falls back to the source's default poll interval so callers still have a
+   * usable decision; every caller MUST treat a present `error` as "this monitor
+   * cannot be scheduled right now" and isolate the failure to that monitor
+   * rather than let it abort a whole tick or diagnostic report. Authoring-time
+   * validation (the `schedule` source's `scopeSchema` and the `rollup` notify
+   * schema) should reject an invalid timezone before it ever reaches here — this
+   * is the defensive last line for a bypassed/legacy value.
+   */
+  error?: string;
 }
 
 /**

@@ -175,11 +175,13 @@ If present, `tags` **MUST** be an array of strings. Tags have no runtime semanti
 > cron; the runtime accumulates observations durably and flushes on the window.
 >
 > Verified: `libs/core/src/schema/monitor-schema.ts` — `rollupNotifySchema` (requires
-> `strategy: 'rollup'` + a five-field cron `window`; optional `timezone`) is the third arm of
+> `strategy: 'rollup'` + a five-field cron `window`; optional `timezone`, validated against
+> `isValidIanaTimeZone()` from `libs/core/src/schema/validate-scope.ts` — the same helper the
+> `schedule` source's `scope.timezone` check uses, issue #297) is the third arm of
 > `notifySchema`. `libs/core/src/runtime/service.ts` — `dispatchRollup()` (accumulate →
 > `cronMatchesDate(window)` window eval → flush+clear on a non-empty window). Proven by
 > `libs/core/src/schema/monitor-schema.test.ts` ("rollup notify" — accept with `window`, reject
-> missing `window`/malformed cron), `apps/cli/src/commands/cli.integration.test.ts` (`validate`
+> missing `window`/malformed cron, reject an invalid IANA `timezone`), `apps/cli/src/commands/cli.integration.test.ts` (`validate`
 > accepts a rollup monitor, rejects one missing `window`), and
 > `libs/core/src/runtime/service.test.ts` ("rollup Pace mode" — durable accumulation across ticks,
 > window flush+clear, empty-window no-delivery, and restart-safety of the accumulated batch).
@@ -199,11 +201,11 @@ notify:
 
 **Field semantics (target):**
 
-| Field      | Type   | Required | Meaning                                                                                            |
-| ---------- | ------ | -------- | -------------------------------------------------------------------------------------------------- |
-| `strategy` | string | yes      | Must be `rollup`                                                                                   |
-| `window`   | string | yes      | Five-field cron expression defining the recurring delivery time; same grammar as `schedule` source |
-| `timezone` | string | no       | IANA timezone for `window` evaluation; defaults to `UTC`                                           |
+| Field      | Type   | Required | Meaning                                                                                                                                                                                              |
+| ---------- | ------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `strategy` | string | yes      | Must be `rollup`                                                                                                                                                                                     |
+| `window`   | string | yes      | Five-field cron expression defining the recurring delivery time; same grammar as `schedule` source                                                                                                   |
+| `timezone` | string | no       | IANA timezone for `window` evaluation; defaults to `UTC`. A present value **MUST** be a name `Intl.DateTimeFormat` accepts — rejected at `validate`/parse time otherwise (issue #297; see 002 §2.2). |
 
 **Interaction with observation cadence (target):** a `rollup` monitor does **not** need to observe
 at low latency — if delivery is once daily there is no benefit to polling every 30 seconds. Authors

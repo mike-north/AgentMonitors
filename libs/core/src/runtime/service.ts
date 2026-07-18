@@ -1000,6 +1000,39 @@ export class AgentMonitorRuntime {
       workspacePath,
     );
     const schedule = this.scheduleForMonitor(monitor, now, workspacePath);
+    if (schedule.error) {
+      // Defensive isolation (issue #297): scheduleForMonitor() never throws —
+      // an invalid IANA timezone surfaces here as `schedule.error` instead.
+      // explainMonitor() MUST NOT mutate runtime state (002 §10.7), so — unlike
+      // the tick path — this does NOT write an observation_history row; it
+      // renders the SAME diagnostic shape a real observe() failure would land
+      // in the 'observation' stage, purely from the in-memory error.
+      stages.push(
+        explainStage(
+          'observation',
+          'failure',
+          'The most recent source observation errored.',
+          { error: schedule.error },
+        ),
+      );
+      return {
+        monitorId: input.monitorId,
+        generatedAt: now,
+        monitor: {
+          id: monitor.id,
+          displayName: monitor.displayName,
+          filePath: monitor.filePath,
+          sourceName,
+          urgency: monitor.frontmatter.urgency,
+        },
+        stages,
+        verdict: explainVerdict(stages),
+        observations: [],
+        events: [],
+        projections: [],
+        leadSessions: [],
+      };
+    }
     const lastObservationAt = runtimeState.lastObservationAt;
     const nextDueAt = schedule.due
       ? now
@@ -1436,14 +1469,24 @@ export class AgentMonitorRuntime {
             source.scopeSchema,
           )
         : [`Unknown source "${sourceName}".`];
-      const valid = scopeErrors.length === 0;
-      if (!valid) invalidCount += 1;
 
       const runtimeState = this.store.getMonitorState(
         monitor.id,
         workspacePath,
       );
       const schedule = this.scheduleForMonitor(monitor, now, workspacePath);
+      // Defensive isolation (issue #297): scheduleForMonitor() never throws — an
+      // invalid IANA timezone surfaces here as `schedule.error` instead. Doctor
+      // is a diagnostic surface (like explain) and must never crash on a single
+      // bad monitor's config; fold the scheduling failure into the same
+      // valid/validationError reporting as a scope error so it's visible in the
+      // rollup rather than silently producing a bogus `due`/`nextDueAt`.
+      const validationErrors = schedule.error
+        ? [...scopeErrors, schedule.error]
+        : scopeErrors;
+      const valid = validationErrors.length === 0;
+      if (!valid) invalidCount += 1;
+
       const history = this.store.listObservationHistory({
         monitorId: monitor.id,
         // Scope to this workspace (issue #345 / #307) so a same-id monitor in
@@ -1503,7 +1546,7 @@ export class AgentMonitorRuntime {
         sourceName,
         urgency: monitor.frontmatter.urgency,
         valid,
-        ...(valid ? {} : { validationError: scopeErrors.join('; ') }),
+        ...(valid ? {} : { validationError: validationErrors.join('; ') }),
         ...(lastObservedAt ? { lastObservedAt } : {}),
         neverObserved,
         due: schedule.due,
@@ -2124,6 +2167,29 @@ export class AgentMonitorRuntime {
     if (this.activeWatchers.has(monitor.id)) return;
 
     const schedule = this.scheduleForMonitor(monitor, now, workspacePath);
+    if (schedule.error) {
+      // Isolate a scheduling failure (issue #297) — e.g. an invalid IANA
+      // timezone — exactly like an observe() failure below: record it on the
+      // tick result and as an 'errored' observation-history row, then skip this
+      // monitor for the tick. A single bad monitor must never abort evaluation
+      // of the rest (AP-per-monitor isolation).
+      acc.erroredObservations.push({
+        monitorId: monitor.id,
+        message: schedule.error,
+      });
+      try {
+        this.store.recordObservationHistory({
+          monitorId: monitor.id,
+          workspacePath,
+          sourceName,
+          result: 'errored',
+          observationData: { error: schedule.error },
+        });
+      } catch {
+        // best-effort audit — ignore write failures
+      }
+      return;
+    }
     if (!schedule.due) {
       // Record skipped monitors so callers can distinguish "not yet due" from
       // "no monitors found" (issue #152). nextDueAt is computed from the same
@@ -2149,12 +2215,37 @@ export class AgentMonitorRuntime {
         // state and always persist the result — `rollupLastFiredMinute` may
         // have been updated even when no observations were flushed.
         const rollupNotifyState = { ...monitorStateForSkip.notifyState };
-        const rollupDispatch = this.dispatchRollup(
-          monitor,
-          [],
-          now,
-          rollupNotifyState,
-        );
+        // dispatchRollup() evaluates `notify.timezone` via cronMatchesDate,
+        // which can throw for an invalid IANA zone exactly like the schedule
+        // watch case above (issue #297). This call sits outside the
+        // observe()/ingest() try/catches (this whole branch runs on the
+        // NOT-due path), so it needs its own isolation: a bad rollup timezone
+        // must not abort the tick for every other monitor either.
+        let rollupDispatch: NotifyDispatchResult;
+        try {
+          rollupDispatch = this.dispatchRollup(
+            monitor,
+            [],
+            now,
+            rollupNotifyState,
+          );
+        } catch (error) {
+          const message =
+            error instanceof Error ? error.message : String(error);
+          acc.erroredObservations.push({ monitorId: monitor.id, message });
+          try {
+            this.store.recordObservationHistory({
+              monitorId: monitor.id,
+              workspacePath,
+              sourceName,
+              result: 'errored',
+              observationData: { error: message },
+            });
+          } catch {
+            // best-effort audit — ignore write failures
+          }
+          return;
+        }
         this.store.setMonitorState(monitor.id, workspacePath, {
           sourceState: monitorStateForSkip.sourceState,
           notifyState: rollupDispatch.nextState,
@@ -2829,13 +2920,29 @@ export class AgentMonitorRuntime {
       const timezone = config['timezone'];
       if (typeof cron !== 'string')
         return { due: false, nextPollMs: schedulingDefaults.scheduleTickMs };
-      const due =
-        cronMatchesDate(
-          cron,
-          now,
-          typeof timezone === 'string' ? timezone : 'UTC',
-        ) && elapsed >= schedulingDefaults.scheduleTickMs;
-      return { due, nextPollMs: schedulingDefaults.scheduleTickMs };
+      // Defensive isolation (issue #297): an invalid IANA `timezone` makes
+      // Intl.DateTimeFormat throw inside cronFieldValuesForDate(). Authoring-time
+      // validation (the schedule source's scopeSchema, checked by `validate` and
+      // `watch declare`) should reject this before a monitor is ever persisted —
+      // this catch is the last line of defense for a bypassed/legacy value, so a
+      // single bad timezone can never escape as an uncaught throw and abort a
+      // whole tick or crash a read-only diagnostic (explain/doctor).
+      try {
+        const due =
+          cronMatchesDate(
+            cron,
+            now,
+            typeof timezone === 'string' ? timezone : 'UTC',
+          ) && elapsed >= schedulingDefaults.scheduleTickMs;
+        return { due, nextPollMs: schedulingDefaults.scheduleTickMs };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          due: false,
+          nextPollMs: schedulingDefaults.scheduleTickMs,
+          error: message,
+        };
+      }
     }
 
     if (monitor.frontmatter.watch.type === 'api-poll') {

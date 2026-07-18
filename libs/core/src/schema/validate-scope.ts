@@ -62,6 +62,49 @@ export function changeDetectionCollectionError(
 }
 
 /**
+ * Returns `true` iff `timeZone` is accepted by `Intl.DateTimeFormat` as an IANA
+ * time zone name. Construction throws a `RangeError` for an invalid zone (e.g. a
+ * typo like `"America/New_Yrok"`), which is the cheapest available check — Node
+ * ships the full IANA database, so this does not depend on a hardcoded list.
+ * Shared between authoring-time validation ({@link invalidTimezoneError}, the
+ * `rollup` notify schema in `monitor-schema.ts`) and the runtime defensive check
+ * in `service.ts` (`scheduleForMonitor`, `dispatchRollup`) so both use IDENTICAL
+ * validity semantics (issue #297).
+ */
+export function isValidIanaTimeZone(timeZone: string): boolean {
+  try {
+    // Intl constructors are callable without `new` per ECMA-402; called only to
+    // trigger the RangeError an invalid zone throws (mirrors monitor-schema.ts's
+    // rollupNotifySchema.timezone refinement).
+    Intl.DateTimeFormat(undefined, { timeZone });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Returns an actionable error when `scope.timezone` is present but not a valid
+ * IANA time zone name, or `undefined` otherwise (issue #297). Without this,
+ * `Intl.DateTimeFormat` throws deep inside cron scheduling at runtime — well
+ * after authoring — aborting the whole tick instead of naming the bad monitor.
+ * Source-agnostic (mirrors {@link changeDetectionCollectionError}): only sources
+ * whose `scopeSchema` declares a `timezone` field (currently `schedule`) are
+ * affected; other sources' scopes never carry this key.
+ */
+export function invalidTimezoneError(
+  watchConfig: Record<string, unknown>,
+): string | undefined {
+  const timezone = watchConfig['timezone'];
+  if (timezone === undefined) return undefined;
+  // A wrong-typed `timezone` is already reported by the JSON Schema `type:
+  // "string"` check in validateScope(); avoid a redundant/confusing second error.
+  if (typeof timezone !== 'string') return undefined;
+  if (isValidIanaTimeZone(timezone)) return undefined;
+  return `scope.timezone: "${timezone}" is not a valid IANA time zone name (e.g. "America/New_York", "UTC").`;
+}
+
+/**
  * Validate a monitor's `watch` scope (the `watch` block minus `type`) against a
  * source's `scopeSchema`, returning the SAME diagnostics `agentmonitors validate`
  * produces (004 §2.2): the {@link validateScope} schema errors, plus the BP3
@@ -79,9 +122,13 @@ export function validateWatchScope(
 ): string[] {
   const errors = validateScope(scope, scopeSchema);
   const collectionError = changeDetectionCollectionError(scope);
-  return collectionError
+  const timezoneError = invalidTimezoneError(scope);
+  const supplementalErrors = [collectionError, timezoneError].filter(
+    (message): message is string => message !== undefined,
+  );
+  return supplementalErrors.length > 0
     ? [
-        collectionError,
+        ...supplementalErrors,
         ...errors.filter((message) => !message.includes('then')),
       ]
     : errors;
