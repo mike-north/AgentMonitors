@@ -103,6 +103,42 @@ means:
 To force a reconciliation attempt without a new commit, re-run the CI workflow on
 `main` (`workflow_dispatch`); its success re-triggers the Release workflow.
 
+## Authentication: npm trusted publishing (OIDC)
+
+The publish step (`pnpm publish`, invoked by `pnpm release` inside
+[`scripts/publish-release-packages.mjs`](../scripts/publish-release-packages.mjs))
+authenticates to npm via [trusted publishing](https://docs.npmjs.com/trusted-publishers/),
+not a long-lived token:
+
+1. The Release workflow's `id-token: write` permission lets GitHub issue the
+   job a short-lived OIDC identity token.
+2. `pnpm publish` (pinned `packageManager` version `pnpm@11.12.0`, well past
+   the `>=11.0.9` fix for [pnpm/pnpm#11513](https://github.com/pnpm/pnpm/issues/11513))
+   exchanges that OIDC token for a short-lived npm publish token — no
+   `NODE_AUTH_TOKEN`/`NPM_TOKEN` is passed to the publish step. Provenance
+   attestation is automatic under trusted publishing; no `--provenance` flag
+   or `NPM_CONFIG_PROVENANCE` is needed.
+3. npm authorizes the exchange only if a **trusted publisher record** exists
+   for the package that exactly matches this workflow's identity:
+
+   | Field             | Value                                   |
+   | ----------------- | --------------------------------------- |
+   | Owner/repository  | `mike-north/AgentMonitors` (exact case) |
+   | Workflow filename | `release.yml` (filename only)           |
+   | Environment       | `npm-publish`                           |
+   | Allowed action    | `publish`                               |
+
+   Every package in `PACKAGE_DIRS` needs its own record — trusted publishing
+   is configured per package on npmjs.com, not per repository. This
+   registration requires an authenticated human (browser + 2FA) and cannot be
+   automated from CI; see the npm trusted-publishers docs linked above.
+
+Trusted publishing requires the source repository to be public — this
+repository is. Read-only registry checks elsewhere in the pipeline (the
+release-work gate's and publisher's `npm view` calls, and CI's
+`publish:packages:dry-run`) don't need authentication at all and are
+unaffected by this.
+
 ## Pre-release safety checks (on PRs)
 
 CI runs these before anything can reach the release path:

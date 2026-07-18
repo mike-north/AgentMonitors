@@ -11,6 +11,11 @@ permissions:
   actions: write
   contents: write
   pull-requests: write
+  # Lets the publish step exchange a GitHub Actions OIDC token for a
+  # short-lived npm publish token (npm trusted publishing). No long-lived
+  # NPM_TOKEN is passed to the publish step; see the "Create Release Pull
+  # Request Or Publish" step below.
+  id-token: write
 
 jobs:
   release:
@@ -23,6 +28,12 @@ jobs:
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.head_branch == 'main'
     runs-on: ubuntu-latest
+    # Matches the npm trusted-publisher record registered for each published
+    # package (owner/repo mike-north/AgentMonitors, workflow release.yml,
+    # environment npm-publish, action "publish"). GitHub auto-creates this
+    # environment on first use; add protection rules under repo Settings ->
+    # Environments if a manual approval gate is ever wanted before publish.
+    environment: npm-publish
     timeout-minutes: 30
 
     steps:
@@ -70,10 +81,17 @@ jobs:
           title: Release packages
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          # NOTE: npm provenance (NPM_CONFIG_PROVENANCE + id-token: write) requires a
-          # PUBLIC source repository — the registry rejects private-repo attestations
-          # with E422. Re-enable both if/when this repo goes public.
+          # No NODE_AUTH_TOKEN here on purpose. Publishing
+          # (`pnpm publish` inside scripts/publish-release-packages.mjs, via
+          # `pnpm release`) authenticates through npm trusted publishing:
+          # pnpm exchanges the `id-token: write` OIDC token above for a
+          # short-lived publish token, matched against each package's npm
+          # trust record. A NODE_AUTH_TOKEN here would either shadow OIDC or,
+          # if empty, actively break it — see docs/release-process.md.
+          # Provenance attestation is automatic under trusted publishing; no
+          # extra flag or NPM_CONFIG_PROVENANCE is needed. Requires the
+          # source repository to be public (it is) and pnpm >=11.0.9 (pinned
+          # via package.json#packageManager) for its OIDC publish support.
 
       - name: Trigger CI For Release Pull Request
         if: |
