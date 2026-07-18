@@ -126,10 +126,11 @@ describe('hook-deliver-debug line formatters', () => {
       hook_event_name: hostile,
       cwd: hostile,
     });
-    const controlChars = [...msg].filter(
-      (ch) => ch.charCodeAt(0) < 0x20 && ch !== '\n',
-    );
-    expect(controlChars).toEqual([]);
+    // describePayload's whole contract is one line (no real newline is ever
+    // legitimate in its output), so the full stream must be raw-control-free
+    // — not just everything except '\n'. A newline-injection regression must
+    // fail this check.
+    assertNoRawControlChars(msg);
     expect(msg).toContain('\\n');
     expect(msg).toContain('\\u001b');
   });
