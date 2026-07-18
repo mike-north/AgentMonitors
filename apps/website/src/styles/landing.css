@@ -1549,15 +1549,24 @@ h3 {
 }
 .quick ol li {
   counter-increment: q;
-  display: grid;
-  grid-template-columns: 26px 1fr;
-  gap: 14px;
+  /* The step's content is bare inline children of the <li> (text runs, <b>,
+     inline <code>) straight from markdown. A grid/flex container here would
+     "blockify" each of those into a separate auto-placed item — scattering
+     text fragments and code pills across cells and collapsing prose to
+     one-word-per-line. So keep the <li> a normal block and float the counter
+     badge into a left gutter via absolute positioning; the content then flows
+     as ordinary wrapped text. */
+  position: relative;
+  padding-left: 40px;
   color: var(--text-2);
   font-size: 15px;
   line-height: 1.55;
 }
 .quick ol li::before {
   content: counter(q);
+  position: absolute;
+  left: 0;
+  top: 0;
   font-family: var(--mono);
   font-size: 12px;
   color: var(--signal);
