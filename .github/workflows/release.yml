@@ -30,9 +30,10 @@ jobs:
     runs-on: ubuntu-latest
     # Matches the npm trusted-publisher record registered for each published
     # package (owner/repo mike-north/AgentMonitors, workflow release.yml,
-    # environment npm-publish, action "publish"). GitHub auto-creates this
-    # environment on first use; add protection rules under repo Settings ->
-    # Environments if a manual approval gate is ever wanted before publish.
+    # environment npm-publish, permissions "publish" [+ "createPackage" for a
+    # package's first release]). GitHub auto-creates this environment on
+    # first use; add protection rules under repo Settings -> Environments if
+    # a manual approval gate is ever wanted before publish.
     environment: npm-publish
     timeout-minutes: 30
 

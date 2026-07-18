@@ -121,12 +121,12 @@ not a long-lived token:
 3. npm authorizes the exchange only if a **trusted publisher record** exists
    for the package that exactly matches this workflow's identity:
 
-   | Field             | Value                                   |
-   | ----------------- | --------------------------------------- |
-   | Owner/repository  | `mike-north/AgentMonitors` (exact case) |
-   | Workflow filename | `release.yml` (filename only)           |
-   | Environment       | `npm-publish`                           |
-   | Allowed action    | `publish`                               |
+   | Field             | Value                                                             |
+   | ----------------- | ----------------------------------------------------------------- |
+   | Owner/repository  | `mike-north/AgentMonitors` (exact case)                           |
+   | Workflow filename | `release.yml` (filename only)                                     |
+   | Environment       | `npm-publish`                                                     |
+   | Permissions       | `publish` (add `createPackage` too for a package's first release) |
 
    Every package in `PACKAGE_DIRS` needs its own record — trusted publishing
    is configured per package on npmjs.com, not per repository. This
