@@ -12,9 +12,9 @@ permissions:
   contents: write
   pull-requests: write
   # Lets the publish step exchange a GitHub Actions OIDC token for a
-  # short-lived npm publish token (npm trusted publishing). No long-lived
-  # NPM_TOKEN is passed to the publish step; see the "Create Release Pull
-  # Request Or Publish" step below.
+  # short-lived npm publish token (npm trusted publishing), which pnpm
+  # prefers over the NPM_TOKEN fallback passed to the publish step below;
+  # see the "Create Release Pull Request Or Publish" step below.
   id-token: write
 
 jobs:
@@ -28,12 +28,12 @@ jobs:
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.head_branch == 'main'
     runs-on: ubuntu-latest
-    # Matches the npm trusted-publisher record registered for each published
-    # package (owner/repo mike-north/AgentMonitors, workflow release.yml,
-    # environment npm-publish, permissions "publish" [+ "createPackage" for a
-    # package's first release]). GitHub auto-creates this environment on
-    # first use; add protection rules under repo Settings -> Environments if
-    # a manual approval gate is ever wanted before publish.
+    # Matches the npm trusted-publisher record identity tuple for each
+    # published package — see docs/release-process.md for the exact values.
+    # GitHub auto-creates this environment on first use. This job also
+    # creates/updates the Version PR and runs a no-op gate on every push to
+    # main, so an environment protection rule here would gate ALL of those
+    # runs, not just publish — split publishing into its own job first.
     environment: npm-publish
     timeout-minutes: 30
 
@@ -74,7 +74,7 @@ jobs:
       - name: Create Release Pull Request Or Publish
         id: changesets
         if: steps.release-work.outputs.should-run == 'true'
-        uses: changesets/action@v1
+        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
         with:
           version: pnpm version:packages
           publish: pnpm release
@@ -82,17 +82,13 @@ jobs:
           title: Release packages
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # No NODE_AUTH_TOKEN here on purpose. Publishing
-          # (`pnpm publish` inside scripts/publish-release-packages.mjs, via
-          # `pnpm release`) authenticates through npm trusted publishing:
-          # pnpm exchanges the `id-token: write` OIDC token above for a
-          # short-lived publish token, matched against each package's npm
-          # trust record. A NODE_AUTH_TOKEN here would either shadow OIDC or,
-          # if empty, actively break it — see docs/release-process.md.
-          # Provenance attestation is automatic under trusted publishing; no
-          # extra flag or NPM_CONFIG_PROVENANCE is needed. Requires the
-          # source repository to be public (it is) and pnpm >=11.0.9 (pinned
-          # via package.json#packageManager) for its OIDC publish support.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # pnpm >=11.0.7 prefers OIDC trusted publishing over this token, so
+          # once a package's trusted-publisher record exists this token goes
+          # unused for it. It stays here as a fallback so publishes keep
+          # working for packages whose records aren't registered yet. Remove
+          # it (and revoke NPM_TOKEN) only after an OIDC publish + provenance
+          # has been verified for every package — see docs/release-process.md.
 
       - name: Trigger CI For Release Pull Request
         if: |
