@@ -126,6 +126,7 @@ export {
   fingerprintText,
   renderShapeArtifact,
 } from './runtime/diff.js';
+export type { ChangeDetectionStrategy } from './runtime/diff.js';
 // Shape stage (G15): deterministic derived facts + render-then-diff
 export {
   computeDerivedFacts,

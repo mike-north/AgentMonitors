@@ -113,10 +113,18 @@ describe('buildDiff — strategy dispatch', () => {
     expect(buildDiff(text, text, 'json-diff')).toBe('');
   });
 
-  it('returns empty string under json-diff when only whitespace/key order differs', () => {
+  // REGRESSION (issue #437 review, empty-per-recipient-diff): the two texts
+  // below are byte-different (key order + whitespace) but structurally equal.
+  // Rendering '' here would violate "change detected ⟺ non-empty diffText" —
+  // a caller with a stale cursor whose latest snapshot happens to be
+  // formatting-only-different would deliver an unread event with an empty
+  // diffText.
+  it('renders a non-empty formatting-only marker under json-diff when only whitespace/key order differs', () => {
     const prev = '{"a":1,"b":2}';
     const curr = '{ "b": 2, "a": 1 }';
-    expect(buildDiff(prev, curr, 'json-diff')).toBe('');
+    const result = buildDiff(prev, curr, 'json-diff');
+    expect(result).not.toBe('');
+    expect(result).toBe('~ formatting-only change (no structural difference)');
   });
 });
 
@@ -344,6 +352,174 @@ describe('buildJsonDiff — bounded output (AC3)', () => {
     // The full 1000-char blob must never appear verbatim in the rendered diff.
     expect(diff).not.toContain(bigValue);
     expect(diff.length).toBeLessThan(400);
+  });
+});
+
+describe('buildJsonDiff — untrusted path escaping and bounding (issue #437 review)', () => {
+  // REGRESSION: a 100,000-char `id` previously produced a 100,345-char
+  // one-entry diff (the identity value was interpolated into the rendered
+  // path verbatim, bypassing the documented 20-entry/300-char bounds).
+  it('bounds a pathologically long identity-key value in a keyed-element path', () => {
+    const longId = 'x'.repeat(100_000);
+    const prev = JSON.stringify([{ id: longId, v: 'before' }]);
+    const curr = JSON.stringify([{ id: longId, v: 'after' }]);
+    const diff = buildJsonDiff(prev, curr) ?? '';
+    expect(diff.length).toBeLessThan(1000);
+    expect(diff).not.toContain(longId);
+  });
+
+  // REGRESSION: an `id` containing a newline previously created a fake
+  // second diff line — the raw value was interpolated into the path with no
+  // control-character escaping, so a single logical entry rendered as two
+  // lines.
+  it('escapes a newline embedded in an identity-key value so it cannot fabricate an extra diff line', () => {
+    const prev = JSON.stringify([{ id: 'a\nb', v: 'before' }]);
+    const curr = JSON.stringify([{ id: 'a\nb', v: 'after' }]);
+    const diff = buildJsonDiff(prev, curr) ?? '';
+    expect(diff.split('\n')).toHaveLength(1);
+    expect(diff).toContain('\\u000a');
+  });
+
+  // REGRESSION: an object field literally named `[x]` rendered as
+  // `+ added[x]: 1`, indistinguishable from the `[index]`/`[key=value]`
+  // array-element path syntax — `formatPathSuffix` omitted the separating
+  // space because the (unescaped) field name started with `[`.
+  it('escapes a leading bracket in a field name so it is not confused with array-element syntax', () => {
+    const prev = JSON.stringify({});
+    const curr = JSON.stringify({ '[x]': 1 });
+    const diff = buildJsonDiff(prev, curr) ?? '';
+    // The escaped field renders with a leading space (a genuine field path),
+    // never as a bare `[x]` that reads like an array index/keyed element.
+    expect(diff).toBe('+ added \\[x\\]: 1');
+  });
+
+  // REGRESSION: `]`/`=` inside an identity value produce an ambiguous
+  // rendered path (e.g. a value of `1]` could be read as closing the
+  // bracket early).
+  it('escapes ] and = inside an identity-key value', () => {
+    const prev = JSON.stringify([{ id: 'weird]=id', v: 'before' }]);
+    const curr = JSON.stringify([{ id: 'weird]=id', v: 'after' }]);
+    const diff = buildJsonDiff(prev, curr) ?? '';
+    expect(diff).toBe('~ changed[id=weird\\]\\=id].v: "before" -> "after"');
+  });
+
+  // Confirms the final total-output cap: even with per-entry, per-value, and
+  // per-path-segment bounds all applied, a pathologically deep object graph
+  // (many nested field paths, each near its own length cap) must not produce
+  // an unbounded `diffText`.
+  it('enforces a hard cap on the total rendered diffText length with an elision marker', () => {
+    let prevObj: Record<string, unknown> = { leaf: 'before' };
+    let currObj: Record<string, unknown> = { leaf: 'after' };
+    // 500 levels of nesting, each keyed by a 60-char segment — well beyond
+    // MAX_JSON_DIFF_OUTPUT_LENGTH once rendered, but shallow enough it will
+    // never approach the RangeError stack-overflow boundary (issue #3).
+    for (let i = 0; i < 500; i++) {
+      const key = `field-${String(i)}-${'y'.repeat(50)}`;
+      prevObj = { [key]: prevObj };
+      currObj = { [key]: currObj };
+    }
+    const diff = buildJsonDiff(
+      JSON.stringify(prevObj),
+      JSON.stringify(currObj),
+    );
+    expect(diff).toBeDefined();
+    expect(diff?.length).toBeLessThanOrEqual(20_100);
+    expect(diff).toContain('output truncated at 20000 characters');
+  });
+});
+
+describe('buildJsonDiff — performance (issue #437 review)', () => {
+  // REGRESSION: the no-identity array matcher previously did a full
+  // JSON.stringify(sortKeysDeep(...)) of both elements PER PROBE (O(N*M)),
+  // making a reversed 5,000-element array take roughly 1.5s of synchronous
+  // daemon-tick time. The counted-multiset rework is O(N+M); this must stay
+  // comfortably under a generous bound even on a slow CI runner.
+  it('diffs a reversed 5,000-element array (no identity key) well under a bounded time', () => {
+    const prev = Array.from({ length: 5000 }, (_, i) => ({
+      // Two fields so no single field is a usable identity key, forcing the
+      // deep-equality multiset matcher.
+      a: i,
+      b: `value-${String(i)}`,
+    }));
+    const curr = [...prev].reverse();
+
+    const start = performance.now();
+    const diff = buildJsonDiff(JSON.stringify(prev), JSON.stringify(curr));
+    const elapsedMs = performance.now() - start;
+
+    expect(diff).toBeDefined();
+    // A pure reorder of every element renders as one `reordered` entry, not
+    // 5,000 remove/add pairs.
+    expect(diff).toContain('reordered');
+    expect(elapsedMs).toBeLessThan(300);
+  });
+});
+
+describe('buildJsonDiff — totality under pathological nesting (issue #437, TOTALITY REGRESSION)', () => {
+  // REGRESSION: the recursive diffJsonValues/deepEqualJson/sortKeysDeep chain
+  // ran OUTSIDE buildJsonDiff's try/catch and stack-overflowed (RangeError)
+  // at roughly 2,500 nesting levels, while JSON.parse itself tolerates
+  // roughly 4.2M — so a deeply nested JSON body made buildJsonDiff throw an
+  // UNCAUGHT RangeError instead of returning undefined (the documented
+  // parse-failure-style fallback signal), which propagated as an uncaught
+  // exception at every ingest call site (service.ts, store.ts) instead of
+  // falling back to buildTextDiff. buildJsonDiff must return `undefined`
+  // (never throw) so the caller's buildTextDiff fallback restores totality.
+  it('returns undefined (never throws) for a JSON value nested deep enough to overflow the recursive traversal', () => {
+    const DEPTH = 20_000; // comfortably past the ~2,500-level overflow boundary
+    let prevText = '"before"';
+    let currText = '"after"';
+    for (let i = 0; i < DEPTH; i++) {
+      prevText = `{"n":${prevText}}`;
+      currText = `{"n":${currText}}`;
+    }
+
+    let result: string | undefined;
+    expect(() => {
+      result = buildJsonDiff(prevText, currText);
+    }).not.toThrow();
+    expect(result).toBeUndefined();
+  });
+
+  it('buildDiff falls back to buildTextDiff for the same pathologically deep JSON pair', () => {
+    const DEPTH = 20_000;
+    let prevText = '"before"';
+    let currText = '"after"';
+    for (let i = 0; i < DEPTH; i++) {
+      prevText = `{"n":${prevText}}`;
+      currText = `{"n":${currText}}`;
+    }
+
+    let result: string | undefined;
+    expect(() => {
+      result = buildDiff(prevText, currText, 'json-diff');
+    }).not.toThrow();
+    expect(result).toBe(buildTextDiff(prevText, currText));
+    expect(result).not.toBe('');
+  });
+});
+
+describe('buildJsonDiff — astral (surrogate-pair) value truncation (issue #437 review)', () => {
+  // REGRESSION: renderJsonValue previously truncated with `.slice(0, 300)`,
+  // a raw UTF-16 index — for a value made of astral characters (each a
+  // surrogate PAIR), a boundary landing between the two halves of a pair
+  // splits it, persisting a lone surrogate (a garbled `\ud83d`-style escape)
+  // into diffText.
+  it('truncates a value composed of astral characters at a code-point boundary, never splitting a surrogate pair', () => {
+    // U+1F600 GRINNING FACE — a single code point, two UTF-16 code units.
+    // 400 repeats -> 400 code points once quoted, comfortably past the
+    // 300-code-point cap, so truncation definitely occurs.
+    const astral = '😀'.repeat(400);
+    const prev = JSON.stringify({ blob: 'y' });
+    const curr = JSON.stringify({ blob: astral });
+    const diff = buildJsonDiff(prev, curr) ?? '';
+    expect(diff).toContain('…(truncated)');
+    // A lone (unpaired) surrogate — a high surrogate not followed by its low
+    // half, or a low surrogate not preceded by its high half — is exactly
+    // what a raw UTF-16-index `.slice()` can produce by splitting a pair.
+    const unpairedSurrogate =
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+    expect(diff).not.toMatch(unpairedSurrogate);
   });
 });
 

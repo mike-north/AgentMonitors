@@ -222,8 +222,13 @@ function removeDottedPath(value: unknown, path: string): void {
   }
 }
 
-/** Recursively sort object keys so content comparison is key-order insensitive. */
-function sortKeys(value: unknown): unknown {
+/**
+ * Recursively sort object keys so content comparison is key-order insensitive.
+ * Exported for reuse by `runtime/diff.ts`'s `json-diff` canonicalization
+ * (issue #437 review) — core-internal only, not part of the public API
+ * surface (not re-exported from `index.ts`).
+ */
+export function sortKeys(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sortKeys);
   if (value !== null && typeof value === 'object') {
     const sorted: Record<string, unknown> = {};

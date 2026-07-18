@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { sortKeys } from '../observation/keyed-collection.js';
 import {
   computeDerivedFacts,
   renderArtifact,
@@ -31,16 +32,37 @@ export function buildTextDiff(previous: string, current: string): string {
 }
 
 /**
+ * The `change-detection.strategy` values a bundled source (`source-api-poll`,
+ * `source-command-poll`) may set on `snapshot.strategy` (003 §4.2/§11.3). This
+ * is an **open** vocabulary — the source contract ([003 §2](../../../../docs/specs/003-source-plugins.md#2-source-contract))
+ * does not require every source to set it, and a third-party source MAY declare
+ * its own strategy string — so the `(string & {})` member preserves literal
+ * autocompletion for the four recognized values while still accepting an
+ * arbitrary string (issue #437 review: avoid an unconstrained `string` on a
+ * curated public-API signature per this repo's "explicit named unions/interfaces
+ * for public contracts" convention).
+ */
+export type ChangeDetectionStrategy =
+  | 'json-diff'
+  | 'text-diff'
+  | 'exit-code'
+  | 'status-code'
+  | (string & {});
+
+/**
  * Read the `change-detection.strategy` an observation was captured under, from
  * the persisted `snapshot`/`snapshotMetadata` metadata a source attaches to
  * every observation (e.g. `plugins/source-command-poll`, `plugins/source-api-poll`
  * both set `snapshot.strategy`). Returns `undefined` for anything that isn't a
  * recognizable metadata object with a string `strategy` field — callers treat
- * that as "use the default line-diff renderer" (issue #437).
+ * that as "use the default line-diff renderer" (issue #437). Setting
+ * `snapshot.strategy` is a bundled-source convention, not a source-contract
+ * requirement (003 §2) — a third-party source that omits it simply always
+ * renders via {@link buildTextDiff}.
  */
 export function changeDetectionStrategyOf(
   snapshotMetadata: unknown,
-): string | undefined {
+): ChangeDetectionStrategy | undefined {
   if (
     snapshotMetadata === null ||
     typeof snapshotMetadata !== 'object' ||
@@ -69,7 +91,7 @@ export function changeDetectionStrategyOf(
 export function buildDiff(
   previous: string,
   current: string,
-  strategy?: string,
+  strategy?: ChangeDetectionStrategy,
 ): string {
   if (strategy === 'json-diff') {
     const structural = buildJsonDiff(previous, current);
@@ -88,6 +110,24 @@ const MAX_JSON_DIFF_ENTRIES = 20;
 
 /** Max rendered length (chars) of one entry's JSON value before truncation. */
 const MAX_JSON_DIFF_VALUE_LENGTH = 300;
+
+/**
+ * Max rendered length (chars) of one path segment (an object key or an
+ * identity-key value used in a `[key=value]` element path) before truncation
+ * — untrusted JSON content, so an attacker-controlled key/id must not be able
+ * to inflate `diffText` on its own (issue #437 review: a 100,000-char `id`
+ * previously produced a 100,345-char one-entry diff).
+ */
+const MAX_PATH_SEGMENT_LENGTH = 60;
+
+/**
+ * Hard cap (chars) on the fully-rendered `diffText`, independent of the
+ * per-entry/per-value/per-path-segment caps above — a last-resort backstop
+ * against a pathological input (e.g. very deep nesting inflating path length,
+ * or many entries each near their own caps) still producing an oversized
+ * `diffText` (issue #437 review).
+ */
+const MAX_JSON_DIFF_OUTPUT_LENGTH = 20_000;
 
 /** Element-identity field candidates tried, in priority order, for arrays of objects. */
 const IDENTITY_KEY_CANDIDATES = [
@@ -108,12 +148,61 @@ type JsonDiffEntry =
   | { kind: 'reordered'; path: string; current: unknown };
 
 /**
+ * Rendered when two JSON texts are structurally equal (same value once key
+ * order/whitespace are normalized) but not byte-identical — e.g. a
+ * reformatted/re-serialized snapshot with reordered keys or different
+ * whitespace. Without this, `buildJsonDiff` would return `''` for a
+ * byte-different pair, violating "change detected ⟺ non-empty `diffText`"
+ * wherever a caller treats a byte-different snapshot as a real change (issue
+ * #437 review).
+ */
+const FORMATTING_ONLY_DIFF =
+  '~ formatting-only change (no structural difference)';
+
+/**
+ * Accumulates structural diff entries with a hard cap on how many are
+ * actually retained (`cap + 1`, enough to detect "more than cap" and render
+ * an exact elision count) while still counting every entry the traversal
+ * visits (issue #437 review: "stop accumulating past cap+1 and keep a running
+ * count for the elision line" — a pathological input with a huge number of
+ * changed leaves must not force the whole entry list into memory just to
+ * render 20 of them and a count of the rest).
+ */
+class DiffEntrySink {
+  private readonly stored: JsonDiffEntry[] = [];
+  private count = 0;
+
+  constructor(private readonly cap: number) {}
+
+  push(entry: JsonDiffEntry): void {
+    this.count++;
+    if (this.stored.length <= this.cap) this.stored.push(entry);
+  }
+
+  /** Entries actually retained, up to `cap + 1` (never the unbounded total). */
+  get entries(): readonly JsonDiffEntry[] {
+    return this.stored;
+  }
+
+  /** Every entry the traversal has visited so far, capped or not. */
+  get total(): number {
+    return this.count;
+  }
+}
+
+/**
  * Render a **structural** diff between two JSON texts: added/removed/changed
  * elements or key paths, bounded to {@link MAX_JSON_DIFF_ENTRIES} entries with
  * an elision marker (issue #437 AC1/AC3). Returns `undefined` — signaling the
  * caller to fall back to {@link buildTextDiff} — when either text fails to
  * parse as JSON, mirroring the `json-diff` `hasChanged` fallback used to decide
- * whether a change occurred in the first place (003 §11.3).
+ * whether a change occurred in the first place (003 §11.3). Also returns
+ * `undefined` when the structural traversal itself overflows the call stack
+ * on a pathologically deep JSON value (`RangeError`, issue #437 review:
+ * `JSON.parse` tolerates roughly 4.2M nesting levels but the recursive
+ * traversal below overflows around 2,500) — this keeps the diff renderer
+ * total: the caller's `buildTextDiff` fallback still produces a `diffText`
+ * instead of the ingest path throwing an uncaught `RangeError`.
  */
 export function buildJsonDiff(
   previous: string,
@@ -130,46 +219,60 @@ export function buildJsonDiff(
     return undefined;
   }
 
-  const entries = diffJsonValues('', prevParsed, currParsed);
-  if (entries.length === 0) return '';
-  return renderJsonDiffEntries(entries);
+  const sink = new DiffEntrySink(MAX_JSON_DIFF_ENTRIES);
+  try {
+    diffJsonValues(sink, '', prevParsed, currParsed);
+  } catch (error) {
+    if (error instanceof RangeError) return undefined;
+    throw error;
+  }
+
+  if (sink.total === 0) {
+    // Raw texts differ (the `previous === current` guard above already
+    // returned) but the parsed values are structurally equal — a
+    // formatting-only change (issue #437 review, empty-per-recipient-diff).
+    return FORMATTING_ONLY_DIFF;
+  }
+  return renderJsonDiffEntries(sink);
 }
 
 function diffJsonValues(
+  sink: DiffEntrySink,
   path: string,
   prev: unknown,
   curr: unknown,
-): JsonDiffEntry[] {
-  if (deepEqualJson(prev, curr)) return [];
+): void {
+  if (deepEqualJson(prev, curr)) return;
   if (Array.isArray(prev) && Array.isArray(curr)) {
-    return diffJsonArray(path, prev, curr);
+    diffJsonArray(sink, path, prev, curr);
+    return;
   }
   if (isPlainRecord(prev) && isPlainRecord(curr)) {
-    return diffJsonObject(path, prev, curr);
+    diffJsonObject(sink, path, prev, curr);
+    return;
   }
-  return [{ kind: 'changed', path, previous: prev, current: curr }];
+  sink.push({ kind: 'changed', path, previous: prev, current: curr });
 }
 
 function diffJsonObject(
+  sink: DiffEntrySink,
   path: string,
   prev: Record<string, unknown>,
   curr: Record<string, unknown>,
-): JsonDiffEntry[] {
-  const entries: JsonDiffEntry[] = [];
+): void {
   const keys = new Set([...Object.keys(prev), ...Object.keys(curr)]);
   for (const key of [...keys].sort()) {
     const childPath = fieldPath(path, key);
     const hasPrev = Object.prototype.hasOwnProperty.call(prev, key);
     const hasCurr = Object.prototype.hasOwnProperty.call(curr, key);
     if (hasPrev && !hasCurr) {
-      entries.push({ kind: 'removed', path: childPath, value: prev[key] });
+      sink.push({ kind: 'removed', path: childPath, value: prev[key] });
     } else if (!hasPrev && hasCurr) {
-      entries.push({ kind: 'added', path: childPath, value: curr[key] });
+      sink.push({ kind: 'added', path: childPath, value: curr[key] });
     } else {
-      entries.push(...diffJsonValues(childPath, prev[key], curr[key]));
+      diffJsonValues(sink, childPath, prev[key], curr[key]);
     }
   }
-  return entries;
 }
 
 /**
@@ -191,22 +294,25 @@ function diffJsonObject(
  * "change detected ⟺ non-empty diffText" (issue #437 follow-up).
  */
 function diffJsonArray(
+  sink: DiffEntrySink,
   path: string,
   prev: unknown[],
   curr: unknown[],
-): JsonDiffEntry[] {
+): void {
   const prevObjects = prev.every(isPlainRecord) ? prev : undefined;
   const currObjects = curr.every(isPlainRecord) ? curr : undefined;
 
   if (prevObjects && currObjects) {
     const identityKey = findIdentityKey(prevObjects, currObjects);
     if (identityKey !== undefined) {
-      return diffJsonArrayByKey(path, identityKey, prevObjects, currObjects);
+      diffJsonArrayByKey(sink, path, identityKey, prevObjects, currObjects);
+      return;
     }
-    return diffJsonArrayByDeepEquality(path, prevObjects, currObjects);
+    diffJsonArrayByDeepEquality(sink, path, prevObjects, currObjects);
+    return;
   }
 
-  return diffJsonArrayByIndex(path, prev, curr);
+  diffJsonArrayByIndex(sink, path, prev, curr);
 }
 
 /** A field is a usable element identity iff every element has it as a unique scalar. */
@@ -247,18 +353,19 @@ function isUniqueScalarKey(
 }
 
 function diffJsonArrayByKey(
+  sink: DiffEntrySink,
   path: string,
   key: string,
   prev: Record<string, unknown>[],
   curr: Record<string, unknown>[],
-): JsonDiffEntry[] {
+): void {
   const prevByKey = new Map(prev.map((el) => [String(el[key]), el]));
   const currByKey = new Map(curr.map((el) => [String(el[key]), el]));
-  const entries: JsonDiffEntry[] = [];
+  const totalBefore = sink.total;
 
   for (const [keyValue, element] of prevByKey) {
     if (!currByKey.has(keyValue)) {
-      entries.push({
+      sink.push({
         kind: 'removed',
         path: keyedElementPath(path, key, keyValue),
         value: element,
@@ -267,7 +374,7 @@ function diffJsonArrayByKey(
   }
   for (const [keyValue, element] of currByKey) {
     if (!prevByKey.has(keyValue)) {
-      entries.push({
+      sink.push({
         kind: 'added',
         path: keyedElementPath(path, key, keyValue),
         value: element,
@@ -277,12 +384,11 @@ function diffJsonArrayByKey(
   for (const [keyValue, currElement] of currByKey) {
     const prevElement = prevByKey.get(keyValue);
     if (prevElement !== undefined) {
-      entries.push(
-        ...diffJsonValues(
-          keyedElementPath(path, key, keyValue),
-          prevElement,
-          currElement,
-        ),
+      diffJsonValues(
+        sink,
+        keyedElementPath(path, key, keyValue),
+        prevElement,
+        currElement,
       );
     }
   }
@@ -292,16 +398,16 @@ function diffJsonArrayByKey(
   // elements), so a pure reorder is a real detected change. The invariant
   // "change detected ⟺ non-empty diffText" must hold even though identity-key
   // matching is itself order-insensitive, so surface the reorder explicitly
-  // instead of silently rendering an empty diff (issue #437 follow-up).
-  if (entries.length === 0) {
+  // instead of silently rendering an empty diff (issue #437 follow-up). Uses
+  // `sink.total` (monotonic across the whole traversal) rather than a local
+  // entries array so the check stays correct even once the sink is capped.
+  if (sink.total === totalBefore) {
     const prevOrder = prev.map((el) => String(el[key]));
     const currOrder = curr.map((el) => String(el[key]));
     if (!arraysEqualByValue(prevOrder, currOrder)) {
-      entries.push({ kind: 'reordered', path, current: currOrder });
+      sink.push({ kind: 'reordered', path, current: currOrder });
     }
   }
-
-  return entries;
 }
 
 /**
@@ -313,67 +419,80 @@ function diffJsonArrayByKey(
  * caller's location (empty at the array's own top level, a dotted/bracketed
  * field path when this array is nested — e.g. `items` — so a removed/added
  * entry never loses which field it came from, issue #437 review).
+ *
+ * Matches via a counted multiset keyed by each element's canonicalized string
+ * (computed ONCE per element, not per probe) instead of an `O(N*M)`
+ * `findIndex` + full re-stringify per comparison — the earlier version diffed
+ * a reversed 5,000-element array in roughly 1.5s of synchronous daemon-tick
+ * time; this is `O(N+M)` (issue #437 review).
  */
 function diffJsonArrayByDeepEquality(
+  sink: DiffEntrySink,
   path: string,
   prev: Record<string, unknown>[],
   curr: Record<string, unknown>[],
-): JsonDiffEntry[] {
-  const unmatchedCurr = [...curr];
-  const removed: Record<string, unknown>[] = [];
-  for (const prevElement of prev) {
-    const matchIndex = unmatchedCurr.findIndex((currElement) =>
-      deepEqualJson(prevElement, currElement),
-    );
-    if (matchIndex === -1) {
-      removed.push(prevElement);
+): void {
+  const prevCanon = prev.map(canonicalizeJson);
+  const currCanon = curr.map(canonicalizeJson);
+
+  const remainingByCanon = new Map<string, Record<string, unknown>[]>();
+  curr.forEach((element, i) => {
+    const canon = currCanon[i] ?? '';
+    const bucket = remainingByCanon.get(canon);
+    if (bucket) bucket.push(element);
+    else remainingByCanon.set(canon, [element]);
+  });
+
+  const totalBefore = sink.total;
+  for (let i = 0; i < prev.length; i++) {
+    const canon = prevCanon[i] ?? '';
+    const bucket = remainingByCanon.get(canon);
+    if (bucket && bucket.length > 0) {
+      bucket.shift();
     } else {
-      unmatchedCurr.splice(matchIndex, 1);
+      sink.push({ kind: 'removed', path, value: prev[i] });
     }
   }
-  const entries: JsonDiffEntry[] = removed.map((value) => ({
-    kind: 'removed' as const,
-    path,
-    value,
-  }));
-  for (const value of unmatchedCurr) {
-    entries.push({ kind: 'added', path, value });
+  for (const bucket of remainingByCanon.values()) {
+    for (const value of bucket) sink.push({ kind: 'added', path, value });
   }
 
   // Every element matched (a perfect multiset match) but the raw arrays are
   // not byte-identical — the only way that happens is a pure reorder, which
   // is a real change under json-diff's order-sensitive `hasChanged` (see the
   // matching note in diffJsonArrayByKey above). Surface it rather than
-  // silently rendering an empty diff (issue #437 follow-up).
-  if (entries.length === 0 && !arraysPositionallyEqual(prev, curr)) {
-    entries.push({ kind: 'reordered', path, current: curr });
+  // silently rendering an empty diff (issue #437 follow-up). Compares the
+  // already-computed canonical strings (no re-canonicalization).
+  if (sink.total === totalBefore) {
+    const reordered =
+      prevCanon.length !== currCanon.length ||
+      prevCanon.some((canon, i) => canon !== currCanon[i]);
+    if (reordered) sink.push({ kind: 'reordered', path, current: curr });
   }
-
-  return entries;
 }
 
 function diffJsonArrayByIndex(
+  sink: DiffEntrySink,
   path: string,
   prev: unknown[],
   curr: unknown[],
-): JsonDiffEntry[] {
-  const entries: JsonDiffEntry[] = [];
+): void {
   const max = Math.max(prev.length, curr.length);
   for (let i = 0; i < max; i++) {
     const childPath = indexPath(path, i);
     if (i >= curr.length) {
-      entries.push({ kind: 'removed', path: childPath, value: prev[i] });
+      sink.push({ kind: 'removed', path: childPath, value: prev[i] });
     } else if (i >= prev.length) {
-      entries.push({ kind: 'added', path: childPath, value: curr[i] });
+      sink.push({ kind: 'added', path: childPath, value: curr[i] });
     } else {
-      entries.push(...diffJsonValues(childPath, prev[i], curr[i]));
+      diffJsonValues(sink, childPath, prev[i], curr[i]);
     }
   }
-  return entries;
 }
 
 function fieldPath(base: string, field: string): string {
-  return base ? `${base}.${field}` : field;
+  const segment = escapePathSegment(field);
+  return base ? `${base}.${segment}` : segment;
 }
 
 function indexPath(base: string, index: number): string {
@@ -381,25 +500,110 @@ function indexPath(base: string, index: number): string {
 }
 
 function keyedElementPath(base: string, key: string, value: string): string {
-  return `${base}[${key}=${value}]`;
+  return `${base}[${key}=${escapePathSegment(value)}]`;
 }
 
-/** Structural JSON equality: sorts object keys so key order never counts as a change. */
+/**
+ * Bound and escape an untrusted string (an object key, or an identity-key
+ * value) before it is interpolated into a rendered diff path (issue #437
+ * review):
+ *
+ * - Truncates at a code-point boundary (never splitting a surrogate pair) to
+ *   {@link MAX_PATH_SEGMENT_LENGTH}, so a pathologically long key/id cannot
+ *   inflate `diffText` on its own (a 100,000-char `id` previously produced a
+ *   100,345-char one-entry diff).
+ * - Backslash-escapes the characters that carry meaning in the rendered path
+ *   syntax itself (`.` the field separator, `[`/`]`/`=` the element-path
+ *   delimiters, and `\` itself) so an untrusted key/value can never be
+ *   confused with path structure — e.g. an object key literally named `[x]`
+ *   no longer renders as `+ added[x]: 1`, indistinguishable from the
+ *   `[index]`/`[key=value]` array-element syntax.
+ * - Escapes control characters (C0, DEL, C1, and the U+2028/U+2029 line/
+ *   paragraph separators) to a `\uXXXX` form so an embedded newline can never
+ *   fabricate an extra rendered diff line.
+ */
+function escapePathSegment(value: string): string {
+  const { text, truncated } = truncateAtCodePoint(
+    value,
+    MAX_PATH_SEGMENT_LENGTH,
+  );
+  let out = '';
+  for (const ch of text) {
+    const code = ch.codePointAt(0) ?? 0;
+    if (ch === '\\' || ch === '.' || ch === '[' || ch === ']' || ch === '=') {
+      out += `\\${ch}`;
+    } else if (
+      code < 0x20 ||
+      (code >= 0x7f && code <= 0x9f) ||
+      code === 0x2028 ||
+      code === 0x2029
+    ) {
+      out += `\\u${code.toString(16).padStart(4, '0')}`;
+    } else {
+      out += ch;
+    }
+  }
+  return truncated ? `${out}…` : out;
+}
+
+/**
+ * Truncate `value` to at most `maxLength` **code points** (never a raw
+ * UTF-16 index, which can split a surrogate pair — e.g. an astral emoji —
+ * producing a lone surrogate that renders as a garbled escape). Shared by
+ * {@link escapePathSegment} and {@link renderJsonValue}/{@link
+ * boundTotalOutput} (issue #437 review).
+ */
+function truncateAtCodePoint(
+  value: string,
+  maxLength: number,
+): { text: string; truncated: boolean } {
+  if (value.length <= maxLength) return { text: value, truncated: false };
+  let out = '';
+  let count = 0;
+  for (const ch of value) {
+    if (count >= maxLength) return { text: out, truncated: true };
+    out += ch;
+    count++;
+  }
+  return { text: out, truncated: false };
+}
+
+/**
+ * Structural JSON equality: compares recursively without ever serializing a
+ * whole subtree, so an unchanged subtree costs `O(size)` once rather than
+ * `O(size)` at every ancestor level that also happens to differ elsewhere
+ * (issue #437 review — the old `JSON.stringify(sortKeysDeep(...))`-based
+ * check re-canonicalized both entire subtrees at every recursion level of
+ * {@link diffJsonValues}). Key order never counts as a change because object
+ * comparison checks membership, not position.
+ */
 function deepEqualJson(a: unknown, b: unknown): boolean {
   if (a === b) return true;
-  return JSON.stringify(sortKeysDeep(a)) === JSON.stringify(sortKeysDeep(b));
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((v, i) => deepEqualJson(v, b[i]));
+  }
+  if (isPlainRecord(a) && isPlainRecord(b)) {
+    const aKeys = Object.keys(a);
+    const bKeys = Object.keys(b);
+    if (aKeys.length !== bKeys.length) return false;
+    return aKeys.every(
+      (k) =>
+        Object.prototype.hasOwnProperty.call(b, k) && deepEqualJson(a[k], b[k]),
+    );
+  }
+  return false;
 }
 
-function sortKeysDeep(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(sortKeysDeep);
-  if (isPlainRecord(value)) {
-    const sorted: Record<string, unknown> = {};
-    for (const key of Object.keys(value).sort()) {
-      sorted[key] = sortKeysDeep(value[key]);
-    }
-    return sorted;
-  }
-  return value;
+/**
+ * Canonicalize one value to a key-order-insensitive string, for use as a
+ * multiset hash key ({@link diffJsonArrayByDeepEquality}) — computed exactly
+ * ONCE per element rather than per pairwise probe. Reuses `sortKeys` from
+ * `observation/keyed-collection.ts` (the same key-order-insensitive
+ * canonicalization keyed-collection diffing already implements) instead of a
+ * duplicate copy (issue #437 review).
+ */
+function canonicalizeJson(value: unknown): string {
+  return JSON.stringify(sortKeys(value));
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -411,22 +615,28 @@ function arraysEqualByValue(a: string[], b: string[]): boolean {
   return a.length === b.length && a.every((value, i) => value === b[i]);
 }
 
-/** Elementwise deep-JSON-equality, used to detect a deep-equality-match reorder. */
-function arraysPositionallyEqual(a: unknown[], b: unknown[]): boolean {
-  return (
-    a.length === b.length && a.every((value, i) => deepEqualJson(value, b[i]))
-  );
-}
-
-function renderJsonDiffEntries(entries: JsonDiffEntry[]): string {
-  const capped = entries.slice(0, MAX_JSON_DIFF_ENTRIES);
+function renderJsonDiffEntries(sink: DiffEntrySink): string {
+  const capped = sink.entries.slice(0, MAX_JSON_DIFF_ENTRIES);
   const lines = capped.map(renderJsonDiffEntry);
-  if (entries.length > MAX_JSON_DIFF_ENTRIES) {
+  if (sink.total > MAX_JSON_DIFF_ENTRIES) {
     lines.push(
-      `… ${String(entries.length - MAX_JSON_DIFF_ENTRIES)} more changes elided`,
+      `… ${String(sink.total - MAX_JSON_DIFF_ENTRIES)} more changes elided`,
     );
   }
-  return lines.join('\n');
+  return boundTotalOutput(lines.join('\n'));
+}
+
+/**
+ * Final backstop over the fully-rendered `diffText`: even with every
+ * per-entry, per-value, and per-path-segment cap applied, a pathologically
+ * deep object graph (many nested field paths, each near its own length cap)
+ * could still add up to an oversized string. Truncates at a code-point
+ * boundary with an explicit elision marker (issue #437 review).
+ */
+function boundTotalOutput(rendered: string): string {
+  if (rendered.length <= MAX_JSON_DIFF_OUTPUT_LENGTH) return rendered;
+  const { text } = truncateAtCodePoint(rendered, MAX_JSON_DIFF_OUTPUT_LENGTH);
+  return `${text}\n… output truncated at ${String(MAX_JSON_DIFF_OUTPUT_LENGTH)} characters`;
 }
 
 /**
@@ -434,7 +644,11 @@ function renderJsonDiffEntries(entries: JsonDiffEntry[]): string {
  * separating space (`removed status: ...`); a bracketed array-element path
  * (`[id=1]`, `[1]`) attaches directly (`removed[id=1]: ...`), and an empty
  * path (whole-element entries with no identity, e.g. deep-equality array
- * matching) attaches nothing (`removed: ...`).
+ * matching) attaches nothing (`removed: ...`). A field name that itself began
+ * with `[` is unambiguous here because {@link escapePathSegment} always
+ * backslash-escapes a literal `[`/`]`/`=` within key/value content — only the
+ * unescaped brackets this module generates for real array/keyed-element
+ * syntax ever start a path.
  */
 function formatPathSuffix(path: string): string {
   if (!path) return '';
@@ -456,8 +670,11 @@ function renderJsonDiffEntry(entry: JsonDiffEntry): string {
 
 function renderJsonValue(value: unknown): string {
   const serialized = JSON.stringify(value);
-  if (serialized.length <= MAX_JSON_DIFF_VALUE_LENGTH) return serialized;
-  return `${serialized.slice(0, MAX_JSON_DIFF_VALUE_LENGTH)}…(truncated)`;
+  const { text, truncated } = truncateAtCodePoint(
+    serialized,
+    MAX_JSON_DIFF_VALUE_LENGTH,
+  );
+  return truncated ? `${text}…(truncated)` : serialized;
 }
 
 /**
