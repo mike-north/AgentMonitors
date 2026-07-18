@@ -213,23 +213,29 @@ content the hook path injects**, not a lesser summary. Two claim shapes render d
   (`… (change summary truncated)`) — a raw diff can be arbitrarily large and the tag body lands in
   the agent's context window (§4.6). This is exactly the block the hook-deliver transport renders
   into `additionalContext` (§5.1); the only per-transport difference is content sanitization (the
-  channel strips `<>[]` for tag safety, §4.6; the hook path preserves them) and the overall cap (the
-  hook path is length-bounded; the channel is **not** — §5.5 below).
+  channel strips `<>[]` for tag safety, §4.6; the hook path preserves them) and the ceiling each
+  applies (the hook path bounds a single turn's `additionalContext` at 4000 chars; the channel packs
+  WHOLE blocks under its own, much larger content ceiling — §5.5 below).
 
 - **Reminder claim** (`normal`/`low` — no event bodies, only a coalesced advisory `message`):
   `content` renders that generic message as-is, aside from the same tag-safety sanitization applied
-  above — no overall length cap, same as the body-injection claim (002 §9.2) — with **no** body
-  injection.
+  above — this shape needs no packing (a coalesced message is already small), same as the
+  body-injection claim (002 §9.2) — with **no** body injection.
 
-The full `content` is **not** length-bounded: the channel reserves and commits the entire delivered
-set (no `maxEvents` — §5.5), so it MUST render every event it claims. Capping the assembled `content`
-would violate §5.5's **claimed-set-equals-rendered-set** invariant — an early block exhausting a cap
-would drop later blocks from the rendered tag while the whole claim was still committed, silently
-omitting claimed-but-unrendered events. Only the **per-event** change summary is bounded (above, and
-§4.6), so no single untrusted diff is dumped wholesale; the number of coalesced events is not capped
-because all of them are claimed and therefore must all surface. (Contrast the hook-deliver transport,
-whose single `additionalContext` string is length-bounded and therefore sizes whole blocks to a cap —
-§5.1, §5.5.)
+`renderChannelEvent` itself renders **every event in the `DeliveryClaim` it is given** — it never
+drops a block to fit a cap. The channel surface IS bounded (§5.5), but by packing WHOLE event blocks
+under a content ceiling **before reserving**, not by cutting an already-claimed render: `channel serve`
+previews the settled high-urgency delivery, sizes how many whole blocks fit
+(`packChannelEventsUnderCap`, `apps/cli/src/channel-render.ts`), and reserves/claims exactly that many
+(`reserveDelivery`'s `maxEvents`) — mirroring exactly how the hook-deliver transport sizes its
+`additionalContext` cap (§5.1, issue #299). This is what makes boundedness compatible with §5.5's
+**claimed-set-equals-rendered-set** invariant: capping the assembled `content` **after** commit would
+have dropped later blocks from the rendered tag while the whole claim was still committed, silently
+omitting claimed-but-unrendered events. Any settled-high events that do not fit stay pending and
+re-deliver on a later poll, with an explicit, bracket-free deferral marker appended to `content` (never
+`<`/`>`/`[`/`]`, so it needs no `contentValue` sanitization pass of its own). Only the **per-event**
+change summary is bounded independently of packing (above, and §4.6), so no single untrusted diff is
+dumped wholesale regardless of how many events fit.
 
 A body-injection claim that rendered only its **title** — dropping the monitor body and the change
 summary — is a **defect on this surface**, not a lighter rendering: the receiving agent would have to
@@ -684,11 +690,22 @@ the cap is shown partially (mid-truncated at a code-point boundary) to guarantee
 its full body stays unread and re-delivers.
 
 The non-high branches need no sizing: `normal`/`low` reminders inject no per-event bodies, and the
-`post-compact` recap re-shows all unread each time, so both self-heal. Uncapped callers (e.g. the
-channel transport, whose surface is not length-bounded) omit `maxEvents` and claim the full delivered
-set exactly as before.
+`post-compact` recap re-shows all unread each time, so both self-heal.
 
-No durable event is lost by truncation; the cap only bounds how much is injected into a single turn.
+**The channel transport (§4.2.1) applies the SAME pack-then-claim pattern, against its own, much
+larger content ceiling.** It is not exempt from boundedness — a coalesced high-urgency push previewed,
+sized, and rendered without limit would make a single `notifications/claude/channel` payload
+unbounded — but unlike the hook path it is not sizing to a single turn's context budget, so its
+ceiling is deliberately generous. `channel serve` previews the settled-high delivery
+(`previewSettledHighDeliveryClient`), sizes whole blocks via `packChannelEventsUnderCap`
+(`apps/cli/src/channel-render.ts`), and passes the result as `reserveDelivery`'s `maxEvents` before
+reserving — the identical pattern §5.5 describes above for the hook path, differing only in the block
+joiner (`\n\n`, no fixed header) and the deferral marker (bracket-free, since the channel sanitizes
+`<>[]` out of `content`, §4.6). A reminder claim (no settled-high events) needs no sizing and omits
+`maxEvents`, claiming the full claim exactly as before.
+
+No durable event is lost by truncation; the cap only bounds how much is injected into a single turn (or,
+for the channel, into a single push).
 
 ### 5.6 Activation packaging (the `agentmonitors` plugin)
 

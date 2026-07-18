@@ -43,8 +43,11 @@ received notification is printed to stdout.
 
 ```json
 { "content": "AgentMon messages are available. Read the inbox.",
-  "meta": { "lifecycle": "turn-interruptible", "mode": "delivery", "event_count": "0", "urgency": "normal" } }
+  "meta": { "lifecycle": "turn-interruptible", "mode": "delivery", "event_count": "1", "urgency": "normal" } }
 ```
+
+(`event_count` on a reminder claim reports the session's pending unread total the reminder refers to —
+it is never `0`, since a reminder is only ever pushed when at least one event is pending; 006 §4.2.)
 
 `high` — the concrete event, after the 15s high-urgency settle:
 
