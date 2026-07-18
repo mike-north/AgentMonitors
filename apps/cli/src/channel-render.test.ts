@@ -106,6 +106,39 @@ describe('renderChannelEvent', () => {
     expect(rendered.length).toBeLessThanOrEqual(MAX_EVENT_DIFF);
   });
 
+  // 006 §4.6 (issue #436 human-review finding #3): the per-event diff bound is
+  // the ONLY remaining truncation path on the channel surface (the overall
+  // content cap was removed — the channel is not length-bounded, §5.5). Its
+  // elision marker is applied INSIDE buildEventBlock and then sanitized, so a
+  // truncated block can never reintroduce a tag-breakout character. This
+  // exercises truncation and breakout characters TOGETHER: a huge diff whose
+  // content is full of `<`, `>`, `[`, `]` must still yield content with NONE of
+  // the forbidden characters, marker included.
+  it('a truncated change summary never reintroduces forbidden characters', () => {
+    const evilBigDiff = '+ <tag>[idx]</tag>\n'.repeat(500); // past MAX_EVENT_DIFF
+    const { content } = renderChannelEvent(
+      makeClaim({
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'build-drift',
+            title: 'a lot changed',
+            summary: 'a lot changed',
+            urgency: 'high',
+            createdAt: '2026-01-01T00:00:00.000Z',
+            body: 'inspect the diff',
+            diffText: evilBigDiff,
+          },
+        ],
+      }),
+    );
+    // Truncation actually happened on this path...
+    expect(content).toContain(DIFF_ELISION_MARKER.trim());
+    // ...and the COMPLETE returned content — marker and all — is tag-safe: none
+    // of the forbidden tag-body characters (`<`, `>`, `[`, `]`, `\r`) survive.
+    expect(content).not.toMatch(/[<>[\]\r]/);
+  });
+
   it('renders one block per event for a coalesced high-urgency claim', () => {
     const { content } = renderChannelEvent(
       makeClaim({
@@ -203,6 +236,37 @@ describe('renderChannelEvent', () => {
     );
     expect(content).not.toMatch(/[<>[\]]/);
     expect(meta.monitor_id).not.toMatch(/[<>[\]]/);
+  });
+
+  // 006 §5.5: the channel claims the FULL delivered set (no `maxEvents`), so it
+  // MUST render every event it claims — the claimed set MUST equal the rendered
+  // set. A large coalesced delivery whose joined blocks exceed the old 4000-char
+  // hook cap must still render every block, uncut.
+  it('renders every event of a large coalesced claim with no overall content cap', () => {
+    const events = Array.from({ length: 30 }, (_, i) => ({
+      eventId: `e${i}`,
+      monitorId: `monitor-${i}`,
+      title: `title ${i}`,
+      summary: `summary ${i}`,
+      urgency: 'high' as const,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      body: 'x'.repeat(300),
+    }));
+    const { content, meta } = renderChannelEvent(
+      makeClaim({
+        events,
+        unreadCounts: { low: 0, normal: 0, high: 30, total: 30 },
+      }),
+    );
+    // Comfortably past the removed hook-style 4000-char cap.
+    expect(content.length).toBeGreaterThan(4000);
+    expect(content).not.toContain('truncated');
+    for (const event of events) {
+      expect(content).toContain(`### ${event.monitorId} (high)`);
+      expect(content).toContain(event.title);
+    }
+    // event_count reflects the full claimed/rendered set, not a partial one.
+    expect(meta.event_count).toBe('30');
   });
 
   // Issue #436: a normal-band reminder carries no concrete events, but its

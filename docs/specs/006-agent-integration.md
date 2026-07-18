@@ -213,16 +213,23 @@ content the hook path injects**, not a lesser summary. Two claim shapes render d
   (`… (change summary truncated)`) — a raw diff can be arbitrarily large and the tag body lands in
   the agent's context window (§4.6). This is exactly the block the hook-deliver transport renders
   into `additionalContext` (§5.1); the only per-transport difference is content sanitization (the
-  channel strips `<>[]` for tag safety, §4.6; the hook path preserves them) and the overall cap.
+  channel strips `<>[]` for tag safety, §4.6; the hook path preserves them) and the overall cap (the
+  hook path is length-bounded; the channel is **not** — §5.5 below).
 
 - **Reminder claim** (`normal`/`low` — no event bodies, only a coalesced advisory `message`):
-  `content` renders that generic message as-is, aside from the same tag-safety sanitization and
-  overall length cap applied above (002 §9.2), with **no** body injection.
+  `content` renders that generic message as-is, aside from the same tag-safety sanitization applied
+  above — no overall length cap, same as the body-injection claim (002 §9.2) — with **no** body
+  injection.
 
-The full `content` is capped at 4000 chars; when truncation occurs an explicit marker is appended
-pointing at the durable, re-discoverable rest (`agentmonitors events list --unread`). Truncation
-never loses an event: surfacing marks rows **claimed, not acknowledged** (BP2), so anything cut here
-stays unread (§4.5, §5.5).
+The full `content` is **not** length-bounded: the channel reserves and commits the entire delivered
+set (no `maxEvents` — §5.5), so it MUST render every event it claims. Capping the assembled `content`
+would violate §5.5's **claimed-set-equals-rendered-set** invariant — an early block exhausting a cap
+would drop later blocks from the rendered tag while the whole claim was still committed, silently
+omitting claimed-but-unrendered events. Only the **per-event** change summary is bounded (above, and
+§4.6), so no single untrusted diff is dumped wholesale; the number of coalesced events is not capped
+because all of them are claimed and therefore must all surface. (Contrast the hook-deliver transport,
+whose single `additionalContext` string is length-bounded and therefore sizes whole blocks to a cap —
+§5.1, §5.5.)
 
 A body-injection claim that rendered only its **title** — dropping the monitor body and the change
 summary — is a **defect on this surface**, not a lighter rendering: the receiving agent would have to
