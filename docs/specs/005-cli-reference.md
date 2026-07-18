@@ -1471,8 +1471,9 @@ Computes a textual diff of one observed object between two stored points, each a
 an ISO-8601 timestamp (resolved to the snapshot at/just-before it). `--from` defaults to the
 session's own baseline cursor; `--to` defaults to the latest snapshot — so a bare invocation answers
 "what has changed for me since my baseline" ([007 §3.2](./007-agent-facing-interaction.md)). Uses the
-runtime's `buildTextDiff` so agent-visible diffs match delivered diffs. A referenced point whose
-snapshot has been pruned is a **clear error**, not an empty diff.
+runtime's `buildDiff` (strategy-aware — structural for `strategy: json-diff`, line-based otherwise,
+issue #437) so agent-visible diffs match delivered diffs. A referenced point whose snapshot has been
+pruned is a **clear error**, not an empty diff.
 
 ### §14.3 `summary` — lightweight payload orientation
 

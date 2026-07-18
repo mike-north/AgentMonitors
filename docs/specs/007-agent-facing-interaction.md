@@ -141,8 +141,9 @@ computes a textual diff of one observed object **between two stored points in ti
   `--to` **MUST** default to the latest stored snapshot. So a bare
   `agentmonitors diff <monitorId> --object <k>` answers "what has changed for me since my baseline",
   reusing the per-recipient seam rather than a new diff engine (AP6).
-- The diff **MUST** be computed with the same `buildTextDiff` the runtime uses
-  ([002 §1.1.2, §5.2](./002-runtime-delivery.md)) so agent-visible diffs match delivered diffs.
+- The diff **MUST** be computed with the same `buildDiff` (strategy-aware; §5.2) the runtime uses
+  ([002 §1.1.2, §5.2](./002-runtime-delivery.md)) so agent-visible diffs match delivered diffs —
+  structural for a `strategy: json-diff` object, line-based otherwise (issue #437).
 - It is a **pure read**: it **MUST NOT** advance the cursor or alter delivery state (§2.1).
 
 > **Snapshot-retention dependency.** A two-arbitrary-point diff requires that historical
@@ -407,9 +408,9 @@ When this document's rules ship, tests **MUST** prove:
   `session_event_state` and `session_object_cursor` are byte-identical before/after the read).
 - **No re-observation (§2.1).** An agent-facing read does **not** invoke a source `observe()` (assert
   via a spy/fake source that its call count is unchanged across the read).
-- **Point-to-point diff (§3.2).** A `diff` between two event ids reproduces `buildTextDiff` of their
-  stored snapshots; the default `--from` equals the recipient's baseline cursor; a pruned/absent
-  point yields a clear error, not an empty diff.
+- **Point-to-point diff (§3.2).** A `diff` between two event ids reproduces `buildDiff` (the
+  strategy-aware renderer) of their stored snapshots; the default `--from` equals the recipient's
+  baseline cursor; a pruned/absent point yields a clear error, not an empty diff.
 - **Async, non-blocking (§2.3).** A verb returns the current answer immediately and never waits for a
   future change (assert it returns without a change occurring).
 - **Ephemeral declaration validity (§4.2).** A declaration with an invalid scope is rejected by the

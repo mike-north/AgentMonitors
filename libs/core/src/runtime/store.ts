@@ -79,7 +79,7 @@ import type {
   SessionObjectCursorRecord,
 } from './types.js';
 import type { Urgency } from '../schema/types.js';
-import { buildTextDiff } from './diff.js';
+import { buildDiff, changeDetectionStrategyOf } from './diff.js';
 
 type InternalInboxDb = BetterSQLite3Database<
   typeof import('../inbox/schema.js')
@@ -825,19 +825,28 @@ export class RuntimeStore {
           objectKey,
           event.workspacePath,
         );
+        // The object's declared change-detection strategy (issue #437): renders
+        // a structural diffText for `strategy: json-diff` instead of a
+        // compact-JSON line diff. Read from the persisted `snapshotMetadata`
+        // (the source's `snapshot` metadata round-tripped through the DB).
+        const strategy = changeDetectionStrategyOf(event.snapshotMetadata);
         if (cursor) {
           // Existing recipient: span from its own cursor. Never advanced here —
           // materialization SEEDS only; the cursor advances at claim
           // (markClaimed), so a recipient that stayed away keeps spanning from
           // its last-seen point across multiple shared observations.
-          perRecipientDiff = buildTextDiff(cursor.baselineContent, artifact);
+          perRecipientDiff = buildDiff(
+            cursor.baselineContent,
+            artifact,
+            strategy,
+          );
         } else {
           // First projection of this object to this session = "caught up to the
           // pre-event state": its delta is the shared diff (prior → artifact),
           // identical to today's single-baseline behavior (backward-compat).
           const previous = baseline?.previousContent ?? null;
           perRecipientDiff =
-            previous !== null ? buildTextDiff(previous, artifact) : null;
+            previous !== null ? buildDiff(previous, artifact, strategy) : null;
           // Seed the cursor to the state the recipient is now caught up to: the
           // prior snapshot for a non-baseline event (so the NEXT event spans
           // prior → next), or this event's own artifact at a baseline event
@@ -1797,9 +1806,10 @@ export class RuntimeStore {
    * each group as DELIVERED — "where things stand now" against this
    * recipient's own baseline cursor. The newest delivered event's per-recipient
    * `session_event_state.diff_text` is RECOMPUTED as
-   * `buildTextDiff(cursor.baselineContent, newestArtifact)` so the delta spans
-   * the recipient's cursor → endpoint (not the shared snapshot baseline). The
-   * older same-object events are recorded CLAIMED-BUT-SUPPRESSED
+   * `buildDiff(cursor.baselineContent, newestArtifact, strategy)` (issue #437:
+   * strategy-aware — structural for `json-diff`, line-based otherwise) so the
+   * delta spans the recipient's cursor → endpoint (not the shared snapshot
+   * baseline). The older same-object events are recorded CLAIMED-BUT-SUPPRESSED
    * (`net_suppressed_at`): retained for `monitor explain` but excluded from
    * delivery (unread/pending/recap).
    *
@@ -1856,7 +1866,11 @@ export class RuntimeStore {
         this.setPerRecipientDiff(
           sessionId,
           event.id,
-          buildTextDiff(cursor.baselineContent, event.snapshotText),
+          buildDiff(
+            cursor.baselineContent,
+            event.snapshotText,
+            changeDetectionStrategyOf(event.snapshotMetadata),
+          ),
         );
       }
     }

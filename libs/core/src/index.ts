@@ -121,6 +121,7 @@ export { RuntimeStore } from './runtime/store.js';
 // CLI `verify` budget) reason from the real values instead of hand-mirrored copies.
 export { schedulingDefaults } from './runtime/scheduling-defaults.js';
 export {
+  buildDiff,
   buildTextDiff,
   fingerprintText,
   renderShapeArtifact,

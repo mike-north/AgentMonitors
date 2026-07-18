@@ -133,6 +133,9 @@ export type BaselineStrategy = (typeof baselineStrategyValues)[number];
 // @public
 export const baselineStrategyValues: readonly ["incremental", "net"];
 
+// @public
+export function buildDiff(previous: string, current: string, strategy?: string): string;
+
 // @public (undocumented)
 export function buildTextDiff(previous: string, current: string): string;
 

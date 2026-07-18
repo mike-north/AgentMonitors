@@ -896,6 +896,15 @@ Supported strategies (verified: `plugins/source-api-poll/src/index.ts`, `ChangeS
 | `json-diff`   | Parse both bodies as JSON, recursively sort object keys, then compare serialized strings. Ignores key ordering and whitespace differences. | JSON APIs                                                              |
 | `status-code` | Compare only HTTP status codes; body changes are ignored.                                                                                  | Watching whether an endpoint goes up/down (e.g. 200 → 503)             |
 
+**`json-diff` renders a structural `diffText`, not a text line diff (issue #437).** This `strategy`
+value is read by the runtime's diff renderer (the source-agnostic `change-detection.strategy` this
+row and §11.3 describe, carried on every emitted observation's `snapshot.strategy`) to choose how
+`diffText` is rendered, not only whether a change occurred: `strategy: json-diff` produces
+added/removed/changed elements or key paths (`buildJsonDiff`) instead of `buildTextDiff`'s line-level
+diff, which degrades to a whole-line remove-all/add-all on compact single-line JSON. See
+[002 §5.2](./002-runtime-delivery.md#52-snapshots-and-diffs) for the renderer's full behavior
+(identity heuristics, bounded output, and the parse-failure fallback to `buildTextDiff`).
+
 **`change-detection.strategy` is optional (issue #230).** When the author **omits** it, the strategy is
 **inferred from the response `Content-Type`**: a JSON media type (`application/json` or any
 structured-syntax `+json` suffix such as `application/ld+json`, per RFC 6838) infers `json-diff`;
@@ -1340,6 +1349,12 @@ Mirrors `api-poll` (§4.2), substituting the local-process equivalents:
 `api-poll`. `exit-code` is first-class in v1 (decision for #81's fourth open question); the broader
 "predicate over the result" generalization is explicitly deferred — if it lands later, `exit-code`
 becomes sugar for one such predicate, which is a compatible evolution.
+
+As with `api-poll`, `strategy: json-diff` also selects the structural `diffText` renderer (issue
+#437) — see the §4.2 note and [002 §5.2](./002-runtime-delivery.md#52-snapshots-and-diffs). This is
+the fix for the observed `command-poll` case: a `gh pr list --json` monitor emitting compact
+single-line JSON no longer degrades to a whole-line remove-all/add-all when one array element
+changes.
 
 Plain `json-diff` MAY set top-level `change-detection.ignore-paths` to remove noisy fields before
 comparison, e.g. `ignore-paths: ['duration']` or `ignore-paths: ['$.duration']`. Paths use the same
