@@ -4,6 +4,10 @@ import type {
   HookDeliveryDiagnosis,
 } from '@agentmonitors/core';
 import type { HookPayload } from './hook-payload.js';
+import {
+  sanitizeUntrustedField,
+  sanitizeUntrustedFieldOrNone,
+} from './hook-deliver-sanitize.js';
 
 /**
  * Pure line-formatting for `hook deliver --debug` (issue #334).
@@ -17,6 +21,14 @@ import type { HookPayload } from './hook-payload.js';
  * wording is unit-testable without a daemon; `apps/cli/src/commands/hook.ts`
  * writes the returned lines to `process.stderr` only when `--debug` is passed.
  *
+ * `--debug` is opt-in, but the lines below still interpolate the SAME
+ * untrusted stdin payload fields (`session_id`, `hook_event_name`, `cwd`) that
+ * the always-on warnings in `hook-deliver-warnings.ts` render — a hostile
+ * payload reaches the operator's terminal/logs raw with `--debug` on unless
+ * every such interpolation goes through the shared
+ * {@link sanitizeUntrustedField} (issue #365, hardening the same vector
+ * closed for the always-on path by #362/#363).
+ *
  * @see ../../../docs/specs/006-agent-integration.md §5 (hook-deliver transport)
  */
 
@@ -26,12 +38,17 @@ function line(message: string): string {
   return `${DEBUG_PREFIX} ${message}`;
 }
 
-/** Echoes the parsed stdin payload's relevant fields (§5.0 input contract). */
+/**
+ * Echoes the parsed stdin payload's relevant fields (§5.0 input contract).
+ * All three fields are untrusted stdin JSON, so each is rendered via
+ * {@link sanitizeUntrustedFieldOrNone} (issue #365) — the same escaping the
+ * always-on warnings apply to the identical fields.
+ */
 export function describePayload(payload: HookPayload): string {
   return line(
-    `stdin payload — session_id=${payload.session_id ?? '(none)'} ` +
-      `hook_event_name=${payload.hook_event_name ?? '(none)'} ` +
-      `cwd=${payload.cwd ?? '(none)'}`,
+    `stdin payload — session_id=${sanitizeUntrustedFieldOrNone(payload.session_id)} ` +
+      `hook_event_name=${sanitizeUntrustedFieldOrNone(payload.hook_event_name)} ` +
+      `cwd=${sanitizeUntrustedFieldOrNone(payload.cwd)}`,
   );
 }
 
@@ -43,18 +60,24 @@ export function describeNoSessionId(): string {
   );
 }
 
-/** `hook_event_name` did not map to a delivery lifecycle (§5.4). */
+/**
+ * `hook_event_name` did not map to a delivery lifecycle (§5.4).
+ * `hookEventName` is untrusted stdin JSON — sanitized (issue #365).
+ */
 export function describeUnmappedLifecycle(
   hookEventName: string | undefined,
 ): string {
   return line(
-    `hook_event_name "${hookEventName ?? '(none)'}" does not map to a ` +
+    `hook_event_name ${sanitizeUntrustedFieldOrNone(hookEventName)} does not map to a ` +
       'delivery lifecycle (only UserPromptSubmit, PostToolUse, and ' +
       'SessionStart do) — additionalContext would be ignored, so nothing is injected.',
   );
 }
 
-/** The lifecycle that will actually be claimed at, and how it was derived. */
+/**
+ * The lifecycle that will actually be claimed at, and how it was derived.
+ * `hookEventName` is untrusted stdin JSON — sanitized (issue #365).
+ */
 export function describeLifecycle(
   lifecycle: string,
   explicitOverride: boolean,
@@ -63,25 +86,34 @@ export function describeLifecycle(
   return line(
     explicitOverride
       ? `resolved lifecycle: ${lifecycle} (explicit --lifecycle override)`
-      : `resolved lifecycle: ${lifecycle} (derived from hook_event_name "${hookEventName ?? '(none)'}")`,
+      : `resolved lifecycle: ${lifecycle} (derived from hook_event_name ${sanitizeUntrustedFieldOrNone(hookEventName)})`,
   );
 }
 
-/** The resolved workspace path and its enabled/socket configuration. */
+/**
+ * The resolved workspace path and its enabled/socket configuration.
+ * `workspacePath` is derived from the untrusted stdin `cwd` field when
+ * present — sanitized (issue #365). `socket` comes from local config, not
+ * the payload, and is left unsanitized.
+ */
 export function describeWorkspace(
   workspacePath: string,
   enabled: boolean,
   socket: string | undefined,
 ): string {
   return line(
-    `workspace ${workspacePath} — enabled=${String(enabled)}, configured socket=${socket ?? '(none)'}`,
+    `workspace ${sanitizeUntrustedField(workspacePath)} — enabled=${String(enabled)}, configured socket=${socket ?? '(none)'}`,
   );
 }
 
-/** The workspace is not enabled — the primary "cwd mismatch" symptom. */
+/**
+ * The workspace is not enabled — the primary "cwd mismatch" symptom.
+ * `workspacePath` is derived from the untrusted stdin `cwd` field when
+ * present — sanitized (issue #365).
+ */
 export function describeWorkspaceDisabled(workspacePath: string): string {
   return line(
-    `workspace ${workspacePath} is not enabled ` +
+    `workspace ${sanitizeUntrustedField(workspacePath)} is not enabled ` +
       '(.claude/agentmonitors.local.md is missing, or enabled: false) — ' +
       'run `agentmonitors init`, or set `enabled: true`. If this path is ' +
       "unexpected, check the hook payload's cwd against the workspace you configured.",
@@ -103,13 +135,18 @@ export function describeDaemonUnreachable(socketPath: string): string {
   );
 }
 
-/** No tracked session's `hostSessionId` matched the payload's `session_id`. */
+/**
+ * No tracked session's `hostSessionId` matched the payload's `session_id`.
+ * `hostSessionId` is untrusted stdin JSON — sanitized (issue #365), the same
+ * escaping the always-on unknown-session warning applies to this same field
+ * (`hook-deliver-warnings.ts`'s `describeUnknownHostSessionWarning`).
+ */
 export function describeNoSessionMatch(
   hostSessionId: string,
   sessions: readonly AgentSessionRecord[],
 ): string {
   return line(
-    `no tracked AgentMon session matches host session_id "${hostSessionId}" ` +
+    `no tracked AgentMon session matches host session_id ${sanitizeUntrustedField(hostSessionId)} ` +
       `(${String(sessions.length)} session(s) known to the daemon at this socket) — ` +
       'run `agentmonitors session start`, or check for a workspace/session mismatch.',
   );
