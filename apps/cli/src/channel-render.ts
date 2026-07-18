@@ -60,7 +60,9 @@ function capContent(content: string): string {
  * buildEventBlock}, so the channel surface is equivalent to the hook surface,
  * differing only in per-transport content sanitization and cap. A reminder claim
  * (`normal`/`low`, which carries no event bodies — only a coalesced advisory
- * `message`) renders that message verbatim, staying generic (002 §9.2).
+ * `message`) renders that message as-is (subject to the same tag-safety
+ * sanitization and length cap as the body-injection path), staying generic
+ * (002 §9.2).
  */
 export function renderChannelEvent(claim: DeliveryClaim): {
   content: string;

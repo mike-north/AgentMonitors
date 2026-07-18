@@ -216,7 +216,8 @@ content the hook path injects**, not a lesser summary. Two claim shapes render d
   channel strips `<>[]` for tag safety, §4.6; the hook path preserves them) and the overall cap.
 
 - **Reminder claim** (`normal`/`low` — no event bodies, only a coalesced advisory `message`):
-  `content` renders that generic message verbatim (002 §9.2), with **no** body injection.
+  `content` renders that generic message as-is, aside from the same tag-safety sanitization and
+  overall length cap applied above (002 §9.2), with **no** body injection.
 
 The full `content` is capped at 4000 chars; when truncation occurs an explicit marker is appended
 pointing at the durable, re-discoverable rest (`agentmonitors events list --unread`). Truncation

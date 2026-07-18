@@ -26,7 +26,8 @@ semantics as the hook-deliver transport, not a lesser summary.
   with an explicit elision marker). The only per-transport difference is content sanitization (the
   channel strips `<>[]` for tag safety, §4.6; the hook path preserves them) and the overall 4000-char
   cap (with its own truncation marker). Reminder claims (`normal`/`low`) still render their generic
-  coalesced message verbatim (002 §9.2) — unchanged.
+  coalesced message as-is, subject to the same tag-safety sanitization and length cap (002 §9.2) —
+  unchanged.
 - **`DeliveryEventSummary.diffText` (new, optional).** The delivery summary a transport receives now
   carries the event's change summary (from `MonitorEventRecord.diffText`), so a transport can surface
   _what changed_, not just the title and instructions. Absent when the event carried no diff. Additive
