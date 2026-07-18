@@ -347,16 +347,19 @@ Rules for the payload-form step:
 > `AgentMonitorRuntime.claimDelivery` in `libs/core/src/runtime/service.ts`) groups a recipient's
 > unclaimed events per `(monitorId, objectKey, workspacePath)`; for a `net` monitor it delivers only
 > the **newest** event per object — with its per-recipient `diff_text` recomputed as
-> `buildTextDiff(cursor.baselineContent, newestArtifact)` (cursor → endpoint) when the group
-> actually collapsed — and records the older intermediates **claimed-but-suppressed**
-> (`session_event_state.net_suppressed_at`): retained and explainable via `monitor explain`
-> ([§10.7](#107-monitor-pipeline-diagnosis)), never delivered. `incremental` (explicit opt-out)
-> delivers all in order. The per-recipient cursor still advances to the newest claimed artifact
-> (`markClaimed`) even when intermediates are suppressed. The monitor's `baseline-strategy` is
-> persisted on each `monitor_events` row (`baseline_strategy`) so the claim-time decision needs no
-> monitor re-scan.
+> `buildDiff(cursor.baselineContent, newestArtifact, strategy)` (cursor → endpoint; strategy-aware
+> as of issue #437 — structural for `strategy: json-diff`, `buildTextDiff`'s line-level diff
+> otherwise, per [§5.2](#52-snapshots-and-diffs)) when the group actually collapsed — and records
+> the older intermediates **claimed-but-suppressed** (`session_event_state.net_suppressed_at`):
+> retained and explainable via `monitor explain` ([§10.7](#107-monitor-pipeline-diagnosis)), never
+> delivered. `incremental` (explicit opt-out) delivers all in order. The per-recipient cursor still
+> advances to the newest claimed artifact (`markClaimed`) even when intermediates are suppressed.
+> The monitor's `baseline-strategy` is persisted on each `monitor_events` row (`baseline_strategy`)
+> so the claim-time decision needs no monitor re-scan.
 > Tested by `libs/core/src/runtime/net-per-recipient.test.ts` (away-across-N → one net delta + 2
 > suppressed; `incremental` contrast; missed-nothing degenerate; shared-chain keeps all N),
+> `libs/core/src/runtime/json-diff-wiring.test.ts` (net-collapse recomputation renders
+> structurally and survives a persistence round-trip, issue #437),
 > `libs/core/src/runtime/service.test.ts` ("baseline strategy (G13, 002 §1.1.7)" — omitting ≡
 > `net`, explicit `net` → 1 delta, explicit `incremental` → N ordered deltas; rollup
 > not-due/due-path parity tests), and
@@ -1071,11 +1074,24 @@ If an emitted observation includes `snapshotText`, the runtime **MUST**:
 2. compute a textual diff if a previous snapshot exists
 3. store the new snapshot after persisting the event
 
-The diff format is a line-level unified-style representation capped at 20 changed lines, produced by `buildTextDiff`. If previous and current text are identical, `buildTextDiff` returns the empty string.
-
 **Snapshot ordering (total materialization order).** `created_at` is stored at epoch-**second** precision, so several snapshots for one `(workspacePath, monitorId, objectKey)` written in the same second (an ordinary same-tick burst) tie on `created_at`. The runtime **MUST** give snapshots a total materialization order and resolve "the latest stored snapshot" to the **most recently materialized** one under identical timestamps — never an older tied row, which would corrupt the shared diff chain (repeating or omitting intermediate changes). This is satisfied by a strictly-increasing (monotonic ULID) snapshot `id` and ordering by `(created_at, id)` — the same tie-break the `monitor_events` table already uses. User-visible newest-first listings that order by second-precision `created_at` (`events list` / `monitor explain` event and observation-history audit rows) apply the same `id` tie-break so their order is stable within a second.
 
-Verified: `libs/core/src/runtime/service.ts` — `processObservation()`; `libs/core/src/runtime/diff.ts` — `buildTextDiff()` (caps the diff at 20 changed lines); `libs/core/src/runtime/store.ts` — `saveSnapshot()`/`latestSnapshot()` (monotonic `snapshotUlid`, `(created_at, id)` tie-break).
+The renderer is chosen by the object's `change-detection.strategy` (003 §4.2/§11.3), via `buildDiff(previous, current, strategy)`:
+
+- **Default** (`strategy` omitted, `text-diff`, `exit-code`, or anything else `buildDiff` does not recognize): a line-level unified-style representation capped at 20 changed lines, produced by `buildTextDiff`. If previous and current text are identical, `buildTextDiff` returns the empty string.
+- **`strategy: json-diff`**: a **structural** diff — added/removed/changed elements or key paths, e.g. `- removed[number=430]: {"number":430,"title":"..."}` — produced by `buildJsonDiff`, capped at 20 diff entries with an explicit `… N more changes elided` marker (the `json-diff` analog of `buildTextDiff`'s line cap), and each rendered value truncated at 300 characters. This avoids `buildTextDiff` degrading a compact single-line JSON snapshot into a whole-line remove-all/add-all when one array element changes (issue #437) — the json-diff strategy already detects the change structurally; the rendered `diffText` no longer throws that structure away. Arrays of objects are diffed by element identity where feasible: a stable-key heuristic (trying `id`, `key`, `uuid`, `_id`, `slug`, `sha`, `number`, `name`, in that order, for a field that is a unique scalar on every element of both sides) first, then whole-element deep-equality matching (order-insensitive; added/removed only — no reliable identity to report a `changed` element against) when no such field exists; arrays of non-object elements diff positionally by index. Both identity-based matchers are themselves order-insensitive, but `hasChanged` is array-order-**sensitive** (it sorts object keys, never array elements) — so a pure element reorder renders an explicit `reordered` entry rather than an empty diff, preserving "change detected ⟺ non-empty `diffText`". `buildJsonDiff` falls back to `undefined` — and `buildDiff` then falls back to `buildTextDiff` — whenever either side fails to parse as JSON, identical to each `json-diff` source's own `hasChanged` fallback (003 §11.3/§4.2): this specific parse-fallback decision never disagrees between the two.
+
+> **Known gap (not yet fixed): `command-poll`'s `ignore-paths` is not carried through to the renderer.**
+> `command-poll`'s `json-diff` strategy MAY set top-level `change-detection.ignore-paths` (003
+> §11.3) to strip noisy fields (e.g. a `duration`) BEFORE its own `hasChanged` comparison decides
+> whether a change occurred. `buildDiff`/`buildJsonDiff` are not given `ignore-paths` and always
+> diff the raw `snapshotText`, so an ignored field's churn still renders in `diffText` — and, in the
+> worst case, can push the real change past `MAX_JSON_DIFF_ENTRIES` and out of the rendered output
+> entirely, even though `hasChanged` correctly ignored that field when deciding a change occurred.
+> Fixing this (carrying `ignore-paths` through the persisted snapshot metadata and stripping the
+> same fields before rendering) is a follow-up, not implemented as part of issue #437.
+
+Verified: `libs/core/src/runtime/service.ts` — `processObservation()`; `libs/core/src/runtime/store.ts` — `insertEvent()`, `collapseNetForClaim()`, `saveSnapshot()`/`latestSnapshot()` (monotonic `snapshotUlid`, `(created_at, id)` tie-break); `libs/core/src/runtime/diff.ts` — `buildDiff()`, `buildTextDiff()` (cap at 20 lines), `buildJsonDiff()` (cap at 20 entries).
 
 This makes snapshot history an object-level concern rather than a monitor-level or session-level concern (SP5).
 

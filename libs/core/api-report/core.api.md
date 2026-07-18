@@ -137,11 +137,17 @@ export type BaselineStrategy = (typeof baselineStrategyValues)[number];
 // @public
 export const baselineStrategyValues: readonly ["incremental", "net"];
 
+// @public
+export function buildDiff(previous: string, current: string, strategy?: ChangeDetectionStrategy): string;
+
 // @public (undocumented)
 export function buildTextDiff(previous: string, current: string): string;
 
 // @public
 export function changeDetectionCollectionError(watchConfig: Record<string, unknown>): string | undefined;
+
+// @public
+export type ChangeDetectionStrategy = 'json-diff' | 'text-diff' | 'exit-code' | 'status-code' | (string & {});
 
 // @public
 export type ChangeKind = 'created' | 'modified' | 'deleted' | 'descoped';

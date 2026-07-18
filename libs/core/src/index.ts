@@ -121,10 +121,12 @@ export { RuntimeStore } from './runtime/store.js';
 // CLI `verify` budget) reason from the real values instead of hand-mirrored copies.
 export { schedulingDefaults } from './runtime/scheduling-defaults.js';
 export {
+  buildDiff,
   buildTextDiff,
   fingerprintText,
   renderShapeArtifact,
 } from './runtime/diff.js';
+export type { ChangeDetectionStrategy } from './runtime/diff.js';
 // Shape stage (G15): deterministic derived facts + render-then-diff
 export {
   computeDerivedFacts,

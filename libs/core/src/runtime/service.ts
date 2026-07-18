@@ -16,7 +16,7 @@ import type { SourceRegistry } from '../observation/registry.js';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import type { AgentRuntimeAdapter } from '../adapter/types.js';
 import type { InterpretAdapter } from '../adapter/interpret.js';
-import { buildTextDiff } from './diff.js';
+import { buildDiff, changeDetectionStrategyOf } from './diff.js';
 import {
   diagnoseReminderSuppression,
   type ReminderSessionCounts,
@@ -3363,9 +3363,13 @@ export class AgentMonitorRuntime {
         )
       : null;
 
+    // The object's declared change-detection strategy (issue #437), read from
+    // the raw observation's `snapshot` metadata so `strategy: json-diff`
+    // renders a structural diffText instead of a compact-JSON line diff.
+    const strategy = changeDetectionStrategyOf(input.observation.snapshot);
     const diffText =
       effectiveSnapshotText && previousSnapshot
-        ? buildTextDiff(previousSnapshot.content, effectiveSnapshotText)
+        ? buildDiff(previousSnapshot.content, effectiveSnapshotText, strategy)
         : null;
 
     const event = this.store.insertEvent(
