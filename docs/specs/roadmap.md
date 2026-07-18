@@ -72,14 +72,17 @@ Priority is a suggestion (P1 = highest). Re-rank freely — that is the point of
 > G8 (`command-poll` source) **shipped** — the bundled package
 > `@agentmonitors/source-command-poll` implements [003 §11](./003-source-plugins.md) verbatim:
 > argv-only execution (never a shell), `text-diff`/`json-diff`/`exit-code` strategies, a 1 MiB stdout
-> cap with stable truncated diffs, SIGTERM→SIGKILL timeout handling with no orphan processes,
-> transition-edge `ok ↔ failing` health signals (nonzero exit with output is a result, not a
-> failure), and `env` never persisted. Registered via `registerCoreSources`
-> (`apps/cli/src/sources.ts`) with an `init --type command-poll` template
-> (`apps/cli/src/commands/init.ts`). Proven by `plugins/source-command-poll/src/index.test.ts` (the
-> §11.7 validation list, incl. the no-shell metacharacter test, the nonzero-exit-is-a-result test,
-> the transition-edge failure tests, and the no-orphan-on-timeout guard) and CLI integration tests
-> (`apps/cli/src/commands/cli.integration.test.ts`). See [003 §11](./003-source-plugins.md) and
+> cap with stable truncated diffs, SIGTERM→SIGKILL timeout handling targeting the command's entire
+> process tree — not just the direct child, fixed in #303 after the process-group escalation only
+> covered a direct child and could hang on a descendant holding stdio open — transition-edge
+> `ok ↔ failing` health signals (nonzero exit with output is a result, not a failure), and `env`
+> never persisted. Registered via `registerCoreSources` (`apps/cli/src/sources.ts`) with an
+> `init --type command-poll` template (`apps/cli/src/commands/init.ts`). Proven by
+> `plugins/source-command-poll/src/index.test.ts` (the §11.7 validation list, incl. the no-shell
+> metacharacter test, the nonzero-exit-is-a-result test, the transition-edge failure tests, and the
+> no-orphan-on-timeout guards for both a direct child and a backgrounded `sh -c` descendant) and CLI
+> integration tests (`apps/cli/src/commands/cli.integration.test.ts`, incl. a live daemon-run/
+> daemon-stop no-orphan check). See [003 §11](./003-source-plugins.md) and
 > [spec-changelog.md](./spec-changelog.md). The cursor (§13) target remains unbuilt.
 
 > G9 (keyed-collection change detection) **shipped** — the `change-detection.collection` mode of

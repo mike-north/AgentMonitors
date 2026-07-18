@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import type {
   JsonSchema,
   KeyedCollectionConfig,
@@ -176,16 +176,66 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
 }
 
 /**
- * Spawn `command` directly (never a shell — `execFile` with `shell: false`), capturing
+ * Bounded wait, after the direct child's own `exit` event, for its stdio streams
+ * to `close` before falling back to whatever stdout has been captured so far. A
+ * descendant that inherited stdout/stderr (e.g. a backgrounded `sleep` under
+ * `sh -c 'sleep 30 & wait'`) can hold those pipes open indefinitely even after the
+ * direct child itself has exited — resolving on `close` alone would hang this call
+ * forever in that case. This bound only matters when a descendant lingers; a normal
+ * command's streams close within milliseconds of `exit`, so it never adds latency
+ * in the common case (003 §11.7, issue #303).
+ */
+const CLOSE_FALLBACK_MS = 2_000;
+
+/**
+ * Best-effort process-tree termination for one escalation step (SIGTERM or SIGKILL).
+ *
+ * On POSIX, `child` was spawned as the leader of its own process group/session
+ * (`detached: true`); signaling the *negative* PID targets that whole group, so a
+ * command's own background jobs (`sh -c 'sleep 30 & wait'`) die with it instead of
+ * surviving as orphans (003 §11.7, issue #303).
+ *
+ * Windows has no process-group-signal equivalent, and no reliable graceful signal
+ * for a non-console-attached spawned process — `taskkill` without `/F` frequently
+ * fails silently for exactly this kind of child. The documented choice (issue #303
+ * AC2) is to always use `taskkill /PID <pid> /T /F`: forceful and tree-wide, on both
+ * the timeout expiry and the grace follow-up. There is no softer Windows phase to
+ * escalate from, so both steps do the same thing — the follow-up is a defensive
+ * retry, not a genuine escalation.
+ */
+function killProcessTree(
+  child: ChildProcess,
+  signal: 'SIGTERM' | 'SIGKILL',
+  isWindows: boolean,
+): void {
+  const pid = child.pid;
+  if (pid === undefined) return;
+  if (isWindows) {
+    execFile('taskkill', ['/PID', String(pid), '/T', '/F'], () => {
+      // Best-effort: a "not found" failure just means the tree already exited.
+    });
+    return;
+  }
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    // Process group already gone — nothing left to signal.
+  }
+}
+
+/**
+ * Spawn `command` directly (never a shell — `spawn` with `shell: false`), capturing
  * stdout (capped at 1 MiB) and the exit code, enforcing `timeout` with a SIGTERM→SIGKILL
- * escalation (003 §11.2). A nonzero exit code with output is a **result**, not a failure
- * (003 §11.2/§11.5); spawn failure and timeout are failures.
+ * escalation targeted at the command's **entire process tree**, not just the direct
+ * child (003 §11.2/§11.7, issue #303). A nonzero exit code with output is a **result**,
+ * not a failure (003 §11.2/§11.5); spawn failure and timeout are failures.
  */
 async function runCommand(scope: ScopeConfig): Promise<ExecOutcome> {
   return new Promise<ExecOutcome>((resolve) => {
     const [file, ...args] = scope.command;
+    const isWindows = process.platform === 'win32';
     // `file` is guaranteed defined: parseScopeConfig rejects an empty command.
-    const child = execFile(
+    const child = spawn(
       // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
       file!,
       args,
@@ -193,102 +243,152 @@ async function runCommand(scope: ScopeConfig): Promise<ExecOutcome> {
         cwd: scope.cwd,
         // `env` is merged over the inherited daemon environment (003 §11.1).
         env: scope.env ? { ...process.env, ...scope.env } : process.env,
-        // We enforce the timeout ourselves (SIGTERM→SIGKILL) rather than relying on
-        // execFile's `timeout`, so the grace escalation matches the spec exactly.
         shell: false,
-        // Bound stdout capture at the 1 MiB cap (003 §11.2). When the child overruns,
-        // execFile kills it and reports ERR_CHILD_PROCESS_STDIO_MAXBUFFER with the
-        // captured-so-far bytes — we treat that as a truncated result, not a failure.
-        maxBuffer: STDOUT_CAP_BYTES,
-        encoding: 'buffer',
-      },
-      (error, stdoutBuf, stderrBuf) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(killTimer);
-        clearTimeout(graceTimer);
-
-        const stderrFull =
-          stderrBuf instanceof Buffer ? stderrBuf.toString('utf8') : '';
-        const stderrTail = stderrFull.slice(-STDERR_TAIL_CHARS);
-
-        // `error.code` is a string (ENOENT, EACCES, ERR_CHILD_PROCESS_STDIO_MAXBUFFER,
-        // …) for spawn/runtime errors and a number for a nonzero exit code.
-        const err = error as (Error & { code?: string | number }) | null;
-        const overflowed = err?.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
-
-        if (timedOut) {
-          resolve({
-            kind: 'failure',
-            error: `Command timed out after ${String(scope.timeoutMs)}ms`,
-            stderrTail,
-          });
-          return;
-        }
-
-        // A string `code` other than the maxBuffer overflow marks a real spawn/runtime
-        // failure (no usable result produced) — §11.5.
-        if (err !== null && typeof err.code === 'string' && !overflowed) {
-          resolve({
-            kind: 'failure',
-            error: err.message,
-            stderrTail,
-          });
-          return;
-        }
-
-        // A real result — including a nonzero exit code (003 §11.2) and a stdout
-        // overflow (a truncated result, which still diffs stably on the capped slice).
-        // `encoding: 'buffer'` guarantees a Buffer at runtime; the union is only a
-        // type-level artifact of execFile's overloaded callback.
-        const buf: Buffer = Buffer.isBuffer(stdoutBuf)
-          ? stdoutBuf
-          : Buffer.from(String(stdoutBuf), 'utf8');
-        const { text, truncated } = capStdout(buf, overflowed);
-        const exitCode =
-          err != null && typeof err.code === 'number' ? err.code : 0;
-        resolve({
-          kind: 'result',
-          result: { stdout: text, exitCode, truncated },
-        });
+        // POSIX: leader of its own process group/session, so the timeout escalation
+        // can signal the whole tree at once (`killProcessTree` above) instead of only
+        // the direct child (003 §11.7, issue #303). Windows has no equivalent flag;
+        // its tree-kill goes through `taskkill /T` instead, which does not depend on
+        // process-group membership.
+        detached: !isWindows,
+        stdio: ['ignore', 'pipe', 'pipe'],
       },
     );
 
     let settled = false;
     let timedOut = false;
+    let truncated = false;
     let graceTimer: ReturnType<typeof setTimeout> | undefined;
+    let closeFallbackTimer: ReturnType<typeof setTimeout> | undefined;
 
-    // Wall-clock timeout: SIGTERM, then SIGKILL after a 5s grace (003 §11.2). This
-    // guarantees no orphaned child survives the grace window.
+    const stdoutChunks: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderrTail = '';
+
+    // Bound stdout capture at the 1 MiB cap (003 §11.2): once the cap is reached,
+    // further bytes are discarded but the stream is never paused, so a chatty child
+    // is always drained and can never block on a full pipe buffer.
+    child.stdout.on('data', (chunk: Buffer) => {
+      if (stdoutBytes >= STDOUT_CAP_BYTES) {
+        if (chunk.length > 0) truncated = true;
+        return;
+      }
+      const remaining = STDOUT_CAP_BYTES - stdoutBytes;
+      if (chunk.length > remaining) {
+        stdoutChunks.push(chunk.subarray(0, remaining));
+        stdoutBytes += remaining;
+        truncated = true;
+      } else {
+        stdoutChunks.push(chunk);
+        stdoutBytes += chunk.length;
+      }
+    });
+
+    // Captured solely for failure diagnostics (003 §11.5); bounded so a pathological
+    // stderr volume can't grow this process's own memory unbounded — only the
+    // trailing STDERR_TAIL_CHARS characters ever survive.
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderrTail += chunk.toString('utf8');
+      if (stderrTail.length > STDERR_TAIL_CHARS * 4) {
+        stderrTail = stderrTail.slice(-STDERR_TAIL_CHARS);
+      }
+    });
+
+    function clearTimers(): void {
+      clearTimeout(killTimer);
+      clearTimeout(graceTimer);
+      clearTimeout(closeFallbackTimer);
+    }
+
+    function finish(outcome: ExecOutcome): void {
+      if (settled) return;
+      settled = true;
+      clearTimers();
+      resolve(outcome);
+    }
+
+    function resolveFromExit(
+      code: number | null,
+      signal: NodeJS.Signals | null,
+    ): void {
+      const tail = stderrTail.slice(-STDERR_TAIL_CHARS);
+      if (timedOut) {
+        finish({
+          kind: 'failure',
+          error: `Command timed out after ${String(scope.timeoutMs)}ms`,
+          stderrTail: tail,
+        });
+        return;
+      }
+      if (signal !== null) {
+        // Terminated by a signal we did not send ourselves (timedOut is false) — no
+        // usable result was produced (003 §11.5).
+        finish({
+          kind: 'failure',
+          error: `Command terminated by signal ${signal}`,
+          stderrTail: tail,
+        });
+        return;
+      }
+      finish({
+        kind: 'result',
+        result: {
+          stdout: Buffer.concat(stdoutChunks).toString('utf8'),
+          exitCode: code ?? 0,
+          truncated,
+        },
+      });
+    }
+
+    child.once('error', (error) => {
+      finish({
+        kind: 'failure',
+        error: error.message,
+        stderrTail: stderrTail.slice(-STDERR_TAIL_CHARS),
+      });
+    });
+
+    child.once('exit', (code, signal) => {
+      if (settled) return;
+      if (timedOut) {
+        // Resolve from the direct child's own exit — never wait on stdio stream
+        // close here. An orphaned descendant that inherited stdout/stderr (e.g.
+        // `sleep` under `sh -c 'sleep 30 & wait'`) can hold those pipes open
+        // indefinitely even once the whole process group has been signaled; gating
+        // resolution on `close` would hang this call forever in that case — the
+        // exact bug this fixes (003 §11.7, issue #303).
+        resolveFromExit(code, signal);
+        return;
+      }
+      // Normal completion: give stdio a bounded window to `close` so a fast,
+      // well-behaved command's full output is still captured (the existing accurate
+      // behavior). The `close` listener below cancels this fallback the moment
+      // streams actually close, which happens within milliseconds unless a
+      // descendant is holding them open.
+      closeFallbackTimer = setTimeout(() => {
+        resolveFromExit(code, signal);
+      }, CLOSE_FALLBACK_MS);
+      closeFallbackTimer.unref();
+    });
+
+    child.once('close', (code, signal) => {
+      if (settled) return;
+      resolveFromExit(code, signal);
+    });
+
+    // Wall-clock timeout: SIGTERM the whole process group, then SIGKILL after a 5s
+    // grace (003 §11.2). Targeting the group — not just the direct child — is what
+    // guarantees no orphaned descendant survives (003 §11.7, issue #303).
     const killTimer = setTimeout(() => {
       timedOut = true;
-      child.kill('SIGTERM');
+      killProcessTree(child, 'SIGTERM', isWindows);
       graceTimer = setTimeout(() => {
-        child.kill('SIGKILL');
+        killProcessTree(child, 'SIGKILL', isWindows);
       }, SIGKILL_GRACE_MS);
       // graceTimer must not keep the event loop alive on its own.
       graceTimer.unref();
     }, scope.timeoutMs);
     killTimer.unref();
   });
-}
-
-/**
- * Cap a stdout buffer at 1 MiB, marking `truncated` on overflow (003 §11.2). The
- * captured slice is always the same leading `STDOUT_CAP_BYTES` bytes, so two
- * truncated captures of identical leading content diff as unchanged. `overflowed`
- * is set when execFile's maxBuffer guard fired (the child produced more than the cap).
- */
-function capStdout(
-  stdout: Buffer,
-  overflowed: boolean,
-): { text: string; truncated: boolean } {
-  const truncated = overflowed || stdout.length > STDOUT_CAP_BYTES;
-  const slice =
-    stdout.length > STDOUT_CAP_BYTES
-      ? stdout.subarray(0, STDOUT_CAP_BYTES)
-      : stdout;
-  return { text: slice.toString('utf8'), truncated };
 }
 
 /** Recursively sort object keys for order-insensitive JSON comparison (mirrors api-poll). */
