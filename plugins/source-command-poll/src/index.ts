@@ -257,7 +257,9 @@ async function runCommand(scope: ScopeConfig): Promise<ExecOutcome> {
     let settled = false;
     let timedOut = false;
     let truncated = false;
-    let graceTimer: ReturnType<typeof setTimeout> | undefined;
+    // Post-timeout SIGKILL escalation timer (003 §11.2/§11.7, issue #303). Deliberately
+    // NOT cleared by `finish()`/`clearTimers()` below — see the comment there.
+    let sigkillTimer: ReturnType<typeof setTimeout> | undefined;
     let closeFallbackTimer: ReturnType<typeof setTimeout> | undefined;
 
     const stdoutChunks: Buffer[] = [];
@@ -294,9 +296,18 @@ async function runCommand(scope: ScopeConfig): Promise<ExecOutcome> {
     });
 
     function clearTimers(): void {
-      clearTimeout(killTimer);
-      clearTimeout(graceTimer);
+      clearTimeout(wallClockTimer);
       clearTimeout(closeFallbackTimer);
+      // `sigkillTimer` is deliberately NOT cleared here. It targets the whole
+      // process GROUP with SIGKILL after the SIGTERM grace period, and must run to
+      // completion even once this promise has already settled: a direct child can
+      // exit on SIGTERM (default disposition) while a descendant it backgrounded
+      // has SIGTERM ignored (e.g. inherited via `exec` from a subshell that
+      // trapped it) and so survives untouched. Cancelling the pending SIGKILL as
+      // soon as the direct child's own `exit` resolved this promise would leave
+      // that descendant orphaned forever (003 §11.7, issue #303). Firing SIGKILL
+      // on an already-empty process group is caught and ignored in
+      // `killProcessTree`, so leaving it armed is always safe.
     }
 
     function finish(outcome: ExecOutcome): void {
@@ -359,11 +370,20 @@ async function runCommand(scope: ScopeConfig): Promise<ExecOutcome> {
         resolveFromExit(code, signal);
         return;
       }
-      // Normal completion: give stdio a bounded window to `close` so a fast,
-      // well-behaved command's full output is still captured (the existing accurate
-      // behavior). The `close` listener below cancels this fallback the moment
-      // streams actually close, which happens within milliseconds unless a
-      // descendant is holding them open.
+      // Normal completion: disarm the wall-clock timeout immediately. Without this,
+      // it stays armed for up to CLOSE_FALLBACK_MS more while we wait below for
+      // stdio to `close` (e.g. a descendant inherited stdout and is holding it
+      // open) — if `scope.timeoutMs` is short enough to elapse during that wait,
+      // it would fire, set `timedOut = true`, and retroactively flip this already-
+      // successful exit into a reported timeout once the fallback resolves
+      // (003 §11.2, issue #303). The direct child is confirmed exited here, so the
+      // wall-clock timeout has nothing left to bound.
+      clearTimeout(wallClockTimer);
+      // Give stdio a bounded window to `close` so a fast, well-behaved command's
+      // full output is still captured (the existing accurate behavior). The
+      // `close` listener below cancels this fallback the moment streams actually
+      // close, which happens within milliseconds unless a descendant is holding
+      // them open.
       closeFallbackTimer = setTimeout(() => {
         resolveFromExit(code, signal);
       }, CLOSE_FALLBACK_MS);
@@ -378,16 +398,23 @@ async function runCommand(scope: ScopeConfig): Promise<ExecOutcome> {
     // Wall-clock timeout: SIGTERM the whole process group, then SIGKILL after a 5s
     // grace (003 §11.2). Targeting the group — not just the direct child — is what
     // guarantees no orphaned descendant survives (003 §11.7, issue #303).
-    const killTimer = setTimeout(() => {
+    const wallClockTimer = setTimeout(() => {
       timedOut = true;
       killProcessTree(child, 'SIGTERM', isWindows);
-      graceTimer = setTimeout(() => {
+      // Unconditional: this must run to completion and SIGKILL the process group
+      // even if the direct child has already exited and `finish()` has already
+      // settled the promise (see the comment in `clearTimers` above) — a
+      // descendant that ignores SIGTERM while the direct child dies from it is
+      // otherwise never reaped (003 §11.7, issue #303). Signaling an
+      // already-empty process group throws ESRCH, which `killProcessTree` catches
+      // and ignores.
+      sigkillTimer = setTimeout(() => {
         killProcessTree(child, 'SIGKILL', isWindows);
       }, SIGKILL_GRACE_MS);
-      // graceTimer must not keep the event loop alive on its own.
-      graceTimer.unref();
+      // sigkillTimer must not keep the event loop alive on its own.
+      sigkillTimer.unref();
     }, scope.timeoutMs);
-    killTimer.unref();
+    wallClockTimer.unref();
   });
 }
 

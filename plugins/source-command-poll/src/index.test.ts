@@ -898,6 +898,102 @@ describe.skipIf(process.platform === 'win32')(
         rmSync(dir, { recursive: true, force: true });
       }
     });
+
+    /**
+     * Regression test for the Copilot finding on PR #430 (issue #303): the direct
+     * child can exit on SIGTERM (its own disposition is default-terminate) while a
+     * descendant it backgrounded has SIGTERM disposition set to ignore — inherited
+     * via `exec` from a subshell that trapped it — and so survives the group
+     * SIGTERM untouched. The buggy code cleared the pending SIGKILL grace-timer as
+     * soon as `finish()` ran for the direct child's `exit` event, cancelling the
+     * follow-up SIGKILL before it could ever reach the still-alive descendant. The
+     * fix must let the grace timer run to completion — and unconditionally SIGKILL
+     * the process group — independent of whether the direct child already exited
+     * and the outer promise already settled.
+     */
+    it('SIGKILLs a descendant that ignores SIGTERM even though the direct shell exits on SIGTERM first', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'am-303-ignore-term-'));
+      const pidFile = join(dir, 'child.pid');
+      try {
+        const hung = {
+          command: [
+            'sh',
+            '-c',
+            `(trap '' TERM; exec sleep 30) & echo $! > ${pidFile}; wait`,
+          ],
+          timeout: '1s',
+        };
+
+        const result = await source.observe(hung, ctx());
+
+        // Same transition-edge failure semantics as any other timeout.
+        expect(result.observations).toHaveLength(1);
+        expect(result.observations[0]?.title).toContain('Command failing');
+        const payload = result.observations[0]?.payload as { error: string };
+        expect(payload.error).toMatch(/timed out/i);
+
+        const grandchildPid = Number(readFileSync(pidFile, 'utf8').trim());
+        expect(Number.isInteger(grandchildPid)).toBe(true);
+
+        // The direct shell dies on the initial SIGTERM (well within timeout +
+        // slack); the descendant ignores that same SIGTERM and can only be
+        // reaped by the SIGKILL the grace timer must still deliver after it —
+        // proving the grace timer was not cancelled by the direct child's exit.
+        const dead = await pollUntil(
+          () => !isProcessAlive(grandchildPid),
+          6_000,
+        );
+        expect(dead).toBe(true);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }, 12_000);
+  },
+);
+
+/**
+ * Regression test for the Copilot finding on PR #430 (issue #303): the wall-clock
+ * timeout timer previously stayed armed until the promise actually settled. When
+ * the direct child exits successfully but a backgrounded descendant inherits
+ * stdout and holds it open, the code waits up to `CLOSE_FALLBACK_MS` for `close`
+ * before falling back — and if the wall-clock timer fires during that wait, it
+ * flips an already-successful exit into a reported timeout. The fix must disarm
+ * the wall-clock timer the moment the direct child is known to have exited
+ * normally, so it can never race the close-fallback wait.
+ */
+describe.skipIf(process.platform === 'win32')(
+  'source-command-poll: a lingering descendant never retro-flags a successful exit as a timeout (issue #303)',
+  () => {
+    it('reports success, not a timeout, when a backgrounded descendant holds stdout open past the wall-clock deadline', async () => {
+      // The shell echoes output and exits almost immediately; a backgrounded
+      // `sleep` inherits stdout and keeps it open well past both the 1s
+      // wall-clock timeout and the close-fallback window, but must never cause
+      // the already-successful exit to be reported as a timeout.
+      const fast = {
+        command: ['sh', '-c', 'echo hi; sleep 5 & exit 0'],
+        timeout: '1s',
+      };
+
+      const baseline = await source.observe(
+        { command: nodeArgv('process.stdout.write("seed")') },
+        ctx(),
+      );
+
+      const start = Date.now();
+      const result = await source.observe(fast, ctx(baseline.nextState));
+      const elapsed = Date.now() - start;
+
+      // Resolved via the close-fallback well before the 1s wall-clock timeout
+      // could have any further chance to fire.
+      expect(elapsed).toBeLessThan(3_000);
+      expect(result.observations).toHaveLength(1);
+      expect(result.observations[0]?.title).toContain('Command output changed');
+      expect(result.nextState).toMatchObject({
+        health: 'ok',
+        baselined: true,
+        stdout: 'hi\n',
+      });
+    });
   },
 );
 
