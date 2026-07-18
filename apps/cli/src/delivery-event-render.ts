@@ -73,6 +73,34 @@ function boundDiff(diff: string): string {
 }
 
 /**
+ * Append `marker` to `body`, trimming `body` at a Unicode code-point boundary
+ * (never splitting a surrogate pair) only if the marker would push the result
+ * past `cap`, so the returned string — marker included — is always ≤ `cap`.
+ * Unlike {@link truncateWithMarker} (which appends the marker only when
+ * truncation is actually needed), this ALWAYS appends `marker` — it is for the
+ * caller's already-decided "this must carry the marker" branch: the single
+ * pathological case where one event's own block already exceeds the packing
+ * cap and must be shown partially. Shared by both injecting transports
+ * (`hook-deliver-render.ts`'s `additionalContext` cap and
+ * `channel-render.ts`'s `MAX_CHANNEL_CONTENT`) so the mid-truncation of a
+ * lone oversized event is implemented once.
+ */
+export function appendMarkerWithinCap(
+  body: string,
+  cap: number,
+  marker: string,
+): string {
+  const budget = Math.max(0, cap - marker.length);
+  if (body.length <= budget) return body + marker;
+  let out = '';
+  for (const ch of body) {
+    if (out.length + ch.length > budget) break;
+    out += ch;
+  }
+  return out + marker;
+}
+
+/**
  * Render one {@link DeliveryEventSummary} into its transport block:
  *
  * ```text

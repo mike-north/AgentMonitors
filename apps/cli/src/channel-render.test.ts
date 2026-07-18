@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import type { DeliveryClaim } from '@agentmonitors/core';
-import { renderChannelEvent } from './channel-render.js';
+import {
+  CHANNEL_DEFERRED_MARKER,
+  MAX_CHANNEL_CONTENT,
+  renderChannelEvent,
+} from './channel-render.js';
 import {
   DIFF_ELISION_MARKER,
   MAX_EVENT_DIFF,
@@ -238,11 +242,12 @@ describe('renderChannelEvent', () => {
     expect(meta.monitor_id).not.toMatch(/[<>[\]]/);
   });
 
-  // 006 §5.5: the channel claims the FULL delivered set (no `maxEvents`), so it
-  // MUST render every event it claims — the claimed set MUST equal the rendered
-  // set. A large coalesced delivery whose joined blocks exceed the old 4000-char
-  // hook cap must still render every block, uncut.
-  it('renders every event of a large coalesced claim with no overall content cap', () => {
+  // 006 §5.5: when the coalesced claim's blocks all fit under
+  // MAX_CHANNEL_CONTENT, the channel renders every event it claims uncut — the
+  // claimed set equals the rendered set. A large coalesced delivery whose
+  // joined blocks exceed the old 4000-char hook cap, but stay under
+  // MAX_CHANNEL_CONTENT, must still render every block, uncut.
+  it('renders every event of a large coalesced claim under the ceiling, uncut', () => {
     const events = Array.from({ length: 30 }, (_, i) => ({
       eventId: `e${i}`,
       monitorId: `monitor-${i}`,
@@ -267,6 +272,69 @@ describe('renderChannelEvent', () => {
     }
     // event_count reflects the full claimed/rendered set, not a partial one.
     expect(meta.event_count).toBe('30');
+  });
+
+  // Issue #442 (PR #442 review comment 3609314694): an OVERSIZED FIRST event
+  // must not bypass the ceiling. `packChannelEventsUnderCap` deliberately
+  // returns at least 1 for a non-empty list (forward progress), so `channel.ts`
+  // will size/reserve a single event even when that event's OWN body dwarfs
+  // MAX_CHANNEL_CONTENT — before this fix, `renderChannelEvent` joined the
+  // block unconditionally with no size check at all, reproducing exactly the
+  // on-head probe: a 5,000,000-char body yielding `{ cap: 20000, fit: 1,
+  // contentLength: 5000016 }`.
+  it('mid-truncates a single oversized event so the pushed content never exceeds the ceiling', () => {
+    const hugeBody = 'x'.repeat(5_000_000);
+    const { content } = renderChannelEvent(
+      makeClaim({
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'runaway-monitor',
+            title: 'huge payload',
+            summary: 'huge payload',
+            urgency: 'high',
+            createdAt: '2026-01-01T00:00:00.000Z',
+            body: hugeBody,
+          },
+        ],
+      }),
+    );
+    // The invariant the ceiling exists to guarantee, verified on the ACTUAL
+    // pushed content — not merely on what the packer sizing function returns.
+    expect(content.length).toBeLessThanOrEqual(MAX_CHANNEL_CONTENT);
+    // Signposted, not silently dropped: the still-unread full body is
+    // recoverable via `agentmonitors events list` (claiming ≠ acking, 006 §5.5).
+    expect(content).toContain(CHANNEL_DEFERRED_MARKER.trim());
+    // Still channel-safe: no tag-breakout characters survive truncation.
+    expect(content).not.toMatch(/[<>[\]\r]/);
+  });
+
+  // Same pathological case, but with a second small event queued behind the
+  // oversized first one: only the first block is mid-truncated; the second
+  // event was never claimed (packChannelEventsUnderCap returns exactly 1 here),
+  // so it must not appear at all — it stays pending for a later poll.
+  it('mid-truncates only the oversized first event when a claim carries just that one event', () => {
+    const hugeBody = 'y'.repeat(5_000_000);
+    const { content, meta } = renderChannelEvent(
+      makeClaim({
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'runaway-monitor',
+            title: 'huge payload',
+            summary: 'huge payload',
+            urgency: 'high',
+            createdAt: '2026-01-01T00:00:00.000Z',
+            body: hugeBody,
+          },
+        ],
+        unreadCounts: { low: 0, normal: 0, high: 2, total: 2 },
+      }),
+      { moreDeferred: true },
+    );
+    expect(content.length).toBeLessThanOrEqual(MAX_CHANNEL_CONTENT);
+    expect(content).toContain(CHANNEL_DEFERRED_MARKER.trim());
+    expect(meta.event_count).toBe('1');
   });
 
   // Issue #436: a normal-band reminder carries no concrete events, but its

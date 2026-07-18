@@ -1,7 +1,9 @@
 import type { DeliveryClaim, DeliveryEventSummary } from '@agentmonitors/core';
 import {
+  appendMarkerWithinCap,
   buildEventBlock,
   packEventsUnderCap as packSharedEventsUnderCap,
+  packWholeBlocks,
 } from './delivery-event-render.js';
 
 // Channel `meta` values become tag attributes, so strip anything that could
@@ -35,9 +37,12 @@ function contentValue(value: string): string {
  * notification. The invariant that makes this safe (006 §5.5, "claimed set
  * equals rendered set") is preserved: the ceiling sizes how many WHOLE event
  * blocks are RESERVED/CLAIMED (`packChannelEventsUnderCap`, used by
- * `channel.ts` before calling `reserveDelivery`), never how many of an
- * already-claimed set are rendered — `renderChannelEvent` still renders every
- * event in the claim it is given.
+ * `channel.ts` before calling `reserveDelivery`), never by dropping a block
+ * from an already-claimed render. `renderChannelEvent` still carries a
+ * defense-in-depth truncation for the one case sizing cannot prevent: a
+ * single event whose own block already exceeds this ceiling (or a claim whose
+ * actual events differ from what was sized — issue #442) — see its doc
+ * comment.
  */
 export const MAX_CHANNEL_CONTENT = 20_000;
 
@@ -103,24 +108,37 @@ export interface RenderChannelEventOptions {
  * `message`) renders that message as-is (subject to the same tag-safety
  * sanitization as the body-injection path), staying generic (002 §9.2).
  *
- * **The channel surface IS bounded (006 §5.5), but by packing WHOLE event
- * blocks under {@link MAX_CHANNEL_CONTENT} BEFORE reserving, never by cutting
- * an already-claimed render.** `renderChannelEvent` itself renders every event
- * in the `claim` it is given — it never drops a block to fit a cap. The
- * boundedness instead lives in `channel.ts`: it previews the settled-high
- * delivery, sizes how many whole blocks fit via
- * {@link packChannelEventsUnderCap}, and reserves/claims exactly that many
- * (`reserveDelivery`'s `maxEvents`), so the deferred remainder stays pending
- * and re-delivers on a later poll. This is what makes claimed-set-equals-
- * rendered-set (006 §5.5) compatible with boundedness: capping `content` here,
- * after commit, would have dropped later blocks from the rendered tag while
- * the whole claim was still committed — silently omitting claimed-but-
- * unrendered events. When the caller passes `options.moreDeferred` (some
- * settled-high events did not make this push), {@link CHANNEL_DEFERRED_MARKER}
- * is appended so the agent knows more is pending. Per-event change summaries
- * remain individually bounded inside {@link buildEventBlock} (006 §4.6,
- * currently 800 chars each) so no single untrusted diff is dumped wholesale
- * regardless of packing.
+ * **The channel surface IS bounded (006 §5.5), primarily by packing WHOLE
+ * event blocks under {@link MAX_CHANNEL_CONTENT} BEFORE reserving, not by
+ * cutting an already-claimed render.** The boundedness mostly lives in
+ * `channel.ts`: it previews the settled-high delivery, sizes how many whole
+ * blocks fit via {@link packChannelEventsUnderCap}, and reserves/claims
+ * exactly that many (`reserveDelivery`'s `maxEvents`), so the deferred
+ * remainder stays pending and re-delivers on a later poll. This is what makes
+ * claimed-set-equals-rendered-set (006 §5.5) compatible with boundedness in
+ * the common case: capping `content` here, after commit, would otherwise drop
+ * later blocks from the rendered tag while the whole claim was still
+ * committed — silently omitting claimed-but-unrendered events.
+ *
+ * `renderChannelEvent` still carries its OWN defense-in-depth ceiling
+ * enforcement (issue #442), because sizing upstream cannot rule out every
+ * over-cap case: {@link packChannelEventsUnderCap} deliberately returns at
+ * least 1 for a non-empty list (forward progress) even when a single event's
+ * own block exceeds the ceiling, and a reserve can race the earlier preview
+ * (`channel.ts`'s `reserveSizedChannelDelivery`) so the actually-claimed
+ * events can differ from what was sized. So `renderChannelEvent` packs the
+ * claim's OWN blocks under {@link MAX_CHANNEL_CONTENT} again here: when every
+ * block fits (the expected, common case), nothing is cut. When it doesn't —
+ * or the caller passes `options.moreDeferred` (some settled-high events did
+ * not make this push) — {@link CHANNEL_DEFERRED_MARKER} is appended, sized
+ * with room reserved so no INCLUDED block is cut. Only in the single
+ * pathological case where even the first block alone exceeds
+ * `MAX_CHANNEL_CONTENT − CHANNEL_DEFERRED_MARKER.length` is it mid-truncated
+ * at a Unicode code-point boundary (mirroring the hook-deliver transport's
+ * `renderHookDelivery`) — its full body stays unread (claiming ≠ acking, BP2 /
+ * SP4). Per-event change summaries are ALSO individually bounded inside
+ * {@link buildEventBlock} (006 §4.6, currently 800 chars each), so no single
+ * untrusted diff is dumped wholesale regardless of packing.
  */
 export function renderChannelEvent(
   claim: DeliveryClaim,
@@ -131,17 +149,49 @@ export function renderChannelEvent(
 } {
   // Body-injection claim → render the concrete event blocks (title + monitor
   // body + bounded change summary), matching the hook path. Reminder claim (no
-  // events) → the coalesced advisory message, kept generic. `renderChannelEvent`
-  // renders every event it is given; boundedness is enforced upstream by
-  // packing WHOLE blocks under the ceiling before reserving (006 §5.5).
-  let content =
-    claim.events.length > 0
-      ? claim.events
-          .map((event) => buildEventBlock(event, contentValue))
-          .join('\n\n')
-      : contentValue(claim.message);
-  if (claim.events.length > 0 && (options.moreDeferred ?? false)) {
-    content += CHANNEL_DEFERRED_MARKER;
+  // events) → the coalesced advisory message, kept generic. Boundedness is
+  // enforced upstream (packing WHOLE blocks under the ceiling before
+  // reserving, 006 §5.5) — but this pack-and-truncate is repeated here as a
+  // defense-in-depth ceiling enforcement (issue #442): sizing upstream cannot
+  // rule out every over-cap case (see the doc comment above).
+  let content: string;
+  if (claim.events.length > 0) {
+    const moreDeferred = options.moreDeferred ?? false;
+    const blocks = claim.events.map((event) =>
+      buildEventBlock(event, contentValue),
+    );
+    const whole = packWholeBlocks(blocks, MAX_CHANNEL_CONTENT, {
+      joiner: '\n\n',
+    });
+    if (whole.includedCount === blocks.length && !moreDeferred) {
+      // Every claimed block fits and nothing was deferred → no marker.
+      content = whole.text;
+    } else {
+      // A marker is needed (some claimed blocks did not fit here, and/or the
+      // caller deferred more): repack reserving marker room so no INCLUDED
+      // block is cut.
+      const reserved = packWholeBlocks(
+        blocks,
+        MAX_CHANNEL_CONTENT - CHANNEL_DEFERRED_MARKER.length,
+        { joiner: '\n\n' },
+      );
+      if (reserved.includedCount >= 1) {
+        content = reserved.text + CHANNEL_DEFERRED_MARKER;
+      } else {
+        // Even the first block alone exceeds (cap − marker): mid-truncate it
+        // at a code-point boundary. This is the ONLY case a durable event is
+        // shown partially; its full body stays unread (claiming ≠ acking,
+        // 006 §5.5).
+        const firstBlock = blocks[0] ?? '';
+        content = appendMarkerWithinCap(
+          firstBlock,
+          MAX_CHANNEL_CONTENT,
+          CHANNEL_DEFERRED_MARKER,
+        );
+      }
+    }
+  } else {
+    content = contentValue(claim.message);
   }
 
   // A reminder claim carries no concrete events (`events: []`), so `event_count`

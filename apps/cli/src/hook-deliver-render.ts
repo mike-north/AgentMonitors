@@ -1,5 +1,6 @@
 import type { DeliveryClaim, DeliveryEventSummary } from '@agentmonitors/core';
 import {
+  appendMarkerWithinCap as appendSharedMarkerWithinCap,
   buildEventBlock as buildSharedEventBlock,
   packEventsUnderCap as packSharedEventsUnderCap,
   packWholeBlocks as packSharedWholeBlocks,
@@ -88,14 +89,7 @@ function truncateForCap(value: string, cap: number): string {
  * partially (see {@link renderHookDelivery}).
  */
 function appendMarkerWithinCap(body: string, cap: number): string {
-  const budget = Math.max(0, cap - TRUNCATION_MARKER.length);
-  if (body.length <= budget) return body + TRUNCATION_MARKER;
-  let out = '';
-  for (const ch of body) {
-    if (out.length + ch.length > budget) break;
-    out += ch;
-  }
-  return out + TRUNCATION_MARKER;
+  return appendSharedMarkerWithinCap(body, cap, TRUNCATION_MARKER);
 }
 
 /** The fixed prefix of a body-injection payload: lead line + blank line. */
