@@ -1286,6 +1286,30 @@ SIGKILL after a 5s grace). `stdout` capture is capped at **1 MiB**; output beyon
 discarded and the result is marked `truncated: true` (a truncated result still diffs — but see the
 validation note in §11.7).
 
+**The timeout escalation targets the command's entire process tree, not just the direct child**
+(issue #303). A supported command may itself invoke a shell that backgrounds a worker
+(`['sh', '-c', 'sleep 30 & wait']`) or spawn its own subprocesses; killing only the direct child
+would leave such descendants running after the observation is reported as timed out — a resource
+leak (accumulated long-lived processes across repeated polls) and a spec violation (§11.7 requires
+no orphan). Platform-specific mechanism:
+
+- **POSIX:** each spawn runs as the leader of its own process group/session (`detached: true`); the
+  timeout escalation signals the **negative PID** (`process.kill(-pid, 'SIGTERM')`, then
+  `'SIGKILL'` after the grace), which targets the whole group at once.
+- **Windows:** there is no process-group-signal equivalent, and no reliable graceful signal for a
+  non-console-attached spawned process (`taskkill` without `/F` frequently fails silently for this
+  kind of child). The documented choice is `taskkill /PID <pid> /T /F` — forceful and tree-wide —
+  issued at both the timeout expiry and the grace follow-up; there is no softer phase to escalate
+  from on this platform.
+
+Resolution on timeout is driven by the direct child's own `exit` event, never by waiting for its
+stdio streams to `close`. A descendant that inherited stdout/stderr (the `sleep` in the example
+above) can hold those pipes open indefinitely even after the whole process group has been signaled;
+gating resolution on stream close would hang the observation forever in that case — the failure
+mode #303 fixes. A short bounded fallback (2s) applies the same principle to ordinary, non-timeout
+completions, so a well-formed command can never hang this call either; a normal command's streams
+close within milliseconds of exit, so this never adds latency in the common case.
+
 The **result** of an execution is `(exitCode, stdout)`. A **nonzero exit code with output is a
 valid result, not a failure** — many CLIs exit nonzero meaningfully (`grep`, linters, a task CLI
 whose backing app is closed). The failure category is reserved for executions that produce no
@@ -1404,6 +1428,15 @@ issue #86's AC1–AC7):
 - `timeout` kills a hung child within the grace period and leaves no orphan process (AC6: _"a
   timed-out child leaves no orphan (killed within the grace window)"_, mirroring the daemon-test
   no-orphan discipline).
+- `timeout` kills the command's **entire process tree**, not just the direct child, and does so
+  without hanging on a descendant that inherited stdout/stderr (issue #303: _"timed-out sh -c
+  descendant is fully terminated"_ — `sh -c 'sleep 30 & wait'`, the supported shell-pipeline idiom
+  from §11.1, leaves no live descendant, verified by PID rather than process-tree membership since
+  an orphan is reparented away from the test process the instant its true parent dies). The same
+  guarantee is verified end to end through a live `daemon run` subprocess and a real `daemon stop`
+  (verified: `apps/cli/src/commands/cli.integration.test.ts` — _"a live daemon kills a backgrounded
+  sh -c descendant on tick timeout, and shutdown leaves it dead"_), so the no-orphan property holds
+  not just per-call but across the daemon's own shutdown.
 - Registration + the `init --type command-poll` template + `validate` accepting/rejecting a
   `command-poll` monitor are covered at the CLI layer (AC7: verified:
   `apps/cli/src/commands/cli.integration.test.ts` — _"scaffolds a command-poll monitor that passes

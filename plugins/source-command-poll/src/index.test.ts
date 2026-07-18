@@ -9,6 +9,9 @@
  * genuinely exercised — not a hand-built approximation. Dates are fixed; no network.
  */
 import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type {
   ObservationContext,
@@ -834,6 +837,197 @@ describe.skipIf(!PGREP_AVAILABLE)(
     });
   },
 );
+
+/**
+ * Regression test for issue #303: `command-poll` timeout previously signaled only
+ * the direct child (`child.kill()`), so a command that backgrounds a worker via a
+ * shell — `sh -c 'sleep 30 & wait'`, the repro from the issue — left the `sleep`
+ * grandchild running after the shell was killed. `pgrep -P <thisProcess>` (used by
+ * the block above) can never catch this: `sleep`'s parent is the shell, not this
+ * test process, so a grandchild leak is invisible to a direct-children-only check
+ * even before the kernel reparents it away. This test instead captures the
+ * grandchild's own PID (the same way the issue's repro does) and asserts by PID —
+ * independent of process-tree membership, so it still catches an orphan after
+ * reparenting.
+ *
+ * Skipped on Windows: `sh` and POSIX process-group semantics don't apply there.
+ * The Windows tree-kill path (`taskkill /T /F` in `killProcessTree`) is exercised
+ * by the ordinary timeout test above on every platform (direct-child kill), which
+ * proves the code path executes; verifying POSIX process-group semantics
+ * specifically needs `sh`.
+ */
+describe.skipIf(process.platform === 'win32')(
+  'source-command-poll: timed-out sh -c descendant is fully terminated (003 §11.7, issue #303)',
+  () => {
+    it('kills the backgrounded grandchild, not just the shell', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'am-303-'));
+      const pidFile = join(dir, 'child.pid');
+      try {
+        const hung = {
+          command: ['sh', '-c', `sleep 30 & echo $! > ${pidFile}; wait`],
+          timeout: '1s',
+        };
+
+        const start = Date.now();
+        const result = await source.observe(hung, ctx());
+        const elapsed = Date.now() - start;
+
+        // Same transition-edge failure semantics as any other timeout (003 §11.5)
+        // — this fix must not change that.
+        expect(result.observations).toHaveLength(1);
+        expect(result.observations[0]?.title).toContain('Command failing');
+        const payload = result.observations[0]?.payload as { error: string };
+        expect(payload.error).toMatch(/timed out/i);
+        expect(result.nextState).toMatchObject({ health: 'failing' });
+
+        // Resolves within timeout + grace + slack — never hangs waiting on the
+        // grandchild's inherited stdout/stderr streams to close (003 §11.7).
+        expect(elapsed).toBeLessThan(1_000 + 5_000 + 3_000);
+
+        const grandchildPid = Number(readFileSync(pidFile, 'utf8').trim());
+        expect(Number.isInteger(grandchildPid)).toBe(true);
+
+        // Poll for the grandchild's death with a deadline rather than a fixed
+        // sleep — SIGKILL delivery after the grace period is not instantaneous.
+        const dead = await pollUntil(
+          () => !isProcessAlive(grandchildPid),
+          6_000,
+        );
+        expect(dead).toBe(true);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    /**
+     * Regression test for the Copilot finding on PR #430 (issue #303): the direct
+     * child can exit on SIGTERM (its own disposition is default-terminate) while a
+     * descendant it backgrounded has SIGTERM disposition set to ignore — inherited
+     * via `exec` from a subshell that trapped it — and so survives the group
+     * SIGTERM untouched. The buggy code cleared the pending SIGKILL grace-timer as
+     * soon as `finish()` ran for the direct child's `exit` event, cancelling the
+     * follow-up SIGKILL before it could ever reach the still-alive descendant. The
+     * fix must let the grace timer run to completion — and unconditionally SIGKILL
+     * the process group — independent of whether the direct child already exited
+     * and the outer promise already settled.
+     */
+    it('SIGKILLs a descendant that ignores SIGTERM even though the direct shell exits on SIGTERM first', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'am-303-ignore-term-'));
+      const pidFile = join(dir, 'child.pid');
+      try {
+        const hung = {
+          command: [
+            'sh',
+            '-c',
+            `(trap '' TERM; exec sleep 30) & echo $! > ${pidFile}; wait`,
+          ],
+          timeout: '1s',
+        };
+
+        const result = await source.observe(hung, ctx());
+
+        // Same transition-edge failure semantics as any other timeout.
+        expect(result.observations).toHaveLength(1);
+        expect(result.observations[0]?.title).toContain('Command failing');
+        const payload = result.observations[0]?.payload as { error: string };
+        expect(payload.error).toMatch(/timed out/i);
+
+        const grandchildPid = Number(readFileSync(pidFile, 'utf8').trim());
+        expect(Number.isInteger(grandchildPid)).toBe(true);
+
+        // The direct shell dies on the initial SIGTERM (well within timeout +
+        // slack); the descendant ignores that same SIGTERM and can only be
+        // reaped by the SIGKILL the grace timer must still deliver after it —
+        // proving the grace timer was not cancelled by the direct child's exit.
+        const dead = await pollUntil(
+          () => !isProcessAlive(grandchildPid),
+          6_000,
+        );
+        expect(dead).toBe(true);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }, 12_000);
+  },
+);
+
+/**
+ * Regression test for the Copilot finding on PR #430 (issue #303): the wall-clock
+ * timeout timer previously stayed armed until the promise actually settled. When
+ * the direct child exits successfully but a backgrounded descendant inherits
+ * stdout and holds it open, the code waits up to `CLOSE_FALLBACK_MS` for `close`
+ * before falling back — and if the wall-clock timer fires during that wait, it
+ * flips an already-successful exit into a reported timeout. The fix must disarm
+ * the wall-clock timer the moment the direct child is known to have exited
+ * normally, so it can never race the close-fallback wait.
+ */
+describe.skipIf(process.platform === 'win32')(
+  'source-command-poll: a lingering descendant never retro-flags a successful exit as a timeout (issue #303)',
+  () => {
+    it('reports success, not a timeout, when a backgrounded descendant holds stdout open past the wall-clock deadline', async () => {
+      // The shell echoes output and exits almost immediately; a backgrounded
+      // `sleep` inherits stdout and keeps it open well past both the 1s
+      // wall-clock timeout and the close-fallback window, but must never cause
+      // the already-successful exit to be reported as a timeout.
+      const fast = {
+        command: ['sh', '-c', 'echo hi; sleep 5 & exit 0'],
+        timeout: '1s',
+      };
+
+      const baseline = await source.observe(
+        { command: nodeArgv('process.stdout.write("seed")') },
+        ctx(),
+      );
+
+      const start = Date.now();
+      const result = await source.observe(fast, ctx(baseline.nextState));
+      const elapsed = Date.now() - start;
+
+      // Resolved via the close-fallback well before the 1s wall-clock timeout
+      // could have any further chance to fire.
+      expect(elapsed).toBeLessThan(3_000);
+      expect(result.observations).toHaveLength(1);
+      expect(result.observations[0]?.title).toContain('Command output changed');
+      expect(result.nextState).toMatchObject({
+        health: 'ok',
+        baselined: true,
+        stdout: 'hi\n',
+      });
+    });
+  },
+);
+
+/**
+ * Whether `pid` currently identifies a live process, checked via POSIX `kill(pid,
+ * 0)` semantics (no actual signal sent). Distinct from `childProcessCount`'s
+ * tree-membership check: this works even after the process has been reparented
+ * away from us, which is exactly what happens to an orphan.
+ */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    const err = e as NodeJS.ErrnoException;
+    // ESRCH: no such process — genuinely dead. Any other error (e.g. EPERM,
+    // meaning it exists but we lack permission to signal it) means it is alive.
+    return err.code !== 'ESRCH';
+  }
+}
+
+/** Poll `predicate` until it returns true or `deadlineMs` elapses. */
+async function pollUntil(
+  predicate: () => boolean,
+  deadlineMs: number,
+  intervalMs = 100,
+): Promise<boolean> {
+  const deadline = Date.now() + deadlineMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  return predicate();
+}
 
 /**
  * Count direct child processes of this test process via POSIX `pgrep`.

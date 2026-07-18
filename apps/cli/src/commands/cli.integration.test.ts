@@ -3060,6 +3060,168 @@ describe('daemon run — explicit --socket over the AF_UNIX limit (issue #337)',
 });
 
 /**
+ * Issue #303: `command-poll` timeout must terminate the entire process tree,
+ * not just the direct child — and the daemon's own shutdown must never leave
+ * a live descendant behind either.
+ * `plugins/source-command-poll/src/index.test.ts` proves the per-call fix in
+ * isolation (unit level, same `sh -c 'sleep … & wait'` repro shape as the
+ * issue); this exercises the same guarantee through a real `daemon run`
+ * subprocess and a real `daemon stop`, matching the no-orphan-daemon
+ * discipline already used throughout this file.
+ *
+ * @see https://github.com/mike-north/AgentMonitors/issues/303
+ */
+describe('daemon run: command-poll timeout leaves no descendant after shutdown (issue #303)', () => {
+  /**
+   * POSIX liveness check by exact PID (`kill(pid, 0)` sends no signal), not
+   * process-tree membership — an orphan is reparented away from this test
+   * process the moment its true parent dies, so a tree-walk (`pgrep -P`)
+   * would miss it even before we get a chance to look.
+   */
+  function isProcessAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (e) {
+      const err = e as NodeJS.ErrnoException;
+      // ESRCH: no such process — genuinely dead. Any other error (e.g.
+      // EPERM, meaning it exists but we lack permission to signal it) means
+      // it is still alive.
+      return err.code !== 'ESRCH';
+    }
+  }
+
+  async function pollUntil(
+    predicate: () => boolean,
+    deadlineMs: number,
+    intervalMs = 100,
+  ): Promise<boolean> {
+    const deadline = Date.now() + deadlineMs;
+    while (Date.now() < deadline) {
+      if (predicate()) return true;
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+    return predicate();
+  }
+
+  it('a live daemon kills a backgrounded sh -c descendant on tick timeout, and shutdown leaves it dead', async () => {
+    if (process.platform === 'win32') return;
+
+    const dir = path.join(tempDir, 'daemon-303-no-orphan');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    const monitorDir = path.join(monitorsRoot, 'hung-cmd');
+    mkdirSync(monitorDir, { recursive: true });
+    const pidFile = path.join(dir, 'child.pid');
+
+    writeFileSync(
+      path.join(monitorDir, 'MONITOR.md'),
+      `---
+name: Backgrounds a descendant
+watch:
+  type: command-poll
+  command:
+    - sh
+    - '-c'
+    - "sleep 30 & echo $! > ${pidFile}; wait"
+  timeout: 1s
+  interval: 5s
+urgency: normal
+---
+When the command output changes, review it.
+`,
+      'utf-8',
+    );
+
+    const socketPath = path.join(dir, 'agentmon.sock');
+    const child = spawn(
+      'node',
+      [
+        CLI_PATH,
+        'daemon',
+        'run',
+        monitorsRoot,
+        '--workspace',
+        dir,
+        '--poll-ms',
+        '300',
+        '--reap-after-ms',
+        '0',
+        '--socket',
+        socketPath,
+      ],
+      {
+        cwd: dir,
+        env: { ...process.env, AGENTMONITORS_DB: ':memory:' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    );
+
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf-8');
+    child.stderr.setEncoding('utf-8');
+    child.stdout.on('data', (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.on('data', (chunk: string) => {
+      stderr += chunk;
+    });
+
+    try {
+      const listenDeadline = Date.now() + 15_000;
+      while (
+        Date.now() < listenDeadline &&
+        !stdout.includes('AgentMon daemon listening')
+      ) {
+        if (child.exitCode !== null) {
+          throw new Error(
+            `Daemon exited early with code ${String(child.exitCode)}.\nSTDOUT:\n${stdout}\nSTDERR:\n${stderr}`,
+          );
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      expect(stdout).toContain('AgentMon daemon listening');
+
+      // Wait for the pid file the backgrounded `sleep` writes on its way up
+      // — proves the monitor's command actually ran under the live daemon.
+      const pidFileDeadline = Date.now() + 10_000;
+      while (Date.now() < pidFileDeadline && !existsSync(pidFile)) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      expect(existsSync(pidFile)).toBe(true);
+      const grandchildPid = Number(readFileSync(pidFile, 'utf-8').trim());
+      expect(Number.isInteger(grandchildPid)).toBe(true);
+
+      // Give the per-observe timeout (1s) + grace (5s) time to land BEFORE
+      // shutdown, so this proves cleanup happens on the tick's own timeout
+      // — not merely as an accidental side effect of killing the daemon
+      // process itself below.
+      const preShutdownDead = await pollUntil(
+        () => !isProcessAlive(grandchildPid),
+        10_000,
+      );
+      expect(preShutdownDead).toBe(true);
+
+      // Now stop the daemon the normal way and confirm the descendant is
+      // (still) gone once the daemon has fully exited — the no-orphan-daemon
+      // discipline extended to command-poll's own children (issue #303).
+      await callDaemon('stop', {}, { socketPath });
+      await new Promise<void>((resolve) => {
+        if (child.exitCode !== null) {
+          resolve();
+          return;
+        }
+        child.once('exit', () => resolve());
+      });
+      expect(isProcessAlive(grandchildPid)).toBe(false);
+    } finally {
+      if (child.exitCode === null) child.kill('SIGTERM');
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
+/**
  * Issue #117: `daemon once` (and the `daemon run` periodic log) must stop
  * printing a clean `emitted 0 event(s)` when a monitor's `observe()` errored on
  * the tick — an author cannot otherwise distinguish a genuine no-change (not a
