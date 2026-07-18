@@ -1,5 +1,10 @@
 import type { DeliveryClaim, DeliveryEventSummary } from '@agentmonitors/core';
-import { buildEventBlock as buildSharedEventBlock } from './delivery-event-render.js';
+import {
+  buildEventBlock as buildSharedEventBlock,
+  packEventsUnderCap as packSharedEventsUnderCap,
+  packWholeBlocks as packSharedWholeBlocks,
+  truncateWithMarker,
+} from './delivery-event-render.js';
 
 const MAX_ADDITIONAL_CONTEXT = 4000;
 
@@ -67,27 +72,12 @@ export interface HookDeliveryOutput {
  * Truncate `value` so the returned string is at most `cap` UTF-16 code units,
  * cutting only at a Unicode CODE-POINT boundary (never splitting a surrogate
  * pair) and, when truncation occurs, appending {@link TRUNCATION_MARKER} so the
- * final string — marker included — is still ≤ `cap`.
- *
- * Iterating with `for…of` / `Array.from` walks code points, so an astral
- * character (emoji) at the boundary is dropped wholesale rather than leaving a
- * lone surrogate (which would corrupt the JSON the hook prints).
+ * final string — marker included — is still ≤ `cap`. Delegates to the shared
+ * {@link truncateWithMarker} (`delivery-event-render.ts`) so this transport and
+ * the channel's per-event diff bound share one code-point-safe implementation.
  */
 function truncateForCap(value: string, cap: number): string {
-  if (value.length <= cap) return value;
-
-  // Budget for the body so that body + marker ≤ cap. The marker is plain ASCII,
-  // so its UTF-16 length equals its code-point count.
-  const budget = Math.max(0, cap - TRUNCATION_MARKER.length);
-
-  let out = '';
-  for (const ch of value) {
-    // ch is a full code point (1 or 2 UTF-16 units); only append if it fits
-    // wholly within the budget, so a surrogate pair is never split.
-    if (out.length + ch.length > budget) break;
-    out += ch;
-  }
-  return out + TRUNCATION_MARKER;
+  return truncateWithMarker(value, cap, TRUNCATION_MARKER);
 }
 
 /**
@@ -126,22 +116,16 @@ function buildEventBlock(event: DeliveryEventSummary): string {
  * (`header` + blocks joined by `\n`) stays within `cap`. A block is added only
  * when it fits in full, so the visible set maps 1:1 to durable events — never a
  * partially-shown block, which would be a claimed-but-unread event with no clean
- * re-delivery boundary (issue #299).
+ * re-delivery boundary (issue #299). Thin wrapper over the transport-shared
+ * {@link packSharedWholeBlocks} (`delivery-event-render.ts`), fixing this
+ * transport's `\n` block joiner.
  */
 function packWholeBlocks(
   header: string,
   blocks: string[],
   cap: number,
 ): { text: string; includedCount: number } {
-  let body = '';
-  let includedCount = 0;
-  for (const block of blocks) {
-    const candidate = body === '' ? block : `${body}\n${block}`;
-    if ((header + candidate).length > cap) break;
-    body = candidate;
-    includedCount += 1;
-  }
-  return { text: header + body, includedCount };
+  return packSharedWholeBlocks(blocks, cap, { header, joiner: '\n' });
 }
 
 /**
@@ -149,7 +133,9 @@ function packWholeBlocks(
  * hook-deliver transport can render under its `additionalContext` cap
  * (006 §5.1, issue #299). The transport uses this to decide how many events to
  * CLAIM, so the claimed set equals the rendered set and the remainder stays
- * pending for the next context event.
+ * pending for the next context event. Thin wrapper over the transport-shared
+ * {@link packSharedEventsUnderCap} (`delivery-event-render.ts`), fixing this
+ * transport's `sanitize`, lead-line `HEADER`, and `TRUNCATION_MARKER` length.
  *
  * When not everything fits, room is reserved for the truncation marker so no
  * INCLUDED block is cut. At least 1 is returned when there is any event — there
@@ -162,18 +148,11 @@ export function packEventsUnderCap(
   events: DeliveryEventSummary[],
   cap: number = MAX_ADDITIONAL_CONTEXT,
 ): number {
-  if (events.length === 0) return 0;
-  const blocks = events.map(buildEventBlock);
-  const whole = packWholeBlocks(HEADER, blocks, cap);
-  // Everything fits → no marker needed → claim them all.
-  if (whole.includedCount === blocks.length) return blocks.length;
-  // A marker will be shown; reserve its room so an included block is never cut.
-  const reserved = packWholeBlocks(
-    HEADER,
-    blocks,
-    cap - TRUNCATION_MARKER.length,
-  );
-  return Math.max(1, reserved.includedCount);
+  return packSharedEventsUnderCap(events, sanitize, cap, {
+    header: HEADER,
+    joiner: '\n',
+    markerLength: TRUNCATION_MARKER.length,
+  });
 }
 
 /** Optional signals for {@link renderHookDelivery}. */

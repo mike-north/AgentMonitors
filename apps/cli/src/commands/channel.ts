@@ -11,13 +11,17 @@ import {
   acknowledgeEventsClient,
   commitDeliveryClient,
   openSessionClient,
+  previewSettledHighDeliveryClient,
   releaseDeliveryClient,
   reserveDeliveryClient,
 } from '../runtime-client.js';
 import { resolveSocketPath } from '../daemon-ipc.js';
 import { readLocalState } from '../local-state.js';
 import { workspacePaths } from '../workspace-paths.js';
-import { renderChannelEvent } from '../channel-render.js';
+import {
+  packChannelEventsUnderCap,
+  renderChannelEvent,
+} from '../channel-render.js';
 import { ACK_TOOL, parseAckArgs } from '../channel-ack.js';
 
 const DEFAULT_POLL_MS = 3000;
@@ -142,6 +146,20 @@ export type ChannelDeliveryOutcome =
  * transient failure never consumes the delivery. The rows are never
  * acknowledged by this path (BP2); a committed claim only means "was surfaced".
  *
+ * **Bounded reservation (006 §5.5, issue #442).** Before reserving, this
+ * PREVIEWS the settled high-urgency delivery (`previewSettledHighDeliveryClient`,
+ * without mutating state) and sizes how many WHOLE event blocks fit under the
+ * channel's content ceiling (`packChannelEventsUnderCap`,
+ * `channel-render.ts`) — mirroring exactly how the hook-deliver transport sizes
+ * its `additionalContext` cap (`hook-deliver-render.ts`'s `packEventsUnderCap`,
+ * issue #299). The computed count becomes `reserveDelivery`'s `maxEvents`, so
+ * the reserved/claimed set is sized to what `push` will actually render — the
+ * claimed set still equals the rendered set (006 §5.5) — and any settled-high
+ * events that do not fit stay pending, re-delivering on a later poll. `push`
+ * receives a second `moreDeferred` flag so the renderer can signpost that more
+ * is pending. A reminder claim (no settled-high events; `events: []`) needs no
+ * sizing, so `maxEvents` is simply omitted for it, exactly as before.
+ *
  * Reserve/commit/release IPC errors propagate to the caller (the poll loop maps
  * them to "daemon unreachable → drop the cached session"); a `push` rejection is
  * handled here (release + `'push-failed'`), not thrown. The `push` seam is what
@@ -151,16 +169,29 @@ export type ChannelDeliveryOutcome =
 export async function runChannelDeliveryCycle(
   boundSession: string,
   socketPath: string,
-  push: (claim: DeliveryClaim) => Promise<void>,
+  push: (claim: DeliveryClaim, moreDeferred: boolean) => Promise<void>,
 ): Promise<ChannelDeliveryOutcome> {
+  const highPreview = await previewSettledHighDeliveryClient(
+    boundSession,
+    socketPath,
+  );
+  let maxEvents: number | undefined;
+  let moreDeferred = false;
+  if (highPreview.length > 0) {
+    const fit = packChannelEventsUnderCap(highPreview);
+    maxEvents = fit;
+    moreDeferred = fit < highPreview.length;
+  }
+
   const reservation = await reserveDeliveryClient(
     boundSession,
     'turn-interruptible',
     socketPath,
+    maxEvents,
   );
   if (!reservation) return 'idle';
   try {
-    await push(reservation.claim);
+    await push(reservation.claim, moreDeferred);
   } catch {
     // Push rejected/disconnected: release the reservation so the leased rows
     // return to pending and re-deliver via the hook path or the next poll (006
@@ -297,8 +328,10 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
       const outcome = await runChannelDeliveryCycle(
         boundSession,
         socketPath,
-        (claim) => {
-          const { content, meta } = renderChannelEvent(claim);
+        (claim, moreDeferred) => {
+          const { content, meta } = renderChannelEvent(claim, {
+            moreDeferred,
+          });
           return mcp.notification({
             method: 'notifications/claude/channel',
             params: { content, meta },

@@ -9,8 +9,10 @@ import type { DeliveryEventSummary } from '@agentmonitors/core';
  * — the only per-transport difference is the {@link sanitize} function each
  * passes (the hook preserves `<>[]`, the channel strips them for tag safety) and
  * the overall cap/truncation each applies afterward. Before this was shared, the
- * channel rendered only the event *title*, silently dropping the monitor body and
- * the change summary the hook path already injected (issue #436).
+ * channel rendered only the event *title*, silently dropping the monitor body
+ * (issue #436) — the `Changes:` change-summary section and
+ * `DeliveryEventSummary.diffText` are BOTH new to this same change, on BOTH
+ * transports; the hook path never had a change summary to drop either.
  */
 
 /**
@@ -33,20 +35,41 @@ export const MAX_EVENT_DIFF = 800;
 export const DIFF_ELISION_MARKER = '\n… (change summary truncated)';
 
 /**
+ * Truncate `value` to at most `cap` UTF-16 code units, cutting only at a
+ * Unicode CODE-POINT boundary (never splitting a surrogate pair, which would
+ * corrupt downstream JSON/tag serialization) and, when truncation occurs,
+ * appending `marker` so the returned string — marker included — is still
+ * ≤ `cap`. Shared by every injecting transport's truncation path: the
+ * per-event diff bound below ({@link boundDiff}), the hook-deliver
+ * `additionalContext` cap (`hook-deliver-render.ts`'s `truncateForCap`), and
+ * the channel's overall packing marker (`channel-render.ts`). Before this was
+ * shared, `boundDiff` and `truncateForCap` were character-identical copies of
+ * this same code-point-safe truncation, differing only in their cap/marker
+ * constants.
+ */
+export function truncateWithMarker(
+  value: string,
+  cap: number,
+  marker: string,
+): string {
+  if (value.length <= cap) return value;
+  const budget = Math.max(0, cap - marker.length);
+  let out = '';
+  for (const ch of value) {
+    if (out.length + ch.length > budget) break;
+    out += ch;
+  }
+  return out + marker;
+}
+
+/**
  * Truncate `diff` to at most {@link MAX_EVENT_DIFF} code units, cutting at a
  * Unicode code-point boundary (never splitting a surrogate pair) and appending
  * {@link DIFF_ELISION_MARKER} when truncation occurs so the marker-included
  * result is still ≤ the cap.
  */
 function boundDiff(diff: string): string {
-  if (diff.length <= MAX_EVENT_DIFF) return diff;
-  const budget = Math.max(0, MAX_EVENT_DIFF - DIFF_ELISION_MARKER.length);
-  let out = '';
-  for (const ch of diff) {
-    if (out.length + ch.length > budget) break;
-    out += ch;
-  }
-  return out + DIFF_ELISION_MARKER;
+  return truncateWithMarker(diff, MAX_EVENT_DIFF, DIFF_ELISION_MARKER);
 }
 
 /**
@@ -89,4 +112,87 @@ export function buildEventBlock(
     block += `\n\nChanges:\n${diff}`;
   }
   return block;
+}
+
+/** The result of {@link packWholeBlocks}: the assembled text and how many
+ * whole blocks it includes. */
+export interface PackedBlocks {
+  text: string;
+  includedCount: number;
+}
+
+/** Options controlling how {@link packWholeBlocks} assembles its output. */
+export interface PackWholeBlocksOptions {
+  /** Fixed text prepended before any blocks (e.g. the hook's lead line). */
+  header?: string;
+  /** Joiner inserted between consecutive blocks. Defaults to `'\n'`. */
+  joiner?: string;
+}
+
+/**
+ * Greedily accumulate WHOLE blocks whose assembled string (`header` +
+ * `joiner`-separated blocks) stays within `cap`. A block is added only when it
+ * fits in full, so the visible set maps 1:1 to durable events — never a
+ * partially-shown block, which would be a claimed-but-unread event with no
+ * clean re-delivery boundary (issue #299). Shared by the hook-deliver
+ * transport (whose blocks are joined by a single `\n` under a lead-line
+ * header) and the channel transport (whose blocks are joined by a blank line,
+ * `\n\n`, with no header).
+ */
+export function packWholeBlocks(
+  blocks: string[],
+  cap: number,
+  options: PackWholeBlocksOptions = {},
+): PackedBlocks {
+  const header = options.header ?? '';
+  const joiner = options.joiner ?? '\n';
+  let body = '';
+  let includedCount = 0;
+  for (const block of blocks) {
+    const candidate = body === '' ? block : `${body}${joiner}${block}`;
+    if ((header + candidate).length > cap) break;
+    body = candidate;
+    includedCount += 1;
+  }
+  return { text: header + body, includedCount };
+}
+
+/** Options controlling {@link packEventsUnderCap}'s sizing. */
+export interface PackEventsUnderCapOptions extends PackWholeBlocksOptions {
+  /**
+   * Length of the elision/truncation marker the caller will append when not
+   * everything fits. Room for it is reserved so an INCLUDED block is never
+   * cut. Defaults to `0` (no marker reserved).
+   */
+  markerLength?: number;
+}
+
+/**
+ * How many WHOLE event blocks (from `events`, oldest-first) fit under `cap`
+ * once rendered via {@link buildEventBlock} with `sanitize` and assembled with
+ * `options` (header/joiner). The caller uses this to decide how many events to
+ * CLAIM/reserve, so the claimed set equals the rendered set and the remainder
+ * stays pending for the next poll/context event (006 §5.5).
+ *
+ * When not everything fits, room is reserved for `options.markerLength` so no
+ * INCLUDED block is cut. At least 1 is returned when there is any event —
+ * there must be forward progress: the first event is surfaced even if its own
+ * body exceeds the cap, in which case the caller mid-truncates it with a
+ * marker pointing at the still-unread full copy. Returns 0 for an empty list.
+ */
+export function packEventsUnderCap(
+  events: DeliveryEventSummary[],
+  sanitize: (value: string) => string,
+  cap: number,
+  options: PackEventsUnderCapOptions = {},
+): number {
+  if (events.length === 0) return 0;
+  const blocks = events.map((event) => buildEventBlock(event, sanitize));
+  const whole = packWholeBlocks(blocks, cap, options);
+  // Everything fits → no marker needed → claim/reserve them all.
+  if (whole.includedCount === blocks.length) return blocks.length;
+  // A marker will be shown; reserve its room so an included block is never cut.
+  const markerLength = options.markerLength ?? 0;
+  const reserved = packWholeBlocks(blocks, cap - markerLength, options);
+  return Math.max(1, reserved.includedCount);
 }

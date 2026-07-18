@@ -14,24 +14,32 @@
  * approximation of the daemon.
  */
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import type { DeliveryClaim, DeliveryReservation } from '@agentmonitors/core';
+import type {
+  DeliveryClaim,
+  DeliveryEventSummary,
+  DeliveryReservation,
+} from '@agentmonitors/core';
 
 vi.mock('../runtime-client.js', () => ({
   reserveDeliveryClient: vi.fn(),
   commitDeliveryClient: vi.fn(),
   releaseDeliveryClient: vi.fn(),
+  previewSettledHighDeliveryClient: vi.fn(),
 }));
 
 import { runChannelDeliveryCycle } from './channel.js';
+import { MAX_CHANNEL_CONTENT } from '../channel-render.js';
 import {
   reserveDeliveryClient,
   commitDeliveryClient,
   releaseDeliveryClient,
+  previewSettledHighDeliveryClient,
 } from '../runtime-client.js';
 
 const reserveMock = vi.mocked(reserveDeliveryClient);
 const commitMock = vi.mocked(commitDeliveryClient);
 const releaseMock = vi.mocked(releaseDeliveryClient);
+const previewMock = vi.mocked(previewSettledHighDeliveryClient);
 
 const CLAIM: DeliveryClaim = {
   sessionId: 'session-1',
@@ -49,10 +57,30 @@ const RESERVATION: DeliveryReservation = {
 
 const okPush = () => Promise.resolve();
 
+function makeEvent(
+  overrides: Partial<DeliveryEventSummary> = {},
+): DeliveryEventSummary {
+  return {
+    eventId: 'e1',
+    monitorId: 'm1',
+    title: 't1',
+    summary: 's1',
+    urgency: 'high',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    body: 'a body',
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   reserveMock.mockReset();
   commitMock.mockReset();
   releaseMock.mockReset();
+  // Most branching tests below are not about the settled-high preview/packing
+  // path (issue #442) — default to "nothing settled" so `maxEvents` is
+  // omitted, matching this file's pre-existing reservations/claims.
+  previewMock.mockReset();
+  previewMock.mockResolvedValue([]);
 });
 
 describe('runChannelDeliveryCycle branching (issue #300)', () => {
@@ -124,5 +152,117 @@ describe('runChannelDeliveryCycle branching (issue #300)', () => {
     await expect(
       runChannelDeliveryCycle('session-1', '/sock', okPush),
     ).rejects.toThrow('daemon unreachable');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Bounded reservation (006 §5.5, issue #442): previews the settled-high
+// delivery, sizes how many WHOLE event blocks fit under the channel's content
+// ceiling via the REAL `packChannelEventsUnderCap`, and passes that count as
+// `reserveDelivery`'s `maxEvents` — so a large coalesced delivery re-delivers
+// its deferred remainder on a LATER poll rather than being reserved/rendered
+// unbounded in one push.
+// ---------------------------------------------------------------------------
+describe('runChannelDeliveryCycle bounded reservation (006 §5.5, issue #442)', () => {
+  // Each body alone is well under the ceiling, but three together exceed it —
+  // forcing `packChannelEventsUnderCap` to defer the third to a later poll.
+  const BIG_BODY = 'x'.repeat(Math.floor(MAX_CHANNEL_CONTENT / 2.2));
+  const events = [
+    makeEvent({ eventId: 'e1', monitorId: 'm1', body: BIG_BODY }),
+    makeEvent({ eventId: 'e2', monitorId: 'm2', body: BIG_BODY }),
+    makeEvent({ eventId: 'e3', monitorId: 'm3', body: BIG_BODY }),
+  ];
+
+  function claimWith(surfaced: DeliveryEventSummary[]): DeliveryClaim {
+    return {
+      sessionId: 'session-1',
+      mode: 'delivery',
+      urgency: 'high',
+      lifecycle: 'turn-interruptible',
+      message: `${String(surfaced.length)} monitor(s) fired`,
+      unreadCounts: {
+        low: 0,
+        normal: 0,
+        high: events.length,
+        total: events.length,
+      },
+      events: surfaced,
+    };
+  }
+
+  it('reserves only as many whole blocks as fit under the ceiling, and defers the rest to a later poll', async () => {
+    // --- Poll 1: all three events are still settled/pending. ---
+    previewMock.mockResolvedValueOnce(events);
+    const firstClaim = claimWith(events.slice(0, 2));
+    reserveMock.mockResolvedValueOnce({
+      reservationId: 'r-1',
+      claim: firstClaim,
+    });
+    commitMock.mockResolvedValueOnce(firstClaim);
+    const pushed: { events: DeliveryEventSummary[]; moreDeferred: boolean }[] =
+      [];
+    const push = (claim: DeliveryClaim, moreDeferred: boolean) => {
+      pushed.push({ events: claim.events, moreDeferred });
+      return Promise.resolve();
+    };
+
+    const first = await runChannelDeliveryCycle('session-1', '/sock', push);
+
+    expect(first).toBe('surfaced');
+    // Sized to 2, not 3: the third block did not fit under the ceiling.
+    expect(reserveMock).toHaveBeenNthCalledWith(
+      1,
+      'session-1',
+      'turn-interruptible',
+      '/sock',
+      2,
+    );
+    expect(pushed[0]?.events.map((e) => e.eventId)).toEqual(['e1', 'e2']);
+    // The push is told more was deferred, so the rendered content can
+    // signpost it (`CHANNEL_DEFERRED_MARKER`).
+    expect(pushed[0]?.moreDeferred).toBe(true);
+
+    // --- Poll 2: only the deferred third event is still settled/pending —
+    // the daemon's own preview reflects that e1/e2 are now claimed. ---
+    const remaining = [events[2]];
+    if (!remaining[0]) throw new Error('expected a third event');
+    previewMock.mockResolvedValueOnce(remaining as DeliveryEventSummary[]);
+    const secondClaim = claimWith(remaining as DeliveryEventSummary[]);
+    reserveMock.mockResolvedValueOnce({
+      reservationId: 'r-2',
+      claim: secondClaim,
+    });
+    commitMock.mockResolvedValueOnce(secondClaim);
+
+    const second = await runChannelDeliveryCycle('session-1', '/sock', push);
+
+    expect(second).toBe('surfaced');
+    // The single remaining event fits alone → reserved in full, nothing left
+    // to defer.
+    expect(reserveMock).toHaveBeenNthCalledWith(
+      2,
+      'session-1',
+      'turn-interruptible',
+      '/sock',
+      1,
+    );
+    expect(pushed[1]?.events.map((e) => e.eventId)).toEqual(['e3']);
+    expect(pushed[1]?.moreDeferred).toBe(false);
+  });
+
+  it('omits maxEvents (reserves the full claim) when nothing is settled-high yet — a reminder claim needs no sizing', async () => {
+    previewMock.mockResolvedValueOnce([]);
+    reserveMock.mockResolvedValueOnce(RESERVATION);
+    commitMock.mockResolvedValueOnce(CLAIM);
+
+    const outcome = await runChannelDeliveryCycle('session-1', '/sock', okPush);
+
+    expect(outcome).toBe('surfaced');
+    expect(reserveMock).toHaveBeenCalledWith(
+      'session-1',
+      'turn-interruptible',
+      '/sock',
+      undefined,
+    );
   });
 });
