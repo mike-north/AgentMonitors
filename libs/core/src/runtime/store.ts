@@ -26,6 +26,29 @@ import { monotonicFactory, ulid } from 'ulid';
  * ordering by `(created_at, id)` reflects materialization order exactly.
  */
 const eventUlid = monotonicFactory();
+
+/**
+ * Monotonic ULID factory for `monitor_snapshots` ids (issue #293). `created_at`
+ * is stored at epoch-SECOND precision, so several snapshots for one
+ * `(workspace, monitor, object)` written in the same second (an ordinary
+ * same-tick burst) all tie on `created_at`. `latestSnapshot()` picks the diff
+ * predecessor, so a tie that resolved to an OLDER row corrupted the shared diff
+ * chain (repeating or omitting intermediate changes). A monotonic factory makes
+ * `id` strictly increasing in insertion order, giving snapshots a total
+ * materialization order; ordering by `(created_at, id)` then reflects it exactly
+ * — the same tie-break the `monitor_events` table already uses (see
+ * {@link eventUlid}).
+ */
+const snapshotUlid = monotonicFactory();
+
+/**
+ * Monotonic ULID factory for `observation_history` ids (issue #293). The audit
+ * trail (`monitor explain`) lists rows newest-first ordered by `created_at`,
+ * which is second-precision, so rows recorded in the same second would surface
+ * in an arbitrary order. A monotonic `id` gives a stable within-second order for
+ * this user-visible listing.
+ */
+const observationUlid = monotonicFactory();
 import type { InboxDb } from '../inbox/db.js';
 import {
   agentSessions,
@@ -1054,7 +1077,10 @@ export class RuntimeStore {
               ...conditions,
             ),
           )
-          .orderBy(desc(monitorEvents.createdAt))
+          // Second-precision `created_at` ties within a tick; the monotonic
+          // event `id` (see `eventUlid`) keeps this newest-first listing stably
+          // ordered (issue #293).
+          .orderBy(desc(monitorEvents.createdAt), desc(monitorEvents.id))
           .all()
           .map((row) => ({
             ...rowToEvent(row.event),
@@ -1086,7 +1112,10 @@ export class RuntimeStore {
               ...conditions,
             ),
           )
-          .orderBy(desc(monitorEvents.createdAt))
+          // Second-precision `created_at` ties within a tick; the monotonic
+          // event `id` (see `eventUlid`) keeps this newest-first listing stably
+          // ordered (issue #293).
+          .orderBy(desc(monitorEvents.createdAt), desc(monitorEvents.id))
           .all()
           .map(rowToEvent);
 
@@ -1118,7 +1147,7 @@ export class RuntimeStore {
     asInternalDb(this.db)
       .insert(monitorSnapshots)
       .values({
-        id: ulid(),
+        id: snapshotUlid(),
         workspacePath: input.workspacePath ?? null,
         monitorId: input.monitorId,
         objectKey: input.objectKey,
@@ -1146,7 +1175,10 @@ export class RuntimeStore {
             : eq(monitorSnapshots.workspacePath, workspacePath),
         ),
       )
-      .orderBy(desc(monitorSnapshots.createdAt))
+      // `created_at` is second-precision, so same-second writes tie; the
+      // monotonic `id` (see `snapshotUlid`) breaks the tie in materialization
+      // order so the newest snapshot is the diff predecessor (issue #293).
+      .orderBy(desc(monitorSnapshots.createdAt), desc(monitorSnapshots.id))
       .get();
     return row ? { content: row.content } : null;
   }
@@ -1291,7 +1323,7 @@ export class RuntimeStore {
     asInternalDb(this.db)
       .insert(observationHistory)
       .values({
-        id: ulid(),
+        id: observationUlid(),
         monitorId: input.monitorId,
         workspacePath: input.workspacePath,
         sourceName: input.sourceName,
@@ -1334,7 +1366,10 @@ export class RuntimeStore {
       .select()
       .from(observationHistory)
       .where(conditions.length > 0 ? and(...conditions) : undefined)
-      .orderBy(desc(observationHistory.createdAt))
+      // Second-precision `created_at` ties for rows recorded in one second; the
+      // monotonic `id` (see `observationUlid`) keeps this newest-first audit
+      // listing stably ordered (issue #293).
+      .orderBy(desc(observationHistory.createdAt), desc(observationHistory.id))
       .limit(query.limit ?? 50)
       .all();
     return rows.map((row) => ({
@@ -1380,7 +1415,10 @@ export class RuntimeStore {
         eq(sessionEventState.sessionId, agentSessions.id),
       )
       .where(and(...conditions))
-      .orderBy(desc(monitorEvents.createdAt))
+      // Second-precision `created_at` ties within a tick; the monotonic event
+      // `id` (see `eventUlid`) keeps this diagnostic listing stably ordered
+      // (issue #293).
+      .orderBy(desc(monitorEvents.createdAt), desc(monitorEvents.id))
       .all();
 
     return rows.map(({ event, state, session }) => ({

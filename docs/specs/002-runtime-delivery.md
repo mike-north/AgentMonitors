@@ -1043,7 +1043,9 @@ If an emitted observation includes `snapshotText`, the runtime **MUST**:
 
 The diff format is a line-level unified-style representation capped at 20 changed lines, produced by `buildTextDiff`. If previous and current text are identical, `buildTextDiff` returns the empty string.
 
-Verified: `libs/core/src/runtime/service.ts` — `processObservation()` lines 566–616; `libs/core/src/runtime/diff.ts` — `buildTextDiff()` (lines 7–26, cap at 20 lines visible at line 21).
+**Snapshot ordering (total materialization order).** `created_at` is stored at epoch-**second** precision, so several snapshots for one `(workspacePath, monitorId, objectKey)` written in the same second (an ordinary same-tick burst) tie on `created_at`. The runtime **MUST** give snapshots a total materialization order and resolve "the latest stored snapshot" to the **most recently materialized** one under identical timestamps — never an older tied row, which would corrupt the shared diff chain (repeating or omitting intermediate changes). This is satisfied by a strictly-increasing (monotonic ULID) snapshot `id` and ordering by `(created_at, id)` — the same tie-break the `monitor_events` table already uses. User-visible newest-first listings that order by second-precision `created_at` (`events list` / `monitor explain` event and observation-history audit rows) apply the same `id` tie-break so their order is stable within a second.
+
+Verified: `libs/core/src/runtime/service.ts` — `processObservation()`; `libs/core/src/runtime/diff.ts` — `buildTextDiff()` (caps the diff at 20 changed lines); `libs/core/src/runtime/store.ts` — `saveSnapshot()`/`latestSnapshot()` (monotonic `snapshotUlid`, `(created_at, id)` tie-break).
 
 This makes snapshot history an object-level concern rather than a monitor-level or session-level concern (SP5).
 
@@ -1502,17 +1504,17 @@ Corresponds to the `monitorEvents` Drizzle table. One row per materialized obser
 
 Stores the full text content of each snapshot for diff computation. Keyed by `(workspace_path, monitor_id, object_key)`.
 
-| Column           | Type             | Notes                     |
-| ---------------- | ---------------- | ------------------------- |
-| `id`             | TEXT PK          | ULID                      |
-| `workspace_path` | TEXT nullable    |                           |
-| `monitor_id`     | TEXT NOT NULL    |                           |
-| `object_key`     | TEXT NOT NULL    |                           |
-| `event_id`       | TEXT NOT NULL    | FK to `monitor_events.id` |
-| `content`        | TEXT NOT NULL    | Full snapshot text        |
-| `created_at`     | INTEGER NOT NULL |                           |
+| Column           | Type             | Notes                                                   |
+| ---------------- | ---------------- | ------------------------------------------------------- |
+| `id`             | TEXT PK          | Monotonic ULID — strictly increasing in insertion order |
+| `workspace_path` | TEXT nullable    |                                                         |
+| `monitor_id`     | TEXT NOT NULL    |                                                         |
+| `object_key`     | TEXT NOT NULL    |                                                         |
+| `event_id`       | TEXT NOT NULL    | FK to `monitor_events.id`                               |
+| `content`        | TEXT NOT NULL    | Full snapshot text                                      |
+| `created_at`     | INTEGER NOT NULL | Epoch **seconds**; ties broken by `id` (§5.2)           |
 
-The draft omitted this table. It is required for snapshot diff computation (§5.2) and is populated by `RuntimeStore.saveSnapshot()`. Verified: `libs/core/src/runtime/store.ts` — `saveSnapshot()` (lines 375–394); `latestSnapshot()` (lines 396–416).
+The draft omitted this table. It is required for snapshot diff computation (§5.2) and is populated by `RuntimeStore.saveSnapshot()`. `id` is a monotonic ULID so same-second snapshots retain a total materialization order and `latestSnapshot()` resolves to the newest via `ORDER BY created_at DESC, id DESC` (§5.2, issue #293). Verified: `libs/core/src/runtime/store.ts` — `saveSnapshot()` / `latestSnapshot()`.
 
 ### `session_event_state`
 
