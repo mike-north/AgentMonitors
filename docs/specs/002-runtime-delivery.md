@@ -1143,6 +1143,37 @@ This makes snapshot history an object-level concern rather than a monitor-level 
 > `session_event_state.diff_text`; the shared object-level diff here is its degenerate
 > single-baseline case (a recipient at the shared baseline gets a byte-identical span).
 
+### 5.4 Event title
+
+> **Status: current.** Resolves issue [#449](https://github.com/mike-north/AgentMonitors/issues/449).
+>
+> Verified: `libs/core/src/runtime/service.ts` — `processObservation()`;
+> `libs/core/src/runtime/event-title.test.ts` (the core rule) and
+> `apps/cli/src/commands/event-title-transports.test.ts` (the same title on both transports).
+
+The runtime — not the source — decides a materialized event's `title`:
+
+1. the monitor's **authored `name`** (frontmatter, [001 §3](./001-monitor-definition.md)) when present;
+2. otherwise the source-provided observation `title`, unchanged.
+
+A source's title is written from the source's point of view and routinely embeds a configuration
+detail (`command-poll` interpolates its `objectKey`, which defaults to the joined argv). The author's
+`name` is the one human-written string that says what the monitor is _for_, so it is the headline the
+recipient sees. The source's per-object text is **not** lost: it remains the `summary` (§5.1), and
+source identity remains on `objectKey` / `payload`.
+
+Both injecting transports render the `summary` on its own line beneath the title
+([006 §4.2.1](./006-agent-integration.md)), omitting it when it repeats the title — so a per-object
+source still names the object that moved, and the delivered text stays self-sufficient.
+
+Because the title is chosen once at materialization, it is **transport-independent** — the hook and
+channel renderers ([006 §4/§5](./006-agent-integration.md)) cannot diverge on it — and it is what
+`events list` and history display too.
+
+Sources still bound any `objectKey` they interpolate into their own title/summary
+([003 §2.8](./003-source-plugins.md#28-an-objectkey-is-an-identity-not-a-headline)), so the fallback
+title of a nameless monitor is bounded as well.
+
 ## 6. Session Projection
 
 Persisted events are not directly tied to one session. They are projected into matching sessions via `session_event_state`. When an event is inserted, the runtime **MUST** project it into matching **lead** sessions only.

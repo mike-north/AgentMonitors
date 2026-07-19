@@ -303,6 +303,32 @@ Shape stage. The motivating case is the E8 OmniFocus composite (§2.6): the sour
 raw `due`/`defer-until`/`priority` and child states; the runtime derives `past due`/`due soon`/
 `revealed`/`urgent`.
 
+### 2.8 An `objectKey` is an identity, not a headline
+
+> **Status: current.** Resolves issue [#449](https://github.com/mike-north/AgentMonitors/issues/449).
+>
+> Verified: `libs/core/src/observation/display.ts` (`displayObjectKey`) with
+> `libs/core/src/observation/display.test.ts`; applied by `plugins/source-command-poll/src/index.ts`,
+> `plugins/source-api-poll/src/index.ts`, and `libs/core/src/observation/keyed-collection.ts`.
+
+An `objectKey` exists to give an observed object a **stable identity**, and is free to be as long as
+identity requires — `command-poll` defaults it to the joined argv (§11.4), which for a `jq`-backed
+poller is hundreds of characters.
+
+A source that interpolates an `objectKey` (or any other unbounded configuration string) into
+human-facing observation text — `title`, `summary` — **MUST** bound it with the shared helper
+`displayObjectKey`, which returns the key unchanged at or below 60 characters and otherwise a
+59-character prefix followed by `…`. The untruncated key remains on the observation's `objectKey`
+and in `payload`, so debugging and querying lose nothing.
+
+The motivating failure: a delivered event whose headline was ~400 characters of the monitor's own
+`jq` program. Delivered text is an agent's action surface and lands in a context window on every
+delivery ([002 §5.4](./002-runtime-delivery.md#54-event-title)); an unbounded implementation detail
+in that position conveys nothing and crowds out what does.
+
+For **keyed collections** (§12) the per-item key value is the informative half, so only the
+monitor-scope half of `<scope>#<key>` is bounded; the item key is always rendered whole.
+
 ## 3. Bundled Source: `file-fingerprint`
 
 Source name: `"file-fingerprint"` (verified: `plugins/source-file-fingerprint/src/index.ts` line 278).
@@ -961,7 +987,9 @@ Auth is configured via the `auth.type` field.
 
 When a change is detected, the source emits one observation (verified: `plugins/source-api-poll/src/index.ts` lines 175–196):
 
-- `title`: `"API response changed: <url>"`
+- `title`: `"API response changed: <url>"` — `<url>` bounded per
+  [§2.8](#28-an-objectkey-is-an-identity-not-a-headline); overridden by the monitor's authored
+  `name` at materialization ([002 §5.4](./002-runtime-delivery.md#54-event-title))
 - `summary`: `"API response changed: <url>"`
 - `payload`: `{ url, status, strategy, body }`
 - `snapshotText`: response body as a string (always set; no binary check)
@@ -1376,7 +1404,10 @@ are validation errors so misplaced or misspelled options do not silently no-op.
 
 Mirrors `api-poll` (§4.4–4.5):
 
-- `title` / `summary`: `"Command output changed: <objectKey>"`
+- `title` / `summary`: `"Command output changed: <objectKey>"`, with `<objectKey>` bounded per
+  [§2.8](#28-an-objectkey-is-an-identity-not-a-headline). The runtime overrides the delivered
+  `title` with the monitor's authored `name` when it has one ([002 §5.4](./002-runtime-delivery.md#54-event-title));
+  this source title is what a **nameless** monitor falls back to, and remains the `summary` either way.
 - `objectKey`: the `key` field if set, otherwise the argv joined with single spaces
   (`ofocus today --json`)
 - `payload`: `{ command, exitCode, strategy, stdout, truncated }` — **never `env`**

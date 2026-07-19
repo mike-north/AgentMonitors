@@ -7007,6 +7007,7 @@ Summarize what changed in the spec/standard docs and whether it affects current 
       const unreadEvents = JSON.parse(unreadResult.stdout) as {
         id: string;
         title: string;
+        summary: string;
         monitorId: string;
       }[];
       expect(unreadEvents).toHaveLength(1);
@@ -7017,8 +7018,12 @@ Summarize what changed in the spec/standard docs and whether it affects current 
       // titled `Incoming change: <path> (<changeKind>)`.
       const [event] = unreadEvents;
       expect(event?.monitorId).toBe('spec-changes');
-      expect(event?.title).toContain('docs/specs/001.md');
-      expect(event?.title).toContain('modified');
+      // The headline is the monitor's authored name (002 §5.4, issue #449); the
+      // per-path detail this acceptance is about rides on `summary`, which the
+      // delivered block renders under the title.
+      expect(event?.title).toBe('Spec & standard changes from upstream');
+      expect(event?.summary).toContain('docs/specs/001.md');
+      expect(event?.summary).toContain('modified');
 
       const claim = runWithEnv(
         [
@@ -7101,13 +7106,15 @@ Summarize what changed in the spec/standard docs and whether it affects current 
       const nestedEvents = JSON.parse(nestedUnreadResult.stdout) as {
         id: string;
         title: string;
+        summary: string;
         monitorId: string;
       }[];
       expect(nestedEvents).toHaveLength(1);
       // The event must name the deeply-nested path, not just a top-level file.
-      // incoming-changes titles: `Incoming change: <path> (<changeKind>)`
-      expect(nestedEvents[0]?.title).toContain('docs/specs/design/nested.md');
-      expect(nestedEvents[0]?.title).toContain('created');
+      // incoming-changes summaries: `Incoming change: <path> (<changeKind>)`
+      // (the title is the monitor's authored name, 002 §5.4).
+      expect(nestedEvents[0]?.summary).toContain('docs/specs/design/nested.md');
+      expect(nestedEvents[0]?.summary).toContain('created');
       expect(nestedEvents[0]?.monitorId).toBe('spec-changes');
 
       // Leave the session clean.

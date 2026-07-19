@@ -165,6 +165,35 @@ poll-until-`daemonAvailable` loop with slightly different timeout/poll constants
 
 Finding 5 (test teardown pid fallback) is test-infrastructure-only, no spec change.
 
+## 2026-07-19 — A delivered event's title is the monitor's authored `name`, and an `objectKey` is bounded in human-facing text (002 §5.4, 003 §2.8, §4.4, §11.4) — Refs #449
+
+Previously the event `title` was whatever the source wrote, and `command-poll` writes
+`"Command output changed: <objectKey>"` with `objectKey` defaulting to the joined argv. A live
+delivery therefore headlined itself with ~400 characters of its own `jq` program while the monitor's
+authored name — "My PRs — CI, review feedback, state changes" — appeared nowhere in the delivery.
+That contradicts the principle #434/#438 established (delivered text is the agent's action surface
+and must be self-sufficient): a headline that is the monitor's own implementation conveys nothing and
+consumes context on every delivery.
+
+Two rules now: **002 §5.4** — the runtime, not the source, chooses the title: the monitor's authored
+`name` when present, otherwise the source title unchanged (documented fallback). The source's
+per-object text stays as the `summary`, and source identity stays on `objectKey`/`payload`, so no
+information is lost. Because the choice happens once at materialization the title is
+transport-independent by construction — hook and channel cannot diverge. **003 §2.8** — an
+`objectKey` is an identity, not a headline: a source interpolating one into `title`/`summary` bounds
+it with `displayObjectKey` (≤60 characters, otherwise a prefix ending in `…`). Keyed collections bound
+only the monitor-scope half of `<scope>#<key>`, keeping the informative item key whole. §4.4
+(`api-poll`) and §11.4 (`command-poll`) updated to cite both rules.
+
+Delivery rendering follows: both injecting transports' shared per-event block now renders the
+`summary` on its own line beneath the title, omitted when the two are identical (006 §4.2.1). Without
+it, a per-object source's delivered block would name no object at all once the title became the
+monitor name — the exact self-sufficiency regression #434/#438 guards against.
+
+Not addressed here: issue #449's third item, a semantic diff hint for `json-diff` `diffText` (the
+"PR #443 became MERGED, PR #447 appeared" rendering). That is the presentation half of #440 and
+remains open.
+
 ## 2026-07-19 — `verify`'s materialize/deliver stages carry a fresh deadline past a late observe resolution instead of inheriting an already-expired one (005 §16 step 6, Budget) — Refs #442
 
 The round-19 fix (below) extends the observe stage's own deadline past the single-interval `detect`

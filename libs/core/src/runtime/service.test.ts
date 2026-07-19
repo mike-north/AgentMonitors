@@ -1389,15 +1389,18 @@ Handle it.
       });
       expect(unread).toHaveLength(2);
       // Held-first ordering preserved (the batch was flushed, not reordered).
-      const titles = unread
+      // Discriminated by `summary`, not `title`: since issue #449 the title of
+      // every event from a NAMED monitor is that monitor's authored name, and
+      // the source's own per-observation text is carried by `summary`.
+      const summaries = unread
         .slice()
         .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
-        .map((event) => event.title);
-      expect(titles).toContain('Held normal item');
-      expect(titles).toContain('Escalated item');
+        .map((event) => event.summary);
+      expect(summaries).toContain('Held normal item');
+      expect(summaries).toContain('Escalated item');
       // The escalated event carries the escalated effective urgency.
       const escalated = unread.find(
-        (event) => event.title === 'Escalated item',
+        (event) => event.summary === 'Escalated item',
       );
       expect(escalated?.urgency).toBe('high');
     } finally {
@@ -3499,7 +3502,10 @@ Handle it.
       override insertEvent(
         input: Omit<MonitorEventRecord, 'id'>,
       ): MonitorEventRecord {
-        if (input.title === 'boom') {
+        // Keyed on `summary`: the materialized `title` is the monitor's
+        // authored name since issue #449, so the source's sentinel text — which
+        // this fault injection targets — now arrives as `summary`.
+        if (input.summary === 'boom') {
           throw new Error('simulated insert failure');
         }
         return super.insertEvent(input);
@@ -3545,7 +3551,7 @@ Handle it.
 
     // (a) watcher survived 'boom' — handle still active and 'ok' produced an event
     const events = runtime.listEvents({ sessionId: session.id });
-    expect(events.some((e) => e.title === 'ok')).toBe(true);
+    expect(events.some((e) => e.summary === 'ok')).toBe(true);
 
     // (b) 'ok' produced a triggered history row
     const history = runtime.listObservationHistory({
@@ -3843,7 +3849,8 @@ Handle it.
       override insertEvent(
         input: Omit<MonitorEventRecord, 'id'>,
       ): MonitorEventRecord {
-        if (input.title === 'bad-obs') {
+        // Sentinel keyed on `summary` (see the note above; issue #449).
+        if (input.summary === 'bad-obs') {
           throw new Error('insert failure for bad-obs');
         }
         return super.insertEvent(input);
@@ -3884,7 +3891,7 @@ Handle it.
     expect(result.emittedEventIds).toHaveLength(1);
     const events = runtime.listEvents({ sessionId: session.id });
     expect(events).toHaveLength(1);
-    expect(events[0]?.title).toBe('good-obs');
+    expect(events[0]?.summary).toBe('good-obs');
     expect(result.emittedEventIds[0]).toBe(events[0]?.id);
 
     // (iii) an errored history row exists for the failing observation
@@ -4061,20 +4068,22 @@ Handle it.
       // is the incremental substrate — all three span observations materialized,
       // none collapsed. Baseline (1) + N=3 = 4 total shared events.
       expect(events).toHaveLength(4);
-      const spanEvents = events.filter((event) => event.title !== 'baseline');
+      const spanEvents = events.filter((event) => event.summary !== 'baseline');
       expect(spanEvents).toHaveLength(3);
       // The three span events share a sub-second tick timestamp, so listEvents'
       // createdAt ordering ties; assert the SET of titles + each title's own
       // endpoint snapshot (nothing folded), not a strict order.
-      const byTitle = new Map(spanEvents.map((event) => [event.title, event]));
-      expect([...byTitle.keys()].sort()).toEqual([
+      const bySummary = new Map(
+        spanEvents.map((event) => [event.summary, event]),
+      );
+      expect([...bySummary.keys()].sort()).toEqual([
         'edit 1',
         'edit 2',
         'edit 3',
       ]);
-      expect(byTitle.get('edit 1')?.snapshotText).toBe(SPAN_STATES[0]);
-      expect(byTitle.get('edit 2')?.snapshotText).toBe(SPAN_STATES[1]);
-      expect(byTitle.get('edit 3')?.snapshotText).toBe(SPAN_STATES[2]);
+      expect(bySummary.get('edit 1')?.snapshotText).toBe(SPAN_STATES[0]);
+      expect(bySummary.get('edit 2')?.snapshotText).toBe(SPAN_STATES[1]);
+      expect(bySummary.get('edit 3')?.snapshotText).toBe(SPAN_STATES[2]);
 
       // Claim the catch-up span (normal urgency → turn-interruptible). The
       // per-recipient `net` collapse runs at claim: only the newest event per
@@ -4102,7 +4111,7 @@ Handle it.
       // endpoint, so all three line edits appear in one delta (collapsed, not
       // replayed). 002 §1.1.7.
       const survivor = events.find((e) => e.id === delivered[0]?.eventId);
-      expect(survivor?.title).toBe('edit 3');
+      expect(survivor?.summary).toBe('edit 3');
       expect(survivor?.snapshotText).toBe(SPAN_STATES[2]);
       const netDelta = delivered[0]?.diffText;
       expect(netDelta).toContain('EDIT-1');
@@ -4112,7 +4121,7 @@ Handle it.
       // The two suppressed intermediates are edits 1 and 2 — recorded, retrievable
       // via explain, never delivered.
       const suppressedTitles = suppressed
-        .map((p) => events.find((e) => e.id === p.eventId)?.title)
+        .map((p) => events.find((e) => e.id === p.eventId)?.summary)
         .sort();
       expect(suppressedTitles).toEqual(['edit 1', 'edit 2']);
     });
@@ -4132,12 +4141,14 @@ Handle it.
      * events", which is what is asserted here.
      */
     function expectIncrementalChain(events: MonitorEventRecord[]): void {
-      const spanEvents = events.filter((event) => event.title !== 'baseline');
+      const spanEvents = events.filter((event) => event.summary !== 'baseline');
       // 002 §1.1.7: N=3 deltas, play-by-play (one event per step, nothing
       // collapsed).
       expect(spanEvents).toHaveLength(3);
-      const byTitle = new Map(spanEvents.map((event) => [event.title, event]));
-      expect([...byTitle.keys()].sort()).toEqual([
+      const bySummary = new Map(
+        spanEvents.map((event) => [event.summary, event]),
+      );
+      expect([...bySummary.keys()].sort()).toEqual([
         'edit 1',
         'edit 2',
         'edit 3',
@@ -4145,13 +4156,13 @@ Handle it.
 
       // Every intermediate observation survived as its own event with its own
       // endpoint snapshot — the play-by-play, not a single net delta.
-      expect(byTitle.get('edit 1')?.snapshotText).toBe(SPAN_STATES[0]);
-      expect(byTitle.get('edit 2')?.snapshotText).toBe(SPAN_STATES[1]);
-      expect(byTitle.get('edit 3')?.snapshotText).toBe(SPAN_STATES[2]);
+      expect(bySummary.get('edit 1')?.snapshotText).toBe(SPAN_STATES[0]);
+      expect(bySummary.get('edit 2')?.snapshotText).toBe(SPAN_STATES[1]);
+      expect(bySummary.get('edit 3')?.snapshotText).toBe(SPAN_STATES[2]);
 
       // Each step is a real, non-empty delta (the state changed at each point).
       for (const title of ['edit 1', 'edit 2', 'edit 3']) {
-        expect(byTitle.get(title)?.diffText).toBeTruthy();
+        expect(bySummary.get(title)?.diffText).toBeTruthy();
       }
     }
 
@@ -4187,7 +4198,7 @@ Handle it.
         monitorsDir,
         workspacePath: rootDir,
       });
-      const spanEvents = events.filter((e) => e.title !== 'baseline');
+      const spanEvents = events.filter((e) => e.summary !== 'baseline');
       const spanIds = new Set(spanEvents.map((e) => e.id));
       const spanProjections = report.projections.filter(
         (p) => p.sessionId === sessionId && spanIds.has(p.eventId),
@@ -4199,7 +4210,7 @@ Handle it.
       expect(suppressed).toHaveLength(2);
       // The surviving event is the endpoint (edit 3, where things stand now).
       const survivor = events.find((e) => e.id === delivered[0]?.eventId);
-      expect(survivor?.title).toBe('edit 3');
+      expect(survivor?.summary).toBe('edit 3');
     });
   });
 
@@ -4360,7 +4371,7 @@ Handle it.
         expect(delivered).toHaveLength(2);
         // Both accumulated observations are present (sorted for deterministic
         // assertion order, since listEvents returns newest-first by default).
-        expect(delivered.map((e) => e.title).sort()).toEqual([
+        expect(delivered.map((e) => e.summary).sort()).toEqual([
           'Change A',
           'Change B',
         ]);
@@ -4472,7 +4483,7 @@ Handle it.
           unreadOnly: true,
         });
         expect(delivered).toHaveLength(1);
-        expect(delivered[0]?.title).toBe('Pre-restart change');
+        expect(delivered[0]?.summary).toBe('Pre-restart change');
         // A valid urgency was materialized for the restart-recovered envelope
         // (hydration backfill, 002 §3 / §4.4 step 1), never `undefined`.
         expect(delivered[0]?.urgency).toBe('normal');
@@ -4828,7 +4839,7 @@ Daily digest.
       const survivor = report.events.find(
         (e) => e.id === delivered[0]?.eventId,
       );
-      expect(survivor?.title).toBe('edit 3');
+      expect(survivor?.summary).toBe('edit 3');
       expect(survivor?.snapshotText).toBe(STATES[2]);
     }
 
@@ -4965,7 +4976,7 @@ Daily digest.
           .reverse();
         expect(delivered).toHaveLength(STATES.length);
         // 002 §1.1.7: N=3 ordered deltas — edit 1 before edit 2 before edit 3.
-        expect(delivered.map((e) => e.title)).toEqual([
+        expect(delivered.map((e) => e.summary)).toEqual([
           'edit 1',
           'edit 2',
           'edit 3',

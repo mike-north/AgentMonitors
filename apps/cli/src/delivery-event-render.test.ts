@@ -146,10 +146,19 @@ describe('truncateWithMarker', () => {
 });
 
 describe('buildEventBlock', () => {
-  it('renders the header, title, and body with no Changes section when diffText is absent', () => {
+  it('renders the header, title, summary, and body with no Changes section when diffText is absent', () => {
     const block = buildEventBlock(makeEvent(), identity);
-    expect(block).toBe('### m1 (high)\nt1\n\na body');
+    // The summary line carries the source's per-object text, which the title no
+    // longer does (002 §5.4, issue #449) — so it is rendered under the title.
+    expect(block).toBe('### m1 (high)\nt1\ns1\n\na body');
     expect(block).not.toContain('Changes:');
+  });
+
+  it('omits the summary line when it is identical to the title (a nameless monitor)', () => {
+    // A monitor with no authored `name` falls back to the source title, so title
+    // and summary are the same string; rendering it twice would be noise.
+    const block = buildEventBlock(makeEvent({ summary: 't1' }), identity);
+    expect(block).toBe('### m1 (high)\nt1\n\na body');
   });
 
   it('appends a bounded Changes section when diffText is present', () => {
@@ -177,7 +186,7 @@ describe('buildEventBlock', () => {
   it('passes every field through sanitize', () => {
     const sanitize = (value: string): string => value.toUpperCase();
     const block = buildEventBlock(makeEvent(), sanitize);
-    expect(block).toBe('### M1 (HIGH)\nT1\n\nA BODY');
+    expect(block).toBe('### M1 (HIGH)\nT1\nS1\n\nA BODY');
   });
 });
 

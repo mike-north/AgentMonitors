@@ -272,6 +272,9 @@ export function diffKeyedCollection(parsedOutput: unknown, config: KeyedCollecti
 }): KeyedCollectionResult;
 
 // @public
+export function displayObjectKey(objectKey: string): string;
+
+// @public
 export interface DoctorDeliveryCounts {
     // (undocumented)
     acknowledged: number;

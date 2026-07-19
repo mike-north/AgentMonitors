@@ -8,6 +8,7 @@ import type {
 } from '@agentmonitors/core';
 import {
   diffKeyedCollection,
+  displayObjectKey,
   parseKeyedCollectionConfig,
 } from '@agentmonitors/core';
 
@@ -656,8 +657,8 @@ const source: ObservationSource = {
       return {
         observations: [
           {
-            title: `API response changed: ${url}`,
-            summary: `API response changed: ${url}`,
+            title: `API response changed: ${displayObjectKey(url)}`,
+            summary: `API response changed: ${displayObjectKey(url)}`,
             payload: {
               url,
               status: status,

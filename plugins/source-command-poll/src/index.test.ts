@@ -747,6 +747,32 @@ describe('source-command-poll', () => {
       );
     });
 
+    // Issue #449: a long argv is an identity, not a headline. `objectKey` keeps
+    // the full joined argv, but the human-facing title/summary bound it (003
+    // §2.7) so a jq-heavy poller cannot make its own implementation the alert.
+    it('bounds the argv in title/summary while objectKey and payload keep it whole (issue #449)', async () => {
+      // A long trailing argument stands in for the reported jq program: the
+      // program ignores it, but it lands in the joined-argv objectKey.
+      const jqTail = 'jq:'.concat('[.[] | {number, state}]'.repeat(12));
+      const argv = [...nodeArgv('process.stdout.write("a")'), jqTail];
+      const baseline = await source.observe({ command: argv }, ctx());
+      const changedArgv = [...nodeArgv('process.stdout.write("b")'), jqTail];
+      const changed = await source.observe(
+        { command: changedArgv },
+        ctx(baseline.nextState),
+      );
+
+      const obs = changed.observations[0];
+      expect(obs?.title).toMatch(/^Command output changed: /);
+      // 60-char bound + the fixed "Command output changed: " prefix.
+      expect(obs?.title).toHaveLength('Command output changed: '.length + 60);
+      expect(obs?.title).not.toContain(jqTail);
+      expect(obs?.summary).toBe(obs?.title);
+      // Debugging loses nothing: identity and payload carry the full argv.
+      expect(obs?.objectKey).toBe(changedArgv.join(' '));
+      expect(obs?.payload).toMatchObject({ command: changedArgv });
+    });
+
     // 003 §11.4: snapshot.command is the argv array, not the objectKey string.
     it('snapshot.command is the argv array, not objectKey (003 §11.4)', async () => {
       const argv = nodeArgv('process.stdout.write("snap-test")');

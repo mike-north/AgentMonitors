@@ -3414,7 +3414,17 @@ export class AgentMonitorRuntime {
         monitorId: input.monitor.id,
         sourceName: input.sourceName,
         urgency: input.effectiveUrgency,
-        title: input.observation.title,
+        // The delivered headline is the monitor's AUTHORED name when it has one
+        // (002 §5.4, issue #449). A source title is written from the source's
+        // point of view and often embeds a configuration detail — `command-poll`
+        // interpolates its `objectKey`, which defaults to the joined argv, so an
+        // unnamed jq-heavy poller announced itself with ~400 characters of its
+        // own implementation. The author's `name` is the one human-written string
+        // that says what the monitor is FOR, so it wins. Fallback when `name` is
+        // absent: the source-provided title, unchanged. The source title is never
+        // lost — it remains the `summary` below (sources set both), and the raw
+        // command stays in `payload.command` / `objectKey` for debugging.
+        title: input.monitor.frontmatter.name ?? input.observation.title,
         body: input.observation.body ?? input.monitor.instructions,
         summary:
           input.observation.summary ??

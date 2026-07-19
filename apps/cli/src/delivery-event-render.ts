@@ -177,12 +177,18 @@ export function appendMarkerWithinCap(
  * ```text
  * ### <monitorId> (<urgency>)
  * <title>
+ * <summary>
  *
  * <body>
  *
  * Changes:
  * <bounded diffText>
  * ```
+ *
+ * `<title>` is the monitor's authored name (002 §5.4); `<summary>` is the
+ * source's per-object text and is emitted only when it differs from the title
+ * (they are identical for a monitor with no authored `name`, which falls back to
+ * the source title).
  *
  * The `Changes:` section is emitted only when the event carries a non-empty
  * `diffText`; the bounded diff is capped at {@link MAX_EVENT_DIFF} with an
@@ -205,7 +211,15 @@ export function buildEventBlock(
   const urgency = sanitize(event.urgency);
   const title = sanitize(event.title);
   const body = sanitize(event.body);
-  let block = `### ${id} (${urgency})\n${title}\n\n${body}`;
+  // The title is the monitor's authored name (002 §5.4, issue #449) — it says
+  // what the monitor is FOR, but not which object moved. The summary carries the
+  // source's per-object text ("Incoming change: docs/specs/001.md (modified)"),
+  // so it is rendered on its own line whenever it adds something the title does
+  // not already say. Without it a per-object source's delivery would name no
+  // object at all, which is exactly the self-sufficiency #434/#438 requires.
+  const summary = sanitize(event.summary);
+  const detail = summary && summary !== title ? `\n${summary}` : '';
+  let block = `### ${id} (${urgency})\n${title}${detail}\n\n${body}`;
   if (event.diffText && event.diffText.trim().length > 0) {
     const diff = sanitize(boundDiff(event.diffText));
     block += `\n\nChanges:\n${diff}`;

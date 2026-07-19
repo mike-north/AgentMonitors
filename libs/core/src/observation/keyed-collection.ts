@@ -1,3 +1,4 @@
+import { displayObjectKey } from './display.js';
 import type { ChangeKind, Observation } from './types.js';
 
 /**
@@ -340,7 +341,11 @@ export function diffKeyedCollection(
 
   const emit = (keyValue: string, changeKind: ChangeKind): void => {
     const objectKey = `${monitorObjectKey}#${keyValue}`;
-    const title = `${titleVerb(changeKind)}: ${objectKey}`;
+    // Bound only the monitor-scope half of the key in human-facing text — the
+    // per-item `keyValue` is the informative part and is always kept whole, so a
+    // long scope (e.g. `command-poll`'s joined argv) can't push it out of the
+    // headline. `objectKey` below keeps the full identity (issue #449).
+    const title = `${titleVerb(changeKind)}: ${displayObjectKey(monitorObjectKey)}#${keyValue}`;
     observations.push({
       title,
       summary: title,
