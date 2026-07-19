@@ -1760,10 +1760,10 @@ silently become a local-only status check when the author's intent is upstream b
 Pull-request alerting has two distinct audiences, and conflating them produces a monitor that is
 wrong for both:
 
-| Role     | Preset      | Watches                                                              | Urgency  |
-| -------- | ----------- | -------------------------------------------------------------------- | -------- |
-| Reviewer | `pr-review` | Open, non-draft PRs in this repo awaiting review, excluding your own | `normal` |
-| Author   | `my-prs`    | CI, review feedback, and state on your own open PRs                  | `normal` |
+| Role     | Preset      | Watches                                                   | Urgency |
+| -------- | ----------- | --------------------------------------------------------- | ------- |
+| Reviewer | `pr-review` | Undecided, non-draft PRs in this repo, excluding your own | `high`  |
+| Author   | `my-prs`    | Your own PRs that need something from you                 | `high`  |
 
 Both are `command-poll` + `json-diff` over `gh pr list`.
 
@@ -1802,66 +1802,76 @@ reviewer, do not self-merge" framing does not apply to one's own work. Because d
 rather than reported, "a draft was marked ready" surfaces as the PR _appearing_ in the set. `updatedAt`
 is deliberately excluded: including it would fire on every push and comment.
 
-`my-prs` queries `--state open` with a generously raised `--limit 30` — **not** `--state all --limit
-10`. `--limit` always applies to a **newest-created-first** list, so a small `--state all` window lets
-an older still-open PR silently age out the moment enough newer PRs (including merged/closed ones,
-which `--state all` also counts against the cap) exist — and once evicted, its CI going red produces no
-event (issue #444 review, finding 4). `--state open` removes merged/closed PRs from the cap entirely,
-so only actually-open work competes for the 30 slots, and a PR leaving the open set (merged or closed)
-then surfaces as a **removal** from the diffed list — the same "dropped off the list" signal
-`pr-review` already uses. The tradeoff this accepts: `state` can now only ever read `OPEN` in the
-delivered payload (it is still carried through, for shape symmetry with `pr-review`), so merged vs.
-closed-unmerged can no longer be told apart from the field itself — only from checking the PR directly,
-as the monitor body now says. It reduces each PR to:
+`my-prs` queries `--state all --limit 60`. Keeping merged and closed PRs in the result set is what
+makes their terminal state **nameable**: "merged, clean up the branch" and "closed unmerged, find out
+why" are different instructions, and `--state open` collapses both into an indistinguishable
+disappearance — which is exactly the trap the issue's acceptance criteria call out.
 
-- `failingChecks` — the sorted names of **failing** entries in `statusCheckRollup` (both `CheckRun`
-  `conclusion` and legacy `StatusContext` `state`). Reducing to failures only means a green→red
-  transition fires and a red→green recovery fires, while the queued/in-progress churn of a normal CI
-  run stays invisible; diffing `statusCheckRollup` whole would instead interrupt once per check, per
-  push.
+The cost is real and is accepted deliberately. `--limit` applies to a **newest-created-first** list,
+and under `--state all` merged/closed PRs also consume slots, so a still-open PR could in principle
+age out of the query and stop being monitored — after which its CI going red would produce no event.
+Two things bound that risk: the window is 60 (measured ~3.5s per poll against a real repository,
+comfortably inside the 5m interval and the source's timeout), and `gh` orders newest-first while an
+author's open PRs are normally their newest. Observed live on an active repository, terminal PRs held
+15 of 20 slots at `--limit 20`, which is what motivated the widening.
 
-  Collapsing the rollup to a single `PASSING`/`PENDING`/`FAILING` verdict was considered and
-  rejected. It is quieter than the raw array, but it reintroduces the same churn one level up: an
-  ordinary push that never breaks CI still walks `PASSING → PENDING → PASSING` and fires **twice**.
-  Reducing to failing check _names_ stays silent across that whole cycle (asserted directly in
-  `apps/cli/src/commands/pr-alerting-presets.test.ts`) and makes the delivered event actionable
-  without a second round-trip to find out which check failed.
+Each PR is then reduced to a single `needs` verdict and **dropped entirely when it is `none`**:
 
-- `reviewDecision`, a per-reviewer `{by, state}` list from `latestReviews`, and an issue-comment
-  count — so a new review, a changed verdict, or a new comment each diff. `gh pr list` exposes no
-  review-thread data, so inline thread replies that do not move `reviewDecision` are not visible.
-- `isDraft` — so both directions of draft↔ready each diff.
+- `merged` / `closed` — terminal; needs cleanup or explanation. Terminal entries deliberately carry
+  no `failingChecks`/`reviews`/`commentCount`, so post-merge comment activity cannot churn them.
+- `ci-failing` — a failing entry in `statusCheckRollup`; `failingChecks` names them.
+- `changes-requested` — blocking review feedback.
+- `draft` — an open draft. Encoding draft as _membership_ rather than as a diffed `isDraft` field is
+  what keeps both directions firing: `false → true` enters the set, `true → false` leaves it.
 
-Note that `reviewDecision` is the **empty string**, not `null`, when GitHub has no decision for a PR.
-A `(.reviewDecision // "NONE")` coalesce is therefore a silent no-op; the preset passes the value
-through unchanged and the monitor body tells the agent what `""` means.
+A green, non-draft, undecided open PR is `none` and never enters the payload, so an ordinary CI run
+(queued → running → passing) produces no event at all.
 
-`--limit` still makes the query a **recency window**, not a set: if there are ever more than 30
-simultaneously open PRs of one's own, an old one aging out produces a removal diff that is not a state
-transition. The monitor body says so explicitly. This residual limitation is inherent to a
-list-and-diff design and is one of the things a semantic `source-github-pr` plugin would remove.
+Supporting fields on non-terminal entries: `failingChecks` (the sorted names of **failing**
+`statusCheckRollup` entries — both `CheckRun` `conclusion` and legacy `StatusContext` `state`), a
+per-reviewer `{by, state}` list from `latestReviews`, and an issue-comment count, so further feedback
+on a PR _already_ needing changes still diffs. `gh pr list` exposes no review-thread data, so inline
+thread replies that do not move `reviewDecision` are not visible at all.
 
-#### Urgency: both presets are `normal`, and `high` is not available to either
+Collapsing `statusCheckRollup` to a single `PASSING`/`PENDING`/`FAILING` verdict was considered and
+rejected: it is quieter than the raw array but reintroduces churn one level up, firing twice on every
+ordinary push (`PASSING → PENDING → PASSING`) even when CI never breaks. Reducing to failing check
+_names_ stays silent across that whole cycle and names the failing check in the delivered event.
 
-`pr-review` is `normal` for the ordinary reason: an unreviewed PR is real work but not a regression —
-nothing is broken while it waits, and review is best picked up at a turn boundary.
+`reviewDecision` is the **empty string**, not `null`, when GitHub has no decision, so a
+`(.reviewDecision // "NONE")` coalesce is a silent no-op; both presets compare against `""`
+explicitly.
 
-`my-prs` is `normal` for a **non-obvious** reason worth stating explicitly, because the intuitive call
-is the opposite. A stalled PR of one's own — red CI, blocking feedback — genuinely is
-interrupt-worthy, which argues for `high`. The blocker is that **`json-diff` is symmetric**: a PR
-_leaving_ an actionable state diffs exactly as much as one entering it. CI recovering red→green, a PR
-merging, and the author's own new PR appearing therefore all fire too.
+#### Membership, not full state — and why both presets are `high`
 
-Payload shaping does not rescue `high`. Filtering the command's output down to only actionable PRs
-(CI failing, `CHANGES_REQUESTED`, terminal states) does not make every fire actionable — it merely
-relocates the benign fire from "a field changed" to "an entry was removed", which `json-diff` reports
-identically. Since no payload design makes every fire actionable, `high` would interrupt mid-turn on
-good news, which is the interrupt-storm anti-pattern (#441). `normal` surfaces the same information
-at a turn boundary instead.
+Both presets emit a **membership set**: a PR appears only while it needs something from its audience,
+and its reason is the entry's `needs` field. Diffing membership rather than full state is what
+suppresses benign traffic — an ordinary CI run never changes the set, so it produces no event.
 
-The general rule this establishes for any `json-diff` monitor: **`high` urgency is only defensible
-when the watched value cannot transition back to a benign state**, because recovery is
-indistinguishable from breakage at the diff layer.
+That filtering is the **precondition** for `high`, and `high` is **required** here for two reasons
+established in the field rather than by reasoning (issue #444):
+
+1. **`normal` reminders are coalesced-until-acknowledgment** ([002 §9.2](./002-runtime-delivery.md)).
+   The implemented guard is `normalPending.length === unreadNormal.length` — _every_ unread normal
+   event must be unclaimed for the coalesced reminder to fire, so one claimed-but-unacked normal event
+   from **any** monitor suppresses it for **all** of them. In an active session that is nearly always
+   true, making a `normal` PR monitor structurally unreliable exactly when its audience has been
+   working. Observed live: three `monitor_events` materialized correctly while delivery was suppressed
+   on all four lead sessions, so the author was never told CI had failed.
+2. **`normal` carries no event body mid-session** ([002 §9.2/§9.3](./002-runtime-delivery.md)). Normal
+   and low deliver a generic reminder with an empty `events` array; bodies arrive only at recap. An
+   author needs to know _which_ PR broke and _how_ while still working.
+
+**Not every fire is actionable, and the presets do not claim otherwise.** `json-diff` is symmetric, so
+an entry _leaving_ the set diffs exactly like one entering it: CI going green, a review answered, a
+draft marked ready, and a terminal PR aging out of the recency window each fire once. These are
+one-per-resolved-item confirmations rather than a storm, and both monitor bodies name them explicitly
+so they are cheap for an agent to dismiss.
+
+The rule this yields for any `json-diff` monitor: **`high` is defensible when the payload is filtered
+so that every _entering_ transition is actionable.** The residual leaving-transitions are the
+unavoidable cost of a symmetric diff; the design goal is to bound them to one per resolved item, not
+to zero.
 
 #### Degradation when `gh` is unusable
 

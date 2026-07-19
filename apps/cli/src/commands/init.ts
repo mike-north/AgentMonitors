@@ -123,9 +123,14 @@ fi`;
  * issue-#388 swap pattern).
  */
 const PR_REVIEW_URGENCY_COMMENT =
-  '# normal, not high: an unreviewed PR is real work, but it is not a regression —\n' +
-  '# nothing is broken while it waits, and reviewing is a task best picked up at a\n' +
-  '# turn boundary rather than mid-edit (002 §9).\n';
+  '# high, and that is only safe because the payload is a MEMBERSHIP set of PRs\n' +
+  '# that actually need reviewing right now: a PR that has been decided leaves the\n' +
+  '# set instead of churning a field inside it, so there is no benign per-push or\n' +
+  '# per-comment traffic to interrupt on. `normal` was tried and rejected — normal\n' +
+  '# reminders are coalesced-until-ack (002 §9.2), so one claimed-but-unacked\n' +
+  '# normal event from ANY monitor suppresses the reminder for all of them, and\n' +
+  '# normal carries no event BODY mid-session (002 §9.2/§9.3), so the reviewer\n' +
+  '# would not learn WHICH PR needs review until session recap.\n';
 
 /**
  * `my-prs`'s urgency-rationale comment; see {@link PR_REVIEW_URGENCY_COMMENT}.
@@ -137,14 +142,20 @@ const PR_REVIEW_URGENCY_COMMENT =
  * that (003 §11.9).
  */
 const MY_PRS_URGENCY_COMMENT =
-  '# normal, not high — and the reason is not obvious. json-diff is symmetric: a PR\n' +
-  '# LEAVING an actionable state diffs exactly as much as one entering it. So CI\n' +
-  '# recovering red -> green, a PR merging, and a new PR of your own appearing all\n' +
-  '# fire too, and no amount of payload shaping changes that (filtering the payload\n' +
-  '# down to only actionable PRs just moves the benign fire from "field changed" to\n' +
-  '# "entry removed"). Since not every fire can be made actionable, high would\n' +
-  '# interrupt mid-turn on good news — the interrupt-storm anti-pattern (#441).\n' +
-  '# normal surfaces the same information at a turn boundary instead (002 §9).\n';
+  '# high, earned by the payload filter above: only PRs that need YOU to do\n' +
+  '# something are in the list at all, so an ordinary CI run (queued -> running ->\n' +
+  '# passing) produces no event. `normal` was tried in the field and does not work\n' +
+  '# here, for two compounding reasons (002 §9.2/§9.3):\n' +
+  '#   1. Normal reminders are coalesced-until-ack. One claimed-but-unacked normal\n' +
+  '#      event from ANY monitor suppresses the coalesced reminder for ALL of them,\n' +
+  '#      which in an active session is nearly always true — so a normal author\n' +
+  '#      monitor goes silent exactly when the agent has been busy.\n' +
+  '#   2. Normal delivers no event BODY mid-session; bodies arrive only at recap.\n' +
+  '#      An author needs to know WHICH PR broke and HOW while still working.\n' +
+  '# Not every fire is actionable: a PR LEAVING the list (CI fixed, review\n' +
+  '# answered, draft marked ready) also diffs. Those are one-per-cycle\n' +
+  '# confirmations, not a storm, and the body below names them so they are cheap\n' +
+  '# to dismiss.\n';
 
 /**
  * Generalized replacement for {@link PR_REVIEW_URGENCY_COMMENT} /
@@ -190,58 +201,67 @@ function yamlBlockScalar(script: string, indent: string): string {
 const PR_REVIEW_QUERY =
   "gh pr list --state open --limit 30 --search '-author:@me' " +
   '--json number,title,isDraft,reviewDecision,headRefName,author ' +
-  '--jq \'[.[] | select(.isDraft == false and (.headRefName | startswith("changeset-release/") | not)) ' +
-  '| {number, title, headRefName, reviewDecision, author: .author.login}] ' +
+  "--jq '[.[] | select(.isDraft == false " +
+  'and (.headRefName | startswith("changeset-release/") | not) ' +
+  'and (((.reviewDecision // "") == "") or (.reviewDecision == "REVIEW_REQUIRED"))) ' +
+  '| {number, title, headRefName, author: .author.login}] ' +
   "| sort_by(.number)'";
 
 /**
- * `--type my-prs`'s `gh` query: the current `gh` user's recent PRs in the
- * current repo (`--author @me` — never a baked-in username). `--state open`
- * with a generously raised `--limit 30` — rather than `--state all --limit
- * 10` — is what keeps every still-open PR in the result set: `--limit`
- * always applies to a **newest-created-first** list, so a small `--state
- * all` window lets an older still-open PR silently age out the moment enough
- * newer PRs (including merged/closed ones, which `--state all` also counts
- * against the cap) exist — and once evicted, its CI going red produces no
- * event. `--state open` removes merged/closed PRs from the cap entirely, so
- * only actually-open work competes for the 30 slots; a PR leaving the open
- * set (merged or closed) then surfaces as a **removal** from the diffed
- * list, the same "dropped off the list" signal `pr-review` already uses —
- * see the monitor body for how to tell which happened.
+ * `--type my-prs`'s `gh` query: the current `gh` user's PRs in the current repo
+ * (`--author @me` — never a baked-in username) that **need the author to do
+ * something**.
  *
- * The `--jq` reduction is what makes the remaining trigger classes diff
- * cleanly:
+ * **The payload is a membership set of actionable PRs, not full state**, and
+ * that is the precondition for `high` urgency (see the template's urgency
+ * comment). Each PR is reduced to a single `needs` verdict and dropped entirely
+ * when it is `none`:
  *
- * - **CI** — `failingChecks` is the sorted list of *failing* check names.
- *   Reducing `statusCheckRollup` to only failures (rather than diffing it
- *   whole) means a green→red transition fires (`[]` → `["build"]`) and a
- *   red→green recovery fires, while the queued/in-progress churn of a normal
- *   CI run — which would otherwise produce an interrupt per check, per push —
- *   is invisible. Note this is quieter than collapsing the rollup to a single
- *   PASSING/PENDING/FAILING verdict, which reintroduces the churn one level up:
- *   every push would fire twice (PASSING→PENDING, PENDING→PASSING) even when
- *   CI never breaks. Naming the failing checks also makes the delivered event
- *   actionable without a second round-trip.
- * - **Review feedback** — `reviewDecision` plus a per-reviewer
- *   `{by, state}` list and an issue-comment count, so a new review, a changed
- *   verdict, or a new comment all diff. (`gh pr list` exposes no review-thread
- *   data, so inline thread replies are not visible here; see the follow-up
- *   note in the monitor body.)
- * - **Draft state** — `isDraft`, so both directions of draft↔ready produce a
- *   diff. `state` is also carried through for symmetry with `pr-review`'s
- *   shape, but with `--state open` it can only ever read `OPEN` in practice —
- *   a merge or close is observed as the entry disappearing, never as this
- *   field changing.
+ * - `merged` / `closed` — terminal; the branch needs cleanup or the closure
+ *   needs explaining. Terminal entries deliberately carry no
+ *   `failingChecks`/`reviews`/`commentCount`, so post-merge comment activity
+ *   cannot churn them.
+ * - `ci-failing` — `statusCheckRollup` holds a failing entry (both `CheckRun`
+ *   `conclusion` and legacy `StatusContext` `state`); `failingChecks` names
+ *   them, so the delivered event says *which* check broke.
+ * - `changes-requested` — blocking review feedback.
+ * - `draft` — an open draft. Encoding draft as *membership* rather than as a
+ *   diffed `isDraft` field is what keeps both directions firing: `false → true`
+ *   enters the set, `true → false` leaves it.
+ *
+ * A green, non-draft, undecided open PR is `none` and never enters the payload,
+ * so an ordinary CI run (queued → running → passing) produces no event at all.
+ *
+ * `--state all --limit 60` rather than `--state open`: a merged PR must stay in
+ * the result set for its terminal state to be *nameable*, because "merged, go
+ * clean up the branch" and "closed unmerged, go find out why" are different
+ * instructions and `--state open` collapses both into an indistinguishable
+ * disappearance. The cost of `--state all` is that merged/closed PRs also count
+ * against `--limit`, so an old still-open PR could in principle age out of the
+ * query and stop being monitored; the window is widened to 60 (measured ~3.5s
+ * per poll against a real repo, comfortably inside a 5m interval) so that
+ * requires 60 newer PRs, and `gh pr list` orders newest-first while an author's
+ * open PRs are normally their newest.
  */
 const MY_PRS_QUERY =
-  'gh pr list --author @me --state open --limit 30 ' +
+  'gh pr list --author @me --state all --limit 60 ' +
   '--json number,title,url,state,isDraft,reviewDecision,statusCheckRollup,latestReviews,comments ' +
-  "--jq '[.[] | {number, title, url, state, isDraft, reviewDecision, " +
-  'failingChecks: ([.statusCheckRollup[]? | select(((.conclusion // .state // "") | ascii_upcase) as $c ' +
+  "--jq '[.[] " +
+  '| (([.statusCheckRollup[]? | select(((.conclusion // .state // "") | ascii_upcase) as $c ' +
   '| $c == "FAILURE" or $c == "TIMED_OUT" or $c == "CANCELLED" or $c == "ERROR" ' +
-  'or $c == "ACTION_REQUIRED" or $c == "STARTUP_FAILURE") | (.name // .context)] | sort), ' +
+  'or $c == "ACTION_REQUIRED" or $c == "STARTUP_FAILURE") | (.name // .context)] | sort)) as $failing ' +
+  '| (if .state == "MERGED" then "merged" ' +
+  'elif .state == "CLOSED" then "closed" ' +
+  'elif ($failing | length) > 0 then "ci-failing" ' +
+  'elif .reviewDecision == "CHANGES_REQUESTED" then "changes-requested" ' +
+  'elif .isDraft then "draft" ' +
+  'else "none" end) as $needs ' +
+  '| select($needs != "none") ' +
+  '| {number, title, url, needs: $needs} ' +
+  '+ (if $needs == "merged" or $needs == "closed" then {} ' +
+  'else {failingChecks: $failing, ' +
   'reviews: ([.latestReviews[]? | {by: .author.login, state}] | sort_by(.by, .state)), ' +
-  "commentCount: (.comments | length)}] | sort_by(.number)'";
+  "commentCount: (.comments | length)} end)] | sort_by(.number)'";
 
 /**
  * The scaffold body for each `--type`. Exported (test-only use) so
@@ -324,25 +344,22 @@ ${yamlBlockScalar(ghPresetScript('pr-review', PR_REVIEW_QUERY), '      ')}
   interval: 5m
   change-detection:
     strategy: json-diff
-${PR_REVIEW_URGENCY_COMMENT}urgency: normal
+${PR_REVIEW_URGENCY_COMMENT}urgency: high
 ---
 
-The set of pull requests awaiting review in this repository changed. Act as the
-reviewer.
+A pull request in this repository needs review. This list holds only PRs that
+are open, out of draft, authored by someone else, and **not yet decided** — so
+anything that *appears* here is waiting on you.
 
-- **A PR appeared in the list** — it was just opened, or a draft was marked
-  ready (drafts are filtered out, so "marked ready" shows up as an appearance).
-  Review it: check out the branch, read the diff against the issue or
-  description it claims to implement, and record findings. Do not merge it
-  yourself.
-- **\`reviewDecision\` moved to \`CHANGES_REQUESTED\` or \`APPROVED\`** — someone
-  else reviewed it. If it is now approved, note that it is ready for whoever
-  owns merging; do not self-merge.
-- **A PR dropped off the list** — it was merged, closed, or converted back to
-  draft. No action needed beyond noting it.
+- **A PR appeared** — it was just opened, or a draft was marked ready. Review
+  it: check out the branch, read the diff against the issue or description it
+  claims to implement, and record findings. Do not merge it yourself.
+- **A PR disappeared** — someone reviewed it (approved or requested changes), or
+  it was merged, closed, or pulled back to draft. No action: it is no longer
+  waiting on you.
 
-Release PRs (\`changeset-release/*\` heads) are filtered out, and so are your
-own PRs — those are what \`my-prs\` is for.
+Release PRs (\`changeset-release/*\` heads) never enter this list, and neither do
+your own PRs — those are what \`my-prs\` is for.
 
 If instead you see a "Command failing" event, \`gh\` could not run — read the
 error and fix the CLI install, auth, or working directory before trusting this
@@ -367,40 +384,35 @@ ${yamlBlockScalar(ghPresetScript('my-prs', MY_PRS_QUERY), '      ')}
   interval: 5m
   change-detection:
     strategy: json-diff
-${MY_PRS_URGENCY_COMMENT}urgency: normal
+${MY_PRS_URGENCY_COMMENT}urgency: high
 ---
 
-Something changed on one of your own pull requests in this repository. Compare
-the entries by \`number\` and act on what moved.
+One of your own pull requests needs attention. This list holds only PRs that
+need something from you; each entry carries a \`needs\` field saying what.
 
-- **\`failingChecks\` gained a name** — CI broke. Pull the failing job's log
-  (\`gh run view --log-failed\`), fix the cause on the branch, and push. Do not
-  ask for review until it is green again.
-- **\`failingChecks\` became empty** — CI recovered. Nothing to do beyond
-  noting it.
-- **\`reviewDecision\` became \`CHANGES_REQUESTED\`, or \`reviews\`/\`commentCount\`
-  grew** — review feedback landed. Read it, address each point in code or reply
-  explaining why not, then push and re-request review.
-- **\`isDraft\` went \`true\` → \`false\`** — the PR is now soliciting review;
-  make sure CI is green and the description is accurate.
-- **\`isDraft\` went \`false\` → \`true\`** — it was pulled back to draft, usually
-  because something was found. Find out what before pushing more.
-- **A PR dropped off the list** — this only watches your still-open PRs, so a
-  disappearance means it merged or was closed — check the PR on GitHub to tell
-  which. If merged: delete the branch and its worktree, and close the issue it
-  referenced if its acceptance criteria are met. If closed unmerged: find out
-  why before reopening or re-doing the work.
+- **\`needs: ci-failing\`** — CI broke. \`failingChecks\` names the failing
+  checks; pull the log (\`gh run view --log-failed\`), fix the cause on the
+  branch, and push. Do not ask for review until it is green.
+- **\`needs: changes-requested\`** — blocking review feedback landed. Read it,
+  address each point in code or reply explaining why not, then push and
+  re-request review. A growing \`reviews\`/\`commentCount\` on an entry already
+  in the list means more feedback arrived.
+- **\`needs: draft\`** — the PR is in draft. If you did not just put it there,
+  someone pulled it back; find out what they found before pushing more.
+- **\`needs: merged\`** — it landed. Delete the branch and its worktree, and
+  close the issue it referenced if its acceptance criteria are met.
+- **\`needs: closed\`** — closed without merging. Find out why before reopening
+  or redoing the work.
 
-Two things that look like transitions but are not:
-
-- **A PR simply disappearing from the list** — it aged out of the most-recent-20
-  window, which is a recency window, not a state. No action.
-- **\`reviewDecision\` is \`""\`** — that is how \`gh\` reports "no decision yet",
-  not a decision that was cleared.
+An entry **leaving** the list is good news, not a transition to act on: CI went
+green, the review was answered, or a draft was marked ready. Note it and move
+on. A PR dropping off because it aged out of the most-recent-60 recency window
+is likewise not a state change.
 
 \`gh pr list\` exposes no review-thread data, so inline review comments that do
-not change \`reviewDecision\` are not visible here; check the PR directly when
-feedback is expected.
+not move \`reviewDecision\` are not visible here; check the PR directly when
+feedback is expected. Note that \`gh\` reports "no decision yet" as an empty
+string, not \`null\`.
 
 If instead you see a "Command failing" event, \`gh\` could not run — read the
 error and fix the CLI install, auth, or working directory before trusting this

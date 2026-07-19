@@ -179,29 +179,28 @@ async function transition(
   return next.titles;
 }
 
-/** One entry in `my-prs`'s reduced, diffed shape. */
+/**
+ * One entry in `my-prs`'s **actionable** payload. A PR appears only while it
+ * needs the author to do something; `needs` says which class it is.
+ */
 interface MyPrEntry {
   number: number;
   title: string;
   url: string;
-  state: 'OPEN' | 'MERGED' | 'CLOSED';
-  isDraft: boolean;
-  reviewDecision: string;
-  failingChecks: string[];
-  reviews: { by: string; state: string }[];
-  commentCount: number;
+  needs: 'ci-failing' | 'changes-requested' | 'draft' | 'merged' | 'closed';
+  failingChecks?: string[];
+  reviews?: { by: string; state: string }[];
+  commentCount?: number;
 }
 
-/** A healthy, open, green, unreviewed PR — the "nothing to report" baseline. */
+/** An open PR whose CI is red — the canonical actionable entry. */
 function myPr(overrides: Partial<MyPrEntry> = {}): MyPrEntry {
   return {
     number: 101,
     title: 'feat: add widget',
     url: 'https://github.com/acme/app/pull/101',
-    state: 'OPEN',
-    isDraft: false,
-    reviewDecision: '',
-    failingChecks: [],
+    needs: 'ci-failing',
+    failingChecks: ['build'],
     reviews: [],
     commentCount: 0,
     ...overrides,
@@ -214,179 +213,6 @@ function fixtureOf(entries: unknown[]): string {
 
 const CHANGED = 'Command output changed: my-prs';
 const CHANGED_REVIEW = 'Command output changed: pr-review';
-
-describe('`--type my-prs` fires on every trigger class (issue #444)', () => {
-  let scope: Scope;
-  let stub: string;
-  beforeAll(() => {
-    scope = presetScope('my-prs');
-    stub = stubGhEchoingFixture();
-  });
-
-  it('fires when CI goes green -> red', async () => {
-    const titles = await transition(
-      scope,
-      stub,
-      fixtureOf([myPr({ failingChecks: [] })]),
-      fixtureOf([myPr({ failingChecks: ['build'] })]),
-    );
-    expect(titles).toEqual([CHANGED]);
-  });
-
-  it('fires when CI recovers red -> green', async () => {
-    const titles = await transition(
-      scope,
-      stub,
-      fixtureOf([myPr({ failingChecks: ['build'] })]),
-      fixtureOf([myPr({ failingChecks: [] })]),
-    );
-    expect(titles).toEqual([CHANGED]);
-  });
-
-  it('fires when reviewDecision becomes CHANGES_REQUESTED', async () => {
-    const titles = await transition(
-      scope,
-      stub,
-      fixtureOf([myPr({ reviewDecision: '' })]),
-      fixtureOf([myPr({ reviewDecision: 'CHANGES_REQUESTED' })]),
-    );
-    expect(titles).toEqual([CHANGED]);
-  });
-
-  it('fires when a new review lands without changing reviewDecision', async () => {
-    const titles = await transition(
-      scope,
-      stub,
-      fixtureOf([myPr({ reviews: [] })]),
-      fixtureOf([myPr({ reviews: [{ by: 'octocat', state: 'COMMENTED' }] })]),
-    );
-    expect(titles).toEqual([CHANGED]);
-  });
-
-  it('fires when a new comment lands', async () => {
-    const titles = await transition(
-      scope,
-      stub,
-      fixtureOf([myPr({ commentCount: 0 })]),
-      fixtureOf([myPr({ commentCount: 1 })]),
-    );
-    expect(titles).toEqual([CHANGED]);
-  });
-
-  it('fires when isDraft goes true -> false (marked ready)', async () => {
-    const titles = await transition(
-      scope,
-      stub,
-      fixtureOf([myPr({ isDraft: true })]),
-      fixtureOf([myPr({ isDraft: false })]),
-    );
-    expect(titles).toEqual([CHANGED]);
-  });
-
-  it('fires when isDraft goes false -> true (pulled back to draft)', async () => {
-    const titles = await transition(
-      scope,
-      stub,
-      fixtureOf([myPr({ isDraft: false })]),
-      fixtureOf([myPr({ isDraft: true })]),
-    );
-    expect(titles).toEqual([CHANGED]);
-  });
-
-  it('fires when state becomes MERGED', async () => {
-    const titles = await transition(
-      scope,
-      stub,
-      fixtureOf([myPr({ state: 'OPEN' })]),
-      fixtureOf([myPr({ state: 'MERGED' })]),
-    );
-    expect(titles).toEqual([CHANGED]);
-  });
-
-  it('fires when state becomes CLOSED', async () => {
-    const titles = await transition(
-      scope,
-      stub,
-      fixtureOf([myPr({ state: 'OPEN' })]),
-      fixtureOf([myPr({ state: 'CLOSED' })]),
-    );
-    expect(titles).toEqual([CHANGED]);
-  });
-
-  it('fires when a newly authored PR appears', async () => {
-    const titles = await transition(
-      scope,
-      stub,
-      fixtureOf([myPr({ number: 101 })]),
-      fixtureOf([myPr({ number: 101 }), myPr({ number: 102 })]),
-    );
-    expect(titles).toEqual([CHANGED]);
-  });
-
-  // Control: without this, every assertion above would pass even if the
-  // monitor fired unconditionally on each tick.
-  it('does NOT fire when nothing changed', async () => {
-    const titles = await transition(
-      scope,
-      stub,
-      fixtureOf([myPr()]),
-      fixtureOf([myPr()]),
-    );
-    expect(titles).toEqual([]);
-  });
-
-  // json-diff compares semantically (003 §11.3), so a re-serialization with
-  // different key order must not manufacture an interrupt.
-  it('does NOT fire on key-order-only differences', async () => {
-    const before = '[{"number":101,"state":"OPEN","failingChecks":[]}]\n';
-    const after = '[{"failingChecks":[],"state":"OPEN","number":101}]\n';
-    const titles = await transition(scope, stub, before, after);
-    expect(titles).toEqual([]);
-  });
-});
-
-describe('`--type pr-review` reviewer queue (issue #444)', () => {
-  let scope: Scope;
-  let stub: string;
-  beforeAll(() => {
-    scope = presetScope('pr-review');
-    stub = stubGhEchoingFixture();
-  });
-
-  it('fires when a non-draft PR appears in the queue', async () => {
-    const titles = await transition(
-      scope,
-      stub,
-      fixtureOf([]),
-      fixtureOf([
-        {
-          number: 7,
-          title: 'fix: thing',
-          headRefName: 'fix/thing',
-          reviewDecision: '',
-          author: 'octocat',
-        },
-      ]),
-    );
-    expect(titles).toEqual([CHANGED_REVIEW]);
-  });
-
-  it('fires when reviewDecision flips', async () => {
-    const base = {
-      number: 7,
-      title: 'fix: thing',
-      headRefName: 'fix/thing',
-      author: 'octocat',
-    };
-    const titles = await transition(
-      scope,
-      stub,
-      fixtureOf([{ ...base, reviewDecision: '' }]),
-      fixtureOf([{ ...base, reviewDecision: 'CHANGES_REQUESTED' }]),
-    );
-    expect(titles).toEqual([CHANGED_REVIEW]);
-  });
-});
 
 /**
  * The shipped `--jq` reduction, run for real. `jq` is preinstalled on the
@@ -440,58 +266,6 @@ describe('the presets’ jq reduction over raw gh output', () => {
     };
   }
 
-  it('excludes a changeset-release/* head from the reviewer queue', async () => {
-    const scope = presetScope('pr-review');
-    const stub = stubGhApplyingJq();
-    const result = await observe(
-      scope,
-      stub,
-      fixtureOf([
-        rawReviewPr({ number: 9, headRefName: 'changeset-release/main' }),
-      ]),
-    );
-    // The release PR is the only candidate, so a correct filter yields [].
-    expect(JSON.parse(result.stdout)).toEqual([]);
-  });
-
-  it('excludes drafts and keeps real PRs, projecting author to a login', async () => {
-    const scope = presetScope('pr-review');
-    const stub = stubGhApplyingJq();
-    const result = await observe(
-      scope,
-      stub,
-      fixtureOf([
-        rawReviewPr({ number: 8, isDraft: true }),
-        rawReviewPr({ number: 7 }),
-        rawReviewPr({ number: 9, headRefName: 'changeset-release/main' }),
-      ]),
-    );
-    expect(JSON.parse(result.stdout)).toEqual([
-      {
-        number: 7,
-        title: 'fix: thing',
-        headRefName: 'fix/thing',
-        reviewDecision: '',
-        author: 'octocat',
-      },
-    ]);
-  });
-
-  it('does NOT fire when a changeset-release PR is opened', async () => {
-    const scope = presetScope('pr-review');
-    const stub = stubGhApplyingJq();
-    const titles = await transition(
-      scope,
-      stub,
-      fixtureOf([rawReviewPr({ number: 7 })]),
-      fixtureOf([
-        rawReviewPr({ number: 7 }),
-        rawReviewPr({ number: 9, headRefName: 'changeset-release/main' }),
-      ]),
-    );
-    expect(titles).toEqual([]);
-  });
-
   /** A raw `gh pr list --json ...` element for the `my-prs` preset. */
   function rawMyPr(overrides: Record<string, unknown> = {}): unknown {
     return {
@@ -524,201 +298,407 @@ describe('the presets’ jq reduction over raw gh output', () => {
     };
   }
 
-  it('reduces a failed CheckRun into failingChecks, and a green one into []', async () => {
-    const scope = presetScope('my-prs');
-    const stub = stubGhApplyingJq();
-    const green = await observe(
-      scope,
-      stub,
-      fixtureOf([
-        rawMyPr({ statusCheckRollup: [checkRun('build', 'SUCCESS')] }),
-      ]),
-    );
-    expect(
-      (JSON.parse(green.stdout) as { failingChecks: string[] }[])[0]
-        ?.failingChecks,
-    ).toEqual([]);
+  /** The green, non-draft, undecided open PR that must never enter `my-prs`. */
+  const QUIET = { statusCheckRollup: [checkRun('build', 'SUCCESS')] };
 
-    const red = await observe(
-      scope,
-      stub,
-      fixtureOf([
-        rawMyPr({
-          statusCheckRollup: [
-            checkRun('build', 'FAILURE'),
-            checkRun('lint', 'SUCCESS'),
-          ],
-        }),
-      ]),
-    );
-    expect(
-      (JSON.parse(red.stdout) as { failingChecks: string[] }[])[0]
-        ?.failingChecks,
-    ).toEqual(['build']);
+  describe('`--type my-prs` fires on every actionable transition', () => {
+    let scope: Scope;
+    let stub: string;
+    beforeAll(() => {
+      scope = presetScope('my-prs');
+      stub = stubGhApplyingJq();
+    });
+
+    it('fires when CI goes green -> red, and names the failing check', async () => {
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([rawMyPr(QUIET)]),
+        fixtureOf([
+          rawMyPr({ statusCheckRollup: [checkRun('build', 'FAILURE')] }),
+        ]),
+      );
+      expect(titles).toEqual([CHANGED]);
+
+      const red = await observe(
+        scope,
+        stub,
+        fixtureOf([
+          rawMyPr({ statusCheckRollup: [checkRun('build', 'FAILURE')] }),
+        ]),
+      );
+      expect(JSON.parse(red.stdout)).toEqual([
+        {
+          number: 101,
+          title: 'feat: add widget',
+          url: 'https://github.com/acme/app/pull/101',
+          needs: 'ci-failing',
+          failingChecks: ['build'],
+          reviews: [],
+          commentCount: 0,
+        },
+      ]);
+    });
+
+    it('fires when reviewDecision becomes CHANGES_REQUESTED', async () => {
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([rawMyPr(QUIET)]),
+        fixtureOf([rawMyPr({ ...QUIET, reviewDecision: 'CHANGES_REQUESTED' })]),
+      );
+      expect(titles).toEqual([CHANGED]);
+    });
+
+    it('fires when more feedback lands on a PR already needing changes', async () => {
+      const base = { ...QUIET, reviewDecision: 'CHANGES_REQUESTED' };
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([rawMyPr(base)]),
+        fixtureOf([rawMyPr({ ...base, comments: [{ body: 'one more' }] })]),
+      );
+      expect(titles).toEqual([CHANGED]);
+    });
+
+    it('fires when isDraft goes false -> true (pulled back to draft)', async () => {
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([rawMyPr(QUIET)]),
+        fixtureOf([rawMyPr({ ...QUIET, isDraft: true })]),
+      );
+      expect(titles).toEqual([CHANGED]);
+    });
+
+    it('fires when isDraft goes true -> false (marked ready)', async () => {
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([rawMyPr({ ...QUIET, isDraft: true })]),
+        fixtureOf([rawMyPr(QUIET)]),
+      );
+      expect(titles).toEqual([CHANGED]);
+    });
+
+    it('fires when state becomes MERGED', async () => {
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([rawMyPr(QUIET)]),
+        fixtureOf([rawMyPr({ ...QUIET, state: 'MERGED' })]),
+      );
+      expect(titles).toEqual([CHANGED]);
+    });
+
+    it('fires when state becomes CLOSED', async () => {
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([rawMyPr(QUIET)]),
+        fixtureOf([rawMyPr({ ...QUIET, state: 'CLOSED' })]),
+      );
+      expect(titles).toEqual([CHANGED]);
+    });
+
+    // The whole reason `--state all` is kept despite costing window slots:
+    // "merged, clean up" and "closed unmerged, find out why" are different
+    // instructions, and `--state open` collapses both into a disappearance.
+    it('names MERGED and CLOSED distinguishably, and keeps terminal entries static', async () => {
+      const merged = await observe(
+        scope,
+        stub,
+        fixtureOf([rawMyPr({ ...QUIET, state: 'MERGED' })]),
+      );
+      expect(JSON.parse(merged.stdout)).toEqual([
+        {
+          number: 101,
+          title: 'feat: add widget',
+          url: 'https://github.com/acme/app/pull/101',
+          needs: 'merged',
+        },
+      ]);
+      const closed = await observe(
+        scope,
+        stub,
+        fixtureOf([rawMyPr({ ...QUIET, state: 'CLOSED' })]),
+      );
+      expect((JSON.parse(closed.stdout) as { needs: string }[])[0]?.needs).toBe(
+        'closed',
+      );
+    });
+
+    it('fires when CI recovers, as an entry leaving the list', async () => {
+      // Not actionable, but not swallowed either — the body tells the agent to
+      // note it and move on.
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([
+          rawMyPr({ statusCheckRollup: [checkRun('build', 'FAILURE')] }),
+        ]),
+        fixtureOf([rawMyPr(QUIET)]),
+      );
+      expect(titles).toEqual([CHANGED]);
+    });
+
+    it('treats a legacy StatusContext FAILURE as actionable', async () => {
+      const result = await observe(
+        scope,
+        stub,
+        fixtureOf([
+          rawMyPr({
+            statusCheckRollup: [
+              {
+                __typename: 'StatusContext',
+                context: 'ci/legacy',
+                state: 'FAILURE',
+              },
+            ],
+          }),
+        ]),
+      );
+      expect(
+        (JSON.parse(result.stdout) as { failingChecks: string[] }[])[0]
+          ?.failingChecks,
+      ).toEqual(['ci/legacy']);
+    });
   });
 
-  it('treats a legacy StatusContext FAILURE state as a failing check', async () => {
-    const scope = presetScope('my-prs');
-    const stub = stubGhApplyingJq();
-    const result = await observe(
-      scope,
-      stub,
-      fixtureOf([
-        rawMyPr({
-          statusCheckRollup: [
-            {
-              __typename: 'StatusContext',
-              context: 'ci/legacy',
-              state: 'FAILURE',
-            },
-          ],
-        }),
-      ]),
-    );
-    expect(
-      (JSON.parse(result.stdout) as { failingChecks: string[] }[])[0]
-        ?.failingChecks,
-    ).toEqual(['ci/legacy']);
+  /**
+   * The silence guarantees. These are the entire safety argument for `high`
+   * urgency: if any of these fired, a high-urgency author monitor would
+   * interrupt the agent mid-turn on a non-event.
+   */
+  describe('`--type my-prs` stays silent on non-events', () => {
+    let scope: Scope;
+    let stub: string;
+    beforeAll(() => {
+      scope = presetScope('my-prs');
+      stub = stubGhApplyingJq();
+    });
+
+    it('does NOT fire on a benign PENDING -> PASSING transition', async () => {
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([
+          rawMyPr({
+            statusCheckRollup: [
+              {
+                __typename: 'CheckRun',
+                name: 'build',
+                status: 'IN_PROGRESS',
+                conclusion: '',
+              },
+            ],
+          }),
+        ]),
+        fixtureOf([rawMyPr(QUIET)]),
+      );
+      expect(titles).toEqual([]);
+    });
+
+    it('stays silent across a full push -> queued -> running -> green cycle', async () => {
+      const cycle = [
+        [checkRun('build', 'SUCCESS')],
+        [
+          {
+            __typename: 'CheckRun',
+            name: 'build',
+            status: 'QUEUED',
+            conclusion: '',
+          },
+        ],
+        [
+          {
+            __typename: 'CheckRun',
+            name: 'build',
+            status: 'IN_PROGRESS',
+            conclusion: '',
+            startedAt: '2026-01-15T09:02:00Z',
+          },
+        ],
+        [checkRun('build', 'SUCCESS', 'COMPLETED')],
+      ];
+      let previous: unknown;
+      const firedAt: number[] = [];
+      for (const [index, rollup] of cycle.entries()) {
+        const result = await observe(
+          scope,
+          stub,
+          fixtureOf([rawMyPr({ statusCheckRollup: rollup })]),
+          previous,
+        );
+        if (result.titles.length > 0) firedAt.push(index);
+        previous = result.state;
+      }
+      expect(firedAt).toEqual([]);
+    });
+
+    it('does NOT fire when a healthy new PR of your own is opened', async () => {
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([rawMyPr(QUIET)]),
+        fixtureOf([rawMyPr(QUIET), rawMyPr({ ...QUIET, number: 102 })]),
+      );
+      expect(titles).toEqual([]);
+    });
+
+    it('does NOT fire when a healthy PR is approved', async () => {
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([rawMyPr(QUIET)]),
+        fixtureOf([rawMyPr({ ...QUIET, reviewDecision: 'APPROVED' })]),
+      );
+      expect(titles).toEqual([]);
+    });
+
+    it('does NOT fire when a healthy PR is retitled or gains a comment', async () => {
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([rawMyPr(QUIET)]),
+        fixtureOf([
+          rawMyPr({
+            ...QUIET,
+            title: 'feat: add widget (v2)',
+            comments: [{ b: 1 }],
+          }),
+        ]),
+      );
+      expect(titles).toEqual([]);
+    });
+
+    it('does NOT fire when a merged PR gains post-merge comments', async () => {
+      const merged = { ...QUIET, state: 'MERGED' };
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([rawMyPr(merged)]),
+        fixtureOf([
+          rawMyPr({
+            ...merged,
+            comments: [{ b: 1 }, { b: 2 }],
+            latestReviews: [
+              { author: { login: 'octocat' }, state: 'COMMENTED' },
+            ],
+          }),
+        ]),
+      );
+      expect(titles).toEqual([]);
+    });
   });
 
-  it('fires on a real green -> red statusCheckRollup transition', async () => {
+  describe('`--type pr-review` reviewer queue', () => {
+    let scope: Scope;
+    let stub: string;
+    beforeAll(() => {
+      scope = presetScope('pr-review');
+      stub = stubGhApplyingJq();
+    });
+
+    it('fires when a non-draft PR appears, and projects author to a login', async () => {
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([]),
+        fixtureOf([rawReviewPr()]),
+      );
+      expect(titles).toEqual([CHANGED_REVIEW]);
+
+      const result = await observe(scope, stub, fixtureOf([rawReviewPr()]));
+      expect(JSON.parse(result.stdout)).toEqual([
+        {
+          number: 7,
+          title: 'fix: thing',
+          headRefName: 'fix/thing',
+          author: 'octocat',
+        },
+      ]);
+    });
+
+    it('fires when a draft is marked ready', async () => {
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([rawReviewPr({ isDraft: true })]),
+        fixtureOf([rawReviewPr({ isDraft: false })]),
+      );
+      expect(titles).toEqual([CHANGED_REVIEW]);
+    });
+
+    it('fires when a PR leaves the queue because it was reviewed', async () => {
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([rawReviewPr()]),
+        fixtureOf([rawReviewPr({ reviewDecision: 'CHANGES_REQUESTED' })]),
+      );
+      expect(titles).toEqual([CHANGED_REVIEW]);
+    });
+
+    it('does NOT fire when a changeset-release PR is opened', async () => {
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([rawReviewPr()]),
+        fixtureOf([
+          rawReviewPr(),
+          rawReviewPr({ number: 9, headRefName: 'changeset-release/main' }),
+        ]),
+      );
+      expect(titles).toEqual([]);
+    });
+
+    it('does NOT fire when a draft PR is opened', async () => {
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([rawReviewPr()]),
+        fixtureOf([rawReviewPr(), rawReviewPr({ number: 8, isDraft: true })]),
+      );
+      expect(titles).toEqual([]);
+    });
+
+    it('does NOT fire when an already-reviewed PR gains further activity', async () => {
+      const reviewed = { reviewDecision: 'APPROVED' };
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([rawReviewPr(reviewed)]),
+        fixtureOf([rawReviewPr({ ...reviewed, title: 'fix: thing (v2)' })]),
+      );
+      expect(titles).toEqual([]);
+    });
+  });
+});
+
+describe('json-diff semantics the presets rely on', () => {
+  it('does NOT fire on key-order-only differences', async () => {
     const scope = presetScope('my-prs');
-    const stub = stubGhApplyingJq();
+    const stub = stubGhEchoingFixture();
     const titles = await transition(
       scope,
       stub,
-      fixtureOf([
-        rawMyPr({ statusCheckRollup: [checkRun('build', 'SUCCESS')] }),
-      ]),
-      fixtureOf([
-        rawMyPr({ statusCheckRollup: [checkRun('build', 'FAILURE')] }),
-      ]),
-    );
-    expect(titles).toEqual([CHANGED]);
-  });
-
-  // The reduction exists precisely so an in-flight CI run does not interrupt
-  // once per check, per push (that is why `high` urgency is tolerable here).
-  it('does NOT fire while checks are merely queued/in-progress', async () => {
-    const scope = presetScope('my-prs');
-    const stub = stubGhApplyingJq();
-    const titles = await transition(
-      scope,
-      stub,
-      fixtureOf([
-        rawMyPr({
-          statusCheckRollup: [
-            {
-              __typename: 'CheckRun',
-              name: 'build',
-              status: 'QUEUED',
-              conclusion: '',
-            },
-          ],
-        }),
-      ]),
-      fixtureOf([
-        rawMyPr({
-          statusCheckRollup: [
-            {
-              __typename: 'CheckRun',
-              name: 'build',
-              status: 'IN_PROGRESS',
-              conclusion: '',
-              startedAt: '2026-01-15T09:02:00Z',
-            },
-          ],
-        }),
-      ]),
+      '[{"number":101,"needs":"ci-failing","failingChecks":["build"]}]\n',
+      '[{"failingChecks":["build"],"needs":"ci-failing","number":101}]\n',
     );
     expect(titles).toEqual([]);
   });
 
-  // The design alternative considered here was collapsing statusCheckRollup to
-  // a single PASSING/PENDING/FAILING verdict. That is quieter than diffing the
-  // rollup raw, but it reintroduces the churn one level up: an ordinary push
-  // that never breaks CI still walks PASSING -> PENDING -> PASSING and would
-  // fire twice. Reducing to failing check NAMES stays silent across the whole
-  // cycle, which is what this asserts — and is why a single-verdict collapse
-  // was rejected rather than adopted.
-  it('stays completely silent across a full push -> CI -> green cycle', async () => {
+  it('does NOT fire when the actionable list is unchanged', async () => {
     const scope = presetScope('my-prs');
-    const stub = stubGhApplyingJq();
-    const cycle = [
-      // Steady state: last run finished green.
-      [checkRun('build', 'SUCCESS')],
-      // Push lands: checks re-queued.
-      [
-        {
-          __typename: 'CheckRun',
-          name: 'build',
-          status: 'QUEUED',
-          conclusion: '',
-        },
-      ],
-      // Checks running.
-      [
-        {
-          __typename: 'CheckRun',
-          name: 'build',
-          status: 'IN_PROGRESS',
-          conclusion: '',
-          startedAt: '2026-01-15T09:02:00Z',
-        },
-      ],
-      // Green again — same verdict as the start, never actionable.
-      [checkRun('build', 'SUCCESS', 'COMPLETED')],
-    ];
-
-    let previous: unknown;
-    const firedAt: number[] = [];
-    for (const [index, rollup] of cycle.entries()) {
-      const result = await observe(
-        scope,
-        stub,
-        fixtureOf([rawMyPr({ statusCheckRollup: rollup })]),
-        previous,
-      );
-      if (result.titles.length > 0) firedAt.push(index);
-      previous = result.state;
-    }
-    expect(firedAt).toEqual([]);
-  });
-
-  it('reduces review feedback to reviewer/state pairs and a comment count', async () => {
-    const scope = presetScope('my-prs');
-    const stub = stubGhApplyingJq();
-    const result = await observe(
+    const stub = stubGhEchoingFixture();
+    const titles = await transition(
       scope,
       stub,
-      fixtureOf([
-        rawMyPr({
-          reviewDecision: 'CHANGES_REQUESTED',
-          latestReviews: [
-            {
-              author: { login: 'octocat' },
-              state: 'CHANGES_REQUESTED',
-              body: 'a very long review body that must not be diffed',
-              submittedAt: '2026-01-15T09:30:00Z',
-            },
-          ],
-          comments: [{ body: 'one' }, { body: 'two' }],
-        }),
-      ]),
+      fixtureOf([myPr()]),
+      fixtureOf([myPr()]),
     );
-    expect(JSON.parse(result.stdout)).toEqual([
-      {
-        number: 101,
-        title: 'feat: add widget',
-        url: 'https://github.com/acme/app/pull/101',
-        state: 'OPEN',
-        isDraft: false,
-        reviewDecision: 'CHANGES_REQUESTED',
-        failingChecks: [],
-        reviews: [{ by: 'octocat', state: 'CHANGES_REQUESTED' }],
-        commentCount: 2,
-      },
-    ]);
+    expect(titles).toEqual([]);
   });
 });
 
@@ -871,8 +851,8 @@ describe('preset portability guarantees (issue #444)', () => {
   // recovering, a PR merging, your own new PR appearing) fire exactly like
   // actionable ones; `high` would therefore interrupt mid-turn on good news —
   // the interrupt-storm anti-pattern (#441). See 002 §9 and 003 §11.9.
-  it('neither preset is high urgency', () => {
-    expect(TEMPLATES['my-prs'] ?? '').toMatch(/^urgency: normal$/m);
-    expect(TEMPLATES['pr-review'] ?? '').toMatch(/^urgency: normal$/m);
+  it('both presets are high urgency', () => {
+    expect(TEMPLATES['my-prs'] ?? '').toMatch(/^urgency: high$/m);
+    expect(TEMPLATES['pr-review'] ?? '').toMatch(/^urgency: high$/m);
   });
 });

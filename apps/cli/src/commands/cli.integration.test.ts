@@ -1333,9 +1333,12 @@ describe('init', () => {
       expect(monitor).toMatch(/^urgency: low$/m);
       // Finding 8: the preset-specific rationale comment (which explained the
       // template's *default* value) must not survive above a seeded value it
-      // no longer describes.
-      expect(monitor).not.toMatch(/# normal, not high:/);
-      expect(monitor).not.toMatch(/# normal, not high —/);
+      // no longer describes. Asserted via the generalized replacement plus the
+      // rationale's distinctive phrase, rather than the comment's opening
+      // words — the latter would silently stop testing anything if the
+      // rationale were ever reworded.
+      expect(monitor).toContain('# urgency overridden via --urgency');
+      expect(monitor).not.toContain('coalesced-until-ack');
 
       const validated = run(['validate', monitorsDir, '--format', 'json'], dir);
       expect(validated.exitCode).toBe(0);

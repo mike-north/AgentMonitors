@@ -192,28 +192,36 @@ Runs against the current working directory. Performs, in order:
 
 Each source produces a distinct starter frontmatter block:
 
-| Source             | Key config fields in template                                                                                              |
-| ------------------ | -------------------------------------------------------------------------------------------------------------------------- |
-| `file-fingerprint` | `globs: ['**/*.ts']`                                                                                                       |
-| `api-poll`         | `url`, `method: GET`, `interval: 5m`; `change-detection.strategy` omitted so the source infers from `Content-Type`         |
-| `command-poll`     | `command: [git, ls-remote, origin, refs/heads/main]`, `interval: 5m`, `change-detection.strategy: text-diff`               |
-| `schedule`         | `cron: '0 9 * * 1-5'`, `timezone: UTC`                                                                                     |
-| `incoming-changes` | `paths: ['docs/specs/**']`, `branch: main`                                                                                 |
-| `pr-review`        | `command-poll` over `gh pr list` (no `--repo`), `key: pr-review`, `interval: 5m`, `json-diff`, `urgency: normal`           |
-| `my-prs`           | `command-poll` over `gh pr list --author @me` (no `--repo`), `key: my-prs`, `interval: 5m`, `json-diff`, `urgency: normal` |
+| Source             | Key config fields in template                                                                                            |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------ |
+| `file-fingerprint` | `globs: ['**/*.ts']`                                                                                                     |
+| `api-poll`         | `url`, `method: GET`, `interval: 5m`; `change-detection.strategy` omitted so the source infers from `Content-Type`       |
+| `command-poll`     | `command: [git, ls-remote, origin, refs/heads/main]`, `interval: 5m`, `change-detection.strategy: text-diff`             |
+| `schedule`         | `cron: '0 9 * * 1-5'`, `timezone: UTC`                                                                                   |
+| `incoming-changes` | `paths: ['docs/specs/**']`, `branch: main`                                                                               |
+| `pr-review`        | `command-poll` over `gh pr list` (no `--repo`), `key: pr-review`, `interval: 5m`, `json-diff`, `urgency: high`           |
+| `my-prs`           | `command-poll` over `gh pr list --author @me` (no `--repo`), `key: my-prs`, `interval: 5m`, `json-diff`, `urgency: high` |
 
 #### Presets (`pr-review` and `my-prs`)
 
 `pr-review` and `my-prs` are not source types — they are two ready-made `command-poll` monitors for
 the two pull-request roles, selected through the same `--type` flag:
 
-- **`pr-review`** (reviewer) — open, non-draft PRs in this repository awaiting review, excluding your
-  own PRs and `changeset-release/*` heads. Fires when a PR appears (opened, or a draft marked ready),
-  when `reviewDecision` flips, and when a PR leaves the queue. `urgency: normal`.
-- **`my-prs`** (author) — the current `gh` user's recent **open** PRs in this repository. Fires when
-  CI goes red or recovers, when review feedback lands, and when a PR is merged, closed, or moved into
-  or out of draft. `urgency: normal` — see [003 §11.9](./003-source-plugins.md) for why `high` is not
-  available to a `json-diff` monitor whose watched value can recover on its own.
+- **`pr-review`** (reviewer) — PRs in this repository actually awaiting review: open, out of draft,
+  authored by someone else, not a `changeset-release/*` release PR, and **not yet decided**. Fires
+  when a PR enters the queue (opened, or a draft marked ready) and when one leaves it (reviewed,
+  merged, closed). `urgency: high`.
+- **`my-prs`** (author) — the current `gh` user's recent PRs in this repository **that need something
+  from them**. Each entry carries a `needs` field (`ci-failing`, `changes-requested`, `draft`,
+  `merged`, `closed`); a green, non-draft, undecided PR does not appear at all, so an ordinary CI run
+  produces no event. `urgency: high`.
+
+Both presets carry a **membership set of actionable items** rather than full PR state, and that is
+what makes `high` safe. `normal` is not an option for either: normal reminders are
+coalesced-until-acknowledgment, so one claimed-but-unacked normal event from any monitor suppresses
+the reminder for all of them, and normal carries no event body mid-session — an author would not
+learn _which_ PR broke until recap. See [003 §11.9](./003-source-plugins.md) and
+[002 §9.2/§9.3](./002-runtime-delivery.md).
 
 **Both are automatically scoped to the repository the session is operating in — via an explicit
 `cwd:` init scaffolds, not `--repo`.** `gh` resolves the repository from its process working
