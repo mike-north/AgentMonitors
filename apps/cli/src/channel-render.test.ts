@@ -308,11 +308,13 @@ describe('renderChannelEvent', () => {
     // Signposted, not silently dropped: the still-unread full body is
     // recoverable via a DIRECTLY RUNNABLE session-scoped command (`events
     // list` requires `--session`, issue #420 P2 — PR #442 round-6 review), not
-    // the bare `--unread` form that would exit 1. This claim is already
-    // committed by the time it renders, so it must use
-    // `buildChannelTruncatedMarker`'s marker (issue #442 round-5/round-6), not
-    // the `CHANNEL_DEFERRED_MARKER` which falsely promises a later-poll
-    // re-delivery.
+    // the bare `--unread` form that would exit 1. This render happens BEFORE
+    // the reservation is committed (issue #442, PR #442 round-11/round-12
+    // review) — at render time it is genuinely unknown whether the commit
+    // that follows will land, so it must use `buildChannelTruncatedMarker`'s
+    // outcome-neutral marker (issue #442 round-5/round-6), not the
+    // `CHANNEL_DEFERRED_MARKER` alone, which would promise a later-poll
+    // re-delivery this single (non-mixed) case cannot guarantee.
     expect(content).toContain(buildChannelTruncatedMarker(sessionId).trim());
     expect(content).toContain(
       `agentmonitors events list --session ${sessionId} --unread`,
@@ -323,10 +325,18 @@ describe('renderChannelEvent', () => {
   });
 
   // Same pathological case, but with a second small event queued behind the
-  // oversized first one: only the first block is mid-truncated; the second
-  // event was never claimed (packChannelEventsUnderCap returns exactly 1 here),
-  // so it must not appear at all — it stays pending for a later poll.
-  it('mid-truncates only the oversized first event when a claim carries just that one event', () => {
+  // oversized first one: the first block is mid-truncated AND a second,
+  // genuinely distinct event stays pending beyond this claim
+  // (packChannelEventsUnderCap sized/reserved exactly the one oversized
+  // event, so the second was never claimed). This is the MIXED case (issue
+  // #442, PR #442 round-12 review): the mid-truncated event's own tail and
+  // the separately-deferred remainder are two different, non-overlapping
+  // facts, so BOTH markers must be signposted — rendering only the
+  // truncation marker would silently drop the "more work is pending" signal,
+  // contradicting 006 §5.5's candidate-growth guarantee (and diverging from
+  // the hook transport's `renderHookDelivery`, which renders both of its
+  // analogous markers in the identical mixed case).
+  it('mid-truncates the oversized first event AND signposts the genuinely deferred remainder (mixed case)', () => {
     const hugeBody = 'y'.repeat(5_000_000);
     const sessionId = 'sess-def456';
     const { content, meta } = renderChannelEvent(
@@ -347,18 +357,19 @@ describe('renderChannelEvent', () => {
       }),
       { moreDeferred: true },
     );
+    // The content ceiling still holds even with both markers appended.
     expect(content.length).toBeLessThanOrEqual(MAX_CHANNEL_CONTENT);
-    // Even though a second event was genuinely deferred (`moreDeferred:
-    // true`), the mid-truncation branch always wins: the one claimed event's
-    // own tail was cut by THIS render (before the reservation is committed),
-    // so the marker must point at the durable, directly-runnable
-    // session-scoped recovery command rather than promise a later poll for
-    // its own tail — an outcome that is not yet knowable at render time.
+    // The mid-truncated event's own tail: recoverable via the durable,
+    // directly-runnable session-scoped recovery command — an
+    // outcome-neutral fact that holds regardless of whether the pending
+    // commit (not yet attempted at render time) ultimately lands.
     expect(content).toContain(buildChannelTruncatedMarker(sessionId).trim());
     expect(content).toContain(
       `agentmonitors events list --session ${sessionId} --unread`,
     );
-    expect(content).not.toContain(CHANNEL_DEFERRED_MARKER.trim());
+    // The separately deferred remainder: a second, distinct event exists
+    // beyond this claim and will surface on a later poll.
+    expect(content).toContain(CHANNEL_DEFERRED_MARKER.trim());
     expect(meta.event_count).toBe('1');
   });
 

@@ -65,23 +65,36 @@ export const CHANNEL_DEFERRED_MARKER =
  * exceeds {@link MAX_CHANNEL_CONTENT} (minus marker room) and had to be
  * mid-truncated (issue #442, PR #442 round-5/round-6 review). Unlike {@link
  * CHANNEL_DEFERRED_MARKER}, this event is not merely deferred — its own
- * content was cut short by THIS render, so the omitted tail is only
- * recoverable via the durable, unread copy of the full event (claiming ≠
- * acking, BP2 / SP4), never via a later ordinary poll of the same row.
+ * content was cut short by THIS render. The omitted tail is recoverable via
+ * the durable, unread copy of the full event (claiming ≠ acking, BP2 / SP4)
+ * right now — but whether it will ALSO resurface via a later ordinary poll
+ * of the same row is genuinely unresolved at render time (see the three-way
+ * commit outcome below, issue #442, PR #442 round-12 review); the marker
+ * deliberately promises only the former, not the latter.
  *
  * **This is rendered BEFORE the reservation is committed** (`channel.ts`'s
  * `reserveAndCommit`: reserve → push/render → commit, issue #442, PR #442
  * round-11 review) — `commitDeliveryClient` is the call that sets
  * `first_notified_at`, and it only runs AFTER this push resolves. So at
- * render time it is genuinely unknown whether the commit that follows will
- * land: a successful commit does prevent the row from surfacing on a later
- * poll (`pendingEventsForSession()` excludes rows with `first_notified_at`
- * set, 002 §7), but a null/rejected commit (the reservation's lease already
- * lapsed) leaves it uncommitted and eligible for at-least-once redelivery
- * (`'surfaced-uncommitted'`, `channel.ts`). The wording below asserts only
- * what holds regardless of that outcome — the full copy is unread and
- * reachable right now via the recovery command — mirroring the hook
- * transport's `buildHookClaimedUnreadMarker` (`hook-deliver-render.ts`),
+ * render time it is genuinely unknown which of THREE outcomes the commit
+ * will land on (issue #442, PR #442 round-12 review — collapsing these to
+ * two conflates a definite outcome with a genuinely uncertain one):
+ *
+ * - **Resolves non-null** — committed: the row is claimed, and
+ *   `pendingEventsForSession()` (which excludes rows with `first_notified_at`
+ *   set, 002 §7) will never surface it again on an ordinary poll.
+ * - **Resolves null** — the reservation's lease already lapsed
+ *   (`'surfaced-uncommitted'`, `channel.ts`): the row was definitely never
+ *   claimed, so it stays eligible for at-least-once redelivery.
+ * - **Rejects** (an IPC/transport error) — UNCERTAIN, not a third definite
+ *   outcome: the daemon may have applied the commit before its response was
+ *   lost, so whether the row ends up claimed or still pending cannot be
+ *   determined from the rejection alone.
+ *
+ * The wording below asserts only what holds regardless of all three
+ * outcomes — the full copy is unread and reachable right now via the
+ * recovery command — mirroring the hook transport's
+ * `buildHookClaimedUnreadMarker` (`hook-deliver-render.ts`),
  * which has the identical render-before-commit ordering and uncertainty.
  *
  * `agentmonitors events list` **requires** `--session <id>` (issue #420 P2,
@@ -299,8 +312,13 @@ export interface RenderChannelEventOptions {
  * command the marker renders, is the only recovery path for the omitted
  * tail (issue #442; see {@link buildChannelTruncatedMarker}'s doc comment
  * for why the marker cannot also promise the tail will never resurface —
- * this render happens before the reservation is committed). Per-event
- * change summaries are ALSO individually
+ * this render happens before the reservation is committed). When `options
+ * .moreDeferred` is ALSO true in this branch (mixed case, issue #442, PR
+ * #442 round-12 review), {@link CHANNEL_DEFERRED_MARKER} is appended too —
+ * the mid-truncated event's own tail and the separately-deferred remainder
+ * are two distinct, non-overlapping facts, and signposting only one would
+ * silently drop the other (mirroring `renderHookDelivery`'s identical mixed
+ * case). Per-event change summaries are ALSO individually
  * bounded inside
  * {@link buildEventBlock} (006 §4.6, currently 800 chars each), so no single
  * untrusted diff is dumped wholesale regardless of packing.
@@ -341,24 +359,44 @@ export function renderChannelEvent(
     } else {
       // Even the first block alone exceeds (cap − marker): mid-truncate it
       // at a code-point boundary. This is the ONLY case a durable event is
-      // shown partially. Unlike the branch above, THIS claim is already
-      // committed (`first_notified_at` set) — the omitted tail will NOT
-      // surface on a later poll (issue #442), so it uses the distinct
-      // marker built by `buildChannelTruncatedMarker`, which points at a
-      // directly runnable `agentmonitors events list --session <id> --unread`
-      // for THIS claim's session (issue #442, PR #442 round-6 review — a bare
-      // `--unread` without `--session` exits 1) instead of promising a later
-      // re-delivery (claiming ≠ acking, 006 §5.5).
+      // shown partially. This render happens BEFORE the reservation is
+      // committed (`channel.ts`'s reserve → push/render → commit ordering),
+      // so at render time the eventual commit outcome for THIS event's own
+      // tail is genuinely unknown (see `buildChannelTruncatedMarker`'s doc
+      // comment for the three-way outcome this implies) — the marker points
+      // at a directly runnable
+      // `agentmonitors events list --session <id> --unread` for THIS claim's
+      // session (issue #442, PR #442 round-6 review — a bare `--unread`
+      // without `--session` exits 1) rather than promising a specific
+      // claimed/redelivery outcome for this event's own tail (claiming ≠
+      // acking, 006 §5.5).
+      //
+      // Mixed case (issue #442, PR #442 round-12 review): `moreDeferred` can
+      // ALSO be true here — this claim's single (oversized) event is the
+      // only one actually reserved, but genuinely more settled-high work
+      // exists beyond it and stays pending (the reservation/claim was sized
+      // to just this one event). Rendering the truncated-event marker alone
+      // would silently suppress that second, distinct signal, contradicting
+      // §5.5's candidate-growth guarantee (and diverging from the hook
+      // transport's `renderHookDelivery`, which renders both of its
+      // analogous markers in the same mixed case). Render BOTH markers
+      // whenever both apply — they describe two different, non-overlapping,
+      // outcome-neutral facts (this event's own tail is recoverable via the
+      // exact session+socket unread command; additional distinct work
+      // remains pending and will surface on a later poll) and are never
+      // redundant with each other. Both are sized within
+      // {@link MAX_CHANNEL_CONTENT} by `appendMarkerWithinCap`'s
+      // marker-length budget, which is computed from the COMBINED marker's
+      // actual length.
       const firstBlock = blocks[0] ?? '';
       const truncatedMarker = buildChannelTruncatedMarker(
         claim.sessionId,
         options.socketPath,
       );
-      content = appendMarkerWithinCap(
-        firstBlock,
-        MAX_CHANNEL_CONTENT,
-        truncatedMarker,
-      );
+      const marker = moreDeferred
+        ? truncatedMarker + CHANNEL_DEFERRED_MARKER
+        : truncatedMarker;
+      content = appendMarkerWithinCap(firstBlock, MAX_CHANNEL_CONTENT, marker);
     }
   } else {
     content = contentValue(claim.message);
