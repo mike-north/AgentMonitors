@@ -280,11 +280,10 @@ async function runCommand(scope: ScopeConfig): Promise<ExecOutcome> {
     const stdoutChunks: Buffer[] = [];
     let stdoutBytes = 0;
     // Trailing stderr bytes retained so far, bounded at STDERR_RETENTION_CAP_BYTES
-    // (issue #302) — independent of the stdout cap. Kept as Buffers (not decoded to
-    // a string chunk-by-chunk) so a multi-byte UTF-8 character split across two
+    // (issue #302) — independent of the stdout cap. Kept as a Buffer (not decoded
+    // to a string chunk-by-chunk) so a multi-byte UTF-8 character split across two
     // `data` events is never corrupted; decoding happens once, on the final tail.
-    const stderrChunks: Buffer[] = [];
-    let stderrBytes = 0;
+    let stderrRetained = Buffer.alloc(0);
 
     // Bound stdout capture at the 1 MiB cap (003 §11.2): once the cap is reached,
     // further bytes are discarded but the stream is never paused, so a chatty child
@@ -311,15 +310,14 @@ async function runCommand(scope: ScopeConfig): Promise<ExecOutcome> {
     // kills the child. Only the trailing bytes survive; older chunks are dropped
     // once the retention cap is exceeded.
     child.stderr.on('data', (chunk: Buffer) => {
-      stderrChunks.push(chunk);
-      stderrBytes += chunk.length;
-      while (
-        stderrChunks.length > 1 &&
-        stderrBytes > STDERR_RETENTION_CAP_BYTES
-      ) {
-        const dropped = stderrChunks.shift();
-        stderrBytes -= dropped?.length ?? 0;
-      }
+      // Concat-then-slice keeps the retained buffer truly bounded at
+      // STDERR_RETENTION_CAP_BYTES on every chunk — including a single chunk
+      // larger than the cap — rather than only evicting whole chunks (which
+      // could retain far more than the cap, or drop bytes from within the
+      // trailing window when a huge chunk is followed by a tiny one).
+      stderrRetained = Buffer.concat([stderrRetained, chunk]).subarray(
+        -STDERR_RETENTION_CAP_BYTES,
+      );
     });
 
     function clearTimers(): void {
@@ -351,9 +349,7 @@ async function runCommand(scope: ScopeConfig): Promise<ExecOutcome> {
      * corrupted (issue #302).
      */
     function stderrTailString(): string {
-      return Buffer.concat(stderrChunks)
-        .toString('utf8')
-        .slice(-STDERR_TAIL_CHARS);
+      return stderrRetained.toString('utf8').slice(-STDERR_TAIL_CHARS);
     }
 
     function resolveFromExit(

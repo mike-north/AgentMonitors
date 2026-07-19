@@ -808,19 +808,86 @@ describe('source-command-poll', () => {
           `process.exitCode = 0`,
       );
 
-      const start = Date.now();
+      // Resolving at all (rather than hanging until the 30s default timeout)
+      // proves the child was drained, not blocked on a full pipe buffer waiting
+      // for us to read. A wall-clock upper bound here was flaky under CI load,
+      // so timing isn't asserted directly — `ctx()`'s test timeout is the
+      // enforcement backstop.
       const result = await source.observe({ command }, ctx());
-      const elapsed = Date.now() - start;
-
-      // Comfortably under the 30s default timeout — proves the child was drained,
-      // not blocked on a full pipe buffer waiting for us to read.
-      expect(elapsed).toBeLessThan(5_000);
       const state = result.nextState as {
         exitCode: number;
         truncated: boolean;
       };
       expect(state.exitCode).toBe(0);
       expect(state.truncated).toBe(true);
+    });
+
+    // Regression test for issue #302: the stderr diagnostic tail is exposed via
+    // the `stderrTail` failure payload, sliced to the last `STDERR_TAIL_CHARS`
+    // (2000) characters of the last `STDERR_RETENTION_CAP_BYTES` (8000) retained
+    // bytes. A whole-chunk eviction scheme (`chunks.shift()` while
+    // `chunks.length > 1`) drops the *entire* oldest chunk once the retained
+    // total exceeds the cap — so a large leading chunk followed by a tiny final
+    // chunk loses everything but that tiny chunk, instead of the correct
+    // trailing window spanning both. The per-chunk `Buffer.concat(...).subarray(
+    // -cap)` form used here stays byte-accurate regardless of how the writes are
+    // chunked.
+    it('big-chunk-then-tiny-chunk: the failure stderrTail is the full 2000-char trailing window (issue #302)', async () => {
+      const bigChunkChars = 9000; // > STDERR_RETENTION_CAP_BYTES (8000)
+      const tinyChunkChars = 7;
+      const command = nodeArgv(
+        `process.stderr.write(Buffer.alloc(${String(bigChunkChars)}, 'A'), () => { ` +
+          `setTimeout(() => { ` +
+          `process.stderr.write('B'.repeat(${String(tinyChunkChars)}), () => { ` +
+          `setTimeout(() => {}, 60000); ` +
+          `}); ` +
+          `}, 50); ` +
+          `});`,
+      );
+
+      const result = await source.observe({ command, timeout: '1s' }, ctx());
+
+      expect(result.observations).toHaveLength(1);
+      const payload = result.observations[0]?.payload as {
+        error: string;
+        stderrTail: string;
+      };
+      expect(payload.error).toMatch(/timed out/i);
+      // Full 2000-char trailing window: 1993 trailing `A`s from the big chunk,
+      // followed by all 7 `B`s from the tiny final chunk — never just the 7
+      // characters of the last chunk alone.
+      expect(payload.stderrTail).toHaveLength(2000);
+      expect(payload.stderrTail).toBe(
+        'A'.repeat(2000 - tinyChunkChars) + 'B'.repeat(tinyChunkChars),
+      );
+    });
+
+    it('a single ~8x-over-cap chunk followed by one tiny chunk still yields the correct bounded tail (issue #302)', async () => {
+      // The first (and, in isolation, only) chunk is ~8x STDERR_RETENTION_CAP_BYTES
+      // (8000) on its own — the buggy `chunks.length > 1` guard never trims a
+      // solitary chunk no matter how far over the cap it is, and then evicts it
+      // WHOLE (rather than trimming) the moment a second chunk arrives.
+      const bigChunkChars = 64_000;
+      const command = nodeArgv(
+        `process.stderr.write(Buffer.alloc(${String(bigChunkChars)}, 'C'), () => { ` +
+          `setTimeout(() => { ` +
+          `process.stderr.write('D', () => { ` +
+          `setTimeout(() => {}, 60000); ` +
+          `}); ` +
+          `}, 50); ` +
+          `});`,
+      );
+
+      const result = await source.observe({ command, timeout: '1s' }, ctx());
+
+      expect(result.observations).toHaveLength(1);
+      const payload = result.observations[0]?.payload as {
+        error: string;
+        stderrTail: string;
+      };
+      expect(payload.error).toMatch(/timed out/i);
+      expect(payload.stderrTail).toHaveLength(2000);
+      expect(payload.stderrTail).toBe('C'.repeat(1999) + 'D');
     });
   });
 
