@@ -1,6 +1,10 @@
 import path from 'node:path';
 import { Command, Option } from 'commander';
-import type { RuntimeTickResult, WatchHandle } from '@agentmonitors/core';
+import type {
+  RuntimeStatus,
+  RuntimeTickResult,
+  WatchHandle,
+} from '@agentmonitors/core';
 import { createRuntime } from '../runtime.js';
 import { reportError } from '../output.js';
 import {
@@ -8,15 +12,32 @@ import {
   createDaemonServer,
   daemonAvailable,
   resolveSocketPath,
+  waitForDaemonAvailable,
+  type DaemonStatusResult,
 } from '../daemon-ipc.js';
 import { daemonStatusClient, daemonTickClient } from '../runtime-client.js';
 import { shouldReap, BOOT_GRACE_MS } from '../reap-decision.js';
 import { resolveManualDaemonSocketPath } from '../manual-daemon.js';
 import { resolveWorkspaceDbPath } from '../workspace-db-path.js';
 import { workspacePaths } from '../workspace-paths.js';
-import { spawnDetachedDaemon } from '../detached-spawn.js';
+import { spawnDetachedDaemon, type SpawnedDaemon } from '../detached-spawn.js';
 
 const DEFAULT_REAP_AFTER_MS = 5 * 60 * 1000;
+
+/**
+ * `daemon status` reads either the live daemon's own `status` response
+ * (which carries `pid`/`reapAfterMs` — issue #389 review findings 1/4) or,
+ * when nothing is running, an in-process `RuntimeStatus` read straight from
+ * the store, which has no OS process or reap window to report. A real type
+ * guard (rather than an inline `'pid' in status` check) is needed here
+ * because `RuntimeStatus` is a non-sealed interface — TS otherwise narrows
+ * the property's type to `unknown` instead of eliminating the branch.
+ */
+function isLiveDaemonStatus(
+  status: RuntimeStatus | DaemonStatusResult,
+): status is DaemonStatusResult {
+  return 'pid' in status;
+}
 
 /**
  * How long `daemon run --detach` waits for the backgrounded daemon to bind its
@@ -27,20 +48,88 @@ const DEFAULT_REAP_AFTER_MS = 5 * 60 * 1000;
 const DETACH_READY_TIMEOUT_MS = 15_000;
 const DETACH_READY_POLL_MS = 150;
 
+/** Outcome of {@link waitForDetachedDaemonReady}. */
+export type DetachReadyOutcome =
+  | { ready: true }
+  | { ready: false; spawnError?: Error };
+
 /**
- * Poll the socket until the detached daemon answers, so `--detach` reports a
- * daemon that is actually reachable rather than merely one that was spawned.
+ * Wait for the just-spawned detached daemon to answer on its socket, racing
+ * the readiness poll against the child's own `error` event (issue #389
+ * review finding 2). Without the race, a synchronous spawn failure (bad
+ * `execPath`, `ENOENT`) would only surface after the FULL readiness timeout
+ * elapsed, and the resulting message would point at a log file the daemon
+ * never got the chance to write — `spawnError` lets the caller fail fast and
+ * report the real cause instead.
+ *
+ * Exported for unit testing: a fake {@link SpawnedDaemon} whose `spawnError`
+ * resolves immediately proves the fail-fast race deterministically, without
+ * waiting out a real readiness timeout or needing an actual OS-level spawn
+ * failure.
  */
-async function waitForDaemon(
+export async function waitForDetachedDaemonReady(
   socketPath: string,
   timeoutMs: number,
-): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    if (await daemonAvailable(socketPath)) return true;
-    if (Date.now() >= deadline) return false;
-    await new Promise((resolve) => setTimeout(resolve, DETACH_READY_POLL_MS));
+  pollMs: number,
+  spawned: SpawnedDaemon,
+): Promise<DetachReadyOutcome> {
+  let sawError: Error | undefined;
+  const errorSignal = spawned.spawnError.then((error) => {
+    sawError = error;
+    return false as const;
+  });
+  const ready = await Promise.race([
+    waitForDaemonAvailable(socketPath, timeoutMs, pollMs),
+    errorSignal,
+  ]);
+  if (ready) return { ready: true };
+  return sawError ? { ready: false, spawnError: sawError } : { ready: false };
+}
+
+/**
+ * Pure decision for issue #389 review finding 1: given the pid our own
+ * `--detach` child was spawned with and the pid `status` reports for whoever
+ * is actually answering the socket now, decide whether a concurrent lazy-boot
+ * elsewhere (`session start`'s check-then-spawn has no cross-process
+ * pre-spawn lock; only the bind-time lock serializes) won the startup race —
+ * our own child lost the bind and already exited, and a DIFFERENT daemon is
+ * the one actually serving this socket. Returns the honest error message to
+ * report, or `undefined` when the daemon we spawned is confirmed to be the
+ * one answering (the ordinary case) — including when identity can't be
+ * checked at all (either pid is unavailable), in which case the caller falls
+ * back to reporting success on reachability alone, as before this finding.
+ *
+ * Extracted as a pure function so the race-detection logic itself has
+ * deterministic unit coverage — reproducing the actual OS-level startup race
+ * on demand in an integration test is inherently timing-dependent.
+ */
+export function describeDetachRaceLoss(input: {
+  spawnedPid: number | undefined;
+  servingPid: number | undefined;
+  servingReapAfterMs: number | undefined;
+  requestedReapAfterMs: number;
+  socketPath: string;
+}): string | undefined {
+  if (
+    input.spawnedPid === undefined ||
+    input.servingPid === undefined ||
+    input.servingPid === input.spawnedPid
+  ) {
+    return undefined;
   }
+  const reapDescription =
+    input.servingReapAfterMs === undefined
+      ? 'unknown'
+      : input.servingReapAfterMs === 0
+        ? 'disabled'
+        : `stops after ${String(Math.round(input.servingReapAfterMs / 1000))}s idle`;
+  return (
+    `Another daemon is already serving ${input.socketPath} (pid ${String(input.servingPid)}) — ` +
+    `the --detach child we spawned (pid ${String(input.spawnedPid)}) lost the startup race and exited. ` +
+    `That daemon's own reap setting applies (${reapDescription}), not the ` +
+    `--reap-after-ms ${String(input.requestedReapAfterMs)} this command requested. Run ` +
+    '`agentmonitors daemon stop` and retry if you need the settings you requested.'
+  );
 }
 
 /**
@@ -104,6 +193,7 @@ export async function runLoop(
   const server = createDaemonServer({
     runtime,
     socketPath,
+    reapAfterMs,
     onStop: () => {
       stopping = true;
       wakeLoop?.();
@@ -413,9 +503,9 @@ Foreground vs background:
         // permission error or an unwritable `--log` path must surface as the
         // CLI's normal one-line error + non-zero exit, never a raw stack
         // trace. The daemon's own `--workspace`/db failures already do.
-        let pid: number | undefined;
+        let spawned: SpawnedDaemon;
         try {
-          pid = spawnDetachedDaemon({
+          spawned = spawnDetachedDaemon({
             monitorsDir,
             workspacePath: workspace,
             socket: socketPath,
@@ -433,13 +523,73 @@ Foreground vs background:
           );
           return;
         }
-        if (!(await waitForDaemon(socketPath, DETACH_READY_TIMEOUT_MS))) {
-          reportError(
-            `Detached daemon did not answer on ${socketPath} within ${String(
-              Math.round(DETACH_READY_TIMEOUT_MS / 1000),
-            )}s. See ${logPath} for why.`,
-            false,
-          );
+        const pid = spawned.pid;
+        const pidNote = pid !== undefined ? ` (pid ${String(pid)})` : '';
+        const outcome = await waitForDetachedDaemonReady(
+          socketPath,
+          DETACH_READY_TIMEOUT_MS,
+          DETACH_READY_POLL_MS,
+          spawned,
+        );
+        if (!outcome.ready) {
+          // The child never became reachable — it must not be left running
+          // unmanaged (issue #389 review finding 2): a slow bind past the
+          // timeout would otherwise leave a live background daemon the user
+          // was told failed, and a subsequent retry would then hit "already
+          // running" against it.
+          if (pid !== undefined) {
+            try {
+              process.kill(pid, 'SIGTERM');
+            } catch {
+              /* already gone */
+            }
+          }
+          if (outcome.spawnError) {
+            // The OS never actually started the process (e.g. ENOENT/EACCES) —
+            // pointing at the log here would be pointing at nothing; it was
+            // never written. Report the real cause instead.
+            reportError(
+              `Failed to spawn the detached daemon${pidNote}: ${outcome.spawnError.message}`,
+              false,
+            );
+          } else {
+            reportError(
+              `Detached daemon${pidNote} did not answer on ${socketPath} within ${String(
+                Math.round(DETACH_READY_TIMEOUT_MS / 1000),
+              )}s; it has been sent SIGTERM. See ${logPath} for why.`,
+              false,
+            );
+          }
+          return;
+        }
+        // Something now answers on the socket — but concurrent lazy-boot
+        // (`session start`'s check-then-spawn has no cross-process pre-spawn
+        // lock; only the bind-time lock serializes) means our spawned child
+        // may have LOST the bind race and already exited, while a DIFFERENT
+        // daemon (e.g. one the SessionStart hook just booted) is the one
+        // actually answering. Verify identity via the pid `status` reports
+        // (issue #389 review finding 1) rather than assuming success.
+        let servingPid: number | undefined;
+        let servingReapAfterMs: number | undefined;
+        try {
+          const status = await daemonStatusClient(socketPath);
+          servingPid = status.pid;
+          servingReapAfterMs = status.reapAfterMs;
+        } catch {
+          // Best-effort identity check only — if `status` itself is
+          // unreachable right after a successful `daemonAvailable` probe,
+          // fall through and report success as before rather than failing a
+          // command whose actual property (daemon reachable) held.
+        }
+        const raceMessage = describeDetachRaceLoss({
+          spawnedPid: pid,
+          servingPid,
+          servingReapAfterMs,
+          requestedReapAfterMs: reapAfterMs,
+          socketPath,
+        });
+        if (raceMessage !== undefined) {
+          reportError(raceMessage, false);
           return;
         }
         console.log('AgentMon daemon started in the background.');
@@ -450,6 +600,19 @@ Foreground vs background:
           reapAfterMs === 0
             ? '  reaping disabled — it runs until `agentmonitors daemon stop`.'
             : `  stops after ${String(Math.round(reapAfterMs / 1000))}s with no active session; use --reap-after-ms 0 to keep it up.`,
+        );
+        return;
+      }
+      if (options.log !== undefined) {
+        // `--log` only makes sense with `--detach` — the foreground path
+        // already inherits the terminal's own stdout/stderr, so Commander
+        // silently accepting `--log` here would leave a user who typed it
+        // (expecting a diagnostic file during an incident) with an empty log
+        // and no idea why (issue #389 review finding 3 — the same
+        // "silently ignored flag" papercut class this PR exists to close).
+        reportError(
+          '--log only applies with --detach (the foreground daemon already writes to this terminal).',
+          false,
         );
         return;
       }
@@ -515,10 +678,26 @@ daemonCommand
       }
       console.log(`Daemon running: ${running ? 'yes' : 'no'}`);
       console.log(`Socket: ${payload.socketPath}`);
-      console.log(`Sessions: ${String(status.sessions)}`);
-      console.log(`Active sessions: ${String(status.activeSessions)}`);
-      console.log(`Dormant sessions: ${String(status.dormantSessions)}`);
-      console.log(`Events: ${String(status.events)}`);
+      // pid/reapAfterMs only exist on the live-daemon response (issue #389
+      // review findings 1/4) — the in-process fallback used when nothing is
+      // running has no OS process or reap window of its own to report.
+      if (isLiveDaemonStatus(status)) {
+        console.log(`Pid: ${String(status.pid)}`);
+        console.log(`Sessions: ${String(status.sessions)}`);
+        console.log(`Active sessions: ${String(status.activeSessions)}`);
+        console.log(`Dormant sessions: ${String(status.dormantSessions)}`);
+        console.log(`Events: ${String(status.events)}`);
+        console.log(
+          status.reapAfterMs === 0
+            ? 'Reaping: disabled'
+            : `Reaping: stops after ${String(Math.round(status.reapAfterMs / 1000))}s idle`,
+        );
+      } else {
+        console.log(`Sessions: ${String(status.sessions)}`);
+        console.log(`Active sessions: ${String(status.activeSessions)}`);
+        console.log(`Dormant sessions: ${String(status.dormantSessions)}`);
+        console.log(`Events: ${String(status.events)}`);
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       reportError(message, options.format === 'json');

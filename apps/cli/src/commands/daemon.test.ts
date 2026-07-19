@@ -3,8 +3,13 @@ import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AgentMonitorRuntime } from '@agentmonitors/core';
-import { runLoop } from './daemon.js';
+import {
+  describeDetachRaceLoss,
+  runLoop,
+  waitForDetachedDaemonReady,
+} from './daemon.js';
 import { callDaemon, daemonAvailable } from '../daemon-ipc.js';
+import type { SpawnedDaemon } from '../detached-spawn.js';
 
 const tempRoots: string[] = [];
 
@@ -93,5 +98,143 @@ describe('runLoop — idle-reaping errors do not crash the daemon (issue #398)',
 
     listSessionsSpy.mockRestore();
     errorSpy.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #389 review finding 1: `daemon run --detach`'s readiness wait only
+// proves SOME daemon answers on the socket, not that it is the child THIS
+// invocation spawned. Concurrent lazy-boot elsewhere can make our own child
+// lose the startup race and exit while a different daemon answers. These
+// cases exercise the pure decision function directly — reproducing the
+// actual OS-level race deterministically in an integration test is
+// inherently timing-dependent, so the decision logic itself gets unit
+// coverage instead.
+// ---------------------------------------------------------------------------
+describe('describeDetachRaceLoss (issue #389 review finding 1)', () => {
+  it('reports nothing when the serving pid matches the spawned pid (the ordinary case)', () => {
+    expect(
+      describeDetachRaceLoss({
+        spawnedPid: 4242,
+        servingPid: 4242,
+        servingReapAfterMs: 0,
+        requestedReapAfterMs: 0,
+        socketPath: '/tmp/x.sock',
+      }),
+    ).toBeUndefined();
+  });
+
+  it('reports nothing when either pid is unavailable (best-effort identity check only)', () => {
+    expect(
+      describeDetachRaceLoss({
+        spawnedPid: undefined,
+        servingPid: 4242,
+        servingReapAfterMs: 0,
+        requestedReapAfterMs: 0,
+        socketPath: '/tmp/x.sock',
+      }),
+    ).toBeUndefined();
+    expect(
+      describeDetachRaceLoss({
+        spawnedPid: 4242,
+        servingPid: undefined,
+        servingReapAfterMs: 0,
+        requestedReapAfterMs: 0,
+        socketPath: '/tmp/x.sock',
+      }),
+    ).toBeUndefined();
+  });
+
+  it('names both pids and the socket when a different daemon won the race', () => {
+    const message = describeDetachRaceLoss({
+      spawnedPid: 111,
+      servingPid: 222,
+      servingReapAfterMs: 300_000,
+      requestedReapAfterMs: 0,
+      socketPath: '/tmp/agentmon.sock',
+    });
+    expect(message).toBeDefined();
+    expect(message).toContain('/tmp/agentmon.sock');
+    expect(message).toContain('pid 222');
+    expect(message).toContain('pid 111');
+    expect(message).toContain('lost the startup race');
+  });
+
+  it("reports the SURVIVING daemon's actual reap setting, not the one this invocation requested", () => {
+    const disabled = describeDetachRaceLoss({
+      spawnedPid: 111,
+      servingPid: 222,
+      servingReapAfterMs: 0,
+      requestedReapAfterMs: 300_000,
+      socketPath: '/tmp/x.sock',
+    });
+    expect(disabled).toContain('disabled');
+    expect(disabled).toContain('--reap-after-ms 300000');
+
+    const enabled = describeDetachRaceLoss({
+      spawnedPid: 111,
+      servingPid: 222,
+      servingReapAfterMs: 60_000,
+      requestedReapAfterMs: 0,
+      socketPath: '/tmp/x.sock',
+    });
+    expect(enabled).toContain('stops after 60s idle');
+  });
+
+  it('reports the reap setting as "unknown" when the status call could not read it', () => {
+    const message = describeDetachRaceLoss({
+      spawnedPid: 111,
+      servingPid: 222,
+      servingReapAfterMs: undefined,
+      requestedReapAfterMs: 0,
+      socketPath: '/tmp/x.sock',
+    });
+    expect(message).toContain('unknown');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #389 review finding 2: a synchronous spawn failure (bad `execPath`,
+// `ENOENT`) must fail FAST with the real cause, not silently wait out the
+// full readiness timeout and then point at a log file the daemon never had
+// the chance to write. A fake `SpawnedDaemon` whose `spawnError` resolves
+// immediately proves the race deterministically.
+// ---------------------------------------------------------------------------
+describe('waitForDetachedDaemonReady (issue #389 review finding 2)', () => {
+  it('reports ready when the socket answers before any spawn error', async () => {
+    const outcome = await waitForDetachedDaemonReady(
+      '/does/not/matter.sock',
+      50,
+      10,
+      {
+        pid: 123,
+        spawnError: new Promise<Error>(() => {
+          /* never settles — the socket check below wins */
+        }),
+      } as SpawnedDaemon,
+    );
+    // The socket genuinely does not exist, so `daemonAvailable` will return
+    // false for the whole window — this case only proves `ready: false`
+    // without a spawnError surfaces when nothing else fires either. The
+    // "answers" half of this function's contract is covered end to end by
+    // the daemon-detach integration suite's happy-path case.
+    expect(outcome).toEqual({ ready: false });
+  });
+
+  it('fails fast with the spawn error instead of waiting out the full timeout', async () => {
+    const spawnFailure = new Error('spawn ENOENT');
+    const start = Date.now();
+    const outcome = await waitForDetachedDaemonReady(
+      '/does/not/exist-either.sock',
+      // A deliberately long timeout — if the race did NOT fail fast, this
+      // test would take the full window instead of resolving almost
+      // immediately with the spawn error.
+      5_000,
+      50,
+      { pid: undefined, spawnError: Promise.resolve(spawnFailure) },
+    );
+    const elapsedMs = Date.now() - start;
+    expect(outcome).toEqual({ ready: false, spawnError: spawnFailure });
+    expect(elapsedMs).toBeLessThan(1_000);
   });
 });

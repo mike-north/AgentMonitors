@@ -49,18 +49,35 @@ export function cliEntry(): string {
   return path.join(packageRoot, 'dist', 'index.cjs');
 }
 
+export interface SpawnedDaemon {
+  /**
+   * The child's pid, or `undefined` when the OS never assigned one (a spawn
+   * that failed synchronously — vanishingly rare; the async `error` case
+   * below is the common failure mode and is reported via {@link spawnError}
+   * instead).
+   */
+  pid: number | undefined;
+  /**
+   * Resolves with the spawn error if the child's `error` event fires (e.g.
+   * `ENOENT`/`EACCES` — the OS never actually started the process), or never
+   * settles if the child spawns successfully. Lets a caller waiting for the
+   * daemon to answer on its socket (issue #389 review finding 2) race this
+   * against that wait to fail fast and report the REAL cause, rather than
+   * waiting out the full readiness timeout and pointing at a log file the
+   * daemon never got a chance to write.
+   */
+  spawnError: Promise<Error>;
+}
+
 /**
  * Spawn `agentmonitors daemon run` as a DETACHED background process so it
  * outlives the short-lived hook (or foreground command) that booted it. stdio
  * is discarded — or appended to {@link SpawnDaemonOptions.logPath} — and the
  * child is unref'd so the parent can exit immediately.
- *
- * Returns the child's pid, or `undefined` when the OS never assigned one
- * (a spawn that failed asynchronously; the `error` listener below reports it).
  */
 export function spawnDetachedDaemon(
   options: SpawnDaemonOptions,
-): number | undefined {
+): SpawnedDaemon {
   const args = [
     cliEntry(),
     'daemon',
@@ -94,12 +111,18 @@ export function spawnDetachedDaemon(
       },
     });
     // Attach the error listener BEFORE unref so that an async OS-level spawn
-    // failure (e.g. ENOENT, EACCES) surfaces to stderr rather than being swallowed.
-    child.on('error', (e) => {
-      console.error(`Failed to spawn daemon: ${e.message}`);
+    // failure (e.g. ENOENT, EACCES) surfaces to stderr rather than being
+    // swallowed — AND so a caller can await `spawnError` to react to it (issue
+    // #389 review finding 2), instead of only ever seeing it as an unrelated
+    // console line.
+    const spawnError = new Promise<Error>((resolve) => {
+      child.on('error', (e) => {
+        console.error(`Failed to spawn daemon: ${e.message}`);
+        resolve(e);
+      });
     });
     child.unref();
-    return child.pid;
+    return { pid: child.pid, spawnError };
   } finally {
     // The child holds its own duplicated descriptor; the parent's copy must be
     // released or a short-lived parent would leak it for its remaining life.

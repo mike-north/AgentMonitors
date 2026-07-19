@@ -11,7 +11,11 @@ import {
   listSessionsClient,
   openSessionClient,
 } from '../runtime-client.js';
-import { daemonAvailable, resolveSocketPath } from '../daemon-ipc.js';
+import {
+  daemonAvailable,
+  resolveSocketPath,
+  waitForDaemonAvailable,
+} from '../daemon-ipc.js';
 import { readLocalState, writeLocalState } from '../local-state.js';
 import { workspacePaths } from '../workspace-paths.js';
 import { spawnDetachedDaemon } from '../detached-spawn.js';
@@ -295,17 +299,11 @@ export async function runSessionStartAction(): Promise<void> {
         ? { reapAfterMs: state.reapAfterMs }
         : {}),
     });
-    // wait for the socket to come up
-    const bootStart = Date.now();
-    while (
-      Date.now() - bootStart < BOOT_TIMEOUT_MS &&
-      !(await daemonAvailable(socket))
-    ) {
-      await new Promise((r) => setTimeout(r, 150));
-    }
+    // wait for the socket to come up (shared with `daemon run --detach` and
+    // `verify --use-workspace-daemon` — issue #389 review finding 7).
     // Guard: if the daemon never came up, report and bail — don't fall through
     // to writeLocalState/openSessionClient pointing at a non-existent socket.
-    if (!(await daemonAvailable(socket))) {
+    if (!(await waitForDaemonAvailable(socket, BOOT_TIMEOUT_MS))) {
       reportError(
         `Daemon failed to start within ${String(BOOT_TIMEOUT_MS / 1000)}s`,
         false,

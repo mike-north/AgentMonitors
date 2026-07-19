@@ -27,6 +27,7 @@ import type {
   AgentMonitorRuntime,
   AgentSessionRole,
   DeliveryLifecycle,
+  RuntimeStatus,
   Urgency,
 } from '@agentmonitors/core';
 import { z } from 'zod';
@@ -232,6 +233,35 @@ export interface DaemonServerOptions {
   runtime: AgentMonitorRuntime;
   socketPath: string;
   onStop?: () => void;
+  /**
+   * The `--reap-after-ms` value THIS daemon process is actually running with
+   * (0 = disabled). Echoed back on `status` (see {@link DaemonStatusResult})
+   * purely so a caller can confirm the flag it passed reached the running
+   * daemon without waiting out the idle window (issue #389 review finding 4),
+   * and so a `--detach` race can report the SURVIVING daemon's real setting
+   * (finding 1). CLI-layer bookkeeping only — the runtime itself has no
+   * concept of a reap window.
+   */
+  reapAfterMs?: number;
+}
+
+/**
+ * `status`'s wire shape: the core {@link RuntimeStatus} plus two CLI-layer
+ * facts the runtime itself has no concept of — which OS process is actually
+ * answering (`pid`) and what reap window it is running with (`reapAfterMs`).
+ * Added for issue #389 review findings 1 and 4: `daemon run --detach` needs
+ * `pid` to tell "my spawned child answered" from "a different daemon won the
+ * startup race and this is IT", and `reapAfterMs` lets a caller (or a test)
+ * confirm `--reap-after-ms` actually reached the daemon without waiting out
+ * the idle window. Every daemon build that serves `status` sets both fields,
+ * so an older client reading a newer daemon (or vice versa) just ignores an
+ * unrecognized field — additive, like {@link DaemonResponse.code}.
+ */
+export interface DaemonStatusResult extends RuntimeStatus {
+  /** `process.pid` of the OS process that answered this `status` call. */
+  pid: number;
+  /** The `--reap-after-ms` value this daemon is running with (0 = disabled). */
+  reapAfterMs: number;
 }
 
 /**
@@ -639,12 +669,25 @@ function handleRequest(
   runtime: AgentMonitorRuntime,
   request: DaemonRequest,
   stop: () => void,
+  /**
+   * The daemon's configured reap window, echoed on `status` (see {@link
+   * DaemonStatusResult}). Omitted by call sites that build a server directly
+   * without going through `daemon run` (most unit tests) — those report `0`
+   * (disabled) rather than guessing a nonzero value nothing configured.
+   */
+  reapAfterMs?: number,
 ): Promise<unknown> {
   switch (request.method) {
     case 'ping':
       return Promise.resolve({ ok: true });
-    case 'status':
-      return Promise.resolve(runtime.status());
+    case 'status': {
+      const result: DaemonStatusResult = {
+        ...runtime.status(),
+        pid: process.pid,
+        reapAfterMs: reapAfterMs ?? 0,
+      };
+      return Promise.resolve(result);
+    }
     case 'stop':
       stop();
       return Promise.resolve({ stopping: true });
@@ -912,6 +955,7 @@ export function createDaemonServer({
   runtime,
   socketPath,
   onStop,
+  reapAfterMs,
 }: DaemonServerOptions): {
   listen(): Promise<void>;
   close(): Promise<void>;
@@ -971,7 +1015,7 @@ export function createDaemonServer({
       // daemon process (issue #292 review). One bad request must never take the
       // daemon down.
       void Promise.resolve()
-        .then(() => handleRequest(runtime, request, stop))
+        .then(() => handleRequest(runtime, request, stop, reapAfterMs))
         .then((result) => {
           respond({ id: request.id, result });
         })
@@ -1183,5 +1227,28 @@ export async function daemonAvailable(socketPath?: string): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Poll `socketPath` with {@link daemonAvailable} until something answers or
+ * `timeoutMs` elapses. Used by every spawn-then-poll boot wait in the CLI —
+ * `daemon run --detach` (15s/150ms), `session start`'s lazy boot (8s/150ms),
+ * and `verify --use-workspace-daemon` (15s/300ms) — so "wait for a daemon we
+ * just spawned to come up" stays one notion with one behavior instead of three
+ * hand-rolled copies with slightly different timeout/poll constants (issue
+ * #389 review finding 7). Each call site keeps its own pre-existing
+ * timeout/poll values; only the polling loop itself is shared.
+ */
+export async function waitForDaemonAvailable(
+  socketPath: string,
+  timeoutMs: number,
+  pollMs = 150,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await daemonAvailable(socketPath)) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
   }
 }

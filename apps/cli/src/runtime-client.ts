@@ -17,11 +17,10 @@ import type {
   ObservationHistoryQuery,
   ObservationHistoryRecord,
   OpenSessionInput,
-  RuntimeStatus,
   RuntimeTickResult,
 } from '@agentmonitors/core';
 import { createRuntime } from './runtime.js';
-import { callDaemon } from './daemon-ipc.js';
+import { callDaemon, type DaemonStatusResult } from './daemon-ipc.js';
 
 export async function openSessionClient(
   input: OpenSessionInput,
@@ -315,8 +314,8 @@ export async function cancelWatchClient(
 
 export async function daemonStatusClient(
   socketPath?: string,
-): Promise<RuntimeStatus> {
-  return await callDaemon<RuntimeStatus>(
+): Promise<DaemonStatusResult> {
+  return await callDaemon<DaemonStatusResult>(
     'status',
     {},
     socketPath ? { socketPath } : {},
