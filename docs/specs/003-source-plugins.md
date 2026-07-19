@@ -1760,22 +1760,33 @@ silently become a local-only status check when the author's intent is upstream b
 Pull-request alerting has two distinct audiences, and conflating them produces a monitor that is
 wrong for both:
 
-| Role     | Preset      | Watches                                          | Urgency  |
-| -------- | ----------- | ------------------------------------------------ | -------- |
-| Reviewer | `pr-review` | Open, non-draft PRs in this repo awaiting review | `normal` |
-| Author   | `my-prs`    | CI, review feedback, and state on your own PRs   | `high`   |
+| Role     | Preset      | Watches                                                              | Urgency  |
+| -------- | ----------- | -------------------------------------------------------------------- | -------- |
+| Reviewer | `pr-review` | Open, non-draft PRs in this repo awaiting review, excluding your own | `normal` |
+| Author   | `my-prs`    | CI, review feedback, and state on your own open PRs                  | `normal` |
 
 Both are `command-poll` + `json-diff` over `gh pr list`.
 
 #### Repository auto-scoping
 
-**Neither preset carries a `--repo` flag, and this is load-bearing.** `gh` resolves the repository
-from its process working directory, and `command-poll`'s effective `cwd` defaults to the runtime
-workspace/config root (§11.1). Omitting `--repo` therefore scopes the monitor to whatever repository
-the session is operating in — the same `MONITOR.md` is correct in every checkout. Interpolating an
-owner/name at scaffold time would hardcode it back and is explicitly not done. The author preset
-applies the same rule to identity: `--author @me` resolves against the current `gh` authentication
-rather than a baked-in login.
+**Neither preset carries a `--repo` flag, and this is load-bearing — but `gh` does NOT resolve the
+repository from wherever the monitor happens to live.** `gh` resolves the repository from its process
+working directory, and that working directory is `command-poll`'s effective `cwd` — which defaults to
+the **daemon's own process working directory** (§11.1), not a "workspace/config root" the daemon might
+not even be running from. A daemon launched from `$HOME`, from a different repository, or from any
+directory other than this project's root would therefore make `gh` silently resolve a different
+repository's PRs — and since `gh` exits 0 either way, nothing surfaces the mistake (issue #444 review,
+finding 1; this correction supersedes an earlier draft of this section, `init.ts`'s comment, and this
+PR's own changeset, all of which incorrectly claimed the daemon's cwd defaults to a workspace/config
+root).
+
+The fix is that `agentmonitors init` scaffolds an **explicit `cwd:`** into both presets' frontmatter,
+set to the absolute project root `init` was run from (the same `process.cwd()` the bootstrap path
+already trusts for enabling the project and fixing up `.gitignore`). That one `cwd:` is what then lets
+omitting `--repo` scope `gh` to the right repository, regardless of where the daemon is later launched
+from — interpolating an owner/name at scaffold time would hardcode it back and is explicitly not done.
+The author preset applies the same auto-scoping rule to identity: `--author @me` resolves against the
+current `gh` authentication rather than a baked-in login.
 
 #### Field selection is what makes the transitions observable
 
@@ -1783,13 +1794,25 @@ rather than a baked-in login.
 diff strategy — decides which real-world events become interrupts.
 
 `pr-review` projects each PR to `{number, title, headRefName, reviewDecision, author}`, filtering out
-drafts and `changeset-release/*` heads (the release/Version PR is never agent-reviewable). Because
-drafts are filtered rather than reported, "a draft was marked ready" surfaces as the PR _appearing_
-in the set. `updatedAt` is deliberately excluded: including it would fire on every push and comment.
+drafts, `changeset-release/*` heads (the release/Version PR is never agent-reviewable), and — via
+`--search '-author:@me'`, GitHub search-qualifier negation (`gh pr list` has no `--author`-exclusion
+flag, only single-value inclusion) — the current user's own PRs. Without that exclusion, a PR the
+reviewer opens themselves would double-fire (`pr-review` and `my-prs` both) and the body's "act as the
+reviewer, do not self-merge" framing does not apply to one's own work. Because drafts are filtered
+rather than reported, "a draft was marked ready" surfaces as the PR _appearing_ in the set. `updatedAt`
+is deliberately excluded: including it would fire on every push and comment.
 
-`my-prs` queries `--state all` rather than `--state open` so a merged PR stays in the result set and
-its `state` is observably `MERGED` rather than merely absent — which is what lets the agent tell
-"merged, clean up the branch" from "closed unmerged, find out why". It reduces each PR to:
+`my-prs` queries `--state open` with a generously raised `--limit 30` — **not** `--state all --limit
+10`. `--limit` always applies to a **newest-created-first** list, so a small `--state all` window lets
+an older still-open PR silently age out the moment enough newer PRs (including merged/closed ones,
+which `--state all` also counts against the cap) exist — and once evicted, its CI going red produces no
+event (issue #444 review, finding 4). `--state open` removes merged/closed PRs from the cap entirely,
+so only actually-open work competes for the 30 slots, and a PR leaving the open set (merged or closed)
+then surfaces as a **removal** from the diffed list — the same "dropped off the list" signal
+`pr-review` already uses. The tradeoff this accepts: `state` can now only ever read `OPEN` in the
+delivered payload (it is still carried through, for shape symmetry with `pr-review`), so merged vs.
+closed-unmerged can no longer be told apart from the field itself — only from checking the PR directly,
+as the monitor body now says. It reduces each PR to:
 
 - `failingChecks` — the sorted names of **failing** entries in `statusCheckRollup` (both `CheckRun`
   `conclusion` and legacy `StatusContext` `state`). Reducing to failures only means a green→red
@@ -1807,15 +1830,16 @@ its `state` is observably `MERGED` rather than merely absent — which is what l
 - `reviewDecision`, a per-reviewer `{by, state}` list from `latestReviews`, and an issue-comment
   count — so a new review, a changed verdict, or a new comment each diff. `gh pr list` exposes no
   review-thread data, so inline thread replies that do not move `reviewDecision` are not visible.
-- `state` and `isDraft` — so merged, closed, and both directions of draft↔ready each diff.
+- `isDraft` — so both directions of draft↔ready each diff.
 
 Note that `reviewDecision` is the **empty string**, not `null`, when GitHub has no decision for a PR.
 A `(.reviewDecision // "NONE")` coalesce is therefore a silent no-op; the preset passes the value
 through unchanged and the monitor body tells the agent what `""` means.
 
-`--limit` makes the query a **recency window**, not a set: an old PR aging out of the window produces
-a removal diff that is not a state transition. The monitor body says so explicitly. This is inherent
-to a list-and-diff design and is one of the things a semantic `source-github-pr` plugin would remove.
+`--limit` still makes the query a **recency window**, not a set: if there are ever more than 30
+simultaneously open PRs of one's own, an old one aging out produces a removal diff that is not a state
+transition. The monitor body says so explicitly. This residual limitation is inherent to a
+list-and-diff design and is one of the things a semantic `source-github-pr` plugin would remove.
 
 #### Urgency: both presets are `normal`, and `high` is not available to either
 
@@ -1853,6 +1877,19 @@ Termination by signal is classified as an execution **failure**, which per §11.
 (a persistently broken `gh` does not interrupt every tick), and emits `Command recovered: <key>` once
 `gh` works again. `$$` targets the `sh` process itself — never `-$$`, which would signal the whole
 process group.
+
+The wrapper takes two further precautions the shell alone can silently violate:
+
+- **`env -u GITHUB_TOKEN`** unsets an inherited `GITHUB_TOKEN` before invoking `gh`. `gh` gives an
+  inherited `GITHUB_TOKEN` unconditional precedence over keyring/`gh auth login` credentials, so a
+  daemon process with one exported (a common shell-startup leftover) would make `@me` — and therefore
+  both presets — silently resolve against the wrong identity, with `gh` exiting 0 either way (issue
+  #444 review, finding 2).
+- **Only the failure branch's redirect sees `gh`'s stderr.** The success path's `out=$(...)` captures
+  stdout alone (stderr is redirected to a per-invocation temp file, cleaned up on both branches); a
+  one-time `gh` warning or `GH_DEBUG` chatter on an otherwise-successful run therefore can never leak
+  into the diffed JSON, which would otherwise degrade `json-diff` to a raw-text comparison of the
+  polluted string (issue #444 review, finding 5).
 
 #### Follow-up
 

@@ -180,7 +180,7 @@ Runs against the current working directory. Performs, in order:
 
 1. **Enable the project.** If `.claude/agentmonitors.local.md` does not already declare `enabled: true`, writes it with the minimal enable shape from the `setup-monitors` skill (`enabled: true` plus the "safe to delete" coordination-state note). An already-enabled file is left untouched so a re-run never clobbers socket/db fields a prior `session start` persisted.
 2. **Fix `.gitignore`.** Ensures `.gitignore` contains the line `.claude/*.local.*` — appends it (creating the file if absent) when missing; a no-op when already present. Never duplicated across runs.
-3. **Offer a first monitor.** Interactively (only on a TTY, and only when neither `--yes` nor `--enable-only` is given) prompts for a source type and monitor name, then scaffolds it through the same path as `init <name>`. `--yes` scaffolds the default monitor (`file-fingerprint`, name `my-monitor`, overridable with `--type`) with no prompt. `--enable-only` skips this step. A non-interactive invocation (non-TTY stdin) without `--yes` never prompts or hangs: it skips scaffolding and tells the caller to pass `--yes` or use `init <name>`.
+3. **Offer a first monitor.** Interactively (only on a TTY, and only when neither `--yes` nor `--enable-only` is given) prompts for a source type **or preset** — the two are listed as separate categories, matching the "not source types" distinction above, so the prompt and its "unknown" error never imply a preset is a kind of source (issue #444 review, finding 7) — and a monitor name, then scaffolds it through the same path as `init <name>`. `--yes` scaffolds the default monitor (`file-fingerprint`, name `my-monitor`, overridable with `--type`) with no prompt. `--enable-only` skips this step. A non-interactive invocation (non-TTY stdin) without `--yes` never prompts or hangs: it skips scaffolding and tells the caller to pass `--yes` or use `init <name>`.
 4. **Validate.** When a monitor was scaffolded, runs the `validate` command in-process against the monitors directory and prints its result.
 5. **Summarize.** Prints a "what happens next + how to verify" summary: automatic startup is conditioned on the Claude Code plugin being present ("If you're using the AgentMon Claude Code plugin, monitoring starts automatically the next time you open a Claude Code session"), with the manual `agentmonitors daemon run <dir> --detach` alternative stated on the very next line for any other host or bare-terminal setup (issue #338 item 3 — the prior unconditional "starts automatically" phrasing overpromised outside Claude Code; the `--detach` form is named rather than a bare `daemon run` so a reader who follows the line literally gets a backgrounded daemon instead of an occupied terminal, issue #389 P1 — see [§9.2](#92-daemon-run--continuous-loop)); a one-shot `daemon once` check; a pointer to `agentmonitors doctor` as the health-check next step (issue #331 — `doctor` is otherwise undiscoverable outside `--help`); and — when a monitor was created — how to verify it fires: `monitor test` for a dry-run, and `agentmonitors verify <name> --dir <dir>` (with `--manual` for any non-`file-fingerprint` type) as the real, CLI-only, one-command proof that it delivers end-to-end ([§16](#16-verify--prove-a-monitor-delivers-end-to-end)). The `setup-monitors` skill's "Verify It Fires" section is still named as a plugin-only supplement, never the sole pointer — a no-plugin/no-docs CLI user must not dead-end there (issue #408). The idempotent "nothing to change" re-run summary carries the same `doctor` pointer.
 
@@ -207,31 +207,40 @@ Each source produces a distinct starter frontmatter block:
 `pr-review` and `my-prs` are not source types — they are two ready-made `command-poll` monitors for
 the two pull-request roles, selected through the same `--type` flag:
 
-- **`pr-review`** (reviewer) — open, non-draft PRs in this repository awaiting review, excluding
-  `changeset-release/*` heads. Fires when a PR appears (opened, or a draft marked ready), when
-  `reviewDecision` flips, and when a PR leaves the queue. `urgency: normal`.
-- **`my-prs`** (author) — the current `gh` user's recent PRs in this repository. Fires when CI goes
-  red or recovers, when review feedback lands, and when a PR is merged, closed, or moved into or out
-  of draft. `urgency: normal` — see [003 §11.9](./003-source-plugins.md) for why `high` is not
+- **`pr-review`** (reviewer) — open, non-draft PRs in this repository awaiting review, excluding your
+  own PRs and `changeset-release/*` heads. Fires when a PR appears (opened, or a draft marked ready),
+  when `reviewDecision` flips, and when a PR leaves the queue. `urgency: normal`.
+- **`my-prs`** (author) — the current `gh` user's recent **open** PRs in this repository. Fires when
+  CI goes red or recovers, when review feedback lands, and when a PR is merged, closed, or moved into
+  or out of draft. `urgency: normal` — see [003 §11.9](./003-source-plugins.md) for why `high` is not
   available to a `json-diff` monitor whose watched value can recover on its own.
 
-**Both are automatically scoped to the repository the session is operating in.** Neither scaffolds a
-`--repo owner/name` flag: `gh` resolves the repository from its working directory, which for a
-project monitor is the runtime workspace/config root. `my-prs` likewise resolves identity through
-`--author @me` rather than a scaffolded username. A scaffolded preset is therefore correct in any
-checkout and needs no editing before it runs — the intent of these presets is that PR alerting takes
-one command rather than ~20 hand-written lines of `gh` argv.
+**Both are automatically scoped to the repository the session is operating in — via an explicit
+`cwd:` init scaffolds, not `--repo`.** `gh` resolves the repository from its process working
+directory, and that is the **daemon's own** working directory (never a "workspace/config root" the
+daemon might not even be running from), so `init` writes the project root it was run from into the
+scaffolded frontmatter as an absolute `cwd:`. Do not remove that field or add a `--repo` flag; either
+would make the preset correct only in the directory the daemon happens to be launched from, which is
+exactly the silent-wrong-repository failure this exists to prevent (issue #444 review, finding 1).
+`my-prs` likewise resolves identity through `--author @me` rather than a scaffolded username. A
+scaffolded preset is therefore correct in any checkout and needs no editing before it runs — the
+intent of these presets is that PR alerting takes one command rather than ~20 hand-written lines of
+`gh` argv.
 
 Both require the [GitHub CLI](https://cli.github.com) on the daemon's `PATH`, authenticated
-(`gh auth login`). When it is missing, unauthenticated, or run outside a GitHub repository, the
-monitor emits a `Command failing: <key>` event on its **first** tick whose `stderrTail` carries both
-`gh`'s own message and the remedy — it never degrades into a silent, never-firing baseline. See
+(`gh auth login`) — with an inherited `GITHUB_TOKEN` scrubbed before every invocation, since `gh` would
+otherwise give it unconditional precedence over that auth and silently resolve `@me` against the wrong
+identity. When `gh` is missing, unauthenticated, or run outside a GitHub repository, the monitor emits
+a `Command failing: <key>` event on its **first** tick whose `stderrTail` carries both `gh`'s own
+message and the remedy — it never degrades into a silent, never-firing baseline. See
 [003 §11.9](./003-source-plugins.md) for the field selection, the urgency rationale, and the failure
 mechanism.
 
-As with any scaffold, the frontmatter `name:` derives from the positional `[name]`
-(`init pr-review --type pr-review` yields `name: Pr review`); pass `--name 'PRs awaiting my review'`
-for a more readable delivery label.
+Unlike a plain `init <name> --type <source-type>` scaffold, a preset's frontmatter `name:` is **not**
+derived from the positional `[name]` — it keeps the template's own curated name (e.g. `PRs awaiting my
+review`) unless `--name` explicitly overrides it. Presets are the one case where the scaffolded name
+is itself product value, not a placeholder to rename (issue #444 review, finding 6); `init pr-review
+--type pr-review` yields `name: PRs awaiting my review`, not a derived `name: Pr review`.
 
 ---
 
