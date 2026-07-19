@@ -65,13 +65,16 @@ function expectedHookActionStep(sessionId: string): string {
 
 /**
  * The channel transport's own action step (`channel-render.ts`'s
- * `buildChannelReminderActionStep`): points at its `agentmon_ack` MCP tool
+ * `buildChannelReminderActionStep`): lists unread events FIRST — a
+ * prerequisite, not an "or" alternative (PR #445 review, finding 2 round 2) —
+ * then points at its `agentmon_ack` MCP tool, scoped to the handled ids,
  * rather than repeating the hook's CLI ack verb.
  */
 function expectedChannelActionStep(sessionId: string): string {
   return (
-    ' Call the agentmon_ack tool, or run ' +
-    `\`agentmonitors events list --session ${sessionId} --unread\` for details.`
+    ' Run ' +
+    `\`agentmonitors events list --session ${sessionId} --unread\` ` +
+    'to see them, then call the agentmon_ack tool with the event_id values of the ones you handled.'
   );
 }
 

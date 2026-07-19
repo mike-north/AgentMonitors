@@ -157,12 +157,23 @@ export function buildChannelTruncatedMarker(
  * names `agentmonitors events ack` directly, `hook-deliver-render.ts`'s
  * `buildHookReminderActionStep`), a channel-connected agent acknowledges
  * through the `agentmon_ack` MCP tool the server's own `instructions` already
- * describe (`channel.ts`) — repeating the CLI ack command here would give a
- * channel-connected agent two conflicting acknowledge paths. The `events
- * list` recovery command is still offered as a fallback for inspecting the
- * detail the coalesced reminder omits, with an explicit `--socket <path>`
- * (issue #358, PR #445 review finding 4) so it can't silently query a stale
- * `$AGENTMONITORS_SOCKET`.
+ * describe (`channel.ts`).
+ *
+ * **Inspection is a PREREQUISITE, not an alternative (PR #445 review, finding
+ * 2, round 2).** A prior wording offered `agentmon_ack` as an "or" alternative
+ * to listing details — but `agentmon_ack` called with no `event_ids`
+ * acknowledges EVERY unread event for the session (`channel-ack.ts`'s
+ * `ACK_TOOL`/`parseAckArgs`: omitting `event_ids` means "all unread"), not
+ * just the ones this reminder refers to. Read literally, the "or" phrasing's
+ * most direct path — call `agentmon_ack` with no arguments — silently
+ * acknowledges unrelated, never-seen cross-band events (e.g. a `low`-urgency
+ * reminder's blanket ack also clearing unread `high`-urgency work the
+ * recipient never inspected). The corrected instruction sequences the two
+ * steps instead: list this session's unread events first, THEN call
+ * `agentmon_ack` with exactly the `event_id` values of the ones actually
+ * handled — never the bare, no-argument form. The `events list` command
+ * carries an explicit `--socket <path>` (issue #358, PR #445 review finding
+ * 4) so it can't silently query a stale `$AGENTMONITORS_SOCKET`.
  */
 function buildChannelReminderActionStep(
   sessionId: string,
@@ -173,8 +184,9 @@ function buildChannelReminderActionStep(
     ? ` --socket ${escapeShellPath(socketPath)}`
     : '';
   return (
-    ' Call the agentmon_ack tool, or run ' +
-    `\`agentmonitors events list --session ${safeSessionId}${socketClause} --unread\` for details.`
+    ' Run ' +
+    `\`agentmonitors events list --session ${safeSessionId}${socketClause} --unread\` ` +
+    'to see them, then call the agentmon_ack tool with the event_id values of the ones you handled.'
   );
 }
 

@@ -298,6 +298,72 @@ describe('renderHookDelivery', () => {
     );
   });
 
+  // PR #445 review, finding 1 (BLOCKER): the ack instruction resolves its
+  // daemon socket env-first (issue #335), the SAME class of bug as the
+  // truncation-recovery markers (issue #358) — a copy-pasted ack with no
+  // `--socket` under a stale `$AGENTMONITORS_SOCKET` silently scopes the ack
+  // to the WRONG daemon, leaving the real session's events unread and
+  // unmuted. The resolved socket (already threaded into every other marker in
+  // this file) must reach this instruction too.
+  it('threads the resolved socket path into the high-urgency ack instruction', () => {
+    const out = renderHookDelivery(
+      makeClaim({
+        sessionId: 'sess-434',
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'watch-a',
+            title: 'A changed',
+            summary: 's',
+            body: 'body a',
+            urgency: 'high',
+            createdAt: '2026-06-04T00:00:00.000Z',
+          },
+        ],
+      }),
+      'UserPromptSubmit',
+      { socketPath: '/tmp/agentmon-real.sock' },
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).toContain(
+      "When handled, acknowledge: agentmonitors events ack --session sess-434 --socket '/tmp/agentmon-real.sock' --event-ids e1",
+    );
+  });
+
+  // PR #445 review, finding 1 (BLOCKER): the same for a post-compact recap —
+  // the recap re-shows unread events until acknowledged, and re-runs at every
+  // SessionStart, so its own copy-pasted ack instruction is just as
+  // vulnerable to a stale `$AGENTMONITORS_SOCKET` as the turn-interruptible
+  // path above.
+  it('threads the resolved socket path into the post-compact recap ack instruction', () => {
+    const out = renderHookDelivery(
+      makeClaim({
+        sessionId: 'sess-recap',
+        mode: 'recap',
+        urgency: undefined,
+        lifecycle: 'post-compact',
+        message: 'Recap of recent activity since your last recap:',
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'watch-src',
+            title: 'Files changed',
+            summary: 'Files changed',
+            body: 'Review the diff.',
+            urgency: 'normal',
+            createdAt: '2026-06-04T00:00:00.000Z',
+          },
+        ],
+      }),
+      'SessionStart',
+      { socketPath: '/tmp/agentmon-real.sock' },
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).toContain(
+      "When handled, acknowledge: agentmonitors events ack --session sess-recap --socket '/tmp/agentmon-real.sock' --event-ids e1",
+    );
+  });
+
   // hookEventName is echoed exactly
   it('echoes the hookEventName into hookSpecificOutput', () => {
     const out = renderHookDelivery(makeClaim(), 'Stop');

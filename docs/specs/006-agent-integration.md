@@ -642,11 +642,12 @@ muted; the remediation existed only in `monitor explain`, which nobody runs whil
 (issue #434 — the delivery-side twin of the silent-degradation family in issue #425).
 
 Therefore the hook transport's body-injection header **MUST** carry a completion instruction naming
-the acknowledge command with the recipient's **real session id**:
+the acknowledge command with the recipient's **real session id** and an explicit **`--socket
+<path>`** (PR #445 review, round 2, finding 1 — BLOCKER; see below):
 
 ```text
 AgentMon: monitored changes are pending — consider handling them before continuing.
-When handled, acknowledge: agentmonitors events ack --session <id> --event-ids <id1>,<id2>
+When handled, acknowledge: agentmonitors events ack --session <id> --socket <path> --event-ids <id1>,<id2>
 
 ### <monitor-id> (<urgency>)
 ...
@@ -670,15 +671,23 @@ Constraints:
 
 - **Once per delivery batch, not per event.** It lives in the shared header, so a delivery carrying
   N event blocks still renders exactly one instruction line naming all N ids.
-- **The header's own length now varies with how many ids it names**, which in turn depends on how
-  many blocks fit under the header — a fixed point. Every sizing path that packs whole event blocks
-  under the cap (`packEventsUnderCap`, `resolveHookClaimFit`, `renderHookDelivery`) resolves this by
-  iterative narrowing: assume the full candidate set is included (the longest header), pack, and if
-  fewer blocks actually fit than assumed, retry with the header narrowed to name only that many ids
-  (shorter header, more room) until the header is self-consistent with what it renders. It carries no
-  `--socket <path>` clause (unlike the truncation-recovery markers, whose whole purpose is to be
-  reliably runnable against the right daemon) — it is an advisory next step, and the header's length
-  is counted against the cap by every packing path.
+- **The header's own length now varies with how many ids it names AND with the resolved socket
+  path's length**, which in turn depends on how many blocks fit under the header — a fixed point.
+  Every sizing path that packs whole event blocks under the cap (`packEventsUnderCap`,
+  `resolveHookClaimFit`, `renderHookDelivery`) resolves this by iterative narrowing: assume the full
+  candidate set is included (the longest header), pack, and if fewer blocks actually fit than
+  assumed, retry with the header narrowed to name only that many ids (shorter header, more room)
+  until the header is self-consistent with what it renders.
+- **Carries an explicit `--socket <path>` (PR #445 review, round 2, finding 1 — BLOCKER).** A prior
+  revision left this instruction socket-less, reasoning it was merely an advisory next step. But
+  `agentmonitors events ack` resolves its daemon socket **env-first**
+  (`resolveManualDaemonSocketPath`, issue #335) — the same class of bug the truncation-recovery
+  markers already guard against (issue #358): a copy-pasted ack run under a stale
+  `$AGENTMONITORS_SOCKET` silently scopes the acknowledge to the **wrong** daemon, leaving the real
+  session's events unread and unmuted while the recipient believes it acknowledged them. The
+  instruction now threads the same resolved `socketPath` already carried by every other marker in
+  this transport (`hook.ts`'s `socketPath`), so every recovery **and** ack command in a given
+  delivery points at the same daemon.
 - **Reminder-only deliveries do not repeat it.** A `normal`/`low` claim has no body-injection header;
   the transport instead appends its own action step directly to the runtime's semantic message
   ([002 §9.2](./002-runtime-delivery.md#92-normal-urgency)) — see below.
@@ -699,14 +708,31 @@ AgentMon: Monitored changes are pending. Run `agentmonitors events list --sessio
 for the hook transport (`hook-deliver-render.ts`'s `buildHookReminderActionStep`), and
 
 ```text
-Monitored changes are pending. Call the agentmon_ack tool, or run `agentmonitors events list --session <id> --socket <path> --unread` for details.
+Monitored changes are pending. Run `agentmonitors events list --session <id> --socket <path> --unread` to see them, then call the agentmon_ack tool with the event_id values of the ones you handled.
 ```
 
 for the channel transport (`channel-render.ts`'s `buildChannelReminderActionStep`), which never repeats
-the hook's CLI ack verb. Neither reminder action step scopes `--event-ids`: this claim only ever fires
-when EVERY unread event of its own urgency band is unclaimed (the guard in [002
-§9.2](./002-runtime-delivery.md#92-normal-urgency)), so — unlike the per-batch instruction above —
-there is no narrower id list within the band to scope to.
+the hook's CLI ack verb.
+
+**Inspection is a prerequisite, not an "or" alternative (PR #445 review, round 2, finding 2 —
+BLOCKER).** A prior revision of the channel action step presented `agentmon_ack` as an alternative to
+listing details — "Call the agentmon_ack tool, **or** run `events list` ... for details." But the
+`agentmon_ack` MCP tool, called with **no** `event_ids`, acknowledges **every** unread event for the
+session across every urgency band (`channel-ack.ts`'s `ACK_TOOL`/`parseAckArgs`: omitting `event_ids`
+means "all unread" — the same blanket-ack shape the per-batch hook instruction above was already
+fixed to avoid, finding 1). Read literally, the "or" phrasing's **most direct** path — call
+`agentmon_ack` with no arguments — silently acknowledges unseen, cross-band work the recipient never
+inspected: e.g. a `low`-urgency reminder's bare ack call also clears unread `high`-urgency events. The
+corrected wording sequences the two steps: list this session's unread events **first**, **then** call
+`agentmon_ack` naming exactly the `event_id` values of the ones actually handled — never the bare,
+no-argument form.
+
+Neither reminder action step scopes `--event-ids`/`event_ids` to a specific list in its own advertised
+recovery command: this claim only ever fires when EVERY unread event of its own urgency band is
+unclaimed (the guard in [002 §9.2](./002-runtime-delivery.md#92-normal-urgency)), so — unlike the
+per-batch instruction above — there is no narrower id list within the band the _runtime_ can supply
+up front; the channel step's corrected wording instead defers that scoping decision to the recipient,
+instructing it to inspect first and then ack only what it actually handled.
 
 Verified by `apps/cli/src/delivery-text.integration.test.ts` (one runtime claim, both transports) and
 the renderer cases in `apps/cli/src/hook-deliver-render.test.ts`.

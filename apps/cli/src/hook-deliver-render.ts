@@ -329,17 +329,27 @@ function appendMarkerWithinCap(
  * event) and kept terse — this lands in an LLM context window (006 §5.1's
  * injection-size concern). The session id and each event id are sanitized
  * like every other claim-derived field reaching this payload (see
- * {@link sanitize}). No `--socket` clause: unlike the truncation-recovery
- * markers, this is an advisory next step, and both the runtime's reminder
- * message and this line stay socket-less to honor the terseness constraint.
+ * {@link sanitize}).
+ *
+ * **Carries an explicit `--socket <path>` (PR #445 review, finding 1).**
+ * `agentmonitors events ack` resolves its daemon socket env-first
+ * (`resolveManualDaemonSocketPath`, issue #335) — the SAME class of bug as
+ * the truncation-recovery markers (issue #358): a copy-pasted ack with no
+ * `--socket` under a stale `$AGENTMONITORS_SOCKET` silently scopes the ack to
+ * the WRONG daemon, leaving the real session's events unread and unmuted
+ * while the agent believes it acknowledged them. `socketPath` is the same
+ * resolved daemon socket already threaded into every other marker in this
+ * file (`hook.ts`'s `socketPath`, issue #358) — reusing it here keeps every
+ * recovery/ack command in this transport pointed at the same daemon.
  */
 function buildHookAckInstruction(
   sessionId: string,
   eventIds: string[],
+  socketPath: string | undefined,
 ): string {
   const idsClause =
     eventIds.length > 0 ? ` --event-ids ${sanitize(eventIds.join(','))}` : '';
-  return `When handled, acknowledge: agentmonitors events ack --session ${sanitize(sessionId)}${idsClause}`;
+  return `When handled, acknowledge: agentmonitors events ack --session ${sanitize(sessionId)}${socketClause(socketPath)}${idsClause}`;
 }
 
 /**
@@ -351,10 +361,17 @@ function buildHookAckInstruction(
  * {@link renderHookDelivery}) goes through {@link resolveHookHeaderPacking},
  * which recomputes this header for the ACTUAL set of events that end up
  * included as packing shrinks that set, so the header's true length is
- * always accounted for wherever blocks are fit.
+ * always accounted for wherever blocks are fit. Also socket-scoped ({@link
+ * buildHookAckInstruction}, PR #445 review finding 1) — every sizing path
+ * threads the same resolved `socketPath` so the header's true length
+ * (varying with socket path length) is accounted for too.
  */
-function buildHeader(sessionId: string, eventIds: string[]): string {
-  return `${LEAD_LINE}\n${buildHookAckInstruction(sessionId, eventIds)}\n\n`;
+function buildHeader(
+  sessionId: string,
+  eventIds: string[],
+  socketPath: string | undefined,
+): string {
+  return `${LEAD_LINE}\n${buildHookAckInstruction(sessionId, eventIds, socketPath)}\n\n`;
 }
 
 /**
@@ -415,11 +432,12 @@ function resolveHookHeaderPacking(
   blocks: string[],
   sessionId: string,
   cap: number,
+  socketPath: string | undefined,
 ): HeaderPacked {
   let guess = events.length;
   for (let i = 0; i <= events.length; i++) {
     const eventIds = events.slice(0, guess).map((event) => event.eventId);
-    const header = buildHeader(sessionId, eventIds);
+    const header = buildHeader(sessionId, eventIds, socketPath);
     const packed = packWholeBlocks(header, blocks, cap);
     if (packed.includedCount === guess) {
       return { text: packed.text, includedCount: packed.includedCount, header };
@@ -427,7 +445,7 @@ function resolveHookHeaderPacking(
     guess = packed.includedCount;
   }
   /* c8 ignore start -- defensive fallback, unreachable at realistic id/cap sizes */
-  const header = buildHeader(sessionId, []);
+  const header = buildHeader(sessionId, [], socketPath);
   const packed = packWholeBlocks(header, blocks, cap);
   return { text: packed.text, includedCount: packed.includedCount, header };
   /* c8 ignore stop */
@@ -464,7 +482,13 @@ export function packEventsUnderCap(
 ): number {
   if (events.length === 0) return 0;
   const blocks = events.map(buildEventBlock);
-  const whole = resolveHookHeaderPacking(events, blocks, sessionId, cap);
+  const whole = resolveHookHeaderPacking(
+    events,
+    blocks,
+    sessionId,
+    cap,
+    socketPath,
+  );
   if (whole.includedCount === blocks.length) return blocks.length;
   const markerLength = buildHookDeferredMarker(sessionId, socketPath).length;
   const reserved = resolveHookHeaderPacking(
@@ -472,6 +496,7 @@ export function packEventsUnderCap(
     blocks,
     sessionId,
     cap - markerLength,
+    socketPath,
   );
   return Math.max(1, reserved.includedCount);
 }
@@ -535,7 +560,13 @@ export function resolveHookClaimFit(
   cap: number = MAX_ADDITIONAL_CONTEXT,
 ): HookClaimFit {
   const blocks = events.map(buildEventBlock);
-  const whole = resolveHookHeaderPacking(events, blocks, sessionId, cap);
+  const whole = resolveHookHeaderPacking(
+    events,
+    blocks,
+    sessionId,
+    cap,
+    socketPath,
+  );
   if (whole.includedCount === blocks.length && !moreDeferred) {
     return { fits: true, includedCount: blocks.length, whole, reserved: whole };
   }
@@ -545,6 +576,7 @@ export function resolveHookClaimFit(
     blocks,
     sessionId,
     cap - deferredMarker.length,
+    socketPath,
   );
   const includedCount = Math.max(1, reserved.includedCount);
   return {
@@ -775,6 +807,7 @@ export function renderHookDelivery(
     const soleEventHeader = buildHeader(
       claim.sessionId,
       firstEvent ? [firstEvent.eventId] : [],
+      options.socketPath,
     );
     const marker =
       moreDeferred && claimedUnreadMarker !== deferredMarker

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { DeliveryClaim } from '@agentmonitors/core';
+import { parseAckArgs } from './channel-ack.js';
 import {
   buildChannelTruncatedMarker,
   CHANNEL_DEFERRED_MARKER,
@@ -402,8 +403,9 @@ describe('renderChannelEvent', () => {
     );
     // Verbatim — the channel adds no attribution of its own.
     expect(content).toBe(
-      `${semanticReminder} Call the agentmon_ack tool, or run ` +
-        '`agentmonitors events list --session s1 --unread` for details.',
+      `${semanticReminder} Run ` +
+        '`agentmonitors events list --session s1 --unread` ' +
+        'to see them, then call the agentmon_ack tool with the event_id values of the ones you handled.',
     );
     expect(content.startsWith('AgentMon')).toBe(false);
     // The channel never repeats the hook's CLI ack verb — that would give a
@@ -413,6 +415,55 @@ describe('renderChannelEvent', () => {
     expect(content).not.toContain('### ');
     // The referent count is the pending total, not 0.
     expect(meta.event_count).toBe('3');
+  });
+
+  // PR #445 review, finding 2 (round 2, BLOCKER): a prior wording offered
+  // `agentmon_ack` as an "or" ALTERNATIVE to listing details — but calling
+  // `agentmon_ack` with no `event_ids` acknowledges EVERY unread event for the
+  // session (`channel-ack.ts`'s `parseAckArgs`: omitting `event_ids` means
+  // "all unread"), not just the ones this reminder refers to. The most
+  // literal reading of the old "or" phrasing — call the tool bare, with no
+  // arguments — would silently ack unseen cross-band work. This is a
+  // text-contract regression test: the reminder must never advertise the
+  // bare, no-argument `agentmon_ack` call as a valid path; it must instead
+  // present inspection (`events list --unread`) as a prerequisite step before
+  // naming `agentmon_ack`, and name it only with a "handled"/event_id-scoped
+  // qualifier.
+  it('never advertises a bare, no-argument agentmon_ack call as an alternative to listing details (PR #445 review, finding 2 regression)', () => {
+    const { content } = renderChannelEvent(
+      makeClaim({
+        urgency: 'normal',
+        events: [],
+        message: 'Monitored changes are pending.',
+        unreadCounts: { low: 0, normal: 3, high: 0, total: 3 },
+      }),
+    );
+    // The regressed phrasing this test guards against.
+    expect(content).not.toContain('Call the agentmon_ack tool, or run');
+    expect(content).not.toContain('for details.');
+    // Listing unread events is presented BEFORE the ack step, as a
+    // prerequisite, not an "or" alternative.
+    const listIndex = content.indexOf('events list');
+    const ackIndex = content.indexOf('agentmon_ack');
+    expect(listIndex).toBeGreaterThan(-1);
+    expect(ackIndex).toBeGreaterThan(listIndex);
+    // The ack step is qualified to the handled events, not a bare call.
+    expect(content).toContain(
+      'call the agentmon_ack tool with the event_id values of the ones you handled',
+    );
+  });
+
+  // Confirms the semantics this text contract depends on: `agentmon_ack`
+  // called with no `event_ids` genuinely acknowledges ALL unread events for
+  // the session, which is exactly why the reminder text above must never
+  // present the bare call as a safe "or" alternative to inspecting first.
+  it('parseAckArgs treats omitted event_ids as "acknowledge all unread" (channel-ack.ts)', () => {
+    const bare = parseAckArgs(undefined);
+    expect(bare).toEqual({ ok: true, args: {} });
+    // No `eventIds` on the parsed args is the tool's own signal, per
+    // `ACK_TOOL`'s description, to acknowledge every unread event — not a
+    // subset the caller inspected first.
+    expect(bare.ok && bare.args.eventIds).toBeUndefined();
   });
 
   // PR #445 review, findings 2/4: the channel's own action step is
