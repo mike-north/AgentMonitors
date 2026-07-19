@@ -864,6 +864,7 @@ watch:
   headers:
     Accept: application/json
   interval: 5m
+  timeout: 30s
   auth:
     type: bearer
     token-env: API_TOKEN
@@ -880,7 +881,8 @@ watch:
   interval: 5m
 ```
 
-Required field: `url` (string). Important optional fields: `method`, `headers`, `interval`, `auth`, `change-detection`.
+Required field: `url` (string). Important optional fields: `method`, `headers`, `interval`, `auth`, `timeout`
+(request/body deadline, default `30s` — see §4.9), `change-detection`.
 
 `interval` is declared in the scope schema with pattern `^\d+[smhd]$` but is used by the scheduling engine, not by the plugin directly (verified: scope schema comment at `plugins/source-api-poll/src/index.ts` line 131).
 
@@ -1040,15 +1042,16 @@ Running a second observation to demonstrate change detection...
 ### 4.9 Request duration, response size, and composite concurrency bounds (issue #304)
 
 A stalled or huge endpoint must not wedge a whole tick, delay unrelated monitors, exhaust daemon
-memory, or amplify the local SQLite database (P1 daemon availability). `api-poll` enforces three
+memory, or amplify the local SQLite database (P1 daemon availability). `api-poll` enforces four
 bounds, all covered by a documented default with — for the deadline — a validated per-monitor
 override:
 
-| Bound                  | Default                         | Override                                                                           |
-| ---------------------- | ------------------------------- | ---------------------------------------------------------------------------------- |
-| Request/body deadline  | `30s`                           | `timeout` (scope field, duration string `^[1-9]\d*[smhd]$`, e.g. `"1m"`)           |
-| Response body size cap | 10 MiB (10 × 1024 × 1024 bytes) | not configurable; not enforced at all for `change-detection.strategy: status-code` |
-| Composite concurrency  | 5 parts in flight at once       | not configurable                                                                   |
+| Bound                                 | Default                         | Override                                                                                                                                                           |
+| ------------------------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Request/body deadline                 | `30s`                           | `timeout` (scope field, duration string `^[1-9]\d*[smhd]$`, e.g. `"1m"`); at most `2147483647`ms (~24.8 days) — the largest delay Node's `setTimeout` can schedule |
+| Response body size cap (per part)     | 10 MiB (10 × 1024 × 1024 bytes) | not configurable; not enforced at all for `change-detection.strategy: status-code`                                                                                 |
+| Composite cumulative body-byte budget | 10 MiB, summed across ALL parts | not configurable                                                                                                                                                   |
+| Composite concurrency                 | 5 parts in flight at once       | not configurable                                                                                                                                                   |
 
 **Request/body deadline.** A single `AbortController`-backed timer, started when the request is
 issued, bounds the ENTIRE exchange — connecting, receiving headers, and streaming the body to
@@ -1065,19 +1068,37 @@ this source's own timer produces; that race is still classified as the same "tim
 (checked via `controller.signal.aborted`, not just the caught error's type), so a caller never sees
 the raw undici error leak through.
 
-`timeout` defaults to `30s` when omitted (matching `command-poll`'s default, 003 §11.1) and is
-resolved by core's shared `parseOperationTimeoutMs` helper (exported next to `parseDuration`, and
-used by both `api-poll` and `command-poll` so the grammar and default cannot drift between the two
-plugins): a present value is parsed with `parseDuration`, so an invalid value throws the same
-descriptive `Invalid duration: "<value>". Expected format: <number><s|m|h|d>` error as every other
-duration field, and a **zero-length** value (`"0s"`, `"0m"`, `"0h"`, `"0d"`) — which would abort
-every request before it could ever complete — is rejected up front with
-`Invalid timeout: "<value>". A zero-length timeout is not allowed; specify at least 1 unit (e.g.
-"1s").`. The JSON Schema `pattern` for `timeout` (`^[1-9]\d*[smhd]$`) requires a non-zero leading
-digit for the same reason, so a "0s"-style value is rejected by validation tooling as well as at
-parse time. In composite mode (§2.6), the **same** deadline applies independently to **each**
-part — a failing part errors the whole composite immediately (see **Composite concurrency**
-below) without starving or serializing the others.
+`timeout` defaults to `30s` when omitted — meaning `config['timeout']` is `undefined` — (matching
+`command-poll`'s default, 003 §11.1) and is resolved by core's shared `parseOperationTimeoutMs`
+helper (exported next to `parseDuration`, and used by both `api-poll` and `command-poll` so the
+grammar and default cannot drift between the two plugins). A _present_ value that is not a string
+(a number, `null`, …) is a misconfiguration, not "omitted", and is rejected rather than silently
+defaulted:
+
+> `Invalid timeout: expected a string matching ^[1-9]\d*[smhd]$ (e.g. "30s"), got <type>.`
+
+A present string is parsed with `parseDuration`, so a malformed value throws the same descriptive
+`Invalid duration: "<value>". Expected format: <number><s|m|h|d>` error as every other duration
+field. Three values `parseDuration` alone would accept are rejected up front, so the parser and the
+JSON Schema `pattern` for `timeout` (`^[1-9]\d*[smhd]$`) always agree:
+
+- A **zero-length** value (`"0s"`, `"0m"`, `"0h"`, `"0d"`) — which would abort every request before
+  it could ever complete — is rejected with `Invalid timeout: "<value>". A zero-length timeout is
+not allowed; specify at least 1 unit (e.g. "1s").`.
+- A **leading-zero** value (`"01s"`, `"007m"`, …) — the schema pattern's `[1-9]\d*` already rejects
+  these, but `parseDuration`'s own `\d+` digit group would otherwise accept them, a schema/parser
+  mismatch — is rejected with `Invalid timeout: "<value>". A leading zero is not allowed; use "1s"
+instead of "01s" …`.
+- A value exceeding **`2147483647`ms** (~24.8 days, e.g. `"25d"`) — the largest delay Node's
+  `setTimeout` can schedule; a longer value silently overflows to a near-instant timer instead of
+  the author's intended deadline — is rejected with `Invalid timeout: "<value>" (<ms>ms) exceeds
+the maximum supported deadline of 2147483647ms (~24.8 days) …`. The JSON Schema `pattern` cannot
+  express this numeric upper bound (it is a pure string grammar), so this one check is
+  parser-only — a documented, narrow gap, not a parity bug.
+
+In composite mode (§2.6), the **same** deadline applies independently to **each** part — a failing
+part errors the whole composite immediately (see **Composite concurrency** below) without starving
+or serializing the others.
 
 **Response body size cap.** The cap is enforced twice, because `Content-Length` is not
 authoritative:
@@ -1127,12 +1148,32 @@ completion. Either way `nextState` never advances and the prior baseline is pres
 concurrency bound changes only how many requests are in flight at once and how fast a doomed batch
 surfaces its failure, not the composite's all-or-nothing semantics.
 
-(Verified: `plugins/source-api-poll/src/index.ts`, `MAX_RESPONSE_BYTES`,
-`MAX_COMPOSITE_CONCURRENCY`, `readBoundedBody`, `fetchBody`; `libs/core/src/notify/notifier.ts`,
-`parseOperationTimeoutMs`, `DEFAULT_OPERATION_TIMEOUT_MS`, `OPERATION_TIMEOUT_PATTERN`;
+**Composite cumulative body-byte budget.** The per-part 10 MiB cap (above) bounds any ONE part;
+the 5-worker concurrency bound (above) bounds how many parts are in flight AT ONCE — but neither
+bounds the aggregate size of the assembled composite. A composite with many small parts, each
+individually far under the per-part cap (e.g. 12 parts × 1 MiB), could still assemble and baseline
+a `snapshotText`/`nextState` many times larger than any single-URL monitor's response, persisted
+every tick. `api-poll` therefore also tracks the running SUM of every part's body length across the
+whole composite; once that running total exceeds the same 10 MiB figure (reused, not a second
+configurable knob), the source throws:
+
+> `api-poll composite "<objectKey>" exceeded the 10485760-byte cumulative part-body budget after
+part "<partId>" (<n> bytes across parts fetched so far) — reduce the number/size of parts or
+split into multiple monitors`
+
+This fails the whole composite exactly like a non-2xx or oversized part: `mapWithConcurrency`
+aborts every other in-flight part via the shared `AbortSignal`, `nextState` never advances, and the
+prior baseline is preserved.
+
+(Verified: `plugins/source-api-poll/src/index.ts`, `MAX_RESPONSE_BYTES`, `MAX_COMPOSITE_BYTES`,
+`MAX_COMPOSITE_CONCURRENCY`, `readBoundedBody`, `fetchBody`, `observeComposite`;
+`libs/core/src/notify/notifier.ts`, `parseOperationTimeoutMs`, `DEFAULT_OPERATION_TIMEOUT_MS`,
+`OPERATION_TIMEOUT_PATTERN`, `MAX_OPERATION_TIMEOUT_MS`;
 `plugins/source-api-poll/src/map-with-concurrency.ts`;
-`plugins/source-api-poll/src/index.test.ts`, "request/body bounds (issue #304)";
-`plugins/source-api-poll/src/map-with-concurrency.test.ts`.)
+`plugins/source-api-poll/src/index.test.ts`, "request/body bounds (issue #304)",
+"composite cumulative byte budget (issue #304 review, second round)";
+`plugins/source-api-poll/src/map-with-concurrency.test.ts`;
+`libs/core/src/notify/notifier.test.ts`.)
 
 ## 5. Bundled Source: `schedule`
 
