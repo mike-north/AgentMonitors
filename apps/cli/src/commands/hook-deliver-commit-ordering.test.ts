@@ -138,7 +138,7 @@ describe('writeAndCommitHookDelivery ordering (issue #442, round-9 review)', () 
     expect(flow.release).not.toHaveBeenCalled();
   });
 
-  it('(a) a commit RPC failure AFTER a successful write never releases — rows stay pending, output already delivered (duplicate OK)', async () => {
+  it('(a) a commit RPC failure AFTER a successful write propagates and never releases — whether the rows ended up claimed is genuinely uncertain, not "stays pending" (issue #442, round-14 review)', async () => {
     const flow = makeFlow({
       continue: true,
       hookSpecificOutput: {
@@ -157,7 +157,12 @@ describe('writeAndCommitHookDelivery ordering (issue #442, round-9 review)', () 
     expect(write).toHaveBeenCalledTimes(1);
     // A commit failure must NOT trigger a release: the reservation's own TTL
     // is the only recovery path here, and releasing after a successful write
-    // would be wrong too (there is no "undo the write").
+    // would be wrong too (there is no "undo the write"). This test proves
+    // ONLY that the rejection propagates to the caller and the helper does
+    // not release — it does NOT prove the rows "stay pending". Unlike a null
+    // resolution (definitely uncommitted, see the next test), a rejected
+    // commit RPC leaves the actual row state genuinely uncertain: the daemon
+    // may have applied the commit before the response was lost.
     expect(flow.release).not.toHaveBeenCalled();
   });
 

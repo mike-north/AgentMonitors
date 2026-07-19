@@ -33,6 +33,7 @@ import {
 import {
   describeCapDeferral,
   describeClaim,
+  describeCommitLapsed,
   describeDaemonUnreachable,
   describeDiagnosisFailure,
   describeHolds,
@@ -911,9 +912,7 @@ Diagnosis:
           // safe, intentional duplicate: the rows return to pending and
           // re-deliver at the next context event (or via a concurrent
           // channel poll) rather than being lost.
-          debug(
-            'reservation committed to nothing (lease expired, or write failed and released)',
-          );
+          debug(describeCommitLapsed());
         }
         debug(describeClaim(claim ?? reservedClaim));
       } catch (error) {

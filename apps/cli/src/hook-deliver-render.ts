@@ -134,10 +134,12 @@ function buildHookClaimedUnreadMarker(
  *
  * - {@link buildHookDeferredMarker}'s "more monitor updates are pending ...
  *   run `events list --unread` to see the rest" is misleading here: the
- *   omitted whole blocks are not "pending" in the ordinary sense (they were
- *   already claimed along with the rest of the recap's candidate set) —
- *   they will not redeliver at "the next context event" the way a genuinely
- *   unclaimed `turn-interruptible` event would.
+ *   omitted whole blocks are not "pending" in the ordinary sense (they are
+ *   reservation candidates, reserved along with the rest of the recap's
+ *   candidate set and about to be claimed once this render's commit lands —
+ *   not yet claimed at render time, per the render-before-commit ordering
+ *   described below) — they will not redeliver at "the next context event"
+ *   the way a genuinely unclaimed `turn-interruptible` event would.
  * - {@link buildHookClaimedUnreadMarker} (in its current, post-round-10
  *   wording) no longer asserts a redelivery outcome either way — but a
  *   recap's own framing is still distinct: it can (and should) promise the
@@ -426,8 +428,11 @@ export interface RenderHookDeliveryOptions {
  *   not yet known whether the row will end up durably claimed. That branch
  *   uses the distinct {@link buildHookClaimedUnreadMarker} instead (issue
  *   #442, PR #442 round-7/round-10 review) — its full body stays unread
- *   either way (claiming ≠ acking, BP2 / SP4), recoverable only via the
- *   durable unread copy; the marker itself asserts only that outcome-agnostic
+ *   regardless of which of the three commit outcomes follows (resolves
+ *   non-null, resolves null, or rejects — claiming ≠ acking, BP2 / SP4), so
+ *   the `events list --unread` command it advertises is the recovery path
+ *   guaranteed across EVERY commit outcome, not merely the sole recourse for
+ *   an uncommitted one; the marker itself asserts only that outcome-agnostic
  *   fact, never a specific claimed/redelivery direction (round-10 review).
  * - **Reminder line** — a `normal`/`low` turn-boundary claim carries no event
  *   bodies (`events: []`) but a populated `message` (the same advisory line

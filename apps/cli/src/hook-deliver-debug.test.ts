@@ -13,6 +13,7 @@ import type {
 import {
   describeCapDeferral,
   describeClaim,
+  describeCommitLapsed,
   describeDaemonUnreachable,
   describeDiagnosisFailure,
   describeHolds,
@@ -430,5 +431,18 @@ describe('hook-deliver-debug line formatters', () => {
     expect(describeInternalError(new Error('kaboom'))).toContain(
       'always exits 0',
     );
+  });
+
+  it('describeCommitLapsed names the definitely-uncommitted (null) outcome only — never a write failure, which releases and rethrows to the outer catch instead of reaching this branch (issue #442, round-14 review)', () => {
+    const message = describeCommitLapsed();
+    expect(message).toContain('committed to nothing');
+    expect(message).toContain('lease expired');
+    // Must not claim (or even mention) a write failure — the CLI's `if
+    // (!claim)` branch this backs only runs on `writeAndCommitHookDelivery`
+    // resolving null; a write failure releases and rethrows before commit is
+    // ever attempted (see `hook.ts`'s call site and
+    // `hook-deliver-commit-ordering.test.ts`'s "(b) a render/write failure
+    // releases the reservation" coverage).
+    expect(message).not.toContain('write failed');
   });
 });

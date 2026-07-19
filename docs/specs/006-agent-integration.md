@@ -409,16 +409,26 @@ Guarantees this establishes (issue #300):
 - **Failed pushes fall back.** A released (or self-expired) reservation leaves the rows `pending`, so
   a transient MCP disconnect costs at most one poll — the hook transport delivers durably regardless
   (§6/§6.1), and the next channel poll retries.
-- **Successful sends stay deduplicated.** The lease (during the push) and the committed claim (after
-  it) both hide the rows from the hook transport, so a surfaced event is never double-surfaced (§4.5).
+- **Successful sends stay deduplicated only once the commit resolves non-null.** The lease (during
+  the push) hides the rows from the hook transport for the in-flight window, but that hiding becomes
+  a durable claim only after `commitDelivery` resolves **non-null**; a **null** resolution means the
+  reservation's lease had already lapsed and the rows were never marked claimed at all (see below).
 - **Rows stay unacknowledged throughout.** Neither reserve, commit, nor release acknowledges;
   acknowledgement remains the separate, explicit `agentmon_ack` / `events ack` act (§4.3, SP4).
-- **At-least-once, never at-most-once.** If the push succeeds but the commit does not land — the
-  reservation lapsed during a slow/hung push, or the daemon restarted and dropped its in-memory lease
-  — the rows were never marked claimed, so they re-deliver via the hook path or the next poll. This
-  is a possible **duplicate** surface in that rare window, never a **lost** delivery (the safe
-  direction, PP1). The transport reports this outcome distinctly and **MUST NOT** treat an
-  uncommitted push as a successful claim.
+- **At-least-once, never at-most-once — three distinct commit outcomes, not two.** After a
+  successful push, `commitDelivery`'s outcome is one of three, and they are **not**
+  interchangeable:
+  1. **Resolves non-null** — the commit landed; the rows are now claimed ("was surfaced").
+  2. **Resolves null** — the reservation's lease had already lapsed (a slow/hung push, or a daemon
+     restart that dropped the in-memory lease) before the commit could apply; the rows are
+     **definitely** still `pending` and re-deliver via the hook path or the next poll.
+  3. **Rejects** — an IPC/transport error on the commit call itself. Whether the daemon applied the
+     commit before the response was lost is **genuinely uncertain**: the rows may be claimed, or may
+     still be `pending`. The transport MUST treat this case as distinct from (2), never assuming
+     "uncommitted" — it reports the uncertainty rather than asserting either state.
+     Cases (2) and (3) both mean the transport **MUST NOT** treat the push as a successful claim, but
+     only case (2) is a **known** re-deliverable-pending state; case (3) is a possible **duplicate**
+     surface in that rare window, never a **lost** delivery (the safe direction, PP1).
 
 While a reservation is in flight, the **diagnostic and hook-state projections are lease-aware too**:
 the `hook deliver --debug` diagnosis (§5.2.1) and the per-session hook-state file
@@ -967,8 +977,11 @@ Unlike round-8, the render (and its markers) now runs BEFORE `commitDelivery` ma
 (sets `first_notified_at`) — see §5.2's render-before-commit ordering (issue #442, PR #442 round-9
 review). `renderHookDelivery` receives the RESERVATION's own claim, still uncommitted at that point —
 and, since round-10, its marker language no longer asserts the row's eventual claimed or redelivery
-state at all, since that outcome is genuinely unknown until the commit that follows the write either
-succeeds or fails. BOTH the single-event mid-truncation branch AND a truncated reminder message
+state at all, since that outcome is genuinely one of three distinct possibilities until the commit
+that follows the write settles: it **resolves non-null** (the rows are now claimed), **resolves
+null** (the lease had already lapsed — the rows are definitely still pending), or **rejects** (an
+IPC/transport error whose effect on the rows is genuinely uncertain, not the same as a null
+resolution). BOTH the single-event mid-truncation branch AND a truncated reminder message
 describe THIS claim's own content being cut, not other pending work being deferred — that much is
 known at render time regardless of the pending commit's outcome. Only the deferred-remainder branch
 (a whole block genuinely left OUT of the render, still pending — never reserved at all) legitimately

@@ -223,6 +223,24 @@ export function describeOutput(
   );
 }
 
+/**
+ * `writeAndCommitHookDelivery`'s commit step resolved `null`: the
+ * reservation's lease expired before the commit could land (or the daemon
+ * restarted and dropped its in-memory lease). This is the definitely-
+ * uncommitted outcome, not an uncertain one — a rejected/lost commit RPC
+ * instead propagates as a thrown error to the outer catch (`describeInternalError`),
+ * since whether that row is claimed is genuinely unknown, never resolvable
+ * here (issue #442, PR #442 round-14 review: this branch runs ONLY on a null
+ * resolution — a write failure releases and rethrows before commit is ever
+ * attempted, so it can never reach this diagnostic).
+ */
+export function describeCommitLapsed(): string {
+  return line(
+    'reservation committed to nothing (lease expired before commit could ' +
+      'land, or the daemon restarted and dropped its in-memory lease)',
+  );
+}
+
 /** The outer try/catch swallowed an internal error (always-exit-0 contract). */
 export function describeInternalError(error: unknown): string {
   return line(
