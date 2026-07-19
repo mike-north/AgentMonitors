@@ -542,10 +542,16 @@ shape:
 - **`hookEventName`** — echoes the event that fired the hook (e.g. `"PostToolUse"`,
   `"UserPromptSubmit"`). Taken from the stdin payload's `hook_event_name`; it must match the firing
   event or the host ignores the `additionalContext`.
-- **`additionalContext`** — the rendered delivery: an attributed lead line, a one-line acknowledge
-  instruction (§5.1.1), then one block per event
-  with the monitor id, urgency, title, and the monitor's **body-instructions** (`DeliveryEventSummary.body`).
-  Capped at 4000 characters. Unlike the channel transport (§4.6), this is a plain JSON string
+- **`additionalContext`** — the rendered delivery, one of two shapes (§5.1.1):
+  - **Body injection** (settled `high`-urgency events, or the `post-compact` recap) — an attributed
+    lead line, a one-line acknowledge instruction, then one block per event with the monitor id,
+    urgency, title, and the monitor's **body-instructions** (`DeliveryEventSummary.body`).
+  - **Reminder-only** (`normal`/`low` claims with no event bodies) — a single attributed line
+    carrying the runtime's semantic reminder message. No header, no separate acknowledge line, and
+    no per-event blocks: the reminder message already names the acknowledge command itself, so
+    §5.1.1's completion instruction is **not** repeated here.
+
+  Both shapes are capped at 4000 characters. Unlike the channel transport (§4.6), this is a plain JSON string
   (`JSON.stringify` escapes it) and is **not** tag-delimited, so `<`, `>`, `[`, `]`, `;`, and
   newlines are preserved verbatim — a monitor body is trusted, user-authored markdown that
   legitimately contains code and links. Only raw C0/C1 control characters (except tab/newline) are

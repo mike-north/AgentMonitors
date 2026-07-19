@@ -34,8 +34,8 @@ event materialized ──▶ projected into lead session(s) ──▶ delivery l
 | `post-compact`         | Session start, as a recap of unread events        |
 
 Claiming a delivery marks the underlying events **claimed** — it does not **acknowledge** them.
-Acknowledgement (`agentmonitors events ack`, or the MCP `agentmon_ack` tool) is always a separate,
-explicit step, so a claimed-but-unhandled event stays discoverable.
+Acknowledgement (`agentmonitors events ack --session <id>`, or the MCP `agentmon_ack` tool) is
+always a separate, explicit step, so a claimed-but-unhandled event stays discoverable.
 
 _Governing spec: [`docs/specs/002-runtime-delivery.md`](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/002-runtime-delivery.md)
 §6 (session projection), §7 (unread/claimed/acknowledged), §9 (delivery lifecycles)._
@@ -56,13 +56,14 @@ a context compaction) with up to the 10 most recent events shown in full — tit
 body text. This is the safety net: nothing that settles while an agent is away goes unseen forever.
 
 The reminder-vs-detail split for `normal`/`low` matters in practice: a `normal` (or `low`) change
-nudges the agent exactly **once** — a single coalesced reminder ("read the inbox") covering every
-currently-unread event of that urgency — and then goes quiet. It does **not** re-nudge for each
-additional `normal`/`low` event that arrives; the path only speaks again once the outstanding
-events are acknowledged (`agentmonitors events ack`). The agent still has to go look
-(`agentmonitors events list --unread`) to see what changed — the reminder never carries per-event
-detail. Only `high` urgency injects the actual event content directly into the turn. If you want
-the agent to react to specifics without acknowledging first, use `urgency: high`.
+nudges the agent exactly **once** — a single coalesced reminder, self-sufficient and naming the
+exact commands to run, covering every currently-unread event of that urgency — and then goes quiet.
+It does **not** re-nudge for each additional `normal`/`low` event that arrives; the path only speaks
+again once the outstanding events are acknowledged (`agentmonitors events ack --session <id>`). The
+agent still has to go look (`agentmonitors events list --session <id> --unread`) to see what
+changed — the reminder never carries per-event detail. Only `high` urgency injects the actual event
+content directly into the turn. If you want the agent to react to specifics without acknowledging
+first, use `urgency: high`.
 
 _Governing spec: 002 §9.1 (high), §9.2 (normal), §9.3 (low), §9.4 (recap)._
 
