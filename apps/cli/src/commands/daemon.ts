@@ -409,15 +409,30 @@ Foreground vs background:
           options.log === undefined
             ? path.join(workspacePaths(workspace).dir, 'daemon.log')
             : path.resolve(options.log);
-        const pid = spawnDetachedDaemon({
-          monitorsDir,
-          workspacePath: workspace,
-          socket: socketPath,
-          db: dbPath,
-          pollMs,
-          reapAfterMs,
-          logPath,
-        });
+        // Opening the log touches the filesystem (mkdir/chmod/open), so a
+        // permission error or an unwritable `--log` path must surface as the
+        // CLI's normal one-line error + non-zero exit, never a raw stack
+        // trace. The daemon's own `--workspace`/db failures already do.
+        let pid: number | undefined;
+        try {
+          pid = spawnDetachedDaemon({
+            monitorsDir,
+            workspacePath: workspace,
+            socket: socketPath,
+            db: dbPath,
+            pollMs,
+            reapAfterMs,
+            logPath,
+          });
+        } catch (error) {
+          const message =
+            error instanceof Error ? error.message : String(error);
+          reportError(
+            `Could not start the detached daemon (log: ${logPath}): ${message}`,
+            false,
+          );
+          return;
+        }
         if (!(await waitForDaemon(socketPath, DETACH_READY_TIMEOUT_MS))) {
           reportError(
             `Detached daemon did not answer on ${socketPath} within ${String(

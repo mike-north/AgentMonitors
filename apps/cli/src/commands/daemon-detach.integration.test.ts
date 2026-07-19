@@ -20,7 +20,15 @@
 
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { callDaemon, daemonAvailable } from '../daemon-ipc.js';
@@ -74,12 +82,16 @@ interface RunResult {
  * (`vitest.serial.config.ts`), so a daemon holding that shared db would leak
  * into their runs.
  */
-function runCli(ws: Workspace, args: string[]): RunResult {
+function runCli(
+  ws: Workspace,
+  args: string[],
+  extraEnv: Record<string, string> = {},
+): RunResult {
   const result = spawnSync('node', [CLI_PATH, ...args], {
     encoding: 'utf-8',
     cwd: ws.dir,
     timeout: 60_000,
-    env: { ...process.env, AGENTMONITORS_DB: ws.db },
+    env: { ...process.env, AGENTMONITORS_DB: ws.db, ...extraEnv },
   });
   return {
     stdout: result.stdout ?? '',
@@ -89,21 +101,29 @@ function runCli(ws: Workspace, args: string[]): RunResult {
 }
 
 /** Start a detached daemon and remember its socket for teardown. */
-function runDetach(ws: Workspace, extraArgs: string[] = []): RunResult {
+function runDetach(
+  ws: Workspace,
+  extraArgs: string[] = [],
+  extraEnv: Record<string, string> = {},
+): RunResult {
   startedSockets.push(ws.socket);
-  return runCli(ws, [
-    'daemon',
-    'run',
-    ws.monitorsDir,
-    '--workspace',
-    ws.dir,
-    '--socket',
-    ws.socket,
-    '--poll-ms',
-    '1000',
-    '--detach',
-    ...extraArgs,
-  ]);
+  return runCli(
+    ws,
+    [
+      'daemon',
+      'run',
+      ws.monitorsDir,
+      '--workspace',
+      ws.dir,
+      '--socket',
+      ws.socket,
+      '--poll-ms',
+      '1000',
+      '--detach',
+      ...extraArgs,
+    ],
+    extraEnv,
+  );
 }
 
 afterEach(async () => {
@@ -195,6 +215,63 @@ describe('daemon run --detach (issue #389 P1)', () => {
     expect(`${second.stdout}${second.stderr}`).toContain(
       'daemon is already running',
     );
+  }, 60_000);
+
+  // The log captures daemon stdout/stderr — workspace paths, socket paths, and
+  // monitor failure messages. Under a common `umask 022` a plain
+  // `openSync(path, 'a')` creates it 0644, readable by every other local user;
+  // it must follow Agent Monitors' owner-only runtime-data policy (002 §3.1)
+  // instead. Regression coverage for both a custom `--log` and the default.
+  it('creates the log owner-only (0600) and its parent 0700, whatever the umask', async () => {
+    const ws = makeWorkspace('logmode');
+    const logDir = path.join(ws.dir, 'logs');
+    const logPath = path.join(logDir, 'daemon.log');
+
+    const previousUmask = process.umask(0o022);
+    try {
+      expect(runDetach(ws, ['--log', logPath]).exitCode).toBe(0);
+    } finally {
+      process.umask(previousUmask);
+    }
+
+    expect(statSync(logPath).mode & 0o777).toBe(0o600);
+    expect(statSync(logDir).mode & 0o777).toBe(0o700);
+  }, 60_000);
+
+  it('applies the same owner-only modes to the DEFAULT log path', async () => {
+    const ws = makeWorkspace('logdefault');
+    // Redirect the derived per-workspace data dir into the temp workspace so
+    // the default log path is exercised without touching the real data root.
+    const xdg = path.join(ws.dir, 'xdg');
+
+    const previousUmask = process.umask(0o022);
+    let stdout: string;
+    try {
+      stdout = runDetach(ws, [], { XDG_DATA_HOME: xdg }).stdout;
+    } finally {
+      process.umask(previousUmask);
+    }
+
+    const logPath = /log:\s+(\S+)/.exec(stdout)?.[1];
+    expect(logPath).toBeDefined();
+    expect(logPath).toContain(xdg);
+    expect(statSync(logPath as string).mode & 0o777).toBe(0o600);
+    expect(statSync(path.dirname(logPath as string)).mode & 0o777).toBe(0o700);
+  }, 60_000);
+
+  it('tightens a pre-existing world-readable log before appending to it', async () => {
+    const ws = makeWorkspace('logtighten');
+    const logPath = path.join(ws.dir, 'preexisting.log');
+    writeFileSync(logPath, 'from an earlier run\n', 'utf-8');
+    chmodSync(logPath, 0o644);
+
+    expect(runDetach(ws, ['--log', logPath]).exitCode).toBe(0);
+
+    expect(statSync(logPath).mode & 0o777).toBe(0o600);
+    // Appended, never truncated — the earlier run's output survives.
+    const contents = readFileSync(logPath, 'utf-8');
+    expect(contents).toContain('from an earlier run');
+    expect(contents).toContain(`AgentMon daemon listening on ${ws.socket}`);
   }, 60_000);
 
   it('documents the flag and the persistent-daemon combination in --help', () => {

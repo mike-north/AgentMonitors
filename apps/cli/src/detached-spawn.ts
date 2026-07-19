@@ -2,6 +2,11 @@ import { spawn } from 'node:child_process';
 import { closeSync, mkdirSync, openSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import {
+  PRIVATE_DIR_MODE,
+  PRIVATE_FILE_MODE,
+  restrictExistingPathMode,
+} from '@agentmonitors/core';
 
 export interface SpawnDaemonOptions {
   monitorsDir: string;
@@ -102,7 +107,27 @@ export function spawnDetachedDaemon(
   }
 }
 
+/**
+ * Open the detached daemon's log for appending under Agent Monitors' owner-only
+ * runtime-data policy (002 §3.1), NOT the ambient umask.
+ *
+ * The log captures the daemon's stdout/stderr — workspace paths, socket paths,
+ * and monitor failure messages — so under a common `umask 022` a plain
+ * `openSync(path, 'a')` would create it `0644` and leave it readable by every
+ * other local user. `PRIVATE_FILE_MODE`/`PRIVATE_DIR_MODE` have no group/other
+ * bits, so a permissive umask has nothing to strip and the file/dir come out
+ * owner-only from birth.
+ *
+ * A missing parent is created `0700`; a pre-existing one keeps its mode, since
+ * `--log` may point into a directory the user owns for their own reasons and
+ * silently tightening someone else's directory would be wrong (the same rule
+ * `ensureSocketDir` applies to a user-chosen socket directory). The file itself
+ * IS tightened when it already exists — it is ours, we are about to append the
+ * daemon's diagnostics to it, and a looser file left by an earlier version (or
+ * by a run before this policy existed) must not stay world-readable.
+ */
 function openLogFd(logPath: string): number {
-  mkdirSync(path.dirname(logPath), { recursive: true });
-  return openSync(logPath, 'a');
+  mkdirSync(path.dirname(logPath), { recursive: true, mode: PRIVATE_DIR_MODE });
+  restrictExistingPathMode(logPath, PRIVATE_FILE_MODE);
+  return openSync(logPath, 'a', PRIVATE_FILE_MODE);
 }
