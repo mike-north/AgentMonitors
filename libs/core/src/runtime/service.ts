@@ -177,7 +177,7 @@ function describeCadence(
  * (002 §9.2/§9.3). This is the message a `DeliveryClaim` with no event bodies
  * carries.
  *
- * Three properties, each fixing a defect of the former `NORMAL_INBOX_PROMPT`
+ * Two properties, each fixing a defect of the former `NORMAL_INBOX_PROMPT`
  * (`'AgentMon messages are available. Read the inbox.'`, issue #438):
  *
  * 1. **No product-name attribution.** Attribution is a property of the delivery
@@ -190,17 +190,26 @@ function describeCadence(
  *    non-authoritative (002 §12); the authoritative path is
  *    events/session-projection. "Read the inbox" pointed at a deprecated
  *    concept with no runnable referent.
- * 3. **Actionable and self-sufficient.** It names concrete, runnable next steps
- *    with the real session id interpolated (the runtime knows it at delivery
- *    time) — including the acknowledge step, so a recipient that acts on the
- *    delivery also clears the coalesced-until-ack suppression that would
- *    otherwise silently mute every later normal reminder (issue #434).
+ *
+ * **No CLI verb, either (PR #445 review, finding 2).** A prior revision of
+ * this function also embedded the concrete `agentmonitors events list`/`ack`
+ * commands — but the CHANNEL transport pushes this string verbatim into its
+ * `<channel>` tag body, and a channel-connected agent acknowledges through the
+ * `agentmon_ack` MCP tool (`channel.ts`), not the CLI. Baking one transport's
+ * verb into the shared, transport-neutral message put conflicting
+ * instructions on the channel surface. Each transport now supplies its OWN
+ * concrete action step, with its OWN sessionId/socket already available on the
+ * `DeliveryClaim`/render options: the hook transport appends
+ * `agentmonitors events list`/`ack` commands (`hook-deliver-render.ts`'s
+ * `buildHookReminderActionStep`); the channel transport points at its
+ * `agentmon_ack` tool (`channel-render.ts`). This keeps the runtime
+ * host-agnostic (AP6) while still leaving each delivered payload
+ * self-sufficient and actionable (issue #438) — the acknowledge step just
+ * moves from this shared sentence to each transport's own phrasing (issue
+ * #434 is unaffected: every transport's phrasing still names it).
  */
-function reminderMessage(sessionId: string): string {
-  return (
-    `Monitored changes are pending. Run \`agentmonitors events list --session ${sessionId} --unread\` ` +
-    `to see them, then \`agentmonitors events ack --session ${sessionId}\` once handled.`
-  );
+function reminderMessage(): string {
+  return 'Monitored changes are pending.';
 }
 
 function unreadDetailsCommand(sessionId: string): string {
@@ -2067,7 +2076,7 @@ export class AgentMonitorRuntime {
             mode: 'delivery',
             urgency: 'normal',
             unreadCounts: sessionUnreadCounts,
-            message: reminderMessage(sessionId),
+            message: reminderMessage(),
             events: [],
           },
         };
@@ -2092,7 +2101,7 @@ export class AgentMonitorRuntime {
           mode: 'delivery',
           urgency: 'low',
           unreadCounts: sessionUnreadCounts,
-          message: reminderMessage(sessionId),
+          message: reminderMessage(),
           events: [],
         },
       };

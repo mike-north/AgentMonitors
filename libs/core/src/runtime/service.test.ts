@@ -939,13 +939,12 @@ Handle it.
     const claim = runtime.claimDelivery(session.id, 'turn-idle');
     expect(claim?.mode).toBe('delivery');
     expect(claim?.urgency).toBe('low');
-    // 002 §9.3 (issues #438/#434): a semantic, unattributed, actionable body
-    // with the real session id — no product-name prefix (transport-owned), no
-    // reference to the legacy `inbox` model.
-    expect(claim?.message).toBe(
-      `Monitored changes are pending. Run \`agentmonitors events list --session ${session.id} --unread\` ` +
-        `to see them, then \`agentmonitors events ack --session ${session.id}\` once handled.`,
-    );
+    // 002 §9.3 (issues #438/#434, PR #445 review finding 2): a semantic,
+    // transport- and verb-neutral body — no product-name prefix, no CLI verb,
+    // no reference to the legacy `inbox` model. Each transport supplies its
+    // own concrete, session-scoped action step (`apps/cli`'s
+    // `hook-deliver-render.ts`/`channel-render.ts`).
+    expect(claim?.message).toBe('Monitored changes are pending.');
   });
 
   it('coalesces normal-urgency reminders until unread events are acknowledged', () => {
@@ -5056,14 +5055,11 @@ Daily digest.
 // @see ../../../../docs/specs/002-runtime-delivery.md §10.7 (monitor explain
 //   projection-and-delivery diagnosis)
 describe('normal-urgency reminder suppression is explainable (issue #333)', () => {
-  // 002 §9.2 (issues #438/#434): the coalesced reminder body for the normal
-  // band — semantic (no product-name attribution; that is transport-owned),
-  // free of the legacy `inbox` model, and self-sufficient: it names concrete
-  // runnable next steps, including the acknowledge step, with the real session
-  // id interpolated.
-  const reminderMessage = (sessionId: string): string =>
-    `Monitored changes are pending. Run \`agentmonitors events list --session ${sessionId} --unread\` ` +
-    `to see them, then \`agentmonitors events ack --session ${sessionId}\` once handled.`;
+  // 002 §9.2 (issues #438/#434, PR #445 review finding 2): the coalesced
+  // reminder body for the normal band — semantic and transport/verb-neutral
+  // (no product-name attribution, no CLI verb; both are transport-owned),
+  // free of the legacy `inbox` model.
+  const reminderMessage = (): string => 'Monitored changes are pending.';
 
   function stubStatefulSource(name: string): ObservationSource {
     return {
@@ -5152,7 +5148,7 @@ describe('normal-urgency reminder suppression is explainable (issue #333)', () =
       const first = runtime.claimDelivery(session.id, 'turn-interruptible');
       expect(first?.mode).toBe('delivery');
       expect(first?.urgency).toBe('normal');
-      expect(first?.message).toBe(reminderMessage(session.id));
+      expect(first?.message).toBe(reminderMessage());
       // Attribution is transport-owned (issue #438): the runtime's own message
       // never carries the product name.
       expect(first?.message).not.toContain('AgentMon');

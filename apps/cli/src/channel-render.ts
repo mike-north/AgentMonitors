@@ -5,6 +5,7 @@ import {
   escapeShellPath,
   packEventsUnderCap as packSharedEventsUnderCap,
   packWholeBlocks,
+  truncateWithMarker,
   type PackedBlocks,
 } from './delivery-event-render.js';
 
@@ -145,6 +146,36 @@ export function buildChannelTruncatedMarker(
     ? ` --socket ${escapeShellPath(socketPath)}`
     : '';
   return `\n\n(this update was too large to show in full; run \`agentmonitors events list --session ${safeSessionId}${socketClause} --unread\` to see the full copy)`;
+}
+
+/**
+ * The action step this transport appends to a reminder-only (`normal`/`low`)
+ * claim's semantic `message` (PR #445 review, finding 2). The runtime's
+ * `reminderMessage()` (`libs/core/src/runtime/service.ts`) states only the
+ * transport-neutral fact that changes are pending; each transport supplies
+ * its own concrete next step. Unlike the hook transport (whose reminder step
+ * names `agentmonitors events ack` directly, `hook-deliver-render.ts`'s
+ * `buildHookReminderActionStep`), a channel-connected agent acknowledges
+ * through the `agentmon_ack` MCP tool the server's own `instructions` already
+ * describe (`channel.ts`) — repeating the CLI ack command here would give a
+ * channel-connected agent two conflicting acknowledge paths. The `events
+ * list` recovery command is still offered as a fallback for inspecting the
+ * detail the coalesced reminder omits, with an explicit `--socket <path>`
+ * (issue #358, PR #445 review finding 4) so it can't silently query a stale
+ * `$AGENTMONITORS_SOCKET`.
+ */
+function buildChannelReminderActionStep(
+  sessionId: string,
+  socketPath: string | undefined,
+): string {
+  const safeSessionId = metaValue(sessionId);
+  const socketClause = socketPath
+    ? ` --socket ${escapeShellPath(socketPath)}`
+    : '';
+  return (
+    ' Call the agentmon_ack tool, or run ' +
+    `\`agentmonitors events list --session ${safeSessionId}${socketClause} --unread\` for details.`
+  );
 }
 
 /**
@@ -406,7 +437,26 @@ export function renderChannelEvent(
       content = appendMarkerWithinCap(firstBlock, MAX_CHANNEL_CONTENT, marker);
     }
   } else {
-    content = contentValue(claim.message);
+    // Reminder claim (`normal`/`low`, no events): the runtime's semantic
+    // message plus this transport's own action step (agentmon_ack, not the
+    // hook's CLI ack verb — see `buildChannelReminderActionStep`). Bounded by
+    // {@link MAX_CHANNEL_CONTENT} like every other branch here (PR #445
+    // review, finding 5) — latent today (the reminder is short), but this was
+    // previously the one render path in the file without the #442
+    // defense-in-depth ceiling. If truncation is ever needed, this is THIS
+    // claim's own content being cut (not other pending work deferred), so it
+    // uses {@link buildChannelTruncatedMarker} — mirroring the hook
+    // transport's identical choice for its reminder-truncation case
+    // (`hook-deliver-render.ts`'s `buildHookClaimedUnreadMarker` usage).
+    const actionStep = buildChannelReminderActionStep(
+      claim.sessionId,
+      options.socketPath,
+    );
+    content = truncateWithMarker(
+      `${contentValue(claim.message)}${actionStep}`,
+      MAX_CHANNEL_CONTENT,
+      buildChannelTruncatedMarker(claim.sessionId, options.socketPath),
+    );
   }
 
   // A reminder claim carries no concrete events (`events: []`), so `event_count`

@@ -255,25 +255,21 @@ Tell the agent the local API changed.
   const claim = runtime.claimDelivery(session.id, 'turn-interruptible');
   assert.ok(claim);
   assert.equal(claim.urgency, 'normal');
-  // 002 §9.2 (issues #438/#434): the coalesced normal-urgency reminder is
-  // self-sufficient — it MUST name BOTH runnable steps, the session-scoped
-  // discovery command (\`events list --session <id> --unread\`) AND the
-  // acknowledge command (\`events ack --session <id>\`), each with the real
-  // session id interpolated. These are transcribed straight from the spec
-  // wording (mirroring the \`reminderMessage\` fixture in
-  // libs/core/src/runtime/service.test.ts) rather than a loose substring
-  // check, so a regression that drops either command — e.g. keeping only the
-  // ack line — fails here, not just in the focused unit tests.
-  const expectedListCommand = \`agentmonitors events list --session \${session.id} --unread\`;
-  const expectedAckCommand = \`agentmonitors events ack --session \${session.id}\`;
-  assert.ok(
-    claim.message.includes(expectedListCommand),
-    \`expected reminder to include the discovery command "\${expectedListCommand}", got: \${claim.message}\`,
-  );
-  assert.ok(
-    claim.message.includes(expectedAckCommand),
-    \`expected reminder to include the ack command "\${expectedAckCommand}", got: \${claim.message}\`,
-  );
+  // 002 §9.2 (issues #438/#434, revised by PR #445 review finding 2): a
+  // prior revision of this assertion (matching a prior revision of
+  // \`reminderMessage\`) required the runtime's reminder body to embed BOTH
+  // runnable commands directly. That embedding was itself the defect finding
+  // 2 identified: the channel transport pushed that string verbatim into its
+  // \`<channel>\` tag, so a channel-connected agent — who acknowledges via the
+  // \`agentmon_ack\` MCP tool, not the CLI — received a conflicting CLI ack
+  // instruction it had no use for. The runtime's message is now semantic and
+  // transport/verb-NEUTRAL; each transport (only \`@agentmonitors/cli\`, not
+  // exercised by this core-only smoke test) supplies its own concrete,
+  // session-scoped action step — including which commands to run — on top of
+  // this shared sentence, so asserting the exact commands belongs in
+  // \`apps/cli\`'s transport-level tests
+  // (\`delivery-text.integration.test.ts\`), not here.
+  assert.equal(claim.message, 'Monitored changes are pending.');
   assert.ok(
     !claim.message.toLowerCase().includes('inbox'),
     \`expected reminder not to reference the legacy inbox, got: \${claim.message}\`,

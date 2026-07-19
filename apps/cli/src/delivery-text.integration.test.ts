@@ -42,15 +42,36 @@ afterEach(() => {
 
 /**
  * The coalesced reminder body 002 §9.2/§9.3 requires the runtime to emit —
- * transcribed from the spec: semantic (no product-name attribution, which is
- * transport-owned), free of the legacy `inbox` model (002 §12), and naming
- * concrete runnable next steps — including the acknowledge step — with the
- * recipient's real session id interpolated.
+ * transcribed from the spec: semantic, transport- and verb-neutral (no
+ * product-name attribution and no CLI verb, both transport-owned per PR #445
+ * review finding 2), free of the legacy `inbox` model (002 §12).
  */
-function expectedReminder(sessionId: string): string {
+function expectedReminder(): string {
+  return 'Monitored changes are pending.';
+}
+
+/**
+ * The hook transport's own action step, appended after
+ * {@link expectedReminder} (`hook-deliver-render.ts`'s
+ * `buildHookReminderActionStep`): concrete, session-scoped CLI commands
+ * including the acknowledge step.
+ */
+function expectedHookActionStep(sessionId: string): string {
   return (
-    `Monitored changes are pending. Run \`agentmonitors events list --session ${sessionId} --unread\` ` +
+    ` Run \`agentmonitors events list --session ${sessionId} --unread\` ` +
     `to see them, then \`agentmonitors events ack --session ${sessionId}\` once handled.`
+  );
+}
+
+/**
+ * The channel transport's own action step (`channel-render.ts`'s
+ * `buildChannelReminderActionStep`): points at its `agentmon_ack` MCP tool
+ * rather than repeating the hook's CLI ack verb.
+ */
+function expectedChannelActionStep(sessionId: string): string {
+  return (
+    ' Call the agentmon_ack tool, or run ' +
+    `\`agentmonitors events list --session ${sessionId} --unread\` for details.`
   );
 }
 
@@ -60,7 +81,11 @@ interface Harness {
   sessionId: string;
   workspacePath: string;
   /** Materialize one durable event of `urgency` into the shared workspace. */
-  emit: (urgency: 'low' | 'normal' | 'high', objectKey: string) => void;
+  emit: (
+    urgency: 'low' | 'normal' | 'high',
+    objectKey: string,
+    createdAt?: Date,
+  ) => void;
 }
 
 function buildHarness(hostSessionId: string): Harness {
@@ -79,7 +104,7 @@ function buildHarness(hostSessionId: string): Harness {
     store,
     sessionId: session.id,
     workspacePath,
-    emit: (urgency, objectKey) => {
+    emit: (urgency, objectKey, createdAt = new Date()) => {
       store.insertEvent({
         workspacePath,
         monitorId: 'docs-monitor',
@@ -95,11 +120,15 @@ function buildHarness(hostSessionId: string): Harness {
         objectKey,
         queryScope: { doc: objectKey },
         tags: ['docs'],
-        createdAt: new Date(),
+        createdAt,
       });
     },
   };
 }
+
+// The high-urgency settle window (006 §5.2/§9.1): an event must be at least
+// this old before a `turn-interruptible` claim will surface it.
+const SETTLED = new Date(Date.now() - 60_000);
 
 describe('delivered text is self-sufficient and transport-attributed (issues #438, #434)', () => {
   // Issue #438, the core acceptance criterion: ONE coalesced reminder produced
@@ -119,35 +148,46 @@ describe('delivered text is self-sufficient and transport-attributed (issues #43
     expect(claim.events).toEqual([]); // §9.2: a reminder carries no event bodies
 
     // 1. The RUNTIME's message is semantic: no product name, no legacy `inbox`,
-    //    and self-sufficient (real session id, runnable commands, ack step).
-    expect(claim.message).toBe(expectedReminder(h.sessionId));
+    //    and carries no transport-specific verb (PR #445 review, finding 2) —
+    //    each transport supplies its own concrete action step below.
+    expect(claim.message).toBe(expectedReminder());
     expect(claim.message).not.toContain('AgentMon');
     expect(claim.message).not.toContain('inbox');
 
-    // 2. HOOK transport: owns attribution → prepends its label, and preserves
-    //    the semantic body verbatim after it.
+    // 2. HOOK transport: owns attribution → prepends its label, and appends
+    //    its OWN CLI action step after the semantic body.
     const hookOut = renderHookDelivery(claim, 'UserPromptSubmit');
     const hookCtx = hookOut?.hookSpecificOutput.additionalContext ?? '';
-    expect(hookCtx).toBe(`AgentMon: ${expectedReminder(h.sessionId)}`);
+    expect(hookCtx).toBe(
+      `AgentMon: ${expectedReminder()}${expectedHookActionStep(h.sessionId)}`,
+    );
 
     // 3. CHANNEL transport: adds NO attribution — the tag already names the
-    //    source. The body is the runtime's semantic message verbatim.
+    //    source. It appends its OWN `agentmon_ack`-pointing action step, never
+    //    the hook's CLI ack verb.
     const { content, meta } = renderChannelEvent(claim);
-    expect(content).toBe(expectedReminder(h.sessionId));
+    expect(content).toBe(
+      `${expectedReminder()}${expectedChannelActionStep(h.sessionId)}`,
+    );
     expect(content).not.toContain('AgentMon');
+    expect(content).not.toContain('events ack');
     expect(meta['urgency']).toBe('normal');
 
-    // 4. Both surfaces carry the same actionable next steps — the property that
-    //    makes the delivered text self-sufficient on either transport.
+    // 4. Both surfaces carry a self-sufficient recovery command (the
+    //    transport-neutral part) — but only the hook names the CLI ack verb;
+    //    the channel points at its own tool instead (PR #445 review, finding
+    //    2), so a channel-connected agent never gets two conflicting
+    //    acknowledge paths.
     for (const surface of [hookCtx, content]) {
       expect(surface).toContain(
         `agentmonitors events list --session ${h.sessionId} --unread`,
       );
-      expect(surface).toContain(
-        `agentmonitors events ack --session ${h.sessionId}`,
-      );
       expect(surface).not.toContain('inbox');
     }
+    expect(hookCtx).toContain(
+      `agentmonitors events ack --session ${h.sessionId}`,
+    );
+    expect(content).not.toContain('events ack');
   });
 
   // Issue #434: the delivered payload must name the ack step, because claiming
@@ -189,7 +229,7 @@ describe('delivered text is self-sufficient and transport-attributed (issues #43
     h.emit('normal', 'doc-3');
     const afterAck = h.runtime.claimDelivery(h.sessionId, 'turn-interruptible');
     expect(afterAck).not.toBeNull();
-    expect(afterAck?.message).toBe(expectedReminder(h.sessionId));
+    expect(afterAck?.message).toBe(expectedReminder());
   });
 
   // Issue #434, the recap half of the DoD: a SessionStart (`post-compact`)
@@ -216,5 +256,66 @@ describe('delivered text is self-sufficient and transport-attributed (issues #43
     expect(ctx.split('When handled, acknowledge:').length - 1).toBe(1);
     // The recap still injects the real event bodies alongside it.
     expect(ctx).toContain('Review the change in doc-1.');
+  });
+
+  // PR #445 review, finding 1 (BLOCKER): `agentmonitors events ack --session
+  // <id>` with no `--event-ids` acknowledges EVERY unread event for the
+  // session. A CAPPED high-urgency delivery deferred the second event (it
+  // genuinely stays pending and re-delivers per §5.5) — a compliant agent
+  // that runs the delivered instruction verbatim must NOT silently acknowledge
+  // (and thereby permanently drop from ordinary redelivery) the event it
+  // never saw.
+  it('scopes the ack instruction to only the rendered events of a capped high-urgency delivery, never the deferred remainder', () => {
+    const h = buildHarness('claude-445-capped');
+    h.emit('high', 'doc-1', SETTLED);
+    h.emit('high', 'doc-2', SETTLED);
+
+    // Cap the claim to exactly 1 event (mirrors the hook transport sizing a
+    // length-bounded `additionalContext` — issue #299).
+    const claim = h.runtime.claimDelivery(h.sessionId, 'turn-interruptible', 1);
+    expect(claim).not.toBeNull();
+    if (!claim) throw new Error('expected a capped high-urgency claim');
+    expect(claim.events).toHaveLength(1);
+    const [renderedEvent] = claim.events;
+    if (!renderedEvent) throw new Error('expected one rendered event');
+
+    const ctx =
+      renderHookDelivery(claim, 'PreToolUse', { moreDeferred: true })
+        ?.hookSpecificOutput.additionalContext ?? '';
+
+    // The instruction names ONLY the rendered event's id.
+    expect(ctx).toContain(
+      `agentmonitors events ack --session ${h.sessionId} --event-ids ${renderedEvent.eventId}`,
+    );
+    // It must never claim to ack a second id — only one event was rendered.
+    expect(ctx).not.toContain(`${renderedEvent.eventId},`);
+
+    // The instruction, run exactly as delivered, must leave the deferred
+    // event unread — proving no silent loss.
+    h.runtime.acknowledgeSession(h.sessionId, [renderedEvent.eventId]);
+    const stillUnread = h.store.unreadEventsForSession(h.sessionId, 'high');
+    expect(stillUnread).toHaveLength(1);
+    expect(stillUnread[0]?.objectKey).toBe('doc-2');
+  });
+
+  // PR #445 review, finding 1: the SAME scoping applies to a `post-compact`
+  // recap, whose rendered `events` (up to 10, §9.4) can be fewer than the
+  // FULL unread set the recap decision actually claims at commit time.
+  it('scopes a recap ack instruction to only the rendered events, leaving un-rendered claimed events recoverable', () => {
+    const h = buildHarness('claude-445-recap-scope');
+    h.emit('normal', 'doc-1');
+    h.emit('normal', 'doc-2');
+
+    const recap = h.runtime.claimDelivery(h.sessionId, 'post-compact');
+    expect(recap).not.toBeNull();
+    if (!recap) throw new Error('expected a recap claim');
+    const ids = recap.events.map((event) => event.eventId).join(',');
+
+    const ctx =
+      renderHookDelivery(recap, 'SessionStart')?.hookSpecificOutput
+        .additionalContext ?? '';
+    expect(ctx).toContain(
+      `When handled, acknowledge: agentmonitors events ack --session ${h.sessionId} --event-ids ${ids}`,
+    );
   });
 });

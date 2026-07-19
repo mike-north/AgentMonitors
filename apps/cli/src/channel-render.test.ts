@@ -387,10 +387,11 @@ describe('renderChannelEvent', () => {
   // message; this transport adds NO prefix, because the enclosing
   // `<channel source="agentmonitors">` tag already names the source — an
   // "AgentMon" prefix here would double-attribute.
-  it('renders a reminder claim verbatim, unattributed, and counts the pending events it refers to', () => {
-    const semanticReminder =
-      'Monitored changes are pending. Run `agentmonitors events list --session s1 --unread` ' +
-      'to see them, then `agentmonitors events ack --session s1` once handled.';
+  it('renders a reminder claim with the runtime message plus the channel-owned agentmon_ack action step, unattributed, counting the pending events it refers to', () => {
+    // 002 §9.2 (PR #445 review, finding 2): the runtime's own message is now
+    // transport-neutral — no CLI verb baked in — so this transport supplies
+    // its OWN action step (`agentmon_ack`, not the hook's CLI ack command).
+    const semanticReminder = 'Monitored changes are pending.';
     const { content, meta } = renderChannelEvent(
       makeClaim({
         urgency: 'normal',
@@ -400,12 +401,37 @@ describe('renderChannelEvent', () => {
       }),
     );
     // Verbatim — the channel adds no attribution of its own.
-    expect(content).toBe(semanticReminder);
+    expect(content).toBe(
+      `${semanticReminder} Call the agentmon_ack tool, or run ` +
+        '`agentmonitors events list --session s1 --unread` for details.',
+    );
     expect(content.startsWith('AgentMon')).toBe(false);
+    // The channel never repeats the hook's CLI ack verb — that would give a
+    // channel-connected agent two conflicting acknowledge paths.
+    expect(content).not.toContain('events ack');
     // No injected event bodies leak into a reminder.
     expect(content).not.toContain('### ');
     // The referent count is the pending total, not 0.
     expect(meta.event_count).toBe('3');
+  });
+
+  // PR #445 review, findings 2/4: the channel's own action step is
+  // session+socket-scoped, mirroring the hook transport's identical
+  // reminder-step contract.
+  it('threads the resolved socket path into the reminder action step', () => {
+    const { content } = renderChannelEvent(
+      makeClaim({
+        sessionId: 'sess-reminder',
+        urgency: 'low',
+        events: [],
+        message: 'Monitored changes are pending.',
+        unreadCounts: { low: 1, normal: 0, high: 0, total: 1 },
+      }),
+      { socketPath: '/tmp/agentmon-real.sock' },
+    );
+    expect(content).toContain(
+      "agentmonitors events list --session sess-reminder --socket '/tmp/agentmon-real.sock' --unread",
+    );
   });
 });
 

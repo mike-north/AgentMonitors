@@ -3,7 +3,6 @@ import {
   appendMarkerWithinCap as appendSharedMarkerWithinCap,
   buildEventBlock as buildSharedEventBlock,
   escapeShellPath,
-  packEventsUnderCap as packSharedEventsUnderCap,
   packWholeBlocks as packSharedWholeBlocks,
   truncateWithMarker,
 } from './delivery-event-render.js';
@@ -18,7 +17,15 @@ export const MAX_ADDITIONAL_CONTEXT = 4000;
  * product name); the channel transport, whose `<channel source="agentmonitors">`
  * tag already names the source, adds nothing. Keeping this a named constant
  * makes the seam explicit and keeps the two hook shapes (body-injection lead
- * line, reminder line) attributed identically.
+ * line, reminder line) attributed with the SAME prefix — though not
+ * identical casing in the sentence that follows it: {@link LEAD_LINE} (its own
+ * fixed advisory text) starts lowercase ("monitored changes…"), while the
+ * reminder line prepends this prefix directly to the runtime's own
+ * `reminderMessage()` sentence, which starts capitalized ("Monitored
+ * changes…") because it also stands on its own in `libs/core` (no prefix)
+ * and in the channel transport (no prefix either) — both of the un-prefixed
+ * uses need a sentence that reads correctly capitalized on its own (PR #445
+ * review, cleanup 7e).
  */
 const HOOK_ATTRIBUTION_PREFIX = 'AgentMon: ';
 
@@ -41,6 +48,36 @@ const LEAD_LINE = `${HOOK_ATTRIBUTION_PREFIX}monitored changes are pending — c
  */
 function socketClause(socketPath: string | undefined): string {
   return socketPath ? ` --socket ${escapeShellPath(socketPath)}` : '';
+}
+
+/**
+ * The action step this transport appends to a reminder-only (`normal`/`low`)
+ * delivery's semantic `message` (PR #445 review, finding 2). The runtime's
+ * `reminderMessage()` (`libs/core/src/runtime/service.ts`) states only the
+ * transport-neutral fact that changes are pending — attribution AND the
+ * concrete next step are both transport-owned (002 §9.2, 006 §5.1.1): this
+ * transport names the CLI verbs directly, with an explicit `--socket <path>`
+ * (issue #358) so a copy-pasted command can't silently query a stale
+ * `$AGENTMONITORS_SOCKET` (PR #445 review, finding 4) — unlike the channel
+ * transport, which instead points at its `agentmon_ack` MCP tool
+ * (`channel-render.ts`'s reminder branch).
+ *
+ * The reminder claims the FULL unread set of its own urgency band (the
+ * runtime only ever emits this claim when every unread event of that band is
+ * still unclaimed — `service.ts`'s `normalPending`/`shouldSendLow` guards), so
+ * (unlike the per-batch ack instruction in {@link buildHookAckInstruction})
+ * there is no narrower id list to scope the ack to here.
+ */
+function buildHookReminderActionStep(
+  sessionId: string,
+  socketPath: string | undefined,
+): string {
+  const safeSessionId = sanitize(sessionId);
+  const socket = socketClause(socketPath);
+  return (
+    ` Run \`agentmonitors events list --session ${safeSessionId}${socket} --unread\` ` +
+    `to see them, then \`agentmonitors events ack --session ${safeSessionId}${socket}\` once handled.`
+  );
 }
 
 /**
@@ -275,29 +312,49 @@ function appendMarkerWithinCap(
  * which nobody runs while things appear fine. This line closes that loop, in
  * the delivered context itself.
  *
+ * **Scoped to the CLAIMED batch, not "ack everything" (PR #445 review,
+ * finding 1).** `agentmonitors events ack --session <id>` with no
+ * `--event-ids` acknowledges EVERY unread event for the session — including
+ * high-urgency events a capped delivery genuinely deferred (they stay
+ * pending and re-deliver next context event, per {@link buildHookDeferredMarker})
+ * and a recap's own un-rendered tail. A compliant agent that runs the
+ * blanket form after handling only the rendered batch would silently
+ * acknowledge — and thereby permanently drop from the ordinary redelivery
+ * path — events it never saw. `eventIds` is always the exact set THIS render
+ * actually included (never the full candidate/claimed set, which can be
+ * larger for a recap — see {@link resolveHookHeaderPacking}), so the
+ * instruction can never claim more than what the recipient was shown.
+ *
  * Emitted ONCE per delivery batch (it lives in the shared header, not per
  * event) and kept terse — this lands in an LLM context window (006 §5.1's
- * injection-size concern). The session id is sanitized like every other
- * claim-derived field reaching this payload (see {@link sanitize}). No
- * `--socket` clause: unlike the truncation-recovery markers, this is an
- * advisory next step, and both the runtime's reminder message and this line
- * stay socket-less to honor the terseness constraint.
+ * injection-size concern). The session id and each event id are sanitized
+ * like every other claim-derived field reaching this payload (see
+ * {@link sanitize}). No `--socket` clause: unlike the truncation-recovery
+ * markers, this is an advisory next step, and both the runtime's reminder
+ * message and this line stay socket-less to honor the terseness constraint.
  */
-function buildHookAckInstruction(sessionId: string): string {
-  return `When handled, acknowledge: agentmonitors events ack --session ${sanitize(sessionId)}`;
+function buildHookAckInstruction(
+  sessionId: string,
+  eventIds: string[],
+): string {
+  const idsClause =
+    eventIds.length > 0 ? ` --event-ids ${sanitize(eventIds.join(','))}` : '';
+  return `When handled, acknowledge: agentmonitors events ack --session ${sanitize(sessionId)}${idsClause}`;
 }
 
 /**
  * The prefix of a body-injection payload: the attributed lead line, the
- * per-batch acknowledge instruction (issue #434), then a blank line before the
- * event blocks. Session-scoped because the ack instruction interpolates the
- * session id — every sizing path that packs blocks under the cap
- * ({@link packEventsUnderCap}, {@link resolveHookClaimFit},
- * {@link renderHookDelivery}) already carries the claim's `sessionId`, so the
- * header's true length is accounted for wherever blocks are fit.
+ * per-batch acknowledge instruction (issue #434, scoped to `eventIds` per PR
+ * #445 review finding 1), then a blank line before the event blocks.
+ * Session- AND event-id-scoped — every sizing path that packs blocks under
+ * the cap ({@link packEventsUnderCap}, {@link resolveHookClaimFit},
+ * {@link renderHookDelivery}) goes through {@link resolveHookHeaderPacking},
+ * which recomputes this header for the ACTUAL set of events that end up
+ * included as packing shrinks that set, so the header's true length is
+ * always accounted for wherever blocks are fit.
  */
-function buildHeader(sessionId: string): string {
-  return `${LEAD_LINE}\n${buildHookAckInstruction(sessionId)}\n\n`;
+function buildHeader(sessionId: string, eventIds: string[]): string {
+  return `${LEAD_LINE}\n${buildHookAckInstruction(sessionId, eventIds)}\n\n`;
 }
 
 /**
@@ -327,23 +384,70 @@ function packWholeBlocks(
   return packSharedWholeBlocks(blocks, cap, { header, joiner: '\n' });
 }
 
+/** The result of {@link resolveHookHeaderPacking}. */
+interface HeaderPacked {
+  text: string;
+  includedCount: number;
+  header: string;
+}
+
+/**
+ * Pack `events`' whole blocks under `cap` with a {@link buildHeader} whose
+ * per-batch ack instruction names EXACTLY the ids of the events the packing
+ * actually includes (PR #445 review, finding 1) — a fixed point, since the
+ * header's own length depends on how many ids it lists, which depends on how
+ * much room is left for blocks, which depends on the header's length.
+ *
+ * Solved by iterative narrowing: start by assuming every candidate event is
+ * included (the longest possible header, the most conservative starting
+ * guess), pack against it, and if fewer blocks actually fit than guessed,
+ * retry with the header narrowed to name only that many ids (shorter header,
+ * more room). `includedCount` is a monotone function of the guessed id
+ * count restricted to the integers `[0, events.length]`, so this converges to
+ * a genuine fixed point (header names exactly what's included) within at
+ * most `events.length + 1` iterations; the loop bound below is exactly that,
+ * so a pathological non-convergent case (unreachable at these string sizes)
+ * falls back to the narrowest, always-self-consistent header — naming no ids
+ * — rather than looping forever or naming an id that didn't actually fit.
+ */
+function resolveHookHeaderPacking(
+  events: DeliveryEventSummary[],
+  blocks: string[],
+  sessionId: string,
+  cap: number,
+): HeaderPacked {
+  let guess = events.length;
+  for (let i = 0; i <= events.length; i++) {
+    const eventIds = events.slice(0, guess).map((event) => event.eventId);
+    const header = buildHeader(sessionId, eventIds);
+    const packed = packWholeBlocks(header, blocks, cap);
+    if (packed.includedCount === guess) {
+      return { text: packed.text, includedCount: packed.includedCount, header };
+    }
+    guess = packed.includedCount;
+  }
+  /* c8 ignore start -- defensive fallback, unreachable at realistic id/cap sizes */
+  const header = buildHeader(sessionId, []);
+  const packed = packWholeBlocks(header, blocks, cap);
+  return { text: packed.text, includedCount: packed.includedCount, header };
+  /* c8 ignore stop */
+}
+
 /**
  * How many WHOLE high-urgency event blocks (from `events`, oldest-first) the
  * hook-deliver transport can render under its `additionalContext` cap
  * (006 §5.1, issue #299). The transport uses this to decide how many events to
  * CLAIM, so the claimed set equals the rendered set and the remainder stays
- * pending for the next context event. Thin wrapper over the transport-shared
- * {@link packSharedEventsUnderCap} (`delivery-event-render.ts`), fixing this
- * transport's `sanitize`, the session-scoped body-injection header
- * ({@link buildHeader} — lead line + per-batch ack instruction), and the
- * session-scoped truncation marker's length.
+ * pending for the next context event.
  *
  * `sessionId` is the session the sizing decision is being made for (the same
  * id the eventual claim/render will carry) — it MUST size against the marker
  * this session's own {@link buildHookDeferredMarker} produces (the marker
- * `renderHookDelivery` actually appends when whole blocks are deferred), since
- * a longer or shorter session id (and socket path) changes the marker's
- * length and therefore how many whole blocks fit (issue #442).
+ * `renderHookDelivery` actually appends when whole blocks are deferred), AND
+ * against the per-batch ack instruction's own length, which now varies with
+ * how many event ids it names ({@link resolveHookHeaderPacking}) — a longer
+ * or shorter session id, socket path, or candidate-event-id list all change
+ * how many whole blocks fit (issue #442; event-id scoping, PR #445 review).
  *
  * When not everything fits, room is reserved for the truncation marker so no
  * INCLUDED block is cut. At least 1 is returned when there is any event — there
@@ -358,11 +462,18 @@ export function packEventsUnderCap(
   cap: number = MAX_ADDITIONAL_CONTEXT,
   socketPath?: string,
 ): number {
-  return packSharedEventsUnderCap(events, sanitize, cap, {
-    header: buildHeader(sessionId),
-    joiner: '\n',
-    markerLength: buildHookDeferredMarker(sessionId, socketPath).length,
-  });
+  if (events.length === 0) return 0;
+  const blocks = events.map(buildEventBlock);
+  const whole = resolveHookHeaderPacking(events, blocks, sessionId, cap);
+  if (whole.includedCount === blocks.length) return blocks.length;
+  const markerLength = buildHookDeferredMarker(sessionId, socketPath).length;
+  const reserved = resolveHookHeaderPacking(
+    events,
+    blocks,
+    sessionId,
+    cap - markerLength,
+  );
+  return Math.max(1, reserved.includedCount);
 }
 
 /** The result of {@link resolveHookClaimFit}. */
@@ -423,14 +534,18 @@ export function resolveHookClaimFit(
   moreDeferred: boolean,
   cap: number = MAX_ADDITIONAL_CONTEXT,
 ): HookClaimFit {
-  const header = buildHeader(sessionId);
   const blocks = events.map(buildEventBlock);
-  const whole = packWholeBlocks(header, blocks, cap);
+  const whole = resolveHookHeaderPacking(events, blocks, sessionId, cap);
   if (whole.includedCount === blocks.length && !moreDeferred) {
     return { fits: true, includedCount: blocks.length, whole, reserved: whole };
   }
   const deferredMarker = buildHookDeferredMarker(sessionId, socketPath);
-  const reserved = packWholeBlocks(header, blocks, cap - deferredMarker.length);
+  const reserved = resolveHookHeaderPacking(
+    events,
+    blocks,
+    sessionId,
+    cap - deferredMarker.length,
+  );
   const includedCount = Math.max(1, reserved.includedCount);
   return {
     fits: includedCount === blocks.length,
@@ -574,21 +689,29 @@ export function renderHookDelivery(
   // one (issue #442, PR #442 round-7 review) — there is no "more updates
   // pending" to promise here.
   //
-  // The runtime emits a SEMANTIC message with no product-name attribution
-  // (issue #438); this transport owns its attribution, so prepend
-  // {@link HOOK_ATTRIBUTION_PREFIX} — the hook's `additionalContext` arrives
-  // unlabeled, so the source must be named here (the channel, whose tag already
-  // names the source, adds nothing). The prefix is prepended BEFORE truncation
-  // so it always survives at the front even when the semantic body is cut.
+  // The runtime emits a SEMANTIC message with no product-name attribution AND
+  // no transport-specific verb (issues #438, #445 review finding 2): this
+  // transport owns both its own attribution — prepend
+  // {@link HOOK_ATTRIBUTION_PREFIX}, since the hook's `additionalContext`
+  // arrives unlabeled (the channel, whose tag already names the source, adds
+  // nothing) — and its own concrete, session+socket-scoped action step
+  // ({@link buildHookReminderActionStep}); the channel transport instead
+  // points at its `agentmon_ack` tool (`channel-render.ts`). The prefix is
+  // prepended BEFORE truncation so it always survives at the front even when
+  // the semantic body is cut.
   if (claim.events.length === 0) {
     const reminder = sanitize(claim.message);
     if (reminder.trim().length === 0) return null;
+    const actionStep = buildHookReminderActionStep(
+      claim.sessionId,
+      options.socketPath,
+    );
     return {
       continue: true,
       hookSpecificOutput: {
         hookEventName,
         additionalContext: truncateForCap(
-          `${HOOK_ATTRIBUTION_PREFIX}${reminder}`,
+          `${HOOK_ATTRIBUTION_PREFIX}${reminder}${actionStep}`,
           MAX_ADDITIONAL_CONTEXT,
           claimedUnreadMarker,
         ),
@@ -596,64 +719,72 @@ export function renderHookDelivery(
     };
   }
 
+  // Body injection: consume {@link resolveHookClaimFit}'s OWN sizing rather
+  // than re-inlining `buildHeader` + packing here (PR #445 review, cleanup
+  // 7c) — the two were a maintained copy-pair (every prior sizing fix had to
+  // land in both places identically), which is exactly the class of drift
+  // issue #442 hit once already.
   const moreDeferred = options.moreDeferred ?? false;
-  const header = buildHeader(claim.sessionId);
-  const blocks = claim.events.map(buildEventBlock);
-  const whole = packWholeBlocks(header, blocks, MAX_ADDITIONAL_CONTEXT);
+  const fit = resolveHookClaimFit(
+    claim.events,
+    claim.sessionId,
+    options.socketPath,
+    moreDeferred,
+    MAX_ADDITIONAL_CONTEXT,
+  );
 
   let additionalContext: string;
-  if (whole.includedCount === blocks.length && !moreDeferred) {
+  if (fit.whole.includedCount === claim.events.length && !moreDeferred) {
     // Every claimed event fits and nothing was deferred → no marker.
-    additionalContext = whole.text;
-  } else {
+    additionalContext = fit.whole.text;
+  } else if (fit.reserved.includedCount >= 1) {
     // A marker is needed (some claimed blocks did not fit here, and/or the caller
-    // deferred more). Repack reserving marker room so no INCLUDED block is cut.
-    // Sized against the DEFERRED marker: this branch only fires when at least
-    // one WHOLE block was genuinely left pending (unclaimed), which is exactly
-    // what that marker promises.
-    const reserved = packWholeBlocks(
-      header,
-      blocks,
-      MAX_ADDITIONAL_CONTEXT - deferredMarker.length,
+    // deferred more). `fit.reserved` already reserved room for the deferred
+    // marker AND named exactly the events it includes in its own header — this
+    // branch only fires when at least one WHOLE block was genuinely left
+    // pending (unclaimed), which is exactly what that marker promises.
+    additionalContext = fit.reserved.text + deferredMarker;
+  } else {
+    // Even the first block alone exceeds (cap − marker): mid-truncate block 0
+    // at a code-point boundary. This is the ONLY case a durable event is shown
+    // partially — and unlike the branch above, THIS event's own content is
+    // what got cut (not other pending work), so it uses the claimed-unread
+    // marker (issue #442, PR #442 round-7/round-10 review) — its outcome-
+    // agnostic wording is correct whether or not this delivery's reservation
+    // ends up durably committed (see {@link buildHookClaimedUnreadMarker}).
+    // Only THIS one event is claimed here, so the header names only its id.
+    //
+    // Mixed case (issue #442, PR #442 round-8 review): `moreDeferred` can
+    // ALSO be true here — this claim's single (oversized) event is the only
+    // one actually reserved, but genuinely more high-urgency work exists
+    // beyond it and stays pending (the reservation/claim was sized to just
+    // this one event). Rendering the claimed-unread marker alone would
+    // silently suppress that second, real signal: an agent reading only
+    // "the full copy stays unread" would have no idea further, DIFFERENT
+    // pending work is queued and genuinely will redeliver. Render BOTH
+    // markers whenever both apply — they describe two different,
+    // non-overlapping facts (this event's own tail vs. the separate pending
+    // remainder) and are never redundant with each other.
+    // For a recap, `deferredMarker === claimedUnreadMarker` (both are the
+    // same recap marker) and `moreDeferred` is never set true by
+    // `reserveSizedHookDelivery` for a non-`turn-interruptible` lifecycle
+    // anyway (issue #442, PR #442 round-9 review) — but guard against ever
+    // doubling an identical marker regardless.
+    const firstEvent = claim.events[0];
+    const firstBlock = firstEvent ? buildEventBlock(firstEvent) : '';
+    const soleEventHeader = buildHeader(
+      claim.sessionId,
+      firstEvent ? [firstEvent.eventId] : [],
     );
-    if (reserved.includedCount >= 1) {
-      additionalContext = reserved.text + deferredMarker;
-    } else {
-      // Even the first block alone exceeds (cap − marker): mid-truncate block 0
-      // at a code-point boundary. This is the ONLY case a durable event is shown
-      // partially — and unlike the branch above, THIS event's own content is
-      // what got cut (not other pending work), so it uses the claimed-unread
-      // marker (issue #442, PR #442 round-7/round-10 review) — its outcome-
-      // agnostic wording is correct whether or not this delivery's reservation
-      // ends up durably committed (see {@link buildHookClaimedUnreadMarker}).
-      //
-      // Mixed case (issue #442, PR #442 round-8 review): `moreDeferred` can
-      // ALSO be true here — this claim's single (oversized) event is the only
-      // one actually reserved, but genuinely more high-urgency work exists
-      // beyond it and stays pending (the reservation/claim was sized to just
-      // this one event). Rendering the claimed-unread marker alone would
-      // silently suppress that second, real signal: an agent reading only
-      // "the full copy stays unread" would have no idea further, DIFFERENT
-      // pending work is queued and genuinely will redeliver. Render BOTH
-      // markers whenever both apply — they describe two different,
-      // non-overlapping facts (this event's own tail vs. the separate pending
-      // remainder) and are never redundant with each other.
-      // For a recap, `deferredMarker === claimedUnreadMarker` (both are the
-      // same recap marker) and `moreDeferred` is never set true by
-      // `reserveSizedHookDelivery` for a non-`turn-interruptible` lifecycle
-      // anyway (issue #442, PR #442 round-9 review) — but guard against ever
-      // doubling an identical marker regardless.
-      const firstBlock = blocks[0] ?? '';
-      const marker =
-        moreDeferred && claimedUnreadMarker !== deferredMarker
-          ? claimedUnreadMarker + deferredMarker
-          : claimedUnreadMarker;
-      additionalContext = appendMarkerWithinCap(
-        header + firstBlock,
-        MAX_ADDITIONAL_CONTEXT,
-        marker,
-      );
-    }
+    const marker =
+      moreDeferred && claimedUnreadMarker !== deferredMarker
+        ? claimedUnreadMarker + deferredMarker
+        : claimedUnreadMarker;
+    additionalContext = appendMarkerWithinCap(
+      soleEventHeader + firstBlock,
+      MAX_ADDITIONAL_CONTEXT,
+      marker,
+    );
   }
 
   return {

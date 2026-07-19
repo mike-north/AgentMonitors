@@ -9692,16 +9692,13 @@ describe('hook deliver', () => {
 // `monitor explain` NAMES the reason (already-claimed / coalesced-until-ack).
 describe('hook claim normal-urgency reminder + suppression diagnosis (issue #333)', () => {
   /**
-   * The coalesced reminder body the runtime emits (002 §9.2, issues #438/#434),
-   * written out here from the spec rather than read back from the
-   * implementation: a SEMANTIC message carrying no product-name attribution
-   * (that is transport-owned), no reference to the legacy `inbox` model, and
-   * concrete runnable next steps — including the acknowledge step — with the
-   * real session id interpolated.
+   * The coalesced reminder body the runtime emits (002 §9.2, issues
+   * #438/#434, PR #445 review finding 2), written out here from the spec
+   * rather than read back from the implementation: a SEMANTIC, transport- and
+   * verb-neutral message — no product-name attribution and no CLI verb, both
+   * transport-owned — with no reference to the legacy `inbox` model.
    */
-  const reminderMessage = (sessionId: string): string =>
-    `Monitored changes are pending. Run \`agentmonitors events list --session ${sessionId} --unread\` ` +
-    `to see them, then \`agentmonitors events ack --session ${sessionId}\` once handled.`;
+  const reminderMessage = (): string => 'Monitored changes are pending.';
 
   it('first turn-interruptible claim surfaces the reminder; a prior claim suppresses it; monitor explain names why', async () => {
     const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-333-'));
@@ -9830,7 +9827,7 @@ describe('hook claim normal-urgency reminder + suppression diagnosis (issue #333
       expect(firstClaim).not.toBeNull();
       expect(firstClaim?.mode).toBe('delivery');
       expect(firstClaim?.urgency).toBe('normal');
-      expect(firstClaim?.message).toBe(reminderMessage(session.id));
+      expect(firstClaim?.message).toBe(reminderMessage());
       // The runtime's own message carries NO product-name attribution — that is
       // owned by each transport (issue #438).
       expect(firstClaim?.message).not.toContain('AgentMon');
@@ -10376,24 +10373,17 @@ describe('hook deliver --debug diagnosis (issue #334)', () => {
         return sessions.find((s) => s.hostSessionId === hostSessionId)?.id;
       };
 
+      // Reuses sessionIdFor's own session lookup (PR #445 review, cleanup
+      // 7d) rather than re-running an independent `session list` query.
       const unreadFor = (hostSessionId: string) => {
-        const sessionsResult = runWithEnv(
-          ['session', 'list', '--format', 'json'],
-          env,
-          ws,
-        );
-        const sessions = JSON.parse(sessionsResult.stdout) as {
-          id: string;
-          hostSessionId: string;
-        }[];
-        const session = sessions.find((s) => s.hostSessionId === hostSessionId);
-        if (!session) return [];
+        const sessionId = sessionIdFor(hostSessionId);
+        if (!sessionId) return [];
         const result = runWithEnv(
           [
             'events',
             'list',
             '--session',
-            session.id,
+            sessionId,
             '--unread',
             '--format',
             'json',
@@ -10459,12 +10449,13 @@ describe('hook deliver --debug diagnosis (issue #334)', () => {
         continue: true,
         hookSpecificOutput: {
           hookEventName: 'UserPromptSubmit',
-          // issue #438/#434: transport-owned attribution + self-sufficient,
-          // actionable text including the acknowledge step.
+          // issue #438/#434, PR #445 review findings 2/4: transport-owned
+          // attribution + self-sufficient, session+socket-scoped actionable
+          // text including the acknowledge step.
           additionalContext:
             `AgentMon: Monitored changes are pending. ` +
-            `Run \`agentmonitors events list --session ${sessionIdA ?? ''} --unread\` to see them, ` +
-            `then \`agentmonitors events ack --session ${sessionIdA ?? ''}\` once handled.`,
+            `Run \`agentmonitors events list --session ${sessionIdA ?? ''} --socket '${socket}' --unread\` to see them, ` +
+            `then \`agentmonitors events ack --session ${sessionIdA ?? ''} --socket '${socket}'\` once handled.`,
         },
       });
       // Only the debug run writes diagnosis — to stderr, never stdout.

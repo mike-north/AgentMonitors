@@ -84,8 +84,8 @@ describe('renderHookDelivery', () => {
       makeClaim({
         urgency: 'normal',
         events: [],
-        message:
-          'Monitored changes are pending. Run `agentmonitors events list --session s1 --unread` to see them, then `agentmonitors events ack --session s1` once handled.',
+        // The runtime's actual (verb-neutral, PR #445 review finding 2) message.
+        message: 'Monitored changes are pending.',
         unreadCounts: { low: 0, normal: 1, high: 0, total: 1 },
       }),
       'UserPromptSubmit',
@@ -117,8 +117,7 @@ describe('renderHookDelivery', () => {
         urgency: 'low',
         lifecycle: 'turn-idle',
         events: [],
-        message:
-          'Monitored changes are pending. Run `agentmonitors events list --session s1 --unread` to see them, then `agentmonitors events ack --session s1` once handled.',
+        message: 'Monitored changes are pending.',
         unreadCounts: { low: 1, normal: 0, high: 0, total: 1 },
       }),
       'UserPromptSubmit',
@@ -130,6 +129,29 @@ describe('renderHookDelivery', () => {
     expect(ctx).toContain('agentmonitors events ack --session s1');
     expect(ctx).not.toContain('inbox');
     expect(ctx).not.toContain('### ');
+  });
+
+  // (PR #445 review, finding 4) the reminder's action step carries an
+  // explicit `--socket <path>` — like the truncation-recovery markers — so a
+  // copy-pasted command can't silently query a stale `$AGENTMONITORS_SOCKET`.
+  it('threads the resolved socket path into the reminder action step', () => {
+    const out = renderHookDelivery(
+      makeClaim({
+        sessionId: 's1',
+        urgency: 'normal',
+        events: [],
+        message: 'Monitored changes are pending.',
+      }),
+      'UserPromptSubmit',
+      { socketPath: '/tmp/agentmon-real.sock' },
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).toContain(
+      "agentmonitors events list --session s1 --socket '/tmp/agentmon-real.sock' --unread",
+    );
+    expect(ctx).toContain(
+      "agentmonitors events ack --session s1 --socket '/tmp/agentmon-real.sock'",
+    );
   });
 
   // (b.4 — issue #198, AC1) the reminder text is sanitized (control characters
@@ -232,6 +254,11 @@ describe('renderHookDelivery', () => {
     expect(ctx).toContain(
       'When handled, acknowledge: agentmonitors events ack --session sess-434',
     );
+    // PR #445 review, finding 1 (BLOCKER): the instruction is scoped to the
+    // ids actually rendered — never a blanket "ack everything unread".
+    expect(ctx).toContain(
+      'When handled, acknowledge: agentmonitors events ack --session sess-434 --event-ids e1,e2',
+    );
     // Emitted once per batch, not once per event.
     const occurrences = ctx.split('When handled, acknowledge:').length - 1;
     expect(occurrences).toBe(1);
@@ -267,7 +294,7 @@ describe('renderHookDelivery', () => {
     );
     const ctx = out?.hookSpecificOutput.additionalContext ?? '';
     expect(ctx).toContain(
-      'When handled, acknowledge: agentmonitors events ack --session sess-recap',
+      'When handled, acknowledge: agentmonitors events ack --session sess-recap --event-ids e1',
     );
   });
 
