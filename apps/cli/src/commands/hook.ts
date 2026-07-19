@@ -453,11 +453,17 @@ export interface HookDeliveryFlowResult {
  * it has successfully written that output. If the write never happens (a
  * render/output failure), the caller releases the reservation instead (the
  * rows return to pending, nothing durably claimed — see `hook.ts`'s
- * `deliver` action). If `commit` itself fails or its result is uncertain
- * (the RPC lands but the response is lost), the safe direction is a LATER
- * DUPLICATE delivery (the rows stay pending and redeliver on the next
- * context event) — never a silent loss, since the output was already
- * written by the time commit is attempted.
+ * `deliver` action). Once the write has succeeded, `commit` itself can land
+ * on one of three outcomes, never a loss either way since the output was
+ * already written by the time commit is attempted: a **non-null** resolve
+ * means the row is durably claimed and will not redeliver; a **null**
+ * resolve means the reservation's lease already lapsed — the row was
+ * definitely never claimed, so it stays pending and WILL redeliver on the
+ * next context event; a **rejection** (an IPC/transport error) is neither —
+ * the daemon may have applied the commit before the response was lost, so
+ * whether the row ends up claimed or still pending is genuinely UNCERTAIN,
+ * making a LATER DUPLICATE delivery merely the safe possibility, not a
+ * guarantee.
  *
  * Mirrors the channel transport's reserve → push → commit ordering
  * (`runChannelDeliveryCycle`, `channel.ts`) — same rationale (never durably
@@ -895,14 +901,16 @@ Diagnosis:
           ),
         );
         if (!claim) {
-          // Either the write failed (release path — nothing was ever durably
-          // claimed) or the reservation vanished before commit could land
-          // (its lease expired, or the daemon restarted and dropped its
-          // in-memory lease). In the commit-uncertain case, the output — if
-          // any — was already written, so this is a safe, intentional
-          // duplicate: the rows return to pending and re-deliver at the next
-          // context event (or via a concurrent channel poll) rather than
-          // being lost.
+          // `commit()` resolved null: the reservation's lease expired before
+          // commit could land (or the daemon restarted and dropped its
+          // in-memory lease) — this is the definitely-uncommitted outcome,
+          // not an uncertain one (a rejected/lost commit RPC instead
+          // propagates as a thrown error to the outer catch below, since
+          // whether that row is claimed is genuinely unknown, not resolvable
+          // here). The output — if any — was already written, so this is a
+          // safe, intentional duplicate: the rows return to pending and
+          // re-deliver at the next context event (or via a concurrent
+          // channel poll) rather than being lost.
           debug(
             'reservation committed to nothing (lease expired, or write failed and released)',
           );

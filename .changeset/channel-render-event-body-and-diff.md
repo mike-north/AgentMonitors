@@ -53,11 +53,16 @@ poll`). The other, rarer case is a single event whose own block still exceeds th
   event, or a truncated reminder message) — not other pending work being deferred. Rendering now
   happens BEFORE the reservation is committed, so the claimed-unread marker deliberately does not
   assert a specific claimed/redelivery outcome (it stated "will not redeliver automatically" in an
-  earlier round, which was false whenever the following commit failed); it instead reads "the full
-  copy stays unread", true regardless of whether the commit succeeds. Both markers can now appear
-  together in the same `additionalContext` when the sole reserved event is itself oversized AND
-  further, different high-urgency work also stays genuinely pending beyond it — previously the
-  claimed-unread marker alone silently suppressed that second, real signal.
+  earlier round, which was false whenever the following commit resolved null — and simply uncertain
+  whenever it rejected instead); it instead reads "the full copy stays unread", true regardless of
+  which of the three commit outcomes occurs. Both markers can now appear together in the same
+  `additionalContext` when the sole reserved event is itself oversized AND further, different
+  high-urgency work also stays genuinely pending beyond it — previously the claimed-unread marker
+  alone silently suppressed that second, real signal. The channel transport has the identical mixed
+  case and the identical fix: when the sole reserved event is itself oversized and further
+  high-urgency work also stays genuinely pending, `renderChannelEvent` now appends its deferral marker
+  alongside the truncation marker instead of the truncation marker alone, which previously silently
+  dropped the "more work is pending" signal on the channel side.
 - Both transports now validate a `turn-interruptible` claim's fit against the SAME budget the renderer
   uses **before ever durably claiming it**: `hook deliver` reserves (leases, does not claim), re-checks
   the actual reserved claim's fit, and only then commits — closing a race where the sizing preview and

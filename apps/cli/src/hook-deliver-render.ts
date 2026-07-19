@@ -82,24 +82,31 @@ function buildHookDeferredMarker(
  * now happens BEFORE the reservation is committed (`reserveRenderAndCommitHookDelivery`
  * / `writeAndCommitHookDelivery`, `hook.ts`, issue #442, PR #442 round-9/10
  * review), off the reservation's own (not-yet-durable) claim — so at render
- * time it is genuinely unknown whether the commit that follows will succeed.
+ * time it is genuinely unknown which of THREE outcomes the commit that
+ * follows will land on (issue #442, PR #442 round-12 review — collapsing
+ * these to two conflates a definite outcome with a genuinely uncertain one).
  * A prior version of this marker asserted "it is claimed but NOT
- * acknowledged ... it will not redeliver automatically" — true if the commit
- * lands, but FALSE if the commit fails or its result is lost: the rows then
- * deliberately stay pending and WILL redeliver via the ordinary
- * context-event flow (§5.5), contradicting the marker's own claim (issue
- * #442, PR #442 round-10 review). The wording below asserts only what holds
- * regardless of the commit's outcome: the full copy is not yet acknowledged,
- * so it stays unread and reachable right now via the recovery command —
- * mirroring the channel transport's `buildChannelTruncatedMarker`
- * (`channel-render.ts`). The channel transport has the SAME render-before-commit
- * ordering (reserve → push/render → commit, `channel.ts`'s `reserveAndCommit`)
- * and therefore the same conditional outcome: a successful commit prevents
- * ordinary repoll, but a null/rejected commit (the reservation's lease
- * already lapsed) leaves the pushed event eligible for at-least-once
- * redelivery on a later poll — so `buildChannelTruncatedMarker` is kept
- * outcome-neutral for the same reason, not because its claim is committed
- * any earlier than this one's.
+ * acknowledged ... it will not redeliver automatically" — true only if the
+ * commit **resolves non-null** (the row is claimed and will never redeliver
+ * via the ordinary context-event flow, §5.5); FALSE if the commit
+ * **resolves null** (the reservation's lease already lapsed — the row was
+ * definitely never claimed, so it stays pending and WILL redeliver); and
+ * neither assertion holds if the commit **rejects** (an IPC/transport
+ * error) — the daemon may have applied it before the response was lost, so
+ * whether the row ends up claimed or still pending is genuinely UNCERTAIN,
+ * not a guaranteed redelivery (issue #442, PR #442 round-10/12 review). The
+ * wording below asserts only what holds regardless of which of the three
+ * outcomes occurs: the full copy is not yet acknowledged, so it stays
+ * unread and reachable right now via the recovery command — mirroring the
+ * channel transport's `buildChannelTruncatedMarker` (`channel-render.ts`).
+ * The channel transport has the SAME render-before-commit ordering
+ * (reserve → push/render → commit, `channel.ts`'s `reserveAndCommit`) and
+ * therefore the same three-way conditional outcome: a successful (non-null)
+ * commit prevents ordinary repoll; a commit that resolves null leaves the
+ * pushed event definitely uncommitted and eligible for at-least-once
+ * redelivery on a later poll; a rejected commit is neither — so
+ * `buildChannelTruncatedMarker` is kept outcome-neutral for the same
+ * reason, not because its claim is committed any earlier than this one's.
  *
  * **Not valid for a `post-compact` recap** — see {@link buildHookRecapMarker}.
  */

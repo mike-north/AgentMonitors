@@ -134,19 +134,25 @@ reordering.
   eventless-reservation transition and asserting no cap-deferral diagnostics are emitted.
 - **The pre-commit truncation marker asserted an outcome it could not yet know.** Round-9 moved
   rendering to BEFORE the reservation's commit, but `buildHookClaimedUnreadMarker` still said "it is
-  claimed but NOT acknowledged ... it will not redeliver automatically" — true if the commit lands,
-  but FALSE if the commit fails or its result is lost: the rows then deliberately stay pending and
-  WILL redeliver via the ordinary context-event flow (§5.5), the opposite of what the marker promised.
+  claimed but NOT acknowledged ... it will not redeliver automatically" — true only if the commit
+  **resolves non-null**, but FALSE if it **resolves null** (the reservation's lease already lapsed):
+  the rows then are definitely never claimed and deliberately stay pending, so they WILL redeliver via
+  the ordinary context-event flow (§5.5) — the opposite of what the marker promised. (A commit that
+  **rejects**, an IPC/transport error, is a third, distinct case the round-9 fix did not yet separate
+  out — see the round-12 entry above: the daemon may have applied it before the response was lost, so
+  the row's eventual state is genuinely UNCERTAIN, not a guaranteed redelivery either.)
   Reworded to assert only what holds regardless of the commit's outcome: "this update was too large to
   show in full; the full copy stays unread — run `agentmonitors events list --session <id> --unread`
   to see it now". `buildHookRecapMarker` is similarly reworded to drop its own premature "is claimed"
   assertion, keeping only the self-healing future-recap promise (true regardless of this particular
   commit's outcome). The channel transport's `buildChannelTruncatedMarker` was already outcome-neutral
   for the identical reason: it has the SAME render-before-commit ordering (reserve → push/render →
-  commit) and the same conditional outcome — a successful commit prevents ordinary repoll, a
-  null/rejected commit leaves the pushed event eligible for at-least-once redelivery — so it needed no
-  wording change here (a round-11 review found stale source/spec comments elsewhere still describing
-  the channel as committed before render; see the 2026-07-19 round-11 entry below).
+  commit) and the same conditional outcome — a successful (non-null) commit prevents ordinary repoll;
+  a commit that resolves null leaves the pushed event definitely eligible for at-least-once
+  redelivery; a rejected commit is neither, leaving the outcome uncertain — so it needed no wording
+  change here (a round-11 review found stale source/spec comments elsewhere still describing the
+  channel as committed before render, and a round-12 review found the null/rejected distinction itself
+  still collapsed in places; see the 2026-07-19 round-11 and round-12 entries above).
 
 006 §5.1, §5.2, and §5.5 previously asserted a specific claimed/redelivery outcome for the hook
 transport's pre-commit truncation markers, and described the synchronous `stdout.write` return as the

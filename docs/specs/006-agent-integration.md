@@ -240,11 +240,12 @@ re-deliver on a later poll, with an explicit, bracket-free deferral marker appen
 change summary is bounded independently of packing (above, and §4.6), so no single untrusted diff is
 dumped wholesale regardless of how many events fit.
 
-**Exception: a single claimed event whose own block alone still exceeds the ceiling.** Sizing upstream
-cannot rule out this pathological case — `packChannelEventsUnderCap` deliberately returns at least 1
-for a non-empty preview (forward progress, §5.5), and a reserve can race the earlier preview so the
-actually-claimed event was never measured. Only in this one case does `renderChannelEvent` cut an
-already-claimed block: it mid-truncates the lone event at a Unicode code-point boundary and appends a
+**Exception: a single reserved (not yet committed) event whose own block alone still exceeds the
+ceiling.** Sizing upstream cannot rule out this pathological case — `packChannelEventsUnderCap`
+deliberately returns at least 1 for a non-empty preview (forward progress, §5.5), and a reserve can
+race the earlier preview so the actually-reserved event was never measured. Only in this one case
+does `renderChannelEvent` cut an already-reserved (not yet durably claimed) block: it mid-truncates
+the lone event at a Unicode code-point boundary and appends a
 DIFFERENT marker than the deferral marker above, because — unlike the deferred-remainder case, where
 the whole block stayed unclaimed and genuinely re-delivers later — this render happens BEFORE the
 reservation is committed, so at render time it is genuinely unknown which of THREE outcomes the commit
@@ -540,13 +541,18 @@ shape:
   truncated reminder message). This marker is rendered from the **reservation's own claim, before
   that reservation is committed** (§5.2, issue #442, PR #442 round-9/10 review) — so it deliberately
   does **not** assert whether the row ends up durably claimed, or whether it will or will not
-  redeliver: at render time that outcome is genuinely unknown (the commit that follows can still
-  fail or be lost). A prior version of this marker asserted "it is claimed but NOT acknowledged ...
-  it will not redeliver automatically" — true if the commit lands, but **false** if it doesn't (the
-  rows then deliberately stay pending and **will** redeliver via the ordinary context-event flow) —
-  fixed to state only what holds regardless of the commit's outcome: the full copy is not yet
-  acknowledged, so it stays unread and reachable right now via the recovery command (issue #442, PR
-  #442 round-10 review). Both markers may appear together in the same `additionalContext` (issue
+  redeliver: at render time it is genuinely unknown which of THREE outcomes the commit that follows
+  will land on (issue #442, PR #442 round-12 review — collapsing these to two conflates a definite
+  outcome with a genuinely uncertain one). A prior version of this marker asserted "it is claimed but
+  NOT acknowledged ... it will not redeliver automatically" — true only if the commit **resolves
+  non-null**; **false** if it **resolves null** (the rows are then definitely never claimed and
+  deliberately stay pending, so they **will** redeliver via the ordinary context-event flow); and
+  neither holds if the commit **rejects** (an IPC/transport error), since the daemon may have applied
+  it before the response was lost, making the row's eventual claimed/pending state genuinely
+  UNCERTAIN rather than a guaranteed redelivery — fixed to state only what holds regardless of which
+  of the three outcomes occurs: the full copy is not yet acknowledged, so it stays unread and
+  reachable right now via the recovery command (issue #442, PR #442 round-10/12 review). Both markers
+  may appear together in the same `additionalContext` (issue
   #442, PR #442 round-8 review): when the sole claimed event is itself oversized (the second
   marker's case) AND further, different high-urgency work also stays genuinely pending beyond it
   (the first marker's case), both are rendered — they describe two non-overlapping facts and
@@ -849,12 +855,17 @@ forward progress. **This case's own tail does not (ordinarily) re-deliver the wa
 deferred-remainder case does**, but the marker used here (§5.1) deliberately does NOT assert that
 outcome, or the claim's durable state, one way or the other: rendering happens BEFORE the reservation
 is committed (§5.2, issue #442, PR #442 round-9/10 review), so at render time it is genuinely unknown
-whether the commit that follows will succeed. If it does, the row is claimed and this event's own
-omitted tail will not surface again via the ordinary context-event flow; if the commit fails or its
-result is lost instead, the rows deliberately stay **pending** and WILL redeliver normally — the
-opposite outcome. A prior version of this marker asserted the redeliver-will-not-happen outcome
-unconditionally ("it is claimed but NOT acknowledged ... it will not redeliver automatically"), which
-was simply false whenever the commit failed (issue #442, PR #442 round-10 review). The fixed wording
+which of THREE outcomes the commit that follows will land on (issue #442, PR #442 round-12 review —
+collapsing these to two conflates a definite outcome with a genuinely uncertain one). If the commit
+**resolves non-null**, the row is claimed and this event's own omitted tail will not surface again
+via the ordinary context-event flow; if it **resolves null** (the reservation's lease already
+lapsed), the row was definitely never claimed, so the rows deliberately stay **pending** and WILL
+redeliver normally — the opposite outcome; if it **rejects** (an IPC/transport error), neither
+holds — the daemon may have applied the commit before the response was lost, so whether the row
+ends up claimed or still pending is genuinely UNCERTAIN, not a guaranteed redelivery. A prior version
+of this marker asserted the redeliver-will-not-happen outcome unconditionally ("it is claimed but NOT
+acknowledged ... it will not redeliver automatically"), which was simply false whenever the commit
+resolved null (issue #442, PR #442 round-10 review). The fixed wording
 states only what is true regardless of outcome: the full body is not yet acknowledged, so it stays
 unread and is recoverable right now via `agentmonitors events list --session <id> --unread` (issue
 #442, PR #442 rounds 7 and 10). **The two markers can co-occur (issue #442, PR #442 round-8
@@ -971,8 +982,12 @@ update was too large to show in full; the full copy stays unread — run `agentm
 regardless of whether the pending commit lands: the full copy is not yet acknowledged, so it stays
 unread and reachable right now via the recovery command. A prior version of this marker asserted "it
 is claimed but NOT acknowledged ... it will not redeliver automatically" — true only if the commit
-succeeds; false if it fails or its result is lost, since the rows then deliberately stay pending and
-DO redeliver via the ordinary context-event flow (issue #442, PR #442 round-10 review). Before the
+**resolves non-null**; false if it **resolves null** (the reservation's lease already lapsed), since
+the rows then are definitely never claimed and deliberately stay pending, so they DO redeliver via
+the ordinary context-event flow; and neither holds if the commit **rejects** (an IPC/transport
+error), since the daemon may have applied it before the response was lost, leaving the row's eventual
+claimed/pending state genuinely UNCERTAIN rather than a guaranteed redelivery (issue #442, PR #442
+round-10/12 review). Before the
 round-7 split, both branches shared one marker whose "more monitor updates are pending" framing
 falsely implied the mid-truncated event's own omitted tail would also redeliver.
 
