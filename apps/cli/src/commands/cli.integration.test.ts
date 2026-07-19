@@ -11714,9 +11714,10 @@ describe('hook deliver: oversized single-event marker socket scoping (issue #358
         await new Promise((resolve) => setTimeout(resolve, 500));
       }
       expect(additionalContext).not.toBe('');
-      // Claimed-unread framing (issue #442, PR #442 round-7 review) — this
-      // event's own omitted tail will NOT redeliver at the next context event.
-      expect(additionalContext).toContain('will not redeliver automatically');
+      // Claimed-unread framing (issue #442, PR #442 round-7/round-10 review) —
+      // this event's own content stays unread, an outcome-agnostic claim that
+      // holds whether or not the reservation's commit lands.
+      expect(additionalContext).toContain('the full copy stays unread');
       expect(additionalContext).not.toContain(
         'more monitor updates are pending',
       );

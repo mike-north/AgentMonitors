@@ -279,12 +279,11 @@ describe('renderHookDelivery', () => {
   // truncation marker pointing at the still-unread event (issue #442: a bare
   // `--unread` without `--session <id>` exits 1, so the marker must render the
   // real command for the claim's own session, not the unusable bare form). A
-  // SINGLE oversized event's own block is claimed synchronously before this
-  // renders, so it uses the claimed-unread framing, not the "more updates are
-  // pending" deferred framing (issue #442, PR #442 round-7 review) — the
-  // omitted tail will NOT redeliver via the ordinary context-event flow.
+  // SINGLE oversized event's own block is what's cut here, so it uses the
+  // outcome-agnostic claimed-unread framing, not the "more updates are
+  // pending" deferred framing (issue #442, PR #442 round-7/round-10 review).
   const TRUNCATION_TAIL =
-    'run `agentmonitors events list --session s1 --unread` to see it]';
+    'run `agentmonitors events list --session s1 --unread` to see it now]';
   it('appends an explicit truncation marker when over the cap', () => {
     const largeBody = 'x'.repeat(10_000);
     const out = renderHookDelivery(
@@ -341,9 +340,10 @@ describe('renderHookDelivery', () => {
     // The unusable bare form (no --session) must never appear.
     expect(ctx).not.toContain('`agentmonitors events list --unread` to see it');
     // The claimed-unread framing, not the "more updates are pending" one —
-    // this event's own tail will not redeliver (issue #442, PR #442 round-7
-    // review).
-    expect(ctx).toContain('will not redeliver automatically');
+    // this event's own content stays unread, an outcome-agnostic claim that
+    // holds whether or not the reservation's commit lands (issue #442, PR #442
+    // round-7/round-10 review).
+    expect(ctx).toContain('the full copy stays unread');
     expect(ctx).not.toContain('more monitor updates are pending');
   });
 
@@ -375,8 +375,8 @@ describe('renderHookDelivery', () => {
     );
     const ctx = out?.hookSpecificOutput.additionalContext ?? '';
     expect(ctx.length).toBeLessThanOrEqual(4000);
-    // This event's own tail: claimed but will not redeliver.
-    expect(ctx).toContain('will not redeliver automatically');
+    // This event's own tail: stays unread (outcome-agnostic wording).
+    expect(ctx).toContain('the full copy stays unread');
     // The genuinely separate, still-pending remainder: will redeliver later.
     expect(ctx).toContain('more monitor updates are pending');
     expect(ctx).toContain(
@@ -609,19 +609,20 @@ describe('renderHookDelivery', () => {
   });
 });
 
-// (issue #442, PR #442 round-9 review) Marker selection is lifecycle-aware:
-// a `post-compact` recap re-shows the FULL unread set on EVERY recap,
-// regardless of whether a row is already claimed (§5.5 — `decideDelivery`'s
-// recap branch reads `unreadEventsForSession`, not `pendingEventsForSession`,
-// and `applyDelivery` claims the FULL candidate set at commit time
-// regardless of what actually renders). Neither of the two ordinary markers
-// is truthful for a recap:
+// (issue #442, PR #442 round-9/round-10 review) Marker selection is
+// lifecycle-aware: a `post-compact` recap re-shows the FULL unread set on
+// EVERY recap, regardless of whether a row is already claimed (§5.5 —
+// `decideDelivery`'s recap branch reads `unreadEventsForSession`, not
+// `pendingEventsForSession`, and `applyDelivery` claims the FULL candidate
+// set at commit time regardless of what actually renders). Neither of the
+// two ordinary markers is truthful for a recap:
 //   - the "genuinely pending" deferred marker ("more monitor updates are
 //     pending ... run events list --unread to see the rest") wrongly implies
 //     the omitted content is NOT yet claimed;
-//   - the claimed-unread marker's "it will not redeliver automatically" is
-//     actively FALSE — the omitted content WILL reappear, automatically, on
-//     the NEXT recap.
+//   - the ordinary claimed-unread marker's outcome-agnostic "the full copy
+//     stays unread" wording is accurate but incomplete for a recap — it
+//     misses the POSITIVE guarantee a recap actually offers ("will reappear
+//     on future recaps"), which the recap-aware marker states explicitly.
 describe('renderHookDelivery post-compact recap marker (issue #442, round-9 review)', () => {
   function recapEvent(
     overrides: Partial<DeliveryEventSummary> = {},
@@ -651,7 +652,7 @@ describe('renderHookDelivery post-compact recap marker (issue #442, round-9 revi
     });
   }
 
-  it('an oversized single-event recap uses recap-aware language, never "will not redeliver automatically"', () => {
+  it('an oversized single-event recap uses recap-aware language, never the ordinary claimed-unread framing', () => {
     const out = renderHookDelivery(
       makeRecapClaim({
         sessionId: 'session-recap',
@@ -663,7 +664,7 @@ describe('renderHookDelivery post-compact recap marker (issue #442, round-9 revi
     expect(ctx.length).toBeLessThanOrEqual(4000);
     expect(ctx).toContain('[truncated');
     // The turn-interruptible claimed-unread framing must NOT leak into a recap.
-    expect(ctx).not.toContain('will not redeliver automatically');
+    expect(ctx).not.toContain('the full copy stays unread');
     // Truthful recap framing: it WILL reappear on future recaps.
     expect(ctx).toContain('will reappear on future recaps');
     expect(ctx).toContain(
@@ -719,7 +720,7 @@ describe('renderHookDelivery post-compact recap marker (issue #442, round-9 revi
       'PreToolUse',
     );
     const ctx = out?.hookSpecificOutput.additionalContext ?? '';
-    expect(ctx).toContain('will not redeliver automatically');
+    expect(ctx).toContain('the full copy stays unread');
     expect(ctx).not.toContain('will reappear on future recaps');
   });
 });

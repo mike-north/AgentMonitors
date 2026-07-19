@@ -211,6 +211,48 @@ describe('reserveSizedHookDelivery substitution race (issue #442)', () => {
     );
 
     expect(result?.reservation.reservationId).toBe('r-reminder');
+    expect(result?.moreDeferred).toBe(false);
+    expect(releaseMock).not.toHaveBeenCalled();
+    expect(reserveMock).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * (issue #442, PR #442 round-10 review) A reminder claim is a race-fallback:
+   * `reserveDelivery` can legitimately return one even though the sizing
+   * PREVIEW saw settled-high rows and computed `moreDeferred: true` from
+   * them (the previewed rows got leased/claimed by another transport before
+   * this reservation landed). Before this fix, `reserveSizedHookDelivery`
+   * returned that STALE preview-derived `moreDeferred` unchanged for the
+   * eventless branch — `renderHookDelivery` never reads it for a `claim.events
+   * .length === 0` reminder (so the render itself was never wrong), but
+   * `hook.ts`'s `--debug` `describeCapDeferral` line DOES read it, so it
+   * would wrongly report a "cap deferral" for a claim that carries no
+   * cap-truncated events at all. Reproduces that exact race: the preview sees
+   * two oversized settled-high events (too big to both fit, so `moreDeferred`
+   * would be computed `true`), but the actual reservation comes back as a
+   * plain reminder.
+   */
+  it('clears a stale preview-derived moreDeferred when the reservation races down to an eventless reminder', async () => {
+    const staleHighEvents = [
+      makeEvent({ eventId: 'p1', monitorId: 'pm1', body: BIG_BODY }),
+      makeEvent({ eventId: 'p2', monitorId: 'pm2', body: BIG_BODY }),
+    ];
+    previewMock.mockResolvedValueOnce(staleHighEvents);
+    reserveMock.mockResolvedValueOnce({
+      reservationId: 'r-reminder-raced',
+      claim: claimWith([]),
+    });
+
+    const result = await reserveSizedHookDelivery(
+      'session-1',
+      'turn-interruptible',
+      '/sock',
+    );
+
+    expect(result?.reservation.reservationId).toBe('r-reminder-raced');
+    // The stale high-preview's moreDeferred must NOT leak into this eventless
+    // reminder's result.
+    expect(result?.moreDeferred).toBe(false);
     expect(releaseMock).not.toHaveBeenCalled();
     expect(reserveMock).toHaveBeenCalledTimes(1);
   });

@@ -39,6 +39,7 @@ vi.mock('../runtime-client.js', () => ({
 import {
   reserveRenderAndCommitHookDelivery,
   writeAndCommitHookDelivery,
+  writeStreamChunk,
   type HookDeliveryFlowResult,
 } from './hook.js';
 import {
@@ -203,6 +204,130 @@ describe('writeAndCommitHookDelivery ordering (issue #442, round-9 review)', () 
     expect(write).not.toHaveBeenCalled();
     expect(flow.commit).toHaveBeenCalledTimes(1);
     expect(claim).not.toBeNull();
+  });
+
+  /**
+   * (issue #442, PR #442 round-10 review) `process.stdout.write`'s
+   * SYNCHRONOUS return value (`true`/`false`) is a backpressure signal, not a
+   * success signal — a write can return `true` immediately and still fail
+   * ASYNCHRONOUSLY afterward (e.g. `EPIPE` once the reading end has already
+   * closed). Reproduces the reviewer's probe shape: a `write` seam that
+   * resolves its "wrote successfully" signal only later, and then rejects —
+   * simulating exactly that delayed-EPIPE case — to prove
+   * `writeAndCommitHookDelivery` awaits full completion before ever
+   * committing, and releases (never commits) on that later failure.
+   */
+  it('(a bug regression) an async write failure that arrives AFTER a synchronous "wrote" signal must still release, not commit — the write is awaited to full completion', async () => {
+    const flow = makeFlow({
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: 'UserPromptSubmit',
+        additionalContext: 'hello',
+      },
+    });
+    const order: string[] = [];
+
+    // Simulates a delayed/erroring Writable: the underlying `stream.write()`
+    // call returns `true` synchronously (as a real Writable would under no
+    // backpressure), but the promise `writeAndCommitHookDelivery` is handed
+    // does not settle until a later microtask/tick, where it rejects — the
+    // asynchronous EPIPE the synchronous return value could never signal.
+    const write = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          // A synchronous `write()` return of `true` happens here, in the
+          // caller's mental model — but the promise itself only rejects
+          // later, after this function has already returned to its caller.
+          setTimeout(() => {
+            order.push('async-write-error');
+            reject(new Error('EPIPE: broken stdout pipe'));
+          }, 0);
+        }),
+    );
+
+    await expect(writeAndCommitHookDelivery(flow, write)).rejects.toThrow(
+      'EPIPE',
+    );
+
+    // The async failure must have been awaited (order recorded) BEFORE this
+    // function resolved/rejected — proving the write's completion, not its
+    // synchronous return, gated the outcome.
+    expect(order).toEqual(['async-write-error']);
+    // Never committed: the write ultimately failed, even though it looked
+    // like a success at the moment `write()` was called.
+    expect(flow.commit).not.toHaveBeenCalled();
+    // Released instead — nothing durably claimed, rows return to pending.
+    expect(flow.release).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * (issue #442, PR #442 round-10 review) `writeStreamChunk` is the real seam
+ * `hook.ts`'s `deliver` action uses in place of a bare `process.stdout.write`
+ * call — it must resolve/reject on the write's actual completion, never the
+ * synchronous return value, and must handle an `'error'` event arriving on
+ * the stream instead of (or racing) the write callback.
+ */
+describe('writeStreamChunk (issue #442, round-10 review)', () => {
+  it('resolves once the write callback reports success, even though the synchronous write() call returned true', async () => {
+    let capturedCallback: ((error?: Error | null) => void) | undefined;
+    const stream = {
+      write: vi.fn(
+        (_chunk: string, callback: (error?: Error | null) => void) => {
+          capturedCallback = callback;
+          return true; // backpressure signal only — not yet "done"
+        },
+      ),
+      once: vi.fn(),
+      removeListener: vi.fn(),
+    } as unknown as NodeJS.WritableStream;
+
+    const pending = writeStreamChunk(stream, 'hello');
+    // Not yet settled: the callback has not fired.
+    let settled = false;
+    void pending.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    capturedCallback?.();
+    await expect(pending).resolves.toBeUndefined();
+  });
+
+  it("rejects when the write callback reports a delayed/asynchronous error — the reviewer's probe shape: synchronous true return, later error", async () => {
+    let capturedCallback: ((error?: Error | null) => void) | undefined;
+    const stream = {
+      write: vi.fn(
+        (_chunk: string, callback: (error?: Error | null) => void) => {
+          capturedCallback = callback;
+          return true;
+        },
+      ),
+      once: vi.fn(),
+      removeListener: vi.fn(),
+    } as unknown as NodeJS.WritableStream;
+
+    const pending = writeStreamChunk(stream, 'hello');
+    capturedCallback?.(new Error('EPIPE: broken stdout pipe'));
+
+    await expect(pending).rejects.toThrow('EPIPE');
+  });
+
+  it('rejects when the stream emits an "error" event instead of the write callback firing', async () => {
+    let errorHandler: ((error: Error) => void) | undefined;
+    const stream = {
+      write: vi.fn(() => true),
+      once: vi.fn((event: string, handler: (error: Error) => void) => {
+        if (event === 'error') errorHandler = handler;
+      }),
+      removeListener: vi.fn(),
+    } as unknown as NodeJS.WritableStream;
+
+    const pending = writeStreamChunk(stream, 'hello');
+    errorHandler?.(new Error('EPIPE: broken stdout pipe'));
+
+    await expect(pending).rejects.toThrow('EPIPE');
   });
 });
 

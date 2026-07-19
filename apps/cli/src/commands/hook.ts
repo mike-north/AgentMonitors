@@ -289,12 +289,29 @@ export async function reserveSizedHookDelivery(
     );
     if (!reservation) return null;
 
-    // A reminder claim, or any non-`turn-interruptible` lifecycle, carries no
-    // per-event sizing risk (see doc comment above) — accept directly.
-    if (
-      reservation.claim.events.length === 0 ||
-      lifecycle !== 'turn-interruptible'
-    ) {
+    // A reminder claim carries no event bodies to size against, so a
+    // `moreDeferred` computed from the settled-high PREVIEW describes that
+    // stale preview, not this claim: the preview↔reserve race let another
+    // transport lease/claim those previewed rows first, and `reserveDelivery`
+    // legitimately falls back to a reminder even though the preview saw
+    // settled-high rows and set `moreDeferred` from them. `renderHookDelivery`
+    // never consults `moreDeferred` for an eventless claim either way (its
+    // `claim.events.length === 0` branch renders the reminder `message`
+    // as-is) — but `--debug`'s `describeCapDeferral` line DOES read it (see
+    // `hook.ts`'s `deliver` action), so a stale `true` here would emit a
+    // "cap deferral" diagnostic for a claim that carries no cap-truncated
+    // events at all. Clear it, mirroring the channel transport's identical
+    // fix (`reserveSizedChannelDelivery`, `channel.ts`) (issue #442, PR #442
+    // round-10 review).
+    if (reservation.claim.events.length === 0) {
+      return { reservation, moreDeferred: false, previewCount };
+    }
+
+    // Any non-`turn-interruptible` lifecycle carries no per-event sizing risk
+    // either (see doc comment above) — accept directly, `moreDeferred` as
+    // computed (always `false` for these lifecycles; see the `if
+    // (lifecycle === 'turn-interruptible')` guard above).
+    if (lifecycle !== 'turn-interruptible') {
       return { reservation, moreDeferred, previewCount };
     }
 
@@ -476,34 +493,94 @@ export async function reserveRenderAndCommitHookDelivery(
 }
 
 /**
- * Write `flow.output` (when non-null) via the caller-supplied `write`, THEN
- * commit — or, if `write` throws, RELEASE the reservation instead of
- * committing (issue #442, PR #442 round-9 review). This is the enforcement
- * point for {@link reserveRenderAndCommitHookDelivery}'s ordering contract:
- * a failed write means nothing was durably surfaced, so nothing gets durably
- * claimed either — the rows return to pending and redeliver normally. A
+ * Write `flow.output` (when non-null) via the caller-supplied `write`, awaiting
+ * its FULL completion, THEN commit — or, if `write` throws (synchronously OR
+ * by rejecting), RELEASE the reservation instead of committing (issue #442,
+ * PR #442 rounds 9-10 review). This is the enforcement point for
+ * {@link reserveRenderAndCommitHookDelivery}'s ordering contract: a failed
+ * write means nothing was durably surfaced, so nothing gets durably claimed
+ * either — the rows return to pending and redeliver normally. A
  * failed/uncertain `commit` (the write already succeeded) is NOT caught
  * here: it propagates to the caller, which is safe because the safe
  * direction at that point is a later DUPLICATE delivery, never a loss (the
  * output already reached the user).
  *
+ * **Why `write` must be awaited, not just called.** `process.stdout.write`'s
+ * synchronous return value (`true`/`false`) is a BACKPRESSURE signal, not a
+ * success signal — it says whether the internal buffer is full, not whether
+ * the bytes ever reached the pipe. A write can return `true` synchronously
+ * and STILL fail asynchronously (e.g. `EPIPE` when the reading end — Claude
+ * Code's hook consumer — has already closed its end of the pipe) after this
+ * function has already returned and the caller has already committed. That
+ * reopens exactly the at-most-once loss window the round-9 fix closed: the
+ * commit lands, but the bytes never arrived. `write`'s CALLBACK (or a
+ * subsequent `'error'` event on the stream) is the only authoritative
+ * completion signal either way — see `deliver`'s call site below, which
+ * promisifies `process.stdout.write(chunk, callback)` and races it against
+ * the stream's `'error'` event for the case an error arrives instead of (or
+ * racing) the callback.
+ *
  * Extracted as its own function so it is independently testable against a
- * `write` seam that can be made to throw, without needing the full CLI
- * action's stdin/socket/session plumbing.
+ * `write` seam that can be made to reject (simulating a delayed/async pipe
+ * failure), without needing the full CLI action's stdin/socket/session
+ * plumbing.
  */
 export async function writeAndCommitHookDelivery(
   flow: HookDeliveryFlowResult,
-  write: (output: HookDeliveryOutput) => void,
+  write: (output: HookDeliveryOutput) => void | Promise<void>,
 ): Promise<DeliveryClaim | null> {
   if (flow.output !== null) {
     try {
-      write(flow.output);
+      await write(flow.output);
     } catch (writeError) {
       await flow.release();
       throw writeError;
     }
   }
   return flow.commit();
+}
+
+/**
+ * Write `chunk` to `stream` and resolve only once the write has FULLY
+ * completed — never on the synchronous `stream.write()` return value, which
+ * signals backpressure (should the caller pause writing), not success (issue
+ * #442, PR #442 round-10 review). A write can return `true` synchronously and
+ * still fail asynchronously (e.g. `EPIPE`, the reading end already closed).
+ *
+ * Node's `Writable.write(chunk, callback)` invokes `callback` once the chunk
+ * is fully handled — with an `Error` if the write failed, or no argument on
+ * success — which is the authoritative completion signal this function
+ * resolves/rejects on. It ALSO listens for the stream's own `'error'` event
+ * during the write (the failure signal an error emitted between the
+ * synchronous call and the callback firing would otherwise be missed by,
+ * since a stream's `'error'` event has no required correlation to any one
+ * pending `write()` call) — whichever fires first settles the promise, and
+ * the listener is always removed afterward so it cannot double-fire or leak
+ * across unrelated later writes to the same stream.
+ *
+ * @see https://nodejs.org/api/stream.html#writablewritechunk-encoding-callback
+ */
+export function writeStreamChunk(
+  stream: NodeJS.WritableStream,
+  chunk: string,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const onStreamError = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      stream.removeListener('error', onStreamError);
+      reject(error);
+    };
+    stream.once('error', onStreamError);
+    stream.write(chunk, (writeError?: Error | null) => {
+      if (settled) return;
+      settled = true;
+      stream.removeListener('error', onStreamError);
+      if (writeError) reject(writeError);
+      else resolve();
+    });
+  });
 }
 
 hookCommand
@@ -748,16 +825,22 @@ Diagnosis:
         debug(describeOutput(output, options.format));
 
         // Write (if there is anything to write) THEN commit — never the
-        // reverse (issue #442, PR #442 round-9 review). A write failure
-        // releases the reservation instead of committing (nothing durably
-        // claimed; rows stay pending) — see `writeAndCommitHookDelivery`.
-        const claim = await writeAndCommitHookDelivery(flow, (toWrite) => {
-          if (options.format === 'text') {
-            process.stdout.write(toWrite.hookSpecificOutput.additionalContext);
-          } else {
-            process.stdout.write(JSON.stringify(toWrite));
-          }
-        });
+        // reverse (issue #442, PR #442 round-9 review). The write itself is
+        // awaited through its ACTUAL completion callback, not `stdout.write`'s
+        // synchronous return value — a `true` return is only a backpressure
+        // signal, and an `EPIPE` can still arrive asynchronously afterward
+        // (issue #442, PR #442 round-10 review; see `writeStreamChunk`). A
+        // write failure — synchronous OR the awaited async rejection — releases
+        // the reservation instead of committing (nothing durably claimed; rows
+        // stay pending) — see `writeAndCommitHookDelivery`.
+        const claim = await writeAndCommitHookDelivery(flow, (toWrite) =>
+          writeStreamChunk(
+            process.stdout,
+            options.format === 'text'
+              ? toWrite.hookSpecificOutput.additionalContext
+              : JSON.stringify(toWrite),
+          ),
+        );
         if (!claim) {
           // Either the write failed (release path — nothing was ever durably
           // claimed) or the reservation vanished before commit could land

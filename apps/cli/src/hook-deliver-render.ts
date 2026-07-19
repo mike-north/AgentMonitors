@@ -40,8 +40,8 @@ function socketClause(socketPath: string | undefined): string {
  * claimed the events actually rendered, so the omitted remainder re-delivers
  * at the next context event (006 §5.1/§5.5). "more monitor updates are
  * pending" is therefore an accurate promise for THIS branch only — see
- * {@link buildHookClaimedUnreadMarker} for the synchronously-claimed
- * single-event mid-truncation branch, which must NOT reuse this framing
+ * {@link buildHookClaimedUnreadMarker} for the single-event mid-truncation
+ * branch, which must NOT reuse this framing
  * (issue #442, PR #442 round-7 review — the two branches were previously
  * rendered by one marker, falsely implying the mid-truncated event's own
  * omitted tail would also redeliver).
@@ -69,21 +69,32 @@ function buildHookDeferredMarker(
 }
 
 /**
- * Build the marker appended when THIS claim's own render was cut short but
- * the underlying row is ALREADY claimed (`claimDeliveryClient` sets
- * `first_notified_at` synchronously, before this render runs) — so, unlike
- * {@link buildHookDeferredMarker}, the omitted content will NOT surface again
- * via the ordinary context-event flow (`pendingEventsForSession` never
- * returns a claimed row, 006 §5.1/§5.5). Used for: (1) the single-event
- * mid-truncation branch (one event's own block exceeds the cap and is shown
- * partially), and (2) a reminder claim (`normal`/`low`, no event blocks) whose
- * coalesced `message` itself is long enough to need truncating — both are
- * this SAME claim's own content being cut, not other pending work being
- * deferred (issue #442, PR #442 round-7 review). Its only recovery path is
- * the durable, still-unread copy of the full event (claiming ≠ acking, BP2 /
- * SP4), so the framing says so explicitly instead of promising a redelivery
- * that will not happen — mirroring the channel transport's
- * `buildChannelTruncatedMarker` (`channel-render.ts`).
+ * Build the marker appended when THIS claim's own render was cut short, but
+ * the underlying row's DURABLE claim state is NOT something this render can
+ * promise either way. Used for: (1) the single-event mid-truncation branch
+ * (one event's own block exceeds the cap and is shown partially), and (2) a
+ * reminder claim (`normal`/`low`, no event blocks) whose coalesced `message`
+ * itself is long enough to need truncating — both are this SAME claim's own
+ * content being cut, not other pending work being deferred (issue #442, PR
+ * #442 round-7 review).
+ *
+ * **Why this can't assert a specific claim/redelivery outcome.** Rendering
+ * now happens BEFORE the reservation is committed (`reserveRenderAndCommitHookDelivery`
+ * / `writeAndCommitHookDelivery`, `hook.ts`, issue #442, PR #442 round-9/10
+ * review), off the reservation's own (not-yet-durable) claim — so at render
+ * time it is genuinely unknown whether the commit that follows will succeed.
+ * A prior version of this marker asserted "it is claimed but NOT
+ * acknowledged ... it will not redeliver automatically" — true if the commit
+ * lands, but FALSE if the commit fails or its result is lost: the rows then
+ * deliberately stay pending and WILL redeliver via the ordinary
+ * context-event flow (§5.5), contradicting the marker's own claim (issue
+ * #442, PR #442 round-10 review). The wording below asserts only what holds
+ * regardless of the commit's outcome: the full copy is not yet acknowledged,
+ * so it stays unread and reachable right now via the recovery command —
+ * mirroring the channel transport's `buildChannelTruncatedMarker`
+ * (`channel-render.ts`), whose claim IS durably committed before render (a
+ * different transport with no such uncertainty, so it can keep asserting
+ * "will NOT surface on a later poll").
  *
  * **Not valid for a `post-compact` recap** — see {@link buildHookRecapMarker}.
  */
@@ -92,7 +103,7 @@ function buildHookClaimedUnreadMarker(
   socketPath?: string,
 ): string {
   const safeSessionId = sanitize(sessionId);
-  return `\n\n[truncated — this update was too large to show in full; it is claimed but NOT acknowledged, so the full copy stays unread (it will not redeliver automatically) — run \`agentmonitors events list --session ${safeSessionId}${socketClause(socketPath)} --unread\` to see it]`;
+  return `\n\n[truncated — this update was too large to show in full; the full copy stays unread — run \`agentmonitors events list --session ${safeSessionId}${socketClause(socketPath)} --unread\` to see it now]`;
 }
 
 /**
@@ -115,21 +126,32 @@ function buildHookClaimedUnreadMarker(
  *   already claimed along with the rest of the recap's candidate set) —
  *   they will not redeliver at "the next context event" the way a genuinely
  *   unclaimed `turn-interruptible` event would.
- * - {@link buildHookClaimedUnreadMarker}'s "it will not redeliver
- *   automatically" is actively FALSE for a recap: the omitted/cut content
- *   WILL reappear, automatically, on the next `post-compact` recap (and any
- *   after that) until it is acknowledged — that is the intentional self-heal
- *   behavior §5.5 documents.
+ * - {@link buildHookClaimedUnreadMarker} (in its current, post-round-10
+ *   wording) no longer asserts a redelivery outcome either way — but a
+ *   recap's own framing is still distinct: it can (and should) promise the
+ *   POSITIVE "will reappear on future recaps" outcome, which is true
+ *   regardless of whether THIS recap's own commit lands, because a FUTURE
+ *   recap always re-sources from `unreadEventsForSession` (§5.5's self-heal).
+ *   The ordinary marker cannot make that promise (a `turn-interruptible`
+ *   claim's tail genuinely does NOT redeliver once acknowledged-adjacent
+ *   state is uncertain), so it settles for the outcome-agnostic "stays
+ *   unread" framing instead — see {@link buildHookClaimedUnreadMarker}'s own
+ *   doc comment.
  *
  * So a recap needs its own truthful framing regardless of which of
  * {@link renderHookDelivery}'s two truncation branches (whole-blocks-omitted,
  * or a single event's own block mid-truncated) produced it — both are, for a
- * recap, the SAME fact: this content is claimed-but-unacknowledged and will
- * keep re-surfacing on future recaps.
+ * recap, the SAME fact: this content stays unread and will keep re-surfacing
+ * on future recaps until acknowledged. Like {@link buildHookClaimedUnreadMarker},
+ * this marker is built from the reservation's own (not-yet-committed) claim
+ * (issue #442, PR #442 round-9/10 review) — so it deliberately does NOT
+ * assert this content "is claimed" at render time either, only the
+ * self-healing future-recap behavior, which holds regardless of this
+ * particular commit's outcome.
  */
 function buildHookRecapMarker(sessionId: string, socketPath?: string): string {
   const safeSessionId = sanitize(sessionId);
-  return `\n\n[truncated — not everything fit in this recap; the omitted content is claimed but NOT acknowledged, so it stays unread and will reappear on future recaps until acknowledged — run \`agentmonitors events list --session ${safeSessionId}${socketClause(socketPath)} --unread\` to see it now]`;
+  return `\n\n[truncated — not everything fit in this recap; the omitted content stays unread and will reappear on future recaps until acknowledged — run \`agentmonitors events list --session ${safeSessionId}${socketClause(socketPath)} --unread\` to see it now]`;
 }
 
 /**
@@ -384,22 +406,26 @@ export interface RenderHookDeliveryOptions {
  *   `--unread` without `--session` exits 1) is appended pointing at the
  *   genuinely-pending rest, which re-delivers at the next context event. Only
  *   when a SINGLE event's own block exceeds the cap is it shown partially
- *   (mid-truncated at a code-point boundary) — this is a DIFFERENT case: the
- *   row is already claimed (`claimDeliveryClient` set `first_notified_at`
- *   synchronously before this render runs), so the omitted tail will NOT
- *   redeliver via the ordinary context-event flow. That branch uses the
- *   distinct {@link buildHookClaimedUnreadMarker} instead (issue #442, PR #442
- *   round-7 review) — its full body stays unread (claiming ≠ acking, BP2 /
- *   SP4), recoverable only via the durable unread copy.
+ *   (mid-truncated at a code-point boundary) — this is a DIFFERENT case: this
+ *   render is built from the RESERVATION's own claim, before the reservation
+ *   is committed (`hook.ts`'s `reserveRenderAndCommitHookDelivery` /
+ *   `writeAndCommitHookDelivery`, issue #442, PR #442 round-9/10 review — the
+ *   render→write→commit ordering, not commit→render), so at render time it is
+ *   not yet known whether the row will end up durably claimed. That branch
+ *   uses the distinct {@link buildHookClaimedUnreadMarker} instead (issue
+ *   #442, PR #442 round-7/round-10 review) — its full body stays unread
+ *   either way (claiming ≠ acking, BP2 / SP4), recoverable only via the
+ *   durable unread copy; the marker itself asserts only that outcome-agnostic
+ *   fact, never a specific claimed/redelivery direction (round-10 review).
  * - **Reminder line** — a `normal`/`low` turn-boundary claim carries no event
  *   bodies (`events: []`) but a populated `message` (the same advisory line
  *   `hook claim` surfaces). It renders that message as a sanitized, length-capped
  *   reminder line, with **no** body injection — so a default (`normal`-urgency)
- *   monitor produces a visible mid-turn signal instead of silence. The
- *   underlying row is ALREADY claimed (not deferred), so any truncation of the
- *   message itself also uses {@link buildHookClaimedUnreadMarker} — the event
- *   stays unread and re-discoverable via `agentmonitors events list --session
- *   <id> --unread`, but will not redeliver on its own.
+ *   monitor produces a visible mid-turn signal instead of silence. Any
+ *   truncation of the message itself also uses {@link buildHookClaimedUnreadMarker}
+ *   — the event stays unread and re-discoverable via `agentmonitors events
+ *   list --session <id> --unread` regardless of whether this delivery's
+ *   commit ultimately lands.
  *
  * The renderer is **pure and side-effect-free**: no I/O, no mutation. Text is
  * preserved faithfully (a monitor body is trusted, user-authored markdown) with
@@ -431,11 +457,15 @@ export function renderHookDelivery(
   // THIS claim's session — see {@link buildHookDeferredMarker} and
   // {@link buildHookClaimedUnreadMarker}. The two are DELIBERATELY distinct
   // for a non-recap claim (see their doc comments): the deferred marker
-  // promises a redelivery that will actually happen; the claimed-unread
-  // marker does not. For a recap, both slots use the SAME recap-aware marker
-  // (`buildHookRecapMarker`) — the distinction between "genuinely pending" and
-  // "already claimed" doesn't apply: recap re-shows everything unread
-  // regardless of claimed state.
+  // promises a redelivery that will actually happen (these events were never
+  // reserved at all — they stay pending, full stop); the claimed-unread marker
+  // makes no redelivery promise either way, since it is rendered from the
+  // reservation's own claim before that reservation is committed (issue #442,
+  // PR #442 round-9/10 review). For a recap, both slots use the SAME
+  // recap-aware marker (`buildHookRecapMarker`) — the distinction between
+  // "genuinely pending" and "this claim's own content" doesn't apply: recap
+  // re-shows everything unread regardless of this delivery's own commit
+  // outcome.
   const deferredMarker = isRecap
     ? buildHookRecapMarker(claim.sessionId, options.socketPath)
     : buildHookDeferredMarker(claim.sessionId, options.socketPath);
@@ -449,11 +479,11 @@ export function renderHookDelivery(
   // which populate `events`), so surface the message as a reminder line instead
   // of emitting nothing. A genuinely empty claim (no events, blank message) is
   // never produced by the runtime — `claimDelivery` returns `null` when nothing
-  // is pending — but we still guard for it so the caller stays silent. The
-  // underlying row is ALREADY claimed by the time this renders, so a truncated
-  // reminder uses the claimed-unread marker, not the deferred one (issue #442,
-  // PR #442 round-7 review) — there is no "more updates pending" to promise
-  // here; it is THIS claim's own message being cut.
+  // is pending — but we still guard for it so the caller stays silent. This is
+  // THIS claim's own message being cut, not other pending work being deferred,
+  // so a truncated reminder uses the claimed-unread marker, not the deferred
+  // one (issue #442, PR #442 round-7 review) — there is no "more updates
+  // pending" to promise here.
   if (claim.events.length === 0) {
     const reminder = sanitize(claim.message);
     if (reminder.trim().length === 0) return null;
@@ -494,21 +524,23 @@ export function renderHookDelivery(
     } else {
       // Even the first block alone exceeds (cap − marker): mid-truncate block 0
       // at a code-point boundary. This is the ONLY case a durable event is shown
-      // partially — and unlike the branch above, THIS event is already claimed,
-      // so its own omitted tail will NOT redeliver (issue #442, PR #442 round-7
-      // review): use the claimed-unread marker, which says so.
+      // partially — and unlike the branch above, THIS event's own content is
+      // what got cut (not other pending work), so it uses the claimed-unread
+      // marker (issue #442, PR #442 round-7/round-10 review) — its outcome-
+      // agnostic wording is correct whether or not this delivery's reservation
+      // ends up durably committed (see {@link buildHookClaimedUnreadMarker}).
       //
       // Mixed case (issue #442, PR #442 round-8 review): `moreDeferred` can
       // ALSO be true here — this claim's single (oversized) event is the only
-      // one actually claimed, but genuinely more high-urgency work exists
+      // one actually reserved, but genuinely more high-urgency work exists
       // beyond it and stays pending (the reservation/claim was sized to just
       // this one event). Rendering the claimed-unread marker alone would
       // silently suppress that second, real signal: an agent reading only
-      // "this update was too large ... it will not redeliver" would have no
-      // idea further, DIFFERENT pending work is queued and genuinely will
-      // redeliver. Render BOTH markers whenever both apply — they describe
-      // two different, non-overlapping facts (this event's own tail vs. the
-      // separate pending remainder) and are never redundant with each other.
+      // "the full copy stays unread" would have no idea further, DIFFERENT
+      // pending work is queued and genuinely will redeliver. Render BOTH
+      // markers whenever both apply — they describe two different,
+      // non-overlapping facts (this event's own tail vs. the separate pending
+      // remainder) and are never redundant with each other.
       // For a recap, `deferredMarker === claimedUnreadMarker` (both are the
       // same recap marker) and `moreDeferred` is never set true by
       // `reserveSizedHookDelivery` for a non-`turn-interruptible` lifecycle
