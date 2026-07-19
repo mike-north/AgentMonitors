@@ -504,29 +504,54 @@ export function computeTransportHealth(
   const channel = buildTransport('channel', input, sharedProblems);
   const transports = [hook, channel];
 
+  // A running heartbeat is not, on its own, an ACTIVE recipient (issue #425
+  // review, round 3). `hook` is keyed per-workspace, not per-session, so a
+  // fresh record left by a session that has since CLOSED still reads as
+  // "running" for the rest of its 24h lease — and `channel`'s own session-id
+  // match falls back to a workspace match (`selectHeartbeat` above) once
+  // there are no live leads to match by session at all. Either way, a
+  // transport can look perfectly healthy while there is nobody left for it to
+  // deliver to. Gate `reach`/`deliverable` on there being at least one
+  // currently-active lead host session (the caller supplies ACTIVE leads
+  // only — see `doctor.ts`) before even asking which transport is listening.
+  const hasActiveLead = input.leadHostSessionIds.length > 0;
+
   // A transport that is present and within its lease is *listening*, even if
   // the daemon behind it is down or its reminders are muted — those are
   // separate, separately-reported facts. Conflating them here is exactly the
   // "one generic unhealthy" collapse this surface exists to avoid.
-  const listening = transports.filter(
-    (transport) =>
-      transport.running &&
-      !transport.problems.some(
-        (problem) =>
-          problem.code === 'workspace-mismatch' ||
-          problem.code === 'environment-mismatch' ||
-          problem.code === 'socket-mismatch',
-      ),
-  );
-  const reach: DeliveryReach =
-    listening.length === 2 ? 'both' : (listening[0]?.name ?? 'none');
+  const listening = hasActiveLead
+    ? transports.filter(
+        (transport) =>
+          transport.running &&
+          !transport.problems.some(
+            (problem) =>
+              problem.code === 'workspace-mismatch' ||
+              problem.code === 'environment-mismatch' ||
+              problem.code === 'socket-mismatch',
+          ),
+      )
+    : [];
+  const reach: DeliveryReach = !hasActiveLead
+    ? 'none'
+    : listening.length === 2
+      ? 'both'
+      : (listening[0]?.name ?? 'none');
 
   const suppressed = sharedProblems.some(
     (problem) => problem.code === 'reminders-suppressed',
   );
-  const deliverable = reach !== 'none' && input.daemonRunning && !suppressed;
+  const deliverable =
+    hasActiveLead && reach !== 'none' && input.daemonRunning && !suppressed;
 
-  const verdict = buildVerdict(reach, input, suppressed, deliverable);
+  const verdict = buildVerdict(
+    reach,
+    input,
+    suppressed,
+    deliverable,
+    hasActiveLead,
+    transports,
+  );
 
   // De-duplicate while preserving report order: several transports commonly
   // share one root cause (a down daemon), and repeating its fix reads as
@@ -554,6 +579,8 @@ function buildVerdict(
   input: TransportHealthInput,
   suppressed: boolean,
   deliverable: boolean,
+  hasActiveLead: boolean,
+  transports: readonly TransportStatus[],
 ): string {
   // Suppression is reported even when nothing is listening. The two are
   // independent problems that must BOTH be fixed before anything arrives, and
@@ -563,12 +590,22 @@ function buildVerdict(
   const mutedClause = suppressed
     ? ' Reminders are ALSO currently suppressed (coalesced-until-ack): acknowledge the claimed events, or nothing will surface even once a transport is listening.'
     : '';
-  if (reach === 'none') {
-    const base =
-      input.leadHostSessionIds.length === 0
-        ? 'delivery to THIS session → via none (no lead session is registered for this workspace; no transport has reported in).'
-        : 'delivery to THIS session → via none: no delivery transport is listening for this workspace.';
+  if (!hasActiveLead) {
+    // Distinct from "no transport has reported in" below: a transport can be
+    // configured and its heartbeat still fresh (`hook` is keyed per
+    // WORKSPACE, not per session, so a session that closed minutes ago
+    // leaves a record that outlives it for the rest of its 24h lease) while
+    // there is genuinely no live session left for it to deliver to. Naming
+    // that explicitly stops a reader from chasing a "fix the transport"
+    // remediation for a problem that has nothing to do with the transport.
+    const anyConfigured = transports.some((transport) => transport.configured);
+    const base = anyConfigured
+      ? 'delivery to THIS session → via none: there is no live session for this workspace — a transport has reported in previously, but no lead session is currently open for it to deliver to.'
+      : 'delivery to THIS session → via none (no lead session is registered for this workspace; no transport has reported in).';
     return `${base}${mutedClause}`;
+  }
+  if (reach === 'none') {
+    return `delivery to THIS session → via none: no delivery transport is listening for this workspace.${mutedClause}`;
   }
   const base = `delivery to THIS session → via ${reach}`;
   if (!input.daemonRunning) {

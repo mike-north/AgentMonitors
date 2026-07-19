@@ -752,9 +752,17 @@ export const doctorCommand = new Command('doctor')
           socketPath,
           daemonRunning,
           ...(daemonErrorMessage ? { daemonErrorMessage } : {}),
-          leadHostSessionIds: report.leadSessions.map(
-            (session) => session.hostSessionId,
-          ),
+          // ACTIVE leads only (issue #425 review, round 3): `leadSessions` is
+          // every lead session ever registered for this workspace, including
+          // ones a prior `session.close` already marked `dormant`. A dormant
+          // session has no live host process to deliver to, so counting its
+          // host session id here let a merely-fresh heartbeat (its TTL had not
+          // yet lapsed, or a NEW session's hook already refreshed the
+          // per-workspace hook record) report `deliverable: true` for a
+          // recipient nothing can actually reach.
+          leadHostSessionIds: report.leadSessions
+            .filter((session) => session.status === 'active')
+            .map((session) => session.hostSessionId),
           heartbeats: readTransportHeartbeats(report.generatedAt),
           diagnoses,
           cliVersion: getCliVersion(),

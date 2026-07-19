@@ -141,6 +141,65 @@ describe('computeTransportHealth', () => {
     });
   });
 
+  describe('no ACTIVE lead recipient (issue #425 review, round 3)', () => {
+    // `hook` is keyed per WORKSPACE, not per session (`heartbeatKey`), so a
+    // heartbeat left by a session that has since closed stays within its 24h
+    // TTL — and reads as `running` — long after there is nobody left to
+    // deliver to. `doctor` is responsible for supplying ONLY active leads
+    // (`leadHostSessionIds`); this suite proves `computeTransportHealth`
+    // actually honors that contract rather than trusting `running` alone.
+    it('reports via none / not deliverable when a fresh heartbeat exists but no lead session is active', () => {
+      const health = computeTransportHealth(input({ leadHostSessionIds: [] }));
+
+      expect(health.deliveryWillReachThisSession).toBe('none');
+      expect(health.deliverable).toBe(false);
+      expect(health.verdict).toContain('no live session');
+      // The heartbeat-derived facts (still running, still bound correctly) are
+      // NOT erased — a reader diagnosing this must be able to see that the
+      // transport itself is fine and the problem is purely "no recipient".
+      for (const transport of health.transports) {
+        expect(transport.configured).toBe(true);
+        expect(transport.running).toBe(true);
+      }
+    });
+
+    it('names the case distinctly from "no transport has reported in at all"', () => {
+      const noTransportAtAll = computeTransportHealth(
+        input({ heartbeats: [], leadHostSessionIds: [] }),
+      );
+      const heartbeatButNoLead = computeTransportHealth(
+        input({ leadHostSessionIds: [] }),
+      );
+
+      expect(noTransportAtAll.verdict).not.toEqual(heartbeatButNoLead.verdict);
+      expect(noTransportAtAll.verdict).toContain(
+        'no transport has reported in',
+      );
+      expect(heartbeatButNoLead.verdict).not.toContain(
+        'no transport has reported in',
+      );
+    });
+
+    it('still reports the same result when the transport looks otherwise unhealthy (stale)', () => {
+      // Absence of an active lead is not merely "another reason it's
+      // unhealthy" — it must dominate even a transport whose own heartbeat
+      // has separately lapsed, since deliverability was already false either
+      // way and the verdict should name the recipient problem, not just staleness.
+      const health = computeTransportHealth(
+        input({
+          leadHostSessionIds: [],
+          heartbeats: [
+            heartbeat('hook', {
+              updatedAt: new Date(NOW.getTime() - 60 * 60 * 1000).toISOString(),
+            }),
+          ],
+        }),
+      );
+      expect(health.deliveryWillReachThisSession).toBe('none');
+      expect(health.deliverable).toBe(false);
+    });
+  });
+
   describe('failure mode (a): no daemon running for this workspace', () => {
     const health = computeTransportHealth(
       input({
