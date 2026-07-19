@@ -192,15 +192,15 @@ Runs against the current working directory. Performs, in order:
 
 Each source produces a distinct starter frontmatter block:
 
-| Source             | Key config fields in template                                                                                            |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------ |
-| `file-fingerprint` | `globs: ['**/*.ts']`                                                                                                     |
-| `api-poll`         | `url`, `method: GET`, `interval: 5m`; `change-detection.strategy` omitted so the source infers from `Content-Type`       |
-| `command-poll`     | `command: [git, ls-remote, origin, refs/heads/main]`, `interval: 5m`, `change-detection.strategy: text-diff`             |
-| `schedule`         | `cron: '0 9 * * 1-5'`, `timezone: UTC`                                                                                   |
-| `incoming-changes` | `paths: ['docs/specs/**']`, `branch: main`                                                                               |
-| `pr-review`        | `command-poll` over `gh pr list` (no `--repo`), `key: pr-review`, `interval: 5m`, `json-diff`, `urgency: normal`         |
-| `my-prs`           | `command-poll` over `gh pr list --author @me` (no `--repo`), `key: my-prs`, `interval: 2m`, `json-diff`, `urgency: high` |
+| Source             | Key config fields in template                                                                                              |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------- |
+| `file-fingerprint` | `globs: ['**/*.ts']`                                                                                                       |
+| `api-poll`         | `url`, `method: GET`, `interval: 5m`; `change-detection.strategy` omitted so the source infers from `Content-Type`         |
+| `command-poll`     | `command: [git, ls-remote, origin, refs/heads/main]`, `interval: 5m`, `change-detection.strategy: text-diff`               |
+| `schedule`         | `cron: '0 9 * * 1-5'`, `timezone: UTC`                                                                                     |
+| `incoming-changes` | `paths: ['docs/specs/**']`, `branch: main`                                                                                 |
+| `pr-review`        | `command-poll` over `gh pr list` (no `--repo`), `key: pr-review`, `interval: 5m`, `json-diff`, `urgency: normal`           |
+| `my-prs`           | `command-poll` over `gh pr list --author @me` (no `--repo`), `key: my-prs`, `interval: 5m`, `json-diff`, `urgency: normal` |
 
 #### Presets (`pr-review` and `my-prs`)
 
@@ -212,7 +212,8 @@ the two pull-request roles, selected through the same `--type` flag:
   `reviewDecision` flips, and when a PR leaves the queue. `urgency: normal`.
 - **`my-prs`** (author) — the current `gh` user's recent PRs in this repository. Fires when CI goes
   red or recovers, when review feedback lands, and when a PR is merged, closed, or moved into or out
-  of draft. `urgency: high`.
+  of draft. `urgency: normal` — see [003 §11.9](./003-source-plugins.md) for why `high` is not
+  available to a `json-diff` monitor whose watched value can recover on its own.
 
 **Both are automatically scoped to the repository the session is operating in.** Neither scaffolds a
 `--repo owner/name` flag: `gh` resolves the repository from its working directory, which for a

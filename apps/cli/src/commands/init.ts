@@ -129,7 +129,11 @@ const PR_REVIEW_QUERY =
  *   whole) means a green→red transition fires (`[]` → `["build"]`) and a
  *   red→green recovery fires, while the queued/in-progress churn of a normal
  *   CI run — which would otherwise produce an interrupt per check, per push —
- *   is invisible.
+ *   is invisible. Note this is quieter than collapsing the rollup to a single
+ *   PASSING/PENDING/FAILING verdict, which reintroduces the churn one level up:
+ *   every push would fire twice (PASSING→PENDING, PENDING→PASSING) even when
+ *   CI never breaks. Naming the failing checks also makes the delivered event
+ *   actionable without a second round-trip.
  * - **Review feedback** — `reviewDecision` plus a per-reviewer
  *   `{by, state}` list and an issue-comment count, so a new review, a changed
  *   verdict, or a new comment all diff. (`gh pr list` exposes no review-thread
@@ -139,7 +143,7 @@ const PR_REVIEW_QUERY =
  *   and both directions of draft↔ready each produce a diff.
  */
 const MY_PRS_QUERY =
-  'gh pr list --author @me --state all --limit 10 ' +
+  'gh pr list --author @me --state all --limit 20 ' +
   '--json number,title,url,state,isDraft,reviewDecision,statusCheckRollup,latestReviews,comments ' +
   "--jq '[.[] | {number, title, url, state, isDraft, reviewDecision, " +
   'failingChecks: ([.statusCheckRollup[]? | select(((.conclusion // .state // "") | ascii_upcase) as $c ' +
@@ -267,15 +271,18 @@ watch:
     - -c
     - |
 ${yamlBlockScalar(ghPresetScript('my-prs', MY_PRS_QUERY), '      ')}
-  interval: 2m
+  interval: 5m
   change-detection:
     strategy: json-diff
-# high, not normal: every transition this watches means your own work has
-# stalled — CI is red, a reviewer is blocked on you, or the PR has landed and
-# the branch needs cleaning up. Those are worth interrupting for. high still
-# settles for 15s before delivering (002 §9), so a burst of check results
-# arrives as one event, not five.
-urgency: high
+# normal, not high — and the reason is not obvious. json-diff is symmetric: a PR
+# LEAVING an actionable state diffs exactly as much as one entering it. So CI
+# recovering red -> green, a PR merging, and a new PR of your own appearing all
+# fire too, and no amount of payload shaping changes that (filtering the payload
+# down to only actionable PRs just moves the benign fire from "field changed" to
+# "entry removed"). Since not every fire can be made actionable, high would
+# interrupt mid-turn on good news — the interrupt-storm anti-pattern (#441).
+# normal surfaces the same information at a turn boundary instead (002 §9).
+urgency: normal
 ---
 
 Something changed on one of your own pull requests in this repository. Compare
@@ -298,6 +305,13 @@ the entries by \`number\` and act on what moved.
   and move on.
 - **\`state\` became \`CLOSED\`** — it was closed without merging. Find out why
   before reopening or re-doing the work.
+
+Two things that look like transitions but are not:
+
+- **A PR simply disappearing from the list** — it aged out of the most-recent-20
+  window, which is a recency window, not a state. No action.
+- **\`reviewDecision\` is \`""\`** — that is how \`gh\` reports "no decision yet",
+  not a decision that was cleared.
 
 \`gh pr list\` exposes no review-thread data, so inline review comments that do
 not change \`reviewDecision\` are not visible here; check the PR directly when

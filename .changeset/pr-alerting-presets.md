@@ -6,4 +6,6 @@ Add two repo-scoped PR-alerting presets to `agentmonitors init --type`: `pr-revi
 
 Both scaffold a ready-to-run `command-poll` monitor over the GitHub CLI and are automatically scoped to whichever repository the session is operating in: they omit `--repo` so `gh` resolves the repository from the daemon's working directory, and `my-prs` uses `--author @me` rather than a scaffolded username. The same `MONITOR.md` is therefore correct in every checkout, and turning on PR alerting takes one command instead of hand-writing `gh` argv.
 
+Both are `normal` urgency. `high` is deliberately not used: `json-diff` fires symmetrically, so a PR leaving an actionable state (CI recovering, a PR merging) is indistinguishable from one entering it, and a high-urgency PR monitor would interrupt mid-turn on good news.
+
 If `gh` is missing, unauthenticated, or run outside a GitHub repository, the monitor reports a failing-command event on its first tick — carrying both `gh`'s message and the fix — rather than silently baselining on empty output and never firing.

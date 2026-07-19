@@ -587,6 +587,57 @@ describe.skipIf(!hasJq)('the presets’ jq reduction over raw gh output', () => 
     expect(titles).toEqual([]);
   });
 
+  // The design alternative considered here was collapsing statusCheckRollup to
+  // a single PASSING/PENDING/FAILING verdict. That is quieter than diffing the
+  // rollup raw, but it reintroduces the churn one level up: an ordinary push
+  // that never breaks CI still walks PASSING -> PENDING -> PASSING and would
+  // fire twice. Reducing to failing check NAMES stays silent across the whole
+  // cycle, which is what this asserts — and is why a single-verdict collapse
+  // was rejected rather than adopted.
+  it('stays completely silent across a full push -> CI -> green cycle', async () => {
+    const scope = presetScope('my-prs');
+    const stub = stubGhApplyingJq();
+    const cycle = [
+      // Steady state: last run finished green.
+      [checkRun('build', 'SUCCESS')],
+      // Push lands: checks re-queued.
+      [
+        {
+          __typename: 'CheckRun',
+          name: 'build',
+          status: 'QUEUED',
+          conclusion: '',
+        },
+      ],
+      // Checks running.
+      [
+        {
+          __typename: 'CheckRun',
+          name: 'build',
+          status: 'IN_PROGRESS',
+          conclusion: '',
+          startedAt: '2026-01-15T09:02:00Z',
+        },
+      ],
+      // Green again — same verdict as the start, never actionable.
+      [checkRun('build', 'SUCCESS', 'COMPLETED')],
+    ];
+
+    let previous: unknown;
+    const firedAt: number[] = [];
+    for (const [index, rollup] of cycle.entries()) {
+      const result = await observe(
+        scope,
+        stub,
+        fixtureOf([rawMyPr({ statusCheckRollup: rollup })]),
+        previous,
+      );
+      if (result.titles.length > 0) firedAt.push(index);
+      previous = result.state;
+    }
+    expect(firedAt).toEqual([]);
+  });
+
   it('reduces review feedback to reviewer/state pairs and a comment count', async () => {
     const scope = presetScope('my-prs');
     const stub = stubGhApplyingJq();
@@ -768,11 +819,13 @@ describe('preset portability guarantees (issue #444)', () => {
     },
   );
 
-  // Urgency is a deliberate product decision, not a copy of the template
-  // default: work stalled on your own PR interrupts (high); an unreviewed PR
-  // is picked up at a turn boundary (normal). See 002 §9.
-  it('my-prs is high urgency and pr-review is normal', () => {
-    expect(TEMPLATES['my-prs'] ?? '').toMatch(/^urgency: high$/m);
+  // Neither preset is `high`, and for my-prs that is a deliberate reversal of
+  // the intuitive call. json-diff is symmetric, so benign transitions (CI
+  // recovering, a PR merging, your own new PR appearing) fire exactly like
+  // actionable ones; `high` would therefore interrupt mid-turn on good news —
+  // the interrupt-storm anti-pattern (#441). See 002 §9 and 003 §11.9.
+  it('neither preset is high urgency', () => {
+    expect(TEMPLATES['my-prs'] ?? '').toMatch(/^urgency: normal$/m);
     expect(TEMPLATES['pr-review'] ?? '').toMatch(/^urgency: normal$/m);
   });
 });

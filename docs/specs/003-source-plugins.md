@@ -1796,18 +1796,48 @@ its `state` is observably `MERGED` rather than merely absent — which is what l
   transition fires and a red→green recovery fires, while the queued/in-progress churn of a normal CI
   run stays invisible; diffing `statusCheckRollup` whole would instead interrupt once per check, per
   push.
+
+  Collapsing the rollup to a single `PASSING`/`PENDING`/`FAILING` verdict was considered and
+  rejected. It is quieter than the raw array, but it reintroduces the same churn one level up: an
+  ordinary push that never breaks CI still walks `PASSING → PENDING → PASSING` and fires **twice**.
+  Reducing to failing check _names_ stays silent across that whole cycle (asserted directly in
+  `apps/cli/src/commands/pr-alerting-presets.test.ts`) and makes the delivered event actionable
+  without a second round-trip to find out which check failed.
+
 - `reviewDecision`, a per-reviewer `{by, state}` list from `latestReviews`, and an issue-comment
   count — so a new review, a changed verdict, or a new comment each diff. `gh pr list` exposes no
   review-thread data, so inline thread replies that do not move `reviewDecision` are not visible.
 - `state` and `isDraft` — so merged, closed, and both directions of draft↔ready each diff.
 
-#### Urgency
+Note that `reviewDecision` is the **empty string**, not `null`, when GitHub has no decision for a PR.
+A `(.reviewDecision // "NONE")` coalesce is therefore a silent no-op; the preset passes the value
+through unchanged and the monitor body tells the agent what `""` means.
 
-`my-prs` is `high` because every transition it watches means the author's own work has stalled: CI is
-red, a reviewer is blocked, or the branch has landed and needs cleanup. Per
-[002 §9](./002-runtime-delivery.md), `high` still settles for 15s before delivery, so a burst of
-check results arrives as one event. `pr-review` is `normal`: an unreviewed PR is real work but not a
-regression — nothing is broken while it waits, and review is best picked up at a turn boundary.
+`--limit` makes the query a **recency window**, not a set: an old PR aging out of the window produces
+a removal diff that is not a state transition. The monitor body says so explicitly. This is inherent
+to a list-and-diff design and is one of the things a semantic `source-github-pr` plugin would remove.
+
+#### Urgency: both presets are `normal`, and `high` is not available to either
+
+`pr-review` is `normal` for the ordinary reason: an unreviewed PR is real work but not a regression —
+nothing is broken while it waits, and review is best picked up at a turn boundary.
+
+`my-prs` is `normal` for a **non-obvious** reason worth stating explicitly, because the intuitive call
+is the opposite. A stalled PR of one's own — red CI, blocking feedback — genuinely is
+interrupt-worthy, which argues for `high`. The blocker is that **`json-diff` is symmetric**: a PR
+_leaving_ an actionable state diffs exactly as much as one entering it. CI recovering red→green, a PR
+merging, and the author's own new PR appearing therefore all fire too.
+
+Payload shaping does not rescue `high`. Filtering the command's output down to only actionable PRs
+(CI failing, `CHANGES_REQUESTED`, terminal states) does not make every fire actionable — it merely
+relocates the benign fire from "a field changed" to "an entry was removed", which `json-diff` reports
+identically. Since no payload design makes every fire actionable, `high` would interrupt mid-turn on
+good news, which is the interrupt-storm anti-pattern (#441). `normal` surfaces the same information
+at a turn boundary instead.
+
+The general rule this establishes for any `json-diff` monitor: **`high` urgency is only defensible
+when the watched value cannot transition back to a benign state**, because recovery is
+indistinguishable from breakage at the diff layer.
 
 #### Degradation when `gh` is unusable
 

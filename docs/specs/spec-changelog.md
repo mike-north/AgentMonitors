@@ -528,9 +528,26 @@ Three contract points are now specified rather than left to the author of each h
    `stderrTail`, any prior baseline is preserved, the alert is edge-triggered, and recovery emits
    `Command recovered: <key>`.
 
-Urgency is asymmetric by design (002 §9): `my-prs` is `high` (a stalled PR of your own is
-interrupt-worthy; the 15s high-urgency settle still coalesces a burst of check results into one
-event), `pr-review` is `normal` (an unreviewed PR is work, not a regression).
+Both presets are `normal` urgency, and the `my-prs` case establishes a general rule (002 §9, 003
+§11.9). The intuitive call is `high` — a stalled PR of one's own is interrupt-worthy — but
+`json-diff` is **symmetric**: a PR leaving an actionable state diffs exactly as much as one entering
+it, so CI recovering red→green, a PR merging, and one's own new PR appearing all fire too. Filtering
+the payload down to only actionable PRs does not fix this; it relocates the benign fire from "a field
+changed" to "an entry was removed", which the diff reports identically. Since no payload design makes
+every fire actionable, `high` would interrupt mid-turn on good news (#441). Generalized: **`high` is
+only defensible for a `json-diff` monitor when the watched value cannot transition back to a benign
+state**, because at the diff layer recovery is indistinguishable from breakage.
+
+Two field traps are recorded rather than left for the next author to rediscover. `reviewDecision` is
+the empty string, not `null`, when there is no decision, so a `// "NONE"` coalesce is a silent no-op.
+And `--limit` makes the query a recency window, not a set: an old PR aging out produces a removal
+diff that is not a transition, which the monitor body calls out explicitly.
+
+Collapsing `statusCheckRollup` to a single `PASSING`/`PENDING`/`FAILING` verdict was considered and
+rejected: it is quieter than the raw array but reintroduces the churn one level up, firing twice on
+every ordinary push (`PASSING → PENDING → PASSING`) even when CI never breaks. Reducing to failing
+check _names_ stays silent across that whole cycle — asserted directly — and names the failing check
+in the delivered event.
 
 Known limitation, recorded rather than worked around: `gh pr list` exposes no review-thread data, so
 inline review comments that do not move `reviewDecision` are invisible to `my-prs`. A first-class
