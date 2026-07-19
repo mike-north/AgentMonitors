@@ -64,12 +64,22 @@ interface RunResult {
   exitCode: number;
 }
 
-/** Run the real CLI to completion, capturing both streams. */
-function runCli(args: string[], cwd: string): RunResult {
+/**
+ * Run the real CLI to completion, capturing both streams.
+ *
+ * `AGENTMONITORS_DB` is always pinned to the case's own temp db. These temp
+ * workspaces are not `enabled`, so `resolveWorkspaceDbPath()` would otherwise
+ * fall back to the machine-wide default db (005 §2) — and this file shares a
+ * single non-isolated fork with the other serial daemon suites
+ * (`vitest.serial.config.ts`), so a daemon holding that shared db would leak
+ * into their runs.
+ */
+function runCli(ws: Workspace, args: string[]): RunResult {
   const result = spawnSync('node', [CLI_PATH, ...args], {
     encoding: 'utf-8',
-    cwd,
+    cwd: ws.dir,
     timeout: 60_000,
+    env: { ...process.env, AGENTMONITORS_DB: ws.db },
   });
   return {
     stdout: result.stdout ?? '',
@@ -81,22 +91,19 @@ function runCli(args: string[], cwd: string): RunResult {
 /** Start a detached daemon and remember its socket for teardown. */
 function runDetach(ws: Workspace, extraArgs: string[] = []): RunResult {
   startedSockets.push(ws.socket);
-  return runCli(
-    [
-      'daemon',
-      'run',
-      ws.monitorsDir,
-      '--workspace',
-      ws.dir,
-      '--socket',
-      ws.socket,
-      '--poll-ms',
-      '1000',
-      '--detach',
-      ...extraArgs,
-    ],
+  return runCli(ws, [
+    'daemon',
+    'run',
+    ws.monitorsDir,
+    '--workspace',
     ws.dir,
-  );
+    '--socket',
+    ws.socket,
+    '--poll-ms',
+    '1000',
+    '--detach',
+    ...extraArgs,
+  ]);
 }
 
 afterEach(async () => {
@@ -105,6 +112,13 @@ afterEach(async () => {
       await callDaemon('stop', {}, { socketPath: socket });
     } catch {
       /* already stopped, or never started */
+    }
+    // Do not merely ASK the daemon to stop — wait until it has actually let go
+    // of the socket. The next file in this fork must not race a shutting-down
+    // daemon (the whole reason these suites run serially).
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline && (await daemonAvailable(socket))) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
     }
   }
   for (const ws of workspaces.splice(0)) {
@@ -139,7 +153,7 @@ describe('daemon run --detach (issue #389 P1)', () => {
     );
 
     // `daemon stop` reaches the backgrounded daemon like any other.
-    const stopped = runCli(['daemon', 'stop', '--socket', ws.socket], ws.dir);
+    const stopped = runCli(ws, ['daemon', 'stop', '--socket', ws.socket]);
     expect(stopped.exitCode).toBe(0);
   }, 60_000);
 
@@ -184,7 +198,7 @@ describe('daemon run --detach (issue #389 P1)', () => {
   }, 60_000);
 
   it('documents the flag and the persistent-daemon combination in --help', () => {
-    const help = runCli(['daemon', 'run', '--help'], tmpdir());
+    const help = runCli(makeWorkspace('help'), ['daemon', 'run', '--help']);
     expect(help.exitCode).toBe(0);
     expect(help.stdout).toContain('--detach');
     expect(help.stdout).toContain('--reap-after-ms 0');

@@ -18,8 +18,11 @@ export default defineConfig({
     include: [
       'src/concurrent-spawn.test.ts',
       'src/detached-spawn.test.ts',
-      'src/commands/daemon-detach.integration.test.ts',
       'src/commands/verify.integration.test.ts',
+      // Last on purpose: it boots several real daemons, and `verify`'s cases
+      // are timing-sensitive enough that any teardown residue ahead of them
+      // shows up as a flake in THEIR results, not this file's.
+      'src/commands/daemon-detach.integration.test.ts',
     ],
     // No file-level parallelism — each file must complete before the next
     // starts so the daemon processes are never competing for CPU.
