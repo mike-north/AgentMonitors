@@ -31,7 +31,12 @@ import {
   reserveSizedChannelDelivery,
   runChannelDeliveryCycle,
 } from './channel.js';
-import { MAX_CHANNEL_CONTENT, renderChannelEvent } from '../channel-render.js';
+import {
+  CHANNEL_DEFERRED_MARKER,
+  CHANNEL_TRUNCATED_MARKER,
+  MAX_CHANNEL_CONTENT,
+  renderChannelEvent,
+} from '../channel-render.js';
 import {
   reserveDeliveryClient,
   commitDeliveryClient,
@@ -705,5 +710,75 @@ describe('reserveSizedChannelDelivery mismatch-release failure propagation (issu
 
     expect(push).not.toHaveBeenCalled();
     expect(commitMock).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR #442 round-5 review: a single event whose own block already exceeds the
+// ceiling still gets COMMITTED after `push` resolves (the mid-truncation
+// happens inside `push`'s rendering, not before reserve/commit) — committing
+// sets `first_notified_at`, and `pendingEventsForSession()` only returns rows
+// where that column is still NULL (006 §9), so this event can NEVER surface
+// on a later poll. The old `CHANNEL_DEFERRED_MARKER` falsely told the agent
+// "they will surface on a later poll"; the cycle goes idle instead, and the
+// full body is only recoverable via the durable unread copy (claiming ≠
+// acking, BP2 / SP4).
+// ---------------------------------------------------------------------------
+describe('runChannelDeliveryCycle oversized single-event commit (issue #442, round-5 review)', () => {
+  it('commits an oversized event whose content was mid-truncated, then reports idle on the next poll (never re-surfaces the omitted tail)', async () => {
+    const hugeEvent = makeEvent({
+      eventId: 'huge-1',
+      monitorId: 'runaway-monitor',
+      body: 'x'.repeat(5_000_000),
+    });
+    const claim: DeliveryClaim = {
+      sessionId: 'session-1',
+      mode: 'delivery',
+      urgency: 'high',
+      lifecycle: 'turn-interruptible',
+      message: '1 monitor(s) fired',
+      unreadCounts: { low: 0, normal: 0, high: 1, total: 1 },
+      events: [hugeEvent],
+    };
+
+    // --- Poll 1: the oversized event is reserved, mid-truncated by the
+    // renderer inside `push`, and committed (the push resolved). ---
+    previewMock.mockResolvedValueOnce([hugeEvent]);
+    reserveMock.mockResolvedValueOnce({ reservationId: 'r-huge', claim });
+    commitMock.mockResolvedValueOnce(claim);
+
+    let renderedContent = '';
+    const push = (pushedClaim: DeliveryClaim, moreDeferred: boolean) => {
+      renderedContent = renderChannelEvent(pushedClaim, {
+        moreDeferred,
+      }).content;
+      return Promise.resolve();
+    };
+
+    const first = await runChannelDeliveryCycle('session-1', '/sock', push);
+
+    expect(first).toBe('surfaced');
+    expect(commitMock).toHaveBeenCalledWith('r-huge', '/sock');
+    // The rendered content signposts the durable unread copy — not a later
+    // poll re-delivery, which cannot happen for a row that is now committed.
+    expect(renderedContent).toContain(CHANNEL_TRUNCATED_MARKER.trim());
+    expect(renderedContent).not.toContain(CHANNEL_DEFERRED_MARKER.trim());
+    expect(renderedContent).toContain('agentmonitors events list --unread');
+
+    // --- Poll 2: the row is now committed (`first_notified_at` set), so a
+    // real daemon's `pendingEventsForSession()` would no longer return it —
+    // nothing else is pending, so both the settled-high preview and the
+    // reservation come back empty/null. ---
+    previewMock.mockResolvedValueOnce([]);
+    reserveMock.mockResolvedValueOnce(null);
+    const push2 = vi.fn(okPush);
+
+    const second = await runChannelDeliveryCycle('session-1', '/sock', push2);
+
+    // The omitted tail does NOT surface on this later poll: the cycle is
+    // idle, not "surfaced" again.
+    expect(second).toBe('idle');
+    expect(push2).not.toHaveBeenCalled();
+    expect(commitMock).toHaveBeenCalledTimes(1);
   });
 });

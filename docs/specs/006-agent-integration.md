@@ -704,6 +704,19 @@ joiner (`\n\n`, no fixed header) and the deferral marker (bracket-free, since th
 `<>[]` out of `content`, §4.6). A reminder claim (no settled-high events) needs no sizing and omits
 `maxEvents`, claiming the full claim exactly as before.
 
+**The single-event pathological case's marker differs from the hook path's, because the channel
+COMMITS before the next poll can run (issue #442).** For the channel's reserve → push → commit cycle,
+by the time `renderChannelEvent` mid-truncates a lone event whose own block still exceeds the ceiling,
+`runChannelDeliveryCycle` is about to commit that reservation on a successful push — setting
+`first_notified_at`, after which `pendingEventsForSession()` (whose query requires that column still
+`NULL`, 002 §7) will never return the row again. Unlike the deferred-remainder case above, the omitted tail
+of THIS event does **not** "re-deliver at the next poll" — it is only recoverable via the durable,
+still-unread copy of the full event (claiming ≠ acking, BP2 / SP4), discoverable via
+`agentmonitors events list --unread`. `channel-render.ts` therefore signposts this case with a distinct
+marker, `CHANNEL_TRUNCATED_MARKER`, that points at that durable copy instead of promising a re-delivery
+that cannot happen — reserving `CHANNEL_DEFERRED_MARKER`'s "surface on a later poll" language for the
+case where a whole block genuinely stayed unclaimed and pending.
+
 No durable event is lost by truncation; the cap only bounds how much is injected into a single turn (or,
 for the channel, into a single push).
 

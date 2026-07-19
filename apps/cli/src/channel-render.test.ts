@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { DeliveryClaim } from '@agentmonitors/core';
 import {
   CHANNEL_DEFERRED_MARKER,
+  CHANNEL_TRUNCATED_MARKER,
   MAX_CHANNEL_CONTENT,
   renderChannelEvent,
 } from './channel-render.js';
@@ -303,8 +304,13 @@ describe('renderChannelEvent', () => {
     // pushed content — not merely on what the packer sizing function returns.
     expect(content.length).toBeLessThanOrEqual(MAX_CHANNEL_CONTENT);
     // Signposted, not silently dropped: the still-unread full body is
-    // recoverable via `agentmonitors events list` (claiming ≠ acking, 006 §5.5).
-    expect(content).toContain(CHANNEL_DEFERRED_MARKER.trim());
+    // recoverable via `agentmonitors events list --unread` (claiming ≠ acking,
+    // 006 §5.5). This claim is already committed by the time it renders, so
+    // it must use the distinct `CHANNEL_TRUNCATED_MARKER` (issue #442
+    // round-5), not the `CHANNEL_DEFERRED_MARKER` which falsely promises a
+    // later-poll re-delivery.
+    expect(content).toContain(CHANNEL_TRUNCATED_MARKER.trim());
+    expect(content).not.toContain(CHANNEL_DEFERRED_MARKER.trim());
     // Still channel-safe: no tag-breakout characters survive truncation.
     expect(content).not.toMatch(/[<>[\]\r]/);
   });
@@ -333,7 +339,12 @@ describe('renderChannelEvent', () => {
       { moreDeferred: true },
     );
     expect(content.length).toBeLessThanOrEqual(MAX_CHANNEL_CONTENT);
-    expect(content).toContain(CHANNEL_DEFERRED_MARKER.trim());
+    // Even though a second event was genuinely deferred (`moreDeferred:
+    // true`), the mid-truncation branch always wins: the claimed event
+    // itself is already committed and its own tail was cut, so the marker
+    // must point at the durable unread copy, not promise a later poll.
+    expect(content).toContain(CHANNEL_TRUNCATED_MARKER.trim());
+    expect(content).not.toContain(CHANNEL_DEFERRED_MARKER.trim());
     expect(meta.event_count).toBe('1');
   });
 

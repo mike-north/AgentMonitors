@@ -60,6 +60,25 @@ export const CHANNEL_DEFERRED_MARKER =
   '\n\n(more monitor updates are pending; they will surface on a later poll)';
 
 /**
+ * Appended when the ONE claimed event's own block already exceeds {@link
+ * MAX_CHANNEL_CONTENT} (minus marker room) and had to be mid-truncated
+ * (issue #442, PR #442 round-5 review). Unlike {@link CHANNEL_DEFERRED_MARKER},
+ * this claim IS committed by `reserveDelivery` before render — `channel.ts`
+ * sets `first_notified_at` on the reservation, and
+ * `pendingEventsForSession()` only returns rows where that column is still
+ * `NULL` (002 §7), so the omitted tail of THIS event will NOT surface on a
+ * later poll: the cycle goes idle. Its only recovery path is the durable,
+ * unread copy of the full event (claiming ≠ acking, BP2 / SP4), discoverable
+ * via `agentmonitors events list --unread` — so this marker points there
+ * instead of promising a later re-delivery. Deliberately bracket-free (no
+ * `<`/`>`/`[`/`]`) for the same tag-safety reason as
+ * {@link CHANNEL_DEFERRED_MARKER}: it never needs `contentValue` sanitization
+ * itself.
+ */
+export const CHANNEL_TRUNCATED_MARKER =
+  '\n\n(this update was too large to show in full; run `agentmonitors events list --unread` to see the full copy)';
+
+/**
  * How many WHOLE high-urgency event blocks (from `events`, oldest-first) a
  * channel push can render under {@link MAX_CHANNEL_CONTENT} (006 §5.5). Mirrors
  * the hook-deliver transport's `packEventsUnderCap` (`hook-deliver-render.ts`,
@@ -206,8 +225,11 @@ export interface RenderChannelEventOptions {
  * pathological case where even the first block alone exceeds
  * `MAX_CHANNEL_CONTENT − CHANNEL_DEFERRED_MARKER.length` is it mid-truncated
  * at a Unicode code-point boundary (mirroring the hook-deliver transport's
- * `renderHookDelivery`) — its full body stays unread (claiming ≠ acking, BP2 /
- * SP4). Per-event change summaries are ALSO individually bounded inside
+ * `renderHookDelivery`), using the distinct {@link CHANNEL_TRUNCATED_MARKER}
+ * — its full body stays unread (claiming ≠ acking, BP2 / SP4), and because
+ * this claim is already committed, the omitted tail will NOT surface on a
+ * later poll (issue #442): the durable unread copy is the only recovery
+ * path. Per-event change summaries are ALSO individually bounded inside
  * {@link buildEventBlock} (006 §4.6, currently 800 chars each), so no single
  * untrusted diff is dumped wholesale regardless of packing.
  */
@@ -247,13 +269,17 @@ export function renderChannelEvent(
     } else {
       // Even the first block alone exceeds (cap − marker): mid-truncate it
       // at a code-point boundary. This is the ONLY case a durable event is
-      // shown partially; its full body stays unread (claiming ≠ acking,
-      // 006 §5.5).
+      // shown partially. Unlike the branch above, THIS claim is already
+      // committed (`first_notified_at` set) — the omitted tail will NOT
+      // surface on a later poll (issue #442), so it uses the distinct
+      // `CHANNEL_TRUNCATED_MARKER`, which points at the durable unread copy
+      // (`agentmonitors events list --unread`) instead of promising a later
+      // re-delivery (claiming ≠ acking, 006 §5.5).
       const firstBlock = blocks[0] ?? '';
       content = appendMarkerWithinCap(
         firstBlock,
         MAX_CHANNEL_CONTENT,
-        CHANNEL_DEFERRED_MARKER,
+        CHANNEL_TRUNCATED_MARKER,
       );
     }
   } else {
