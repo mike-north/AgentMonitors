@@ -409,4 +409,31 @@ describe('buildChannelTruncatedMarker', () => {
     expect(embeddedId).not.toMatch(/[<>[\]\r\n;]/);
     expect(marker).toContain('agentmonitors events list --session');
   });
+
+  // Issue #358/#442, PR #442 round-7 review: `events list` resolves its
+  // socket env-first (issue #335), so a bare (no `--socket`) marker command
+  // could silently query a stale or different workspace's daemon. The marker
+  // must carry the EXACT socket `channel serve` is bound to.
+  it('threads the resolved socket path into the marker as an explicit --socket flag', () => {
+    const marker = buildChannelTruncatedMarker(
+      'session-42',
+      '/tmp/agentmon-real.sock',
+    );
+    expect(marker).toBe(
+      "\n\n(this update was too large to show in full; run `agentmonitors events list --session session-42 --socket '/tmp/agentmon-real.sock' --unread` to see the full copy)",
+    );
+  });
+
+  it('shell-quotes a socket path so the advertised command stays safe to paste', () => {
+    const marker = buildChannelTruncatedMarker(
+      'session-42',
+      "/tmp/weird ' path.sock",
+    );
+    expect(marker).toContain(String.raw`--socket '/tmp/weird '\'' path.sock'`);
+  });
+
+  it('omits --socket entirely when no socket path is supplied', () => {
+    const marker = buildChannelTruncatedMarker('session-42');
+    expect(marker).not.toContain('--socket');
+  });
 });

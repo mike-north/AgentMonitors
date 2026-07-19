@@ -314,18 +314,57 @@ export async function reserveSizedChannelDelivery(
     );
     if (fit.fits) {
       // Re-check for the candidate-set-growth race (issue #442, PR #442
-      // round-6 review): a settled event that arrived AFTER the preview that
-      // sized this reservation, and is therefore not part of the claim,
-      // still needs `moreDeferred: true` so the render signposts it — even
-      // though this claim, taken on its own, fits and needed no shrinking.
-      const revalidatedMoreDeferred =
-        moreDeferred ||
-        (await settledWorkRemainsBeyondClaim(
-          boundSession,
-          socketPath,
-          reservation.claim.events,
-        ));
-      return { reservation, moreDeferred: revalidatedMoreDeferred };
+      // round-6/round-7 review): a settled event that arrived AFTER the
+      // preview that sized this reservation, and is therefore not part of the
+      // claim, still needs `moreDeferred: true` so the render signposts it —
+      // even though this claim, taken on its own, fits and needed no
+      // shrinking. Skipped once `moreDeferred` is already `true` (short
+      // circuit) — a second preview would be redundant.
+      let revalidatedMoreDeferred = moreDeferred;
+      if (!moreDeferred) {
+        try {
+          revalidatedMoreDeferred = await settledWorkRemainsBeyondClaim(
+            boundSession,
+            socketPath,
+            reservation.claim.events,
+          );
+        } catch (error) {
+          // The post-reservation preview itself failed (daemon hiccup mid-poll,
+          // issue #442 round-7 review): release the reservation BEFORE
+          // propagating, or the leased rows stay claimed-in-limbo until the 30s
+          // reservation TTL even though this reservation was never committed —
+          // no other transport (hook path, next poll) could see them either.
+          await releaseDeliveryClient(reservation.reservationId, socketPath);
+          throw error;
+        }
+      }
+      if (!revalidatedMoreDeferred) {
+        return { reservation, moreDeferred };
+      }
+      // `moreDeferred` flipped to `true` AFTER this claim was already accepted
+      // against the ORIGINAL (pre-flip) value: `resolveChannelClaimFit` sizes
+      // against `cap` when `moreDeferred` is `false` but against
+      // `cap − CHANNEL_DEFERRED_MARKER.length` once it's `true` (marker room
+      // must be reserved) — the SAME predicate `renderChannelEvent` uses. A
+      // claim that fit under the wider `false` budget can therefore no longer
+      // fit once marker room is reserved for the newly-`true` value (issue
+      // #442, PR #442 round-7 review): recompute the fit against the FINAL
+      // `moreDeferred` before trusting it, exactly as the initial fit check
+      // above did for the original value.
+      const finalFit = resolveChannelClaimFit(
+        reservation.claim.events,
+        true,
+        MAX_CHANNEL_CONTENT,
+      );
+      if (finalFit.fits) {
+        return { reservation, moreDeferred: true };
+      }
+      // No longer fits under the marker-reserving budget: release (rows return
+      // to pending — nothing lost) and retry through the SAME mismatch path
+      // below, tightening the cap to what was just measured.
+      await releaseDeliveryClient(reservation.reservationId, socketPath);
+      forcedCap = Math.max(1, finalFit.includedCount);
+      continue;
     }
 
     // Mismatch: the actually-claimed set does not fit. Release it (the rows
@@ -526,6 +565,7 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
         (claim, moreDeferred) => {
           const { content, meta } = renderChannelEvent(claim, {
             moreDeferred,
+            socketPath,
           });
           return mcp.notification({
             method: 'notifications/claude/channel',

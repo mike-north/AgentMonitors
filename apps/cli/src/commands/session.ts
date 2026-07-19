@@ -299,7 +299,9 @@ sessionCommand
         'post-compact',
         socket,
       );
-      const delivery = renderHookDelivery(claim, 'SessionStart');
+      const delivery = renderHookDelivery(claim, 'SessionStart', {
+        socketPath: socket,
+      });
       if (delivery !== null) {
         // stdout is the SessionStart hook's wire channel: it MUST contain only
         // this JSON. Do NOT add `console.log`/diagnostics to stdout in this

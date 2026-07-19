@@ -35,6 +35,21 @@ export const MAX_EVENT_DIFF = 800;
 export const DIFF_ELISION_MARKER = '\n… (change summary truncated)';
 
 /**
+ * POSIX single-quote `value` for safe inclusion in a copy-paste shell command
+ * (issue #442). The truncation markers on both transports advertise a
+ * directly-runnable `agentmonitors events list ... --socket <path>` command —
+ * a socket path is a filesystem path and can legitimately contain spaces or
+ * shell metacharacters (e.g. a workspace directory with a space in its name),
+ * so it is quoted rather than interpolated raw. Wraps `value` in single quotes
+ * and escapes any embedded single quote as the POSIX-idiomatic `'\''`
+ * (close-quote, escaped-quote, reopen-quote) so the result is always safe to
+ * paste into `sh`/`bash`/`zsh` verbatim.
+ */
+export function shellQuoteSingle(value: string): string {
+  return `'${value.replaceAll("'", String.raw`'\''`)}'`;
+}
+
+/**
  * Truncate `value` to at most `cap` UTF-16 code units, cutting only at a
  * Unicode CODE-POINT boundary (never splitting a surrogate pair, which would
  * corrupt downstream JSON/tag serialization) and, when truncation occurs,

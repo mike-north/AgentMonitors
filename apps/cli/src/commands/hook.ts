@@ -325,7 +325,12 @@ Diagnosis:
             socketPath,
           );
           if (highPreview.length > 0) {
-            const fit = packEventsUnderCap(highPreview, match.id);
+            const fit = packEventsUnderCap(
+              highPreview,
+              match.id,
+              undefined,
+              socketPath,
+            );
             claim = await claimDeliveryClient(
               match.id,
               lifecycle,
@@ -350,6 +355,7 @@ Diagnosis:
         // text is an inspection aid for humans running it manually.
         const output = renderHookDelivery(claim, hookEventName ?? '', {
           moreDeferred,
+          socketPath,
         });
         debug(describeOutput(output, options.format));
         if (output !== null) {

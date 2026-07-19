@@ -1130,7 +1130,12 @@ async function claimAndRender(
       socketPath,
     );
     if (highPreview.length > 0) {
-      const fit = packEventsUnderCap(highPreview, sessionId);
+      const fit = packEventsUnderCap(
+        highPreview,
+        sessionId,
+        undefined,
+        socketPath,
+      );
       claim = await claimDeliveryClient(sessionId, lifecycle, socketPath, fit);
       moreDeferred = fit < highPreview.length;
     } else {
@@ -1139,7 +1144,10 @@ async function claimAndRender(
   } else {
     claim = await claimDeliveryClient(sessionId, lifecycle, socketPath);
   }
-  const output = renderHookDelivery(claim, hookEventName, { moreDeferred });
+  const output = renderHookDelivery(claim, hookEventName, {
+    moreDeferred,
+    socketPath,
+  });
   return output?.hookSpecificOutput.additionalContext ?? null;
 }
 

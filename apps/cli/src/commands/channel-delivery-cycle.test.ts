@@ -36,6 +36,7 @@ import {
   CHANNEL_DEFERRED_MARKER,
   MAX_CHANNEL_CONTENT,
   renderChannelEvent,
+  resolveChannelClaimFit,
 } from '../channel-render.js';
 import {
   reserveDeliveryClient,
@@ -872,5 +873,198 @@ describe('runChannelDeliveryCycle oversized single-event commit (issue #442, rou
     expect(second).toBe('idle');
     expect(push2).not.toHaveBeenCalled();
     expect(commitMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR #442 round-7 review (comment 3609754507): the candidate-set-growth
+// revalidation (round-6) computes `revalidatedMoreDeferred` AFTER
+// `resolveChannelClaimFit` already accepted the claim against the ORIGINAL
+// `moreDeferred` value. At the cap boundary — two blocks that together fit
+// under the FULL cap but NOT under the marker-reserving budget — a third
+// candidate settling in the revalidation window flips `moreDeferred` to
+// `true` post-acceptance. Left unchecked, `renderChannelEvent` would then
+// have to reserve marker room itself and silently drop the second block from
+// the render while `meta.event_count` still reported the full committed
+// count — a committed-but-unrendered event. The fix recomputes the fit
+// against the FINAL `moreDeferred` and releases/retries on mismatch, exactly
+// like the initial fit check does.
+// ---------------------------------------------------------------------------
+describe('reserveSizedChannelDelivery moreDeferred flip after acceptance (issue #442, round-7 review)', () => {
+  function claimWith(surfaced: DeliveryEventSummary[]): DeliveryClaim {
+    return {
+      sessionId: 'session-1',
+      mode: 'delivery',
+      urgency: 'high',
+      lifecycle: 'turn-interruptible',
+      message: `${String(surfaced.length)} monitor(s) fired`,
+      unreadCounts: {
+        low: 0,
+        normal: 0,
+        high: surfaced.length,
+        total: surfaced.length,
+      },
+      events: surfaced,
+    };
+  }
+
+  /**
+   * Binary-search the largest per-event body size where two SAME-sized
+   * events, joined into blocks, fit under the FULL `MAX_CHANNEL_CONTENT` cap
+   * (`resolveChannelClaimFit(..., false, cap).fits === true`) — computed
+   * against the ACTUAL packing logic (not hand-counted characters), so the
+   * boundary tracks `resolveChannelClaimFit`'s real behavior even if its
+   * overhead per block changes.
+   */
+  function twoEventsAtCapBoundary(): {
+    a: DeliveryEventSummary;
+    b: DeliveryEventSummary;
+  } {
+    const pair = (
+      size: number,
+    ): [DeliveryEventSummary, DeliveryEventSummary] => [
+      makeEvent({ eventId: 'e1', monitorId: 'm1', body: 'q'.repeat(size) }),
+      makeEvent({ eventId: 'e2', monitorId: 'm2', body: 'q'.repeat(size) }),
+    ];
+    let lo = 1;
+    let hi = MAX_CHANNEL_CONTENT;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      const fit = resolveChannelClaimFit(pair(mid), false, MAX_CHANNEL_CONTENT);
+      if (fit.fits) lo = mid;
+      else hi = mid - 1;
+    }
+    const [a, b] = pair(lo);
+    // Sanity-check the boundary actually straddles the marker-reserving
+    // threshold too — i.e. the SAME pair no longer fits once `moreDeferred`
+    // is `true` and marker room must be reserved. If this ever fails, the
+    // packing overhead changed enough that the binary search needs revisiting
+    // — better to fail loudly here than produce a silently-vacuous test below.
+    const reservedFit = resolveChannelClaimFit(
+      [a, b],
+      true,
+      MAX_CHANNEL_CONTENT,
+    );
+    expect(reservedFit.fits).toBe(false);
+    return { a, b };
+  }
+
+  it('releases and re-sizes when a moreDeferred flip (candidate-set growth) makes the accepted claim no longer fit the marker-reserving budget', async () => {
+    const { a, b } = twoEventsAtCapBoundary();
+    const thirdEvent = makeEvent({ eventId: 'e3', monitorId: 'm3' });
+
+    // Attempt 1 sizing preview: only a, b are settled → maxEvents=2,
+    // moreDeferred computed false (both fit, nothing else settled yet).
+    previewMock.mockResolvedValueOnce([a, b]);
+    const claim = claimWith([a, b]);
+    reserveMock.mockResolvedValueOnce({ reservationId: 'r-1', claim });
+    // Revalidation preview (after acceptance): a THIRD event has now settled
+    // too — genuine candidate-set growth.
+    previewMock.mockResolvedValueOnce([a, b, thirdEvent]);
+    // The flip makes the accepted claim (a+b) no longer fit the
+    // marker-reserving budget: released and retried.
+    releaseMock.mockResolvedValueOnce(undefined);
+    // Attempt 2 sizing preview: nothing was claimed (release returned a+b to
+    // pending), so all three are still settled.
+    previewMock.mockResolvedValueOnce([a, b, thirdEvent]);
+    // forcedCap (from the mismatch) constrains this reservation to 1 event.
+    const retryClaim = claimWith([a]);
+    reserveMock.mockResolvedValueOnce({
+      reservationId: 'r-2',
+      claim: retryClaim,
+    });
+
+    const result = await reserveSizedChannelDelivery('session-1', '/sock');
+
+    expect(result).not.toBeNull();
+    // The oversized (a+b) reservation was released, not committed as-is.
+    expect(releaseMock).toHaveBeenCalledTimes(1);
+    expect(releaseMock).toHaveBeenCalledWith('r-1', '/sock');
+    expect(reserveMock).toHaveBeenCalledTimes(2);
+    expect(result?.reservation.reservationId).toBe('r-2');
+    expect(result?.reservation.claim.events.map((e) => e.eventId)).toEqual([
+      'e1',
+    ]);
+    // b and thirdEvent both remain genuinely pending.
+    expect(result?.moreDeferred).toBe(true);
+
+    // Regression: every COMMITTED event must be RENDERED — the render must
+    // never silently drop a committed block while `event_count` still
+    // reports the full committed count.
+    expect(result).not.toBeNull();
+    const committedClaim = result?.reservation.claim as DeliveryClaim;
+    const { content, meta } = renderChannelEvent(committedClaim, {
+      moreDeferred: result?.moreDeferred ?? false,
+    });
+    expect(meta.event_count).toBe(String(committedClaim.events.length));
+    for (const event of committedClaim.events) {
+      expect(content).toContain(`### ${event.monitorId}`);
+    }
+    expect(content).toContain(CHANNEL_DEFERRED_MARKER.trim());
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR #442 round-7 review (comment 3609754507): if the SECOND (post-reservation)
+// revalidation preview call itself rejects (a transient daemon hiccup mid-poll),
+// the `await` previously threw before the reservation id ever reached
+// `runChannelDeliveryCycle` — so `releaseDeliveryClient` was never called and
+// the leased rows stayed claimed-in-limbo until the 30s reservation TTL, even
+// though this reservation was never committed. The fix releases the
+// reservation BEFORE propagating the error.
+// ---------------------------------------------------------------------------
+describe('reserveSizedChannelDelivery post-reservation preview failure (issue #442, round-7 review)', () => {
+  function claimWith(surfaced: DeliveryEventSummary[]): DeliveryClaim {
+    return {
+      sessionId: 'session-1',
+      mode: 'delivery',
+      urgency: 'high',
+      lifecycle: 'turn-interruptible',
+      message: `${String(surfaced.length)} monitor(s) fired`,
+      unreadCounts: {
+        low: 0,
+        normal: 0,
+        high: surfaced.length,
+        total: surfaced.length,
+      },
+      events: surfaced,
+    };
+  }
+
+  it('releases the reservation before propagating when the revalidation preview rejects', async () => {
+    const onlyEvent = makeEvent({ eventId: 'e1', monitorId: 'm1' });
+    previewMock.mockResolvedValueOnce([onlyEvent]);
+    const claim = claimWith([onlyEvent]);
+    reserveMock.mockResolvedValueOnce({ reservationId: 'r-1', claim });
+    previewMock.mockRejectedValueOnce(new Error('daemon unreachable'));
+    releaseMock.mockResolvedValueOnce(undefined);
+
+    await expect(
+      reserveSizedChannelDelivery('session-1', '/sock'),
+    ).rejects.toThrow('daemon unreachable');
+
+    expect(releaseMock).toHaveBeenCalledWith('r-1', '/sock');
+    expect(releaseMock).toHaveBeenCalledTimes(1);
+    // No retry: the reservation is released and the error propagates
+    // immediately, exactly like the mismatch-release-failure path.
+    expect(reserveMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('propagates through runChannelDeliveryCycle too (never leaves the reservation leased)', async () => {
+    const onlyEvent = makeEvent({ eventId: 'e1', monitorId: 'm1' });
+    previewMock.mockResolvedValueOnce([onlyEvent]);
+    const claim = claimWith([onlyEvent]);
+    reserveMock.mockResolvedValueOnce({ reservationId: 'r-1', claim });
+    previewMock.mockRejectedValueOnce(new Error('daemon unreachable'));
+    releaseMock.mockResolvedValueOnce(undefined);
+    const push = vi.fn(okPush);
+
+    await expect(
+      runChannelDeliveryCycle('session-1', '/sock', push),
+    ).rejects.toThrow('daemon unreachable');
+
+    expect(push).not.toHaveBeenCalled();
+    expect(commitMock).not.toHaveBeenCalled();
+    expect(releaseMock).toHaveBeenCalledWith('r-1', '/sock');
   });
 });

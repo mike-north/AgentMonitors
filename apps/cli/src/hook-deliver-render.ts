@@ -4,6 +4,7 @@ import {
   buildEventBlock as buildSharedEventBlock,
   packEventsUnderCap as packSharedEventsUnderCap,
   packWholeBlocks as packSharedWholeBlocks,
+  shellQuoteSingle,
   truncateWithMarker,
 } from './delivery-event-render.js';
 
@@ -13,34 +14,80 @@ const LEAD_LINE =
   'AgentMon: monitored changes are pending — consider handling them before continuing.';
 
 /**
- * Build the marker appended when the assembled context is truncated. It tells
- * the agent the visible context is incomplete and points at the durable,
- * re-discoverable source of the rest. Claiming a delivery does NOT
- * acknowledge it (BP2 / SP4): `unreadEventsForSession` filters on
- * `acknowledgedAt IS NULL` only, so an event whose body was truncated away
- * here remains UNREAD and is still listed by `agentmonitors events list
- * --session <id> --unread` (and re-delivered by the next context event). No
- * event is lost by truncation.
+ * Render the `--socket <path>` clause shared by both hook markers below, or
+ * `''` when no socket was supplied. `socketPath`, when provided, is the
+ * daemon socket THIS hook invocation actually resolved and claimed against
+ * (`hook.ts`'s `socketPath` — the workspace's own persisted/derived socket,
+ * which can differ from `$AGENTMONITORS_SOCKET`, issue #358). `agentmonitors
+ * events list` itself resolves env-first (`resolveManualDaemonSocketPath`,
+ * issue #335), so a copy-pasted recovery command with no `--socket` could
+ * silently query a stale or different workspace's daemon (PR #442 round-7
+ * review). Quoted with {@link shellQuoteSingle} so the advertised command
+ * stays safe to paste verbatim even if the path contains spaces.
+ */
+function socketClause(socketPath: string | undefined): string {
+  return socketPath ? ` --socket ${shellQuoteSingle(socketPath)}` : '';
+}
+
+/**
+ * Build the marker appended when a WHOLE event block was left OUT of this
+ * render — either because it did not fit under the cap, or because the
+ * caller deferred more (`options.moreDeferred`) — but genuinely stays
+ * **pending** (`first_notified_at` still `NULL`): `claimDeliveryClient` only
+ * claimed the events actually rendered, so the omitted remainder re-delivers
+ * at the next context event (006 §5.1/§5.5). "more monitor updates are
+ * pending" is therefore an accurate promise for THIS branch only — see
+ * {@link buildHookClaimedUnreadMarker} for the synchronously-claimed
+ * single-event mid-truncation branch, which must NOT reuse this framing
+ * (issue #442, PR #442 round-7 review — the two branches were previously
+ * rendered by one marker, falsely implying the mid-truncated event's own
+ * omitted tail would also redeliver).
  *
  * `agentmonitors events list` **requires** `--session <id>` (issue #420 P2,
  * `apps/cli/src/commands/events.ts`) — a bare `agentmonitors events list
- * --unread` exits 1, so a marker advertising that alone left the ONLY stated
- * recovery path unusable (issue #442, mirroring the channel transport's
- * `buildChannelTruncatedMarker` fix — `channel-render.ts`). The marker
- * instead renders the exact, directly executable command for the session
- * that received THIS delivery, taking `sessionId` from the claim itself and
- * sanitizing it the same way every other claim-derived field reaching this
- * payload is sanitized (see {@link sanitize}) — an id that happened to carry
- * a raw control character would otherwise corrupt the rendered command.
+ * --unread` exits 1, so the marker renders the exact, directly executable
+ * command for the session that received THIS delivery, taking `sessionId`
+ * from the claim itself and sanitizing it the same way every other
+ * claim-derived field reaching this payload is sanitized (see
+ * {@link sanitize}) — an id that happened to carry a raw control character
+ * would otherwise corrupt the rendered command.
  *
- * The caller passes this marker's own length to {@link packEventsUnderCap},
- * {@link truncateForCap}, and {@link appendMarkerWithinCap} — so the varying
- * length of a longer or shorter session id is already accounted for in cap
- * sizing; no separate adjustment is needed at each call site.
+ * The caller passes this marker's own length to {@link packEventsUnderCap}
+ * and {@link truncateForCap} — so the varying length of a longer or shorter
+ * session id (and, now, socket path) is already accounted for in cap sizing;
+ * no separate adjustment is needed at each call site.
  */
-function buildHookTruncatedMarker(sessionId: string): string {
+function buildHookDeferredMarker(
+  sessionId: string,
+  socketPath?: string,
+): string {
   const safeSessionId = sanitize(sessionId);
-  return `\n\n[truncated — more monitor updates are pending; run \`agentmonitors events list --session ${safeSessionId} --unread\` to see the rest]`;
+  return `\n\n[truncated — more monitor updates are pending; run \`agentmonitors events list --session ${safeSessionId}${socketClause(socketPath)} --unread\` to see the rest]`;
+}
+
+/**
+ * Build the marker appended when THIS claim's own render was cut short but
+ * the underlying row is ALREADY claimed (`claimDeliveryClient` sets
+ * `first_notified_at` synchronously, before this render runs) — so, unlike
+ * {@link buildHookDeferredMarker}, the omitted content will NOT surface again
+ * via the ordinary context-event flow (`pendingEventsForSession` never
+ * returns a claimed row, 006 §5.1/§5.5). Used for: (1) the single-event
+ * mid-truncation branch (one event's own block exceeds the cap and is shown
+ * partially), and (2) a reminder claim (`normal`/`low`, no event blocks) whose
+ * coalesced `message` itself is long enough to need truncating — both are
+ * this SAME claim's own content being cut, not other pending work being
+ * deferred (issue #442, PR #442 round-7 review). Its only recovery path is
+ * the durable, still-unread copy of the full event (claiming ≠ acking, BP2 /
+ * SP4), so the framing says so explicitly instead of promising a redelivery
+ * that will not happen — mirroring the channel transport's
+ * `buildChannelTruncatedMarker` (`channel-render.ts`).
+ */
+function buildHookClaimedUnreadMarker(
+  sessionId: string,
+  socketPath?: string,
+): string {
+  const safeSessionId = sanitize(sessionId);
+  return `\n\n[truncated — this update was too large to show in full; it is claimed but NOT acknowledged, so the full copy stays unread (it will not redeliver automatically) — run \`agentmonitors events list --session ${safeSessionId}${socketClause(socketPath)} --unread\` to see it]`;
 }
 
 /**
@@ -157,9 +204,10 @@ function packWholeBlocks(
  *
  * `sessionId` is the session the sizing decision is being made for (the same
  * id the eventual claim/render will carry) — it MUST size against the marker
- * this session's own {@link buildHookTruncatedMarker} produces, since a longer
- * or shorter session id changes the marker's length and therefore how many
- * whole blocks fit (issue #442).
+ * this session's own {@link buildHookDeferredMarker} produces (the marker
+ * `renderHookDelivery` actually appends when whole blocks are deferred), since
+ * a longer or shorter session id (and socket path) changes the marker's
+ * length and therefore how many whole blocks fit (issue #442).
  *
  * When not everything fits, room is reserved for the truncation marker so no
  * INCLUDED block is cut. At least 1 is returned when there is any event — there
@@ -172,11 +220,12 @@ export function packEventsUnderCap(
   events: DeliveryEventSummary[],
   sessionId: string,
   cap: number = MAX_ADDITIONAL_CONTEXT,
+  socketPath?: string,
 ): number {
   return packSharedEventsUnderCap(events, sanitize, cap, {
     header: HEADER,
     joiner: '\n',
-    markerLength: buildHookTruncatedMarker(sessionId).length,
+    markerLength: buildHookDeferredMarker(sessionId, socketPath).length,
   });
 }
 
@@ -189,6 +238,14 @@ export interface RenderHookDeliveryOptions {
    * claimed events themselves fit.
    */
   moreDeferred?: boolean;
+  /**
+   * The daemon socket path THIS hook invocation actually resolved and claimed
+   * against (`hook.ts`'s `socketPath`). Threaded into both marker builders so
+   * their advertised recovery command carries an explicit `--socket <path>`
+   * (issue #358, PR #442 round-7 review) instead of relying on
+   * `$AGENTMONITORS_SOCKET`, which `events list` resolves env-first.
+   */
+  socketPath?: string;
 }
 
 /**
@@ -206,20 +263,27 @@ export interface RenderHookDeliveryOptions {
  *   length-bounded transport can claim exactly what it renders. When events are
  *   omitted here — because they did not fit, or because the caller deferred more
  *   via {@link RenderHookDeliveryOptions.moreDeferred} — the marker built by
- *   {@link buildHookTruncatedMarker} (a directly runnable `agentmonitors events
+ *   {@link buildHookDeferredMarker} (a directly runnable `agentmonitors events
  *   list --session <id> --unread` for THIS claim's session, issue #442 — a bare
  *   `--unread` without `--session` exits 1) is appended pointing at the
- *   still-unread rest. Only when a SINGLE event's own block exceeds the cap is
- *   it shown partially (mid-truncated at a code-point boundary); its full body
- *   stays unread (claiming ≠ acking, BP2 / SP4).
+ *   genuinely-pending rest, which re-delivers at the next context event. Only
+ *   when a SINGLE event's own block exceeds the cap is it shown partially
+ *   (mid-truncated at a code-point boundary) — this is a DIFFERENT case: the
+ *   row is already claimed (`claimDeliveryClient` set `first_notified_at`
+ *   synchronously before this render runs), so the omitted tail will NOT
+ *   redeliver via the ordinary context-event flow. That branch uses the
+ *   distinct {@link buildHookClaimedUnreadMarker} instead (issue #442, PR #442
+ *   round-7 review) — its full body stays unread (claiming ≠ acking, BP2 /
+ *   SP4), recoverable only via the durable unread copy.
  * - **Reminder line** — a `normal`/`low` turn-boundary claim carries no event
  *   bodies (`events: []`) but a populated `message` (the same advisory line
  *   `hook claim` surfaces). It renders that message as a sanitized, length-capped
  *   reminder line, with **no** body injection — so a default (`normal`-urgency)
  *   monitor produces a visible mid-turn signal instead of silence. The
- *   underlying rows are claimed but NOT acknowledged (BP2 / SP4), so the event
+ *   underlying row is ALREADY claimed (not deferred), so any truncation of the
+ *   message itself also uses {@link buildHookClaimedUnreadMarker} — the event
  *   stays unread and re-discoverable via `agentmonitors events list --session
- *   <id> --unread`.
+ *   <id> --unread`, but will not redeliver on its own.
  *
  * The renderer is **pure and side-effect-free**: no I/O, no mutation. Text is
  * preserved faithfully (a monitor body is trusted, user-authored markdown) with
@@ -237,10 +301,21 @@ export function renderHookDelivery(
 ): HookDeliveryOutput | null {
   if (!claim) return null;
 
-  // Built once per claim from its own `sessionId` (issue #442) so every marker
+  // Built once per claim from its own `sessionId` (issue #442) and the
+  // resolved `socketPath` (issue #358, PR #442 round-7 review) so every marker
   // rendered below points at the exact, directly runnable recovery command for
-  // THIS claim's session — see {@link buildHookTruncatedMarker}.
-  const truncatedMarker = buildHookTruncatedMarker(claim.sessionId);
+  // THIS claim's session — see {@link buildHookDeferredMarker} and
+  // {@link buildHookClaimedUnreadMarker}. The two are DELIBERATELY distinct
+  // (see their doc comments): the deferred marker promises a redelivery that
+  // will actually happen; the claimed-unread marker does not.
+  const deferredMarker = buildHookDeferredMarker(
+    claim.sessionId,
+    options.socketPath,
+  );
+  const claimedUnreadMarker = buildHookClaimedUnreadMarker(
+    claim.sessionId,
+    options.socketPath,
+  );
 
   // Reminder-only delivery (issue #198): a `normal`/`low` turn-boundary claim
   // has no event bodies to inject, only a lightweight advisory `message`. Body
@@ -248,7 +323,11 @@ export function renderHookDelivery(
   // which populate `events`), so surface the message as a reminder line instead
   // of emitting nothing. A genuinely empty claim (no events, blank message) is
   // never produced by the runtime — `claimDelivery` returns `null` when nothing
-  // is pending — but we still guard for it so the caller stays silent.
+  // is pending — but we still guard for it so the caller stays silent. The
+  // underlying row is ALREADY claimed by the time this renders, so a truncated
+  // reminder uses the claimed-unread marker, not the deferred one (issue #442,
+  // PR #442 round-7 review) — there is no "more updates pending" to promise
+  // here; it is THIS claim's own message being cut.
   if (claim.events.length === 0) {
     const reminder = sanitize(claim.message);
     if (reminder.trim().length === 0) return null;
@@ -259,7 +338,7 @@ export function renderHookDelivery(
         additionalContext: truncateForCap(
           reminder,
           MAX_ADDITIONAL_CONTEXT,
-          truncatedMarker,
+          claimedUnreadMarker,
         ),
       },
     };
@@ -276,22 +355,27 @@ export function renderHookDelivery(
   } else {
     // A marker is needed (some claimed blocks did not fit here, and/or the caller
     // deferred more). Repack reserving marker room so no INCLUDED block is cut.
+    // Sized against the DEFERRED marker: this branch only fires when at least
+    // one WHOLE block was genuinely left pending (unclaimed), which is exactly
+    // what that marker promises.
     const reserved = packWholeBlocks(
       HEADER,
       blocks,
-      MAX_ADDITIONAL_CONTEXT - truncatedMarker.length,
+      MAX_ADDITIONAL_CONTEXT - deferredMarker.length,
     );
     if (reserved.includedCount >= 1) {
-      additionalContext = reserved.text + truncatedMarker;
+      additionalContext = reserved.text + deferredMarker;
     } else {
       // Even the first block alone exceeds (cap − marker): mid-truncate block 0
       // at a code-point boundary. This is the ONLY case a durable event is shown
-      // partially; its full body stays unread (claiming ≠ acking, 006 §5.5).
+      // partially — and unlike the branch above, THIS event is already claimed,
+      // so its own omitted tail will NOT redeliver (issue #442, PR #442 round-7
+      // review): use the claimed-unread marker, which says so.
       const firstBlock = blocks[0] ?? '';
       additionalContext = appendMarkerWithinCap(
         HEADER + firstBlock,
         MAX_ADDITIONAL_CONTEXT,
-        truncatedMarker,
+        claimedUnreadMarker,
       );
     }
   }

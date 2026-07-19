@@ -276,11 +276,15 @@ describe('renderHookDelivery', () => {
 
   // (e.2) truncation marker: an over-cap body yields output that is (a) ≤ cap
   // and (b) ends with the explicit, directly runnable session-scoped
-  // truncation marker pointing at the still-unread events (issue #442: a bare
+  // truncation marker pointing at the still-unread event (issue #442: a bare
   // `--unread` without `--session <id>` exits 1, so the marker must render the
-  // real command for the claim's own session, not the unusable bare form).
+  // real command for the claim's own session, not the unusable bare form). A
+  // SINGLE oversized event's own block is claimed synchronously before this
+  // renders, so it uses the claimed-unread framing, not the "more updates are
+  // pending" deferred framing (issue #442, PR #442 round-7 review) — the
+  // omitted tail will NOT redeliver via the ordinary context-event flow.
   const TRUNCATION_TAIL =
-    'run `agentmonitors events list --session s1 --unread` to see the rest]';
+    'run `agentmonitors events list --session s1 --unread` to see it]';
   it('appends an explicit truncation marker when over the cap', () => {
     const largeBody = 'x'.repeat(10_000);
     const out = renderHookDelivery(
@@ -332,17 +336,66 @@ describe('renderHookDelivery', () => {
     );
     const ctx = out?.hookSpecificOutput.additionalContext ?? '';
     expect(ctx).toContain(
-      'run `agentmonitors events list --session session-abc-123 --unread` to see the rest',
+      'run `agentmonitors events list --session session-abc-123 --unread` to see it',
     );
     // The unusable bare form (no --session) must never appear.
-    expect(ctx).not.toContain(
-      '`agentmonitors events list --unread` to see the rest',
+    expect(ctx).not.toContain('`agentmonitors events list --unread` to see it');
+    // The claimed-unread framing, not the "more updates are pending" one —
+    // this event's own tail will not redeliver (issue #442, PR #442 round-7
+    // review).
+    expect(ctx).toContain('will not redeliver automatically');
+    expect(ctx).not.toContain('more monitor updates are pending');
+  });
+
+  // (e.2.3 — issue #358/#442, PR #442 round-7 review) the marker's recovery
+  // command must carry an explicit `--socket <path>`, since `events list`
+  // resolves its own socket env-first (issue #335) and would otherwise ignore
+  // the workspace's own (possibly different) resolved socket, silently
+  // querying a stale or wrong daemon.
+  it('threads the resolved socket path into the marker as an explicit --socket flag', () => {
+    const largeBody = 'x'.repeat(10_000);
+    const out = renderHookDelivery(
+      makeClaim({
+        sessionId: 'session-abc-123',
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'watch-src',
+            title: 'Files changed',
+            summary: 'Files changed',
+            body: largeBody,
+            urgency: 'high',
+            createdAt: '2026-06-04T00:00:00.000Z',
+          },
+        ],
+      }),
+      'PreToolUse',
+      { socketPath: '/tmp/agentmon-real.sock' },
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).toContain(
+      "run `agentmonitors events list --session session-abc-123 --socket '/tmp/agentmon-real.sock' --unread` to see it",
     );
   });
 
-  // (e.2.2 — issue #442) the `moreDeferred` reminder-style marker (appended
-  // even when the claimed events themselves fit) is ALSO session-scoped, since
-  // it reuses the same marker builder.
+  // A socket path containing a shell metacharacter (a single quote) must not
+  // corrupt the advertised command or allow shell injection when pasted
+  // verbatim.
+  it('shell-quotes a socket path so the advertised command stays safe to paste', () => {
+    const out = renderHookDelivery(
+      makeClaim({ sessionId: 'session-xyz' }),
+      'PostToolUse',
+      { moreDeferred: true, socketPath: "/tmp/weird ' path.sock" },
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).toContain(String.raw`--socket '/tmp/weird '\'' path.sock'`);
+  });
+
+  // (e.2.2 — issue #442) the `moreDeferred` deferred-remainder marker (appended
+  // when genuinely-pending events were left unclaimed) is ALSO session-scoped
+  // — and, unlike the mid-truncation case above, keeps the "more updates are
+  // pending" framing, since those events really do redeliver (issue #442, PR
+  // #442 round-7 review).
   it('renders a session-scoped marker when the caller deferred more events', () => {
     const out = renderHookDelivery(
       makeClaim({ sessionId: 'session-xyz' }),
@@ -569,6 +622,27 @@ describe('packEventsUnderCap', () => {
     const longFit = packEventsUnderCap(events, longSessionId);
     expect(shortFit).toBe(2);
     expect(longFit).toBe(1);
+  });
+
+  // (issue #358/#442, PR #442 round-7 review) the marker now also embeds an
+  // explicit `--socket <path>`, so a long socket path must ALSO shrink how
+  // many whole blocks fit — mirroring the long-session-id case above.
+  it('sizes against the socket path length, not just the session id', () => {
+    const events = [
+      makeEvent('mon-a', 'a'.repeat(1700)),
+      makeEvent('mon-b', 'b'.repeat(1700)),
+      makeEvent('mon-c', 'c'.repeat(1700)),
+    ];
+    const longSocketPath = '/tmp/' + 'x'.repeat(500) + '.sock';
+    const noSocketFit = packEventsUnderCap(events, 's1');
+    const withSocketFit = packEventsUnderCap(
+      events,
+      's1',
+      undefined,
+      longSocketPath,
+    );
+    expect(noSocketFit).toBe(2);
+    expect(withSocketFit).toBe(1);
   });
 });
 

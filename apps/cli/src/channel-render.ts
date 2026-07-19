@@ -4,6 +4,7 @@ import {
   buildEventBlock,
   packEventsUnderCap as packSharedEventsUnderCap,
   packWholeBlocks,
+  shellQuoteSingle,
   type PackedBlocks,
 } from './delivery-event-render.js';
 
@@ -89,12 +90,31 @@ export const CHANNEL_DEFERRED_MARKER =
  * The caller ({@link renderChannelEvent}) passes this marker's length to
  * {@link appendMarkerWithinCap}, which computes its truncation budget from
  * the marker's ACTUAL length — so the varying length of a longer or shorter
- * session id is already accounted for in cap sizing; no separate adjustment
- * is needed at the call site.
+ * session id (and, now, socket path) is already accounted for in cap sizing;
+ * no separate adjustment is needed at the call site.
+ *
+ * `socketPath`, when provided, is rendered as an explicit `--socket <path>`
+ * so the advertised command is reliably runnable regardless of
+ * `$AGENTMONITORS_SOCKET` (issue #358, PR #442 round-7 review): `channel
+ * serve` may be bound to an **enabled workspace's own persisted/derived
+ * socket** (`resolveChannelSocketPath`, `channel.ts`), which takes precedence
+ * over a stale `AGENTMONITORS_SOCKET` left over from a different workspace —
+ * but `agentmonitors events list` itself resolves env-first
+ * (`resolveManualDaemonSocketPath`, issue #335), so a copy-pasted command with
+ * no `--socket` could silently query the wrong (or a dead) daemon. The path
+ * is quoted with {@link shellQuoteSingle} so it stays safe to paste verbatim
+ * even if it contains spaces. Omitted (no `--socket` clause) only when the
+ * caller genuinely has no socket to advertise.
  */
-export function buildChannelTruncatedMarker(sessionId: string): string {
+export function buildChannelTruncatedMarker(
+  sessionId: string,
+  socketPath?: string,
+): string {
   const safeSessionId = metaValue(sessionId);
-  return `\n\n(this update was too large to show in full; run \`agentmonitors events list --session ${safeSessionId} --unread\` to see the full copy)`;
+  const socketClause = socketPath
+    ? ` --socket ${shellQuoteSingle(socketPath)}`
+    : '';
+  return `\n\n(this update was too large to show in full; run \`agentmonitors events list --session ${safeSessionId}${socketClause} --unread\` to see the full copy)`;
 }
 
 /**
@@ -200,6 +220,16 @@ export interface RenderChannelEventOptions {
    * fits.
    */
   moreDeferred?: boolean;
+  /**
+   * The daemon socket path THIS `channel serve` poll is actually bound to
+   * (`resolveChannelSocketPath`, `channel.ts`). Threaded into
+   * {@link buildChannelTruncatedMarker} so the mid-truncation marker's
+   * advertised recovery command carries an explicit `--socket <path>` (issue
+   * #358, PR #442 round-7 review) rather than relying on
+   * `$AGENTMONITORS_SOCKET`, which `events list` resolves env-first and can
+   * point at a stale or different workspace's daemon.
+   */
+  socketPath?: string;
 }
 
 /**
@@ -299,7 +329,10 @@ export function renderChannelEvent(
       // `--unread` without `--session` exits 1) instead of promising a later
       // re-delivery (claiming ≠ acking, 006 §5.5).
       const firstBlock = blocks[0] ?? '';
-      const truncatedMarker = buildChannelTruncatedMarker(claim.sessionId);
+      const truncatedMarker = buildChannelTruncatedMarker(
+        claim.sessionId,
+        options.socketPath,
+      );
       content = appendMarkerWithinCap(
         firstBlock,
         MAX_CHANNEL_CONTENT,

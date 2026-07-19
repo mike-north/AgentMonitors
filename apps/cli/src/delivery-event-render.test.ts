@@ -18,6 +18,7 @@ import {
   MAX_EVENT_DIFF,
   packEventsUnderCap,
   packWholeBlocks,
+  shellQuoteSingle,
   truncateWithMarker,
 } from './delivery-event-render.js';
 
@@ -37,6 +38,26 @@ function makeEvent(
     ...overrides,
   };
 }
+
+describe('shellQuoteSingle', () => {
+  it('wraps a plain path in single quotes', () => {
+    expect(shellQuoteSingle('/tmp/agentmon.sock')).toBe("'/tmp/agentmon.sock'");
+  });
+
+  it('escapes an embedded single quote so the quoted command stays valid shell syntax', () => {
+    expect(shellQuoteSingle("/tmp/weird ' path.sock")).toBe(
+      String.raw`'/tmp/weird '\'' path.sock'`,
+    );
+  });
+
+  it('quotes a path containing spaces (a common workspace-directory case)', () => {
+    const quoted = shellQuoteSingle('/Users/me/My Project/.sock');
+    // Round-trips as a single shell word: no unescaped, unquoted space.
+    expect(quoted).toBe("'/Users/me/My Project/.sock'");
+    expect(quoted.startsWith("'")).toBe(true);
+    expect(quoted.endsWith("'")).toBe(true);
+  });
+});
 
 describe('truncateWithMarker', () => {
   it('returns the value unchanged when it already fits under the cap', () => {
