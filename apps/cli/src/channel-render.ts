@@ -4,6 +4,7 @@ import {
   buildEventBlock,
   packEventsUnderCap as packSharedEventsUnderCap,
   packWholeBlocks,
+  type PackedBlocks,
 } from './delivery-event-render.js';
 
 // Channel `meta` values become tag attributes, so strip anything that could
@@ -78,6 +79,76 @@ export function packChannelEventsUnderCap(
     joiner: '\n\n',
     markerLength: CHANNEL_DEFERRED_MARKER.length,
   });
+}
+
+/** The result of {@link resolveChannelClaimFit}. */
+export interface ChannelClaimFit {
+  /**
+   * Whether {@link renderChannelEvent} will render EVERY block in `events`
+   * WHOLE for the given `moreDeferred` flag — i.e. nothing in the claim gets
+   * cut, though {@link CHANNEL_DEFERRED_MARKER} may still be appended when
+   * `moreDeferred` is true even though nothing was cut. This is the fit
+   * question `channel.ts`'s post-reserve check needs (issue #442): did the
+   * ACTUAL claim survive rendering intact?
+   */
+  fits: boolean;
+  /**
+   * How many whole blocks fit under the EFFECTIVE budget the renderer will
+   * use for this claim — at least 1 for a non-empty claim (forward
+   * progress), matching {@link packChannelEventsUnderCap}'s semantics.
+   */
+  includedCount: number;
+  /** Blocks packed at the FULL `cap` (no marker room reserved). */
+  whole: PackedBlocks;
+  /** Blocks packed at `cap − CHANNEL_DEFERRED_MARKER.length` — the budget
+   * {@link renderChannelEvent} actually uses whenever a marker will be
+   * appended. */
+  reserved: PackedBlocks;
+}
+
+/**
+ * Determine whether {@link renderChannelEvent} will render every block of
+ * `events` WHOLE, checked against the SAME effective budget the renderer
+ * itself uses (issue #442, PR #442 round-3 review). This is the ONE place
+ * that decision is computed: both `renderChannelEvent` (deciding whether to
+ * append {@link CHANNEL_DEFERRED_MARKER} and, if so, how many blocks make the
+ * cut) and `channel.ts`'s `reserveSizedChannelDelivery` (deciding whether the
+ * just-reserved ACTUAL claim needs to be released and re-sized) call this
+ * function, so the two sizing predicates can never diverge.
+ *
+ * Before this was shared, `channel.ts` validated the actual claim against the
+ * FULL `MAX_CHANNEL_CONTENT` via `packChannelEventsUnderCap`, while
+ * `renderChannelEvent` repacks with room reserved for the marker whenever one
+ * will be needed (`moreDeferred`, or the count check itself would defer). A
+ * claim whose joined length landed between `(cap − marker)` and `cap` passed
+ * the channel.ts check (it fit under the full cap) but was then silently
+ * shrunk by the renderer — the committed set no longer equalled the rendered
+ * set, while `meta.event_count` still reported the full committed count.
+ */
+export function resolveChannelClaimFit(
+  events: DeliveryEventSummary[],
+  moreDeferred: boolean,
+  cap: number = MAX_CHANNEL_CONTENT,
+): ChannelClaimFit {
+  const blocks = events.map((event) => buildEventBlock(event, contentValue));
+  const whole = packWholeBlocks(blocks, cap, { joiner: '\n\n' });
+  const reserved = packWholeBlocks(
+    blocks,
+    cap - CHANNEL_DEFERRED_MARKER.length,
+    {
+      joiner: '\n\n',
+    },
+  );
+  if (whole.includedCount === blocks.length && !moreDeferred) {
+    return { fits: true, includedCount: blocks.length, whole, reserved };
+  }
+  const includedCount = Math.max(1, reserved.includedCount);
+  return {
+    fits: includedCount === blocks.length,
+    includedCount,
+    whole,
+    reserved,
+  };
 }
 
 /** Optional signals for {@link renderChannelEvent}. */
@@ -160,35 +231,30 @@ export function renderChannelEvent(
     const blocks = claim.events.map((event) =>
       buildEventBlock(event, contentValue),
     );
-    const whole = packWholeBlocks(blocks, MAX_CHANNEL_CONTENT, {
-      joiner: '\n\n',
-    });
-    if (whole.includedCount === blocks.length && !moreDeferred) {
+    const fit = resolveChannelClaimFit(
+      claim.events,
+      moreDeferred,
+      MAX_CHANNEL_CONTENT,
+    );
+    if (fit.whole.includedCount === blocks.length && !moreDeferred) {
       // Every claimed block fits and nothing was deferred → no marker.
-      content = whole.text;
-    } else {
+      content = fit.whole.text;
+    } else if (fit.reserved.includedCount >= 1) {
       // A marker is needed (some claimed blocks did not fit here, and/or the
       // caller deferred more): repack reserving marker room so no INCLUDED
       // block is cut.
-      const reserved = packWholeBlocks(
-        blocks,
-        MAX_CHANNEL_CONTENT - CHANNEL_DEFERRED_MARKER.length,
-        { joiner: '\n\n' },
+      content = fit.reserved.text + CHANNEL_DEFERRED_MARKER;
+    } else {
+      // Even the first block alone exceeds (cap − marker): mid-truncate it
+      // at a code-point boundary. This is the ONLY case a durable event is
+      // shown partially; its full body stays unread (claiming ≠ acking,
+      // 006 §5.5).
+      const firstBlock = blocks[0] ?? '';
+      content = appendMarkerWithinCap(
+        firstBlock,
+        MAX_CHANNEL_CONTENT,
+        CHANNEL_DEFERRED_MARKER,
       );
-      if (reserved.includedCount >= 1) {
-        content = reserved.text + CHANNEL_DEFERRED_MARKER;
-      } else {
-        // Even the first block alone exceeds (cap − marker): mid-truncate it
-        // at a code-point boundary. This is the ONLY case a durable event is
-        // shown partially; its full body stays unread (claiming ≠ acking,
-        // 006 §5.5).
-        const firstBlock = blocks[0] ?? '';
-        content = appendMarkerWithinCap(
-          firstBlock,
-          MAX_CHANNEL_CONTENT,
-          CHANNEL_DEFERRED_MARKER,
-        );
-      }
     }
   } else {
     content = contentValue(claim.message);

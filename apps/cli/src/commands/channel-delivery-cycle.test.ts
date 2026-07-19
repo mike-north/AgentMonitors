@@ -466,3 +466,174 @@ describe('reserveSizedChannelDelivery race handling (issue #442)', () => {
     expect(content.length).toBeLessThanOrEqual(MAX_CHANNEL_CONTENT);
   });
 });
+
+// ---------------------------------------------------------------------------
+// PR #442 round-3 review: the actual-claim fit check must validate against
+// the SAME effective budget `renderChannelEvent` uses, not the full cap alone
+// (`packChannelEventsUnderCap(actualEvents)` in isolation omits the
+// deferred-marker budget). Reproduces the reviewer's on-head probe: two
+// blocks whose joined length lands strictly between `(cap − marker)` and
+// `cap` pass a full-cap-only check, but `renderChannelEvent` — because
+// `moreDeferred` is true — repacks WITH marker room reserved and drops the
+// second block. Before the fix, `meta.event_count` reported 2 while only one
+// block's content was actually rendered, and both rows were committed
+// (silently losing the second event's surfaced content, though the row
+// itself stayed durable).
+// ---------------------------------------------------------------------------
+describe('reserveSizedChannelDelivery actual-claim fit vs. renderer budget (issue #442, round-3 review)', () => {
+  // Calibrated so the two blocks joined (b1 + '\n\n' + b2) land at 19,938
+  // chars: > (MAX_CHANNEL_CONTENT − CHANNEL_DEFERRED_MARKER.length = 19,929)
+  // but <= MAX_CHANNEL_CONTENT (20,000) — the exact boundary window the old
+  // full-cap-only check could not see.
+  const BOUNDARY_BODY = 'x'.repeat(9950);
+
+  function claimWith(surfaced: DeliveryEventSummary[]): DeliveryClaim {
+    return {
+      sessionId: 'session-1',
+      mode: 'delivery',
+      urgency: 'high',
+      lifecycle: 'turn-interruptible',
+      message: `${String(surfaced.length)} monitor(s) fired`,
+      unreadCounts: {
+        low: 0,
+        normal: 0,
+        high: surfaced.length,
+        total: surfaced.length,
+      },
+      events: surfaced,
+    };
+  }
+
+  it('releases and re-sizes a claim that fits the full cap but not the marker-reserved budget when moreDeferred is true', async () => {
+    const boundaryEvents = [
+      makeEvent({ eventId: 'e1', monitorId: 'm1', body: BOUNDARY_BODY }),
+      makeEvent({ eventId: 'e2', monitorId: 'm2', body: BOUNDARY_BODY }),
+    ];
+    // A third, unrelated settled event forces the preview-time sizing to
+    // moreDeferred: true (its own pack, over 3 events, already reserves
+    // marker room and sizes down to 1) — but the mocked reservation
+    // "substitutes" the two boundary-sized events instead (mirroring the
+    // preview↔reserve race the existing race(a)/(b) tests exercise), so the
+    // actually-claimed set is exactly the boundary pair above.
+    const thirdEvent = makeEvent({
+      eventId: 'e3',
+      monitorId: 'm3',
+      body: 'z'.repeat(200),
+    });
+    previewMock.mockResolvedValueOnce([
+      boundaryEvents[0] as DeliveryEventSummary,
+      boundaryEvents[1] as DeliveryEventSummary,
+      thirdEvent,
+    ]);
+    const mismatchedClaim = claimWith(boundaryEvents);
+    reserveMock.mockResolvedValueOnce({
+      reservationId: 'r-boundary',
+      claim: mismatchedClaim,
+    });
+    releaseMock.mockResolvedValueOnce(undefined);
+
+    // Retry: the rows are still pending (released, not claimed) and this
+    // time size/reserve correctly to a single event.
+    previewMock.mockResolvedValueOnce([
+      boundaryEvents[0] as DeliveryEventSummary,
+    ]);
+    const fixedClaim = claimWith([boundaryEvents[0] as DeliveryEventSummary]);
+    reserveMock.mockResolvedValueOnce({
+      reservationId: 'r-fixed',
+      claim: fixedClaim,
+    });
+
+    const result = await reserveSizedChannelDelivery('session-1', '/sock');
+
+    expect(result).not.toBeNull();
+    // The boundary-fitting-but-marker-shrinking claim was released, not
+    // trusted as-is.
+    expect(releaseMock).toHaveBeenCalledWith('r-boundary', '/sock');
+    expect(result?.reservation.reservationId).toBe('r-fixed');
+
+    // The invariant this fixes: render the FINAL committed claim and assert
+    // the committed set equals the rendered set — every committed event's
+    // block actually appears, and `event_count` matches the events actually
+    // present (never reporting more than what was rendered).
+    const { content, meta } = renderChannelEvent(
+      result?.reservation.claim as DeliveryClaim,
+      { moreDeferred: result?.moreDeferred ?? false },
+    );
+    const committedEvents = (result?.reservation.claim as DeliveryClaim).events;
+    expect(meta.event_count).toBe(String(committedEvents.length));
+    for (const event of committedEvents) {
+      expect(content).toContain(`### ${event.monitorId} (high)`);
+    }
+    expect(content.length).toBeLessThanOrEqual(MAX_CHANNEL_CONTENT);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR #442 round-3 review: a release failure on the mismatch path must
+// propagate — not be swallowed — so the oversized reservation's stuck-leased
+// rows are surfaced as a cycle failure rather than misreported as `'idle'`.
+// ---------------------------------------------------------------------------
+describe('reserveSizedChannelDelivery mismatch-release failure propagation (issue #442, round-3 review)', () => {
+  const BIG_BODY = 'q'.repeat(Math.floor(MAX_CHANNEL_CONTENT / 2.2));
+
+  function claimWith(surfaced: DeliveryEventSummary[]): DeliveryClaim {
+    return {
+      sessionId: 'session-1',
+      mode: 'delivery',
+      urgency: 'high',
+      lifecycle: 'turn-interruptible',
+      message: `${String(surfaced.length)} monitor(s) fired`,
+      unreadCounts: {
+        low: 0,
+        normal: 0,
+        high: surfaced.length,
+        total: surfaced.length,
+      },
+      events: surfaced,
+    };
+  }
+
+  it('propagates a release rejection instead of swallowing it, and does not attempt a retry reservation', async () => {
+    const oversizedEvents = [
+      makeEvent({ eventId: 'o1', monitorId: 'om1', body: BIG_BODY }),
+      makeEvent({ eventId: 'o2', monitorId: 'om2', body: BIG_BODY }),
+      makeEvent({ eventId: 'o3', monitorId: 'om3', body: BIG_BODY }),
+    ];
+    previewMock.mockResolvedValueOnce(oversizedEvents);
+    reserveMock.mockResolvedValueOnce({
+      reservationId: 'r-oversized',
+      claim: claimWith(oversizedEvents),
+    });
+    releaseMock.mockRejectedValueOnce(new Error('daemon unreachable'));
+
+    await expect(
+      reserveSizedChannelDelivery('session-1', '/sock'),
+    ).rejects.toThrow('daemon unreachable');
+
+    // No retry: the loop must not proceed past a release it could not
+    // confirm succeeded.
+    expect(reserveMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('propagates through runChannelDeliveryCycle too (never misreports "idle")', async () => {
+    const oversizedEvents = [
+      makeEvent({ eventId: 'o1', monitorId: 'om1', body: BIG_BODY }),
+      makeEvent({ eventId: 'o2', monitorId: 'om2', body: BIG_BODY }),
+      makeEvent({ eventId: 'o3', monitorId: 'om3', body: BIG_BODY }),
+    ];
+    previewMock.mockResolvedValueOnce(oversizedEvents);
+    reserveMock.mockResolvedValueOnce({
+      reservationId: 'r-oversized',
+      claim: claimWith(oversizedEvents),
+    });
+    releaseMock.mockRejectedValueOnce(new Error('daemon unreachable'));
+    const push = vi.fn(okPush);
+
+    await expect(
+      runChannelDeliveryCycle('session-1', '/sock', push),
+    ).rejects.toThrow('daemon unreachable');
+
+    expect(push).not.toHaveBeenCalled();
+    expect(commitMock).not.toHaveBeenCalled();
+  });
+});

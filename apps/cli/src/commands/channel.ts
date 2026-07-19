@@ -19,8 +19,10 @@ import { resolveSocketPath } from '../daemon-ipc.js';
 import { readLocalState } from '../local-state.js';
 import { workspacePaths } from '../workspace-paths.js';
 import {
+  MAX_CHANNEL_CONTENT,
   packChannelEventsUnderCap,
   renderChannelEvent,
+  resolveChannelClaimFit,
 } from '../channel-render.js';
 import { ACK_TOOL, parseAckArgs } from '../channel-ack.js';
 
@@ -164,17 +166,31 @@ const MAX_CHANNEL_RESERVE_ATTEMPTS = 3;
  *
  * Either way, `reserveDelivery`'s `maxEvents` bounds only the CANDIDATE
  * *count*, not the actually-claimed content size. This re-derives the fit from
- * the REAL claimed events (`packChannelEventsUnderCap(reservation.claim.events)`)
- * after every reserve, never trusting the earlier preview once a reservation
- * exists: if the actual claim doesn't fit, the reservation is released (so the
- * rows return to pending — no delivery is lost) and retried, tightening the
- * requested `maxEvents` to what was just measured. Bounded by
- * {@link MAX_CHANNEL_RESERVE_ATTEMPTS}; the final attempt forces `maxEvents: 1`,
- * which always terminates (`packChannelEventsUnderCap` of a single-event claim
- * is always ≥ its own length), so this never loops forever and always makes
+ * the REAL claimed events via {@link resolveChannelClaimFit} after every
+ * reserve, never trusting the earlier preview once a reservation exists —
+ * critically, the SAME predicate `renderChannelEvent` itself uses to decide
+ * whether it needs to append `CHANNEL_DEFERRED_MARKER` (issue #442, PR #442
+ * round-3 review): sizing the actual claim against the full cap while the
+ * renderer sizes against (cap − marker) whenever a marker is needed would let
+ * a claim through here that the renderer then silently shrinks. If the actual
+ * claim doesn't fit, the reservation is released (so the rows return to
+ * pending — no delivery is lost; the release itself is NOT best-effort here —
+ * see below) and retried, tightening the requested `maxEvents` to what was
+ * just measured. Bounded by {@link MAX_CHANNEL_RESERVE_ATTEMPTS}; the final
+ * attempt forces `maxEvents: 1`, which always terminates (a single-event
+ * claim's fit is always whole), so this never loops forever and always makes
  * forward progress. `renderChannelEvent`'s own defense-in-depth truncation
  * (`channel-render.ts`) is the last-resort backstop if even that single event's
  * own block exceeds the ceiling.
+ *
+ * A release failure on the mismatch path PROPAGATES (unlike the push-failure
+ * release in `runChannelDeliveryCycle`, which is best-effort since the
+ * reservation self-expires either way): silently swallowing it here would
+ * leave the oversized reservation leased while this loop discards its id, so
+ * a later `reserveDelivery` could come back `null` and the cycle would
+ * misreport `'idle'` while those rows stay unavailable until lease expiry —
+ * contradicting the "reserve/commit/release IPC errors propagate" contract
+ * (issue #442, PR #442 round-3 review).
  *
  * Returns `null` when nothing is pending to reserve (mirrors `reserveDelivery`
  * returning `null`).
@@ -224,18 +240,37 @@ export async function reserveSizedChannelDelivery(
 
     // Trust only the ACTUAL claimed events from here — never the preview that
     // produced `maxEvents`, which can already be stale (see doc comment).
-    const fitActual = packChannelEventsUnderCap(reservation.claim.events);
-    if (fitActual >= reservation.claim.events.length) {
+    // Validated against `resolveChannelClaimFit` — the SAME predicate
+    // `renderChannelEvent` uses — so a claim that fits under the full cap but
+    // would still be shrunk by the renderer's marker-reserving repack (issue
+    // #442, PR #442 round-3 review) is caught here too: `packChannelEventsUnderCap`
+    // alone (no `moreDeferred` awareness) let such a claim through, so
+    // `renderChannelEvent` silently dropped a committed block while
+    // `meta.event_count` still reported the full committed count.
+    const fit = resolveChannelClaimFit(
+      reservation.claim.events,
+      moreDeferred,
+      MAX_CHANNEL_CONTENT,
+    );
+    if (fit.fits) {
       return { reservation, moreDeferred };
     }
 
     // Mismatch: the actually-claimed set does not fit. Release it (the rows
     // return to pending — nothing is lost) and retry, tightening the cap to
-    // what was just measured.
-    await releaseDeliveryClient(reservation.reservationId, socketPath).catch(
-      () => undefined,
-    );
-    forcedCap = Math.max(1, fitActual);
+    // what was just measured. Unlike the push-failure release in
+    // `runChannelDeliveryCycle` (best-effort there, since the reservation
+    // self-expires after a rejected push either way), a release failure HERE
+    // must PROPAGATE: if it silently swallowed and the release actually
+    // failed, the oversized reservation would stay leased while this loop
+    // discards its id — a later `reserveDelivery` can then come back `null`
+    // (nothing else pending) even though those rows are unavailable until
+    // lease expiry, and the cycle would report `'idle'` rather than
+    // surfacing the failure (issue #442, PR #442 round-3 review). This
+    // matches the documented contract that reserve/commit/release IPC errors
+    // propagate to the caller.
+    await releaseDeliveryClient(reservation.reservationId, socketPath);
+    forcedCap = Math.max(1, fit.includedCount);
   }
   // Unreachable: the final (`isLastAttempt`) iteration above always returns,
   // since a single-event claim's fit is always ≥ its own length. Kept only to
