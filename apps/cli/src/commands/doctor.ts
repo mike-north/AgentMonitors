@@ -2,6 +2,7 @@ import path from 'node:path';
 import { Command, Option } from 'commander';
 import type {
   DoctorMonitorRollup,
+  HookDeliveryDiagnosis,
   MonitorDoctorReport,
 } from '@agentmonitors/core';
 import { reportError } from '../output.js';
@@ -13,10 +14,19 @@ import {
 } from '../daemon-ipc.js';
 import { resolveManualDaemonSocketPath } from '../manual-daemon.js';
 import {
+  diagnoseHookDeliveryClient,
   doctorReportClient,
   doctorReportInProcess,
 } from '../runtime-client.js';
 import { resolveWorkspaceDbPath } from '../workspace-db-path.js';
+import { getCliVersion } from '../cli-version.js';
+import { readTransportHeartbeats } from '../transport-heartbeat.js';
+import {
+  computeTransportHealth,
+  isSharedProblem,
+  type DeliveryTransportHealth,
+  type TransportStatus,
+} from '../transport-health.js';
 
 /**
  * A single named health check with an actionable remediation on failure.
@@ -289,12 +299,167 @@ function buildChecks(
   return checks;
 }
 
+/**
+ * Append the delivery-transport checks (issue #425) — "what is the listening
+ * method for this session, and is it healthy?".
+ *
+ * Exit-code discipline mirrors the existing `daemon-reachable`/`lead-session`
+ * treatment: a `fail` here must mean something is genuinely broken, never
+ * merely "not in use right now". Two states are therefore deliberately NOT
+ * failures:
+ *
+ * - **No lead session.** Nothing is listening because no agent session is open.
+ *   That is the expected idle state, not a degradation.
+ * - **A lead session, but no transport has ever reported in.** Reached by every
+ *   flow that registers a session without running a delivery transport (a
+ *   `session start` in a script, a freshly-opened session that has not yet had
+ *   its first `UserPromptSubmit`). Failing here would cry wolf on a setup that
+ *   is about to be fine on the very next prompt.
+ *
+ * Everything else — a transport bound to another workspace, a lapsed
+ * heartbeat, muted reminders — involves a transport that DID report in, so it
+ * is reported as a genuine `fail` with its own remediation. The pre-existing
+ * `daemon-reachable` check already fails the "daemon died under a live session"
+ * case, so this section never needs to double-report it to be loud.
+ */
+function transportChecks(
+  health: DeliveryTransportHealth,
+  hasLeadSession: boolean,
+): DoctorCheck[] {
+  const checks: DoctorCheck[] = [];
+  const anyConfigured = health.transports.some(
+    (transport) => transport.configured,
+  );
+
+  for (const transport of health.transports) {
+    const name = `transport:${transport.name}`;
+    if (!transport.configured) {
+      checks.push({
+        name,
+        status: hasLeadSession ? 'idle' : 'skip',
+        detail: hasLeadSession
+          ? `No ${transport.name} transport has reported in for this workspace. Either it has not run yet (the hook transport records itself on the first prompt of a session; the channel is optional), or it is running under a different HOME/data root and is invisible from here.`
+          : `No ${transport.name} transport has reported in (expected when no agent session is currently open).`,
+      });
+      continue;
+    }
+
+    // A transport row reports only the problems that transport OWNS. Two
+    // categories are excluded: the unprovable channel-registration caveat (an
+    // advisory, not a defect — it must not turn a working transport red), and
+    // pipeline-wide problems like a down daemon or muted reminders, which the
+    // `delivery-verdict` check below reports once instead of repeating them on
+    // every row as if they were independent failures.
+    const blocking = transport.problems.filter(
+      (problem) =>
+        problem.code !== 'channel-registration-unverified' &&
+        !isSharedProblem(problem.code),
+    );
+    const bound = transport.boundTo;
+    const summary = [
+      `pid=${String(bound?.pid ?? 0)}`,
+      `version=${transport.version ?? 'unknown'}`,
+      `workspace=${bound?.workspacePath ?? 'unknown'}`,
+      `socket=${bound?.socketPath ?? 'unknown'}`,
+      `last-delivery=${transport.lastDelivery ?? 'never'}`,
+    ].join('  ');
+
+    if (blocking.length === 0) {
+      checks.push({ name, status: 'pass', detail: summary });
+      continue;
+    }
+    checks.push({
+      name,
+      status: 'fail',
+      // Every problem is named with its own code so two simultaneous
+      // degradations never read as one generic failure.
+      detail: `${summary}\n    ${blocking.map((problem) => `[${problem.code}] ${problem.detail}`).join('\n    ')}`,
+      remediation: blocking.map((problem) => problem.remediation).join(' '),
+    });
+  }
+
+  const suppression = health.pipelineProblems.find(
+    (problem) => problem.code === 'reminders-suppressed',
+  );
+
+  // `idle` only when there is genuinely nothing to judge: no session open, or
+  // a session whose transports have not reported in AND no pipeline-level
+  // problem. A pipeline problem (muted reminders, a down daemon) is a real,
+  // live degradation that must fail even before a transport registers —
+  // otherwise the worst case, suppression on a workspace with no heartbeat yet,
+  // would exit 0 while nothing can ever arrive.
+  const idleVerdict =
+    !hasLeadSession || (!anyConfigured && health.pipelineProblems.length === 0);
+  checks.push({
+    name: 'delivery-verdict',
+    status: idleVerdict ? 'idle' : health.deliverable ? 'pass' : 'fail',
+    detail: health.verdict,
+    ...(health.deliverable
+      ? {}
+      : {
+          remediation:
+            suppression?.remediation ??
+            (health.remediation.length > 0
+              ? health.remediation.join(' ')
+              : 'Open a Claude Code session in this workspace so a delivery transport registers itself.'),
+        }),
+  });
+
+  return checks;
+}
+
+/**
+ * The human-readable "Delivery transports" block (issue #425 §2). Rendered
+ * above the check list because it answers the question a reader arrived with —
+ * "will I be told?" — before the per-monitor detail.
+ */
+function renderTransportSection(health: DeliveryTransportHealth): string[] {
+  const lines: string[] = ['Delivery transports:'];
+  for (const transport of health.transports) {
+    lines.push(`  ${transportLine(transport)}`);
+    for (const problem of transport.problems) {
+      // Pipeline-wide problems are printed once below the rows (from
+      // `pipelineProblems`), so a single down daemon does not read as one
+      // problem per transport.
+      if (isSharedProblem(problem.code)) continue;
+      lines.push(`      ! [${problem.code}] ${problem.detail}`);
+      lines.push(`        ↳ ${problem.remediation}`);
+    }
+  }
+  // Read from `pipelineProblems`, NOT from the transports: these must stay
+  // visible when no transport has reported in at all, which is exactly when
+  // muted reminders would otherwise vanish behind "nothing is listening".
+  for (const problem of health.pipelineProblems) {
+    lines.push(`  ! [${problem.code}] ${problem.detail}`);
+    lines.push(`    ↳ ${problem.remediation}`);
+  }
+  lines.push(`  verdict: ${health.verdict}`);
+  return lines;
+}
+
+function transportLine(transport: TransportStatus): string {
+  if (!transport.configured) {
+    return `${transport.name}: not reporting`;
+  }
+  const bound = transport.boundTo;
+  const state = transport.running ? 'running' : 'stale';
+  return [
+    `${transport.name}: ${state}`,
+    `pid=${String(bound?.pid ?? 0)}`,
+    `version=${transport.version ?? 'unknown'}`,
+    `workspace=${bound?.workspacePath ?? 'unknown'}`,
+    `socket=${bound?.socketPath ?? 'unknown'}`,
+    `last-delivery=${transport.lastDelivery ?? 'never'}`,
+  ].join('  ');
+}
+
 function renderText(
   report: MonitorDoctorReport,
   checks: DoctorCheck[],
   workspace: string,
   daemonRunning: boolean,
   socketPath: string,
+  health: DeliveryTransportHealth,
 ): string {
   const lines: string[] = [];
   // The banner names the real invocation ("agentmonitors doctor"), not the
@@ -307,6 +472,8 @@ function renderText(
   lines.push(
     `Daemon:    ${daemonRunning ? 'running' : 'not running'} (${socketPath})`,
   );
+  lines.push('');
+  lines.push(...renderTransportSection(health));
   lines.push('');
   for (const check of checks) {
     lines.push(`${STATUS_GLYPH[check.status]} ${check.name}: ${check.detail}`);
@@ -333,6 +500,7 @@ function toJson(
   workspace: string,
   daemonRunning: boolean,
   socketPath: string,
+  health: DeliveryTransportHealth,
 ): string {
   const passed = checks.filter((check) => check.status === 'pass').length;
   const failed = checks.filter((check) => check.status === 'fail').length;
@@ -345,6 +513,33 @@ function toJson(
     monitorsDir: report.monitorsDir,
     daemon: { running: daemonRunning, socketPath },
     leadSession: report.hasLeadSession,
+    // Delivery-transport health (issue #425). `deliveryWillReachThisSession`
+    // names the listening METHOD; `deliverable` answers "will anything actually
+    // arrive right now" — they differ precisely in the suppression case, which
+    // is the one that hid a broken CI signal in the field.
+    transports: health.transports.map((transport) => ({
+      name: transport.name,
+      configured: transport.configured,
+      running: transport.running,
+      healthy: transport.healthy,
+      boundTo: transport.boundTo ?? null,
+      version: transport.version ?? null,
+      lastDelivery: transport.lastDelivery,
+      problems: transport.problems.map((problem) => ({
+        code: problem.code,
+        detail: problem.detail,
+        remediation: problem.remediation,
+      })),
+    })),
+    pipelineProblems: health.pipelineProblems.map((problem) => ({
+      code: problem.code,
+      detail: problem.detail,
+      remediation: problem.remediation,
+    })),
+    deliveryWillReachThisSession: health.deliveryWillReachThisSession,
+    deliverable: health.deliverable,
+    verdict: health.verdict,
+    remediation: health.remediation,
     checks: checks.map((check) => ({
       name: check.name,
       status: check.status,
@@ -371,6 +566,39 @@ function toJson(
     summary: { passed, failed, skipped, idle },
   };
   return JSON.stringify(payload, null, 2);
+}
+
+/**
+ * Ask the daemon why delivery would be withheld for each lead session, at both
+ * reminder lifecycles.
+ *
+ * Both are queried because the two bands are held at different lifecycles
+ * (normal at `turn-interruptible`, low at `turn-idle`, 002 §9.2/§9.3) — asking
+ * only one would silently miss the other band's suppression, which is the exact
+ * class of blind spot this surface exists to close.
+ *
+ * A diagnosis failure is skipped rather than propagated: `doctor` is a
+ * read-only diagnostic, and one unavailable sub-answer must not take down the
+ * whole report. The transports section then simply reports no suppression,
+ * which is what it would have reported for a healthy session anyway.
+ */
+async function gatherDeliveryDiagnoses(
+  report: MonitorDoctorReport,
+  socketPath: string,
+): Promise<HookDeliveryDiagnosis[]> {
+  const diagnoses: HookDeliveryDiagnosis[] = [];
+  for (const session of report.leadSessions) {
+    for (const lifecycle of ['turn-interruptible', 'turn-idle'] as const) {
+      try {
+        diagnoses.push(
+          await diagnoseHookDeliveryClient(session.id, lifecycle, socketPath),
+        );
+      } catch {
+        continue;
+      }
+    }
+  }
+  return diagnoses;
 }
 
 export const doctorCommand = new Command('doctor')
@@ -467,10 +695,47 @@ export const doctorCommand = new Command('doctor')
           daemonErrorMessage,
         );
 
+        // Delivery-transport health (issue #425). The suppression verdict is a
+        // LIVE question — it depends on which unread events are currently
+        // claimed — so it is only asked when the daemon answered; the persisted
+        // fallback state cannot compute it. When it is unavailable the surface
+        // reports the down daemon instead, which is the dominant problem anyway.
+        const diagnoses = daemonRunning
+          ? await gatherDeliveryDiagnoses(report, socketPath)
+          : [];
+        const health = computeTransportHealth({
+          workspacePath: workspace,
+          socketPath,
+          daemonRunning,
+          ...(daemonErrorMessage ? { daemonErrorMessage } : {}),
+          leadHostSessionIds: report.leadSessions.map(
+            (session) => session.hostSessionId,
+          ),
+          heartbeats: readTransportHeartbeats(),
+          diagnoses,
+          cliVersion: getCliVersion(),
+          now: report.generatedAt,
+        });
+        checks.push(...transportChecks(health, report.hasLeadSession));
+
         console.log(
           json
-            ? toJson(report, checks, workspace, daemonRunning, socketPath)
-            : renderText(report, checks, workspace, daemonRunning, socketPath),
+            ? toJson(
+                report,
+                checks,
+                workspace,
+                daemonRunning,
+                socketPath,
+                health,
+              )
+            : renderText(
+                report,
+                checks,
+                workspace,
+                daemonRunning,
+                socketPath,
+                health,
+              ),
         );
 
         if (checks.some((check) => check.status === 'fail')) {

@@ -1412,3 +1412,85 @@ Per [004 §6](./004-validation-testing.md), each host adapter, when it ships, **
   caveat, generalized);
 - proof that **delivery semantics are unchanged** vs the Claude adapter (§11.5): same claimed-not-ack
   behavior (BP2), same lead-only projection, same urgency/lifecycle handling.
+
+## 12. Transport Health & Heartbeats (_current_ — issue #425)
+
+A transport that is **up** is not a transport that is **delivering**. Both transports can silently
+diverge from the workspace they were meant to serve, and every divergence presents identically —
+nothing arrives — while every surface looks green. Three distinct instances of this were observed in
+a single day of dogfooding: a reaped daemon with no session to revive it; a channel server bound to
+the home-directory workspace because the session was launched from `$HOME`; and correct, materialized
+events whose reminders were withheld on every lead session by the `coalesced-until-ack` guard
+(002 §9.2/§9.3). The third is the important one: both transports were connected and correctly
+configured, and the agent was still never told its PR's CI had broken.
+
+### 12.1 Why each transport needs a heartbeat
+
+The two transports fail in opposite ways, and neither is observable without a record:
+
+- **`hook deliver`** spawns a fresh CLI per prompt, re-resolving its workspace, socket, and binary
+  every time. It self-heals, but leaves no trace — so "are the hooks installed at all?" is
+  unanswerable from outside, and "installed but idle" is indistinguishable from "never installed".
+- **`channel serve`** is a long-lived MCP subprocess that **freezes** its environment (`HOME`,
+  `CLAUDE_PROJECT_DIR`, resolved socket, CLI binary) at session start. It keeps looking connected
+  long after any of those stops matching reality.
+
+Each therefore writes a **transport heartbeat** naming the process, the exact binary and version
+serving it, the environment it resolved, the workspace and socket it bound to, and when it last
+actually delivered. `channel serve` refreshes its record every poll (and removes it on clean
+shutdown); `hook deliver` writes one per invocation once it has resolved a session, plus a second
+carrying the delivery timestamp when it surfaces something.
+
+### 12.2 Leases, not just timestamps
+
+Every record carries an explicit `ttlMs` alongside `updatedAt`. A server killed without cleanup
+(SIGKILL, host crash) leaves its file behind, so a reader must be able to judge the record dead
+**without trusting the writer to have removed it**. Expressing the bound as an owner-declared TTL
+rather than a reader-side constant keeps that judgement correct if a future writer heartbeats on a
+different cadence, and gives a lease primitive a later daemon-lifetime policy can consume directly.
+The two TTLs differ by design: the channel's is short (tens of seconds, well above its poll cadence),
+while the hook's spans a day — there is no hook process between prompts, so a short lease would
+report a perfectly healthy setup as dead during any human pause.
+
+### 12.3 Registry layout is load-bearing
+
+Records live in a machine-wide registry under the resolved data root
+(`<dataRoot>/agentmonitors/transports/`), **not** inside the per-workspace data directory. Storing a
+channel heartbeat inside the workspace _it resolved_ would make the most important failure mode
+undetectable by construction: a server bound to workspace X could never be seen by a health check
+run in workspace Y. A flat registry lets the health surface enumerate every transport on the machine
+and match a record to **this** session by host session id, turning "your channel is listening to a
+different workspace" from an invisible absence into a reported finding.
+
+A transport running under a genuinely different `HOME`/`XDG_DATA_HOME` resolves a different data root
+and is invisible from here. That case is reported honestly as an **absence** whose wording names the
+possibility — never as a clean bill of health.
+
+### 12.4 What the health surface must report
+
+`agentmonitors doctor` renders the verdict (005 §15, "Delivery transports"). Its contract:
+
+1. Name the listening method — `hook`, `channel`, `both`, or `none`.
+2. Report each cause **distinctly**, never collapsed into one generic "unhealthy": an absent daemon,
+   a workspace/socket/environment misbinding, muted reminders, and a lapsed heartbeat share only
+   their symptom and have entirely different fixes.
+3. Attach a concrete remediation — a command or a specific action — to every problem.
+4. Separate "which method is listening" from "will anything actually arrive right now". Suppression
+   is precisely where those two answers diverge, and reporting only the first is what hid a real CI
+   failure.
+
+### 12.5 What a heartbeat cannot prove
+
+During the channels research preview, Claude Code loads the plugin's channel MCP server as a _plain_
+MCP server unless the session was started with
+`--dangerously-load-development-channels plugin:agentmonitors@agentmonitors` (or the plugin is on the
+approved channel allowlist). In that state the server connects and `mcp.notification()` resolves
+normally, but the host **never registers a channel listener and drops the events with no error
+returned to the server**. "Channel transport: connected" is therefore not sufficient for healthy, and
+the server cannot detect the difference from its side.
+
+The surface reports this as an explicitly-unverifiable **advisory** rather than either asserting
+health it cannot prove or crying wolf about a condition that is usually absent: it does not mark the
+channel unhealthy, and it points at `agentmonitors verify` (an end-to-end proof) plus the dev-flag
+remediation. A future active probe — emit a synthetic channel event, confirm the claim/ack lands back
+in the store within a bound — would upgrade this from advisory to detection.

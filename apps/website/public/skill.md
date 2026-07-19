@@ -400,7 +400,38 @@ inspect after a plain `verify` run beyond what it already printed. If you ran th
 manual recipe instead (which pins `AGENTMONITORS_DB` by hand), see that appendix's own debug notes
 for reading back its persisted state.
 
-When the user says "it didn't fire," don't guess — run:
+### First: is anything still listening?
+
+`verify` proves delivery works **once**, at setup time. It does not stay true. Before digging into
+a specific monitor, check whether a delivery transport is still listening for this session at all:
+
+```bash
+agentmonitors doctor
+```
+
+Read the **Delivery transports** section and its verdict line
+(`delivery to THIS session → via {hook | channel | both | none}`). It names the listening method
+and, when delivery is currently blocked, which of these it is — each with its own fix:
+
+- **`daemon-unreachable`** — there is no daemon for this workspace (it was reaped, or never
+  started). Nothing can deliver. Run `agentmonitors daemon run`, or open a session in this
+  workspace.
+- **`workspace-mismatch`** — the transport is bound to a *different workspace* than the monitors
+  you're waiting on. Usually means the session was launched from somewhere other than the repo.
+  Start a session from the repo directory.
+- **`reminders-suppressed`** — everything is up, but reminders are **muted**: an earlier unread
+  event is already claimed, so new ones won't surface (`coalesced-until-ack`). Clear it with
+  `agentmonitors events ack --session <id>`. This one is worth knowing about, because nothing
+  looks broken while it is happening.
+- **`heartbeat-stale`** — a channel server registered but stopped reporting; reconnect the MCP
+  server or start a new session.
+
+`agentmonitors doctor --format json` exposes the same thing as `transports[]`,
+`deliveryWillReachThisSession`, `deliverable`, and `remediation[]`.
+
+### Then: why didn't this monitor fire?
+
+When the user says "it didn't fire" and the transports are healthy, don't guess — run:
 
 ```bash
 agentmonitors monitor explain <id> --dir .claude/monitors

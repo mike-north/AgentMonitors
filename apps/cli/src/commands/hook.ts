@@ -25,6 +25,7 @@ import {
   type HookDeliveryOutput,
 } from '../hook-deliver-render.js';
 import { readHookPayload } from '../hook-payload.js';
+import { writeTransportHeartbeat } from '../transport-heartbeat.js';
 import {
   isManualDaemonConnectionError,
   manualDaemonErrorMessage,
@@ -835,6 +836,22 @@ Diagnosis:
         }
         debug(describeSessionMatch(match));
 
+        // Record that the hook transport reached this point for this workspace
+        // (issue #425). This is the ONLY durable evidence that the hook path is
+        // wired up at all: `hook deliver` spawns fresh per prompt and leaves no
+        // other trace, so without it `doctor` cannot distinguish "hooks are
+        // installed and simply had nothing to deliver" from "the plugin's hooks
+        // were never installed" — both are silence. Written here, after session
+        // resolution, so the record only exists once the transport has actually
+        // proven it can resolve a workspace, socket, and session. Never throws.
+        writeTransportHeartbeat({
+          transport: 'hook',
+          workspacePath,
+          socketPath,
+          hostSessionId,
+          sessionId: match.id,
+        });
+
         // Pending-by-urgency counts + per-band hold reasons (issue #334). Pure
         // read (never claims/mutates); computed ONLY when --debug is set, so
         // the non-debug path makes no extra daemon round trip.
@@ -940,6 +957,21 @@ Diagnosis:
           debug(describeCommitLapsed());
         }
         debug(describeClaim(claim ?? reservedClaim));
+
+        // Refresh the heartbeat with the delivery timestamp (issue #425).
+        // `lastDelivery` is what separates "the transport runs" from "the
+        // transport delivers": a hook that fires every prompt but has never
+        // surfaced anything is the signature of a workspace whose events are
+        // going elsewhere. Recorded on the committed-or-lapsed path alike —
+        // both mean the render was written to the host.
+        writeTransportHeartbeat({
+          transport: 'hook',
+          workspacePath,
+          socketPath,
+          hostSessionId,
+          sessionId: match.id,
+          lastDeliveryAt: new Date(),
+        });
       } catch (error) {
         // Any internal error is swallowed: a hook that throws would interrupt
         // the user's session (BP2 / always-exit-0 contract). Debug mode still
