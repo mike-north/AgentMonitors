@@ -195,6 +195,21 @@ describe('computeVerifyBudget', () => {
     );
   });
 
+  // Regression (issue #442 round 19): `noChangeConfirmMs` is the wall-clock
+  // budget the observe stage's two-distinct-row `no-change` discriminator
+  // needs — roughly two full ticks, not the single-interval `detectMs`.
+  it('folds two intervals (not one) plus margin into noChangeConfirmMs', () => {
+    const monitor = monitorFrom(
+      "watch:\n  type: file-fingerprint\n  globs:\n    - '*.md'\n  interval: '4s'\nurgency: normal",
+    );
+    const budget = computeVerifyBudget(monitor);
+    expect(budget.noChangeConfirmMs).toBe(4_000 * 2 + 5_000);
+    // It must exceed detectMs (single-interval) — that is the whole point of
+    // the fix: the old single-interval persistence window undershot what two
+    // genuinely distinct post-trigger ticks need.
+    expect(budget.noChangeConfirmMs).toBeGreaterThan(budget.detectMs);
+  });
+
   it('scales the margin to 25% of a long interval', () => {
     // api-poll default 300_000 → margin = max(5000, 75_000) = 75_000
     const monitor = monitorFrom(

@@ -120,6 +120,20 @@ export interface VerifyBudget {
   baselineMs: number;
   /** Budget to detect + deliver the triggered change after baseline (ms). */
   detectMs: number;
+  /**
+   * Wall-clock budget the observe stage needs to DECISIVELY confirm a
+   * `no-change` verdict (issue #442 round 19): two DISTINCT post-trigger
+   * observation-history rows both reporting `no-change` — not just one stale
+   * row persisting — which takes roughly two full ticks (one to record the
+   * first post-trigger `no-change`, a second full interval later to confirm
+   * it wasn't a one-off). `2 * intervalMs + marginMs`; no settle term, since a
+   * genuine no-change tick never enters a notify settle window. `verify.ts`
+   * extends the observe stage's deadline to at least this value — but ONLY
+   * when using the default derived budget; an explicit `--timeout-ms` is
+   * honored as-is (a timeout shorter than one interval still fails fast with
+   * `budget-exceeded`, per the documented CLI flag semantics).
+   */
+  noChangeConfirmMs: number;
   /** Total end-to-end budget (ms). */
   totalMs: number;
 }
@@ -148,6 +162,7 @@ export function computeVerifyBudget(monitor: MonitorDefinition): VerifyBudget {
   const marginMs = Math.max(5_000, Math.ceil(intervalMs * 0.25));
   const baselineMs = intervalMs + marginMs;
   const detectMs = intervalMs + settleMs + highClaimSettleMs + marginMs;
+  const noChangeConfirmMs = intervalMs * 2 + marginMs;
   return {
     intervalMs,
     settleMs,
@@ -155,6 +170,7 @@ export function computeVerifyBudget(monitor: MonitorDefinition): VerifyBudget {
     marginMs,
     baselineMs,
     detectMs,
+    noChangeConfirmMs,
     totalMs: baselineMs + detectMs,
   };
 }

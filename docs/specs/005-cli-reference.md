@@ -1804,6 +1804,21 @@ agentmonitors verify [monitor] [--dir <path>] [--workspace <path>]
    flush. So a `suppressed` row is not a distinct `verify` verdict; it is treated as "settling" and
    keeps the wait alive, suppressing the `no-change` fail-fast until the flush (or the budget) — the
    post-trigger history is `[suppressed, no-change…, triggered]` (issue #399 criterion 4).
+
+   A `no-change` verdict requires **two distinct post-trigger observation-history rows** (different
+   ids), both reporting `no-change`, before it is treated as decisive (issue #442 round 19). A single
+   `no-change` row — however long it persists across polls — is not sufficient evidence: a daemon tick
+   already in flight (mid-scan) when the trigger fired can finish and record its necessarily-stale,
+   pre-trigger `no-change` row _after_ the trigger's timestamp under enough scheduling delay (a busy
+   CI runner), and every subsequent poll re-reads that SAME row — persistence alone is just the
+   caller's own clock passing, not new information. A second, genuinely later tick completing and also
+   reporting `no-change` is real evidence neither post-trigger tick observed the change. A `triggered`
+   row still wins immediately regardless. Confirming two distinct rows takes roughly two full monitor
+   poll intervals of wall time, so `verify` extends the observe stage's deadline (only when using the
+   **default** derived budget, never when an explicit `--timeout-ms` is given — an explicit override
+   is honored as the operator's real cap, and a timeout shorter than one interval still fails fast with
+   `budget-exceeded`) to at least `2 × interval + margin`.
+
 7. **Materialize.** Confirm an unread event exists for the session.
 8. **Deliver.** Claim via the **real `hook deliver` path** — for `high` urgency at
    `turn-interruptible` (previewing settled high events and packing them under the 4000-char cap
@@ -1871,7 +1886,17 @@ for `throttle`; and, for `high` urgency with **no** explicit `notify` block, the
 (002 §9.1), plus a margin of `max(5s, 25% of interval)`. Two phases are budgeted separately —
 **baseline** (`interval + margin`) and **detect** (`interval + settle + high-claim-settle +
 margin`). Elapsed/ETA progress is printed to **stderr** so the operator is never left staring at
-empty output; `--timeout-ms` overrides the detect-phase budget. (These interval/settle defaults are
+empty output; `--timeout-ms` overrides the detect-phase budget.
+
+A third derived figure, `noChangeConfirmMs` (`2 × interval + margin` — no settle term, since a
+genuine `no-change` tick never enters a notify settle window), is the wall-clock budget the observe
+stage's two-distinct-row `no-change` discriminator needs (issue #442 round 19, step 6 above). When
+using the **default** derived budget, `verify` extends the observe stage's own deadline to at least
+`noChangeConfirmMs` — past the single-interval `detect` deadline the rest of the phase (materialize,
+deliver) uses — so a genuine no-change verdict has time to gather its second confirming row instead
+of racing the shorter deadline into a spurious `budget-exceeded`. An explicit `--timeout-ms` is
+**never** extended this way: it is the operator's stated cap, so a value shorter than one interval
+still fails fast with `budget-exceeded` rather than being silently stretched. (These interval/settle defaults are
 sourced from the runtime's canonical `schedulingDefaults` export in `@agentmonitors/core` — the same
 values the daemon schedules against, not a hand-mirrored copy — and the settle resolution itself
 calls the same `defaultNotifyConfigForUrgency` function the runtime tick uses, so the budget estimate

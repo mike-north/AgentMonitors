@@ -50,6 +50,10 @@ import {
   type VerifyBudget,
 } from '../verify-budget.js';
 import {
+  resolveObserveDeadline,
+  resolveObserveVerdict,
+} from '../verify-observe.js';
+import {
   renderVerifyJson,
   renderVerifyText,
   type Stage,
@@ -141,17 +145,6 @@ function watchBaseDir(monitor: MonitorDefinition, workspace: string): string {
   if (typeof raw === 'string' && raw.length > 0)
     return path.resolve(workspace, raw);
   return workspace;
-}
-
-/**
- * Coerce a record timestamp to epoch ms. Over the daemon socket, `Date` fields
- * are JSON-serialized to ISO strings (the `ObservationHistoryRecord.createdAt:
- * Date` type describes the in-process shape, not the deserialized wire shape),
- * so a bare `.getTime()` would throw. Accept `Date | string | number`.
- */
-function toMs(value: Date | string | number): number {
-  if (value instanceof Date) return value.getTime();
-  return new Date(value).getTime();
 }
 
 const TRIGGER_CONTENT = (token: string): string =>
@@ -652,6 +645,16 @@ interface RunOptions {
   daemon: IsolatedDaemon;
   budget: VerifyBudget;
   detectCapMs: number;
+  /**
+   * True when `detectCapMs` came from an explicit `--timeout-ms`, not the
+   * default derived budget. The observe stage's no-change discriminator
+   * (issue #442 round 19) only extends its deadline past `detectCapMs` to fit
+   * `budget.noChangeConfirmMs` in the DEFAULT case — an explicit override is
+   * honored as the operator's real cap, so a timeout shorter than one
+   * interval still fails fast with `budget-exceeded` rather than being
+   * silently stretched.
+   */
+  timeoutOverridden: boolean;
   manual: boolean;
   /**
    * When true the run targets the persistent workspace daemon (which outlives
@@ -668,7 +671,7 @@ interface RunOptions {
 /** The core orchestration once a monitor is resolved and a daemon is reachable. */
 async function runVerification(opts: RunOptions): Promise<VerifyResult> {
   const { monitor, workspace, daemon, budget, detectCapMs, manual } = opts;
-  const { useWorkspaceDaemon, triggerCmd } = opts;
+  const { useWorkspaceDaemon, triggerCmd, timeoutOverridden } = opts;
   const mode: TriggerMode = manual
     ? 'manual'
     : triggerCmd !== undefined
@@ -889,59 +892,45 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
     // row AFTER `observeFrom` once the daemon is under enough scheduling delay
     // (heavy CPU contention — the exact condition a shared CI runner can hit,
     // even inside this suite's own serial/single-daemon isolation). That row
-    // satisfies the `createdAt > observeFrom` filter below even though it never
-    // actually observed the post-trigger state, wrongly fail-fasting `verify`.
-    // Guard against it the same way the `suppressed` carve-out above already
-    // does for the debounce case: don't trust the FIRST post-trigger
-    // `no-change` sighting as decisive — require it to persist for a full
-    // monitor interval (long enough for a tick that genuinely started after
-    // the trigger to run and see the change) before treating it as a verdict.
-    // A `triggered` row arriving in that window (the real, non-stale tick)
-    // still wins immediately via the check above it.
-    let noChangeSince: number | null = null;
+    // satisfies the `createdAt > observeFrom` filter even though it never
+    // actually observed the post-trigger state, wrongly fail-fasting `verify`
+    // if trusted on sight. `resolveObserveVerdict` (verify-observe.ts) guards
+    // against this: a `no-change` verdict requires a SECOND, DISTINCT
+    // post-trigger row also reporting `no-change` — not merely the first one
+    // persisting, which is just the same stale row being re-read every poll.
+    // That discriminator needs roughly two full ticks of wall time to
+    // legitimately resolve, so the observe deadline is extended to
+    // `budget.noChangeConfirmMs` — but only for the DEFAULT derived budget; an
+    // explicit `--timeout-ms` is honored as the operator's real cap (a
+    // shorter override still fails fast with `budget-exceeded`).
+    const observeDeadline = resolveObserveDeadline(
+      observeFrom,
+      detectDeadline,
+      budget.noChangeConfirmMs,
+      timeoutOverridden,
+    );
+    const observeBudgetMs = observeDeadline - observeFrom;
+    const seenNoChangeIds = new Set<string>();
     const observed = await pollUntil<
       'triggered' | 'no-change' | 'no-files-matched'
     >(
-      detectDeadline,
+      observeDeadline,
       daemon,
       async () => {
         const rows = await listObservationHistoryClient(
           { monitorId: monitor.id, workspacePath: workspace, limit: 10 },
           daemon.socketPath,
         );
-        const post = rows.filter((r) => toMs(r.createdAt) > observeFrom);
-        if (post.some((r) => r.result === 'triggered')) return 'triggered';
-        // A post-trigger `no-files-matched` is always definitive: the glob
-        // scope resolved to zero files, so nothing could ever be observed.
-        if (
-          mode !== 'manual' &&
-          post.some((r) => r.result === 'no-files-matched')
-        ) {
-          return 'no-files-matched';
-        }
-        // A post-trigger `no-change` normally means the change wasn't
-        // observable — but NOT while a debounce/throttle notify window is
-        // settling. There the change WAS observed (recorded as a `suppressed`
-        // row that holds the batch) and the emitting `triggered` row only
-        // appears at flush; the intervening `no-change` ticks are settling
-        // noise, not a verdict. So only fail-fast on `no-change` when no
-        // post-trigger `suppressed` row is present; otherwise keep polling
-        // until the flush (or the budget) — 002 §9.2/§9.3.
-        if (
-          mode !== 'manual' &&
-          post.some((r) => r.result === 'no-change') &&
-          !post.some((r) => r.result === 'suppressed')
-        ) {
-          noChangeSince ??= Date.now();
-          if (Date.now() - noChangeSince < budget.intervalMs) return null;
-          return 'no-change';
-        }
-        noChangeSince = null;
-        return null;
+        return resolveObserveVerdict(
+          rows,
+          observeFrom,
+          mode === 'manual',
+          seenNoChangeIds,
+        );
       },
       () => {
         progress(
-          `waiting for the change to be observed… ${String(Math.round((Date.now() - observeFrom) / 1000))}s / ~${String(Math.round(detectCapMs / 1000))}s`,
+          `waiting for the change to be observed… ${String(Math.round((Date.now() - observeFrom) / 1000))}s / ~${String(Math.round(observeBudgetMs / 1000))}s`,
         );
       },
     );
@@ -973,14 +962,14 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
       stages.push({
         name: 'observe',
         status: 'fail',
-        detail: `no change observed within ${String(Math.round(detectCapMs / 1000))}s`,
+        detail: `no change observed within ${String(Math.round(observeBudgetMs / 1000))}s`,
       });
       return finalize({
         ok: false,
         stages,
         failure: {
           kind: 'budget-exceeded',
-          message: `no change was observed within the budget (${String(Math.round(detectCapMs / 1000))}s). ${budgetExceededHint(mode)}`,
+          message: `no change was observed within the budget (${String(Math.round(observeBudgetMs / 1000))}s). ${budgetExceededHint(mode)}`,
         },
       });
     }
@@ -1444,12 +1433,14 @@ export const verifyCommand = new Command('verify')
         const overrideMs = options.timeoutMs
           ? Number(options.timeoutMs)
           : undefined;
-        const detectCapMs =
+        const validOverrideMs =
           overrideMs !== undefined &&
           Number.isFinite(overrideMs) &&
           overrideMs > 0
             ? overrideMs
-            : budget.detectMs;
+            : undefined;
+        const timeoutOverridden = validOverrideMs !== undefined;
+        const detectCapMs = validOverrideMs ?? budget.detectMs;
 
         daemon = options.useWorkspaceDaemon
           ? await useWorkspaceDaemon(monitorsDir, workspace)
@@ -1461,6 +1452,7 @@ export const verifyCommand = new Command('verify')
           daemon,
           budget,
           detectCapMs,
+          timeoutOverridden,
           manual: options.manual === true,
           useWorkspaceDaemon: options.useWorkspaceDaemon === true,
           triggerCmd: options.triggerCmd,
