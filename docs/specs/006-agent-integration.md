@@ -222,10 +222,11 @@ content the hook path injects**, not a lesser summary. Two claim shapes render d
   above — this shape needs no packing (a coalesced message is already small), same as the
   body-injection claim (002 §9.2) — with **no** body injection.
 
-`renderChannelEvent` itself renders **every event in the `DeliveryClaim` it is given** — it never
-drops a block to fit a cap. The channel surface IS bounded (§5.5), but by packing WHOLE event blocks
-under a content ceiling **before reserving**, not by cutting an already-claimed render: `channel serve`
-previews the settled high-urgency delivery, sizes how many whole blocks fit
+`renderChannelEvent` renders **every event in the `DeliveryClaim` it is given**, in the common case —
+it never drops a WHOLE block to fit a cap. The channel surface IS bounded (§5.5), but primarily by
+packing WHOLE event blocks under a content ceiling **before reserving**, not by cutting an
+already-claimed render: `channel serve` previews the settled high-urgency delivery, sizes how many
+whole blocks fit
 (`packChannelEventsUnderCap`, `apps/cli/src/channel-render.ts`), and reserves/claims exactly that many
 (`reserveDelivery`'s `maxEvents`) — mirroring exactly how the hook-deliver transport sizes its
 `additionalContext` cap (§5.1, issue #299). This is what makes boundedness compatible with §5.5's
@@ -236,6 +237,18 @@ re-deliver on a later poll, with an explicit, bracket-free deferral marker appen
 `<`/`>`/`[`/`]`, so it needs no `contentValue` sanitization pass of its own). Only the **per-event**
 change summary is bounded independently of packing (above, and §4.6), so no single untrusted diff is
 dumped wholesale regardless of how many events fit.
+
+**Exception: a single claimed event whose own block alone still exceeds the ceiling.** Sizing upstream
+cannot rule out this pathological case — `packChannelEventsUnderCap` deliberately returns at least 1
+for a non-empty preview (forward progress, §5.5), and a reserve can race the earlier preview so the
+actually-claimed event was never measured. Only in this one case does `renderChannelEvent` cut an
+already-claimed block: it mid-truncates the lone event at a Unicode code-point boundary and appends a
+DIFFERENT marker than the deferral marker above, because — unlike the deferred-remainder case, where
+the whole block stayed unclaimed and genuinely re-delivers later — this claim is already committed by
+the time it renders, so the omitted tail will **never** re-deliver on a later poll (§5.5 has the full
+mechanics and the reason the two markers must differ). That marker names the exact, session-scoped
+`agentmonitors events list --session <id> --unread` command as the one remaining recovery path for the
+full, still-unread event — never the bare `--unread` form (`events list` requires `--session`, §5).
 
 A body-injection claim that rendered only its **title** — dropping the monitor body and the change
 summary — is a **defect on this surface**, not a lighter rendering: the receiving agent would have to
@@ -704,6 +717,18 @@ joiner (`\n\n`, no fixed header) and the deferral marker (bracket-free, since th
 `<>[]` out of `content`, §4.6). A reminder claim (no settled-high events) needs no sizing and omits
 `maxEvents`, claiming the full claim exactly as before.
 
+**A settled event that arrives strictly BETWEEN the sizing preview and the reservation (a
+"candidate-set growth" race, issue #442, PR #442 round-6 review) must still surface the deferral
+marker.** Preview and reserve are two separate IPC round-trips (as above), so the candidate set can
+grow, not just shrink or substitute: the preview held exactly one event (so `maxEvents = 1`,
+`moreDeferred = false`), a second event settles before `reserveDelivery` runs, and the resulting
+one-event claim genuinely fits — nothing needs re-sizing or releasing. But that second, now-settled
+event is real pending work the render must still signpost; treating the claim as "fits, nothing
+deferred" would silently omit it. `reserveSizedChannelDelivery` re-runs the same read-only settled-high
+preview once more, AFTER a reservation is accepted, and compares it against the claimed event ids —
+any settled event not in the claim forces `moreDeferred: true` before the result is returned to
+`channel.ts`.
+
 **The single-event pathological case's marker differs from the hook path's, because the channel
 COMMITS before the next poll can run (issue #442).** For the channel's reserve → push → commit cycle,
 by the time `renderChannelEvent` mid-truncates a lone event whose own block still exceeds the ceiling,
@@ -711,9 +736,14 @@ by the time `renderChannelEvent` mid-truncates a lone event whose own block stil
 `first_notified_at`, after which `pendingEventsForSession()` (whose query requires that column still
 `NULL`, 002 §7) will never return the row again. Unlike the deferred-remainder case above, the omitted tail
 of THIS event does **not** "re-deliver at the next poll" — it is only recoverable via the durable,
-still-unread copy of the full event (claiming ≠ acking, BP2 / SP4), discoverable via
-`agentmonitors events list --unread`. `channel-render.ts` therefore signposts this case with a distinct
-marker, `CHANNEL_TRUNCATED_MARKER`, that points at that durable copy instead of promising a re-delivery
+still-unread copy of the full event (claiming ≠ acking, BP2 / SP4). `agentmonitors events list`
+**requires** `--session <id>` (§5, issue #420 P2) — a bare `agentmonitors events list --unread` exits
+1, so the marker must render the exact, directly runnable command for the session that received THIS
+delivery, not the bare form (issue #442, PR #442 round-6 review). `channel-render.ts` therefore
+signposts this case with a distinct marker, built by `buildChannelTruncatedMarker(sessionId)`, reading
+``(this update was too large to show in full; run `agentmonitors events list --session <id> --unread`
+to see the full copy)`` with the claim's own (sanitized) `sessionId` substituted in — pointing at that
+durable copy instead of promising a re-delivery
 that cannot happen — reserving `CHANNEL_DEFERRED_MARKER`'s "surface on a later poll" language for the
 case where a whole block genuinely stayed unclaimed and pending.
 
