@@ -255,7 +255,25 @@ Tell the agent the local API changed.
   const claim = runtime.claimDelivery(session.id, 'turn-interruptible');
   assert.ok(claim);
   assert.equal(claim.urgency, 'normal');
-  assert.equal(claim.message, 'AgentMon messages are available. Read the inbox.');
+  // Issue #438: the reminder must be self-sufficient (contain the exact
+  // command + session id an agent needs to act) and must not carry the
+  // legacy "AgentMon"/"inbox" framing this text replaced.
+  assert.ok(
+    claim.message.includes('events ack --session'),
+    \`expected reminder to include the ack command, got: \${claim.message}\`,
+  );
+  assert.ok(
+    claim.message.includes(session.id),
+    \`expected reminder to include the session id, got: \${claim.message}\`,
+  );
+  assert.ok(
+    !claim.message.toLowerCase().includes('inbox'),
+    \`expected reminder not to reference the legacy inbox, got: \${claim.message}\`,
+  );
+  assert.ok(
+    !claim.message.includes('AgentMon'),
+    \`expected reminder to be unattributed (no "AgentMon" prefix), got: \${claim.message}\`,
+  );
 
   const hookState = JSON.parse(readFileSync(hookStatePath, 'utf8'));
   assert.equal(hookState.sessionId, session.id);
