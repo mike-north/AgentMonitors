@@ -111,11 +111,17 @@ describe('renderChannelEvent', () => {
     expect(rendered.length).toBeLessThanOrEqual(MAX_EVENT_DIFF);
   });
 
-  // 006 §4.6 (issue #436 human-review finding #3): the per-event diff bound is
-  // the ONLY remaining truncation path on the channel surface (the overall
-  // content cap was removed — the channel is not length-bounded, §5.5). Its
-  // elision marker is applied INSIDE buildEventBlock and then sanitized, so a
-  // truncated block can never reintroduce a tag-breakout character. This
+  // 006 §4.6 / §4.2.1 / §5.5 (issue #436 human-review finding #3): the
+  // per-event diff bound is an INDEPENDENT truncation layer from the
+  // channel's own content ceiling (`MAX_CHANNEL_CONTENT`, 20,000 chars,
+  // exercised further down this file) — the channel packs WHOLE blocks under
+  // that ceiling (never dropping a partial block to fit), with the single
+  // exception of a lone oversized event, which `renderChannelEvent`
+  // mid-truncates as a last resort (§4.2.1). The per-event diff bound applies
+  // regardless of overall size, so no single untrusted diff is dumped
+  // wholesale even when the whole claim comfortably fits under the ceiling.
+  // Its elision marker is applied INSIDE buildEventBlock and then sanitized,
+  // so a truncated block can never reintroduce a tag-breakout character. This
   // exercises truncation and breakout characters TOGETHER: a huge diff whose
   // content is full of `<`, `>`, `[`, `]` must still yield content with NONE of
   // the forbidden characters, marker included.
