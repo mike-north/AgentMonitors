@@ -48,9 +48,10 @@ import {
  * `start` action to its old direct-`claimDeliveryClient` wiring would have
  * left every one of those tests green (a mutation-blind regression gap).
  *
- * Returns `null` when there is nothing to reserve (a fresh session, or a
- * lapsed reservation) or `write` failed (the reservation was released,
- * nothing durably claimed); returns the committed claim otherwise.
+ * Returns `null` when there is nothing to reserve (a fresh session) or when
+ * commit resolves `null` because the reservation lapsed; rejects after
+ * releasing the reservation when `write` fails; returns the committed claim
+ * otherwise.
  */
 export async function deliverSessionStartRecap(
   sessionId: string,
@@ -218,154 +219,170 @@ sessionCommand
     }
   });
 
+/**
+ * `session start`'s actual Commander action handler, extracted and exported
+ * (issue #442, PR #442 round-18 review) so a test can drive the REAL command
+ * wiring — not just the `deliverSessionStartRecap` helper it calls — end to
+ * end. Before this extraction, every ordering regression in
+ * `session-start-recap-ordering.test.ts` called `deliverSessionStartRecap`
+ * directly; reverting only this file's call site (~what is now the
+ * `deliverSessionStartRecap` call below) back to a direct
+ * `claimDeliveryClient` → render → un-awaited `process.stdout.write` — while
+ * leaving `deliverSessionStartRecap` itself unused and in place — left every
+ * one of those tests green, a mutation-blind regression gap. `.action()`
+ * below calls this function VERBATIM; do not add logic between them.
+ */
+export async function runSessionStartAction(): Promise<void> {
+  // Claude Code delivers hook input as JSON on STDIN (not env vars). The host
+  // session id comes from the payload's `session_id`; there is NO
+  // `CLAUDE_CODE_SESSION_ID` env var in a real hook invocation. This is the
+  // same contract `hook deliver` reads.
+  const payload = await readHookPayload();
+  const hostSessionId = payload.session_id;
+  if (!hostSessionId) return; // not a Claude session; nothing to do
+
+  const workspacePath =
+    payload.cwd ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
+
+  const state = readLocalState(workspacePath);
+  if (!state.enabled) {
+    // Quick-exit: monitoring not enabled here. A silent quick-exit is a
+    // dead-end for a user who authored monitors and simply missed the
+    // enable step (issue #269) — they get zero signal forever. So before
+    // exiting, check whether the project actually has monitor definitions
+    // sitting unwatched; if so, surface a one-line advisory through the
+    // SAME additionalContext mechanism used by the recap below. Still
+    // exits 0 and still does NOT open a session or boot a daemon — this
+    // is advisory only (non-goals: never auto-enable, never boot).
+    //
+    // A workspace with NO monitor definitions stays fully silent (never
+    // nag a user who hasn't opted in at all yet).
+    const disabledMonitorsDir = path.join(workspacePath, '.claude', 'monitors');
+    const scan = await scanMonitors(disabledMonitorsDir);
+    const monitorCount = scan.monitors.length + scan.errors.length;
+    if (monitorCount > 0) {
+      const advisory = renderMonitoringDisabledAdvisory(
+        monitorCount,
+        'SessionStart',
+      );
+      // stdout is the SessionStart hook's wire channel — see the identical
+      // note on the recap write below.
+      process.stdout.write(JSON.stringify(advisory));
+    }
+    return;
+  }
+
+  const paths = workspacePaths(workspacePath);
+  // Resolve the socket up-front through the SAME transform `daemon run` applies
+  // when it binds (resolveSocketPath falls back to a short /tmp socket when the
+  // derived path exceeds the ~100-char Unix limit). Resolving here keeps the
+  // spawner, the daemonAvailable poll, openSessionClient, and the persisted
+  // `.local.md` socket all pointing at the actual bound socket — and stores the
+  // REAL path so sibling hooks (end, deliver) read a socket that exists.
+  const socket = resolveSocketPath(state.socket ?? paths.socket);
+  const db = state.db ?? paths.db;
+  const monitorsDir = path.join(workspacePath, '.claude', 'monitors');
+
+  const BOOT_TIMEOUT_MS = 8_000;
+  if (!(await daemonAvailable(socket))) {
+    spawnDetachedDaemon({
+      monitorsDir,
+      workspacePath,
+      socket,
+      db,
+      pollMs: 1000,
+      ...(state.reapAfterMs !== undefined
+        ? { reapAfterMs: state.reapAfterMs }
+        : {}),
+    });
+    // wait for the socket to come up
+    const bootStart = Date.now();
+    while (
+      Date.now() - bootStart < BOOT_TIMEOUT_MS &&
+      !(await daemonAvailable(socket))
+    ) {
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    // Guard: if the daemon never came up, report and bail — don't fall through
+    // to writeLocalState/openSessionClient pointing at a non-existent socket.
+    if (!(await daemonAvailable(socket))) {
+      reportError(
+        `Daemon failed to start within ${String(BOOT_TIMEOUT_MS / 1000)}s`,
+        false,
+      );
+      return;
+    }
+  }
+  // persist the resolved paths for sibling hooks (deliver/end)
+  writeLocalState(workspacePath, { ...state, socket, db });
+
+  try {
+    const opened = await openSessionClient(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId,
+        workspacePath,
+      }),
+      socket,
+    );
+
+    // One-line success ack on STDERR (issue #420 P3). stdout is this
+    // command's hook wire channel and MUST stay clean (it carries only the
+    // post-compact recap JSON below, if any) — so a hand-wiring user who
+    // needs to confirm the session registered gets it on stderr, which the
+    // Claude Code host never reads. Silent success was a dead end that forced
+    // a second `session list` just to tell it worked.
+    console.error(
+      `AgentMon: session ${opened.id} registered; daemon at ${socket}`,
+    );
+
+    // SessionStart is a context event, so this command ALSO surfaces the
+    // post-compact recap — from the SAME stdin payload we already read.
+    // The plugin runs `session start` as ONE hook command; a separately
+    // chained `agentmonitors hook deliver` would see an already-consumed
+    // stdin (one hook invocation = one stdin stream), parse `{}`, and
+    // silently no-op. Reading once and delivering here is the fix. On a
+    // fresh start nothing is pending → `flow.output` is null → nothing is
+    // printed; on a compact-resume the unread events are recapped.
+    //
+    // This is a RESERVE → RENDER → WRITE → COMMIT sequence, never a direct
+    // claim-then-render (issue #442, PR #442 round-16 review): the prior
+    // code called `claimDeliveryClient` — the durable `first_notified_at`
+    // mutation — BEFORE rendering or writing anything, then wrote via a bare,
+    // un-awaited `process.stdout.write`. `process.stdout.write`'s synchronous
+    // return value is only a backpressure signal; an async `EPIPE` arriving
+    // after that call would durably claim the recap rows while emitting
+    // nothing — the exact at-most-once loss window `hook deliver` closed for
+    // its own transport (`reserveRenderAndCommitHookDelivery` /
+    // `writeAndCommitHookDelivery`, `hook.ts`). `deliverSessionStartRecap`
+    // (above) reuses that same shared flow (its `post-compact` branch needs
+    // no per-event cap sizing, so it reserves the full unread set directly),
+    // closing the identical window for the SessionStart recap: a write
+    // failure releases the reservation instead of committing — no new claim
+    // is applied and the recap cursor is not advanced. The reservation's
+    // candidates come from the session's UNREAD events (not only
+    // never-yet-claimed ones), so releasing does not force every row back to
+    // `pending`: a row an earlier delivery already claimed stays claimed,
+    // while a genuinely pending row remains pending. Either way every row
+    // stays unread and is eligible to appear again on a future recap.
+    //
+    // stdout is the SessionStart hook's wire channel: it MUST contain only
+    // this JSON. Do NOT add `console.log`/diagnostics to stdout in this
+    // command — anything else here corrupts the hook output Claude reads.
+    await deliverSessionStartRecap(opened.id, socket, (toWrite) =>
+      writeStreamChunk(process.stdout, JSON.stringify(toWrite)),
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    reportError(message, false);
+  }
+}
+
 sessionCommand
   .command('start')
   .description(
     'Lazy-boot the project daemon (if needed) and register this session',
   )
-  .action(async () => {
-    // Claude Code delivers hook input as JSON on STDIN (not env vars). The host
-    // session id comes from the payload's `session_id`; there is NO
-    // `CLAUDE_CODE_SESSION_ID` env var in a real hook invocation. This is the
-    // same contract `hook deliver` reads.
-    const payload = await readHookPayload();
-    const hostSessionId = payload.session_id;
-    if (!hostSessionId) return; // not a Claude session; nothing to do
-
-    const workspacePath =
-      payload.cwd ?? process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd();
-
-    const state = readLocalState(workspacePath);
-    if (!state.enabled) {
-      // Quick-exit: monitoring not enabled here. A silent quick-exit is a
-      // dead-end for a user who authored monitors and simply missed the
-      // enable step (issue #269) — they get zero signal forever. So before
-      // exiting, check whether the project actually has monitor definitions
-      // sitting unwatched; if so, surface a one-line advisory through the
-      // SAME additionalContext mechanism used by the recap below. Still
-      // exits 0 and still does NOT open a session or boot a daemon — this
-      // is advisory only (non-goals: never auto-enable, never boot).
-      //
-      // A workspace with NO monitor definitions stays fully silent (never
-      // nag a user who hasn't opted in at all yet).
-      const disabledMonitorsDir = path.join(
-        workspacePath,
-        '.claude',
-        'monitors',
-      );
-      const scan = await scanMonitors(disabledMonitorsDir);
-      const monitorCount = scan.monitors.length + scan.errors.length;
-      if (monitorCount > 0) {
-        const advisory = renderMonitoringDisabledAdvisory(
-          monitorCount,
-          'SessionStart',
-        );
-        // stdout is the SessionStart hook's wire channel — see the identical
-        // note on the recap write below.
-        process.stdout.write(JSON.stringify(advisory));
-      }
-      return;
-    }
-
-    const paths = workspacePaths(workspacePath);
-    // Resolve the socket up-front through the SAME transform `daemon run` applies
-    // when it binds (resolveSocketPath falls back to a short /tmp socket when the
-    // derived path exceeds the ~100-char Unix limit). Resolving here keeps the
-    // spawner, the daemonAvailable poll, openSessionClient, and the persisted
-    // `.local.md` socket all pointing at the actual bound socket — and stores the
-    // REAL path so sibling hooks (end, deliver) read a socket that exists.
-    const socket = resolveSocketPath(state.socket ?? paths.socket);
-    const db = state.db ?? paths.db;
-    const monitorsDir = path.join(workspacePath, '.claude', 'monitors');
-
-    const BOOT_TIMEOUT_MS = 8_000;
-    if (!(await daemonAvailable(socket))) {
-      spawnDetachedDaemon({
-        monitorsDir,
-        workspacePath,
-        socket,
-        db,
-        pollMs: 1000,
-        ...(state.reapAfterMs !== undefined
-          ? { reapAfterMs: state.reapAfterMs }
-          : {}),
-      });
-      // wait for the socket to come up
-      const bootStart = Date.now();
-      while (
-        Date.now() - bootStart < BOOT_TIMEOUT_MS &&
-        !(await daemonAvailable(socket))
-      ) {
-        await new Promise((r) => setTimeout(r, 150));
-      }
-      // Guard: if the daemon never came up, report and bail — don't fall through
-      // to writeLocalState/openSessionClient pointing at a non-existent socket.
-      if (!(await daemonAvailable(socket))) {
-        reportError(
-          `Daemon failed to start within ${String(BOOT_TIMEOUT_MS / 1000)}s`,
-          false,
-        );
-        return;
-      }
-    }
-    // persist the resolved paths for sibling hooks (deliver/end)
-    writeLocalState(workspacePath, { ...state, socket, db });
-
-    try {
-      const opened = await openSessionClient(
-        claudeCodeAdapter.createSessionInput({
-          hostSessionId,
-          workspacePath,
-        }),
-        socket,
-      );
-
-      // One-line success ack on STDERR (issue #420 P3). stdout is this
-      // command's hook wire channel and MUST stay clean (it carries only the
-      // post-compact recap JSON below, if any) — so a hand-wiring user who
-      // needs to confirm the session registered gets it on stderr, which the
-      // Claude Code host never reads. Silent success was a dead end that forced
-      // a second `session list` just to tell it worked.
-      console.error(
-        `AgentMon: session ${opened.id} registered; daemon at ${socket}`,
-      );
-
-      // SessionStart is a context event, so this command ALSO surfaces the
-      // post-compact recap — from the SAME stdin payload we already read.
-      // The plugin runs `session start` as ONE hook command; a separately
-      // chained `agentmonitors hook deliver` would see an already-consumed
-      // stdin (one hook invocation = one stdin stream), parse `{}`, and
-      // silently no-op. Reading once and delivering here is the fix. On a
-      // fresh start nothing is pending → `flow.output` is null → nothing is
-      // printed; on a compact-resume the unread events are recapped.
-      //
-      // This is a RESERVE → RENDER → WRITE → COMMIT sequence, never a direct
-      // claim-then-render (issue #442, PR #442 round-16 review): the prior
-      // code called `claimDeliveryClient` — the durable `first_notified_at`
-      // mutation — BEFORE rendering or writing anything, then wrote via a bare,
-      // un-awaited `process.stdout.write`. `process.stdout.write`'s synchronous
-      // return value is only a backpressure signal; an async `EPIPE` arriving
-      // after that call would durably claim the recap rows while emitting
-      // nothing — the exact at-most-once loss window `hook deliver` closed for
-      // its own transport (`reserveRenderAndCommitHookDelivery` /
-      // `writeAndCommitHookDelivery`, `hook.ts`). `deliverSessionStartRecap`
-      // (above) reuses that same shared flow (its `post-compact` branch needs
-      // no per-event cap sizing, so it reserves the full unread set directly),
-      // closing the identical window for the SessionStart recap: a write
-      // failure releases the reservation (rows stay pending, nothing durably
-      // claimed) instead of committing.
-      //
-      // stdout is the SessionStart hook's wire channel: it MUST contain only
-      // this JSON. Do NOT add `console.log`/diagnostics to stdout in this
-      // command — anything else here corrupts the hook output Claude reads.
-      await deliverSessionStartRecap(opened.id, socket, (toWrite) =>
-        writeStreamChunk(process.stdout, JSON.stringify(toWrite)),
-      );
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      reportError(message, false);
-    }
-  });
+  .action(runSessionStartAction);
 
 sessionCommand
   .command('end')

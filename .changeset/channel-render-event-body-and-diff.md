@@ -76,6 +76,12 @@ poll`). The other, rarer case is a single event whose own block still exceeds th
   asynchronously afterward (e.g. `EPIPE` once the reading end has closed); previously that async
   failure could arrive after the reservation was already committed, silently losing the delivery. A
   write failure (synchronous or asynchronous) now releases the reservation instead of committing.
+- `agentmonitors session start`'s `SessionStart` post-compact recap now follows the identical
+  reserve → render → write → commit ordering: it reserves the `post-compact` delivery, renders it,
+  writes it to stdout **awaiting the write's full completion**, and only then commits — instead of
+  the prior direct `claimDelivery` call (the durable claim) made BEFORE anything was rendered or
+  written. A write failure now releases the reservation instead of committing, so nothing is
+  durably (re-)claimed when the recap never reached the agent.
 - A reminder claim raced down from a settled-high sizing preview no longer inherits that preview's
   stale `moreDeferred: true` — it is always reported `false` for an eventless reminder, mirroring the
   channel transport's identical handling of the same preview↔reserve race.

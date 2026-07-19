@@ -26,15 +26,28 @@
  * wiring would have left every test in this file green — a mutation-blind
  * regression gap. These tests now import and invoke `deliverSessionStartRecap`
  * from `./session.js` itself (the function the `start` action calls), and
- * assert `claimDeliveryClient` is never called directly, so a regression to
- * the old direct-claim shape fails here. See the bottom of this file for the
- * mutation check performed to confirm that.
+ * assert `claimDeliveryClient` is never called directly.
  *
- * These tests exercise that flow end-to-end against a REAL, delayed-failure
- * `Writable` (mirroring `hook-deliver-commit-ordering.test.ts`'s real-stream
- * regressions for the `turn-interruptible`/generic case), proving a write
- * failure releases the reservation instead of committing — the rows stay
- * pending and redeliver at the next context event rather than being lost.
+ * Round-18 review: even with that fix, every test here still calls
+ * `deliverSessionStartRecap` directly rather than the `start` command's
+ * actual `.action()` handler — reverting only `session.ts`'s call site (back
+ * to the pre-fix direct-claim shape) while leaving `deliverSessionStartRecap`
+ * itself unused would still leave every test in THIS file green. That gap is
+ * closed by `session-start-action.test.ts`, which drives the exported
+ * `runSessionStartAction` — the exact function `.action()` registers — and
+ * documents the mutation check performed against it.
+ *
+ * These tests exercise `deliverSessionStartRecap`'s reserve/render/write/commit
+ * flow end-to-end against a REAL, delayed-failure `Writable` (mirroring
+ * `hook-deliver-commit-ordering.test.ts`'s real-stream regressions for the
+ * `turn-interruptible`/generic case), proving a write failure releases the
+ * reservation instead of committing: no new claim is applied and the recap
+ * cursor is not advanced. Because the `post-compact` reservation's candidates
+ * are a session's UNREAD events (not only never-yet-claimed ones), releasing
+ * does not force every row back to `pending` — a row an earlier delivery
+ * already claimed stays claimed, a genuinely pending row stays pending —
+ * but every row in the reservation remains unread and eligible to appear
+ * again on a future recap.
  *
  * @see docs/specs/005-cli-reference.md §10.4
  * @see docs/specs/006-agent-integration.md §5.6
@@ -169,8 +182,10 @@ describe("session.ts's deliverSessionStartRecap: reserve -> render -> write -> c
 
     // Never committed: the write failed, so nothing gets durably claimed.
     expect(commitMock).not.toHaveBeenCalled();
-    // Released instead — the recap rows return to pending and redeliver at
-    // the next context event.
+    // Released instead — no new claim is applied and the recap cursor is not
+    // advanced; the rows remain unread and eligible for a future recap (a
+    // never-yet-claimed row also stays pending, but this release does not
+    // reset an already-claimed row's claimed state).
     expect(releaseMock).toHaveBeenCalledTimes(1);
     expect(releaseMock).toHaveBeenCalledWith('recap-r-2', '/sock');
     // Still never a direct claim.
