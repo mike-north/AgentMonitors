@@ -609,6 +609,121 @@ describe('renderHookDelivery', () => {
   });
 });
 
+// (issue #442, PR #442 round-9 review) Marker selection is lifecycle-aware:
+// a `post-compact` recap re-shows the FULL unread set on EVERY recap,
+// regardless of whether a row is already claimed (§5.5 — `decideDelivery`'s
+// recap branch reads `unreadEventsForSession`, not `pendingEventsForSession`,
+// and `applyDelivery` claims the FULL candidate set at commit time
+// regardless of what actually renders). Neither of the two ordinary markers
+// is truthful for a recap:
+//   - the "genuinely pending" deferred marker ("more monitor updates are
+//     pending ... run events list --unread to see the rest") wrongly implies
+//     the omitted content is NOT yet claimed;
+//   - the claimed-unread marker's "it will not redeliver automatically" is
+//     actively FALSE — the omitted content WILL reappear, automatically, on
+//     the NEXT recap.
+describe('renderHookDelivery post-compact recap marker (issue #442, round-9 review)', () => {
+  function recapEvent(
+    overrides: Partial<DeliveryEventSummary> = {},
+  ): DeliveryEventSummary {
+    return {
+      eventId: 'e1',
+      monitorId: 'watch-src',
+      title: 'Files changed',
+      summary: 'Files changed',
+      body: 'a body',
+      urgency: 'normal',
+      createdAt: '2026-06-04T00:00:00.000Z',
+      ...overrides,
+    };
+  }
+
+  function makeRecapClaim(
+    overrides: Partial<DeliveryClaim> = {},
+  ): DeliveryClaim {
+    return makeClaim({
+      mode: 'recap',
+      urgency: undefined,
+      lifecycle: 'post-compact',
+      message: 'Recap of recent AgentMon activity since your last recap:',
+      events: [recapEvent()],
+      ...overrides,
+    });
+  }
+
+  it('an oversized single-event recap uses recap-aware language, never "will not redeliver automatically"', () => {
+    const out = renderHookDelivery(
+      makeRecapClaim({
+        sessionId: 'session-recap',
+        events: [recapEvent({ body: 'x'.repeat(10_000) })],
+      }),
+      'SessionStart',
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx.length).toBeLessThanOrEqual(4000);
+    expect(ctx).toContain('[truncated');
+    // The turn-interruptible claimed-unread framing must NOT leak into a recap.
+    expect(ctx).not.toContain('will not redeliver automatically');
+    // Truthful recap framing: it WILL reappear on future recaps.
+    expect(ctx).toContain('will reappear on future recaps');
+    expect(ctx).toContain(
+      'run `agentmonitors events list --session session-recap --unread` to see it now',
+    );
+  });
+
+  it('a multi-event recap whose combined blocks exceed the cap uses recap-aware language, never the genuinely-pending "more monitor updates" framing', () => {
+    const bodyA = `AAAA ${'a'.repeat(2200)}`;
+    const bodyB = `BBBB ${'b'.repeat(2200)}`;
+    const out = renderHookDelivery(
+      makeRecapClaim({
+        sessionId: 'session-recap-multi',
+        events: [
+          recapEvent({ eventId: 'e1', monitorId: 'mon-a', body: bodyA }),
+          recapEvent({ eventId: 'e2', monitorId: 'mon-b', body: bodyB }),
+        ],
+      }),
+      'SessionStart',
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx.length).toBeLessThanOrEqual(4000);
+    // First block shown in full; second omitted from THIS recap render.
+    expect(ctx).toContain(bodyA);
+    expect(ctx).not.toContain('BBBB');
+    expect(ctx).toContain('[truncated');
+    // The omitted event was already claimed at commit time (the recap
+    // decision claims the FULL candidate set) — the ordinary "genuinely
+    // pending, will redeliver at the next context event" framing is wrong
+    // here; it never redelivers via the context-event flow, only via the
+    // next recap.
+    expect(ctx).not.toContain('more monitor updates are pending');
+    expect(ctx).toContain('will reappear on future recaps');
+    expect(ctx).toContain(
+      'run `agentmonitors events list --session session-recap-multi --unread` to see it now',
+    );
+  });
+
+  it('a recap that fits entirely under the cap carries no marker at all', () => {
+    const out = renderHookDelivery(makeRecapClaim(), 'SessionStart');
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).not.toContain('[truncated');
+  });
+
+  it('a non-recap (turn-interruptible) claim keeps the ordinary markers unchanged', () => {
+    // Regression guard: the lifecycle-aware branch must not alter behavior
+    // for the non-recap lifecycles already covered above.
+    const out = renderHookDelivery(
+      makeClaim({
+        sessionId: 'session-plain',
+        events: [recapEvent({ body: 'x'.repeat(10_000) })],
+      }),
+      'PreToolUse',
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).toContain('will not redeliver automatically');
+    expect(ctx).not.toContain('will reappear on future recaps');
+  });
+});
+
 // (issue #299) The transport-side sizing used to CLAIM exactly the events that
 // will be rendered under the context cap, so the truncated-away remainder stays
 // pending and re-delivers at the next context event.

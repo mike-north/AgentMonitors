@@ -84,6 +84,8 @@ function buildHookDeferredMarker(
  * SP4), so the framing says so explicitly instead of promising a redelivery
  * that will not happen — mirroring the channel transport's
  * `buildChannelTruncatedMarker` (`channel-render.ts`).
+ *
+ * **Not valid for a `post-compact` recap** — see {@link buildHookRecapMarker}.
  */
 function buildHookClaimedUnreadMarker(
   sessionId: string,
@@ -91,6 +93,43 @@ function buildHookClaimedUnreadMarker(
 ): string {
   const safeSessionId = sanitize(sessionId);
   return `\n\n[truncated — this update was too large to show in full; it is claimed but NOT acknowledged, so the full copy stays unread (it will not redeliver automatically) — run \`agentmonitors events list --session ${safeSessionId}${socketClause(socketPath)} --unread\` to see it]`;
+}
+
+/**
+ * Build the marker used for a truncated `post-compact` **recap** — lifecycle-
+ * aware, distinct from both {@link buildHookDeferredMarker} and
+ * {@link buildHookClaimedUnreadMarker} (issue #442, PR #442 round-9 review).
+ *
+ * Neither of those two markers is TRUE for a recap. A recap's decision
+ * (`decideDelivery`'s `post-compact` branch, `service.ts`) reads ALL unread
+ * events for the session and claims the FULL unread set at apply time
+ * (`applyDelivery` claims `decision.candidates`, not just the rendered
+ * `recapSlice`) — but recap re-SOURCES from `unreadEventsForSession`, not
+ * `pendingEventsForSession`, so a row being claimed (`first_notified_at` set)
+ * never hides it from a FUTURE recap; only acknowledging does (§5.5). That
+ * means:
+ *
+ * - {@link buildHookDeferredMarker}'s "more monitor updates are pending ...
+ *   run `events list --unread` to see the rest" is misleading here: the
+ *   omitted whole blocks are not "pending" in the ordinary sense (they were
+ *   already claimed along with the rest of the recap's candidate set) —
+ *   they will not redeliver at "the next context event" the way a genuinely
+ *   unclaimed `turn-interruptible` event would.
+ * - {@link buildHookClaimedUnreadMarker}'s "it will not redeliver
+ *   automatically" is actively FALSE for a recap: the omitted/cut content
+ *   WILL reappear, automatically, on the next `post-compact` recap (and any
+ *   after that) until it is acknowledged — that is the intentional self-heal
+ *   behavior §5.5 documents.
+ *
+ * So a recap needs its own truthful framing regardless of which of
+ * {@link renderHookDelivery}'s two truncation branches (whole-blocks-omitted,
+ * or a single event's own block mid-truncated) produced it — both are, for a
+ * recap, the SAME fact: this content is claimed-but-unacknowledged and will
+ * keep re-surfacing on future recaps.
+ */
+function buildHookRecapMarker(sessionId: string, socketPath?: string): string {
+  const safeSessionId = sanitize(sessionId);
+  return `\n\n[truncated — not everything fit in this recap; the omitted content is claimed but NOT acknowledged, so it stays unread and will reappear on future recaps until acknowledged — run \`agentmonitors events list --session ${safeSessionId}${socketClause(socketPath)} --unread\` to see it now]`;
 }
 
 /**
@@ -378,21 +417,31 @@ export function renderHookDelivery(
 ): HookDeliveryOutput | null {
   if (!claim) return null;
 
+  // A `post-compact` recap is a DIFFERENT lifecycle from a `turn-interruptible`
+  // (or `turn-idle`) claim: it intentionally re-shows the full unread set on
+  // EVERY recap, regardless of whether a given row already got claimed
+  // (§5.5) — so neither of the two markers below is truthful for it. Marker
+  // selection is therefore lifecycle-aware (issue #442, PR #442 round-9
+  // review): see {@link buildHookRecapMarker}.
+  const isRecap = claim.lifecycle === 'post-compact';
+
   // Built once per claim from its own `sessionId` (issue #442) and the
   // resolved `socketPath` (issue #358, PR #442 round-7 review) so every marker
   // rendered below points at the exact, directly runnable recovery command for
   // THIS claim's session — see {@link buildHookDeferredMarker} and
   // {@link buildHookClaimedUnreadMarker}. The two are DELIBERATELY distinct
-  // (see their doc comments): the deferred marker promises a redelivery that
-  // will actually happen; the claimed-unread marker does not.
-  const deferredMarker = buildHookDeferredMarker(
-    claim.sessionId,
-    options.socketPath,
-  );
-  const claimedUnreadMarker = buildHookClaimedUnreadMarker(
-    claim.sessionId,
-    options.socketPath,
-  );
+  // for a non-recap claim (see their doc comments): the deferred marker
+  // promises a redelivery that will actually happen; the claimed-unread
+  // marker does not. For a recap, both slots use the SAME recap-aware marker
+  // (`buildHookRecapMarker`) — the distinction between "genuinely pending" and
+  // "already claimed" doesn't apply: recap re-shows everything unread
+  // regardless of claimed state.
+  const deferredMarker = isRecap
+    ? buildHookRecapMarker(claim.sessionId, options.socketPath)
+    : buildHookDeferredMarker(claim.sessionId, options.socketPath);
+  const claimedUnreadMarker = isRecap
+    ? deferredMarker
+    : buildHookClaimedUnreadMarker(claim.sessionId, options.socketPath);
 
   // Reminder-only delivery (issue #198): a `normal`/`low` turn-boundary claim
   // has no event bodies to inject, only a lightweight advisory `message`. Body
@@ -460,10 +509,16 @@ export function renderHookDelivery(
       // redeliver. Render BOTH markers whenever both apply — they describe
       // two different, non-overlapping facts (this event's own tail vs. the
       // separate pending remainder) and are never redundant with each other.
+      // For a recap, `deferredMarker === claimedUnreadMarker` (both are the
+      // same recap marker) and `moreDeferred` is never set true by
+      // `reserveSizedHookDelivery` for a non-`turn-interruptible` lifecycle
+      // anyway (issue #442, PR #442 round-9 review) — but guard against ever
+      // doubling an identical marker regardless.
       const firstBlock = blocks[0] ?? '';
-      const marker = moreDeferred
-        ? claimedUnreadMarker + deferredMarker
-        : claimedUnreadMarker;
+      const marker =
+        moreDeferred && claimedUnreadMarker !== deferredMarker
+          ? claimedUnreadMarker + deferredMarker
+          : claimedUnreadMarker;
       additionalContext = appendMarkerWithinCap(
         HEADER + firstBlock,
         MAX_ADDITIONAL_CONTEXT,
