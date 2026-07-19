@@ -702,8 +702,13 @@ explicitly acknowledged.
 The truncation marker (§5.1) is appended whenever the render omits any pending event — because a
 whole block did not fit **or** because the transport deferred more high-urgency work — signposting
 that more updates are pending. The single pathological case where one event's own block alone exceeds
-the cap is shown partially (mid-truncated at a code-point boundary) to guarantee forward progress;
-its full body stays unread and re-delivers.
+the cap is shown partially (mid-truncated at a code-point boundary) to guarantee forward progress.
+**This case does NOT re-deliver**, unlike the deferred-remainder case above: `claimDelivery` sets
+`first_notified_at` on the row **synchronously**, before this render runs, so
+`pendingEventsForSession()` (which requires that column still `NULL`) never returns it again at a
+later context event. Its full body stays unread (claiming ≠ acking, BP2 / SP4) and is recoverable
+ONLY via the durable unread copy, `agentmonitors events list --session <id> --unread` (issue #442,
+PR #442 round-7 review).
 
 The non-high branches need no sizing: `normal`/`low` reminders inject no per-event bodies, and the
 `post-compact` recap re-shows all unread each time, so both self-heal.
@@ -732,31 +737,41 @@ preview once more, AFTER a reservation is accepted, and compares it against the 
 any settled event not in the claim forces `moreDeferred: true` before the result is returned to
 `channel.ts`.
 
-**The single-event pathological case's marker differs from the hook path's, because the channel
-COMMITS before the next poll can run (issue #442).** For the channel's reserve → push → commit cycle,
-by the time `renderChannelEvent` mid-truncates a lone event whose own block still exceeds the ceiling,
-`runChannelDeliveryCycle` is about to commit that reservation on a successful push — setting
+**The single-event pathological case's marker differs from the deferred-remainder marker, because the
+channel COMMITS before the next poll can run (issue #442).** For the channel's reserve → push → commit
+cycle, by the time `renderChannelEvent` mid-truncates a lone event whose own block still exceeds the
+ceiling, `runChannelDeliveryCycle` is about to commit that reservation on a successful push — setting
 `first_notified_at`, after which `pendingEventsForSession()` (whose query requires that column still
 `NULL`, 002 §7) will never return the row again. Unlike the deferred-remainder case above, the omitted tail
 of THIS event does **not** "re-deliver at the next poll" — it is only recoverable via the durable,
 still-unread copy of the full event (claiming ≠ acking, BP2 / SP4). `agentmonitors events list`
 **requires** `--session <id>` (§5, issue #420 P2) — a bare `agentmonitors events list --unread` exits
 1, so the marker must render the exact, directly runnable command for the session that received THIS
-delivery, not the bare form (issue #442, PR #442 round-6 review). `channel-render.ts` therefore
-signposts this case with a distinct marker, built by `buildChannelTruncatedMarker(sessionId)`, reading
-``(this update was too large to show in full; run `agentmonitors events list --session <id> --unread`
-to see the full copy)`` with the claim's own (sanitized) `sessionId` substituted in — pointing at that
-durable copy instead of promising a re-delivery
-that cannot happen — reserving `CHANNEL_DEFERRED_MARKER`'s "surface on a later poll" language for the
+delivery, not the bare form (issue #442, PR #442 round-6 review). It must also carry an explicit
+`--socket <path>` (issue #358, PR #442 round-7 review): `events list` itself resolves its socket
+ENV-FIRST (`resolveManualDaemonSocketPath`, issue #335), so a copy-pasted command with no `--socket`
+could silently query a stale `$AGENTMONITORS_SOCKET` left over from a different workspace rather than
+the daemon `channel serve` is actually bound to. `channel-render.ts` therefore signposts this case
+with a distinct marker, built by `buildChannelTruncatedMarker(sessionId, socketPath)`, reading
+``(this update was too large to show in full; run `agentmonitors events list --session <id> --socket
+<path> --unread` to see the full copy)`` with the claim's own (sanitized) `sessionId` and the
+resolved (shell-quoted) `socketPath` substituted in — pointing at that durable copy instead of
+promising a re-delivery that cannot happen — reserving `CHANNEL_DEFERRED_MARKER`'s "surface on a later poll" language for the
 case where a whole block genuinely stayed unclaimed and pending.
 
-**The hook-deliver transport uses a single, already session-scoped marker for both branches
-instead.** Unlike the channel's two-phase reserve/commit, `claimDeliveryClient` claims (and sets
-`first_notified_at`) synchronously, so a hook-deliver claim's deferred-remainder branch and its
-single-event mid-truncation branch are both rendered by one marker builder,
-`buildHookTruncatedMarker(sessionId)` (§5.1), rather than the channel's two distinct marker
-constants — there is no "will re-deliver later" framing to preserve on the hook side that would be
-undermined by session-scoping it.
+**The hook-deliver transport ALSO uses two distinct, session- and socket-scoped markers, mirroring
+the channel side (issue #442, PR #442 round-7 review).** `claimDeliveryClient` claims (and sets
+`first_notified_at`) **synchronously** for every hook-deliver claim — unlike the channel's two-phase
+reserve/commit — so BOTH the single-event mid-truncation branch AND a truncated reminder message are
+already-claimed content being cut, not other pending work being deferred. Only the
+deferred-remainder branch (a whole block genuinely left OUT of the render, still pending) legitimately
+promises a later redelivery. `hook-deliver-render.ts` therefore builds two markers from the SAME two
+inputs the channel side uses: `buildHookDeferredMarker(sessionId, socketPath)` — "more monitor updates
+are pending", used only for the genuinely-deferred-remainder branch — and
+`buildHookClaimedUnreadMarker(sessionId, socketPath)` — the claimed-unread framing, used for the
+single-event mid-truncation branch and for a truncated reminder message. Before this split, both
+branches shared one marker whose "more monitor updates are pending" framing falsely implied the
+mid-truncated event's own omitted tail would also redeliver.
 
 No durable event is lost by truncation; the cap only bounds how much is injected into a single turn (or,
 for the channel, into a single push).
