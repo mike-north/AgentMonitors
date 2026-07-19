@@ -3,6 +3,15 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /**
+ * Memoized result of the manifest read below. `undefined` means "not yet
+ * resolved"; every other value (including the `'0.0.0'` fallback) is cached.
+ * A `package.json` never changes for the lifetime of a running process, so
+ * re-reading and re-parsing it on every call — as the channel transport does
+ * on every 3s poll via `writeTransportHeartbeat` — is a pure, unbounded waste.
+ */
+let cachedVersion: string | undefined;
+
+/**
  * Read the CLI's version from its own `package.json`. Both the TS source
  * (`src/*.ts`) and the bundled artifact (`dist/index.cjs`) sit one level below
  * the package root, so a single `..` resolves the manifest in either layout.
@@ -15,13 +24,15 @@ import { fileURLToPath } from 'node:url';
  * ("which CLI is actually serving this session?").
  */
 export function getCliVersion(): string {
+  if (cachedVersion !== undefined) return cachedVersion;
   try {
     const dir = dirname(fileURLToPath(import.meta.url));
     const pkg = JSON.parse(
       readFileSync(join(dir, '..', 'package.json'), 'utf8'),
     ) as { version?: unknown };
-    return typeof pkg.version === 'string' ? pkg.version : '0.0.0';
+    cachedVersion = typeof pkg.version === 'string' ? pkg.version : '0.0.0';
   } catch {
-    return '0.0.0';
+    cachedVersion = '0.0.0';
   }
+  return cachedVersion;
 }

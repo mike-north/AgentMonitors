@@ -11,7 +11,6 @@ import {
   writeFileSync,
   readFileSync,
 } from 'node:fs';
-import { homedir } from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
 import {
@@ -32,6 +31,7 @@ import type {
 } from '@agentmonitors/core';
 import { z } from 'zod';
 import { resolveDbPath } from './db-path.js';
+import { resolveDataRoot } from './workspace-paths.js';
 
 type JsonRecord = Record<string, unknown>;
 const MAX_UNIX_SOCKET_PATH_LENGTH = 100;
@@ -360,13 +360,12 @@ function isUnsupportedRequestResponse(response: {
 function socketBaseDir(): string {
   const dbPath = resolveDbPath();
   if (dbPath === ':memory:') {
-    // Mirror `workspacePaths()`'s XDG-aware data root so a caller who relocates
-    // their data via `XDG_DATA_HOME` gets a consistent default socket location
-    // (and so tests can isolate this path). Falls back to `~/.local/share` when
-    // unset, matching the pre-existing behavior for the common case.
-    const dataRoot =
-      process.env['XDG_DATA_HOME'] ?? path.join(homedir(), '.local', 'share');
-    return path.join(dataRoot, 'agentmonitors');
+    // Mirror the canonical XDG-aware data root (`workspace-paths.ts`) so a
+    // caller who relocates their data via `XDG_DATA_HOME` gets a consistent
+    // default socket location (and so tests can isolate this path) — imported
+    // rather than re-derived, so this and the transport registry can never
+    // silently diverge from each other.
+    return path.join(resolveDataRoot(), 'agentmonitors');
   }
   return path.dirname(dbPath);
 }
