@@ -255,16 +255,24 @@ Tell the agent the local API changed.
   const claim = runtime.claimDelivery(session.id, 'turn-interruptible');
   assert.ok(claim);
   assert.equal(claim.urgency, 'normal');
-  // Issue #438: the reminder must be self-sufficient (contain the exact
-  // command + session id an agent needs to act) and must not carry the
-  // legacy "AgentMon"/"inbox" framing this text replaced.
+  // 002 §9.2 (issues #438/#434): the coalesced normal-urgency reminder is
+  // self-sufficient — it MUST name BOTH runnable steps, the session-scoped
+  // discovery command (\`events list --session <id> --unread\`) AND the
+  // acknowledge command (\`events ack --session <id>\`), each with the real
+  // session id interpolated. These are transcribed straight from the spec
+  // wording (mirroring the \`reminderMessage\` fixture in
+  // libs/core/src/runtime/service.test.ts) rather than a loose substring
+  // check, so a regression that drops either command — e.g. keeping only the
+  // ack line — fails here, not just in the focused unit tests.
+  const expectedListCommand = \`agentmonitors events list --session \${session.id} --unread\`;
+  const expectedAckCommand = \`agentmonitors events ack --session \${session.id}\`;
   assert.ok(
-    claim.message.includes('events ack --session'),
-    \`expected reminder to include the ack command, got: \${claim.message}\`,
+    claim.message.includes(expectedListCommand),
+    \`expected reminder to include the discovery command "\${expectedListCommand}", got: \${claim.message}\`,
   );
   assert.ok(
-    claim.message.includes(session.id),
-    \`expected reminder to include the session id, got: \${claim.message}\`,
+    claim.message.includes(expectedAckCommand),
+    \`expected reminder to include the ack command "\${expectedAckCommand}", got: \${claim.message}\`,
   );
   assert.ok(
     !claim.message.toLowerCase().includes('inbox'),
