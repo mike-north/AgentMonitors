@@ -39,7 +39,7 @@ pnpm audit:prod             # pnpm audit --prod --audit-level high (raw report)
 pnpm check:dependency-audit # same audit, gated by scripts/audit-allowlist.json (CI: .github/workflows/dependency-audit.yml)
 pnpm fix:lint-ts    # eslint --fix
 pnpm fix:format     # prettier --write
-pnpm clean          # remove all dist/ dirs
+pnpm clean          # remove dist/ + api-extractor temp/ dirs and reset the nx cache
 ```
 
 Per-package / single-test:
