@@ -931,7 +931,19 @@ which left them to discover `& disown` and their own log redirection. With `--de
    `--detach` can compare it against its own spawned pid: on a match it reports success as before; on
    a mismatch it reports the OTHER daemon's pid and its actual reap setting (not the
    `--reap-after-ms` THIS invocation requested), exits non-zero, and suggests `daemon stop` + retry.
-5. On success, prints the pid, the socket, the log path, and whether idle reaping is active.
+   Identity must be **proven**, not assumed: `daemon status` is retried within the same 15s readiness
+   window, and an unproven outcome — a status call that keeps erroring, or one that reports no pid to
+   compare against — is reported as a failure, never as success (round-2 review finding 3611413813).
+5. **Never reports a failure while leaving its child running** (round-2 review finding 3611470928).
+   Every non-success `--detach` outcome — readiness timeout, spawn error, race loss, and unproven
+   identity — terminates the process THIS invocation spawned and confirms it is gone (`SIGTERM`,
+   escalating to `SIGKILL` if it has not exited within a short grace window) before returning. Only
+   the spawned pid is ever signalled: a daemon proven to be serving under a DIFFERENT pid belongs to
+   a concurrent lazy boot and is left untouched. Without this, "the daemon did not start" could be
+   false — an unowned daemon would keep serving, indefinitely under `--reap-after-ms 0`, and the
+   retry the error message suggests would collide with the process that invocation orphaned. The
+   error message states whether the cleanup succeeded.
+6. On success, prints the pid, the socket, the log path, and whether idle reaping is active.
 
 `--detach` composes with `--reap-after-ms 0`: that pair is the supported way to run a daemon that
 stays up while **no** agent session is open (so a monitor can raise work for an idle agent), and the

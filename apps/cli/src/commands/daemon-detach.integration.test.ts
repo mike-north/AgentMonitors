@@ -490,6 +490,20 @@ describe('daemon run --detach (issue #389 P1)', () => {
       'AgentMon daemon started in the background.',
     );
 
+    // Round-2 finding 3611470928, on the REAL command path: when the loser
+    // took the identity branch it DID spawn a child before losing the race,
+    // and having just reported "not started" it must not leave that child
+    // running — under `--reap-after-ms 0` it would linger forever, and the
+    // retry the message suggests would collide with it. (The other honest
+    // outcome, the pre-spawn "already running" guard, never spawns anything,
+    // so there is no pid to check.)
+    const loserChildPid = /child we spawned \(pid (\d+)\)/.exec(loserOutput);
+    if (loserChildPid?.[1] !== undefined) {
+      const strandedPid = Number(loserChildPid[1]);
+      expect(loserOutput).toContain('has been terminated');
+      expect(isProcessAlive(strandedPid)).toBe(false);
+    }
+
     // The winner's reported pid is confirmed by `daemon status` as the one
     // actually serving the socket.
     const winnerPidMatch = /pid:\s+(\d+)/.exec(winners[0]?.stdout ?? '');

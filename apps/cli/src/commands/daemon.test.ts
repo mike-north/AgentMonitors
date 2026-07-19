@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -6,6 +7,7 @@ import { AgentMonitorRuntime } from '@agentmonitors/core';
 import {
   describeDetachIdentityIssue,
   runLoop,
+  terminateSpawnedDetachedDaemon,
   waitForDetachedDaemonReady,
   waitForDetachIdentityProof,
 } from './daemon.js';
@@ -315,5 +317,120 @@ describe('waitForDetachedDaemonReady (issue #389 review finding 2)', () => {
     const elapsedMs = Date.now() - start;
     expect(outcome).toEqual({ ready: false, spawnError: spawnFailure });
     expect(elapsedMs).toBeLessThan(1_000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round-2 review finding 3611470928: every `--detach` outcome we REPORT as a
+// failure must actually leave no process behind. Reporting "not started" while
+// an unowned daemon keeps serving — indefinitely under `--reap-after-ms 0` —
+// makes the error message a lie and sets up the suggested retry to collide
+// with the very process this invocation orphaned.
+//
+// Driven with real, disposable child processes so the terminate-and-confirm
+// contract is proven deterministically, with no daemon or socket involved.
+// ---------------------------------------------------------------------------
+describe('terminateSpawnedDetachedDaemon (round-2 finding 3611470928)', () => {
+  const spawnedChildren: ChildProcess[] = [];
+
+  /** A real child that stays alive until signalled. */
+  function spawnLongLivedChild(): number {
+    const child = spawn(
+      process.execPath,
+      ['-e', 'setInterval(() => {}, 1000)'],
+      {
+        stdio: 'ignore',
+      },
+    );
+    spawnedChildren.push(child);
+    const pid = child.pid;
+    if (pid === undefined) throw new Error('child was not assigned a pid');
+    return pid;
+  }
+
+  /** A real child that IGNORES SIGTERM, forcing the SIGKILL escalation. */
+  function spawnUnkillableChild(): number {
+    const child = spawn(
+      process.execPath,
+      ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"],
+      { stdio: 'ignore' },
+    );
+    spawnedChildren.push(child);
+    const pid = child.pid;
+    if (pid === undefined) throw new Error('child was not assigned a pid');
+    return pid;
+  }
+
+  function isAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  afterEach(() => {
+    for (const child of spawnedChildren.splice(0)) {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        /* already gone */
+      }
+    }
+  });
+
+  it('terminates a live child and confirms it is actually gone', async () => {
+    const pid = spawnLongLivedChild();
+    expect(isAlive(pid)).toBe(true);
+
+    await expect(terminateSpawnedDetachedDaemon(pid)).resolves.toBe(true);
+
+    // The contract is "confirmed gone", not "signal sent".
+    expect(isAlive(pid)).toBe(false);
+  });
+
+  // A wedged daemon that swallows SIGTERM would otherwise keep holding the
+  // socket after we told the user it was gone.
+  it('escalates to SIGKILL when the child ignores SIGTERM', async () => {
+    const pid = spawnUnkillableChild();
+    expect(isAlive(pid)).toBe(true);
+
+    // A short grace window so the escalation is exercised promptly.
+    await expect(terminateSpawnedDetachedDaemon(pid, 300, 25)).resolves.toBe(
+      true,
+    );
+
+    expect(isAlive(pid)).toBe(false);
+  });
+
+  it('is a no-op that reports success when no pid was ever assigned', async () => {
+    await expect(terminateSpawnedDetachedDaemon(undefined)).resolves.toBe(true);
+  });
+
+  it('reports success for a pid that has already exited', async () => {
+    const pid = spawnLongLivedChild();
+    process.kill(pid, 'SIGKILL');
+    // Wait for the OS to actually reap it before asserting the no-op path.
+    const deadline = Date.now() + 2_000;
+    while (isAlive(pid) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+
+    await expect(terminateSpawnedDetachedDaemon(pid)).resolves.toBe(true);
+  });
+
+  // The guard that keeps a concurrent lazy-boot daemon safe: this helper is
+  // only ever handed OUR pid, so a proven-different serving pid is never
+  // signalled. Proven here by terminating one child while a second stands in
+  // for the daemon that won the socket race.
+  it('never signals a process it was not given — a different serving pid survives', async () => {
+    const ourPid = spawnLongLivedChild();
+    const otherServingPid = spawnLongLivedChild();
+
+    await expect(terminateSpawnedDetachedDaemon(ourPid)).resolves.toBe(true);
+
+    expect(isAlive(ourPid)).toBe(false);
+    expect(isAlive(otherServingPid)).toBe(true);
   });
 });

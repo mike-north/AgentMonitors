@@ -9,6 +9,21 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-07-19 — `daemon run --detach` never reports a failure while leaving its child running (005 §9.2) — Refs #389
+
+Review follow-up. `--detach`'s unproven-identity branch reported failure and returned **without
+terminating the child it had spawned**. If our child was in fact the daemon that successfully bound
+the socket but `daemon status` never proved it (persistent status errors, or no pid reported), the
+command told the user it was not started, exited non-zero, and left an unowned daemon serving —
+indefinitely under `--reap-after-ms 0` — so the retry its own error message suggested then collided
+with the process that invocation orphaned.
+
+Every non-success `--detach` outcome (readiness timeout, spawn error, race loss, unproven identity)
+now terminates the spawned process and **confirms it is gone** — `SIGTERM`, escalating to `SIGKILL`
+if it has not exited within a short grace window — before returning, and the error message states
+whether that cleanup succeeded. Only the pid THIS invocation spawned is ever signalled: a daemon
+proven to be serving under a different pid belongs to a concurrent lazy boot and is left untouched.
+
 ## 2026-07-19 — Manual-CLI ergonomics: `daemon run --detach`, an always-on no-socket diagnostic on `hook deliver`, and `events` help that names the required `--session` (005 §3, §9.2, §11.1, §12.2/§12.2.1) — Refs #389
 
 Three independent papercuts on the "drive the CLI directly, no plugin" path, all surfaced by a blind

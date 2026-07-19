@@ -86,6 +86,73 @@ export async function waitForDetachedDaemonReady(
   return sawError ? { ready: false, spawnError: sawError } : { ready: false };
 }
 
+/** How long to wait for a SIGTERM'd detach child to exit before escalating. */
+const DETACH_TERMINATE_GRACE_MS = 3_000;
+const DETACH_TERMINATE_POLL_MS = 50;
+
+/** Whether `pid` still names a live process this user may signal. */
+function isProcessAlive(pid: number): boolean {
+  try {
+    // Signal 0 performs the permission/existence check without delivering.
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Terminate the child THIS command spawned and wait until it is actually gone,
+ * for every `--detach` outcome we report as a failure (round-2 review finding
+ * 3611470928).
+ *
+ * Reporting failure while leaving the process running is the worst of both
+ * worlds: the user is told the daemon did not start, yet an unowned daemon
+ * keeps serving — indefinitely under `--reap-after-ms 0` — and the retry the
+ * error message suggests then collides with the daemon this very invocation
+ * orphaned. Terminating makes the failure report true.
+ *
+ * Only ever call this with the pid WE spawned. A daemon proven to be serving
+ * under a different pid belongs to someone else (a concurrent lazy boot) and
+ * must never be signalled; that case still terminates our own losing child,
+ * which is ours to clean up.
+ *
+ * SIGTERM first so the daemon's own handler can close its socket cleanly, then
+ * escalate to SIGKILL if it has not exited within the grace window — otherwise
+ * a wedged child would still hold the socket after we claimed it was gone.
+ * Returns whether the process is confirmed gone.
+ *
+ * Exported for unit testing: a real, disposable child process proves the
+ * terminate-and-confirm contract deterministically, with no daemon needed.
+ */
+export async function terminateSpawnedDetachedDaemon(
+  pid: number | undefined,
+  graceMs: number = DETACH_TERMINATE_GRACE_MS,
+  pollMs: number = DETACH_TERMINATE_POLL_MS,
+): Promise<boolean> {
+  if (pid === undefined) return true;
+  if (!isProcessAlive(pid)) return true;
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch {
+    // Vanished between the liveness probe and the signal — the desired state.
+    return true;
+  }
+  const deadline = Date.now() + graceMs;
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(pid)) return true;
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+  try {
+    process.kill(pid, 'SIGKILL');
+  } catch {
+    return true;
+  }
+  // Give the OS a moment to reap, then report the truth either way.
+  await new Promise((resolve) => setTimeout(resolve, pollMs));
+  return !isProcessAlive(pid);
+}
+
 /** Outcome of {@link waitForDetachIdentityProof}. */
 export interface DetachIdentityProbe {
   servingPid: number | undefined;
@@ -606,13 +673,7 @@ Foreground vs background:
           // timeout would otherwise leave a live background daemon the user
           // was told failed, and a subsequent retry would then hit "already
           // running" against it.
-          if (pid !== undefined) {
-            try {
-              process.kill(pid, 'SIGTERM');
-            } catch {
-              /* already gone */
-            }
-          }
+          await terminateSpawnedDetachedDaemon(pid);
           if (outcome.spawnError) {
             // The OS never actually started the process (e.g. ENOENT/EACCES) —
             // pointing at the log here would be pointing at nothing; it was
@@ -657,7 +718,19 @@ Foreground vs background:
           statusError,
         });
         if (identityMessage !== undefined) {
-          reportError(identityMessage, false);
+          // We are about to tell the user this did NOT start, so our child
+          // must not be left running (round-2 review finding 3611470928).
+          // Only OUR pid is signalled: when `servingPid` proves a different
+          // daemon owns the socket, that one is untouched — the process we
+          // terminate is the losing child we ourselves spawned.
+          const terminated = await terminateSpawnedDetachedDaemon(pid);
+          const cleanupNote =
+            pid === undefined
+              ? ''
+              : terminated
+                ? ` The process we spawned${pidNote} has been terminated.`
+                : ` WARNING: the process we spawned${pidNote} could not be terminated and may still be running — check it before retrying.`;
+          reportError(`${identityMessage}${cleanupNote}`, false);
           return;
         }
         console.log('AgentMon daemon started in the background.');
