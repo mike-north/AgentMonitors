@@ -879,6 +879,26 @@ async function observeComposite(
   // Render ONCE: the same string drives both change-detection (nextState) and
   // the observation snapshotText, avoiding a second render on change.
   const rendered = renderCompositeSnapshot(results);
+
+  // ---- Final cumulative byte budget check on the FULLY RENDERED artifact
+  // (issue #304 review, fourth round) ----
+  // The running `totalBytes` check above sums each part's OWN framed section
+  // (`framedPartByteLength`) as it is fetched, but `renderCompositeSnapshot`
+  // joins those sections with `\n\n` separators that the running total never
+  // counted (a reviewer-measured 2-byte undercount on a 50-part fixture).
+  // Checking `Buffer.byteLength(rendered)` here — the ACTUAL byte length of
+  // the artifact that becomes `snapshotText`/`nextState` — closes that gap
+  // regardless of part count or fetch order, rather than trying to predict
+  // the separator count mid-loop (which depends on the final sort order, not
+  // fetch-completion order). `nextState` never advances on this throw, so the
+  // prior baseline is preserved (002 §3), exactly like the running check.
+  const renderedBytes = Buffer.byteLength(rendered, 'utf8');
+  if (renderedBytes > MAX_COMPOSITE_BYTES) {
+    throw new Error(
+      `api-poll composite "${composite.objectKey}" exceeded the ${String(MAX_COMPOSITE_BYTES)}-byte cumulative rendered-artifact budget (${String(renderedBytes)} bytes across the composite's ${String(results.length)} rendered parts including inter-part separators) — reduce the number/size of parts or split into multiple monitors`,
+    );
+  }
+
   const nextState: CompositeState = { composite: rendered };
 
   const prev = isCompositeState(previousState) ? previousState : undefined;

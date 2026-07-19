@@ -126,9 +126,21 @@ export function parseCompositeConfig(
     // Issue #304 review, third round: bounds the rendered composite
     // artifact's per-part framing overhead (see MAX_PART_ID_LENGTH doc
     // comment).
-    if (id.length > MAX_PART_ID_LENGTH) {
+    //
+    // Issue #304 review, fourth round: counted in CODE POINTS, not UTF-16
+    // code units. `id.length` counts UTF-16 code units, but the JSON Schema
+    // `maxLength` keyword (scopeSchema in index.ts) counts Unicode code
+    // points (per the JSON Schema spec) — for astral-plane characters (e.g.
+    // most emoji), one code point is a UTF-16 SURROGATE PAIR, i.e. 2 code
+    // units. A 200-emoji id is 200 code points (passes the schema's
+    // `maxLength: 256`) but 400 UTF-16 code units, so `id.length` (400) wrongly
+    // rejected it here even though authoring-time `agentmonitors validate`
+    // (schema-only) had already accepted it. `Array.from(id).length` iterates
+    // by code point (respecting surrogate pairs), matching the schema's count.
+    const idLength = Array.from(id).length;
+    if (idLength > MAX_PART_ID_LENGTH) {
       throw new Error(
-        `change-detection.composite.parts[${String(index)}].id must not exceed ${String(MAX_PART_ID_LENGTH)} characters (got ${String(id.length)})`,
+        `change-detection.composite.parts[${String(index)}].id must not exceed ${String(MAX_PART_ID_LENGTH)} characters (got ${String(idLength)})`,
       );
     }
     if (typeof url !== 'string' || url.length === 0) {
@@ -193,9 +205,13 @@ export function renderCompositeSnapshot(parts: FetchedPart[]): string {
  * id-framing overhead plus its body, and a reviewer-reported repro (an
  * empty-body part with an 11 MiB `id`) inflates the artifact entirely
  * through framing, with zero body bytes. Excludes the `\n\n` join
- * separators between sections — a few bytes per part, dwarfed by
- * `MAX_COMPOSITE_BYTES` and further bounded by `MAX_COMPOSITE_PARTS` — so
- * this is a slight undercount of the final artifact, never an overcount.
+ * separators {@link renderCompositeSnapshot} inserts between sections, so
+ * summing this per-part is a slight undercount of the final rendered
+ * artifact (issue #304 review, fourth round: measured as a 2-byte
+ * undercount on a 50-part fixture) — never an overcount. Callers that need
+ * the exact final size (the composite cumulative byte budget in `index.ts`)
+ * MUST additionally check `Buffer.byteLength(renderCompositeSnapshot(...))`
+ * once all parts are known, rather than relying on this running sum alone.
  */
 export function framedPartByteLength(part: FetchedPart): number {
   return Buffer.byteLength(framedPartSection(part), 'utf8');

@@ -1828,14 +1828,25 @@ When the document changes, act on it.
         );
       });
 
+      // `renderCompositeSnapshot` joins framed sections with a `\n\n`
+      // separator that the running per-part `framedPartByteLength` sum never
+      // counts (issue #304 review, fourth round: a reviewer-measured 2-byte
+      // undercount on a 50-part fixture let an over-budget artifact pass).
+      // The boundary fixtures below assert the FINAL rendered byte length —
+      // `Buffer.byteLength(renderCompositeSnapshot(...))`, exactly what
+      // `index.ts`'s final check computes — sits at or one over the budget,
+      // not just the pre-separator running sum.
+      const SEPARATOR_BYTES = Buffer.byteLength('\n\n', 'utf8');
+
       it('a composite whose cumulative RENDERED bytes sit exactly at the budget succeeds (boundary)', async () => {
         // Two same-length (1-char) ids contribute identical framing overhead
         // (`framedPartByteLength` sums the SAME `## <id>\n<body>` text
         // `renderCompositeSnapshot` emits), so body size is chosen so the
-        // rendered total lands EXACTLY at the budget — not merely the raw
-        // body sum, which is what the pre-third-round budget checked.
+        // FINAL rendered total — including the single `\n\n` separator
+        // between the two sorted parts — lands EXACTLY at the budget.
         const overheadPerPart = framedPartByteLength({ id: 'a', body: '' });
-        const bodySize = (MAX_COMPOSITE_BYTES - 2 * overheadPerPart) / 2;
+        const bodySize =
+          (MAX_COMPOSITE_BYTES - 2 * overheadPerPart - SEPARATOR_BYTES) / 2;
         vi.stubGlobal('fetch', mockFixedSizeBody(bodySize));
 
         const config = {
@@ -1850,30 +1861,56 @@ When the document changes, act on it.
           },
         };
 
+        // Sanity-check the fixture math against the same render function the
+        // source uses, so a future change to the framing format fails this
+        // test's setup rather than silently shifting the boundary by a byte.
+        const body = 'a'.repeat(bodySize);
+        expect(
+          Buffer.byteLength(
+            renderCompositeSnapshot([
+              { id: 'a', body },
+              { id: 'b', body },
+            ]),
+            'utf8',
+          ),
+        ).toBe(MAX_COMPOSITE_BYTES);
+
         const result = await source.observe(config, { now: new Date() });
         expect(result.observations).toHaveLength(0);
         expect(result.nextState).toBeDefined();
       });
 
       it('a composite whose cumulative RENDERED bytes are one byte over the budget throws (boundary)', async () => {
-        // Same exact-budget pair as the previous test, plus a third
-        // minimal part — its own framing/body pushes the running total past
-        // the budget by at least one byte.
+        // Same exact-budget pair as the previous test, except part "b"'s
+        // body is one byte longer — the same two-part shape (same single
+        // `\n\n` separator, already counted in the exact-budget fixture)
+        // with the smallest possible perturbation that pushes the FINAL
+        // rendered total exactly one byte past the budget.
         const overheadPerPart = framedPartByteLength({ id: 'a', body: '' });
-        const bodySize = (MAX_COMPOSITE_BYTES - 2 * overheadPerPart) / 2;
+        const bodySize =
+          (MAX_COMPOSITE_BYTES - 2 * overheadPerPart - SEPARATOR_BYTES) / 2;
         vi.stubGlobal(
           'fetch',
           vi.fn((input: string) => {
-            const body =
-              input === 'https://api.example.com/parts/c'
-                ? 'x'
-                : 'a'.repeat(bodySize);
+            const size =
+              input === 'https://api.example.com/parts/b'
+                ? bodySize + 1
+                : bodySize;
             return Promise.resolve({
               status: 200,
-              text: () => Promise.resolve(body),
+              text: () => Promise.resolve('a'.repeat(size)),
             });
           }),
         );
+
+        const renderedBytes = Buffer.byteLength(
+          renderCompositeSnapshot([
+            { id: 'a', body: 'a'.repeat(bodySize) },
+            { id: 'b', body: 'a'.repeat(bodySize + 1) },
+          ]),
+          'utf8',
+        );
+        expect(renderedBytes).toBe(MAX_COMPOSITE_BYTES + 1);
 
         const config = {
           'change-detection': {
@@ -1882,7 +1919,6 @@ When the document changes, act on it.
               parts: [
                 { id: 'a', url: 'https://api.example.com/parts/a' },
                 { id: 'b', url: 'https://api.example.com/parts/b' },
-                { id: 'c', url: 'https://api.example.com/parts/c' },
               ],
             },
           },
@@ -1983,6 +2019,78 @@ When the document changes, act on it.
           },
         });
         expect(config?.parts[0]?.id).toHaveLength(MAX_PART_ID_LENGTH);
+      });
+
+      // Issue #304 review, fourth round: `id.length` counts UTF-16 CODE
+      // UNITS, but the JSON Schema `maxLength` keyword (and `@cfworker/json-
+      // schema`'s implementation of it, `ucs2length`) counts Unicode CODE
+      // POINTS. For an astral-plane character (e.g. most emoji, outside the
+      // Basic Multilingual Plane), one code point is a UTF-16 SURROGATE PAIR
+      // — 2 code units. A 200-emoji id is 200 code points (passes the
+      // schema's `maxLength: 256`, so `agentmonitors validate` accepted it)
+      // but 400 UTF-16 code units, so the pre-fix `id.length` check here
+      // wrongly rejected a config the schema had already blessed. The parser
+      // now counts `Array.from(id).length` (code points), matching the
+      // schema.
+      it('parseCompositeConfig counts part ids in Unicode code points, not UTF-16 code units (astral emoji)', () => {
+        const emojiId = '\u{1F600}'.repeat(200); // 200 code points, 400 UTF-16 units
+        expect(emojiId.length).toBe(400);
+        expect(Array.from(emojiId).length).toBe(200);
+
+        const config = parseCompositeConfig({
+          composite: {
+            'object-key': 'emoji-id-composite',
+            parts: [{ id: emojiId, url: 'https://api.example.com/a' }],
+          },
+        });
+        expect(config?.parts[0]?.id).toBe(emojiId);
+      });
+
+      it('parseCompositeConfig rejects an id with one more than MAX_PART_ID_LENGTH emoji code points (astral boundary)', () => {
+        const emojiId = '\u{1F600}'.repeat(MAX_PART_ID_LENGTH + 1);
+        expect(Array.from(emojiId).length).toBe(MAX_PART_ID_LENGTH + 1);
+
+        expect(() =>
+          parseCompositeConfig({
+            composite: {
+              'object-key': 'overlong-emoji-id',
+              parts: [{ id: emojiId, url: 'https://api.example.com/a' }],
+            },
+          }),
+        ).toThrow(
+          new RegExp(
+            `id must not exceed ${String(MAX_PART_ID_LENGTH)} characters \\(got ${String(MAX_PART_ID_LENGTH + 1)}\\)`,
+          ),
+        );
+      });
+
+      it('scopeSchema accepts a 200-code-point emoji id via validateWatchScope (schema/parser parity)', () => {
+        // Confirms `validateWatchScope` (the JSON Schema path, used by
+        // authoring-time `agentmonitors validate`) and `parseCompositeConfig`
+        // (the runtime parser, used by `tick()`, 002 §2.2) agree on this
+        // astral-character id: both must accept it, or a config that passes
+        // authoring-time validation would still fail at runtime.
+        const emojiId = '\u{1F600}'.repeat(200);
+        const errors = validateWatchScope(
+          {
+            'change-detection': {
+              composite: {
+                'object-key': 'emoji-id-composite',
+                parts: [{ id: emojiId, url: 'https://api.example.com/a' }],
+              },
+            },
+          },
+          source.scopeSchema,
+        );
+        expect(errors).toHaveLength(0);
+
+        const config = parseCompositeConfig({
+          composite: {
+            'object-key': 'emoji-id-composite',
+            parts: [{ id: emojiId, url: 'https://api.example.com/a' }],
+          },
+        });
+        expect(config?.parts[0]?.id).toBe(emojiId);
       });
 
       it('scopeSchema rejects more than MAX_COMPOSITE_PARTS entries via validateWatchScope', () => {
