@@ -585,7 +585,18 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
   // Track the last delivery across refreshes: each write is a whole record, so
   // omitting this would erase a previously-reported delivery on the next poll.
   let lastDeliveryAt: Date | undefined;
+  // Set the instant EOF/shutdown begins (before the heartbeat record is
+  // removed) and checked by every heartbeat write below. Without this, a poll
+  // already in flight when EOF arrives settles AFTER the EOF handler removes
+  // the heartbeat file, and its unconditional post-poll `heartbeat()` (below)
+  // recreates the very record the clean-shutdown path just deleted — a
+  // shut-down server would then read as "still listening" for the rest of the
+  // TTL (issue #425 review, round 3).
+  let shuttingDown = false;
   const heartbeat = (): void => {
+    if (shuttingDown) {
+      return;
+    }
     writeTransportHeartbeat({
       ...heartbeatInput,
       startedAt,
@@ -677,6 +688,11 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
   // cleanup can complete first.
   process.stdin.on('end', () => {
     stopped = true;
+    // Set BEFORE removing the record: an in-flight poll's `await` may still be
+    // pending and its `finally`-style post-settle `heartbeat()` call happens
+    // after this handler returns, so the guard must already be up before the
+    // record is deleted, or that later call recreates it.
+    shuttingDown = true;
     if (timer) {
       clearTimeout(timer);
     }

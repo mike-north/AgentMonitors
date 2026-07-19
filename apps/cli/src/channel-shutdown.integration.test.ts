@@ -6,6 +6,7 @@ import {
   readdirSync,
   rmSync,
 } from 'node:fs';
+import net from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -119,6 +120,86 @@ function runChannelServeToCompletion(hostSessionId: string): Promise<number> {
   });
 }
 
+/**
+ * A minimal fake daemon that ACCEPTS the connection and reads a full request
+ * line, then holds — writing no response until {@link HoldingFakeDaemon.release}
+ * is called. This is what lets the race test below reach "a poll is in
+ * flight, deterministically" without racing a real timeout: `resolveConnected`
+ * resolves the instant the request is on the wire, which is exactly the
+ * moment `channel serve`'s `resolveSession()` call is pending.
+ */
+interface HoldingFakeDaemon {
+  socketPath: string;
+  /** Resolves once the daemon has read a full request line and is holding it. */
+  connected: Promise<void>;
+  /** Answer the held request with an error, releasing the pending client call. */
+  release(): void;
+  close(): Promise<void>;
+}
+
+function startHoldingFakeDaemon(dir: string): Promise<HoldingFakeDaemon> {
+  const socketPath = path.join(dir, 'fake-daemon.sock');
+  let resolveConnected: (() => void) | undefined;
+  const connected = new Promise<void>((resolve) => {
+    resolveConnected = resolve;
+  });
+  let heldSocket: net.Socket | undefined;
+  let heldRequestId: string | undefined;
+
+  const server = net.createServer((socket) => {
+    let buffer = '';
+    socket.setEncoding('utf-8');
+    socket.on('data', (chunk) => {
+      buffer += typeof chunk === 'string' ? chunk : chunk.toString('utf-8');
+      const newline = buffer.indexOf('\n');
+      if (newline === -1) return;
+      const raw = buffer.slice(0, newline);
+      try {
+        const request: unknown = JSON.parse(raw);
+        if (
+          typeof request === 'object' &&
+          request !== null &&
+          'id' in request &&
+          typeof (request as { id: unknown }).id === 'string'
+        ) {
+          heldSocket = socket;
+          heldRequestId = (request as { id: string }).id;
+          resolveConnected?.();
+        }
+      } catch {
+        // Malformed line: ignore, this fake daemon only needs to hold ONE
+        // well-formed request for the test to reach its intended state.
+      }
+    });
+  });
+
+  return new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(socketPath, () => {
+      resolve({
+        socketPath,
+        connected,
+        release: () => {
+          if (heldSocket && heldRequestId) {
+            heldSocket.end(
+              `${JSON.stringify({
+                id: heldRequestId,
+                error: 'fake daemon: deliberately unreachable',
+              })}\n`,
+            );
+          }
+        },
+        close: () =>
+          new Promise<void>((res) => {
+            server.close(() => {
+              res();
+            });
+          }),
+      });
+    });
+  });
+}
+
 describe('channel serve shutdown (issue #425)', () => {
   it('exits on its own after the host disconnects, despite the recurring heartbeat', async () => {
     // The regression this guards: a `setInterval`/re-armed `setTimeout` that is
@@ -155,5 +236,104 @@ describe('channel serve shutdown (issue #425)', () => {
       .toString()
       .trim();
     expect(survivors).toBe('0');
+  }, 30_000);
+
+  it('does not recreate its heartbeat when EOF arrives while a poll is in flight (issue #425 review, round 3)', async () => {
+    // The regression this guards, precisely: `resolveSession()` inside `poll`
+    // is awaiting a daemon reply when EOF arrives. The EOF handler removes the
+    // heartbeat file synchronously, but `poll`'s own post-settle `heartbeat()`
+    // call (run unconditionally on both the success AND failure paths) fires
+    // only once the still-pending daemon call finally settles — AFTER the
+    // removal. Without a `shuttingDown` guard on that call, it recreates the
+    // very record the clean-shutdown path just deleted, and a server that
+    // shut down cleanly reads as "still listening" for the rest of the TTL.
+    //
+    // A fake daemon that holds its response under our control (rather than a
+    // socket to nowhere) is what makes this deterministic: it lets the test
+    // reach "a poll is in flight" and release it AFTER asserting the
+    // immediate post-EOF state, instead of hoping a failed connect attempt
+    // and a real heartbeat write happen to interleave in the right order.
+    const hostSessionId = 'shutdown-race-in-flight';
+    const daemon = await startHoldingFakeDaemon(workspace);
+    try {
+      const child = spawn(
+        process.execPath,
+        [
+          CLI_PATH,
+          'channel',
+          'serve',
+          '--workspace',
+          workspace,
+          '--host-session-id',
+          hostSessionId,
+          '--poll-ms',
+          '200',
+          // Explicit --socket always wins (resolveChannelSocketPath) over the
+          // enabled workspace's own persisted socket set up in `beforeEach` —
+          // this is what points the poll at OUR fake daemon instead.
+          '--socket',
+          daemon.socketPath,
+        ],
+        {
+          cwd: workspace,
+          env: { ...process.env, XDG_DATA_HOME: dataHome },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        },
+      );
+      child.stdout.resume();
+      child.stderr.resume();
+
+      const exited = new Promise<number>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          child.kill('SIGKILL');
+          reject(
+            new Error(
+              `channel serve did not exit within ${String(EXIT_BUDGET_MS)}ms after stdin EOF.`,
+            ),
+          );
+        }, EXIT_BUDGET_MS);
+        child.once('error', (error) => {
+          clearTimeout(timer);
+          reject(error);
+        });
+        child.once('exit', (code) => {
+          clearTimeout(timer);
+          resolve(code ?? -1);
+        });
+      });
+
+      const heartbeatFiles = (): string[] =>
+        existsSync(transportsDir())
+          ? readdirSync(transportsDir()).filter((name) =>
+              name.includes(hostSessionId),
+            )
+          : [];
+
+      // Reach the in-flight state: the poll's `resolveSession()` request has
+      // reached our fake daemon and is now held there.
+      await daemon.connected;
+      expect(heartbeatFiles().length).toBeGreaterThan(0);
+
+      // The host disconnects while that poll is still pending — exactly the
+      // interleaving the regression depends on.
+      child.stdin.end();
+
+      // Give the EOF handler time to run synchronously-ish: `shuttingDown`
+      // flips true and the heartbeat file is removed BEFORE the held poll is
+      // released below.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(heartbeatFiles()).toEqual([]);
+
+      // NOW release the held poll. Its post-settle `heartbeat()` call is the
+      // one at issue: unguarded, this recreates the file the EOF handler just
+      // removed.
+      daemon.release();
+
+      const code = await exited;
+      expect(code).toBe(0);
+      expect(heartbeatFiles()).toEqual([]);
+    } finally {
+      await daemon.close();
+    }
   }, 30_000);
 });
