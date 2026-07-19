@@ -1,6 +1,10 @@
 import { Command, Option } from 'commander';
 import path from 'node:path';
-import { claudeCodeAdapter, scanMonitors } from '@agentmonitors/core';
+import {
+  claudeCodeAdapter,
+  scanMonitors,
+  type DeliveryClaim,
+} from '@agentmonitors/core';
 import { reportError } from '../output.js';
 import {
   closeSessionClient,
@@ -12,7 +16,10 @@ import { readLocalState, writeLocalState } from '../local-state.js';
 import { workspacePaths } from '../workspace-paths.js';
 import { spawnDetachedDaemon } from '../detached-spawn.js';
 import { readHookPayload } from '../hook-payload.js';
-import { renderMonitoringDisabledAdvisory } from '../hook-deliver-render.js';
+import {
+  renderMonitoringDisabledAdvisory,
+  type HookDeliveryOutput,
+} from '../hook-deliver-render.js';
 import {
   reserveRenderAndCommitHookDelivery,
   writeAndCommitHookDelivery,
@@ -23,6 +30,42 @@ import {
   manualDaemonErrorMessage,
   resolveManualDaemonSocketPath,
 } from '../manual-daemon.js';
+
+/**
+ * Reserve → render → write → commit the SessionStart post-compact recap for
+ * `sessionId`, via the `write` seam (never `commit`ting until `write` has
+ * fully succeeded — see `reserveRenderAndCommitHookDelivery` /
+ * `writeAndCommitHookDelivery` in `hook.ts`, whose exact flow this reuses
+ * verbatim, so the `start` action below is a thin caller rather than a
+ * second, divergent copy of the ordering).
+ *
+ * Extracted as its own function (issue #442, PR #442 round-17 review) so
+ * `session start`'s ACTUAL command wiring is independently testable against
+ * an injectable `write` seam without needing the full CLI action's
+ * stdin/socket/daemon-boot plumbing. Before this extraction, the recap
+ * ordering tests exercised `hook.ts`'s shared helpers directly, without ever
+ * importing or invoking anything from `session.ts` — so reverting the
+ * `start` action to its old direct-`claimDeliveryClient` wiring would have
+ * left every one of those tests green (a mutation-blind regression gap).
+ *
+ * Returns `null` when there is nothing to reserve (a fresh session, or a
+ * lapsed reservation) or `write` failed (the reservation was released,
+ * nothing durably claimed); returns the committed claim otherwise.
+ */
+export async function deliverSessionStartRecap(
+  sessionId: string,
+  socketPath: string,
+  write: (output: HookDeliveryOutput) => void | Promise<void>,
+): Promise<DeliveryClaim | null> {
+  const flow = await reserveRenderAndCommitHookDelivery(
+    sessionId,
+    'post-compact',
+    socketPath,
+    'SessionStart',
+  );
+  if (!flow) return null;
+  return writeAndCommitHookDelivery(flow, write);
+}
 
 export const sessionCommand = new Command('session').description(
   'Manage agent sessions tracked by AgentMon',
@@ -305,25 +348,19 @@ sessionCommand
       // after that call would durably claim the recap rows while emitting
       // nothing — the exact at-most-once loss window `hook deliver` closed for
       // its own transport (`reserveRenderAndCommitHookDelivery` /
-      // `writeAndCommitHookDelivery`, `hook.ts`). Reusing that same shared flow
-      // here (its `post-compact` branch needs no per-event cap sizing, so it
-      // reserves the full unread set directly) closes the identical window for
-      // the SessionStart recap: a write failure releases the reservation
-      // (rows stay pending, nothing durably claimed) instead of committing.
-      const flow = await reserveRenderAndCommitHookDelivery(
-        opened.id,
-        'post-compact',
-        socket,
-        'SessionStart',
+      // `writeAndCommitHookDelivery`, `hook.ts`). `deliverSessionStartRecap`
+      // (above) reuses that same shared flow (its `post-compact` branch needs
+      // no per-event cap sizing, so it reserves the full unread set directly),
+      // closing the identical window for the SessionStart recap: a write
+      // failure releases the reservation (rows stay pending, nothing durably
+      // claimed) instead of committing.
+      //
+      // stdout is the SessionStart hook's wire channel: it MUST contain only
+      // this JSON. Do NOT add `console.log`/diagnostics to stdout in this
+      // command — anything else here corrupts the hook output Claude reads.
+      await deliverSessionStartRecap(opened.id, socket, (toWrite) =>
+        writeStreamChunk(process.stdout, JSON.stringify(toWrite)),
       );
-      if (flow) {
-        // stdout is the SessionStart hook's wire channel: it MUST contain only
-        // this JSON. Do NOT add `console.log`/diagnostics to stdout in this
-        // command — anything else here corrupts the hook output Claude reads.
-        await writeAndCommitHookDelivery(flow, (toWrite) =>
-          writeStreamChunk(process.stdout, JSON.stringify(toWrite)),
-        );
-      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       reportError(message, false);

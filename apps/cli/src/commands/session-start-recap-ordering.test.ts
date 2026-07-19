@@ -1,6 +1,6 @@
 /**
  * Failure-injection tests for `session start`'s SessionStart post-compact
- * recap ordering (issue #442, PR #442 round-16 review).
+ * recap ordering (issue #442, PR #442 round-16/17 review).
  *
  * Before this fix, `session start` committed the reservation via a direct
  * `claimDeliveryClient` call — the durable `first_notified_at` mutation —
@@ -13,16 +13,28 @@
  * durably claim the recap rows while the recap itself never reached the
  * agent — an at-most-once loss window.
  *
- * The fix routes `session start`'s recap through the exact SAME shared
+ * The fix routes `session start`'s recap through `session.ts`'s own exported
+ * `deliverSessionStartRecap` — which itself calls the exact SAME shared
  * `reserveRenderAndCommitHookDelivery` / `writeAndCommitHookDelivery` /
- * `writeStreamChunk` flow `hook.ts`'s `deliver` action uses (`session.ts`
- * imports them directly from `./hook.js`), for the `post-compact` lifecycle
- * specifically — the lifecycle `session start` actually claims. These tests
- * exercise that flow end-to-end against a REAL, delayed-failure `Writable`
- * (mirroring `hook-deliver-commit-ordering.test.ts`'s real-stream regressions
- * for the `turn-interruptible`/generic case), proving a write failure
- * releases the reservation instead of committing — the rows stay pending and
- * redeliver at the next context event rather than being lost.
+ * `writeStreamChunk` flow `hook.ts`'s `deliver` action uses — for the
+ * `post-compact` lifecycle specifically, the lifecycle `session start`
+ * actually claims.
+ *
+ * Round-17 review: the prior version of this file drove `hook.ts`'s shared
+ * helpers directly and never imported anything from `session.ts`, so
+ * reverting `session.ts`'s `start` action to its old direct-`claimDeliveryClient`
+ * wiring would have left every test in this file green — a mutation-blind
+ * regression gap. These tests now import and invoke `deliverSessionStartRecap`
+ * from `./session.js` itself (the function the `start` action calls), and
+ * assert `claimDeliveryClient` is never called directly, so a regression to
+ * the old direct-claim shape fails here. See the bottom of this file for the
+ * mutation check performed to confirm that.
+ *
+ * These tests exercise that flow end-to-end against a REAL, delayed-failure
+ * `Writable` (mirroring `hook-deliver-commit-ordering.test.ts`'s real-stream
+ * regressions for the `turn-interruptible`/generic case), proving a write
+ * failure releases the reservation instead of committing — the rows stay
+ * pending and redeliver at the next context event rather than being lost.
  *
  * @see docs/specs/005-cli-reference.md §10.4
  * @see docs/specs/006-agent-integration.md §5.6
@@ -43,12 +55,10 @@ vi.mock('../runtime-client.js', () => ({
   reserveDeliveryClient: vi.fn(),
 }));
 
+import { deliverSessionStartRecap } from './session.js';
+import { writeStreamChunk } from './hook.js';
 import {
-  reserveRenderAndCommitHookDelivery,
-  writeAndCommitHookDelivery,
-  writeStreamChunk,
-} from './hook.js';
-import {
+  claimDeliveryClient,
   commitDeliveryClient,
   releaseDeliveryClient,
   reserveDeliveryClient,
@@ -57,6 +67,7 @@ import {
 const reserveMock = vi.mocked(reserveDeliveryClient);
 const commitMock = vi.mocked(commitDeliveryClient);
 const releaseMock = vi.mocked(releaseDeliveryClient);
+const claimMock = vi.mocked(claimDeliveryClient);
 
 function makeEvent(
   overrides: Partial<DeliveryEventSummary> = {},
@@ -94,30 +105,39 @@ beforeEach(() => {
   reserveMock.mockReset();
   commitMock.mockReset();
   releaseMock.mockReset();
+  claimMock.mockReset();
 });
 
-describe("session start's post-compact recap: reserve -> render -> write -> commit (issue #442, round-16 review)", () => {
-  it('the exact flow session.ts calls (post-compact, no --socket sizing preview) reserves and renders BEFORE ever committing', async () => {
+describe("session.ts's deliverSessionStartRecap: reserve -> render -> write -> commit (issue #442, round-17 review)", () => {
+  it('drives the actual session.ts command path (post-compact), reserving and rendering BEFORE ever committing, and never calling claimDeliveryClient directly', async () => {
     const event = makeEvent();
     reserveMock.mockResolvedValueOnce({
       reservationId: 'recap-r-1',
       claim: recapClaim([event]),
     });
+    const order: string[] = [];
+    commitMock.mockImplementationOnce(async () => {
+      order.push('commit');
+      return recapClaim([event]);
+    });
 
-    const flow = await reserveRenderAndCommitHookDelivery(
+    const written: string[] = [];
+    const claim = await deliverSessionStartRecap(
       'session-1',
-      'post-compact',
       '/sock',
-      'SessionStart',
+      (toWrite) => {
+        order.push('write');
+        written.push(JSON.stringify(toWrite));
+      },
     );
 
-    expect(flow).not.toBeNull();
-    expect(flow?.output?.hookSpecificOutput.additionalContext).toContain(
-      'recap body text',
-    );
-    expect(flow?.output?.hookSpecificOutput.hookEventName).toBe('SessionStart');
-    // Rendering happened without ever calling commit.
-    expect(commitMock).not.toHaveBeenCalled();
+    expect(written[0]).toContain('recap body text');
+    expect(claim).not.toBeNull();
+    // Write happened strictly before commit.
+    expect(order).toEqual(['write', 'commit']);
+    // The old direct-claim shape never runs: reservation flows only through
+    // reserve/commit, never claimDeliveryClient.
+    expect(claimMock).not.toHaveBeenCalled();
   });
 
   it('a write failure against a REAL closed-fd Writable releases the reservation instead of committing — nothing durably claimed', async () => {
@@ -127,14 +147,6 @@ describe("session start's post-compact recap: reserve -> render -> write -> comm
       claim: recapClaim([event]),
     });
     releaseMock.mockResolvedValueOnce(undefined);
-
-    const flow = await reserveRenderAndCommitHookDelivery(
-      'session-1',
-      'post-compact',
-      '/sock',
-      'SessionStart',
-    );
-    expect(flow).not.toBeNull();
 
     // A real fs write stream on an already-closed fd: every write to it fails
     // with EBADF — the same "real, delayed-failure Writable" shape as
@@ -147,9 +159,8 @@ describe("session start's post-compact recap: reserve -> render -> write -> comm
 
     try {
       await expect(
-        writeAndCommitHookDelivery(
-          flow as NonNullable<typeof flow>,
-          (toWrite) => writeStreamChunk(stream, JSON.stringify(toWrite)),
+        deliverSessionStartRecap('session-1', '/sock', (toWrite) =>
+          writeStreamChunk(stream, JSON.stringify(toWrite)),
         ),
       ).rejects.toThrow(/EBADF/);
     } finally {
@@ -162,6 +173,8 @@ describe("session start's post-compact recap: reserve -> render -> write -> comm
     // the next context event.
     expect(releaseMock).toHaveBeenCalledTimes(1);
     expect(releaseMock).toHaveBeenCalledWith('recap-r-2', '/sock');
+    // Still never a direct claim.
+    expect(claimMock).not.toHaveBeenCalled();
   });
 
   it('a successful write against a real Writable commits only AFTER the write settles', async () => {
@@ -170,14 +183,6 @@ describe("session start's post-compact recap: reserve -> render -> write -> comm
       reservationId: 'recap-r-3',
       claim: recapClaim([event]),
     });
-
-    const flow = await reserveRenderAndCommitHookDelivery(
-      'session-1',
-      'post-compact',
-      '/sock',
-      'SessionStart',
-    );
-    expect(flow).not.toBeNull();
 
     const order: string[] = [];
     const chunks: string[] = [];
@@ -198,8 +203,9 @@ describe("session start's post-compact recap: reserve -> render -> write -> comm
       return recapClaim([event]);
     });
 
-    const claim = await writeAndCommitHookDelivery(
-      flow as NonNullable<typeof flow>,
+    const claim = await deliverSessionStartRecap(
+      'session-1',
+      '/sock',
       (toWrite) => writeStreamChunk(stream, JSON.stringify(toWrite)),
     );
 
@@ -207,5 +213,6 @@ describe("session start's post-compact recap: reserve -> render -> write -> comm
     expect(chunks[0]).toContain('recap body text');
     expect(claim).not.toBeNull();
     expect(releaseMock).not.toHaveBeenCalled();
+    expect(claimMock).not.toHaveBeenCalled();
   });
 });
