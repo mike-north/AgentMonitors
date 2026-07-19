@@ -701,7 +701,8 @@ describe('source-command-poll', () => {
       expect(baseline.nextState).toMatchObject({ truncated: true });
 
       // A second run with identical leading content (also 2 MiB of "a") must NOT
-      // report a change — the capped slice is identical.
+      // report a change — the capped slice is identical, over the bounded retained
+      // stdout (the same leading STDOUT_CAP_BYTES survive both runs).
       const second = await source.observe(
         { command: bigOutput },
         ctx(baseline.nextState),
@@ -711,6 +712,114 @@ describe('source-command-poll', () => {
       // The stored stdout is capped at exactly 1 MiB.
       const state = second.nextState as { stdout: string; truncated: boolean };
       expect(state.stdout.length).toBe(1024 * 1024);
+      expect(state.truncated).toBe(true);
+    });
+  });
+
+  // Drain, don't kill: a command producing more than the cap on either stream must
+  // still run to completion and report its real exit status (issue #302).
+  describe('drains excess output without killing the process (003 §11.2, issue #302)', () => {
+    it('>1 MiB stdout: a marker side effect after the overflow still lands, and the real exit code (7) is reported', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'am-302-stdout-'));
+      const markerFile = join(dir, 'marker');
+      try {
+        // Emit 2 MiB of stdout — well past the 1 MiB cap — THEN perform a side
+        // effect and exit nonzero. If the old execFile({ maxBuffer }) behavior were
+        // still in play, the child would be SIGKILLed the moment it crossed the
+        // cap: the marker would never be written and the real exit code (7) would
+        // never be observed (a killed process has no exit code, and the old code
+        // fabricated 0). Both landing proves the process ran to real completion.
+        // `process.exitCode` (not `process.exit()`) so Node waits for the
+        // stdout stream to actually drain before the process terminates — an
+        // explicit `process.exit()` right after a large write truncates output
+        // at whatever the pipe had buffered, which would make this test flaky
+        // for reasons unrelated to the source's own draining behavior.
+        const command = nodeArgv(
+          `process.stdout.write("a".repeat(2 * 1024 * 1024)); ` +
+            `require("fs").writeFileSync(${JSON.stringify(markerFile)}, "done"); ` +
+            `process.exitCode = 7`,
+        );
+
+        const result = await source.observe({ command }, ctx());
+
+        expect(readFileSync(markerFile, 'utf8')).toBe('done');
+        const state = result.nextState as {
+          exitCode: number;
+          truncated: boolean;
+          stdout: string;
+        };
+        expect(state.exitCode).toBe(7);
+        expect(state.truncated).toBe(true);
+        expect(state.stdout.length).toBe(1024 * 1024);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('>1 MiB stderr with small stdout: stdout is captured intact and the real exit code is reported', async () => {
+      // A large stderr volume must never affect stdout capture or cause a failure —
+      // stderr's retention cap is independent of stdout's (issue #302).
+      const command = nodeArgv(
+        `process.stderr.write("e".repeat(2 * 1024 * 1024)); ` +
+          `process.stdout.write("small-stdout"); ` +
+          `process.exitCode = 3`,
+      );
+
+      const result = await source.observe({ command }, ctx());
+
+      const state = result.nextState as {
+        exitCode: number;
+        truncated: boolean;
+        stdout: string;
+      };
+      expect(state.exitCode).toBe(3);
+      // stdout never crossed its own cap — not truncated.
+      expect(state.truncated).toBe(false);
+      expect(state.stdout).toBe('small-stdout');
+    });
+
+    it('simultaneous large stdout and stderr: both are drained and the real exit code is reported', async () => {
+      const command = nodeArgv(
+        `process.stderr.write("e".repeat(2 * 1024 * 1024)); ` +
+          `process.stdout.write("a".repeat(2 * 1024 * 1024)); ` +
+          `process.exitCode = 5`,
+      );
+
+      const result = await source.observe({ command }, ctx());
+
+      const state = result.nextState as {
+        exitCode: number;
+        truncated: boolean;
+        stdout: string;
+      };
+      expect(state.exitCode).toBe(5);
+      expect(state.truncated).toBe(true);
+      expect(state.stdout.length).toBe(1024 * 1024);
+    });
+
+    // Negative test: a command that would exceed the cap on both streams AND keeps
+    // writing well past it must still resolve promptly, not hang the tick waiting
+    // for a kill or for buffers to "settle" — draining, not blocking, is what keeps
+    // this bounded.
+    it('a command that keeps writing far past the cap on both streams still resolves promptly', async () => {
+      const command = nodeArgv(
+        `process.stderr.write("e".repeat(4 * 1024 * 1024)); ` +
+          `process.stdout.write("a".repeat(4 * 1024 * 1024)); ` +
+          `process.exitCode = 0`,
+      );
+
+      const start = Date.now();
+      const result = await source.observe({ command }, ctx());
+      const elapsed = Date.now() - start;
+
+      // Comfortably under the 30s default timeout — proves the child was drained,
+      // not blocked on a full pipe buffer waiting for us to read.
+      expect(elapsed).toBeLessThan(5_000);
+      const state = result.nextState as {
+        exitCode: number;
+        truncated: boolean;
+      };
+      expect(state.exitCode).toBe(0);
       expect(state.truncated).toBe(true);
     });
   });

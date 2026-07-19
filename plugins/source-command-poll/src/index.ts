@@ -40,11 +40,21 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 /** Grace period between SIGTERM and SIGKILL on timeout (003 §11.2). */
 const SIGKILL_GRACE_MS = 5_000;
 
-/** Maximum captured stdout, in bytes (003 §11.2). */
+/** Maximum retained stdout, in bytes (003 §11.2). Excess is drained, not kept. */
 const STDOUT_CAP_BYTES = 1024 * 1024;
 
 /** Number of trailing stderr characters retained for failure diagnostics (003 §11.5). */
 const STDERR_TAIL_CHARS = 2000;
+
+/**
+ * Maximum retained stderr, in bytes — bounded independently of `STDOUT_CAP_BYTES`
+ * (003 §11.2, issue #302). Sized generously above `STDERR_TAIL_CHARS` (4 bytes/char
+ * worst case for UTF-8) so the final tail slice is never short on multi-byte input,
+ * while still being a small, fixed bound regardless of how much stderr the child
+ * writes — a pathological volume of stderr can never grow this process's own memory
+ * unbounded, and (like stdout) never causes the child to be killed.
+ */
+const STDERR_RETENTION_CAP_BYTES = STDERR_TAIL_CHARS * 4;
 
 interface ScopeConfig {
   command: string[];
@@ -224,11 +234,16 @@ function killProcessTree(
 }
 
 /**
- * Spawn `command` directly (never a shell — `spawn` with `shell: false`), capturing
- * stdout (capped at 1 MiB) and the exit code, enforcing `timeout` with a SIGTERM→SIGKILL
- * escalation targeted at the command's **entire process tree**, not just the direct
- * child (003 §11.2/§11.7, issue #303). A nonzero exit code with output is a **result**,
- * not a failure (003 §11.2/§11.5); spawn failure and timeout are failures.
+ * Spawn `command` directly (never a shell — `spawn` with `shell: false`), draining
+ * stdout and stderr as they stream rather than buffering to completion, enforcing
+ * `timeout` with a SIGTERM→SIGKILL escalation targeted at the command's **entire
+ * process tree**, not just the direct child (003 §11.2/§11.7, issue #303). A nonzero
+ * exit code with output is a **result**, not a failure (003 §11.2/§11.5); spawn
+ * failure and timeout are failures. Crucially, neither stream exceeding its
+ * retention cap ever kills the child (issue #302) — `data` listeners are attached
+ * unconditionally, so the pipe keeps draining and the command always runs to its
+ * real completion (side effects and all); the caps only bound what is *kept*, never
+ * what is *drained*, so the reported exit code is always the command's actual one.
  */
 async function runCommand(scope: ScopeConfig): Promise<ExecOutcome> {
   return new Promise<ExecOutcome>((resolve) => {
@@ -264,11 +279,16 @@ async function runCommand(scope: ScopeConfig): Promise<ExecOutcome> {
 
     const stdoutChunks: Buffer[] = [];
     let stdoutBytes = 0;
-    let stderrTail = '';
+    // Trailing stderr bytes retained so far, bounded at STDERR_RETENTION_CAP_BYTES
+    // (issue #302) — independent of the stdout cap. Kept as Buffers (not decoded to
+    // a string chunk-by-chunk) so a multi-byte UTF-8 character split across two
+    // `data` events is never corrupted; decoding happens once, on the final tail.
+    const stderrChunks: Buffer[] = [];
+    let stderrBytes = 0;
 
     // Bound stdout capture at the 1 MiB cap (003 §11.2): once the cap is reached,
     // further bytes are discarded but the stream is never paused, so a chatty child
-    // is always drained and can never block on a full pipe buffer.
+    // is always drained and can never block on a full pipe buffer (issue #302).
     child.stdout.on('data', (chunk: Buffer) => {
       if (stdoutBytes >= STDOUT_CAP_BYTES) {
         if (chunk.length > 0) truncated = true;
@@ -285,13 +305,20 @@ async function runCommand(scope: ScopeConfig): Promise<ExecOutcome> {
       }
     });
 
-    // Captured solely for failure diagnostics (003 §11.5); bounded so a pathological
-    // stderr volume can't grow this process's own memory unbounded — only the
-    // trailing STDERR_TAIL_CHARS characters ever survive.
+    // Captured solely for failure diagnostics (003 §11.5), bounded independently of
+    // stdout (issue #302): a pathological stderr volume can never grow this
+    // process's own memory unbounded, and — like stdout — never pauses the pipe or
+    // kills the child. Only the trailing bytes survive; older chunks are dropped
+    // once the retention cap is exceeded.
     child.stderr.on('data', (chunk: Buffer) => {
-      stderrTail += chunk.toString('utf8');
-      if (stderrTail.length > STDERR_TAIL_CHARS * 4) {
-        stderrTail = stderrTail.slice(-STDERR_TAIL_CHARS);
+      stderrChunks.push(chunk);
+      stderrBytes += chunk.length;
+      while (
+        stderrChunks.length > 1 &&
+        stderrBytes > STDERR_RETENTION_CAP_BYTES
+      ) {
+        const dropped = stderrChunks.shift();
+        stderrBytes -= dropped?.length ?? 0;
       }
     });
 
@@ -317,11 +344,23 @@ async function runCommand(scope: ScopeConfig): Promise<ExecOutcome> {
       resolve(outcome);
     }
 
+    /**
+     * Decode the retained trailing stderr bytes to the final `STDERR_TAIL_CHARS`
+     * diagnostic tail. Decoding happens once, here, from the bounded byte buffer —
+     * never per-chunk — so a UTF-8 character split across `data` events is never
+     * corrupted (issue #302).
+     */
+    function stderrTailString(): string {
+      return Buffer.concat(stderrChunks)
+        .toString('utf8')
+        .slice(-STDERR_TAIL_CHARS);
+    }
+
     function resolveFromExit(
       code: number | null,
       signal: NodeJS.Signals | null,
     ): void {
-      const tail = stderrTail.slice(-STDERR_TAIL_CHARS);
+      const tail = stderrTailString();
       if (timedOut) {
         finish({
           kind: 'failure',
@@ -354,7 +393,7 @@ async function runCommand(scope: ScopeConfig): Promise<ExecOutcome> {
       finish({
         kind: 'failure',
         error: error.message,
-        stderrTail: stderrTail.slice(-STDERR_TAIL_CHARS),
+        stderrTail: stderrTailString(),
       });
     });
 

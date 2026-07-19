@@ -1313,6 +1313,18 @@ SIGKILL after a 5s grace). `stdout` capture is capped at **1 MiB**; output beyon
 discarded and the result is marked `truncated: true` (a truncated result still diffs — but see the
 validation note in §11.7).
 
+**Excess output is drained, never a reason to kill the command** (issue #302). Both `stdout` and
+`stderr` are consumed as they stream, not buffered to completion: `stdout` retains only its leading
+**1 MiB** (`STDOUT_CAP_BYTES`) — the same leading bytes on every capture, so two truncated captures
+of identical leading content diff as unchanged (§11.7 AC6) — and bytes past the cap are still read
+off the pipe and discarded, never left to back up. `stderr` is retained independently, bounded to a
+small fixed cap sized around the diagnostic tail (§11.5) rather than the full 1 MiB stdout cap, since
+its only use is failure diagnostics, never diffing (§11.3). Neither cap is a kill trigger: a command that writes 50 MiB of stdout still runs to its real
+completion — side effects included — and its actual exit code is reported. This replaces an earlier
+implementation that used `execFile({ maxBuffer })`, which killed the child the moment either stream
+crossed the cap and fabricated a synthetic zero exit code — silently discarding the real exit status
+and any side effects the command had not yet completed.
+
 **The timeout escalation targets the command's entire process tree, not just the direct child**
 (issue #303). A supported command may itself invoke a shell that backgrounds a worker
 (`['sh', '-c', 'sleep 30 & wait']`) or spawn its own subprocesses; killing only the direct child
@@ -1458,6 +1470,17 @@ issue #86's AC1–AC7):
 - Output exceeding the 1 MiB cap sets `truncated: true` and still produces stable diffs (two
   truncated captures of identical leading content do not report change) (AC6: _"marks truncated and
   produces stable diffs across identical leading content"_).
+- Excess output on either stream never kills the command (issue #302): a command that writes past
+  the stdout cap still performs a side effect _after_ the overflow and reports its real, nonzero
+  exit code (_">1 MiB stdout: a marker side effect after the overflow still lands, and the real exit
+  code (7) is reported"_); a command that writes past stderr's independent cap with only a small
+  stdout still reports intact stdout and the real exit code (_">1 MiB stderr with small stdout:
+  stdout is captured intact and the real exit code is reported"_); a command exceeding the cap on
+  **both** streams simultaneously behaves the same way (_"simultaneous large stdout and stderr: both
+  are drained and the real exit code is reported"_); and a command that keeps writing well past both
+  caps still resolves promptly rather than hanging the tick (_"a command that keeps writing far past
+  the cap on both streams still resolves promptly"_) — all four verified in the _"drains excess
+  output without killing the process"_ describe block.
 - `timeout` kills a hung child within the grace period and leaves no orphan process (AC6: _"a
   timed-out child leaves no orphan (killed within the grace window)"_, mirroring the daemon-test
   no-orphan discipline).
