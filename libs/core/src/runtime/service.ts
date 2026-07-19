@@ -447,11 +447,26 @@ function recipientSummary(
  * Map a delivered {@link MonitorEventRecord} into the {@link DeliveryEventSummary}
  * a transport receives. Kept in one place so the claim path and the delivery
  * preview (issue #299) emit byte-identical event summaries.
+ *
+ * `perRecipientDiffs` maps each surfaced event id → the delta THIS recipient
+ * computed against its OWN baseline cursor (`session_event_state.diff_text`,
+ * G10 / 002 §1.1.2). Surfacing the per-recipient delta — not the shared
+ * latest-snapshot delta on `MonitorEventRecord.diffText` — is what keeps the
+ * change summary correct under divergent recipient cursors: a session last seen
+ * at `a1` receives the full `a1→a3` span, while a session already caught up to
+ * `a2` receives only `a2→a3` from the same shared observation (session isolation,
+ * issue #436). The shared `MonitorEventRecord.diffText` is used only as the
+ * legacy fallback for pre-G10 rows whose per-recipient column is NULL (mirroring
+ * `perRecipientDiffsForSession`'s own contract and the explain projection).
  */
 function toDeliveryEventSummary(
   event: MonitorEventRecord,
   digests: Map<string, string>,
+  perRecipientDiffs: Map<string, string>,
 ): DeliveryEventSummary {
+  // Per-recipient delta (this session's own baseline span) when present; the
+  // shared latest-snapshot delta only for legacy NULL rows (issue #436).
+  const diffText = perRecipientDiffs.get(event.id) ?? event.diffText;
   return {
     eventId: event.id,
     monitorId: event.monitorId,
@@ -460,6 +475,10 @@ function toDeliveryEventSummary(
     urgency: event.urgency,
     createdAt: event.createdAt.toISOString(),
     body: event.body,
+    // Surface the change summary when the recipient has one; a transport bounds
+    // it before rendering (issue #436). Prefer `undefined` over `null` on the
+    // delivery summary (optional-field convention), so omit it for a null diff.
+    ...(diffText ? { diffText } : {}),
   };
 }
 
@@ -1946,9 +1965,14 @@ export class AgentMonitorRuntime {
         const surfacedHigh =
           computeNetCollapseView(surfacedCandidates).delivered;
 
+        const surfacedIds = surfacedHigh.map((event) => event.id);
         const digests = this.store.interpretDigestsForSession(
           sessionId,
-          surfacedHigh.map((event) => event.id),
+          surfacedIds,
+        );
+        const perRecipientDiffs = this.store.perRecipientDiffsForSession(
+          sessionId,
+          surfacedIds,
         );
         return {
           sessionId,
@@ -1967,7 +1991,7 @@ export class AgentMonitorRuntime {
               })),
             ),
             events: surfacedHigh.map((event) =>
-              toDeliveryEventSummary(event, digests),
+              toDeliveryEventSummary(event, digests, perRecipientDiffs),
             ),
           },
         };
@@ -2029,9 +2053,14 @@ export class AgentMonitorRuntime {
       // until acked (006 §5.5).
       const deliveredUnread = computeNetCollapseView(unread).delivered;
       const recapSlice = deliveredUnread.slice(-MAX_RECAP_EVENTS);
+      const recapIds = recapSlice.map((event) => event.id);
       const digests = this.store.interpretDigestsForSession(
         sessionId,
-        recapSlice.map((event) => event.id),
+        recapIds,
+      );
+      const perRecipientDiffs = this.store.perRecipientDiffsForSession(
+        sessionId,
+        recapIds,
       );
       const message = [
         'Recap of recent AgentMon activity since your last recap:',
@@ -2055,7 +2084,7 @@ export class AgentMonitorRuntime {
           unreadCounts: sessionUnreadCounts,
           message,
           events: recapSlice.map((event) =>
-            toDeliveryEventSummary(event, digests),
+            toDeliveryEventSummary(event, digests, perRecipientDiffs),
           ),
         },
       };
@@ -2118,11 +2147,18 @@ export class AgentMonitorRuntime {
     // Same pure collapse DECISION the claim uses, so the previewed set is exactly
     // what a full claim would surface — only without persisting the collapse.
     const { delivered } = computeNetCollapseView(settledHigh);
+    const deliveredIds = delivered.map((event) => event.id);
     const digests = this.store.interpretDigestsForSession(
       sessionId,
-      delivered.map((event) => event.id),
+      deliveredIds,
     );
-    return delivered.map((event) => toDeliveryEventSummary(event, digests));
+    const perRecipientDiffs = this.store.perRecipientDiffsForSession(
+      sessionId,
+      deliveredIds,
+    );
+    return delivered.map((event) =>
+      toDeliveryEventSummary(event, digests, perRecipientDiffs),
+    );
   }
 
   /**

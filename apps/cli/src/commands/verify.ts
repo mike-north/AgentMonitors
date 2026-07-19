@@ -17,7 +17,6 @@ import {
   scanMonitors,
   SourceRegistry,
   type AgentSessionRecord,
-  type DeliveryClaim,
   type MonitorDefinition,
   type MonitorEventRecord,
   type Urgency,
@@ -35,19 +34,14 @@ import { readLocalState } from '../local-state.js';
 import { resolveManualDaemonSocketPath } from '../manual-daemon.js';
 import { resolveWorkspaceDbPath } from '../workspace-db-path.js';
 import {
-  claimDeliveryClient,
   closeSessionClient,
   listEventsClient,
   listObservationHistoryClient,
   openSessionClient,
-  previewSettledHighDeliveryClient,
   retractObjectEventsClient,
   suppressObjectEventsClient,
 } from '../runtime-client.js';
-import {
-  packEventsUnderCap,
-  renderHookDelivery,
-} from '../hook-deliver-render.js';
+import { reserveRenderAndCommitHookDelivery } from './hook.js';
 import {
   computeVerifyBudget,
   deliveryLifecycleForUrgency,
@@ -55,6 +49,10 @@ import {
   isLiteralGlob,
   type VerifyBudget,
 } from '../verify-budget.js';
+import {
+  resolveObserveDeadline,
+  resolveObserveVerdict,
+} from '../verify-observe.js';
 import {
   renderVerifyJson,
   renderVerifyText,
@@ -147,17 +145,6 @@ function watchBaseDir(monitor: MonitorDefinition, workspace: string): string {
   if (typeof raw === 'string' && raw.length > 0)
     return path.resolve(workspace, raw);
   return workspace;
-}
-
-/**
- * Coerce a record timestamp to epoch ms. Over the daemon socket, `Date` fields
- * are JSON-serialized to ISO strings (the `ObservationHistoryRecord.createdAt:
- * Date` type describes the in-process shape, not the deserialized wire shape),
- * so a bare `.getTime()` would throw. Accept `Date | string | number`.
- */
-function toMs(value: Date | string | number): number {
-  if (value instanceof Date) return value.getTime();
-  return new Date(value).getTime();
 }
 
 const TRIGGER_CONTENT = (token: string): string =>
@@ -658,6 +645,16 @@ interface RunOptions {
   daemon: IsolatedDaemon;
   budget: VerifyBudget;
   detectCapMs: number;
+  /**
+   * True when `detectCapMs` came from an explicit `--timeout-ms`, not the
+   * default derived budget. The observe stage's no-change discriminator
+   * (issue #442 round 19) only extends its deadline past `detectCapMs` to fit
+   * `budget.noChangeConfirmMs` in the DEFAULT case — an explicit override is
+   * honored as the operator's real cap, so a timeout shorter than one
+   * interval still fails fast with `budget-exceeded` rather than being
+   * silently stretched.
+   */
+  timeoutOverridden: boolean;
   manual: boolean;
   /**
    * When true the run targets the persistent workspace daemon (which outlives
@@ -674,7 +671,7 @@ interface RunOptions {
 /** The core orchestration once a monitor is resolved and a daemon is reachable. */
 async function runVerification(opts: RunOptions): Promise<VerifyResult> {
   const { monitor, workspace, daemon, budget, detectCapMs, manual } = opts;
-  const { useWorkspaceDaemon, triggerCmd } = opts;
+  const { useWorkspaceDaemon, triggerCmd, timeoutOverridden } = opts;
   const mode: TriggerMode = manual
     ? 'manual'
     : triggerCmd !== undefined
@@ -890,46 +887,50 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
     // fail-fast 'no-change'/'no-files-matched' (the trigger did nothing).
     inFlightStage = 'observe';
     const detectDeadline = observeFrom + detectCapMs;
+    // A tick that was already IN FLIGHT (mid-scan) when the trigger fired can
+    // still finish and record its (necessarily stale, pre-trigger) `no-change`
+    // row AFTER `observeFrom` once the daemon is under enough scheduling delay
+    // (heavy CPU contention — the exact condition a shared CI runner can hit,
+    // even inside this suite's own serial/single-daemon isolation). That row
+    // satisfies the `createdAt > observeFrom` filter even though it never
+    // actually observed the post-trigger state, wrongly fail-fasting `verify`
+    // if trusted on sight. `resolveObserveVerdict` (verify-observe.ts) guards
+    // against this: a `no-change` verdict requires a SECOND, DISTINCT
+    // post-trigger row also reporting `no-change` — not merely the first one
+    // persisting, which is just the same stale row being re-read every poll.
+    // That discriminator needs roughly two full ticks of wall time to
+    // legitimately resolve, so the observe deadline is extended to
+    // `budget.noChangeConfirmMs` — but only for the DEFAULT derived budget; an
+    // explicit `--timeout-ms` is honored as the operator's real cap (a
+    // shorter override still fails fast with `budget-exceeded`).
+    const observeDeadline = resolveObserveDeadline(
+      observeFrom,
+      detectDeadline,
+      budget.noChangeConfirmMs,
+      timeoutOverridden,
+    );
+    const observeBudgetMs = observeDeadline - observeFrom;
+    const seenNoChangeIds = new Set<string>();
     const observed = await pollUntil<
       'triggered' | 'no-change' | 'no-files-matched'
     >(
-      detectDeadline,
+      observeDeadline,
       daemon,
       async () => {
         const rows = await listObservationHistoryClient(
           { monitorId: monitor.id, workspacePath: workspace, limit: 10 },
           daemon.socketPath,
         );
-        const post = rows.filter((r) => toMs(r.createdAt) > observeFrom);
-        if (post.some((r) => r.result === 'triggered')) return 'triggered';
-        // A post-trigger `no-files-matched` is always definitive: the glob
-        // scope resolved to zero files, so nothing could ever be observed.
-        if (
-          mode !== 'manual' &&
-          post.some((r) => r.result === 'no-files-matched')
-        ) {
-          return 'no-files-matched';
-        }
-        // A post-trigger `no-change` normally means the change wasn't
-        // observable — but NOT while a debounce/throttle notify window is
-        // settling. There the change WAS observed (recorded as a `suppressed`
-        // row that holds the batch) and the emitting `triggered` row only
-        // appears at flush; the intervening `no-change` ticks are settling
-        // noise, not a verdict. So only fail-fast on `no-change` when no
-        // post-trigger `suppressed` row is present; otherwise keep polling
-        // until the flush (or the budget) — 002 §9.2/§9.3.
-        if (
-          mode !== 'manual' &&
-          post.some((r) => r.result === 'no-change') &&
-          !post.some((r) => r.result === 'suppressed')
-        ) {
-          return 'no-change';
-        }
-        return null;
+        return resolveObserveVerdict(
+          rows,
+          observeFrom,
+          mode === 'manual',
+          seenNoChangeIds,
+        );
       },
       () => {
         progress(
-          `waiting for the change to be observed… ${String(Math.round((Date.now() - observeFrom) / 1000))}s / ~${String(Math.round(detectCapMs / 1000))}s`,
+          `waiting for the change to be observed… ${String(Math.round((Date.now() - observeFrom) / 1000))}s / ~${String(Math.round(observeBudgetMs / 1000))}s`,
         );
       },
     );
@@ -961,14 +962,14 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
       stages.push({
         name: 'observe',
         status: 'fail',
-        detail: `no change observed within ${String(Math.round(detectCapMs / 1000))}s`,
+        detail: `no change observed within ${String(Math.round(observeBudgetMs / 1000))}s`,
       });
       return finalize({
         ok: false,
         stages,
         failure: {
           kind: 'budget-exceeded',
-          message: `no change was observed within the budget (${String(Math.round(detectCapMs / 1000))}s). ${budgetExceededHint(mode)}`,
+          message: `no change was observed within the budget (${String(Math.round(observeBudgetMs / 1000))}s). ${budgetExceededHint(mode)}`,
         },
       });
     }
@@ -978,9 +979,30 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
       detail: 'change detected (triggered)',
     });
 
+    // #442 round 20: `detectDeadline` was sized assuming observe resolves
+    // within one interval, leaving `budget.postObserveBudgetMs` (settle +
+    // high-claim-settle + margin) for materialize/deliver. But the observe
+    // stage's OWN deadline can extend past `detectDeadline` (up to
+    // `noChangeConfirmMs`, for the two-distinct-row `no-change`
+    // discriminator above) — so a real `triggered` row landing in that
+    // extension window would otherwise hand materialize/deliver an
+    // already-expired `detectDeadline` and zero remaining time, failing
+    // `budget-exceeded` even though the event is durable (reproduced
+    // deterministically: a 20s-interval monitor with a backgrounded trigger
+    // whose real change lands ~30s in — observe passes ~40s in, inside the
+    // extended window, but the un-carried `detectDeadline` (25s) had already
+    // passed — see verify.integration.test.ts). Re-grant materialize/deliver a
+    // fresh deadline measured from when observe ACTUALLY resolved, using the
+    // same remainder budget — but only for the default derived budget; an
+    // explicit `--timeout-ms` keeps `detectDeadline` as the hard total cap
+    // (never extended, matching the observe-stage override semantics above).
+    const postObserveDeadline = timeoutOverridden
+      ? detectDeadline
+      : Math.max(detectDeadline, Date.now() + budget.postObserveBudgetMs);
+
     // Materialize: confirm an unread event exists for the session.
     inFlightStage = 'materialize';
-    const event = await pollUntil(detectDeadline, daemon, async () => {
+    const event = await pollUntil(postObserveDeadline, daemon, async () => {
       const events = await listEventsClient(
         {
           sessionId: session?.id ?? '',
@@ -1019,8 +1041,11 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
     const hookEventName =
       lifecycle === 'turn-interruptible' ? 'UserPromptSubmit' : 'SessionStart';
     inFlightStage = 'deliver';
+    // Same carried deadline as materialize above (#442 round 20) — deliver is
+    // the second half of the remainder budget re-granted from observe's
+    // actual resolution time, not a second independent extension.
     const additionalContext = await pollUntil(
-      detectDeadline,
+      postObserveDeadline,
       daemon,
       async () => {
         const rendered = await claimAndRender(
@@ -1112,9 +1137,22 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
 
 /**
  * Claim + render exactly as `hook deliver` does after resolving a session
- * (hook.ts): for `turn-interruptible` preview the settled high events, pack how
- * many fit under the cap, and claim exactly that many; otherwise take the plain
- * claim. Returns the rendered `additionalContext`, or null when nothing surfaces.
+ * (issue #442, PR #442 round-9 review): reuses the SAME shared
+ * reserve → validate-fit → render → commit flow
+ * (`reserveRenderAndCommitHookDelivery`, `hook.ts`) `hook deliver` itself
+ * calls — including the post-reservation candidate-growth check
+ * (`reserveSizedHookDelivery`'s `settledWorkRemainsBeyondClaim`) — rather than
+ * a bespoke preview → direct `claimDeliveryClient` → render sequence of its
+ * own. Before this fix, `verify` could pass even when the production
+ * claimed-set-equals-rendered-set contract (§5.5) was violated: a
+ * substitution race between `verify`'s own preview and its direct claim could
+ * replace the previewed events with larger blocks under the same count,
+ * durably claim all the replacements, and let the renderer silently omit
+ * already-claimed blocks — exactly the bug `reserveSizedHookDelivery` exists
+ * to close on the real hook path. Returns the rendered `additionalContext`,
+ * or null when nothing surfaces. The commit happens only after this function
+ * has captured the rendered output (never before), mirroring `hook deliver`'s
+ * own render-before-commit ordering.
  */
 async function claimAndRender(
   sessionId: string,
@@ -1122,25 +1160,17 @@ async function claimAndRender(
   socketPath: string,
   hookEventName: string,
 ): Promise<string | null> {
-  let claim: DeliveryClaim | null;
-  let moreDeferred = false;
-  if (lifecycle === 'turn-interruptible') {
-    const highPreview = await previewSettledHighDeliveryClient(
-      sessionId,
-      socketPath,
-    );
-    if (highPreview.length > 0) {
-      const fit = packEventsUnderCap(highPreview);
-      claim = await claimDeliveryClient(sessionId, lifecycle, socketPath, fit);
-      moreDeferred = fit < highPreview.length;
-    } else {
-      claim = await claimDeliveryClient(sessionId, lifecycle, socketPath);
-    }
-  } else {
-    claim = await claimDeliveryClient(sessionId, lifecycle, socketPath);
-  }
-  const output = renderHookDelivery(claim, hookEventName, { moreDeferred });
-  return output?.hookSpecificOutput.additionalContext ?? null;
+  const flow = await reserveRenderAndCommitHookDelivery(
+    sessionId,
+    lifecycle,
+    socketPath,
+    hookEventName,
+  );
+  if (!flow) return null;
+  const additionalContext =
+    flow.output?.hookSpecificOutput.additionalContext ?? null;
+  await flow.commit();
+  return additionalContext;
 }
 
 /**
@@ -1427,12 +1457,14 @@ export const verifyCommand = new Command('verify')
         const overrideMs = options.timeoutMs
           ? Number(options.timeoutMs)
           : undefined;
-        const detectCapMs =
+        const validOverrideMs =
           overrideMs !== undefined &&
           Number.isFinite(overrideMs) &&
           overrideMs > 0
             ? overrideMs
-            : budget.detectMs;
+            : undefined;
+        const timeoutOverridden = validOverrideMs !== undefined;
+        const detectCapMs = validOverrideMs ?? budget.detectMs;
 
         daemon = options.useWorkspaceDaemon
           ? await useWorkspaceDaemon(monitorsDir, workspace)
@@ -1444,6 +1476,7 @@ export const verifyCommand = new Command('verify')
           daemon,
           budget,
           detectCapMs,
+          timeoutOverridden,
           manual: options.manual === true,
           useWorkspaceDaemon: options.useWorkspaceDaemon === true,
           triggerCmd: options.triggerCmd,

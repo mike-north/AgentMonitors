@@ -31,6 +31,12 @@ import {
 import { decodeToon } from '../toon-format.js';
 import { runChannelDeliveryCycle } from './channel.js';
 import { claimDeliveryClient } from '../runtime-client.js';
+import {
+  buildChannelTruncatedMarker,
+  CHANNEL_DEFERRED_MARKER,
+  renderChannelEvent,
+} from '../channel-render.js';
+import { escapeShellPath } from '../delivery-event-render.js';
 
 const CLI_PATH = path.resolve(__dirname, '../../dist/index.cjs');
 const CLI_PACKAGE_DIR = path.resolve(__dirname, '../..');
@@ -11320,6 +11326,439 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
       await teardown(f);
     }
   }, 30_000);
+
+  // ---------------------------------------------------------------------------
+  // PR #442 round-6 review (comment 3609676603): the mocked "oversized-event
+  // commit-to-idle" unit test (`channel-delivery-cycle.test.ts`) stubs `poll
+  // two` (empty preview + null reservation) and so would stay green even if
+  // `commitDeliveryClient` stopped setting `first_notified_at`. This test
+  // drives the REAL daemon/store instead: a genuine high-urgency monitor
+  // event with a body so large `renderChannelEvent` must mid-truncate it,
+  // committed through the real `reserveDelivery`/`commitDelivery` IPC, then a
+  // SECOND real poll cycle against the same live daemon to prove the row
+  // genuinely goes idle (not surfaced again) — and the full, untruncated body
+  // is still retrievable through the exact command the truncation marker
+  // advertises (`agentmonitors events list --session <id> --unread`).
+  // ---------------------------------------------------------------------------
+  it('commits a real oversized high-urgency event through the live daemon, then genuinely goes idle on the next poll; the full body stays retrievable via the exact session-scoped command the marker advertises', async () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-chcycle-huge-'));
+    const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-huge');
+    mkdirSync(monitorsDir, { recursive: true });
+    const watchedFile = path.join(ws, 'watched.txt');
+    writeFileSync(watchedFile, 'initial content', 'utf-8');
+    // The monitor's own markdown body becomes `DeliveryEventSummary.body`
+    // (`observation.body ?? monitor.instructions`) — a huge one is what
+    // forces `renderChannelEvent`'s mid-truncation branch for a REAL event,
+    // not a hand-built fixture.
+    const hugeBody = 'x'.repeat(1_000_000);
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      [
+        '---',
+        'name: Watch huge',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs:',
+        '    - "watched.txt"',
+        `  cwd: ${JSON.stringify(ws)}`,
+        '  interval: "1s"',
+        'urgency: high',
+        // Short notify debounce so the event MATERIALIZES quickly; the
+        // SEPARATE 15s claim-time settle window (002 §9.1,
+        // DEFAULT_HIGH_URGENCY_SETTLE_MS) is not configurable and is what
+        // this test actually waits out below.
+        'notify:',
+        '  strategy: debounce',
+        '  settle-for: "1s"',
+        '---',
+        hugeBody,
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+
+    // Adversarial-but-filesystem-legal socket path (issue #442, PR #442
+    // round-8 review): a space and brackets are both legal bytes in a Unix
+    // domain socket path, but they are ALSO `<channel>`-tag-breakout
+    // characters (brackets) and shell metacharacters (space). This proves the
+    // marker's `--socket` clause is BOTH transport-safe (§4.6) and
+    // shell-round-trip-safe end to end against a real daemon, not just at the
+    // unit level.
+    const socket = path.join(
+      '/tmp',
+      `agentmon chcycle [huge] ${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const db = path.join(ws, 'channel-cycle-huge.db');
+    const hostSessionId = `chcycle-huge-${Date.now()}`;
+    writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 30_000 });
+    const env: Record<string, string> = {
+      CLAUDE_PROJECT_DIR: ws,
+      AGENTMONITORS_DB: db,
+      AGENTMONITORS_SOCKET: socket,
+    };
+
+    const start = runWithStdin(
+      ['session', 'start'],
+      env,
+      JSON.stringify({
+        session_id: hostSessionId,
+        hook_event_name: 'SessionStart',
+        cwd: ws,
+      }),
+      ws,
+    );
+    expect(start.exitCode).toBe(0);
+    expect(await daemonAvailable(socket)).toBe(true);
+
+    try {
+      const sessions = JSON.parse(
+        runWithEnv(
+          ['session', 'list', '--socket', socket, '--format', 'json'],
+          env,
+          ws,
+        ).stdout,
+      ) as { id: string; hostSessionId: string }[];
+      const sessionId =
+        sessions.find((s) => s.hostSessionId === hostSessionId)?.id ?? '';
+      expect(sessionId).not.toBe('');
+
+      // Fire the monitor exactly once after the baseline tick.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
+      writeFileSync(watchedFile, 'changed content', 'utf-8');
+
+      const unreadEvents = (): { id: string; body?: string }[] =>
+        JSON.parse(
+          runWithEnv(
+            [
+              'events',
+              'list',
+              '--session',
+              sessionId,
+              '--unread',
+              '--format',
+              'json',
+              '--socket',
+              socket,
+            ],
+            env,
+            ws,
+          ).stdout,
+        ) as { id: string; body?: string }[];
+
+      // Wait for the event to MATERIALIZE (the 1s notify debounce).
+      const materializeDeadline = Date.now() + 10_000;
+      let eventId = '';
+      while (Date.now() < materializeDeadline) {
+        const events = unreadEvents();
+        if (events.length >= 1) {
+          eventId = events[0]?.id ?? '';
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      expect(eventId).not.toBe('');
+
+      // Wait out the SEPARATE 15s claim-time settle window before a
+      // `turn-interruptible` reservation will surface it.
+      let outcome: string | undefined;
+      let renderedContent = '';
+      const settleDeadline = Date.now() + 25_000;
+      while (Date.now() < settleDeadline) {
+        outcome = await runChannelDeliveryCycle(sessionId, socket, (claim) => {
+          renderedContent = renderChannelEvent(claim, {
+            moreDeferred: false,
+            socketPath: socket,
+          }).content;
+          return Promise.resolve();
+        });
+        if (outcome === 'surfaced') break;
+        expect(outcome).toBe('idle'); // no other outcome is expected while polling
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      expect(outcome).toBe('surfaced');
+
+      // The real, live-daemon-committed content is mid-truncated (it dwarfs
+      // MAX_CHANNEL_CONTENT) and signposts the durable unread copy via the
+      // EXACT session-scoped, socket-scoped command (issue #442, PR #442
+      // round-6/round-7 review).
+      expect(renderedContent).toContain(
+        buildChannelTruncatedMarker(sessionId, socket).trim(),
+      );
+      expect(renderedContent).toContain(
+        `agentmonitors events list --session ${sessionId} --socket ${escapeShellPath(socket)} --unread`,
+      );
+      expect(renderedContent).not.toContain(CHANNEL_DEFERRED_MARKER.trim());
+      // The adversarial socket path's own tag-breakout brackets must not
+      // survive raw into the pushed `<channel>` content (006 §4.6) — only
+      // their escaped `\xNN` form should appear.
+      expect(renderedContent).not.toMatch(/\[huge\]/);
+
+      // The row is now genuinely committed (`first_notified_at` set) in the
+      // REAL store — a second real poll cycle must NOT re-surface the omitted
+      // tail: the cycle goes idle, proving commit really did stick (not just
+      // that a mock said so).
+      let pushAfterCommitCallCount = 0;
+      const second = await runChannelDeliveryCycle(sessionId, socket, () => {
+        pushAfterCommitCallCount += 1;
+        return Promise.resolve();
+      });
+      expect(second).toBe('idle');
+      expect(pushAfterCommitCallCount).toBe(0);
+
+      // The full, untruncated body is still retrievable — still unread
+      // (claiming ≠ acking) — via the EXACT command the marker advertised.
+      const stillUnread = unreadEvents();
+      const committedEvent = stillUnread.find((e) => e.id === eventId);
+      expect(committedEvent).toBeDefined();
+      expect(committedEvent?.body).toBe(hugeBody);
+
+      // PR #442 round-7 review (issue #358): `events list` resolves its own
+      // socket ENV-FIRST (`resolveManualDaemonSocketPath`, issue #335), so a
+      // marker command with NO `--socket` could silently query a stale
+      // `AGENTMONITORS_SOCKET` left over from a different workspace. Prove
+      // the EXACT advertised command (extracted from the real marker text,
+      // not hand-retyped) is reliably runnable despite a stale env var by
+      // executing it as a real subprocess, as a user would copy-paste it,
+      // with `AGENTMONITORS_SOCKET` deliberately pointing at a DIFFERENT,
+      // dead socket.
+      const [, extractedCommand] =
+        /`(agentmonitors[^`]+)`/.exec(
+          buildChannelTruncatedMarker(sessionId, socket),
+        ) ?? [];
+      expect(extractedCommand).toBeDefined();
+      // `--format json` is appended ONLY so this assertion can parse
+      // structured output deterministically regardless of the ambient
+      // agent-detection heuristic (`resolveFormat`) in the test environment —
+      // it is NOT part of the marker's own advertised command, which the
+      // assertion above already confirmed byte-for-byte.
+      const advertisedCommand = `${extractedCommand ?? ''} --format json`;
+      const staleSocket = path.join(
+        '/tmp',
+        `agentmon-stale-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+      );
+      const shimDir = makeAgentmonitorsShimDir();
+      // `escapeShellPath` documents bash/zsh ANSI-C quoting (`$'...'`) as its
+      // escaping mechanism when the socket path carries any unsafe byte (here,
+      // the adversarial path's space and brackets) — `$'...'` is a bash/zsh
+      // extension, not POSIX `sh` (e.g. `dash` treats it as literal `$`
+      // followed by a plain single-quoted string, which would NOT decode the
+      // `\xNN` escapes). Run via `/bin/bash`, matching the contract the
+      // marker's own doc comment (`escapeShellPath`) documents, rather than
+      // `/bin/sh`.
+      const recovered = execFileSync('/bin/bash', ['-c', advertisedCommand], {
+        encoding: 'utf-8',
+        env: {
+          ...process.env,
+          PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ''}`,
+          // A stale env var from a DIFFERENT workspace — must NOT win.
+          AGENTMONITORS_SOCKET: staleSocket,
+        },
+      });
+      const recoveredEvents = JSON.parse(recovered) as {
+        id: string;
+        body?: string;
+      }[];
+      expect(recoveredEvents.some((e) => e.id === eventId)).toBe(true);
+      expect(recoveredEvents.find((e) => e.id === eventId)?.body).toBe(
+        hugeBody,
+      );
+    } finally {
+      try {
+        await callDaemon('stop', {}, { socketPath: socket });
+      } catch {
+        // already stopped
+      }
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// PR #442 round-7 review (comment 3609790074/3609790077): the hook transport's
+// truncation marker now ALSO embeds an explicit `--socket <path>` (issue #358,
+// mirroring the channel-side fix above) — `agentmonitors events list` resolves
+// its own socket ENV-FIRST (issue #335), so a bare marker command could
+// silently query a stale or different workspace's daemon. This drives a REAL
+// daemon + a real `hook deliver` claim of a genuinely oversized single event
+// (mid-truncated, synchronously claimed — `first_notified_at` set before this
+// renders, so it will NOT redeliver at the next context event, unlike the
+// genuinely-deferred-remainder branch) and executes the EXACT advertised
+// recovery command as a subprocess with a stale `AGENTMONITORS_SOCKET`,
+// proving it reaches the right daemon regardless.
+// ---------------------------------------------------------------------------
+describe('hook deliver: oversized single-event marker socket scoping (issue #358, #442)', () => {
+  it('advertises a directly runnable, socket-scoped, claimed-unread recovery command that survives a stale AGENTMONITORS_SOCKET', async () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-hd-huge-'));
+    const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-huge');
+    mkdirSync(monitorsDir, { recursive: true });
+    const watchedFile = path.join(ws, 'watched.txt');
+    writeFileSync(watchedFile, 'initial content', 'utf-8');
+    const hugeBody = 'x'.repeat(1_000_000);
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      [
+        '---',
+        'name: Watch huge',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs:',
+        '    - "watched.txt"',
+        `  cwd: ${JSON.stringify(ws)}`,
+        '  interval: "1s"',
+        'urgency: high',
+        // Short notify debounce so the event MATERIALIZES quickly; the
+        // SEPARATE 15s claim-time settle window (002 §9.1,
+        // DEFAULT_HIGH_URGENCY_SETTLE_MS) is not configurable and is what
+        // this test actually waits out below.
+        'notify:',
+        '  strategy: debounce',
+        '  settle-for: "1s"',
+        '---',
+        hugeBody,
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+
+    const socket = path.join(
+      '/tmp',
+      `agentmon-hd-huge-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const db = path.join(ws, 'hd-huge.db');
+    const hostSessionId = `hd-huge-${Date.now()}`;
+    writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 30_000 });
+    const env: Record<string, string> = {
+      AGENTMONITORS_DB: db,
+      AGENTMONITORS_SOCKET: socket,
+    };
+    const daemon = await startDaemon(
+      path.join(ws, '.claude', 'monitors'),
+      ws,
+      env,
+      socket,
+    );
+
+    try {
+      const sessionOpen = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          hostSessionId,
+          '--workspace',
+          ws,
+          '--format',
+          'json',
+        ],
+        env,
+        ws,
+      );
+      expect(sessionOpen.exitCode).toBe(0);
+      const session = JSON.parse(sessionOpen.stdout) as { id: string };
+
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
+      writeFileSync(watchedFile, 'changed content', 'utf-8');
+
+      const unread = () =>
+        runWithEnv(
+          [
+            'events',
+            'list',
+            '--session',
+            session.id,
+            '--unread',
+            '--format',
+            'json',
+          ],
+          env,
+          ws,
+        );
+
+      const materializeDeadline = Date.now() + 10_000;
+      let eventId = '';
+      while (Date.now() < materializeDeadline) {
+        const events = JSON.parse(unread().stdout) as { id: string }[];
+        if (events.length >= 1) {
+          eventId = events[0]?.id ?? '';
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      expect(eventId).not.toBe('');
+
+      // Wait out the 15s claim-time settle window, then drive a real
+      // PostToolUse `hook deliver` — the exact input contract a Claude Code
+      // hook feeds the command.
+      let additionalContext = '';
+      const settleDeadline = Date.now() + 25_000;
+      while (Date.now() < settleDeadline) {
+        const deliver = runWithStdin(
+          ['hook', 'deliver'],
+          env,
+          JSON.stringify({
+            session_id: hostSessionId,
+            hook_event_name: 'PostToolUse',
+            cwd: ws,
+          }),
+          ws,
+        );
+        expect(deliver.exitCode).toBe(0);
+        if (deliver.stdout.trim() !== '') {
+          additionalContext = (
+            JSON.parse(deliver.stdout) as {
+              hookSpecificOutput: { additionalContext: string };
+            }
+          ).hookSpecificOutput.additionalContext;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      expect(additionalContext).not.toBe('');
+      // Claimed-unread framing (issue #442, PR #442 round-7/round-10 review) —
+      // this event's own content stays unread, an outcome-agnostic claim that
+      // holds whether or not the reservation's commit lands.
+      expect(additionalContext).toContain('the full copy stays unread');
+      expect(additionalContext).not.toContain(
+        'more monitor updates are pending',
+      );
+
+      const [, extractedCommand] =
+        /`(agentmonitors[^`]+)`/.exec(additionalContext) ?? [];
+      expect(extractedCommand).toBeDefined();
+      expect(extractedCommand).toContain(`--socket '${socket}'`);
+
+      // `--format json` is appended ONLY so this assertion can parse
+      // structured output deterministically — it is not part of the marker's
+      // own advertised command, already confirmed above.
+      const advertisedCommand = `${extractedCommand ?? ''} --format json`;
+      const staleSocket = path.join(
+        '/tmp',
+        `agentmon-hd-stale-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+      );
+      const shimDir = makeAgentmonitorsShimDir();
+      const recovered = execFileSync('/bin/sh', ['-c', advertisedCommand], {
+        encoding: 'utf-8',
+        env: {
+          ...process.env,
+          PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ''}`,
+          // A stale env var from a DIFFERENT workspace — must NOT win.
+          AGENTMONITORS_SOCKET: staleSocket,
+        },
+      });
+      const recoveredEvents = JSON.parse(recovered) as {
+        id: string;
+        body?: string;
+      }[];
+      expect(recoveredEvents.some((e) => e.id === eventId)).toBe(true);
+      expect(recoveredEvents.find((e) => e.id === eventId)?.body).toBe(
+        hugeBody,
+      );
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 60_000);
 });
 
 // ---------------------------------------------------------------------------

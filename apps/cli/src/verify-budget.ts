@@ -120,7 +120,51 @@ export interface VerifyBudget {
   baselineMs: number;
   /** Budget to detect + deliver the triggered change after baseline (ms). */
   detectMs: number;
-  /** Total end-to-end budget (ms). */
+  /**
+   * Wall-clock budget the observe stage needs to DECISIVELY confirm a
+   * `no-change` verdict (issue #442 round 19): two DISTINCT post-trigger
+   * observation-history rows both reporting `no-change` — not just one stale
+   * row persisting — which takes roughly two full ticks (one to record the
+   * first post-trigger `no-change`, a second full interval later to confirm
+   * it wasn't a one-off). `2 * intervalMs + marginMs`; no settle term, since a
+   * genuine no-change tick never enters a notify settle window. `verify.ts`
+   * extends the observe stage's deadline to at least this value — but ONLY
+   * when using the default derived budget; an explicit `--timeout-ms` is
+   * honored as-is (a timeout shorter than one interval still fails fast with
+   * `budget-exceeded`, per the documented CLI flag semantics).
+   */
+  noChangeConfirmMs: number;
+  /**
+   * Budget granted to the materialize + deliver stages, counted from the
+   * moment the observe stage actually resolves — `settleMs + highClaimSettleMs
+   * + marginMs` (i.e. `detectMs - intervalMs`, the portion of `detectMs` that
+   * isn't the observe-stage interval term).
+   *
+   * `detectDeadline` (`observeFrom + detectMs`) is sized on the assumption
+   * observe resolves within one interval, leaving this remainder for
+   * materialize/deliver. But `noChangeConfirmMs` can extend the observe
+   * stage's own deadline past `detectDeadline` (issue #442 round 19) — so a
+   * *real* triggered row that lands in that extension window (after
+   * `detectDeadline` but before the extended observe deadline) would
+   * otherwise hand materialize/deliver an already-expired deadline and zero
+   * remaining time (issue #442 round 20). `verify.ts` grants materialize and
+   * deliver a fresh deadline of `max(detectDeadline, observeResolvedAt +
+   * postObserveBudgetMs)` — the same remainder budget, just measured from
+   * when observe actually finished — for the DEFAULT derived budget only; an
+   * explicit `--timeout-ms` is still honored as the hard total (never
+   * extended past its own `detectDeadline`).
+   */
+  postObserveBudgetMs: number;
+  /**
+   * Total end-to-end budget (ms) — the worst-case default maximum, including
+   * the round-20 materialize/deliver extension: `baselineMs +
+   * max(detectMs, noChangeConfirmMs) + postObserveBudgetMs`. The
+   * `max(detectMs, noChangeConfirmMs)` term is the observe stage's own
+   * worst-case deadline (extended for the two-distinct-row `no-change`
+   * discriminator); `postObserveBudgetMs` is then re-granted to
+   * materialize/deliver measured from whenever observe actually resolves,
+   * so it is additive rather than overlapping with the observe window.
+   */
   totalMs: number;
 }
 
@@ -148,6 +192,8 @@ export function computeVerifyBudget(monitor: MonitorDefinition): VerifyBudget {
   const marginMs = Math.max(5_000, Math.ceil(intervalMs * 0.25));
   const baselineMs = intervalMs + marginMs;
   const detectMs = intervalMs + settleMs + highClaimSettleMs + marginMs;
+  const noChangeConfirmMs = intervalMs * 2 + marginMs;
+  const postObserveBudgetMs = settleMs + highClaimSettleMs + marginMs;
   return {
     intervalMs,
     settleMs,
@@ -155,7 +201,10 @@ export function computeVerifyBudget(monitor: MonitorDefinition): VerifyBudget {
     marginMs,
     baselineMs,
     detectMs,
-    totalMs: baselineMs + detectMs,
+    noChangeConfirmMs,
+    postObserveBudgetMs,
+    totalMs:
+      baselineMs + Math.max(detectMs, noChangeConfirmMs) + postObserveBudgetMs,
   };
 }
 

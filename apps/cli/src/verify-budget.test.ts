@@ -168,7 +168,16 @@ describe('computeVerifyBudget', () => {
     expect(budget.marginMs).toBe(5_000);
     expect(budget.baselineMs).toBe(4_000 + 5_000);
     expect(budget.detectMs).toBe(4_000 + 0 + 0 + 5_000);
-    expect(budget.totalMs).toBe(budget.baselineMs + budget.detectMs);
+    // totalMs (issue #442 round 20) is the worst-case default maximum: the
+    // observe stage's own worst-case deadline (`max(detectMs,
+    // noChangeConfirmMs)`) plus the materialize/deliver remainder
+    // (`postObserveBudgetMs`) re-granted from whenever observe resolves.
+    expect(budget.postObserveBudgetMs).toBe(0 + 0 + 5_000);
+    expect(budget.totalMs).toBe(
+      budget.baselineMs +
+        Math.max(budget.detectMs, budget.noChangeConfirmMs) +
+        budget.postObserveBudgetMs,
+    );
   });
 
   it('adds both the default debounce settle and the claim-settle window to the detect phase (issue #406)', () => {
@@ -193,6 +202,42 @@ describe('computeVerifyBudget', () => {
         schedulingDefaults.highUrgencyClaimSettleMs +
         5_000,
     );
+  });
+
+  // Regression (issue #442 round 19): `noChangeConfirmMs` is the wall-clock
+  // budget the observe stage's two-distinct-row `no-change` discriminator
+  // needs — roughly two full ticks, not the single-interval `detectMs`.
+  it('folds two intervals (not one) plus margin into noChangeConfirmMs', () => {
+    const monitor = monitorFrom(
+      "watch:\n  type: file-fingerprint\n  globs:\n    - '*.md'\n  interval: '4s'\nurgency: normal",
+    );
+    const budget = computeVerifyBudget(monitor);
+    expect(budget.noChangeConfirmMs).toBe(4_000 * 2 + 5_000);
+    // It must exceed detectMs (single-interval) — that is the whole point of
+    // the fix: the old single-interval persistence window undershot what two
+    // genuinely distinct post-trigger ticks need.
+    expect(budget.noChangeConfirmMs).toBeGreaterThan(budget.detectMs);
+  });
+
+  // Regression (issue #442 round 20): totalMs must reflect the worst-case
+  // default maximum, INCLUDING the materialize/deliver extension granted when
+  // observe resolves in the noChangeConfirmMs window past detectMs — not just
+  // baselineMs + detectMs, which undercounts by exactly this scenario.
+  it('folds the observe stage worst-case deadline plus a re-granted materialize/deliver remainder into totalMs', () => {
+    const monitor = monitorFrom(
+      "watch:\n  type: file-fingerprint\n  globs:\n    - '*.md'\n  interval: '4s'\nurgency: normal",
+    );
+    const budget = computeVerifyBudget(monitor);
+    // noChangeConfirmMs (13_000) exceeds detectMs (9_000) for this config, so
+    // totalMs must be sized off noChangeConfirmMs, not detectMs.
+    expect(budget.noChangeConfirmMs).toBeGreaterThan(budget.detectMs);
+    expect(budget.totalMs).toBe(
+      budget.baselineMs + budget.noChangeConfirmMs + budget.postObserveBudgetMs,
+    );
+    // The naive pre-fix formula (baselineMs + detectMs) must UNDERSHOOT the
+    // corrected totalMs — that undershoot is exactly what caused materialize
+    // to receive an already-expired deadline.
+    expect(budget.totalMs).toBeGreaterThan(budget.baselineMs + budget.detectMs);
   });
 
   it('scales the margin to 25% of a long interval', () => {

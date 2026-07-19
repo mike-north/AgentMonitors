@@ -181,6 +181,29 @@ export interface DeliveryEventSummary {
    * instructions, not just the title/summary.
    */
   body: string;
+  /**
+   * The change summary for this event — what actually changed at the observed
+   * source (a file diff, an API-body diff, a command-output diff). Carries the
+   * concrete evidence the monitor fired on, so a delivery transport can surface
+   * *what changed*, not just the title and the author's instructions.
+   *
+   * This is the **recipient-specific** delta (`session_event_state.diff_text`,
+   * G10 / 002 §1.1.2): the diff THIS recipient's own baseline cursor produces
+   * against the shared observation, not necessarily the shared latest-snapshot
+   * delta on `MonitorEventRecord.diffText`. Two sessions at divergent cursors
+   * receive different (correct) spans from the same shared event — a session
+   * last seen two observations ago receives the full multi-observation span,
+   * while a caught-up session receives only the latest delta (session
+   * isolation, issue #436). The shared `MonitorEventRecord.diffText` is used
+   * only as a **legacy fallback** for a pre-G10 row whose per-recipient column
+   * is `null` (mirrors `perRecipientDiffsForSession`'s own contract).
+   *
+   * Optional: absent when the event carried no diff at all (neither the
+   * per-recipient nor the shared value is present). Transports that surface it
+   * MUST bound it — a raw diff can be arbitrarily large and the render lands in
+   * the agent's context window.
+   */
+  diffText?: string;
 }
 
 export interface DeliveryClaim {

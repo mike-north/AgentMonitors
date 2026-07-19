@@ -378,6 +378,82 @@ describe('agentmonitors verify', () => {
     );
   }, 30_000);
 
+  it("reaches PASS end-to-end when a real triggered change is observed after the un-extended detect deadline but before the observe stage's no-change-confirm deadline (issue #442 round 20)", () => {
+    const ws = path.join(tempDir, 'trigger-cmd-late-observe');
+    mkdirSync(ws, { recursive: true });
+    const watched = path.join(ws, 'watched.txt');
+    // 20s interval, normal urgency, no --timeout-ms override: budget.detectMs =
+    // interval(20s) + settle(0) + claim-settle(0) + margin(25% = 5s) = 25s;
+    // budget.noChangeConfirmMs = 2*interval + margin = 45s. The observe stage's
+    // OWN deadline is extended (round 19) to the larger of the two — 45s — but
+    // pre-fix, materialize/deliver still polled against the un-extended 25s
+    // `detectDeadline`. A SMALL interval can't reproduce this: with the 5s
+    // margin floor dominating, the observe stage's round-19 two-distinct-row
+    // `no-change` discriminator would fail-fast well before a slow trigger's
+    // real change ever lands (verified empirically — see git history for this
+    // test). A large interval is required so genuinely only ONE stale
+    // `no-change` tick occurs before the real change (never reaching the
+    // two-row bar), while the real `triggered` row still lands past the
+    // un-extended `detectDeadline`.
+    writeMonitor(
+      ws,
+      'cmd-watch-late',
+      `name: Cmd watch late\nwatch:\n  type: command-poll\n  command:\n    - cat\n    - ${JSON.stringify(watched)}\n  interval: '20s'\nurgency: normal`,
+    );
+    writeFileSync(watched, 'baseline contents\n', 'utf-8');
+
+    // The trigger command backgrounds its own change in a fully-detached
+    // subshell (stdio redirected away from the piped `execSync` streams, so
+    // `fire()` returns almost immediately instead of blocking on the
+    // background job's inherited pipe) — `observeFrom` starts at ~t=0s while
+    // the real file rewrite lands at t≈30s: after the first post-trigger tick
+    // (~20s, genuinely sees no change yet — one `no-change` row, never
+    // reaching round 19's two-row bar) but comfortably before the second tick
+    // (~40s, which observes the already-written file as `triggered`) — landing
+    // inside the [25s, 45s] round-19 extension window, past the un-extended
+    // 25s `detectDeadline`. This is the reviewer's deterministic repro:
+    // pre-fix, observe passes around t≈40s, but materialize's own deadline
+    // (still the un-carried 25s `detectDeadline`) had already expired, so
+    // materialize immediately failed `budget-exceeded` even though the event
+    // was durable (reproduced against the pre-fix code before this test was
+    // added).
+    const result = run(
+      [
+        'verify',
+        'cmd-watch-late',
+        '--workspace',
+        ws,
+        '--trigger-cmd',
+        `(sleep 30 && printf 'changed by delayed background trigger\\n' > ${JSON.stringify(watched)}) </dev/null >/dev/null 2>&1 &`,
+        '--format',
+        'json',
+      ],
+      ws,
+    );
+    expect(result.exitCode).toBe(0);
+    const report = JSON.parse(result.stdout) as {
+      ok: boolean;
+      failure: { kind: string; message: string } | null;
+      stages: { name: string; status: string; detail: string }[];
+      additionalContext: string | null;
+    };
+    expect(report.ok).toBe(true);
+    expect(report.failure).toBeNull();
+    // The whole pipeline — not just observe — must complete: materialize and
+    // deliver are the two stages that pre-fix inherited the already-expired
+    // `detectDeadline` and failed regardless of the observe outcome.
+    expect(report.stages.find((s) => s.name === 'observe')?.status).toBe(
+      'pass',
+    );
+    expect(report.stages.find((s) => s.name === 'materialize')?.status).toBe(
+      'pass',
+    );
+    expect(report.stages.find((s) => s.name === 'deliver')?.status).toBe(
+      'pass',
+    );
+    expect(report.additionalContext).toContain('review it');
+  }, 90_000);
+
   it('FAILs bounded (does not hang) when --trigger-cmd never exits, honoring --timeout-ms (issue #416: execSync needs a timeout)', () => {
     const ws = path.join(tempDir, 'trigger-cmd-timeout');
     mkdirSync(ws, { recursive: true });

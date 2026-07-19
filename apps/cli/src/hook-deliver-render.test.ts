@@ -275,10 +275,15 @@ describe('renderHookDelivery', () => {
   });
 
   // (e.2) truncation marker: an over-cap body yields output that is (a) ≤ cap
-  // and (b) ends with the explicit truncation marker pointing at the still-
-  // unread events. The marker proves the truncation is signposted, not silent.
+  // and (b) ends with the explicit, directly runnable session-scoped
+  // truncation marker pointing at the still-unread event (issue #442: a bare
+  // `--unread` without `--session <id>` exits 1, so the marker must render the
+  // real command for the claim's own session, not the unusable bare form). A
+  // SINGLE oversized event's own block is what's cut here, so it uses the
+  // outcome-agnostic claimed-unread framing, not the "more updates are
+  // pending" deferred framing (issue #442, PR #442 round-7/round-10 review).
   const TRUNCATION_TAIL =
-    'run `agentmonitors events list --unread` to see the rest]';
+    'run `agentmonitors events list --session s1 --unread` to see it now]';
   it('appends an explicit truncation marker when over the cap', () => {
     const largeBody = 'x'.repeat(10_000);
     const out = renderHookDelivery(
@@ -303,6 +308,162 @@ describe('renderHookDelivery', () => {
     // (b) ends with the truncation marker
     expect(ctx.endsWith(TRUNCATION_TAIL)).toBe(true);
     expect(ctx).toContain('[truncated');
+  });
+
+  // (e.2.1 — issue #442 regression) the marker's command is derived from THIS
+  // claim's own sessionId, not the default fixture's — proving the fix isn't
+  // hardcoded and that a bare `--unread` (which exits 1 without `--session`)
+  // never leaks into the rendered marker.
+  it('renders the truncation marker with the exact claim sessionId, not a bare --unread', () => {
+    const largeBody = 'x'.repeat(10_000);
+    const out = renderHookDelivery(
+      makeClaim({
+        sessionId: 'session-abc-123',
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'watch-src',
+            title: 'Files changed',
+            summary: 'Files changed',
+            body: largeBody,
+            urgency: 'high',
+            createdAt: '2026-06-04T00:00:00.000Z',
+          },
+        ],
+      }),
+      'PreToolUse',
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).toContain(
+      'run `agentmonitors events list --session session-abc-123 --unread` to see it',
+    );
+    // The unusable bare form (no --session) must never appear.
+    expect(ctx).not.toContain('`agentmonitors events list --unread` to see it');
+    // The claimed-unread framing, not the "more updates are pending" one —
+    // this event's own content stays unread, an outcome-agnostic claim that
+    // holds whether or not the reservation's commit lands (issue #442, PR #442
+    // round-7/round-10 review).
+    expect(ctx).toContain('the full copy stays unread');
+    expect(ctx).not.toContain('more monitor updates are pending');
+  });
+
+  // (issue #442, PR #442 round-8 review) Mixed case: this claim's single
+  // event is ITSELF oversized (mid-truncation branch) AND `moreDeferred` is
+  // true — genuinely more high-urgency work exists beyond this one claimed
+  // event and stays pending. Before the fix, the claimed-unread marker alone
+  // suppressed the second, real signal that further, DIFFERENT work is
+  // queued and will redeliver — the render must carry BOTH signposts.
+  it('renders both the claimed-unread notice and the genuinely-pending deferral notice when the sole claimed event is itself oversized', () => {
+    const largeBody = 'x'.repeat(10_000);
+    const out = renderHookDelivery(
+      makeClaim({
+        sessionId: 'session-mixed',
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'watch-src',
+            title: 'Files changed',
+            summary: 'Files changed',
+            body: largeBody,
+            urgency: 'high',
+            createdAt: '2026-06-04T00:00:00.000Z',
+          },
+        ],
+      }),
+      'PreToolUse',
+      { moreDeferred: true },
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx.length).toBeLessThanOrEqual(4000);
+    // This event's own tail: stays unread (outcome-agnostic wording).
+    expect(ctx).toContain('the full copy stays unread');
+    // The genuinely separate, still-pending remainder: will redeliver later.
+    expect(ctx).toContain('more monitor updates are pending');
+    expect(ctx).toContain(
+      'run `agentmonitors events list --session session-mixed --unread` to see the rest',
+    );
+    expect(ctx).toContain(
+      'run `agentmonitors events list --session session-mixed --unread` to see it',
+    );
+  });
+
+  // (e.2.3 — issue #358/#442, PR #442 round-7 review) the marker's recovery
+  // command must carry an explicit `--socket <path>`, since `events list`
+  // resolves its own socket env-first (issue #335) and would otherwise ignore
+  // the workspace's own (possibly different) resolved socket, silently
+  // querying a stale or wrong daemon.
+  it('threads the resolved socket path into the marker as an explicit --socket flag', () => {
+    const largeBody = 'x'.repeat(10_000);
+    const out = renderHookDelivery(
+      makeClaim({
+        sessionId: 'session-abc-123',
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'watch-src',
+            title: 'Files changed',
+            summary: 'Files changed',
+            body: largeBody,
+            urgency: 'high',
+            createdAt: '2026-06-04T00:00:00.000Z',
+          },
+        ],
+      }),
+      'PreToolUse',
+      { socketPath: '/tmp/agentmon-real.sock' },
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).toContain(
+      "run `agentmonitors events list --session session-abc-123 --socket '/tmp/agentmon-real.sock' --unread` to see it",
+    );
+  });
+
+  // A socket path containing a shell metacharacter (a single quote) must not
+  // corrupt the advertised command or allow shell injection when pasted
+  // verbatim.
+  it('shell-quotes a socket path so the advertised command stays safe to paste', () => {
+    const out = renderHookDelivery(
+      makeClaim({ sessionId: 'session-xyz' }),
+      'PostToolUse',
+      { moreDeferred: true, socketPath: "/tmp/weird ' path.sock" },
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).toContain(
+      String.raw`--socket $'/tmp/weird\x20\x27\x20path.sock'`,
+    );
+  });
+
+  // PR #442 round-8 review: `additionalContext` preserves `<>[]` verbatim (it
+  // is a plain JSON string, not tag-delimited — see `sanitize`), but a socket
+  // path is still shell-escaped via the transport-shared `escapeShellPath` for
+  // consistency with the channel transport and so the advertised command is
+  // guaranteed to round-trip to the exact original path.
+  it('escapes a socket path carrying shell/control characters via the shared helper', () => {
+    const out = renderHookDelivery(
+      makeClaim({ sessionId: 'session-xyz' }),
+      'PostToolUse',
+      { moreDeferred: true, socketPath: '/tmp/x`bad\r.sock' },
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).toContain(String.raw`\x60`);
+    expect(ctx).toContain(String.raw`\x0d`);
+  });
+
+  // (e.2.2 — issue #442) the `moreDeferred` deferred-remainder marker (appended
+  // when genuinely-pending events were left unclaimed) is ALSO session-scoped
+  // — and, unlike the mid-truncation case above, keeps the "more updates are
+  // pending" framing, since those events really do redeliver (issue #442, PR
+  // #442 round-7 review).
+  it('renders a session-scoped marker when the caller deferred more events', () => {
+    const out = renderHookDelivery(
+      makeClaim({ sessionId: 'session-xyz' }),
+      'PostToolUse',
+      { moreDeferred: true },
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).toContain(
+      'run `agentmonitors events list --session session-xyz --unread` to see the rest',
+    );
   });
 
   // (e.3) when the content fits under the cap, NO marker is appended.
@@ -448,6 +609,122 @@ describe('renderHookDelivery', () => {
   });
 });
 
+// (issue #442, PR #442 round-9/round-10 review) Marker selection is
+// lifecycle-aware: a `post-compact` recap re-shows the FULL unread set on
+// EVERY recap, regardless of whether a row is already claimed (§5.5 —
+// `decideDelivery`'s recap branch reads `unreadEventsForSession`, not
+// `pendingEventsForSession`, and `applyDelivery` claims the FULL candidate
+// set at commit time regardless of what actually renders). Neither of the
+// two ordinary markers is truthful for a recap:
+//   - the "genuinely pending" deferred marker ("more monitor updates are
+//     pending ... run events list --unread to see the rest") wrongly implies
+//     the omitted content is NOT yet claimed;
+//   - the ordinary claimed-unread marker's outcome-agnostic "the full copy
+//     stays unread" wording is accurate but incomplete for a recap — it
+//     misses the POSITIVE guarantee a recap actually offers ("will reappear
+//     on future recaps"), which the recap-aware marker states explicitly.
+describe('renderHookDelivery post-compact recap marker (issue #442, round-9 review)', () => {
+  function recapEvent(
+    overrides: Partial<DeliveryEventSummary> = {},
+  ): DeliveryEventSummary {
+    return {
+      eventId: 'e1',
+      monitorId: 'watch-src',
+      title: 'Files changed',
+      summary: 'Files changed',
+      body: 'a body',
+      urgency: 'normal',
+      createdAt: '2026-06-04T00:00:00.000Z',
+      ...overrides,
+    };
+  }
+
+  function makeRecapClaim(
+    overrides: Partial<DeliveryClaim> = {},
+  ): DeliveryClaim {
+    return makeClaim({
+      mode: 'recap',
+      urgency: undefined,
+      lifecycle: 'post-compact',
+      message: 'Recap of recent AgentMon activity since your last recap:',
+      events: [recapEvent()],
+      ...overrides,
+    });
+  }
+
+  it('an oversized single-event recap uses recap-aware language, never the ordinary claimed-unread framing', () => {
+    const out = renderHookDelivery(
+      makeRecapClaim({
+        sessionId: 'session-recap',
+        events: [recapEvent({ body: 'x'.repeat(10_000) })],
+      }),
+      'SessionStart',
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx.length).toBeLessThanOrEqual(4000);
+    expect(ctx).toContain('[truncated');
+    // The turn-interruptible claimed-unread framing must NOT leak into a recap.
+    expect(ctx).not.toContain('the full copy stays unread');
+    // Truthful recap framing: it WILL reappear on future recaps.
+    expect(ctx).toContain('will reappear on future recaps');
+    expect(ctx).toContain(
+      'run `agentmonitors events list --session session-recap --unread` to see it now',
+    );
+  });
+
+  it('a multi-event recap whose combined blocks exceed the cap uses recap-aware language, never the genuinely-pending "more monitor updates" framing', () => {
+    const bodyA = `AAAA ${'a'.repeat(2200)}`;
+    const bodyB = `BBBB ${'b'.repeat(2200)}`;
+    const out = renderHookDelivery(
+      makeRecapClaim({
+        sessionId: 'session-recap-multi',
+        events: [
+          recapEvent({ eventId: 'e1', monitorId: 'mon-a', body: bodyA }),
+          recapEvent({ eventId: 'e2', monitorId: 'mon-b', body: bodyB }),
+        ],
+      }),
+      'SessionStart',
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx.length).toBeLessThanOrEqual(4000);
+    // First block shown in full; second omitted from THIS recap render.
+    expect(ctx).toContain(bodyA);
+    expect(ctx).not.toContain('BBBB');
+    expect(ctx).toContain('[truncated');
+    // The omitted event was already claimed at commit time (the recap
+    // decision claims the FULL candidate set) — the ordinary "genuinely
+    // pending, will redeliver at the next context event" framing is wrong
+    // here; it never redelivers via the context-event flow, only via the
+    // next recap.
+    expect(ctx).not.toContain('more monitor updates are pending');
+    expect(ctx).toContain('will reappear on future recaps');
+    expect(ctx).toContain(
+      'run `agentmonitors events list --session session-recap-multi --unread` to see it now',
+    );
+  });
+
+  it('a recap that fits entirely under the cap carries no marker at all', () => {
+    const out = renderHookDelivery(makeRecapClaim(), 'SessionStart');
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).not.toContain('[truncated');
+  });
+
+  it('a non-recap (turn-interruptible) claim keeps the ordinary markers unchanged', () => {
+    // Regression guard: the lifecycle-aware branch must not alter behavior
+    // for the non-recap lifecycles already covered above.
+    const out = renderHookDelivery(
+      makeClaim({
+        sessionId: 'session-plain',
+        events: [recapEvent({ body: 'x'.repeat(10_000) })],
+      }),
+      'PreToolUse',
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).toContain('the full copy stays unread');
+    expect(ctx).not.toContain('will reappear on future recaps');
+  });
+});
+
 // (issue #299) The transport-side sizing used to CLAIM exactly the events that
 // will be rendered under the context cap, so the truncated-away remainder stays
 // pending and re-delivers at the next context event.
@@ -470,7 +747,7 @@ describe('packEventsUnderCap', () => {
   }
 
   it('returns 0 for an empty list', () => {
-    expect(packEventsUnderCap([])).toBe(0);
+    expect(packEventsUnderCap([], 's1')).toBe(0);
   });
 
   it('returns the full count when every whole block fits under the cap', () => {
@@ -479,7 +756,7 @@ describe('packEventsUnderCap', () => {
       makeEvent('mon-b', 'short body B'),
       makeEvent('mon-c', 'short body C'),
     ];
-    expect(packEventsUnderCap(events)).toBe(3);
+    expect(packEventsUnderCap(events, 's1')).toBe(3);
   });
 
   it('returns only the events that fit (reserving marker room) when combined length exceeds the cap', () => {
@@ -488,7 +765,7 @@ describe('packEventsUnderCap', () => {
       makeEvent('mon-a', 'a'.repeat(2200)),
       makeEvent('mon-b', 'b'.repeat(2200)),
     ];
-    expect(packEventsUnderCap(events)).toBe(1);
+    expect(packEventsUnderCap(events, 's1')).toBe(1);
   });
 
   it('returns at least 1 even when the first event alone exceeds the cap (forward progress)', () => {
@@ -498,7 +775,48 @@ describe('packEventsUnderCap', () => {
     ];
     // The first is surfaced (and claimed) even though it overflows — it is
     // mid-truncated by renderHookDelivery; the marker points at the unread rest.
-    expect(packEventsUnderCap(events)).toBe(1);
+    expect(packEventsUnderCap(events, 's1')).toBe(1);
+  });
+
+  // (issue #442 regression) the marker's length varies with the session id
+  // (it is embedded in the rendered command), so sizing MUST reserve room
+  // based on THIS session's own marker length — not a fixed constant. Three
+  // ~1700-char blocks combined exceed the cap, so the packer reserves marker
+  // room: a SHORT session id's marker leaves room for 2 whole blocks, while a
+  // much LONGER session id's marker (500 extra chars embedded in the rendered
+  // command) leaves room for only 1.
+  it('sizes against the session-specific marker length, not a fixed constant', () => {
+    const events = [
+      makeEvent('mon-a', 'a'.repeat(1700)),
+      makeEvent('mon-b', 'b'.repeat(1700)),
+      makeEvent('mon-c', 'c'.repeat(1700)),
+    ];
+    const longSessionId = 'x'.repeat(500);
+    const shortFit = packEventsUnderCap(events, 's1');
+    const longFit = packEventsUnderCap(events, longSessionId);
+    expect(shortFit).toBe(2);
+    expect(longFit).toBe(1);
+  });
+
+  // (issue #358/#442, PR #442 round-7 review) the marker now also embeds an
+  // explicit `--socket <path>`, so a long socket path must ALSO shrink how
+  // many whole blocks fit — mirroring the long-session-id case above.
+  it('sizes against the socket path length, not just the session id', () => {
+    const events = [
+      makeEvent('mon-a', 'a'.repeat(1700)),
+      makeEvent('mon-b', 'b'.repeat(1700)),
+      makeEvent('mon-c', 'c'.repeat(1700)),
+    ];
+    const longSocketPath = '/tmp/' + 'x'.repeat(500) + '.sock';
+    const noSocketFit = packEventsUnderCap(events, 's1');
+    const withSocketFit = packEventsUnderCap(
+      events,
+      's1',
+      undefined,
+      longSocketPath,
+    );
+    expect(noSocketFit).toBe(2);
+    expect(withSocketFit).toBe(1);
   });
 });
 

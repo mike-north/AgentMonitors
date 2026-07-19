@@ -1070,7 +1070,7 @@ Code hook payload on stdin** (a JSON object — there is **no `CLAUDE_CODE_SESSI
 3. If no daemon is listening at the socket, spawns `daemon run` as a **detached background process** (`stdio: 'ignore'`, `.unref()`), passing the derived socket/db paths, the monitors dir, and `reap-after-ms` from the local state. Waits up to 8 seconds for the socket to appear.
 4. Persists the resolved socket/db paths back to `.claude/agentmonitors.local.md` (so sibling hooks can use them without re-deriving).
 5. Opens a session via the `session.open` IPC method (`claudeCodeAdapter.createSessionInput()` with `hostSessionId` and `workspacePath`).
-6. **Surfaces the post-compact recap in the same process.** `SessionStart` is a context event, and a Claude Code hook invocation provides only **one** stdin stream — so the recap cannot be a separately chained `hook deliver` (it would see an already-consumed stdin and no-op; see 006 §5.6). Reusing the payload it already read, `session start` claims `post-compact` for the session and, if there are unread events, prints the rendered `SessionStart` hook JSON (`{ "continue": true, "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": "…" } }`) to stdout.
+6. **Surfaces the post-compact recap in the same process.** `SessionStart` is a context event, and a Claude Code hook invocation provides only **one** stdin stream — so the recap cannot be a separately chained `hook deliver` (it would see an already-consumed stdin and no-op; see 006 §5.6). Reusing the payload it already read, `session start` reserves the `post-compact` delivery for the session, renders it, and — only if there are unread events — writes the rendered `SessionStart` hook JSON (`{ "continue": true, "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": "…" } }`) to stdout, **awaiting the write's actual completion** before committing the reservation (the same RESERVE → RENDER → WRITE → COMMIT ordering `hook deliver` uses, via the shared `reserveRenderAndCommitHookDelivery` / `writeAndCommitHookDelivery` helpers — see 006 §5.6). The `post-compact` reservation's candidate rows come from a session's **unread** events (not only never-yet-claimed ones), so they can include rows an earlier delivery already claimed. A write failure (including an asynchronous `EPIPE` arriving after a synchronous "wrote" signal) releases the reservation instead of committing: this applies no new claim and does not advance the recap cursor, but it does NOT reset any row's existing claimed state either — a row already claimed by an earlier delivery stays claimed (it will not redeliver via the ordinary pending-event hook/channel path), while a row that was never claimed remains pending. Either way, every row in the reservation remains **unread** and is eligible to appear again on a future recap.
 
 **Output:**
 
@@ -1087,7 +1087,7 @@ daemon at <socket>` (issue #420 P3). Silent success was a dead end that forced a
 
 **Exit code (two layers):**
 
-- The **CLI command** exits **0** on a quick-exit (no `session_id`, or monitoring not enabled) and on success (with or without recap output). A genuine failure — the daemon not starting within the boot timeout, or a `session.open`/`claimDelivery` error — is reported to **stderr** and exits **non-zero** (`reportError(…, false)` sets `process.exitCode = 1`).
+- The **CLI command** exits **0** on a quick-exit (no `session_id`, or monitoring not enabled) and on success (with or without recap output). A genuine failure — the daemon not starting within the boot timeout, or a `session.open`/reserve/commit/write error — is reported to **stderr** and exits **non-zero** (`reportError(…, false)` sets `process.exitCode = 1`).
 - The **plugin hook wrapper** (`agent-plugins/agentmonitors/hooks/hooks.json`) runs the command as `agentmonitors session start || true`, so the **hook invocation** is best-effort from Claude Code's perspective — a CLI failure never disrupts the session. The best-effort property is the wrapper's, not the command's.
 
 **Designed for use as a `SessionStart` hook** (see 006 §5.6). Claude Code does not need the daemon to be pre-started.
@@ -1805,6 +1805,33 @@ agentmonitors verify [monitor] [--dir <path>] [--workspace <path>]
    flush. So a `suppressed` row is not a distinct `verify` verdict; it is treated as "settling" and
    keeps the wait alive, suppressing the `no-change` fail-fast until the flush (or the budget) — the
    post-trigger history is `[suppressed, no-change…, triggered]` (issue #399 criterion 4).
+
+   A `no-change` verdict requires **two distinct post-trigger observation-history rows** (different
+   ids), both reporting `no-change`, before it is treated as decisive (issue #442 round 19). A single
+   `no-change` row — however long it persists across polls — is not sufficient evidence: a daemon tick
+   already in flight (mid-scan) when the trigger fired can finish and record its necessarily-stale,
+   pre-trigger `no-change` row _after_ the trigger's timestamp under enough scheduling delay (a busy
+   CI runner), and every subsequent poll re-reads that SAME row — persistence alone is just the
+   caller's own clock passing, not new information. A second, genuinely later tick completing and also
+   reporting `no-change` is real evidence neither post-trigger tick observed the change. A `triggered`
+   row still wins immediately regardless. Confirming two distinct rows takes roughly two full monitor
+   poll intervals of wall time, so `verify` extends the observe stage's deadline (only when using the
+   **default** derived budget, never when an explicit `--timeout-ms` is given — an explicit override
+   is honored as the operator's real cap, and a timeout shorter than one interval still fails fast with
+   `budget-exceeded`) to at least `2 × interval + margin`.
+
+   That observe-stage extension can let a **real** `triggered` row land after the single-interval
+   `detect` deadline the rest of the phase was sized against — e.g. a 20s-interval monitor with a
+   backgrounded trigger whose real change lands ~30s in: a real change observed at ~40s inside the
+   45s extended window, when the un-extended detect deadline was only 25s (issue #442 round 20).
+   Materialize and deliver (steps 7–8 below) therefore do not reuse that already-possibly-expired
+   `detect` deadline outright: `verify` re-grants them a fresh deadline of `max(detect deadline,
+observe's actual resolution time + postObserveBudgetMs)` — the same settle + high-claim-settle +
+   margin remainder `detectMs` already earmarked for these two stages, just measured from when observe
+   actually finished rather than from the original trigger time. Like the observe extension itself,
+   this re-grant applies only to the **default** derived budget; an explicit `--timeout-ms` keeps the
+   detect deadline as the hard total cap for materialize/deliver too.
+
 7. **Materialize.** Confirm an unread event exists for the session.
 8. **Deliver.** Claim via the **real `hook deliver` path** — for `high` urgency at
    `turn-interruptible` (previewing settled high events and packing them under the 4000-char cap
@@ -1872,11 +1899,33 @@ for `throttle`; and, for `high` urgency with **no** explicit `notify` block, the
 (002 §9.1), plus a margin of `max(5s, 25% of interval)`. Two phases are budgeted separately —
 **baseline** (`interval + margin`) and **detect** (`interval + settle + high-claim-settle +
 margin`). Elapsed/ETA progress is printed to **stderr** so the operator is never left staring at
-empty output; `--timeout-ms` overrides the detect-phase budget. (These interval/settle defaults are
-sourced from the runtime's canonical `schedulingDefaults` export in `@agentmonitors/core` — the same
-values the daemon schedules against, not a hand-mirrored copy — and the settle resolution itself
-calls the same `defaultNotifyConfigForUrgency` function the runtime tick uses, so the budget estimate
-cannot drift from real scheduling or notify defaults.)
+empty output; `--timeout-ms` overrides the detect-phase budget.
+
+A third derived figure, `noChangeConfirmMs` (`2 × interval + margin` — no settle term, since a
+genuine `no-change` tick never enters a notify settle window), is the wall-clock budget the observe
+stage's two-distinct-row `no-change` discriminator needs (issue #442 round 19, step 6 above). When
+using the **default** derived budget, `verify` extends the observe stage's own deadline to at least
+`noChangeConfirmMs` — past the single-interval `detect` deadline the rest of the phase (materialize,
+deliver) was originally sized against — so a genuine no-change verdict has time to gather its second
+confirming row instead of racing the shorter deadline into a spurious `budget-exceeded`. An explicit
+`--timeout-ms` is **never** extended this way: it is the operator's stated cap, so a value shorter
+than one interval still fails fast with `budget-exceeded` rather than being silently stretched. (These
+interval/settle defaults are sourced from the runtime's canonical `schedulingDefaults` export in
+`@agentmonitors/core` — the same values the daemon schedules against, not a hand-mirrored copy — and
+the settle resolution itself calls the same `defaultNotifyConfigForUrgency` function the runtime tick
+uses, so the budget estimate cannot drift from real scheduling or notify defaults.)
+
+A fourth derived figure, `postObserveBudgetMs` (`settleMs + highClaimSettleMs + marginMs`, i.e.
+`detectMs - intervalMs` — the portion of `detectMs` NOT already spent on the observe stage's own
+interval term), is the budget materialize and deliver are re-granted, measured from whenever observe
+actually resolves rather than from the original trigger time (issue #442 round 20, step 6 above). This
+closes a gap the round-19 observe extension opened: a real `triggered` row landing in the extended
+observe window (after the single-interval `detect` deadline but before `noChangeConfirmMs`) would
+otherwise hand materialize/deliver an already-expired deadline and zero remaining time, failing
+`budget-exceeded` even though the event is durable. `totalMs` — the worst-case default maximum a fully
+successful run can take — folds all of this in: `baselineMs + max(detectMs, noChangeConfirmMs) +
+postObserveBudgetMs`. As with the observe extension, this re-grant applies only to the default derived
+budget; an explicit `--timeout-ms` keeps its own value as the hard total cap throughout.
 
 ### Output
 

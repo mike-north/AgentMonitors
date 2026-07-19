@@ -26,6 +26,10 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
+import type { DeliveryClaim, DeliveryEventSummary } from '@agentmonitors/core';
+import { renderChannelEvent } from '../channel-render.js';
+import { renderHookDelivery } from '../hook-deliver-render.js';
+import { buildEventBlock } from '../delivery-event-render.js';
 
 const CHANNEL_SOURCE = readFileSync(
   path.resolve(__dirname, 'channel.ts'),
@@ -58,7 +62,7 @@ describe('agentmon_ack MCP tool vs. hooks-only CLI: shared daemon-IPC plumbing (
     expect(EVENTS_SOURCE).toMatch(/await\s+acknowledgeEventsClient\s*\(/);
   });
 
-  it('the channel push loop (channel.ts) reserves/commits and `hook deliver`/`hook claim` (hook.ts) claims — both from the same module, both the same core delivery decision (issue #300)', () => {
+  it('the channel push loop and `hook deliver` (both channel.ts and hook.ts) reserve/validate/commit — both reduce to the same core delivery decision (issue #300, issue #442 rounds 8-9)', () => {
     // The channel no longer claims BEFORE it pushes (that was the delivery-loss
     // bug, issue #300): it RESERVES, pushes, then COMMITS on success (or
     // RELEASES on a failed push). reserve/commit are the deferred form of the
@@ -81,11 +85,120 @@ describe('agentmon_ack MCP tool vs. hooks-only CLI: shared daemon-IPC plumbing (
     // The channel MUST NOT claim before surfacing — the removed bug.
     expect(CHANNEL_SOURCE).not.toMatch(/claimDeliveryClient/);
 
-    // The hook transport still claims directly (its additionalContext injection
-    // is synchronous — there is no fallible push to defer behind).
+    // `hook deliver` (the CLI command a Claude Code hook actually invokes) no
+    // longer claims directly either (issue #442, PR #442 round-8/round-9
+    // review): it reserves, re-validates fit AND the candidate-growth race,
+    // renders, WRITES, and only then commits — mirroring the channel's
+    // reserve → push → commit ordering so a render/write failure can still be
+    // recovered by releasing (nothing durably claimed) instead of losing a
+    // delivery behind an already-applied commit.
+    expect(importsFromRuntimeClient(HOOK_SOURCE, 'reserveDeliveryClient')).toBe(
+      true,
+    );
+    expect(importsFromRuntimeClient(HOOK_SOURCE, 'commitDeliveryClient')).toBe(
+      true,
+    );
+    expect(importsFromRuntimeClient(HOOK_SOURCE, 'releaseDeliveryClient')).toBe(
+      true,
+    );
+    expect(HOOK_SOURCE).toMatch(/await\s+reserveDeliveryClient\s*\(/);
+    // Called from a `commit`/`release` closure returned to the caller (never
+    // committed/released until after a successful write), not directly
+    // `await`ed inline the way the channel side is — so this only checks the
+    // call itself is present, not the `await` keyword.
+    expect(HOOK_SOURCE).toMatch(/commitDeliveryClient\s*\(/);
+    expect(HOOK_SOURCE).toMatch(/releaseDeliveryClient\s*\(/);
+
+    // Only the manual, single-shot `hook claim` subcommand (a human-invoked
+    // debugging aid, not the hook-wired `deliver` path) still calls
+    // `claimDeliveryClient` directly — it has no fallible surface (no push,
+    // no render-then-write step) to defer a commit behind.
     expect(importsFromRuntimeClient(HOOK_SOURCE, 'claimDeliveryClient')).toBe(
       true,
     );
     expect(HOOK_SOURCE).toMatch(/await\s+claimDeliveryClient\s*\(/);
+  });
+});
+
+/**
+ * Rendering parity (issue #436): the two injecting transports must surface the
+ * SAME event content — the channel is a rendering surface over the same
+ * semantics, "only the surface" differs (006 §6). This exercises the REAL
+ * renderers (`renderHookDelivery` and `renderChannelEvent`) against one shared
+ * `DeliveryClaim`, not a hand-built approximation, and asserts both emit the
+ * transport-shared per-event block (`buildEventBlock`): title + monitor body +
+ * bounded change summary. Test data is ASCII with no tag-breakout or control
+ * characters, so both transports' per-field sanitizers are identity here and the
+ * blocks are byte-identical — isolating the parity contract from the transports'
+ * distinct content-safety rules.
+ */
+describe('channel vs hook-deliver: rendering parity for the same event (issue #436)', () => {
+  const identity = (value: string): string => value;
+
+  function makeEvent(
+    overrides: Partial<DeliveryEventSummary> = {},
+  ): DeliveryEventSummary {
+    return {
+      eventId: 'e1',
+      monitorId: 'merge-queue',
+      title: 'A PR is ready to merge',
+      summary: 'A PR is ready to merge',
+      urgency: 'high',
+      createdAt: '2026-07-18T00:00:00.000Z',
+      body: 'Review the PR, then squash-merge it if CI is green.',
+      diffText: '- label: needs-review\n+ label: ready-to-merge',
+      ...overrides,
+    };
+  }
+
+  function makeHighClaim(event: DeliveryEventSummary): DeliveryClaim {
+    return {
+      sessionId: 's1',
+      mode: 'delivery',
+      urgency: 'high',
+      lifecycle: 'turn-interruptible',
+      message: event.title,
+      unreadCounts: { low: 0, normal: 0, high: 1, total: 1 },
+      events: [event],
+    };
+  }
+
+  it('both transports render the identical per-event block (title + body + bounded diff)', () => {
+    const event = makeEvent();
+    const claim = makeHighClaim(event);
+    const expectedBlock = buildEventBlock(event, identity);
+
+    const hook = renderHookDelivery(claim, 'UserPromptSubmit');
+    const hookContext = hook?.hookSpecificOutput.additionalContext ?? '';
+    const { content: channelContent } = renderChannelEvent(claim);
+
+    // The shared block appears verbatim in BOTH surfaces.
+    expect(hookContext).toContain(expectedBlock);
+    expect(channelContent).toContain(expectedBlock);
+
+    // Concretely: title, monitor body, and change summary all reach both.
+    for (const surface of [hookContext, channelContent]) {
+      expect(surface).toContain('A PR is ready to merge');
+      expect(surface).toContain(
+        'Review the PR, then squash-merge it if CI is green.',
+      );
+      expect(surface).toContain('Changes:');
+      expect(surface).toContain('+ label: ready-to-merge');
+    }
+  });
+
+  it('a title-only render (no body, no diff reaching the agent) is a parity break — both now carry more than the title', () => {
+    // This is the exact regression from issue #436: the channel used to render
+    // claim.message (the title) alone. Assert neither surface is title-only.
+    const claim = makeHighClaim(makeEvent());
+    const hook = renderHookDelivery(claim, 'UserPromptSubmit');
+    const hookContext = hook?.hookSpecificOutput.additionalContext ?? '';
+    const { content: channelContent } = renderChannelEvent(claim);
+
+    for (const surface of [hookContext, channelContent]) {
+      // More than just the title line is present.
+      expect(surface).toContain('Review the PR');
+      expect(surface).toContain('Changes:');
+    }
   });
 });
