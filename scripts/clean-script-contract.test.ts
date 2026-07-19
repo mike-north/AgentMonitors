@@ -115,6 +115,20 @@ describe('assertPackageCleanRemovesDistAndTemp', () => {
     ).not.toThrow();
   });
 
+  // Regression fixture for the post-#443 review finding: `||` means "only
+  // run if the previous command FAILED", so `rm -rf dist || rm -rf temp`
+  // does NOT reliably remove `temp` — a successful `rm -rf dist` (the
+  // normal case) skips the second command entirely. The pre-fix guard
+  // flattened `&&` and `||` identically and wrongly accepted this.
+  it('rejects "temp" removed only via `|| rm -rf temp` (guard false-accept #1)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'rm -rf dist || rm -rf temp' } },
+        'test-package',
+      ),
+    ).toThrow(/must also remove "temp"/);
+  });
+
   // The real proof: every actual, on-disk package discovered by
   // `findApiExtractorPackageDirs` must satisfy the contract. If any future
   // package's `clean` script drifts back to a `dist`-only shape, this
@@ -227,6 +241,71 @@ describe('assertRootCleanRunsWorkspaceCleanAndReset', () => {
         },
       }),
     ).not.toThrow();
+  });
+
+  // Regression fixtures for the post-#443 review finding: `||` means "only
+  // run if the previous command FAILED", so `nx reset` reachable only via
+  // `run-many || nx reset` does NOT reliably reset the cache — a
+  // successful `run-many` (the normal case) skips it entirely. The pre-fix
+  // guard flattened `&&` and `||` identically and wrongly accepted both of
+  // these shapes.
+  it('rejects `nx run-many` reachable only via `||` (guard false-accept #1a)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'echo noop || NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace && NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/must invoke `nx run-many --target=clean`/);
+  });
+
+  it('rejects `nx reset` reachable only via `||` (guard false-accept #1b)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace || NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/must also run `nx reset`/);
+  });
+
+  // Regression fixtures for the post-#443 review finding: `\b`-bounded
+  // regexes match a word boundary right before a hyphen, so
+  // `--target=clean-old`, `--exclude=agentmonitors-workspace-old`, and
+  // `nx reset-old` were all wrongly accepted as the exact required tokens.
+  it('rejects `--target=clean-old` masquerading as `--target=clean` (guard false-accept #2a)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'NX_TUI=false nx run-many --target=clean-old --exclude=agentmonitors-workspace && NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/must invoke `nx run-many --target=clean`/);
+  });
+
+  it('rejects `--exclude=agentmonitors-workspace-old` masquerading as excluding the workspace root (guard false-accept #2b)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace-old && NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(new RegExp(`must exclude\\s+"${WORKSPACE_ROOT_PROJECT_NAME}"`));
+  });
+
+  it('rejects `nx reset-old` masquerading as `nx reset` (guard false-accept #2c)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace && NX_TUI=false nx reset-old',
+        },
+      }),
+    ).toThrow(/must also run `nx reset`/);
   });
 
   // The real proof: the actual, on-disk root package.json.

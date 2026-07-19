@@ -113,19 +113,143 @@ export function findApiExtractorPackageDirs(root = REPO_ROOT) {
 }
 
 /**
+ * @typedef {{ command: string, guaranteed: boolean }} ChainedCommand
+ */
+
+/**
  * Split a shell script string into its individual chained commands (on
- * `&&`, `||`, `;`, or a newline). Mirrors
- * `api-report-ci-wiring.mjs`'s `splitChainedCommands` — kept local so this
- * module has no import-time dependency on that one's internals.
+ * `&&`, `||`, `;`, or a newline), each tagged with whether it is
+ * `guaranteed` to run.
+ *
+ * A command joined by `;` or a newline always runs, regardless of the
+ * previous command's exit status — `guaranteed: true`. A command joined by
+ * `&&` only runs if the previous command SUCCEEDED, which every command
+ * this guard cares about (`rm -rf`, `nx run-many`, `nx reset`) does in
+ * practice, so it's also treated as `guaranteed: true` (this mirrors how
+ * the rest of this module already accepted `&&`-chained commands before
+ * this fix). A command joined by `||` only runs if the previous command
+ * FAILED — `guaranteed: false` — so e.g. `rm -rf dist || rm -rf temp` must
+ * NOT be accepted as removing both `dist` and `temp`: a successful first
+ * `rm -rf dist` skips the second command entirely. Earlier versions of
+ * this guard flattened `&&` and `||` identically, silently accepting that
+ * shape (issue #443 post-merge review).
+ *
+ * This intentionally does not special-case a standalone background `&`
+ * (as opposed to `&&`): none of this repo's real `clean` scripts use it,
+ * and a backgrounded `rm -rf`/`nx` step wouldn't reliably complete before
+ * `clean` returns anyway, so it's out of scope for a synchronous
+ * before/after contract like this one — if it appears, the surrounding
+ * text simply won't match any of the exact-token checks below and the
+ * script is rejected by default, which is the safe outcome.
+ *
+ * Mirrors the split delimiters (though not the guaranteed/unguaranteed
+ * distinction) in `api-report-ci-wiring.mjs`'s `splitChainedCommands` —
+ * kept local so this module has no import-time dependency on that one's
+ * internals.
  *
  * @param {string} script
- * @returns {string[]}
+ * @returns {ChainedCommand[]}
  */
 function splitChainedCommands(script) {
-  return script
-    .split(/&&|\|\||;|\n/)
-    .map((command) => command.trim())
-    .filter((command) => command.length > 0);
+  const commands = [];
+  /** @type {string | undefined} */
+  let precedingOperator;
+
+  for (const token of script.split(/(&&|\|\||;|\n)/)) {
+    if (token === '&&' || token === '||' || token === ';' || token === '\n') {
+      precedingOperator = token;
+      continue;
+    }
+    const command = token.trim();
+    if (command.length === 0) {
+      continue;
+    }
+    commands.push({ command, guaranteed: precedingOperator !== '||' });
+    precedingOperator = undefined;
+  }
+
+  return commands;
+}
+
+/**
+ * Split a single shell command into its whitespace-separated tokens.
+ *
+ * @param {string} command
+ * @returns {string[]}
+ */
+function tokenize(command) {
+  return command.split(/\s+/).filter((token) => token.length > 0);
+}
+
+/**
+ * Extract the value of an exact `--flagName=value` token from a command's
+ * tokens, or `undefined` if the flag isn't present. Exact flag-name match
+ * only — deliberately not a `\b`-bounded regex, which matches a word
+ * boundary right before a hyphen and so would wrongly treat
+ * `--target=clean-old` as satisfying a check for `--target=clean` (issue
+ * #443 post-merge review).
+ *
+ * @param {string[]} tokens
+ * @param {string} flagName
+ * @returns {string | undefined}
+ */
+function findFlagValue(tokens, flagName) {
+  const prefix = `--${flagName}=`;
+  const token = tokens.find((candidate) => candidate.startsWith(prefix));
+  return token === undefined ? undefined : token.slice(prefix.length);
+}
+
+/**
+ * Whether a command's tokens begin with exactly the given token sequence,
+ * e.g. `startsWithTokens('NX_TUI=false nx reset', 'NX_TUI=false', 'nx',
+ * 'reset')`. Exact per-token comparison, not a `\b`-bounded regex, so a
+ * `reset-old` token can never satisfy a check for the `reset` token.
+ *
+ * @param {string} command
+ * @param {...string} expectedTokens
+ * @returns {boolean}
+ */
+function startsWithTokens(command, ...expectedTokens) {
+  const tokens = tokenize(command);
+  return expectedTokens.every((expected, index) => tokens[index] === expected);
+}
+
+/**
+ * Whether a command contains the given token sequence contiguously
+ * anywhere within it (not just at the start) — e.g. `containsTokens('NX_TUI=false nx reset', 'nx', 'reset')`.
+ * Exact per-token comparison for the same reason as {@link startsWithTokens}.
+ *
+ * @param {string} command
+ * @param {...string} expectedTokens
+ * @returns {boolean}
+ */
+function containsTokens(command, ...expectedTokens) {
+  const tokens = tokenize(command);
+  for (let start = 0; start + expectedTokens.length <= tokens.length; start++) {
+    if (
+      expectedTokens.every(
+        (expected, offset) => tokens[start + offset] === expected,
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether a command is an `nx run-many --target=clean` invocation, using
+ * exact token/flag-value matching (see {@link findFlagValue}) rather than
+ * a `\b`-bounded regex.
+ *
+ * @param {string} command
+ * @returns {boolean}
+ */
+function isNxRunManyCleanCommand(command) {
+  return (
+    containsTokens(command, 'nx', 'run-many') &&
+    findFlagValue(tokenize(command), 'target') === 'clean'
+  );
 }
 
 /**
@@ -154,12 +278,17 @@ export function assertPackageCleanRemovesDistAndTemp(pkg, label) {
     throw new Error(`${label} is missing a "clean" script`);
   }
 
-  const rmCommands = splitChainedCommands(clean).filter((command) =>
-    /^rm\s+-rf\b/.test(command),
-  );
+  // Only commands `guaranteed` to run count toward the contract — a
+  // `rm -rf temp` reachable only via `rm -rf dist || rm -rf temp` does NOT
+  // reliably remove `temp`, since a successful `rm -rf dist` (the normal
+  // case) skips it entirely.
+  const rmCommands = splitChainedCommands(clean)
+    .filter((entry) => entry.guaranteed && /^rm\s+-rf\b/.test(entry.command))
+    .map((entry) => entry.command);
   if (rmCommands.length === 0) {
     throw new Error(
-      `${label} "clean" script must run \`rm -rf\` — got: ${JSON.stringify(clean)} (issue #443)`,
+      `${label} "clean" script must run \`rm -rf\` unconditionally (not only ` +
+        `after a prior command fails via \`||\`) — got: ${JSON.stringify(clean)} (issue #443)`,
     );
   }
 
@@ -207,46 +336,54 @@ export function assertRootCleanRunsWorkspaceCleanAndReset(pkg) {
     throw new Error('root package.json is missing a "clean" script');
   }
 
-  const commands = splitChainedCommands(clean);
+  // Only `guaranteed` commands count — `nx run-many ... || nx reset` does
+  // NOT reliably reset the cache, since a successful run-many (the normal
+  // case) skips the `nx reset` entirely.
+  const commands = splitChainedCommands(clean).filter(
+    (entry) => entry.guaranteed,
+  );
 
-  const runManyIndex = commands.findIndex((command) =>
-    /nx run-many\s+--target=clean\b/.test(command),
+  const runManyIndex = commands.findIndex((entry) =>
+    isNxRunManyCleanCommand(entry.command),
   );
   if (runManyIndex === -1) {
     throw new Error(
-      'root "clean" script must invoke `nx run-many --target=clean` to ' +
+      'root "clean" script must invoke `nx run-many --target=clean` ' +
+        'unconditionally (not only after a prior command fails via `||`) to ' +
         `fan the per-project clean out across the workspace — got: ${JSON.stringify(clean)} (issue #443)`,
     );
   }
-  const runManyCommand = commands[runManyIndex];
+  const runManyCommand = commands[runManyIndex].command;
+  const runManyTokens = tokenize(runManyCommand);
 
-  const excludePattern = new RegExp(
-    `--exclude=\\S*\\b${WORKSPACE_ROOT_PROJECT_NAME}\\b`,
-  );
-  if (!excludePattern.test(runManyCommand)) {
+  const excludeValue = findFlagValue(runManyTokens, 'exclude');
+  const excludedProjects =
+    excludeValue === undefined ? [] : excludeValue.split(',');
+  if (!excludedProjects.includes(WORKSPACE_ROOT_PROJECT_NAME)) {
     throw new Error(
       'root "clean" script\'s `nx run-many --target=clean` must exclude ' +
         `"${WORKSPACE_ROOT_PROJECT_NAME}" (the workspace root project has no ` +
         `"clean" target of its own) — got: ${JSON.stringify(runManyCommand)} (issue #443)`,
     );
   }
-  if (!/^NX_TUI=false\s+nx run-many\b/.test(runManyCommand)) {
+  if (!startsWithTokens(runManyCommand, 'NX_TUI=false', 'nx', 'run-many')) {
     throw new Error(
       'root "clean" script\'s `nx run-many --target=clean` invocation must ' +
         `itself be scoped with "NX_TUI=false" — got: ${JSON.stringify(runManyCommand)} (issue #443)`,
     );
   }
 
-  const resetIndex = commands.findIndex((command) =>
-    /\bnx reset\b/.test(command),
+  const resetIndex = commands.findIndex((entry) =>
+    containsTokens(entry.command, 'nx', 'reset'),
   );
   if (resetIndex === -1) {
     throw new Error(
-      'root "clean" script must also run `nx reset` after the per-project ' +
+      'root "clean" script must also run `nx reset` unconditionally (not ' +
+        'only after a prior command fails via `||`) after the per-project ' +
         `clean, to reset the Nx cache/daemon — got: ${JSON.stringify(clean)} (issue #443)`,
     );
   }
-  const resetCommand = commands[resetIndex];
+  const resetCommand = commands[resetIndex].command;
 
   if (resetIndex < runManyIndex) {
     throw new Error(
@@ -255,7 +392,7 @@ export function assertRootCleanRunsWorkspaceCleanAndReset(pkg) {
     );
   }
 
-  if (!/^NX_TUI=false\s+nx reset\b/.test(resetCommand)) {
+  if (!startsWithTokens(resetCommand, 'NX_TUI=false', 'nx', 'reset')) {
     throw new Error(
       'root "clean" script\'s `nx reset` invocation must itself be scoped ' +
         'with "NX_TUI=false" — a shared prefix earlier in the chain does ' +
