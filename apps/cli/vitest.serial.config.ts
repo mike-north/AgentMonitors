@@ -32,6 +32,7 @@ export default defineConfig({
       'src/commands/daemon-detach.integration.test.ts',
       'src/commands/verify.integration.test.ts',
       'src/commands/cli.docker.test.ts',
+      'src/channel-shutdown.integration.test.ts',
     ],
     // No file-level parallelism — each file must complete before the next
     // starts so the daemon processes are never competing for CPU.

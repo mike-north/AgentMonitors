@@ -33,6 +33,9 @@ export default defineConfig({
       '**/daemon-detach.integration.test.ts',
       '**/verify.integration.test.ts',
       '**/cli.docker.test.ts',
+      // Spawns a real `channel serve` subprocess and waits for it to exit on
+      // its own, so it belongs with the other process-spawning suites.
+      '**/channel-shutdown.integration.test.ts',
     ],
   },
 });
