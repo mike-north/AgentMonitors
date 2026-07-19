@@ -884,15 +884,15 @@ is only how often the daemon wakes up to ask the runtime whether any monitor is 
 agentmonitors daemon run [monitorsDir] [options]
 ```
 
-| Argument / Flag        | Type                  | Default                           | Description                                                                                                 |
-| ---------------------- | --------------------- | --------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `[monitorsDir]`        | positional (optional) | `.claude/monitors`                | Directory containing `MONITOR.md` files                                                                     |
-| `--workspace <path>`   | string                | `process.cwd()`                   | Workspace path for session projection and per-workspace db/socket resolution (resolved to an absolute path) |
-| `--poll-ms <ms>`       | number (string)       | `30000`                           | Polling interval in milliseconds                                                                            |
-| `--socket <path>`      | string                | resolved default                  | Unix domain socket path for the daemon                                                                      |
-| `--reap-after-ms <ms>` | number (string)       | `300000`                          | Stop after this many ms with no active sessions; `0` disables idle reaping                                  |
-| `--detach`             | boolean               | `false`                           | Run the daemon in the background and return (issue #389 P1); see **Background mode** below                  |
-| `--log <path>`         | string                | `<workspace data dir>/daemon.log` | With `--detach`, append the backgrounded daemon's stdout+stderr here (created if missing)                   |
+| Argument / Flag        | Type                  | Default                           | Description                                                                                                                                                                                                                      |
+| ---------------------- | --------------------- | --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `[monitorsDir]`        | positional (optional) | `.claude/monitors`                | Directory containing `MONITOR.md` files                                                                                                                                                                                          |
+| `--workspace <path>`   | string                | `process.cwd()`                   | Workspace path for session projection and per-workspace db/socket resolution (resolved to an absolute path)                                                                                                                      |
+| `--poll-ms <ms>`       | number (string)       | `30000`                           | Polling interval in milliseconds                                                                                                                                                                                                 |
+| `--socket <path>`      | string                | resolved default                  | Unix domain socket path for the daemon                                                                                                                                                                                           |
+| `--reap-after-ms <ms>` | number (string)       | `300000`                          | Stop after this many ms with no active sessions; `0` disables idle reaping                                                                                                                                                       |
+| `--detach`             | boolean               | `false`                           | Run the daemon in the background and return (issue #389 P1); see **Background mode** below                                                                                                                                       |
+| `--log <path>`         | string                | `<workspace data dir>/daemon.log` | With `--detach`, append the backgrounded daemon's stdout+stderr here (created if missing). **Requires `--detach`** — given without it, the command errors rather than silently discarding the flag (issue #389 review finding 3) |
 
 Starts the daemon loop: creates a Unix domain socket server, listens for IPC commands, then polls `runtime.tick()` at `--poll-ms` intervals. `--poll-ms` is the loop-wake cadence; per-monitor observation is still gated by each monitor's schedule or `watch.interval`.
 
@@ -916,9 +916,22 @@ which left them to discover `& disown` and their own log redirection. With `--de
 2. Re-invokes itself as a detached, `unref`'d child running plain `daemon run` (no `--detach`) — the
    same `spawnDetachedDaemon()` path a hook-driven lazy boot takes ([§10.1](#101-session-start)) —
    with the child's stdout+stderr appended (never truncated) to `--log`.
-3. Polls the socket until the child answers, up to 15s. On success it prints the pid, the socket,
-   the log path, and whether idle reaping is active; on timeout it exits non-zero and names the log
-   file to read.
+3. Polls the socket until SOMETHING answers, up to 15s, racing that poll against the spawned child's
+   own `error` event (issue #389 review finding 2): a synchronous OS-level spawn failure (bad
+   `execPath`, `ENOENT`) is reported immediately with the real cause, rather than waiting out the
+   full 15s and pointing at a log file the daemon never got the chance to write. On a genuine
+   readiness timeout, the child (whose pid is now known) is sent `SIGTERM` before the command exits
+   non-zero — a slow bind must not leave a live background daemon the user was told failed.
+4. Once something answers, verifies the daemon that actually bound the socket IS the child THIS
+   invocation spawned (issue #389 review finding 1): concurrent lazy-boot elsewhere (`session start`
+   has no cross-process pre-spawn lock; only the bind-time startup lock,
+   [§9.2](#92-daemon-run--continuous-loop) internals, serializes the actual bind) can make the
+   spawned child lose the race and exit while a DIFFERENT daemon answers. `daemon status`'s response
+   now carries the answering process's `pid` and `reapAfterMs` (see [§9.3](#93-daemon-status)) so
+   `--detach` can compare it against its own spawned pid: on a match it reports success as before; on
+   a mismatch it reports the OTHER daemon's pid and its actual reap setting (not the
+   `--reap-after-ms` THIS invocation requested), exits non-zero, and suggests `daemon stop` + retry.
+5. On success, prints the pid, the socket, the log path, and whether idle reaping is active.
 
 `--detach` composes with `--reap-after-ms 0`: that pair is the supported way to run a daemon that
 stays up while **no** agent session is open (so a monitor can raise work for an idle agent), and the
@@ -957,15 +970,18 @@ queries status via the socket. Otherwise falls back to calling
 `createRuntime(resolveWorkspaceDbPath(...)).status()` in-process against the same per-workspace
 database `doctor` would read.
 
-**Text output:**
+**Text output** (when a daemon is actually running — `pid`/`Reaping` are omitted from the in-process
+fallback, which has no OS process or reap window of its own to report):
 
 ```
 Daemon running: yes|no
 Socket: <path>
+Pid: <n>
 Sessions: <n>
 Active sessions: <n>
 Dormant sessions: <n>
 Events: <n>
+Reaping: disabled|stops after <n>s idle
 ```
 
 **JSON output:**
@@ -974,12 +990,21 @@ Events: <n>
 {
   "running": <boolean>,
   "socketPath": "<string>",
+  "pid": <number>,
   "sessions": <number>,
   "activeSessions": <number>,
   "dormantSessions": <number>,
-  "events": <number>
+  "events": <number>,
+  "reapAfterMs": <number>
 }
 ```
+
+`pid` (the OS process answering) and `reapAfterMs` (the `--reap-after-ms` this daemon is actually
+running with; `0` = disabled) are additions from issue #389 review findings 1/4: `daemon run
+--detach` reads them back to confirm the daemon it spawned is the one actually serving the socket
+(rather than a different daemon that won a concurrent lazy-boot race), and to prove `--reap-after-ms`
+reached the running process without waiting out the idle window. Both are absent from the
+in-process fallback (no live daemon to ask).
 
 ### §9.4 `daemon stop`
 
@@ -1348,11 +1373,23 @@ indistinguishable from "nothing pending." So each writes exactly one line to std
 
 - **No per-workspace socket configured** (step 3 — the workspace is enabled, but neither `--socket`
   nor a `socket:` entry in `.claude/agentmonitors.local.md` names one, and falling back to a shared
-  default socket would cross workspace isolation; issue #389 P2):
+  default socket would cross workspace isolation; issue #389 P2). This is NOT manual-only (issue #389
+  review finding 6, correcting an earlier claim here) — `session start`'s own SessionStart-hook lazy
+  boot can time out mid-session, leaving the workspace enabled with no socket persisted, which is the
+  SAME shape as a workspace that has never had a session start at all. `.local.md`'s
+  `lastBootFailureAt` marker (written by `session start`'s boot-timeout guard, cleared on the next
+  successful boot) tells the two apart, and each gets its own message:
+  - Never configured (no `lastBootFailureAt`):
 
-  ```text
-  hook deliver: no per-workspace socket configured (neither --socket nor a `socket:` entry in .claude/agentmonitors.local.md) — refusing to fall back to a shared default socket; nothing delivered. Start a daemon for this workspace with `agentmonitors daemon run --detach`, or pass --socket.
-  ```
+    ```text
+    hook deliver: no per-workspace socket configured (neither --socket nor a `socket:` entry in .claude/agentmonitors.local.md) — refusing to fall back to a shared default socket; nothing delivered. Start a daemon for this workspace with `agentmonitors daemon run --detach`, or pass --socket.
+    ```
+
+  - This session's own lazy boot failed (`lastBootFailureAt` present):
+
+    ```text
+    hook deliver: no per-workspace socket configured — the last automatic daemon boot for this workspace (via the SessionStart hook) failed to come up in time; nothing delivered. It will retry automatically the next time a session starts here — run `agentmonitors daemon run --detach` yourself only if you need it available before then.
+    ```
 
   A workspace that is **not enabled** stays silent on both streams — that is an opt-out, not a
   misconfiguration, and warning there would fire on every hook in every unmonitored repo.
@@ -1363,8 +1400,10 @@ indistinguishable from "nothing pending." So each writes exactly one line to std
   hook deliver: no session registered for host session id "<id>"
   ```
 
-The plugin only wires `hook deliver` into `UserPromptSubmit` with a well-formed payload, so none of
-these fire in normal operation — only on the manual/no-docs path these diagnostics exist to unblock.
+The plugin only wires `hook deliver` into `UserPromptSubmit` with a well-formed payload, so the
+malformed-payload, unmapped-lifecycle, and unresolvable-`session_id` branches only ever fire on the
+manual/no-docs path these diagnostics exist to unblock — the no-socket branch above is the one
+exception, reachable from the automated path too (see above).
 Untrusted stdin values in these lines (`<name>`, `<id>`) are JSON-string-escaped — including DEL,
 the C1 controls (U+0080–U+009F), and the U+2028/U+2029 line/paragraph separators, which
 `JSON.stringify` alone leaves raw — so no control or line-breaking code point can reach the terminal
