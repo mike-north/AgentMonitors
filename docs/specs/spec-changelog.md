@@ -30,18 +30,29 @@ rejected promise -> uncaught EPIPE`, which could exit the hook process nonzero d
   crashes the process.
 - **006, source comments, and this changelog still described the channel transport's oversized-event
   marker as committed before render — but production reserves, pushes/renders, and only THEN commits
-  (`runChannelDeliveryCycle`, mirroring the hook side's round-9 reordering).** A null/rejected commit
-  (the reservation's lease already lapsed, `'surfaced-uncommitted'`) leaves the pushed event
-  uncommitted and eligible for at-least-once redelivery, contradicting the prior "already committed,
-  will never re-deliver" framing. Corrected `channel-render.ts`'s and `hook-deliver-render.ts`'s doc
-  comments, 006 §4.2.1 and §5.5, and the round-10 entry above to state the conditional truth: a
-  successful commit prevents ordinary repoll; a null/rejected commit leaves the row eligible for
-  redelivery. `buildChannelTruncatedMarker` itself needed no wording change — it was already
-  outcome-neutral.
+  (`runChannelDeliveryCycle`, mirroring the hook side's round-9 reordering).** Corrected
+  `channel-render.ts`'s and `hook-deliver-render.ts`'s doc comments, 006 §4.2.1 and §5.5, and the
+  round-10 entry above to state the conditional truth in full: a successful (non-null) commit prevents
+  ordinary repoll; a commit that resolves null means the reservation's lease already lapsed
+  (`'surfaced-uncommitted'`) and the row is definitely uncommitted and eligible for at-least-once
+  redelivery; a commit that REJECTS (an IPC/transport error) is a third, distinct case, not the same as
+  resolving null — the daemon may have applied it before the response was lost, so whether the row is
+  claimed or still pending is genuinely UNCERTAIN. The round-11 pass had collapsed the null and
+  rejected cases together ("a null/rejected commit leaves it uncommitted and eligible for redelivery"),
+  which is a false guarantee for the rejected case and contradicted the round-11 fix's own point that
+  render-time commit outcome is genuinely unknown. Round-12 also fixed a channel-only mixed case:
+  when the reserved single event is oversized AND `moreDeferred` is true, `renderChannelEvent`
+  appended only the truncation marker, silently dropping the "more work is pending" signal —
+  `CHANNEL_DEFERRED_MARKER` is now appended alongside it, matching the hook transport's existing dual-
+  marker handling of the identical mixed case. `buildChannelTruncatedMarker`'s own TEXT needed no
+  wording change — it was already outcome-neutral; only the prose describing what it does and doesn't
+  guarantee needed correcting.
 
 006 §4.2.1 and §5.5 previously asserted the channel transport's claim is durably committed before
-render; both sections, plus the round-10 entry above, are now corrected to describe the actual
-reserve → push/render → commit ordering and its conditional outcome.
+render, and — after the round-11 fix — conflated a null commit resolution with a rejected commit
+call; both sections, plus the round-10 entry above, are now corrected to describe the actual
+reserve → push/render → commit ordering and its three-way conditional outcome, and to document the
+mixed-case dual-marker rendering.
 
 ## 2026-07-18 — Hook-deliver commits AFTER writing (not before), re-validates the candidate-growth race, `verify` reuses the same reserve/validate/commit flow, and marker selection is lifecycle-aware for post-compact recaps (006 §5.2, §5.5, §6.1) — Refs #442
 

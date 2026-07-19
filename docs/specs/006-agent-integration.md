@@ -247,14 +247,31 @@ actually-claimed event was never measured. Only in this one case does `renderCha
 already-claimed block: it mid-truncates the lone event at a Unicode code-point boundary and appends a
 DIFFERENT marker than the deferral marker above, because — unlike the deferred-remainder case, where
 the whole block stayed unclaimed and genuinely re-delivers later — this render happens BEFORE the
-reservation is committed, so at render time it is genuinely unknown whether the omitted tail will
-re-deliver: a successful commit means it will **never** re-deliver on a later poll, but a null/rejected
-commit leaves it eligible for at-least-once redelivery instead (§5.5 has the full mechanics and the
-reason the two markers must differ, and why the marker itself stays outcome-neutral). That marker
-names the exact, session- and socket-scoped `agentmonitors events list --session <id> --socket <path>
---unread` command (the socket path transport-safe-escaped, issue #442, PR #442 round-8 review — see
-§5.5) as the recovery path that holds regardless of that outcome, for the full, still-unread event —
-never the bare `--unread` form (`events list` requires `--session`, §5).
+reservation is committed, so at render time it is genuinely unknown which of THREE outcomes the commit
+that follows will land on (issue #442, PR #442 round-12 review — collapsing these to two conflates a
+definite outcome with a genuinely uncertain one): a commit that **resolves non-null** means the row is
+claimed and will **never** re-deliver on a later ordinary poll; a commit that **resolves null** (the
+reservation's lease already lapsed, `'surfaced-uncommitted'`) means the row was definitely never
+claimed and stays eligible for at-least-once redelivery; a commit that **rejects** (an IPC/transport
+error) is neither of those — the daemon may have applied it before the response was lost, so whether
+the row ends up claimed or still pending is genuinely UNCERTAIN, not a guaranteed redelivery (§5.5 has
+the full mechanics and the reason the two markers must differ, and why the marker itself stays
+outcome-neutral across all three cases). That marker names the exact, session- and socket-scoped
+`agentmonitors events list --session <id> --socket <path> --unread` command (the socket path
+transport-safe-escaped, issue #442, PR #442 round-8 review — see §5.5) as the recovery path that holds
+regardless of that outcome, for the full, still-unread event — never the bare `--unread` form (`events
+list` requires `--session`, §5).
+
+**Mixed case: the oversized single event AND a genuinely deferred remainder (issue #442, PR #442
+round-12 review).** `moreDeferred` can be true in the SAME render as the mid-truncation exception above
+— the claim's one (oversized) event is the only one actually reserved, but additional, distinct
+settled-high work exists beyond it and stays genuinely pending. The two facts do not overlap (this
+event's own cut tail vs. a separate deferred event) and neither implies the other, so `renderChannelEvent`
+appends BOTH markers — the truncation marker above AND the deferral marker — sized together within
+`MAX_CHANNEL_CONTENT`; appending only the truncation marker would silently drop the "more work is
+pending" signal and violate this section's candidate-growth guarantee. This mirrors the hook-deliver
+transport's `renderHookDelivery`, which renders both of its analogous markers in the identical mixed
+case (§5.5).
 
 A body-injection claim that rendered only its **title** — dropping the monitor body and the change
 summary — is a **defect on this surface**, not a lighter rendering: the receiving agent would have to
@@ -879,14 +896,25 @@ rendering — and therefore this mid-truncation — happens BEFORE the reservati
 #442, PR #442 round-11 review).** For the channel's reserve → push → commit cycle
 (`runChannelDeliveryCycle`), `renderChannelEvent` mid-truncates a lone event whose own block still
 exceeds the ceiling as PART OF the push itself; the commit that sets `first_notified_at` only runs
-AFTER that push resolves. So at render time it is genuinely unknown whether the commit that follows
-will land: if it does, `pendingEventsForSession()` (whose query requires that column still `NULL`,
-002 §7) will never return the row again, and the omitted tail does **not** "re-deliver at the next
-poll" the way the deferred-remainder case does; if the commit is null/rejected instead (the
-reservation's lease already lapsed, `'surfaced-uncommitted'`), the row was never claimed and stays
-eligible for at-least-once redelivery on a later poll — the opposite outcome. Either way, the durable,
-still-unread copy of the full event is the recovery path that holds regardless (claiming ≠ acking,
-BP2 / SP4). `agentmonitors events list` **requires** `--session <id>` (§5, issue #420 P2) — a bare
+AFTER that push resolves. So at render time it is genuinely unknown which of THREE outcomes the commit
+that follows will land on (issue #442, PR #442 round-12 review — collapsing these to two conflates a
+definite outcome with a genuinely uncertain one):
+
+- **Resolves non-null** — committed: `pendingEventsForSession()` (whose query requires
+  `first_notified_at` still `NULL`, 002 §7) will never return the row again, so the omitted tail does
+  **not** "re-deliver at the next poll" the way the deferred-remainder case does.
+- **Resolves null** — the reservation's lease already lapsed (`'surfaced-uncommitted'`): the row was
+  definitely never claimed and stays eligible for at-least-once redelivery on a later poll — the
+  opposite outcome from the bullet above.
+- **Rejects** (an IPC/transport error) — this is NOT the same as resolving null: the daemon may have
+  applied the commit before its response was lost, so whether the row ends up claimed or still pending
+  cannot be determined from the rejection alone. Treating a rejection as a guaranteed redelivery would
+  be as wrong as treating it as a guaranteed commit.
+
+Either way — regardless of which of the three outcomes actually occurs — the durable, still-unread
+copy of the full event is the recovery path that holds (claiming ≠ acking, BP2 / SP4), which is the
+only thing the marker itself asserts. `agentmonitors events list` **requires** `--session <id>` (§5,
+issue #420 P2) — a bare
 `agentmonitors events list --unread` exits 1, so the marker must render the exact, directly runnable
 command for the session that received THIS delivery, not the bare form (issue #442, PR #442 round-6
 review). It must also carry an explicit `--socket <path>` (issue #358, PR #442 round-7 review):
@@ -909,6 +937,17 @@ conservative safe set — no forbidden byte can then appear in the tag body, whi
 reconstructs exactly when the advertised command is run — reserving `CHANNEL_DEFERRED_MARKER`'s
 "surface on a later poll" language for the case where a whole block genuinely stayed unclaimed and
 pending.
+
+**Mixed case: both markers together (issue #442, PR #442 round-12 review).** The single-event
+pathological case above and the deferred-remainder case are not mutually exclusive: `moreDeferred` can
+be true in the SAME render where the lone claimed event also had to be mid-truncated (its own block
+exceeded the ceiling). The two facts describe different, non-overlapping events — this claim's own
+truncated tail vs. a separate, genuinely-pending event beyond the claim — so `renderChannelEvent`
+appends BOTH the truncation marker and `CHANNEL_DEFERRED_MARKER`, sized together within
+`MAX_CHANNEL_CONTENT`. Appending only the truncation marker in this case would silently drop the
+"more work is pending" signal, contradicting this section's candidate-growth guarantee. This mirrors
+`renderHookDelivery`'s identical handling (below): when its analogous mixed case occurs, it renders
+both `buildHookClaimedUnreadMarker` and `buildHookDeferredMarker` together rather than picking one.
 
 **The hook-deliver transport ALSO uses two distinct, session- and socket-scoped markers, mirroring
 the channel side (issue #442, PR #442 round-7 review), and (since round-8) reserves/commits through
