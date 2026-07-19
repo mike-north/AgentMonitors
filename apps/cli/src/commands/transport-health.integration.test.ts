@@ -291,7 +291,13 @@ This monitor fires on a schedule.
   }
 
   /** Register a lead session so a session-scoped transport can be correlated. */
-  function openLeadSession(fixture: TransportFixture): void {
+  /**
+   * Register a lead session so a session-scoped transport can be correlated.
+   * Returns the AgentMon session id (distinct from `HOST_SESSION`) so a caller
+   * can drive its lifecycle further — e.g. `session close` for the
+   * closed-session gating test below.
+   */
+  function openLeadSession(fixture: TransportFixture): string {
     const opened = runWithEnv(
       [
         'session',
@@ -307,15 +313,30 @@ This monitor fires on a schedule.
       fixture.dir,
     );
     expect(opened.exitCode).toBe(0);
+    return (JSON.parse(opened.stdout) as { id: string }).id;
   }
 
   // --- Failure mode (a): no daemon running for this workspace ---------------
-  // Deliberately NO daemon: the socket in the fixture is dead. This is the
-  // reviewer-agent incident — a hook-lazy-booted daemon reaped while an idle
-  // listener fired no hooks to revive it, and nothing anywhere said so.
-  it('names the absent daemon as its own problem, distinct from the transports themselves', () => {
+  // The reviewer-agent incident — a hook-lazy-booted daemon reaped while an
+  // idle listener fired no hooks to revive it, and nothing anywhere said so.
+  // The lead session is registered FIRST, through a real (briefly live)
+  // daemon, then that daemon is stopped before `doctor` runs — reproducing
+  // the actual incident shape (a session that WAS active, now orphaned by a
+  // reaped daemon) rather than "no daemon and no active lead", which is a
+  // different, already-idle case gated by the ACTIVE-lead check (issue #425
+  // review, round 3) and covered separately below.
+  it('names the absent daemon as its own problem, distinct from the transports themselves', async () => {
     const fixture = transportFixture('no-daemon');
+    const daemon = await startDaemon(
+      fixture.monitorsRoot,
+      fixture.dir,
+      fixture.env,
+      fixture.socketPath,
+    );
+    openLeadSession(fixture);
     seedHeartbeat(fixture, 'hook');
+    daemon.stop();
+    await daemon.waitForExit();
 
     const result = runWithEnv(
       ['doctor', '--workspace', fixture.dir],
@@ -672,6 +693,82 @@ This monitor fires on a schedule.
       // `pipelineProblems` is present even when empty: an absent key would be
       // indistinguishable from "nothing was checked".
       expect(Array.isArray(payload.pipelineProblems)).toBe(true);
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+    }
+  }, 30_000);
+
+  // --- Closed session: a fresh heartbeat is not an ACTIVE recipient (issue
+  // #425 review, round 3) --------------------------------------------------
+  // `hook` is keyed per WORKSPACE, not per session (`heartbeatKey`), so its
+  // record stays within its 24h TTL — and looks "running" — long after the
+  // one lead session in this workspace has closed. Without gating on an
+  // ACTIVE lead, `doctor` reported `deliverable: true` / "via hook" for a
+  // recipient that no longer has a live process to receive anything.
+  it('reports no live session — not "via hook" — once the only lead session has closed', async () => {
+    const fixture = transportFixture('closed-session');
+    const daemon = await startDaemon(
+      fixture.monitorsRoot,
+      fixture.dir,
+      fixture.env,
+      fixture.socketPath,
+    );
+    try {
+      const sessionId = openLeadSession(fixture);
+      seedHeartbeat(fixture, 'hook');
+
+      // Confirm the healthy baseline first: with the session still open, this
+      // exact heartbeat DOES read as deliverable — otherwise the assertions
+      // below would prove nothing about the close transition specifically.
+      const before = runWithEnv(
+        ['doctor', '--workspace', fixture.dir],
+        fixture.env,
+        fixture.dir,
+      );
+      expect(before.stdout).toContain('delivery to THIS session → via hook');
+
+      const closed = runWithEnv(
+        ['session', 'close', sessionId, '--format', 'json'],
+        fixture.env,
+        fixture.dir,
+      );
+      expect(closed.exitCode).toBe(0);
+      expect((JSON.parse(closed.stdout) as { status: string }).status).toBe(
+        'dormant',
+      );
+
+      const result = runWithEnv(
+        ['doctor', '--workspace', fixture.dir],
+        fixture.env,
+        fixture.dir,
+      );
+
+      // The heartbeat itself still reads as running — the transport process
+      // never learned the session closed — but nothing is a valid recipient.
+      expect(result.stdout).toContain('hook: running');
+      expect(result.stdout).toContain('via none');
+      expect(result.stdout).not.toContain(
+        'delivery to THIS session → via hook',
+      );
+      expect(result.stdout).toContain('no live session');
+      // A closed session is a real, live degradation (a transport is running
+      // with nobody to deliver to) rather than the ordinary idle "nothing has
+      // ever registered" case, so `delivery-verdict` must FAIL, not sit idle.
+      expect(result.stdout).toContain('✗ delivery-verdict');
+      expect(result.exitCode).toBe(1);
+
+      const json = runWithEnv(
+        ['doctor', '--workspace', fixture.dir, '--format', 'json'],
+        fixture.env,
+        fixture.dir,
+      );
+      const payload = JSON.parse(json.stdout) as {
+        deliveryWillReachThisSession: string;
+        deliverable: boolean;
+      };
+      expect(payload.deliveryWillReachThisSession).toBe('none');
+      expect(payload.deliverable).toBe(false);
     } finally {
       daemon.stop();
       await daemon.waitForExit();
