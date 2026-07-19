@@ -246,9 +246,11 @@ already-claimed block: it mid-truncates the lone event at a Unicode code-point b
 DIFFERENT marker than the deferral marker above, because — unlike the deferred-remainder case, where
 the whole block stayed unclaimed and genuinely re-delivers later — this claim is already committed by
 the time it renders, so the omitted tail will **never** re-deliver on a later poll (§5.5 has the full
-mechanics and the reason the two markers must differ). That marker names the exact, session-scoped
-`agentmonitors events list --session <id> --unread` command as the one remaining recovery path for the
-full, still-unread event — never the bare `--unread` form (`events list` requires `--session`, §5).
+mechanics and the reason the two markers must differ). That marker names the exact, session- and
+socket-scoped `agentmonitors events list --session <id> --socket <path> --unread` command (the socket
+path transport-safe-escaped, issue #442, PR #442 round-8 review — see §5.5) as the one remaining
+recovery path for the full, still-unread event — never the bare `--unread` form (`events list`
+requires `--session`, §5).
 
 A body-injection claim that rendered only its **title** — dropping the monitor body and the change
 summary — is a **defect on this surface**, not a lighter rendering: the receiving agent would have to
@@ -499,17 +501,40 @@ shape:
   legitimately contains code and links. Only raw C0/C1 control characters (except tab/newline) are
   stripped. **Truncation:** when the assembled context exceeds the 4000-char cap, it is truncated at
   a Unicode **code-point** boundary (never splitting a surrogate pair, which would corrupt the JSON)
-  and an explicit marker is appended:
+  and an explicit marker is appended — but **which** marker depends on whether the omitted content
+  genuinely re-delivers, mirroring the channel transport's split (§4.2.1) and detailed fully in §5.5:
 
   ```text
-  [truncated — more monitor updates are pending; run `agentmonitors events list --session <id> --unread` to see the rest]
+  [truncated — more monitor updates are pending; run `agentmonitors events list --session <id> --socket <path> --unread` to see the rest]
   ```
 
+  is used when a WHOLE event block was left unclaimed (still pending — it genuinely re-delivers at
+  the next context event), while
+
+  ```text
+  [truncated — this update was too large to show in full; it is claimed but NOT acknowledged, so the full copy stays unread (it will not redeliver automatically) — run `agentmonitors events list --session <id> --socket <path> --unread` to see it]
+  ```
+
+  is used when THIS claim's own content was cut (a single event's own block exceeds the cap, or a
+  truncated reminder message) — that content is already claimed, so it will **not** redeliver on its
+  own. Both markers may appear together in the same `additionalContext` (issue #442, PR #442
+  round-8 review): when the sole claimed event is itself oversized (the second marker's case) AND
+  further, different high-urgency work also stays genuinely pending beyond it (the first marker's
+  case), both are rendered — they describe two non-overlapping facts and neither implies the other.
+
   `agentmonitors events list` **requires** `--session <id>` (§5, issue #420 P2) — a bare
-  `agentmonitors events list --unread` exits 1 — so the marker renders the exact, directly runnable
+  `agentmonitors events list --unread` exits 1 — so each marker renders the exact, directly runnable
   command for the session that received THIS delivery, with the claim's own (sanitized) `sessionId`
-  substituted in, not the bare form (issue #442). The final string including the marker is still
-  ≤ 4000 chars. Truncation never drops a durable event: see §5.5 (unread-recoverability).
+  substituted in, not the bare form (issue #442). Each marker also carries an explicit `--socket
+<path>` (issue #358, PR #442 round-7 review): `agentmonitors events list` resolves its own socket
+  **env-first**, so a copy-pasted command with no `--socket` could silently query a stale
+  `$AGENTMONITORS_SOCKET` left over from a different workspace rather than the daemon `hook deliver`
+  actually resolved and claimed against. The socket path is rendered via the transport-shared
+  `escapeShellPath` (`delivery-event-render.ts`, issue #442, PR #442 round-8 review) — the SAME
+  helper the channel transport's `content` uses (§4.2.1) — so it is both shell-safe (spaces, quotes)
+  and round-trips to the exact original path when the advertised command is run in `bash`/`zsh`. The
+  final string including whichever marker(s) apply is still ≤ 4000 chars. Truncation never drops a
+  durable event: see §5.5 (unread-recoverability).
 
 - **No `permissionDecision` field** — advisory; the agent decides what to do.
 
@@ -532,7 +557,25 @@ empty stdout is the signal to Claude Code to proceed silently.
    not found → exit 0, print nothing **on stdout**; ALSO write one line to **stderr**,
    unconditionally (regardless of `--debug`), naming the unresolved id (issue #329) — see the exact
    wording and rationale in §5.2.1.
-7. Call `claimDeliveryClient(sessionId, lifecycle, socket)`. If null → exit 0, print nothing.
+7. **Reserve, re-validate, then commit** (`reserveSizedHookDelivery`, issue #442, PR #442 round-8
+   review) — not a single direct `claimDeliveryClient(sessionId, lifecycle, socket, maxEvents)` call.
+   For a `turn-interruptible` claim, sizing (`previewSettledHighDeliveryClient` +
+   `packEventsUnderCap`) and the reservation itself are two SEPARATE IPC round-trips, so the events
+   the reservation actually returns can differ from the ones the preview measured (a concurrent
+   caller substitutes different, larger pending events into the same requested count). Claiming
+   directly on an unvalidated count would let a substituted, oversized set pass the count check but
+   still fail `renderHookDelivery`'s own repack — and because a claim marks the underlying rows
+   claimed **synchronously**, the truncated-away tail of an already-claimed row can never redeliver
+   (§5.5). `reserveSizedHookDelivery` therefore **reserves** (leases, does not yet claim), then
+   re-validates the fit of the **actual** reserved claim via `resolveHookClaimFit` — the same
+   predicate `renderHookDelivery` uses — releasing and retrying with a tighter cap on a mismatch
+   (bounded; the final attempt forces a single-event reservation, which always terminates). Only once
+   the fit is confirmed does the command **commit** the reservation (`commitDeliveryClient`), which is
+   what actually marks the rows claimed. Non-`turn-interruptible` lifecycles, and a reminder claim
+   (`events: []`), carry no per-event sizing risk and are reserved+committed unsized. If reservation
+   returns nothing pending, or the commit itself returns `null` (the reservation's lease expired
+   before commit — effectively unreachable in this command's synchronous flow) → exit 0, print
+   nothing.
 8. Render via `renderHookDelivery(claim, hookEventName)`. If null (no event bodies and no reminder
    message) → exit 0, print nothing.
 9. Write output and exit 0. The omitted/default format and `--format json` write compact hook wire
@@ -690,31 +733,53 @@ surface. Concretely, the hook-deliver transport:
    in delivery order, applying the same per-recipient `net` collapse decision but persisting nothing);
 2. **sizes** how many **whole** event blocks fit under the cap (never a partial block, which would be
    a claimed-but-unread event with no clean re-delivery boundary), reserving room for the truncation
-   marker; then
-3. **claims** exactly that many (`claimDelivery`'s `maxEvents`), so the deferred remainder is left
+   marker;
+3. **reserves** (leases, does not yet claim) with that count as `maxEvents`, then **re-validates the
+   fit of the ACTUAL reserved claim** — not the sizing preview, which is a separate IPC round-trip and
+   can already be stale by the time the reservation lands (issue #442, PR #442 round-8 review;
+   `resolveHookClaimFit`, the same predicate `renderHookDelivery` itself uses). A mismatch releases the
+   reservation (the rows return to `pending` — nothing was ever claimed, so nothing is lost) and
+   retries with a tighter cap, exactly mirroring the channel transport's
+   `reserveSizedChannelDelivery`/`resolveChannelClaimFit` below; then
+4. **commits** the validated reservation (`commitDeliveryClient`), so the deferred remainder is left
    **pending** (`first_notified_at` NULL) and re-delivers at the next context event.
 
-Because claiming marks the underlying rows **claimed**, which is **not** acknowledgement (BP2 / SP4;
+This reserve → validate-fit → commit sequence exists specifically to close a substitution race a
+direct sized claim (`claimDelivery(sessionId, lifecycle, maxEvents)`, the pre-#442-round-8
+implementation) could not: preview and claim are two separate IPC round-trips, so a concurrent caller
+could substitute different, larger pending events into the same requested COUNT — passing the count
+check but still overflowing the cap. Because a claim marks the underlying rows claimed
+**synchronously**, an event dropped from a mismatched claim's render could never redeliver. Reserving
+first (leasing, not claiming) makes the mismatch check-and-retry safe: nothing is durably consumed
+until the fit is confirmed.
+
+Because committing marks the underlying rows **claimed**, which is **not** acknowledgement (BP2 / SP4;
 `unreadEventsForSession` filters on `acknowledgedAt IS NULL` only), every event — surfaced or
 deferred — also **remains unread** and listable via `agentmonitors events list --unread` until
 explicitly acknowledged.
 
-The truncation marker (§5.1) is appended whenever the render omits any pending event — because a
-whole block did not fit **or** because the transport deferred more high-urgency work — signposting
-that more updates are pending. The single pathological case where one event's own block alone exceeds
-the cap is shown partially (mid-truncated at a code-point boundary) to guarantee forward progress.
-**This case does NOT re-deliver**, unlike the deferred-remainder case above: `claimDelivery` sets
-`first_notified_at` on the row **synchronously**, before this render runs, so
+The deferred-remainder truncation marker (§5.1) is appended whenever the render omits any pending
+event — because a whole block did not fit **or** because the transport deferred more high-urgency
+work — signposting that more updates are pending. The single pathological case where one event's own
+block alone exceeds the cap is shown partially (mid-truncated at a code-point boundary) to guarantee
+forward progress. **This case does NOT re-deliver**, unlike the deferred-remainder case above:
+`commitDelivery` sets `first_notified_at` on the row **synchronously** at commit time, which — per the
+reserve → validate-fit → commit sequence above — happens before this render runs, so
 `pendingEventsForSession()` (which requires that column still `NULL`) never returns it again at a
 later context event. Its full body stays unread (claiming ≠ acking, BP2 / SP4) and is recoverable
 ONLY via the durable unread copy, `agentmonitors events list --session <id> --unread` (issue #442,
-PR #442 round-7 review).
+PR #442 round-7 review). **The two markers can co-occur (issue #442, PR #442 round-8 review):** when
+the sole claimed event is itself this pathological oversized case AND further, different high-urgency
+work also stays genuinely pending beyond it (`moreDeferred`), `renderHookDelivery` renders BOTH
+markers together — they describe two non-overlapping facts (this event's own tail vs. a separate,
+still-pending remainder) and neither implies the other, so omitting either one would silently drop a
+real signal.
 
 The non-high branches need no sizing: `normal`/`low` reminders inject no per-event bodies, and the
 `post-compact` recap re-shows all unread each time, so both self-heal.
 
-**The channel transport (§4.2.1) applies the SAME pack-then-claim pattern, against its own, much
-larger content ceiling.** It is not exempt from boundedness — a coalesced high-urgency push previewed,
+**The channel transport (§4.2.1) applies the SAME reserve → validate-fit → commit pattern, against its
+own, much larger content ceiling.** It is not exempt from boundedness — a coalesced high-urgency push previewed,
 sized, and rendered without limit would make a single `notifications/claude/channel` payload
 unbounded — but unlike the hook path it is not sizing to a single turn's context budget, so its
 ceiling is deliberately generous. `channel serve` previews the settled-high delivery
@@ -755,23 +820,41 @@ the daemon `channel serve` is actually bound to. `channel-render.ts` therefore s
 with a distinct marker, built by `buildChannelTruncatedMarker(sessionId, socketPath)`, reading
 ``(this update was too large to show in full; run `agentmonitors events list --session <id> --socket
 <path> --unread` to see the full copy)`` with the claim's own (sanitized) `sessionId` and the
-resolved (shell-quoted) `socketPath` substituted in — pointing at that durable copy instead of
+resolved `socketPath` substituted in. The socket path is rendered via the transport-shared
+`escapeShellPath` (`delivery-event-render.ts`, issue #442, PR #442 round-8 review) — NOT a plain
+POSIX single-quote (the prior approach): a single-quoted path preserves every byte literally,
+including `<`/`>`/`[`/`]`, and this marker is appended into `content` AFTER `contentValue`'s own
+tag-safety sanitization pass has already run, so a socket path carrying those bytes would otherwise
+reintroduce them raw into the pushed `<channel>` body (006 §4.6). `escapeShellPath` instead renders
+the path in bash/zsh ANSI-C quoting (`$'...'`), hex-escaping (`\xNN`) every byte outside a
+conservative safe set — no forbidden byte can then appear in the tag body, while the path still
+reconstructs exactly when the advertised command is run — pointing at that durable copy instead of
 promising a re-delivery that cannot happen — reserving `CHANNEL_DEFERRED_MARKER`'s "surface on a later poll" language for the
 case where a whole block genuinely stayed unclaimed and pending.
 
 **The hook-deliver transport ALSO uses two distinct, session- and socket-scoped markers, mirroring
-the channel side (issue #442, PR #442 round-7 review).** `claimDeliveryClient` claims (and sets
-`first_notified_at`) **synchronously** for every hook-deliver claim — unlike the channel's two-phase
-reserve/commit — so BOTH the single-event mid-truncation branch AND a truncated reminder message are
-already-claimed content being cut, not other pending work being deferred. Only the
-deferred-remainder branch (a whole block genuinely left OUT of the render, still pending) legitimately
-promises a later redelivery. `hook-deliver-render.ts` therefore builds two markers from the SAME two
-inputs the channel side uses: `buildHookDeferredMarker(sessionId, socketPath)` — "more monitor updates
-are pending", used only for the genuinely-deferred-remainder branch — and
-`buildHookClaimedUnreadMarker(sessionId, socketPath)` — the claimed-unread framing, used for the
-single-event mid-truncation branch and for a truncated reminder message. Before this split, both
-branches shared one marker whose "more monitor updates are pending" framing falsely implied the
-mid-truncated event's own omitted tail would also redeliver.
+the channel side (issue #442, PR #442 round-7 review), and (since round-8) reserves/commits through
+the SAME two-phase sequence the channel side does (§5.5 above) rather than a single direct claim.**
+`commitDelivery` marks the rows claimed (sets `first_notified_at`) **synchronously** — before the
+render runs — but the render itself only ever sees an ALREADY-VALIDATED, already-committed claim by
+this point, exactly as before the round-8 fix; what changed is that the reservation is now re-checked
+against `resolveHookClaimFit` before it ever reaches that commit (§5.5). So BOTH the single-event
+mid-truncation branch AND a truncated reminder message are already-claimed content being cut, not
+other pending work being deferred. Only the deferred-remainder branch (a whole block genuinely left
+OUT of the render, still pending) legitimately promises a later redelivery. `hook-deliver-render.ts`
+therefore builds two markers from the SAME two inputs the channel side uses:
+`buildHookDeferredMarker(sessionId, socketPath)` — "more monitor updates are pending", used only for
+the genuinely-deferred-remainder branch — and `buildHookClaimedUnreadMarker(sessionId, socketPath)` —
+the claimed-unread framing, used for the single-event mid-truncation branch and for a truncated
+reminder message. Before this split, both branches shared one marker whose "more monitor updates are
+pending" framing falsely implied the mid-truncated event's own omitted tail would also redeliver.
+
+**The two markers are NOT mutually exclusive (issue #442, PR #442 round-8 review).** When the sole
+claimed event is itself the pathological mid-truncation case AND further, different high-urgency work
+also stays genuinely pending beyond it (`moreDeferred`), `renderHookDelivery` renders BOTH markers in
+the same `additionalContext` — the claimed-unread marker's "will not redeliver" framing describes only
+THIS event's own omitted tail, and does not (and must not) speak for the separate, genuinely-pending
+remainder, which the deferred marker signposts correctly.
 
 No durable event is lost by truncation; the cap only bounds how much is injected into a single turn (or,
 for the channel, into a single push).

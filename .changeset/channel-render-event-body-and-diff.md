@@ -45,5 +45,24 @@ poll`). The other, rarer case is a single event whose own block still exceeds th
   summary per event now that `diffText` is rendered there too, so `packEventsUnderCap` fits fewer
   events per delivery under the existing 4000-char cap than it did before this change — expected,
   not a regression: the deferred remainder still re-delivers at the next context event.
+- The hook-deliver transport uses the same **two distinct, session- and socket-scoped markers** as
+  the channel side: a genuinely-deferred-remainder marker ("more monitor updates are pending; ...
+  redeliver") and a claimed-unread marker for content that is already claimed but was itself cut (a
+  single oversized event, or a truncated reminder message) and therefore will **not** redeliver on its
+  own. Both can now appear together in the same `additionalContext` when the sole claimed event is
+  itself oversized AND further, different high-urgency work also stays genuinely pending beyond it —
+  previously the claimed-unread marker alone silently suppressed that second, real signal.
+- Both transports now validate a `turn-interruptible` claim's fit against the SAME budget the renderer
+  uses **before ever durably claiming it**: `hook deliver` reserves (leases, does not claim), re-checks
+  the actual reserved claim's fit, and only then commits — closing a race where the sizing preview and
+  the eventual claim are separate round-trips and a concurrent caller could substitute different,
+  larger pending events into the same requested count, passing the count check but overflowing the
+  cap on an already-(and now irreversibly-)claimed row.
+- Both markers' `--socket <path>` clause is now rendered with a shared, transport-safe path escaper
+  (bash/zsh ANSI-C quoting, hex-escaping any byte outside a conservative safe set) instead of a plain
+  POSIX single-quote: a socket path is interpolated into the recovery command AFTER the surrounding
+  content's own tag-safety sanitization has already run, so a path containing `<`/`>`/`[`/`]` (or a
+  backtick / control character) could otherwise reintroduce those forbidden bytes into the pushed
+  content raw. The new escaping is both tag-safe and shell-round-trip-safe.
 
 See docs/specs/006-agent-integration.md §4.2.1 and §5.5.
