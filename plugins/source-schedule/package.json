@@ -29,7 +29,7 @@
     "build": "tsup && tsc -p tsconfig.build.json && api-extractor run --local --verbose -c api-extractor.build.json",
     "check": "tsc --noEmit",
     "test": "vitest run",
-    "clean": "rm -rf dist",
+    "clean": "rm -rf dist temp",
     "check:api-report": "tsup && tsc -p tsconfig.build.json && api-extractor run --verbose -c api-extractor.report.json",
     "fix:api-report": "tsup && tsc -p tsconfig.build.json && api-extractor run --local --verbose -c api-extractor.report.json"
   },
