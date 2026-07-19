@@ -315,9 +315,19 @@ async function runCommand(scope: ScopeConfig): Promise<ExecOutcome> {
       // larger than the cap — rather than only evicting whole chunks (which
       // could retain far more than the cap, or drop bytes from within the
       // trailing window when a huge chunk is followed by a tiny one).
-      stderrRetained = Buffer.concat([stderrRetained, chunk]).subarray(
-        -STDERR_RETENTION_CAP_BYTES,
-      );
+      //
+      // `Buffer.subarray` returns a VIEW onto its source, not a copy: slicing
+      // the trailing window off `combined` would keep the whole concatenated
+      // backing store alive for as long as `stderrRetained` is referenced,
+      // silently defeating the retention cap (a `stderrRetained.length` of
+      // 8000 could still pin an arbitrarily large `.buffer.byteLength`). Copy
+      // the trailing window with `Buffer.from` whenever it's over the cap so
+      // only the bounded bytes are retained.
+      const combined = Buffer.concat([stderrRetained, chunk]);
+      stderrRetained =
+        combined.length > STDERR_RETENTION_CAP_BYTES
+          ? Buffer.from(combined.subarray(-STDERR_RETENTION_CAP_BYTES))
+          : combined;
     });
 
     function clearTimers(): void {
@@ -356,12 +366,14 @@ async function runCommand(scope: ScopeConfig): Promise<ExecOutcome> {
       code: number | null,
       signal: NodeJS.Signals | null,
     ): void {
-      const tail = stderrTailString();
+      // Only decode/concat the retained stderr when it's actually needed (the
+      // failure branches below) — the success path never reads it, so
+      // computing it unconditionally would allocate on every successful tick.
       if (timedOut) {
         finish({
           kind: 'failure',
           error: `Command timed out after ${String(scope.timeoutMs)}ms`,
-          stderrTail: tail,
+          stderrTail: stderrTailString(),
         });
         return;
       }
@@ -371,7 +383,7 @@ async function runCommand(scope: ScopeConfig): Promise<ExecOutcome> {
         finish({
           kind: 'failure',
           error: `Command terminated by signal ${signal}`,
-          stderrTail: tail,
+          stderrTail: stderrTailString(),
         });
         return;
       }

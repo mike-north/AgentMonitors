@@ -12,7 +12,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type {
   ObservationContext,
   ObservationResult,
@@ -888,6 +888,48 @@ describe('source-command-poll', () => {
       expect(payload.error).toMatch(/timed out/i);
       expect(payload.stderrTail).toHaveLength(2000);
       expect(payload.stderrTail).toBe('C'.repeat(1999) + 'D');
+    });
+
+    // Regression test for issue #302: `Buffer.subarray` returns a VIEW onto its
+    // source rather than a copy. Slicing the trailing window straight off the
+    // `Buffer.concat(...)` result (without `Buffer.from(...)` copying it) keeps
+    // the whole concatenated backing store alive — `stderrRetained.length` would
+    // report the capped 8000 bytes while `stderrRetained.buffer.byteLength`
+    // (the actual retained allocation) could still be far larger, silently
+    // defeating the retention cap this feature promises. Asserting on the
+    // backing `ArrayBuffer`, not just the `Buffer` view's `length`, is what
+    // actually proves the cap holds.
+    it('retains only the capped bytes in the backing ArrayBuffer, not a view onto the full concat (issue #302)', async () => {
+      const stderrRetentionCapBytes = 8000; // STDERR_RETENTION_CAP_BYTES (index.ts)
+      const fromSpy = vi.spyOn(Buffer, 'from');
+      try {
+        const bigChunkChars = 64_000; // >> STDERR_RETENTION_CAP_BYTES (8000)
+        const command = nodeArgv(
+          `process.stderr.write(Buffer.alloc(${String(bigChunkChars)}, 'E'), () => { ` +
+            `setTimeout(() => {}, 60000); ` +
+            `});`,
+        );
+
+        const result = await source.observe({ command, timeout: '1s' }, ctx());
+
+        expect(result.observations).toHaveLength(1);
+        const payload = result.observations[0]?.payload as {
+          error: string;
+          stderrTail: string;
+        };
+        expect(payload.error).toMatch(/timed out/i);
+
+        // The retained stderr buffer is created via exactly one `Buffer.from`
+        // call (the copy-on-cap-exceeded path added for issue #302).
+        expect(fromSpy).toHaveBeenCalledTimes(1);
+        const retained = fromSpy.mock.results[0]?.value as Buffer;
+        expect(retained.length).toBe(stderrRetentionCapBytes);
+        expect(retained.buffer.byteLength).toBeLessThanOrEqual(
+          stderrRetentionCapBytes,
+        );
+      } finally {
+        fromSpy.mockRestore();
+      }
     });
   });
 
