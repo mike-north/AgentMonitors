@@ -5,7 +5,11 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import type { DeliveryClaim, DeliveryReservation } from '@agentmonitors/core';
+import type {
+  DeliveryClaim,
+  DeliveryEventSummary,
+  DeliveryReservation,
+} from '@agentmonitors/core';
 import { claudeCodeAdapter } from '@agentmonitors/core';
 import {
   acknowledgeEventsClient,
@@ -195,6 +199,43 @@ const MAX_CHANNEL_RESERVE_ATTEMPTS = 3;
  * Returns `null` when nothing is pending to reserve (mirrors `reserveDelivery`
  * returning `null`).
  */
+/**
+ * Whether settled high-urgency work remains pending BEYOND the events this
+ * attempt just claimed (issue #442, PR #442 round-6 review — "candidate-set
+ * growth" race).
+ *
+ * A `moreDeferred` computed only from the preview that PRECEDED this
+ * reservation can go stale in the other direction from the races {@link
+ * reserveSizedChannelDelivery} already re-sizes for: the preview held exactly
+ * as many events as `maxEvents`, so `moreDeferred` was computed `false` — but
+ * a SECOND event settles (crosses the 15s debounce boundary) in the gap
+ * between that preview and this `reserve` call. The claim legitimately
+ * contains only the first event and fits under the ceiling, so the earlier
+ * mismatch check (`resolveChannelClaimFit`) reports `fits: true` — that check
+ * only asks "does the CLAIMED set fit", never "is there MORE settled work
+ * than what got claimed". Left unchecked, the push would render with no
+ * {@link CHANNEL_DEFERRED_MARKER} even though the second, now-settled event
+ * stays pending — contrary to 006 §5.5 ("the render omits any pending event
+ * ... signposting that more updates are pending").
+ *
+ * Re-runs the SAME read-only preview {@link reserveSizedChannelDelivery}
+ * itself uses for sizing (no core changes required) and compares it against
+ * the actually-claimed event ids — a settled event that is NOT in the claim
+ * means genuine deferred work remains.
+ */
+async function settledWorkRemainsBeyondClaim(
+  boundSession: string,
+  socketPath: string,
+  claimedEvents: DeliveryEventSummary[],
+): Promise<boolean> {
+  const claimedIds = new Set(claimedEvents.map((event) => event.eventId));
+  const stillSettled = await previewSettledHighDeliveryClient(
+    boundSession,
+    socketPath,
+  );
+  return stillSettled.some((event) => !claimedIds.has(event.eventId));
+}
+
 export async function reserveSizedChannelDelivery(
   boundSession: string,
   socketPath: string,
@@ -272,7 +313,19 @@ export async function reserveSizedChannelDelivery(
       MAX_CHANNEL_CONTENT,
     );
     if (fit.fits) {
-      return { reservation, moreDeferred };
+      // Re-check for the candidate-set-growth race (issue #442, PR #442
+      // round-6 review): a settled event that arrived AFTER the preview that
+      // sized this reservation, and is therefore not part of the claim,
+      // still needs `moreDeferred: true` so the render signposts it — even
+      // though this claim, taken on its own, fits and needed no shrinking.
+      const revalidatedMoreDeferred =
+        moreDeferred ||
+        (await settledWorkRemainsBeyondClaim(
+          boundSession,
+          socketPath,
+          reservation.claim.events,
+        ));
+      return { reservation, moreDeferred: revalidatedMoreDeferred };
     }
 
     // Mismatch: the actually-claimed set does not fit. Release it (the rows

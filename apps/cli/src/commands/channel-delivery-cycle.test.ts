@@ -32,8 +32,8 @@ import {
   runChannelDeliveryCycle,
 } from './channel.js';
 import {
+  buildChannelTruncatedMarker,
   CHANNEL_DEFERRED_MARKER,
-  CHANNEL_TRUNCATED_MARKER,
   MAX_CHANNEL_CONTENT,
   renderChannelEvent,
 } from '../channel-render.js';
@@ -644,6 +644,92 @@ describe('reserveSizedChannelDelivery eventless reminder claim (issue #442, roun
 });
 
 // ---------------------------------------------------------------------------
+// PR #442 round-6 review (comment 3609676601): candidate-set GROWTH race —
+// the preview holds exactly one event (maxEvents=1, moreDeferred=false); a
+// SECOND event settles before `reserveDelivery` runs; the resulting claim
+// legitimately contains only the first event and fits, so the earlier
+// mismatch check reports `fits: true` — but the second, now-settled event is
+// left pending with no `CHANNEL_DEFERRED_MARKER` signposting it, contrary to
+// 006 §5.5 ("the render omits any pending event ... signposting that more
+// updates are pending").
+// ---------------------------------------------------------------------------
+describe('reserveSizedChannelDelivery candidate-set growth race (issue #442, round-6 review)', () => {
+  function claimWith(surfaced: DeliveryEventSummary[]): DeliveryClaim {
+    return {
+      sessionId: 'session-1',
+      mode: 'delivery',
+      urgency: 'high',
+      lifecycle: 'turn-interruptible',
+      message: `${String(surfaced.length)} monitor(s) fired`,
+      unreadCounts: {
+        low: 0,
+        normal: 0,
+        high: surfaced.length,
+        total: surfaced.length,
+      },
+      events: surfaced,
+    };
+  }
+
+  it('sets moreDeferred when a second event settles between the sizing preview and the reservation', async () => {
+    const firstEvent = makeEvent({ eventId: 'e1', monitorId: 'm1' });
+    const secondEvent = makeEvent({ eventId: 'e2', monitorId: 'm2' });
+
+    // Sizing preview sees only the first event → maxEvents=1, moreDeferred
+    // computed false (nothing else was settled AT THAT TIME).
+    previewMock.mockResolvedValueOnce([firstEvent]);
+    const claim = claimWith([firstEvent]);
+    reserveMock.mockResolvedValueOnce({ reservationId: 'r-1', claim });
+    // Revalidation preview (run AFTER the reservation is accepted): the
+    // second event has now settled too, so it is visible here even though it
+    // was never part of this claim.
+    previewMock.mockResolvedValueOnce([firstEvent, secondEvent]);
+
+    const result = await reserveSizedChannelDelivery('session-1', '/sock');
+
+    expect(result).not.toBeNull();
+    expect(result?.reservation.reservationId).toBe('r-1');
+    expect(result?.reservation.claim.events.map((e) => e.eventId)).toEqual([
+      'e1',
+    ]);
+    // The claim itself was never released/retried — it genuinely fits.
+    expect(releaseMock).not.toHaveBeenCalled();
+    expect(reserveMock).toHaveBeenCalledTimes(1);
+    // The revalidation preview ran once more, after the reservation.
+    expect(previewMock).toHaveBeenCalledTimes(2);
+    // The pushed content must carry the deferred marker, since e2 remains
+    // settled-but-unclaimed even though the claim of e1 alone fits.
+    expect(result?.moreDeferred).toBe(true);
+    const { content } = renderChannelEvent(
+      result?.reservation.claim as DeliveryClaim,
+      { moreDeferred: result?.moreDeferred ?? false },
+    );
+    expect(content).toContain(CHANNEL_DEFERRED_MARKER.trim());
+  });
+
+  it('leaves moreDeferred false when no further settled work remains beyond the claimed set', async () => {
+    const onlyEvent = makeEvent({ eventId: 'e1', monitorId: 'm1' });
+
+    previewMock.mockResolvedValueOnce([onlyEvent]);
+    const claim = claimWith([onlyEvent]);
+    reserveMock.mockResolvedValueOnce({ reservationId: 'r-1', claim });
+    // Revalidation preview: still just the one (now-claimed) event — nothing
+    // grew in the gap.
+    previewMock.mockResolvedValueOnce([onlyEvent]);
+
+    const result = await reserveSizedChannelDelivery('session-1', '/sock');
+
+    expect(result).not.toBeNull();
+    expect(result?.moreDeferred).toBe(false);
+    const { content } = renderChannelEvent(
+      result?.reservation.claim as DeliveryClaim,
+      { moreDeferred: result?.moreDeferred ?? false },
+    );
+    expect(content).not.toContain(CHANNEL_DEFERRED_MARKER.trim());
+  });
+});
+
+// ---------------------------------------------------------------------------
 // PR #442 round-3 review: a release failure on the mismatch path must
 // propagate — not be swallowed — so the oversized reservation's stuck-leased
 // rows are surfaced as a cycle failure rather than misreported as `'idle'`.
@@ -761,9 +847,15 @@ describe('runChannelDeliveryCycle oversized single-event commit (issue #442, rou
     expect(commitMock).toHaveBeenCalledWith('r-huge', '/sock');
     // The rendered content signposts the durable unread copy — not a later
     // poll re-delivery, which cannot happen for a row that is now committed.
-    expect(renderedContent).toContain(CHANNEL_TRUNCATED_MARKER.trim());
+    // The marker must be the DIRECTLY RUNNABLE session-scoped command (issue
+    // #442 round-6 review): a bare `--unread` without `--session` exits 1.
+    expect(renderedContent).toContain(
+      buildChannelTruncatedMarker(claim.sessionId).trim(),
+    );
     expect(renderedContent).not.toContain(CHANNEL_DEFERRED_MARKER.trim());
-    expect(renderedContent).toContain('agentmonitors events list --unread');
+    expect(renderedContent).toContain(
+      `agentmonitors events list --session ${claim.sessionId} --unread`,
+    );
 
     // --- Poll 2: the row is now committed (`first_notified_at` set), so a
     // real daemon's `pendingEventsForSession()` would no longer return it —

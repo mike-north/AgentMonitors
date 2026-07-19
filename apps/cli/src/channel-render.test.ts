@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { DeliveryClaim } from '@agentmonitors/core';
 import {
+  buildChannelTruncatedMarker,
   CHANNEL_DEFERRED_MARKER,
-  CHANNEL_TRUNCATED_MARKER,
   MAX_CHANNEL_CONTENT,
   renderChannelEvent,
 } from './channel-render.js';
@@ -285,8 +285,10 @@ describe('renderChannelEvent', () => {
   // contentLength: 5000016 }`.
   it('mid-truncates a single oversized event so the pushed content never exceeds the ceiling', () => {
     const hugeBody = 'x'.repeat(5_000_000);
+    const sessionId = 'sess-abc123';
     const { content } = renderChannelEvent(
       makeClaim({
+        sessionId,
         events: [
           {
             eventId: 'e1',
@@ -304,12 +306,17 @@ describe('renderChannelEvent', () => {
     // pushed content — not merely on what the packer sizing function returns.
     expect(content.length).toBeLessThanOrEqual(MAX_CHANNEL_CONTENT);
     // Signposted, not silently dropped: the still-unread full body is
-    // recoverable via `agentmonitors events list --unread` (claiming ≠ acking,
-    // 006 §5.5). This claim is already committed by the time it renders, so
-    // it must use the distinct `CHANNEL_TRUNCATED_MARKER` (issue #442
-    // round-5), not the `CHANNEL_DEFERRED_MARKER` which falsely promises a
-    // later-poll re-delivery.
-    expect(content).toContain(CHANNEL_TRUNCATED_MARKER.trim());
+    // recoverable via a DIRECTLY RUNNABLE session-scoped command (`events
+    // list` requires `--session`, issue #420 P2 — PR #442 round-6 review), not
+    // the bare `--unread` form that would exit 1. This claim is already
+    // committed by the time it renders, so it must use
+    // `buildChannelTruncatedMarker`'s marker (issue #442 round-5/round-6), not
+    // the `CHANNEL_DEFERRED_MARKER` which falsely promises a later-poll
+    // re-delivery.
+    expect(content).toContain(buildChannelTruncatedMarker(sessionId).trim());
+    expect(content).toContain(
+      `agentmonitors events list --session ${sessionId} --unread`,
+    );
     expect(content).not.toContain(CHANNEL_DEFERRED_MARKER.trim());
     // Still channel-safe: no tag-breakout characters survive truncation.
     expect(content).not.toMatch(/[<>[\]\r]/);
@@ -321,8 +328,10 @@ describe('renderChannelEvent', () => {
   // so it must not appear at all — it stays pending for a later poll.
   it('mid-truncates only the oversized first event when a claim carries just that one event', () => {
     const hugeBody = 'y'.repeat(5_000_000);
+    const sessionId = 'sess-def456';
     const { content, meta } = renderChannelEvent(
       makeClaim({
+        sessionId,
         events: [
           {
             eventId: 'e1',
@@ -342,8 +351,12 @@ describe('renderChannelEvent', () => {
     // Even though a second event was genuinely deferred (`moreDeferred:
     // true`), the mid-truncation branch always wins: the claimed event
     // itself is already committed and its own tail was cut, so the marker
-    // must point at the durable unread copy, not promise a later poll.
-    expect(content).toContain(CHANNEL_TRUNCATED_MARKER.trim());
+    // must point at the durable, directly-runnable session-scoped recovery
+    // command, not promise a later poll.
+    expect(content).toContain(buildChannelTruncatedMarker(sessionId).trim());
+    expect(content).toContain(
+      `agentmonitors events list --session ${sessionId} --unread`,
+    );
     expect(content).not.toContain(CHANNEL_DEFERRED_MARKER.trim());
     expect(meta.event_count).toBe('1');
   });
@@ -365,5 +378,35 @@ describe('renderChannelEvent', () => {
     expect(content).not.toContain('### ');
     // The referent count is the pending total, not 0.
     expect(meta.event_count).toBe('3');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR #442 round-6 review: `agentmonitors events list` requires `--session
+// <id>` (issue #420 P2); the truncation marker must render a directly
+// executable command, not the bare `--unread` form the reviewer confirmed
+// exits 1.
+// ---------------------------------------------------------------------------
+describe('buildChannelTruncatedMarker', () => {
+  it('renders the exact runnable recovery command, including the real session id', () => {
+    const marker = buildChannelTruncatedMarker('session-42');
+    expect(marker).toBe(
+      '\n\n(this update was too large to show in full; run `agentmonitors events list --session session-42 --unread` to see the full copy)',
+    );
+  });
+
+  it('sanitizes a session id carrying tag/attribute-breakout characters', () => {
+    const marker = buildChannelTruncatedMarker('a<b>c[d];e\r\nf');
+    // The raw, unsanitized id must not survive verbatim into the marker.
+    expect(marker).not.toContain('a<b>c[d];e\r\nf');
+    // No tag-breakout or attribute-breakout characters survive from the
+    // EMBEDDED session id (§4.6) — the marker's own template intentionally
+    // starts with `\n\n`, so only the id-derived characters are checked here.
+    const [, embeddedId] = /--session (\S+) --unread/.exec(marker) ?? [
+      undefined,
+      '',
+    ];
+    expect(embeddedId).not.toMatch(/[<>[\]\r\n;]/);
+    expect(marker).toContain('agentmonitors events list --session');
   });
 });

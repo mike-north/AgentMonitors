@@ -31,6 +31,11 @@ import {
 import { decodeToon } from '../toon-format.js';
 import { runChannelDeliveryCycle } from './channel.js';
 import { claimDeliveryClient } from '../runtime-client.js';
+import {
+  buildChannelTruncatedMarker,
+  CHANNEL_DEFERRED_MARKER,
+  renderChannelEvent,
+} from '../channel-render.js';
 
 const CLI_PATH = path.resolve(__dirname, '../../dist/index.cjs');
 const CLI_PACKAGE_DIR = path.resolve(__dirname, '../..');
@@ -11320,6 +11325,187 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
       await teardown(f);
     }
   }, 30_000);
+
+  // ---------------------------------------------------------------------------
+  // PR #442 round-6 review (comment 3609676603): the mocked "oversized-event
+  // commit-to-idle" unit test (`channel-delivery-cycle.test.ts`) stubs `poll
+  // two` (empty preview + null reservation) and so would stay green even if
+  // `commitDeliveryClient` stopped setting `first_notified_at`. This test
+  // drives the REAL daemon/store instead: a genuine high-urgency monitor
+  // event with a body so large `renderChannelEvent` must mid-truncate it,
+  // committed through the real `reserveDelivery`/`commitDelivery` IPC, then a
+  // SECOND real poll cycle against the same live daemon to prove the row
+  // genuinely goes idle (not surfaced again) — and the full, untruncated body
+  // is still retrievable through the exact command the truncation marker
+  // advertises (`agentmonitors events list --session <id> --unread`).
+  // ---------------------------------------------------------------------------
+  it('commits a real oversized high-urgency event through the live daemon, then genuinely goes idle on the next poll; the full body stays retrievable via the exact session-scoped command the marker advertises', async () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-chcycle-huge-'));
+    const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-huge');
+    mkdirSync(monitorsDir, { recursive: true });
+    const watchedFile = path.join(ws, 'watched.txt');
+    writeFileSync(watchedFile, 'initial content', 'utf-8');
+    // The monitor's own markdown body becomes `DeliveryEventSummary.body`
+    // (`observation.body ?? monitor.instructions`) — a huge one is what
+    // forces `renderChannelEvent`'s mid-truncation branch for a REAL event,
+    // not a hand-built fixture.
+    const hugeBody = 'x'.repeat(1_000_000);
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      [
+        '---',
+        'name: Watch huge',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs:',
+        '    - "watched.txt"',
+        `  cwd: ${JSON.stringify(ws)}`,
+        '  interval: "1s"',
+        'urgency: high',
+        // Short notify debounce so the event MATERIALIZES quickly; the
+        // SEPARATE 15s claim-time settle window (002 §9.1,
+        // DEFAULT_HIGH_URGENCY_SETTLE_MS) is not configurable and is what
+        // this test actually waits out below.
+        'notify:',
+        '  strategy: debounce',
+        '  settle-for: "1s"',
+        '---',
+        hugeBody,
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+
+    const socket = path.join(
+      '/tmp',
+      `agentmon-chcycle-huge-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const db = path.join(ws, 'channel-cycle-huge.db');
+    const hostSessionId = `chcycle-huge-${Date.now()}`;
+    writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 30_000 });
+    const env: Record<string, string> = {
+      CLAUDE_PROJECT_DIR: ws,
+      AGENTMONITORS_DB: db,
+      AGENTMONITORS_SOCKET: socket,
+    };
+
+    const start = runWithStdin(
+      ['session', 'start'],
+      env,
+      JSON.stringify({
+        session_id: hostSessionId,
+        hook_event_name: 'SessionStart',
+        cwd: ws,
+      }),
+      ws,
+    );
+    expect(start.exitCode).toBe(0);
+    expect(await daemonAvailable(socket)).toBe(true);
+
+    try {
+      const sessions = JSON.parse(
+        runWithEnv(
+          ['session', 'list', '--socket', socket, '--format', 'json'],
+          env,
+          ws,
+        ).stdout,
+      ) as { id: string; hostSessionId: string }[];
+      const sessionId =
+        sessions.find((s) => s.hostSessionId === hostSessionId)?.id ?? '';
+      expect(sessionId).not.toBe('');
+
+      // Fire the monitor exactly once after the baseline tick.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
+      writeFileSync(watchedFile, 'changed content', 'utf-8');
+
+      const unreadEvents = (): { id: string; body?: string }[] =>
+        JSON.parse(
+          runWithEnv(
+            [
+              'events',
+              'list',
+              '--session',
+              sessionId,
+              '--unread',
+              '--format',
+              'json',
+              '--socket',
+              socket,
+            ],
+            env,
+            ws,
+          ).stdout,
+        ) as { id: string; body?: string }[];
+
+      // Wait for the event to MATERIALIZE (the 1s notify debounce).
+      const materializeDeadline = Date.now() + 10_000;
+      let eventId = '';
+      while (Date.now() < materializeDeadline) {
+        const events = unreadEvents();
+        if (events.length >= 1) {
+          eventId = events[0]?.id ?? '';
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      expect(eventId).not.toBe('');
+
+      // Wait out the SEPARATE 15s claim-time settle window before a
+      // `turn-interruptible` reservation will surface it.
+      let outcome: string | undefined;
+      let renderedContent = '';
+      const settleDeadline = Date.now() + 25_000;
+      while (Date.now() < settleDeadline) {
+        outcome = await runChannelDeliveryCycle(sessionId, socket, (claim) => {
+          renderedContent = renderChannelEvent(claim, {
+            moreDeferred: false,
+          }).content;
+          return Promise.resolve();
+        });
+        if (outcome === 'surfaced') break;
+        expect(outcome).toBe('idle'); // no other outcome is expected while polling
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      expect(outcome).toBe('surfaced');
+
+      // The real, live-daemon-committed content is mid-truncated (it dwarfs
+      // MAX_CHANNEL_CONTENT) and signposts the durable unread copy via the
+      // EXACT session-scoped command (issue #442, PR #442 round-6 review).
+      expect(renderedContent).toContain(
+        buildChannelTruncatedMarker(sessionId).trim(),
+      );
+      expect(renderedContent).toContain(
+        `agentmonitors events list --session ${sessionId} --unread`,
+      );
+      expect(renderedContent).not.toContain(CHANNEL_DEFERRED_MARKER.trim());
+
+      // The row is now genuinely committed (`first_notified_at` set) in the
+      // REAL store — a second real poll cycle must NOT re-surface the omitted
+      // tail: the cycle goes idle, proving commit really did stick (not just
+      // that a mock said so).
+      let pushAfterCommitCallCount = 0;
+      const second = await runChannelDeliveryCycle(sessionId, socket, () => {
+        pushAfterCommitCallCount += 1;
+        return Promise.resolve();
+      });
+      expect(second).toBe('idle');
+      expect(pushAfterCommitCallCount).toBe(0);
+
+      // The full, untruncated body is still retrievable — still unread
+      // (claiming ≠ acking) — via the EXACT command the marker advertised.
+      const stillUnread = unreadEvents();
+      const committedEvent = stillUnread.find((e) => e.id === eventId);
+      expect(committedEvent).toBeDefined();
+      expect(committedEvent?.body).toBe(hugeBody);
+    } finally {
+      try {
+        await callDaemon('stop', {}, { socketPath: socket });
+      } catch {
+        // already stopped
+      }
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 60_000);
 });
 
 // ---------------------------------------------------------------------------
