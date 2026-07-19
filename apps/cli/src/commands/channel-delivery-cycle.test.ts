@@ -569,6 +569,64 @@ describe('reserveSizedChannelDelivery actual-claim fit vs. renderer budget (issu
 });
 
 // ---------------------------------------------------------------------------
+// PR #442 round-4 review: a stale settled-high preview that seeded
+// `moreDeferred: true` must not be applied to a REMINDER reservation
+// (`claim.events: []`) that `reserveDelivery` legitimately returns instead —
+// the previewed rows raced to another transport's lease/claim before reserve
+// ran, and `renderChannelEvent` renders the reminder's `message` directly,
+// never consulting `moreDeferred`/`resolveChannelClaimFit` on that path.
+// ---------------------------------------------------------------------------
+describe('reserveSizedChannelDelivery eventless reminder claim (issue #442, round-4 review)', () => {
+  const REMINDER_CLAIM: DeliveryClaim = {
+    sessionId: 'session-1',
+    mode: 'delivery',
+    urgency: 'normal',
+    lifecycle: 'turn-interruptible',
+    message: '3 monitor(s) updated',
+    unreadCounts: { low: 0, normal: 2, high: 1, total: 3 },
+    events: [],
+  };
+
+  it('accepts a reminder claim with events: [] on the first reservation, without releasing or retrying, even when the stale high preview set moreDeferred', async () => {
+    // Two oversized high events in the preview force `moreDeferred: true` and
+    // a tight `maxEvents` — but by the time `reserveDelivery` runs, another
+    // transport has already leased/claimed both, so the reservation that
+    // comes back is a normal reminder (`events: []`), which core returns
+    // irrespective of `maxEvents` for the reminder branch.
+    const oversizedEvents = [
+      makeEvent({
+        eventId: 'e1',
+        monitorId: 'm1',
+        body: 'x'.repeat(MAX_CHANNEL_CONTENT),
+      }),
+      makeEvent({
+        eventId: 'e2',
+        monitorId: 'm2',
+        body: 'y'.repeat(MAX_CHANNEL_CONTENT),
+      }),
+    ];
+    previewMock.mockResolvedValueOnce(oversizedEvents);
+    reserveMock.mockResolvedValueOnce({
+      reservationId: 'r-reminder',
+      claim: REMINDER_CLAIM,
+    });
+
+    const result = await reserveSizedChannelDelivery('session-1', '/sock');
+
+    expect(result).not.toBeNull();
+    expect(result?.reservation.reservationId).toBe('r-reminder');
+    expect(result?.reservation.claim.events).toEqual([]);
+    // The stale high-preview's moreDeferred must not leak into the accepted
+    // reminder result: renderChannelEvent's reminder branch ignores it, so it
+    // would only ever cause a spurious release/retry loop here.
+    expect(result?.moreDeferred).toBe(false);
+    expect(releaseMock).not.toHaveBeenCalled();
+    expect(reserveMock).toHaveBeenCalledTimes(1);
+    expect(previewMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // PR #442 round-3 review: a release failure on the mismatch path must
 // propagate — not be swallowed — so the oversized reservation's stuck-leased
 // rows are surfaced as a cycle failure rather than misreported as `'idle'`.

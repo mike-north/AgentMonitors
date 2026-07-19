@@ -238,6 +238,25 @@ export async function reserveSizedChannelDelivery(
     );
     if (!reservation) return null;
 
+    // An eventless claim is a REMINDER (normal/low urgency, no settled-high
+    // body to inject): `reserveDelivery` legitimately returns one even when
+    // the preview above saw settled-high rows and set `maxEvents`/`moreDeferred`
+    // from them, because the preview↔reserve race let another transport
+    // lease/claim those previewed rows first (core ignores `maxEvents` for the
+    // reminder branch — it isn't sizing a body). `renderChannelEvent` renders
+    // the reminder's coalesced `message` as-is and never consults
+    // `moreDeferred`/`resolveChannelClaimFit` on this path (`channel-render.ts`),
+    // so validating the STALE high-preview's `moreDeferred` against this empty
+    // claim is meaningless: `resolveChannelClaimFit([], true, cap)` always
+    // reports `fits: false` (an empty block list can never satisfy a
+    // `moreDeferred`-forced marker fit), which released a perfectly valid
+    // reminder and retried/looped instead of surfacing it (issue #442, PR #442
+    // round-4 review). Accept it directly and clear `moreDeferred` — it
+    // describes the stale high preview, not this claim.
+    if (reservation.claim.events.length === 0) {
+      return { reservation, moreDeferred: false };
+    }
+
     // Trust only the ACTUAL claimed events from here — never the preview that
     // produced `maxEvents`, which can already be stale (see doc comment).
     // Validated against `resolveChannelClaimFit` — the SAME predicate
