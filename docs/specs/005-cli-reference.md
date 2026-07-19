@@ -1819,6 +1819,18 @@ agentmonitors verify [monitor] [--dir <path>] [--workspace <path>]
    is honored as the operator's real cap, and a timeout shorter than one interval still fails fast with
    `budget-exceeded`) to at least `2 × interval + margin`.
 
+   That observe-stage extension can let a **real** `triggered` row land after the single-interval
+   `detect` deadline the rest of the phase was sized against — e.g. a 20s-interval monitor with a
+   backgrounded trigger whose real change lands ~30s in: a real change observed at ~40s inside the
+   45s extended window, when the un-extended detect deadline was only 25s (issue #442 round 20).
+   Materialize and deliver (steps 7–8 below) therefore do not reuse that already-possibly-expired
+   `detect` deadline outright: `verify` re-grants them a fresh deadline of `max(detect deadline,
+observe's actual resolution time + postObserveBudgetMs)` — the same settle + high-claim-settle +
+   margin remainder `detectMs` already earmarked for these two stages, just measured from when observe
+   actually finished rather than from the original trigger time. Like the observe extension itself,
+   this re-grant applies only to the **default** derived budget; an explicit `--timeout-ms` keeps the
+   detect deadline as the hard total cap for materialize/deliver too.
+
 7. **Materialize.** Confirm an unread event exists for the session.
 8. **Deliver.** Claim via the **real `hook deliver` path** — for `high` urgency at
    `turn-interruptible` (previewing settled high events and packing them under the 4000-char cap
@@ -1893,14 +1905,26 @@ genuine `no-change` tick never enters a notify settle window), is the wall-clock
 stage's two-distinct-row `no-change` discriminator needs (issue #442 round 19, step 6 above). When
 using the **default** derived budget, `verify` extends the observe stage's own deadline to at least
 `noChangeConfirmMs` — past the single-interval `detect` deadline the rest of the phase (materialize,
-deliver) uses — so a genuine no-change verdict has time to gather its second confirming row instead
-of racing the shorter deadline into a spurious `budget-exceeded`. An explicit `--timeout-ms` is
-**never** extended this way: it is the operator's stated cap, so a value shorter than one interval
-still fails fast with `budget-exceeded` rather than being silently stretched. (These interval/settle defaults are
-sourced from the runtime's canonical `schedulingDefaults` export in `@agentmonitors/core` — the same
-values the daemon schedules against, not a hand-mirrored copy — and the settle resolution itself
-calls the same `defaultNotifyConfigForUrgency` function the runtime tick uses, so the budget estimate
-cannot drift from real scheduling or notify defaults.)
+deliver) was originally sized against — so a genuine no-change verdict has time to gather its second
+confirming row instead of racing the shorter deadline into a spurious `budget-exceeded`. An explicit
+`--timeout-ms` is **never** extended this way: it is the operator's stated cap, so a value shorter
+than one interval still fails fast with `budget-exceeded` rather than being silently stretched. (These
+interval/settle defaults are sourced from the runtime's canonical `schedulingDefaults` export in
+`@agentmonitors/core` — the same values the daemon schedules against, not a hand-mirrored copy — and
+the settle resolution itself calls the same `defaultNotifyConfigForUrgency` function the runtime tick
+uses, so the budget estimate cannot drift from real scheduling or notify defaults.)
+
+A fourth derived figure, `postObserveBudgetMs` (`settleMs + highClaimSettleMs + marginMs`, i.e.
+`detectMs - intervalMs` — the portion of `detectMs` NOT already spent on the observe stage's own
+interval term), is the budget materialize and deliver are re-granted, measured from whenever observe
+actually resolves rather than from the original trigger time (issue #442 round 20, step 6 above). This
+closes a gap the round-19 observe extension opened: a real `triggered` row landing in the extended
+observe window (after the single-interval `detect` deadline but before `noChangeConfirmMs`) would
+otherwise hand materialize/deliver an already-expired deadline and zero remaining time, failing
+`budget-exceeded` even though the event is durable. `totalMs` — the worst-case default maximum a fully
+successful run can take — folds all of this in: `baselineMs + max(detectMs, noChangeConfirmMs) +
+postObserveBudgetMs`. As with the observe extension, this re-grant applies only to the default derived
+budget; an explicit `--timeout-ms` keeps its own value as the hard total cap throughout.
 
 ### Output
 

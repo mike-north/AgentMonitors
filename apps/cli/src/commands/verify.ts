@@ -979,9 +979,30 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
       detail: 'change detected (triggered)',
     });
 
+    // #442 round 20: `detectDeadline` was sized assuming observe resolves
+    // within one interval, leaving `budget.postObserveBudgetMs` (settle +
+    // high-claim-settle + margin) for materialize/deliver. But the observe
+    // stage's OWN deadline can extend past `detectDeadline` (up to
+    // `noChangeConfirmMs`, for the two-distinct-row `no-change`
+    // discriminator above) — so a real `triggered` row landing in that
+    // extension window would otherwise hand materialize/deliver an
+    // already-expired `detectDeadline` and zero remaining time, failing
+    // `budget-exceeded` even though the event is durable (reproduced
+    // deterministically: a 20s-interval monitor with a backgrounded trigger
+    // whose real change lands ~30s in — observe passes ~40s in, inside the
+    // extended window, but the un-carried `detectDeadline` (25s) had already
+    // passed — see verify.integration.test.ts). Re-grant materialize/deliver a
+    // fresh deadline measured from when observe ACTUALLY resolved, using the
+    // same remainder budget — but only for the default derived budget; an
+    // explicit `--timeout-ms` keeps `detectDeadline` as the hard total cap
+    // (never extended, matching the observe-stage override semantics above).
+    const postObserveDeadline = timeoutOverridden
+      ? detectDeadline
+      : Math.max(detectDeadline, Date.now() + budget.postObserveBudgetMs);
+
     // Materialize: confirm an unread event exists for the session.
     inFlightStage = 'materialize';
-    const event = await pollUntil(detectDeadline, daemon, async () => {
+    const event = await pollUntil(postObserveDeadline, daemon, async () => {
       const events = await listEventsClient(
         {
           sessionId: session?.id ?? '',
@@ -1020,8 +1041,11 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
     const hookEventName =
       lifecycle === 'turn-interruptible' ? 'UserPromptSubmit' : 'SessionStart';
     inFlightStage = 'deliver';
+    // Same carried deadline as materialize above (#442 round 20) — deliver is
+    // the second half of the remainder budget re-granted from observe's
+    // actual resolution time, not a second independent extension.
     const additionalContext = await pollUntil(
-      detectDeadline,
+      postObserveDeadline,
       daemon,
       async () => {
         const rendered = await claimAndRender(
