@@ -36,6 +36,7 @@ export default defineConfig({
       // Spawns a real `channel serve` subprocess and waits for it to exit on
       // its own, so it belongs with the other process-spawning suites.
       '**/channel-shutdown.integration.test.ts',
+      '**/transport-health.integration.test.ts',
     ],
   },
 });
