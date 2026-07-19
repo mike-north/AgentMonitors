@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Observation } from '../observation/types.js';
 import {
+  DEFAULT_OPERATION_TIMEOUT_MS,
   createDebounceNotifier,
   createImmediateNotifier,
   createThrottleNotifier,
   parseDuration,
+  parseOperationTimeoutMs,
 } from './notifier.js';
 
 const obs = (title: string): Observation => ({ title });
@@ -32,6 +34,48 @@ describe('parseDuration', () => {
 
   it('throws on missing unit', () => {
     expect(() => parseDuration('5')).toThrow('Invalid duration');
+  });
+});
+
+// Issue #304 review, findings 5 + 6: `api-poll` and `command-poll` each
+// hand-maintained an identical `timeout` scope-field default/parse/pattern —
+// this is the shared helper both now call.
+describe('parseOperationTimeoutMs', () => {
+  it('falls back to the shared default when the raw value is undefined', () => {
+    expect(parseOperationTimeoutMs(undefined)).toBe(
+      DEFAULT_OPERATION_TIMEOUT_MS,
+    );
+  });
+
+  it('falls back to the shared default for a non-string raw value', () => {
+    // Matches both plugins' pre-existing behavior: a non-string `timeout` is
+    // silently treated as "omitted" rather than a validation error here — the
+    // JSON Schema `pattern` check is what rejects a malformed author value.
+    expect(parseOperationTimeoutMs(42)).toBe(DEFAULT_OPERATION_TIMEOUT_MS);
+  });
+
+  it('parses a present string via parseDuration', () => {
+    expect(parseOperationTimeoutMs('5m')).toBe(300_000);
+  });
+
+  it('rejects "0s" — a zero-length deadline is never meaningful', () => {
+    expect(() => parseOperationTimeoutMs('0s')).toThrow(
+      /Invalid timeout: "0s"/,
+    );
+  });
+
+  it('rejects "0m", "0h", and "0d" the same way as "0s"', () => {
+    for (const zero of ['0m', '0h', '0d']) {
+      expect(() => parseOperationTimeoutMs(zero)).toThrow(
+        /A zero-length timeout is not allowed/,
+      );
+    }
+  });
+
+  it('propagates the underlying parseDuration error for a malformed value', () => {
+    expect(() => parseOperationTimeoutMs('soon')).toThrow(
+      /Invalid duration: "soon"/,
+    );
   });
 });
 
