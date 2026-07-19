@@ -884,6 +884,21 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
     // fail-fast 'no-change'/'no-files-matched' (the trigger did nothing).
     inFlightStage = 'observe';
     const detectDeadline = observeFrom + detectCapMs;
+    // A tick that was already IN FLIGHT (mid-scan) when the trigger fired can
+    // still finish and record its (necessarily stale, pre-trigger) `no-change`
+    // row AFTER `observeFrom` once the daemon is under enough scheduling delay
+    // (heavy CPU contention — the exact condition a shared CI runner can hit,
+    // even inside this suite's own serial/single-daemon isolation). That row
+    // satisfies the `createdAt > observeFrom` filter below even though it never
+    // actually observed the post-trigger state, wrongly fail-fasting `verify`.
+    // Guard against it the same way the `suppressed` carve-out above already
+    // does for the debounce case: don't trust the FIRST post-trigger
+    // `no-change` sighting as decisive — require it to persist for a full
+    // monitor interval (long enough for a tick that genuinely started after
+    // the trigger to run and see the change) before treating it as a verdict.
+    // A `triggered` row arriving in that window (the real, non-stale tick)
+    // still wins immediately via the check above it.
+    let noChangeSince: number | null = null;
     const observed = await pollUntil<
       'triggered' | 'no-change' | 'no-files-matched'
     >(
@@ -917,8 +932,11 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
           post.some((r) => r.result === 'no-change') &&
           !post.some((r) => r.result === 'suppressed')
         ) {
+          noChangeSince ??= Date.now();
+          if (Date.now() - noChangeSince < budget.intervalMs) return null;
           return 'no-change';
         }
+        noChangeSince = null;
         return null;
       },
       () => {
