@@ -509,20 +509,32 @@ describe('reserveSizedChannelDelivery actual-claim fit vs. renderer budget (issu
       makeEvent({ eventId: 'e1', monitorId: 'm1', body: BOUNDARY_BODY }),
       makeEvent({ eventId: 'e2', monitorId: 'm2', body: BOUNDARY_BODY }),
     ];
-    // A third, unrelated settled event forces the preview-time sizing to
-    // moreDeferred: true (its own pack, over 3 events, already reserves
-    // marker room and sizes down to 1) — but the mocked reservation
-    // "substitutes" the two boundary-sized events instead (mirroring the
-    // preview↔reserve race the existing race(a)/(b) tests exercise), so the
-    // actually-claimed set is exactly the boundary pair above.
+    // The preview must be faithful to what `packChannelEventsUnderCap` (core's
+    // actual sizing function) computes `maxEvents` as — otherwise the mocked
+    // reservation below (returning 2 events) is a claim core could never
+    // produce for that `maxEvents`. Two small preview events fit the full cap
+    // easily; a third, oversized one pushes the joined set over
+    // MAX_CHANNEL_CONTENT, forcing marker-room reservation. That reserved
+    // pack still fits the two small blocks (they're tiny), so
+    // `packChannelEventsUnderCap` sizes `maxEvents` to 2 (moreDeferred: true,
+    // since 2 < 3 previewed) — a reservation returning 2 events is exactly
+    // what core would produce here. The mocked reservation then "substitutes"
+    // the two BOUNDARY-sized events instead (mirroring the preview↔reserve
+    // race the existing race(a)/(b) tests exercise), so the actually-claimed
+    // set is the boundary pair above — same count (2) as `maxEvents`, but
+    // sized to land in the exact boundary window this test targets.
+    const previewSmallEvents = [
+      makeEvent({ eventId: 'p1', monitorId: 'p1', body: 'small body 1' }),
+      makeEvent({ eventId: 'p2', monitorId: 'p2', body: 'small body 2' }),
+    ];
     const thirdEvent = makeEvent({
       eventId: 'e3',
       monitorId: 'm3',
-      body: 'z'.repeat(200),
+      body: 'z'.repeat(19_960),
     });
     previewMock.mockResolvedValueOnce([
-      boundaryEvents[0] as DeliveryEventSummary,
-      boundaryEvents[1] as DeliveryEventSummary,
+      previewSmallEvents[0] as DeliveryEventSummary,
+      previewSmallEvents[1] as DeliveryEventSummary,
       thirdEvent,
     ]);
     const mismatchedClaim = claimWith(boundaryEvents);
