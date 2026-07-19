@@ -1748,20 +1748,32 @@ arrives — with completely different causes and fixes. `doctor` therefore print
 transports** section above the checks, built from the transport heartbeats each transport writes
 (006 §12), and reports each cause **distinctly**; a generic "unhealthy" is explicitly not acceptable:
 
-| Problem code                      | Means                                                                                  |
-| --------------------------------- | -------------------------------------------------------------------------------------- |
-| `daemon-unreachable`              | No daemon for this workspace: nothing can deliver, however healthy the transports      |
-| `workspace-mismatch`              | This session's transport is bound to a **different workspace** than the monitors       |
-| `socket-mismatch`                 | Same workspace, but bound to a different (usually dead) daemon socket                  |
-| `environment-mismatch`            | The transport resolved a different `HOME` / data root, so it reads a different db      |
-| `reminders-suppressed`            | Transports are up but reminders are **muted** by `coalesced-until-ack` (002 §9.2/§9.3) |
-| `heartbeat-stale`                 | A transport registered but its lease lapsed — presumed killed without cleanup          |
-| `version-skew`                    | Advisory: a long-lived transport is still serving an older CLI build than this one     |
-| `channel-registration-unverified` | Advisory: the host never confirms channel registration; prove delivery end to end      |
+| Problem code                      | Means                                                                                                                                      |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `daemon-unreachable`              | No daemon for this workspace: nothing can deliver, however healthy the transports                                                          |
+| `workspace-mismatch`              | This session's transport is bound to a **different workspace** than the monitors                                                           |
+| `socket-mismatch`                 | Same workspace, but bound to a different (usually dead) daemon socket                                                                      |
+| `environment-mismatch`            | The transport resolved a different `HOME` / data root, so it reads a different db                                                          |
+| `reminders-suppressed`            | Transports are up but reminders are **muted** by `coalesced-until-ack` (002 §9.2/§9.3)                                                     |
+| `heartbeat-stale`                 | A transport registered but its lease lapsed — presumed killed without cleanup                                                              |
+| `version-skew`                    | Advisory: a long-lived transport is still serving an older CLI build than this one                                                         |
+| `channel-registration-unverified` | Advisory: the host never confirms channel registration; prove delivery end to end                                                          |
+| `delivery-diagnosis-unavailable`  | The daemon's suppression check itself failed for one or more lead sessions — **not** the same as "checked, nothing suppressed" (see below) |
 
-`daemon-unreachable` and `reminders-suppressed` are **pipeline-wide** — they block the hook and
-channel paths alike — so they are recorded on every configured transport in `--json` but rendered
-**once**, at the verdict, rather than repeated per row as if they were independent failures.
+`daemon-unreachable`, `reminders-suppressed`, and `delivery-diagnosis-unavailable` are
+**pipeline-wide** — they block the hook and channel paths alike — so they are recorded on every
+configured transport in `--json` but rendered **once**, at the verdict, rather than repeated per row
+as if they were independent failures.
+
+**`delivery-diagnosis-unavailable` (issue #425 review, round 4).** `doctor` asks the daemon's
+`hook.diagnose` RPC, per lead session, whether reminders are currently suppressed
+(`reminders-suppressed` above). That call can itself fail — e.g. an older daemon build that predates
+`hook.diagnose` and rejects it as unsupported, or a connection error mid-report — and before this fix
+a failed call was silently dropped, leaving the returned diagnosis set indistinguishable from "the
+check ran and found nothing suppressed". `deliverable` then read `true` even though whether a
+suppression was active had never actually been answered — a false green. `delivery-diagnosis-unavailable`
+makes that distinction explicit and, unlike the two advisory codes above, IS blocking: `deliverable`
+can never be `true` while it is present, precisely because "unknown" must not be reported as "healthy".
 
 `version-skew` and `channel-registration-unverified` are the two **advisory, non-blocking** codes: both
 are reported when present, but neither counts toward a transport's `healthy` field, its `fail` status,

@@ -71,7 +71,17 @@ export type TransportProblemCode =
   /** A long-lived transport is running an older CLI than this one. */
   | 'version-skew'
   /** The channel is up, but host-side channel registration is unprovable here. */
-  | 'channel-registration-unverified';
+  | 'channel-registration-unverified'
+  /**
+   * (c') Whether reminders are suppressed could not be determined for one or
+   * more lead sessions — the daemon's `hook.diagnose` call failed (e.g. an
+   * older daemon that rejects it as unsupported). Distinct from
+   * `reminders-suppressed`: that code means the check ran and found an active
+   * suppression; this one means the check never ran at all, so a suppression
+   * could be silently active. `deliverable` must not read `true` while this is
+   * present (issue #425 review, round 4).
+   */
+  | 'delivery-diagnosis-unavailable';
 
 /**
  * Problems that belong to the delivery pipeline as a whole rather than to one
@@ -84,6 +94,7 @@ export type TransportProblemCode =
 const SHARED_PROBLEM_CODES: readonly TransportProblemCode[] = [
   'daemon-unreachable',
   'reminders-suppressed',
+  'delivery-diagnosis-unavailable',
 ];
 
 /** Whether a problem is pipeline-wide (report once) or transport-owned. */
@@ -185,6 +196,14 @@ export interface TransportHealthInput {
   heartbeats: readonly TransportHeartbeat[];
   /** Per-lead-session delivery diagnoses, when the daemon was reachable. */
   diagnoses: readonly HookDeliveryDiagnosis[];
+  /**
+   * Ids of lead sessions whose delivery diagnosis could not be obtained (the
+   * daemon's `hook.diagnose` call threw). Non-empty here means the
+   * suppression check was skipped for at least one session — not that it ran
+   * and found nothing — so it must block `deliverable` rather than being
+   * indistinguishable from "no suppression".
+   */
+  diagnosisUnavailableSessionIds: readonly string[];
   /** This CLI's own version, for skew comparison. */
   cliVersion: string;
   /**
@@ -318,6 +337,35 @@ function suppressionProblems(input: TransportHealthInput): TransportProblem[] {
             `Acknowledge the claimed events so the reminder re-fires: \`agentmonitors events ack --session ${sessionId}\`.`,
         )
         .join(' '),
+    },
+  ];
+}
+
+/**
+ * Report the sessions for which the suppression check itself could not be
+ * run, rather than letting a skipped check read as "checked, nothing found".
+ *
+ * Reported once as a pipeline-wide problem (like {@link suppressionProblems}):
+ * `hook.diagnose` failing is a property of the daemon connection, not of one
+ * transport, so attributing it to a single transport row would wrongly imply
+ * the other transport's suppression state was actually verified.
+ */
+function diagnosisUnavailableProblems(
+  input: TransportHealthInput,
+): TransportProblem[] {
+  if (input.diagnosisUnavailableSessionIds.length === 0) return [];
+  const sessions = input.diagnosisUnavailableSessionIds;
+  return [
+    {
+      code: 'delivery-diagnosis-unavailable',
+      detail:
+        `Whether reminders are currently suppressed could not be determined ` +
+        `for ${String(sessions.length)} lead session(s) (${sessions.join(', ')}): ` +
+        `the daemon's delivery-diagnosis request failed (for example, an older ` +
+        `daemon build that predates it). A suppression could be silently active, ` +
+        `so this cannot be reported as deliverable.`,
+      remediation:
+        'Restart the daemon on the current CLI build (`agentmonitors daemon run` after stopping any older one), then re-run `agentmonitors doctor`.',
     },
   ];
 }
@@ -499,6 +547,7 @@ export function computeTransportHealth(
   const sharedProblems: TransportProblem[] = [];
   if (!input.daemonRunning) sharedProblems.push(daemonProblem(input));
   sharedProblems.push(...suppressionProblems(input));
+  sharedProblems.push(...diagnosisUnavailableProblems(input));
 
   const hook = buildTransport('hook', input, sharedProblems);
   const channel = buildTransport('channel', input, sharedProblems);
@@ -541,13 +590,19 @@ export function computeTransportHealth(
   const suppressed = sharedProblems.some(
     (problem) => problem.code === 'reminders-suppressed',
   );
+  const diagnosisUnavailable = input.diagnosisUnavailableSessionIds.length > 0;
   const deliverable =
-    hasActiveLead && reach !== 'none' && input.daemonRunning && !suppressed;
+    hasActiveLead &&
+    reach !== 'none' &&
+    input.daemonRunning &&
+    !suppressed &&
+    !diagnosisUnavailable;
 
   const verdict = buildVerdict(
     reach,
     input,
     suppressed,
+    diagnosisUnavailable,
     deliverable,
     hasActiveLead,
     transports,
@@ -578,6 +633,7 @@ function buildVerdict(
   reach: DeliveryReach,
   input: TransportHealthInput,
   suppressed: boolean,
+  diagnosisUnavailable: boolean,
   deliverable: boolean,
   hasActiveLead: boolean,
   transports: readonly TransportStatus[],
@@ -613,6 +669,9 @@ function buildVerdict(
   }
   if (suppressed) {
     return `${base}, but NOT deliverable right now: reminders are suppressed (coalesced-until-ack) — new events will not surface until the claimed ones are acknowledged.`;
+  }
+  if (diagnosisUnavailable) {
+    return `${base}, but NOT deliverable: whether reminders are suppressed could not be determined (the daemon's delivery-diagnosis request failed) — see the problems above.`;
   }
   return deliverable
     ? `${base} (healthy).`

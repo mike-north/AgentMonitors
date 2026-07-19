@@ -1,5 +1,8 @@
 import { createHash } from 'node:crypto';
 import {
+  closeSync,
+  constants as fsConstants,
+  openSync,
   readFileSync,
   readdirSync,
   renameSync,
@@ -311,10 +314,27 @@ export function writeTransportHeartbeat(
     // same record concurrently would otherwise write the same temp file and
     // could rename each other's partial content into place.
     const tmp = `${target}.${String(process.pid)}.tmp`;
-    writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`, {
-      encoding: 'utf-8',
-      mode: PRIVATE_FILE_MODE,
-    });
+    // The temp path is still deterministic (this pid's own prior crash could
+    // have left a stale file, or the registry directory predates the 0700
+    // migration and something planted a symlink there), so treat whatever
+    // sits there as hostile — mirroring `writePrivateFileAtomic`
+    // (local-permissions.ts): remove it (`rm` does not follow symlinks) and
+    // recreate with `O_EXCL`, which refuses to follow a symlink planted
+    // between the two calls. A plain `writeFileSync(tmp, ...)` would instead
+    // follow a pre-planted symlink and overwrite whatever it points at.
+    rmSync(tmp, { force: true });
+    const fd = openSync(
+      tmp,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL,
+      PRIVATE_FILE_MODE,
+    );
+    try {
+      writeFileSync(fd, `${JSON.stringify(record, null, 2)}\n`, {
+        encoding: 'utf-8',
+      });
+    } finally {
+      closeSync(fd);
+    }
     renameSync(tmp, target);
   } catch {
     return undefined;
@@ -444,6 +464,14 @@ export function readTransportHeartbeats(now?: Date): TransportHeartbeat[] {
   return records;
 }
 
+/**
+ * Tolerance for ordinary clock skew between a heartbeat's writer and whatever
+ * process later reads it back (`doctor`, GC on the next write). A few seconds
+ * of drift between two processes' clocks is normal; anything beyond it is not
+ * skew, it is a corrupt or forged record.
+ */
+export const HEARTBEAT_FUTURE_TOLERANCE_MS = 5_000;
+
 /** Whether a record's lease has expired as of `now`. */
 export function isHeartbeatStale(
   heartbeat: TransportHeartbeat,
@@ -454,5 +482,15 @@ export function isHeartbeatStale(
   // — the conservative direction: we would rather flag a live transport for
   // inspection than report a dead one as healthy.
   if (Number.isNaN(updatedAt)) return true;
-  return now.getTime() - updatedAt > heartbeat.ttlMs;
+  const age = now.getTime() - updatedAt;
+  // A negative `age` means `updatedAt` is in the future relative to `now`. Past
+  // the small clock-skew tolerance above, that can only be a corrupt record or
+  // a writer with a badly wrong clock — and treating a future timestamp as
+  // "infinitely fresh" is the wrong failure mode: it would never age past its
+  // TTL, so `readTransportHeartbeats`' opportunistic GC would never reap it,
+  // and `doctor` would keep reporting a possibly-dead transport as `running`
+  // forever (issue #425 review, round 4). Report it as stale instead — the
+  // same conservative direction as the unparseable-timestamp case above.
+  if (age < -HEARTBEAT_FUTURE_TOLERANCE_MS) return true;
+  return age > heartbeat.ttlMs;
 }

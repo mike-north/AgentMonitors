@@ -3,8 +3,10 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import os from 'node:os';
@@ -551,6 +553,30 @@ describe('isHeartbeatStale', () => {
       isHeartbeatStale({ ...base, updatedAt: 'whenever' }, new Date()),
     ).toBe(true);
   });
+
+  // Regression: a FUTURE `updatedAt` (clock skew or a corrupt/forged record)
+  // used to be treated as fresh forever — `now - updatedAt` is negative, so it
+  // is never `> ttlMs` no matter how far in the future the record claims to be.
+  // That blocked opportunistic GC (`readTransportHeartbeats` never reaped it)
+  // and let `doctor` report a dead transport as `running` indefinitely (issue
+  // #425 review, round 4).
+  it('treats a far-future updatedAt as stale, not fresh forever', () => {
+    expect(
+      isHeartbeatStale(
+        { ...base, updatedAt: '2026-07-20T12:00:00.000Z' },
+        new Date('2026-07-19T12:00:00.000Z'),
+      ),
+    ).toBe(true);
+  });
+
+  it('tolerates a few seconds of future clock skew as fresh', () => {
+    expect(
+      isHeartbeatStale(
+        { ...base, updatedAt: '2026-07-19T12:00:02.000Z' },
+        new Date('2026-07-19T12:00:00.000Z'),
+      ),
+    ).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -602,6 +628,61 @@ describe.skipIf(process.platform === 'win32')(
       });
 
       expect(mode(transportRegistryDir())).toBe(0o700);
+    });
+  },
+);
+
+// ---------------------------------------------------------------------------
+// The temp-file write must not follow a pre-planted symlink at its
+// deterministic path (issue #425 review, round 4). The registry directory
+// predates the 0700 migration in some installs, so a symlink planted there
+// while it was still permissive must not let a later refresh overwrite
+// whatever that symlink points at.
+// ---------------------------------------------------------------------------
+describe.skipIf(process.platform === 'win32')(
+  'writeTransportHeartbeat does not follow a planted symlink at the temp path (issue #425 review)',
+  () => {
+    it('removes a pre-planted symlink at the temp path instead of following it', () => {
+      // Establish the real target file and learn its exact on-disk name.
+      writeTransportHeartbeat({
+        transport: 'hook',
+        workspacePath: WORKSPACE,
+        socketPath: SOCKET,
+        now: new Date('2026-07-19T12:00:00.000Z'),
+      });
+      const [recordName] = readdirSync(transportRegistryDir()).filter((name) =>
+        name.startsWith('hook-'),
+      );
+      if (recordName === undefined) throw new Error('no hook record written');
+      const target = path.join(transportRegistryDir(), recordName);
+      const tmpPath = `${target}.${String(process.pid)}.tmp`;
+
+      // Plant a symlink at the deterministic temp path, pointing at an
+      // unrelated "victim" file outside the registry — exactly what an
+      // attacker with write access during the pre-migration permissive window
+      // could have left behind.
+      const victim = path.join(dataHome, 'victim.txt');
+      writeFileSync(victim, 'do-not-overwrite');
+      symlinkSync(victim, tmpPath);
+
+      writeTransportHeartbeat({
+        transport: 'hook',
+        workspacePath: WORKSPACE,
+        socketPath: SOCKET,
+        now: new Date('2026-07-19T12:05:00.000Z'),
+      });
+
+      // The victim file must be untouched — a plain `writeFileSync(tmpPath,
+      // ...)` would have followed the symlink and clobbered it.
+      expect(readFileSync(victim, 'utf-8')).toBe('do-not-overwrite');
+      // The real record still refreshed correctly.
+      const record: unknown = JSON.parse(readFileSync(target, 'utf-8'));
+      expect(isTransportHeartbeat(record)).toBe(true);
+      if (!isTransportHeartbeat(record)) throw new Error('unreachable');
+      expect(record.updatedAt).toBe('2026-07-19T12:05:00.000Z');
+      // The symlink at the temp path was consumed (rm'd, then recreated as a
+      // real file which was renamed away) rather than left dangling.
+      expect(() => statSync(tmpPath)).toThrow();
     });
   },
 );

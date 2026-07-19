@@ -612,6 +612,18 @@ function toJson(
   return JSON.stringify(payload, null, 2);
 }
 
+/** The result of asking the daemon for every lead session's delivery diagnosis. */
+interface DeliveryDiagnosisResult {
+  diagnoses: HookDeliveryDiagnosis[];
+  /**
+   * Ids of lead sessions for which at least one lifecycle's diagnosis could
+   * not be obtained (e.g. an older daemon that rejects `hook.diagnose` as
+   * unsupported — `DaemonUnsupportedRequestError`, issue #382 — or a
+   * transient connection failure mid-report).
+   */
+  unavailableSessionIds: string[];
+}
+
 /**
  * Ask the daemon why delivery would be withheld for each lead session, at both
  * reminder lifecycles.
@@ -621,16 +633,26 @@ function toJson(
  * only one would silently miss the other band's suppression, which is the exact
  * class of blind spot this surface exists to close.
  *
- * A diagnosis failure is skipped rather than propagated: `doctor` is a
- * read-only diagnostic, and one unavailable sub-answer must not take down the
- * whole report. The transports section then simply reports no suppression,
- * which is what it would have reported for a healthy session anyway.
+ * A per-call diagnosis failure does not abort the whole report — `doctor` is a
+ * read-only diagnostic, and one unavailable sub-answer must not take down
+ * every other check — but it is NOT silently swallowed either: before this fix,
+ * a thrown `hook.diagnose` (e.g. `DaemonUnsupportedRequestError` from an older
+ * daemon build) left `diagnoses` looking identical to "no suppression is
+ * active", so `computeTransportHealth` reported `deliverable: true` even
+ * though whether reminders were suppressed was never actually answered — a
+ * false green (issue #425 review, round 4). Every failed lifecycle now records
+ * its session id in `unavailableSessionIds`, which the caller threads into
+ * {@link computeTransportHealth} as an explicit, named advisory so `deliverable`
+ * can never read `true` while the check was skipped.
  */
-async function gatherDeliveryDiagnoses(
+// Exported for unit testing (doctor.test.ts) — not part of the CLI's public
+// surface, which is `doctorCommand` alone.
+export async function gatherDeliveryDiagnoses(
   report: MonitorDoctorReport,
   socketPath: string,
-): Promise<HookDeliveryDiagnosis[]> {
+): Promise<DeliveryDiagnosisResult> {
   const diagnoses: HookDeliveryDiagnosis[] = [];
+  const unavailableSessionIds = new Set<string>();
   for (const session of report.leadSessions) {
     for (const lifecycle of ['turn-interruptible', 'turn-idle'] as const) {
       try {
@@ -638,11 +660,11 @@ async function gatherDeliveryDiagnoses(
           await diagnoseHookDeliveryClient(session.id, lifecycle, socketPath),
         );
       } catch {
-        continue;
+        unavailableSessionIds.add(session.id);
       }
     }
   }
-  return diagnoses;
+  return { diagnoses, unavailableSessionIds: [...unavailableSessionIds] };
 }
 
 export const doctorCommand = new Command('doctor')
@@ -744,9 +766,9 @@ export const doctorCommand = new Command('doctor')
         // claimed — so it is only asked when the daemon answered; the persisted
         // fallback state cannot compute it. When it is unavailable the surface
         // reports the down daemon instead, which is the dominant problem anyway.
-        const diagnoses = daemonRunning
+        const { diagnoses, unavailableSessionIds } = daemonRunning
           ? await gatherDeliveryDiagnoses(report, socketPath)
-          : [];
+          : { diagnoses: [], unavailableSessionIds: [] };
         const health = computeTransportHealth({
           workspacePath: workspace,
           socketPath,
@@ -765,6 +787,7 @@ export const doctorCommand = new Command('doctor')
             .map((session) => session.hostSessionId),
           heartbeats: readTransportHeartbeats(report.generatedAt),
           diagnoses,
+          diagnosisUnavailableSessionIds: unavailableSessionIds,
           cliVersion: getCliVersion(),
           // Supplied by the caller, not read inside `computeTransportHealth`
           // (issue #425 review): the function's own doc claims purity ("every

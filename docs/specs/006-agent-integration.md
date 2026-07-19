@@ -1447,6 +1447,15 @@ already recorded, rather than resetting it — a per-invocation whole-record ove
 would make `lastDelivery` read `never` on almost every hook invocation, inverting its diagnostic
 purpose.
 
+Every write is also atomic and symlink-safe (issue #425 review, round 4), mirroring
+`writePrivateFileAtomic` (000, local-permissions.ts): the record is written to a deterministic sibling
+temp path, then renamed into place. Because the registry directory predates the 0700-owner-only
+migration in some installs, the temp path cannot be trusted blindly — a symlink planted there while
+the directory was still permissive would let a plain `writeFileSync` follow it and clobber whatever it
+points at. The write therefore removes any pre-existing path at the temp location first (`rm` does not
+follow symlinks) and (re)creates it with `O_EXCL`, which refuses to follow a symlink planted between
+the two calls, before writing and renaming.
+
 ### 12.2.1 The channel heartbeat is not gated on the poll settling
 
 `channel serve`'s heartbeat refreshes on its own timer, independent of how long any single poll's
@@ -1474,6 +1483,15 @@ file is then removed. Without this, an uncleanly-killed transport's file would s
 every subsequent `doctor` run in that workspace would fail `[heartbeat-stale]` permanently, even long
 after no lead session was ever open again, which is precisely the "cry wolf on nothing actually open"
 outcome the health surface exists to avoid (005 §15).
+
+**A future `updatedAt` is stale, not "fresh forever" (issue #425 review, round 4).** Staleness is
+computed as `now - updatedAt > ttlMs`; a record whose `updatedAt` is somehow ahead of `now` (clock
+skew between writer and reader, or a corrupt/forged record) makes that difference negative, which is
+never `> ttlMs` no matter how far in the future the timestamp claims to be — such a record would never
+age out. Beyond a small clock-skew tolerance (a few seconds), a future `updatedAt` is therefore treated
+as stale, the same conservative direction already used for an unparseable timestamp: it both restores
+GC (an un-aging record was invisible to the reaper above) and stops `doctor` from reporting a dead or
+bogus transport as `running` indefinitely.
 
 ### 12.3 Registry layout is load-bearing
 
@@ -1518,6 +1536,12 @@ heartbeat clobber another's and a reader judge the wrong session's binding.
 4. Separate "which method is listening" from "will anything actually arrive right now". Suppression
    is precisely where those two answers diverge, and reporting only the first is what hid a real CI
    failure.
+5. Never report "unknown" as "healthy". Answering (4) requires asking the daemon, per lead session,
+   whether a reminder is currently suppressed; if that ASK itself fails (an older daemon rejecting the
+   request as unsupported, or a connection error), `doctor` must say so explicitly
+   (`delivery-diagnosis-unavailable`, 005 §15) rather than silently treating a failed check the same
+   as a check that ran and found nothing — the latter is exactly the false-green issue #425 review
+   round 4 found.
 
 ### 12.5 What a heartbeat cannot prove
 

@@ -69,6 +69,7 @@ function input(
     leadHostSessionIds: [HOST_SESSION],
     heartbeats: [heartbeat('hook'), heartbeat('channel')],
     diagnoses: [],
+    diagnosisUnavailableSessionIds: [],
     cliVersion: CLI_VERSION,
     expectedHome: os.homedir(),
     expectedDataRoot: resolveDataRoot(),
@@ -478,6 +479,71 @@ describe('computeTransportHealth', () => {
         }),
       );
       expect(settling.deliverable).toBe(true);
+    });
+  });
+
+  // Regression: `doctor` used to swallow a thrown `hook.diagnose` (e.g. an
+  // older daemon rejecting it as unsupported) and proceed as if the check had
+  // run and found no suppression, so `deliverable` read `true` even though
+  // whether reminders were suppressed was never actually answered (issue #425
+  // review, round 4).
+  describe('failure mode (c′): delivery-diagnosis check itself unavailable', () => {
+    it('reports a distinct advisory code, not a bare pass', () => {
+      const health = computeTransportHealth(
+        input({
+          diagnoses: [],
+          diagnosisUnavailableSessionIds: ['session-abc'],
+        }),
+      );
+      const codes = health.pipelineProblems.map((problem) => problem.code);
+      expect(codes).toContain('delivery-diagnosis-unavailable');
+      expect(codes).not.toContain('reminders-suppressed');
+    });
+
+    it('never reports deliverable=true while the check was skipped, even with both transports listening', () => {
+      const health = computeTransportHealth(
+        input({
+          diagnoses: [],
+          diagnosisUnavailableSessionIds: ['session-abc'],
+        }),
+      );
+      expect(health.deliveryWillReachThisSession).toBe('both');
+      expect(health.deliverable).toBe(false);
+      expect(health.verdict).toContain('could not be determined');
+    });
+
+    it('names the affected session in the detail', () => {
+      const health = computeTransportHealth(
+        input({
+          diagnoses: [],
+          diagnosisUnavailableSessionIds: ['session-abc'],
+        }),
+      );
+      const problem = health.pipelineProblems.find(
+        (candidate) => candidate.code === 'delivery-diagnosis-unavailable',
+      );
+      expect(problem?.detail).toContain('session-abc');
+      expect(problem?.remediation).toContain('agentmonitors daemon run');
+    });
+
+    it('is attached to every configured transport, not just one', () => {
+      const health = computeTransportHealth(
+        input({
+          diagnoses: [],
+          diagnosisUnavailableSessionIds: ['session-abc'],
+        }),
+      );
+      for (const transport of health.transports) {
+        expect(codesOf(transport)).toContain('delivery-diagnosis-unavailable');
+      }
+    });
+
+    it('does not report the code at all when every diagnosis succeeded', () => {
+      const health = computeTransportHealth(input({ diagnoses: [] }));
+      expect(
+        health.pipelineProblems.map((problem) => problem.code),
+      ).not.toContain('delivery-diagnosis-unavailable');
+      expect(health.deliverable).toBe(true);
     });
   });
 
