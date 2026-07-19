@@ -65,6 +65,16 @@ changed — the reminder never carries per-event detail. Only `high` urgency inj
 content directly into the turn. If you want the agent to react to specifics without acknowledging
 first, use `urgency: high`.
 
+**`high` and recap deliveries also need an explicit ack, and acking un-mutes the reminder.** Claiming
+a `high`-urgency delivery (or a `post-compact` recap) marks the events it renders **claimed**, not
+**acknowledged** — and until they're acknowledged, the coalesced `normal`/`low` reminder above stays
+**suppressed** for that session, even for unrelated events, because a session with any
+claimed-but-unacknowledged event no longer has "every unread event of the band still unclaimed" (the
+condition the reminder requires to fire). Because of this, every `high`/recap delivery carries its own
+one-line acknowledge instruction naming the exact ids it just showed you (e.g. `agentmonitors events
+ack --session <id> --event-ids <id1>,<id2>`) — run it once you've handled what it showed. Acking is
+what turns the coalesced reminder back on for the next `normal`/`low` event.
+
 _Governing spec: 002 §9.1 (high), §9.2 (normal), §9.3 (low), §9.4 (recap)._
 
 ## What the Claude Code plugin automates (hooks)

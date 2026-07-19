@@ -42,7 +42,7 @@ received notification is printed to stdout.
 `normal` — a coalesced reminder:
 
 ```json
-{ "content": "Monitored changes are pending. Run `agentmonitors events list --session <id> --unread` to see them, then `agentmonitors events ack --session <id>` once handled.",
+{ "content": "Monitored changes are pending. Call the agentmon_ack tool, or run `agentmonitors events list --session <id> --unread` for details.",
   "meta": { "lifecycle": "turn-interruptible", "mode": "delivery", "event_count": "1", "urgency": "normal" } }
 ```
 

@@ -235,9 +235,14 @@ content the hook path injects**, not a lesser summary. Two claim shapes render d
   WHOLE blocks under its own, much larger content ceiling — §5.5 below).
 
 - **Reminder claim** (`normal`/`low` — no event bodies, only a coalesced advisory `message`):
-  `content` renders that generic message as-is, aside from the same tag-safety sanitization applied
-  above — this shape needs no packing (a coalesced message is already small), same as the
-  body-injection claim (002 §9.2) — with **no** body injection.
+  `content` renders that generic message, sanitized for tag safety, **plus this transport's own
+  action step** appended after it (§5.1.1, PR #445 review finding 2) — the runtime's message alone no
+  longer names a CLI verb, so the channel appends "Call the agentmon_ack tool, or run `agentmonitors
+events list --session <id> --socket <path> --unread` for details." rather than repeating the hook's
+  `events ack` command, which a channel-connected agent has no use for. This combined string is still
+  bounded by {@link MAX_CHANNEL_CONTENT} (PR #445 review finding 5) — latent today since the reminder
+  is short, but this was previously the one render path in the file without the #442
+  defense-in-depth ceiling — with **no** body injection.
 
 `renderChannelEvent` renders **every event in the `DeliveryClaim` it is given**, in the common case —
 it never drops a WHOLE block to fit a cap. The channel surface IS bounded (§5.5), but primarily by
@@ -547,9 +552,10 @@ shape:
     lead line, a one-line acknowledge instruction, then one block per event with the monitor id,
     urgency, title, and the monitor's **body-instructions** (`DeliveryEventSummary.body`).
   - **Reminder-only** (`normal`/`low` claims with no event bodies) — a single attributed line
-    carrying the runtime's semantic reminder message. No header, no separate acknowledge line, and
-    no per-event blocks: the reminder message already names the acknowledge command itself, so
-    §5.1.1's completion instruction is **not** repeated here.
+    carrying the runtime's semantic reminder message PLUS this transport's own session+socket-scoped
+    action step (§5.1.1) appended directly after it. No header and no per-event blocks; §5.1.1's
+    per-batch completion instruction is **not** repeated here — the reminder's own action step already
+    names the acknowledge command.
 
   Both shapes are capped at 4000 characters. Unlike the channel transport (§4.6), this is a plain JSON string
   (`JSON.stringify` escapes it) and is **not** tag-delimited, so `<`, `>`, `[`, `]`, `;`, and
@@ -640,26 +646,67 @@ the acknowledge command with the recipient's **real session id**:
 
 ```text
 AgentMon: monitored changes are pending — consider handling them before continuing.
-When handled, acknowledge: agentmonitors events ack --session <id>
+When handled, acknowledge: agentmonitors events ack --session <id> --event-ids <id1>,<id2>
 
 ### <monitor-id> (<urgency>)
 ...
 ```
 
+**Scoped to the ids actually rendered, not "ack everything unread" (PR #445 review, finding 1 —
+BLOCKER).** `agentmonitors events ack --session <id>` with no `--event-ids` acknowledges **every**
+unread event for the session, across every urgency band. A capped high-urgency delivery genuinely
+defers some events beyond what fits under the 4000-char cap (§5.1) — they stay pending and re-deliver
+at the next context event ([§5.5](#55-unread-recoverability-truncation-and-partial-delivery)) — and a
+`post-compact` recap's own `events` array is only its rendered slice (up to 10, [002
+§9.4](./002-runtime-delivery.md#94-recap)) of a FULL unread set the recap decision actually claims at
+commit time. A compliant agent that ran the blanket instruction after handling only what it was shown
+would silently acknowledge — and thereby permanently drop from ordinary redelivery — events it never
+saw: exactly the event-loss-during-batching class this project's review priorities rank first,
+reintroduced by instruction text. The instruction therefore **MUST** interpolate `--event-ids`
+(comma-separated, matching the CLI's own flag syntax) naming exactly the event ids THIS render
+included — never the full candidate/claimed set, which can be larger for a recap.
+
 Constraints:
 
 - **Once per delivery batch, not per event.** It lives in the shared header, so a delivery carrying
-  N event blocks still renders exactly one instruction line.
-- **Terse.** This text lands in an LLM context window and competes with the event bodies for the
-  4000-char cap (§5.1). It carries no `--socket <path>` clause (unlike the truncation-recovery
-  markers, whose whole purpose is to be reliably runnable against the right daemon) — it is an
-  advisory next step, and the header's length is counted against the cap by every packing path.
+  N event blocks still renders exactly one instruction line naming all N ids.
+- **The header's own length now varies with how many ids it names**, which in turn depends on how
+  many blocks fit under the header — a fixed point. Every sizing path that packs whole event blocks
+  under the cap (`packEventsUnderCap`, `resolveHookClaimFit`, `renderHookDelivery`) resolves this by
+  iterative narrowing: assume the full candidate set is included (the longest header), pack, and if
+  fewer blocks actually fit than assumed, retry with the header narrowed to name only that many ids
+  (shorter header, more room) until the header is self-consistent with what it renders. It carries no
+  `--socket <path>` clause (unlike the truncation-recovery markers, whose whole purpose is to be
+  reliably runnable against the right daemon) — it is an advisory next step, and the header's length
+  is counted against the cap by every packing path.
 - **Reminder-only deliveries do not repeat it.** A `normal`/`low` claim has no body-injection header;
-  its acknowledge step is already part of the runtime's semantic message
-  ([002 §9.2](./002-runtime-delivery.md#92-normal-urgency)), so it renders once there.
+  the transport instead appends its own action step directly to the runtime's semantic message
+  ([002 §9.2](./002-runtime-delivery.md#92-normal-urgency)) — see below.
 
-The channel transport does not render this line: a channel-connected agent acknowledges through the
-`agentmon_ack` tool (§4.3), which the server's own instructions already describe.
+**Reminder-only deliveries: verb ownership is transport-owned too (PR #445 review, finding 2 —
+BLOCKER).** The runtime's `DeliveryClaim.message` for a `normal`/`low` reminder claim is now purely
+semantic and transport-neutral — `Monitored changes are pending.` — carrying **no** CLI verb baked in.
+An earlier revision embedded the concrete `agentmonitors events list`/`events ack` commands directly in
+this shared message, but the channel transport pushes it verbatim into its `<channel>` tag body, and a
+channel-connected agent acknowledges through the `agentmon_ack` MCP tool (§4.3), not the CLI — baking
+one transport's verb into the transport-neutral message put conflicting instructions on the channel
+surface. Each transport now appends its **own** action step, socket-scoped (PR #445 review, finding 4):
+
+```text
+AgentMon: Monitored changes are pending. Run `agentmonitors events list --session <id> --socket <path> --unread` to see them, then `agentmonitors events ack --session <id> --socket <path>` once handled.
+```
+
+for the hook transport (`hook-deliver-render.ts`'s `buildHookReminderActionStep`), and
+
+```text
+Monitored changes are pending. Call the agentmon_ack tool, or run `agentmonitors events list --session <id> --socket <path> --unread` for details.
+```
+
+for the channel transport (`channel-render.ts`'s `buildChannelReminderActionStep`), which never repeats
+the hook's CLI ack verb. Neither reminder action step scopes `--event-ids`: this claim only ever fires
+when EVERY unread event of its own urgency band is unclaimed (the guard in [002
+§9.2](./002-runtime-delivery.md#92-normal-urgency)), so — unlike the per-batch instruction above —
+there is no narrower id list within the band to scope to.
 
 Verified by `apps/cli/src/delivery-text.integration.test.ts` (one runtime claim, both transports) and
 the renderer cases in `apps/cli/src/hook-deliver-render.test.ts`.
