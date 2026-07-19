@@ -317,6 +317,184 @@ describe('isTransportHeartbeat', () => {
   });
 });
 
+describe('writeTransportHeartbeat lastDeliveryAt merge (issue #425 review)', () => {
+  it('preserves a prior lastDeliveryAt across a refresh that omits it', () => {
+    // Simulates the hook transport: a fresh process per prompt writes a
+    // record BEFORE it knows whether anything will be delivered, then
+    // (maybe) a second write records the delivery. Before this fix, the
+    // first write's whole-record overwrite erased the second write's
+    // `lastDeliveryAt` on the very next prompt.
+    writeTransportHeartbeat({
+      transport: 'hook',
+      workspacePath: WORKSPACE,
+      socketPath: SOCKET,
+      lastDeliveryAt: new Date('2026-07-19T10:00:00.000Z'),
+    });
+    expect(readTransportHeartbeats()[0]?.lastDeliveryAt).toBe(
+      '2026-07-19T10:00:00.000Z',
+    );
+
+    // A later refresh with nothing new to report (an empty prompt) omits
+    // `lastDeliveryAt` entirely.
+    writeTransportHeartbeat({
+      transport: 'hook',
+      workspacePath: WORKSPACE,
+      socketPath: SOCKET,
+    });
+
+    expect(readTransportHeartbeats()[0]?.lastDeliveryAt).toBe(
+      '2026-07-19T10:00:00.000Z',
+    );
+  });
+
+  it('lets an explicit lastDeliveryAt override whatever was on disk', () => {
+    writeTransportHeartbeat({
+      transport: 'hook',
+      workspacePath: WORKSPACE,
+      socketPath: SOCKET,
+      lastDeliveryAt: new Date('2026-07-19T10:00:00.000Z'),
+    });
+
+    writeTransportHeartbeat({
+      transport: 'hook',
+      workspacePath: WORKSPACE,
+      socketPath: SOCKET,
+      lastDeliveryAt: new Date('2026-07-19T11:00:00.000Z'),
+    });
+
+    expect(readTransportHeartbeats()[0]?.lastDeliveryAt).toBe(
+      '2026-07-19T11:00:00.000Z',
+    );
+  });
+
+  it('has no lastDeliveryAt to preserve on the very first write', () => {
+    writeTransportHeartbeat({
+      transport: 'hook',
+      workspacePath: WORKSPACE,
+      socketPath: SOCKET,
+    });
+    expect(readTransportHeartbeats()[0]?.lastDeliveryAt).toBeUndefined();
+  });
+});
+
+describe('heartbeat key collisions (issue #425 review)', () => {
+  it('never collides two host session ids whose sanitized forms would match', () => {
+    // `run:1` and `run_1` both collapse to the cleaned prefix `run_1` under
+    // the sanitizer's allowlist — without a hash suffix, the second write
+    // would silently clobber the first's file, and a reader would then judge
+    // the WRONG session's binding.
+    writeTransportHeartbeat({
+      transport: 'channel',
+      workspacePath: WORKSPACE,
+      socketPath: SOCKET,
+      hostSessionId: 'run:1',
+    });
+    writeTransportHeartbeat({
+      transport: 'channel',
+      workspacePath: WORKSPACE,
+      socketPath: SOCKET,
+      hostSessionId: 'run_1',
+    });
+
+    const ids = readTransportHeartbeats()
+      .map((record) => record.hostSessionId)
+      .sort();
+    expect(ids).toEqual(['run:1', 'run_1']);
+  });
+
+  it('never collides two ids differing only past the 96-char truncation point', () => {
+    const prefix = 'a'.repeat(100);
+    writeTransportHeartbeat({
+      transport: 'channel',
+      workspacePath: WORKSPACE,
+      socketPath: SOCKET,
+      hostSessionId: `${prefix}-first`,
+    });
+    writeTransportHeartbeat({
+      transport: 'channel',
+      workspacePath: WORKSPACE,
+      socketPath: SOCKET,
+      hostSessionId: `${prefix}-second`,
+    });
+
+    const ids = readTransportHeartbeats()
+      .map((record) => record.hostSessionId)
+      .sort();
+    expect(ids).toEqual([`${prefix}-first`, `${prefix}-second`]);
+  });
+});
+
+describe('opportunistic registry GC (issue #425 review)', () => {
+  it('reaps an expired-past-TTL record from disk while still reporting it for THIS read', () => {
+    const writtenAt = new Date('2026-07-19T11:00:00.000Z');
+    writeTransportHeartbeat({
+      transport: 'channel',
+      workspacePath: WORKSPACE,
+      socketPath: SOCKET,
+      hostSessionId: 'host-1',
+      ttlMs: 30_000,
+      now: writtenAt,
+    });
+
+    // Well past the 30s lease — simulates an uncleanly-killed process (SIGKILL,
+    // host crash) that never called `removeTransportHeartbeat`.
+    const readAt = new Date('2026-07-19T12:00:00.000Z');
+    const firstRead = readTransportHeartbeats(readAt);
+    // Still returned on the read that observed it stale: this pass's caller
+    // gets an accurate "it was stale" finding, not a silent absence.
+    expect(firstRead).toHaveLength(1);
+    expect(firstRead[0]?.hostSessionId).toBe('host-1');
+
+    // But the backing file is gone: the NEXT read sees a clean absence
+    // instead of the same dead record forever (the bug: doctor turned
+    // permanently red for one uncleanly-killed channel server).
+    expect(readTransportHeartbeats(readAt)).toHaveLength(0);
+  });
+
+  it('does not reap a record that is still within its lease', () => {
+    const writtenAt = new Date('2026-07-19T11:00:00.000Z');
+    writeTransportHeartbeat({
+      transport: 'hook',
+      workspacePath: WORKSPACE,
+      socketPath: SOCKET,
+      now: writtenAt,
+    });
+
+    const soonAfter = new Date('2026-07-19T11:00:05.000Z');
+    expect(readTransportHeartbeats(soonAfter)).toHaveLength(1);
+    expect(readTransportHeartbeats(soonAfter)).toHaveLength(1);
+  });
+
+  it('also reaps opportunistically on a write, not only a read', () => {
+    // A channel poll writes its OWN heartbeat every ~3s regardless of whether
+    // anything ever calls `readTransportHeartbeats` — relying solely on reads
+    // to reap OTHER transports' expired records would leave them sitting
+    // until the next `doctor` run.
+    writeTransportHeartbeat({
+      transport: 'hook',
+      workspacePath: WORKSPACE,
+      socketPath: SOCKET,
+      ttlMs: 1_000,
+      now: new Date('2026-07-19T11:00:00.000Z'),
+    });
+
+    writeTransportHeartbeat({
+      transport: 'channel',
+      workspacePath: WORKSPACE,
+      socketPath: SOCKET,
+      hostSessionId: 'host-2',
+      now: new Date('2026-07-19T11:05:00.000Z'),
+    });
+
+    const records = readTransportHeartbeats(
+      new Date('2026-07-19T11:05:00.000Z'),
+    );
+    expect(records.map((record) => record.transport).sort()).toEqual([
+      'channel',
+    ]);
+  });
+});
+
 describe('isHeartbeatStale', () => {
   const base = {
     schemaVersion: 1 as const,

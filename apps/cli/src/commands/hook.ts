@@ -958,19 +958,27 @@ Diagnosis:
         }
         debug(describeClaim(claim ?? reservedClaim));
 
-        // Refresh the heartbeat with the delivery timestamp (issue #425).
-        // `lastDelivery` is what separates "the transport runs" from "the
-        // transport delivers": a hook that fires every prompt but has never
-        // surfaced anything is the signature of a workspace whose events are
-        // going elsewhere. Recorded on the committed-or-lapsed path alike —
-        // both mean the render was written to the host.
+        // Refresh the heartbeat, recording a delivery timestamp ONLY when
+        // `output` was non-null (issue #425 review). `lastDelivery` is what
+        // separates "the transport runs" from "the transport delivers": a
+        // hook that fires every prompt but has never surfaced anything is the
+        // signature of a workspace whose events are going elsewhere. If we
+        // reach this line, `writeAndCommitHookDelivery` did not throw, so a
+        // non-null `output` DID reach the host (a write failure always
+        // releases and re-throws, skipping straight to the outer catch below)
+        // — but `flow.output` can itself be `null` ("genuinely nothing to
+        // surface", see `HookDeliveryFlowResult`), in which case nothing was
+        // written and this call must NOT claim a delivery happened.
+        // `writeTransportHeartbeat` preserves whatever `lastDeliveryAt` the
+        // prior write already recorded when this call omits it, so an empty
+        // prompt no longer resets `last-delivery` back to `never`.
         writeTransportHeartbeat({
           transport: 'hook',
           workspacePath,
           socketPath,
           hostSessionId,
           sessionId: match.id,
-          lastDeliveryAt: new Date(),
+          ...(output !== null ? { lastDeliveryAt: new Date() } : {}),
         });
       } catch (error) {
         // Any internal error is swallowed: a hook that throws would interrupt

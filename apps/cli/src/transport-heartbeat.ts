@@ -11,6 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { PRIVATE_FILE_MODE } from '@agentmonitors/core';
 import { getCliVersion } from './cli-version.js';
+import { resolveDataRoot, workspaceHash } from './workspace-paths.js';
 
 /**
  * Durable liveness records for the two delivery transports (006 §3/§4/§5).
@@ -143,13 +144,6 @@ export const CHANNEL_HEARTBEAT_TTL_MS = 30_000;
  */
 export const HOOK_HEARTBEAT_TTL_MS = 24 * 60 * 60 * 1000;
 
-/** Resolve the data root the same way `workspacePaths`/`resolveSocketPath` do. */
-export function resolveDataRoot(): string {
-  return (
-    process.env['XDG_DATA_HOME'] ?? path.join(os.homedir(), '.local', 'share')
-  );
-}
-
 /** The machine-wide transport registry directory. */
 export function transportRegistryDir(): string {
   return path.join(resolveDataRoot(), 'agentmonitors', 'transports');
@@ -161,12 +155,22 @@ export function transportRegistryDir(): string {
  * The key is derived from a host session id, which is host-supplied input we do
  * not control: a value containing `/` or `..` would otherwise let a heartbeat
  * escape the registry directory and overwrite an unrelated file. Everything
- * outside a conservative allowlist collapses to `_`, and the result is length
- * bounded so a pathological id cannot blow past `NAME_MAX`.
+ * outside a conservative allowlist collapses to `_`, and the cleaned prefix is
+ * length bounded so a pathological id cannot blow past `NAME_MAX`.
+ *
+ * A collapsed/truncated key alone is not injective: `run:1` and `run_1`
+ * collapse to the same cleaned prefix, and two ids differing only past
+ * position 96 truncate identically — either case would let one session's
+ * heartbeat silently clobber another's, and a reader would then judge the
+ * WRONG session's binding. Appending a short hash of the RAW (untruncated,
+ * unsanitized) key makes every distinct input map to a distinct filename
+ * regardless of what the cleaned prefix collapses to.
  */
 function sanitizeKey(key: string): string {
   const cleaned = key.replaceAll(/[^A-Za-z0-9._-]/g, '_').slice(0, 96);
-  return cleaned.length > 0 ? cleaned : 'unknown';
+  const base = cleaned.length > 0 ? cleaned : 'unknown';
+  const suffix = createHash('sha256').update(key).digest('hex').slice(0, 8);
+  return `${base}-${suffix}`;
 }
 
 function heartbeatPath(transport: TransportName, key: string): string {
@@ -195,16 +199,10 @@ export function heartbeatKey(
     return input.hostSessionId ?? `pid-${String(process.pid)}`;
   }
   // Hash rather than embed the workspace path: paths contain separators and can
-  // exceed a filename's length budget.
-  return workspaceKey(input.workspacePath);
-}
-
-/** Stable short key for a workspace path (mirrors `workspacePaths`' hashing). */
-export function workspaceKey(workspacePath: string): string {
-  return createHash('sha256')
-    .update(path.resolve(workspacePath))
-    .digest('hex')
-    .slice(0, 16);
+  // exceed a filename's length budget. `workspaceHash` is the same canonical
+  // derivation `workspacePaths()` uses (workspace-paths.ts) — imported rather
+  // than re-derived so the two can never silently diverge.
+  return workspaceHash(input.workspacePath);
 }
 
 /** The fields a caller supplies; the rest are captured from the environment. */
@@ -222,6 +220,23 @@ export interface WriteHeartbeatInput {
 }
 
 /**
+ * Read the `lastDeliveryAt` an existing record at `target` already carries,
+ * or `undefined` if there is none / it cannot be read. Best-effort: any
+ * failure (missing file, corrupt JSON, invalid schema) is treated the same as
+ * "nothing to carry forward" — this is a read on the hot write path, and a
+ * transient read failure must degrade to "reset the field", never to a
+ * thrown error.
+ */
+function readExistingLastDeliveryAt(target: string): string | undefined {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(target, 'utf-8'));
+    return isTransportHeartbeat(parsed) ? parsed.lastDeliveryAt : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Write (or refresh) a transport heartbeat.
  *
  * **Never throws.** Both writers are on delivery-critical paths — `hook
@@ -232,11 +247,34 @@ export interface WriteHeartbeatInput {
  *
  * The write is atomic (temp file + `rename`) so a concurrent reader can never
  * observe a half-written record and misreport a healthy transport as corrupt.
+ *
+ * **Read-modify-write on `lastDeliveryAt`.** Every write is otherwise a whole
+ * new record — `pid`/`version`/`home`/etc. always reflect the CURRENT writer,
+ * never a stale prior value. `lastDeliveryAt` is the one field that must
+ * survive a refresh that has nothing new to report: `hook deliver` spawns a
+ * fresh process per prompt, so a caller that omits `lastDeliveryAt` (the
+ * ordinary "nothing to surface this prompt" case) is not asserting "there was
+ * never a delivery" — it has simply not observed one on THIS invocation. Without
+ * carrying the prior value forward, every empty-prompt heartbeat silently reset
+ * `last-delivery` to `never`, inverting the field's entire diagnostic purpose
+ * (issue #425 review). An explicit `input.lastDeliveryAt` always wins over
+ * whatever was on disk.
  */
 export function writeTransportHeartbeat(
   input: WriteHeartbeatInput,
 ): TransportHeartbeat | undefined {
   const now = input.now ?? new Date();
+  const workspacePath = path.resolve(input.workspacePath);
+  const target = heartbeatPath(
+    input.transport,
+    heartbeatKey(input.transport, {
+      workspacePath,
+      ...(input.hostSessionId ? { hostSessionId: input.hostSessionId } : {}),
+    }),
+  );
+  const lastDeliveryAt =
+    input.lastDeliveryAt?.toISOString() ?? readExistingLastDeliveryAt(target);
+
   const record: TransportHeartbeat = {
     schemaVersion: TRANSPORT_HEARTBEAT_SCHEMA_VERSION,
     transport: input.transport,
@@ -246,7 +284,7 @@ export function writeTransportHeartbeat(
     version: getCliVersion(),
     home: os.homedir(),
     dataRoot: resolveDataRoot(),
-    workspacePath: path.resolve(input.workspacePath),
+    workspacePath,
     socketPath: input.socketPath,
     ...(input.hostSessionId ? { hostSessionId: input.hostSessionId } : {}),
     ...(input.sessionId ? { sessionId: input.sessionId } : {}),
@@ -257,18 +295,9 @@ export function writeTransportHeartbeat(
       (input.transport === 'channel'
         ? CHANNEL_HEARTBEAT_TTL_MS
         : HOOK_HEARTBEAT_TTL_MS),
-    ...(input.lastDeliveryAt
-      ? { lastDeliveryAt: input.lastDeliveryAt.toISOString() }
-      : {}),
+    ...(lastDeliveryAt ? { lastDeliveryAt } : {}),
   };
 
-  const target = heartbeatPath(
-    input.transport,
-    heartbeatKey(input.transport, {
-      workspacePath: record.workspacePath,
-      ...(input.hostSessionId ? { hostSessionId: input.hostSessionId } : {}),
-    }),
-  );
   try {
     mkdirSync(path.dirname(target), { recursive: true });
     // `${target}.<pid>.tmp`, not a fixed `.tmp`: two transports refreshing the
@@ -280,10 +309,21 @@ export function writeTransportHeartbeat(
       mode: PRIVATE_FILE_MODE,
     });
     renameSync(tmp, target);
-    return record;
   } catch {
     return undefined;
   }
+  // Opportunistic GC on the write path too, not only on read (issue #425
+  // review): a busy channel poll writes its own record every ~3s regardless of
+  // whether anything ever reads the registry, so relying solely on
+  // `readTransportHeartbeats` to reap other transports' expired records would
+  // leave them sitting until the next `doctor` run. Best-effort: a failed scan
+  // here must not turn "write my own heartbeat" into a thrown error.
+  try {
+    readTransportHeartbeats(now);
+  } catch {
+    // Never throws (see the function doc above).
+  }
+  return record;
 }
 
 /** Remove a transport's heartbeat (clean shutdown). Never throws. */
@@ -351,8 +391,24 @@ export function isTransportHeartbeat(
  * throwing: one corrupt record must not blind `doctor` to every other
  * transport on the machine. A missing registry directory is simply an empty
  * list — the ordinary state before any transport has ever run.
+ *
+ * **Opportunistic GC.** A transport that dies without cleanup (SIGKILL, host
+ * crash) never calls {@link removeTransportHeartbeat}, so — before this fix —
+ * its record sat on disk forever, past its own declared lease, and every
+ * future read kept reporting it `heartbeat-stale`: one uncleanly-killed
+ * channel server made every subsequent `doctor` run in that workspace fail
+ * `[heartbeat-stale]` permanently, even long after no lead session was even
+ * open (issue #425 review). When a caller supplies `now` (every production
+ * caller does — `doctor` passes its own report's `generatedAt`, and
+ * `writeTransportHeartbeat` passes the write's own timestamp), a record found
+ * to be expired-past-TTL on this scan is still INCLUDED in the returned list
+ * — this pass's caller still gets an accurate "it was stale" finding — but
+ * its backing file is reaped (`rmSync`) as a side effect, so the NEXT read
+ * sees a clean absence instead of the same dead record forever. Omitting
+ * `now` (as most tests that only care about the current record set do) skips
+ * GC entirely — a plain read, no side effects.
  */
-export function readTransportHeartbeats(): TransportHeartbeat[] {
+export function readTransportHeartbeats(now?: Date): TransportHeartbeat[] {
   let names: string[];
   try {
     names = readdirSync(transportRegistryDir());
@@ -362,15 +418,17 @@ export function readTransportHeartbeats(): TransportHeartbeat[] {
   const records: TransportHeartbeat[] = [];
   for (const name of names) {
     if (!name.endsWith('.json')) continue;
+    const filePath = path.join(transportRegistryDir(), name);
     try {
-      const parsed: unknown = JSON.parse(
-        readFileSync(path.join(transportRegistryDir(), name), 'utf-8'),
-      );
+      const parsed: unknown = JSON.parse(readFileSync(filePath, 'utf-8'));
       if (
         isTransportHeartbeat(parsed) &&
         parsed.schemaVersion === TRANSPORT_HEARTBEAT_SCHEMA_VERSION
       ) {
         records.push(parsed);
+        if (now !== undefined && isHeartbeatStale(parsed, now)) {
+          rmSync(filePath, { force: true });
+        }
       }
     } catch {
       continue;

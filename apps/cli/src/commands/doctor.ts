@@ -1,3 +1,4 @@
+import os from 'node:os';
 import path from 'node:path';
 import { Command, Option } from 'commander';
 import type {
@@ -19,8 +20,12 @@ import {
   doctorReportInProcess,
 } from '../runtime-client.js';
 import { resolveWorkspaceDbPath } from '../workspace-db-path.js';
+import { resolveDataRoot } from '../workspace-paths.js';
 import { getCliVersion } from '../cli-version.js';
-import { readTransportHeartbeats } from '../transport-heartbeat.js';
+import {
+  readTransportHeartbeats,
+  type TransportName,
+} from '../transport-heartbeat.js';
 import {
   computeTransportHealth,
   isSharedProblem,
@@ -300,6 +305,31 @@ function buildChecks(
 }
 
 /**
+ * The five-field transport summary line (`pid`/`version`/`workspace`/
+ * `socket`/`last-delivery`), shared by both places that render it: the
+ * `transport:<name>` check detail below and the human-readable
+ * `Delivery transports:` block's `transportLine`. Extracted so the two never
+ * silently drift apart field-by-field.
+ */
+function transportSummary(transport: TransportStatus): string {
+  const bound = transport.boundTo;
+  return [
+    `pid=${String(bound?.pid ?? 0)}`,
+    `version=${transport.version ?? 'unknown'}`,
+    `workspace=${bound?.workspacePath ?? 'unknown'}`,
+    `socket=${bound?.socketPath ?? 'unknown'}`,
+    `last-delivery=${transport.lastDelivery ?? 'never'}`,
+  ].join('  ');
+}
+
+/** Remediation for a transport that has never reported in for this workspace. */
+function notConfiguredRemediation(transport: TransportName): string {
+  return transport === 'hook'
+    ? "Submit a prompt in a Claude Code session in this workspace — the `UserPromptSubmit` hook runs `agentmonitors hook deliver` and writes this transport's first heartbeat. If a prompt has already been submitted and this still shows, the plugin hooks are not installed."
+    : 'Start (or reconnect) a Claude Code session in this workspace so `agentmonitors channel serve` boots and writes its heartbeat. The channel is optional — the hook transport keeps delivering meanwhile.';
+}
+
+/**
  * Append the delivery-transport checks (issue #425) — "what is the listening
  * method for this session, and is it healthy?".
  *
@@ -309,7 +339,16 @@ function buildChecks(
  * failures:
  *
  * - **No lead session.** Nothing is listening because no agent session is open.
- *   That is the expected idle state, not a degradation.
+ *   That is the expected idle state, not a degradation — including for a
+ *   transport that DID report in during some past session: a heartbeat left
+ *   behind by an uncleanly-killed process (SIGKILL, host crash) is stale or
+ *   misbound evidence about a session that is no longer open, not a live
+ *   failure of anything happening now (005 §15). Gating on `hasLeadSession`
+ *   here, the same way the `!configured` branch already does, is what keeps a
+ *   single dead heartbeat from failing every future `doctor` run in this
+ *   workspace forever — `readTransportHeartbeats` also reaps it once its
+ *   lease has expired, but that is a courtesy for the NEXT read; this gate is
+ *   what keeps THIS read honest in the meantime.
  * - **A lead session, but no transport has ever reported in.** Reached by every
  *   flow that registers a session without running a delivery transport (a
  *   `session start` in a script, a freshly-opened session that has not yet had
@@ -317,10 +356,11 @@ function buildChecks(
  *   is about to be fine on the very next prompt.
  *
  * Everything else — a transport bound to another workspace, a lapsed
- * heartbeat, muted reminders — involves a transport that DID report in, so it
- * is reported as a genuine `fail` with its own remediation. The pre-existing
- * `daemon-reachable` check already fails the "daemon died under a live session"
- * case, so this section never needs to double-report it to be loud.
+ * heartbeat, muted reminders — involves a transport that DID report in AND a
+ * lead session that IS currently open, so it is reported as a genuine `fail`
+ * with its own remediation. The pre-existing `daemon-reachable` check already
+ * fails the "daemon died under a live session" case, so this section never
+ * needs to double-report it to be loud.
  */
 function transportChecks(
   health: DeliveryTransportHealth,
@@ -340,29 +380,41 @@ function transportChecks(
         detail: hasLeadSession
           ? `No ${transport.name} transport has reported in for this workspace. Either it has not run yet (the hook transport records itself on the first prompt of a session; the channel is optional), or it is running under a different HOME/data root and is invisible from here.`
           : `No ${transport.name} transport has reported in (expected when no agent session is currently open).`,
+        // Idle is not the same as "nothing to do" — the reader who hits this
+        // first (every fresh setup) still needs a concrete next step, not a
+        // bare status glyph (005 §15).
+        remediation: notConfiguredRemediation(transport.name),
       });
       continue;
     }
 
-    // A transport row reports only the problems that transport OWNS. Two
-    // categories are excluded: the unprovable channel-registration caveat (an
-    // advisory, not a defect — it must not turn a working transport red), and
-    // pipeline-wide problems like a down daemon or muted reminders, which the
-    // `delivery-verdict` check below reports once instead of repeating them on
-    // every row as if they were independent failures.
+    const summary = transportSummary(transport);
+
+    if (!hasLeadSession) {
+      checks.push({
+        name,
+        status: 'idle',
+        detail: `${summary}  (no lead session is currently open for this workspace, so its health is not being evaluated right now)`,
+        remediation:
+          'Open a Claude Code session in this workspace — the SessionStart hook registers a lead session automatically. Re-run `agentmonitors doctor` once one is open to get a live verdict for this transport.',
+      });
+      continue;
+    }
+
+    // A transport row reports only the problems that transport OWNS. Three
+    // categories are excluded: the unprovable channel-registration caveat and
+    // version-skew (both advisories, never defects — see `transport-health.ts`
+    // for why crying wolf on either would make a working transport read as
+    // broken on every run/upgrade), and pipeline-wide problems like a down
+    // daemon or muted reminders, which the `delivery-verdict` check below
+    // reports once instead of repeating them on every row as if they were
+    // independent failures.
     const blocking = transport.problems.filter(
       (problem) =>
         problem.code !== 'channel-registration-unverified' &&
+        problem.code !== 'version-skew' &&
         !isSharedProblem(problem.code),
     );
-    const bound = transport.boundTo;
-    const summary = [
-      `pid=${String(bound?.pid ?? 0)}`,
-      `version=${transport.version ?? 'unknown'}`,
-      `workspace=${bound?.workspacePath ?? 'unknown'}`,
-      `socket=${bound?.socketPath ?? 'unknown'}`,
-      `last-delivery=${transport.lastDelivery ?? 'never'}`,
-    ].join('  ');
 
     if (blocking.length === 0) {
       checks.push({ name, status: 'pass', detail: summary });
@@ -441,16 +493,8 @@ function transportLine(transport: TransportStatus): string {
   if (!transport.configured) {
     return `${transport.name}: not reporting`;
   }
-  const bound = transport.boundTo;
   const state = transport.running ? 'running' : 'stale';
-  return [
-    `${transport.name}: ${state}`,
-    `pid=${String(bound?.pid ?? 0)}`,
-    `version=${transport.version ?? 'unknown'}`,
-    `workspace=${bound?.workspacePath ?? 'unknown'}`,
-    `socket=${bound?.socketPath ?? 'unknown'}`,
-    `last-delivery=${transport.lastDelivery ?? 'never'}`,
-  ].join('  ');
+  return `${transport.name}: ${state}  ${transportSummary(transport)}`;
 }
 
 function renderText(
@@ -711,9 +755,17 @@ export const doctorCommand = new Command('doctor')
           leadHostSessionIds: report.leadSessions.map(
             (session) => session.hostSessionId,
           ),
-          heartbeats: readTransportHeartbeats(),
+          heartbeats: readTransportHeartbeats(report.generatedAt),
           diagnoses,
           cliVersion: getCliVersion(),
+          // Supplied by the caller, not read inside `computeTransportHealth`
+          // (issue #425 review): the function's own doc claims purity ("every
+          // value is passed in"), but reading `os.homedir()`/`resolveDataRoot()`
+          // live inside `bindingProblems` broke that claim — `doctor` is the
+          // one place that should resolve "what do WE expect", exactly like
+          // `socketPath` above.
+          expectedHome: os.homedir(),
+          expectedDataRoot: resolveDataRoot(),
           now: report.generatedAt,
         });
         checks.push(...transportChecks(health, report.hasLeadSession));

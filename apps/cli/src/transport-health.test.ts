@@ -11,10 +11,10 @@ import {
 import {
   CHANNEL_HEARTBEAT_TTL_MS,
   TRANSPORT_HEARTBEAT_SCHEMA_VERSION,
-  resolveDataRoot,
   type TransportHeartbeat,
   type TransportName,
 } from './transport-heartbeat.js';
+import { resolveDataRoot } from './workspace-paths.js';
 
 /**
  * Delivery-transport health verdict (issue #425).
@@ -70,6 +70,8 @@ function input(
     heartbeats: [heartbeat('hook'), heartbeat('channel')],
     diagnoses: [],
     cliVersion: CLI_VERSION,
+    expectedHome: os.homedir(),
+    expectedDataRoot: resolveDataRoot(),
     now: NOW,
     ...overrides,
   };
@@ -277,6 +279,36 @@ describe('computeTransportHealth', () => {
       expect(codesOf(find(health2.transports, 'channel'))).not.toContain(
         'workspace-mismatch',
       );
+    });
+
+    it('never matches a hook record by host session id across workspaces (issue #425 review)', () => {
+      // The hook transport has no per-session identity of its own — its
+      // record is keyed and overwritten per WORKSPACE (a fresh short-lived
+      // process per prompt), so a record belonging to THIS host session but a
+      // DIFFERENT workspace is stale evidence about a workspace this session
+      // no longer leads, not a live mismatch. Session-id-first matching is
+      // only correct for the long-lived, per-session `channel` transport;
+      // applying it to `hook` too would report a false `workspace-mismatch`
+      // (with "restart the transport" remediation) for a session that simply
+      // has not yet submitted its first prompt in ITS current workspace —
+      // even though hooks re-resolve and self-heal on every prompt with no
+      // action needed.
+      const health = computeTransportHealth(
+        input({
+          workspacePath: '/repos/workspace-b',
+          heartbeats: [
+            // Same host session id, but bound to a DIFFERENT workspace — the
+            // session's hook last fired there, before it started leading
+            // workspace-b.
+            heartbeat('hook', { workspacePath: '/repos/workspace-a' }),
+          ],
+        }),
+      );
+      const hook = find(health.transports, 'hook');
+      // Not a false mismatch: since no hook record exists for workspace-b, the
+      // correct read is "not configured here yet", not "misbound".
+      expect(hook.configured).toBe(false);
+      expect(codesOf(hook)).not.toContain('workspace-mismatch');
     });
   });
 
@@ -487,6 +519,31 @@ describe('computeTransportHealth', () => {
         channel.problems.find((problem) => problem.code === 'version-skew')
           ?.detail,
       ).toContain('1.1.0');
+    });
+
+    it('is informational, not blocking — a skewed transport still reports healthy', () => {
+      // Issue #425 review: version-skew was previously a blocking problem, so
+      // `doctor` exited 1 for up to the hook's full 24h heartbeat TTL after
+      // EVERY CLI upgrade (the hook heartbeat legitimately carries the
+      // pre-upgrade version until the next prompt) — the exact cry-wolf
+      // outcome issue #373 exists to prevent, and it directly contradicted the
+      // hook remediation's own "No action needed" wording. This must behave
+      // like `channel-registration-unverified`: present, but never the reason
+      // a transport (or the overall verdict) is unhealthy/undeliverable.
+      const health = computeTransportHealth(
+        input({
+          heartbeats: [
+            heartbeat('hook', { version: '1.1.0' }),
+            heartbeat('channel', { version: '1.1.0' }),
+          ],
+        }),
+      );
+      for (const transport of health.transports) {
+        expect(codesOf(transport)).toContain('version-skew');
+        expect(transport.healthy).toBe(true);
+      }
+      expect(health.deliverable).toBe(true);
+      expect(health.verdict).toContain('healthy');
     });
   });
 

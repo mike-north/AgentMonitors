@@ -46,3 +46,22 @@ lastDelivery, problems[] }` plus top-level `deliveryWillReachThisSession`, `deli
   at `agentmonitors verify` and the dev-flag remediation.
 
 See docs/specs/006-agent-integration.md §12 and docs/specs/005-cli-reference.md §15.
+
+**Review fixes (before first release):**
+
+- The transport registry is now reaped opportunistically on read and write, so a transport that dies
+  without cleanup no longer fails `doctor` in that workspace forever; `transport:<name>` checks are
+  also gated on a lead session being currently open, matching the "no lead session → idle" contract.
+- The hook transport's `lastDeliveryAt` is preserved across a refresh that has nothing new to report
+  (a read-modify-write), instead of resetting to `never` on the next empty prompt, and is recorded
+  only when a delivery actually wrote output to the host.
+- `version-skew` is now informational, like `channel-registration-unverified` — it no longer fails a
+  transport or blocks the verdict.
+- The heartbeat registry key now appends a short hash of the raw host session id, so two ids that
+  collapse to the same sanitized filename can no longer clobber each other's records.
+- The channel heartbeat now refreshes on an independent timer instead of only after each poll
+  settles, so a wedged daemon can no longer make a live, correctly-bound channel server flap to
+  `heartbeat-stale`.
+- Session-id-first heartbeat matching is now restricted to the channel transport; the hook transport
+  (no per-session identity) always matches by workspace.
+- Idle `transport:<name>` checks now always carry a remediation, in both text and `--json`.

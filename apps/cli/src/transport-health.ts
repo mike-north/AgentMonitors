@@ -1,9 +1,7 @@
-import os from 'node:os';
 import path from 'node:path';
 import type { HookDeliveryDiagnosis } from '@agentmonitors/core';
 import {
   isHeartbeatStale,
-  resolveDataRoot,
   type TransportHeartbeat,
   type TransportName,
 } from './transport-heartbeat.js';
@@ -189,6 +187,15 @@ export interface TransportHealthInput {
   diagnoses: readonly HookDeliveryDiagnosis[];
   /** This CLI's own version, for skew comparison. */
   cliVersion: string;
+  /**
+   * `HOME` as THIS command resolves it — supplied by the caller (`doctor`)
+   * rather than read here, so `computeTransportHealth` stays a pure function
+   * of its input (every failure mode constructible in a test without a real
+   * `os.homedir()`/env dependency).
+   */
+  expectedHome: string;
+  /** Data root as THIS command resolves it — same purity rationale. */
+  expectedDataRoot: string;
   now: Date;
 }
 
@@ -255,16 +262,17 @@ function bindingProblems(
   }
 
   if (
-    heartbeat.home !== os.homedir() ||
-    heartbeat.dataRoot !== resolveDataRoot()
+    heartbeat.home !== input.expectedHome ||
+    heartbeat.dataRoot !== input.expectedDataRoot
   ) {
     problems.push({
       code: 'environment-mismatch',
       detail:
         `The ${heartbeat.transport} transport resolved HOME="${heartbeat.home}" ` +
         `and data root "${heartbeat.dataRoot}", but this command resolves ` +
-        `HOME="${os.homedir()}" and "${resolveDataRoot()}". The two are reading ` +
-        `different databases and sockets, so neither can see the other's state.`,
+        `HOME="${input.expectedHome}" and "${input.expectedDataRoot}". The two ` +
+        `are reading different databases and sockets, so neither can see the ` +
+        `other's state.`,
       remediation: reconnect,
     });
   }
@@ -317,12 +325,24 @@ function suppressionProblems(input: TransportHealthInput): TransportProblem[] {
 /**
  * Pick the heartbeat that describes THIS session's transport.
  *
- * Selection order matters for detecting the misbinding case. A channel record
- * is matched by host session id **first, across every workspace** — that match
- * is precisely what turns "my session's channel is listening to another
- * workspace" from an invisible absence into a reported `workspace-mismatch`.
- * Only if no session-keyed record exists do we fall back to a workspace-keyed
- * one (the hook transport, which has no per-session identity).
+ * Selection order matters for detecting the misbinding case, but it must only
+ * apply to a SESSION-SCOPED transport. `channel serve` is one long-lived
+ * process per host session, so matching it by host session id **first, across
+ * every workspace** is precisely what turns "my session's channel is
+ * listening to another workspace" from an invisible absence into a reported
+ * `workspace-mismatch`.
+ *
+ * `hook deliver`, by contrast, is a fresh short-lived process per PROMPT with
+ * no stable per-session identity of its own — its record is keyed and
+ * overwritten per WORKSPACE (see `heartbeatKey`), so any session's most recent
+ * prompt in this workspace is a valid match for every lead session here. If
+ * session-id-first matching were applied to it too, a session whose hook last
+ * fired in workspace A — now leading workspace B, before its first prompt
+ * there — would find no session match in B, fall through to a workspace match
+ * that also fails (the record still says A), and report a false
+ * `workspace-mismatch` with "restart the transport" — even though hooks
+ * re-resolve on every prompt and self-heal with no action needed. So `hook`
+ * always matches by workspace only; only `channel` tries session id first.
  */
 function selectHeartbeat(
   transport: TransportName,
@@ -331,19 +351,22 @@ function selectHeartbeat(
   const candidates = input.heartbeats.filter(
     (heartbeat) => heartbeat.transport === transport,
   );
-  const sessionMatches = candidates.filter(
+  const byWorkspace = candidates.filter(
     (heartbeat) =>
-      heartbeat.hostSessionId !== undefined &&
-      input.leadHostSessionIds.includes(heartbeat.hostSessionId),
+      path.resolve(heartbeat.workspacePath) ===
+      path.resolve(input.workspacePath),
   );
   const pool =
-    sessionMatches.length > 0
-      ? sessionMatches
-      : candidates.filter(
-          (heartbeat) =>
-            path.resolve(heartbeat.workspacePath) ===
-            path.resolve(input.workspacePath),
-        );
+    transport === 'channel'
+      ? (() => {
+          const sessionMatches = candidates.filter(
+            (heartbeat) =>
+              heartbeat.hostSessionId !== undefined &&
+              input.leadHostSessionIds.includes(heartbeat.hostSessionId),
+          );
+          return sessionMatches.length > 0 ? sessionMatches : byWorkspace;
+        })()
+      : byWorkspace;
   // Most recently refreshed wins: with several sessions in one workspace, the
   // freshest record is the one whose health a user is actually asking about.
   return [...pool].sort(
@@ -387,13 +410,22 @@ function buildTransport(
   }
 
   if (heartbeat.version !== input.cliVersion) {
+    // Informational, not blocking (like `channel-registration-unverified`
+    // below) — see the `blocking` filter. The hook transport's heartbeat
+    // legitimately carries the PRE-upgrade version for up to its 24h TTL after
+    // every CLI release (it only refreshes on the next prompt), so treating
+    // this as a failure made `doctor` exit 1 for up to a day after every
+    // single upgrade — the exact cry-wolf outcome issue #373 exists to
+    // prevent, and directly contradicted the hook remediation's own "No
+    // action needed" wording.
     problems.push({
       code: 'version-skew',
       detail:
         `The ${transport} transport is running @agentmonitors/cli ` +
         `${heartbeat.version} (${heartbeat.cliPath}), but this command is ` +
         `${input.cliVersion}. A long-lived transport keeps serving the build it ` +
-        `started with, so a fix you just installed may not be in effect there.`,
+        `started with, so a fix you just installed may not be in effect there. ` +
+        `This is informational: delivery is not blocked by it.`,
       remediation:
         transport === 'channel'
           ? 'Start a new Claude Code session in this workspace so the channel server respawns on the current build.'
@@ -428,7 +460,9 @@ function buildTransport(
   problems.push(...sharedProblems);
 
   const blocking = problems.filter(
-    (problem) => problem.code !== 'channel-registration-unverified',
+    (problem) =>
+      problem.code !== 'channel-registration-unverified' &&
+      problem.code !== 'version-skew',
   );
 
   return {

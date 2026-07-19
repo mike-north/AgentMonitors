@@ -31,6 +31,7 @@ import {
 import { ACK_TOOL, parseAckArgs } from '../channel-ack.js';
 import { getCliVersion } from '../cli-version.js';
 import {
+  CHANNEL_HEARTBEAT_TTL_MS,
   removeTransportHeartbeat,
   writeTransportHeartbeat,
 } from '../transport-heartbeat.js';
@@ -598,6 +599,21 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
   // points at the wrong fix entirely.
   heartbeat();
 
+  // Independent refresh timer, NOT gated on the poll settling (issue #425
+  // review). Refreshing only from inside `poll` ties this transport's
+  // liveness signal to the daemon IPC's latency: a daemon wedged for longer
+  // than `CHANNEL_HEARTBEAT_TTL_MS` would let a live, correctly-bound server
+  // lapse to `heartbeat-stale` — blaming the TRANSPORT for the DAEMON's
+  // outage, exactly the mis-attribution `poll`'s own post-settle refresh
+  // (below) already avoids for the reserve/commit/release IPC itself. A third
+  // of the TTL comfortably re-arms the lease well before it could expire, and
+  // is independent of how long any single poll's round trip takes.
+  const heartbeatTimer = setInterval(
+    heartbeat,
+    Math.floor(CHANNEL_HEARTBEAT_TTL_MS / 3),
+  );
+  heartbeatTimer.unref();
+
   const poll = async (): Promise<void> => {
     try {
       const boundSession = await resolveSession();
@@ -664,6 +680,7 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
     if (timer) {
       clearTimeout(timer);
     }
+    clearInterval(heartbeatTimer);
     // Remove the heartbeat on a clean shutdown so `doctor` reports "no channel"
     // immediately rather than "stale channel" for the whole TTL — the two point
     // at different fixes. An unclean death (SIGKILL, host crash) leaves the

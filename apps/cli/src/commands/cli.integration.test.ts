@@ -12576,18 +12576,62 @@ This monitor fires on a schedule.
 
   // --- Failure mode (c): reminders suppressed by coalesced-until-ack --------
   // The hardest case, and the reason this is a HEALTH surface: the daemon is
-  // up, a lead session is open, events materialized on real transitions — and
-  // the agent is still never told, because one earlier unread event is already
-  // claimed. Driven end to end through the real CLI: claim one event, let a
-  // second materialize, then ask doctor.
+  // up, a lead session is open, an event materialized on a real transition —
+  // and the agent is still never told, because that unread event is already
+  // claimed. Driven end to end through the real CLI.
+  //
+  // Deterministic by construction (issue #425 review — the prior version of
+  // this test wrapped every assertion in
+  // `if (result.stdout.includes('[reminders-suppressed]'))`, so if the
+  // schedule-monitor-plus-`daemon once` precondition it relied on ever failed
+  // to materialize the state in time, EVERY assertion below was silently
+  // skipped and the test passed green while proving nothing — exactly the
+  // hardest failure mode this whole surface exists to catch, going unguarded).
+  // This version follows the same real-daemon recipe issue #333's regression
+  // test uses: open the session FIRST, then drive an actual file-fingerprint
+  // change through a live daemon tick and POLL for the resulting unread event
+  // before claiming it — so the precondition is confirmed to hold, never
+  // merely hoped for.
   it('reports muted reminders with the session-scoped ack remediation, and fails the verdict', async () => {
-    const fixture = transportFixture('suppressed');
-    const daemon = await startDaemon(
-      fixture.monitorsRoot,
-      fixture.dir,
-      fixture.env,
-      fixture.socketPath,
+    const dir = path.join(tempDir, 'transports-suppressed');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    const monitorDir = path.join(monitorsRoot, 'docs-watcher');
+    mkdirSync(monitorDir, { recursive: true });
+    const watchedFile = path.join(dir, 'watched.txt');
+    writeFileSync(watchedFile, 'initial content', 'utf-8');
+    writeFileSync(
+      path.join(monitorDir, 'MONITOR.md'),
+      [
+        '---',
+        'name: Docs watcher',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs:',
+        '    - "watched.txt"',
+        `  cwd: ${JSON.stringify(dir)}`,
+        '  interval: "1s"',
+        'urgency: normal',
+        '---',
+        'When files change, review them.',
+        '',
+      ].join('\n'),
+      'utf-8',
     );
+
+    const dataHome = path.join(dir, 'data-home');
+    mkdirSync(dataHome, { recursive: true });
+    const socketPath = path.join(
+      '/tmp',
+      `agentmon-tr-suppressed-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    writeLocalState(dir, { enabled: true, socket: socketPath });
+    const env = {
+      XDG_DATA_HOME: dataHome,
+      AGENTMONITORS_DB: path.join(dir, 'agentmon.db'),
+      AGENTMONITORS_SOCKET: socketPath,
+    };
+
+    const daemon = await startDaemon(monitorsRoot, dir, env, socketPath);
     try {
       const opened = runWithEnv(
         [
@@ -12596,20 +12640,51 @@ This monitor fires on a schedule.
           '--host-session-id',
           HOST_SESSION,
           '--workspace',
-          fixture.dir,
+          dir,
           '--format',
           'json',
         ],
-        fixture.env,
-        fixture.dir,
+        env,
+        dir,
       );
       expect(opened.exitCode).toBe(0);
       const sessionId = (JSON.parse(opened.stdout) as { id: string }).id;
 
-      // Materialize two events in-process (the `daemon once` in the fixture
-      // produced the first; this produces a second), then claim — leaving the
-      // exact mixed claimed/unclaimed state the guard holds on. Ticking
-      // in-process rather than waiting on the cron keeps this deterministic.
+      // Let the baseline tick complete, then change the watched file — a real
+      // daemon tick materializes exactly one durable, unread normal event
+      // (mirrors issue #333's regression test).
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      writeFileSync(watchedFile, 'changed: added eval()', 'utf-8');
+
+      const unread = () =>
+        runWithEnv(
+          [
+            'events',
+            'list',
+            '--session',
+            sessionId,
+            '--unread',
+            '--format',
+            'json',
+          ],
+          env,
+          dir,
+        );
+      const eventDeadline = Date.now() + 10_000;
+      while (Date.now() < eventDeadline) {
+        const polled = unread();
+        if (
+          polled.exitCode === 0 &&
+          (JSON.parse(polled.stdout) as unknown[]).length >= 1
+        ) {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      // Confirmed, not hoped for: the precondition the rest of this test
+      // depends on actually holds before we act on it.
+      expect(JSON.parse(unread().stdout)).toHaveLength(1);
+
       const claim = runWithEnv(
         [
           'hook',
@@ -12621,28 +12696,31 @@ This monitor fires on a schedule.
           '--format',
           'json',
         ],
-        fixture.env,
-        fixture.dir,
+        env,
+        dir,
       );
       expect(claim.exitCode).toBe(0);
+      const claimed = JSON.parse(claim.stdout) as { mode: string } | null;
+      // The first turn-interruptible claim over an unclaimed normal event
+      // always surfaces the coalesced reminder (002 §9.2) and durably claims
+      // the event (never acknowledges it) — confirming the exact
+      // claimed-but-unread state the suppression guard holds on, rather than
+      // assuming the claim did what it was expected to.
+      expect(claimed?.mode).toBe('delivery');
+      // Still unread (claiming never acknowledges — BP2/SP4): the suppression
+      // guard's precondition (an unread event that IS claimed) is exactly
+      // this state, confirmed rather than assumed.
+      expect(JSON.parse(unread().stdout)).toHaveLength(1);
 
-      const result = runWithEnv(
-        ['doctor', '--workspace', fixture.dir],
-        fixture.env,
-        fixture.dir,
+      const result = runWithEnv(['doctor', '--workspace', dir], env, dir);
+
+      expect(result.stdout).toContain('[reminders-suppressed]');
+      expect(result.stdout).toContain('coalesced-until-ack');
+      expect(result.stdout).toContain(
+        `agentmonitors events ack --session ${sessionId}`,
       );
-
-      // Only assert the suppression path when the claim actually produced the
-      // mixed state; a reminder-only claim leaves nothing claimed, and asserting
-      // regardless would make this test's meaning depend on tick timing.
-      if (result.stdout.includes('[reminders-suppressed]')) {
-        expect(result.stdout).toContain('coalesced-until-ack');
-        expect(result.stdout).toContain(
-          `agentmonitors events ack --session ${sessionId}`,
-        );
-        expect(result.stdout).toContain('✗ delivery-verdict');
-        expect(result.exitCode).toBe(1);
-      }
+      expect(result.stdout).toContain('✗ delivery-verdict');
+      expect(result.exitCode).toBe(1);
     } finally {
       daemon.stop();
       await daemon.waitForExit();
