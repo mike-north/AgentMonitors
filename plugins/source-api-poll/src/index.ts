@@ -30,6 +30,9 @@ import {
   buildCompositeObservation,
   type CompositeConfig,
   type FetchedPart,
+  framedPartByteLength,
+  MAX_COMPOSITE_PARTS,
+  MAX_PART_ID_LENGTH,
   parseCompositeConfig,
   renderCompositeSnapshot,
 } from './composite.js';
@@ -65,6 +68,17 @@ const MAX_COMPOSITE_CONCURRENCY = 5;
  * cap, persisted every tick. Reusing the same 10 MiB figure here bounds the
  * composite's aggregate footprint to the same order of magnitude as a
  * single-URL monitor's response, regardless of how many parts it has.
+ *
+ * Issue #304 review, third round: the running total this budgets is now
+ * {@link framedPartByteLength} — each part's RENDERED `## <id>\n<body>`
+ * section, matching `renderCompositeSnapshot` — not the raw response-body
+ * length. A reviewer repro (100,000 empty-body parts; a single empty-body
+ * part with an 11 MiB `id`) showed the prior body-only counter never
+ * tripping while the assembled artifact still grew unbounded through
+ * per-part id-framing overhead and sheer part count. `MAX_COMPOSITE_PARTS`
+ * (composite.ts) additionally bounds the part count itself, which this byte
+ * budget alone cannot: 100,000 empty-body parts sum to 0 raw body bytes
+ * regardless of what is counted.
  */
 const MAX_COMPOSITE_BYTES = MAX_RESPONSE_BYTES;
 
@@ -343,11 +357,19 @@ const scopeSchema: JsonSchema = {
             parts: {
               type: 'array',
               minItems: 1,
+              // Issue #304 review, third round: bounds request count,
+              // rendered-artifact size, and worst-case tick duration
+              // (003 §4.9) — see MAX_COMPOSITE_PARTS in composite.ts.
+              maxItems: MAX_COMPOSITE_PARTS,
               items: {
                 type: 'object',
                 properties: {
                   id: {
                     type: 'string',
+                    // Issue #304 review, third round: bounds the rendered
+                    // composite artifact's per-part framing overhead — see
+                    // MAX_PART_ID_LENGTH in composite.ts.
+                    maxLength: MAX_PART_ID_LENGTH,
                     description: 'Stable identity for this part of the whole',
                   },
                   url: {
@@ -778,14 +800,17 @@ async function observeComposite(
   previousState: unknown,
   timeoutMs: number,
 ): Promise<ObservationResult> {
-  // Cumulative byte budget across ALL parts (issue #304 review, second
-  // round): `MAX_RESPONSE_BYTES` bounds each part individually, but nothing
-  // previously bounded the SUM — a composite with many small parts could
-  // still assemble/baseline a snapshot many times the size of any
-  // single-URL monitor's response. `totalBytes` is read-modify-written only
-  // from inside each worker's callback below; `mapWithConcurrency`'s workers
-  // run on the single JS event loop turn-by-turn (never truly in parallel),
-  // so this plain counter needs no lock.
+  // Cumulative RENDERED-artifact byte budget across ALL parts (issue #304
+  // review, second AND third round): `MAX_RESPONSE_BYTES` bounds each part's
+  // body individually, but nothing previously bounded the SUM — a composite
+  // with many small parts could still assemble/baseline a snapshot many
+  // times the size of any single-URL monitor's response. `totalBytes` sums
+  // each part's RENDERED framed section (see `framedPartByteLength`), not
+  // its raw body, so id-framing overhead counts too (third round). Read-
+  // modify-written only from inside each worker's callback below;
+  // `mapWithConcurrency`'s workers run on the single JS event loop
+  // turn-by-turn (never truly in parallel), so this plain counter needs no
+  // lock.
   let totalBytes = 0;
 
   // Issue underlying calls CONCURRENTLY, up to MAX_COMPOSITE_CONCURRENCY at a
@@ -827,21 +852,27 @@ async function observeComposite(
         );
       }
 
-      // ---- Cumulative composite byte budget (issue #304 review, second round) ----
+      // ---- Cumulative composite byte budget (issue #304 review, second AND
+      // third round) ----
       // Checked AFTER each part's own per-part byte cap (readBoundedBody) has
       // already passed, so this is purely the aggregate-across-parts check.
-      // Throwing here fails the whole batch exactly like the non-2xx case
-      // above: `mapWithConcurrency` aborts every other in-flight part via the
-      // shared signal instead of letting them run to completion, and
-      // `nextState` never advances.
-      totalBytes += Buffer.byteLength(body, 'utf8');
+      // Sums the RENDERED framed section (`## <id>\n<body>`, matching
+      // `renderCompositeSnapshot`) rather than the raw body — the reviewer's
+      // third-round repro (an empty-body part with an 11 MiB `id`) showed a
+      // body-only counter never tripping while the artifact still grew
+      // unbounded through id-framing overhead alone. Throwing here fails the
+      // whole batch exactly like the non-2xx case above: `mapWithConcurrency`
+      // aborts every other in-flight part via the shared signal instead of
+      // letting them run to completion, and `nextState` never advances.
+      const fetchedPart: FetchedPart = { id: part.id, body };
+      totalBytes += framedPartByteLength(fetchedPart);
       if (totalBytes > MAX_COMPOSITE_BYTES) {
         throw new Error(
-          `api-poll composite "${composite.objectKey}" exceeded the ${String(MAX_COMPOSITE_BYTES)}-byte cumulative part-body budget after part "${part.id}" (${String(totalBytes)} bytes across parts fetched so far) — reduce the number/size of parts or split into multiple monitors`,
+          `api-poll composite "${composite.objectKey}" exceeded the ${String(MAX_COMPOSITE_BYTES)}-byte cumulative rendered-artifact budget after part "${part.id}" (${String(totalBytes)} bytes across the composite's framed parts fetched so far) — reduce the number/size of parts or split into multiple monitors`,
         );
       }
 
-      return { id: part.id, body } satisfies FetchedPart;
+      return fetchedPart;
     },
   );
 

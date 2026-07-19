@@ -1046,12 +1046,14 @@ memory, or amplify the local SQLite database (P1 daemon availability). `api-poll
 bounds, all covered by a documented default with — for the deadline — a validated per-monitor
 override:
 
-| Bound                                 | Default                         | Override                                                                                                                                                           |
-| ------------------------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Request/body deadline                 | `30s`                           | `timeout` (scope field, duration string `^[1-9]\d*[smhd]$`, e.g. `"1m"`); at most `2147483647`ms (~24.8 days) — the largest delay Node's `setTimeout` can schedule |
-| Response body size cap (per part)     | 10 MiB (10 × 1024 × 1024 bytes) | not configurable; not enforced at all for `change-detection.strategy: status-code`                                                                                 |
-| Composite cumulative body-byte budget | 10 MiB, summed across ALL parts | not configurable                                                                                                                                                   |
-| Composite concurrency                 | 5 parts in flight at once       | not configurable                                                                                                                                                   |
+| Bound                                                       | Default                                            | Override                                                                                                                                                           |
+| ----------------------------------------------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Request/body deadline                                       | `30s`                                              | `timeout` (scope field, duration string `^[1-9]\d*[smhd]$`, e.g. `"1m"`); at most `2147483647`ms (~24.8 days) — the largest delay Node's `setTimeout` can schedule |
+| Response body size cap (per part)                           | 10 MiB (10 × 1024 × 1024 bytes)                    | not configurable; not enforced at all for `change-detection.strategy: status-code`                                                                                 |
+| Composite cumulative artifact-byte budget                   | 10 MiB, summed across ALL parts' rendered sections | not configurable                                                                                                                                                   |
+| Composite concurrency                                       | 5 parts in flight at once                          | not configurable                                                                                                                                                   |
+| Composite part count (issue #304 review, third round)       | 50 `parts` entries max                             | not configurable                                                                                                                                                   |
+| Composite part `id` length (issue #304 review, third round) | 256 characters max                                 | not configurable                                                                                                                                                   |
 
 **Request/body deadline.** A single `AbortController`-backed timer, started when the request is
 issued, bounds the ENTIRE exchange — connecting, receiving headers, and streaming the body to
@@ -1148,30 +1150,58 @@ completion. Either way `nextState` never advances and the prior baseline is pres
 concurrency bound changes only how many requests are in flight at once and how fast a doomed batch
 surfaces its failure, not the composite's all-or-nothing semantics.
 
-**Composite cumulative body-byte budget.** The per-part 10 MiB cap (above) bounds any ONE part;
-the 5-worker concurrency bound (above) bounds how many parts are in flight AT ONCE — but neither
-bounds the aggregate size of the assembled composite. A composite with many small parts, each
-individually far under the per-part cap (e.g. 12 parts × 1 MiB), could still assemble and baseline
-a `snapshotText`/`nextState` many times larger than any single-URL monitor's response, persisted
-every tick. `api-poll` therefore also tracks the running SUM of every part's body length across the
-whole composite; once that running total exceeds the same 10 MiB figure (reused, not a second
-configurable knob), the source throws:
+**Composite cumulative artifact-byte budget.** The per-part 10 MiB cap (above) bounds any ONE
+part's response body; the 5-worker concurrency bound (above) bounds how many parts are in flight
+AT ONCE — but neither bounds the aggregate size of the assembled composite. A composite with many
+small parts, each individually far under the per-part cap (e.g. 12 parts × 1 MiB), could still
+assemble and baseline a `snapshotText`/`nextState` many times larger than any single-URL monitor's
+response, persisted every tick. `api-poll` therefore also tracks the running SUM of every part's
+**rendered** section — the `## <id>\n<body>` text `renderCompositeSnapshot` emits for it, not just
+its raw response body — across the whole composite; once that running total exceeds the same
+10 MiB figure (reused, not a second configurable knob), the source throws:
 
-> `api-poll composite "<objectKey>" exceeded the 10485760-byte cumulative part-body budget after
-part "<partId>" (<n> bytes across parts fetched so far) — reduce the number/size of parts or
-split into multiple monitors`
+> `api-poll composite "<objectKey>" exceeded the 10485760-byte cumulative rendered-artifact budget
+after part "<partId>" (<n> bytes across the composite's framed parts fetched so far) — reduce the
+number/size of parts or split into multiple monitors`
 
 This fails the whole composite exactly like a non-2xx or oversized part: `mapWithConcurrency`
 aborts every other in-flight part via the shared `AbortSignal`, `nextState` never advances, and the
 prior baseline is preserved.
 
+**Composite part count and part-`id` length (issue #304 review, third round).** The byte budget
+above bounds aggregate _size_, but bounds neither the number of parts nor a single part's `id`
+length — and a reviewer showed both matter independently of body size: 100,000 empty-body parts (0
+cumulative body bytes) completed 100,000 requests and produced a 1,699,998-byte baseline without
+tripping the (then body-only) budget, and a single empty-body part with an 11 MiB `id` produced an
+11,534,340-byte baseline the same way, since `renderCompositeSnapshot` frames every part with
+`## <id>\n` regardless of how large the body is. `api-poll` therefore also caps:
+
+- `change-detection.composite.parts` at **50 entries** — rejected in both the JSON Schema
+  (`maxItems`, so `agentmonitors validate`/`monitor test`/`watch declare` catch it at authoring
+  time) and the parser (`change-detection.composite.parts must not exceed 50 entries (got <n>)`,
+  defense in depth for a hand-edited `MONITOR.md` that skipped validation — 002 §2.2).
+- each part's `id` at **256 characters** — rejected the same way in both the schema (`maxLength`)
+  and the parser (`change-detection.composite.parts[<i>].id must not exceed 256 characters (got
+<n>)`).
+
+Both are structural rejections at config-parse time, before `observe()` issues a single request —
+neither reviewer repro shape above ever reaches the network under this bound. The part-count cap
+also bounds **worst-case tick duration**: with `MAX_COMPOSITE_CONCURRENCY` (5) workers, a composite
+takes at most `ceil(parts / 5) * timeout` to resolve or fail, so at the 50-part cap and the default
+30s timeout, one composite's worst case is `ceil(50 / 5) * 30s = 300s` (5 minutes) — a known,
+documented ceiling rather than an unbounded function of how many parts an author (or a
+misconfigured/compromised MONITOR.md) declares.
+
 (Verified: `plugins/source-api-poll/src/index.ts`, `MAX_RESPONSE_BYTES`, `MAX_COMPOSITE_BYTES`,
 `MAX_COMPOSITE_CONCURRENCY`, `readBoundedBody`, `fetchBody`, `observeComposite`;
+`plugins/source-api-poll/src/composite.ts`, `MAX_COMPOSITE_PARTS`, `MAX_PART_ID_LENGTH`,
+`framedPartByteLength`, `parseCompositeConfig`;
 `libs/core/src/notify/notifier.ts`, `parseOperationTimeoutMs`, `DEFAULT_OPERATION_TIMEOUT_MS`,
 `OPERATION_TIMEOUT_PATTERN`, `MAX_OPERATION_TIMEOUT_MS`;
 `plugins/source-api-poll/src/map-with-concurrency.ts`;
 `plugins/source-api-poll/src/index.test.ts`, "request/body bounds (issue #304)",
-"composite cumulative byte budget (issue #304 review, second round)";
+"composite cumulative byte budget (issue #304 review, second + third round)",
+"composite part-count and part-id bounds (issue #304 review, third round)";
 `plugins/source-api-poll/src/map-with-concurrency.test.ts`;
 `libs/core/src/notify/notifier.test.ts`.)
 

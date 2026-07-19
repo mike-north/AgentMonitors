@@ -8,10 +8,14 @@ import {
   SourceRegistry,
   claudeCodeAdapter,
   createDb,
+  validateWatchScope,
 } from '@agentmonitors/core';
 import source from './index.js';
 import {
   buildCompositeObservation,
+  framedPartByteLength,
+  MAX_COMPOSITE_PARTS,
+  MAX_PART_ID_LENGTH,
   parseCompositeConfig,
   renderCompositeSnapshot,
 } from './composite.js';
@@ -1778,8 +1782,10 @@ When the document changes, act on it.
     // could still assemble and baseline a snapshot many times that size
     // every tick (the reported case: 12 x 1 MiB parts = 12.5 MB with no
     // aggregate bound). `MAX_COMPOSITE_BYTES` bounds the cumulative total
-    // across every part in the SAME composite.
-    describe('composite cumulative byte budget (issue #304 review, second round)', () => {
+    // across every part in the SAME composite — and, since the third round,
+    // sums the RENDERED framed section (`## <id>\n<body>`) rather than the
+    // raw body, so id-framing overhead counts toward the budget too.
+    describe('composite cumulative byte budget (issue #304 review, second + third round)', () => {
       const MAX_COMPOSITE_BYTES = 10 * 1024 * 1024;
 
       /** A `fetch` mock returning a fixed-size body for every part URL. */
@@ -1817,16 +1823,20 @@ When the document changes, act on it.
           source.observe(config, { now: new Date() }),
         ).rejects.toThrow(
           new RegExp(
-            `exceeded the ${String(MAX_COMPOSITE_BYTES)}-byte cumulative part-body budget`,
+            `exceeded the ${String(MAX_COMPOSITE_BYTES)}-byte cumulative rendered-artifact budget`,
           ),
         );
       });
 
-      it('a composite whose cumulative part bytes sit exactly at the budget succeeds (boundary)', async () => {
-        // 2 parts x 5 MiB = 10 MiB exactly — AT, not over, the cumulative
-        // budget, so this must NOT throw.
-        const partSize = 5 * 1024 * 1024;
-        vi.stubGlobal('fetch', mockFixedSizeBody(partSize));
+      it('a composite whose cumulative RENDERED bytes sit exactly at the budget succeeds (boundary)', async () => {
+        // Two same-length (1-char) ids contribute identical framing overhead
+        // (`framedPartByteLength` sums the SAME `## <id>\n<body>` text
+        // `renderCompositeSnapshot` emits), so body size is chosen so the
+        // rendered total lands EXACTLY at the budget — not merely the raw
+        // body sum, which is what the pre-third-round budget checked.
+        const overheadPerPart = framedPartByteLength({ id: 'a', body: '' });
+        const bodySize = (MAX_COMPOSITE_BYTES - 2 * overheadPerPart) / 2;
+        vi.stubGlobal('fetch', mockFixedSizeBody(bodySize));
 
         const config = {
           'change-detection': {
@@ -1845,17 +1855,19 @@ When the document changes, act on it.
         expect(result.nextState).toBeDefined();
       });
 
-      it('a composite whose cumulative part bytes are one byte over the budget throws (boundary)', async () => {
-        // Two 5 MiB parts land exactly at the budget (see test above); a
-        // third single-byte part tips the cumulative total one byte over.
-        const fiveMiB = 5 * 1024 * 1024;
+      it('a composite whose cumulative RENDERED bytes are one byte over the budget throws (boundary)', async () => {
+        // Same exact-budget pair as the previous test, plus a third
+        // minimal part — its own framing/body pushes the running total past
+        // the budget by at least one byte.
+        const overheadPerPart = framedPartByteLength({ id: 'a', body: '' });
+        const bodySize = (MAX_COMPOSITE_BYTES - 2 * overheadPerPart) / 2;
         vi.stubGlobal(
           'fetch',
           vi.fn((input: string) => {
             const body =
               input === 'https://api.example.com/parts/c'
                 ? 'x'
-                : 'a'.repeat(fiveMiB);
+                : 'a'.repeat(bodySize);
             return Promise.resolve({
               status: 200,
               text: () => Promise.resolve(body),
@@ -1880,9 +1892,192 @@ When the document changes, act on it.
           source.observe(config, { now: new Date() }),
         ).rejects.toThrow(
           new RegExp(
-            `exceeded the ${String(MAX_COMPOSITE_BYTES)}-byte cumulative part-body budget`,
+            `exceeded the ${String(MAX_COMPOSITE_BYTES)}-byte cumulative rendered-artifact budget`,
           ),
         );
+      });
+
+      it('an empty-body part with an oversized id inflates the rendered artifact through framing alone', () => {
+        // Issue #304 review, third round, reviewer repro #2: a single
+        // empty-body part with an 11 MiB id produced an 11.5 MB baseline
+        // under the (pre-fix) body-only counter, which never counted a
+        // single byte for this part. `MAX_PART_ID_LENGTH` now rejects the
+        // oversized id at PARSE time, before any fetch — this asserts the
+        // parser-level rejection directly (the runtime-integration variant
+        // below exercises the same repro through `source.observe`).
+        const oversizedId = 'x'.repeat(11 * 1024 * 1024);
+        expect(() =>
+          parseCompositeConfig({
+            composite: {
+              'object-key': 'oversized-id-composite',
+              parts: [{ id: oversizedId, url: 'https://api.example.com/a' }],
+            },
+          }),
+        ).toThrow(
+          new RegExp(
+            `id must not exceed ${String(MAX_PART_ID_LENGTH)} characters`,
+          ),
+        );
+      });
+    });
+
+    // Issue #304 review, third round: the cumulative BYTE budget bounds
+    // aggregate size, but bounds neither the number of parts (and therefore
+    // requests/worst-case tick duration, 003 §4.9) nor a single part's id
+    // length (which inflates the rendered artifact through framing alone,
+    // independent of any response body). `MAX_COMPOSITE_PARTS` and
+    // `MAX_PART_ID_LENGTH` close both gaps, enforced identically in the
+    // JSON Schema (authoring-time `agentmonitors validate`) and the parser
+    // (defense in depth for a hand-edited MONITOR.md, 002 §2.2).
+    describe('composite part-count and part-id bounds (issue #304 review, third round)', () => {
+      it('parseCompositeConfig rejects more than MAX_COMPOSITE_PARTS entries', () => {
+        const parts = Array.from(
+          { length: MAX_COMPOSITE_PARTS + 1 },
+          (_, i) => ({
+            id: `part-${String(i)}`,
+            url: `https://api.example.com/parts/${String(i)}`,
+          }),
+        );
+        expect(() =>
+          parseCompositeConfig({
+            composite: { 'object-key': 'too-many-parts', parts },
+          }),
+        ).toThrow(
+          new RegExp(`must not exceed ${String(MAX_COMPOSITE_PARTS)} entries`),
+        );
+      });
+
+      it('parseCompositeConfig accepts exactly MAX_COMPOSITE_PARTS entries (boundary)', () => {
+        const parts = Array.from({ length: MAX_COMPOSITE_PARTS }, (_, i) => ({
+          id: `part-${String(i)}`,
+          url: `https://api.example.com/parts/${String(i)}`,
+        }));
+        const config = parseCompositeConfig({
+          composite: { 'object-key': 'exactly-max-parts', parts },
+        });
+        expect(config?.parts).toHaveLength(MAX_COMPOSITE_PARTS);
+      });
+
+      it('parseCompositeConfig rejects a part id longer than MAX_PART_ID_LENGTH', () => {
+        const overlongId = 'x'.repeat(MAX_PART_ID_LENGTH + 1);
+        expect(() =>
+          parseCompositeConfig({
+            composite: {
+              'object-key': 'overlong-id',
+              parts: [{ id: overlongId, url: 'https://api.example.com/a' }],
+            },
+          }),
+        ).toThrow(
+          new RegExp(
+            `id must not exceed ${String(MAX_PART_ID_LENGTH)} characters`,
+          ),
+        );
+      });
+
+      it('parseCompositeConfig accepts a part id exactly MAX_PART_ID_LENGTH long (boundary)', () => {
+        const exactId = 'x'.repeat(MAX_PART_ID_LENGTH);
+        const config = parseCompositeConfig({
+          composite: {
+            'object-key': 'exact-id-length',
+            parts: [{ id: exactId, url: 'https://api.example.com/a' }],
+          },
+        });
+        expect(config?.parts[0]?.id).toHaveLength(MAX_PART_ID_LENGTH);
+      });
+
+      it('scopeSchema rejects more than MAX_COMPOSITE_PARTS entries via validateWatchScope', () => {
+        const parts = Array.from(
+          { length: MAX_COMPOSITE_PARTS + 1 },
+          (_, i) => ({
+            id: `part-${String(i)}`,
+            url: `https://api.example.com/parts/${String(i)}`,
+          }),
+        );
+        const errors = validateWatchScope(
+          {
+            'change-detection': {
+              composite: { 'object-key': 'too-many-parts', parts },
+            },
+          },
+          source.scopeSchema,
+        );
+        expect(errors.length).toBeGreaterThan(0);
+      });
+
+      it('scopeSchema rejects a part id longer than MAX_PART_ID_LENGTH via validateWatchScope', () => {
+        const overlongId = 'x'.repeat(MAX_PART_ID_LENGTH + 1);
+        const errors = validateWatchScope(
+          {
+            'change-detection': {
+              composite: {
+                'object-key': 'overlong-id',
+                parts: [{ id: overlongId, url: 'https://api.example.com/a' }],
+              },
+            },
+          },
+          source.scopeSchema,
+        );
+        expect(errors.length).toBeGreaterThan(0);
+      });
+
+      it('reviewer repro: 100,000 empty-body parts are rejected at parse (part-count cap), never issuing a single request', async () => {
+        // Issue #304 review, third round, reviewer repro #1: 100,000
+        // empty-body parts (0 cumulative body bytes) completed 100,000
+        // requests and produced a 1,699,998-byte baseline under the
+        // (pre-fix) body-only budget, which never tripped. `MAX_COMPOSITE_PARTS`
+        // rejects this at config-parse time, before `observe()` issues a
+        // single fetch.
+        const fetchMock = vi.fn(() =>
+          Promise.resolve({ status: 200, text: () => Promise.resolve('') }),
+        );
+        vi.stubGlobal('fetch', fetchMock);
+
+        const parts = Array.from({ length: 100_000 }, (_, i) => ({
+          id: `p${String(i)}`,
+          url: `https://api.example.com/parts/${String(i)}`,
+        }));
+        const config = {
+          'change-detection': {
+            composite: { 'object-key': 'reviewer-repro-1', parts },
+          },
+        };
+
+        await expect(
+          source.observe(config, { now: new Date() }),
+        ).rejects.toThrow(
+          new RegExp(`must not exceed ${String(MAX_COMPOSITE_PARTS)} entries`),
+        );
+        expect(fetchMock).not.toHaveBeenCalled();
+      });
+
+      it('reviewer repro: an empty-body part with an 11 MiB id is rejected at parse, never issuing a request', async () => {
+        // Issue #304 review, third round, reviewer repro #2: one empty-body
+        // part with an 11 MiB id produced an 11,534,340-byte baseline
+        // without tripping the (pre-fix) body-only budget check.
+        // `MAX_PART_ID_LENGTH` rejects this at config-parse time.
+        const fetchMock = vi.fn(() =>
+          Promise.resolve({ status: 200, text: () => Promise.resolve('') }),
+        );
+        vi.stubGlobal('fetch', fetchMock);
+
+        const oversizedId = 'x'.repeat(11 * 1024 * 1024);
+        const config = {
+          'change-detection': {
+            composite: {
+              'object-key': 'reviewer-repro-2',
+              parts: [{ id: oversizedId, url: 'https://api.example.com/a' }],
+            },
+          },
+        };
+
+        await expect(
+          source.observe(config, { now: new Date() }),
+        ).rejects.toThrow(
+          new RegExp(
+            `id must not exceed ${String(MAX_PART_ID_LENGTH)} characters`,
+          ),
+        );
+        expect(fetchMock).not.toHaveBeenCalled();
       });
     });
   });
