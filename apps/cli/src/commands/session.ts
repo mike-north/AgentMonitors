@@ -304,6 +304,18 @@ export async function runSessionStartAction(): Promise<void> {
     // Guard: if the daemon never came up, report and bail — don't fall through
     // to writeLocalState/openSessionClient pointing at a non-existent socket.
     if (!(await waitForDaemonAvailable(socket, BOOT_TIMEOUT_MS))) {
+      // Record that THIS lazy boot failed (issue #389 review finding 6) —
+      // `hook deliver`'s always-on no-socket warning reads this back to tell
+      // "the automated boot just failed, and will retry next session" from
+      // "no session has ever started here at all" (see
+      // `describeBootFailedNoSocketWarning` in `hook-deliver-warnings.ts`).
+      // `socket`/`db` are NOT persisted here — only a successful boot earns
+      // that (see the success path below) — so `hook deliver` still sees the
+      // same "enabled, no socket" shape it always has, plus this marker.
+      writeLocalState(workspacePath, {
+        ...state,
+        lastBootFailureAt: new Date().toISOString(),
+      });
       reportError(
         `Daemon failed to start within ${String(BOOT_TIMEOUT_MS / 1000)}s`,
         false,
@@ -311,8 +323,13 @@ export async function runSessionStartAction(): Promise<void> {
       return;
     }
   }
-  // persist the resolved paths for sibling hooks (deliver/end)
-  writeLocalState(workspacePath, { ...state, socket, db });
+  // persist the resolved paths for sibling hooks (deliver/end). A successful
+  // boot supersedes any earlier failure marker — drop it (rather than
+  // spreading a stale `state.lastBootFailureAt` forward) so the NEXT `hook
+  // deliver` sees a clean, fully-booted workspace, not a leftover "the last
+  // boot failed" note from a prior session (issue #389 review finding 6).
+  const { lastBootFailureAt: _staleBootFailure, ...clearedState } = state;
+  writeLocalState(workspacePath, { ...clearedState, socket, db });
 
   try {
     const opened = await openSessionClient(

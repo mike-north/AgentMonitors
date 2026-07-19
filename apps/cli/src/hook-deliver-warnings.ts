@@ -22,10 +22,21 @@
  * delivery for up to ~15s; empty output during that window is normal and MUST
  * NOT warn — 002 §9.1) stays silent, as does every other quiet-return branch
  * (disabled workspace, unreachable daemon, nothing pending, …), each of which
- * remains diagnosable via `--debug` (`hook-deliver-debug.ts`). The plugin only
- * wires `hook deliver` into `UserPromptSubmit` with a well-formed payload, so
- * none of these lines fire in normal operation — only on the manual/no-docs
- * path these diagnostics exist to unblock.
+ * remains diagnosable via `--debug` (`hook-deliver-debug.ts`).
+ *
+ * The no-per-workspace-socket branch is NOT manual-only (issue #389 review
+ * finding 6, correcting an earlier claim here): `session start`'s own
+ * SessionStart-hook lazy boot can time out mid-session, leaving the workspace
+ * enabled with no socket persisted — the SAME shape as a workspace that has
+ * never had a session start at all. {@link describeNoSocketWarning} covers
+ * the latter (a genuinely manual/no-docs invocation); {@link
+ * describeBootFailedNoSocketWarning} covers the former, reading `.local.md`'s
+ * `lastBootFailureAt` marker (`local-state.ts`) to tell the two apart and
+ * pointing at automatic retry rather than a manual override. Every OTHER
+ * branch in this module remains genuinely manual-only — the plugin only wires
+ * `hook deliver` into `UserPromptSubmit` with a well-formed payload, so a
+ * malformed payload, an unmapped lifecycle, or an unresolvable session_id
+ * only ever occur on that manual/no-docs path.
  *
  * @see ./commands/hook.ts (writes these lines to stderr, unconditionally, on
  *   the relevant branch)
@@ -72,8 +83,16 @@ export function describeMalformedPayloadWarning(): string {
  * for the same reason as the siblings above: the empty stdout is otherwise
  * indistinguishable from "nothing pending," and this state never self-resolves
  * until something writes the socket. Returned WITHOUT a trailing newline; the
- * caller appends one. In the integrated flow `session start` persists `socket:`
- * before any `hook deliver` fires, so this fires only on the manual path.
+ * caller appends one.
+ *
+ * Covers the case where NO session has ever started in this workspace at all
+ * (e.g. `init --enable-only` ran, but the plugin's SessionStart hook — or a
+ * manual `session start` — has not fired yet): the caller (`hook.ts`) uses
+ * this variant when `.local.md` carries no `lastBootFailureAt` marker.
+ * {@link describeBootFailedNoSocketWarning} is the OTHER case — a lazy boot
+ * that DID run but failed (issue #389 review finding 6) — where "start a
+ * daemon yourself" is misleading advice, since the automated path will retry
+ * on its own.
  */
 export function describeNoSocketWarning(): string {
   return (
@@ -81,6 +100,29 @@ export function describeNoSocketWarning(): string {
     '`socket:` entry in .claude/agentmonitors.local.md) — refusing to fall back ' +
     'to a shared default socket; nothing delivered. Start a daemon for this ' +
     'workspace with `agentmonitors daemon run --detach`, or pass --socket.'
+  );
+}
+
+/**
+ * Same missing-socket state as {@link describeNoSocketWarning}, but for the
+ * OTHER way a workspace ends up enabled with no socket persisted (issue #389
+ * review finding 6): `session start`'s own SessionStart-hook lazy boot ran
+ * this session and timed out (`session.ts`'s `BOOT_TIMEOUT_MS` guard) before
+ * it could persist `socket:` — recorded as `.local.md`'s `lastBootFailureAt`
+ * (`local-state.ts`). Unlike the never-configured case, "run `daemon run
+ * --detach` yourself" is misleading here: the SAME automated path that just
+ * failed will retry on its own the next time a session starts in this
+ * workspace, so the honest remediation leads with that and treats the manual
+ * command as an optional stopgap, not the primary fix. Returned WITHOUT a
+ * trailing newline; the caller appends one.
+ */
+export function describeBootFailedNoSocketWarning(): string {
+  return (
+    'hook deliver: no per-workspace socket configured — the last automatic ' +
+    'daemon boot for this workspace (via the SessionStart hook) failed to come ' +
+    'up in time; nothing delivered. It will retry automatically the next time a ' +
+    'session starts here — run `agentmonitors daemon run --detach` yourself ' +
+    'only if you need it available before then.'
   );
 }
 

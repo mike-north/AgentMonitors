@@ -51,6 +51,7 @@ import {
   describeWorkspaceDisabled,
 } from '../hook-deliver-debug.js';
 import {
+  describeBootFailedNoSocketWarning,
   describeMalformedPayloadWarning,
   describeNoSocketWarning,
   describeUnknownHostSessionWarning,
@@ -787,7 +788,20 @@ Diagnosis:
           // until a socket is persisted — so warn on stderr ALWAYS, not only
           // under --debug (issue #389 P2). STDOUT and the exit code are
           // untouched.
-          process.stderr.write(`${describeNoSocketWarning()}\n`);
+          //
+          // Two distinct ways to reach this state (issue #389 review finding
+          // 6): `state.lastBootFailureAt` distinguishes THIS session's own
+          // SessionStart-hook boot having failed (automated path — retries on
+          // its own) from no session ever having started here at all
+          // (genuinely manual/no-docs path — "run daemon run --detach
+          // yourself" is the actual fix there).
+          process.stderr.write(
+            `${
+              state.lastBootFailureAt !== undefined
+                ? describeBootFailedNoSocketWarning()
+                : describeNoSocketWarning()
+            }\n`,
+          );
           debug(describeNoSocket());
           return;
         }

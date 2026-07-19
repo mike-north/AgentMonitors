@@ -8,6 +8,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  describeBootFailedNoSocketWarning,
   describeMalformedPayloadWarning,
   describeNoSocketWarning,
   describeUnknownHostSessionWarning,
@@ -130,6 +131,39 @@ describe('describeNoSocketWarning (issue #389 P2)', () => {
 
   it('stays a single line and does not include a trailing newline', () => {
     expect(describeNoSocketWarning()).not.toContain('\n');
+  });
+});
+
+describe('describeBootFailedNoSocketWarning (issue #389 review finding 6)', () => {
+  it('names the same missing-socket condition as the sibling warning', () => {
+    const msg = describeBootFailedNoSocketWarning();
+    expect(msg).toContain('hook deliver:');
+    expect(msg).toContain('no per-workspace socket configured');
+  });
+
+  it('attributes the state to a failed automatic boot, not a manual gap', () => {
+    const msg = describeBootFailedNoSocketWarning();
+    expect(msg).toContain('SessionStart hook');
+    expect(msg).toContain('failed to come up in time');
+  });
+
+  it('leads with automatic retry, offering the manual command only as a fallback', () => {
+    const msg = describeBootFailedNoSocketWarning();
+    expect(msg).toContain('retry automatically');
+    expect(msg.indexOf('retry automatically')).toBeLessThan(
+      msg.indexOf('agentmonitors daemon run --detach'),
+    );
+  });
+
+  it('is textually distinct from the never-configured variant', () => {
+    expect(describeBootFailedNoSocketWarning()).not.toBe(
+      describeNoSocketWarning(),
+    );
+  });
+
+  it('stays a single line and does not include a trailing newline', () => {
+    const msg = describeBootFailedNoSocketWarning();
+    expect(msg).not.toContain('\n');
   });
 });
 
