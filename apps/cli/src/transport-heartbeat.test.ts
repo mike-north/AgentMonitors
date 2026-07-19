@@ -1,8 +1,10 @@
 import {
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import os from 'node:os';
@@ -550,3 +552,56 @@ describe('isHeartbeatStale', () => {
     ).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The transport registry is owner-only, even under a permissive umask (issue
+// #425 review, round 3). Every record it holds names a workspace path, a
+// socket path, and — for `channel` — a host session id; a world-readable
+// registry directory would leak all of that to any local user. POSIX-only
+// (modes are meaningless on win32), matching the daemon-IPC-artifacts suite's
+// convention (`daemon-ipc.test.ts`).
+// ---------------------------------------------------------------------------
+const mode = (p: string): number => statSync(p).mode & 0o777;
+
+describe.skipIf(process.platform === 'win32')(
+  'transport registry directory is owner-only (issue #425 review)',
+  () => {
+    let originalUmask: number;
+
+    beforeEach(() => {
+      originalUmask = process.umask(0o000);
+    });
+
+    afterEach(() => {
+      process.umask(originalUmask);
+    });
+
+    it('creates a missing registry directory 0700 even under umask 000', () => {
+      writeTransportHeartbeat({
+        transport: 'channel',
+        workspacePath: WORKSPACE,
+        socketPath: SOCKET,
+        now: new Date('2026-07-19T12:00:00.000Z'),
+      });
+
+      expect(mode(transportRegistryDir())).toBe(0o700);
+    });
+
+    it('tightens a pre-existing, permissively-created registry directory', () => {
+      // Simulate a registry directory left behind by an older build that used
+      // a raw `mkdirSync` (no explicit mode) under a permissive umask.
+      mkdirSync(transportRegistryDir(), { recursive: true });
+      chmodSync(transportRegistryDir(), 0o777);
+      expect(mode(transportRegistryDir())).toBe(0o777);
+
+      writeTransportHeartbeat({
+        transport: 'hook',
+        workspacePath: WORKSPACE,
+        socketPath: SOCKET,
+        now: new Date('2026-07-19T12:00:00.000Z'),
+      });
+
+      expect(mode(transportRegistryDir())).toBe(0o700);
+    });
+  },
+);

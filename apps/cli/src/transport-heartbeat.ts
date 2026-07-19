@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto';
 import {
-  mkdirSync,
   readFileSync,
   readdirSync,
   renameSync,
@@ -9,7 +8,7 @@ import {
 } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { PRIVATE_FILE_MODE } from '@agentmonitors/core';
+import { ensurePrivateDir, PRIVATE_FILE_MODE } from '@agentmonitors/core';
 import { getCliVersion } from './cli-version.js';
 import { resolveDataRoot, workspaceHash } from './workspace-paths.js';
 
@@ -299,7 +298,15 @@ export function writeTransportHeartbeat(
   };
 
   try {
-    mkdirSync(path.dirname(target), { recursive: true });
+    // Owner-only (0700), not the raw `mkdirSync` default: the registry dir
+    // otherwise inherits the process umask, so a permissive umask (e.g. 000)
+    // leaves every transport heartbeat — which carries a workspace path, a
+    // socket path, and a host session id — world-readable (issue #425 review,
+    // round 3). `ensurePrivateDir` is the established owner-only-directory
+    // helper (also used by the daemon socket dir and per-workspace data
+    // dirs), so this both creates missing ancestors at 0700 and tightens an
+    // already-existing, more-permissive directory left by an older build.
+    ensurePrivateDir(path.dirname(target));
     // `${target}.<pid>.tmp`, not a fixed `.tmp`: two transports refreshing the
     // same record concurrently would otherwise write the same temp file and
     // could rename each other's partial content into place.
