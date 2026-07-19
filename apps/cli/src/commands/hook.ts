@@ -52,6 +52,7 @@ import {
 } from '../hook-deliver-debug.js';
 import {
   describeMalformedPayloadWarning,
+  describeNoSocketWarning,
   describeUnknownHostSessionWarning,
   describeUnmappedLifecycleWarning,
 } from '../hook-deliver-warnings.js';
@@ -679,14 +680,16 @@ Output formats:
   default/json  Compact Claude Code hook wire JSON when something is pending.
   text          Rendered additionalContext only, for manual inspection.
 
-Always-on STDERR diagnostics (issues #329, #420):
-  Three failure branches whose empty STDOUT is otherwise indistinguishable from
+Always-on STDERR diagnostics (issues #329, #420, #389):
+  Four failure branches whose empty STDOUT is otherwise indistinguishable from
   "nothing pending" — and which never resolve on their own — ALWAYS write one line to
   STDERR, even without --debug. STDOUT and the exit code are unaffected:
     - malformed / non-hook payload (no session_id):
         hook deliver: no session_id in the stdin payload — ...
     - hook_event_name that maps to no delivery lifecycle:
         hook deliver: hook_event_name "<name>" does not map to a delivery lifecycle ...
+    - no per-workspace socket configured (no --socket, no socket: in .local.md):
+        hook deliver: no per-workspace socket configured ...
     - session_id that matches no tracked session:
         hook deliver: no session registered for host session id "<id>"
   The expected (and silent) ~15s high-urgency claim-settle window still writes nothing.
@@ -778,6 +781,13 @@ Diagnosis:
         // per-workspace isolation.
         const explicitSocket = options.socket ?? state.socket;
         if (!explicitSocket) {
+          // Enabled workspace, but nothing points at a socket. Like the
+          // branches above (#329, #420 P1), the empty stdout here is
+          // indistinguishable from "nothing pending" and never self-resolves
+          // until a socket is persisted — so warn on stderr ALWAYS, not only
+          // under --debug (issue #389 P2). STDOUT and the exit code are
+          // untouched.
+          process.stderr.write(`${describeNoSocketWarning()}\n`);
           debug(describeNoSocket());
           return;
         }

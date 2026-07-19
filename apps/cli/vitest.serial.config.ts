@@ -18,6 +18,7 @@ export default defineConfig({
     include: [
       'src/concurrent-spawn.test.ts',
       'src/detached-spawn.test.ts',
+      'src/commands/daemon-detach.integration.test.ts',
       'src/commands/verify.integration.test.ts',
     ],
     // No file-level parallelism — each file must complete before the next

@@ -49,7 +49,11 @@ export const eventsCommand = new Command('events').description(
 
 const eventsListCommand = eventsCommand
   .command('list')
-  .description('List events for a session')
+  // The summary itself names the required option (issue #389 P3): `events
+  // --help` renders only this line per subcommand, so without it the
+  // requirement is discoverable only by running the command and reading
+  // commander's `error: required option '--session <id>' not specified`.
+  .description('List events for a session (requires --session <id>)')
   .requiredOption('--session <id>', 'AgentMon session id (required)')
   .option('--socket <path>', 'Unix domain socket path for the daemon')
   .option('--monitor <id>', 'Filter by monitor id')
@@ -133,7 +137,10 @@ appendErrorHints(eventsListCommand, [REQUIRED_SESSION_ERROR_HINT]);
 
 const eventsAckCommand = eventsCommand
   .command('ack')
-  .description('Acknowledge one or more events for a session')
+  // Same requirement, same reason as `events list` above (issue #389 P3).
+  .description(
+    'Acknowledge one or more events for a session (requires --session <id>)',
+  )
   .requiredOption('--session <id>', 'AgentMon session id (required)')
   .option('--socket <path>', 'Unix domain socket path for the daemon')
   .option(

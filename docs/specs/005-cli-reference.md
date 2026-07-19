@@ -182,7 +182,7 @@ Runs against the current working directory. Performs, in order:
 2. **Fix `.gitignore`.** Ensures `.gitignore` contains the line `.claude/*.local.*` — appends it (creating the file if absent) when missing; a no-op when already present. Never duplicated across runs.
 3. **Offer a first monitor.** Interactively (only on a TTY, and only when neither `--yes` nor `--enable-only` is given) prompts for a source type and monitor name, then scaffolds it through the same path as `init <name>`. `--yes` scaffolds the default monitor (`file-fingerprint`, name `my-monitor`, overridable with `--type`) with no prompt. `--enable-only` skips this step. A non-interactive invocation (non-TTY stdin) without `--yes` never prompts or hangs: it skips scaffolding and tells the caller to pass `--yes` or use `init <name>`.
 4. **Validate.** When a monitor was scaffolded, runs the `validate` command in-process against the monitors directory and prints its result.
-5. **Summarize.** Prints a "what happens next + how to verify" summary: automatic startup is conditioned on the Claude Code plugin being present ("If you're using the AgentMon Claude Code plugin, monitoring starts automatically the next time you open a Claude Code session"), with the manual `agentmonitors daemon run` alternative stated on the very next line for any other host or bare-terminal setup (issue #338 item 3 — the prior unconditional "starts automatically" phrasing overpromised outside Claude Code); a one-shot `daemon once` check; a pointer to `agentmonitors doctor` as the health-check next step (issue #331 — `doctor` is otherwise undiscoverable outside `--help`); and — when a monitor was created — how to verify it fires: `monitor test` for a dry-run, and `agentmonitors verify <name> --dir <dir>` (with `--manual` for any non-`file-fingerprint` type) as the real, CLI-only, one-command proof that it delivers end-to-end ([§16](#16-verify--prove-a-monitor-delivers-end-to-end)). The `setup-monitors` skill's "Verify It Fires" section is still named as a plugin-only supplement, never the sole pointer — a no-plugin/no-docs CLI user must not dead-end there (issue #408). The idempotent "nothing to change" re-run summary carries the same `doctor` pointer.
+5. **Summarize.** Prints a "what happens next + how to verify" summary: automatic startup is conditioned on the Claude Code plugin being present ("If you're using the AgentMon Claude Code plugin, monitoring starts automatically the next time you open a Claude Code session"), with the manual `agentmonitors daemon run <dir> --detach` alternative stated on the very next line for any other host or bare-terminal setup (issue #338 item 3 — the prior unconditional "starts automatically" phrasing overpromised outside Claude Code; the `--detach` form is named rather than a bare `daemon run` so a reader who follows the line literally gets a backgrounded daemon instead of an occupied terminal, issue #389 P1 — see [§9.2](#92-daemon-run--continuous-loop)); a one-shot `daemon once` check; a pointer to `agentmonitors doctor` as the health-check next step (issue #331 — `doctor` is otherwise undiscoverable outside `--help`); and — when a monitor was created — how to verify it fires: `monitor test` for a dry-run, and `agentmonitors verify <name> --dir <dir>` (with `--manual` for any non-`file-fingerprint` type) as the real, CLI-only, one-command proof that it delivers end-to-end ([§16](#16-verify--prove-a-monitor-delivers-end-to-end)). The `setup-monitors` skill's "Verify It Fires" section is still named as a plugin-only supplement, never the sole pointer — a no-plugin/no-docs CLI user must not dead-end there (issue #408). The idempotent "nothing to change" re-run summary carries the same `doctor` pointer.
 
 **Idempotency:** re-running the bootstrap on an already-enabled project whose `.gitignore` is correct (and, for `--yes`, whose default monitor already exists) changes nothing and prints an "already set up — nothing to change" message. Exits 0.
 
@@ -884,13 +884,15 @@ is only how often the daemon wakes up to ask the runtime whether any monitor is 
 agentmonitors daemon run [monitorsDir] [options]
 ```
 
-| Argument / Flag        | Type                  | Default            | Description                                                                                                 |
-| ---------------------- | --------------------- | ------------------ | ----------------------------------------------------------------------------------------------------------- |
-| `[monitorsDir]`        | positional (optional) | `.claude/monitors` | Directory containing `MONITOR.md` files                                                                     |
-| `--workspace <path>`   | string                | `process.cwd()`    | Workspace path for session projection and per-workspace db/socket resolution (resolved to an absolute path) |
-| `--poll-ms <ms>`       | number (string)       | `30000`            | Polling interval in milliseconds                                                                            |
-| `--socket <path>`      | string                | resolved default   | Unix domain socket path for the daemon                                                                      |
-| `--reap-after-ms <ms>` | number (string)       | `300000`           | Stop after this many ms with no active sessions; `0` disables idle reaping                                  |
+| Argument / Flag        | Type                  | Default                           | Description                                                                                                 |
+| ---------------------- | --------------------- | --------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `[monitorsDir]`        | positional (optional) | `.claude/monitors`                | Directory containing `MONITOR.md` files                                                                     |
+| `--workspace <path>`   | string                | `process.cwd()`                   | Workspace path for session projection and per-workspace db/socket resolution (resolved to an absolute path) |
+| `--poll-ms <ms>`       | number (string)       | `30000`                           | Polling interval in milliseconds                                                                            |
+| `--socket <path>`      | string                | resolved default                  | Unix domain socket path for the daemon                                                                      |
+| `--reap-after-ms <ms>` | number (string)       | `300000`                          | Stop after this many ms with no active sessions; `0` disables idle reaping                                  |
+| `--detach`             | boolean               | `false`                           | Run the daemon in the background and return (issue #389 P1); see **Background mode** below                  |
+| `--log <path>`         | string                | `<workspace data dir>/daemon.log` | With `--detach`, append the backgrounded daemon's stdout+stderr here (created if missing)                   |
 
 Starts the daemon loop: creates a Unix domain socket server, listens for IPC commands, then polls `runtime.tick()` at `--poll-ms` intervals. `--poll-ms` is the loop-wake cadence; per-monitor observation is still gated by each monitor's schedule or `watch.interval`.
 
@@ -901,7 +903,27 @@ uses) rather than the bare global default. This is what makes a directly-invoked
 Getting Started guide's own documented usage, with no flags beyond `[monitorsDir]` — agree with
 `doctor`, `session open`/`list`, and `daemon status` about the workspace's durable state.
 
-**Startup check:** refuses to start if another daemon is already listening at the resolved socket path (exits with error message and code 1).
+**Startup check:** refuses to start if another daemon is already listening at the resolved socket path (exits with error message and code 1). This check runs before `--detach` backgrounds anything, so `--detach` can never spawn a second daemon onto a bound socket.
+
+**Background mode (`--detach`, issue #389 P1):** without it the daemon runs in the foreground and
+occupies the terminal until `Ctrl-C` or `daemon stop` — but `init`'s "what happens next" summary
+tells manual/non-plugin users to start the daemon themselves ([§3](#3-init--scaffold-a-monitor)),
+which left them to discover `& disown` and their own log redirection. With `--detach`, the command:
+
+1. Resolves every value exactly as the foreground path does (monitors dir, workspace, socket, db,
+   `--poll-ms`, `--reap-after-ms`) and passes them **explicitly** to the child, so the backgrounded
+   daemon is the same daemon a foreground run would have been.
+2. Re-invokes itself as a detached, `unref`'d child running plain `daemon run` (no `--detach`) — the
+   same `spawnDetachedDaemon()` path a hook-driven lazy boot takes ([§10.1](#101-session-start)) —
+   with the child's stdout+stderr appended (never truncated) to `--log`.
+3. Polls the socket until the child answers, up to 15s. On success it prints the pid, the socket,
+   the log path, and whether idle reaping is active; on timeout it exits non-zero and names the log
+   file to read.
+
+`--detach` composes with `--reap-after-ms 0`: that pair is the supported way to run a daemon that
+stays up while **no** agent session is open (so a monitor can raise work for an idle agent), and the
+success output says "reaping disabled" rather than an idle-stop window. The child is `detached: true`
+and `unref`'d, so it outlives the shell that started it; `daemon stop` reaches it like any other.
 
 **Signal handling:** `SIGINT` and `SIGTERM` trigger a graceful stop (closes the socket, exits the loop).
 
@@ -1148,6 +1170,13 @@ line. Both `events list` and `events ack` therefore append a second stderr line 
 `Run \`agentmonitors session list\` to find a session id.`— and repeat the same pointer in`--help`'s trailing text. The default `error:` line and the non-zero exit are unchanged; the hint
 is strictly additive.
 
+**The requirement is stated in `--help`, not only in the error (issue #389 P3).** `events --help`
+renders one summary line per subcommand, so a reader who never runs the command still has to
+discover `--session` from a runtime error. Both summaries therefore name it — _"List events for a
+session (requires `--session <id>`)"_ and _"Acknowledge one or more events for a session (requires
+`--session <id>`)"_ — and the option's own description is suffixed `(required)`. `--session` stays
+**required** on both subcommands; only its documentation changed.
+
 **`--unread` matches "unacknowledged," not "never seen" (002 §7; issue #338 item 1).** It filters
 on `acknowledgedAt IS NULL`, which **includes** events already claimed at a delivery lifecycle but
 not yet run through `events ack`. Each returned event's `deliveryState` field (see below)
@@ -1246,7 +1275,7 @@ or the workspace/session is not configured.
 
 1. Read stdin as a JSON hook payload (TTY/empty/unparseable → `{}`; never hangs). If `session_id` is absent → exit 0, print nothing on stdout; ALSO write a one-line malformed-payload diagnostic to **stderr**, unconditionally (issue #420 P1; see §12.2.1).
 2. Derive the lifecycle from `hook_event_name` (unless `--lifecycle` is passed). If it maps to no delivery lifecycle (e.g. `PreToolUse`, `Stop`, a missing/unknown event) → exit 0, print nothing on stdout; ALSO write a one-line unmapped-lifecycle diagnostic to **stderr**, unconditionally (issue #420 P1; see §12.2.1).
-3. Read `.claude/agentmonitors.local.md` via `payload.cwd ?? CLAUDE_PROJECT_DIR ?? cwd`. If `!enabled` or no explicit socket → exit 0, print nothing.
+3. Read `.claude/agentmonitors.local.md` via `payload.cwd ?? CLAUDE_PROJECT_DIR ?? cwd`. If `!enabled` → exit 0, print nothing (silent on both streams — a workspace that opted out must not warn on every hook). If enabled but there is no explicit socket (neither `--socket` nor a `socket:` entry) → exit 0, print nothing on stdout; ALSO write a one-line no-socket diagnostic to **stderr**, unconditionally (issue #389 P2; see §12.2.1).
 4. Check daemon availability. If unreachable → exit 0, print nothing.
 5. List sessions, find the one matching `session_id`. If not found → exit 0, print nothing on
    stdout; ALSO write `hook deliver: no session registered for host session id "<id>"` to
@@ -1299,11 +1328,11 @@ a flag (blind DX study S3 F3). `--debug` writes a parallel, step-by-step diagnos
 **stdout's contract does not change in any mode** — a hook wired without `--debug` behaves exactly as
 before, and running the identical payload with and without `--debug` produces byte-identical stdout.
 
-**Three branches also write to stderr WITHOUT `--debug`.** Every other quiet-return branch resolves
+**Four branches also write to stderr WITHOUT `--debug`.** Every other quiet-return branch resolves
 itself (the ~15s high-urgency claim-settle window) or is a genuinely idle, non-actionable state.
-These three cannot: they can never resolve on their own, and their silent empty output is
+These four cannot: they can never resolve on their own, and their silent empty output is
 indistinguishable from "nothing pending." So each writes exactly one line to stderr, unconditionally
-— **stdout and the exit code are unaffected in all three**:
+— **stdout and the exit code are unaffected in all four**:
 
 - **Malformed / non-hook payload** (step 1 — no `session_id`; issue #420 P1):
 
@@ -1316,6 +1345,17 @@ indistinguishable from "nothing pending." So each writes exactly one line to std
   ```text
   hook deliver: hook_event_name "<name>" does not map to a delivery lifecycle (only UserPromptSubmit, PostToolUse, and SessionStart do); nothing delivered.
   ```
+
+- **No per-workspace socket configured** (step 3 — the workspace is enabled, but neither `--socket`
+  nor a `socket:` entry in `.claude/agentmonitors.local.md` names one, and falling back to a shared
+  default socket would cross workspace isolation; issue #389 P2):
+
+  ```text
+  hook deliver: no per-workspace socket configured (neither --socket nor a `socket:` entry in .claude/agentmonitors.local.md) — refusing to fall back to a shared default socket; nothing delivered. Start a daemon for this workspace with `agentmonitors daemon run --detach`, or pass --socket.
+  ```
+
+  A workspace that is **not enabled** stays silent on both streams — that is an opt-out, not a
+  misconfiguration, and warning there would fire on every hook in every unmonitored repo.
 
 - **Unresolvable `session_id`** (step 5; issue #329):
 

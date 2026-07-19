@@ -13,8 +13,35 @@ import { daemonStatusClient, daemonTickClient } from '../runtime-client.js';
 import { shouldReap, BOOT_GRACE_MS } from '../reap-decision.js';
 import { resolveManualDaemonSocketPath } from '../manual-daemon.js';
 import { resolveWorkspaceDbPath } from '../workspace-db-path.js';
+import { workspacePaths } from '../workspace-paths.js';
+import { spawnDetachedDaemon } from '../detached-spawn.js';
 
 const DEFAULT_REAP_AFTER_MS = 5 * 60 * 1000;
+
+/**
+ * How long `daemon run --detach` waits for the backgrounded daemon to bind its
+ * socket before giving up and pointing the user at the log (issue #389 P1).
+ * Generous enough for a cold Node start on a loaded machine; a genuine bind
+ * failure (stale socket, permissions) surfaces in the log either way.
+ */
+const DETACH_READY_TIMEOUT_MS = 15_000;
+const DETACH_READY_POLL_MS = 150;
+
+/**
+ * Poll the socket until the detached daemon answers, so `--detach` reports a
+ * daemon that is actually reachable rather than merely one that was spawned.
+ */
+async function waitForDaemon(
+  socketPath: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await daemonAvailable(socketPath)) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, DETACH_READY_POLL_MS));
+  }
+}
 
 /**
  * Append per-monitor errored lines to a tick summary so a non-zero errored
@@ -292,6 +319,29 @@ daemonCommand
     'Stop the daemon after this many ms of idle (no active sessions). Set 0 to disable.',
     String(DEFAULT_REAP_AFTER_MS),
   )
+  .option(
+    '--detach',
+    'Run the daemon in the background and return, printing its pid, socket, and log path. ' +
+      'Combine with --reap-after-ms 0 for a daemon that outlives every session.',
+  )
+  .option(
+    '--log <path>',
+    'With --detach, append the daemon output here (default: daemon.log in the workspace data dir)',
+  )
+  .addHelpText(
+    'after',
+    `
+Foreground vs background:
+  Without --detach the daemon runs in the foreground and occupies the terminal
+  until Ctrl-C or \`agentmonitors daemon stop\`.
+  With --detach it is backgrounded, survives the terminal that started it, and
+  the command returns once the daemon answers on its socket.
+
+  A daemon that must stay up while no agent session is open (e.g. so a monitor
+  can alert an idle agent) needs the reaper disabled as well:
+      agentmonitors daemon run --detach --reap-after-ms 0
+`,
+  )
   .action(
     async (
       monitorsDir: string,
@@ -300,6 +350,8 @@ daemonCommand
         pollMs: string;
         socket?: string;
         reapAfterMs: string;
+        detach?: boolean;
+        log?: string;
       },
     ) => {
       const pollMs = Number(options.pollMs);
@@ -338,6 +390,51 @@ daemonCommand
         reportError(
           `AgentMon daemon is already running at ${socketPath}.`,
           false,
+        );
+        return;
+      }
+      // Background mode (issue #389 P1): `init` tells manual users to "start
+      // the daemon yourself: agentmonitors daemon run", which then occupies
+      // their terminal — leaving them to discover `& disown` plus their own
+      // log redirection. `--detach` re-invokes this same command WITHOUT
+      // `--detach` in a detached child (reusing the exact spawn path a
+      // hook-driven boot takes), waits until that child actually answers on
+      // the socket, and reports where to find it. Every resolved value —
+      // monitors dir, workspace, socket, db, poll interval, and the reap
+      // window (including `--reap-after-ms 0`, the persistent-daemon
+      // combination) — is passed through explicitly, so the backgrounded
+      // daemon is the same daemon the foreground run would have been.
+      if (options.detach === true) {
+        const logPath =
+          options.log === undefined
+            ? path.join(workspacePaths(workspace).dir, 'daemon.log')
+            : path.resolve(options.log);
+        const pid = spawnDetachedDaemon({
+          monitorsDir,
+          workspacePath: workspace,
+          socket: socketPath,
+          db: dbPath,
+          pollMs,
+          reapAfterMs,
+          logPath,
+        });
+        if (!(await waitForDaemon(socketPath, DETACH_READY_TIMEOUT_MS))) {
+          reportError(
+            `Detached daemon did not answer on ${socketPath} within ${String(
+              Math.round(DETACH_READY_TIMEOUT_MS / 1000),
+            )}s. See ${logPath} for why.`,
+            false,
+          );
+          return;
+        }
+        console.log('AgentMon daemon started in the background.');
+        if (pid !== undefined) console.log(`  pid:    ${String(pid)}`);
+        console.log(`  socket: ${socketPath}`);
+        console.log(`  log:    ${logPath}`);
+        console.log(
+          reapAfterMs === 0
+            ? '  reaping disabled — it runs until `agentmonitors daemon stop`.'
+            : `  stops after ${String(Math.round(reapAfterMs / 1000))}s with no active session; use --reap-after-ms 0 to keep it up.`,
         );
         return;
       }

@@ -1,6 +1,6 @@
 /**
  * Tests for the pure `hook deliver` always-on stderr warning formatters
- * (issues #329, #420 P1).
+ * (issues #329, #420 P1, #389 P2).
  *
  * @see ./commands/hook.ts (writes these lines to stderr, unconditionally)
  * @see ../../../docs/specs/005-cli-reference.md §12.2.1 (always-on diagnostics)
@@ -9,6 +9,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   describeMalformedPayloadWarning,
+  describeNoSocketWarning,
   describeUnknownHostSessionWarning,
   describeUnmappedLifecycleWarning,
 } from './hook-deliver-warnings.js';
@@ -108,6 +109,27 @@ describe('describeMalformedPayloadWarning (issue #420 P1)', () => {
     expect(msg).toContain('Claude Code hook JSON payload on stdin');
     // Single control-safe line; the caller appends the newline.
     expect(msg).not.toContain('\n');
+  });
+});
+
+describe('describeNoSocketWarning (issue #389 P2)', () => {
+  it('names both configuration sources and why the shared default is refused', () => {
+    const msg = describeNoSocketWarning();
+    expect(msg).toContain('hook deliver:');
+    expect(msg).toContain('no per-workspace socket configured');
+    expect(msg).toContain('--socket');
+    expect(msg).toContain('.claude/agentmonitors.local.md');
+    expect(msg).toContain('refusing to fall back');
+  });
+
+  it('offers the remediation a manual user can act on', () => {
+    expect(describeNoSocketWarning()).toContain(
+      'agentmonitors daemon run --detach',
+    );
+  });
+
+  it('stays a single line and does not include a trailing newline', () => {
+    expect(describeNoSocketWarning()).not.toContain('\n');
   });
 });
 

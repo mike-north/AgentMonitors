@@ -10,11 +10,12 @@
  * — the Claude Code host never sees stderr — but an operator polling
  * `hook deliver` manually while diagnosing a broken hook wire does.
  *
- * Scope is deliberately narrow: the three branches here are the ones whose
+ * Scope is deliberately narrow: the four branches here are the ones whose
  * empty stdout is otherwise indistinguishable from "nothing pending" AND can
  * never resolve on their own —
  *   - a malformed / non-hook stdin payload (no `session_id`),
- *   - a `hook_event_name` that maps to no delivery lifecycle, and
+ *   - a `hook_event_name` that maps to no delivery lifecycle,
+ *   - an enabled workspace with no per-workspace socket configured (#389 P2), and
  *   - an unresolvable host `session_id` (stale/mistyped; #329).
  * A payload that IS a real hook call but is merely held by the expected
  * high-urgency claim-settle window (the runtime debounces high-urgency
@@ -60,6 +61,26 @@ export function describeMalformedPayloadWarning(): string {
   return (
     'hook deliver: no session_id in the stdin payload — expected a Claude Code ' +
     'hook JSON payload on stdin; nothing delivered.'
+  );
+}
+
+/**
+ * The workspace is enabled but has no per-workspace socket to connect to —
+ * neither `--socket` nor a `socket:` entry in `.claude/agentmonitors.local.md`
+ * — so `hook deliver` refuses to fall back to a shared default socket (that
+ * would cross workspace isolation). Emitted unconditionally (issue #389 P2)
+ * for the same reason as the siblings above: the empty stdout is otherwise
+ * indistinguishable from "nothing pending," and this state never self-resolves
+ * until something writes the socket. Returned WITHOUT a trailing newline; the
+ * caller appends one. In the integrated flow `session start` persists `socket:`
+ * before any `hook deliver` fires, so this fires only on the manual path.
+ */
+export function describeNoSocketWarning(): string {
+  return (
+    'hook deliver: no per-workspace socket configured (neither --socket nor a ' +
+    '`socket:` entry in .claude/agentmonitors.local.md) — refusing to fall back ' +
+    'to a shared default socket; nothing delivered. Start a daemon for this ' +
+    'workspace with `agentmonitors daemon run --detach`, or pass --socket.'
   );
 }
 
