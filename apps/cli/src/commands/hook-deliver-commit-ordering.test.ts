@@ -15,9 +15,14 @@
  * `hook.ts`) renders off the RESERVATION's own claim first and defers commit
  * until AFTER a successful write:
  *
- * (a) a commit RPC failure AFTER output was successfully written must leave
- *     the rows pending (nothing was ever durably claimed) — the safe
- *     direction is a later DUPLICATE delivery, never a loss.
+ * (a) a commit RPC rejection AFTER output was successfully written must
+ *     propagate to the caller WITHOUT releasing the reservation — the
+ *     daemon-side outcome is genuinely uncertain (it may have applied the
+ *     commit before the response was lost), so the safe direction is a
+ *     later DUPLICATE delivery, never a loss.
+ * (a2) only a commit RPC that RESOLVES null (the reservation's lease
+ *     already lapsed) proves the rows were never claimed and are back to
+ *     pending — a rejection alone does not prove this.
  * (b) a render/write failure BEFORE commit must release the reservation —
  *     nothing durably claimed, rows return to pending.
  *

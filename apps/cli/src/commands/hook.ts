@@ -508,9 +508,10 @@ export async function reserveRenderAndCommitHookDelivery(
  * write means nothing was durably surfaced, so nothing gets durably claimed
  * either — the rows return to pending and redeliver normally. A
  * failed/uncertain `commit` (the write already succeeded) is NOT caught
- * here: it propagates to the caller, which is safe because the safe
- * direction at that point is a later DUPLICATE delivery, never a loss (the
- * output already reached the user).
+ * here: it propagates to the caller. A rejected/uncertain commit CAN
+ * produce a later duplicate delivery, if the commit in fact never applied —
+ * but it cannot lose this surface, because the write already completed
+ * before commit was attempted (the output already reached the user).
  *
  * **Why `write` must be awaited, not just called.** `process.stdout.write`'s
  * synchronous return value (`true`/`false`) is a BACKPRESSURE signal, not a

@@ -138,8 +138,14 @@ function buildHookClaimedUnreadMarker(
  *   reservation candidates, reserved along with the rest of the recap's
  *   candidate set and about to be claimed once this render's commit lands —
  *   not yet claimed at render time, per the render-before-commit ordering
- *   described below) — they will not redeliver at "the next context event"
- *   the way a genuinely unclaimed `turn-interruptible` event would.
+ *   described below) — the deferred marker's own wording makes no promise
+ *   about the ordinary redelivery direction either way (a null commit
+ *   returns the rows to pending, eligible for redelivery at the next
+ *   applicable context event; a rejected commit leaves that outcome
+ *   unknown), so borrowing it here would misleadingly imply a guarantee
+ *   the recap case can't back up. The recap marker below is preferred
+ *   precisely because it CAN make a guarantee that holds across all three
+ *   commit outcomes: future recap resurfacing.
  * - {@link buildHookClaimedUnreadMarker} (in its current, post-round-10
  *   wording) no longer asserts a redelivery outcome either way — but a
  *   recap's own framing is still distinct: it can (and should) promise the

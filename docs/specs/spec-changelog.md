@@ -424,9 +424,11 @@ urgency bands, or the unread/claimed/acknowledged model; the hook transport is u
   `pending` for the hook path or the next poll). Leased rows are hidden from a concurrent hook claim,
   so the in-flight window preserves cross-transport dedup (§4.5).
 - **Guarantees:** no claim before surfacing (claim timestamps stay truthful); failed/disconnected
-  pushes fall back to the hook path or retry; successful sends stay deduplicated; rows stay
-  unacknowledged throughout. The reservation registry is in-memory and daemon-local, and a lost or
-  self-expired lease safely returns rows to `pending` (PP1).
+  pushes fall back to the hook path or retry; a successful push is durably deduplicated only once its
+  commit resolves non-null — a null resolve permits ordinary redelivery, and a rejected commit leaves
+  the daemon-side outcome uncertain (see the three-way outcome below); rows stay unacknowledged
+  throughout. The reservation registry is in-memory and daemon-local, and a lost or self-expired lease
+  safely returns rows to `pending` (PP1).
 - **At-least-once boundary — three distinct commit outcomes, not two.** After a successful push,
   `commitDelivery` either resolves non-null (the rows are now claimed), resolves null (the lease had
   already lapsed mid-push or the daemon restarted — the rows are definitely still pending and
