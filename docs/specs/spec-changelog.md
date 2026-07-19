@@ -9,6 +9,40 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-07-19 — `writeStreamChunk` now swallows the paired post-callback `'error'` event, and the channel transport's render-before-commit ordering is reflected everywhere it was previously described as commit-before-render (006 §4.2.1, §5.5) — Refs #442
+
+Two fixes found on this PR's round-11 review.
+
+- **`writeStreamChunk` could still crash the hook process despite the round-10 fix.** A real Node
+  `Writable` is not mutually exclusive between its write callback and its `'error'` event: when a
+  write fails, Node invokes the callback with the error AND separately EMITS the paired `'error'`
+  event on a LATER tick for that SAME failure. The round-10 version removed its only `'error'`
+  listener as soon as the callback settled the promise, so that paired emission had no listener left
+  and became an UNCAUGHT exception — three independent real-stream probes (a closed pipe's write, a
+  spawned child's closed stdin, and an `fs` write stream on a closed fd) reproduced `callback EPIPE ->
+rejected promise -> uncaught EPIPE`, which could exit the hook process nonzero despite its
+  always-exit-0 contract. Fixed by keeping the `'error'` listener armed through that later tick
+  whenever the callback settles with an error (so the paired event is safely swallowed instead of
+  going uncaught), detaching it only on the paths where no paired event will ever follow — a
+  successful write, or `stream.write()` itself throwing synchronously. New regressions drive an
+  actually-closed `fs` write stream (closed fd) and a real closed pipe (a child process whose stdin's
+  reader has exited), with a `process.on('uncaughtException', ...)` guard proving neither reproduction
+  crashes the process.
+- **006, source comments, and this changelog still described the channel transport's oversized-event
+  marker as committed before render — but production reserves, pushes/renders, and only THEN commits
+  (`runChannelDeliveryCycle`, mirroring the hook side's round-9 reordering).** A null/rejected commit
+  (the reservation's lease already lapsed, `'surfaced-uncommitted'`) leaves the pushed event
+  uncommitted and eligible for at-least-once redelivery, contradicting the prior "already committed,
+  will never re-deliver" framing. Corrected `channel-render.ts`'s and `hook-deliver-render.ts`'s doc
+  comments, 006 §4.2.1 and §5.5, and the round-10 entry above to state the conditional truth: a
+  successful commit prevents ordinary repoll; a null/rejected commit leaves the row eligible for
+  redelivery. `buildChannelTruncatedMarker` itself needed no wording change — it was already
+  outcome-neutral.
+
+006 §4.2.1 and §5.5 previously asserted the channel transport's claim is durably committed before
+render; both sections, plus the round-10 entry above, are now corrected to describe the actual
+reserve → push/render → commit ordering and its conditional outcome.
+
 ## 2026-07-18 — Hook-deliver commits AFTER writing (not before), re-validates the candidate-growth race, `verify` reuses the same reserve/validate/commit flow, and marker selection is lifecycle-aware for post-compact recaps (006 §5.2, §5.5, §6.1) — Refs #442
 
 Four fixes found on this PR's round-9 review.
@@ -96,8 +130,12 @@ reordering.
   show in full; the full copy stays unread — run `agentmonitors events list --session <id> --unread`
   to see it now". `buildHookRecapMarker` is similarly reworded to drop its own premature "is claimed"
   assertion, keeping only the self-healing future-recap promise (true regardless of this particular
-  commit's outcome). The channel transport's `buildChannelTruncatedMarker` is unaffected — its claim
-  IS durably committed before render, a different transport with no such uncertainty.
+  commit's outcome). The channel transport's `buildChannelTruncatedMarker` was already outcome-neutral
+  for the identical reason: it has the SAME render-before-commit ordering (reserve → push/render →
+  commit) and the same conditional outcome — a successful commit prevents ordinary repoll, a
+  null/rejected commit leaves the pushed event eligible for at-least-once redelivery — so it needed no
+  wording change here (a round-11 review found stale source/spec comments elsewhere still describing
+  the channel as committed before render; see the 2026-07-19 round-11 entry below).
 
 006 §5.1, §5.2, and §5.5 previously asserted a specific claimed/redelivery outcome for the hook
 transport's pre-commit truncation markers, and described the synchronous `stdout.write` return as the

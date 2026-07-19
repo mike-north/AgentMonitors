@@ -230,9 +230,11 @@ whole blocks fit
 (`packChannelEventsUnderCap`, `apps/cli/src/channel-render.ts`), and reserves/claims exactly that many
 (`reserveDelivery`'s `maxEvents`) — mirroring exactly how the hook-deliver transport sizes its
 `additionalContext` cap (§5.1, issue #299). This is what makes boundedness compatible with §5.5's
-**claimed-set-equals-rendered-set** invariant: capping the assembled `content` **after** commit would
-have dropped later blocks from the rendered tag while the whole claim was still committed, silently
-omitting claimed-but-unrendered events. Any settled-high events that do not fit stay pending and
+**claimed-set-equals-rendered-set** invariant: capping the assembled `content` **after the claim was
+already reserved** would have dropped later blocks from the rendered tag while the whole claim was
+still eligible to be committed, silently omitting claimed-but-unrendered events — rendering (the
+push) always runs before the commit that marks rows claimed, never the reverse (§5.5). Any
+settled-high events that do not fit stay pending and
 re-deliver on a later poll, with an explicit, bracket-free deferral marker appended to `content` (never
 `<`/`>`/`[`/`]`, so it needs no `contentValue` sanitization pass of its own). Only the **per-event**
 change summary is bounded independently of packing (above, and §4.6), so no single untrusted diff is
@@ -244,13 +246,15 @@ for a non-empty preview (forward progress, §5.5), and a reserve can race the ea
 actually-claimed event was never measured. Only in this one case does `renderChannelEvent` cut an
 already-claimed block: it mid-truncates the lone event at a Unicode code-point boundary and appends a
 DIFFERENT marker than the deferral marker above, because — unlike the deferred-remainder case, where
-the whole block stayed unclaimed and genuinely re-delivers later — this claim is already committed by
-the time it renders, so the omitted tail will **never** re-deliver on a later poll (§5.5 has the full
-mechanics and the reason the two markers must differ). That marker names the exact, session- and
-socket-scoped `agentmonitors events list --session <id> --socket <path> --unread` command (the socket
-path transport-safe-escaped, issue #442, PR #442 round-8 review — see §5.5) as the one remaining
-recovery path for the full, still-unread event — never the bare `--unread` form (`events list`
-requires `--session`, §5).
+the whole block stayed unclaimed and genuinely re-delivers later — this render happens BEFORE the
+reservation is committed, so at render time it is genuinely unknown whether the omitted tail will
+re-deliver: a successful commit means it will **never** re-deliver on a later poll, but a null/rejected
+commit leaves it eligible for at-least-once redelivery instead (§5.5 has the full mechanics and the
+reason the two markers must differ, and why the marker itself stays outcome-neutral). That marker
+names the exact, session- and socket-scoped `agentmonitors events list --session <id> --socket <path>
+--unread` command (the socket path transport-safe-escaped, issue #442, PR #442 round-8 review — see
+§5.5) as the recovery path that holds regardless of that outcome, for the full, still-unread event —
+never the bare `--unread` form (`events list` requires `--session`, §5).
 
 A body-injection claim that rendered only its **title** — dropping the monitor body and the change
 summary — is a **defect on this surface**, not a lighter rendering: the receiving agent would have to
@@ -870,25 +874,31 @@ preview once more, AFTER a reservation is accepted, and compares it against the 
 any settled event not in the claim forces `moreDeferred: true` before the result is returned to
 `channel.ts`.
 
-**The single-event pathological case's marker differs from the deferred-remainder marker, because the
-channel COMMITS before the next poll can run (issue #442).** For the channel's reserve → push → commit
-cycle, by the time `renderChannelEvent` mid-truncates a lone event whose own block still exceeds the
-ceiling, `runChannelDeliveryCycle` is about to commit that reservation on a successful push — setting
-`first_notified_at`, after which `pendingEventsForSession()` (whose query requires that column still
-`NULL`, 002 §7) will never return the row again. Unlike the deferred-remainder case above, the omitted tail
-of THIS event does **not** "re-deliver at the next poll" — it is only recoverable via the durable,
-still-unread copy of the full event (claiming ≠ acking, BP2 / SP4). `agentmonitors events list`
-**requires** `--session <id>` (§5, issue #420 P2) — a bare `agentmonitors events list --unread` exits
-1, so the marker must render the exact, directly runnable command for the session that received THIS
-delivery, not the bare form (issue #442, PR #442 round-6 review). It must also carry an explicit
-`--socket <path>` (issue #358, PR #442 round-7 review): `events list` itself resolves its socket
-ENV-FIRST (`resolveManualDaemonSocketPath`, issue #335), so a copy-pasted command with no `--socket`
-could silently query a stale `$AGENTMONITORS_SOCKET` left over from a different workspace rather than
-the daemon `channel serve` is actually bound to. `channel-render.ts` therefore signposts this case
-with a distinct marker, built by `buildChannelTruncatedMarker(sessionId, socketPath)`, reading
-``(this update was too large to show in full; run `agentmonitors events list --session <id> --socket
-<path> --unread` to see the full copy)`` with the claim's own (sanitized) `sessionId` and the
-resolved `socketPath` substituted in. The socket path is rendered via the transport-shared
+**The single-event pathological case's marker differs from the deferred-remainder marker, because
+rendering — and therefore this mid-truncation — happens BEFORE the reservation is committed (issue
+#442, PR #442 round-11 review).** For the channel's reserve → push → commit cycle
+(`runChannelDeliveryCycle`), `renderChannelEvent` mid-truncates a lone event whose own block still
+exceeds the ceiling as PART OF the push itself; the commit that sets `first_notified_at` only runs
+AFTER that push resolves. So at render time it is genuinely unknown whether the commit that follows
+will land: if it does, `pendingEventsForSession()` (whose query requires that column still `NULL`,
+002 §7) will never return the row again, and the omitted tail does **not** "re-deliver at the next
+poll" the way the deferred-remainder case does; if the commit is null/rejected instead (the
+reservation's lease already lapsed, `'surfaced-uncommitted'`), the row was never claimed and stays
+eligible for at-least-once redelivery on a later poll — the opposite outcome. Either way, the durable,
+still-unread copy of the full event is the recovery path that holds regardless (claiming ≠ acking,
+BP2 / SP4). `agentmonitors events list` **requires** `--session <id>` (§5, issue #420 P2) — a bare
+`agentmonitors events list --unread` exits 1, so the marker must render the exact, directly runnable
+command for the session that received THIS delivery, not the bare form (issue #442, PR #442 round-6
+review). It must also carry an explicit `--socket <path>` (issue #358, PR #442 round-7 review):
+`events list` itself resolves its socket ENV-FIRST (`resolveManualDaemonSocketPath`, issue #335), so a
+copy-pasted command with no `--socket` could silently query a stale `$AGENTMONITORS_SOCKET` left over
+from a different workspace rather than the daemon `channel serve` is actually bound to.
+`channel-render.ts` therefore signposts this case with a distinct marker, built by
+`buildChannelTruncatedMarker(sessionId, socketPath)`, reading ``(this update was too large to show in
+full; run `agentmonitors events list --session <id> --socket <path> --unread` to see the full
+copy)`` — deliberately outcome-neutral, asserting only that the full copy stays unread and reachable
+right now, never a specific claimed/redelivery outcome — with the claim's own (sanitized) `sessionId`
+and the resolved `socketPath` substituted in. The socket path is rendered via the transport-shared
 `escapeShellPath` (`delivery-event-render.ts`, issue #442, PR #442 round-8 review) — NOT a plain
 POSIX single-quote (the prior approach): a single-quoted path preserves every byte literally,
 including `<`/`>`/`[`/`]`, and this marker is appended into `content` AFTER `contentValue`'s own
@@ -896,9 +906,9 @@ tag-safety sanitization pass has already run, so a socket path carrying those by
 reintroduce them raw into the pushed `<channel>` body (006 §4.6). `escapeShellPath` instead renders
 the path in bash/zsh ANSI-C quoting (`$'...'`), hex-escaping (`\xNN`) every byte outside a
 conservative safe set — no forbidden byte can then appear in the tag body, while the path still
-reconstructs exactly when the advertised command is run — pointing at that durable copy instead of
-promising a re-delivery that cannot happen — reserving `CHANNEL_DEFERRED_MARKER`'s "surface on a later poll" language for the
-case where a whole block genuinely stayed unclaimed and pending.
+reconstructs exactly when the advertised command is run — reserving `CHANNEL_DEFERRED_MARKER`'s
+"surface on a later poll" language for the case where a whole block genuinely stayed unclaimed and
+pending.
 
 **The hook-deliver transport ALSO uses two distinct, session- and socket-scoped markers, mirroring
 the channel side (issue #442, PR #442 round-7 review), and (since round-8) reserves/commits through

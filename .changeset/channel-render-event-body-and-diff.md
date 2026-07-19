@@ -33,9 +33,10 @@ run `events list` to see what changed — defeating push delivery.
   own marker: some settled-high events genuinely did not fit and stay pending — they **will**
   re-deliver on a later poll (`... more monitor updates are pending; they will surface on a later
 poll`). The other, rarer case is a single event whose own block still exceeds the content ceiling
-  even alone; that one claimed event is mid-truncated and — because the claim is already committed by
-  the time it renders — it will **not** re-deliver later. Its marker instead names the exact,
-  directly-runnable recovery command for that session and socket
+  even alone; that one event is mid-truncated as PART OF the push, before the reservation is
+  committed, so at that point it is genuinely unknown whether the redelivery-suppressing commit that
+  follows will land — its marker stays outcome-neutral rather than promising a specific outcome
+  either way. It names the exact, directly-runnable recovery command for that session and socket
   (`` `agentmonitors events list --session <id> --socket <path> --unread` `` — `events list` requires
   `--session`, so a bare `--unread` form would fail, and the explicit `--socket` guards against a stale
   `$AGENTMONITORS_SOCKET` silently querying the wrong workspace's daemon), pointing at the still-unread,

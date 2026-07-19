@@ -349,10 +349,11 @@ describe('renderChannelEvent', () => {
     );
     expect(content.length).toBeLessThanOrEqual(MAX_CHANNEL_CONTENT);
     // Even though a second event was genuinely deferred (`moreDeferred:
-    // true`), the mid-truncation branch always wins: the claimed event
-    // itself is already committed and its own tail was cut, so the marker
-    // must point at the durable, directly-runnable session-scoped recovery
-    // command, not promise a later poll.
+    // true`), the mid-truncation branch always wins: the one claimed event's
+    // own tail was cut by THIS render (before the reservation is committed),
+    // so the marker must point at the durable, directly-runnable
+    // session-scoped recovery command rather than promise a later poll for
+    // its own tail — an outcome that is not yet knowable at render time.
     expect(content).toContain(buildChannelTruncatedMarker(sessionId).trim());
     expect(content).toContain(
       `agentmonitors events list --session ${sessionId} --unread`,

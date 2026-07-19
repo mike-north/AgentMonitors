@@ -64,12 +64,25 @@ export const CHANNEL_DEFERRED_MARKER =
  * Build the marker appended when the ONE claimed event's own block already
  * exceeds {@link MAX_CHANNEL_CONTENT} (minus marker room) and had to be
  * mid-truncated (issue #442, PR #442 round-5/round-6 review). Unlike {@link
- * CHANNEL_DEFERRED_MARKER}, this claim IS committed by `reserveDelivery`
- * before render — `channel.ts` sets `first_notified_at` on the reservation,
- * and `pendingEventsForSession()` only returns rows where that column is
- * still `NULL` (002 §7), so the omitted tail of THIS event will NOT surface
- * on a later poll: the cycle goes idle. Its only recovery path is the
- * durable, unread copy of the full event (claiming ≠ acking, BP2 / SP4).
+ * CHANNEL_DEFERRED_MARKER}, this event is not merely deferred — its own
+ * content was cut short by THIS render, so the omitted tail is only
+ * recoverable via the durable, unread copy of the full event (claiming ≠
+ * acking, BP2 / SP4), never via a later ordinary poll of the same row.
+ *
+ * **This is rendered BEFORE the reservation is committed** (`channel.ts`'s
+ * `reserveAndCommit`: reserve → push/render → commit, issue #442, PR #442
+ * round-11 review) — `commitDeliveryClient` is the call that sets
+ * `first_notified_at`, and it only runs AFTER this push resolves. So at
+ * render time it is genuinely unknown whether the commit that follows will
+ * land: a successful commit does prevent the row from surfacing on a later
+ * poll (`pendingEventsForSession()` excludes rows with `first_notified_at`
+ * set, 002 §7), but a null/rejected commit (the reservation's lease already
+ * lapsed) leaves it uncommitted and eligible for at-least-once redelivery
+ * (`'surfaced-uncommitted'`, `channel.ts`). The wording below asserts only
+ * what holds regardless of that outcome — the full copy is unread and
+ * reachable right now via the recovery command — mirroring the hook
+ * transport's `buildHookClaimedUnreadMarker` (`hook-deliver-render.ts`),
+ * which has the identical render-before-commit ordering and uncertainty.
  *
  * `agentmonitors events list` **requires** `--session <id>` (issue #420 P2,
  * `apps/cli/src/commands/events.ts`) — a bare `agentmonitors events list
@@ -259,9 +272,11 @@ export interface RenderChannelEventOptions {
  * exactly that many (`reserveDelivery`'s `maxEvents`), so the deferred
  * remainder stays pending and re-delivers on a later poll. This is what makes
  * claimed-set-equals-rendered-set (006 §5.5) compatible with boundedness in
- * the common case: capping `content` here, after commit, would otherwise drop
- * later blocks from the rendered tag while the whole claim was still
- * committed — silently omitting claimed-but-unrendered events.
+ * the common case: capping `content` here, after the claim was already
+ * reserved, would otherwise drop later blocks from the rendered tag while the
+ * whole claim was still eligible to be committed — silently omitting
+ * claimed-but-unrendered events (rendering runs BEFORE commit, see
+ * {@link buildChannelTruncatedMarker}'s doc comment).
  *
  * `renderChannelEvent` still carries its OWN defense-in-depth ceiling
  * enforcement (issue #442), because sizing upstream cannot rule out every
@@ -280,10 +295,12 @@ export interface RenderChannelEventOptions {
  * at a Unicode code-point boundary (mirroring the hook-deliver transport's
  * `renderHookDelivery`), using the distinct marker built by {@link
  * buildChannelTruncatedMarker} — its full body stays unread (claiming ≠
- * acking, BP2 / SP4), and because this claim is already committed, the
- * omitted tail will NOT surface on a later poll (issue #442): the durable
- * unread copy, at the exact session-scoped command the marker renders, is
- * the only recovery path. Per-event change summaries are ALSO individually
+ * acking, BP2 / SP4); the durable unread copy, at the exact session-scoped
+ * command the marker renders, is the only recovery path for the omitted
+ * tail (issue #442; see {@link buildChannelTruncatedMarker}'s doc comment
+ * for why the marker cannot also promise the tail will never resurface —
+ * this render happens before the reservation is committed). Per-event
+ * change summaries are ALSO individually
  * bounded inside
  * {@link buildEventBlock} (006 §4.6, currently 800 chars each), so no single
  * untrusted diff is dumped wholesale regardless of packing.

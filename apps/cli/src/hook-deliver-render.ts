@@ -92,9 +92,14 @@ function buildHookDeferredMarker(
  * regardless of the commit's outcome: the full copy is not yet acknowledged,
  * so it stays unread and reachable right now via the recovery command —
  * mirroring the channel transport's `buildChannelTruncatedMarker`
- * (`channel-render.ts`), whose claim IS durably committed before render (a
- * different transport with no such uncertainty, so it can keep asserting
- * "will NOT surface on a later poll").
+ * (`channel-render.ts`). The channel transport has the SAME render-before-commit
+ * ordering (reserve → push/render → commit, `channel.ts`'s `reserveAndCommit`)
+ * and therefore the same conditional outcome: a successful commit prevents
+ * ordinary repoll, but a null/rejected commit (the reservation's lease
+ * already lapsed) leaves the pushed event eligible for at-least-once
+ * redelivery on a later poll — so `buildChannelTruncatedMarker` is kept
+ * outcome-neutral for the same reason, not because its claim is committed
+ * any earlier than this one's.
  *
  * **Not valid for a `post-compact` recap** — see {@link buildHookRecapMarker}.
  */
