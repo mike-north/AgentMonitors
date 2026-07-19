@@ -593,6 +593,9 @@ export interface KeyedCollectionResult {
 // @public
 export type KeyedSnapshot = Record<string, unknown>;
 
+// @public
+export const MAX_OPERATION_TIMEOUT_MS = 2147483647;
+
 // @public (undocumented)
 export interface MonitorDefinition {
     displayName: string;

@@ -107,7 +107,42 @@ const cases: readonly ParityCase[] = [
     input: { command: [process.execPath, '-e', ''], timeout: '0s' },
     expectValid: false,
   },
+  // Issue #304 review, second round: the schema `pattern` (`[1-9]\d*`) has
+  // always rejected a leading zero, but the parser's `parseOperationTimeoutMs`
+  // (via `parseDuration`'s own `\d+` digit group) previously accepted it —
+  // a schema/parser mismatch. Both now reject it.
+  {
+    label: 'timeout "01s" is rejected (leading zero)',
+    input: { command: [process.execPath, '-e', ''], timeout: '01s' },
+    expectValid: false,
+  },
+  // Issue #304 review, second round: a present non-string `timeout` (here a
+  // number) was previously silently treated as "omitted" by the parser while
+  // the schema already rejected it — both now reject it.
+  {
+    label: 'timeout 30 (number, not a string) is rejected',
+    input: { command: [process.execPath, '-e', ''], timeout: 30 },
+    expectValid: false,
+  },
 ];
+
+// Issue #304 review, second round: "25d" exceeds Node's 32-bit setTimeout max
+// (2,147,483,647ms) and would otherwise silently fire almost immediately
+// instead of the author's intended 25-day deadline. The JSON Schema
+// `pattern` (a pure string grammar) cannot express this numeric upper bound,
+// so the schema still ACCEPTS "25d" while the parser rejects it — a
+// deliberate, narrow, documented gap between the two, not a parity bug. Kept
+// as its own assertion rather than a `cases` row, since `expectParity` treats
+// schema/parser disagreement as a failure by design (see its docstring).
+describe('command-poll timeout upper bound (issue #304 review, second round)', () => {
+  it('the parser rejects "25d" even though the schema pattern alone accepts it', async () => {
+    const input = { command: [process.execPath, '-e', ''], timeout: '25d' };
+    expect(validateScope(input, source.scopeSchema)).toEqual([]);
+    await expect(
+      source.observe(input, { now: new Date('2024-01-15T00:00:00.000Z') }),
+    ).rejects.toThrow(/exceeds the maximum supported deadline/);
+  });
+});
 
 describe('command-poll schema ↔ parser parity', () => {
   it.each(cases.map((c) => [c.label, c] as const))(

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Observation } from '../observation/types.js';
 import {
   DEFAULT_OPERATION_TIMEOUT_MS,
+  MAX_OPERATION_TIMEOUT_MS,
   createDebounceNotifier,
   createImmediateNotifier,
   createThrottleNotifier,
@@ -47,11 +48,18 @@ describe('parseOperationTimeoutMs', () => {
     );
   });
 
-  it('falls back to the shared default for a non-string raw value', () => {
-    // Matches both plugins' pre-existing behavior: a non-string `timeout` is
-    // silently treated as "omitted" rather than a validation error here — the
-    // JSON Schema `pattern` check is what rejects a malformed author value.
-    expect(parseOperationTimeoutMs(42)).toBe(DEFAULT_OPERATION_TIMEOUT_MS);
+  // Issue #304 review, second round: a present-but-wrong-type `timeout`
+  // (a number, `null`, an object, …) is a misconfiguration, not "omitted" —
+  // it must be rejected rather than silently treated as the default. Only
+  // `undefined` (genuinely omitted) falls back.
+  it('rejects a present non-string raw value instead of silently defaulting', () => {
+    expect(() => parseOperationTimeoutMs(42)).toThrow(
+      /Invalid timeout: expected a string matching/,
+    );
+  });
+
+  it('rejects a present `null` raw value the same way', () => {
+    expect(() => parseOperationTimeoutMs(null)).toThrow(/got null/);
   });
 
   it('parses a present string via parseDuration', () => {
@@ -75,6 +83,42 @@ describe('parseOperationTimeoutMs', () => {
   it('propagates the underlying parseDuration error for a malformed value', () => {
     expect(() => parseOperationTimeoutMs('soon')).toThrow(
       /Invalid duration: "soon"/,
+    );
+  });
+
+  // Issue #304 review, second round: the schema `pattern` (`[1-9]\d*`) has
+  // always rejected a leading zero, but `parseDuration`'s own `\d+` digit
+  // group happily accepted it — a schema/parser mismatch. Reject it here too
+  // so both layers agree (a deliberate validation tightening, documented in
+  // the affected packages' changesets).
+  it('rejects a leading-zero duration ("01s") even though parseDuration alone would accept it', () => {
+    expect(() => parseOperationTimeoutMs('01s')).toThrow(
+      /A leading zero is not allowed/,
+    );
+  });
+
+  it('rejects "007m" the same way as "01s"', () => {
+    expect(() => parseOperationTimeoutMs('007m')).toThrow(
+      /A leading zero is not allowed/,
+    );
+  });
+
+  // Issue #304 review, second round: "25d" (2,160,000,000ms) exceeds Node's
+  // 32-bit signed setTimeout max (2,147,483,647ms, ~24.8 days) and would
+  // otherwise silently overflow to a ~1ms timer instead of the author's
+  // intended 25-day deadline.
+  it('rejects a duration exceeding the maximum setTimeout delay ("25d")', () => {
+    expect(() => parseOperationTimeoutMs('25d')).toThrow(
+      /exceeds the maximum supported deadline/,
+    );
+  });
+
+  it('accepts a duration exactly at the maximum setTimeout delay', () => {
+    // 2_147_483_647ms is just under 24d20h31m23.647s; "24d" (2,073,600,000ms)
+    // is comfortably under the max and a round, human-authored value.
+    expect(parseOperationTimeoutMs('24d')).toBe(2_073_600_000);
+    expect(parseOperationTimeoutMs('24d')).toBeLessThanOrEqual(
+      MAX_OPERATION_TIMEOUT_MS,
     );
   });
 });

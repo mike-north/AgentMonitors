@@ -1486,6 +1486,43 @@ When the document changes, act on it.
         ).rejects.toThrow(/Invalid timeout: "0s"/);
       });
 
+      // Issue #304 review, second round: a present but non-string `timeout`
+      // (a number here) previously fell back silently to the default
+      // instead of being rejected as a misconfiguration.
+      it('rejects a non-string timeout override instead of silently defaulting', async () => {
+        await expect(
+          source.observe(
+            { url: 'https://api.example.com/x', timeout: 123 },
+            { now: new Date() },
+          ),
+        ).rejects.toThrow(/Invalid timeout: expected a string/);
+      });
+
+      // Issue #304 review, second round: the schema pattern (`[1-9]\d*`)
+      // rejects a leading zero, but `parseDuration`'s own `\d+` digit group
+      // previously accepted it — a schema/parser mismatch.
+      it('rejects a leading-zero timeout override ("01s")', async () => {
+        await expect(
+          source.observe(
+            { url: 'https://api.example.com/x', timeout: '01s' },
+            { now: new Date() },
+          ),
+        ).rejects.toThrow(/A leading zero is not allowed/);
+      });
+
+      // Issue #304 review, second round: "25d" (2,160,000,000ms) exceeds
+      // Node's 32-bit signed setTimeout max (2,147,483,647ms) — without a
+      // bound this would silently overflow to a near-instant timer instead
+      // of the author's intended 25-day deadline.
+      it('rejects a timeout override exceeding the maximum setTimeout delay ("25d")', async () => {
+        await expect(
+          source.observe(
+            { url: 'https://api.example.com/x', timeout: '25d' },
+            { now: new Date() },
+          ),
+        ).rejects.toThrow(/exceeds the maximum supported deadline/);
+      });
+
       it('does not advance nextState past a timed-out tick', async () => {
         vi.stubGlobal(
           'fetch',
@@ -1731,6 +1768,121 @@ When the document changes, act on it.
         );
         await vi.advanceTimersByTimeAsync(1000);
         await assertion;
+      });
+    });
+
+    // Issue #304 review, second round: the 5-worker concurrency limit above
+    // bounds how many parts are IN FLIGHT at once, but nothing previously
+    // bounded the SUM of all fetched part bodies — a composite with many
+    // small parts, each individually far under `MAX_RESPONSE_BYTES` (10 MiB),
+    // could still assemble and baseline a snapshot many times that size
+    // every tick (the reported case: 12 x 1 MiB parts = 12.5 MB with no
+    // aggregate bound). `MAX_COMPOSITE_BYTES` bounds the cumulative total
+    // across every part in the SAME composite.
+    describe('composite cumulative byte budget (issue #304 review, second round)', () => {
+      const MAX_COMPOSITE_BYTES = 10 * 1024 * 1024;
+
+      /** A `fetch` mock returning a fixed-size body for every part URL. */
+      function mockFixedSizeBody(sizeBytes: number): ReturnType<typeof vi.fn> {
+        const body = 'a'.repeat(sizeBytes);
+        return vi.fn(() =>
+          Promise.resolve({
+            status: 200,
+            text: () => Promise.resolve(body),
+          }),
+        );
+      }
+
+      it('errors the whole composite once cumulative part bytes exceed the budget', async () => {
+        // 3 parts x 4 MiB = 12 MiB, well past the 10 MiB cumulative budget —
+        // each part is individually far under the single-response 10 MiB
+        // per-part cap, so only the AGGREGATE check catches this.
+        const partSize = 4 * 1024 * 1024;
+        vi.stubGlobal('fetch', mockFixedSizeBody(partSize));
+
+        const config = {
+          'change-detection': {
+            composite: {
+              'object-key': 'huge-composite',
+              parts: [
+                { id: 'a', url: 'https://api.example.com/parts/a' },
+                { id: 'b', url: 'https://api.example.com/parts/b' },
+                { id: 'c', url: 'https://api.example.com/parts/c' },
+              ],
+            },
+          },
+        };
+
+        await expect(
+          source.observe(config, { now: new Date() }),
+        ).rejects.toThrow(
+          new RegExp(
+            `exceeded the ${String(MAX_COMPOSITE_BYTES)}-byte cumulative part-body budget`,
+          ),
+        );
+      });
+
+      it('a composite whose cumulative part bytes sit exactly at the budget succeeds (boundary)', async () => {
+        // 2 parts x 5 MiB = 10 MiB exactly — AT, not over, the cumulative
+        // budget, so this must NOT throw.
+        const partSize = 5 * 1024 * 1024;
+        vi.stubGlobal('fetch', mockFixedSizeBody(partSize));
+
+        const config = {
+          'change-detection': {
+            composite: {
+              'object-key': 'exact-budget-composite',
+              parts: [
+                { id: 'a', url: 'https://api.example.com/parts/a' },
+                { id: 'b', url: 'https://api.example.com/parts/b' },
+              ],
+            },
+          },
+        };
+
+        const result = await source.observe(config, { now: new Date() });
+        expect(result.observations).toHaveLength(0);
+        expect(result.nextState).toBeDefined();
+      });
+
+      it('a composite whose cumulative part bytes are one byte over the budget throws (boundary)', async () => {
+        // Two 5 MiB parts land exactly at the budget (see test above); a
+        // third single-byte part tips the cumulative total one byte over.
+        const fiveMiB = 5 * 1024 * 1024;
+        vi.stubGlobal(
+          'fetch',
+          vi.fn((input: string) => {
+            const body =
+              input === 'https://api.example.com/parts/c'
+                ? 'x'
+                : 'a'.repeat(fiveMiB);
+            return Promise.resolve({
+              status: 200,
+              text: () => Promise.resolve(body),
+            });
+          }),
+        );
+
+        const config = {
+          'change-detection': {
+            composite: {
+              'object-key': 'over-budget-by-one-composite',
+              parts: [
+                { id: 'a', url: 'https://api.example.com/parts/a' },
+                { id: 'b', url: 'https://api.example.com/parts/b' },
+                { id: 'c', url: 'https://api.example.com/parts/c' },
+              ],
+            },
+          },
+        };
+
+        await expect(
+          source.observe(config, { now: new Date() }),
+        ).rejects.toThrow(
+          new RegExp(
+            `exceeded the ${String(MAX_COMPOSITE_BYTES)}-byte cumulative part-body budget`,
+          ),
+        );
       });
     });
   });

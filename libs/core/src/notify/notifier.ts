@@ -50,29 +50,81 @@ export const DEFAULT_OPERATION_TIMEOUT_MS = 30_000;
 export const OPERATION_TIMEOUT_PATTERN = '^[1-9]\\d*[smhd]$';
 
 /**
+ * The largest delay Node's `setTimeout`/`setInterval` can schedule: a 32-bit
+ * signed integer of milliseconds (`2_147_483_647`, ~24.8 days). A longer
+ * value silently overflows to a 1ms timer (with a `TimeoutOverflowWarning` on
+ * stderr) instead of throwing, so without this bound a config like
+ * `timeout: "25d"` would fire almost immediately — the opposite of the
+ * author's intent — rather than erroring at parse time (issue #304 review).
+ *
+ * @see https://nodejs.org/api/timers.html#settimeoutcallback-delay-args
+ */
+export const MAX_OPERATION_TIMEOUT_MS = 2_147_483_647;
+
+/**
  * Resolve a source's `timeout` scope field into milliseconds (issue #304
  * review, findings 5 and 6). `rawTimeout` is the raw `config['timeout']`
- * value read straight off the author's config: a present string is parsed via
- * {@link parseDuration}; anything else — including `undefined`, when the
- * author omits the field — falls back to
- * {@link DEFAULT_OPERATION_TIMEOUT_MS}. This mirrors the exact
- * `typeof rawTimeout === 'string' ? parseDuration(rawTimeout) : DEFAULT`
- * fallback both `api-poll` and `command-poll` previously duplicated.
+ * value read straight off the author's config: `undefined` — the author
+ * omitted the field — falls back to {@link DEFAULT_OPERATION_TIMEOUT_MS}.
+ * Anything else must be a string; a present-but-wrong-type value (a number,
+ * `null`, an object, …) is a misconfiguration, not "omitted", and is rejected
+ * rather than silently defaulted (issue #304 review, second-round finding:
+ * `timeout: 123` or `timeout: null` previously fell back to the default
+ * exactly like an omitted field, hiding the mistake).
  *
- * Unlike a bare {@link parseDuration} call, a **zero-length** duration
- * (`"0s"`, `"0m"`, `"0h"`, `"0d"`) is rejected here even though
- * `parseDuration` itself accepts it — other `parseDuration` callers use zero
- * meaningfully (e.g. notify `settle-for: 0`) — because a zero-length
- * request/command deadline is never a meaningful configuration: it would
- * abort every request or command before it could ever complete, producing a
- * confusing per-tick `timed out after 0ms` error on every run.
+ * A present string is parsed via {@link parseDuration}, so a malformed value
+ * (e.g. `"soon"`, missing a unit) throws the same descriptive
+ * `Invalid duration: "<value>". Expected format: <number><s|m|h|d>` error as
+ * every other duration field. Two values that `parseDuration` alone would
+ * accept are rejected here, ahead of the parse, so this parser and the
+ * `OPERATION_TIMEOUT_PATTERN` JSON Schema `pattern` (which requires a
+ * non-zero leading digit) agree on every input:
+ *
+ * - A **zero-length** duration (`"0s"`, `"0m"`, `"0h"`, `"0d"`, …) — other
+ *   `parseDuration` callers use zero meaningfully (e.g. notify
+ *   `settle-for: 0`), but a zero-length request/command deadline is never a
+ *   meaningful configuration: it would abort every request or command before
+ *   it could ever complete, producing a confusing per-tick
+ *   `timed out after 0ms` error on every run.
+ * - A **leading-zero** duration (`"01s"`, `"007m"`, …) — issue #304 review,
+ *   second-round finding: the schema pattern's `[1-9]\d*` already rejects
+ *   these, but `parseDuration`'s own `\d+` digit group happily parses them,
+ *   so a schema-valid config could previously behave differently than a
+ *   parser-only call with the same string. Rejecting leading zeros here too
+ *   is a deliberate validation tightening (documented in the affected
+ *   packages' changesets) so the two never disagree.
+ *
+ * Finally, a value that parses to more milliseconds than
+ * {@link MAX_OPERATION_TIMEOUT_MS} — e.g. `"25d"` — is rejected: Node's
+ * `setTimeout` cannot schedule that delay and would silently fire almost
+ * immediately instead.
  */
 export function parseOperationTimeoutMs(rawTimeout: unknown): number {
-  if (typeof rawTimeout !== 'string') return DEFAULT_OPERATION_TIMEOUT_MS;
-  const ms = parseDuration(rawTimeout);
-  if (ms <= 0) {
+  if (rawTimeout === undefined) return DEFAULT_OPERATION_TIMEOUT_MS;
+  if (typeof rawTimeout !== 'string') {
+    const got = rawTimeout === null ? 'null' : typeof rawTimeout;
+    throw new Error(
+      `Invalid timeout: expected a string matching ${OPERATION_TIMEOUT_PATTERN} (e.g. "30s"), got ${got}.`,
+    );
+  }
+
+  const zeroLengthMatch = /^0+[smhd]$/.exec(rawTimeout);
+  if (zeroLengthMatch) {
     throw new Error(
       `Invalid timeout: "${rawTimeout}". A zero-length timeout is not allowed; specify at least 1 unit (e.g. "1s").`,
+    );
+  }
+  const leadingZeroMatch = /^0\d+[smhd]$/.exec(rawTimeout);
+  if (leadingZeroMatch) {
+    throw new Error(
+      `Invalid timeout: "${rawTimeout}". A leading zero is not allowed; use "1s" instead of "01s" (must match ${OPERATION_TIMEOUT_PATTERN}).`,
+    );
+  }
+
+  const ms = parseDuration(rawTimeout);
+  if (ms > MAX_OPERATION_TIMEOUT_MS) {
+    throw new Error(
+      `Invalid timeout: "${rawTimeout}" (${String(ms)}ms) exceeds the maximum supported deadline of ${String(MAX_OPERATION_TIMEOUT_MS)}ms (~24.8 days) — Node's setTimeout cannot schedule a longer delay.`,
     );
   }
   return ms;

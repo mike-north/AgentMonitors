@@ -597,7 +597,7 @@ const scopeSchema: JsonSchema = {
       type: 'string',
       pattern: OPERATION_TIMEOUT_PATTERN,
       description:
-        'Wall-clock limit (e.g. "30s"). Expiry is an execution failure. Must be at least 1 unit — a zero-length deadline is rejected.',
+        'Wall-clock limit (e.g. "30s"). Expiry is an execution failure. Must be at least 1 unit — a zero-length or leading-zero deadline (e.g. "0s", "01s") is rejected — and at most 2147483647ms (~24.8 days), the largest delay Node\'s setTimeout can schedule.',
     },
     key: {
       type: 'string',

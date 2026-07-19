@@ -54,6 +54,20 @@ const MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
  */
 const MAX_COMPOSITE_CONCURRENCY = 5;
 
+/**
+ * Maximum cumulative bytes across ALL fetched parts of one composite
+ * observation (issue #304 review, second round). `MAX_RESPONSE_BYTES` bounds
+ * each individual part's body, and `MAX_COMPOSITE_CONCURRENCY` bounds how
+ * many parts are in flight at once — but neither bounds the *aggregate*: a
+ * composite with many small parts (e.g. 12 parts x 1 MiB, each individually
+ * well under the per-part cap) still assembles and baselines a
+ * `snapshotText`/`nextState` many times larger than any single-URL monitor's
+ * cap, persisted every tick. Reusing the same 10 MiB figure here bounds the
+ * composite's aggregate footprint to the same order of magnitude as a
+ * single-URL monitor's response, regardless of how many parts it has.
+ */
+const MAX_COMPOSITE_BYTES = MAX_RESPONSE_BYTES;
+
 interface AuthConfig {
   type: 'bearer' | 'basic';
   'token-env'?: string;
@@ -71,13 +85,18 @@ interface ScopeConfig {
   method: string | undefined;
   /**
    * Request/body deadline in milliseconds (issue #304). Resolved via core's
-   * shared `parseOperationTimeoutMs` (issue #304 review, findings 5 + 6):
-   * defaults to `DEFAULT_OPERATION_TIMEOUT_MS` when `timeout` is omitted;
-   * parses a present string via `parseDuration` (`^\d+[smhd]$`), so an
-   * invalid value throws the same descriptive error as every other duration
-   * field in the codebase (defence-in-depth alongside the schema `pattern`);
-   * and rejects a zero-length value (`"0s"`, …) even though `parseDuration`
-   * itself would accept it.
+   * shared `parseOperationTimeoutMs` (issue #304 review, findings 5 + 6, and
+   * second-round findings on non-string values / leading zeros / timer
+   * overflow): defaults to `DEFAULT_OPERATION_TIMEOUT_MS` when `timeout` is
+   * genuinely omitted (`undefined`); a *present* non-string value (a number,
+   * `null`, …) is rejected rather than silently defaulted; a present string
+   * is parsed via `parseDuration`, so an invalid value throws the same
+   * descriptive error as every other duration field in the codebase
+   * (defence-in-depth alongside the schema `pattern`); a zero-length
+   * (`"0s"`) or leading-zero (`"01s"`) value is rejected, matching the
+   * schema `pattern`'s `[1-9]\d*` grammar; and a value exceeding Node's
+   * 32-bit `setTimeout` max (`"25d"`) is rejected instead of silently
+   * overflowing to a near-instant timer.
    */
   timeoutMs: number;
   /**
@@ -272,7 +291,7 @@ const scopeSchema: JsonSchema = {
       pattern: OPERATION_TIMEOUT_PATTERN,
       default: '30s',
       description:
-        'Deadline for a single request, covering both the response headers and streaming the body to completion. In composite mode (change-detection.composite), the same deadline applies to each part. Default 30s; must be at least 1 unit (e.g. "1s") — a zero-length deadline is rejected.',
+        'Deadline for a single request, covering both the response headers and streaming the body to completion. In composite mode (change-detection.composite), the same deadline applies to each part. Default 30s; must be at least 1 unit (e.g. "1s") — a zero-length or leading-zero deadline (e.g. "0s", "01s") is rejected — and at most 2147483647ms (~24.8 days), the largest delay Node\'s setTimeout can schedule.',
     },
     'change-detection': {
       type: 'object',
@@ -759,6 +778,16 @@ async function observeComposite(
   previousState: unknown,
   timeoutMs: number,
 ): Promise<ObservationResult> {
+  // Cumulative byte budget across ALL parts (issue #304 review, second
+  // round): `MAX_RESPONSE_BYTES` bounds each part individually, but nothing
+  // previously bounded the SUM — a composite with many small parts could
+  // still assemble/baseline a snapshot many times the size of any
+  // single-URL monitor's response. `totalBytes` is read-modify-written only
+  // from inside each worker's callback below; `mapWithConcurrency`'s workers
+  // run on the single JS event loop turn-by-turn (never truly in parallel),
+  // so this plain counter needs no lock.
+  let totalBytes = 0;
+
   // Issue underlying calls CONCURRENTLY, up to MAX_COMPOSITE_CONCURRENCY at a
   // time (issue #304), so latency is bounded by the slowest *batch* rather
   // than the sum of all parts, without starting every request in an
@@ -797,6 +826,21 @@ async function observeComposite(
           `api-poll received HTTP ${String(status)} from composite part "${part.id}" (${redactUrlForWarning(part.url)}) — check auth/url; not establishing a baseline on an error response`,
         );
       }
+
+      // ---- Cumulative composite byte budget (issue #304 review, second round) ----
+      // Checked AFTER each part's own per-part byte cap (readBoundedBody) has
+      // already passed, so this is purely the aggregate-across-parts check.
+      // Throwing here fails the whole batch exactly like the non-2xx case
+      // above: `mapWithConcurrency` aborts every other in-flight part via the
+      // shared signal instead of letting them run to completion, and
+      // `nextState` never advances.
+      totalBytes += Buffer.byteLength(body, 'utf8');
+      if (totalBytes > MAX_COMPOSITE_BYTES) {
+        throw new Error(
+          `api-poll composite "${composite.objectKey}" exceeded the ${String(MAX_COMPOSITE_BYTES)}-byte cumulative part-body budget after part "${part.id}" (${String(totalBytes)} bytes across parts fetched so far) — reduce the number/size of parts or split into multiple monitors`,
+        );
+      }
+
       return { id: part.id, body } satisfies FetchedPart;
     },
   );
