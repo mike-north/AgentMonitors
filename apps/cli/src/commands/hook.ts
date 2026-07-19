@@ -1,6 +1,7 @@
 import { Command, Option } from 'commander';
 import type {
   DeliveryClaim,
+  DeliveryEventSummary,
   DeliveryLifecycle,
   DeliveryReservation,
 } from '@agentmonitors/core';
@@ -21,6 +22,7 @@ import {
   packEventsUnderCap,
   renderHookDelivery,
   resolveHookClaimFit,
+  type HookDeliveryOutput,
 } from '../hook-deliver-render.js';
 import { readHookPayload } from '../hook-payload.js';
 import {
@@ -154,11 +156,51 @@ export interface SizedHookDelivery {
 }
 
 /**
+ * Whether settled high-urgency work remains pending BEYOND the events this
+ * attempt just reserved (issue #442, PR #442 round-9 review — "candidate-set
+ * growth" race, mirroring the channel transport's
+ * `settledWorkRemainsBeyondClaim` in `channel.ts`).
+ *
+ * A `moreDeferred` computed only from the preview that PRECEDED this
+ * reservation can go stale in the OTHER direction from the substitution race
+ * {@link reserveSizedHookDelivery} already re-sizes for: the preview held
+ * exactly as many events as `maxEvents` (say, one), so `moreDeferred` was
+ * computed `false` — but a SECOND event settles (crosses the 15s debounce
+ * boundary) in the gap between that preview and the `reserve` call. The
+ * reservation legitimately contains only the first event and fits under the
+ * cap, so {@link resolveHookClaimFit}'s fit check reports `fits: true` — that
+ * check only asks "does the RESERVED set fit", never "is there MORE settled
+ * work than what got reserved". Left unchecked, `hook deliver` would render
+ * with no deferred marker even though the second, now-settled event stays
+ * pending — contrary to §5.5 ("the render omits any pending event ...
+ * signposting that more updates are pending").
+ *
+ * Re-runs the SAME read-only preview {@link reserveSizedHookDelivery} itself
+ * uses for sizing and compares it against the actually-reserved event ids — a
+ * settled event that is NOT in the reservation means genuine deferred work
+ * remains.
+ */
+async function settledWorkRemainsBeyondClaim(
+  sessionId: string,
+  socketPath: string,
+  reservedEvents: DeliveryEventSummary[],
+): Promise<boolean> {
+  const reservedIds = new Set(reservedEvents.map((event) => event.eventId));
+  const stillSettled = await previewSettledHighDeliveryClient(
+    sessionId,
+    socketPath,
+  );
+  return stillSettled.some((event) => !reservedIds.has(event.eventId));
+}
+
+/**
  * Reserve — but do NOT yet claim — the delivery for `sessionId`/`lifecycle`,
  * sizing a `turn-interruptible` body-injection claim to fit the hook-deliver
  * `additionalContext` cap and RE-VALIDATING that fit against the ACTUALLY
  * reserved claim before the caller ever commits it (issue #442, PR #442
- * round-8 review).
+ * round-8 review). Also re-validates `moreDeferred` itself against a
+ * post-reservation preview (issue #442, PR #442 round-9 review) — see
+ * {@link settledWorkRemainsBeyondClaim}.
  *
  * **Why re-validate at all.** `previewSettledHighDeliveryClient` (sizing) and
  * `reserveDeliveryClient` (reservation) are two SEPARATE IPC round-trips, so
@@ -270,7 +312,60 @@ export async function reserveSizedHookDelivery(
       MAX_ADDITIONAL_CONTEXT,
     );
     if (fit.fits) {
-      return { reservation, moreDeferred, previewCount };
+      // Re-check for the candidate-set-growth race (issue #442, PR #442
+      // round-9 review): a settled event that arrived AFTER the preview that
+      // sized this reservation, and is therefore not part of the reservation,
+      // still needs `moreDeferred: true` so the render signposts it — even
+      // though this reservation, taken on its own, fits and needed no
+      // shrinking. Skipped once `moreDeferred` is already `true` (short
+      // circuit) — a second preview would be redundant.
+      let revalidatedMoreDeferred = moreDeferred;
+      if (!moreDeferred) {
+        try {
+          revalidatedMoreDeferred = await settledWorkRemainsBeyondClaim(
+            sessionId,
+            socketPath,
+            reservation.claim.events,
+          );
+        } catch (error) {
+          // The post-reservation preview itself failed (daemon hiccup
+          // mid-poll, mirroring channel.ts's round-7 review fix): release the
+          // reservation BEFORE propagating, or the leased rows stay
+          // claimed-in-limbo until the reservation TTL even though this
+          // reservation was never committed — no other transport (channel
+          // path, next context event) could see them either.
+          await releaseDeliveryClient(reservation.reservationId, socketPath);
+          throw error;
+        }
+      }
+      if (!revalidatedMoreDeferred) {
+        return { reservation, moreDeferred, previewCount };
+      }
+      // `moreDeferred` flipped to `true` AFTER this reservation was already
+      // accepted against the ORIGINAL (pre-flip) value: `resolveHookClaimFit`
+      // sizes against `cap` when `moreDeferred` is `false` but against
+      // `cap − <deferred marker length>` once it's `true` (marker room must
+      // be reserved) — the SAME predicate `renderHookDelivery` uses. A claim
+      // that fit under the wider `false` budget can therefore no longer fit
+      // once marker room is reserved for the newly-`true` value: recompute
+      // the fit against the FINAL `moreDeferred` before trusting it, exactly
+      // as the initial fit check above did for the original value.
+      const finalFit = resolveHookClaimFit(
+        reservation.claim.events,
+        sessionId,
+        socketPath,
+        true,
+        MAX_ADDITIONAL_CONTEXT,
+      );
+      if (finalFit.fits) {
+        return { reservation, moreDeferred: true, previewCount };
+      }
+      // No longer fits under the marker-reserving budget: release (rows
+      // return to pending — nothing lost) and retry through the SAME
+      // mismatch path below, tightening the cap to what was just measured.
+      await releaseDeliveryClient(reservation.reservationId, socketPath);
+      forcedCap = Math.max(1, finalFit.includedCount);
+      continue;
     }
 
     // Mismatch: the actually-reserved set does not fit. Release it (the rows
@@ -283,6 +378,132 @@ export async function reserveSizedHookDelivery(
   // since a single-event claim's fit is always whole. Kept only to satisfy
   // the return type.
   return null;
+}
+
+/** The result of {@link reserveRenderAndCommitHookDelivery}. */
+export interface HookDeliveryFlowResult {
+  /** The rendered payload, or `null` when there is genuinely nothing to surface. */
+  output: HookDeliveryOutput | null;
+  /** Whether more settled high-urgency work remains pending beyond this delivery. */
+  moreDeferred: boolean;
+  /**
+   * The settled high-urgency preview count at the moment this reservation
+   * was accepted (see {@link SizedHookDelivery.previewCount}) — for
+   * `--debug`'s `describeCapDeferral` line only.
+   */
+  previewCount: number | undefined;
+  /** The reservation's own (not-yet-committed) claim `output` was rendered from — for `--debug` only. */
+  reservedClaim: DeliveryClaim;
+  /**
+   * Commit the reservation this `output` was rendered from, marking the rows
+   * durably claimed (`first_notified_at`). **Callers MUST call this only
+   * AFTER `output` has been successfully written** (or immediately, when
+   * `output` is `null` — there is nothing to write) — see the ordering
+   * rationale on {@link reserveRenderAndCommitHookDelivery}. Returns the
+   * committed claim, or `null` if the reservation's lease already expired (a
+   * safe no-op: the rows re-deliver later via the ordinary context-event
+   * flow, and duplicate delivery — not loss — is the safe direction here).
+   */
+  commit: () => Promise<DeliveryClaim | null>;
+  /**
+   * Release the reservation WITHOUT claiming — the rows return to pending.
+   * Callers use this when writing `output` failed: nothing was durably
+   * surfaced, so nothing should be durably claimed (issue #442, PR #442
+   * round-9 review).
+   */
+  release: () => Promise<void>;
+}
+
+/**
+ * Reserve, re-validate, RENDER, then hand the caller a `commit` callback to
+ * invoke only after the rendered `output` has been successfully written
+ * (issue #442, PR #442 round-9 review — an at-most-once loss window).
+ *
+ * **The bug this closes.** The prior flow committed the reservation
+ * (`commitDeliveryClient` — the durable `first_notified_at` mutation) BEFORE
+ * any hook output was rendered or written to stdout. If the daemon applied
+ * the commit but its RPC response was lost, or if rendering/stdout writing
+ * failed afterward, the surrounding try/catch (the hook's always-exit-0
+ * contract) swallowed the error and emitted nothing — while the rows were
+ * PERMANENTLY excluded from ordinary redelivery (`pendingEventsForSession`
+ * never returns an already-claimed row, §5.5). That is an at-most-once loss
+ * window: the delivery could vanish with no user-visible signal and no path
+ * back except the durable-but-unread copy via `agentmonitors events list`.
+ *
+ * **The fix.** Render the already-validated `reservation.claim` FIRST — this
+ * function does that immediately, using the reservation's claim, never a
+ * committed one — and return a `commit` closure the caller invokes only once
+ * it has successfully written that output. If the write never happens (a
+ * render/output failure), the caller releases the reservation instead (the
+ * rows return to pending, nothing durably claimed — see `hook.ts`'s
+ * `deliver` action). If `commit` itself fails or its result is uncertain
+ * (the RPC lands but the response is lost), the safe direction is a LATER
+ * DUPLICATE delivery (the rows stay pending and redeliver on the next
+ * context event) — never a silent loss, since the output was already
+ * written by the time commit is attempted.
+ *
+ * Mirrors the channel transport's reserve → push → commit ordering
+ * (`runChannelDeliveryCycle`, `channel.ts`) — same rationale (never durably
+ * consume a delivery before it is actually surfaced), applied to the hook
+ * transport's synchronous stdout write instead of a fallible MCP push.
+ */
+export async function reserveRenderAndCommitHookDelivery(
+  sessionId: string,
+  lifecycle: DeliveryLifecycle,
+  socketPath: string,
+  hookEventName: string,
+): Promise<HookDeliveryFlowResult | null> {
+  const sized = await reserveSizedHookDelivery(
+    sessionId,
+    lifecycle,
+    socketPath,
+  );
+  if (!sized) return null;
+  const output = renderHookDelivery(sized.reservation.claim, hookEventName, {
+    moreDeferred: sized.moreDeferred,
+    socketPath,
+  });
+  return {
+    output,
+    moreDeferred: sized.moreDeferred,
+    previewCount: sized.previewCount,
+    reservedClaim: sized.reservation.claim,
+    commit: () =>
+      commitDeliveryClient(sized.reservation.reservationId, socketPath),
+    release: () =>
+      releaseDeliveryClient(sized.reservation.reservationId, socketPath),
+  };
+}
+
+/**
+ * Write `flow.output` (when non-null) via the caller-supplied `write`, THEN
+ * commit — or, if `write` throws, RELEASE the reservation instead of
+ * committing (issue #442, PR #442 round-9 review). This is the enforcement
+ * point for {@link reserveRenderAndCommitHookDelivery}'s ordering contract:
+ * a failed write means nothing was durably surfaced, so nothing gets durably
+ * claimed either — the rows return to pending and redeliver normally. A
+ * failed/uncertain `commit` (the write already succeeded) is NOT caught
+ * here: it propagates to the caller, which is safe because the safe
+ * direction at that point is a later DUPLICATE delivery, never a loss (the
+ * output already reached the user).
+ *
+ * Extracted as its own function so it is independently testable against a
+ * `write` seam that can be made to throw, without needing the full CLI
+ * action's stdin/socket/session plumbing.
+ */
+export async function writeAndCommitHookDelivery(
+  flow: HookDeliveryFlowResult,
+  write: (output: HookDeliveryOutput) => void,
+): Promise<DeliveryClaim | null> {
+  if (flow.output !== null) {
+    try {
+      write(flow.output);
+    } catch (writeError) {
+      await flow.release();
+      throw writeError;
+    }
+  }
+  return flow.commit();
 }
 
 hookCommand
@@ -476,74 +697,81 @@ Diagnosis:
         // is length-bounded (the 4000-char additionalContext, 006 §5.1), so we
         // must claim ONLY the events that actually fit — otherwise events
         // truncated out of the render would be marked claimed and never
-        // re-delivered (issue #299). This is now a RESERVE → validate-fit →
-        // COMMIT sequence, not a direct sized claim (issue #442, PR #442
-        // round-8 review): `previewSettledHighDeliveryClient` (sizing) and the
-        // eventual reservation are two separate IPC round-trips, so the events
-        // actually returned can differ from the ones the preview measured (a
-        // concurrent caller substitutes different, larger pending events into
-        // the same requested count). Claiming directly on an unvalidated count
-        // would let a substituted, oversized set pass the count check but then
-        // fail `renderHookDelivery`'s own repack — and a synchronously-claimed
+        // re-delivered (issue #299). This is a RESERVE → validate-fit →
+        // RENDER → WRITE → COMMIT sequence, not a direct sized claim (issue
+        // #442, PR #442 rounds 8-9). `previewSettledHighDeliveryClient`
+        // (sizing) and the eventual reservation are two separate IPC
+        // round-trips, so the events actually returned can differ from the
+        // ones the preview measured (a concurrent caller substitutes
+        // different, larger pending events into the same requested count).
+        // Claiming directly on an unvalidated count would let a substituted,
+        // oversized set pass the count check but then fail
+        // `renderHookDelivery`'s own repack — and a synchronously-claimed
         // row's truncated-away tail can never redeliver.
-        // `reserveSizedHookDelivery` re-validates the fit of the ACTUAL
-        // reserved claim (never the stale preview) before anything here
-        // commits, releasing and retrying on a mismatch (mirroring the channel
-        // transport's `reserveSizedChannelDelivery`/`resolveChannelClaimFit`).
-        // Non-high deliveries (normal/low reminders inject no bodies; the
-        // post-compact recap self-heals by re-showing all unread) need no
-        // sizing, so they are reserved+committed unsized.
-        let claim: DeliveryClaim | null = null;
-        let moreDeferred = false;
-        const sized = await reserveSizedHookDelivery(
+        // `reserveSizedHookDelivery` re-validates the fit (and the
+        // `moreDeferred` candidate-growth race) of the ACTUAL reserved claim
+        // (never the stale preview) before anything here commits, releasing
+        // and retrying on a mismatch (mirroring the channel transport's
+        // `reserveSizedChannelDelivery`/`resolveChannelClaimFit`).
+        //
+        // Crucially, the COMMIT — the durable `first_notified_at` mutation
+        // that permanently excludes these rows from ordinary redelivery — now
+        // happens AFTER the rendered output is successfully written, never
+        // before (issue #442, PR #442 round-9 review): committing first left
+        // an at-most-once loss window where a lost commit-RPC response, or a
+        // render/write failure AFTER commit, would durably consume the
+        // delivery while emitting nothing. Rendering off the RESERVATION's
+        // own claim (never a committed one) and deferring commit until after
+        // a successful write means a write failure can still be recovered by
+        // releasing the reservation (nothing durably claimed, rows stay
+        // pending) — and a commit failure/uncertainty after a successful
+        // write only risks a later DUPLICATE delivery, the safe direction,
+        // never a loss. Mirrors the channel transport's reserve → push →
+        // commit ordering (`runChannelDeliveryCycle`, `channel.ts`).
+        const flow = await reserveRenderAndCommitHookDelivery(
           match.id,
           lifecycle,
           socketPath,
+          hookEventName ?? '',
         );
-        if (sized) {
-          moreDeferred = sized.moreDeferred;
-          if (moreDeferred && sized.previewCount !== undefined) {
-            debug(
-              describeCapDeferral(
-                sized.previewCount,
-                sized.reservation.claim.events.length,
-              ),
-            );
-          }
-          claim = await commitDeliveryClient(
-            sized.reservation.reservationId,
-            socketPath,
-          );
-          if (!claim) {
-            // The reservation vanished before commit could land (its lease
-            // expired, or the daemon restarted and dropped its in-memory
-            // lease) — effectively unreachable in the hook's synchronous,
-            // single-invocation flow, but handled the safe way: nothing was
-            // surfaced, so behave exactly as "nothing pending." The rows
-            // return to pending and re-deliver at the next context event (or
-            // via a concurrent channel poll) rather than being lost.
-            debug('reservation committed to nothing (lease expired)');
-          }
-        }
-        debug(describeClaim(claim));
 
-        // Render and emit.  The echoed hookEventName must match the firing
-        // event so the host honors the additionalContext. Null → nothing
-        // pending → print nothing. The default remains the hook wire JSON
-        // because this command is normally wired directly into Claude hooks;
-        // text is an inspection aid for humans running it manually.
-        const output = renderHookDelivery(claim, hookEventName ?? '', {
-          moreDeferred,
-          socketPath,
-        });
-        debug(describeOutput(output, options.format));
-        if (output !== null) {
-          if (options.format === 'text') {
-            process.stdout.write(output.hookSpecificOutput.additionalContext);
-          } else {
-            process.stdout.write(JSON.stringify(output));
-          }
+        if (!flow) {
+          debug(describeClaim(null));
+          debug(describeOutput(null, options.format));
+          return;
         }
+
+        const { output, moreDeferred, previewCount, reservedClaim } = flow;
+        if (moreDeferred && previewCount !== undefined) {
+          debug(describeCapDeferral(previewCount, reservedClaim.events.length));
+        }
+        debug(describeOutput(output, options.format));
+
+        // Write (if there is anything to write) THEN commit — never the
+        // reverse (issue #442, PR #442 round-9 review). A write failure
+        // releases the reservation instead of committing (nothing durably
+        // claimed; rows stay pending) — see `writeAndCommitHookDelivery`.
+        const claim = await writeAndCommitHookDelivery(flow, (toWrite) => {
+          if (options.format === 'text') {
+            process.stdout.write(toWrite.hookSpecificOutput.additionalContext);
+          } else {
+            process.stdout.write(JSON.stringify(toWrite));
+          }
+        });
+        if (!claim) {
+          // Either the write failed (release path — nothing was ever durably
+          // claimed) or the reservation vanished before commit could land
+          // (its lease expired, or the daemon restarted and dropped its
+          // in-memory lease). In the commit-uncertain case, the output — if
+          // any — was already written, so this is a safe, intentional
+          // duplicate: the rows return to pending and re-deliver at the next
+          // context event (or via a concurrent channel poll) rather than
+          // being lost.
+          debug(
+            'reservation committed to nothing (lease expired, or write failed and released)',
+          );
+        }
+        debug(describeClaim(claim ?? reservedClaim));
       } catch (error) {
         // Any internal error is swallowed: a hook that throws would interrupt
         // the user's session (BP2 / always-exit-0 contract). Debug mode still

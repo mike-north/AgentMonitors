@@ -62,7 +62,7 @@ describe('agentmon_ack MCP tool vs. hooks-only CLI: shared daemon-IPC plumbing (
     expect(EVENTS_SOURCE).toMatch(/await\s+acknowledgeEventsClient\s*\(/);
   });
 
-  it('the channel push loop (channel.ts) reserves/commits and `hook deliver`/`hook claim` (hook.ts) claims — both from the same module, both the same core delivery decision (issue #300)', () => {
+  it('the channel push loop and `hook deliver` (both channel.ts and hook.ts) reserve/validate/commit — both reduce to the same core delivery decision (issue #300, issue #442 rounds 8-9)', () => {
     // The channel no longer claims BEFORE it pushes (that was the delivery-loss
     // bug, issue #300): it RESERVES, pushes, then COMMITS on success (or
     // RELEASES on a failed push). reserve/commit are the deferred form of the
@@ -85,8 +85,34 @@ describe('agentmon_ack MCP tool vs. hooks-only CLI: shared daemon-IPC plumbing (
     // The channel MUST NOT claim before surfacing — the removed bug.
     expect(CHANNEL_SOURCE).not.toMatch(/claimDeliveryClient/);
 
-    // The hook transport still claims directly (its additionalContext injection
-    // is synchronous — there is no fallible push to defer behind).
+    // `hook deliver` (the CLI command a Claude Code hook actually invokes) no
+    // longer claims directly either (issue #442, PR #442 round-8/round-9
+    // review): it reserves, re-validates fit AND the candidate-growth race,
+    // renders, WRITES, and only then commits — mirroring the channel's
+    // reserve → push → commit ordering so a render/write failure can still be
+    // recovered by releasing (nothing durably claimed) instead of losing a
+    // delivery behind an already-applied commit.
+    expect(importsFromRuntimeClient(HOOK_SOURCE, 'reserveDeliveryClient')).toBe(
+      true,
+    );
+    expect(importsFromRuntimeClient(HOOK_SOURCE, 'commitDeliveryClient')).toBe(
+      true,
+    );
+    expect(importsFromRuntimeClient(HOOK_SOURCE, 'releaseDeliveryClient')).toBe(
+      true,
+    );
+    expect(HOOK_SOURCE).toMatch(/await\s+reserveDeliveryClient\s*\(/);
+    // Called from a `commit`/`release` closure returned to the caller (never
+    // committed/released until after a successful write), not directly
+    // `await`ed inline the way the channel side is — so this only checks the
+    // call itself is present, not the `await` keyword.
+    expect(HOOK_SOURCE).toMatch(/commitDeliveryClient\s*\(/);
+    expect(HOOK_SOURCE).toMatch(/releaseDeliveryClient\s*\(/);
+
+    // Only the manual, single-shot `hook claim` subcommand (a human-invoked
+    // debugging aid, not the hook-wired `deliver` path) still calls
+    // `claimDeliveryClient` directly — it has no fallible surface (no push,
+    // no render-then-write step) to defer a commit behind.
     expect(importsFromRuntimeClient(HOOK_SOURCE, 'claimDeliveryClient')).toBe(
       true,
     );

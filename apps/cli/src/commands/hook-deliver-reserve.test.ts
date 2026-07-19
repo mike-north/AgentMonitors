@@ -247,3 +247,149 @@ describe('reserveSizedHookDelivery substitution race (issue #442)', () => {
     expect(result).toBeNull();
   });
 });
+
+/**
+ * Candidate-set-growth race (issue #442, PR #442 round-9 review): a settled
+ * event that arrives AFTER the sizing preview but BEFORE `reserve` returns is
+ * invisible to that preview's `moreDeferred`, yet still needs to signpost as
+ * pending — mirrors `channel-delivery-cycle.test.ts`'s
+ * `reserveSizedChannelDelivery candidate-set growth race` suite exactly, on
+ * the hook transport's `reserveSizedHookDelivery`.
+ *
+ * Before this fix: the preview sees only event A → `maxEvents=1`,
+ * `moreDeferred=false`. Event B settles (crosses the 15s debounce boundary)
+ * before `reserve` runs. The reservation legitimately returns only A, which
+ * fits under the cap on its own — so the fit check passed and the (stale)
+ * `moreDeferred: false` was returned unchanged, silently dropping the marker
+ * that would have told the agent B is genuinely pending (§5.5).
+ */
+describe('reserveSizedHookDelivery candidate-set growth race (issue #442, round-9 review)', () => {
+  it('sets moreDeferred when a second event settles between the sizing preview and the reservation', async () => {
+    const firstEvent = makeEvent({ eventId: 'e1', monitorId: 'm1' });
+    const secondEvent = makeEvent({ eventId: 'e2', monitorId: 'm2' });
+
+    // Sizing preview sees only the first event → maxEvents=1, moreDeferred
+    // computed false (nothing else was settled AT THAT TIME).
+    previewMock.mockResolvedValueOnce([firstEvent]);
+    const claim = claimWith([firstEvent]);
+    reserveMock.mockResolvedValueOnce({ reservationId: 'r-1', claim });
+    // Revalidation preview (run AFTER the reservation is accepted): the
+    // second event has now settled too, so it is visible here even though it
+    // was never part of this reservation.
+    previewMock.mockResolvedValueOnce([firstEvent, secondEvent]);
+
+    const result = await reserveSizedHookDelivery(
+      'session-1',
+      'turn-interruptible',
+      '/sock',
+    );
+
+    expect(result).not.toBeNull();
+    expect(result?.reservation.reservationId).toBe('r-1');
+    expect(result?.reservation.claim.events.map((e) => e.eventId)).toEqual([
+      'e1',
+    ]);
+    // The reservation itself was never released/retried — it genuinely fits.
+    expect(releaseMock).not.toHaveBeenCalled();
+    expect(reserveMock).toHaveBeenCalledTimes(1);
+    // The revalidation preview ran once more, after the reservation.
+    expect(previewMock).toHaveBeenCalledTimes(2);
+    // e2 remains settled-but-unclaimed even though the reservation of e1
+    // alone fits — moreDeferred must flip true so the render signposts it.
+    expect(result?.moreDeferred).toBe(true);
+  });
+
+  it('leaves moreDeferred false when no further settled work remains beyond the reserved set', async () => {
+    const onlyEvent = makeEvent({ eventId: 'e1', monitorId: 'm1' });
+
+    previewMock.mockResolvedValueOnce([onlyEvent]);
+    const claim = claimWith([onlyEvent]);
+    reserveMock.mockResolvedValueOnce({ reservationId: 'r-1', claim });
+    // Revalidation preview: still just the one (now-reserved) event —
+    // nothing grew in the gap.
+    previewMock.mockResolvedValueOnce([onlyEvent]);
+
+    const result = await reserveSizedHookDelivery(
+      'session-1',
+      'turn-interruptible',
+      '/sock',
+    );
+
+    expect(result).not.toBeNull();
+    expect(result?.moreDeferred).toBe(false);
+  });
+
+  it('releases the reservation before propagating when the revalidation preview rejects', async () => {
+    const onlyEvent = makeEvent({ eventId: 'e1', monitorId: 'm1' });
+    previewMock.mockResolvedValueOnce([onlyEvent]);
+    const claim = claimWith([onlyEvent]);
+    reserveMock.mockResolvedValueOnce({ reservationId: 'r-1', claim });
+    previewMock.mockRejectedValueOnce(new Error('daemon unreachable'));
+    releaseMock.mockResolvedValueOnce(undefined);
+
+    await expect(
+      reserveSizedHookDelivery('session-1', 'turn-interruptible', '/sock'),
+    ).rejects.toThrow('daemon unreachable');
+
+    expect(releaseMock).toHaveBeenCalledWith('r-1', '/sock');
+    expect(releaseMock).toHaveBeenCalledTimes(1);
+    // No retry: the reservation is released and the error propagates
+    // immediately.
+    expect(reserveMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('recomputes fit against the final moreDeferred value and retries when marker room no longer fits', async () => {
+    // Two events whose combined blocks fit under the FULL cap, but not under
+    // (cap − deferred-marker length) once moreDeferred flips true.
+    const BODY = 'y'.repeat(1900);
+    const firstEvent = makeEvent({
+      eventId: 'e1',
+      monitorId: 'm1',
+      body: BODY,
+    });
+    const secondEvent = makeEvent({
+      eventId: 'e2',
+      monitorId: 'm2',
+      body: BODY,
+    });
+    const thirdEvent = makeEvent({ eventId: 'e3', monitorId: 'm3' });
+
+    // Attempt 1: sizing preview sees e1+e2 (fits at maxEvents=2, moreDeferred
+    // false); reservation returns exactly those two, which fit under the
+    // FULL cap — but a third event (e3) settles in the gap, so the
+    // revalidation preview flips moreDeferred true, and marker-reserved
+    // repacking can no longer fit both e1 and e2.
+    previewMock.mockResolvedValueOnce([firstEvent, secondEvent]);
+    reserveMock.mockResolvedValueOnce({
+      reservationId: 'r-grown',
+      claim: claimWith([firstEvent, secondEvent]),
+    });
+    previewMock.mockResolvedValueOnce([firstEvent, secondEvent, thirdEvent]);
+
+    // Attempt 2 (retry, tightened to the just-measured includedCount).
+    previewMock.mockResolvedValueOnce([firstEvent, secondEvent, thirdEvent]);
+    reserveMock.mockResolvedValueOnce({
+      reservationId: 'r-fixed',
+      claim: claimWith([firstEvent]),
+    });
+
+    const result = await reserveSizedHookDelivery(
+      'session-1',
+      'turn-interruptible',
+      '/sock',
+    );
+
+    expect(result).not.toBeNull();
+    expect(releaseMock).toHaveBeenCalledWith('r-grown', '/sock');
+    expect(result?.reservation.reservationId).toBe('r-fixed');
+    expect(result?.moreDeferred).toBe(true);
+    const fit = resolveHookClaimFit(
+      result?.reservation.claim.events ?? [],
+      'session-1',
+      '/sock',
+      true,
+      MAX_ADDITIONAL_CONTEXT,
+    );
+    expect(fit.fits).toBe(true);
+  });
+});

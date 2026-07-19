@@ -17,7 +17,6 @@ import {
   scanMonitors,
   SourceRegistry,
   type AgentSessionRecord,
-  type DeliveryClaim,
   type MonitorDefinition,
   type MonitorEventRecord,
   type Urgency,
@@ -35,19 +34,14 @@ import { readLocalState } from '../local-state.js';
 import { resolveManualDaemonSocketPath } from '../manual-daemon.js';
 import { resolveWorkspaceDbPath } from '../workspace-db-path.js';
 import {
-  claimDeliveryClient,
   closeSessionClient,
   listEventsClient,
   listObservationHistoryClient,
   openSessionClient,
-  previewSettledHighDeliveryClient,
   retractObjectEventsClient,
   suppressObjectEventsClient,
 } from '../runtime-client.js';
-import {
-  packEventsUnderCap,
-  renderHookDelivery,
-} from '../hook-deliver-render.js';
+import { reserveRenderAndCommitHookDelivery } from './hook.js';
 import {
   computeVerifyBudget,
   deliveryLifecycleForUrgency,
@@ -1112,9 +1106,22 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
 
 /**
  * Claim + render exactly as `hook deliver` does after resolving a session
- * (hook.ts): for `turn-interruptible` preview the settled high events, pack how
- * many fit under the cap, and claim exactly that many; otherwise take the plain
- * claim. Returns the rendered `additionalContext`, or null when nothing surfaces.
+ * (issue #442, PR #442 round-9 review): reuses the SAME shared
+ * reserve → validate-fit → render → commit flow
+ * (`reserveRenderAndCommitHookDelivery`, `hook.ts`) `hook deliver` itself
+ * calls — including the post-reservation candidate-growth check
+ * (`reserveSizedHookDelivery`'s `settledWorkRemainsBeyondClaim`) — rather than
+ * a bespoke preview → direct `claimDeliveryClient` → render sequence of its
+ * own. Before this fix, `verify` could pass even when the production
+ * claimed-set-equals-rendered-set contract (§5.5) was violated: a
+ * substitution race between `verify`'s own preview and its direct claim could
+ * replace the previewed events with larger blocks under the same count,
+ * durably claim all the replacements, and let the renderer silently omit
+ * already-claimed blocks — exactly the bug `reserveSizedHookDelivery` exists
+ * to close on the real hook path. Returns the rendered `additionalContext`,
+ * or null when nothing surfaces. The commit happens only after this function
+ * has captured the rendered output (never before), mirroring `hook deliver`'s
+ * own render-before-commit ordering.
  */
 async function claimAndRender(
   sessionId: string,
@@ -1122,33 +1129,17 @@ async function claimAndRender(
   socketPath: string,
   hookEventName: string,
 ): Promise<string | null> {
-  let claim: DeliveryClaim | null;
-  let moreDeferred = false;
-  if (lifecycle === 'turn-interruptible') {
-    const highPreview = await previewSettledHighDeliveryClient(
-      sessionId,
-      socketPath,
-    );
-    if (highPreview.length > 0) {
-      const fit = packEventsUnderCap(
-        highPreview,
-        sessionId,
-        undefined,
-        socketPath,
-      );
-      claim = await claimDeliveryClient(sessionId, lifecycle, socketPath, fit);
-      moreDeferred = fit < highPreview.length;
-    } else {
-      claim = await claimDeliveryClient(sessionId, lifecycle, socketPath);
-    }
-  } else {
-    claim = await claimDeliveryClient(sessionId, lifecycle, socketPath);
-  }
-  const output = renderHookDelivery(claim, hookEventName, {
-    moreDeferred,
+  const flow = await reserveRenderAndCommitHookDelivery(
+    sessionId,
+    lifecycle,
     socketPath,
-  });
-  return output?.hookSpecificOutput.additionalContext ?? null;
+    hookEventName,
+  );
+  if (!flow) return null;
+  const additionalContext =
+    flow.output?.hookSpecificOutput.additionalContext ?? null;
+  await flow.commit();
+  return additionalContext;
 }
 
 /**
