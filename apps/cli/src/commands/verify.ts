@@ -1130,7 +1130,7 @@ async function claimAndRender(
       socketPath,
     );
     if (highPreview.length > 0) {
-      const fit = packEventsUnderCap(highPreview);
+      const fit = packEventsUnderCap(highPreview, sessionId);
       claim = await claimDeliveryClient(sessionId, lifecycle, socketPath, fit);
       moreDeferred = fit < highPreview.length;
     } else {

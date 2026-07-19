@@ -13,16 +13,35 @@ const LEAD_LINE =
   'AgentMon: monitored changes are pending — consider handling them before continuing.';
 
 /**
- * Appended verbatim when the assembled context is truncated. It tells the agent
- * the visible context is incomplete and points at the durable, re-discoverable
- * source of the rest. Claiming a delivery does NOT acknowledge it (BP2 / SP4):
- * `unreadEventsForSession` filters on `acknowledgedAt IS NULL` only, so an event
- * whose body was truncated away here remains UNREAD and is still listed by
- * `agentmonitors events list --unread` (and re-delivered by the next context
- * event). No event is lost by truncation.
+ * Build the marker appended when the assembled context is truncated. It tells
+ * the agent the visible context is incomplete and points at the durable,
+ * re-discoverable source of the rest. Claiming a delivery does NOT
+ * acknowledge it (BP2 / SP4): `unreadEventsForSession` filters on
+ * `acknowledgedAt IS NULL` only, so an event whose body was truncated away
+ * here remains UNREAD and is still listed by `agentmonitors events list
+ * --session <id> --unread` (and re-delivered by the next context event). No
+ * event is lost by truncation.
+ *
+ * `agentmonitors events list` **requires** `--session <id>` (issue #420 P2,
+ * `apps/cli/src/commands/events.ts`) — a bare `agentmonitors events list
+ * --unread` exits 1, so a marker advertising that alone left the ONLY stated
+ * recovery path unusable (issue #442, mirroring the channel transport's
+ * `buildChannelTruncatedMarker` fix — `channel-render.ts`). The marker
+ * instead renders the exact, directly executable command for the session
+ * that received THIS delivery, taking `sessionId` from the claim itself and
+ * sanitizing it the same way every other claim-derived field reaching this
+ * payload is sanitized (see {@link sanitize}) — an id that happened to carry
+ * a raw control character would otherwise corrupt the rendered command.
+ *
+ * The caller passes this marker's own length to {@link packEventsUnderCap},
+ * {@link truncateForCap}, and {@link appendMarkerWithinCap} — so the varying
+ * length of a longer or shorter session id is already accounted for in cap
+ * sizing; no separate adjustment is needed at each call site.
  */
-const TRUNCATION_MARKER =
-  '\n\n[truncated — more monitor updates are pending; run `agentmonitors events list --unread` to see the rest]';
+function buildHookTruncatedMarker(sessionId: string): string {
+  const safeSessionId = sanitize(sessionId);
+  return `\n\n[truncated — more monitor updates are pending; run \`agentmonitors events list --session ${safeSessionId} --unread\` to see the rest]`;
+}
 
 /**
  * `additionalContext` is a plain JSON string — `JSON.stringify` escapes quotes,
@@ -72,24 +91,28 @@ export interface HookDeliveryOutput {
 /**
  * Truncate `value` so the returned string is at most `cap` UTF-16 code units,
  * cutting only at a Unicode CODE-POINT boundary (never splitting a surrogate
- * pair) and, when truncation occurs, appending {@link TRUNCATION_MARKER} so the
- * final string — marker included — is still ≤ `cap`. Delegates to the shared
+ * pair) and, when truncation occurs, appending `marker` so the final string —
+ * marker included — is still ≤ `cap`. Delegates to the shared
  * {@link truncateWithMarker} (`delivery-event-render.ts`) so this transport and
  * the channel's per-event diff bound share one code-point-safe implementation.
  */
-function truncateForCap(value: string, cap: number): string {
-  return truncateWithMarker(value, cap, TRUNCATION_MARKER);
+function truncateForCap(value: string, cap: number, marker: string): string {
+  return truncateWithMarker(value, cap, marker);
 }
 
 /**
- * Append {@link TRUNCATION_MARKER} to `body`, trimming `body` at a Unicode
- * code-point boundary only if the marker would push it past `cap`, so the result
- * (marker included) is always ≤ `cap`. Used for the single pathological case
- * where one event's own block already exceeds the cap and must be shown
- * partially (see {@link renderHookDelivery}).
+ * Append `marker` to `body`, trimming `body` at a Unicode code-point boundary
+ * only if the marker would push it past `cap`, so the result (marker
+ * included) is always ≤ `cap`. Used for the single pathological case where
+ * one event's own block already exceeds the cap and must be shown partially
+ * (see {@link renderHookDelivery}).
  */
-function appendMarkerWithinCap(body: string, cap: number): string {
-  return appendSharedMarkerWithinCap(body, cap, TRUNCATION_MARKER);
+function appendMarkerWithinCap(
+  body: string,
+  cap: number,
+  marker: string,
+): string {
+  return appendSharedMarkerWithinCap(body, cap, marker);
 }
 
 /** The fixed prefix of a body-injection payload: lead line + blank line. */
@@ -129,7 +152,14 @@ function packWholeBlocks(
  * CLAIM, so the claimed set equals the rendered set and the remainder stays
  * pending for the next context event. Thin wrapper over the transport-shared
  * {@link packSharedEventsUnderCap} (`delivery-event-render.ts`), fixing this
- * transport's `sanitize`, lead-line `HEADER`, and `TRUNCATION_MARKER` length.
+ * transport's `sanitize`, lead-line `HEADER`, and the session-scoped
+ * truncation marker's length.
+ *
+ * `sessionId` is the session the sizing decision is being made for (the same
+ * id the eventual claim/render will carry) — it MUST size against the marker
+ * this session's own {@link buildHookTruncatedMarker} produces, since a longer
+ * or shorter session id changes the marker's length and therefore how many
+ * whole blocks fit (issue #442).
  *
  * When not everything fits, room is reserved for the truncation marker so no
  * INCLUDED block is cut. At least 1 is returned when there is any event — there
@@ -140,12 +170,13 @@ function packWholeBlocks(
  */
 export function packEventsUnderCap(
   events: DeliveryEventSummary[],
+  sessionId: string,
   cap: number = MAX_ADDITIONAL_CONTEXT,
 ): number {
   return packSharedEventsUnderCap(events, sanitize, cap, {
     header: HEADER,
     joiner: '\n',
-    markerLength: TRUNCATION_MARKER.length,
+    markerLength: buildHookTruncatedMarker(sessionId).length,
   });
 }
 
@@ -174,18 +205,21 @@ export interface RenderHookDeliveryOptions {
  *   under the cap (issue #299): the visible set maps 1:1 to durable events so a
  *   length-bounded transport can claim exactly what it renders. When events are
  *   omitted here — because they did not fit, or because the caller deferred more
- *   via {@link RenderHookDeliveryOptions.moreDeferred} — the
- *   {@link TRUNCATION_MARKER} is appended pointing at the still-unread rest.
- *   Only when a SINGLE event's own block exceeds the cap is it shown partially
- *   (mid-truncated at a code-point boundary); its full body stays unread
- *   (claiming ≠ acking, BP2 / SP4).
+ *   via {@link RenderHookDeliveryOptions.moreDeferred} — the marker built by
+ *   {@link buildHookTruncatedMarker} (a directly runnable `agentmonitors events
+ *   list --session <id> --unread` for THIS claim's session, issue #442 — a bare
+ *   `--unread` without `--session` exits 1) is appended pointing at the
+ *   still-unread rest. Only when a SINGLE event's own block exceeds the cap is
+ *   it shown partially (mid-truncated at a code-point boundary); its full body
+ *   stays unread (claiming ≠ acking, BP2 / SP4).
  * - **Reminder line** — a `normal`/`low` turn-boundary claim carries no event
  *   bodies (`events: []`) but a populated `message` (the same advisory line
  *   `hook claim` surfaces). It renders that message as a sanitized, length-capped
  *   reminder line, with **no** body injection — so a default (`normal`-urgency)
  *   monitor produces a visible mid-turn signal instead of silence. The
  *   underlying rows are claimed but NOT acknowledged (BP2 / SP4), so the event
- *   stays unread and re-discoverable via `agentmonitors events list --unread`.
+ *   stays unread and re-discoverable via `agentmonitors events list --session
+ *   <id> --unread`.
  *
  * The renderer is **pure and side-effect-free**: no I/O, no mutation. Text is
  * preserved faithfully (a monitor body is trusted, user-authored markdown) with
@@ -203,6 +237,11 @@ export function renderHookDelivery(
 ): HookDeliveryOutput | null {
   if (!claim) return null;
 
+  // Built once per claim from its own `sessionId` (issue #442) so every marker
+  // rendered below points at the exact, directly runnable recovery command for
+  // THIS claim's session — see {@link buildHookTruncatedMarker}.
+  const truncatedMarker = buildHookTruncatedMarker(claim.sessionId);
+
   // Reminder-only delivery (issue #198): a `normal`/`low` turn-boundary claim
   // has no event bodies to inject, only a lightweight advisory `message`. Body
   // injection stays reserved for `high` and the `post-compact` recap (both of
@@ -217,7 +256,11 @@ export function renderHookDelivery(
       continue: true,
       hookSpecificOutput: {
         hookEventName,
-        additionalContext: truncateForCap(reminder, MAX_ADDITIONAL_CONTEXT),
+        additionalContext: truncateForCap(
+          reminder,
+          MAX_ADDITIONAL_CONTEXT,
+          truncatedMarker,
+        ),
       },
     };
   }
@@ -236,10 +279,10 @@ export function renderHookDelivery(
     const reserved = packWholeBlocks(
       HEADER,
       blocks,
-      MAX_ADDITIONAL_CONTEXT - TRUNCATION_MARKER.length,
+      MAX_ADDITIONAL_CONTEXT - truncatedMarker.length,
     );
     if (reserved.includedCount >= 1) {
-      additionalContext = reserved.text + TRUNCATION_MARKER;
+      additionalContext = reserved.text + truncatedMarker;
     } else {
       // Even the first block alone exceeds (cap − marker): mid-truncate block 0
       // at a code-point boundary. This is the ONLY case a durable event is shown
@@ -248,6 +291,7 @@ export function renderHookDelivery(
       additionalContext = appendMarkerWithinCap(
         HEADER + firstBlock,
         MAX_ADDITIONAL_CONTEXT,
+        truncatedMarker,
       );
     }
   }

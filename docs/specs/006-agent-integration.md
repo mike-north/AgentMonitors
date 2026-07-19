@@ -502,11 +502,14 @@ shape:
   and an explicit marker is appended:
 
   ```text
-  [truncated — more monitor updates are pending; run `agentmonitors events list --unread` to see the rest]
+  [truncated — more monitor updates are pending; run `agentmonitors events list --session <id> --unread` to see the rest]
   ```
 
-  The final string including the marker is still ≤ 4000 chars. Truncation never drops a durable
-  event: see §5.5 (unread-recoverability).
+  `agentmonitors events list` **requires** `--session <id>` (§5, issue #420 P2) — a bare
+  `agentmonitors events list --unread` exits 1 — so the marker renders the exact, directly runnable
+  command for the session that received THIS delivery, with the claim's own (sanitized) `sessionId`
+  substituted in, not the bare form (issue #442). The final string including the marker is still
+  ≤ 4000 chars. Truncation never drops a durable event: see §5.5 (unread-recoverability).
 
 - **No `permissionDecision` field** — advisory; the agent decides what to do.
 
@@ -746,6 +749,14 @@ to see the full copy)`` with the claim's own (sanitized) `sessionId` substituted
 durable copy instead of promising a re-delivery
 that cannot happen — reserving `CHANNEL_DEFERRED_MARKER`'s "surface on a later poll" language for the
 case where a whole block genuinely stayed unclaimed and pending.
+
+**The hook-deliver transport uses a single, already session-scoped marker for both branches
+instead.** Unlike the channel's two-phase reserve/commit, `claimDeliveryClient` claims (and sets
+`first_notified_at`) synchronously, so a hook-deliver claim's deferred-remainder branch and its
+single-event mid-truncation branch are both rendered by one marker builder,
+`buildHookTruncatedMarker(sessionId)` (§5.1), rather than the channel's two distinct marker
+constants — there is no "will re-deliver later" framing to preserve on the hook side that would be
+undermined by session-scoping it.
 
 No durable event is lost by truncation; the cap only bounds how much is injected into a single turn (or,
 for the channel, into a single push).

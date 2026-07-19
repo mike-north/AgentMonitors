@@ -325,7 +325,7 @@ Diagnosis:
             socketPath,
           );
           if (highPreview.length > 0) {
-            const fit = packEventsUnderCap(highPreview);
+            const fit = packEventsUnderCap(highPreview, match.id);
             claim = await claimDeliveryClient(
               match.id,
               lifecycle,

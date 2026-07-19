@@ -275,10 +275,12 @@ describe('renderHookDelivery', () => {
   });
 
   // (e.2) truncation marker: an over-cap body yields output that is (a) ≤ cap
-  // and (b) ends with the explicit truncation marker pointing at the still-
-  // unread events. The marker proves the truncation is signposted, not silent.
+  // and (b) ends with the explicit, directly runnable session-scoped
+  // truncation marker pointing at the still-unread events (issue #442: a bare
+  // `--unread` without `--session <id>` exits 1, so the marker must render the
+  // real command for the claim's own session, not the unusable bare form).
   const TRUNCATION_TAIL =
-    'run `agentmonitors events list --unread` to see the rest]';
+    'run `agentmonitors events list --session s1 --unread` to see the rest]';
   it('appends an explicit truncation marker when over the cap', () => {
     const largeBody = 'x'.repeat(10_000);
     const out = renderHookDelivery(
@@ -303,6 +305,54 @@ describe('renderHookDelivery', () => {
     // (b) ends with the truncation marker
     expect(ctx.endsWith(TRUNCATION_TAIL)).toBe(true);
     expect(ctx).toContain('[truncated');
+  });
+
+  // (e.2.1 — issue #442 regression) the marker's command is derived from THIS
+  // claim's own sessionId, not the default fixture's — proving the fix isn't
+  // hardcoded and that a bare `--unread` (which exits 1 without `--session`)
+  // never leaks into the rendered marker.
+  it('renders the truncation marker with the exact claim sessionId, not a bare --unread', () => {
+    const largeBody = 'x'.repeat(10_000);
+    const out = renderHookDelivery(
+      makeClaim({
+        sessionId: 'session-abc-123',
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'watch-src',
+            title: 'Files changed',
+            summary: 'Files changed',
+            body: largeBody,
+            urgency: 'high',
+            createdAt: '2026-06-04T00:00:00.000Z',
+          },
+        ],
+      }),
+      'PreToolUse',
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).toContain(
+      'run `agentmonitors events list --session session-abc-123 --unread` to see the rest',
+    );
+    // The unusable bare form (no --session) must never appear.
+    expect(ctx).not.toContain(
+      '`agentmonitors events list --unread` to see the rest',
+    );
+  });
+
+  // (e.2.2 — issue #442) the `moreDeferred` reminder-style marker (appended
+  // even when the claimed events themselves fit) is ALSO session-scoped, since
+  // it reuses the same marker builder.
+  it('renders a session-scoped marker when the caller deferred more events', () => {
+    const out = renderHookDelivery(
+      makeClaim({ sessionId: 'session-xyz' }),
+      'PostToolUse',
+      { moreDeferred: true },
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).toContain(
+      'run `agentmonitors events list --session session-xyz --unread` to see the rest',
+    );
   });
 
   // (e.3) when the content fits under the cap, NO marker is appended.
@@ -470,7 +520,7 @@ describe('packEventsUnderCap', () => {
   }
 
   it('returns 0 for an empty list', () => {
-    expect(packEventsUnderCap([])).toBe(0);
+    expect(packEventsUnderCap([], 's1')).toBe(0);
   });
 
   it('returns the full count when every whole block fits under the cap', () => {
@@ -479,7 +529,7 @@ describe('packEventsUnderCap', () => {
       makeEvent('mon-b', 'short body B'),
       makeEvent('mon-c', 'short body C'),
     ];
-    expect(packEventsUnderCap(events)).toBe(3);
+    expect(packEventsUnderCap(events, 's1')).toBe(3);
   });
 
   it('returns only the events that fit (reserving marker room) when combined length exceeds the cap', () => {
@@ -488,7 +538,7 @@ describe('packEventsUnderCap', () => {
       makeEvent('mon-a', 'a'.repeat(2200)),
       makeEvent('mon-b', 'b'.repeat(2200)),
     ];
-    expect(packEventsUnderCap(events)).toBe(1);
+    expect(packEventsUnderCap(events, 's1')).toBe(1);
   });
 
   it('returns at least 1 even when the first event alone exceeds the cap (forward progress)', () => {
@@ -498,7 +548,27 @@ describe('packEventsUnderCap', () => {
     ];
     // The first is surfaced (and claimed) even though it overflows — it is
     // mid-truncated by renderHookDelivery; the marker points at the unread rest.
-    expect(packEventsUnderCap(events)).toBe(1);
+    expect(packEventsUnderCap(events, 's1')).toBe(1);
+  });
+
+  // (issue #442 regression) the marker's length varies with the session id
+  // (it is embedded in the rendered command), so sizing MUST reserve room
+  // based on THIS session's own marker length — not a fixed constant. Three
+  // ~1700-char blocks combined exceed the cap, so the packer reserves marker
+  // room: a SHORT session id's marker leaves room for 2 whole blocks, while a
+  // much LONGER session id's marker (500 extra chars embedded in the rendered
+  // command) leaves room for only 1.
+  it('sizes against the session-specific marker length, not a fixed constant', () => {
+    const events = [
+      makeEvent('mon-a', 'a'.repeat(1700)),
+      makeEvent('mon-b', 'b'.repeat(1700)),
+      makeEvent('mon-c', 'c'.repeat(1700)),
+    ];
+    const longSessionId = 'x'.repeat(500);
+    const shortFit = packEventsUnderCap(events, 's1');
+    const longFit = packEventsUnderCap(events, longSessionId);
+    expect(shortFit).toBe(2);
+    expect(longFit).toBe(1);
   });
 });
 
