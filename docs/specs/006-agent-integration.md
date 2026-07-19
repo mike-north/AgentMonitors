@@ -1106,12 +1106,17 @@ shell-guarded for the "installed plugin, missing CLI" case (a user who hasn't ye
   `agentmonitors session start && agentmonitors hook deliver` is broken: `session start` consumes the
   payload, and the subsequent `hook deliver` sees EOF, parses `{}`, finds no `session_id`, and
   silently no-ops — killing the recap. Therefore `agentmonitors session start` reads the payload
-  **once** and, after registering, performs the post-compact recap **itself** (claims
-  `post-compact` and prints the rendered `additionalContext` when there are unread events). The
-  SessionStart hook runs the single command `agentmonitors session start`; there is no chained
-  delivery. (This also avoids the parallel-execution race a two-entry form would have had.) The
-  `UserPromptSubmit` and `SessionEnd` hooks are each their own invocation with their own stdin, so
-  they remain single commands.
+  **once** and, after registering, performs the post-compact recap **itself** — reserving,
+  rendering, writing (awaited to completion), and only then committing the `post-compact`
+  reservation via the SAME shared `reserveRenderAndCommitHookDelivery` / `writeAndCommitHookDelivery`
+  flow `hook deliver` uses (§5.2, issue #442, PR #442 round-16 review), printing the rendered
+  `additionalContext` when there are unread events. This closes the same at-most-once loss window
+  §5.2 describes for `hook deliver`'s own commit ordering: committing the reservation BEFORE the
+  recap was successfully written would durably claim the unread rows even if an asynchronous write
+  failure (e.g. `EPIPE`) meant nothing ever reached the agent. The SessionStart hook runs the single
+  command `agentmonitors session start`; there is no chained delivery. (This also avoids the
+  parallel-execution race a two-entry form would have had.) The `UserPromptSubmit` and `SessionEnd`
+  hooks are each their own invocation with their own stdin, so they remain single commands.
 
 The channel MCP (§4) ships in the same plugin via
 [`.mcp.json`](../../agent-plugins/agentmonitors/.mcp.json) (server key `agentmonitors`, preserving
