@@ -500,6 +500,42 @@ poll-until-`daemonAvailable` loop with slightly different timeout/poll constants
 (`daemon-ipc.ts`); each call site keeps its own pre-existing timeout/poll values — no behavior change.
 
 Finding 5 (test teardown pid fallback) is test-infrastructure-only, no spec change.
+## 2026-07-19 — Repo-scoped PR-alerting presets: `init --type pr-review` and `--type my-prs` (003 §11.9, 005 §2) — Refs #444
+
+Added two ready-made `command-poll` presets to `init --type`, one per pull-request role: `pr-review`
+(reviewer — open, non-draft PRs awaiting review, excluding `changeset-release/*` heads) and `my-prs`
+(author — CI, review feedback, and state changes on the current `gh` user's own PRs). Both are new
+`TEMPLATES` entries only; no source, schema, or runtime behavior changed.
+
+Three contract points are now specified rather than left to the author of each hand-written monitor:
+
+1. **Repository auto-scoping is achieved by omission.** Neither preset scaffolds `--repo`, because
+   `gh` resolves the repository from its working directory and `command-poll`'s effective `cwd`
+   defaults to the runtime workspace/config root (003 §11.1). Interpolating an owner/name at scaffold
+   time is explicitly rejected — it would hardcode what the omission makes portable. `--author @me`
+   applies the same rule to identity.
+2. **Which fields are diffed is the real product decision.** `json-diff` fires on any semantic change
+   to stdout, so the `--jq` reduction decides what becomes an interrupt. `my-prs` reduces
+   `statusCheckRollup` to only the _failing_ check names, which is what makes green→red fire while
+   the queued/in-progress churn of a normal CI run stays silent; diffing the rollup whole would
+   interrupt once per check, per push. It queries `--state all` rather than `--state open` so a merged
+   PR's `state` is observably `MERGED` rather than merely absent.
+3. **A broken `gh` is a loud failure, not a silent baseline.** 003 §11.2/§11.5 classify a nonzero exit
+   _with output_ as a normal result, so a preset that merely `exit 1`-ed on `gh` failure would record
+   the error text as its first baseline and never fire again. Both presets instead terminate by
+   signal (`kill -TERM $$`) after writing a remedy to stderr, which §11.5 classifies as an execution
+   failure: `Command failing: <key>` is emitted on the very first tick, the remedy travels in
+   `stderrTail`, any prior baseline is preserved, the alert is edge-triggered, and recovery emits
+   `Command recovered: <key>`.
+
+Urgency is asymmetric by design (002 §9): `my-prs` is `high` (a stalled PR of your own is
+interrupt-worthy; the 15s high-urgency settle still coalesces a burst of check results into one
+event), `pr-review` is `normal` (an unreviewed PR is work, not a regression).
+
+Known limitation, recorded rather than worked around: `gh pr list` exposes no review-thread data, so
+inline review comments that do not move `reviewDecision` are invisible to `my-prs`. A first-class
+`source-github-pr` plugin modelling PR transitions semantically remains the north star and would
+close that gap; these presets deliver the capability without it.
 
 ## 2026-07-19 — Transport-health review fixes round 4: future-timestamp staleness, symlink-safe writes, delivery-diagnosis-unavailable (006 §12; 005 §15) — Refs #425
 

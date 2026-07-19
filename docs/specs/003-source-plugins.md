@@ -1751,7 +1751,86 @@ advertises a new commit.
 The `init --type command-poll` scaffold uses this recipe so a newly generated monitor does not
 silently become a local-only status check when the author's intent is upstream branch monitoring.
 
-### 11.9 Non-goals (v1)
+### 11.9 PR-alerting recipe: reviewer and author roles
+
+> **Status: current — shipped** (issue #444). Scaffolded by
+> `agentmonitors init --type pr-review` and `--type my-prs`; see
+> [005 §2](./005-cli-reference.md#2-init--scaffold-a-monitor).
+
+Pull-request alerting has two distinct audiences, and conflating them produces a monitor that is
+wrong for both:
+
+| Role     | Preset      | Watches                                          | Urgency  |
+| -------- | ----------- | ------------------------------------------------ | -------- |
+| Reviewer | `pr-review` | Open, non-draft PRs in this repo awaiting review | `normal` |
+| Author   | `my-prs`    | CI, review feedback, and state on your own PRs   | `high`   |
+
+Both are `command-poll` + `json-diff` over `gh pr list`.
+
+#### Repository auto-scoping
+
+**Neither preset carries a `--repo` flag, and this is load-bearing.** `gh` resolves the repository
+from its process working directory, and `command-poll`'s effective `cwd` defaults to the runtime
+workspace/config root (§11.1). Omitting `--repo` therefore scopes the monitor to whatever repository
+the session is operating in — the same `MONITOR.md` is correct in every checkout. Interpolating an
+owner/name at scaffold time would hardcode it back and is explicitly not done. The author preset
+applies the same rule to identity: `--author @me` resolves against the current `gh` authentication
+rather than a baked-in login.
+
+#### Field selection is what makes the transitions observable
+
+`json-diff` fires on any semantic change to the command's stdout, so the `--jq` reduction — not the
+diff strategy — decides which real-world events become interrupts.
+
+`pr-review` projects each PR to `{number, title, headRefName, reviewDecision, author}`, filtering out
+drafts and `changeset-release/*` heads (the release/Version PR is never agent-reviewable). Because
+drafts are filtered rather than reported, "a draft was marked ready" surfaces as the PR _appearing_
+in the set. `updatedAt` is deliberately excluded: including it would fire on every push and comment.
+
+`my-prs` queries `--state all` rather than `--state open` so a merged PR stays in the result set and
+its `state` is observably `MERGED` rather than merely absent — which is what lets the agent tell
+"merged, clean up the branch" from "closed unmerged, find out why". It reduces each PR to:
+
+- `failingChecks` — the sorted names of **failing** entries in `statusCheckRollup` (both `CheckRun`
+  `conclusion` and legacy `StatusContext` `state`). Reducing to failures only means a green→red
+  transition fires and a red→green recovery fires, while the queued/in-progress churn of a normal CI
+  run stays invisible; diffing `statusCheckRollup` whole would instead interrupt once per check, per
+  push.
+- `reviewDecision`, a per-reviewer `{by, state}` list from `latestReviews`, and an issue-comment
+  count — so a new review, a changed verdict, or a new comment each diff. `gh pr list` exposes no
+  review-thread data, so inline thread replies that do not move `reviewDecision` are not visible.
+- `state` and `isDraft` — so merged, closed, and both directions of draft↔ready each diff.
+
+#### Urgency
+
+`my-prs` is `high` because every transition it watches means the author's own work has stalled: CI is
+red, a reviewer is blocked, or the branch has landed and needs cleanup. Per
+[002 §9](./002-runtime-delivery.md), `high` still settles for 15s before delivery, so a burst of
+check results arrives as one event. `pr-review` is `normal`: an unreviewed PR is real work but not a
+regression — nothing is broken while it waits, and review is best picked up at a turn boundary.
+
+#### Degradation when `gh` is unusable
+
+A missing, unauthenticated, or wrongly-located `gh` must not degrade into a silent baseline. Both
+presets wrap the query in `sh -c` and, on `gh` failure, write a remedy to stderr and terminate
+themselves with `kill -TERM $$`.
+
+The signal is deliberate. §11.2/§11.5 classify a nonzero exit _with output_ as a normal result, so a
+plain `exit 1` would let the first tick record the error text as the baseline and never fire again.
+Termination by signal is classified as an execution **failure**, which per §11.5 emits
+`Command failing: <key>` on the very first tick, carries the remedy in the observation's
+`stderrTail`, preserves any prior baseline instead of re-baselining onto garbage, is edge-triggered
+(a persistently broken `gh` does not interrupt every tick), and emits `Command recovered: <key>` once
+`gh` works again. `$$` targets the `sh` process itself — never `-$$`, which would signal the whole
+process group.
+
+#### Follow-up
+
+A first-class `source-github-pr` plugin that models PR transitions semantically — rather than diffing
+reduced `gh` JSON — is the north star, and would also expose review threads. These presets deliver
+the capability without it.
+
+### 11.10 Non-goals (v1)
 
 - No domain-specific source code (OmniFocus, git, gh, …) in this repo — those are `MONITOR.md`
   consumers of `command-poll`.

@@ -144,7 +144,7 @@ agentmonitors init [name] [options]
 | ------------------- | --------------------- | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `[name]`            | positional (optional) | —                     | Monitor name, becomes the subdirectory name. **Omit to run the project bootstrap** instead of scaffolding one monitor.                                                                                                                             |
 | `--dir <dir>`       | option                | `.claude/monitors`    | Base directory for monitors                                                                                                                                                                                                                        |
-| `--type <type>`     | option (choices)      | `file-fingerprint`    | Observation source type: `file-fingerprint`, `api-poll`, `command-poll`, `schedule`, `incoming-changes`                                                                                                                                            |
+| `--type <type>`     | option (choices)      | `file-fingerprint`    | Observation source type — `file-fingerprint`, `api-poll`, `command-poll`, `schedule`, `incoming-changes` — or a **preset**: `pr-review`, `my-prs` (see [Presets](#presets-pr-review-and-my-prs))                                                   |
 | `--enable-only`     | boolean               | —                     | Bootstrap only: enable the project and fix `.gitignore`, then stop (no monitor, no prompts)                                                                                                                                                        |
 | `--yes`             | boolean               | —                     | Bootstrap non-interactively: accept defaults and scaffold a starter monitor without prompting                                                                                                                                                      |
 | `--glob <pattern>`  | option (repeatable)   | —                     | Scaffold form only. Seeds `watch.globs` (`file-fingerprint`) or `watch.paths` (`incoming-changes`), value-preserving; rejected for any other `--type`                                                                                              |
@@ -160,7 +160,7 @@ Human-readable only (no `--format` flag). Byte-for-byte unchanged by the bootstr
 
 - **Success:** prints `Created monitor: <dir>/<name>/MONITOR.md` followed by a hint to run `agentmonitors validate <dir>` and `agentmonitors doctor`, then a line recommending `agentmonitors verify <name> --dir <dir>` to prove the monitor delivers end-to-end — with `--manual` appended for any `--type` other than `file-fingerprint` (issue #408; `verify`'s auto-trigger, [§16](#16-verify--prove-a-monitor-delivers-end-to-end), only fabricates a change for `watch.globs`-based sources today).
 - **Failure (duplicate):** prints to stderr `Monitor already exists: <dir>/<name>/MONITOR.md`; exits with code 1.
-- **Failure (unsupported seed):** `--glob` on a `--type` with no path-pattern list in its template (`api-poll`, `command-poll`, `schedule`) prints to stderr `--glob is not supported for --type <type> (only file-fingerprint and incoming-changes have a path-pattern list)`; exits with code 1. No directory is created. `--command` on any `--type` other than `command-poll` prints to stderr `--command is not supported for --type <type> (only command-poll has a command: argv array)`; exits with code 1. No directory is created.
+- **Failure (unsupported seed):** `--glob` on a `--type` with no path-pattern list in its template (`api-poll`, `command-poll`, `schedule`, `pr-review`, `my-prs`) prints to stderr `--glob is not supported for --type <type> (only file-fingerprint and incoming-changes have a path-pattern list)`; exits with code 1. No directory is created. `--command` on any `--type` other than `command-poll` prints to stderr `--command is not supported for --type <type> (only command-poll has a seedable command: argv array; the pr-review and my-prs presets ship a fixed gh query)`; exits with code 1. No directory is created. The presets deliberately reject `--command`: their `gh` query and its `--jq` reduction are the preset (see [003 §11.9](./003-source-plugins.md)), and replacing the argv would leave the monitor body describing transitions the new command cannot produce.
 
 #### Seed flags (`--glob`, `--command`, `--name`, `--urgency`)
 
@@ -192,13 +192,45 @@ Runs against the current working directory. Performs, in order:
 
 Each source produces a distinct starter frontmatter block:
 
-| Source             | Key config fields in template                                                                                      |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------ |
-| `file-fingerprint` | `globs: ['**/*.ts']`                                                                                               |
-| `api-poll`         | `url`, `method: GET`, `interval: 5m`; `change-detection.strategy` omitted so the source infers from `Content-Type` |
-| `command-poll`     | `command: [git, ls-remote, origin, refs/heads/main]`, `interval: 5m`, `change-detection.strategy: text-diff`       |
-| `schedule`         | `cron: '0 9 * * 1-5'`, `timezone: UTC`                                                                             |
-| `incoming-changes` | `paths: ['docs/specs/**']`, `branch: main`                                                                         |
+| Source             | Key config fields in template                                                                                            |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------ |
+| `file-fingerprint` | `globs: ['**/*.ts']`                                                                                                     |
+| `api-poll`         | `url`, `method: GET`, `interval: 5m`; `change-detection.strategy` omitted so the source infers from `Content-Type`       |
+| `command-poll`     | `command: [git, ls-remote, origin, refs/heads/main]`, `interval: 5m`, `change-detection.strategy: text-diff`             |
+| `schedule`         | `cron: '0 9 * * 1-5'`, `timezone: UTC`                                                                                   |
+| `incoming-changes` | `paths: ['docs/specs/**']`, `branch: main`                                                                               |
+| `pr-review`        | `command-poll` over `gh pr list` (no `--repo`), `key: pr-review`, `interval: 5m`, `json-diff`, `urgency: normal`         |
+| `my-prs`           | `command-poll` over `gh pr list --author @me` (no `--repo`), `key: my-prs`, `interval: 2m`, `json-diff`, `urgency: high` |
+
+#### Presets (`pr-review` and `my-prs`)
+
+`pr-review` and `my-prs` are not source types — they are two ready-made `command-poll` monitors for
+the two pull-request roles, selected through the same `--type` flag:
+
+- **`pr-review`** (reviewer) — open, non-draft PRs in this repository awaiting review, excluding
+  `changeset-release/*` heads. Fires when a PR appears (opened, or a draft marked ready), when
+  `reviewDecision` flips, and when a PR leaves the queue. `urgency: normal`.
+- **`my-prs`** (author) — the current `gh` user's recent PRs in this repository. Fires when CI goes
+  red or recovers, when review feedback lands, and when a PR is merged, closed, or moved into or out
+  of draft. `urgency: high`.
+
+**Both are automatically scoped to the repository the session is operating in.** Neither scaffolds a
+`--repo owner/name` flag: `gh` resolves the repository from its working directory, which for a
+project monitor is the runtime workspace/config root. `my-prs` likewise resolves identity through
+`--author @me` rather than a scaffolded username. A scaffolded preset is therefore correct in any
+checkout and needs no editing before it runs — the intent of these presets is that PR alerting takes
+one command rather than ~20 hand-written lines of `gh` argv.
+
+Both require the [GitHub CLI](https://cli.github.com) on the daemon's `PATH`, authenticated
+(`gh auth login`). When it is missing, unauthenticated, or run outside a GitHub repository, the
+monitor emits a `Command failing: <key>` event on its **first** tick whose `stderrTail` carries both
+`gh`'s own message and the remedy — it never degrades into a silent, never-firing baseline. See
+[003 §11.9](./003-source-plugins.md) for the field selection, the urgency rationale, and the failure
+mechanism.
+
+As with any scaffold, the frontmatter `name:` derives from the positional `[name]`
+(`init pr-review --type pr-review` yields `name: Pr review`); pass `--name 'PRs awaiting my review'`
+for a more readable delivery label.
 
 ---
 

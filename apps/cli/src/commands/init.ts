@@ -53,6 +53,102 @@ const COMMAND_POLL_DEFAULT_COMMAND_BLOCK =
   );
 
 /**
+ * Shell preamble shared by the two PR-alerting presets (`pr-review`,
+ * `my-prs`). Both run `gh` through `sh -c` rather than as a bare argv array so
+ * a `gh` that is missing, unauthenticated, or pointed at a non-GitHub
+ * directory becomes a **loud** condition instead of an empty-output baseline
+ * that never fires again.
+ *
+ * The mechanism is deliberate. `command-poll` classifies a nonzero exit *with*
+ * output as a normal result (003 §11.2/§11.5), so a plain `exit 1` here would
+ * be diffed like any other output: the very first tick would silently record
+ * the error text as the baseline and stay quiet forever. Terminating by a
+ * signal instead (`kill -TERM $$`) is classified as an execution **failure**,
+ * which emits the `Command failing: <key>` health observation on the very
+ * first tick, preserves any prior baseline rather than re-baselining onto
+ * garbage, and emits `Command recovered: <key>` once `gh` works again
+ * (003 §11.5). The human-readable remedy is written to stderr, which the
+ * failure observation carries as `stderrTail`.
+ *
+ * `$$` is the `sh` process's own PID — not `-$$`, which would signal the whole
+ * process group and reach siblings this monitor does not own.
+ *
+ * Note the absence of `--repo`: `gh` resolves the repository from its working
+ * directory, and `command-poll`'s effective `cwd` defaults to the runtime
+ * workspace/config root (003 §11.1). Omitting the flag is what makes these
+ * presets scope themselves to whatever repository the session is operating in;
+ * interpolating an owner/name at scaffold time would hardcode it right back.
+ */
+function ghPresetScript(preset: string, query: string): string {
+  return `out=$(${query} 2>&1) || {
+  printf '%s\\n' "$out" >&2
+  printf 'agentmonitors %s: the GitHub CLI query failed, so PR alerting is NOT running.\\nFix one of these, then re-run: agentmonitors monitor test <this file>\\n  1. Install the GitHub CLI: https://cli.github.com\\n  2. Authenticate it: gh auth login\\n  3. Run the daemon from inside a git repo that has a GitHub remote.\\n' '${preset}' >&2
+  kill -TERM $$
+  exit 1
+}
+printf '%s\\n' "$out"`;
+}
+
+/** Indent a multi-line shell script to sit under a YAML `- |` block scalar. */
+function yamlBlockScalar(script: string, indent: string): string {
+  return script
+    .split('\n')
+    .map((line) => (line === '' ? '' : `${indent}${line}`))
+    .join('\n');
+}
+
+/**
+ * `--type pr-review`'s `gh` query: open, non-draft PRs in the current repo.
+ * `changeset-release/*` heads are excluded — the release/Version PR is never
+ * agent-reviewable. Fields are chosen so `json-diff` fires on exactly the
+ * reviewer-relevant transitions and nothing else: a PR entering the set (newly
+ * opened, or a draft marked ready — drafts are filtered out, so "marked ready"
+ * *is* an appearance), leaving it (merged/closed/converted back to draft), or
+ * flipping `reviewDecision`. `updatedAt` is deliberately absent: including it
+ * would fire on every push and comment.
+ */
+const PR_REVIEW_QUERY =
+  'gh pr list --state open --limit 30 ' +
+  '--json number,title,isDraft,reviewDecision,headRefName,author ' +
+  '--jq \'[.[] | select(.isDraft == false and (.headRefName | startswith("changeset-release/") | not)) ' +
+  '| {number, title, headRefName, reviewDecision, author: .author.login}] ' +
+  "| sort_by(.number)'";
+
+/**
+ * `--type my-prs`'s `gh` query: the current `gh` user's recent PRs in the
+ * current repo (`--author @me` — never a baked-in username). `--state all`
+ * rather than `--state open` is load-bearing: a merged PR must stay in the
+ * result set for `state` to be observably `MERGED` rather than merely absent,
+ * which is what lets the body distinguish "merged, go clean up" from "closed
+ * unmerged, go find out why".
+ *
+ * The `--jq` reduction is what makes all three trigger classes diff cleanly:
+ *
+ * - **CI** — `failingChecks` is the sorted list of *failing* check names.
+ *   Reducing `statusCheckRollup` to only failures (rather than diffing it
+ *   whole) means a green→red transition fires (`[]` → `["build"]`) and a
+ *   red→green recovery fires, while the queued/in-progress churn of a normal
+ *   CI run — which would otherwise produce an interrupt per check, per push —
+ *   is invisible.
+ * - **Review feedback** — `reviewDecision` plus a per-reviewer
+ *   `{by, state}` list and an issue-comment count, so a new review, a changed
+ *   verdict, or a new comment all diff. (`gh pr list` exposes no review-thread
+ *   data, so inline thread replies are not visible here; see the follow-up
+ *   note in the monitor body.)
+ * - **State** — `state` (OPEN/MERGED/CLOSED) and `isDraft`, so merged, closed,
+ *   and both directions of draft↔ready each produce a diff.
+ */
+const MY_PRS_QUERY =
+  'gh pr list --author @me --state all --limit 10 ' +
+  '--json number,title,url,state,isDraft,reviewDecision,statusCheckRollup,latestReviews,comments ' +
+  "--jq '[.[] | {number, title, url, state, isDraft, reviewDecision, " +
+  'failingChecks: ([.statusCheckRollup[]? | select(((.conclusion // .state // "") | ascii_upcase) as $c ' +
+  '| $c == "FAILURE" or $c == "TIMED_OUT" or $c == "CANCELLED" or $c == "ERROR" ' +
+  'or $c == "ACTION_REQUIRED" or $c == "STARTUP_FAILURE") | (.name // .context)] | sort), ' +
+  'reviews: ([.latestReviews[]? | {by: .author.login, state}] | sort_by(.by, .state)), ' +
+  "commentCount: (.comments | length)}] | sort_by(.number)'";
+
+/**
  * The scaffold body for each `--type`. Exported (test-only use) so
  * `scaffold-defaults.test.ts` can assert the `command-poll` entry's parsed
  * `command:` block still equals {@link COMMAND_POLL_SCAFFOLD_DEFAULT_COMMAND}
@@ -112,6 +208,104 @@ urgency: normal
 
 When the upstream branch changes, review the new commits and decide whether they
 affect this workspace.
+`.trimStart(),
+
+  'pr-review': yaml`
+---
+name: PRs awaiting my review
+watch:
+  type: command-poll
+  # Scoped to whatever repo the daemon runs in: there is no --repo flag, so gh
+  # resolves the repository from the working directory. Do not add one.
+  key: pr-review
+  command:
+    - sh
+    - -c
+    - |
+${yamlBlockScalar(ghPresetScript('pr-review', PR_REVIEW_QUERY), '      ')}
+  interval: 5m
+  change-detection:
+    strategy: json-diff
+# normal, not high: an unreviewed PR is real work, but it is not a regression —
+# nothing is broken while it waits, and reviewing is a task best picked up at a
+# turn boundary rather than mid-edit (002 §9).
+urgency: normal
+---
+
+The set of pull requests awaiting review in this repository changed. Act as the
+reviewer.
+
+- **A PR appeared in the list** — it was just opened, or a draft was marked
+  ready (drafts are filtered out, so "marked ready" shows up as an appearance).
+  Review it: check out the branch, read the diff against the issue or
+  description it claims to implement, and record findings. Do not merge it
+  yourself.
+- **\`reviewDecision\` moved to \`CHANGES_REQUESTED\` or \`APPROVED\`** — someone
+  else reviewed it. If it is now approved, note that it is ready for whoever
+  owns merging; do not self-merge.
+- **A PR dropped off the list** — it was merged, closed, or converted back to
+  draft. No action needed beyond noting it.
+
+Release PRs (\`changeset-release/*\` heads) are filtered out; they are not
+agent-reviewable.
+
+If instead you see a "Command failing" event, \`gh\` could not run — read the
+error and fix the CLI install, auth, or working directory before trusting this
+monitor again.
+`.trimStart(),
+
+  'my-prs': yaml`
+---
+name: My pull requests
+watch:
+  type: command-poll
+  # Scoped to whatever repo the daemon runs in (no --repo flag) and to whoever
+  # gh is authenticated as (--author @me, never a baked-in username).
+  key: my-prs
+  command:
+    - sh
+    - -c
+    - |
+${yamlBlockScalar(ghPresetScript('my-prs', MY_PRS_QUERY), '      ')}
+  interval: 2m
+  change-detection:
+    strategy: json-diff
+# high, not normal: every transition this watches means your own work has
+# stalled — CI is red, a reviewer is blocked on you, or the PR has landed and
+# the branch needs cleaning up. Those are worth interrupting for. high still
+# settles for 15s before delivering (002 §9), so a burst of check results
+# arrives as one event, not five.
+urgency: high
+---
+
+Something changed on one of your own pull requests in this repository. Compare
+the entries by \`number\` and act on what moved.
+
+- **\`failingChecks\` gained a name** — CI broke. Pull the failing job's log
+  (\`gh run view --log-failed\`), fix the cause on the branch, and push. Do not
+  ask for review until it is green again.
+- **\`failingChecks\` became empty** — CI recovered. Nothing to do beyond
+  noting it.
+- **\`reviewDecision\` became \`CHANGES_REQUESTED\`, or \`reviews\`/\`commentCount\`
+  grew** — review feedback landed. Read it, address each point in code or reply
+  explaining why not, then push and re-request review.
+- **\`isDraft\` went \`true\` → \`false\`** — the PR is now soliciting review;
+  make sure CI is green and the description is accurate.
+- **\`isDraft\` went \`false\` → \`true\`** — it was pulled back to draft, usually
+  because something was found. Find out what before pushing more.
+- **\`state\` became \`MERGED\`** — it landed. Delete the branch and its
+  worktree, close the issue it referenced if its acceptance criteria are met,
+  and move on.
+- **\`state\` became \`CLOSED\`** — it was closed without merging. Find out why
+  before reopening or re-doing the work.
+
+\`gh pr list\` exposes no review-thread data, so inline review comments that do
+not change \`reviewDecision\` are not visible here; check the PR directly when
+feedback is expected.
+
+If instead you see a "Command failing" event, \`gh\` could not run — read the
+error and fix the CLI install, auth, or working directory before trusting this
+monitor again.
 `.trimStart(),
 
   schedule: yaml`
@@ -292,7 +486,7 @@ export function seedCommand(
 ): string {
   if (type !== 'command-poll') {
     throw new InitSeedError(
-      `--command is not supported for --type ${type} (only command-poll has a command: argv array)`,
+      `--command is not supported for --type ${type} (only command-poll has a seedable command: argv array; the pr-review and my-prs presets ship a fixed gh query)`,
     );
   }
   // The seeded command is no longer the illustrative upstream-tip example, so
@@ -719,7 +913,10 @@ export const initCommand = new Command('init')
   )
   .option('--dir <dir>', 'Base directory for monitors', '.claude/monitors')
   .addOption(
-    new Option('--type <type>', 'Observation source type')
+    new Option(
+      '--type <type>',
+      'Observation source type, or a ready-made preset (pr-review: PRs awaiting your review; my-prs: CI/review/state changes on your own PRs — both auto-scoped to the current repo)',
+    )
       .choices(VALID_TYPES)
       .default(DEFAULT_TYPE),
   )
