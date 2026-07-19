@@ -8,6 +8,7 @@ import type {
 } from '@agentmonitors/core';
 import {
   diffKeyedCollection,
+  parseDuration,
   parseKeyedCollectionConfig,
 } from '@agentmonitors/core';
 
@@ -32,6 +33,34 @@ import {
   renderCompositeSnapshot,
 } from './composite.js';
 
+/**
+ * Default wall-clock deadline for a single request, covering both the initial
+ * response (headers) and streaming the body to completion (issue #304). A
+ * stalled connect, a server that never sends headers, and a stalled/trickling
+ * chunked body are all bounded by the same deadline. Matches `command-poll`'s
+ * default (003 §11.1) for consistency across bundled sources.
+ */
+const DEFAULT_TIMEOUT_MS = 30_000;
+
+/**
+ * Maximum response body size, in bytes, that `api-poll` will buffer (issue
+ * #304). Enforced twice: as an early rejection against a trusted
+ * `Content-Length` header (before any body bytes are read), and — because
+ * `Content-Length` can be absent (chunked encoding) or simply wrong — as a
+ * running count while streaming the body, which is the authority. Either path
+ * aborts the request and errors the observation; no partial body is ever
+ * baselined or persisted.
+ */
+const MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Maximum number of composite parts (§2.6) fetched concurrently within one
+ * `observe()` call (issue #304). Without a cap, a composite with many parts
+ * starts every request at once, multiplying the stalled-connection and
+ * memory-pressure risk this issue exists to bound.
+ */
+const MAX_COMPOSITE_CONCURRENCY = 5;
+
 interface AuthConfig {
   type: 'bearer' | 'basic';
   'token-env'?: string;
@@ -47,6 +76,14 @@ interface ScopeConfig {
   auth: AuthConfig | undefined;
   headers: Record<string, string> | undefined;
   method: string | undefined;
+  /**
+   * Request/body deadline in milliseconds (issue #304). Defaults to
+   * {@link DEFAULT_TIMEOUT_MS} when `timeout` is omitted; parsed via the
+   * shared `parseDuration` (`^\d+[smhd]$`) when present, so an invalid value
+   * throws the same descriptive error as every other duration field in the
+   * codebase (defence-in-depth alongside the schema `pattern`).
+   */
+  timeoutMs: number;
   /**
    * The change-detection strategy as written by the author, or `undefined` when
    * the author omitted `change-detection.strategy`. The omitted case is resolved
@@ -129,6 +166,12 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
     );
   }
 
+  const rawTimeout = config['timeout'];
+  const timeoutMs =
+    typeof rawTimeout === 'string'
+      ? parseDuration(rawTimeout)
+      : DEFAULT_TIMEOUT_MS;
+
   return {
     url: typeof url === 'string' ? url : undefined,
     auth: config['auth'] as AuthConfig | undefined,
@@ -137,6 +180,7 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
     explicitStrategy,
     collection,
     composite,
+    timeoutMs,
   };
 }
 
@@ -230,6 +274,13 @@ const scopeSchema: JsonSchema = {
       pattern: '^\\d+[smhd]$',
       description:
         'Polling interval (e.g., "5m"). Used by the scheduling engine, not by this plugin directly.',
+    },
+    timeout: {
+      type: 'string',
+      pattern: '^\\d+[smhd]$',
+      default: '30s',
+      description:
+        'Deadline for a single request, covering both the response headers and streaming the body to completion. In composite mode (change-detection.composite), the same deadline applies to each part. Default 30s.',
     },
     'change-detection': {
       type: 'object',
@@ -328,42 +379,151 @@ const scopeSchema: JsonSchema = {
   ],
 };
 
-/** One HTTP fetch, with the §153-item-6 cause-preserving error wrapping. */
+/** Whether `err` is a Web-standard `AbortError` (thrown by an aborted fetch/read). */
+function isAbortError(err: unknown): boolean {
+  return err instanceof Error && err.name === 'AbortError';
+}
+
+/** Timeout error message shared by both the header fetch and the body read (issue #304). */
+function timeoutMessage(url: string, timeoutMs: number): string {
+  return `api-poll request to ${redactUrlForWarning(url)} timed out after ${String(timeoutMs)}ms`;
+}
+
+/** Oversize error message shared by the declared and streamed byte-cap checks (issue #304). */
+function oversizeMessage(url: string, detail: string): string {
+  return `api-poll response from ${redactUrlForWarning(url)} ${detail}, exceeding the ${String(MAX_RESPONSE_BYTES)}-byte cap`;
+}
+
+/**
+ * Read a fetch `Response` body under the shared byte cap (issue #304).
+ *
+ * `Content-Length`, when present, is checked first as an early rejection — no
+ * point streaming a body the server already told us is too large. But
+ * `Content-Length` is not authoritative: it can be absent (chunked transfer
+ * encoding) or simply wrong, so every chunk read from the body stream is
+ * counted, and the running total is the actual authority. Either check aborts
+ * `controller` and throws before returning a body, so the caller never
+ * baselines or persists a partial/oversized body.
+ *
+ * Test doubles that return a plain `{ text() }` mock without a streaming
+ * `.body` fall back to `response.text()` unbounded — real `fetch` responses
+ * always expose `.body` as a `ReadableStream`, so production traffic is
+ * always bounded by the streamed count.
+ */
+async function readBoundedBody(
+  response: Response,
+  controller: AbortController,
+  url: string,
+  timeoutMs: number,
+): Promise<string> {
+  const declaredBytes = readContentLength(response);
+  if (declaredBytes !== undefined && declaredBytes > MAX_RESPONSE_BYTES) {
+    throw new Error(
+      oversizeMessage(
+        url,
+        `declares Content-Length ${String(declaredBytes)} bytes`,
+      ),
+    );
+  }
+
+  const body = response.body;
+  if (!body) {
+    return response.text();
+  }
+
+  // Node's global `ReadableStream` typings (no DOM lib in this project, see
+  // tsconfig.base.json `lib: ["ES2022"]`) resolve `getReader().read()` to an
+  // untyped result; annotate it explicitly rather than propagating `any`.
+  // (`ReadableStreamReadResult` itself is only exported from the
+  // `node:stream/web` module, not globally, so it is spelled out inline.)
+  const reader: ReadableStreamDefaultReader<Uint8Array> = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = (await reader.read()) as {
+        done: boolean;
+        value: Uint8Array | undefined;
+      };
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > MAX_RESPONSE_BYTES) {
+        controller.abort();
+        throw new Error(
+          oversizeMessage(url, `streamed ${String(total)} bytes`),
+        );
+      }
+      chunks.push(value);
+    }
+  } catch (readErr) {
+    if (isAbortError(readErr)) {
+      throw new Error(timeoutMessage(url, timeoutMs), { cause: readErr });
+    }
+    throw readErr;
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString(
+    'utf8',
+  );
+}
+
+/**
+ * One HTTP fetch, bounded by a single request/body deadline (issue #304) and
+ * the shared byte cap, with the §153-item-6 cause-preserving error wrapping
+ * for network-level failures.
+ */
 async function fetchBody(
   url: string,
   method: string | undefined,
   combinedHeaders: Record<string, string>,
+  timeoutMs: number,
 ): Promise<{ body: string; status: number; contentType: string | undefined }> {
-  let response: Response;
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
   try {
-    response = await fetch(url, {
-      method: method ?? 'GET',
-      headers: combinedHeaders,
-    });
-  } catch (fetchErr) {
-    // Node's undici/fetch wraps the real network failure (ECONNREFUSED,
-    // ENOTFOUND, timeout …) as `err.cause`. The outer `err.message` is the
-    // generic "fetch failed", which is unhelpful in `monitor explain` output.
-    // Re-throw a new error that includes the real cause in the message so
-    // callers — both `monitor test` and the runtime's observation-history
-    // audit — see the underlying reason. Issue #153 (item 6).
-    const causeMsg =
-      fetchErr instanceof Error && fetchErr.cause instanceof Error
-        ? fetchErr.cause.message
-        : null;
-    const baseMsg =
-      fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
-    // Use fetchErr as the cause to satisfy the preserve-caught-error rule;
-    // the full cause chain is reachable via err.cause.cause.
-    throw new Error(causeMsg ? `${baseMsg}: ${causeMsg}` : baseMsg, {
-      cause: fetchErr,
-    });
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: method ?? 'GET',
+        headers: combinedHeaders,
+        signal: controller.signal,
+      });
+    } catch (fetchErr) {
+      if (isAbortError(fetchErr) || controller.signal.aborted) {
+        throw new Error(timeoutMessage(url, timeoutMs), { cause: fetchErr });
+      }
+      // Node's undici/fetch wraps the real network failure (ECONNREFUSED,
+      // ENOTFOUND, timeout …) as `err.cause`. The outer `err.message` is the
+      // generic "fetch failed", which is unhelpful in `monitor explain` output.
+      // Re-throw a new error that includes the real cause in the message so
+      // callers — both `monitor test` and the runtime's observation-history
+      // audit — see the underlying reason. Issue #153 (item 6).
+      const causeMsg =
+        fetchErr instanceof Error && fetchErr.cause instanceof Error
+          ? fetchErr.cause.message
+          : null;
+      const baseMsg =
+        fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+      // Use fetchErr as the cause to satisfy the preserve-caught-error rule;
+      // the full cause chain is reachable via err.cause.cause.
+      throw new Error(causeMsg ? `${baseMsg}: ${causeMsg}` : baseMsg, {
+        cause: fetchErr,
+      });
+    }
+
+    const body = await readBoundedBody(response, controller, url, timeoutMs);
+    return {
+      body,
+      status: response.status,
+      contentType: readContentType(response),
+    };
+  } finally {
+    clearTimeout(timer);
   }
-  return {
-    body: await response.text(),
-    status: response.status,
-    contentType: readContentType(response),
-  };
 }
 
 /**
@@ -382,6 +542,27 @@ function readContentType(response: Response): string | undefined {
   ) {
     const value = (headers as Headers).get('content-type');
     return value ?? undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Read a trusted `Content-Length` from a fetch `Response`, in bytes, or
+ * `undefined` if absent/unparseable — tolerant of lightweight test doubles
+ * that omit `headers`, mirroring {@link readContentType}. Used only as an
+ * early rejection for the byte cap (issue #304); the streamed count remains
+ * the authority regardless of what this returns.
+ */
+function readContentLength(response: Response): number | undefined {
+  const headers = (response as { headers?: unknown }).headers;
+  if (
+    typeof headers === 'object' &&
+    headers !== null &&
+    typeof (headers as { get?: unknown }).get === 'function'
+  ) {
+    const value = (headers as Headers).get('content-length');
+    const parsed = value === null ? NaN : Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
   }
   return undefined;
 }
@@ -482,6 +663,60 @@ function isCompositeState(value: unknown): value is CompositeState {
 }
 
 /**
+ * Run `fn` over `items` with at most `limit` invocations in flight at once,
+ * preserving input order in the returned array (issue #304). Fails fast: the
+ * first rejection stops new work from starting and is what the returned
+ * promise rejects with, matching `Promise.all`'s reject-on-first-failure
+ * semantics — just with a bounded number of simultaneous in-flight calls
+ * instead of starting everything at once.
+ */
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array<R>(items.length);
+  let nextIndex = 0;
+  // Held in an object rather than bare closure variables: multiple `worker`
+  // instances run concurrently (interleaved by `await`), and TypeScript's
+  // control-flow narrowing of a bare `let` incorrectly assumes no other
+  // in-flight call could have mutated it between an `if` check and its use.
+  // A property read is re-checked each time instead of narrowed once.
+  const failure: { happened: boolean; error: unknown } = {
+    happened: false,
+    error: undefined,
+  };
+
+  async function worker(): Promise<void> {
+    for (;;) {
+      if (failure.happened) return;
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= items.length) return;
+      try {
+        // `index < items.length` was just checked, so this element exists.
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+        results[index] = await fn(items[index]!);
+      } catch (err) {
+        // Whichever concurrent worker fails first "wins" the surfaced error —
+        // a later overwrite from a second failing worker is harmless: the
+        // caller only needs to know the batch failed and see *an* error from
+        // it, not necessarily the temporally-first one.
+        failure.happened = true;
+        failure.error = err;
+        return;
+      }
+    }
+  }
+
+  const workerCount = Math.min(limit, items.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+
+  if (failure.happened) throw failure.error;
+  return results;
+}
+
+/**
  * Composite observe path (003 §2.6): issue **N** calls within one `observe()`,
  * reduce them into **one** deterministic snapshot under **one** `objectKey`, and
  * emit a single composite observation. The source's `nextState` holds only the
@@ -493,25 +728,32 @@ async function observeComposite(
   combinedHeaders: Record<string, string>,
   method: string | undefined,
   previousState: unknown,
+  timeoutMs: number,
 ): Promise<ObservationResult> {
-  // Issue all underlying calls CONCURRENTLY (Promise.all) so latency is
-  // bounded by the slowest part, not the sum of all parts. A failed part still
-  // fails the whole observation: Promise.all rejects on any rejection, so
+  // Issue underlying calls CONCURRENTLY, up to MAX_COMPOSITE_CONCURRENCY at a
+  // time (issue #304), so latency is bounded by the slowest *batch* rather
+  // than the sum of all parts, without starting every request in an
+  // arbitrarily large composite at once. A failed part still fails the whole
+  // observation: mapWithConcurrency rejects on the first failure, so
   // `nextState` never advances and the prior baseline is preserved (002 §3) —
-  // we never silently emit a composite missing a part.
-  const results = await Promise.all(
-    composite.parts.map(async (part) => {
+  // we never silently emit a composite missing a part. Each part gets the
+  // same request/body deadline and byte cap as a single-URL monitor.
+  const results = await mapWithConcurrency(
+    composite.parts,
+    MAX_COMPOSITE_CONCURRENCY,
+    async (part) => {
       const { body, status } = await fetchBody(
         part.url,
         method,
         combinedHeaders,
+        timeoutMs,
       );
       // ---- Non-2xx → errored observation (issue #220, composite parity) -------
       // A composite assembles its snapshot by body-diffing the rendered whole, so
       // a non-2xx part body (a 401/500 error page) must NOT be baselined into the
       // snapshot — that would make a misconfigured monitor look healthy and diff
-      // error pages. Throwing here rejects the surrounding Promise.all, so
-      // `nextState` never advances and the prior baseline is preserved (002 §3),
+      // error pages. Throwing here fails the surrounding mapWithConcurrency call,
+      // so `nextState` never advances and the prior baseline is preserved (002 §3),
       // exactly as the single-URL path does. There is no `status-code` exemption
       // in composite mode: composite is always a body-diffing assembly, never a
       // status-transition watcher, so every part must be a 2xx success.
@@ -521,7 +763,7 @@ async function observeComposite(
         );
       }
       return { id: part.id, body } satisfies FetchedPart;
-    }),
+    },
   );
 
   // Render ONCE: the same string drives both change-detection (nextState) and
@@ -559,6 +801,7 @@ const source: ObservationSource = {
       explicitStrategy,
       collection,
       composite,
+      timeoutMs,
     } = parseScopeConfig(config);
     const authHeaders = resolveAuth(auth);
     const combinedHeaders = { ...authHeaders, ...headers };
@@ -571,6 +814,7 @@ const source: ObservationSource = {
         combinedHeaders,
         method,
         context.previousState,
+        timeoutMs,
       );
     }
 
@@ -583,6 +827,7 @@ const source: ObservationSource = {
       url,
       method,
       combinedHeaders,
+      timeoutMs,
     );
 
     // Resolve the effective strategy: explicit wins verbatim; otherwise infer

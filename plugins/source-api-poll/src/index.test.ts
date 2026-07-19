@@ -1292,4 +1292,302 @@ When the document changes, act on it.
       expect(latest?.snapshotText).toContain('two v3 CHANGED');
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // Issue #304: `api-poll` can wait forever or consume unbounded memory. These
+  // tests exercise the three bounds directly: a request/body deadline, a
+  // streamed byte cap (with a trusted Content-Length early check), and bounded
+  // composite concurrency. Each bound must errored-observation the tick — no
+  // partial body baselined, no `nextState` advance.
+  // ---------------------------------------------------------------------------
+  describe('request/body bounds (issue #304)', () => {
+    function makeAbortError(): Error {
+      const err = new Error('The operation was aborted');
+      err.name = 'AbortError';
+      return err;
+    }
+
+    /** A `fetch` mock whose headers never arrive until the caller's signal aborts. */
+    function mockNeverRespondingFetch(): ReturnType<typeof vi.fn> {
+      return vi.fn(
+        (_url: string, init: RequestInit) =>
+          new Promise((_resolve, reject) => {
+            const signal = init.signal;
+            if (!signal) throw new Error('test requires an AbortSignal');
+            signal.addEventListener('abort', () => {
+              reject(makeAbortError());
+            });
+          }),
+      );
+    }
+
+    /**
+     * A `fetch` mock whose headers resolve immediately (2xx) but whose body
+     * stream never completes a read — mimicking a stalled/trickling chunked
+     * response — until the caller's signal aborts.
+     */
+    function mockHangingBodyFetch(): ReturnType<typeof vi.fn> {
+      return vi.fn((_url: string, init: RequestInit) =>
+        Promise.resolve({
+          status: 200,
+          headers: { get: () => null },
+          body: {
+            getReader: () => ({
+              read: () =>
+                new Promise((_resolve, reject) => {
+                  const signal = init.signal;
+                  if (!signal) throw new Error('test requires an AbortSignal');
+                  if (signal.aborted) {
+                    reject(makeAbortError());
+                    return;
+                  }
+                  signal.addEventListener('abort', () => {
+                    reject(makeAbortError());
+                  });
+                }),
+              releaseLock: () => {
+                // no-op
+              },
+            }),
+          },
+        }),
+      );
+    }
+
+    /** A `fetch` mock returning a declared `Content-Length` header, no streaming body. */
+    function mockDeclaredContentLength(
+      declaredBytes: number,
+    ): ReturnType<typeof vi.fn> {
+      return vi.fn(() =>
+        Promise.resolve({
+          status: 200,
+          headers: {
+            get: (name: string) =>
+              name.toLowerCase() === 'content-length'
+                ? String(declaredBytes)
+                : null,
+          },
+          text: () => Promise.resolve('should never be read'),
+        }),
+      );
+    }
+
+    /** A `fetch` mock streaming the given chunks with no `Content-Length` header. */
+    function mockStreamingChunks(
+      chunks: Uint8Array[],
+    ): ReturnType<typeof vi.fn> {
+      return vi.fn(() => {
+        let index = 0;
+        return Promise.resolve({
+          status: 200,
+          headers: { get: () => null },
+          body: {
+            getReader: () => ({
+              read: () => {
+                if (index >= chunks.length) {
+                  return Promise.resolve({ done: true, value: undefined });
+                }
+                const value = chunks[index];
+                index += 1;
+                return Promise.resolve({ done: false, value });
+              },
+              releaseLock: () => {
+                // no-op
+              },
+            }),
+          },
+        });
+      });
+    }
+
+    describe('request/body deadline', () => {
+      it('aborts and errors the observation when headers never arrive', async () => {
+        vi.stubGlobal('fetch', mockNeverRespondingFetch());
+
+        await expect(
+          source.observe(
+            { url: 'https://api.example.com/never-responds', timeout: '1s' },
+            { now: new Date() },
+          ),
+        ).rejects.toThrow(/timed out after 1000ms/);
+      });
+
+      it('aborts and errors the observation when the body stalls mid-stream', async () => {
+        vi.stubGlobal('fetch', mockHangingBodyFetch());
+
+        await expect(
+          source.observe(
+            { url: 'https://api.example.com/stalls', timeout: '1s' },
+            { now: new Date() },
+          ),
+        ).rejects.toThrow(/timed out after 1000ms/);
+      });
+
+      it('a request that completes within the deadline is unaffected', async () => {
+        vi.stubGlobal(
+          'fetch',
+          vi.fn().mockResolvedValue({
+            text: () => Promise.resolve('fast response'),
+            status: 200,
+          }),
+        );
+
+        const result = await source.observe(
+          { url: 'https://api.example.com/fast', timeout: '1s' },
+          { now: new Date() },
+        );
+        expect(result.observations).toHaveLength(0);
+        expect(result.nextState).toBeDefined();
+      });
+
+      it('rejects an invalid timeout override', async () => {
+        await expect(
+          source.observe(
+            { url: 'https://api.example.com/x', timeout: 'soon' },
+            { now: new Date() },
+          ),
+        ).rejects.toThrow(/Invalid duration: "soon"/);
+      });
+
+      it('does not advance nextState past a timed-out tick', async () => {
+        vi.stubGlobal(
+          'fetch',
+          vi.fn().mockResolvedValue({
+            text: () => Promise.resolve('baseline body'),
+            status: 200,
+          }),
+        );
+        const url = 'https://api.example.com/recovers';
+        const baseline = await source.observe({ url }, { now: new Date() });
+
+        vi.stubGlobal('fetch', mockNeverRespondingFetch());
+        await expect(
+          source.observe(
+            { url, timeout: '1s' },
+            { previousState: baseline.nextState, now: new Date() },
+          ),
+        ).rejects.toThrow(/timed out/);
+
+        // A subsequent successful poll still diffs against the ORIGINAL baseline
+        // (the runtime never persisted a `nextState` from the errored tick).
+        vi.stubGlobal(
+          'fetch',
+          vi.fn().mockResolvedValue({
+            text: () => Promise.resolve('changed body'),
+            status: 200,
+          }),
+        );
+        const recovered = await source.observe(
+          { url },
+          { previousState: baseline.nextState, now: new Date() },
+        );
+        expect(recovered.observations).toHaveLength(1);
+      });
+    });
+
+    describe('byte cap', () => {
+      it('rejects a declared Content-Length above the cap without reading the body', async () => {
+        const mockFetch = mockDeclaredContentLength(50 * 1024 * 1024);
+        vi.stubGlobal('fetch', mockFetch);
+
+        await expect(
+          source.observe(
+            { url: 'https://api.example.com/huge-declared' },
+            { now: new Date() },
+          ),
+        ).rejects.toThrow(/exceeding the .*-byte cap/);
+      });
+
+      it('caps a chunked body with no Content-Length via streamed counting', async () => {
+        // No single chunk exceeds the cap on its own, but the running total does
+        // — proving the streamed count (not any one chunk) is the authority.
+        const chunk = new Uint8Array(6 * 1024 * 1024);
+        vi.stubGlobal('fetch', mockStreamingChunks([chunk, chunk]));
+
+        await expect(
+          source.observe(
+            { url: 'https://api.example.com/huge-chunked' },
+            { now: new Date() },
+          ),
+        ).rejects.toThrow(/exceeding the .*-byte cap/);
+      });
+
+      it('a body within the cap is read normally', async () => {
+        const encoder = new TextEncoder();
+        vi.stubGlobal(
+          'fetch',
+          mockStreamingChunks([
+            encoder.encode('{"data":'),
+            encoder.encode('"small"}'),
+          ]),
+        );
+
+        const result = await source.observe(
+          { url: 'https://api.example.com/small' },
+          { now: new Date() },
+        );
+        expect(result.observations).toHaveLength(0);
+        expect(result.nextState).toBeDefined();
+      });
+    });
+
+    describe('composite concurrency (003 §2.6)', () => {
+      it('bounds simultaneous in-flight part requests', async () => {
+        const partCount = 12;
+        let active = 0;
+        let maxActive = 0;
+
+        vi.stubGlobal(
+          'fetch',
+          vi.fn(async (input: string) => {
+            active += 1;
+            maxActive = Math.max(maxActive, active);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            active -= 1;
+            return {
+              status: 200,
+              text: () => Promise.resolve(`body for ${input}`),
+            };
+          }),
+        );
+
+        const config = {
+          'change-detection': {
+            composite: {
+              'object-key': 'many-parts',
+              parts: Array.from({ length: partCount }, (_, i) => ({
+                id: `part-${String(i)}`,
+                url: `https://api.example.com/parts/${String(i)}`,
+              })),
+            },
+          },
+        };
+
+        await source.observe(config, { now: new Date() });
+
+        // Bounded well below "all N parts at once" — proves concurrency is
+        // capped, not merely finite.
+        expect(maxActive).toBeLessThan(partCount);
+        expect(maxActive).toBeLessThanOrEqual(5);
+      });
+
+      it('a slow/never-responding part still errors the whole composite via its own deadline', async () => {
+        vi.stubGlobal('fetch', mockNeverRespondingFetch());
+
+        const config = {
+          'change-detection': {
+            composite: {
+              'object-key': 'stalled-part',
+              parts: [{ id: 'only', url: 'https://api.example.com/stalled' }],
+            },
+          },
+          timeout: '1s',
+        };
+
+        await expect(
+          source.observe(config, { now: new Date() }),
+        ).rejects.toThrow(/timed out after 1000ms/);
+      });
+    });
+  });
 });

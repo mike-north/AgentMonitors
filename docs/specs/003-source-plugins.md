@@ -1037,6 +1037,71 @@ Baseline established. The "api-poll" source requires a prior baseline before it 
 Running a second observation to demonstrate change detection...
 ```
 
+### 4.9 Request duration, response size, and composite concurrency bounds (issue #304)
+
+A stalled or huge endpoint must not wedge a whole tick, delay unrelated monitors, exhaust daemon
+memory, or amplify the local SQLite database (P1 daemon availability). `api-poll` enforces three
+bounds, all covered by a documented default with — for the deadline — a validated per-monitor
+override:
+
+| Bound                  | Default                         | Override                                                            |
+| ---------------------- | ------------------------------- | ------------------------------------------------------------------- |
+| Request/body deadline  | `30s`                           | `timeout` (scope field, duration string `^\d+[smhd]$`, e.g. `"1m"`) |
+| Response body size cap | 10 MiB (10 × 1024 × 1024 bytes) | not configurable                                                    |
+| Composite concurrency  | 5 parts in flight at once       | not configurable                                                    |
+
+**Request/body deadline.** A single `AbortController`-backed timer, started when the request is
+issued, bounds the ENTIRE exchange — connecting, receiving headers, and streaming the body to
+completion — not just the initial `fetch()` call. A server that never sends headers and a
+server that sends headers promptly but then stalls or trickles a chunked body are both aborted at
+the same deadline. On abort, the source throws:
+
+> `api-poll request to <url> timed out after <timeoutMs>ms`
+
+exactly like a network-level failure (§4.6): the runtime records an **`errored`** observation, no
+`nextState` advance, and any prior baseline is preserved. `timeout` defaults to `30s` when omitted
+(matching `command-poll`'s default, 003 §11.1) and is parsed with the same `parseDuration` used
+throughout the codebase, so an invalid value throws the same descriptive
+`Invalid duration: "<value>". Expected format: <number><s|m|h|d>` error as every other duration
+field. In composite mode (§2.6), the **same** deadline applies independently to **each** part —
+one slow part errors the whole composite without starving or serializing the others.
+
+**Response body size cap.** The cap is enforced twice, because `Content-Length` is not
+authoritative:
+
+1. **Early rejection.** If the response declares a `Content-Length` header above the cap, the
+   source throws before reading any body bytes:
+
+   > `api-poll response from <url> declares Content-Length <n> bytes, exceeding the 10485760-byte cap`
+
+2. **Streamed counting (the authority).** Regardless of what — or whether — `Content-Length` was
+   declared (it is absent under chunked transfer encoding, and can simply be wrong), every chunk
+   read from the response body stream is counted; once the running total exceeds the cap, the
+   source aborts the in-flight request and throws:
+
+   > `api-poll response from <url> streamed <n> bytes, exceeding the 10485760-byte cap`
+
+Either path is a thrown error (not a truncated result): the runtime records an `errored`
+observation, exactly as for the deadline. `api-poll` never baselines or persists a partial or
+oversized body — unlike `command-poll`'s stdout cap (003 §11.2), which truncates and still treats
+the capped output as a valid, diffable result. The difference matches the failure mode: a huge
+command output is still meaningful once capped, but treating a stalled/incomplete HTTP body as a
+successful baseline would silently corrupt future diffs.
+
+**Composite concurrency.** Composite mode (§2.6) issues one call per `parts` entry within a single
+`observe()`. Without a bound, a composite with many parts starts every request at once, multiplying
+both the stalled-connection risk and memory pressure this issue exists to bound. `api-poll` runs at
+most 5 part-fetches concurrently; when there are more than 5 parts, each completed fetch's slot is
+immediately taken by the next queued part (a bounded worker pool, not fixed batches of 5). Every
+part still gets the same request/body deadline and byte cap as a single-URL monitor. A failing part
+(non-2xx per §4.8, timeout, or oversize) fails the whole composite observation exactly as before —
+`nextState` never advances and the prior baseline is preserved — the concurrency bound changes only
+how many requests are in flight at once, not the composite's all-or-nothing semantics.
+
+(Verified: `plugins/source-api-poll/src/index.ts`, `DEFAULT_TIMEOUT_MS`, `MAX_RESPONSE_BYTES`,
+`MAX_COMPOSITE_CONCURRENCY`, `readBoundedBody`, `mapWithConcurrency`;
+`plugins/source-api-poll/src/index.test.ts`, "request/body bounds (issue #304)".)
+
 ## 5. Bundled Source: `schedule`
 
 Source name: `"schedule"` (verified: `plugins/source-schedule/src/index.ts` line 47).
