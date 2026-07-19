@@ -132,20 +132,26 @@ function buildHookClaimedUnreadMarker(
  * never hides it from a FUTURE recap; only acknowledging does (§5.5). That
  * means:
  *
- * - {@link buildHookDeferredMarker}'s "more monitor updates are pending ...
- *   run `events list --unread` to see the rest" is misleading here: the
- *   omitted whole blocks are not "pending" in the ordinary sense (they are
- *   reservation candidates, reserved along with the rest of the recap's
- *   candidate set and about to be claimed once this render's commit lands —
- *   not yet claimed at render time, per the render-before-commit ordering
- *   described below) — the deferred marker's own wording makes no promise
- *   about the ordinary redelivery direction either way (a null commit
- *   returns the rows to pending, eligible for redelivery at the next
- *   applicable context event; a rejected commit leaves that outcome
- *   unknown), so borrowing it here would misleadingly imply a guarantee
- *   the recap case can't back up. The recap marker below is preferred
- *   precisely because it CAN make a guarantee that holds across all three
- *   commit outcomes: future recap resurfacing.
+ * - {@link buildHookDeferredMarker}'s own contract — "more monitor updates
+ *   are pending; run `events list --unread` to see the rest" — is a genuine
+ *   promise that the omitted rows stay pending and WILL redeliver: it is
+ *   built only for rows that were never reserved at all (see its own doc
+ *   comment). That promise does not hold here: the recap's omitted whole
+ *   blocks ARE part of THIS reservation's candidate set (`applyDelivery`
+ *   claims `decision.candidates`, not just the rendered `recapSlice`) and
+ *   are about to be claimed once this render's commit lands — not yet
+ *   claimed at render time, per the render-before-commit ordering described
+ *   below. So whether they end up claimed (and therefore excluded from
+ *   ordinary, `pendingEventsForSession`-sourced redelivery) or return to
+ *   pending depends on which of the three commit outcomes follows (a null
+ *   commit returns them to pending; a resolved non-null commit claims them;
+ *   a rejected commit leaves that outcome unknown) — reusing the deferred
+ *   marker here would misleadingly borrow a guarantee this reservation
+ *   can't back up. The recap marker below is preferred precisely because it
+ *   CAN make a guarantee that holds across all three commit outcomes:
+ *   future recap resurfacing, which is unaffected by whether THIS commit
+ *   claims these rows (§5.5's self-heal re-sources from
+ *   `unreadEventsForSession`, not `pendingEventsForSession`).
  * - {@link buildHookClaimedUnreadMarker} (in its current, post-round-10
  *   wording) no longer asserts a redelivery outcome either way — but a
  *   recap's own framing is still distinct: it can (and should) promise the
@@ -412,6 +418,19 @@ export interface RenderHookDeliveryOptions {
  * genuinely nothing to surface — a null claim, or a claim carrying neither
  * event bodies nor a reminder message — so the caller can skip stdout entirely.
  *
+ * Two callers use this renderer, both going through the SAME
+ * reserve → render → write → commit flow (`reserveRenderAndCommitHookDelivery`
+ * / `writeAndCommitHookDelivery`, `hook.ts`) so neither ever durably commits a
+ * reservation before its rendered output has actually been written (issue
+ * #442, PR #442 round-9/round-16 review): `hook.ts`'s `hook deliver` action
+ * (`turn-interruptible`/`turn-idle` claims, and its own `post-compact` path),
+ * and `session.ts`'s `session start` action, which reuses the identical flow
+ * for the `post-compact` recap it surfaces from the SAME stdin payload it
+ * reads to register the session (a chained `hook deliver` would see an
+ * already-consumed stdin and no-op — 006 §5.6). Both callers render off the
+ * RESERVATION's own (not-yet-committed) claim, never a claim that has already
+ * been durably committed.
+ *
  * Two delivery shapes are rendered (issue #198):
  *
  * - **Body injection** — a claim with `events` (settled `high`-urgency
@@ -455,7 +474,7 @@ export interface RenderHookDeliveryOptions {
  * only raw control characters removed (see {@link sanitize}); the total
  * `additionalContext` is capped so a large diff cannot blow the context window.
  *
- * @param claim - The delivery claim from `claimDeliveryClient`, or null.
+ * @param claim - The (not-yet-committed) reservation's claim, or null.
  * @param hookEventName - The Claude Code event name to echo (e.g. `"PreToolUse"`).
  * @param options - See {@link RenderHookDeliveryOptions}.
  */

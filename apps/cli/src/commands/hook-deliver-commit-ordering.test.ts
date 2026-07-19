@@ -18,8 +18,9 @@
  * (a) a commit RPC rejection AFTER output was successfully written must
  *     propagate to the caller WITHOUT releasing the reservation — the
  *     daemon-side outcome is genuinely uncertain (it may have applied the
- *     commit before the response was lost), so the safe direction is a
- *     later DUPLICATE delivery, never a loss.
+ *     commit before the response was lost), so the only remaining risk is a
+ *     POSSIBLE later duplicate delivery if the commit did not in fact apply —
+ *     never a loss, since the output was already written.
  * (a2) only a commit RPC that RESOLVES null (the reservation's lease
  *     already lapsed) proves the rows were never claimed and are back to
  *     pending — a rejection alone does not prove this.

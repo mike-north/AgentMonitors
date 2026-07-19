@@ -3,7 +3,6 @@ import path from 'node:path';
 import { claudeCodeAdapter, scanMonitors } from '@agentmonitors/core';
 import { reportError } from '../output.js';
 import {
-  claimDeliveryClient,
   closeSessionClient,
   listSessionsClient,
   openSessionClient,
@@ -13,10 +12,12 @@ import { readLocalState, writeLocalState } from '../local-state.js';
 import { workspacePaths } from '../workspace-paths.js';
 import { spawnDetachedDaemon } from '../detached-spawn.js';
 import { readHookPayload } from '../hook-payload.js';
+import { renderMonitoringDisabledAdvisory } from '../hook-deliver-render.js';
 import {
-  renderHookDelivery,
-  renderMonitoringDisabledAdvisory,
-} from '../hook-deliver-render.js';
+  reserveRenderAndCommitHookDelivery,
+  writeAndCommitHookDelivery,
+  writeStreamChunk,
+} from './hook.js';
 import {
   isManualDaemonConnectionError,
   manualDaemonErrorMessage,
@@ -292,21 +293,36 @@ sessionCommand
       // chained `agentmonitors hook deliver` would see an already-consumed
       // stdin (one hook invocation = one stdin stream), parse `{}`, and
       // silently no-op. Reading once and delivering here is the fix. On a
-      // fresh start nothing is pending → renderHookDelivery returns null →
-      // nothing is printed; on a compact-resume the unread events are recapped.
-      const claim = await claimDeliveryClient(
+      // fresh start nothing is pending → `flow.output` is null → nothing is
+      // printed; on a compact-resume the unread events are recapped.
+      //
+      // This is a RESERVE → RENDER → WRITE → COMMIT sequence, never a direct
+      // claim-then-render (issue #442, PR #442 round-16 review): the prior
+      // code called `claimDeliveryClient` — the durable `first_notified_at`
+      // mutation — BEFORE rendering or writing anything, then wrote via a bare,
+      // un-awaited `process.stdout.write`. `process.stdout.write`'s synchronous
+      // return value is only a backpressure signal; an async `EPIPE` arriving
+      // after that call would durably claim the recap rows while emitting
+      // nothing — the exact at-most-once loss window `hook deliver` closed for
+      // its own transport (`reserveRenderAndCommitHookDelivery` /
+      // `writeAndCommitHookDelivery`, `hook.ts`). Reusing that same shared flow
+      // here (its `post-compact` branch needs no per-event cap sizing, so it
+      // reserves the full unread set directly) closes the identical window for
+      // the SessionStart recap: a write failure releases the reservation
+      // (rows stay pending, nothing durably claimed) instead of committing.
+      const flow = await reserveRenderAndCommitHookDelivery(
         opened.id,
         'post-compact',
         socket,
+        'SessionStart',
       );
-      const delivery = renderHookDelivery(claim, 'SessionStart', {
-        socketPath: socket,
-      });
-      if (delivery !== null) {
+      if (flow) {
         // stdout is the SessionStart hook's wire channel: it MUST contain only
         // this JSON. Do NOT add `console.log`/diagnostics to stdout in this
         // command — anything else here corrupts the hook output Claude reads.
-        process.stdout.write(JSON.stringify(delivery));
+        await writeAndCommitHookDelivery(flow, (toWrite) =>
+          writeStreamChunk(process.stdout, JSON.stringify(toWrite)),
+        );
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
