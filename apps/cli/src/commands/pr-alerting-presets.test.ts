@@ -278,9 +278,29 @@ describe('the presets’ jq reduction over raw gh output', () => {
       statusCheckRollup: [],
       latestReviews: [],
       comments: [],
+      mergedAt: null,
+      closedAt: null,
       ...overrides,
     };
   }
+
+  /**
+   * An ISO timestamp `secondsAgo` before now. The terminal-state filter is
+   * evaluated by `jq`'s `now` against the real wall clock, so these fixtures
+   * cannot use a frozen constant — the offset is what the assertion is about.
+   */
+  function ago(secondsAgo: number): string {
+    // Second precision, matching what the GitHub API actually returns.
+    // `jq`'s `fromdateiso8601` rejects fractional seconds outright, which is
+    // why the query strips them defensively — see the `.[0-9]+Z` sub there.
+    return `${new Date(Date.now() - secondsAgo * 1000)
+      .toISOString()
+      .slice(0, 19)}Z`;
+  }
+
+  /** Merged/closed recently enough to still be actionable (window is 6h). */
+  const JUST_MERGED = { state: 'MERGED', mergedAt: ago(60) };
+  const JUST_CLOSED = { state: 'CLOSED', closedAt: ago(60) };
 
   function checkRun(
     name: string,
@@ -386,7 +406,7 @@ describe('the presets’ jq reduction over raw gh output', () => {
         scope,
         stub,
         fixtureOf([rawMyPr(QUIET)]),
-        fixtureOf([rawMyPr({ ...QUIET, state: 'MERGED' })]),
+        fixtureOf([rawMyPr({ ...QUIET, ...JUST_MERGED })]),
       );
       expect(titles).toEqual([CHANGED]);
     });
@@ -396,7 +416,7 @@ describe('the presets’ jq reduction over raw gh output', () => {
         scope,
         stub,
         fixtureOf([rawMyPr(QUIET)]),
-        fixtureOf([rawMyPr({ ...QUIET, state: 'CLOSED' })]),
+        fixtureOf([rawMyPr({ ...QUIET, ...JUST_CLOSED })]),
       );
       expect(titles).toEqual([CHANGED]);
     });
@@ -408,7 +428,7 @@ describe('the presets’ jq reduction over raw gh output', () => {
       const merged = await observe(
         scope,
         stub,
-        fixtureOf([rawMyPr({ ...QUIET, state: 'MERGED' })]),
+        fixtureOf([rawMyPr({ ...QUIET, ...JUST_MERGED })]),
       );
       expect(JSON.parse(merged.stdout)).toEqual([
         {
@@ -421,7 +441,7 @@ describe('the presets’ jq reduction over raw gh output', () => {
       const closed = await observe(
         scope,
         stub,
-        fixtureOf([rawMyPr({ ...QUIET, state: 'CLOSED' })]),
+        fixtureOf([rawMyPr({ ...QUIET, ...JUST_CLOSED })]),
       );
       expect((JSON.parse(closed.stdout) as { needs: string }[])[0]?.needs).toBe(
         'closed',
@@ -470,6 +490,194 @@ describe('the presets’ jq reduction over raw gh output', () => {
    * urgency: if any of these fired, a high-urgency author monitor would
    * interrupt the agent mid-turn on a non-event.
    */
+  describe('`--type my-prs` review-revision signal (PR #446 review, thread 2)', () => {
+    let scope: Scope;
+    let stub: string;
+    beforeAll(() => {
+      scope = presetScope('my-prs');
+      stub = stubGhApplyingJq();
+    });
+
+    function review(state: string, submittedAt: string): unknown {
+      return {
+        author: { login: 'octocat' },
+        state,
+        submittedAt,
+        body: 'body text, deliberately not part of the diffed payload',
+      };
+    }
+
+    // The defect: reducing each latest review to only {by, state} made a SECOND
+    // CHANGES_REQUESTED from the SAME reviewer invisible — reviewDecision, the
+    // reduced array, and commentCount were all unchanged, so json-diff emitted
+    // nothing even though new blocking feedback had landed.
+    it('fires on repeat feedback from the same reviewer in the same state', async () => {
+      const base = { ...QUIET, reviewDecision: 'CHANGES_REQUESTED' };
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([
+          rawMyPr({
+            ...base,
+            latestReviews: [
+              review('CHANGES_REQUESTED', '2026-01-15T09:00:00Z'),
+            ],
+          }),
+        ]),
+        fixtureOf([
+          rawMyPr({
+            ...base,
+            latestReviews: [
+              review('CHANGES_REQUESTED', '2026-01-15T11:30:00Z'),
+            ],
+          }),
+        ]),
+      );
+      expect(titles).toEqual([CHANGED]);
+    });
+
+    it('carries submittedAt as the revision signal, and never the review body', async () => {
+      const result = await observe(
+        scope,
+        stub,
+        fixtureOf([
+          rawMyPr({
+            ...QUIET,
+            reviewDecision: 'CHANGES_REQUESTED',
+            latestReviews: [
+              review('CHANGES_REQUESTED', '2026-01-15T09:00:00Z'),
+            ],
+          }),
+        ]),
+      );
+      const [entry] = JSON.parse(result.stdout) as {
+        reviews: { by: string; state: string; at: string }[];
+      }[];
+      expect(entry?.reviews).toEqual([
+        {
+          by: 'octocat',
+          state: 'CHANGES_REQUESTED',
+          at: '2026-01-15T09:00:00Z',
+        },
+      ]);
+      expect(result.stdout).not.toContain('deliberately not part');
+    });
+
+    // submittedAt is fixed at submission, so unlike updatedAt it cannot churn
+    // between polls — the revision signal must not itself become a diff source.
+    it('does NOT fire when an unchanged review is re-observed', async () => {
+      const same = {
+        ...QUIET,
+        reviewDecision: 'CHANGES_REQUESTED',
+        latestReviews: [review('CHANGES_REQUESTED', '2026-01-15T09:00:00Z')],
+      };
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([rawMyPr(same)]),
+        fixtureOf([rawMyPr(same)]),
+      );
+      expect(titles).toEqual([]);
+    });
+  });
+
+  describe('`--type my-prs` terminal states are time-bounded', () => {
+    let scope: Scope;
+    let stub: string;
+    beforeAll(() => {
+      scope = presetScope('my-prs');
+      stub = stubGhApplyingJq();
+    });
+
+    it('drops a PR merged longer ago than the 6h window', async () => {
+      const stale = await observe(
+        scope,
+        stub,
+        fixtureOf([
+          rawMyPr({ ...QUIET, state: 'MERGED', mergedAt: ago(7 * 3600) }),
+        ]),
+      );
+      expect(JSON.parse(stale.stdout)).toEqual([]);
+    });
+
+    it('keeps a PR merged inside the window', async () => {
+      const fresh = await observe(
+        scope,
+        stub,
+        fixtureOf([rawMyPr({ ...QUIET, ...JUST_MERGED })]),
+      );
+      expect(JSON.parse(fresh.stdout)).toHaveLength(1);
+    });
+
+    // Without the time bound, terminal rows accumulate until they fall out of
+    // --limit, so every new merge evicts an older one and emits a spurious
+    // removal diff — a spurious interrupt at high urgency.
+    it('does NOT fire when a long-since-merged PR is present across polls', async () => {
+      const old = { ...QUIET, state: 'MERGED', mergedAt: ago(48 * 3600) };
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([rawMyPr(old)]),
+        fixtureOf([rawMyPr(old), rawMyPr({ ...old, number: 99 })]),
+      );
+      expect(titles).toEqual([]);
+    });
+
+    // GitHub returns second-precision timestamps, but `fromdateiso8601`
+    // errors outright on fractional seconds — an unhandled error would take
+    // the whole monitor down, so the query strips them and fails open.
+    it('tolerates a fractional-second timestamp', async () => {
+      const withMillis = `${new Date(Date.now() - 60_000)
+        .toISOString()
+        .slice(0, 19)}.123Z`;
+      const result = await observe(
+        scope,
+        stub,
+        fixtureOf([
+          rawMyPr({ ...QUIET, state: 'MERGED', mergedAt: withMillis }),
+        ]),
+      );
+      expect(JSON.parse(result.stdout)).toHaveLength(1);
+    });
+
+    // Fail open: an unparseable timestamp keeps the row rather than silently
+    // dropping a merge the author still needs to act on.
+    it('keeps a terminal PR whose timestamp cannot be parsed', async () => {
+      const result = await observe(
+        scope,
+        stub,
+        fixtureOf([
+          rawMyPr({ ...QUIET, state: 'MERGED', mergedAt: 'not-a-timestamp' }),
+        ]),
+      );
+      expect(JSON.parse(result.stdout)).toHaveLength(1);
+    });
+
+    // Trap: any timestamp left in the payload changes on essentially every
+    // poll and would fire continuously. mergedAt/closedAt are filter-only.
+    it('emits no timestamp field into the diffed payload', async () => {
+      const result = await observe(
+        scope,
+        stub,
+        fixtureOf([
+          rawMyPr({ ...QUIET, ...JUST_MERGED }),
+          rawMyPr({ ...QUIET, number: 102 }),
+        ]),
+      );
+      expect(result.stdout).not.toContain('mergedAt');
+      expect(result.stdout).not.toContain('closedAt');
+      expect(result.stdout).not.toContain('updatedAt');
+      // An ISO-8601 timestamp anywhere outside the review revision signal.
+      const entries = JSON.parse(result.stdout) as Record<string, unknown>[];
+      for (const entry of entries) {
+        for (const [field, value] of Object.entries(entry)) {
+          if (field === 'reviews') continue;
+          expect(String(value)).not.toMatch(/\d{4}-\d{2}-\d{2}T/);
+        }
+      }
+    });
+  });
+
   describe('`--type my-prs` stays silent on non-events', () => {
     let scope: Scope;
     let stub: string;
@@ -573,7 +781,7 @@ describe('the presets’ jq reduction over raw gh output', () => {
     });
 
     it('does NOT fire when a merged PR gains post-merge comments', async () => {
-      const merged = { ...QUIET, state: 'MERGED' };
+      const merged = { ...QUIET, ...JUST_MERGED };
       const titles = await transition(
         scope,
         stub,
@@ -810,6 +1018,93 @@ describe('graceful degradation when gh is unusable (issue #444)', () => {
       'Command recovered: my-prs',
     ]);
   });
+});
+
+describe('reviewer scoping (PR #446 review, thread 1)', () => {
+  /** The scaffolded `watch.command` argv, joined for flag inspection. */
+  function commandOf(type: 'pr-review' | 'my-prs'): string {
+    return (presetScope(type)['command'] as string[]).join(' ');
+  }
+
+  /**
+   * The defect: the reviewer preset returned every open, non-draft,
+   * non-release PR — including the user's own and unrelated ones — despite
+   * being defined as *the current reviewer's* queue. Draft/release filtering
+   * lives in the `--jq`, so only an argv-level assertion catches its absence.
+   */
+  it('scopes the reviewer queue to a reviewer, not to every open PR', () => {
+    const command = commandOf('pr-review');
+    expect(command).toContain('--search');
+    // One of the documented reviewer-scoping qualifiers must be present; a
+    // bare `--search ''` or a missing flag is exactly the unscoped defect.
+    expect(command).toMatch(
+      /--search\s+'?(review-requested:@me|-author:@me|label:[\w-]+)/,
+    );
+  });
+
+  it('defaults to explicit review requests', () => {
+    expect(commandOf('pr-review')).toContain("--search 'review-requested:@me'");
+  });
+
+  /**
+   * Reviewer scoping is workflow-dependent: `review-requested:@me` matches
+   * nothing for a solo maintainer, or when PRs are authored and reviewed under
+   * one identity (GitHub does not allow requesting review from yourself).
+   * Measured against this repository: unscoped returns 6 open PRs,
+   * `review-requested:@me` returns 0. An author in any of those workflows must
+   * be able to fix it by editing one string, so the alternatives ship in the
+   * scaffold rather than living only in the docs.
+   */
+  it('scaffolds the alternative scoping models as ready-to-edit comments', () => {
+    const template = TEMPLATES['pr-review'] ?? '';
+    expect(template).toContain('-author:@me');
+    expect(template).toContain('label:needs-review');
+    expect(template).toContain('REVIEWER SCOPING');
+  });
+
+  /**
+   * An empty scoped result is indistinguishable from "nothing needs review",
+   * so the scaffold must say so rather than degrading silently.
+   */
+  it('warns in the monitor body that an empty queue may mean mis-scoping', () => {
+    const template = TEMPLATES['pr-review'] ?? '';
+    expect(template).toContain('If this monitor never fires');
+    expect(template).toContain(
+      'gh pr list --state open --search "review-requested:@me"',
+    );
+  });
+});
+
+describe('delivered alert readability (issue #449 guard)', () => {
+  /**
+   * `command-poll` titles its observation `Command output changed: <objectKey>`,
+   * and `objectKey` defaults to the **joined argv** — which for these presets
+   * would put the entire `gh` command and `--jq` program in the alert headline.
+   * Both presets therefore set an explicit `key:`. Making the title use the
+   * monitor's authored `name` instead is issue #449 (a source-level change
+   * affecting every command-poll monitor); this guard only keeps the presets
+   * from regressing to the raw-argv title.
+   */
+  it.each(['my-prs', 'pr-review'] as const)(
+    '%s titles its event with a short key, never the raw command',
+    async (type) => {
+      const scope = presetScope(type);
+      const stub = stubGhEchoingFixture();
+      const baseline = await observe(scope, stub, fixtureOf([]));
+      const changed = await observe(
+        scope,
+        stub,
+        fixtureOf([{ number: 1, needs: 'ci-failing' }]),
+        baseline.state,
+      );
+      expect(changed.titles).toEqual([`Command output changed: ${type}`]);
+      const title = changed.titles[0] ?? '';
+      expect(title).not.toContain('gh pr list');
+      expect(title).not.toContain('--jq');
+      expect(title).not.toContain('[.[]');
+      expect(title.length).toBeLessThan(60);
+    },
+  );
 });
 
 describe('preset portability guarantees (issue #444)', () => {

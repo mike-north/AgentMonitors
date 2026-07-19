@@ -1817,8 +1817,20 @@ author's open PRs are normally their newest. Observed live on an active reposito
 
 Each PR is then reduced to a single `needs` verdict and **dropped entirely when it is `none`**:
 
-- `merged` / `closed` — terminal; needs cleanup or explanation. Terminal entries deliberately carry
-  no `failingChecks`/`reviews`/`commentCount`, so post-merge comment activity cannot churn them.
+- `merged` / `closed` — terminal, and **time-bounded to 6 hours** after `mergedAt`/`closedAt`.
+  Terminal state is briefly actionable (delete the branch, close the issue) and then it is history.
+  Bounding by time rather than letting terminal rows accumulate until they fall out of `--limit` is
+  what makes the drop-off predictable: without it every new merge evicts an older terminal row from
+  the window and emits a spurious removal diff, which at `high` urgency is a spurious interrupt. The
+  bound reads `mergedAt`/`closedAt`, never `updatedAt`, so a post-merge comment cannot silently
+  extend it. Terminal entries also carry no `failingChecks`/`reviews`/`commentCount`, so post-merge
+  activity cannot churn them.
+
+  Neither timestamp is emitted into the payload. **Any timestamp left in the diffed output changes on
+  essentially every poll and fires continuously** — the filter reads it and discards it. Because
+  `fromdateiso8601` errors outright on fractional seconds, the query strips them and treats an
+  unparseable timestamp as _current_ (fail-open: a stale row beats a missed merge alert).
+
 - `ci-failing` — a failing entry in `statusCheckRollup`; `failingChecks` names them.
 - `changes-requested` — blocking review feedback.
 - `draft` — an open draft. Encoding draft as _membership_ rather than as a diffed `isDraft` field is
@@ -1841,6 +1853,34 @@ _names_ stays silent across that whole cycle and names the failing check in the 
 `reviewDecision` is the **empty string**, not `null`, when GitHub has no decision, so a
 `(.reviewDecision // "NONE")` coalesce is a silent no-op; both presets compare against `""`
 explicitly.
+
+#### Reviewer scoping is workflow-dependent and therefore selectable
+
+A reviewer queue must answer "which PRs need **my** review", not "which PRs exist". An unscoped query
+is wrong twice over: it alerts on work the reviewer does not own, and unrelated rows consume the
+30-row window and can hide an actual request.
+
+**There is no single filter that is correct for every workflow**, so the scaffold ships a documented
+default plus ready-to-uncomment alternatives, each with the case it applies to:
+
+| `--search` scope       | Correct for                                                                                                                                          | Returns nothing when                                           |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| `review-requested:@me` | **Default.** Teams with explicit review requests. Includes team-assigned requests — GitHub expands a team request to its members for this qualifier. | Solo maintainer; or author and reviewer are the same identity. |
+| `-author:@me`          | "I review everyone else's work."                                                                                                                     | Every PR is authored by you.                                   |
+| `label:needs-review`   | Label-driven review handoff.                                                                                                                         | The label is not applied.                                      |
+| (empty)                | Small repo where you review everything.                                                                                                              | Never — but unrelated PRs consume the window.                  |
+
+Measured against this repository: unscoped returns 6 open PRs, `review-requested:@me` returns 0, and
+no open PR carries a requested reviewer — because PRs are opened and reviewed under one identity and
+GitHub does not permit requesting review from yourself. The same cause makes `-author:@me` empty here.
+Label-driven scoping is the only one that works in that case.
+
+**The empty case is silent**, and that is the residual risk: a mis-scoped filter is indistinguishable
+from "nothing needs review", the same silent-degradation class as a monitor that never fires. The
+scaffolded body therefore names it prominently and gives the exact command to check
+(`gh pr list --state open --search "review-requested:@me"`). A stronger guard — `validate` or
+`monitor test` warning when the configured scope returns zero rows on a first run — needs support in
+those commands and is **not** implemented here; it is the natural follow-up.
 
 #### Membership, not full state — and why both presets are `high`
 

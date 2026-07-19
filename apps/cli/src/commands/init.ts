@@ -183,6 +183,69 @@ function yamlBlockScalar(script: string, indent: string): string {
 }
 
 /**
+ * How long after merge/close a terminal PR stays in `my-prs`'s payload (6h).
+ *
+ * Terminal state is *briefly* actionable — delete the branch, close the issue —
+ * and then it is history. Bounding membership by time rather than letting
+ * terminal rows accumulate until they fall out of `--limit` is what makes the
+ * drop-off predictable: without it, every new merge evicts an older terminal row
+ * from the window and emits a spurious removal diff, which at `high` urgency is
+ * a spurious interrupt. With it, each terminal PR produces exactly one entry and
+ * one time-predictable drop-off, independent of `--limit`.
+ *
+ * The bound reads `mergedAt`/`closedAt` — **not** `updatedAt`. Those are fixed
+ * at the moment of merge/close, so a post-merge comment cannot silently extend
+ * the window, and neither timestamp is ever emitted into the payload: a
+ * timestamp in the diffed output would change on essentially every poll and fire
+ * continuously.
+ */
+const TERMINAL_WINDOW_SECONDS = 21600;
+
+/**
+ * The default reviewer-scoping search for `--type pr-review`.
+ *
+ * **There is no single filter that is correct for every workflow**, so this is a
+ * documented default with alternatives scaffolded as ready-to-uncomment options
+ * (see {@link PR_REVIEW_SCOPE_COMMENT}). `review-requested:@me` is the
+ * semantically exact reading of "PRs awaiting *my* review" and is right for the
+ * common team workflow where review is explicitly requested. It matches nothing
+ * in two real cases: a solo maintainer, and an agent fleet where PRs are opened
+ * and reviewed under the same identity (GitHub does not permit requesting review
+ * from yourself). Measured against this repository: unscoped returns 6 open PRs,
+ * `review-requested:@me` returns 0, and no open PR has any requested reviewer.
+ *
+ * That failure is **silent** — an empty result is indistinguishable from "nothing
+ * needs review" — so the scaffolded body says so prominently and tells the author
+ * how to check.
+ */
+const PR_REVIEW_DEFAULT_SCOPE = 'review-requested:@me';
+
+/**
+ * The scaffolded comment block above `pr-review`'s `command:`, listing the
+ * reviewer-scoping alternatives so an author in any of the four workflows can
+ * get a working monitor by editing one string rather than rewriting the `--jq`.
+ */
+const PR_REVIEW_SCOPE_COMMENT =
+  "  # REVIEWER SCOPING — the --search '...' inside the command below decides\n" +
+  '  # WHOSE review queue this is. There is no filter that is correct for every\n' +
+  '  # workflow; the default suits explicit team review requests. If this monitor\n' +
+  '  # never fires, this is almost certainly why — check with:\n' +
+  '  #   gh pr list --state open --search "review-requested:@me"\n' +
+  '  # and if that prints nothing while open PRs exist, switch to one of:\n' +
+  '  #   review-requested:@me   (default) explicit review requests — includes\n' +
+  '  #                          team-assigned requests, since GitHub expands a\n' +
+  '  #                          team request to its members for this qualifier.\n' +
+  '  #                          Matches NOTHING for a solo maintainer, or when\n' +
+  '  #                          PRs are authored and reviewed under one identity.\n' +
+  '  #   -author:@me            "I review everyone else\'s work". Matches nothing\n' +
+  '  #                          when every PR is authored by you.\n' +
+  '  #   label:needs-review     label-driven. The only option that works when\n' +
+  '  #                          author and reviewer are the same identity.\n' +
+  '  #   (empty --search)       unscoped: every open PR. Fine for a small repo\n' +
+  '  #                          where you review everything; at scale unrelated\n' +
+  '  #                          PRs consume the 30-row window.\n';
+
+/**
  * `--type pr-review`'s `gh` query: open, non-draft PRs in the current repo,
  * excluding the current `gh` user's own PRs (`--search '-author:@me'` —
  * GitHub search-qualifier negation; `gh pr list` has no `--author`-exclusion
@@ -199,7 +262,8 @@ function yamlBlockScalar(script: string, indent: string): string {
  * would fire on every push and comment.
  */
 const PR_REVIEW_QUERY =
-  "gh pr list --state open --limit 30 --search '-author:@me' " +
+  'gh pr list --state open --limit 30 ' +
+  `--search '${PR_REVIEW_DEFAULT_SCOPE}' ` +
   '--json number,title,isDraft,reviewDecision,headRefName,author ' +
   "--jq '[.[] | select(.isDraft == false " +
   'and (.headRefName | startswith("changeset-release/") | not) ' +
@@ -245,13 +309,18 @@ const PR_REVIEW_QUERY =
  */
 const MY_PRS_QUERY =
   'gh pr list --author @me --state all --limit 60 ' +
-  '--json number,title,url,state,isDraft,reviewDecision,statusCheckRollup,latestReviews,comments ' +
+  '--json number,title,url,state,isDraft,reviewDecision,statusCheckRollup,' +
+  'latestReviews,comments,mergedAt,closedAt ' +
   "--jq '[.[] " +
   '| (([.statusCheckRollup[]? | select(((.conclusion // .state // "") | ascii_upcase) as $c ' +
   '| $c == "FAILURE" or $c == "TIMED_OUT" or $c == "CANCELLED" or $c == "ERROR" ' +
   'or $c == "ACTION_REQUIRED" or $c == "STARTUP_FAILURE") | (.name // .context)] | sort)) as $failing ' +
-  '| (if .state == "MERGED" then "merged" ' +
-  'elif .state == "CLOSED" then "closed" ' +
+  '| ((.mergedAt // .closedAt // "")) as $terminalAt ' +
+  '| (if $terminalAt == "" then now ' +
+  'else (try (($terminalAt | sub("\\\\.[0-9]+Z$"; "Z")) | fromdateiso8601) catch now) end) as $terminalEpoch ' +
+  '| (if .state == "MERGED" or .state == "CLOSED" ' +
+  `then (if $terminalEpoch > (now - ${String(TERMINAL_WINDOW_SECONDS)}) ` +
+  'then (if .state == "MERGED" then "merged" else "closed" end) else "none" end) ' +
   'elif ($failing | length) > 0 then "ci-failing" ' +
   'elif .reviewDecision == "CHANGES_REQUESTED" then "changes-requested" ' +
   'elif .isDraft then "draft" ' +
@@ -260,7 +329,8 @@ const MY_PRS_QUERY =
   '| {number, title, url, needs: $needs} ' +
   '+ (if $needs == "merged" or $needs == "closed" then {} ' +
   'else {failingChecks: $failing, ' +
-  'reviews: ([.latestReviews[]? | {by: .author.login, state}] | sort_by(.by, .state)), ' +
+  'reviews: ([.latestReviews[]? | {by: .author.login, state, at: .submittedAt}] ' +
+  '| sort_by(.by, .at, .state)), ' +
   "commentCount: (.comments | length)} end)] | sort_by(.number)'";
 
 /**
@@ -336,7 +406,7 @@ watch:
   # location — omitting cwd would make gh resolve whatever repo the daemon
   # happens to be launched from instead. Do not remove cwd: or add --repo.
   key: pr-review
-  command:
+${PR_REVIEW_SCOPE_COMMENT}  command:
     - sh
     - -c
     - |
@@ -358,8 +428,17 @@ anything that *appears* here is waiting on you.
   it was merged, closed, or pulled back to draft. No action: it is no longer
   waiting on you.
 
-Release PRs (\`changeset-release/*\` heads) never enter this list, and neither do
-your own PRs — those are what \`my-prs\` is for.
+Release PRs (\`changeset-release/*\` heads) never enter this list, and by default
+neither do PRs you were not asked to review.
+
+**If this monitor never fires, check the reviewer scoping before assuming there
+is nothing to review.** An empty result looks exactly like "no PRs need you". The
+default \`--search 'review-requested:@me'\` matches only PRs where your review was
+explicitly requested, so it returns nothing for a solo maintainer, or when PRs are
+authored and reviewed under the same identity. Run
+\`gh pr list --state open --search "review-requested:@me"\`; if that prints nothing
+while open PRs exist, switch the \`--search\` in this file to one of the
+alternatives listed in its comments.
 
 If instead you see a "Command failing" event, \`gh\` could not run — read the
 error and fix the CLI install, auth, or working directory before trusting this
@@ -405,9 +484,9 @@ need something from you; each entry carries a \`needs\` field saying what.
   or redoing the work.
 
 An entry **leaving** the list is good news, not a transition to act on: CI went
-green, the review was answered, or a draft was marked ready. Note it and move
-on. A PR dropping off because it aged out of the most-recent-60 recency window
-is likewise not a state change.
+green, the review was answered, or a draft was marked ready. Note it and move on.
+A merged or closed PR also drops off on its own about 6 hours after it landed —
+that is the entry expiring, not a new state change.
 
 \`gh pr list\` exposes no review-thread data, so inline review comments that do
 not move \`reviewDecision\` are not visible here; check the PR directly when

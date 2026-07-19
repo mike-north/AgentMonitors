@@ -208,13 +208,17 @@ Each source produces a distinct starter frontmatter block:
 the two pull-request roles, selected through the same `--type` flag:
 
 - **`pr-review`** (reviewer) — PRs in this repository actually awaiting review: open, out of draft,
-  authored by someone else, not a `changeset-release/*` release PR, and **not yet decided**. Fires
-  when a PR enters the queue (opened, or a draft marked ready) and when one leaves it (reviewed,
-  merged, closed). `urgency: high`.
+  not a `changeset-release/*` release PR, **not yet decided**, and within the configured reviewer
+  scope (`--search 'review-requested:@me'` by default, with `-author:@me`, `label:needs-review`, and
+  unscoped scaffolded as ready-to-edit alternatives — reviewer scoping is workflow-dependent, and the
+  default matches nothing when PRs are authored and reviewed under one identity). Fires when a PR
+  enters the queue and when one leaves it. `urgency: high`. See
+  [003 §11.9](./003-source-plugins.md) for the scoping table and the silent-empty caveat.
 - **`my-prs`** (author) — the current `gh` user's recent PRs in this repository **that need something
   from them**. Each entry carries a `needs` field (`ci-failing`, `changes-requested`, `draft`,
   `merged`, `closed`); a green, non-draft, undecided PR does not appear at all, so an ordinary CI run
-  produces no event. `urgency: high`.
+  produces no event. Terminal entries expire 6h after merge/close rather than lingering until they
+  fall out of the query window. `urgency: high`.
 
 Both presets carry a **membership set of actionable items** rather than full PR state, and that is
 what makes `high` safe. `normal` is not an option for either: normal reminders are
