@@ -35,18 +35,74 @@ export const MAX_EVENT_DIFF = 800;
 export const DIFF_ELISION_MARKER = '\n… (change summary truncated)';
 
 /**
- * POSIX single-quote `value` for safe inclusion in a copy-paste shell command
- * (issue #442). The truncation markers on both transports advertise a
- * directly-runnable `agentmonitors events list ... --socket <path>` command —
- * a socket path is a filesystem path and can legitimately contain spaces or
- * shell metacharacters (e.g. a workspace directory with a space in its name),
- * so it is quoted rather than interpolated raw. Wraps `value` in single quotes
- * and escapes any embedded single quote as the POSIX-idiomatic `'\''`
- * (close-quote, escaped-quote, reopen-quote) so the result is always safe to
- * paste into `sh`/`bash`/`zsh` verbatim.
+ * Bytes that need no escaping at all inside {@link escapeShellPath}'s output —
+ * deliberately conservative (alphanumerics plus the handful of characters a
+ * filesystem path routinely contains: `/`, `.`, `_`, `-`). Everything else,
+ * including plain POSIX shell metacharacters (spaces, quotes) AND every
+ * `<channel>`-tag-breakout character (`< > [ ] ; \r \n`) and backtick, is
+ * treated as unsafe and hex-escaped (see {@link escapeShellPath}).
  */
-export function shellQuoteSingle(value: string): string {
-  return `'${value.replaceAll("'", String.raw`'\''`)}'`;
+const PATH_SAFE_CHAR = /^[A-Za-z0-9/._-]$/;
+
+/**
+ * Render `value` (a filesystem path) as a shell-safe, tag-safe token that
+ * ALSO round-trips to the exact original path when the advertised command is
+ * run (issue #442, PR #442 round-8 review). Both truncation markers
+ * (`buildChannelTruncatedMarker` in `channel-render.ts`, and the two markers
+ * in `hook-deliver-render.ts`) interpolate an explicit `--socket <path>` into
+ * their advertised `agentmonitors events list ...` recovery command using this
+ * helper — one implementation shared by both transports so the two round-trip
+ * guarantees can never diverge.
+ *
+ * A plain POSIX single-quote (the prior approach, `shellQuoteSingle`) is safe
+ * for the SHELL — but on the channel transport the quoted result is embedded
+ * directly into the `<channel>` tag body, bypassing `contentValue`'s own
+ * sanitization pass (the marker text, socket path included, is appended
+ * verbatim AFTER sanitization — see `renderChannelEvent`). A socket path is an
+ * arbitrary filesystem path an attacker-influenced workspace name could shape,
+ * e.g. `/tmp/x<channel>[oops].sock`; single-quoting alone preserves every byte
+ * literally (that is the whole point of single-quoting), so the raw
+ * `<`/`>`/`[`/`]` (and a raw CR or backtick, which can corrupt a code span or
+ * the surrounding payload) would reappear in the pushed content unescaped —
+ * violating 006 §4.6's tag-safety contract even though the shell-safety
+ * contract was satisfied.
+ *
+ * The fix: render the path in bash/zsh **ANSI-C quoting** (`$'...'`), with
+ * every byte outside the conservative {@link PATH_SAFE_CHAR} set (UTF-8
+ * encoded, so a multi-byte code point becomes multiple `\xNN` escapes) emitted
+ * as a `\xNN` hex escape. No raw forbidden byte can then appear in the tag
+ * body — including a raw single quote itself, so no `'\''`-style
+ * close/escape/reopen dance is needed — while `$'...'` still expands back to
+ * the exact original path in `bash`/`zsh` when the advertised command is run.
+ * When the path contains ONLY safe bytes (the common case — a plain,
+ * unremarkable filesystem path), no escaping is needed at all and the simpler,
+ * more readable plain single-quoted form is returned instead (matching the
+ * PR's suggested "only ANSI-C-quote when necessary" refinement) — the two
+ * quoting styles are both valid, round-trip-safe shell tokens; which one is
+ * used depends only on whether `value` contains anything the safe set
+ * excludes.
+ */
+export function escapeShellPath(value: string): string {
+  let hasUnsafeByte = false;
+  for (const ch of value) {
+    if (!PATH_SAFE_CHAR.test(ch)) {
+      hasUnsafeByte = true;
+      break;
+    }
+  }
+  if (!hasUnsafeByte) return `'${value}'`;
+
+  let escaped = '';
+  for (const ch of value) {
+    if (PATH_SAFE_CHAR.test(ch)) {
+      escaped += ch;
+      continue;
+    }
+    for (const byte of Buffer.from(ch, 'utf8')) {
+      escaped += `\\x${byte.toString(16).padStart(2, '0')}`;
+    }
+  }
+  return `$'${escaped}'`;
 }
 
 /**

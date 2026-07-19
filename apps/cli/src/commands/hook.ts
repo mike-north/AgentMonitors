@@ -1,17 +1,26 @@
 import { Command, Option } from 'commander';
-import type { DeliveryLifecycle } from '@agentmonitors/core';
+import type {
+  DeliveryClaim,
+  DeliveryLifecycle,
+  DeliveryReservation,
+} from '@agentmonitors/core';
 import { reportError } from '../output.js';
 import {
   claimDeliveryClient,
+  commitDeliveryClient,
   diagnoseHookDeliveryClient,
   listSessionsClient,
   previewSettledHighDeliveryClient,
+  releaseDeliveryClient,
+  reserveDeliveryClient,
 } from '../runtime-client.js';
 import { daemonAvailable, resolveSocketPath } from '../daemon-ipc.js';
 import { readLocalState } from '../local-state.js';
 import {
+  MAX_ADDITIONAL_CONTEXT,
   packEventsUnderCap,
   renderHookDelivery,
+  resolveHookClaimFit,
 } from '../hook-deliver-render.js';
 import { readHookPayload } from '../hook-payload.js';
 import {
@@ -119,6 +128,161 @@ function lifecycleForEvent(
     default:
       return undefined;
   }
+}
+
+/**
+ * Upper bound on how many times {@link reserveSizedHookDelivery} will
+ * reserve → discover an actual-claim size mismatch → release → retry before
+ * forcing a single-event reservation (issue #442, PR #442 round-8 review).
+ * Mirrors the channel transport's `MAX_CHANNEL_RESERVE_ATTEMPTS`
+ * (`commands/channel.ts`) — same rationale, same bound.
+ */
+const MAX_HOOK_RESERVE_ATTEMPTS = 3;
+
+/** The result of a successful {@link reserveSizedHookDelivery} call. */
+export interface SizedHookDelivery {
+  reservation: DeliveryReservation;
+  moreDeferred: boolean;
+  /**
+   * The settled high-urgency preview count at the moment this reservation was
+   * accepted — only meaningful (and only used) for the `--debug`
+   * `describeCapDeferral` line when `moreDeferred` is true. `undefined` when
+   * no preview was taken (non-`turn-interruptible` lifecycles, or a reminder
+   * claim).
+   */
+  previewCount: number | undefined;
+}
+
+/**
+ * Reserve — but do NOT yet claim — the delivery for `sessionId`/`lifecycle`,
+ * sizing a `turn-interruptible` body-injection claim to fit the hook-deliver
+ * `additionalContext` cap and RE-VALIDATING that fit against the ACTUALLY
+ * reserved claim before the caller ever commits it (issue #442, PR #442
+ * round-8 review).
+ *
+ * **Why re-validate at all.** `previewSettledHighDeliveryClient` (sizing) and
+ * `reserveDeliveryClient` (reservation) are two SEPARATE IPC round-trips, so
+ * the events the reservation actually returns can differ from the ones the
+ * preview measured — most dangerously a **substitution**: a concurrent caller
+ * claims/leases the previewed rows first, and the reservation instead fills
+ * the same requested *count* from different, larger pending events whose
+ * block sizes were never measured by that preview. The prior code claimed
+ * directly on the unvalidated count (`claimDeliveryClient(..., fit)`): a
+ * substituted, larger set would pass the COUNT check but still fail
+ * `renderHookDelivery`'s own repack — and because `claimDelivery` sets
+ * `first_notified_at` synchronously, the truncated-away tail of an
+ * already-claimed row can **never redeliver** (§5.5's core guarantee, broken).
+ *
+ * **The fix.** Reserve first (leasing the rows — no durable claim yet), then
+ * check the REAL reserved claim's fit via {@link resolveHookClaimFit} — the
+ * SAME predicate `renderHookDelivery` uses to decide whether/how much it must
+ * cut. A mismatch releases the reservation (the rows return to `pending`;
+ * nothing is lost, since nothing was ever claimed) and retries with a
+ * tightened cap — mirroring the channel transport's
+ * `reserveSizedChannelDelivery` (`commands/channel.ts`) exactly. Bounded by
+ * {@link MAX_HOOK_RESERVE_ATTEMPTS}; the final attempt forces `maxEvents: 1`,
+ * which is always whole (a single-event claim's own block may still exceed
+ * the cap, but `renderHookDelivery`'s mid-truncation backstop handles that
+ * pathological case — see its doc comment), so this always terminates.
+ *
+ * **Scope.** Only a `turn-interruptible` BODY-INJECTION claim carries the
+ * count/size risk this guards against — the per-event block cap only applies
+ * there (issue #299). A reminder claim (`events: []`) is a single coalesced
+ * `message`, not assembled from a variable number of per-event blocks, so
+ * there is nothing for a substitution race to drop; `turn-idle`/`post-compact`
+ * need no sizing either (the recap self-heals by re-showing all unread each
+ * time, §5.5). Both are reserved with no `maxEvents` and accepted directly.
+ *
+ * Returns `null` when nothing is pending to reserve (mirrors `reserveDelivery`
+ * returning `null`).
+ */
+export async function reserveSizedHookDelivery(
+  sessionId: string,
+  lifecycle: DeliveryLifecycle,
+  socketPath: string,
+): Promise<SizedHookDelivery | null> {
+  let forcedCap: number | undefined;
+  for (let attempt = 1; attempt <= MAX_HOOK_RESERVE_ATTEMPTS; attempt++) {
+    const isLastAttempt = attempt === MAX_HOOK_RESERVE_ATTEMPTS;
+    let maxEvents: number | undefined;
+    let moreDeferred = false;
+    let previewCount: number | undefined;
+
+    if (lifecycle === 'turn-interruptible') {
+      const highPreview = await previewSettledHighDeliveryClient(
+        sessionId,
+        socketPath,
+      );
+      previewCount = highPreview.length;
+      if (isLastAttempt) {
+        // Forward-progress fallback: repeated mismatches mean sizing keeps
+        // racing with reservation. Force a single event so THIS attempt
+        // cannot fail to make progress.
+        maxEvents = 1;
+        moreDeferred = highPreview.length > 1;
+      } else if (highPreview.length > 0) {
+        let fit = packEventsUnderCap(
+          highPreview,
+          sessionId,
+          undefined,
+          socketPath,
+        );
+        if (forcedCap !== undefined) fit = Math.min(fit, forcedCap);
+        fit = Math.max(1, fit);
+        maxEvents = fit;
+        moreDeferred = fit < highPreview.length;
+      } else if (forcedCap !== undefined) {
+        // A prior attempt proved a smaller cap was needed, but this preview
+        // raced empty — still force the known-safe cap so a freshly settled
+        // event can't slip back in unbounded.
+        maxEvents = forcedCap;
+      }
+    }
+
+    const reservation = await reserveDeliveryClient(
+      sessionId,
+      lifecycle,
+      socketPath,
+      maxEvents,
+    );
+    if (!reservation) return null;
+
+    // A reminder claim, or any non-`turn-interruptible` lifecycle, carries no
+    // per-event sizing risk (see doc comment above) — accept directly.
+    if (
+      reservation.claim.events.length === 0 ||
+      lifecycle !== 'turn-interruptible'
+    ) {
+      return { reservation, moreDeferred, previewCount };
+    }
+
+    // Trust only the ACTUAL reserved events from here — never the preview
+    // that produced `maxEvents`, which can already be stale (substitution).
+    // Validated against `resolveHookClaimFit` — the SAME predicate
+    // `renderHookDelivery` uses — so a claim that would still be shrunk by
+    // the renderer's marker-reserving repack is caught here too, before any
+    // durable claim is made.
+    const fit = resolveHookClaimFit(
+      reservation.claim.events,
+      sessionId,
+      socketPath,
+      moreDeferred,
+      MAX_ADDITIONAL_CONTEXT,
+    );
+    if (fit.fits) {
+      return { reservation, moreDeferred, previewCount };
+    }
+
+    // Mismatch: the actually-reserved set does not fit. Release it (the rows
+    // return to pending — nothing is lost, since nothing was ever claimed)
+    // and retry, tightening the cap to what was just measured.
+    await releaseDeliveryClient(reservation.reservationId, socketPath);
+    forcedCap = Math.max(1, fit.includedCount);
+  }
+  // Unreachable: the final (isLastAttempt) iteration above always returns,
+  // since a single-event claim's fit is always whole. Kept only to satisfy
+  // the return type.
+  return null;
 }
 
 hookCommand
@@ -305,46 +469,61 @@ Diagnosis:
           }
         }
 
-        // Claim any pending deliveries for this session at this lifecycle point.
+        // Claim any pending deliveries for this session at this lifecycle
+        // point.
         //
-        // For a `turn-interruptible` high-urgency delivery the visible surface is
-        // length-bounded (the 4000-char additionalContext, 006 §5.1), so we must
-        // claim ONLY the events that actually fit — otherwise events truncated
-        // out of the render would be marked claimed and never re-delivered
-        // (issue #299). We therefore PREVIEW the settled high events first, size
-        // how many whole blocks fit under the cap, then claim exactly that many;
-        // the deferred remainder stays pending and re-delivers at the next
-        // context event. Non-high deliveries (normal/low reminders inject no
-        // bodies; the post-compact recap self-heals by re-showing all unread)
-        // need no sizing, so they take the plain claim.
-        let claim = null;
+        // For a `turn-interruptible` high-urgency delivery the visible surface
+        // is length-bounded (the 4000-char additionalContext, 006 §5.1), so we
+        // must claim ONLY the events that actually fit — otherwise events
+        // truncated out of the render would be marked claimed and never
+        // re-delivered (issue #299). This is now a RESERVE → validate-fit →
+        // COMMIT sequence, not a direct sized claim (issue #442, PR #442
+        // round-8 review): `previewSettledHighDeliveryClient` (sizing) and the
+        // eventual reservation are two separate IPC round-trips, so the events
+        // actually returned can differ from the ones the preview measured (a
+        // concurrent caller substitutes different, larger pending events into
+        // the same requested count). Claiming directly on an unvalidated count
+        // would let a substituted, oversized set pass the count check but then
+        // fail `renderHookDelivery`'s own repack — and a synchronously-claimed
+        // row's truncated-away tail can never redeliver.
+        // `reserveSizedHookDelivery` re-validates the fit of the ACTUAL
+        // reserved claim (never the stale preview) before anything here
+        // commits, releasing and retrying on a mismatch (mirroring the channel
+        // transport's `reserveSizedChannelDelivery`/`resolveChannelClaimFit`).
+        // Non-high deliveries (normal/low reminders inject no bodies; the
+        // post-compact recap self-heals by re-showing all unread) need no
+        // sizing, so they are reserved+committed unsized.
+        let claim: DeliveryClaim | null = null;
         let moreDeferred = false;
-        if (lifecycle === 'turn-interruptible') {
-          const highPreview = await previewSettledHighDeliveryClient(
-            match.id,
+        const sized = await reserveSizedHookDelivery(
+          match.id,
+          lifecycle,
+          socketPath,
+        );
+        if (sized) {
+          moreDeferred = sized.moreDeferred;
+          if (moreDeferred && sized.previewCount !== undefined) {
+            debug(
+              describeCapDeferral(
+                sized.previewCount,
+                sized.reservation.claim.events.length,
+              ),
+            );
+          }
+          claim = await commitDeliveryClient(
+            sized.reservation.reservationId,
             socketPath,
           );
-          if (highPreview.length > 0) {
-            const fit = packEventsUnderCap(
-              highPreview,
-              match.id,
-              undefined,
-              socketPath,
-            );
-            claim = await claimDeliveryClient(
-              match.id,
-              lifecycle,
-              socketPath,
-              fit,
-            );
-            moreDeferred = fit < highPreview.length;
-            if (moreDeferred)
-              debug(describeCapDeferral(highPreview.length, fit));
-          } else {
-            claim = await claimDeliveryClient(match.id, lifecycle, socketPath);
+          if (!claim) {
+            // The reservation vanished before commit could land (its lease
+            // expired, or the daemon restarted and dropped its in-memory
+            // lease) — effectively unreachable in the hook's synchronous,
+            // single-invocation flow, but handled the safe way: nothing was
+            // surfaced, so behave exactly as "nothing pending." The rows
+            // return to pending and re-deliver at the next context event (or
+            // via a concurrent channel poll) rather than being lost.
+            debug('reservation committed to nothing (lease expired)');
           }
-        } else {
-          claim = await claimDeliveryClient(match.id, lifecycle, socketPath);
         }
         debug(describeClaim(claim));
 

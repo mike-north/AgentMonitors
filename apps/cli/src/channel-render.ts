@@ -2,9 +2,9 @@ import type { DeliveryClaim, DeliveryEventSummary } from '@agentmonitors/core';
 import {
   appendMarkerWithinCap,
   buildEventBlock,
+  escapeShellPath,
   packEventsUnderCap as packSharedEventsUnderCap,
   packWholeBlocks,
-  shellQuoteSingle,
   type PackedBlocks,
 } from './delivery-event-render.js';
 
@@ -101,10 +101,14 @@ export const CHANNEL_DEFERRED_MARKER =
  * over a stale `AGENTMONITORS_SOCKET` left over from a different workspace —
  * but `agentmonitors events list` itself resolves env-first
  * (`resolveManualDaemonSocketPath`, issue #335), so a copy-pasted command with
- * no `--socket` could silently query the wrong (or a dead) daemon. The path
- * is quoted with {@link shellQuoteSingle} so it stays safe to paste verbatim
- * even if it contains spaces. Omitted (no `--socket` clause) only when the
- * caller genuinely has no socket to advertise.
+ * no `--socket` could silently query the wrong (or a dead) daemon. The path is
+ * escaped with {@link escapeShellPath} — NOT `metaValue`/`contentValue`, since
+ * both of those strip the very tag-breakout characters a raw path could
+ * contain rather than round-tripping them — so it stays both tag-safe (006
+ * §4.6) and shell-safe, and reconstructs to the exact original path when the
+ * advertised command is run (issue #442, PR #442 round-8 review). Omitted (no
+ * `--socket` clause) only when the caller genuinely has no socket to
+ * advertise.
  */
 export function buildChannelTruncatedMarker(
   sessionId: string,
@@ -112,7 +116,7 @@ export function buildChannelTruncatedMarker(
 ): string {
   const safeSessionId = metaValue(sessionId);
   const socketClause = socketPath
-    ? ` --socket ${shellQuoteSingle(socketPath)}`
+    ? ` --socket ${escapeShellPath(socketPath)}`
     : '';
   return `\n\n(this update was too large to show in full; run \`agentmonitors events list --session ${safeSessionId}${socketClause} --unread\` to see the full copy)`;
 }

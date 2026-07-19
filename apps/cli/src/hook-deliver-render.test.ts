@@ -347,6 +347,46 @@ describe('renderHookDelivery', () => {
     expect(ctx).not.toContain('more monitor updates are pending');
   });
 
+  // (issue #442, PR #442 round-8 review) Mixed case: this claim's single
+  // event is ITSELF oversized (mid-truncation branch) AND `moreDeferred` is
+  // true — genuinely more high-urgency work exists beyond this one claimed
+  // event and stays pending. Before the fix, the claimed-unread marker alone
+  // suppressed the second, real signal that further, DIFFERENT work is
+  // queued and will redeliver — the render must carry BOTH signposts.
+  it('renders both the claimed-unread notice and the genuinely-pending deferral notice when the sole claimed event is itself oversized', () => {
+    const largeBody = 'x'.repeat(10_000);
+    const out = renderHookDelivery(
+      makeClaim({
+        sessionId: 'session-mixed',
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'watch-src',
+            title: 'Files changed',
+            summary: 'Files changed',
+            body: largeBody,
+            urgency: 'high',
+            createdAt: '2026-06-04T00:00:00.000Z',
+          },
+        ],
+      }),
+      'PreToolUse',
+      { moreDeferred: true },
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx.length).toBeLessThanOrEqual(4000);
+    // This event's own tail: claimed but will not redeliver.
+    expect(ctx).toContain('will not redeliver automatically');
+    // The genuinely separate, still-pending remainder: will redeliver later.
+    expect(ctx).toContain('more monitor updates are pending');
+    expect(ctx).toContain(
+      'run `agentmonitors events list --session session-mixed --unread` to see the rest',
+    );
+    expect(ctx).toContain(
+      'run `agentmonitors events list --session session-mixed --unread` to see it',
+    );
+  });
+
   // (e.2.3 — issue #358/#442, PR #442 round-7 review) the marker's recovery
   // command must carry an explicit `--socket <path>`, since `events list`
   // resolves its own socket env-first (issue #335) and would otherwise ignore
@@ -388,7 +428,25 @@ describe('renderHookDelivery', () => {
       { moreDeferred: true, socketPath: "/tmp/weird ' path.sock" },
     );
     const ctx = out?.hookSpecificOutput.additionalContext ?? '';
-    expect(ctx).toContain(String.raw`--socket '/tmp/weird '\'' path.sock'`);
+    expect(ctx).toContain(
+      String.raw`--socket $'/tmp/weird\x20\x27\x20path.sock'`,
+    );
+  });
+
+  // PR #442 round-8 review: `additionalContext` preserves `<>[]` verbatim (it
+  // is a plain JSON string, not tag-delimited — see `sanitize`), but a socket
+  // path is still shell-escaped via the transport-shared `escapeShellPath` for
+  // consistency with the channel transport and so the advertised command is
+  // guaranteed to round-trip to the exact original path.
+  it('escapes a socket path carrying shell/control characters via the shared helper', () => {
+    const out = renderHookDelivery(
+      makeClaim({ sessionId: 'session-xyz' }),
+      'PostToolUse',
+      { moreDeferred: true, socketPath: '/tmp/x`bad\r.sock' },
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).toContain(String.raw`\x60`);
+    expect(ctx).toContain(String.raw`\x0d`);
   });
 
   // (e.2.2 — issue #442) the `moreDeferred` deferred-remainder marker (appended

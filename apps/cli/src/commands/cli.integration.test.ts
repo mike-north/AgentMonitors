@@ -36,6 +36,7 @@ import {
   CHANNEL_DEFERRED_MARKER,
   renderChannelEvent,
 } from '../channel-render.js';
+import { escapeShellPath } from '../delivery-event-render.js';
 
 const CLI_PATH = path.resolve(__dirname, '../../dist/index.cjs');
 const CLI_PACKAGE_DIR = path.resolve(__dirname, '../..');
@@ -11376,9 +11377,16 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
       'utf-8',
     );
 
+    // Adversarial-but-filesystem-legal socket path (issue #442, PR #442
+    // round-8 review): a space and brackets are both legal bytes in a Unix
+    // domain socket path, but they are ALSO `<channel>`-tag-breakout
+    // characters (brackets) and shell metacharacters (space). This proves the
+    // marker's `--socket` clause is BOTH transport-safe (§4.6) and
+    // shell-round-trip-safe end to end against a real daemon, not just at the
+    // unit level.
     const socket = path.join(
       '/tmp',
-      `agentmon-chcycle-huge-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+      `agentmon chcycle [huge] ${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'channel-cycle-huge.db');
     const hostSessionId = `chcycle-huge-${Date.now()}`;
@@ -11477,9 +11485,13 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
         buildChannelTruncatedMarker(sessionId, socket).trim(),
       );
       expect(renderedContent).toContain(
-        `agentmonitors events list --session ${sessionId} --socket '${socket}' --unread`,
+        `agentmonitors events list --session ${sessionId} --socket ${escapeShellPath(socket)} --unread`,
       );
       expect(renderedContent).not.toContain(CHANNEL_DEFERRED_MARKER.trim());
+      // The adversarial socket path's own tag-breakout brackets must not
+      // survive raw into the pushed `<channel>` content (006 §4.6) — only
+      // their escaped `\xNN` form should appear.
+      expect(renderedContent).not.toMatch(/\[huge\]/);
 
       // The row is now genuinely committed (`first_notified_at` set) in the
       // REAL store — a second real poll cycle must NOT re-surface the omitted
@@ -11525,7 +11537,15 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
         `agentmon-stale-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
       );
       const shimDir = makeAgentmonitorsShimDir();
-      const recovered = execFileSync('/bin/sh', ['-c', advertisedCommand], {
+      // `escapeShellPath` documents bash/zsh ANSI-C quoting (`$'...'`) as its
+      // escaping mechanism when the socket path carries any unsafe byte (here,
+      // the adversarial path's space and brackets) — `$'...'` is a bash/zsh
+      // extension, not POSIX `sh` (e.g. `dash` treats it as literal `$`
+      // followed by a plain single-quoted string, which would NOT decode the
+      // `\xNN` escapes). Run via `/bin/bash`, matching the contract the
+      // marker's own doc comment (`escapeShellPath`) documents, rather than
+      // `/bin/sh`.
+      const recovered = execFileSync('/bin/bash', ['-c', advertisedCommand], {
         encoding: 'utf-8',
         env: {
           ...process.env,

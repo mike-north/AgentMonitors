@@ -10,17 +10,21 @@
  *
  * @see docs/specs/006-agent-integration.md §4.2.1, §5.1, §5.5
  */
+import { spawnSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
 import type { DeliveryEventSummary } from '@agentmonitors/core';
 import {
   buildEventBlock,
   DIFF_ELISION_MARKER,
+  escapeShellPath,
   MAX_EVENT_DIFF,
   packEventsUnderCap,
   packWholeBlocks,
-  shellQuoteSingle,
   truncateWithMarker,
 } from './delivery-event-render.js';
+
+/** 006 §4.6: every tag-breakout / attribute-breakout character. */
+const FORBIDDEN_CHARS = /[<>[\]\r\n;]/;
 
 const identity = (value: string): string => value;
 
@@ -39,23 +43,68 @@ function makeEvent(
   };
 }
 
-describe('shellQuoteSingle', () => {
-  it('wraps a plain path in single quotes', () => {
-    expect(shellQuoteSingle('/tmp/agentmon.sock')).toBe("'/tmp/agentmon.sock'");
+// ---------------------------------------------------------------------------
+// PR #442 round-8 review: a socket path is interpolated into a truncation
+// marker AFTER the surrounding content has already been tag/attribute-safety
+// sanitized (`contentValue`/`metaValue` in channel-render.ts) — so an explicit
+// path carrying `< > [ ] ; \r \n` or a backtick would otherwise reintroduce
+// those forbidden bytes into the pushed content raw. `escapeShellPath` must be
+// BOTH transport-safe (no forbidden byte survives) AND shell-round-trip-safe
+// (bash/zsh reconstruct the exact original path).
+// ---------------------------------------------------------------------------
+describe('escapeShellPath', () => {
+  it('wraps a plain, all-safe path in single quotes (no escaping needed)', () => {
+    expect(escapeShellPath('/tmp/agentmon.sock')).toBe("'/tmp/agentmon.sock'");
   });
 
-  it('escapes an embedded single quote so the quoted command stays valid shell syntax', () => {
-    expect(shellQuoteSingle("/tmp/weird ' path.sock")).toBe(
-      String.raw`'/tmp/weird '\'' path.sock'`,
-    );
+  it('ANSI-C-escapes an embedded single quote instead of the close/escape/reopen trick', () => {
+    const escaped = escapeShellPath("/tmp/weird ' path.sock");
+    expect(escaped).toBe(String.raw`$'/tmp/weird\x20\x27\x20path.sock'`);
+    // No raw quote or space survives unescaped in the tag body.
+    expect(escaped).not.toMatch(FORBIDDEN_CHARS);
   });
 
-  it('quotes a path containing spaces (a common workspace-directory case)', () => {
-    const quoted = shellQuoteSingle('/Users/me/My Project/.sock');
-    // Round-trips as a single shell word: no unescaped, unquoted space.
-    expect(quoted).toBe("'/Users/me/My Project/.sock'");
-    expect(quoted.startsWith("'")).toBe(true);
-    expect(quoted.endsWith("'")).toBe(true);
+  it('ANSI-C-escapes a path containing spaces (a common workspace-directory case)', () => {
+    const escaped = escapeShellPath('/Users/me/My Project/.sock');
+    expect(escaped).toBe(String.raw`$'/Users/me/My\x20Project/.sock'`);
+  });
+
+  it('ANSI-C-escapes tag-breakout characters so none survive raw', () => {
+    const escaped = escapeShellPath('/tmp/x<channel>[oops].sock');
+    expect(escaped).toBe(String.raw`$'/tmp/x\x3cchannel\x3e\x5boops\x5d.sock'`);
+    expect(escaped).not.toMatch(FORBIDDEN_CHARS);
+  });
+
+  it('ANSI-C-escapes control characters (CR) and a backtick', () => {
+    const escaped = escapeShellPath('/tmp/weird`\r.sock');
+    expect(escaped).not.toContain('`');
+    expect(escaped).not.toMatch(FORBIDDEN_CHARS);
+    expect(escaped).toContain(String.raw`\x60`);
+    expect(escaped).toContain(String.raw`\x0d`);
+  });
+
+  it('round-trips a multi-byte code point via UTF-8 byte escapes', () => {
+    const escaped = escapeShellPath('/tmp/wörk.sock');
+    // ö is U+00F6, UTF-8 encoded as 0xC3 0xB6.
+    expect(escaped).toBe(String.raw`$'/tmp/w\xc3\xb6rk.sock'`);
+  });
+
+  it('reconstructs the exact original path when evaluated by a real shell', () => {
+    const adversarialPaths = [
+      '/tmp/agentmon.sock',
+      "/tmp/weird ' path.sock",
+      '/tmp/x<channel>[oops].sock',
+      '/Users/me/My Project/.sock',
+      '/tmp/wörk.sock',
+    ];
+    for (const path of adversarialPaths) {
+      const escaped = escapeShellPath(path);
+      const result = spawnSync('bash', ['-c', `printf '%s' ${escaped}`], {
+        encoding: 'utf8',
+      });
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe(path);
+    }
   });
 });
 

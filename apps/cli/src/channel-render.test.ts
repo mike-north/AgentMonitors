@@ -429,11 +429,35 @@ describe('buildChannelTruncatedMarker', () => {
       'session-42',
       "/tmp/weird ' path.sock",
     );
-    expect(marker).toContain(String.raw`--socket '/tmp/weird '\'' path.sock'`);
+    expect(marker).toContain(
+      String.raw`--socket $'/tmp/weird\x20\x27\x20path.sock'`,
+    );
   });
 
   it('omits --socket entirely when no socket path is supplied', () => {
     const marker = buildChannelTruncatedMarker('session-42');
     expect(marker).not.toContain('--socket');
+  });
+
+  // PR #442 round-8 review: the socket path is interpolated into `content`
+  // AFTER `contentValue`'s tag-safety sanitization pass has already run, so an
+  // explicit path carrying tag-breakout characters must not reintroduce them
+  // raw into the pushed content.
+  it('never lets a socket path reintroduce a forbidden tag-breakout character into the marker', () => {
+    const marker = buildChannelTruncatedMarker(
+      'session-42',
+      '/tmp/x<channel>[oops];bad\r\nend`.sock',
+    );
+    // Isolate ONLY the interpolated `--socket <escaped>` clause — the marker's
+    // own fixed template legitimately contains a backtick pair (a markdown
+    // code span around the advertised command), which is not the thing under
+    // test here.
+    const [, socketClause] = /--socket (\S+) --unread/.exec(marker) ?? [
+      undefined,
+      '',
+    ];
+    expect(socketClause).not.toMatch(/[<>[\]\r\n;`]/);
+    expect(socketClause).toContain(String.raw`\x3c`);
+    expect(socketClause).toContain(String.raw`\x60`);
   });
 });

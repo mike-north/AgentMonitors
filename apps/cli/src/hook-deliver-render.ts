@@ -2,13 +2,13 @@ import type { DeliveryClaim, DeliveryEventSummary } from '@agentmonitors/core';
 import {
   appendMarkerWithinCap as appendSharedMarkerWithinCap,
   buildEventBlock as buildSharedEventBlock,
+  escapeShellPath,
   packEventsUnderCap as packSharedEventsUnderCap,
   packWholeBlocks as packSharedWholeBlocks,
-  shellQuoteSingle,
   truncateWithMarker,
 } from './delivery-event-render.js';
 
-const MAX_ADDITIONAL_CONTEXT = 4000;
+export const MAX_ADDITIONAL_CONTEXT = 4000;
 
 const LEAD_LINE =
   'AgentMon: monitored changes are pending — consider handling them before continuing.';
@@ -22,11 +22,14 @@ const LEAD_LINE =
  * events list` itself resolves env-first (`resolveManualDaemonSocketPath`,
  * issue #335), so a copy-pasted recovery command with no `--socket` could
  * silently query a stale or different workspace's daemon (PR #442 round-7
- * review). Quoted with {@link shellQuoteSingle} so the advertised command
- * stays safe to paste verbatim even if the path contains spaces.
+ * review). Escaped with the transport-shared {@link escapeShellPath} (issue
+ * #442, PR #442 round-8 review) — shared with the channel transport's
+ * `buildChannelTruncatedMarker` — so the advertised command both stays safe to
+ * paste verbatim (spaces, quotes) AND reconstructs to the exact original
+ * socket path when run.
  */
 function socketClause(socketPath: string | undefined): string {
-  return socketPath ? ` --socket ${shellQuoteSingle(socketPath)}` : '';
+  return socketPath ? ` --socket ${escapeShellPath(socketPath)}` : '';
 }
 
 /**
@@ -229,6 +232,80 @@ export function packEventsUnderCap(
   });
 }
 
+/** The result of {@link resolveHookClaimFit}. */
+export interface HookClaimFit {
+  /**
+   * Whether {@link renderHookDelivery} will render EVERY block in `events`
+   * WHOLE for the given `moreDeferred` flag — i.e. nothing in the claim gets
+   * cut, though the deferred marker may still be appended when `moreDeferred`
+   * is true even though nothing was cut. Mirrors the channel transport's
+   * `resolveChannelClaimFit` (`channel-render.ts`) — the fit question
+   * `hook.ts`'s post-reserve check needs (issue #442, PR #442 round-8 review):
+   * did the ACTUAL reserved claim survive rendering intact?
+   */
+  fits: boolean;
+  /**
+   * How many whole blocks fit under the EFFECTIVE budget the renderer will
+   * use for this claim — at least 1 for a non-empty claim (forward progress).
+   */
+  includedCount: number;
+  /** Blocks packed at the FULL `cap` (no marker room reserved). */
+  whole: PackedHookBlocks;
+  /** Blocks packed at `cap − <this session's deferred marker length>` — the
+   * budget {@link renderHookDelivery} actually uses whenever a marker will be
+   * appended. */
+  reserved: PackedHookBlocks;
+}
+
+/** The `{ text, includedCount }` shape shared by {@link HookClaimFit}'s two packings. */
+export interface PackedHookBlocks {
+  text: string;
+  includedCount: number;
+}
+
+/**
+ * Determine whether {@link renderHookDelivery} will render every block of
+ * `events` WHOLE, checked against the SAME effective budget the renderer
+ * itself uses (issue #442, PR #442 round-8 review).
+ *
+ * `claimDeliveryClient`/`reserveDeliveryClient`'s `maxEvents` bounds only the
+ * candidate **count** — `previewSettledHighDeliveryClient` and the eventual
+ * claim/reservation are two SEPARATE IPC round-trips, so the events actually
+ * returned can differ from the ones the earlier preview sized `maxEvents`
+ * against (a "substitution race": e.g. another transport claims/leases the
+ * previewed rows first, and the reservation instead fills the same COUNT from
+ * different, larger pending events). Sizing on count alone would then commit
+ * (via `claimDelivery`) a set that no longer fits the rendered cap — and
+ * because the row is claimed synchronously, the truncated-away tail can
+ * **never redeliver** (§5.5). `hook.ts`'s `reserveSizedHookDelivery` calls
+ * this function on the ACTUAL reserved claim, before committing, so a
+ * mismatch can still be released and retried while the rows are only leased,
+ * not yet claimed — mirroring the channel transport's
+ * `reserveSizedChannelDelivery`/`resolveChannelClaimFit` pattern exactly.
+ */
+export function resolveHookClaimFit(
+  events: DeliveryEventSummary[],
+  sessionId: string,
+  socketPath: string | undefined,
+  moreDeferred: boolean,
+  cap: number = MAX_ADDITIONAL_CONTEXT,
+): HookClaimFit {
+  const blocks = events.map(buildEventBlock);
+  const whole = packWholeBlocks(HEADER, blocks, cap);
+  if (whole.includedCount === blocks.length && !moreDeferred) {
+    return { fits: true, includedCount: blocks.length, whole, reserved: whole };
+  }
+  const deferredMarker = buildHookDeferredMarker(sessionId, socketPath);
+  const reserved = packWholeBlocks(HEADER, blocks, cap - deferredMarker.length);
+  const includedCount = Math.max(1, reserved.includedCount);
+  return {
+    fits: includedCount === blocks.length,
+    includedCount,
+    whole,
+    reserved,
+  };
+}
+
 /** Optional signals for {@link renderHookDelivery}. */
 export interface RenderHookDeliveryOptions {
   /**
@@ -371,11 +448,26 @@ export function renderHookDelivery(
       // partially — and unlike the branch above, THIS event is already claimed,
       // so its own omitted tail will NOT redeliver (issue #442, PR #442 round-7
       // review): use the claimed-unread marker, which says so.
+      //
+      // Mixed case (issue #442, PR #442 round-8 review): `moreDeferred` can
+      // ALSO be true here — this claim's single (oversized) event is the only
+      // one actually claimed, but genuinely more high-urgency work exists
+      // beyond it and stays pending (the reservation/claim was sized to just
+      // this one event). Rendering the claimed-unread marker alone would
+      // silently suppress that second, real signal: an agent reading only
+      // "this update was too large ... it will not redeliver" would have no
+      // idea further, DIFFERENT pending work is queued and genuinely will
+      // redeliver. Render BOTH markers whenever both apply — they describe
+      // two different, non-overlapping facts (this event's own tail vs. the
+      // separate pending remainder) and are never redundant with each other.
       const firstBlock = blocks[0] ?? '';
+      const marker = moreDeferred
+        ? claimedUnreadMarker + deferredMarker
+        : claimedUnreadMarker;
       additionalContext = appendMarkerWithinCap(
         HEADER + firstBlock,
         MAX_ADDITIONAL_CONTEXT,
-        claimedUnreadMarker,
+        marker,
       );
     }
   }
