@@ -1708,7 +1708,7 @@ whether the daemon was actually live.
 | `monitors-valid`     | every discovered monitor validates (no scope/parse/dup errors)                                        | Run `agentmonitors validate <dir>` and fix the reported errors (`skip` when there are no monitors)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `daemon-reachable`   | the `doctor.report` call reached a live daemon                                                        | Start it with `agentmonitors daemon run`, or let a Claude Code session start it automatically — `idle` when it doesn't and no lead session is registered (nothing is actually broken); **`fail`** when it doesn't but a lead session IS registered (issue #382 — an agent session is open with no daemon serving it, almost certainly a mid-session crash), see below                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `lead-session`       | a lead session is registered for this workspace                                                       | Open a Claude Code session (the `SessionStart` hook runs `agentmonitors session start`, which lazy-boots the daemon and registers a lead session automatically); to do it by hand with no plugin, pipe a hook payload to that same command — `echo '{"session_id":"manual-cli-session","cwd":"<path>"}' \| agentmonitors session start`. It recommends `session start`, **not** `session open`, because `session open`'s `--host-session-id` is a required option with no meaningful value for a manual CLI user — a copy-pasted `session open` fails with `error: required option '--host-session-id' not specified` (issue #387). The failure `detail` and remediation both **name the exact workspace path searched** (issue #335), so a future db/socket-derivation mismatch is self-diagnosing: compare it directly against `agentmonitors session list`'s workspace column; `idle` (not `fail`) when no lead session is registered, see below |
-| `transport:<name>`   | the transport (`hook` / `channel`) is within its heartbeat lease and bound to this workspace's daemon | Reported per problem code (006 §12): re-resolve the workspace / respawn the transport; `idle` when it has never reported in, `skip` when no lead session is open                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `transport:<name>`   | the transport (`hook` / `channel`) is within its heartbeat lease and bound to this workspace's daemon | Reported per problem code (006 §12): re-resolve the workspace / respawn the transport; `idle` when it has never reported in with a lead session open, `skip` when it has never reported in and no lead session is open, and `idle` even when it HAS reported in (possibly with problems) if no lead session is currently open — nothing needs delivery right now, so a stale/misbound record from a past session is not a live failure                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `delivery-verdict`   | some transport is listening AND delivery is not currently blocked                                     | Names the specific blocker — a down daemon, a misbound transport, or reminders suppressed by `coalesced-until-ack` (`agentmonitors events ack --session <id>`); `idle` when no lead session or no transport has reported in                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `monitor:<id>`       | the monitor is valid and has been observed at least once                                              | Start the daemon (or wait for the next tick), then check `agentmonitors monitor history <id>`; `monitor test` dry-runs it (`skip` for an invalid monitor — see `monitors-valid`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
@@ -1756,12 +1756,21 @@ transports** section above the checks, built from the transport heartbeats each 
 | `environment-mismatch`            | The transport resolved a different `HOME` / data root, so it reads a different db      |
 | `reminders-suppressed`            | Transports are up but reminders are **muted** by `coalesced-until-ack` (002 §9.2/§9.3) |
 | `heartbeat-stale`                 | A transport registered but its lease lapsed — presumed killed without cleanup          |
-| `version-skew`                    | A long-lived transport is still serving an older CLI build than this one               |
+| `version-skew`                    | Advisory: a long-lived transport is still serving an older CLI build than this one     |
 | `channel-registration-unverified` | Advisory: the host never confirms channel registration; prove delivery end to end      |
 
 `daemon-unreachable` and `reminders-suppressed` are **pipeline-wide** — they block the hook and
 channel paths alike — so they are recorded on every configured transport in `--json` but rendered
 **once**, at the verdict, rather than repeated per row as if they were independent failures.
+
+`version-skew` and `channel-registration-unverified` are the two **advisory, non-blocking** codes: both
+are reported when present, but neither counts toward a transport's `healthy` field, its `fail` status,
+or the overall `deliverable` verdict. `version-skew` was blocking through issue #373; it was made
+informational because the hook transport's heartbeat legitimately carries the pre-upgrade CLI version
+for up to its full 24h TTL after every release (it only refreshes on the next prompt) — treating it as
+blocking made `doctor` exit non-zero for up to a day after every single upgrade, the exact cry-wolf
+outcome issue #373 exists to prevent, and it directly contradicted the hook remediation's own "No
+action needed" wording.
 
 The section closes with a single verdict line: `delivery to THIS session → via {hook | channel |
 both | none}`, plus whether it is deliverable **right now**. Those are deliberately two different
@@ -1769,11 +1778,25 @@ answers: a transport whose reminders are currently suppressed is still the liste
 nothing will actually arrive — reporting only the method is what let a real CI failure go
 undelivered while every surface looked green.
 
-**Exit code.** A `transport:<name>` check is `fail` only for a transport that DID report in and is
-genuinely broken (misbound, stale). "A lead session exists but no transport has reported in yet" is
+**Exit code.** A `transport:<name>` check is `fail` only for a transport that DID report in, is
+genuinely broken (misbound, stale — advisory codes never count), **and a lead session is currently
+registered for this workspace**. "A lead session exists but no transport has reported in yet" is
 `idle`, not `fail` — it is the ordinary state of a script-registered session or a freshly-opened one
 that has not yet had its first prompt, and failing there would cry wolf on a setup that is about to
-be fine. With no lead session at all, both transport checks are `skip` and the verdict is `idle`.
+be fine. With no lead session at all, both transport checks are `idle`/`skip` and the verdict is
+`idle` — this now holds even for a transport that DID report in during some past session: a heartbeat
+left behind by an uncleanly-killed process (SIGKILL, host crash) is stale or misbound evidence about a
+session that is no longer open, not a live failure of anything happening now. Every `idle` transport
+check — configured or not — still carries a non-null `remediation` naming a concrete next step, never
+a bare status glyph.
+
+**Registry garbage collection.** The transport heartbeat registry (006 §12) is reaped opportunistically
+on both read and write: any record found to be expired past its own declared TTL is still used to
+compute THIS report's verdict (so a genuinely stale transport is still reported accurately once), but
+its backing file is then removed. Without this, a transport that dies without cleanup (SIGKILL, host
+crash — the exact case the TTL exists for) would leave its record on disk forever, and every future
+`doctor` run in that workspace would report `[heartbeat-stale]` permanently, including with no lead
+session ever open again — directly contradicting the "no lead session → idle" contract above.
 
 ### Per-monitor rollup
 

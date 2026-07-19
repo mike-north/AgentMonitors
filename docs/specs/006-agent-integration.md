@@ -1437,9 +1437,24 @@ The two transports fail in opposite ways, and neither is observable without a re
 
 Each therefore writes a **transport heartbeat** naming the process, the exact binary and version
 serving it, the environment it resolved, the workspace and socket it bound to, and when it last
-actually delivered. `channel serve` refreshes its record every poll (and removes it on clean
-shutdown); `hook deliver` writes one per invocation once it has resolved a session, plus a second
-carrying the delivery timestamp when it surfaces something.
+actually delivered. `channel serve` refreshes its record on an independent timer (§12.2.1), not only
+after each poll settles, and removes it on clean shutdown; `hook deliver` writes one per invocation
+once it has resolved a session, plus a second — recording a delivery timestamp only when it actually
+wrote output to the host — once it knows whether it surfaced anything. Every write is a
+read-modify-write on the delivery timestamp specifically: a write that has nothing new to report
+(an empty prompt, a poll cycle with no delivery) preserves whatever `lastDeliveryAt` the prior write
+already recorded, rather than resetting it — a per-invocation whole-record overwrite that dropped this
+would make `lastDelivery` read `never` on almost every hook invocation, inverting its diagnostic
+purpose.
+
+### 12.2.1 The channel heartbeat is not gated on the poll settling
+
+`channel serve`'s heartbeat refreshes on its own timer, independent of how long any single poll's
+reserve/commit/release IPC round trip takes. Refreshing only from inside the poll would tie this
+transport's liveness signal to the daemon's latency: a daemon wedged longer than the channel's TTL
+would make a live, correctly-bound server lapse to `heartbeat-stale` — blaming the transport for the
+daemon's outage, the same class of mis-attribution the daemon-unreachable/transport-defect split in
+§12.4 exists to avoid elsewhere.
 
 ### 12.2 Leases, not just timestamps
 
@@ -1452,6 +1467,14 @@ The two TTLs differ by design: the channel's is short (tens of seconds, well abo
 while the hook's spans a day — there is no hook process between prompts, so a short lease would
 report a perfectly healthy setup as dead during any human pause.
 
+**A lapsed record is reaped, not left forever.** The registry is scanned opportunistically on both
+read and write; a record found expired-past-its-own-TTL is still returned to the caller that observed
+it (so the ONE report that catches it still reports `heartbeat-stale` accurately), but its backing
+file is then removed. Without this, an uncleanly-killed transport's file would sit on disk forever —
+every subsequent `doctor` run in that workspace would fail `[heartbeat-stale]` permanently, even long
+after no lead session was ever open again, which is precisely the "cry wolf on nothing actually open"
+outcome the health surface exists to avoid (005 §15).
+
 ### 12.3 Registry layout is load-bearing
 
 Records live in a machine-wide registry under the resolved data root
@@ -1462,9 +1485,26 @@ run in workspace Y. A flat registry lets the health surface enumerate every tran
 and match a record to **this** session by host session id, turning "your channel is listening to a
 different workspace" from an invisible absence into a reported finding.
 
+**Session-id-first matching applies only to `channel`.** `channel serve` is one long-lived process per
+host session, so matching its record by host session id — across every workspace — is exactly what
+detects the misbinding above. `hook deliver` has no per-session identity of its own: it is a fresh
+short-lived process per prompt, keyed and overwritten per WORKSPACE (any session's most recent prompt
+in a workspace is a valid match for every lead session there). Applying session-id-first matching to
+`hook` too would let a session whose hook last fired in workspace A — now leading workspace B, before
+its first prompt there — find no session match, fall through to a workspace match that also fails, and
+report a false `workspace-mismatch` with "restart the transport", even though hooks re-resolve and
+self-heal on every prompt with no action needed. `hook` therefore always matches by workspace only.
+
 A transport running under a genuinely different `HOME`/`XDG_DATA_HOME` resolves a different data root
 and is invisible from here. That case is reported honestly as an **absence** whose wording names the
 possibility — never as a clean bill of health.
+
+**The registry key is collision-safe.** A host session id is untrusted input; the key sanitizer both
+collapses everything outside a conservative filename allowlist to `_` (so a `/` or `..` cannot escape
+the registry directory) AND appends a short hash of the RAW, unsanitized, untruncated id. Without the
+hash suffix, two distinct ids that collapse to the same cleaned prefix (`run:1` and `run_1`) — or that
+differ only past the truncation point — would silently share one file, letting one session's
+heartbeat clobber another's and a reader judge the wrong session's binding.
 
 ### 12.4 What the health surface must report
 
