@@ -7,9 +7,10 @@ import type {
   ObservationSource,
 } from '@agentmonitors/core';
 import {
+  OPERATION_TIMEOUT_PATTERN,
   diffKeyedCollection,
-  parseDuration,
   parseKeyedCollectionConfig,
+  parseOperationTimeoutMs,
 } from '@agentmonitors/core';
 
 // Re-exported so API Extractor can resolve the default export's type — and
@@ -32,15 +33,7 @@ import {
   parseCompositeConfig,
   renderCompositeSnapshot,
 } from './composite.js';
-
-/**
- * Default wall-clock deadline for a single request, covering both the initial
- * response (headers) and streaming the body to completion (issue #304). A
- * stalled connect, a server that never sends headers, and a stalled/trickling
- * chunked body are all bounded by the same deadline. Matches `command-poll`'s
- * default (003 §11.1) for consistency across bundled sources.
- */
-const DEFAULT_TIMEOUT_MS = 30_000;
+import { mapWithConcurrency } from './map-with-concurrency.js';
 
 /**
  * Maximum response body size, in bytes, that `api-poll` will buffer (issue
@@ -77,11 +70,14 @@ interface ScopeConfig {
   headers: Record<string, string> | undefined;
   method: string | undefined;
   /**
-   * Request/body deadline in milliseconds (issue #304). Defaults to
-   * {@link DEFAULT_TIMEOUT_MS} when `timeout` is omitted; parsed via the
-   * shared `parseDuration` (`^\d+[smhd]$`) when present, so an invalid value
-   * throws the same descriptive error as every other duration field in the
-   * codebase (defence-in-depth alongside the schema `pattern`).
+   * Request/body deadline in milliseconds (issue #304). Resolved via core's
+   * shared `parseOperationTimeoutMs` (issue #304 review, findings 5 + 6):
+   * defaults to `DEFAULT_OPERATION_TIMEOUT_MS` when `timeout` is omitted;
+   * parses a present string via `parseDuration` (`^\d+[smhd]$`), so an
+   * invalid value throws the same descriptive error as every other duration
+   * field in the codebase (defence-in-depth alongside the schema `pattern`);
+   * and rejects a zero-length value (`"0s"`, …) even though `parseDuration`
+   * itself would accept it.
    */
   timeoutMs: number;
   /**
@@ -166,11 +162,7 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
     );
   }
 
-  const rawTimeout = config['timeout'];
-  const timeoutMs =
-    typeof rawTimeout === 'string'
-      ? parseDuration(rawTimeout)
-      : DEFAULT_TIMEOUT_MS;
+  const timeoutMs = parseOperationTimeoutMs(config['timeout']);
 
   return {
     url: typeof url === 'string' ? url : undefined,
@@ -277,10 +269,10 @@ const scopeSchema: JsonSchema = {
     },
     timeout: {
       type: 'string',
-      pattern: '^\\d+[smhd]$',
+      pattern: OPERATION_TIMEOUT_PATTERN,
       default: '30s',
       description:
-        'Deadline for a single request, covering both the response headers and streaming the body to completion. In composite mode (change-detection.composite), the same deadline applies to each part. Default 30s.',
+        'Deadline for a single request, covering both the response headers and streaming the body to completion. In composite mode (change-detection.composite), the same deadline applies to each part. Default 30s; must be at least 1 unit (e.g. "1s") — a zero-length deadline is rejected.',
     },
     'change-detection': {
       type: 'object',
@@ -395,6 +387,32 @@ function oversizeMessage(url: string, detail: string): string {
 }
 
 /**
+ * Abort the in-flight request and, if its response body stream has not been
+ * consumed, cancel it — releasing the underlying connection back to the pool
+ * instead of leaving it open with an unconsumed body pending (issue #304
+ * review, finding 1). Shared by every path that rejects a response before (or
+ * partway through) reading its body, so all of them release the connection
+ * the same way.
+ */
+async function abortAndReleaseBody(
+  controller: AbortController,
+  response: Response,
+): Promise<void> {
+  controller.abort();
+  try {
+    // `response.body` is `undefined` on the declared-Content-Length rejection
+    // path for lightweight test doubles (and on any response with no body at
+    // all); optional chaining is a no-op there. A real, already-locked stream
+    // (mid-stream cancellation) can reject `cancel()` — that rejection is not
+    // itself an error worth surfacing over the oversize/timeout error the
+    // caller is already about to throw.
+    await response.body?.cancel();
+  } catch {
+    // Best-effort release; see comment above.
+  }
+}
+
+/**
  * Read a fetch `Response` body under the shared byte cap (issue #304).
  *
  * `Content-Length`, when present, is checked first as an early rejection — no
@@ -402,8 +420,9 @@ function oversizeMessage(url: string, detail: string): string {
  * `Content-Length` is not authoritative: it can be absent (chunked transfer
  * encoding) or simply wrong, so every chunk read from the body stream is
  * counted, and the running total is the actual authority. Either check aborts
- * `controller` and throws before returning a body, so the caller never
- * baselines or persists a partial/oversized body.
+ * the request AND releases the response body (issue #304 review, finding 1)
+ * before throwing, so the caller never baselines or persists a
+ * partial/oversized body and never leaks the connection.
  *
  * Test doubles that return a plain `{ text() }` mock without a streaming
  * `.body` fall back to `response.text()` unbounded — real `fetch` responses
@@ -418,6 +437,7 @@ async function readBoundedBody(
 ): Promise<string> {
   const declaredBytes = readContentLength(response);
   if (declaredBytes !== undefined && declaredBytes > MAX_RESPONSE_BYTES) {
+    await abortAndReleaseBody(controller, response);
     throw new Error(
       oversizeMessage(
         url,
@@ -439,6 +459,13 @@ async function readBoundedBody(
   const reader: ReadableStreamDefaultReader<Uint8Array> = body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
+  // Identifies the streamed-oversize rejection thrown below by reference, so
+  // the catch clause can tell it apart from an abort-driven read failure even
+  // though the oversize path itself calls `controller.abort()` (to release
+  // the connection) before throwing — without this, the `signal.aborted`
+  // fallback added for finding 4 below would misclassify our OWN oversize
+  // rejection as a timeout.
+  let oversizeRejection: Error | undefined;
   try {
     for (;;) {
       const { done, value } = (await reader.read()) as {
@@ -450,14 +477,22 @@ async function readBoundedBody(
       total += value.byteLength;
       if (total > MAX_RESPONSE_BYTES) {
         controller.abort();
-        throw new Error(
+        oversizeRejection = new Error(
           oversizeMessage(url, `streamed ${String(total)} bytes`),
         );
+        throw oversizeRejection;
       }
       chunks.push(value);
     }
   } catch (readErr) {
-    if (isAbortError(readErr)) {
+    if (readErr === oversizeRejection) throw readErr;
+    // Issue #304 review, finding 4: under an HTTP/2 or socket-teardown race,
+    // undici can reject a mid-body read with a raw `TypeError: terminated`
+    // instead of the `AbortError` this source's own timer produces — the
+    // `signal.aborted` fallback still classifies that race as the documented
+    // "timed out" error rather than surfacing the raw undici error. Mirrors
+    // `fetchBody`'s own `isAbortError(err) || controller.signal.aborted` check.
+    if (isAbortError(readErr) || controller.signal.aborted) {
       throw new Error(timeoutMessage(url, timeoutMs), { cause: readErr });
     }
     throw readErr;
@@ -467,6 +502,28 @@ async function readBoundedBody(
   return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString(
     'utf8',
   );
+}
+
+/** Options controlling one bounded `fetchBody` call (issue #304 review). */
+interface FetchBodyOptions {
+  /**
+   * When `false`, skip reading the response body entirely (issue #304
+   * review, finding 2): the `status-code` strategy never inspects the body —
+   * the status transition IS the watched signal — so reading it at all is
+   * both unnecessary and, for a large endpoint, exactly the wedge/memory risk
+   * this issue exists to bound. The unconsumed body is released back to the
+   * connection pool via `cancel()` rather than left dangling. Defaults to
+   * `true` (every other strategy needs the body).
+   */
+  readBody?: boolean;
+  /**
+   * An external signal that also aborts this request when it fires (issue
+   * #304 review, finding 3): `observeComposite` wires each part's fetch to
+   * the composite batch's shared signal, so once ANY part fails the whole
+   * batch is doomed and every other in-flight part is cancelled immediately
+   * instead of running to its own full per-part deadline.
+   */
+  externalSignal?: AbortSignal;
 }
 
 /**
@@ -479,11 +536,20 @@ async function fetchBody(
   method: string | undefined,
   combinedHeaders: Record<string, string>,
   timeoutMs: number,
+  options: FetchBodyOptions = {},
 ): Promise<{ body: string; status: number; contentType: string | undefined }> {
+  const { readBody = true, externalSignal } = options;
   const controller = new AbortController();
   const timer = setTimeout(() => {
     controller.abort();
   }, timeoutMs);
+  const onExternalAbort = (): void => {
+    controller.abort();
+  };
+  if (externalSignal) {
+    if (externalSignal.aborted) controller.abort();
+    externalSignal.addEventListener('abort', onExternalAbort);
+  }
   try {
     let response: Response;
     try {
@@ -515,6 +581,20 @@ async function fetchBody(
       });
     }
 
+    if (!readBody) {
+      try {
+        // Release the unconsumed body back to the connection pool without
+        // reading it (issue #304 review, finding 2) — cheaper than a full
+        // read, and exempts `status-code` monitors from the byte cap by
+        // construction, since the body is never buffered at all.
+        await response.body?.cancel();
+      } catch {
+        // Best-effort: cancelling an already-closed/errored stream is not
+        // itself an error worth surfacing here.
+      }
+      return { body: '', status: response.status, contentType: undefined };
+    }
+
     const body = await readBoundedBody(response, controller, url, timeoutMs);
     return {
       body,
@@ -523,6 +603,9 @@ async function fetchBody(
     };
   } finally {
     clearTimeout(timer);
+    if (externalSignal) {
+      externalSignal.removeEventListener('abort', onExternalAbort);
+    }
   }
 }
 
@@ -663,60 +746,6 @@ function isCompositeState(value: unknown): value is CompositeState {
 }
 
 /**
- * Run `fn` over `items` with at most `limit` invocations in flight at once,
- * preserving input order in the returned array (issue #304). Fails fast: the
- * first rejection stops new work from starting and is what the returned
- * promise rejects with, matching `Promise.all`'s reject-on-first-failure
- * semantics — just with a bounded number of simultaneous in-flight calls
- * instead of starting everything at once.
- */
-async function mapWithConcurrency<T, R>(
-  items: readonly T[],
-  limit: number,
-  fn: (item: T) => Promise<R>,
-): Promise<R[]> {
-  const results: R[] = new Array<R>(items.length);
-  let nextIndex = 0;
-  // Held in an object rather than bare closure variables: multiple `worker`
-  // instances run concurrently (interleaved by `await`), and TypeScript's
-  // control-flow narrowing of a bare `let` incorrectly assumes no other
-  // in-flight call could have mutated it between an `if` check and its use.
-  // A property read is re-checked each time instead of narrowed once.
-  const failure: { happened: boolean; error: unknown } = {
-    happened: false,
-    error: undefined,
-  };
-
-  async function worker(): Promise<void> {
-    for (;;) {
-      if (failure.happened) return;
-      const index = nextIndex;
-      nextIndex += 1;
-      if (index >= items.length) return;
-      try {
-        // `index < items.length` was just checked, so this element exists.
-        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-        results[index] = await fn(items[index]!);
-      } catch (err) {
-        // Whichever concurrent worker fails first "wins" the surfaced error —
-        // a later overwrite from a second failing worker is harmless: the
-        // caller only needs to know the batch failed and see *an* error from
-        // it, not necessarily the temporally-first one.
-        failure.happened = true;
-        failure.error = err;
-        return;
-      }
-    }
-  }
-
-  const workerCount = Math.min(limit, items.length);
-  await Promise.all(Array.from({ length: workerCount }, () => worker()));
-
-  if (failure.happened) throw failure.error;
-  return results;
-}
-
-/**
  * Composite observe path (003 §2.6): issue **N** calls within one `observe()`,
  * reduce them into **one** deterministic snapshot under **one** `objectKey`, and
  * emit a single composite observation. The source's `nextState` holds only the
@@ -734,19 +763,25 @@ async function observeComposite(
   // time (issue #304), so latency is bounded by the slowest *batch* rather
   // than the sum of all parts, without starting every request in an
   // arbitrarily large composite at once. A failed part still fails the whole
-  // observation: mapWithConcurrency rejects on the first failure, so
+  // observation immediately, without waiting for other in-flight parts (issue
+  // #304 review, finding 3): `mapWithConcurrency` races a dedicated failure
+  // promise against the worker pool, and the shared `AbortSignal` it hands
+  // each part (wired into `fetchBody` below as `externalSignal`) cancels
+  // every other in-flight part the instant the batch is doomed, instead of
+  // letting them run to their own full per-part deadline. Either way,
   // `nextState` never advances and the prior baseline is preserved (002 §3) —
-  // we never silently emit a composite missing a part. Each part gets the
-  // same request/body deadline and byte cap as a single-URL monitor.
+  // we never silently emit a composite missing a part. Each part still gets
+  // the same request/body deadline and byte cap as a single-URL monitor.
   const results = await mapWithConcurrency(
     composite.parts,
     MAX_COMPOSITE_CONCURRENCY,
-    async (part) => {
+    async (part, signal) => {
       const { body, status } = await fetchBody(
         part.url,
         method,
         combinedHeaders,
         timeoutMs,
+        { externalSignal: signal },
       );
       // ---- Non-2xx → errored observation (issue #220, composite parity) -------
       // A composite assembles its snapshot by body-diffing the rendered whole, so
@@ -823,11 +858,22 @@ const source: ObservationSource = {
       throw new Error('scope.url must be a string');
     }
 
+    // `status-code` never inspects the body — the status transition IS the
+    // watched signal (003 §4.9's exemption also applies here: reading and
+    // buffering a body the strategy will never look at is exactly the
+    // wedge/memory risk this issue exists to bound). Skip reading it
+    // entirely for that strategy (issue #304 review, finding 2) — cheaper,
+    // and exempts `status-code` monitors from the response byte cap by
+    // construction. This can only be decided here for an EXPLICIT
+    // `status-code` value: an omitted strategy is inferred from the response
+    // Content-Type below, and inference never produces `status-code`.
+    const readBody = explicitStrategy !== 'status-code';
     const { body, status, contentType } = await fetchBody(
       url,
       method,
       combinedHeaders,
       timeoutMs,
+      { readBody },
     );
 
     // Resolve the effective strategy: explicit wins verbatim; otherwise infer

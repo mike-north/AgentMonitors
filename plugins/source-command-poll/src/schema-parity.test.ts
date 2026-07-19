@@ -93,6 +93,20 @@ const cases: readonly ParityCase[] = [
     input: {},
     expectValid: false,
   },
+  {
+    label: 'timeout "1s" is accepted',
+    input: { command: [process.execPath, '-e', ''], timeout: '1s' },
+    expectValid: true,
+  },
+  // Issue #304 review, finding 5 + 6: the `timeout` scope field is now parsed
+  // by the same shared `parseOperationTimeoutMs` (core) that `api-poll` uses,
+  // and its JSON Schema `pattern` (`OPERATION_TIMEOUT_PATTERN`) was updated in
+  // lockstep — a zero-length deadline must be rejected by BOTH, not just one.
+  {
+    label: 'timeout "0s" is rejected (zero-length deadline)',
+    input: { command: [process.execPath, '-e', ''], timeout: '0s' },
+    expectValid: false,
+  },
 ];
 
 describe('command-poll schema ↔ parser parity', () => {

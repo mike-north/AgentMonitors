@@ -85,6 +85,19 @@ describe('source-command-poll', () => {
       ).rejects.toThrow(/\["sh", "-c", "git status \| grep main"\]/);
     });
 
+    // Issue #304 review, finding 5 + 6: `command-poll` shares the `timeout`
+    // scope-field parsing (`parseOperationTimeoutMs`) with `api-poll` — a
+    // zero-length deadline aborts the command before it can ever complete,
+    // which is never a meaningful configuration.
+    it('rejects a "0s" timeout override', async () => {
+      await expect(
+        source.observe(
+          { command: nodeArgv('process.stdout.write("ok")'), timeout: '0s' },
+          ctx(),
+        ),
+      ).rejects.toThrow(/Invalid timeout: "0s"/);
+    });
+
     it('accepts an explicit sh -c argv form (the supported pipeline idiom)', async () => {
       // ["sh","-c","<pipeline>"] is a valid argv array — shell features are opt-in
       // by spawning a shell explicitly, not by the source word-splitting a string.

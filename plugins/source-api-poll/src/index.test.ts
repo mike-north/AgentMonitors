@@ -1301,6 +1301,19 @@ When the document changes, act on it.
   // partial body baselined, no `nextState` advance.
   // ---------------------------------------------------------------------------
   describe('request/body bounds (issue #304)', () => {
+    // Issue #304 review, finding 6c: these deadline/concurrency tests
+    // previously burned real wall-clock seconds (`timeout: '1s'` × 3, a real
+    // `setTimeout(…, 20)` in the composite-concurrency test below) while this
+    // same file already establishes the fake-timer pattern (see `composite ×
+    // runtime integration`). Fake timers also make the abort boundary exact
+    // instead of merely "eventually settles".
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
     function makeAbortError(): Error {
       const err = new Error('The operation was aborted');
       err.name = 'AbortError';
@@ -1404,23 +1417,34 @@ When the document changes, act on it.
       it('aborts and errors the observation when headers never arrive', async () => {
         vi.stubGlobal('fetch', mockNeverRespondingFetch());
 
-        await expect(
-          source.observe(
-            { url: 'https://api.example.com/never-responds', timeout: '1s' },
-            { now: new Date() },
-          ),
-        ).rejects.toThrow(/timed out after 1000ms/);
+        const observePromise = source.observe(
+          { url: 'https://api.example.com/never-responds', timeout: '1s' },
+          { now: new Date() },
+        );
+        // Attach the rejection assertion BEFORE advancing timers — vitest's
+        // `expect(...).rejects` synchronously attaches a handler to
+        // `observePromise`, which must happen before the promise actually
+        // rejects (which `advanceTimersByTimeAsync` triggers) or Node reports
+        // an unhandled rejection in the gap.
+        const assertion = expect(observePromise).rejects.toThrow(
+          /timed out after 1000ms/,
+        );
+        await vi.advanceTimersByTimeAsync(1000);
+        await assertion;
       });
 
       it('aborts and errors the observation when the body stalls mid-stream', async () => {
         vi.stubGlobal('fetch', mockHangingBodyFetch());
 
-        await expect(
-          source.observe(
-            { url: 'https://api.example.com/stalls', timeout: '1s' },
-            { now: new Date() },
-          ),
-        ).rejects.toThrow(/timed out after 1000ms/);
+        const observePromise = source.observe(
+          { url: 'https://api.example.com/stalls', timeout: '1s' },
+          { now: new Date() },
+        );
+        const assertion = expect(observePromise).rejects.toThrow(
+          /timed out after 1000ms/,
+        );
+        await vi.advanceTimersByTimeAsync(1000);
+        await assertion;
       });
 
       it('a request that completes within the deadline is unaffected', async () => {
@@ -1449,6 +1473,19 @@ When the document changes, act on it.
         ).rejects.toThrow(/Invalid duration: "soon"/);
       });
 
+      // Issue #304 review, finding 5: a zero-length timeout aborts every
+      // request before it can ever complete, which is never a meaningful
+      // configuration — reject it at parse time via the shared
+      // `parseOperationTimeoutMs` helper (core), same as `"soon"` above.
+      it('rejects a "0s" timeout override', async () => {
+        await expect(
+          source.observe(
+            { url: 'https://api.example.com/x', timeout: '0s' },
+            { now: new Date() },
+          ),
+        ).rejects.toThrow(/Invalid timeout: "0s"/);
+      });
+
       it('does not advance nextState past a timed-out tick', async () => {
         vi.stubGlobal(
           'fetch',
@@ -1461,12 +1498,13 @@ When the document changes, act on it.
         const baseline = await source.observe({ url }, { now: new Date() });
 
         vi.stubGlobal('fetch', mockNeverRespondingFetch());
-        await expect(
-          source.observe(
-            { url, timeout: '1s' },
-            { previousState: baseline.nextState, now: new Date() },
-          ),
-        ).rejects.toThrow(/timed out/);
+        const timedOutPromise = source.observe(
+          { url, timeout: '1s' },
+          { previousState: baseline.nextState, now: new Date() },
+        );
+        const assertion = expect(timedOutPromise).rejects.toThrow(/timed out/);
+        await vi.advanceTimersByTimeAsync(1000);
+        await assertion;
 
         // A subsequent successful poll still diffs against the ORIGINAL baseline
         // (the runtime never persisted a `nextState` from the errored tick).
@@ -1496,6 +1534,103 @@ When the document changes, act on it.
             { now: new Date() },
           ),
         ).rejects.toThrow(/exceeding the .*-byte cap/);
+      });
+
+      // Issue #304 review, finding 1: the declared-Content-Length rejection
+      // threw without `controller.abort()` or `response.body.cancel()`,
+      // leaking the connection — undici kept the socket open with the
+      // unconsumed body pending. One leak per tick (×5 in composite mode).
+      it('aborts the request and releases the connection on a declared-oversize rejection', async () => {
+        let capturedSignal: AbortSignal | undefined;
+        let bodyCancelCalls = 0;
+        vi.stubGlobal(
+          'fetch',
+          vi.fn((_url: string, init: RequestInit) => {
+            capturedSignal = init.signal ?? undefined;
+            return Promise.resolve({
+              status: 200,
+              headers: {
+                get: (name: string) =>
+                  name.toLowerCase() === 'content-length'
+                    ? String(50 * 1024 * 1024)
+                    : null,
+              },
+              body: {
+                cancel: () => {
+                  bodyCancelCalls += 1;
+                  return Promise.resolve();
+                },
+              },
+              text: () => Promise.resolve('should never be read'),
+            });
+          }),
+        );
+
+        await expect(
+          source.observe(
+            { url: 'https://api.example.com/huge-declared-leak' },
+            { now: new Date() },
+          ),
+        ).rejects.toThrow(/exceeding the .*-byte cap/);
+
+        expect(capturedSignal?.aborted).toBe(true);
+        expect(bodyCancelCalls).toBe(1);
+      });
+
+      // Issue #304 review, finding 2: the body cap (and full buffering) was
+      // enforced BEFORE resolveStrategy, but `status-code` monitors never
+      // need the body at all — the status transition IS the watched object.
+      // A >10MiB endpoint that used to observe 200 → 503 fine regressed to
+      // erroring on every tick once the cap was added.
+      it('status-code strategy is exempt from the byte cap — observes a status transition on an over-cap endpoint without erroring', async () => {
+        const overCapBytes = 50 * 1024 * 1024;
+        let bodyReadAttempted = false;
+
+        function mockOversizeStatusEndpoint(
+          status: number,
+        ): ReturnType<typeof vi.fn> {
+          return vi.fn(() =>
+            Promise.resolve({
+              status,
+              headers: {
+                get: (name: string) =>
+                  name.toLowerCase() === 'content-length'
+                    ? String(overCapBytes)
+                    : null,
+              },
+              body: {
+                cancel: () => Promise.resolve(),
+                getReader: () => {
+                  bodyReadAttempted = true;
+                  throw new Error('status-code must never read the body');
+                },
+              },
+              text: () => {
+                bodyReadAttempted = true;
+                return Promise.reject(
+                  new Error('status-code must never read the body'),
+                );
+              },
+            }),
+          );
+        }
+
+        const config = {
+          url: 'https://api.example.com/huge-artifact',
+          'change-detection': { strategy: 'status-code' },
+        };
+
+        vi.stubGlobal('fetch', mockOversizeStatusEndpoint(200));
+        const baseline = await source.observe(config, { now: new Date() });
+        expect(baseline.observations).toHaveLength(0);
+
+        vi.stubGlobal('fetch', mockOversizeStatusEndpoint(503));
+        const changed = await source.observe(config, {
+          previousState: baseline.nextState,
+          now: new Date(),
+        });
+        expect(changed.observations).toHaveLength(1);
+        expect(bodyReadAttempted).toBe(false);
       });
 
       it('caps a chunked body with no Content-Length via streamed counting', async () => {
@@ -1563,7 +1698,13 @@ When the document changes, act on it.
           },
         };
 
-        await source.observe(config, { now: new Date() });
+        const observePromise = source.observe(config, { now: new Date() });
+        // Several sequential 20ms batches (12 parts, 5 at a time) — run every
+        // pending fake timer to completion rather than a single fixed
+        // advance, since each batch's `setTimeout` is only scheduled once the
+        // previous batch's slot frees up.
+        await vi.runAllTimersAsync();
+        await observePromise;
 
         // Bounded well below "all N parts at once" — proves concurrency is
         // capped, not merely finite.
@@ -1584,9 +1725,12 @@ When the document changes, act on it.
           timeout: '1s',
         };
 
-        await expect(
-          source.observe(config, { now: new Date() }),
-        ).rejects.toThrow(/timed out after 1000ms/);
+        const observePromise = source.observe(config, { now: new Date() });
+        const assertion = expect(observePromise).rejects.toThrow(
+          /timed out after 1000ms/,
+        );
+        await vi.advanceTimersByTimeAsync(1000);
+        await assertion;
       });
     });
   });

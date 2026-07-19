@@ -9,9 +9,10 @@ import type {
   ObservationSource,
 } from '@agentmonitors/core';
 import {
+  OPERATION_TIMEOUT_PATTERN,
   diffKeyedCollection,
-  parseDuration,
   parseKeyedCollectionConfig,
+  parseOperationTimeoutMs,
 } from '@agentmonitors/core';
 
 // Re-exported so API Extractor can resolve the default export's type — and
@@ -33,9 +34,6 @@ export type {
  * is first-class in v1.
  */
 type ChangeStrategy = 'text-diff' | 'json-diff' | 'exit-code';
-
-/** Default wall-clock execution limit when `timeout` is not configured (003 §11.1). */
-const DEFAULT_TIMEOUT_MS = 30_000;
 
 /** Grace period between SIGTERM and SIGKILL on timeout (003 §11.2). */
 const SIGKILL_GRACE_MS = 5_000;
@@ -153,11 +151,7 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
       ? (rawEnv as Record<string, string>)
       : undefined;
 
-  const rawTimeout = config['timeout'];
-  const timeoutMs =
-    typeof rawTimeout === 'string'
-      ? parseDuration(rawTimeout)
-      : DEFAULT_TIMEOUT_MS;
+  const timeoutMs = parseOperationTimeoutMs(config['timeout']);
 
   const key = config['key'];
   const objectKey =
@@ -601,9 +595,9 @@ const scopeSchema: JsonSchema = {
     },
     timeout: {
       type: 'string',
-      pattern: '^\\d+[smhd]$',
+      pattern: OPERATION_TIMEOUT_PATTERN,
       description:
-        'Wall-clock limit (e.g. "30s"). Expiry is an execution failure.',
+        'Wall-clock limit (e.g. "30s"). Expiry is an execution failure. Must be at least 1 unit — a zero-length deadline is rejected.',
     },
     key: {
       type: 'string',

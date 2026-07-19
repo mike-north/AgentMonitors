@@ -1044,11 +1044,11 @@ memory, or amplify the local SQLite database (P1 daemon availability). `api-poll
 bounds, all covered by a documented default with — for the deadline — a validated per-monitor
 override:
 
-| Bound                  | Default                         | Override                                                            |
-| ---------------------- | ------------------------------- | ------------------------------------------------------------------- |
-| Request/body deadline  | `30s`                           | `timeout` (scope field, duration string `^\d+[smhd]$`, e.g. `"1m"`) |
-| Response body size cap | 10 MiB (10 × 1024 × 1024 bytes) | not configurable                                                    |
-| Composite concurrency  | 5 parts in flight at once       | not configurable                                                    |
+| Bound                  | Default                         | Override                                                                           |
+| ---------------------- | ------------------------------- | ---------------------------------------------------------------------------------- |
+| Request/body deadline  | `30s`                           | `timeout` (scope field, duration string `^[1-9]\d*[smhd]$`, e.g. `"1m"`)           |
+| Response body size cap | 10 MiB (10 × 1024 × 1024 bytes) | not configurable; not enforced at all for `change-detection.strategy: status-code` |
+| Composite concurrency  | 5 parts in flight at once       | not configurable                                                                   |
 
 **Request/body deadline.** A single `AbortController`-backed timer, started when the request is
 issued, bounds the ENTIRE exchange — connecting, receiving headers, and streaming the body to
@@ -1059,18 +1059,32 @@ the same deadline. On abort, the source throws:
 > `api-poll request to <url> timed out after <timeoutMs>ms`
 
 exactly like a network-level failure (§4.6): the runtime records an **`errored`** observation, no
-`nextState` advance, and any prior baseline is preserved. `timeout` defaults to `30s` when omitted
-(matching `command-poll`'s default, 003 §11.1) and is parsed with the same `parseDuration` used
-throughout the codebase, so an invalid value throws the same descriptive
-`Invalid duration: "<value>". Expected format: <number><s|m|h|d>` error as every other duration
-field. In composite mode (§2.6), the **same** deadline applies independently to **each** part —
-one slow part errors the whole composite without starving or serializing the others.
+`nextState` advance, and any prior baseline is preserved. Under an HTTP/2 or socket-teardown race,
+undici can reject a mid-body read with a raw `TypeError: terminated` instead of the `AbortError`
+this source's own timer produces; that race is still classified as the same "timed out" error
+(checked via `controller.signal.aborted`, not just the caught error's type), so a caller never sees
+the raw undici error leak through.
+
+`timeout` defaults to `30s` when omitted (matching `command-poll`'s default, 003 §11.1) and is
+resolved by core's shared `parseOperationTimeoutMs` helper (exported next to `parseDuration`, and
+used by both `api-poll` and `command-poll` so the grammar and default cannot drift between the two
+plugins): a present value is parsed with `parseDuration`, so an invalid value throws the same
+descriptive `Invalid duration: "<value>". Expected format: <number><s|m|h|d>` error as every other
+duration field, and a **zero-length** value (`"0s"`, `"0m"`, `"0h"`, `"0d"`) — which would abort
+every request before it could ever complete — is rejected up front with
+`Invalid timeout: "<value>". A zero-length timeout is not allowed; specify at least 1 unit (e.g.
+"1s").`. The JSON Schema `pattern` for `timeout` (`^[1-9]\d*[smhd]$`) requires a non-zero leading
+digit for the same reason, so a "0s"-style value is rejected by validation tooling as well as at
+parse time. In composite mode (§2.6), the **same** deadline applies independently to **each**
+part — a failing part errors the whole composite immediately (see **Composite concurrency**
+below) without starving or serializing the others.
 
 **Response body size cap.** The cap is enforced twice, because `Content-Length` is not
 authoritative:
 
 1. **Early rejection.** If the response declares a `Content-Length` header above the cap, the
-   source throws before reading any body bytes:
+   source aborts the request and releases the (unread) response body back to the connection pool,
+   then throws before reading any body bytes:
 
    > `api-poll response from <url> declares Content-Length <n> bytes, exceeding the 10485760-byte cap`
 
@@ -1088,19 +1102,37 @@ the capped output as a valid, diffable result. The difference matches the failur
 command output is still meaningful once capped, but treating a stalled/incomplete HTTP body as a
 successful baseline would silently corrupt future diffs.
 
+**`status-code` is exempt from the byte cap.** `change-detection.strategy: status-code` never
+inspects the response body — the status transition IS the watched object (§4.2, §4.8) — so
+`api-poll` skips reading the body entirely for it: the response is released back to the connection
+pool via `cancel()` without buffering or counting a single byte. This is strictly cheaper than the
+body-diffing strategies AND means a `status-code` monitor watching a large endpoint (e.g. a big
+static artifact whose availability is being tracked) is never subject to the 10 MiB cap — it can
+still observe a `200 → 503` transition even though the response body, if read, would exceed the
+cap. This exemption applies only when `change-detection.strategy` is written explicitly as
+`status-code`; an omitted strategy is inferred from the response `Content-Type` (§4.2) and can only
+resolve to a body-diffing strategy, so the body is always read in the inferred case.
+
 **Composite concurrency.** Composite mode (§2.6) issues one call per `parts` entry within a single
 `observe()`. Without a bound, a composite with many parts starts every request at once, multiplying
 both the stalled-connection risk and memory pressure this issue exists to bound. `api-poll` runs at
 most 5 part-fetches concurrently; when there are more than 5 parts, each completed fetch's slot is
 immediately taken by the next queued part (a bounded worker pool, not fixed batches of 5). Every
 part still gets the same request/body deadline and byte cap as a single-URL monitor. A failing part
-(non-2xx per §4.8, timeout, or oversize) fails the whole composite observation exactly as before —
-`nextState` never advances and the prior baseline is preserved — the concurrency bound changes only
-how many requests are in flight at once, not the composite's all-or-nothing semantics.
+(non-2xx per §4.8, timeout, or oversize) fails the whole composite observation **immediately** —
+the pool races a dedicated failure promise against the worker pool, so the batch rejects the moment
+the first part fails rather than waiting for other in-flight parts to reach their own deadline —
+and aborts every other in-flight part via a shared `AbortSignal` instead of letting them run to
+completion. Either way `nextState` never advances and the prior baseline is preserved; the
+concurrency bound changes only how many requests are in flight at once and how fast a doomed batch
+surfaces its failure, not the composite's all-or-nothing semantics.
 
-(Verified: `plugins/source-api-poll/src/index.ts`, `DEFAULT_TIMEOUT_MS`, `MAX_RESPONSE_BYTES`,
-`MAX_COMPOSITE_CONCURRENCY`, `readBoundedBody`, `mapWithConcurrency`;
-`plugins/source-api-poll/src/index.test.ts`, "request/body bounds (issue #304)".)
+(Verified: `plugins/source-api-poll/src/index.ts`, `MAX_RESPONSE_BYTES`,
+`MAX_COMPOSITE_CONCURRENCY`, `readBoundedBody`, `fetchBody`; `libs/core/src/notify/notifier.ts`,
+`parseOperationTimeoutMs`, `DEFAULT_OPERATION_TIMEOUT_MS`, `OPERATION_TIMEOUT_PATTERN`;
+`plugins/source-api-poll/src/map-with-concurrency.ts`;
+`plugins/source-api-poll/src/index.test.ts`, "request/body bounds (issue #304)";
+`plugins/source-api-poll/src/map-with-concurrency.test.ts`.)
 
 ## 5. Bundled Source: `schedule`
 
@@ -1334,16 +1366,16 @@ watch:
     strategy: json-diff
 ```
 
-| Field                           | Type             | Required | Default                  | Description                                                                      |
-| ------------------------------- | ---------------- | -------- | ------------------------ | -------------------------------------------------------------------------------- |
-| `command`                       | `string[]`       | Yes      | —                        | Argv array; `command[0]` is the executable (resolved via `PATH`). `minItems: 1`. |
-| `interval`                      | duration string  | No       | runtime default          | Poll cadence hint; owned by the scheduling engine, same as `api-poll`.           |
-| `cwd`                           | `string`         | No       | daemon working directory | Working directory for the child process.                                         |
-| `env`                           | `object<string>` | No       | `{}`                     | Literal env vars merged over the inherited daemon environment.                   |
-| `timeout`                       | duration string  | No       | `30s`                    | Wall-clock limit; expiry is an **execution failure** (§11.5).                    |
-| `key`                           | `string`         | No       | joined argv              | Overrides the observation `objectKey` (§11.4).                                   |
-| `change-detection.strategy`     | enum             | No       | `text-diff`              | `text-diff` \| `json-diff` \| `exit-code` (§11.3).                               |
-| `change-detection.ignore-paths` | `string[]`       | No       | `[]`                     | Plain `json-diff` paths removed before comparison (§11.3).                       |
+| Field                           | Type             | Required | Default                  | Description                                                                                                                                                            |
+| ------------------------------- | ---------------- | -------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `command`                       | `string[]`       | Yes      | —                        | Argv array; `command[0]` is the executable (resolved via `PATH`). `minItems: 1`.                                                                                       |
+| `interval`                      | duration string  | No       | runtime default          | Poll cadence hint; owned by the scheduling engine, same as `api-poll`.                                                                                                 |
+| `cwd`                           | `string`         | No       | daemon working directory | Working directory for the child process.                                                                                                                               |
+| `env`                           | `object<string>` | No       | `{}`                     | Literal env vars merged over the inherited daemon environment.                                                                                                         |
+| `timeout`                       | duration string  | No       | `30s`                    | Wall-clock limit; expiry is an **execution failure** (§11.5). Parsed via core's shared `parseOperationTimeoutMs` (§4.9) — a zero-length value (`"0s"`, …) is rejected. |
+| `key`                           | `string`         | No       | joined argv              | Overrides the observation `objectKey` (§11.4).                                                                                                                         |
+| `change-detection.strategy`     | enum             | No       | `text-diff`              | `text-diff` \| `json-diff` \| `exit-code` (§11.3).                                                                                                                     |
+| `change-detection.ignore-paths` | `string[]`       | No       | `[]`                     | Plain `json-diff` paths removed before comparison (§11.3).                                                                                                             |
 
 **`command` MUST be an argv array; a shell string form MUST NOT be accepted.** The child is spawned
 directly (`execFile` semantics, `shell: false`): there is no word-splitting, globbing, quoting, or
