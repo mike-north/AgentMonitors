@@ -512,15 +512,24 @@ shape:
   the next context event), while
 
   ```text
-  [truncated — this update was too large to show in full; it is claimed but NOT acknowledged, so the full copy stays unread (it will not redeliver automatically) — run `agentmonitors events list --session <id> --socket <path> --unread` to see it]
+  [truncated — this update was too large to show in full; the full copy stays unread — run `agentmonitors events list --session <id> --socket <path> --unread` to see it now]
   ```
 
   is used when THIS claim's own content was cut (a single event's own block exceeds the cap, or a
-  truncated reminder message) — that content is already claimed, so it will **not** redeliver on its
-  own. Both markers may appear together in the same `additionalContext` (issue #442, PR #442
-  round-8 review): when the sole claimed event is itself oversized (the second marker's case) AND
-  further, different high-urgency work also stays genuinely pending beyond it (the first marker's
-  case), both are rendered — they describe two non-overlapping facts and neither implies the other.
+  truncated reminder message). This marker is rendered from the **reservation's own claim, before
+  that reservation is committed** (§5.2, issue #442, PR #442 round-9/10 review) — so it deliberately
+  does **not** assert whether the row ends up durably claimed, or whether it will or will not
+  redeliver: at render time that outcome is genuinely unknown (the commit that follows can still
+  fail or be lost). A prior version of this marker asserted "it is claimed but NOT acknowledged ...
+  it will not redeliver automatically" — true if the commit lands, but **false** if it doesn't (the
+  rows then deliberately stay pending and **will** redeliver via the ordinary context-event flow) —
+  fixed to state only what holds regardless of the commit's outcome: the full copy is not yet
+  acknowledged, so it stays unread and reachable right now via the recovery command (issue #442, PR
+  #442 round-10 review). Both markers may appear together in the same `additionalContext` (issue
+  #442, PR #442 round-8 review): when the sole claimed event is itself oversized (the second
+  marker's case) AND further, different high-urgency work also stays genuinely pending beyond it
+  (the first marker's case), both are rendered — they describe two non-overlapping facts and
+  neither implies the other.
 
   `agentmonitors events list` **requires** `--session <id>` (§5, issue #420 P2) — a bare
   `agentmonitors events list --unread` exits 1 — so each marker renders the exact, directly runnable
@@ -578,12 +587,24 @@ empty stdout is the signal to Claude Code to proceed silently.
    confirmed, `renderHookDelivery` renders the RESERVATION's own claim (never a committed one) into
    `output`; the command writes that `output` to stdout FIRST, and only commits
    (`commitDeliveryClient`) AFTER the write has succeeded — see the at-most-once-loss rationale below.
-   A write failure releases the reservation instead of committing (nothing durably claimed; the rows
-   return to pending). Non-`turn-interruptible` lifecycles, and a reminder claim (`events: []`), carry
-   no per-event sizing risk and are reserved+committed unsized (recap re-validation of
-   `moreDeferred` never applies — see step 8). If reservation returns nothing pending, or the commit
-   itself returns `null` (the reservation's lease expired before commit, or the daemon restarted) →
-   exit 0. In the lease-expired case the output — if any — was ALREADY written by this point, so this
+   The write itself is awaited through `writeStreamChunk`'s completion callback (or the stream's own
+   `'error'` event, whichever fires first) — **never** `stdout.write`'s synchronous return value, which
+   signals backpressure (whether the internal buffer is full), not success: a write can return `true`
+   immediately and still fail asynchronously afterward (e.g. `EPIPE` once Claude Code's hook consumer
+   has already closed its end of the pipe), which would otherwise reopen the same at-most-once loss
+   window this ordering fix closes (issue #442, PR #442 round-10 review). A write failure — synchronous
+   OR the awaited async rejection — releases the reservation instead of committing (nothing durably
+   claimed; the rows return to pending). Non-`turn-interruptible` lifecycles, and a reminder claim
+   (`events: []`), carry no per-event sizing risk and are reserved+committed unsized (recap
+   re-validation of `moreDeferred` never applies — see step 8); a reminder claim's `moreDeferred` is
+   also always reported `false` regardless of what the settled-high sizing preview computed before the
+   preview↔reserve race fell back to it (mirroring the channel transport's identical fix, issue #442,
+   PR #442 round-10 review) — `renderHookDelivery` never reads `moreDeferred` for an eventless claim,
+   but `--debug`'s cap-deferral diagnostic does, and a stale preview-derived value would otherwise
+   report a spurious cap deferral for a claim with no cap-truncated events at all. If reservation
+   returns nothing pending, or the commit itself returns `null` (the reservation's lease expired before
+   commit, or the daemon restarted) → exit 0. In the lease-expired case the output — if any — was
+   ALREADY written by this point, so this
    is a safe, intentional duplicate rather than a loss.
 8. Render (as part of step 7, using the reservation's own claim, BEFORE commit) via
    `renderHookDelivery(claim, hookEventName)`. If null (no event bodies and no reminder message),
@@ -803,18 +824,24 @@ The deferred-remainder truncation marker (§5.1) is appended whenever the render
 event — because a whole block did not fit **or** because the transport deferred more high-urgency
 work — signposting that more updates are pending. The single pathological case where one event's own
 block alone exceeds the cap is shown partially (mid-truncated at a code-point boundary) to guarantee
-forward progress. **This case does NOT re-deliver**, unlike the deferred-remainder case above:
-`commitDelivery` sets `first_notified_at` on the row **synchronously** at commit time, which — per the
-reserve → validate-fit → commit sequence above — happens before this render runs, so
-`pendingEventsForSession()` (which requires that column still `NULL`) never returns it again at a
-later context event. Its full body stays unread (claiming ≠ acking, BP2 / SP4) and is recoverable
-ONLY via the durable unread copy, `agentmonitors events list --session <id> --unread` (issue #442,
-PR #442 round-7 review). **The two markers can co-occur (issue #442, PR #442 round-8 review):** when
-the sole claimed event is itself this pathological oversized case AND further, different high-urgency
-work also stays genuinely pending beyond it (`moreDeferred`), `renderHookDelivery` renders BOTH
-markers together — they describe two non-overlapping facts (this event's own tail vs. a separate,
-still-pending remainder) and neither implies the other, so omitting either one would silently drop a
-real signal.
+forward progress. **This case's own tail does not (ordinarily) re-deliver the way the
+deferred-remainder case does**, but the marker used here (§5.1) deliberately does NOT assert that
+outcome, or the claim's durable state, one way or the other: rendering happens BEFORE the reservation
+is committed (§5.2, issue #442, PR #442 round-9/10 review), so at render time it is genuinely unknown
+whether the commit that follows will succeed. If it does, the row is claimed and this event's own
+omitted tail will not surface again via the ordinary context-event flow; if the commit fails or its
+result is lost instead, the rows deliberately stay **pending** and WILL redeliver normally — the
+opposite outcome. A prior version of this marker asserted the redeliver-will-not-happen outcome
+unconditionally ("it is claimed but NOT acknowledged ... it will not redeliver automatically"), which
+was simply false whenever the commit failed (issue #442, PR #442 round-10 review). The fixed wording
+states only what is true regardless of outcome: the full body is not yet acknowledged, so it stays
+unread and is recoverable right now via `agentmonitors events list --session <id> --unread` (issue
+#442, PR #442 rounds 7 and 10). **The two markers can co-occur (issue #442, PR #442 round-8
+review):** when the sole reserved event is itself this pathological oversized case AND further,
+different high-urgency work also stays genuinely pending beyond it (`moreDeferred`),
+`renderHookDelivery` renders BOTH markers together — they describe two non-overlapping facts (this
+event's own tail vs. a separate, still-pending remainder) and neither implies the other, so omitting
+either one would silently drop a real signal.
 
 The non-high branches need no sizing: `normal`/`low` reminders inject no per-event bodies, and the
 `post-compact` recap re-shows all unread each time, so both self-heal.
@@ -878,26 +905,34 @@ the channel side (issue #442, PR #442 round-7 review), and (since round-8) reser
 the SAME two-phase sequence the channel side does (§5.5 above) rather than a single direct claim.**
 Unlike round-8, the render (and its markers) now runs BEFORE `commitDelivery` marks the rows claimed
 (sets `first_notified_at`) — see §5.2's render-before-commit ordering (issue #442, PR #442 round-9
-review). `renderHookDelivery` receives the RESERVATION's own claim, still uncommitted at that point,
-and its marker language still describes the row's eventual claimed state (single-event mid-truncation
-and a truncated reminder message ARE claimed content by the time the commit — which strictly follows
-a successful write — actually lands). BOTH the single-event mid-truncation branch AND a truncated
-reminder message describe already-(about to be)-claimed content being cut, not other pending work
-being deferred. Only the deferred-remainder branch (a whole block genuinely left OUT of the render,
-still pending — never reserved, so never claimed) legitimately promises a later redelivery.
+review). `renderHookDelivery` receives the RESERVATION's own claim, still uncommitted at that point —
+and, since round-10, its marker language no longer asserts the row's eventual claimed or redelivery
+state at all, since that outcome is genuinely unknown until the commit that follows the write either
+succeeds or fails. BOTH the single-event mid-truncation branch AND a truncated reminder message
+describe THIS claim's own content being cut, not other pending work being deferred — that much is
+known at render time regardless of the pending commit's outcome. Only the deferred-remainder branch
+(a whole block genuinely left OUT of the render, still pending — never reserved at all) legitimately
+promises a later redelivery, since those rows were never part of this reservation to begin with.
 `hook-deliver-render.ts` therefore builds two markers from the SAME two inputs the channel side uses:
 `buildHookDeferredMarker(sessionId, socketPath)` — "more monitor updates are pending", used only for
 the genuinely-deferred-remainder branch — and `buildHookClaimedUnreadMarker(sessionId, socketPath)` —
-the claimed-unread framing, used for the single-event mid-truncation branch and for a truncated
-reminder message. Before this split, both branches shared one marker whose "more monitor updates are
-pending" framing falsely implied the mid-truncated event's own omitted tail would also redeliver.
+used for the single-event mid-truncation branch and for a truncated reminder message, reading "this
+update was too large to show in full; the full copy stays unread — run `agentmonitors events list
+--session <id> --socket <path> --unread` to see it now". This wording states only what holds
+regardless of whether the pending commit lands: the full copy is not yet acknowledged, so it stays
+unread and reachable right now via the recovery command. A prior version of this marker asserted "it
+is claimed but NOT acknowledged ... it will not redeliver automatically" — true only if the commit
+succeeds; false if it fails or its result is lost, since the rows then deliberately stay pending and
+DO redeliver via the ordinary context-event flow (issue #442, PR #442 round-10 review). Before the
+round-7 split, both branches shared one marker whose "more monitor updates are pending" framing
+falsely implied the mid-truncated event's own omitted tail would also redeliver.
 
 **The two markers are NOT mutually exclusive (issue #442, PR #442 round-8 review).** When the sole
-claimed event is itself the pathological mid-truncation case AND further, different high-urgency work
+reserved event is itself the pathological mid-truncation case AND further, different high-urgency work
 also stays genuinely pending beyond it (`moreDeferred`), `renderHookDelivery` renders BOTH markers in
-the same `additionalContext` — the claimed-unread marker's "will not redeliver" framing describes only
-THIS event's own omitted tail, and does not (and must not) speak for the separate, genuinely-pending
-remainder, which the deferred marker signposts correctly.
+the same `additionalContext` — the claimed-unread marker's outcome-agnostic "the full copy stays
+unread" framing describes only THIS event's own omitted tail, and does not (and must not) speak for
+the separate, genuinely-pending remainder, which the deferred marker signposts correctly.
 
 **Marker selection is lifecycle-aware: a `post-compact` recap needs its own, THIRD framing, distinct
 from both markers above (issue #442, PR #442 round-9 review).** `decideDelivery`'s `post-compact`
@@ -905,19 +940,24 @@ branch (`service.ts`) reads `unreadEventsForSession` — NOT `pendingEventsForSe
 `applyDelivery` claims the FULL candidate set (every unread event, not just the rendered
 `recapSlice`) at commit time regardless of what actually renders. Because recap re-sources from
 UNREAD state, a row being claimed (`first_notified_at` set) never hides it from a FUTURE recap; only
-acknowledging does. That makes BOTH ordinary markers untruthful for a recap:
-`buildHookDeferredMarker`'s "more monitor updates are pending ... run `events list --unread` to see
-the rest" wrongly implies the omitted whole blocks are not yet claimed (they are — the recap's full
-candidate set is claimed at commit regardless of rendering); `buildHookClaimedUnreadMarker`'s "it will
-not redeliver automatically" is actively FALSE for a recap — the omitted/cut content WILL reappear,
-automatically, on the NEXT `post-compact` recap (and any after that) until acknowledged, which is the
-intentional self-heal behavior this section already documents. `renderHookDelivery` therefore checks
-`claim.lifecycle === 'post-compact'` and, when true, uses a single unified `buildHookRecapMarker` in
-place of BOTH ordinary markers (for the whole-blocks-omitted branch AND the single-event
-mid-truncation branch alike — for a recap both are the SAME fact: claimed-but-unacknowledged content
-that will keep re-surfacing on future recaps), reading "not everything fit in this recap; the omitted
-content is claimed but NOT acknowledged, so it stays unread and will reappear on future recaps until
-acknowledged — run `agentmonitors events list --session <id> --socket <path> --unread` to see it now".
+acknowledging does — and that self-heal guarantee holds regardless of whether THIS particular recap's
+own commit lands, since a future recap always re-sources from `unreadEventsForSession` again. That
+makes BOTH ordinary markers insufficient for a recap: `buildHookDeferredMarker`'s "more monitor
+updates are pending ... run `events list --unread` to see the rest" wrongly implies the omitted whole
+blocks are not (about to be) claimed along with the rest of the recap's candidate set;
+`buildHookClaimedUnreadMarker`'s outcome-agnostic "the full copy stays unread" is accurate but
+incomplete for a recap — it misses the stronger, POSITIVE guarantee a recap actually offers: the
+omitted/cut content WILL reappear, automatically, on the NEXT `post-compact` recap (and any after
+that) until acknowledged, which is the intentional self-heal behavior this section already documents.
+`renderHookDelivery` therefore checks `claim.lifecycle === 'post-compact'` and, when true, uses a
+single unified `buildHookRecapMarker` in place of BOTH ordinary markers (for the whole-blocks-omitted
+branch AND the single-event mid-truncation branch alike — for a recap both are the SAME fact: content
+that stays unread and will keep re-surfacing on future recaps), reading "not everything fit in this
+recap; the omitted content stays unread and will reappear on future recaps until acknowledged — run
+`agentmonitors events list --session <id> --socket <path> --unread` to see it now". Like the ordinary
+claimed-unread marker, this recap marker is also built from the reservation's own claim before commit
+— so it deliberately asserts only the self-healing future-recap behavior (true regardless of this
+particular commit's outcome), never that this content specifically "is claimed" right now.
 
 No durable event is lost by truncation; the cap only bounds how much is injected into a single turn (or,
 for the channel, into a single push).

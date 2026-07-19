@@ -48,17 +48,31 @@ poll`). The other, rarer case is a single event whose own block still exceeds th
   not a regression: the deferred remainder still re-delivers at the next context event.
 - The hook-deliver transport uses the same **two distinct, session- and socket-scoped markers** as
   the channel side: a genuinely-deferred-remainder marker ("more monitor updates are pending; ...
-  redeliver") and a claimed-unread marker for content that is already claimed but was itself cut (a
-  single oversized event, or a truncated reminder message) and therefore will **not** redeliver on its
-  own. Both can now appear together in the same `additionalContext` when the sole claimed event is
-  itself oversized AND further, different high-urgency work also stays genuinely pending beyond it —
-  previously the claimed-unread marker alone silently suppressed that second, real signal.
+  redeliver") and a claimed-unread marker for THIS claim's own content being cut (a single oversized
+  event, or a truncated reminder message) — not other pending work being deferred. Rendering now
+  happens BEFORE the reservation is committed, so the claimed-unread marker deliberately does not
+  assert a specific claimed/redelivery outcome (it stated "will not redeliver automatically" in an
+  earlier round, which was false whenever the following commit failed); it instead reads "the full
+  copy stays unread", true regardless of whether the commit succeeds. Both markers can now appear
+  together in the same `additionalContext` when the sole reserved event is itself oversized AND
+  further, different high-urgency work also stays genuinely pending beyond it — previously the
+  claimed-unread marker alone silently suppressed that second, real signal.
 - Both transports now validate a `turn-interruptible` claim's fit against the SAME budget the renderer
   uses **before ever durably claiming it**: `hook deliver` reserves (leases, does not claim), re-checks
   the actual reserved claim's fit, and only then commits — closing a race where the sizing preview and
   the eventual claim are separate round-trips and a concurrent caller could substitute different,
   larger pending events into the same requested count, passing the count check but overflowing the
   cap on an already-(and now irreversibly-)claimed row.
+- `hook deliver` renders off the reservation's own (not-yet-committed) claim, writes it to stdout,
+  and only commits AFTER that write **fully** completes — awaited through the write's own completion
+  callback (or a stream `'error'` event, whichever fires first), never `stdout.write`'s synchronous
+  return value, which only signals backpressure. A write can return `true` immediately and still fail
+  asynchronously afterward (e.g. `EPIPE` once the reading end has closed); previously that async
+  failure could arrive after the reservation was already committed, silently losing the delivery. A
+  write failure (synchronous or asynchronous) now releases the reservation instead of committing.
+- A reminder claim raced down from a settled-high sizing preview no longer inherits that preview's
+  stale `moreDeferred: true` — it is always reported `false` for an eventless reminder, mirroring the
+  channel transport's identical handling of the same preview↔reserve race.
 - Both markers' `--socket <path>` clause is now rendered with a shared, transport-safe path escaper
   (bash/zsh ANSI-C quoting, hex-escaping any byte outside a conservative safe set) instead of a plain
   POSIX single-quote: a socket path is interpolated into the recovery command AFTER the surrounding
