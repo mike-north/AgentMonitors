@@ -551,35 +551,88 @@ export async function writeAndCommitHookDelivery(
  * is fully handled — with an `Error` if the write failed, or no argument on
  * success — which is the authoritative completion signal this function
  * resolves/rejects on. It ALSO listens for the stream's own `'error'` event
- * during the write (the failure signal an error emitted between the
- * synchronous call and the callback firing would otherwise be missed by,
- * since a stream's `'error'` event has no required correlation to any one
- * pending `write()` call) — whichever fires first settles the promise, and
- * the listener is always removed afterward so it cannot double-fire or leak
- * across unrelated later writes to the same stream.
+ * (the failure signal an error emitted between the synchronous call and the
+ * callback firing would otherwise be missed by, since a stream's `'error'`
+ * event has no required correlation to any one pending `write()` call).
+ *
+ * **The callback and the event are NOT mutually exclusive on a real
+ * `Writable`** (issue #442, PR #442 round-11 review): when the underlying
+ * write fails, Node invokes the callback with the error AND separately
+ * EMITS the paired `'error'` event on a later tick (`errorOrDestroy` /
+ * `afterWriteTick`). An earlier version of this function removed its only
+ * `'error'` listener as soon as the callback settled the promise, so that
+ * paired emission had no listener left and became an uncaught exception —
+ * three independent real-stream probes (a closed pipe's write, a spawned
+ * child's closed stdin, and an `fs` write stream on a closed fd) reproduced
+ * `callback EPIPE -> promise rejected -> uncaught EPIPE`, which could exit
+ * the hook process nonzero despite its always-exit-0 contract.
+ *
+ * The fix: the `'error'` listener stays armed (via `once`, so it can fire at
+ * most once) whenever the callback settles with an error, specifically so it
+ * can swallow that later paired event instead of leaving it uncaught; the
+ * listener is detached explicitly only on the paths where no paired event
+ * will ever follow — a successful write, or `stream.write()` itself throwing
+ * synchronously (so the callback never fires and the listener would
+ * otherwise never be cleaned up). Either the callback or the event may be
+ * the FIRST signal to arrive; whichever is first settles/rejects the
+ * returned promise exactly once.
  *
  * @see https://nodejs.org/api/stream.html#writablewritechunk-encoding-callback
+ * @see https://nodejs.org/api/stream.html#event-error
  */
 export function writeStreamChunk(
   stream: NodeJS.WritableStream,
   chunk: string,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-    let settled = false;
+    // A plain `boolean` local would get narrowed to the literal `false` by
+    // the time the `catch` block below runs (TS/eslint cannot prove the
+    // write callback — which mutates it — ever runs synchronously before
+    // then), tripping `no-unnecessary-condition` on a guard that IS
+    // necessary once a real stream is involved. Boxing it in an object
+    // sidesteps that false-positive narrowing.
+    const state = { settled: false };
     const onStreamError = (error: Error): void => {
-      if (settled) return;
-      settled = true;
-      stream.removeListener('error', onStreamError);
+      if (state.settled) {
+        // The write callback already settled this promise with the SAME
+        // error; this is the paired 'error' event a real Writable emits on
+        // a later tick. `once` has already unregistered this handler —
+        // swallow it here so it can never become an uncaught exception.
+        return;
+      }
+      state.settled = true;
       reject(error);
     };
     stream.once('error', onStreamError);
-    stream.write(chunk, (writeError?: Error | null) => {
-      if (settled) return;
-      settled = true;
-      stream.removeListener('error', onStreamError);
-      if (writeError) reject(writeError);
-      else resolve();
-    });
+    try {
+      stream.write(chunk, (writeError?: Error | null) => {
+        if (writeError) {
+          if (!state.settled) {
+            state.settled = true;
+            reject(writeError);
+          }
+          // Deliberately leave `onStreamError` attached: it must stay armed
+          // to swallow the paired 'error' event this same failure emits on
+          // a later tick (see doc comment above).
+          return;
+        }
+        if (state.settled) return;
+        state.settled = true;
+        // No error was reported, so no paired 'error' event will follow —
+        // detach now rather than leaking the listener onto later writes.
+        stream.removeListener('error', onStreamError);
+        resolve();
+      });
+    } catch (syncError) {
+      // stream.write() threw synchronously: the callback will never fire,
+      // so no paired event is coming either — detach to avoid leaking the
+      // listener forever.
+      if (!state.settled) {
+        state.settled = true;
+        stream.removeListener('error', onStreamError);
+        reject(syncError as Error);
+      }
+    }
   });
 }
 
