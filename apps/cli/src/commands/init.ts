@@ -73,21 +73,95 @@ const COMMAND_POLL_DEFAULT_COMMAND_BLOCK =
  * `$$` is the `sh` process's own PID — not `-$$`, which would signal the whole
  * process group and reach siblings this monitor does not own.
  *
- * Note the absence of `--repo`: `gh` resolves the repository from its working
- * directory, and `command-poll`'s effective `cwd` defaults to the runtime
- * workspace/config root (003 §11.1). Omitting the flag is what makes these
- * presets scope themselves to whatever repository the session is operating in;
- * interpolating an owner/name at scaffold time would hardcode it right back.
+ * `env -u GITHUB_TOKEN` unsets an inherited `GITHUB_TOKEN` before invoking
+ * `gh`. `gh` gives an inherited `GITHUB_TOKEN` unconditional precedence over
+ * keyring/`gh auth login` credentials, so a daemon process that happens to
+ * have one exported (a common shell-startup leftover) would make `@me` — and
+ * therefore both presets — silently resolve against the wrong identity, with
+ * no error to surface it. Scrubbing it here is the same fix this repo's own
+ * tooling applies to every non-interactive `gh` invocation.
+ *
+ * Only the failure branch's `2>"$errfile"` sees `gh`'s stderr: the success
+ * path's `out=$(...)` captures stdout alone, so a one-time `gh` warning or
+ * `GH_DEBUG` chatter on an otherwise-successful run can never leak into the
+ * diffed JSON (which would otherwise degrade `json-diff` to a raw-text
+ * comparison of the polluted string). `$errfile` is scoped per-invocation by
+ * `$$` (this `sh` process's own PID) and removed on both branches, so
+ * concurrent ticks never collide or leak a stale file.
+ *
+ * Note the absence of `--repo`: `gh` resolves the repository from its
+ * process working directory. That working directory is the **daemon's own**
+ * cwd (§11.1) — never a "workspace/config root" the daemon might not even be
+ * running from — so the scaffolded frontmatter carries an explicit `cwd:`
+ * (see {@link seedPresetCwd}) pointing at the project root `init` was run
+ * from, rather than relying on wherever the daemon happens to be launched.
+ * Omitting `--repo` is what then lets that one `cwd` scope `gh` to the right
+ * repository; interpolating an owner/name at scaffold time would hardcode it
+ * right back.
  */
 function ghPresetScript(preset: string, query: string): string {
-  return `out=$(${query} 2>&1) || {
-  printf '%s\\n' "$out" >&2
+  return `errfile="\${TMPDIR:-/tmp}/agentmonitors-${preset}-$$.stderr"
+if out=$(env -u GITHUB_TOKEN ${query} 2>"$errfile"); then
+  rm -f "$errfile"
+  printf '%s\\n' "$out"
+else
+  cat "$errfile" >&2
+  rm -f "$errfile"
   printf 'agentmonitors %s: the GitHub CLI query failed, so PR alerting is NOT running.\\nFix one of these, then re-run: agentmonitors monitor test <this file>\\n  1. Install the GitHub CLI: https://cli.github.com\\n  2. Authenticate it: gh auth login\\n  3. Run the daemon from inside a git repo that has a GitHub remote.\\n' '${preset}' >&2
   kill -TERM $$
   exit 1
+fi`;
 }
-printf '%s\\n' "$out"`;
-}
+
+/**
+ * `pr-review`'s urgency-rationale comment, above `urgency: normal` in the
+ * template. Extracted to a constant (rather than inlined) so
+ * {@link seedUrgency} can swap it out for {@link GENERALIZED_URGENCY_COMMENT}
+ * when `--urgency` overrides the seeded value — otherwise a seeded
+ * `--urgency high` would ship directly under a comment explaining why it is
+ * `normal, not high` (mirrors {@link COMMAND_POLL_EXAMPLE_COMMENT}'s
+ * issue-#388 swap pattern).
+ */
+const PR_REVIEW_URGENCY_COMMENT =
+  '# normal, not high: an unreviewed PR is real work, but it is not a regression —\n' +
+  '# nothing is broken while it waits, and reviewing is a task best picked up at a\n' +
+  '# turn boundary rather than mid-edit (002 §9).\n';
+
+/**
+ * `my-prs`'s urgency-rationale comment; see {@link PR_REVIEW_URGENCY_COMMENT}.
+ * `normal` here is a deliberate reversal of the intuitive call (field-tested
+ * live, not merely reasoned about): `json-diff` is symmetric, so a PR
+ * *leaving* an actionable state diffs exactly as much as one *entering* it —
+ * CI recovering, a merge, and a new PR of one's own all fire identically to
+ * the transitions that would justify `high`, and no payload shaping rescues
+ * that (003 §11.9).
+ */
+const MY_PRS_URGENCY_COMMENT =
+  '# normal, not high — and the reason is not obvious. json-diff is symmetric: a PR\n' +
+  '# LEAVING an actionable state diffs exactly as much as one entering it. So CI\n' +
+  '# recovering red -> green, a PR merging, and a new PR of your own appearing all\n' +
+  '# fire too, and no amount of payload shaping changes that (filtering the payload\n' +
+  '# down to only actionable PRs just moves the benign fire from "field changed" to\n' +
+  '# "entry removed"). Since not every fire can be made actionable, high would\n' +
+  '# interrupt mid-turn on good news — the interrupt-storm anti-pattern (#441).\n' +
+  '# normal surfaces the same information at a turn boundary instead (002 §9).\n';
+
+/**
+ * Generalized replacement for {@link PR_REVIEW_URGENCY_COMMENT} /
+ * {@link MY_PRS_URGENCY_COMMENT} once a `--urgency` seed has overwritten the
+ * preset's own default: neither preset-specific rationale describes the
+ * seeded value, so only the general contract pointer applies.
+ */
+const GENERALIZED_URGENCY_COMMENT =
+  '# urgency overridden via --urgency; see 002 §9 for how each level is delivered.\n';
+
+/** Maps a preset `--type` to its urgency-rationale comment, for
+ * {@link seedUrgency}'s comment-swap. Types with no such comment (every
+ * non-preset template) are absent, so the swap is a no-op for them. */
+const PRESET_URGENCY_COMMENTS: Partial<Record<string, string>> = {
+  'pr-review': PR_REVIEW_URGENCY_COMMENT,
+  'my-prs': MY_PRS_URGENCY_COMMENT,
+};
 
 /** Indent a multi-line shell script to sit under a YAML `- |` block scalar. */
 function yamlBlockScalar(script: string, indent: string): string {
@@ -98,17 +172,23 @@ function yamlBlockScalar(script: string, indent: string): string {
 }
 
 /**
- * `--type pr-review`'s `gh` query: open, non-draft PRs in the current repo.
- * `changeset-release/*` heads are excluded — the release/Version PR is never
- * agent-reviewable. Fields are chosen so `json-diff` fires on exactly the
- * reviewer-relevant transitions and nothing else: a PR entering the set (newly
- * opened, or a draft marked ready — drafts are filtered out, so "marked ready"
- * *is* an appearance), leaving it (merged/closed/converted back to draft), or
+ * `--type pr-review`'s `gh` query: open, non-draft PRs in the current repo,
+ * excluding the current `gh` user's own PRs (`--search '-author:@me'` —
+ * GitHub search-qualifier negation; `gh pr list` has no `--author`-exclusion
+ * flag, only single-value inclusion). Without this, a PR the reviewer opens
+ * themselves would appear in their own review queue: `my-prs` already covers
+ * it, and "review your own PR" is not an action the body's "act as the
+ * reviewer, do not self-merge" framing makes sense for. `changeset-release/*`
+ * heads are excluded — the release/Version PR is never agent-reviewable.
+ * Fields are chosen so `json-diff` fires on exactly the reviewer-relevant
+ * transitions and nothing else: a PR entering the set (newly opened, or a
+ * draft marked ready — drafts are filtered out, so "marked ready" *is* an
+ * appearance), leaving it (merged/closed/converted back to draft), or
  * flipping `reviewDecision`. `updatedAt` is deliberately absent: including it
  * would fire on every push and comment.
  */
 const PR_REVIEW_QUERY =
-  'gh pr list --state open --limit 30 ' +
+  "gh pr list --state open --limit 30 --search '-author:@me' " +
   '--json number,title,isDraft,reviewDecision,headRefName,author ' +
   '--jq \'[.[] | select(.isDraft == false and (.headRefName | startswith("changeset-release/") | not)) ' +
   '| {number, title, headRefName, reviewDecision, author: .author.login}] ' +
@@ -116,13 +196,21 @@ const PR_REVIEW_QUERY =
 
 /**
  * `--type my-prs`'s `gh` query: the current `gh` user's recent PRs in the
- * current repo (`--author @me` — never a baked-in username). `--state all`
- * rather than `--state open` is load-bearing: a merged PR must stay in the
- * result set for `state` to be observably `MERGED` rather than merely absent,
- * which is what lets the body distinguish "merged, go clean up" from "closed
- * unmerged, go find out why".
+ * current repo (`--author @me` — never a baked-in username). `--state open`
+ * with a generously raised `--limit 30` — rather than `--state all --limit
+ * 10` — is what keeps every still-open PR in the result set: `--limit`
+ * always applies to a **newest-created-first** list, so a small `--state
+ * all` window lets an older still-open PR silently age out the moment enough
+ * newer PRs (including merged/closed ones, which `--state all` also counts
+ * against the cap) exist — and once evicted, its CI going red produces no
+ * event. `--state open` removes merged/closed PRs from the cap entirely, so
+ * only actually-open work competes for the 30 slots; a PR leaving the open
+ * set (merged or closed) then surfaces as a **removal** from the diffed
+ * list, the same "dropped off the list" signal `pr-review` already uses —
+ * see the monitor body for how to tell which happened.
  *
- * The `--jq` reduction is what makes all three trigger classes diff cleanly:
+ * The `--jq` reduction is what makes the remaining trigger classes diff
+ * cleanly:
  *
  * - **CI** — `failingChecks` is the sorted list of *failing* check names.
  *   Reducing `statusCheckRollup` to only failures (rather than diffing it
@@ -139,11 +227,14 @@ const PR_REVIEW_QUERY =
  *   verdict, or a new comment all diff. (`gh pr list` exposes no review-thread
  *   data, so inline thread replies are not visible here; see the follow-up
  *   note in the monitor body.)
- * - **State** — `state` (OPEN/MERGED/CLOSED) and `isDraft`, so merged, closed,
- *   and both directions of draft↔ready each produce a diff.
+ * - **Draft state** — `isDraft`, so both directions of draft↔ready produce a
+ *   diff. `state` is also carried through for symmetry with `pr-review`'s
+ *   shape, but with `--state open` it can only ever read `OPEN` in practice —
+ *   a merge or close is observed as the entry disappearing, never as this
+ *   field changing.
  */
 const MY_PRS_QUERY =
-  'gh pr list --author @me --state all --limit 20 ' +
+  'gh pr list --author @me --state open --limit 30 ' +
   '--json number,title,url,state,isDraft,reviewDecision,statusCheckRollup,latestReviews,comments ' +
   "--jq '[.[] | {number, title, url, state, isDraft, reviewDecision, " +
   'failingChecks: ([.statusCheckRollup[]? | select(((.conclusion // .state // "") | ascii_upcase) as $c ' +
@@ -219,8 +310,11 @@ affect this workspace.
 name: PRs awaiting my review
 watch:
   type: command-poll
-  # Scoped to whatever repo the daemon runs in: there is no --repo flag, so gh
-  # resolves the repository from the working directory. Do not add one.
+  # Scoped to THIS repository via the explicit cwd below (init fills it in
+  # with this project's root): gh resolves the repository from its process
+  # working directory, which is the daemon's own cwd, NOT this file's
+  # location — omitting cwd would make gh resolve whatever repo the daemon
+  # happens to be launched from instead. Do not remove cwd: or add --repo.
   key: pr-review
   command:
     - sh
@@ -230,10 +324,7 @@ ${yamlBlockScalar(ghPresetScript('pr-review', PR_REVIEW_QUERY), '      ')}
   interval: 5m
   change-detection:
     strategy: json-diff
-# normal, not high: an unreviewed PR is real work, but it is not a regression —
-# nothing is broken while it waits, and reviewing is a task best picked up at a
-# turn boundary rather than mid-edit (002 §9).
-urgency: normal
+${PR_REVIEW_URGENCY_COMMENT}urgency: normal
 ---
 
 The set of pull requests awaiting review in this repository changed. Act as the
@@ -250,8 +341,8 @@ reviewer.
 - **A PR dropped off the list** — it was merged, closed, or converted back to
   draft. No action needed beyond noting it.
 
-Release PRs (\`changeset-release/*\` heads) are filtered out; they are not
-agent-reviewable.
+Release PRs (\`changeset-release/*\` heads) are filtered out, and so are your
+own PRs — those are what \`my-prs\` is for.
 
 If instead you see a "Command failing" event, \`gh\` could not run — read the
 error and fix the CLI install, auth, or working directory before trusting this
@@ -263,8 +354,10 @@ monitor again.
 name: My pull requests
 watch:
   type: command-poll
-  # Scoped to whatever repo the daemon runs in (no --repo flag) and to whoever
-  # gh is authenticated as (--author @me, never a baked-in username).
+  # Scoped to THIS repository via the explicit cwd below (init fills it in
+  # with this project's root, not --repo — see the pr-review template's
+  # comment for why) and to whoever gh is authenticated as (--author @me,
+  # never a baked-in username).
   key: my-prs
   command:
     - sh
@@ -274,15 +367,7 @@ ${yamlBlockScalar(ghPresetScript('my-prs', MY_PRS_QUERY), '      ')}
   interval: 5m
   change-detection:
     strategy: json-diff
-# normal, not high — and the reason is not obvious. json-diff is symmetric: a PR
-# LEAVING an actionable state diffs exactly as much as one entering it. So CI
-# recovering red -> green, a PR merging, and a new PR of your own appearing all
-# fire too, and no amount of payload shaping changes that (filtering the payload
-# down to only actionable PRs just moves the benign fire from "field changed" to
-# "entry removed"). Since not every fire can be made actionable, high would
-# interrupt mid-turn on good news — the interrupt-storm anti-pattern (#441).
-# normal surfaces the same information at a turn boundary instead (002 §9).
-urgency: normal
+${MY_PRS_URGENCY_COMMENT}urgency: normal
 ---
 
 Something changed on one of your own pull requests in this repository. Compare
@@ -300,11 +385,11 @@ the entries by \`number\` and act on what moved.
   make sure CI is green and the description is accurate.
 - **\`isDraft\` went \`false\` → \`true\`** — it was pulled back to draft, usually
   because something was found. Find out what before pushing more.
-- **\`state\` became \`MERGED\`** — it landed. Delete the branch and its
-  worktree, close the issue it referenced if its acceptance criteria are met,
-  and move on.
-- **\`state\` became \`CLOSED\`** — it was closed without merging. Find out why
-  before reopening or re-doing the work.
+- **A PR dropped off the list** — this only watches your still-open PRs, so a
+  disappearance means it merged or was closed — check the PR on GitHub to tell
+  which. If merged: delete the branch and its worktree, and close the issue it
+  referenced if its acceptance criteria are met. If closed unmerged: find out
+  why before reopening or re-doing the work.
 
 Two things that look like transitions but are not:
 
@@ -355,6 +440,21 @@ const VALID_TYPES = Object.keys(TEMPLATES);
 const DEFAULT_TYPE = 'file-fingerprint';
 const DEFAULT_MONITOR_NAME = 'my-monitor';
 const VALID_URGENCIES = ['low', 'normal', 'high'];
+
+/**
+ * `--type` values that are ready-made presets rather than observation source
+ * types (005 §2: "pr-review and my-prs are not source types"). Used to (a)
+ * keep {@link VALID_TYPES} — which Commander's `.choices()` still needs as one
+ * flat list — split apart wherever the CLI presents types to a human, so the
+ * interactive prompt and its error don't imply a preset is a kind of source,
+ * and (b) drive {@link seedPresetCwd}, since only these two templates ship a
+ * `key:` line for it to anchor on.
+ */
+const PRESET_TYPES = new Set(['pr-review', 'my-prs']);
+
+/** {@link VALID_TYPES} minus {@link PRESET_TYPES} — the actual observation
+ * source types, for prompt/error text that must not conflate the two. */
+const SOURCE_TYPES = VALID_TYPES.filter((type) => !PRESET_TYPES.has(type));
 
 /**
  * Types whose template has a seedable path-pattern list: `globs:` for
@@ -433,9 +533,30 @@ function deriveNameFromPositional(positional: string): string | undefined {
 
 /** Replace the template's `urgency:` frontmatter line with the seeded value.
  * `urgency` is Commander-`.choices()`-constrained to {@link VALID_URGENCIES},
- * so it's always a bare, unquoted YAML scalar. */
-function seedUrgency(template: string, urgency: string): string {
-  return template.replace(/^urgency: .*$/m, `urgency: ${urgency}`);
+ * so it's always a bare, unquoted YAML scalar.
+ *
+ * For the two presets, `urgency:` sits directly under a rationale comment
+ * that explains that *specific* value (issue #444 review). A bare value swap
+ * would leave that comment attached to a now-wrong value — e.g. `--urgency
+ * high` on `pr-review` would ship directly under "normal, not high: ...".
+ * When the seeded value differs from the template's own default, the
+ * preset-specific comment is swapped for {@link GENERALIZED_URGENCY_COMMENT}
+ * first, the same #388 pattern {@link seedCommand} already applies to
+ * `command-poll`'s illustrative-comment.
+ */
+function seedUrgency(template: string, type: string, urgency: string): string {
+  const rationaleComment = PRESET_URGENCY_COMMENTS[type];
+  const alreadyMatches = new RegExp(`^urgency: ${urgency}$`, 'm').test(
+    template,
+  );
+  const withGeneralizedComment =
+    rationaleComment !== undefined && !alreadyMatches
+      ? template.replace(rationaleComment, GENERALIZED_URGENCY_COMMENT)
+      : template;
+  return withGeneralizedComment.replace(
+    /^urgency: .*$/m,
+    `urgency: ${urgency}`,
+  );
 }
 
 /**
@@ -548,7 +669,9 @@ function applySeeds(
 ): string {
   let result = template;
   if (seeds.name !== undefined) result = seedName(result, seeds.name);
-  if (seeds.urgency !== undefined) result = seedUrgency(result, seeds.urgency);
+  if (seeds.urgency !== undefined) {
+    result = seedUrgency(result, type, seeds.urgency);
+  }
   if (seeds.globs !== undefined && seeds.globs.length > 0) {
     result = seedGlobs(result, type, seeds.globs);
   }
@@ -617,6 +740,30 @@ interface ScaffoldResult {
 }
 
 /**
+ * Seed an explicit `cwd:` into a PR-alerting preset's (`pr-review`/`my-prs`)
+ * frontmatter, right after its `key:` line, pointing `gh`'s child process at
+ * `cwd` — the project root `init` was run from.
+ *
+ * Without this, `command-poll`'s effective `cwd` is the **daemon's own**
+ * process working directory (§11.1) — never this project's root — so a
+ * daemon later launched from `$HOME`, another repo, or any directory other
+ * than this one would make `gh` silently resolve a different repository's
+ * PRs; `gh` exits 0 either way, so nothing would surface the mistake (issue
+ * #444 review, finding 1). `init` knows the real project root at scaffold
+ * time (the same `process.cwd()` {@link ensureEnabled}/{@link ensureGitignore}
+ * already trust), so recording it as an absolute `cwd:` makes the scaffolded
+ * file correct regardless of where the daemon is later launched from.
+ */
+function seedPresetCwd(template: string, cwd: string): string {
+  const pattern = /^( *)key: (?:pr-review|my-prs)$/m;
+  return template.replace(
+    pattern,
+    (match, indent: string) =>
+      `${match}\n${indent}cwd: ${yamlSingleQuoted(cwd)}`,
+  );
+}
+
+/**
  * Write a template `MONITOR.md` for `type` into `<dir>/<name>/`. Shared by the
  * named `init <name>` scaffold path and the bare-init bootstrap so both produce
  * byte-identical monitor files. Never overwrites an existing monitor: returns
@@ -629,6 +776,10 @@ interface ScaffoldResult {
  * unaffected. Seeding is applied — and can throw {@link InitSeedError} — before
  * any filesystem write, so a rejected seed (e.g. `--glob` on a type with no
  * path-pattern list) never leaves a partial directory behind.
+ *
+ * {@link seedPresetCwd} runs unconditionally for the two presets (never
+ * user-seeded, never skippable) — both scaffold paths need it, not just the
+ * named one, since the bootstrap path can equally scaffold `--type pr-review`.
  */
 function scaffoldMonitor(
   dir: string,
@@ -644,7 +795,10 @@ function scaffoldMonitor(
   if (existsSync(path.join(monitorDir, 'MONITOR.md'))) {
     return { status: 'exists', monitorDir };
   }
-  const content = applySeeds(template, type, seeds);
+  let content = applySeeds(template, type, seeds);
+  if (PRESET_TYPES.has(type)) {
+    content = seedPresetCwd(content, process.cwd());
+  }
   mkdirSync(monitorDir, { recursive: true });
   writeFileSync(path.join(monitorDir, 'MONITOR.md'), content, 'utf-8');
   return { status: 'created', monitorDir };
@@ -739,9 +893,13 @@ async function promptForMonitor(): Promise<{
 
     let type = DEFAULT_TYPE;
     for (;;) {
+      // Presets (pr-review, my-prs) are listed separately from source types
+      // — 005 §2 is explicit that a preset is not a kind of source, and
+      // conflating them here would make a future source-type-wide behavior
+      // wrongly sweep presets in.
       const answer = (
         await rl.question(
-          `Source type (${VALID_TYPES.join(', ')}) [${DEFAULT_TYPE}]: `,
+          `Source type (${SOURCE_TYPES.join(', ')}) or preset (${[...PRESET_TYPES].join(', ')}) [${DEFAULT_TYPE}]: `,
         )
       ).trim();
       if (answer === '') break;
@@ -750,7 +908,7 @@ async function promptForMonitor(): Promise<{
         break;
       }
       console.log(
-        `Unknown source type "${answer}". Try one of the listed types.`,
+        `Unknown source type or preset "${answer}". Try one of the listed types or presets.`,
       );
     }
 
@@ -991,7 +1149,20 @@ export const initCommand = new Command('init')
         // with no word to capitalize (empty or separators-only, e.g. `---`),
         // so `name` is omitted from the seed in that case and the template's
         // own default name: line survives untouched.
-        const derivedName = options.name ?? deriveNameFromPositional(name);
+        //
+        // Presets are the other case that must keep the template's own
+        // `name:`: their curated names (e.g. "PRs awaiting my review") ARE
+        // the product value, unlike the throwaway placeholder #375's
+        // derivation replaces. Deriving from the positional would silently
+        // clobber it — `init pr-review --type pr-review` would otherwise
+        // rename it to "Pr review" (issue #444 review, finding 6) — so the
+        // derived-name seed is skipped for preset types; `--name` still
+        // overrides explicitly.
+        const derivedName =
+          options.name ??
+          (PRESET_TYPES.has(options.type)
+            ? undefined
+            : deriveNameFromPositional(name));
         const seeds: SeedOptions = {
           ...(derivedName !== undefined ? { name: derivedName } : {}),
           ...(options.urgency !== undefined

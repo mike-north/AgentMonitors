@@ -13,31 +13,52 @@
  * @see https://docs.github.com/en/graphql/reference/enums#statusstate — check conclusions
  */
 import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { parseMonitor } from '@agentmonitors/core';
 import commandPoll from '@agentmonitors/source-command-poll';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { TEMPLATES } from './init.js';
 
 /** Where the scaffolded template's `watch:` block lands after parsing. */
 type Scope = Record<string, unknown>;
 
 /**
+ * Every directory this file's `mkdtempSync` calls create, so a single
+ * `afterAll` can remove them all — nothing here is a fixture a later test
+ * depends on finding on disk.
+ */
+const createdTempDirs: string[] = [];
+
+afterAll(() => {
+  for (const dir of createdTempDirs) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
  * Parse a preset template exactly as `init` scaffolds it and hand back the
  * `watch:` config with `type` stripped — the shape the source receives.
  * Failing here means the shipped template no longer parses, which is the same
  * failure `agentmonitors validate` would report.
+ *
+ * `parseMonitor(content, filePath)` never reads `filePath` from disk — it
+ * only derives the monitor id from its parent directory name (see
+ * `libs/core/src/parser/parse-monitor.ts`) — so this passes a synthetic,
+ * never-created path rather than actually `mkdtempSync`/`writeFileSync`ing a
+ * MONITOR.md nothing reads.
  */
 function presetScope(type: 'pr-review' | 'my-prs'): Scope {
   const template = TEMPLATES[type];
   if (template === undefined) throw new Error(`no template for ${type}`);
-  const file = path.join(
-    mkdtempSync(path.join(tmpdir(), 'am444-parse-')),
-    'MONITOR.md',
-  );
-  writeFileSync(file, template, 'utf-8');
+  const file = path.join(tmpdir(), `am444-parse-${type}`, 'MONITOR.md');
   const parsed = parseMonitor(template, file);
   if (!parsed.ok) {
     throw new Error(
@@ -51,7 +72,9 @@ function presetScope(type: 'pr-review' | 'my-prs'): Scope {
 }
 
 function tempDir(prefix: string): string {
-  return mkdtempSync(path.join(tmpdir(), `am444-${prefix}-`));
+  const dir = mkdtempSync(path.join(tmpdir(), `am444-${prefix}-`));
+  createdTempDirs.push(dir);
+  return dir;
 }
 
 function writeExecutable(file: string, contents: string): void {
@@ -367,8 +390,9 @@ describe('`--type pr-review` reviewer queue (issue #444)', () => {
 
 /**
  * The shipped `--jq` reduction, run for real. `jq` is preinstalled on the
- * `ubuntu-latest` runner every CI job uses, so this coverage is never skipped
- * in CI; the guard only spares a contributor whose machine lacks `jq`.
+ * `ubuntu-latest` runner every CI job uses, so this coverage is never
+ * supposed to be skipped in CI — the guard below only spares a contributor
+ * whose local machine lacks `jq`.
  */
 const hasJq = (() => {
   try {
@@ -379,7 +403,30 @@ const hasJq = (() => {
   }
 })();
 
-describe.skipIf(!hasJq)('the presets’ jq reduction over raw gh output', () => {
+// `describe.skipIf(!hasJq)` would silently report this entire suite as
+// SKIPPED rather than FAILED if a CI runner ever lost its `jq` install —
+// the one environment where that must be loud. Instead the suite always
+// registers; when `jq` is missing, it registers a single test that only
+// throws when `process.env.CI` is set (so a jq-less local machine still
+// gets a quiet, explicit pass rather than a spurious failure) and returns
+// before registering the real jq-dependent tests, which would otherwise
+// fail with a much less legible "jq: command not found" per test.
+describe('the presets’ jq reduction over raw gh output', () => {
+  if (!hasJq) {
+    it('requires jq to be installed', () => {
+      if (process.env.CI) {
+        throw new Error(
+          'jq was not found on PATH. This suite must run for real in CI ' +
+            '(the ubuntu-latest runner ships jq) — check the runner image ' +
+            'or install step rather than silently skipping this coverage.',
+        );
+      }
+      // Not CI: no jq on a contributor's machine is expected; this test
+      // passing (without exercising real jq) is the intended no-op.
+    });
+    return;
+  }
+
   /** A raw `gh pr list --json ...` element for the `pr-review` preset. */
   function rawReviewPr(overrides: Record<string, unknown> = {}): unknown {
     return {

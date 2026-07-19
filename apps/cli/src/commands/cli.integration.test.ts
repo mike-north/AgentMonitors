@@ -11,6 +11,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -1257,6 +1258,95 @@ describe('init', () => {
     expect(parsed.valid).toBe(1);
     expect(parsed.monitors[0]?.name).toBe('TS source watcher');
   });
+
+  // Issue #444 review, finding 9(a): drive the REAL scaffold path (not the raw
+  // TEMPLATES string) for both PR-alerting presets, with and without
+  // --urgency, and assert the written file both parses cleanly and keeps its
+  // curated name — the line-anchored `name:`/`urgency:` seed regexes against
+  // an unquoted multi-word preset name are precisely where scaffold-time drift
+  // would bite, and nothing previously ran them through the actual CLI.
+  it.each(['pr-review', 'my-prs'] as const)(
+    '%s scaffolds a parseable monitor with its curated name preserved (issue #444, finding 9a)',
+    (type) => {
+      const dir = path.join(tempDir, `init-preset-${type}`);
+      mkdirSync(dir, { recursive: true });
+      const monitorsDir = path.join(dir, 'monitors');
+      const created = run(
+        ['init', type, '--dir', monitorsDir, '--type', type],
+        dir,
+      );
+      expect(created.exitCode).toBe(0);
+      const monitor = readFileSync(
+        path.join(monitorsDir, type, 'MONITOR.md'),
+        'utf-8',
+      );
+      // The positional <name> must NOT have clobbered the template's own
+      // curated name (finding 6) — e.g. never a derived `name: Pr review`.
+      expect(monitor).not.toMatch(/^name: Pr review$/m);
+      expect(monitor).not.toMatch(/^name: My prs$/m);
+      const curatedName =
+        type === 'pr-review' ? 'PRs awaiting my review' : 'My pull requests';
+      expect(monitor).toContain(`name: ${curatedName}`);
+      // The scaffold-time project root (finding 1) is seeded verbatim. Real
+      // paths, since `process.cwd()` (what `init` reads) resolves symlinks a
+      // temp-dir path may contain (e.g. macOS's /var -> /private/var), while
+      // `dir` here is the pre-resolution string passed as the child's cwd.
+      expect(monitor).toContain(`cwd: '${realpathSync(dir)}'`);
+
+      const validated = run(['validate', monitorsDir, '--format', 'json'], dir);
+      expect(validated.exitCode).toBe(0);
+      const parsed = JSON.parse(validated.stdout) as {
+        valid: number;
+        invalid: number;
+        monitors: { name: string }[];
+      };
+      expect(parsed.valid).toBe(1);
+      expect(parsed.invalid).toBe(0);
+      expect(parsed.monitors[0]?.name).toBe(curatedName);
+    },
+  );
+
+  it.each(['pr-review', 'my-prs'] as const)(
+    '%s scaffolds a parseable monitor when --urgency overrides the default (issue #444, finding 9a)',
+    (type) => {
+      const dir = path.join(tempDir, `init-preset-urgency-${type}`);
+      mkdirSync(dir, { recursive: true });
+      const monitorsDir = path.join(dir, 'monitors');
+      const created = run(
+        [
+          'init',
+          type,
+          '--dir',
+          monitorsDir,
+          '--type',
+          type,
+          '--urgency',
+          'low',
+        ],
+        dir,
+      );
+      expect(created.exitCode).toBe(0);
+      const monitor = readFileSync(
+        path.join(monitorsDir, type, 'MONITOR.md'),
+        'utf-8',
+      );
+      expect(monitor).toMatch(/^urgency: low$/m);
+      // Finding 8: the preset-specific rationale comment (which explained the
+      // template's *default* value) must not survive above a seeded value it
+      // no longer describes.
+      expect(monitor).not.toMatch(/# normal, not high:/);
+      expect(monitor).not.toMatch(/# normal, not high —/);
+
+      const validated = run(['validate', monitorsDir, '--format', 'json'], dir);
+      expect(validated.exitCode).toBe(0);
+      const parsed = JSON.parse(validated.stdout) as {
+        valid: number;
+        invalid: number;
+      };
+      expect(parsed.valid).toBe(1);
+      expect(parsed.invalid).toBe(0);
+    },
+  );
 
   // Issue #388 AC (a): --command seeds watch.command verbatim for command-poll,
   // one argv token per flag (including a leading-dash token like --porcelain,
