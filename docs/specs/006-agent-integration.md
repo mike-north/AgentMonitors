@@ -542,7 +542,8 @@ shape:
 - **`hookEventName`** — echoes the event that fired the hook (e.g. `"PostToolUse"`,
   `"UserPromptSubmit"`). Taken from the stdin payload's `hook_event_name`; it must match the firing
   event or the host ignores the `additionalContext`.
-- **`additionalContext`** — the rendered delivery: a lead line followed by one block per event
+- **`additionalContext`** — the rendered delivery: an attributed lead line, a one-line acknowledge
+  instruction (§5.1.1), then one block per event
   with the monitor id, urgency, title, and the monitor's **body-instructions** (`DeliveryEventSummary.body`).
   Capped at 4000 characters. Unlike the channel transport (§4.6), this is a plain JSON string
   (`JSON.stringify` escapes it) and is **not** tag-delimited, so `<`, `>`, `[`, `]`, `;`, and
@@ -603,6 +604,59 @@ shape:
 
 When there is nothing pending, the command **MUST** print nothing and exit 0 in every format — an
 empty stdout is the signal to Claude Code to proceed silently.
+
+### 5.1.1 Attribution is transport-owned; delivered text is self-sufficient (issues #438, #434)
+
+**Attribution belongs to the delivery surface, not to the message.** The runtime emits an
+unattributed, semantic `DeliveryClaim.message` ([002 §9.2](./002-runtime-delivery.md#92-normal-urgency));
+each transport then decides its own prefix:
+
+| Transport         | Prefix       | Why                                                                                                                                       |
+| ----------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| Hook-deliver (§5) | `AgentMon: ` | `additionalContext` is injected into the agent's context window **unlabeled** — nothing else identifies the source.                       |
+| Channel (§4)      | none         | The enclosing `<channel source="agentmonitors">` tag already names the source; a prefix here would **double-attribute** the same message. |
+
+A transport **MUST NOT** rely on the runtime to supply its label, and the runtime **MUST NOT** embed
+one. This is also what keeps the core host-agnostic: per-surface phrasing lives in the transport /
+adapter. Adding a new surface means choosing its attribution there, not editing the runtime.
+
+**The acknowledge instruction.** A body-injection delivery (settled high-urgency events at
+`turn-interruptible`, or the `post-compact` recap surfaced at `SessionStart`) **claims** the events it
+renders — and claiming is never acknowledging (BP2 / SP4). Until the recipient acknowledges, the
+coalesced-until-ack rule ([002 §9.2](./002-runtime-delivery.md#92-normal-urgency)) suppresses every
+subsequent normal-urgency reminder for that session. Previously the delivered payload named no way to
+acknowledge, so an agent that fully handled the delivered work still left its own channel silently
+muted; the remediation existed only in `monitor explain`, which nobody runs while things appear fine
+(issue #434 — the delivery-side twin of the silent-degradation family in issue #425).
+
+Therefore the hook transport's body-injection header **MUST** carry a completion instruction naming
+the acknowledge command with the recipient's **real session id**:
+
+```text
+AgentMon: monitored changes are pending — consider handling them before continuing.
+When handled, acknowledge: agentmonitors events ack --session <id>
+
+### <monitor-id> (<urgency>)
+...
+```
+
+Constraints:
+
+- **Once per delivery batch, not per event.** It lives in the shared header, so a delivery carrying
+  N event blocks still renders exactly one instruction line.
+- **Terse.** This text lands in an LLM context window and competes with the event bodies for the
+  4000-char cap (§5.1). It carries no `--socket <path>` clause (unlike the truncation-recovery
+  markers, whose whole purpose is to be reliably runnable against the right daemon) — it is an
+  advisory next step, and the header's length is counted against the cap by every packing path.
+- **Reminder-only deliveries do not repeat it.** A `normal`/`low` claim has no body-injection header;
+  its acknowledge step is already part of the runtime's semantic message
+  ([002 §9.2](./002-runtime-delivery.md#92-normal-urgency)), so it renders once there.
+
+The channel transport does not render this line: a channel-connected agent acknowledges through the
+`agentmon_ack` tool (§4.3), which the server's own instructions already describe.
+
+Verified by `apps/cli/src/delivery-text.integration.test.ts` (one runtime claim, both transports) and
+the renderer cases in `apps/cli/src/hook-deliver-render.test.ts`.
 
 ### 5.2 Behavior
 
@@ -1287,6 +1341,24 @@ Transport and integration tests should be able to prove:
   observed-not-contracted, so re-verify alongside the channel-probe diagnostic on new host versions.
 - Decide whether the channel server should open a synthetic workspace-lead session when channels are
   used **without** the hook-driven `session open` flow, or require the hook flow as a precondition.
+- **Deferred, not rejected (issue #434): should `hook deliver` auto-acknowledge events claimed by a
+  PREVIOUS delivery to the same session when a NEWER delivery is surfaced?** That would make the
+  coalesced-until-ack loop self-healing without any agent cooperation. It is deliberately **not**
+  built here. Auto-acking on delivery would collapse two of the three distinct delivery states
+  (unread / claimed / acknowledged, [002 §9.4](./002-runtime-delivery.md)) into one: "acknowledged"
+  would come to mean "a later delivery happened," not "a recipient handled this," which is precisely
+  the distinction acknowledgment exists to carry (BP2 / SP4) and which `events list --unread`,
+  `doctor`, and `monitor explain` all report against. It also silently discards the evidence that
+  work was surfaced and dropped — the signal issue #425's transport-health surface depends on. The
+  cheaper, non-destructive half of the fix (telling the recipient how to acknowledge, §5.1.1) is what
+  ships instead; whether to additionally auto-ack is a deliberate model change that needs an explicit
+  decision alongside issue #435, not an implementation detail of the delivery renderer.
+- **Follow-ups from issue #438, deliberately out of scope of the wording fix:** a channel-native
+  `agentmon_inbox` tool (list unread + claim, so a channel-connected agent completes the loop without
+  shelling out) and an agent-invocable `/agentmonitors:inbox` slash command or skill. Both are
+  genuinely useful and are **enabled** by the per-transport seam §5.1.1 establishes — each surface can
+  now name its own best verb — but both add host-specific surface area well beyond the delivered-text
+  contract, so they are tracked separately rather than bundled into it.
 - **Multi-host (§11):** the concrete per-host lifecycle-hook names, session-identity signals, and
   workspace-binding mechanisms for Codex and Cursor (CLI + desktop) are **not yet pinned** — they
   **MUST** be confirmed with a per-host probe diagnostic (the `experiments/channel-probe` pattern

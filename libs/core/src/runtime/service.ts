@@ -172,8 +172,36 @@ function describeCadence(
   if (typeof interval === 'string') return `every ${interval}`;
   return `every ${String(Math.round(nextPollMs / 1000))}s`;
 }
-const NORMAL_INBOX_PROMPT = 'AgentMon messages are available. Read the inbox.';
-const IDLE_INBOX_PROMPT = 'AgentMon has inbox updates ready for review.';
+/**
+ * Semantic, transport-neutral body for a coalesced normal/low-urgency reminder
+ * (002 §9.2/§9.3). This is the message a `DeliveryClaim` with no event bodies
+ * carries.
+ *
+ * Three properties, each fixing a defect of the former `NORMAL_INBOX_PROMPT`
+ * (`'AgentMon messages are available. Read the inbox.'`, issue #438):
+ *
+ * 1. **No product-name attribution.** Attribution is a property of the delivery
+ *    SURFACE, owned by each transport — the hook adapter prefixes its own label
+ *    (its `additionalContext` arrives unlabeled), while the channel adds none
+ *    (its `<channel source="agentmonitors">` tag already names the source).
+ *    Emitting "AgentMon" here double-attributed the channel. So the runtime,
+ *    per the host-agnostic-core rule, emits only the semantic message.
+ * 2. **No reference to the legacy `inbox` model.** `inbox_items` is
+ *    non-authoritative (002 §12); the authoritative path is
+ *    events/session-projection. "Read the inbox" pointed at a deprecated
+ *    concept with no runnable referent.
+ * 3. **Actionable and self-sufficient.** It names concrete, runnable next steps
+ *    with the real session id interpolated (the runtime knows it at delivery
+ *    time) — including the acknowledge step, so a recipient that acts on the
+ *    delivery also clears the coalesced-until-ack suppression that would
+ *    otherwise silently mute every later normal reminder (issue #434).
+ */
+function reminderMessage(sessionId: string): string {
+  return (
+    `Monitored changes are pending. Run \`agentmonitors events list --session ${sessionId} --unread\` ` +
+    `to see them, then \`agentmonitors events ack --session ${sessionId}\` once handled.`
+  );
+}
 
 function unreadDetailsCommand(sessionId: string): string {
   return `agentmonitors events list --session ${sessionId} --unread --format json`;
@@ -2039,7 +2067,7 @@ export class AgentMonitorRuntime {
             mode: 'delivery',
             urgency: 'normal',
             unreadCounts: sessionUnreadCounts,
-            message: NORMAL_INBOX_PROMPT,
+            message: reminderMessage(sessionId),
             events: [],
           },
         };
@@ -2064,7 +2092,7 @@ export class AgentMonitorRuntime {
           mode: 'delivery',
           urgency: 'low',
           unreadCounts: sessionUnreadCounts,
-          message: IDLE_INBOX_PROMPT,
+          message: reminderMessage(sessionId),
           events: [],
         },
       };

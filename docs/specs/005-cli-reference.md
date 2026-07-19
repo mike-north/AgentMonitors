@@ -1303,7 +1303,9 @@ Claims a pending delivery payload for a session at the specified lifecycle point
 **Text output (`--format text`):**
 
 - If no pending delivery: `No pending delivery.`
-- If delivery present: prints `claim.message`.
+- If delivery present: prints `claim.message` **verbatim** — the runtime's unattributed semantic
+  body ([002 §9.2](./002-runtime-delivery.md#92-normal-urgency)). No transport attribution is added
+  here; `hook claim` is a diagnostic view of the claim, not a delivery surface.
 
 ---
 
@@ -1357,7 +1359,7 @@ wire JSON. The example below is pretty-printed for readability; the command emit
   "continue": true,
   "hookSpecificOutput": {
     "hookEventName": "PostToolUse",
-    "additionalContext": "AgentMon: monitored changes are pending — consider handling them before continuing.\n\n### watch-src (high)\n..."
+    "additionalContext": "AgentMon: monitored changes are pending — consider handling them before continuing.\nWhen handled, acknowledge: agentmonitors events ack --session <id>\n\n### watch-src (high)\n..."
   }
 }
 ```
@@ -1369,10 +1371,15 @@ wire JSON. The example below is pretty-printed for readability; the command emit
   "continue": true,
   "hookSpecificOutput": {
     "hookEventName": "UserPromptSubmit",
-    "additionalContext": "AgentMon messages are available. Read the inbox."
+    "additionalContext": "AgentMon: Monitored changes are pending. Run `agentmonitors events list --session <id> --unread` to see them, then `agentmonitors events ack --session <id>` once handled."
   }
 }
 ```
+
+The `AgentMon: ` prefix is added by **this transport**, not by the runtime: the claim's own
+`message` is the unattributed semantic body ([002 §9.2](./002-runtime-delivery.md#92-normal-urgency)),
+and the channel transport renders that same body with no prefix at all
+([006 §5](./006-agent-integration.md)).
 
 **No output** when nothing is pending (empty stdout + exit 0).
 
@@ -1492,9 +1499,11 @@ mode it is additionally named on stderr rather than silently disappearing.
 
 Note: for a derived `turn-interruptible` lifecycle, `normal` urgency produces `events: []` (reminder
 only — no body injection); `low` does likewise at `turn-idle`. "Reminder only" is **not** silence:
-the command emits a hook JSON object whose `additionalContext` is the claim's advisory `message`
-(e.g. `"AgentMon messages are available. Read the inbox."` — the same line `hook claim` surfaces), so
-a default (`normal`-urgency) monitor produces a visible mid-turn reminder. Body text is surfaced only
+the command emits a hook JSON object whose `additionalContext` is this transport's attribution
+prefix followed by the claim's advisory `message` (the same unattributed line `hook claim --format text`
+surfaces — see [002 §9.2](./002-runtime-delivery.md#92-normal-urgency) for its normative wording), so
+a default (`normal`-urgency) monitor produces a visible mid-turn reminder that names the exact
+commands to run, including the acknowledge step. Body text is surfaced only
 for **high-urgency settled events** and **`post-compact`** (`SessionStart`) recap. The claimed rows
 are not acknowledged, so the event stays unread and re-discoverable via `events list --unread`.
 Over-cap context is truncated at a code-point boundary with an explicit `[truncated …]` marker; the

@@ -9135,10 +9135,15 @@ describe('hook deliver', () => {
       };
       expect(output.continue).toBe(true);
       expect(output.hookSpecificOutput.hookEventName).toBe('UserPromptSubmit');
-      expect(output.hookSpecificOutput.additionalContext).toContain(
-        'AgentMon messages are available.',
-      );
-      expect(output.hookSpecificOutput.additionalContext).not.toContain('### ');
+      // issue #438: transport-owned attribution (hook prepends its label) + a
+      // self-sufficient, actionable next step. issue #434: the acknowledge step
+      // travels in the delivered payload. No bare "inbox" reference.
+      const reminderCtx = output.hookSpecificOutput.additionalContext;
+      expect(reminderCtx).toContain('AgentMon: Monitored changes are pending.');
+      expect(reminderCtx).toContain('agentmonitors events list --session ');
+      expect(reminderCtx).toContain('agentmonitors events ack --session ');
+      expect(reminderCtx).not.toContain('inbox');
+      expect(reminderCtx).not.toContain('### ');
       expect(output).not.toHaveProperty('permissionDecision');
     } finally {
       daemon.stop();
@@ -9258,8 +9263,12 @@ describe('hook deliver', () => {
       expect(deliverResult.stdout.trim()).not.toBe('');
       expect(() => JSON.parse(deliverResult.stdout)).toThrow();
       expect(deliverResult.stdout).toContain(
-        'AgentMon messages are available.',
+        'AgentMon: Monitored changes are pending.',
       );
+      expect(deliverResult.stdout).toContain(
+        'agentmonitors events ack --session ',
+      );
+      expect(deliverResult.stdout).not.toContain('inbox');
       expect(deliverResult.stdout).not.toContain('hookSpecificOutput');
       expect(deliverResult.stdout).not.toContain('### ');
     } finally {
@@ -9682,8 +9691,17 @@ describe('hook deliver', () => {
 // surfaces on the first claim; (2) after a claim, the reminder is suppressed and
 // `monitor explain` NAMES the reason (already-claimed / coalesced-until-ack).
 describe('hook claim normal-urgency reminder + suppression diagnosis (issue #333)', () => {
-  const NORMAL_INBOX_PROMPT =
-    'AgentMon messages are available. Read the inbox.';
+  /**
+   * The coalesced reminder body the runtime emits (002 §9.2, issues #438/#434),
+   * written out here from the spec rather than read back from the
+   * implementation: a SEMANTIC message carrying no product-name attribution
+   * (that is transport-owned), no reference to the legacy `inbox` model, and
+   * concrete runnable next steps — including the acknowledge step — with the
+   * real session id interpolated.
+   */
+  const reminderMessage = (sessionId: string): string =>
+    `Monitored changes are pending. Run \`agentmonitors events list --session ${sessionId} --unread\` ` +
+    `to see them, then \`agentmonitors events ack --session ${sessionId}\` once handled.`;
 
   it('first turn-interruptible claim surfaces the reminder; a prior claim suppresses it; monitor explain names why', async () => {
     const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-333-'));
@@ -9812,7 +9830,11 @@ describe('hook claim normal-urgency reminder + suppression diagnosis (issue #333
       expect(firstClaim).not.toBeNull();
       expect(firstClaim?.mode).toBe('delivery');
       expect(firstClaim?.urgency).toBe('normal');
-      expect(firstClaim?.message).toBe(NORMAL_INBOX_PROMPT);
+      expect(firstClaim?.message).toBe(reminderMessage(session.id));
+      // The runtime's own message carries NO product-name attribution — that is
+      // owned by each transport (issue #438).
+      expect(firstClaim?.message).not.toContain('AgentMon');
+      expect(firstClaim?.message).not.toContain('inbox');
       expect(firstClaim?.events).toEqual([]); // §9.2: reminder carries no events
 
       // The divergent precondition from the study transcript: the first claim
@@ -10341,6 +10363,19 @@ describe('hook deliver --debug diagnosis (issue #334)', () => {
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
       writeFileSync(watchedFile, 'changed content', 'utf-8');
 
+      const sessionIdFor = (hostSessionId: string): string | undefined => {
+        const sessionsResult = runWithEnv(
+          ['session', 'list', '--format', 'json'],
+          env,
+          ws,
+        );
+        const sessions = JSON.parse(sessionsResult.stdout) as {
+          id: string;
+          hostSessionId: string;
+        }[];
+        return sessions.find((s) => s.hostSessionId === hostSessionId)?.id;
+      };
+
       const unreadFor = (hostSessionId: string) => {
         const sessionsResult = runWithEnv(
           ['session', 'list', '--format', 'json'],
@@ -10401,14 +10436,35 @@ describe('hook deliver --debug diagnosis (issue #334)', () => {
 
       expect(plain.exitCode).toBe(0);
       expect(debugRun.exitCode).toBe(0);
-      // The core regression guard: stdout is byte-identical in every mode.
-      expect(debugRun.stdout).toBe(plain.stdout);
+
+      // The two runs are two DIFFERENT lead sessions (each needs its own
+      // unclaimed projection to surface a reminder at all), and the delivered
+      // reminder now interpolates the recipient's real session id (issue #438)
+      // — so the one legitimate difference between the two payloads is that
+      // id. Normalize it away, then assert the rest is byte-identical: that is
+      // the actual regression guard (issue #334 — `--debug` must never write
+      // diagnosis to stdout).
+      const sessionIdA = sessionIdFor(hostA);
+      const sessionIdB = sessionIdFor(hostB);
+      expect(sessionIdA).toBeDefined();
+      expect(sessionIdB).toBeDefined();
+      const normalize = (out: string, sessionId: string): string =>
+        out.split(sessionId).join('<session>');
+      expect(normalize(debugRun.stdout, sessionIdB ?? '')).toBe(
+        normalize(plain.stdout, sessionIdA ?? ''),
+      );
+
       expect(plain.stdout.trim()).not.toBe('');
       expect(JSON.parse(plain.stdout)).toMatchObject({
         continue: true,
         hookSpecificOutput: {
           hookEventName: 'UserPromptSubmit',
-          additionalContext: 'AgentMon messages are available. Read the inbox.',
+          // issue #438/#434: transport-owned attribution + self-sufficient,
+          // actionable text including the acknowledge step.
+          additionalContext:
+            `AgentMon: Monitored changes are pending. ` +
+            `Run \`agentmonitors events list --session ${sessionIdA ?? ''} --unread\` to see them, ` +
+            `then \`agentmonitors events ack --session ${sessionIdA ?? ''}\` once handled.`,
         },
       });
       // Only the debug run writes diagnosis — to stderr, never stdout.

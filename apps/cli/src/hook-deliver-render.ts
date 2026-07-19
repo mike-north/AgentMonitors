@@ -10,8 +10,19 @@ import {
 
 export const MAX_ADDITIONAL_CONTEXT = 4000;
 
-const LEAD_LINE =
-  'AgentMon: monitored changes are pending — consider handling them before continuing.';
+/**
+ * The attribution label this transport prepends to every payload it delivers.
+ * Attribution is transport-owned (issue #438): the hook's `additionalContext`
+ * arrives in the agent's context window UNLABELED, so the hook adapter names
+ * the source itself. The runtime core emits only the semantic message (no
+ * product name); the channel transport, whose `<channel source="agentmonitors">`
+ * tag already names the source, adds nothing. Keeping this a named constant
+ * makes the seam explicit and keeps the two hook shapes (body-injection lead
+ * line, reminder line) attributed identically.
+ */
+const HOOK_ATTRIBUTION_PREFIX = 'AgentMon: ';
+
+const LEAD_LINE = `${HOOK_ATTRIBUTION_PREFIX}monitored changes are pending — consider handling them before continuing.`;
 
 /**
  * Render the `--socket <path>` clause shared by both hook markers below, or
@@ -252,8 +263,42 @@ function appendMarkerWithinCap(
   return appendSharedMarkerWithinCap(body, cap, marker);
 }
 
-/** The fixed prefix of a body-injection payload: lead line + blank line. */
-const HEADER = `${LEAD_LINE}\n\n`;
+/**
+ * The one-line acknowledge instruction appended to the body-injection header
+ * (issue #434). A body-injection delivery (settled high-urgency events, or the
+ * `post-compact` recap) CLAIMS the events it renders — but claiming is not
+ * acknowledgment (BP2 / SP4), and until the recipient acknowledges, the
+ * `coalesced-until-ack` rule (002 §9.2) suppresses every subsequent
+ * normal-urgency reminder for the session. The delivered payload used to name
+ * no way to acknowledge, so an agent that fully handled the work still left the
+ * channel silently muted — the remediation lived only in `monitor explain`,
+ * which nobody runs while things appear fine. This line closes that loop, in
+ * the delivered context itself.
+ *
+ * Emitted ONCE per delivery batch (it lives in the shared header, not per
+ * event) and kept terse — this lands in an LLM context window (006 §5.1's
+ * injection-size concern). The session id is sanitized like every other
+ * claim-derived field reaching this payload (see {@link sanitize}). No
+ * `--socket` clause: unlike the truncation-recovery markers, this is an
+ * advisory next step, and both the runtime's reminder message and this line
+ * stay socket-less to honor the terseness constraint.
+ */
+function buildHookAckInstruction(sessionId: string): string {
+  return `When handled, acknowledge: agentmonitors events ack --session ${sanitize(sessionId)}`;
+}
+
+/**
+ * The prefix of a body-injection payload: the attributed lead line, the
+ * per-batch acknowledge instruction (issue #434), then a blank line before the
+ * event blocks. Session-scoped because the ack instruction interpolates the
+ * session id — every sizing path that packs blocks under the cap
+ * ({@link packEventsUnderCap}, {@link resolveHookClaimFit},
+ * {@link renderHookDelivery}) already carries the claim's `sessionId`, so the
+ * header's true length is accounted for wherever blocks are fit.
+ */
+function buildHeader(sessionId: string): string {
+  return `${LEAD_LINE}\n${buildHookAckInstruction(sessionId)}\n\n`;
+}
 
 /**
  * Render one event as its `additionalContext` block, using the transport-shared
@@ -289,8 +334,9 @@ function packWholeBlocks(
  * CLAIM, so the claimed set equals the rendered set and the remainder stays
  * pending for the next context event. Thin wrapper over the transport-shared
  * {@link packSharedEventsUnderCap} (`delivery-event-render.ts`), fixing this
- * transport's `sanitize`, lead-line `HEADER`, and the session-scoped
- * truncation marker's length.
+ * transport's `sanitize`, the session-scoped body-injection header
+ * ({@link buildHeader} — lead line + per-batch ack instruction), and the
+ * session-scoped truncation marker's length.
  *
  * `sessionId` is the session the sizing decision is being made for (the same
  * id the eventual claim/render will carry) — it MUST size against the marker
@@ -313,7 +359,7 @@ export function packEventsUnderCap(
   socketPath?: string,
 ): number {
   return packSharedEventsUnderCap(events, sanitize, cap, {
-    header: HEADER,
+    header: buildHeader(sessionId),
     joiner: '\n',
     markerLength: buildHookDeferredMarker(sessionId, socketPath).length,
   });
@@ -377,13 +423,14 @@ export function resolveHookClaimFit(
   moreDeferred: boolean,
   cap: number = MAX_ADDITIONAL_CONTEXT,
 ): HookClaimFit {
+  const header = buildHeader(sessionId);
   const blocks = events.map(buildEventBlock);
-  const whole = packWholeBlocks(HEADER, blocks, cap);
+  const whole = packWholeBlocks(header, blocks, cap);
   if (whole.includedCount === blocks.length && !moreDeferred) {
     return { fits: true, includedCount: blocks.length, whole, reserved: whole };
   }
   const deferredMarker = buildHookDeferredMarker(sessionId, socketPath);
-  const reserved = packWholeBlocks(HEADER, blocks, cap - deferredMarker.length);
+  const reserved = packWholeBlocks(header, blocks, cap - deferredMarker.length);
   const includedCount = Math.max(1, reserved.includedCount);
   return {
     fits: includedCount === blocks.length,
@@ -526,6 +573,13 @@ export function renderHookDelivery(
   // so a truncated reminder uses the claimed-unread marker, not the deferred
   // one (issue #442, PR #442 round-7 review) — there is no "more updates
   // pending" to promise here.
+  //
+  // The runtime emits a SEMANTIC message with no product-name attribution
+  // (issue #438); this transport owns its attribution, so prepend
+  // {@link HOOK_ATTRIBUTION_PREFIX} — the hook's `additionalContext` arrives
+  // unlabeled, so the source must be named here (the channel, whose tag already
+  // names the source, adds nothing). The prefix is prepended BEFORE truncation
+  // so it always survives at the front even when the semantic body is cut.
   if (claim.events.length === 0) {
     const reminder = sanitize(claim.message);
     if (reminder.trim().length === 0) return null;
@@ -534,7 +588,7 @@ export function renderHookDelivery(
       hookSpecificOutput: {
         hookEventName,
         additionalContext: truncateForCap(
-          reminder,
+          `${HOOK_ATTRIBUTION_PREFIX}${reminder}`,
           MAX_ADDITIONAL_CONTEXT,
           claimedUnreadMarker,
         ),
@@ -543,8 +597,9 @@ export function renderHookDelivery(
   }
 
   const moreDeferred = options.moreDeferred ?? false;
+  const header = buildHeader(claim.sessionId);
   const blocks = claim.events.map(buildEventBlock);
-  const whole = packWholeBlocks(HEADER, blocks, MAX_ADDITIONAL_CONTEXT);
+  const whole = packWholeBlocks(header, blocks, MAX_ADDITIONAL_CONTEXT);
 
   let additionalContext: string;
   if (whole.includedCount === blocks.length && !moreDeferred) {
@@ -557,7 +612,7 @@ export function renderHookDelivery(
     // one WHOLE block was genuinely left pending (unclaimed), which is exactly
     // what that marker promises.
     const reserved = packWholeBlocks(
-      HEADER,
+      header,
       blocks,
       MAX_ADDITIONAL_CONTEXT - deferredMarker.length,
     );
@@ -594,7 +649,7 @@ export function renderHookDelivery(
           ? claimedUnreadMarker + deferredMarker
           : claimedUnreadMarker;
       additionalContext = appendMarkerWithinCap(
-        HEADER + firstBlock,
+        header + firstBlock,
         MAX_ADDITIONAL_CONTEXT,
         marker,
       );

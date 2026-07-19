@@ -939,7 +939,13 @@ Handle it.
     const claim = runtime.claimDelivery(session.id, 'turn-idle');
     expect(claim?.mode).toBe('delivery');
     expect(claim?.urgency).toBe('low');
-    expect(claim?.message).toBe('AgentMon has inbox updates ready for review.');
+    // 002 §9.3 (issues #438/#434): a semantic, unattributed, actionable body
+    // with the real session id — no product-name prefix (transport-owned), no
+    // reference to the legacy `inbox` model.
+    expect(claim?.message).toBe(
+      `Monitored changes are pending. Run \`agentmonitors events list --session ${session.id} --unread\` ` +
+        `to see them, then \`agentmonitors events ack --session ${session.id}\` once handled.`,
+    );
   });
 
   it('coalesces normal-urgency reminders until unread events are acknowledged', () => {
@@ -5050,9 +5056,14 @@ Daily digest.
 // @see ../../../../docs/specs/002-runtime-delivery.md §10.7 (monitor explain
 //   projection-and-delivery diagnosis)
 describe('normal-urgency reminder suppression is explainable (issue #333)', () => {
-  // 002 §9.2: the generic reminder message for the normal band.
-  const NORMAL_INBOX_PROMPT =
-    'AgentMon messages are available. Read the inbox.';
+  // 002 §9.2 (issues #438/#434): the coalesced reminder body for the normal
+  // band — semantic (no product-name attribution; that is transport-owned),
+  // free of the legacy `inbox` model, and self-sufficient: it names concrete
+  // runnable next steps, including the acknowledge step, with the real session
+  // id interpolated.
+  const reminderMessage = (sessionId: string): string =>
+    `Monitored changes are pending. Run \`agentmonitors events list --session ${sessionId} --unread\` ` +
+    `to see them, then \`agentmonitors events ack --session ${sessionId}\` once handled.`;
 
   function stubStatefulSource(name: string): ObservationSource {
     return {
@@ -5141,7 +5152,11 @@ describe('normal-urgency reminder suppression is explainable (issue #333)', () =
       const first = runtime.claimDelivery(session.id, 'turn-interruptible');
       expect(first?.mode).toBe('delivery');
       expect(first?.urgency).toBe('normal');
-      expect(first?.message).toBe(NORMAL_INBOX_PROMPT);
+      expect(first?.message).toBe(reminderMessage(session.id));
+      // Attribution is transport-owned (issue #438): the runtime's own message
+      // never carries the product name.
+      expect(first?.message).not.toContain('AgentMon');
+      expect(first?.message).not.toContain('inbox');
       expect(first?.events).toEqual([]); // §9.2: no per-event payloads
 
       // The divergent precondition from the study: that first claim marked the

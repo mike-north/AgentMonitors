@@ -48,8 +48,8 @@ decides which lifecycle a monitor's events surface at, and how much detail is in
 | Urgency   | Surfaces at            | Timing                                                              | What's included                                             |
 | --------- | ----------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------ |
 | `high`    | `turn-interruptible`   | After a **15 s settle window** — not instant                          | The concrete events: titles, summaries, and full body text  |
-| `normal`  | `turn-interruptible`   | **Coalesced-until-ack**: one reminder for the whole unread batch, then silent until it's acknowledged | A generic reminder only ("AgentMon messages are available. Read the inbox.") — no per-event detail |
-| `low`     | `turn-idle`            | **Coalesced-until-ack**: one reminder for the whole unread batch, then silent until it's acknowledged | A generic reminder only ("AgentMon has inbox updates ready for review.") — no per-event detail |
+| `normal`  | `turn-interruptible`   | **Coalesced-until-ack**: one reminder for the whole unread batch, then silent until it's acknowledged | A reminder only — no per-event detail — naming the exact commands to run: `agentmonitors events list --session <id> --unread`, then `agentmonitors events ack --session <id>` |
+| `low`     | `turn-idle`            | **Coalesced-until-ack**: one reminder for the whole unread batch, then silent until it's acknowledged | The same reminder as `normal` — no per-event detail |
 
 Regardless of urgency, **every unread event is recapped at `post-compact`** (session start, after
 a context compaction) with up to the 10 most recent events shown in full — titles, summaries, and

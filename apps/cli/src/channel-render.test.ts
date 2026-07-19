@@ -381,18 +381,28 @@ describe('renderChannelEvent', () => {
 
   // Issue #436: a normal-band reminder carries no concrete events, but its
   // event_count must reflect the pending events it refers to — NOT read "0"
-  // (which looks like a bug). 002 §9.2: reminders stay generic.
-  it('renders a reminder claim generically and counts the pending events it refers to', () => {
+  // (which looks like a bug). 002 §9.2: reminders carry no event bodies.
+  //
+  // Issue #438: attribution is transport-owned. The runtime emits a SEMANTIC
+  // message; this transport adds NO prefix, because the enclosing
+  // `<channel source="agentmonitors">` tag already names the source — an
+  // "AgentMon" prefix here would double-attribute.
+  it('renders a reminder claim verbatim, unattributed, and counts the pending events it refers to', () => {
+    const semanticReminder =
+      'Monitored changes are pending. Run `agentmonitors events list --session s1 --unread` ' +
+      'to see them, then `agentmonitors events ack --session s1` once handled.';
     const { content, meta } = renderChannelEvent(
       makeClaim({
         urgency: 'normal',
         events: [],
-        message: 'AgentMon messages are available. Read the inbox.',
+        message: semanticReminder,
         unreadCounts: { low: 0, normal: 3, high: 0, total: 3 },
       }),
     );
-    // Stays generic — no injected event bodies leak into a reminder.
-    expect(content).toBe('AgentMon messages are available. Read the inbox.');
+    // Verbatim — the channel adds no attribution of its own.
+    expect(content).toBe(semanticReminder);
+    expect(content.startsWith('AgentMon')).toBe(false);
+    // No injected event bodies leak into a reminder.
     expect(content).not.toContain('### ');
     // The referent count is the pending total, not 0.
     expect(meta.event_count).toBe('3');

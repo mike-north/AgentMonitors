@@ -275,7 +275,14 @@ export interface RenderChannelEventOptions {
  * differing only in per-transport content sanitization. A reminder claim
  * (`normal`/`low`, which carries no event bodies — only a coalesced advisory
  * `message`) renders that message as-is (subject to the same tag-safety
- * sanitization as the body-injection path), staying generic (002 §9.2).
+ * sanitization as the body-injection path).
+ *
+ * Attribution is transport-owned (issue #438): the runtime emits a SEMANTIC
+ * reminder `message` with no product-name prefix, and this transport adds
+ * NONE — the enclosing `<channel source="agentmonitors">` tag already names
+ * the source, so an "AgentMon" prefix here would double-attribute. (The hook
+ * transport, whose `additionalContext` arrives unlabeled, prepends its own
+ * label instead — see `hook-deliver-render.ts`'s `HOOK_ATTRIBUTION_PREFIX`.)
  *
  * **The channel surface IS bounded (006 §5.5), primarily by packing WHOLE
  * event blocks under {@link MAX_CHANNEL_CONTENT} BEFORE reserving, not by
