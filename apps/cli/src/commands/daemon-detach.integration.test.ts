@@ -104,6 +104,43 @@ function runCli(
 }
 
 /**
+ * Whether `pid` still refers to a live process, via the standard
+ * signal-0-probe idiom (`kill(pid, 0)` delivers no signal but still performs
+ * the permission/existence check — throws `ESRCH` once the process is gone).
+ * Used instead of `daemonAvailable` for teardown/liveness checks that must
+ * hold for a daemon that NEVER bound its socket (round-2 finding
+ * 3611413817) — `daemonAvailable` would report `false` for that case
+ * regardless of whether the process itself is still running.
+ */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Record whatever pid a CLI invocation's combined output names for `ws`'s
+ * socket, for `afterEach` to fall back to a direct `kill` on (issue #389
+ * review finding 5 / round-2 finding 3611413817). A SUCCESSFUL `--detach`
+ * prints `pid: N` on stdout; a ready-TIMEOUT prints `(pid N)` on stderr via
+ * `reportError` — the exact case this fallback exists for, since the spawned
+ * child never bound the socket and `daemonAvailable` will never see it. Every
+ * caller that spawns a detached child (success OR failure) must route
+ * through this so the pid is captured regardless of which stream or exit
+ * code it came from.
+ */
+function recordSpawnedPid(ws: Workspace, result: RunResult): void {
+  const combined = `${result.stdout}${result.stderr}`;
+  const pidMatch = /pid:?\s+(\d+)/.exec(combined);
+  if (pidMatch?.[1] !== undefined) {
+    startedPids.set(ws.socket, Number(pidMatch[1]));
+  }
+}
+
+/**
  * Start a detached daemon, remembering its socket (and, if it reports one,
  * its pid) for teardown. Capturing the pid lets `afterEach` fall back to a
  * direct `kill` when `daemon stop` over IPC fails (issue #389 review finding
@@ -133,10 +170,7 @@ function runDetach(
     ],
     extraEnv,
   );
-  const pidMatch = /pid:\s+(\d+)/.exec(result.stdout);
-  if (pidMatch?.[1] !== undefined) {
-    startedPids.set(ws.socket, Number(pidMatch[1]));
-  }
+  recordSpawnedPid(ws, result);
   return result;
 }
 
@@ -154,14 +188,16 @@ afterEach(async () => {
     while (Date.now() < deadline && (await daemonAvailable(socket))) {
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
-    // Fallback for issue #389 review finding 5: `callDaemon('stop')` only
-    // reaches a daemon that actually bound the socket. A daemon that never
-    // came up (exactly the regression class these tests exist to catch —
-    // ready-timeout, spawn failure, a race loser) leaves nothing to stop over
-    // IPC, so if the socket is STILL answering after the wait above, fall
-    // back to killing the pid this case captured directly.
+    // Fallback for issue #389 review finding 5 / round-2 finding 3611413817:
+    // `callDaemon('stop')` only reaches a daemon that actually bound the
+    // socket. A daemon that never came up (exactly the regression class these
+    // tests exist to catch — ready-timeout, spawn failure, a race loser)
+    // leaves nothing to stop over IPC AND never satisfies `daemonAvailable`,
+    // so gating this kill on the socket being reachable made it a no-op for
+    // precisely the never-bound case it was meant to cover. Kill the
+    // recorded pid whenever it is still alive, independent of the socket.
     const pid = startedPids.get(socket);
-    if (pid !== undefined && (await daemonAvailable(socket))) {
+    if (pid !== undefined && isProcessAlive(pid)) {
       try {
         process.kill(pid, 'SIGTERM');
       } catch {
@@ -370,6 +406,22 @@ describe('daemon run --detach (issue #389 P1)', () => {
       expect(output).toMatch(/did not answer on .* within 15s/);
       expect(output).toContain('sent SIGTERM');
       expect(output).toMatch(/\(pid \d+\)/);
+
+      // Round-2 finding 3611413817: this timeout path prints its pid on
+      // STDERR (via `reportError`), not stdout, and this test previously
+      // called `runCli` directly rather than the recording helper — so a
+      // regression that dropped the production SIGTERM here would leave an
+      // untracked child with no teardown safety net at all, and this suite
+      // would not catch it. Route through the SAME recording helper every
+      // other case uses, then decisively PROVE the child is actually gone —
+      // not merely that we asked it to die — via the pid this output names.
+      recordSpawnedPid(ws, result);
+      const pid = startedPids.get(ws.socket);
+      expect(pid).toBeDefined();
+      if (pid !== undefined) {
+        expect(isProcessAlive(pid)).toBe(false);
+        startedPids.delete(ws.socket);
+      }
     } finally {
       chmodSync(noPermDir, 0o700);
     }

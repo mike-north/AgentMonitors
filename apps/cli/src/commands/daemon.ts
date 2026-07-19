@@ -86,49 +86,117 @@ export async function waitForDetachedDaemonReady(
   return sawError ? { ready: false, spawnError: sawError } : { ready: false };
 }
 
+/** Outcome of {@link waitForDetachIdentityProof}. */
+export interface DetachIdentityProbe {
+  servingPid: number | undefined;
+  servingReapAfterMs: number | undefined;
+  statusError: Error | undefined;
+}
+
+/**
+ * Retry `daemon status` until it proves who is serving the socket, or the
+ * readiness deadline passes (round-2 review finding 3611413813) — a single
+ * best-effort call right after `daemonAvailable` succeeds is exactly the fail
+ * -open gap the finding names: a transient error there must not be read as
+ * "identity confirmed", it must be retried within the SAME window
+ * `--detach` already promises the user (`DETACH_READY_TIMEOUT_MS`), since
+ * the daemon that only just bound its socket may still be a moment away from
+ * being able to answer `status` too.
+ */
+export async function waitForDetachIdentityProof(
+  socketPath: string,
+  deadline: number,
+  pollMs: number,
+): Promise<DetachIdentityProbe> {
+  let lastError: Error | undefined;
+  for (;;) {
+    try {
+      const status = await daemonStatusClient(socketPath);
+      return {
+        servingPid: status.pid,
+        servingReapAfterMs: status.reapAfterMs,
+        statusError: undefined,
+      };
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      if (Date.now() >= deadline) {
+        return {
+          servingPid: undefined,
+          servingReapAfterMs: undefined,
+          statusError: lastError,
+        };
+      }
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
+    }
+  }
+}
+
 /**
  * Pure decision for issue #389 review finding 1: given the pid our own
- * `--detach` child was spawned with and the pid `status` reports for whoever
- * is actually answering the socket now, decide whether a concurrent lazy-boot
- * elsewhere (`session start`'s check-then-spawn has no cross-process
- * pre-spawn lock; only the bind-time lock serializes) won the startup race —
- * our own child lost the bind and already exited, and a DIFFERENT daemon is
- * the one actually serving this socket. Returns the honest error message to
- * report, or `undefined` when the daemon we spawned is confirmed to be the
- * one answering (the ordinary case) — including when identity can't be
- * checked at all (either pid is unavailable), in which case the caller falls
- * back to reporting success on reachability alone, as before this finding.
+ * `--detach` child was spawned with and whatever `status` was able to learn
+ * about the pid actually answering the socket now, decide whether the daemon
+ * we spawned is confirmed to be the one serving it. Three outcomes:
+ *
+ * 1. Both pids are known and match — the ordinary case. Returns `undefined`.
+ * 2. Both pids are known and differ — a concurrent lazy-boot elsewhere
+ *    (`session start`'s check-then-spawn has no cross-process pre-spawn
+ *    lock; only the bind-time lock serializes) won the startup race: our own
+ *    child lost the bind and already exited, and a DIFFERENT daemon is the
+ *    one actually serving this socket. Returns the race-loss message.
+ * 3. Either pid could not be determined (the caller could not reach `status`
+ *    within the readiness deadline, or the OS never gave us our own child's
+ *    pid) — identity is UNPROVEN. This fails CLOSED (round-2 review finding
+ *    3611413813): reporting success here would recreate the exact false
+ *    "confirmed" report this whole check exists to close, just moved one
+ *    layer down from "reachable" to "reachable, allegedly ours". Returns a
+ *    message that states the uncertainty honestly rather than asserting
+ *    success.
  *
  * Extracted as a pure function so the race-detection logic itself has
  * deterministic unit coverage — reproducing the actual OS-level startup race
  * on demand in an integration test is inherently timing-dependent.
  */
-export function describeDetachRaceLoss(input: {
+export function describeDetachIdentityIssue(input: {
   spawnedPid: number | undefined;
   servingPid: number | undefined;
   servingReapAfterMs: number | undefined;
   requestedReapAfterMs: number;
   socketPath: string;
+  statusError: Error | undefined;
 }): string | undefined {
-  if (
-    input.spawnedPid === undefined ||
-    input.servingPid === undefined ||
-    input.servingPid === input.spawnedPid
-  ) {
-    return undefined;
+  if (input.spawnedPid !== undefined && input.servingPid !== undefined) {
+    if (input.servingPid === input.spawnedPid) return undefined;
+    const reapDescription =
+      input.servingReapAfterMs === undefined
+        ? 'unknown'
+        : input.servingReapAfterMs === 0
+          ? 'disabled'
+          : `stops after ${String(Math.round(input.servingReapAfterMs / 1000))}s idle`;
+    return (
+      `Another daemon is already serving ${input.socketPath} (pid ${String(input.servingPid)}) — ` +
+      `the --detach child we spawned (pid ${String(input.spawnedPid)}) lost the startup race and exited. ` +
+      `That daemon's own reap setting applies (${reapDescription}), not the ` +
+      `--reap-after-ms ${String(input.requestedReapAfterMs)} this command requested. Run ` +
+      '`agentmonitors daemon stop` and retry if you need the settings you requested.'
+    );
   }
-  const reapDescription =
-    input.servingReapAfterMs === undefined
-      ? 'unknown'
-      : input.servingReapAfterMs === 0
-        ? 'disabled'
-        : `stops after ${String(Math.round(input.servingReapAfterMs / 1000))}s idle`;
+  // Identity is unproven: something answers the socket (daemonAvailable
+  // already confirmed that), but we could not confirm it is the pid we
+  // spawned. Report the uncertainty explicitly rather than the child's pid
+  // as a "confirmed" success.
+  const spawnedNote =
+    input.spawnedPid === undefined
+      ? 'the spawned process (no pid was reported for it)'
+      : `the spawned process (pid ${String(input.spawnedPid)})`;
+  const causeNote =
+    input.statusError !== undefined
+      ? ` \`daemon status\` kept failing (${input.statusError.message}) while waiting.`
+      : ' `daemon status` never reported a pid to compare against.';
   return (
-    `Another daemon is already serving ${input.socketPath} (pid ${String(input.servingPid)}) — ` +
-    `the --detach child we spawned (pid ${String(input.spawnedPid)}) lost the startup race and exited. ` +
-    `That daemon's own reap setting applies (${reapDescription}), not the ` +
-    `--reap-after-ms ${String(input.requestedReapAfterMs)} this command requested. Run ` +
-    '`agentmonitors daemon stop` and retry if you need the settings you requested.'
+    `Could not confirm ${spawnedNote} is the one now serving ${input.socketPath}.${causeNote} ` +
+    'It has NOT been reported as started. Run `agentmonitors daemon status` to see what, if ' +
+    'anything, is actually serving this socket, then `agentmonitors daemon stop` before retrying ' +
+    'if a stray process needs clearing first.'
   );
 }
 
@@ -525,6 +593,7 @@ Foreground vs background:
         }
         const pid = spawned.pid;
         const pidNote = pid !== undefined ? ` (pid ${String(pid)})` : '';
+        const detachStartedAt = Date.now();
         const outcome = await waitForDetachedDaemonReady(
           socketPath,
           DETACH_READY_TIMEOUT_MS,
@@ -568,28 +637,27 @@ Foreground vs background:
         // may have LOST the bind race and already exited, while a DIFFERENT
         // daemon (e.g. one the SessionStart hook just booted) is the one
         // actually answering. Verify identity via the pid `status` reports
-        // (issue #389 review finding 1) rather than assuming success.
-        let servingPid: number | undefined;
-        let servingReapAfterMs: number | undefined;
-        try {
-          const status = await daemonStatusClient(socketPath);
-          servingPid = status.pid;
-          servingReapAfterMs = status.reapAfterMs;
-        } catch {
-          // Best-effort identity check only — if `status` itself is
-          // unreachable right after a successful `daemonAvailable` probe,
-          // fall through and report success as before rather than failing a
-          // command whose actual property (daemon reachable) held.
-        }
-        const raceMessage = describeDetachRaceLoss({
+        // (issue #389 review finding 1), retrying within the SAME readiness
+        // deadline this command already promised, rather than a single
+        // best-effort call that fails open on the first hiccup (round-2
+        // review finding 3611413813).
+        const identityDeadline = detachStartedAt + DETACH_READY_TIMEOUT_MS;
+        const { servingPid, servingReapAfterMs, statusError } =
+          await waitForDetachIdentityProof(
+            socketPath,
+            identityDeadline,
+            DETACH_READY_POLL_MS,
+          );
+        const identityMessage = describeDetachIdentityIssue({
           spawnedPid: pid,
           servingPid,
           servingReapAfterMs,
           requestedReapAfterMs: reapAfterMs,
           socketPath,
+          statusError,
         });
-        if (raceMessage !== undefined) {
-          reportError(raceMessage, false);
+        if (identityMessage !== undefined) {
+          reportError(identityMessage, false);
           return;
         }
         console.log('AgentMon daemon started in the background.');

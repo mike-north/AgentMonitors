@@ -4,9 +4,10 @@ import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AgentMonitorRuntime } from '@agentmonitors/core';
 import {
-  describeDetachRaceLoss,
+  describeDetachIdentityIssue,
   runLoop,
   waitForDetachedDaemonReady,
+  waitForDetachIdentityProof,
 } from './daemon.js';
 import { callDaemon, daemonAvailable } from '../daemon-ipc.js';
 import type { SpawnedDaemon } from '../detached-spawn.js';
@@ -102,56 +103,83 @@ describe('runLoop — idle-reaping errors do not crash the daemon (issue #398)',
 });
 
 // ---------------------------------------------------------------------------
-// Issue #389 review finding 1: `daemon run --detach`'s readiness wait only
-// proves SOME daemon answers on the socket, not that it is the child THIS
-// invocation spawned. Concurrent lazy-boot elsewhere can make our own child
-// lose the startup race and exit while a different daemon answers. These
-// cases exercise the pure decision function directly — reproducing the
-// actual OS-level race deterministically in an integration test is
-// inherently timing-dependent, so the decision logic itself gets unit
-// coverage instead.
+// Issue #389 review finding 1 (round 2: 3611413813): `daemon run --detach`'s
+// readiness wait only proves SOME daemon answers on the socket, not that it
+// is the child THIS invocation spawned. Concurrent lazy-boot elsewhere can
+// make our own child lose the startup race and exit while a different daemon
+// answers — and a `status` call that errors, or that can't report a pid, must
+// NOT be read as "identity confirmed" either (the fail-open gap the round-2
+// finding named). These cases exercise the pure decision function directly —
+// reproducing the actual OS-level race deterministically in an integration
+// test is inherently timing-dependent, so the decision logic itself gets
+// unit coverage instead.
 // ---------------------------------------------------------------------------
-describe('describeDetachRaceLoss (issue #389 review finding 1)', () => {
+describe('describeDetachIdentityIssue (issue #389 review finding 1)', () => {
   it('reports nothing when the serving pid matches the spawned pid (the ordinary case)', () => {
     expect(
-      describeDetachRaceLoss({
+      describeDetachIdentityIssue({
         spawnedPid: 4242,
         servingPid: 4242,
         servingReapAfterMs: 0,
         requestedReapAfterMs: 0,
         socketPath: '/tmp/x.sock',
+        statusError: undefined,
       }),
     ).toBeUndefined();
   });
 
-  it('reports nothing when either pid is unavailable (best-effort identity check only)', () => {
-    expect(
-      describeDetachRaceLoss({
-        spawnedPid: undefined,
-        servingPid: 4242,
-        servingReapAfterMs: 0,
-        requestedReapAfterMs: 0,
-        socketPath: '/tmp/x.sock',
-      }),
-    ).toBeUndefined();
-    expect(
-      describeDetachRaceLoss({
-        spawnedPid: 4242,
-        servingPid: undefined,
-        servingReapAfterMs: 0,
-        requestedReapAfterMs: 0,
-        socketPath: '/tmp/x.sock',
-      }),
-    ).toBeUndefined();
+  // Round-2 finding 3611413813: the pre-fix version of this decision reported
+  // SUCCESS (`undefined`) whenever either pid was unavailable — recreating
+  // the exact false-success case the whole check exists to close, just moved
+  // one layer down. Fail CLOSED instead: identity is unproven, so this must
+  // report the uncertainty, never silently pass.
+  it('fails CLOSED — reports the identity as unproven, never success — when either pid is unavailable', () => {
+    const spawnedPidMissing = describeDetachIdentityIssue({
+      spawnedPid: undefined,
+      servingPid: 4242,
+      servingReapAfterMs: 0,
+      requestedReapAfterMs: 0,
+      socketPath: '/tmp/x.sock',
+      statusError: undefined,
+    });
+    expect(spawnedPidMissing).toBeDefined();
+    expect(spawnedPidMissing).toContain('/tmp/x.sock');
+    expect(spawnedPidMissing).toContain('Could not confirm');
+    expect(spawnedPidMissing).not.toContain('started in the background');
+
+    const servingPidMissing = describeDetachIdentityIssue({
+      spawnedPid: 4242,
+      servingPid: undefined,
+      servingReapAfterMs: 0,
+      requestedReapAfterMs: 0,
+      socketPath: '/tmp/x.sock',
+      statusError: undefined,
+    });
+    expect(servingPidMissing).toBeDefined();
+    expect(servingPidMissing).toContain('pid 4242');
+    expect(servingPidMissing).toContain('Could not confirm');
+  });
+
+  it('names the status error when that is why identity could not be proven', () => {
+    const message = describeDetachIdentityIssue({
+      spawnedPid: 4242,
+      servingPid: undefined,
+      servingReapAfterMs: undefined,
+      requestedReapAfterMs: 0,
+      socketPath: '/tmp/x.sock',
+      statusError: new Error('socket hang up'),
+    });
+    expect(message).toContain('socket hang up');
   });
 
   it('names both pids and the socket when a different daemon won the race', () => {
-    const message = describeDetachRaceLoss({
+    const message = describeDetachIdentityIssue({
       spawnedPid: 111,
       servingPid: 222,
       servingReapAfterMs: 300_000,
       requestedReapAfterMs: 0,
       socketPath: '/tmp/agentmon.sock',
+      statusError: undefined,
     });
     expect(message).toBeDefined();
     expect(message).toContain('/tmp/agentmon.sock');
@@ -161,35 +189,86 @@ describe('describeDetachRaceLoss (issue #389 review finding 1)', () => {
   });
 
   it("reports the SURVIVING daemon's actual reap setting, not the one this invocation requested", () => {
-    const disabled = describeDetachRaceLoss({
+    const disabled = describeDetachIdentityIssue({
       spawnedPid: 111,
       servingPid: 222,
       servingReapAfterMs: 0,
       requestedReapAfterMs: 300_000,
       socketPath: '/tmp/x.sock',
+      statusError: undefined,
     });
     expect(disabled).toContain('disabled');
     expect(disabled).toContain('--reap-after-ms 300000');
 
-    const enabled = describeDetachRaceLoss({
+    const enabled = describeDetachIdentityIssue({
       spawnedPid: 111,
       servingPid: 222,
       servingReapAfterMs: 60_000,
       requestedReapAfterMs: 0,
       socketPath: '/tmp/x.sock',
+      statusError: undefined,
     });
     expect(enabled).toContain('stops after 60s idle');
   });
 
   it('reports the reap setting as "unknown" when the status call could not read it', () => {
-    const message = describeDetachRaceLoss({
+    const message = describeDetachIdentityIssue({
       spawnedPid: 111,
       servingPid: 222,
       servingReapAfterMs: undefined,
       requestedReapAfterMs: 0,
       socketPath: '/tmp/x.sock',
+      statusError: undefined,
     });
     expect(message).toContain('unknown');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round-2 review finding 3611413813 (part 2): identity must be RETRIED within
+// the readiness deadline, not given up on after a single `status` call. This
+// exercises `waitForDetachIdentityProof` directly against a real daemon IPC
+// server, proving a transient failure followed by a real answer resolves to
+// the true pid rather than the caller falling back to "unproven" too early.
+// ---------------------------------------------------------------------------
+describe('waitForDetachIdentityProof (issue #389 review finding 1, round 2)', () => {
+  it('retries daemon status until it answers, within the deadline', async () => {
+    const dir = tempDir();
+    const socketPath = path.join(dir, 'agentmon.sock');
+    const monitorsDir = path.join(dir, '.claude', 'monitors');
+    mkdirSync(monitorsDir, { recursive: true });
+
+    // No daemon is listening yet — the first attempts must fail, then a
+    // daemon binds partway through, and the retry loop must pick it up
+    // rather than giving up after the very first failed attempt.
+    const loopPromise = runLoop(
+      monitorsDir,
+      dir,
+      20,
+      socketPath,
+      0,
+      ':memory:',
+    );
+    try {
+      const deadline = Date.now() + 5_000;
+      const probe = await waitForDetachIdentityProof(socketPath, deadline, 25);
+      expect(probe.servingPid).toBeDefined();
+      expect(probe.statusError).toBeUndefined();
+    } finally {
+      await callDaemon('stop', {}, { socketPath }).catch(() => undefined);
+      await loopPromise;
+    }
+  });
+
+  it('reports the last status error once the deadline passes with nothing ever answering', async () => {
+    const deadline = Date.now() + 100;
+    const probe = await waitForDetachIdentityProof(
+      '/does/not/exist-389-identity.sock',
+      deadline,
+      20,
+    );
+    expect(probe.servingPid).toBeUndefined();
+    expect(probe.statusError).toBeInstanceOf(Error);
   });
 });
 
