@@ -153,6 +153,33 @@ export async function terminateSpawnedDetachedDaemon(
   return !isProcessAlive(pid);
 }
 
+/**
+ * Describe the result of {@link terminateSpawnedDetachedDaemon} for inclusion
+ * in a `--detach` failure report (round-4 review 3611539482).
+ *
+ * Every non-success `--detach` outcome awaits cleanup, but merely awaiting it
+ * and discarding the result would leave the report unable to say whether
+ * cleanup actually worked — silently identical wording whether the process is
+ * confirmed gone or still alive. Returns `''` when there was no pid to clean
+ * up in the first place (nothing to report), otherwise a sentence stating
+ * success or, on failure, an explicit WARNING telling the caller to check
+ * before retrying.
+ *
+ * Shared by both non-success `--detach` branches (ready-timeout/spawn-error
+ * and unproven-identity) so the wording — and its unit coverage — cannot
+ * drift between them.
+ */
+export function describeSpawnedCleanupOutcome(
+  pid: number | undefined,
+  pidNote: string,
+  terminated: boolean,
+): string {
+  if (pid === undefined) return '';
+  return terminated
+    ? ` The process we spawned${pidNote} has been terminated.`
+    : ` WARNING: the process we spawned${pidNote} could not be terminated and may still be running — check it before retrying.`;
+}
+
 /** Outcome of {@link waitForDetachIdentityProof}. */
 export interface DetachIdentityProbe {
   servingPid: number | undefined;
@@ -673,20 +700,30 @@ Foreground vs background:
           // timeout would otherwise leave a live background daemon the user
           // was told failed, and a subsequent retry would then hit "already
           // running" against it.
-          await terminateSpawnedDetachedDaemon(pid);
+          const terminated = await terminateSpawnedDetachedDaemon(pid);
+          // Thread the cleanup result into the report the same way the
+          // identity-unproven branch below does: the caller needs to know
+          // whether it is actually safe to retry, not just that we tried
+          // (round-4 review 3611539482 — awaiting-and-discarding this result
+          // left the message unable to state whether cleanup succeeded).
+          const cleanupNote = describeSpawnedCleanupOutcome(
+            pid,
+            pidNote,
+            terminated,
+          );
           if (outcome.spawnError) {
             // The OS never actually started the process (e.g. ENOENT/EACCES) —
             // pointing at the log here would be pointing at nothing; it was
             // never written. Report the real cause instead.
             reportError(
-              `Failed to spawn the detached daemon${pidNote}: ${outcome.spawnError.message}`,
+              `Failed to spawn the detached daemon${pidNote}: ${outcome.spawnError.message}${cleanupNote}`,
               false,
             );
           } else {
             reportError(
               `Detached daemon${pidNote} did not answer on ${socketPath} within ${String(
                 Math.round(DETACH_READY_TIMEOUT_MS / 1000),
-              )}s; it has been sent SIGTERM. See ${logPath} for why.`,
+              )}s.${cleanupNote} See ${logPath} for why.`,
               false,
             );
           }
@@ -724,12 +761,11 @@ Foreground vs background:
           // daemon owns the socket, that one is untouched — the process we
           // terminate is the losing child we ourselves spawned.
           const terminated = await terminateSpawnedDetachedDaemon(pid);
-          const cleanupNote =
-            pid === undefined
-              ? ''
-              : terminated
-                ? ` The process we spawned${pidNote} has been terminated.`
-                : ` WARNING: the process we spawned${pidNote} could not be terminated and may still be running — check it before retrying.`;
+          const cleanupNote = describeSpawnedCleanupOutcome(
+            pid,
+            pidNote,
+            terminated,
+          );
           reportError(`${identityMessage}${cleanupNote}`, false);
           return;
         }

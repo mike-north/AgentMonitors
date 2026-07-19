@@ -4,11 +4,21 @@
  * spawned daemon process is not CPU-starved by concurrent test workers.
  */
 
-import { describe, it, expect } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { afterEach, beforeEach, describe, it, expect } from 'vitest';
+import {
+  chmodSync,
+  closeSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { spawnDetachedDaemon } from './detached-spawn.js';
+import { PRIVATE_DIR_MODE, PRIVATE_FILE_MODE } from '@agentmonitors/core';
+import { openLogFd, spawnDetachedDaemon } from './detached-spawn.js';
 import { daemonAvailable, callDaemon } from './daemon-ipc.js';
 
 // TODO (Plan C): add a UAT that proves the daemon survives PARENT-PROCESS EXIT,
@@ -53,3 +63,90 @@ describe('spawnDetachedDaemon', () => {
     }
   }, 20_000);
 });
+
+// POSIX permission modes are meaningless on win32; skip the whole suite there.
+describe.skipIf(process.platform === 'win32')(
+  'openLogFd mode (round-4 review 3611294358)',
+  () => {
+    let originalUmask: number;
+    let tmpDir: string;
+
+    beforeEach(() => {
+      // The whole point of this policy is to ignore the ambient umask — set an
+      // explicit permissive one (the common developer/CI default) so a
+      // regression that fell back to plain `mkdirSync`/`openSync` would be
+      // caught rather than accidentally passing under an already-strict
+      // ambient umask.
+      originalUmask = process.umask(0o022);
+      tmpDir = mkdtempSync(path.join(tmpdir(), 'agentmon-logfd-'));
+    });
+
+    afterEach(() => {
+      process.umask(originalUmask);
+      rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    /** Extract the permission bits (mode & 0o777) of a path via lstat. */
+    function modeOf(target: string): number {
+      return lstatSync(target).mode & 0o777;
+    }
+
+    it('creates a fresh log file 0600 and its missing parent dir 0700 under the default (nested) path', () => {
+      const logPath = path.join(tmpDir, '.claude', 'daemon', 'daemon.log');
+
+      const fd = openLogFd(logPath);
+      closeSync(fd);
+
+      expect(modeOf(logPath)).toBe(PRIVATE_FILE_MODE);
+      expect(modeOf(path.dirname(logPath))).toBe(PRIVATE_DIR_MODE);
+      // The intermediate ancestor `mkdirSync` created is private too — not
+      // just the immediate parent.
+      expect(modeOf(path.join(tmpDir, '.claude'))).toBe(PRIVATE_DIR_MODE);
+    });
+
+    it('creates a fresh log file 0600 and its missing parent dir 0700 under a custom (flat) path', () => {
+      const logPath = path.join(tmpDir, 'custom.log');
+
+      const fd = openLogFd(logPath);
+      closeSync(fd);
+
+      expect(modeOf(logPath)).toBe(PRIVATE_FILE_MODE);
+      expect(modeOf(path.dirname(logPath))).toBe(PRIVATE_DIR_MODE);
+    });
+
+    it('tightens a pre-existing world-readable parent dir and log file (migration from an earlier version)', () => {
+      const parent = path.join(tmpDir, 'legacy');
+      const logPath = path.join(parent, 'daemon.log');
+      mkdirSync(parent, { recursive: true });
+      chmodSync(parent, 0o755);
+      writeFileSync(logPath, 'previous run output\n');
+      chmodSync(logPath, 0o644);
+      expect(modeOf(parent)).toBe(0o755);
+      expect(modeOf(logPath)).toBe(0o644);
+
+      const fd = openLogFd(logPath);
+      closeSync(fd);
+
+      expect(modeOf(parent)).toBe(PRIVATE_DIR_MODE);
+      expect(modeOf(logPath)).toBe(PRIVATE_FILE_MODE);
+      // Tightening is a chmod, not a rewrite — the daemon's earlier output
+      // must survive the mode migration.
+      expect(readFileSync(logPath, 'utf-8')).toBe('previous run output\n');
+    });
+
+    it('appends rather than truncating a pre-existing log across repeated detached boots', () => {
+      const logPath = path.join(tmpDir, 'daemon.log');
+
+      const first = openLogFd(logPath);
+      writeFileSync(first, 'first boot\n');
+      closeSync(first);
+
+      const second = openLogFd(logPath);
+      writeFileSync(second, 'second boot\n');
+      closeSync(second);
+
+      expect(readFileSync(logPath, 'utf-8')).toBe('first boot\nsecond boot\n');
+      expect(modeOf(logPath)).toBe(PRIVATE_FILE_MODE);
+    });
+  },
+);

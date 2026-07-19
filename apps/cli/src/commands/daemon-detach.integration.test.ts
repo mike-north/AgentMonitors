@@ -404,7 +404,11 @@ describe('daemon run --detach (issue #389 P1)', () => {
       expect(result.exitCode).not.toBe(0);
       const output = `${result.stdout}${result.stderr}`;
       expect(output).toMatch(/did not answer on .* within 15s/);
-      expect(output).toContain('sent SIGTERM');
+      // Round-4 review 3611539482: the cleanup result must be stated, not
+      // just attempted — here the child already died mid-bind, so cleanup
+      // reports success rather than a bare "sent SIGTERM" that didn't say
+      // whether it worked.
+      expect(output).toContain('has been terminated');
       expect(output).toMatch(/\(pid \d+\)/);
 
       // Round-2 finding 3611413817: this timeout path prints its pid on

@@ -836,9 +836,9 @@ artifacts on startup** (BP4, [000 §5](./000-principles.md)).
 - **Directories — `0700` (`rwx------`):** the per-workspace data directory, session directories
   (which hold hook state), the socket directory the daemon creates, and the startup-lock directory.
 - **Files — `0600` (`rw-------`):** the SQLite database, its `-wal`/`-shm`/`-journal` sidecars,
-  hook-state files, the startup-lock pid file, and the `.claude/agentmonitors.local.md` coordination
-  file. (The `.claude` directory itself belongs to the host tool and is **not** re-moded — only the
-  coordination file we own is.)
+  hook-state files, the startup-lock pid file, the `.claude/agentmonitors.local.md` coordination
+  file, and `daemon run --detach`'s `--log` file. (The `.claude` directory itself belongs to the
+  host tool and is **not** re-moded — only the coordination file we own is.)
 - **Sockets:** the Unix domain socket is **bound under a restricted (`0o077`) umask so it is born
   `0600`** (Node binds a Unix socket synchronously inside `listen()`, so the umask window closes
   before the socket is observable), then re-chmod'd `0600` after bind as defense-in-depth, and —
@@ -877,9 +877,13 @@ Verified: `libs/core/src/security/local-permissions.ts` — `ensurePrivateDir`,
 `libs/core/src/inbox/db.ts` — `createDb`; `libs/core/src/hook-bridge/bridge.ts` +
 `libs/core/src/runtime/service.ts` — hook-state writes; `apps/cli/src/daemon-ipc.ts` — socket,
 startup lock, and the long-socket-path fallback ([§10.3](#103-socket-path-resolution));
-`apps/cli/src/local-state.ts` — coordination file; tests: `local-permissions.test.ts`,
-`inbox/db-permissions.test.ts`, `hook-bridge/bridge.test.ts`, `daemon-ipc.test.ts`, and the
-real-binary UAT in `apps/cli/src/commands/cli.integration.test.ts`.
+`apps/cli/src/local-state.ts` — coordination file; `apps/cli/src/detached-spawn.ts` — `openLogFd`
+(the `--detach` log: its parent directory via `ensurePrivateDir`, and the file itself created
+`0600` and tightened via `restrictExistingPathMode` before every append, so neither the ambient
+umask nor a pre-existing permissive file/dir from an earlier run leaves it world-readable); tests:
+`local-permissions.test.ts`, `inbox/db-permissions.test.ts`, `hook-bridge/bridge.test.ts`,
+`daemon-ipc.test.ts`, `detached-spawn.test.ts`, and the real-binary UAT in
+`apps/cli/src/commands/cli.integration.test.ts`.
 
 ## 4. Notify Dispatch
 

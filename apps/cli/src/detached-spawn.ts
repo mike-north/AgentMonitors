@@ -1,9 +1,9 @@
 import { spawn } from 'node:child_process';
-import { closeSync, mkdirSync, openSync } from 'node:fs';
+import { closeSync, openSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import {
-  PRIVATE_DIR_MODE,
+  ensurePrivateDir,
   PRIVATE_FILE_MODE,
   restrictExistingPathMode,
 } from '@agentmonitors/core';
@@ -137,20 +137,24 @@ export function spawnDetachedDaemon(
  * The log captures the daemon's stdout/stderr — workspace paths, socket paths,
  * and monitor failure messages — so under a common `umask 022` a plain
  * `openSync(path, 'a')` would create it `0644` and leave it readable by every
- * other local user. `PRIVATE_FILE_MODE`/`PRIVATE_DIR_MODE` have no group/other
- * bits, so a permissive umask has nothing to strip and the file/dir come out
- * owner-only from birth.
+ * other local user. `PRIVATE_FILE_MODE` has no group/other bits, so a
+ * permissive umask has nothing to strip and the file comes out owner-only from
+ * birth.
  *
- * A missing parent is created `0700`; a pre-existing one keeps its mode, since
- * `--log` may point into a directory the user owns for their own reasons and
- * silently tightening someone else's directory would be wrong (the same rule
- * `ensureSocketDir` applies to a user-chosen socket directory). The file itself
- * IS tightened when it already exists — it is ours, we are about to append the
+ * The parent directory is created (or tightened, if it already exists looser)
+ * via {@link ensurePrivateDir} — the same AgentMon-owned-location helper every
+ * other runtime-data directory uses (session dirs, the socket directory), so
+ * this creation site can't drift from that policy. The log file itself IS
+ * tightened when it already exists — it is ours, we are about to append the
  * daemon's diagnostics to it, and a looser file left by an earlier version (or
  * by a run before this policy existed) must not stay world-readable.
+ *
+ * Exported (this package has no api-extractor rollup) purely so its mode
+ * regression tests can call it directly instead of round-tripping through a
+ * real detached daemon spawn (round-4 review 3611294358).
  */
-function openLogFd(logPath: string): number {
-  mkdirSync(path.dirname(logPath), { recursive: true, mode: PRIVATE_DIR_MODE });
+export function openLogFd(logPath: string): number {
+  ensurePrivateDir(path.dirname(logPath));
   restrictExistingPathMode(logPath, PRIVATE_FILE_MODE);
   return openSync(logPath, 'a', PRIVATE_FILE_MODE);
 }

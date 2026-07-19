@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AgentMonitorRuntime } from '@agentmonitors/core';
 import {
   describeDetachIdentityIssue,
+  describeSpawnedCleanupOutcome,
   runLoop,
   terminateSpawnedDetachedDaemon,
   waitForDetachedDaemonReady,
@@ -116,6 +117,37 @@ describe('runLoop — idle-reaping errors do not crash the daemon (issue #398)',
 // test is inherently timing-dependent, so the decision logic itself gets
 // unit coverage instead.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Round-4 review finding 3611539482: the ready-timeout/spawn-error branch
+// awaited terminateSpawnedDetachedDaemon(pid) but discarded its result, so the
+// failure report could never state whether cleanup actually succeeded — a
+// direct contradiction of the spec language both non-success --detach
+// branches share. Both outcomes (terminated / not terminated) get direct unit
+// coverage on the pure formatter, since reliably forcing a real child to
+// survive SIGTERM+SIGKILL in an integration test would be flaky.
+// ---------------------------------------------------------------------------
+describe('describeSpawnedCleanupOutcome (round-4 review 3611539482)', () => {
+  it('reports nothing when there was no pid to clean up', () => {
+    expect(describeSpawnedCleanupOutcome(undefined, '', true)).toBe('');
+    expect(describeSpawnedCleanupOutcome(undefined, '', false)).toBe('');
+  });
+
+  it('states cleanup succeeded, naming the pid, when termination is confirmed', () => {
+    const note = describeSpawnedCleanupOutcome(4242, ' (pid 4242)', true);
+    expect(note).toContain('has been terminated');
+    expect(note).toContain('(pid 4242)');
+    expect(note).not.toContain('WARNING');
+  });
+
+  it('states cleanup FAILED with an explicit WARNING, naming the pid, when the process is still alive', () => {
+    const note = describeSpawnedCleanupOutcome(4242, ' (pid 4242)', false);
+    expect(note).toContain('WARNING');
+    expect(note).toContain('could not be terminated');
+    expect(note).toContain('may still be running');
+    expect(note).toContain('(pid 4242)');
+  });
+});
+
 describe('describeDetachIdentityIssue (issue #389 review finding 1)', () => {
   it('reports nothing when the serving pid matches the spawned pid (the ordinary case)', () => {
     expect(
