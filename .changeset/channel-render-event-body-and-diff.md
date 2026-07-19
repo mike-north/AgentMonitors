@@ -35,10 +35,11 @@ run `events list` to see what changed — defeating push delivery.
 poll`). The other, rarer case is a single event whose own block still exceeds the content ceiling
   even alone; that one claimed event is mid-truncated and — because the claim is already committed by
   the time it renders — it will **not** re-deliver later. Its marker instead names the exact,
-  directly-runnable recovery command for that session
-  (`` `agentmonitors events list --session <id> --unread` `` — `events list` requires `--session`, so a
-  bare `--unread` form would fail), pointing at the still-unread, un-truncated copy of the full event
-  (claiming an event is never the same as acknowledging it).
+  directly-runnable recovery command for that session and socket
+  (`` `agentmonitors events list --session <id> --socket <path> --unread` `` — `events list` requires
+  `--session`, so a bare `--unread` form would fail, and the explicit `--socket` guards against a stale
+  `$AGENTMONITORS_SOCKET` silently querying the wrong workspace's daemon), pointing at the still-unread,
+  un-truncated copy of the full event (claiming an event is never the same as acknowledging it).
 - A reminder tag's `event_count` now reports the pending unread total the reminder refers to, instead
   of the confusing `0`.
 - The hook-deliver transport's `additionalContext` blocks also grow by up to ~800 chars of change
