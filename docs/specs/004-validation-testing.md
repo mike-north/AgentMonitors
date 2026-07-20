@@ -209,6 +209,40 @@ The `RuntimeStore.saveSnapshot()` and `RuntimeStore.latestSnapshot()` methods (i
 | Activation plugin `hooks.json` command strings stay wired to the CLI stdin contract (config drift)                                                                                 | Covered (`apps/cli/src/commands/cli.integration.test.ts` — "drives the plugin's literal hooks.json command strings end to end (boot, deliver body, deregister)"; "SessionStart command falls back to the install-hint JSON when agentmonitors is not on PATH"). The suite parses the real `agent-plugins/agentmonitors/hooks/hooks.json` and runs each `SessionStart`/`UserPromptSubmit`/`SessionEnd` command verbatim via `/bin/sh -c` with an `agentmonitors` PATH shim, so a drifted command string (flag re-added, binary renamed, chain broken), a regressed stdin contract, or an invalid missing-CLI fallback breaks the test. |
 | A global install of the packed launcher (no workspace `node_modules`) can go from `agentmonitors init` to a delivered signal over the real hook stdin/stdout contract (issue #276) | Covered (`scripts/test-e2e-fresh-install-hooks.mjs`, `pnpm test:e2e-fresh-install-hooks`, CI per-PR) — see [§2.7](#27-fresh-environment-e2e-hooks-path).                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
+### 3.6 PR-alerting presets (`init --type pr-review` / `--type my-prs`, issue #444)
+
+All rows below are covered by `apps/cli/src/commands/pr-alerting-presets.test.ts`, which drives the
+real `command-poll` source over the real scaffolded `watch:` block with only the `gh` binary stubbed
+(see [003 §11.9](./003-source-plugins.md#119-pr-alerting-recipe-reviewer-and-author-roles)).
+
+| Scenario                                                                               | Coverage (describe block)                                                                                                 |
+| -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| Reviewer scoping defaults to `review-requested:@me` and rejects an unscoped query      | `reviewer scoping (PR #446 review, thread 1)`                                                                             |
+| `pr-review` fires only for actionable transitions (appear/leave/draft-marked-ready)    | `--type pr-review reviewer queue`                                                                                         |
+| `my-prs` fires on every actionable `needs` transition (CI, review, draft, terminal)    | `--type my-prs fires on every actionable transition`                                                                      |
+| A repeat review from the same reviewer in the same state still fires (`at` field)      | `--type my-prs review-revision signal (PR #446 review, thread 2)`                                                         |
+| Terminal (`merged`/`closed`) rows are time-bounded to 6h and never re-churn            | `--type my-prs terminal states are time-bounded`                                                                          |
+| `my-prs` stays silent across benign transitions (approval, retitle, post-merge chat)   | `--type my-prs stays silent on non-events`                                                                                |
+| `pr-review` and `my-prs` payloads never both claim the same PR (issue #441)            | `the two presets do not overlap (issue #441 interrupt multiplier)`                                                        |
+| `GH_TOKEN`/`GITHUB_TOKEN`/`GH_REPO` are scrubbed before invoking `gh`                  | `gh environment/temp-file hardening (PR #446 review, thread 3)`                                                           |
+| The per-invocation stderr temp file is `mktemp`-created and always cleaned up          | `gh environment/temp-file hardening (PR #446 review, thread 3)`                                                           |
+| `commentCount` excludes the PR author's own comments and bot comments                  | `--type my-prs fires on every actionable transition` ("does NOT fire when only…" / "fires when a reviewer…" cases)        |
+| A missing/unauthenticated `gh` surfaces `Command failing`, never a silent baseline     | `graceful degradation when gh is unusable (issue #444)`                                                                   |
+| Neither preset hardcodes a repository, username, or working directory                  | `preset portability guarantees (issue #444)`                                                                              |
+| `my-prs`'s open-PR coverage survives terminal-history volume (finding 989)             | `` `--type my-prs` open-PR coverage survives terminal-history volume (PR #446 review, finding 989) ``                     |
+| A CI-crossing transition fires each monitor exactly once, matching the documented pair | `the two presets do not overlap (issue #441 interrupt multiplier)` ("a CI failure that crosses the readiness partition…") |
+| The delivered event body stays readable (short titles, no raw command)                 | `delivered alert readability (issue #449 guard)`                                                                          |
+
+Environment isolation is the `env`-focused rows above, not a separate scenario: it is exercised as a
+property of the same `gh`-stubbed `observe()` calls rather than through a dedicated sandbox, since
+`command-poll`'s `env` config field is already the mechanism under test (003 §11.9's "Repository
+auto-scoping"). `cwd`/workspace-root portability is covered at the source level, not the preset level,
+since it is `command-poll`'s own resolution behavior (003 §11.1) that both presets now rely on by
+omitting `cwd:` entirely: see `plugins/source-command-poll/src/index.test.ts`'s "cwd resolution (003
+§11.1)" describe block, which proves the SAME monitor state resolves to a different working directory
+once `workspacePath` changes (simulating a relocated project) with no state baked into the monitor.
+High-urgency silence on non-events is the `stays silent on non-events` row.
+
 ## 4. Test Style Guidance
 
 Each tricky rule should have a named example plus explicit assertions. Agent Monitors tests MUST prefer:

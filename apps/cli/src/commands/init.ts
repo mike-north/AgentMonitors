@@ -73,41 +73,72 @@ const COMMAND_POLL_DEFAULT_COMMAND_BLOCK =
  * `$$` is the `sh` process's own PID — not `-$$`, which would signal the whole
  * process group and reach siblings this monitor does not own.
  *
- * `env -u GITHUB_TOKEN` unsets an inherited `GITHUB_TOKEN` before invoking
- * `gh`. `gh` gives an inherited `GITHUB_TOKEN` unconditional precedence over
- * keyring/`gh auth login` credentials, so a daemon process that happens to
- * have one exported (a common shell-startup leftover) would make `@me` — and
- * therefore both presets — silently resolve against the wrong identity, with
- * no error to surface it. Scrubbing it here is the same fix this repo's own
- * tooling applies to every non-interactive `gh` invocation.
+ * `unset GH_TOKEN GITHUB_TOKEN GH_REPO` (below, once per script) scrubs three inherited overrides
+ * before invoking `gh`. `GH_TOKEN`/`GITHUB_TOKEN` each give unconditional precedence over
+ * keyring/`gh auth login` credentials (`GH_TOKEN` takes priority over `GITHUB_TOKEN` when both are
+ * set), so a daemon process that happens to have either exported (a common shell-startup leftover)
+ * would make `@me` — and therefore both presets — silently resolve against the wrong identity, with no
+ * error to surface it. `GH_REPO` overrides which repository `gh pr list` targets outright, which would
+ * silently defeat the working-directory-based auto-scoping below. Scrubbing all three is the same fix
+ * this repo's own tooling applies to every non-interactive `gh` invocation. `unset` rather than
+ * `env -u` per call is what makes this scrub apply uniformly across a multi-call `fetchCmd` (see
+ * {@link ghPresetScript}) — `env -u ... cmd1 && cmd2` would only wrap `cmd1`.
  *
- * Only the failure branch's `2>"$errfile"` sees `gh`'s stderr: the success
- * path's `out=$(...)` captures stdout alone, so a one-time `gh` warning or
- * `GH_DEBUG` chatter on an otherwise-successful run can never leak into the
- * diffed JSON (which would otherwise degrade `json-diff` to a raw-text
- * comparison of the polluted string). `$errfile` is scoped per-invocation by
- * `$$` (this `sh` process's own PID) and removed on both branches, so
- * concurrent ticks never collide or leak a stale file.
+ * Only the failure branch's `2>"$errfile"` sees `gh`'s stderr: the success path's `out=$(...)`
+ * captures stdout alone, so a one-time `gh` warning or `GH_DEBUG` chatter on an otherwise-successful
+ * run can never leak into the diffed JSON (which would otherwise degrade `json-diff` to a raw-text
+ * comparison of the polluted string). `$errfile` is created with `mktemp` (private, mode 0600, and
+ * collision-proof — no predictable PID-based path for a shared `/tmp` to pre-seed with a symlink) and
+ * removed by an `EXIT` trap rather than explicit `rm -f` calls on each branch, so it is also cleaned up
+ * on a `kill -TERM $$` self-signal (the failure branch below) or an external `SIGTERM` from
+ * `command-poll`'s own timeout escalation (003 §11.2/§11.7) — a signal a shell with no trap for that
+ * signal still runs its `EXIT` trap for, per POSIX. `SIGKILL` cannot be trapped by any shell, so that
+ * one remaining escalation step is the only path a stale file can survive under — the same limit every
+ * `mktemp`-based script has.
  *
- * Note the absence of `--repo`: `gh` resolves the repository from its
- * process working directory. That working directory is the **daemon's own**
- * cwd (§11.1) — never a "workspace/config root" the daemon might not even be
- * running from — so the scaffolded frontmatter carries an explicit `cwd:`
- * (see {@link seedPresetCwd}) pointing at the project root `init` was run
- * from, rather than relying on wherever the daemon happens to be launched.
- * Omitting `--repo` is what then lets that one `cwd` scope `gh` to the right
+ * Note the absence of `--repo`: `gh` resolves the repository from its process
+ * working directory. Neither preset's frontmatter carries an explicit `cwd:`
+ * — `command-poll` resolves an omitted `cwd` against the **runtime**
+ * workspace/config root for a project monitor (003 §11.1), which is where
+ * this repository's `MONITOR.md` lives, so `gh` lands in the right directory
+ * without a path baked into the file at scaffold time. Omitting `--repo` is
+ * what then lets that resolved working directory scope `gh` to the right
  * repository; interpolating an owner/name at scaffold time would hardcode it
  * right back.
+ *
+ * `fetchCmd` is one `gh` invocation, or several joined by `&&` (see
+ * {@link MY_PRS_FETCH} — issue #444 review, finding 989): a `&&` chain
+ * short-circuits on the first failure, so `raw=$(${fetchCmd} ...)`'s own
+ * exit status still reflects the FIRST failing `gh` call even when later
+ * calls in the chain never run, which is what keeps the loud-failure
+ * contract above intact for a multi-call fetch.
+ *
+ * `reduceJq` runs as a separate `jq -sc` stage over the fetch's raw stdout,
+ * not as `gh`'s own `--jq` flag: `-s`/`--slurp` folds however many
+ * top-level JSON arrays `fetchCmd` printed (one per `gh` call) into one
+ * array-of-arrays, so `reduceJq` always starts with `add` to flatten it
+ * back to a single array of PRs — for a one-call `fetchCmd` this is a
+ * no-op (`[[...]] | add == [...]`), so `reduceJq` bodies are unchanged
+ * from when they ran as `gh --jq`.
  */
-function ghPresetScript(preset: string, query: string): string {
-  return `errfile="\${TMPDIR:-/tmp}/agentmonitors-${preset}-$$.stderr"
-if out=$(env -u GITHUB_TOKEN ${query} 2>"$errfile"); then
-  rm -f "$errfile"
+function ghPresetScript(
+  preset: string,
+  fetchCmd: string,
+  reduceJq: string,
+): string {
+  const failureMessage = `printf 'agentmonitors %s: the GitHub CLI query failed, so PR alerting is NOT running.\\nFix one of these, then re-run: agentmonitors monitor test <this file>\\n  1. Install the GitHub CLI: https://cli.github.com\\n  2. Authenticate it: gh auth login\\n  3. Run the daemon from inside a git repo that has a GitHub remote.\\n' '${preset}' >&2`;
+  return `errfile=$(mktemp "\${TMPDIR:-/tmp}/agentmonitors-${preset}-XXXXXX" 2>/dev/null) || {
+  ${failureMessage}
+  kill -TERM $$
+  exit 1
+}
+trap 'rm -f "$errfile"' EXIT
+unset GH_TOKEN GITHUB_TOKEN GH_REPO
+if raw=$(${fetchCmd} 2>"$errfile") && out=$(printf '%s\\n' "$raw" | jq -sc '${reduceJq}' 2>>"$errfile"); then
   printf '%s\\n' "$out"
 else
   cat "$errfile" >&2
-  rm -f "$errfile"
-  printf 'agentmonitors %s: the GitHub CLI query failed, so PR alerting is NOT running.\\nFix one of these, then re-run: agentmonitors monitor test <this file>\\n  1. Install the GitHub CLI: https://cli.github.com\\n  2. Authenticate it: gh auth login\\n  3. Run the daemon from inside a git repo that has a GitHub remote.\\n' '${preset}' >&2
+  ${failureMessage}
   kill -TERM $$
   exit 1
 fi`;
@@ -269,18 +300,20 @@ const PR_REVIEW_SCOPE_COMMENT =
  * deliver two alerts for one transition — issue #441's measured
  * interrupt-multiplier, reproduced by construction.
  */
-const PR_REVIEW_QUERY =
+const PR_REVIEW_FETCH =
   'gh pr list --state open --limit 30 ' +
   `--search '${PR_REVIEW_DEFAULT_SCOPE}' ` +
-  '--json number,title,isDraft,reviewDecision,headRefName,author,statusCheckRollup ' +
-  "--jq '[.[] | select(.isDraft == false " +
+  '--json number,title,isDraft,reviewDecision,headRefName,author,statusCheckRollup';
+
+const PR_REVIEW_REDUCE =
+  'add | [.[] | select(.isDraft == false ' +
   'and (.headRefName | startswith("changeset-release/") | not) ' +
   'and (((.reviewDecision // "") == "") or (.reviewDecision == "REVIEW_REQUIRED")) ' +
   'and ([.statusCheckRollup[]? | select(((.conclusion // .state // "") | ascii_upcase) as $c ' +
   '| $c == "FAILURE" or $c == "TIMED_OUT" or $c == "CANCELLED" or $c == "ERROR" ' +
   'or $c == "ACTION_REQUIRED" or $c == "STARTUP_FAILURE")] | length) == 0) ' +
   '| {number, title, headRefName, author: .author.login}] ' +
-  "| sort_by(.number)'";
+  '| sort_by(.number)';
 
 /**
  * `--type my-prs`'s `gh` query: the current `gh` user's PRs in the current repo
@@ -307,22 +340,42 @@ const PR_REVIEW_QUERY =
  * A green, non-draft, undecided open PR is `none` and never enters the payload,
  * so an ordinary CI run (queued → running → passing) produces no event at all.
  *
- * `--state all --limit 60` rather than `--state open`: a merged PR must stay in
- * the result set for its terminal state to be *nameable*, because "merged, go
- * clean up the branch" and "closed unmerged, go find out why" are different
- * instructions and `--state open` collapses both into an indistinguishable
- * disappearance. The cost of `--state all` is that merged/closed PRs also count
- * against `--limit`, so an old still-open PR could in principle age out of the
- * query and stop being monitored; the window is widened to 60 (measured ~3.5s
- * per poll against a real repo, comfortably inside a 5m interval) so that
- * requires 60 newer PRs, and `gh pr list` orders newest-first while an author's
- * open PRs are normally their newest.
+ * `commentCount` excludes the author's own comments (compared against `author.login`,
+ * fetched alongside the other fields) and bot comments (`login` ending `[bot]`, the
+ * GitHub convention for bot accounts — Dependabot, Copilot, most CI bots). Without
+ * that filter, every reply the author posts to their own PR, or every bot status
+ * comment, would increment `commentCount` on an already-actionable entry and
+ * re-fire the high-urgency interrupt for activity that carries no new feedback
+ * (PR #446 review).
+ *
+ * `my-prs` fetches THREE separate `gh pr list` calls — `--state open`, `--state merged`, and
+ * `--state closed` ({@link MY_PRS_FETCH}) — rather than one `--state all` call, so that
+ * merged/closed history can never compete with open PRs for a shared `--limit` window (issue #444
+ * review, finding 989). A single `--state all --limit N` call orders newest-created-first across ALL
+ * states, so on an active repository terminal PRs can consume most of the window (measured live: 15 of
+ * 20 slots at `--limit 20`) and age a still-open PR out of the query entirely — after which its CI
+ * going red would silently produce no event, forever, until it happened to re-enter the window. Three
+ * separate calls each get their OWN `--limit`, so open coverage (`--limit 30`, generous for one
+ * author's concurrent PRs) can never be displaced by terminal history, and terminal coverage
+ * (`--limit 20` each for `merged`/`closed`) only needs to outlast the 6-hour terminal window, not
+ * compete with open PRs at all. The three raw arrays are unioned by {@link ghPresetScript}'s `jq -sc`
+ * stage; `reviewDecision`/`state` never overlap a PR across the three states, so `unique_by(.number)`
+ * in {@link MY_PRS_REDUCE} is a defensive no-op against real `gh` output — it only matters against a
+ * test stub that (deliberately, to keep transition fixtures simple) returns the same fixture for every
+ * call.
  */
-const MY_PRS_QUERY =
-  'gh pr list --author @me --state all --limit 60 ' +
-  '--json number,title,url,state,isDraft,reviewDecision,statusCheckRollup,' +
-  'latestReviews,comments,mergedAt,closedAt ' +
-  "--jq '[.[] " +
+const MY_PRS_JSON_FIELDS =
+  'number,title,url,state,isDraft,reviewDecision,statusCheckRollup,' +
+  'latestReviews,comments,mergedAt,closedAt,author';
+
+const MY_PRS_FETCH =
+  `gh pr list --author @me --state open --limit 30 --json ${MY_PRS_JSON_FIELDS} && ` +
+  `gh pr list --author @me --state merged --limit 20 --json ${MY_PRS_JSON_FIELDS} && ` +
+  `gh pr list --author @me --state closed --limit 20 --json ${MY_PRS_JSON_FIELDS}`;
+
+const MY_PRS_REDUCE =
+  'add | unique_by(.number) | [.[] ' +
+  '| (.author.login) as $me ' +
   '| (([.statusCheckRollup[]? | select(((.conclusion // .state // "") | ascii_upcase) as $c ' +
   '| $c == "FAILURE" or $c == "TIMED_OUT" or $c == "CANCELLED" or $c == "ERROR" ' +
   'or $c == "ACTION_REQUIRED" or $c == "STARTUP_FAILURE") | (.name // .context)] | sort)) as $failing ' +
@@ -342,7 +395,9 @@ const MY_PRS_QUERY =
   'else {failingChecks: $failing, ' +
   'reviews: ([.latestReviews[]? | {by: .author.login, state, at: .submittedAt}] ' +
   '| sort_by(.by, .at, .state)), ' +
-  "commentCount: (.comments | length)} end)] | sort_by(.number)'";
+  'commentCount: ([.comments[]? | select((.author.login // "") != $me ' +
+  'and ((.author.login // "") | endswith("[bot]") | not))] ' +
+  '| length)} end)] | sort_by(.number)';
 
 /**
  * The scaffold body for each `--type`. Exported (test-only use) so
@@ -411,17 +466,17 @@ affect this workspace.
 name: PRs awaiting my review
 watch:
   type: command-poll
-  # Scoped to THIS repository via the explicit cwd below (init fills it in
-  # with this project's root): gh resolves the repository from its process
-  # working directory, which is the daemon's own cwd, NOT this file's
-  # location — omitting cwd would make gh resolve whatever repo the daemon
-  # happens to be launched from instead. Do not remove cwd: or add --repo.
+  # Scoped to THIS repository: gh resolves the repository from its process
+  # working directory, which command-poll defaults (no cwd: needed here) to
+  # this project's root — the runtime workspace/config root, resolved fresh
+  # on every tick from wherever this file lives, not a path baked in at scaffold
+  # time. Do not add --repo or a hardcoded cwd:.
   key: pr-review
 ${PR_REVIEW_SCOPE_COMMENT}  command:
     - sh
     - -c
     - |
-${yamlBlockScalar(ghPresetScript('pr-review', PR_REVIEW_QUERY), '      ')}
+${yamlBlockScalar(ghPresetScript('pr-review', PR_REVIEW_FETCH, PR_REVIEW_REDUCE), '      ')}
   interval: 5m
   change-detection:
     strategy: json-diff
@@ -461,8 +516,7 @@ monitor again.
 name: My pull requests
 watch:
   type: command-poll
-  # Scoped to THIS repository via the explicit cwd below (init fills it in
-  # with this project's root, not --repo — see the pr-review template's
+  # Scoped to THIS repository (no cwd: needed — see the pr-review template's
   # comment for why) and to whoever gh is authenticated as (--author @me,
   # never a baked-in username).
   key: my-prs
@@ -470,7 +524,7 @@ watch:
     - sh
     - -c
     - |
-${yamlBlockScalar(ghPresetScript('my-prs', MY_PRS_QUERY), '      ')}
+${yamlBlockScalar(ghPresetScript('my-prs', MY_PRS_FETCH, MY_PRS_REDUCE), '      ')}
   interval: 5m
   change-detection:
     strategy: json-diff
@@ -545,12 +599,10 @@ const VALID_URGENCIES = ['low', 'normal', 'high'];
 
 /**
  * `--type` values that are ready-made presets rather than observation source
- * types (005 §2: "pr-review and my-prs are not source types"). Used to (a)
- * keep {@link VALID_TYPES} — which Commander's `.choices()` still needs as one
- * flat list — split apart wherever the CLI presents types to a human, so the
- * interactive prompt and its error don't imply a preset is a kind of source,
- * and (b) drive {@link seedPresetCwd}, since only these two templates ship a
- * `key:` line for it to anchor on.
+ * types (005 §2: "pr-review and my-prs are not source types"). Used to keep
+ * {@link VALID_TYPES} — which Commander's `.choices()` still needs as one flat
+ * list — split apart wherever the CLI presents types to a human, so the
+ * interactive prompt and its error don't imply a preset is a kind of source.
  */
 const PRESET_TYPES = new Set(['pr-review', 'my-prs']);
 
@@ -842,30 +894,6 @@ interface ScaffoldResult {
 }
 
 /**
- * Seed an explicit `cwd:` into a PR-alerting preset's (`pr-review`/`my-prs`)
- * frontmatter, right after its `key:` line, pointing `gh`'s child process at
- * `cwd` — the project root `init` was run from.
- *
- * Without this, `command-poll`'s effective `cwd` is the **daemon's own**
- * process working directory (§11.1) — never this project's root — so a
- * daemon later launched from `$HOME`, another repo, or any directory other
- * than this one would make `gh` silently resolve a different repository's
- * PRs; `gh` exits 0 either way, so nothing would surface the mistake (issue
- * #444 review, finding 1). `init` knows the real project root at scaffold
- * time (the same `process.cwd()` {@link ensureEnabled}/{@link ensureGitignore}
- * already trust), so recording it as an absolute `cwd:` makes the scaffolded
- * file correct regardless of where the daemon is later launched from.
- */
-function seedPresetCwd(template: string, cwd: string): string {
-  const pattern = /^( *)key: (?:pr-review|my-prs)$/m;
-  return template.replace(
-    pattern,
-    (match, indent: string) =>
-      `${match}\n${indent}cwd: ${yamlSingleQuoted(cwd)}`,
-  );
-}
-
-/**
  * Write a template `MONITOR.md` for `type` into `<dir>/<name>/`. Shared by the
  * named `init <name>` scaffold path and the bare-init bootstrap so both produce
  * byte-identical monitor files. Never overwrites an existing monitor: returns
@@ -879,9 +907,14 @@ function seedPresetCwd(template: string, cwd: string): string {
  * any filesystem write, so a rejected seed (e.g. `--glob` on a type with no
  * path-pattern list) never leaves a partial directory behind.
  *
- * {@link seedPresetCwd} runs unconditionally for the two presets (never
- * user-seeded, never skippable) — both scaffold paths need it, not just the
- * named one, since the bootstrap path can equally scaffold `--type pr-review`.
+ * Neither preset seeds an explicit `cwd:` (issue #444 review, finding 826): a
+ * PR-alerting preset omits `cwd` entirely, and `command-poll` now defaults an
+ * omitted `cwd` to the **runtime** workspace/config root for a project
+ * monitor (003 §11.1) — the same root the daemon resolves fresh on every
+ * tick, from wherever `MONITOR.md` actually lives, never a value baked into
+ * the file at scaffold time. Baking in `process.cwd()` here, as an earlier
+ * revision did, broke the very first tick after the project was relocated or
+ * shared to another checkout path.
  */
 function scaffoldMonitor(
   dir: string,
@@ -897,10 +930,7 @@ function scaffoldMonitor(
   if (existsSync(path.join(monitorDir, 'MONITOR.md'))) {
     return { status: 'exists', monitorDir };
   }
-  let content = applySeeds(template, type, seeds);
-  if (PRESET_TYPES.has(type)) {
-    content = seedPresetCwd(content, process.cwd());
-  }
+  const content = applySeeds(template, type, seeds);
   mkdirSync(monitorDir, { recursive: true });
   writeFileSync(path.join(monitorDir, 'MONITOR.md'), content, 'utf-8');
   return { status: 'created', monitorDir };

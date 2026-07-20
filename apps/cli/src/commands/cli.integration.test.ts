@@ -11,7 +11,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  realpathSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -1287,11 +1286,13 @@ describe('init', () => {
       const curatedName =
         type === 'pr-review' ? 'PRs awaiting my review' : 'My pull requests';
       expect(monitor).toContain(`name: ${curatedName}`);
-      // The scaffold-time project root (finding 1) is seeded verbatim. Real
-      // paths, since `process.cwd()` (what `init` reads) resolves symlinks a
-      // temp-dir path may contain (e.g. macOS's /var -> /private/var), while
-      // `dir` here is the pre-resolution string passed as the child's cwd.
-      expect(monitor).toContain(`cwd: '${realpathSync(dir)}'`);
+      // No `cwd:` is seeded at scaffold time (issue #444 review, finding
+      // 826, superseding the prior finding-1 fix that baked one in):
+      // `command-poll` now resolves an omitted `cwd` against the runtime
+      // workspace/config root itself (003 §11.1), so the scaffolded file
+      // carries no project-root-shaped state that would go stale if the
+      // project were relocated after scaffolding.
+      expect(monitor).not.toMatch(/^\s*cwd:/m);
 
       const validated = run(['validate', monitorsDir, '--format', 'json'], dir);
       expect(validated.exitCode).toBe(0);

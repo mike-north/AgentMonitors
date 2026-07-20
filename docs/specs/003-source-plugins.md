@@ -1487,16 +1487,27 @@ watch:
     strategy: json-diff
 ```
 
-| Field                           | Type             | Required | Default                  | Description                                                                                                                                                            |
-| ------------------------------- | ---------------- | -------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `command`                       | `string[]`       | Yes      | —                        | Argv array; `command[0]` is the executable (resolved via `PATH`). `minItems: 1`.                                                                                       |
-| `interval`                      | duration string  | No       | runtime default          | Poll cadence hint; owned by the scheduling engine, same as `api-poll`.                                                                                                 |
-| `cwd`                           | `string`         | No       | daemon working directory | Working directory for the child process.                                                                                                                               |
-| `env`                           | `object<string>` | No       | `{}`                     | Literal env vars merged over the inherited daemon environment.                                                                                                         |
-| `timeout`                       | duration string  | No       | `30s`                    | Wall-clock limit; expiry is an **execution failure** (§11.5). Parsed via core's shared `parseOperationTimeoutMs` (§4.9) — a zero-length value (`"0s"`, …) is rejected. |
-| `key`                           | `string`         | No       | joined argv              | Overrides the observation `objectKey` (§11.4).                                                                                                                         |
-| `change-detection.strategy`     | enum             | No       | `text-diff`              | `text-diff` \| `json-diff` \| `exit-code` (§11.3).                                                                                                                     |
-| `change-detection.ignore-paths` | `string[]`       | No       | `[]`                     | Plain `json-diff` paths removed before comparison (§11.3).                                                                                                             |
+| Field                           | Type             | Required | Default         | Description                                                                      |
+| ------------------------------- | ---------------- | -------- | --------------- | -------------------------------------------------------------------------------- |
+| `command`                       | `string[]`       | Yes      | —               | Argv array; `command[0]` is the executable (resolved via `PATH`). `minItems: 1`. |
+| `interval`                      | duration string  | No       | runtime default | Poll cadence hint; owned by the scheduling engine, same as `api-poll`.           |
+| `cwd`                           | `string`         | No       | see below       | Working directory for the child process.                                         |
+| `env`                           | `object<string>` | No       | `{}`            | Literal env vars merged over the inherited daemon environment.                   |
+| `timeout`                       | duration string  | No       | `30s`           | Wall-clock limit; expiry is an **execution failure** (§11.5). Parsed via core's shared `parseOperationTimeoutMs` (§4.9) — a zero-length value (`"0s"`, …) is rejected. |
+| `key`                           | `string`         | No       | joined argv     | Overrides the observation `objectKey` (§11.4).                                   |
+| `change-detection.strategy`     | enum             | No       | `text-diff`     | `text-diff` \| `json-diff` \| `exit-code` (§11.3).                               |
+| `change-detection.ignore-paths` | `string[]`       | No       | `[]`            | Plain `json-diff` paths removed before comparison (§11.3).                       |
+
+**`cwd` resolution** (issue #444 review, finding 826): an **absolute** `cwd` is used as-is, unchanged.
+A **relative** `cwd` resolves against the runtime workspace/config root for a project monitor — the
+same base `file-fingerprint` already resolves a relative `cwd`/`globs` against (§3.1) — rather than the
+daemon process's own working directory. When `cwd` is **omitted entirely**, a project monitor now
+defaults to that same workspace/config root instead of the daemon's own working directory; a user-level
+monitor (no workspace/config root available) keeps the pre-existing default, the daemon's own process
+working directory. This is what lets a scaffolded `MONITOR.md` that never mentions `cwd` still target
+the right directory after the project is relocated, cloned elsewhere, or shared to a teammate's checkout
+— the runtime resolves the workspace root fresh on every tick from wherever `MONITOR.md` was found,
+never from a value an earlier scaffold baked into the file.
 
 **`command` MUST be an argv array; a shell string form MUST NOT be accepted.** The child is spawned
 directly (`execFile` semantics, `shell: false`): there is no word-splitting, globbing, quoting, or
@@ -1771,49 +1782,62 @@ Both are `command-poll` + `json-diff` over `gh pr list`.
 
 **Neither preset carries a `--repo` flag, and this is load-bearing — but `gh` does NOT resolve the
 repository from wherever the monitor happens to live.** `gh` resolves the repository from its process
-working directory, and that working directory is `command-poll`'s effective `cwd` — which defaults to
-the **daemon's own process working directory** (§11.1), not a "workspace/config root" the daemon might
-not even be running from. A daemon launched from `$HOME`, from a different repository, or from any
-directory other than this project's root would therefore make `gh` silently resolve a different
-repository's PRs — and since `gh` exits 0 either way, nothing surfaces the mistake (issue #444 review,
-finding 1; this correction supersedes an earlier draft of this section, `init.ts`'s comment, and this
-PR's own changeset, all of which incorrectly claimed the daemon's cwd defaults to a workspace/config
-root).
+working directory, and that working directory is `command-poll`'s effective `cwd` (§11.1). A daemon
+launched from `$HOME`, from a different repository, or from any directory other than this project's
+root would therefore make `gh` silently resolve a different repository's PRs — and since `gh` exits 0
+either way, nothing surfaces the mistake (issue #444 review, finding 1).
 
-The fix is that `agentmonitors init` scaffolds an **explicit `cwd:`** into both presets' frontmatter,
-set to the absolute project root `init` was run from (the same `process.cwd()` the bootstrap path
-already trusts for enabling the project and fixing up `.gitignore`). That one `cwd:` is what then lets
-omitting `--repo` scope `gh` to the right repository, regardless of where the daemon is later launched
-from — interpolating an owner/name at scaffold time would hardcode it back and is explicitly not done.
-The author preset applies the same auto-scoping rule to identity: `--author @me` resolves against the
-current `gh` authentication rather than a baked-in login.
+Neither preset's frontmatter carries an explicit `cwd:` (issue #444 review, finding 826, superseding an
+earlier revision of both this section and `init.ts` that baked in an absolute `process.cwd()` at
+scaffold time). §11.1 now resolves an **omitted** `cwd` against the runtime workspace/config root for a
+project monitor, the same base `file-fingerprint` already resolves a relative `cwd`/`globs` against
+(§3) — a root the daemon derives fresh on every tick from wherever `MONITOR.md` was found, never a value
+baked into the file. Baking in an absolute path broke on the very first tick after the project was
+relocated or shared to a different checkout path (a scaffolded `MONITOR.md` can be committed and shared,
+same as any other project file); resolving it at runtime instead means the scaffolded file has no
+project-root-shaped state to go stale. The author preset applies the same auto-scoping rule to identity:
+`--author @me` resolves against the current `gh` authentication rather than a baked-in login.
 
 #### Field selection is what makes the transitions observable
 
 `json-diff` fires on any semantic change to the command's stdout, so the `--jq` reduction — not the
 diff strategy — decides which real-world events become interrupts.
 
-`pr-review` projects each PR to `{number, title, headRefName, reviewDecision, author}`, filtering out
-drafts, `changeset-release/*` heads (the release/Version PR is never agent-reviewable), and — via
-`--search '-author:@me'`, GitHub search-qualifier negation (`gh pr list` has no `--author`-exclusion
-flag, only single-value inclusion) — the current user's own PRs. Without that exclusion, a PR the
-reviewer opens themselves would double-fire (`pr-review` and `my-prs` both) and the body's "act as the
-reviewer, do not self-merge" framing does not apply to one's own work. Because drafts are filtered
-rather than reported, "a draft was marked ready" surfaces as the PR _appearing_ in the set. `updatedAt`
-is deliberately excluded: including it would fire on every push and comment.
+`pr-review` projects each PR to `{number, title, headRefName, author}`. `reviewDecision` is **not**
+carried as a field — it decides membership instead: a PR stays in the set only while its decision is
+empty or `REVIEW_REQUIRED`, so a decision landing removes the PR (one benign fire) rather than churning
+a value inside the set. Filtering also drops drafts, `changeset-release/*` heads (the release/Version
+PR is never agent-reviewable), and PRs with failing CI (see "The two presets must not overlap" above —
+this is the clause that keeps `pr-review` and `my-prs` disjoint). Reviewer scoping is a configurable
+`--search` qualifier rather than a hardcoded exclusion — `gh pr list` has no `--author`-exclusion flag,
+and `-author:@me`/`review-requested:@me` are each wrong for some workflow (see "Reviewer scoping is
+workflow-dependent and therefore selectable" below for the full set of alternatives and why). The
+default is `--search 'review-requested:@me'`. Because drafts are filtered rather than reported, "a
+draft was marked ready" surfaces as the PR _appearing_ in the set. `updatedAt` is deliberately excluded:
+including it would fire on every push and comment.
 
-`my-prs` queries `--state all --limit 60`. Keeping merged and closed PRs in the result set is what
-makes their terminal state **nameable**: "merged, clean up the branch" and "closed unmerged, find out
-why" are different instructions, and `--state open` collapses both into an indistinguishable
-disappearance — which is exactly the trap the issue's acceptance criteria call out.
+`my-prs` fetches **three separate** `gh pr list` calls — `--state open --limit 30`, `--state merged
+--limit 20`, `--state closed --limit 20` — rather than one `--state all --limit N` call, and unions the
+three raw arrays before reducing (issue #444 review, finding 989). Keeping merged and closed PRs in the
+combined result is what makes their terminal state **nameable**: "merged, clean up the branch" and
+"closed unmerged, find out why" are different instructions, and `--state open` alone collapses both into
+an indistinguishable disappearance — exactly the trap the issue's acceptance criteria call out.
 
-The cost is real and is accepted deliberately. `--limit` applies to a **newest-created-first** list,
-and under `--state all` merged/closed PRs also consume slots, so a still-open PR could in principle
-age out of the query and stop being monitored — after which its CI going red would produce no event.
-Two things bound that risk: the window is 60 (measured ~3.5s per poll against a real repository,
-comfortably inside the 5m interval and the source's timeout), and `gh` orders newest-first while an
-author's open PRs are normally their newest. Observed live on an active repository, terminal PRs held
-15 of 20 slots at `--limit 20`, which is what motivated the widening.
+A single `--state all --limit N` call was tried first and rejected: `--limit` applies to a
+**newest-created-first** list, and under `--state all` merged/closed history consumes slots from the
+SAME window as open PRs, so a still-open PR could age out of the query entirely — after which its CI
+going red would produce no event, silently, until the PR happened to re-enter the window (or never, on
+a repository that keeps merging). Observed live on an active repository, terminal rows held 15 of 20
+slots at `--limit 20`; widening the shared limit only moves the same failure threshold further out, it
+does not remove it. Three separate calls fix this structurally rather than statistically: each state
+gets its OWN `--limit`, so open coverage (`--limit 30`, generous for one author's concurrent PRs) can
+never be displaced by terminal volume, and terminal coverage (`--limit 20` each) only has to outlast the
+6-hour terminal window below, not compete with open PRs for room. The three arrays cannot overlap on a
+real repository (a PR is never simultaneously `OPEN`, `MERGED`, and `CLOSED`), so the union needs no
+deduplication in production; the reduction's `unique_by(.number)` is defense-in-depth only
+(`apps/cli/src/commands/pr-alerting-presets.test.ts` covers the eviction fix directly: a still-open,
+ci-failing PR stays visible behind 99 newer merged PRs, which the single-call design would have
+evicted).
 
 Each PR is then reduced to a single `needs` verdict and **dropped entirely when it is `none`**:
 
@@ -1841,9 +1865,16 @@ A green, non-draft, undecided open PR is `none` and never enters the payload, so
 
 Supporting fields on non-terminal entries: `failingChecks` (the sorted names of **failing**
 `statusCheckRollup` entries — both `CheckRun` `conclusion` and legacy `StatusContext` `state`), a
-per-reviewer `{by, state}` list from `latestReviews`, and an issue-comment count, so further feedback
-on a PR _already_ needing changes still diffs. `gh pr list` exposes no review-thread data, so inline
-thread replies that do not move `reviewDecision` are not visible at all.
+per-reviewer `{by, state, at}` list from `latestReviews` (`at` is `submittedAt`, sorted along with `by`
+and `state` so a second review from the same reviewer landing in the same state — e.g. a repeat
+`CHANGES_REQUESTED` with a new blocker — still changes the reduced entry and diffs, instead of silently
+matching the prior poll), and an issue-comment count, so further feedback on a PR _already_ needing
+changes still diffs. The count excludes the author's own comments (compared against `author.login`, an
+extra fetched field) and bot comments (`login` ending `[bot]`, the GitHub convention for bot accounts) —
+without that filter, the author replying to their own PR or a bot posting a status comment would
+increment the count and re-fire the high-urgency interrupt for activity that carries no new feedback.
+`gh pr list` exposes no review-thread data, so inline thread replies that do not move `reviewDecision`
+are not visible at all.
 
 Collapsing `statusCheckRollup` to a single `PASSING`/`PENDING`/`FAILING` verdict was considered and
 rejected: it is quieter than the raw array but reintroduces churn one level up, firing twice on every
@@ -1915,12 +1946,28 @@ overlapping on 2; after, `[1]` and `[2, 3, 4]` are disjoint. `apps/cli/src/comma
 asserts every plausible PR state lands in at most one payload, and that assertion fails if the
 exclusion is removed.
 
-One residual, by nature rather than by defect: a PR merging leaves `pr-review` (no longer open) and
-enters `my-prs` as `merged`. Under the default scope those are different PRs, so nothing doubles.
-Under a same-identity scope it is one benign removal plus one actionable entry for the same merge —
-one extra dismissible fire, not the multiplier #441 measured. Cross-monitor coalescing at the delivery
-layer (#441) reduces this further but is complementary: the presets are designed not to be redundant
-in the first place, which is #441's own preferred remedy.
+One residual, by nature rather than by defect: **static membership disjointness does not imply
+glitch-free crossing.** `pr-review` and `my-prs` are two independently scheduled `command-poll`
+monitors, each diffing its own payload against its own prior baseline — nothing coordinates them — so a
+single real-world event that moves a PR across the readiness partition still produces one diff on EACH
+monitor in the same tick. Two transitions do this:
+
+- **A PR merges**: `pr-review` sees `[PR] -> []` (no longer open); `my-prs` sees `[] -> [PR, needs:
+merged]`.
+- **CI on an undecided PR goes red**: `pr-review` sees `[PR] -> []` (no longer review-ready, per the
+  exclusion above); `my-prs` sees `[] -> [PR, needs: ci-failing]`.
+
+Under the default scope (`review-requested:@me`) neither case can fire on your own PR at all — GitHub
+forbids requesting your own review, so `pr-review` never claims a PR `my-prs` also claims, and this
+residual is unreachable. Under a same-identity scope (the label-driven model, or an unscoped queue) it
+is reachable: one benign removal plus one actionable entry for the same event — one extra dismissible
+fire, not the N-round-trip multiplier #441 measured. `apps/cli/src/commands/pr-alerting-presets.test.ts`
+pins the CI-crossing shape directly (a dual-monitor transition regression asserting the exact `[PR]->[]`
+/ `[]->[PR, needs: ci-failing]` pair), so a change that makes this fire for a different, undocumented
+reason is still caught. No redesign coordinates the two monitors to collapse this into a single alert:
+cross-monitor coalescing at the delivery layer (#441) would reduce it further but is complementary — the
+presets are designed not to be redundant in the first place, which is #441's own preferred remedy, and
+is exactly what the exclusion above already does for every OTHER PR state.
 
 #### Membership, not full state — and why both presets are `high`
 
@@ -1968,18 +2015,34 @@ Termination by signal is classified as an execution **failure**, which per §11.
 `gh` works again. `$$` targets the `sh` process itself — never `-$$`, which would signal the whole
 process group.
 
-The wrapper takes two further precautions the shell alone can silently violate:
+The wrapper takes three further precautions the shell alone can silently violate:
 
-- **`env -u GITHUB_TOKEN`** unsets an inherited `GITHUB_TOKEN` before invoking `gh`. `gh` gives an
-  inherited `GITHUB_TOKEN` unconditional precedence over keyring/`gh auth login` credentials, so a
-  daemon process with one exported (a common shell-startup leftover) would make `@me` — and therefore
-  both presets — silently resolve against the wrong identity, with `gh` exiting 0 either way (issue
-  #444 review, finding 2).
-- **Only the failure branch's redirect sees `gh`'s stderr.** The success path's `out=$(...)` captures
-  stdout alone (stderr is redirected to a per-invocation temp file, cleaned up on both branches); a
-  one-time `gh` warning or `GH_DEBUG` chatter on an otherwise-successful run therefore can never leak
-  into the diffed JSON, which would otherwise degrade `json-diff` to a raw-text comparison of the
-  polluted string (issue #444 review, finding 5).
+- **`unset GH_TOKEN GITHUB_TOKEN GH_REPO`** scrubs three inherited overrides, once, before any `gh`
+  call the script makes. `GH_TOKEN`/`GITHUB_TOKEN` each give unconditional precedence over keyring/
+  `gh auth login` credentials, so a daemon process with either exported (a common shell-startup
+  leftover) would make `@me` — and therefore both presets — silently resolve against the wrong identity,
+  with `gh` exiting 0 either way (issue #444 review, finding 2). `GH_REPO` overrides which repository
+  `gh pr list` targets outright, which would silently defeat the working-directory-based repository
+  auto-scoping above. `unset` rather than `env -u` per invocation is what makes the scrub apply
+  uniformly across `my-prs`'s multi-call fetch (see "Open-PR coverage is fetched separately from
+  terminal history" below): `env -u ... cmd1 && cmd2` would only wrap `cmd1`, leaving `cmd2`/`cmd3`
+  exposed to a leaked override.
+- **`--jq` runs as a separate `jq -sc` pipeline stage over the fetch's raw stdout, not as a `gh --jq`
+  flag.** This is what lets `my-prs`'s fetch be more than one `gh` call: `-s`/`--slurp` folds however
+  many top-level JSON arrays the fetch printed into one array-of-arrays, and the reduction always opens
+  with `add` to flatten it back to a single array of PRs — for `pr-review`'s single-call fetch this is a
+  no-op (`[[...]] | add == [...]`), so the reduction bodies are unchanged from when they ran as
+  `gh --jq`.
+- **Only the failure branch's redirect sees `gh`'s stderr.** The success path's `raw=$(...)` captures
+  stdout alone; a one-time `gh` warning or `GH_DEBUG` chatter on an otherwise-successful run therefore
+  can never leak into the diffed JSON, which would otherwise degrade `json-diff` to a raw-text
+  comparison of the polluted string (issue #444 review, finding 5). Stderr is redirected to a temp file
+  created with `mktemp` (private, mode 0600, collision-proof — no predictable PID-based path for a
+  shared `/tmp` to pre-seed with a symlink) and removed by an `EXIT` trap rather than an explicit
+  `rm -f` on each branch, so cleanup also survives the `kill -TERM $$` self-signal above and an
+  external `SIGTERM` from `command-poll`'s own timeout escalation (§11.2/§11.7) — a shell with no trap
+  for a given signal still runs its `EXIT` trap for it, per POSIX. `SIGKILL` cannot be trapped by any
+  shell, so that is the one escalation step a stale file can still survive.
 
 #### Follow-up
 

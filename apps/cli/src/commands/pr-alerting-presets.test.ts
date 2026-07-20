@@ -16,6 +16,7 @@ import { execFileSync } from 'node:child_process';
 import {
   chmodSync,
   mkdtempSync,
+  readdirSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -105,15 +106,44 @@ function stubGhApplyingJq(): string {
   const dir = tempDir('stub-jq');
   writeExecutable(
     path.join(dir, 'gh'),
-    // Walk argv for `--jq <program>`; everything else is ignored.
+    // The shipped presets apply `--jq` as a SEPARATE `jq -sc` stage over
+    // `gh`'s raw stdout (see `ghPresetScript`'s `reduceJq` parameter), not
+    // as a `gh --jq` flag, so the stub's only job is to hand back the raw
+    // fixture verbatim — the real reduction runs for real, in the script
+    // under test, via the real `jq` binary already required by `hasJq`.
+    '#!/bin/sh\ncat "$AM444_FIXTURE"\n',
+  );
+  return dir;
+}
+
+/**
+ * A `PATH` directory holding a stub `gh` that mimics real `gh pr list
+ * --state <s> --limit <n>` filtering: it reads `$AM444_FIXTURE` as a raw
+ * array, keeps only entries whose `.state` matches `--state` case-
+ * insensitively, truncates to `--limit`, and prints the result — exactly
+ * the per-state, per-call windowing `my-prs`'s three separate `gh` calls
+ * rely on (issue #444 review, finding 989). `jq` performs the filter for
+ * real rather than a hand-rolled shell parse, since the stub itself needs
+ * no `--jq` support (that flag is no longer passed to `gh` at all).
+ */
+function stubGhFilteringByState(): string {
+  const dir = tempDir('stub-state-filter');
+  writeExecutable(
+    path.join(dir, 'gh'),
     [
       '#!/bin/sh',
-      'prog=""',
+      'state=""',
+      'limit=""',
       'while [ $# -gt 0 ]; do',
-      '  if [ "$1" = "--jq" ]; then prog="$2"; fi',
+      '  case "$1" in',
+      '    --state) state="$2" ;;',
+      '    --limit) limit="$2" ;;',
+      '  esac',
       '  shift',
       'done',
-      'jq -c "$prog" < "$AM444_FIXTURE"',
+      'jq -c --arg state "$state" --argjson limit "$limit" \'' +
+        '[.[] | select((.state // "") | ascii_downcase == $state)] | .[0:$limit]' +
+        '\' < "$AM444_FIXTURE"',
       '',
     ].join('\n'),
   );
@@ -280,6 +310,7 @@ describe('the presets’ jq reduction over raw gh output', () => {
       comments: [],
       mergedAt: null,
       closedAt: null,
+      author: { login: 'octocat' },
       ...overrides,
     };
   }
@@ -381,6 +412,80 @@ describe('the presets’ jq reduction over raw gh output', () => {
       expect(titles).toEqual([CHANGED]);
     });
 
+    it('does NOT fire when only the author’s own comment lands on a PR already needing changes (PR #446 review)', async () => {
+      const base = { ...QUIET, reviewDecision: 'CHANGES_REQUESTED' };
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([rawMyPr(base)]),
+        fixtureOf([
+          rawMyPr({
+            ...base,
+            comments: [{ author: { login: 'octocat' }, body: 'ack, on it' }],
+          }),
+        ]),
+      );
+      expect(titles).toEqual([]);
+    });
+
+    it('does NOT fire when only a bot comment lands on a PR already needing changes (PR #446 review)', async () => {
+      const base = { ...QUIET, reviewDecision: 'CHANGES_REQUESTED' };
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([rawMyPr(base)]),
+        fixtureOf([
+          rawMyPr({
+            ...base,
+            comments: [
+              { author: { login: 'dependabot[bot]' }, body: 'rebased' },
+            ],
+          }),
+        ]),
+      );
+      expect(titles).toEqual([]);
+    });
+
+    it('fires when a reviewer (not the author, not a bot) comments on a PR already needing changes', async () => {
+      const base = { ...QUIET, reviewDecision: 'CHANGES_REQUESTED' };
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([rawMyPr(base)]),
+        fixtureOf([
+          rawMyPr({
+            ...base,
+            comments: [
+              { author: { login: 'reviewer-bob' }, body: 'still blocking' },
+            ],
+          }),
+        ]),
+      );
+      expect(titles).toEqual([CHANGED]);
+
+      const observed = await observe(
+        scope,
+        stub,
+        fixtureOf([
+          rawMyPr({
+            ...base,
+            comments: [
+              { author: { login: 'reviewer-bob' }, body: 'still blocking' },
+              { author: { login: 'octocat' }, body: 'my own reply' },
+              {
+                author: { login: 'copilot-pull-request-reviewer[bot]' },
+                body: 'bot note',
+              },
+            ],
+          }),
+        ]),
+      );
+      const [entry] = JSON.parse(observed.stdout) as { commentCount: number }[];
+      // Only reviewer-bob's comment counts: octocat is the PR author, and the
+      // copilot reviewer is a bot ([bot]-suffixed login).
+      expect(entry?.commentCount).toBe(1);
+    });
+
     it('fires when isDraft goes false -> true (pulled back to draft)', async () => {
       const titles = await transition(
         scope,
@@ -399,6 +504,41 @@ describe('the presets’ jq reduction over raw gh output', () => {
         fixtureOf([rawMyPr(QUIET)]),
       );
       expect(titles).toEqual([CHANGED]);
+    });
+
+    /**
+     * Characterization test for issue #444 review, finding 824: a PR
+     * opened directly as a draft (the author's OWN, deliberate first
+     * action) is indistinguishable from "someone pulled a ready PR back to
+     * draft" — both are `false -> true` (or, on the very first tick, an
+     * entering-membership) transitions on the same `isDraft` field, and
+     * `command-poll`'s stateless `json-diff` polling carries no history
+     * that would let a preset tell them apart. This is a documented,
+     * accepted limitation (003 §11.9's `my-prs` body already tells the
+     * author how to disambiguate: "if you did not just put it there,
+     * someone pulled it back"), not a defect — pinning it here as a
+     * characterization test (rather than leaving it unasserted) is what
+     * keeps that documentation accurate if the reduction's `draft` handling
+     * ever changes.
+     */
+    it('fires for a PR opened directly as a draft, indistinguishable from a pulled-back PR (issue #444 review, finding 824)', async () => {
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([]),
+        fixtureOf([rawMyPr({ ...QUIET, isDraft: true })]),
+      );
+      expect(titles).toEqual([CHANGED]);
+      const [entry] = JSON.parse(
+        (
+          await observe(
+            scope,
+            stub,
+            fixtureOf([rawMyPr({ ...QUIET, isDraft: true })]),
+          )
+        ).stdout,
+      ) as { needs: string }[];
+      expect(entry?.needs).toBe('draft');
     });
 
     it('fires when state becomes MERGED', async () => {
@@ -578,6 +718,68 @@ describe('the presets’ jq reduction over raw gh output', () => {
         fixtureOf([rawMyPr(same)]),
       );
       expect(titles).toEqual([]);
+    });
+  });
+
+  /**
+   * Regression coverage for issue #444 review finding 989: a single
+   * `--state all --limit N` call orders newest-created-first across every
+   * state, so merged/closed history competes with open PRs for the SAME
+   * window — on an active repository, terminal rows measured 15 of 20
+   * slots at `--limit 20`, aging a still-open PR out of the query entirely
+   * (after which its CI going red would silently produce no event, ever,
+   * until it re-entered the window). `my-prs` now fetches `--state open`,
+   * `--state merged`, and `--state closed` as three SEPARATE `gh` calls,
+   * each with its own `--limit`, so open coverage can never be displaced by
+   * terminal volume. `stubGhFilteringByState` mimics real `gh`'s per-call
+   * state filtering (the other tests in this file don't need to — they use
+   * a single fixture that the stub hands back verbatim for every call,
+   * relying on `unique_by(.number)` to make the repetition harmless), which
+   * is what lets this test actually reproduce the eviction the old,
+   * single-call design was vulnerable to.
+   */
+  describe('`--type my-prs` open-PR coverage survives terminal-history volume (PR #446 review, finding 989)', () => {
+    it('still surfaces a still-open, ci-failing PR after 99 newer merged PRs', async () => {
+      const scope = presetScope('my-prs');
+      const stub = stubGhFilteringByState();
+
+      // 99 merged PRs, newest-first (as real `gh pr list` orders them) —
+      // comfortably past the OLD design's single-call `--limit 60`, which
+      // would have evicted the open PR below entirely (it was never fetched
+      // at all, let alone diffed).
+      const mergedHistory = Array.from({ length: 99 }, (_, i) =>
+        rawMyPr({
+          number: 1000 + i,
+          state: 'MERGED',
+          mergedAt: ago(3600 * (i + 1)),
+        }),
+      );
+      // The oldest-created (and therefore last-in-array, under newest-first
+      // ordering) PR in the fixture: still open, and its CI just went red.
+      const stillOpenCiFailing = rawMyPr({
+        number: 1,
+        state: 'OPEN',
+        statusCheckRollup: [checkRun('build', 'FAILURE')],
+      });
+      const fixture = fixtureOf([...mergedHistory, stillOpenCiFailing]);
+
+      const baseline = await observe(scope, stub, fixture);
+      // A dedicated `--state open` call fetches this PR regardless of how
+      // much merged history exists, so it is visible on the very first
+      // (baselining) tick already — nothing to diff away.
+      const [entry] = JSON.parse(baseline.stdout) as { number: number }[];
+      expect(entry?.number).toBe(1);
+
+      // And it keeps firing on a real transition, exactly like any other
+      // actionable PR — this is not a baseline-only artifact.
+      const recovered = rawMyPr({ number: 1, state: 'OPEN', ...QUIET });
+      const next = await observe(
+        scope,
+        stub,
+        fixtureOf([...mergedHistory, recovered]),
+        baseline.state,
+      );
+      expect(next.titles).toEqual([CHANGED]);
     });
   });
 
@@ -876,6 +1078,83 @@ describe('the presets’ jq reduction over raw gh output', () => {
         JSON.parse((await observe(mineScope, stub, raw)).stdout),
       ).toHaveLength(1);
     });
+
+    /**
+     * Regression/characterization test for PR #446 review, thread
+     * `discussion_r3615190027`. Static membership disjointness (asserted
+     * above) does NOT imply glitch-free crossing: `pr-review` and `my-prs`
+     * are two independent `command-poll` monitors, each diffing its own
+     * payload against its own prior baseline, so a single CI failure that
+     * moves a PR across the readiness partition still produces ONE diff on
+     * EACH monitor in the same tick — `pr-review` sees `[PR] -> []`,
+     * `my-prs` sees `[] -> [PR, needs: ci-failing]` — and both fire.
+     *
+     * This is the SAME class of residual double-fire 003 §11.9 already
+     * documents for a PR merging (`[PR] -> []` on `pr-review`, `[] ->
+     * [PR, needs: merged]` on `my-prs`) under a same-identity reviewer
+     * scope: one dismissible removal plus one actionable entry for the same
+     * real-world event, not the N-round-trip multiplier issue #441
+     * measured. It is reachable only when a reviewer-scoping model does NOT
+     * exclude the current user's own PRs from `pr-review` (the label-driven
+     * model, or an unscoped queue) — under the DEFAULT `review-requested:@me`
+     * scope this never fires on your own PR at all, since GitHub forbids
+     * requesting your own review (verified above: `gives a red undecided PR
+     * to my-prs only`, same fixture, same scope, only `my-prs` claims it).
+     *
+     * No redesign coordinates the two monitors to suppress this: they are
+     * independently scheduled `command-poll` instances with no shared
+     * state, by design (issue #441's own preferred remedy is not shipping
+     * redundant payloads in the first place, which this pair already does —
+     * see "the two presets do not overlap" above). This test exists so a
+     * regression that makes the crossing fire on BOTH monitors for a
+     * DIFFERENT reason (e.g. pr-review stops excluding red PRs) is still
+     * caught, and so the accepted, documented shape of this one residual
+     * case doesn't silently drift.
+     */
+    it('a CI failure that crosses the readiness partition fires once per monitor, not a multiplier (PR #446 review, thread r3615190027)', async () => {
+      const green = {
+        ...(rawMyPr(QUIET) as object),
+        ...(rawReviewPr(QUIET) as object),
+      };
+      const red = {
+        ...(rawMyPr({
+          statusCheckRollup: [checkRun('build', 'FAILURE')],
+        }) as object),
+        ...(rawReviewPr({
+          statusCheckRollup: [checkRun('build', 'FAILURE')],
+        }) as object),
+      };
+
+      const reviewBaseline = await observe(
+        reviewScope,
+        stub,
+        fixtureOf([green]),
+      );
+      const mineBaseline = await observe(mineScope, stub, fixtureOf([]));
+      expect(JSON.parse(reviewBaseline.stdout)).toHaveLength(1);
+      expect(JSON.parse(mineBaseline.stdout)).toEqual([]);
+
+      const reviewAfter = await observe(
+        reviewScope,
+        stub,
+        fixtureOf([red]),
+        reviewBaseline.state,
+      );
+      const mineAfter = await observe(
+        mineScope,
+        stub,
+        fixtureOf([red]),
+        mineBaseline.state,
+      );
+
+      // pr-review: [PR] -> [] — one dismissible "no longer needs review" fire.
+      expect(reviewAfter.titles).toEqual([CHANGED_REVIEW]);
+      expect(JSON.parse(reviewAfter.stdout)).toEqual([]);
+      // my-prs: [] -> [PR, needs: ci-failing] — one actionable fire.
+      expect(mineAfter.titles).toEqual([CHANGED]);
+      const [entry] = JSON.parse(mineAfter.stdout) as { needs: string }[];
+      expect(entry?.needs).toBe('ci-failing');
+    });
   });
 
   describe('`--type pr-review` reviewer queue', () => {
@@ -1098,6 +1377,120 @@ describe('graceful degradation when gh is unusable (issue #444)', () => {
   });
 });
 
+describe('gh environment/temp-file hardening (PR #446 review, thread 3)', () => {
+  /**
+   * A stub `gh` that fails loudly — reporting exactly which variable leaked —
+   * if `GH_TOKEN`, `GITHUB_TOKEN`, or `GH_REPO` reach it. A real `gh` would
+   * instead silently honor whichever leaked, resolving `@me`/the repository
+   * against the wrong identity with no error (issue #444 review, finding 2;
+   * PR #446 review thread 3).
+   */
+  function stubGhAssertingScrubbedEnv(): string {
+    const dir = tempDir('stub-scrub-check');
+    writeExecutable(
+      path.join(dir, 'gh'),
+      [
+        '#!/bin/sh',
+        'if [ -n "$GH_TOKEN" ] || [ -n "$GITHUB_TOKEN" ] || [ -n "$GH_REPO" ]; then',
+        '  echo "leaked: GH_TOKEN=$GH_TOKEN GITHUB_TOKEN=$GITHUB_TOKEN GH_REPO=$GH_REPO" >&2',
+        '  exit 1',
+        'fi',
+        'cat "$AM444_FIXTURE"',
+        '',
+      ].join('\n'),
+    );
+    return dir;
+  }
+
+  it.each(['my-prs', 'pr-review'] as const)(
+    '%s scrubs GH_TOKEN, GITHUB_TOKEN, and GH_REPO before invoking gh',
+    async (type) => {
+      const scope = presetScope(type);
+      const fixtureFile = path.join(tempDir('fixture'), 'fixture.json');
+      writeFileSync(fixtureFile, fixtureOf([]), 'utf-8');
+      const result = await commandPoll.observe(
+        {
+          ...scope,
+          env: {
+            PATH: pathWith(stubGhAssertingScrubbedEnv()),
+            AM444_FIXTURE: fixtureFile,
+            GH_TOKEN: 'poison-gh-token',
+            GITHUB_TOKEN: 'poison-github-token',
+            GH_REPO: 'someone-else/other-repo',
+          },
+        },
+        { now: new Date('2026-01-15T10:00:00.000Z') },
+      );
+      // A first-ever run baselines silently either way; the assertion that
+      // matters is that no leaked variable ever triggered the stub's failure
+      // branch — if it had, this run would surface `Command failing: <type>`
+      // instead of baselining quietly. Dropping any one of the three `-u`
+      // flags in `ghPresetScript` reintroduces the leak this guards against.
+      expect(result.observations).toEqual([]);
+    },
+  );
+
+  /** A stub `gh` that fails the way an unauthenticated CLI does. */
+  function stubGhFailing(): string {
+    const dir = tempDir('stub-fail');
+    writeExecutable(
+      path.join(dir, 'gh'),
+      '#!/bin/sh\necho "gh: To get started with GitHub CLI, please run: gh auth login" >&2\nexit 4\n',
+    );
+    return dir;
+  }
+
+  it('removes its per-invocation stderr temp file after both a successful and a failing run', async () => {
+    const scope = presetScope('my-prs');
+    const tmp = tempDir('mktemp-cleanup-check');
+
+    const fixtureFile = path.join(tmp, 'fixture.json');
+    writeFileSync(fixtureFile, fixtureOf([]), 'utf-8');
+    await commandPoll.observe(
+      {
+        ...scope,
+        env: {
+          PATH: pathWith(stubGhEchoingFixture()),
+          AM444_FIXTURE: fixtureFile,
+          TMPDIR: tmp,
+        },
+      },
+      { now: new Date('2026-01-15T10:00:00.000Z') },
+    );
+
+    await commandPoll.observe(
+      {
+        ...scope,
+        env: {
+          PATH: pathWith(stubGhFailing()),
+          TMPDIR: tmp,
+        },
+      },
+      { now: new Date('2026-01-15T10:05:00.000Z') },
+    );
+
+    const leftoverStderrFiles = readdirSync(tmp).filter(
+      (name) => name.includes('agentmonitors-') && name.endsWith('.stderr'),
+    );
+    expect(leftoverStderrFiles).toEqual([]);
+  });
+
+  it('scaffolds the mktemp-based, trap-cleaned stderr file (not a predictable PID path)', () => {
+    for (const type of ['pr-review', 'my-prs'] as const) {
+      const template = TEMPLATES[type];
+      expect(template).toBeDefined();
+      expect(template).toContain('mktemp');
+      expect(template).toContain('trap \'rm -f "$errfile"\' EXIT');
+      // The pre-hardening implementation embedded the sh PID directly in the
+      // filename (`agentmonitors-<preset>-$$.stderr`), a predictable path in
+      // a shared /tmp. mktemp's own XXXXXX template replaces it.
+      expect(template).not.toMatch(
+        /errfile="\$\{TMPDIR:-\/tmp\}\/[^"]*-\$\$\.stderr"/,
+      );
+    }
+  });
+});
+
 describe('reviewer scoping (PR #446 review, thread 1)', () => {
   /** The scaffolded `watch.command` argv, joined for flag inspection. */
   function commandOf(type: 'pr-review' | 'my-prs'): string {
@@ -1163,6 +1556,50 @@ describe('delivered alert readability (issue #449 guard)', () => {
    * affecting every command-poll monitor); this guard only keeps the presets
    * from regressing to the raw-argv title.
    */
+  /**
+   * One raw `gh pr list --json ...` entry per preset that its real `--jq`
+   * reduction (now a separate `jq -sc` stage, not a `gh --jq` flag) classes
+   * as actionable — `stubGhEchoingFixture` hands this straight to `gh`, and
+   * the shipped script's own `jq` reduces it for real, so this exercises the
+   * same pipeline production traffic does, not a pre-reduced shortcut.
+   */
+  const RAW_ACTIONABLE_FIXTURE: Record<'my-prs' | 'pr-review', unknown[]> = {
+    'my-prs': [
+      {
+        number: 1,
+        title: 'feat: add widget',
+        url: 'https://github.com/acme/app/pull/1',
+        state: 'OPEN',
+        isDraft: false,
+        reviewDecision: '',
+        statusCheckRollup: [
+          {
+            __typename: 'CheckRun',
+            name: 'build',
+            status: 'COMPLETED',
+            conclusion: 'FAILURE',
+          },
+        ],
+        latestReviews: [],
+        comments: [],
+        mergedAt: null,
+        closedAt: null,
+        author: { login: 'octocat' },
+      },
+    ],
+    'pr-review': [
+      {
+        number: 1,
+        title: 'fix: thing',
+        isDraft: false,
+        reviewDecision: '',
+        headRefName: 'fix/thing',
+        author: { login: 'octocat' },
+        statusCheckRollup: [],
+      },
+    ],
+  };
+
   it.each(['my-prs', 'pr-review'] as const)(
     '%s titles its event with a short key, never the raw command',
     async (type) => {
@@ -1172,7 +1609,7 @@ describe('delivered alert readability (issue #449 guard)', () => {
       const changed = await observe(
         scope,
         stub,
-        fixtureOf([{ number: 1, needs: 'ci-failing' }]),
+        fixtureOf(RAW_ACTIONABLE_FIXTURE[type]),
         baseline.state,
       );
       expect(changed.titles).toEqual([`Command output changed: ${type}`]);

@@ -227,17 +227,19 @@ the reminder for all of them, and normal carries no event body mid-session — a
 learn _which_ PR broke until recap. See [003 §11.9](./003-source-plugins.md) and
 [002 §9.2/§9.3](./002-runtime-delivery.md).
 
-**Both are automatically scoped to the repository the session is operating in — via an explicit
-`cwd:` init scaffolds, not `--repo`.** `gh` resolves the repository from its process working
-directory, and that is the **daemon's own** working directory (never a "workspace/config root" the
-daemon might not even be running from), so `init` writes the project root it was run from into the
-scaffolded frontmatter as an absolute `cwd:`. Do not remove that field or add a `--repo` flag; either
-would make the preset correct only in the directory the daemon happens to be launched from, which is
-exactly the silent-wrong-repository failure this exists to prevent (issue #444 review, finding 1).
-`my-prs` likewise resolves identity through `--author @me` rather than a scaffolded username. A
-scaffolded preset is therefore correct in any checkout and needs no editing before it runs — the
-intent of these presets is that PR alerting takes one command rather than ~20 hand-written lines of
-`gh` argv.
+**Both are automatically scoped to the repository the session is operating in — via `command-poll`'s
+own workspace-root-relative `cwd` default, never a `--repo` flag or a `cwd:` baked into the scaffolded
+file.** `gh` resolves the repository from its process working directory; `command-poll` (§11.1 in 003)
+resolves an omitted `cwd` against the runtime workspace/config root for a project monitor, so `init`
+scaffolds **no `cwd:` at all** for either preset and the correct directory is resolved fresh on every
+tick, not baked in as an absolute path at scaffold time. Do not add a `cwd:` or a `--repo` flag; either
+would make the preset correct only in one checkout, which is exactly the silent-wrong-repository failure
+this exists to prevent (issue #444 review, findings 1 and 826) — a scaffolded preset committed or shared
+to another checkout stays correct after the fix, where a baked-in absolute `cwd:` broke on the very
+first tick after relocation. `my-prs` likewise resolves identity through `--author @me` rather than a
+scaffolded username. A scaffolded preset is therefore correct in any checkout and needs no editing
+before it runs — the intent of these presets is that PR alerting takes one command rather than ~20
+hand-written lines of `gh` argv.
 
 Both require the [GitHub CLI](https://cli.github.com) on the daemon's `PATH`, authenticated
 (`gh auth login`) — with an inherited `GITHUB_TOKEN` scrubbed before every invocation, since `gh` would
