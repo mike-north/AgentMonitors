@@ -8,14 +8,17 @@ Make delivered monitor text self-sufficient, and let each transport own its own 
 
 The coalesced `normal`/`low` reminder used to read `AgentMon messages are available. Read the inbox.`
 — which named a product on a surface that already identified it, pointed at the non-authoritative
-legacy `inbox` model, and told the recipient nothing they could actually run. It now reads:
+legacy `inbox` model, and told the recipient nothing they could actually run. The runtime's own
+message is now just the transport/verb-neutral semantic sentence:
 
 ```
-Monitored changes are pending. Run `agentmonitors events list --session <id> --unread` to see them,
-then `agentmonitors events ack --session <id>` once handled.
+Monitored changes are pending.
 ```
 
-with the recipient's real session id interpolated.
+Each transport appends its own concrete, session- (and where applicable socket-) scoped action step:
+the hook transport appends `agentmonitors events list --session <id> --unread` / `agentmonitors
+events ack --session <id>`, and the channel transport points at listing the unread events followed
+by its `agentmon_ack` tool.
 
 - **Attribution is transport-owned.** The runtime emits an unattributed, semantic message; the
   hook transport prepends `AgentMon: ` (its injected context arrives unlabeled), and the channel

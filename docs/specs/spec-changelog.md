@@ -1030,13 +1030,16 @@ model, explicitly non-authoritative per 002 §12, so the instruction had no runn
 was not actionable — neither an agent nor a human could tell what to run.
 
 Resolved by splitting the concern along the transport seam. The runtime now emits an **unattributed,
-semantic** message built by `reminderMessage(sessionId)` — "Monitored changes are pending. Run
-`agentmonitors events list --session <id> --unread` to see them, then `agentmonitors events ack
---session <id>` once handled." — with the recipient's real session id interpolated. **Attribution
-became transport-owned:** the hook transport prepends `AgentMon: ` (its `additionalContext` arrives
-unlabeled), the channel prepends nothing. 002 §9.2 states the wording contract normatively (no product
-name, no `inbox` reference, self-sufficient down to the ack step); §9.3 now shares it, so the low band
-no longer has separate prose. The legacy `inbox` CLI surface is untouched.
+transport/verb-neutral, semantic** message built by `reminderMessage()` — just "Monitored changes are
+pending." — with no CLI commands and no session id embedded. Each transport supplies its own concrete
+action step, scoped with the session id (and, where applicable, the resolved socket path) it already
+has on hand: the hook transport appends `agentmonitors events list --session <id> --unread` /
+`agentmonitors events ack --session <id>` commands, the channel transport points at its `agentmon_ack`
+tool. **Attribution became transport-owned:** the hook transport prepends `AgentMon: ` (its
+`additionalContext` arrives unlabeled), the channel prepends nothing. 002 §9.2 states the wording
+contract normatively (no product name, no `inbox` reference, self-sufficient down to the ack step);
+§9.3 now shares it, so the low band no longer has separate prose. The legacy `inbox` CLI surface is
+untouched.
 
 **2. Nothing in a delivered payload said how to acknowledge (#434).** A body-injection delivery claims
 the events it renders, and claiming is not acknowledging — so under the coalesced-until-ack rule

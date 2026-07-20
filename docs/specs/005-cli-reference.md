@@ -1359,7 +1359,7 @@ wire JSON. The example below is pretty-printed for readability; the command emit
   "continue": true,
   "hookSpecificOutput": {
     "hookEventName": "PostToolUse",
-    "additionalContext": "AgentMon: monitored changes are pending — consider handling them before continuing.\nWhen handled, acknowledge: agentmonitors events ack --session <id>\n\n### watch-src (high)\n..."
+    "additionalContext": "AgentMon: monitored changes are pending — consider handling them before continuing.\nWhen handled, acknowledge: agentmonitors events ack --session <id> --socket <path> --event-ids <ids>\n\n### watch-src (high)\n..."
   }
 }
 ```
@@ -1371,7 +1371,7 @@ wire JSON. The example below is pretty-printed for readability; the command emit
   "continue": true,
   "hookSpecificOutput": {
     "hookEventName": "UserPromptSubmit",
-    "additionalContext": "AgentMon: Monitored changes are pending. Run `agentmonitors events list --session <id> --unread` to see them, then `agentmonitors events ack --session <id>` once handled."
+    "additionalContext": "AgentMon: Monitored changes are pending. Run `agentmonitors events list --session <id> --socket <path> --unread` to see them, then `agentmonitors events ack --session <id> --socket <path>` once handled."
   }
 }
 ```

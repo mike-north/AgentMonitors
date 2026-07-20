@@ -48,7 +48,7 @@ decides which lifecycle a monitor's events surface at, and how much detail is in
 | Urgency   | Surfaces at            | Timing                                                              | What's included                                             |
 | --------- | ----------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------ |
 | `high`    | `turn-interruptible`   | After a **15 s settle window** — not instant                          | The concrete events: titles, summaries, and full body text  |
-| `normal`  | `turn-interruptible`   | **Coalesced-until-ack**: one reminder for the whole unread batch, then silent until it's acknowledged | A reminder only — no per-event detail — naming the exact commands to run: `agentmonitors events list --session <id> --unread`, then `agentmonitors events ack --session <id>` |
+| `normal`  | `turn-interruptible`   | **Coalesced-until-ack**: one reminder for the whole unread batch, then silent until it's acknowledged | A reminder only — no per-event detail — naming the exact action to take next: on the hook transport, the `agentmonitors events list`/`events ack` commands; on the channel transport, listing the unread events and then calling the `agentmon_ack` tool with their ids |
 | `low`     | `turn-idle`            | **Coalesced-until-ack**: one reminder for the whole unread batch, then silent until it's acknowledged | The same reminder as `normal` — no per-event detail |
 
 Regardless of urgency, **every unread event is recapped at `post-compact`** (session start, after
@@ -57,23 +57,26 @@ body text. This is the safety net: nothing that settles while an agent is away g
 
 The reminder-vs-detail split for `normal`/`low` matters in practice: a `normal` (or `low`) change
 nudges the agent exactly **once** — a single coalesced reminder, self-sufficient and naming the
-exact commands to run, covering every currently-unread event of that urgency — and then goes quiet.
-It does **not** re-nudge for each additional `normal`/`low` event that arrives; the path only speaks
-again once the outstanding events are acknowledged (`agentmonitors events ack --session <id>`). The
-agent still has to go look (`agentmonitors events list --session <id> --unread`) to see what
-changed — the reminder never carries per-event detail. Only `high` urgency injects the actual event
-content directly into the turn. If you want the agent to react to specifics without acknowledging
-first, use `urgency: high`.
+exact next action for its transport, covering every currently-unread event of that urgency — and
+then goes quiet. It does **not** re-nudge for each additional `normal`/`low` event that arrives; the
+path only speaks again once the outstanding events are acknowledged (on the hook transport,
+`agentmonitors events ack --session <id>`; on the channel transport, the `agentmon_ack` tool). The
+agent still has to go look — `agentmonitors events list --session <id> --unread` on the hook
+transport — to see what changed; the reminder never carries per-event detail. Only `high` urgency
+injects the actual event content directly into the turn. If you want the agent to react to
+specifics without acknowledging first, use `urgency: high`.
 
 **`high` and recap deliveries also need an explicit ack, and acking un-mutes the reminder.** Claiming
 a `high`-urgency delivery (or a `post-compact` recap) marks the events it renders **claimed**, not
-**acknowledged** — and until they're acknowledged, the coalesced `normal`/`low` reminder above stays
-**suppressed** for that session, even for unrelated events, because a session with any
-claimed-but-unacknowledged event no longer has "every unread event of the band still unclaimed" (the
-condition the reminder requires to fire). Because of this, every `high`/recap delivery carries its own
-one-line acknowledge instruction naming the exact ids it just showed you (e.g. `agentmonitors events
-ack --session <id> --event-ids <id1>,<id2>`) — run it once you've handled what it showed. Acking is
-what turns the coalesced reminder back on for the next `normal`/`low` event.
+**acknowledged**. The coalesced-until-ack guard is **band-scoped**: it compares a band's own
+claimed-but-unacknowledged events against that same band's unread total, so an unacknowledged claim
+suppresses the reminder only for the band(s) the claimed events actually belong to. A `high`-only
+claim therefore does not block a NEW `normal`/`low` reminder from firing for unrelated,
+still-unclaimed events in the same session — the two coexist. Because of this, every `high`/recap
+delivery carries its own one-line acknowledge instruction naming the exact ids it just showed you
+(e.g. `agentmonitors events ack --session <id> --event-ids <id1>,<id2>`) — run it once you've
+handled what it showed. Acking is what turns the coalesced reminder back on for the affected band's
+next `normal`/`low` event.
 
 _Governing spec: 002 §9.1 (high), §9.2 (normal), §9.3 (low), §9.4 (recap)._
 
