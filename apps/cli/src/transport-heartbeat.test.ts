@@ -184,7 +184,28 @@ describe('writeTransportHeartbeat', () => {
   it('never throws when the registry cannot be written', () => {
     // Both writers sit on delivery-critical paths; an observability record must
     // not be able to break the delivery it observes.
-    process.env['XDG_DATA_HOME'] = '/proc/nonexistent-cannot-create';
+    //
+    // The unwritable location is a path whose PARENT IS A REGULAR FILE, so
+    // every `mkdir` beneath it fails `ENOTDIR` immediately. Two alternatives
+    // were tried and are wrong:
+    //
+    // - `/proc/<missing>/…` (what this test used originally) HANGS FOREVER on
+    //   Linux: `mkdirSync(path, { recursive: true })` under procfs never
+    //   returns, while a plain non-recursive `mkdirSync` on the same path
+    //   throws `ENOENT` in under a millisecond. Because that call is
+    //   SYNCHRONOUS, vitest cannot interrupt it — its test timeout never
+    //   fires, the worker spins, and the whole run hangs with no output.
+    //   That is exactly how this suite burned CI's entire 30-minute budget
+    //   four times with a completely silent log. It passed locally only
+    //   because macOS has no `/proc`, so the same call failed instantly.
+    // - A `chmod 0500` directory does not work either: CI containers run as
+    //   root, and root ignores permission bits, so the write would SUCCEED and
+    //   the test would silently stop testing anything.
+    const blocker = path.join(dataHome, 'not-a-directory');
+    writeFileSync(blocker, 'regular file, not a directory');
+    process.env['XDG_DATA_HOME'] = path.join(blocker, 'nested');
+
+    const startedAt = Date.now();
     expect(() =>
       writeTransportHeartbeat({
         transport: 'hook',
@@ -192,6 +213,12 @@ describe('writeTransportHeartbeat', () => {
         socketPath: SOCKET,
       }),
     ).not.toThrow();
+    // Guards the regression above: the failure path must fail FAST. A blocking
+    // filesystem call here cannot be caught by a test timeout (it is
+    // synchronous), so the only way to catch it is to assert afterwards that
+    // we got here at all and promptly. The bound is deliberately loose — this
+    // work is sub-millisecond in practice — so it flags a hang, never slowness.
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
   });
 });
 
