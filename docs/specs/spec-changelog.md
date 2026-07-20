@@ -190,6 +190,11 @@ Delivery rendering follows: both injecting transports' shared per-event block no
 it, a per-object source's delivered block would name no object at all once the title became the
 monitor name — the exact self-sufficiency regression #434/#438 guards against.
 
+`api-poll` additionally **redacts** the URL it interpolates (userinfo/query/fragment stripped, the
+treatment its warning text already had) before bounding it. Title and summary are durably persisted
+and delivered to agents, and a polled URL routinely carries a token, so the redaction that protected
+diagnostics has to protect delivered text too; `objectKey`/`payload.url` keep the exact URL.
+
 Not addressed here: issue #449's third item, a semantic diff hint for `json-diff` `diffText` (the
 "PR #443 became MERGED, PR #447 appeared" rendering). That is the presentation half of #440 and
 remains open.

@@ -212,7 +212,7 @@ describe('issue #449: delivered event title is the monitor name, not the raw com
 
     // Documented fallback (002 §5.4): the source-provided title, unchanged.
     expect(title).toMatch(/^Command output changed: /);
-    // …but the interpolated objectKey is bounded (003 §2.7), so a 200-character
+    // …but the interpolated objectKey is bounded (003 §2.8), so a 200-character
     // argv can no longer become the headline.
     expect(title.length).toBeLessThan(90);
     expect(title).not.toContain(harness.command[2]);

@@ -570,6 +570,34 @@ describe('source-api-poll', () => {
       expect(result.warnings?.[0]).not.toContain('#frag');
     });
 
+    // Issue #449 review: title/summary are durably persisted on every event and
+    // rendered into agent deliveries, so they get the same redaction the warning
+    // text already had — a URL carrying a token must not leak into them.
+    it('redacts credentials, query, and fragment from the observation title and summary', async () => {
+      const url =
+        'https://user:pass@status.example.com/incidents?token=secret#frag';
+      mockBody('{"status":"operational"}');
+      const baseline = await source.observe({ url }, { now: new Date() });
+      mockBody('{"status":"degraded"}');
+      const changed = await source.observe(
+        { url },
+        { now: new Date(), previousState: baseline.nextState },
+      );
+
+      const obs = changed.observations[0];
+      expect(obs?.title).toBe(
+        'API response changed: https://status.example.com/incidents',
+      );
+      expect(obs?.summary).toBe(obs?.title);
+      for (const secret of ['user', 'pass', 'token=secret', '#frag']) {
+        expect(obs?.title).not.toContain(secret);
+        expect(obs?.summary).not.toContain(secret);
+      }
+      // The author's exact URL is still available for debugging.
+      expect(obs?.objectKey).toBe(url);
+      expect(obs?.payload).toMatchObject({ url });
+    });
+
     it('does NOT warn when json-diff body parses as JSON', async () => {
       mockBody('{"status":"operational"}');
       const result = await source.observe(

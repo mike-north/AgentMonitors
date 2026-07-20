@@ -438,8 +438,12 @@ function isParseableJson(body: string): boolean {
 
 /**
  * Remove URL components that commonly carry credentials or request-scoped
- * tokens before embedding a URL in a non-fatal warning. The source should still
- * fetch the author's exact URL; only diagnostic text gets the redacted form.
+ * tokens before embedding a URL in **any** human-facing text: a non-fatal
+ * warning, and the observation `title`/`summary`, which are durably persisted on
+ * every event and rendered into agent deliveries (002 §5.4). The source should
+ * still fetch the author's exact URL, and the untouched URL remains on
+ * `payload.url` / `objectKey` for debugging; only text a human or agent reads
+ * gets the redacted form.
  */
 function redactUrlForWarning(url: string): string {
   try {
@@ -657,8 +661,11 @@ const source: ObservationSource = {
       return {
         observations: [
           {
-            title: `API response changed: ${displayObjectKey(url)}`,
-            summary: `API response changed: ${displayObjectKey(url)}`,
+            // Redacted (userinfo/query/fragment stripped) AND bounded: this
+            // text is persisted on the event and delivered to agents, so a URL
+            // carrying a token must not leak into it (issue #449 review).
+            title: `API response changed: ${displayObjectKey(redactUrlForWarning(url))}`,
+            summary: `API response changed: ${displayObjectKey(redactUrlForWarning(url))}`,
             payload: {
               url,
               status: status,

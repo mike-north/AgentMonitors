@@ -26,6 +26,10 @@ appeared nowhere.
   beneath the title (omitted when the two are identical, which is the nameless-monitor case). This
   keeps a per-object source's delivery self-sufficient: the block names both what the monitor is for
   and which object moved.
+- `api-poll` now redacts the URL in its observation title/summary (userinfo, query, and fragment
+  stripped — the same redaction its warning text already used) before bounding it, so a polled URL
+  carrying a token cannot leak into durably persisted, agent-delivered text. The exact URL remains on
+  `objectKey` and `payload.url`.
 - `displayObjectKey` is an additive `@agentmonitors/core` public export (minor bump); existing
   consumers are unaffected.
 

@@ -987,10 +987,13 @@ Auth is configured via the `auth.type` field.
 
 When a change is detected, the source emits one observation (verified: `plugins/source-api-poll/src/index.ts` lines 175–196):
 
-- `title`: `"API response changed: <url>"` — `<url>` bounded per
+- `title`: `"API response changed: <url>"` — `<url>` is **redacted** (userinfo, query, and fragment
+  stripped, the same treatment warning text gets) and then bounded per
   [§2.8](#28-an-objectkey-is-an-identity-not-a-headline); overridden by the monitor's authored
-  `name` at materialization ([002 §5.4](./002-runtime-delivery.md#54-event-title))
-- `summary`: `"API response changed: <url>"`
+  `name` at materialization ([002 §5.4](./002-runtime-delivery.md#54-event-title)). Redaction is
+  required because title/summary are durably persisted and delivered to agents, and a polled URL
+  routinely carries a token; the author's exact URL stays on `objectKey`/`payload.url`.
+- `summary`: `"API response changed: <url>"` (identically redacted and bounded)
 - `payload`: `{ url, status, strategy, body }`
 - `snapshotText`: response body as a string (always set; no binary check)
 - `objectKey`: `<url>`
