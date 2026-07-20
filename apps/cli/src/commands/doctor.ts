@@ -360,9 +360,11 @@ function notConfiguredRemediation(transport: TransportName): string {
  *   failure of anything happening now (005 §15). Gating on `hasLeadSession`
  *   here, the same way the `!configured` branch already does, is what keeps a
  *   single dead heartbeat from failing every future `doctor` run in this
- *   workspace forever — `readTransportHeartbeats` also reaps it once its
- *   lease has expired, but that is a courtesy for the NEXT read; this gate is
- *   what keeps THIS read honest in the meantime.
+ *   workspace forever. `readTransportHeartbeats` itself never reaps — GC is a
+ *   write-path-only responsibility (issue #425 review, round 6) — so a lapsed
+ *   record is durable across every `doctor` run until some transport
+ *   actually writes again; this gate is what keeps every one of those reads
+ *   honest in the meantime.
  * - **A lead session, but no transport has ever reported in.** Reached by every
  *   flow that registers a session without running a delivery transport (a
  *   `session start` in a script, a freshly-opened session that has not yet had

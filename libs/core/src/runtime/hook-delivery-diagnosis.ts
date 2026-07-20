@@ -52,6 +52,16 @@ export interface HookDeliveryHold {
    * pending event reaches the claim-time settle threshold.
    */
   settleRemainingMs?: number;
+  /**
+   * `already-claimed` / `coalesced-until-ack` only: the exact ids of this
+   * band's unread-but-already-claimed events — the ones actually holding the
+   * coalesced reminder back. Threaded through so a consumer (e.g. `doctor`'s
+   * remediation) can acknowledge PRECISELY these rows rather than every
+   * unread event on the session, which would also clear unrelated,
+   * never-surfaced work (issue #425 review, round 6). Empty for
+   * `settle-window`, where nothing is claimed yet.
+   */
+  claimedEventIds: string[];
   /** Human-readable explanation naming the mechanism and the remedy. */
   message: string;
 }
@@ -83,6 +93,7 @@ export function classifyReminderHold(
   urgency: 'normal' | 'low',
   unreadCount: number,
   pendingCount: number,
+  claimedEventIds: string[] = [],
 ): HookDeliveryHold | null {
   const claimedCount = unreadCount - pendingCount;
   // Fires (not held) when there is unread work and none of it is claimed yet.
@@ -98,7 +109,14 @@ export function classifyReminderHold(
       ? `${label}-urgency reminder at ${lifecycle} is suppressed: all ${String(unreadCount)} unread ${urgency} event(s) are already claimed (coalesced-until-ack). It re-fires once they are acknowledged (\`${ackHint}\`) or a fresh unclaimed ${urgency} event arrives.`
       : `${label}-urgency reminder at ${lifecycle} is suppressed: ${String(claimedCount)} of ${String(unreadCount)} unread ${urgency} event(s) are already claimed (coalesced-until-ack). It re-fires only once every unread ${urgency} event is unclaimed — acknowledge the claimed ones (\`${ackHint}\`).`;
 
-  return { urgency, reason, unreadCount, pendingCount, message };
+  return {
+    urgency,
+    reason,
+    unreadCount,
+    pendingCount,
+    claimedEventIds,
+    message,
+  };
 }
 
 /**
@@ -136,6 +154,9 @@ export function classifySettleWindowHold(
     unreadCount,
     pendingCount,
     settleRemainingMs,
+    // Nothing is claimed at `settle-window`: it holds because pending
+    // (unclaimed) work simply has not aged into its settle threshold yet.
+    claimedEventIds: [],
     message:
       `High-urgency delivery at turn-interruptible is held: ${String(pendingCount)} ` +
       `pending event(s) are within the ${String(settleSeconds)}s settle window ` +

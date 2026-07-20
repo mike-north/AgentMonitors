@@ -1485,13 +1485,15 @@ The two TTLs differ by design: the channel's is short (tens of seconds, well abo
 while the hook's spans a day — there is no hook process between prompts, so a short lease would
 report a perfectly healthy setup as dead during any human pause.
 
-**A lapsed record is reaped, not left forever.** The registry is scanned opportunistically on both
-read and write; a record found expired-past-its-own-TTL is still returned to the caller that observed
-it (so the ONE report that catches it still reports `heartbeat-stale` accurately), but its backing
-file is then removed. Without this, an uncleanly-killed transport's file would sit on disk forever —
-every subsequent `doctor` run in that workspace would fail `[heartbeat-stale]` permanently, even long
-after no lead session was ever open again, which is precisely the "cry wolf on nothing actually open"
-outcome the health surface exists to avoid (005 §15).
+**A lapsed record is reaped, not left forever — but only via a write.** The registry is scanned
+opportunistically on the WRITE path only (never on read, per the paragraph above); a record found
+expired-past-its-own-TTL is still returned to whichever reader observed it in the meantime (so the ONE
+report that catches it still reports `heartbeat-stale` accurately, potentially across many `doctor`
+runs), but its backing file is removed the next time ANY transport on the machine writes a heartbeat.
+Without this, an uncleanly-killed transport's file would sit on disk forever — every subsequent
+`doctor` run in that workspace would fail `[heartbeat-stale]` permanently, even long after no lead
+session was ever open again, which is precisely the "cry wolf on nothing actually open" outcome the
+health surface exists to avoid (005 §15).
 
 **A future `updatedAt` is stale, not "fresh forever" (issue #425 review, round 4).** Staleness is
 computed as `now - updatedAt > ttlMs`; a record whose `updatedAt` is somehow ahead of `now` (clock

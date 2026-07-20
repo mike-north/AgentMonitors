@@ -339,12 +339,19 @@ export function writeTransportHeartbeat(
   } catch {
     return undefined;
   }
-  // Opportunistic GC on the write path too, not only on read (issue #425
-  // review): a busy channel poll writes its own record every ~3s regardless of
-  // whether anything ever reads the registry, so relying solely on
-  // `readTransportHeartbeats` to reap other transports' expired records would
-  // leave them sitting until the next `doctor` run. Best-effort: a failed scan
-  // here must not turn "write my own heartbeat" into a thrown error.
+  // Opportunistic GC lives SOLELY on the write path (issue #425 review,
+  // round 6) — `readTransportHeartbeats` never mutates. A read-side reap
+  // meant `doctor` itself deleted the only evidence of the failure it had
+  // just reported: `[heartbeat-stale]` on run 1, then a clean "not
+  // configured" idle verdict on run 2, purely because the diagnostic had
+  // been invoked once already (005 §15's "diagnoses only, never mutates"
+  // contract). A live process WRITING again is the genuine reconciliation
+  // event a lapsed record should wait for; a bystander's read is not. A busy
+  // channel poll writes its own record every ~3s regardless of whether
+  // anything ever reads the registry, so this is still enough to reap OTHER
+  // transports' expired records promptly rather than leaving them until
+  // something else happens to write. Best-effort: a failed scan here must
+  // not turn "write my own heartbeat" into a thrown error.
   try {
     reapExpiredHeartbeats(now);
   } catch {
@@ -438,21 +445,19 @@ export function isTransportHeartbeat(
  * transport on the machine. A missing registry directory is simply an empty
  * list — the ordinary state before any transport has ever run.
  *
- * **Opportunistic GC.** A transport that dies without cleanup (SIGKILL, host
- * crash) never calls {@link removeTransportHeartbeat}, so — before this fix —
- * its record sat on disk forever, past its own declared lease, and every
- * future read kept reporting it `heartbeat-stale`: one uncleanly-killed
- * channel server made every subsequent `doctor` run in that workspace fail
- * `[heartbeat-stale]` permanently, even long after no lead session was even
- * open (issue #425 review). When a caller supplies `now` (every production
- * caller does — `doctor` passes its own report's `generatedAt`, and
- * `writeTransportHeartbeat` passes the write's own timestamp), a record found
- * to be expired-past-TTL on this scan is still INCLUDED in the returned list
- * — this pass's caller still gets an accurate "it was stale" finding — but
- * its backing file is reaped (`rmSync`) as a side effect, so the NEXT read
- * sees a clean absence instead of the same dead record forever. Omitting
- * `now` (as most tests that only care about the current record set do) skips
- * GC entirely — a plain read, no side effects.
+ * **Pure — never mutates, never reaps** (issue #425 review, round 6). This
+ * function takes no `now` and has no GC side effect; a stale-past-TTL record
+ * is returned exactly as read, every time, until something else reconciles
+ * it. That is deliberate: `doctor` is 005 §15's "diagnoses only" surface, and
+ * reaping on THIS read path previously let one `doctor` invocation destroy
+ * the only evidence of the failure it had just reported — the record proving
+ * `[heartbeat-stale]` on run 1 was gone by run 2, which then saw no
+ * configured transports and reported a clean idle/exit-0 verdict for a
+ * transport that was, in fact, still dead. Expiry reconciliation belongs
+ * solely to {@link writeTransportHeartbeat}'s call to
+ * {@link reapExpiredHeartbeats}: a live process WRITING again is the genuine
+ * "this transport is back" event, whereas a bystander merely reading the
+ * registry is not, and must not be able to erase what it observes.
  */
 export function readTransportHeartbeats(): TransportHeartbeat[] {
   let names: string[];

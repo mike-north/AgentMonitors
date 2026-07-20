@@ -2183,14 +2183,32 @@ export class AgentMonitorRuntime {
     lifecycle: DeliveryLifecycle,
   ): HookDeliveryDiagnosis {
     const now = new Date();
+    const unreadLow = this.store.unreadEventsForSession(sessionId, 'low');
+    const unreadNormal = this.store.unreadEventsForSession(sessionId, 'normal');
     const unreadCounts = {
-      low: this.store.unreadEventsForSession(sessionId, 'low').length,
-      normal: this.store.unreadEventsForSession(sessionId, 'normal').length,
+      low: unreadLow.length,
+      normal: unreadNormal.length,
       high: this.store.unreadEventsForSession(sessionId, 'high').length,
     };
     const sessionUnreadCounts = {
       ...unreadCounts,
       total: unreadCounts.low + unreadCounts.normal + unreadCounts.high,
+    };
+
+    // The ids actually holding a band's coalesced reminder back: unread MINUS
+    // pending (unclaimed), i.e. the claimed ones. Computed here rather than in
+    // the pure classifier so `doctor`'s remediation can acknowledge exactly
+    // these rows instead of every unread event on the session (issue #425
+    // review, round 6) — acknowledging unrelated, never-surfaced work would be
+    // a different bug in the opposite direction.
+    const claimedIds = (
+      unread: readonly { id: string }[],
+      pending: readonly { id: string }[],
+    ): string[] => {
+      const pendingIds = new Set(pending.map((event) => event.id));
+      return unread
+        .filter((event) => !pendingIds.has(event.id))
+        .map((event) => event.id);
     };
 
     const holds: HookDeliveryHold[] = [];
@@ -2214,17 +2232,23 @@ export class AgentMonitorRuntime {
           DEFAULT_HIGH_URGENCY_SETTLE_MS,
       ).length;
       if (settledHighCount === 0) {
-        const pendingNormal = this.pendingForClaim(sessionId, 'normal').length;
+        const pendingNormal = this.pendingForClaim(sessionId, 'normal');
         const normalHold = classifyReminderHold(
           'normal',
           unreadCounts.normal,
-          pendingNormal,
+          pendingNormal.length,
+          claimedIds(unreadNormal, pendingNormal),
         );
         if (normalHold) holds.push(normalHold);
       }
     } else if (lifecycle === 'turn-idle') {
-      const pendingLow = this.pendingForClaim(sessionId, 'low').length;
-      const lowHold = classifyReminderHold('low', unreadCounts.low, pendingLow);
+      const pendingLow = this.pendingForClaim(sessionId, 'low');
+      const lowHold = classifyReminderHold(
+        'low',
+        unreadCounts.low,
+        pendingLow.length,
+        claimedIds(unreadLow, pendingLow),
+      );
       if (lowHold) holds.push(lowHold);
     }
 

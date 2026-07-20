@@ -79,7 +79,10 @@ function input(
 }
 
 /** A diagnosis whose normal band is muted by the coalesced-until-ack guard. */
-function suppressedDiagnosis(sessionId: string): HookDeliveryDiagnosis {
+function suppressedDiagnosis(
+  sessionId: string,
+  claimedEventIds: string[] = [`${sessionId}-claimed-1`],
+): HookDeliveryDiagnosis {
   return {
     sessionId,
     lifecycle: 'turn-interruptible',
@@ -90,6 +93,7 @@ function suppressedDiagnosis(sessionId: string): HookDeliveryDiagnosis {
         reason: 'coalesced-until-ack',
         unreadCount: 11,
         pendingCount: 10,
+        claimedEventIds,
         message:
           'Normal-urgency reminder at turn-interruptible is suppressed: 1 of 11 unread normal event(s) are already claimed (coalesced-until-ack).',
       },
@@ -331,6 +335,47 @@ describe('computeTransportHealth', () => {
       );
       const channel = find(health.transports, 'channel');
       expect(codesOf(channel)).not.toContain('channel-lead-uncovered');
+    });
+  });
+
+  describe('the every-active-lead-covered rule applies to hook too, not only channel (issue #425 review, round 6)', () => {
+    it('flags an active lead with no evidence in the (single, workspace-keyed) hook heartbeat', () => {
+      // Regression: hook heartbeats already carry `hostSessionId`, but
+      // coverage was only checked for `channel`. With two active leads and a
+      // hook heartbeat naming only one of them, `computeTransportHealth`
+      // previously returned `deliveryWillReachThisSession: 'hook'` and
+      // `deliverable: true` for the whole workspace even though the second
+      // lead had no hook invocation evidence at all — a script-registered or
+      // freshly opened session could go completely uncovered while another
+      // session's activity made the aggregate read healthy.
+      const health = computeTransportHealth(
+        input({
+          leadHostSessionIds: ['session-covered', 'session-uncovered'],
+          heartbeats: [heartbeat('hook', { hostSessionId: 'session-covered' })],
+        }),
+      );
+      const hook = find(health.transports, 'hook');
+      expect(codesOf(hook)).toContain('hook-lead-uncovered');
+      expect(
+        hook.problems.find((problem) => problem.code === 'hook-lead-uncovered')
+          ?.detail,
+      ).toContain('session-uncovered');
+      expect(hook.healthy).toBe(false);
+      // A partially-covered hook must not read as this session's clean
+      // listening method.
+      expect(health.deliveryWillReachThisSession).not.toBe('hook');
+      expect(health.deliverable).toBe(false);
+    });
+
+    it('reports no uncovered leads when the single hook heartbeat names the only active lead', () => {
+      const health = computeTransportHealth(
+        input({
+          leadHostSessionIds: ['session-a'],
+          heartbeats: [heartbeat('hook', { hostSessionId: 'session-a' })],
+        }),
+      );
+      const hook = find(health.transports, 'hook');
+      expect(codesOf(hook)).not.toContain('hook-lead-uncovered');
     });
   });
 
@@ -623,6 +668,19 @@ describe('computeTransportHealth', () => {
       );
     });
 
+    it('scopes the remediation to the exact claimed event ids and the resolved socket, never a blanket ack (issue #425 review, round 6)', () => {
+      // Regression: `events ack --session <id>` with no `--event-ids` acks
+      // EVERY unread row for the session — including events the agent never
+      // claimed or saw — and omitting `--socket` could target a different
+      // daemon than the one this `doctor` invocation actually diagnosed.
+      const remediation = health.remediation.join(' ');
+      expect(remediation).toContain('--event-ids session-abc-claimed-1');
+      expect(remediation).toContain(`--socket ${SOCKET}`);
+      // Never a bare `--session <id>` with nothing after it — that IS the
+      // unscoped "ack everything" form this regression forbids.
+      expect(remediation).not.toMatch(/--session session-abc`/);
+    });
+
     it('attributes the suppression to both transports, since both share the gate', () => {
       // `reserve` (channel) and `claim` (hook) consult the same guard —
       // blaming one would imply the other still works.
@@ -643,6 +701,18 @@ describe('computeTransportHealth', () => {
       const remediation = many.remediation.join(' ');
       expect(remediation).toContain('--session session-abc');
       expect(remediation).toContain('--session session-def');
+      // Each session's remediation must carry ONLY its own claimed ids —
+      // never another session's, which would ack unrelated unseen work.
+      const abcLine = remediation
+        .split('`')
+        .find((segment) => segment.includes('--session session-abc'));
+      const defLine = remediation
+        .split('`')
+        .find((segment) => segment.includes('--session session-def'));
+      expect(abcLine).toContain('session-abc-claimed-1');
+      expect(abcLine).not.toContain('session-def-claimed-1');
+      expect(defLine).toContain('session-def-claimed-1');
+      expect(defLine).not.toContain('session-abc-claimed-1');
     });
 
     it('stays visible when NO transport has reported in', () => {
@@ -666,6 +736,18 @@ describe('computeTransportHealth', () => {
       expect(health.remediation.join(' ')).toContain(
         'agentmonitors events ack --session session-abc',
       );
+    });
+
+    it('omits `--event-ids` (falls back to the daemon default) when a hold carries no claimed ids', () => {
+      // Defensive: `diagnoseHookDelivery` always supplies real ids, but the
+      // pure classifier defaults to `[]` for a hand-built caller. Rendering
+      // an empty `--event-ids ` flag would be worse than omitting it.
+      const health = computeTransportHealth(
+        input({ diagnoses: [suppressedDiagnosis('session-abc', [])] }),
+      );
+      const remediation = health.remediation.join(' ');
+      expect(remediation).not.toContain('--event-ids');
+      expect(remediation).toContain(`--socket ${SOCKET}`);
     });
 
     it('exposes a down daemon as a pipeline problem, not only per transport', () => {

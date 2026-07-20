@@ -58,9 +58,10 @@ See docs/specs/006-agent-integration.md §12 and docs/specs/005-cli-reference.md
 
 **Review fixes (before first release):**
 
-- The transport registry is now reaped opportunistically on read and write, so a transport that dies
-  without cleanup no longer fails `doctor` in that workspace forever; `transport:<name>` checks are
-  also gated on a lead session being currently open, matching the "no lead session → idle" contract.
+- The transport registry is now reaped opportunistically on write only (never on read — see below),
+  so a transport that dies without cleanup no longer fails `doctor` in that workspace forever;
+  `transport:<name>` checks are also gated on a lead session being currently open, matching the "no
+  lead session → idle" contract.
 - The hook transport's `lastDeliveryAt` is preserved across a refresh that has nothing new to report
   (a read-modify-write), instead of resetting to `never` on the next empty prompt, and is recorded
   only when a delivery actually wrote output to the host.
@@ -88,3 +89,19 @@ See docs/specs/006-agent-integration.md §12 and docs/specs/005-cli-reference.md
   both unparseable and implausibly-future timestamps sorting as oldest, so a corrupt or forged record
   can no longer become the representative over a valid, current one. Every matching record's problems
   are still unioned regardless of which one is chosen.
+- **Reaping is now a write-path-only responsibility.** `readTransportHeartbeats` never mutates: a
+  read-side reap previously let `doctor` destroy the evidence of the failure it had just reported (a
+  first run reports `[heartbeat-stale]` and exits 1; a second run, with nothing recovered, then found
+  no record at all and reported a clean idle/exit-0 verdict). A lapsed record now stays durable across
+  every `doctor` run until some transport actually writes a heartbeat again.
+- **A new `hook-lead-uncovered` problem code** extends the every-active-lead-covered rule to `hook`:
+  with two active leads and a hook heartbeat naming only one of them, the other is now reported
+  explicitly instead of a workspace-wide `deliverable: true` masking that a second lead has no hook
+  invocation evidence at all.
+- A persisted, semantically-invalid numeric heartbeat field (`ttlMs`/`pid`/`schemaVersion` as
+  `Infinity`, `NaN`, or non-positive) is now rejected rather than trusted — `JSON.parse` happily
+  overflows `1e309` to `Infinity`, which made a lease immortal and un-reapable.
+- The `reminders-suppressed` remediation now names the exact claimed event ids holding the reminder
+  back and the socket `doctor` itself resolved, instead of a blanket
+  `agentmonitors events ack --session <id>` that would acknowledge every unread row on the session
+  (including events never claimed or seen) against whichever daemon the default socket resolves to.

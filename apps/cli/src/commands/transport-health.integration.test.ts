@@ -666,6 +666,16 @@ This monitor fires on a schedule.
       expect(result.stdout).toContain(
         `agentmonitors events ack --session ${sessionId}`,
       );
+      // Regression (issue #425 review, round 6): scoped to the exact claimed
+      // event id and the resolved socket, never a blanket
+      // `--session <id>` with no `--event-ids` (which would ack every unread
+      // row on the session) nor the wrong daemon's socket.
+      const claimedEventId = (
+        JSON.parse(unread().stdout) as { id: string }[]
+      )[0]?.id;
+      expect(claimedEventId).toBeDefined();
+      expect(result.stdout).toContain(`--event-ids ${claimedEventId}`);
+      expect(result.stdout).toContain(`--socket ${socketPath}`);
       expect(result.stdout).toContain('✗ delivery-verdict');
       expect(result.exitCode).toBe(1);
     } finally {
@@ -916,6 +926,84 @@ This monitor fires on a schedule.
         'channel-lead-uncovered',
       );
       expect(channel?.healthy).toBe(false);
+      expect(payload.deliverable).toBe(false);
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+    }
+  }, 30_000);
+
+  it('surfaces an active lead with no hook invocation evidence, not just channel (issue #425 review, round 6)', async () => {
+    // Regression: the every-active-lead-covered rule (round 5) was applied to
+    // `channel` only. Hook heartbeats already carry `hostSessionId`, but with
+    // two active leads and a hook heartbeat naming only one, a real daemon
+    // previously read `deliveryWillReachThisSession: 'hook'` and
+    // `deliverable: true` for the workspace, even though the second lead had
+    // no hook invocation at all.
+    const fixture = transportFixture('hook-uncovered-lead');
+    const daemon = await startDaemon(
+      fixture.monitorsRoot,
+      fixture.dir,
+      fixture.env,
+      fixture.socketPath,
+    );
+    try {
+      const coveredHost = 'hook-uncovered-lead-covered';
+      const uncoveredHost = 'hook-uncovered-lead-uncovered';
+      const openedCovered = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          coveredHost,
+          '--workspace',
+          fixture.dir,
+          '--format',
+          'json',
+        ],
+        fixture.env,
+        fixture.dir,
+      );
+      expect(openedCovered.exitCode).toBe(0);
+      const openedUncovered = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          uncoveredHost,
+          '--workspace',
+          fixture.dir,
+          '--format',
+          'json',
+        ],
+        fixture.env,
+        fixture.dir,
+      );
+      expect(openedUncovered.exitCode).toBe(0);
+
+      // The single, workspace-keyed hook heartbeat names only the covered
+      // lead — hooks are per-workspace, not per-session, so there is never a
+      // second file to check.
+      seedHeartbeat(fixture, 'hook', { hostSessionId: coveredHost });
+
+      const result = runWithEnv(
+        ['doctor', '--workspace', fixture.dir, '--format', 'json'],
+        fixture.env,
+        fixture.dir,
+      );
+      const payload = JSON.parse(result.stdout) as {
+        transports: {
+          name: string;
+          healthy: boolean;
+          problems: { code: string }[];
+        }[];
+        deliverable: boolean;
+      };
+      const hook = payload.transports.find((t) => t.name === 'hook');
+      expect(hook?.problems.map((p) => p.code)).toContain(
+        'hook-lead-uncovered',
+      );
+      expect(hook?.healthy).toBe(false);
       expect(payload.deliverable).toBe(false);
     } finally {
       daemon.stop();

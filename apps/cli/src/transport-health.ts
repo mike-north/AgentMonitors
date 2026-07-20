@@ -101,7 +101,22 @@ export type TransportProblemCode =
    * true` for the whole workspace, silently hiding that the other lead has no
    * channel listener whatsoever.
    */
-  | 'channel-lead-uncovered';
+  | 'channel-lead-uncovered'
+  /**
+   * At least one ACTIVE lead session in this workspace has NO evidence the
+   * hook transport has ever fired for it — the single hook heartbeat this
+   * workspace has on disk names a DIFFERENT lead's host session id (issue
+   * #425 review, round 6). `hook`'s record is deliberately per-workspace, not
+   * per-session (see `heartbeatKey`), so unlike `channel-lead-uncovered` this
+   * can never be resolved by finding a second matching record — there is only
+   * ever one. With active leads `a` and `b` and a hook heartbeat carrying
+   * `a`'s session id, the record is still real evidence that hooks are wired
+   * up in this workspace, but it is silent on whether `b`'s hook has EVER
+   * fired: a freshly opened or script-registered `b` can have no hook
+   * invocation at all while `a`'s activity makes the workspace-wide aggregate
+   * read `deliverable: true`.
+   */
+  | 'hook-lead-uncovered';
 
 /**
  * Problems that belong to the delivery pipeline as a whole rather than to one
@@ -377,11 +392,36 @@ function suppressionProblems(input: TransportHealthInput): TransportProblem[] {
     {
       code: 'reminders-suppressed',
       detail,
+      // Scoped to the CLAIMED event ids this diagnosis actually named, and to
+      // the socket THIS `doctor` invocation resolved (issue #425 review,
+      // round 6). `events ack --session <id>` with no `--event-ids` acks
+      // EVERY unread row for that session, including unrelated events the
+      // agent may never have claimed or seen — a reader following this advice
+      // could clear unseen work far beyond what suppressed the reminder.
+      // Omitting `--socket` similarly risks acknowledging against a
+      // different daemon than the one this `doctor` run diagnosed, when a
+      // non-default socket is in play. `claimedEventIds` can be empty only if
+      // a caller constructed a hold outside `diagnoseHookDelivery` (the pure
+      // classifier defaults it to `[]`); the flag is simply omitted then,
+      // falling back to the daemon's own "ack all unread" default rather than
+      // rendering an empty `--event-ids`.
       remediation: sessions
-        .map(
-          (sessionId) =>
-            `Acknowledge the claimed events so the reminder re-fires: \`agentmonitors events ack --session ${sessionId}\`.`,
-        )
+        .map((sessionId) => {
+          const ids = [
+            ...new Set(
+              suppressed
+                .filter((entry) => entry.sessionId === sessionId)
+                .flatMap((entry) => entry.hold.claimedEventIds),
+            ),
+          ];
+          const eventIdsFlag =
+            ids.length > 0 ? ` --event-ids ${ids.join(',')}` : '';
+          return (
+            `Acknowledge the claimed events so the reminder re-fires: ` +
+            `\`agentmonitors events ack --session ${sessionId}${eventIdsFlag} ` +
+            `--socket ${input.socketPath}\`.`
+          );
+        })
         .join(' '),
     },
   ];
@@ -685,38 +725,58 @@ function buildTransport(
     (entry) => entry.problems,
   );
 
-  // A channel record matching SOME active lead sessions does not prove it
-  // matches ALL of them (issue #425 review, round 5): with two active leads
-  // and a healthy channel heartbeat for only one, the prior check ("at least
-  // one active lead has a matching channel heartbeat") was satisfied and
-  // reported a clean `deliverable: true`, `channel.healthy: true` verdict for
-  // the whole workspace while the other active lead had no channel listener
-  // at all. Surface every uncovered active lead explicitly rather than
-  // issuing a workspace-wide clean bill of health that only one of several
-  // recipients actually earned.
-  if (transport === 'channel') {
-    const matchedLeadIds = new Set(
-      matches
-        .map((candidate) => candidate.hostSessionId)
-        .filter((id): id is string => id !== undefined),
+  // A transport record matching SOME active lead sessions does not prove it
+  // matches ALL of them (issue #425 review, round 5, extended to `hook` in
+  // round 6): with two active leads and a healthy heartbeat naming only one
+  // of them, the prior check ("at least one active lead has a matching
+  // heartbeat") was satisfied and reported a clean `deliverable: true`
+  // verdict for the whole workspace while the other active lead had no
+  // evidence of that transport at all. Surface every uncovered active lead
+  // explicitly rather than issuing a workspace-wide clean bill of health that
+  // only one of several recipients actually earned.
+  //
+  // `hook` has at most one record on disk (workspace-keyed, overwritten per
+  // prompt — see `heartbeatKey`), so `matches` here has at most one entry;
+  // "uncovered" for hook therefore means "every active lead other than the
+  // one this single record names", not "no record found at all". That is
+  // still a real, actionable gap: a second lead's hook may simply never have
+  // fired.
+  const matchedLeadIds = new Set(
+    matches
+      .map((candidate) => candidate.hostSessionId)
+      .filter((id): id is string => id !== undefined),
+  );
+  const uncoveredLeadIds = input.leadHostSessionIds.filter(
+    (id) => !matchedLeadIds.has(id),
+  );
+  if (uncoveredLeadIds.length > 0) {
+    problems.push(
+      transport === 'channel'
+        ? {
+            code: 'channel-lead-uncovered',
+            detail:
+              `No channel heartbeat matches ${String(uncoveredLeadIds.length)} ` +
+              `other active lead session(s) here (${uncoveredLeadIds.join(', ')}): ` +
+              `a channel is reporting for at least one active lead in this ` +
+              `workspace, but not for these — they have no channel listener at ` +
+              `all, so a workspace-wide "channel is healthy" verdict would be ` +
+              `true for one recipient and silently false for the others.`,
+            remediation:
+              'Start (or reconnect) a Claude Code session with the AgentMon plugin loaded as a channel for each of those host sessions, or rely on the hook transport, which delivers without one.',
+          }
+        : {
+            code: 'hook-lead-uncovered',
+            detail:
+              `The hook heartbeat for this workspace names a different active ` +
+              `lead session, not ${String(uncoveredLeadIds.length)} other one(s) ` +
+              `here (${uncoveredLeadIds.join(', ')}): hooks re-resolve per prompt, ` +
+              `so this only proves SOME lead's hook has fired in this workspace, ` +
+              `never that every active lead's has — those session(s) may have no ` +
+              `hook invocation at all yet.`,
+            remediation:
+              'Submit a prompt in each of those Claude Code sessions so `UserPromptSubmit` runs `agentmonitors hook deliver` and records its heartbeat. If it does not, the plugin hooks are not installed for that session.',
+          },
     );
-    const uncoveredLeadIds = input.leadHostSessionIds.filter(
-      (id) => !matchedLeadIds.has(id),
-    );
-    if (uncoveredLeadIds.length > 0) {
-      problems.push({
-        code: 'channel-lead-uncovered',
-        detail:
-          `No channel heartbeat matches ${String(uncoveredLeadIds.length)} ` +
-          `other active lead session(s) here (${uncoveredLeadIds.join(', ')}): ` +
-          `a channel is reporting for at least one active lead in this ` +
-          `workspace, but not for these — they have no channel listener at ` +
-          `all, so a workspace-wide "channel is healthy" verdict would be ` +
-          `true for one recipient and silently false for the others.`,
-        remediation:
-          'Start (or reconnect) a Claude Code session with the AgentMon plugin loaded as a channel for each of those host sessions, or rely on the hook transport, which delivers without one.',
-      });
-    }
   }
 
   // Shared problems are recorded on every configured transport so a consumer

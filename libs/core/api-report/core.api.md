@@ -153,7 +153,7 @@ export type ChangeDetectionStrategy = 'json-diff' | 'text-diff' | 'exit-code' | 
 export type ChangeKind = 'created' | 'modified' | 'deleted' | 'descoped';
 
 // @public
-export function classifyReminderHold(urgency: 'normal' | 'low', unreadCount: number, pendingCount: number): HookDeliveryHold | null;
+export function classifyReminderHold(urgency: 'normal' | 'low', unreadCount: number, pendingCount: number, claimedEventIds?: string[]): HookDeliveryHold | null;
 
 // @public
 export function classifySettleWindowHold(pendingHighCreatedAt: readonly Date[], unreadCount: number, now: Date, settleMs: number): HookDeliveryHold | null;
@@ -424,6 +424,7 @@ export interface HookDeliveryDiagnosis {
 
 // @public
 export interface HookDeliveryHold {
+    claimedEventIds: string[];
     message: string;
     pendingCount: number;
     // (undocumented)
