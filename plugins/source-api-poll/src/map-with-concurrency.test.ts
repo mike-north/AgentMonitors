@@ -49,6 +49,38 @@ describe('mapWithConcurrency', () => {
     ).resolves.toEqual([]);
   });
 
+  // Copilot review (PR #448): an unvalidated `limit` <= 0 makes `workerCount`
+  // (`Math.min(limit, items.length)`) 0, so the call would previously resolve
+  // immediately with an array of uninitialized entries and `fn` never invoked
+  // for a non-empty `items` — silent data loss rather than a thrown error.
+  describe('limit validation', () => {
+    it.each([0, -1, -5])(
+      'throws for a non-positive limit (%d) instead of silently dropping all items',
+      async (limit) => {
+        const fn = vi.fn((n: number) => Promise.resolve(n));
+        await expect(mapWithConcurrency([1, 2, 3], limit, fn)).rejects.toThrow(
+          /limit must be a positive integer/,
+        );
+        expect(fn).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([1.5, NaN, Infinity])(
+      'throws for a non-integer limit (%s)',
+      async (limit) => {
+        await expect(
+          mapWithConcurrency([1], limit, (n) => Promise.resolve(n)),
+        ).rejects.toThrow(/limit must be a positive integer/);
+      },
+    );
+
+    it('accepts a positive integer limit', async () => {
+      await expect(
+        mapWithConcurrency([1, 2, 3], 2, (n) => Promise.resolve(n * 2)),
+      ).resolves.toEqual([2, 4, 6]);
+    });
+  });
+
   // Issue #304 review, finding 3: workers previously only checked a shared
   // `failed` flag *between* items, so an instantly-failing part still waited
   // for every in-flight sibling to finish (up to its own full deadline)

@@ -31,6 +31,17 @@ export async function mapWithConcurrency<T, R>(
   limit: number,
   fn: (item: T, signal: AbortSignal) => Promise<R>,
 ): Promise<R[]> {
+  // `limit` currently only ever arrives as a positive integer constant
+  // (`MAX_COMPOSITE_CONCURRENCY`), but this is a shared helper — a future
+  // caller passing 0/negative/non-integer would otherwise make `workerCount`
+  // (below) 0, silently resolving with an array of uninitialized entries and
+  // never invoking `fn` for any item. Fail loudly instead of losing work.
+  if (!Number.isInteger(limit) || limit < 1) {
+    throw new Error(
+      `mapWithConcurrency: limit must be a positive integer, got ${String(limit)}`,
+    );
+  }
+
   const results: R[] = new Array<R>(items.length);
   let nextIndex = 0;
   const batchController = new AbortController();

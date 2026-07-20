@@ -1042,9 +1042,9 @@ Running a second observation to demonstrate change detection...
 ### 4.9 Request duration, response size, and composite concurrency bounds (issue #304)
 
 A stalled or huge endpoint must not wedge a whole tick, delay unrelated monitors, exhaust daemon
-memory, or amplify the local SQLite database (P1 daemon availability). `api-poll` enforces four
-bounds, all covered by a documented default with — for the deadline — a validated per-monitor
-override:
+memory, or amplify the local SQLite database (P1 daemon availability). `api-poll` enforces the six
+bounds below, each covered by a documented default with — for the deadline — a validated
+per-monitor override:
 
 | Bound                                                       | Default                                            | Override                                                                                                                                                           |
 | ----------------------------------------------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
