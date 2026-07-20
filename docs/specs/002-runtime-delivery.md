@@ -856,6 +856,18 @@ artifacts on startup** (BP4, [000 §5](./000-principles.md)).
   the resulting descriptor rather than the path, so a planted symlink at the log path is refused
   (surfaced as a clean spawn failure) instead of silently appending the daemon's output into
   whatever it points at.
+- **The `--detach` log's `fchmod` is fail-closed, not warn-and-continue.** If that final `fchmod`
+  on the opened descriptor itself fails — e.g. `EPERM`/`EACCES` because a pre-existing `--log` file
+  is owned by another user and open-for-append succeeded but tightening did not — the runtime
+  closes the descriptor and refuses to start the detached daemon, reporting an actionable error
+  naming the path and the underlying cause. This is a deliberate exception to "degrade gracefully"
+  below: that rule covers artifacts the runtime silently _tightens_ without changing whether the
+  triggering operation proceeds (a socket, a directory, a hook-state file, the database — all of
+  which need only to be written, not to gate anything). The log file is different: whether it can
+  be made owner-only gates whether the daemon starts logging at all, and the log carries workspace
+  paths and monitor-failure details for the lifetime of the process. Starting to write those details
+  into a file the daemon cannot secure is worse than refusing to start; the caller can point `--log`
+  at a file it owns, or remove the existing one, and retry.
 - **Sockets:** the Unix domain socket is **bound under a restricted (`0o077`) umask so it is born
   `0600`** (Node binds a Unix socket synchronously inside `listen()`, so the umask window closes
   before the socket is observable), then re-chmod'd `0600` after bind as defense-in-depth, and —
@@ -886,7 +898,10 @@ artifacts on startup** (BP4, [000 §5](./000-principles.md)).
   continue, leaving the mode unchanged — they do **not** throw. The daemon must never die because an
   artifact it was asked to write is not one it can chmod; correspondingly, a single malformed or
   unexpected IPC request is answered with an error response, never allowed to crash the daemon
-  process ([§10.4](#104-ipc-wire-protocol)).
+  process ([§10.4](#104-ipc-wire-protocol)). This rule governs artifacts the daemon tightens
+  incidentally to an already-necessary write; it does **not** cover the `--detach` log file's own
+  `fchmod`, which is fail-closed per the bullet above — there the mode check gates whether the
+  daemon starts at all, not merely whether a write that would happen regardless succeeds.
 - **Windows.** POSIX modes are not meaningful; the helpers create the paths without mode enforcement.
 
 Verified: `libs/core/src/security/local-permissions.ts` — `ensurePrivateDir`,
@@ -900,10 +915,11 @@ the default location, and the log file itself created `0600`/tightened via
 `restrictExistingPathMode` before every append, then opened `O_NOFOLLOW` with the descriptor
 `fchmod`'d — never the path — so neither the ambient umask, a pre-existing permissive file/dir from
 an earlier run, nor a symlink planted at the log path leaves it world-readable or writes through to
-an unintended target); tests:
+an unintended target; a descriptor `fchmod` failure closes the descriptor and fails the spawn rather
+than warning and continuing); tests:
 `local-permissions.test.ts`, `inbox/db-permissions.test.ts`, `hook-bridge/bridge.test.ts`,
-`daemon-ipc.test.ts`, `detached-spawn.test.ts`, and the real-binary UAT in
-`apps/cli/src/commands/cli.integration.test.ts`.
+`daemon-ipc.test.ts`, `detached-spawn.test.ts`, `open-log-fd-fail-closed.test.ts`, and the
+real-binary UAT in `apps/cli/src/commands/cli.integration.test.ts`.
 
 ## 4. Notify Dispatch
 
