@@ -1159,20 +1159,35 @@ The runtime — not the source — decides a materialized event's `title`:
 A source's title is written from the source's point of view and routinely embeds a configuration
 detail (`command-poll` interpolates its `objectKey`, which defaults to the joined argv). The author's
 `name` is the one human-written string that says what the monitor is _for_, so it is the headline the
-recipient sees. The source's per-object text is **not** lost: it remains the `summary` (§5.1), and
-source identity remains on `objectKey` / `payload`.
+recipient sees. Source identity always remains on `objectKey` / `payload`.
 
-Both injecting transports render the `summary` on its own line beneath the title
-([006 §4.2.1](./006-agent-integration.md)), omitting it when it repeats the title — so a per-object
-source still names the object that moved, and the delivered text stays self-sufficient.
+**What happens to the source's `title` depends on whether the observation carries its own `summary`
+(the compatibility contract):**
+
+| Observation                                                  | Named monitor delivers                                                                                                                                   | Nameless monitor delivers                     |
+| ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| `title` only, or `title` == `summary` (every bundled source) | title = `name`; detail line = source title (via the derived `summary`, §5.1)                                                                             | title = source title; no detail line          |
+| `title` + a **distinct** `summary`                           | title = `name`; detail line = `summary` — the source's `title` string does **not** appear in delivered text                                              | title = source title; detail line = `summary` |
+| `title` + `body`, no `summary`                               | title = `name`; detail line suppressed (the derived summary equals the body, which the block already renders — [006 §4.2.1](./006-agent-integration.md)) | title = source title; body below              |
+
+So for a **named** monitor whose source sets a title and a _different_ summary, the source's title is
+genuinely dropped from delivered text. This is intended, not an accident: `summary` is defined as the
+short per-object text for lightweight delivery surfaces ([003 §2.1](./003-source-plugins.md)), so a
+source that supplies one has already said which string it wants surfaced. A source that wants its
+title preserved should make `summary` carry that text — which is what every bundled source does.
+
+Both injecting transports render the detail line beneath the title
+([006 §4.2.1](./006-agent-integration.md)) — so a per-object source still names the object that
+moved, and the delivered text stays self-sufficient.
 
 Because the title is chosen once at materialization, it is **transport-independent** — the hook and
 channel renderers ([006 §4/§5](./006-agent-integration.md)) cannot diverge on it — and it is what
 `events list` and history display too.
 
-Sources still bound any `objectKey` they interpolate into their own title/summary
-([003 §2.8](./003-source-plugins.md#28-an-objectkey-is-an-identity-not-a-headline)), so the fallback
-title of a nameless monitor is bounded as well.
+Sources bound a **configuration-identity** `objectKey` they interpolate into their own title/summary
+([003 §2.8](./003-source-plugins.md#28-an-objectkey-is-an-identity-not-a-headline)), so a nameless
+monitor's fallback title is bounded for those sources; path-like keys are deliberately excluded there
+and remain unbounded.
 
 ## 6. Session Projection
 

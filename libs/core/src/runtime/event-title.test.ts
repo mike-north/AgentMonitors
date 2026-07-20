@@ -41,8 +41,17 @@ afterEach(() => {
   }
 });
 
-/** Emits one changing observation per tick, titled the way a real source would. */
-function scriptedSource(): ObservationSource {
+/**
+ * Emits one changing observation per tick. `fields` overrides the observation's
+ * text so a test can drive the distinct-`title`/`summary` case a third-party
+ * source may legitimately produce (002 §5.4's compatibility table).
+ */
+function scriptedSource(
+  fields: { title: string; summary?: string; body?: string } = {
+    title: SOURCE_TITLE,
+    summary: SOURCE_TITLE,
+  },
+): ObservationSource {
   let tick = 0;
   return {
     name: 'scripted-title',
@@ -53,8 +62,7 @@ function scriptedSource(): ObservationSource {
       return Promise.resolve({
         observations: [
           {
-            title: SOURCE_TITLE,
-            summary: SOURCE_TITLE,
+            ...fields,
             snapshotText: `revision ${String(tick)}`,
             objectKey: OBJECT_KEY,
             changeKind: 'modified',
@@ -72,6 +80,7 @@ function scriptedSource(): ObservationSource {
  */
 async function materializeOneEvent(
   monitorName: string | undefined,
+  observationFields?: { title: string; summary?: string; body?: string },
 ): Promise<MonitorEventRecord> {
   const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-title-'));
   tempDirs.push(rootDir);
@@ -95,7 +104,9 @@ async function materializeOneEvent(
   );
 
   const registry = new SourceRegistry();
-  registry.register(scriptedSource());
+  registry.register(
+    observationFields ? scriptedSource(observationFields) : scriptedSource(),
+  );
   const db = createDb(path.join(rootDir, 'agentmon.db'));
   const runtime = new AgentMonitorRuntime(new RuntimeStore(db), registry, [
     claudeCodeAdapter,
@@ -125,5 +136,44 @@ describe('issue #449: event title selection', () => {
   it('falls back to the source title when the monitor has no name', async () => {
     const event = await materializeOneEvent(undefined);
     expect(event.title).toBe(SOURCE_TITLE);
+  });
+
+  // Raised in review of #449: `Observation.summary` is optional and MAY differ
+  // from the required `title`, so "the source title is never lost" was false.
+  // These lock the actual compatibility contract now written in 002 §5.4.
+  describe('a source whose summary DIFFERS from its title (002 §5.4 table)', () => {
+    const DISTINCT = {
+      title: 'Upstream feed reported a change',
+      summary: 'PR #443 moved to MERGED',
+    };
+
+    it('named monitor: name headlines, the distinct summary is the detail — the source title is dropped', async () => {
+      const event = await materializeOneEvent('Spec watcher', DISTINCT);
+      expect(event.title).toBe('Spec watcher');
+      expect(event.summary).toBe(DISTINCT.summary);
+      // Documented consequence: the source's own title string is not in the
+      // delivered text. It is intended — the source chose `summary` as the
+      // surfaced string — and is asserted so a future change is a deliberate one.
+      expect(event.title).not.toBe(DISTINCT.title);
+      expect(event.summary).not.toBe(DISTINCT.title);
+    });
+
+    it('nameless monitor: the source title headlines AND its distinct summary is the detail', async () => {
+      const event = await materializeOneEvent(undefined, DISTINCT);
+      expect(event.title).toBe(DISTINCT.title);
+      expect(event.summary).toBe(DISTINCT.summary);
+    });
+  });
+
+  // 002 §5.1 derives an absent summary from `body`; the delivered block must not
+  // then render that body twice (issue #449 review).
+  it('derives summary from body when the source omits summary', async () => {
+    const event = await materializeOneEvent('Spec watcher', {
+      title: 'Alert',
+      body: 'Do the work',
+    });
+    expect(event.title).toBe('Spec watcher');
+    expect(event.summary).toBe('Do the work');
+    expect(event.body).toBe('Do the work');
   });
 });

@@ -218,7 +218,12 @@ export function buildEventBlock(
   // not already say. Without it a per-object source's delivery would name no
   // object at all, which is exactly the self-sufficiency #434/#438 requires.
   const summary = sanitize(event.summary);
-  const detail = summary && summary !== title ? `\n${summary}` : '';
+  // Also skip when the summary IS the body: materialization derives an absent
+  // `Observation.summary` from `body` (002 §5.1), so a source that supplies only
+  // `title` + `body` would otherwise render its body twice — once here and once
+  // in the template below (issue #449 review).
+  const detail =
+    summary && summary !== title && summary !== body ? `\n${summary}` : '';
   let block = `### ${id} (${urgency})\n${title}${detail}\n\n${body}`;
   if (event.diffText && event.diffText.trim().length > 0) {
     const diff = sanitize(boundDiff(event.diffText));

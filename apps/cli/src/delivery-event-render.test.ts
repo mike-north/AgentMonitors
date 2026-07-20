@@ -154,6 +154,22 @@ describe('buildEventBlock', () => {
     expect(block).not.toContain('Changes:');
   });
 
+  it('omits the summary line when it merely repeats the body (source set only title + body)', () => {
+    // Materialization derives an absent `Observation.summary` from `body`
+    // (002 §5.1), so this is a valid third-party observation shape — the body
+    // must not be rendered twice (issue #449 review).
+    const block = buildEventBlock(
+      makeEvent({
+        title: 'Alert',
+        summary: 'Do the work',
+        body: 'Do the work',
+      }),
+      identity,
+    );
+    expect(block).toBe('### m1 (high)\nAlert\n\nDo the work');
+    expect(block.split('Do the work').length - 1).toBe(1);
+  });
+
   it('omits the summary line when it is identical to the title (a nameless monitor)', () => {
     // A monitor with no authored `name` falls back to the source title, so title
     // and summary are the same string; rendering it twice would be noise.

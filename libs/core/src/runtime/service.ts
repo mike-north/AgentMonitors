@@ -756,6 +756,13 @@ export class AgentMonitorRuntime {
     const frontmatter = monitorFrontmatterSchema.parse({
       watch: { ...record.scope, type: record.sourceName },
       urgency: urgencyBand,
+      // An explicit `--display-name` IS the authored name for an ephemeral
+      // monitor — its only naming affordance, since it has no frontmatter file.
+      // It must reach `frontmatter.name` (not just `displayName`) so the event
+      // title rule (002 §5.4) treats ephemeral and persistent monitors
+      // identically (007 §4.6). Absent, `name` stays unset and the source title
+      // remains the fallback, exactly as for a nameless persistent monitor.
+      ...(record.displayName ? { name: record.displayName } : {}),
     });
     return {
       id: record.id,

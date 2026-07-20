@@ -17,11 +17,15 @@ appeared nowhere.
   choice happens once in the core, the hook and channel transports carry the identical headline.
 - The source's own per-object text is not lost — it remains the event `summary`, and the full source
   identity remains on `objectKey` and in `payload` for debugging and querying.
-- Sources that interpolate an `objectKey` into human-facing text now bound it with the new
-  `displayObjectKey` helper (unchanged at or below 60 characters, otherwise a prefix ending in `…`),
-  so even a nameless monitor's fallback title is headline-sized. Applied by `command-poll`,
-  `api-poll`, and keyed-collection change detection, which bounds only the monitor-scope half of a
-  `<scope>#<key>` identity so the informative per-item key is always rendered whole.
+- Sources that interpolate a **configuration-identity** `objectKey` — `command-poll`'s joined argv
+  and `api-poll`'s URL — now bound it with the new `displayObjectKey` helper (unchanged at or below
+  60 code units, otherwise a prefix ending in `…`, cut at a grapheme-cluster boundary so truncation
+  never emits a lone surrogate or splits a flag/ZWJ sequence). Keyed-collection change detection
+  bounds only the monitor-scope half of a `<scope>#<key>` identity, so the informative per-item key
+  is always rendered whole. Path-like keys (`file-fingerprint`, `incoming-changes`) are deliberately
+  NOT bounded: a path's informative part is its tail, so head-truncation would destroy it; those need
+  a path-aware ellipsis, tracked separately. A nameless monitor's fallback title is therefore
+  headline-sized for the configuration-identity sources, not universally.
 - Both injecting transports' shared per-event block now renders the event `summary` on its own line
   beneath the title (omitted when the two are identical, which is the nameless-monitor case). This
   keeps a per-object source's delivery self-sufficient: the block names both what the monitor is for
@@ -30,6 +34,9 @@ appeared nowhere.
   stripped — the same redaction its warning text already used) before bounding it, so a polled URL
   carrying a token cannot leak into durably persisted, agent-delivered text. The exact URL remains on
   `objectKey` and `payload.url`.
+- An ephemeral monitor's explicit `--display-name` now reaches the authored-name signal, so a named
+  ephemeral watch headlines with its display name exactly as a persistent monitor's `name:` does —
+  including after a daemon restart reconstructs the definition from its durable record.
 - `displayObjectKey` is an additive `@agentmonitors/core` public export (minor bump); existing
   consumers are unaffected.
 

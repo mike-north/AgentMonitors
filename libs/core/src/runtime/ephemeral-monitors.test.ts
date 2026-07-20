@@ -510,6 +510,69 @@ describe('ephemeral monitors — lifecycle (007 §4.4, criterion 3)', () => {
     ).toContain(record.id);
   });
 
+  // Issue #449 review: an ephemeral monitor's `--display-name` is its ONLY
+  // naming affordance (it has no frontmatter file), so it must reach the same
+  // authored-name signal a persistent monitor's `name:` does — otherwise a named
+  // ephemeral watch still headlines with the source's implementation detail,
+  // violating 007 §4.6's "same pipeline semantics".
+  it('titles a named ephemeral watch with its display name, across a daemon restart (002 §5.4, 007 §4.6)', async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'am-eph-title-'));
+    tempDirs.push(root);
+    const dbPath = path.join(root, 'agentmon.db');
+    const first = makeHarness(dbPath, root);
+    const session = openLead(first.runtime, root, 'host-title');
+    first.runtime.declareEphemeralMonitor({
+      sessionId: session.id,
+      source: 'test-ephemeral',
+      scope: { target: 'foo' },
+      displayName: 'PR queue',
+    });
+
+    await first.runtime.tick(first.monitorsDir, root);
+    const [event] = first.runtime.listEvents({ sessionId: session.id });
+    expect(event?.title).toBe('PR queue');
+    // The source's own text is still the summary, as for a persistent monitor.
+    expect(event?.summary).toBe('changed: foo');
+
+    // Restart: a fresh runtime over the SAME db reconstructs the definition from
+    // the durable record alone (`ephemeralRecordToMonitor`), so the name must
+    // survive that reconstruction rather than living only in the first
+    // runtime's memory. Mirrors the restart-survival test's shape: the second
+    // runtime's own tick materializes the post-restart event.
+    const second = makeHarness(dbPath, root);
+    const before = second.runtime.listEvents({ sessionId: session.id }).length;
+    await second.runtime.tick(second.monitorsDir, root);
+    const titles = second.runtime
+      .listEvents({ sessionId: session.id })
+      .map((e) => e.title);
+    expect(titles.length).toBeGreaterThanOrEqual(before);
+    // Every event this monitor ever produced — pre- and post-restart — carries
+    // the authored name; none fell back to the source title.
+    expect(new Set(titles)).toEqual(new Set(['PR queue']));
+    // And the reconstructed record itself still carries the display name.
+    expect(
+      second.store.listActiveEphemeralMonitors(root).map((r) => r.displayName),
+    ).toEqual(['PR queue']);
+  });
+
+  it('falls back to the source title for an UNNAMED ephemeral watch (002 §5.4)', async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'am-eph-untitled-'));
+    tempDirs.push(root);
+    const first = makeHarness(':memory:', root);
+    const session = openLead(first.runtime, root, 'host-untitled');
+    first.runtime.declareEphemeralMonitor({
+      sessionId: session.id,
+      source: 'test-ephemeral',
+      scope: { target: 'foo' },
+    });
+
+    await first.runtime.tick(first.monitorsDir, root);
+    const [event] = first.runtime.listEvents({ sessionId: session.id });
+    // No display name → no authored name → the source title stands, exactly as
+    // for a nameless persistent monitor. (NOT the monitor id.)
+    expect(event?.title).toBe('changed: foo');
+  });
+
   it('does NOT resurrect after the session has ended (restart-safety)', async () => {
     const root = mkdtempSync(path.join(tmpdir(), 'am-eph-nores-'));
     tempDirs.push(root);
