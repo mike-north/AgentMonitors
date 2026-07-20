@@ -135,15 +135,36 @@ describe('writeTransportHeartbeat', () => {
     expect(ids.sort()).toEqual(['host-a', 'host-b']);
   });
 
-  it('keys hook records per workspace so repeated prompts do not accumulate files', () => {
-    // `hook deliver` is a fresh process per prompt; keying per-process would
-    // leave one stale file behind for every prompt the user ever submitted.
+  it('keys hook records per host session, so each active lead has its own evidence', () => {
+    // Workspace keying capped this at ONE record, so only the most recent
+    // prompter could ever be "covered" — which made a healthy multi-session
+    // workspace indistinguishable from a genuine gap and produced a false RED
+    // (issue #425 review, round 6 follow-up).
+    for (const hostSessionId of ['lead-a', 'lead-b']) {
+      writeTransportHeartbeat({
+        transport: 'hook',
+        workspacePath: WORKSPACE,
+        socketPath: SOCKET,
+        hostSessionId,
+      });
+    }
+
+    const ids = readTransportHeartbeats()
+      .map((record) => record.hostSessionId)
+      .sort();
+    expect(ids).toEqual(['lead-a', 'lead-b']);
+  });
+
+  it("overwrites one session's hook record in place, so prompts do not accumulate files", () => {
+    // Bounded by SESSIONS, not prompts: `hook deliver` is a fresh process every
+    // prompt, and the same session must reuse its own record rather than
+    // leaving one file per prompt the user ever submitted.
     for (let i = 0; i < 3; i++) {
       writeTransportHeartbeat({
         transport: 'hook',
         workspacePath: WORKSPACE,
         socketPath: SOCKET,
-        hostSessionId: `host-${String(i)}`,
+        hostSessionId: 'lead-a',
       });
     }
     expect(readTransportHeartbeats()).toHaveLength(1);

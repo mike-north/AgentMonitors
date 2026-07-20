@@ -197,14 +197,32 @@ export function heartbeatKey(
   transport: TransportName,
   input: { workspacePath: string; hostSessionId?: string },
 ): string {
-  if (transport === 'channel') {
-    return input.hostSessionId ?? `pid-${String(process.pid)}`;
-  }
-  // Hash rather than embed the workspace path: paths contain separators and can
-  // exceed a filename's length budget. `workspaceHash` is the same canonical
-  // derivation `workspacePaths()` uses (workspace-paths.ts) — imported rather
-  // than re-derived so the two can never silently diverge.
-  return workspaceHash(input.workspacePath);
+  // BOTH transports key per host session when one is known (issue #425 review,
+  // round 6 follow-up). Keying `hook` per WORKSPACE meant each prompt
+  // overwrote the last, so only ONE active lead could ever have a record —
+  // which made the workspace-wide coverage check unable to tell a genuine gap
+  // apart from a perfectly healthy workspace. Reproduced on the previous head:
+  // two active leads that had BOTH just run `hook deliver` successfully still
+  // reported `[hook-lead-uncovered]` against whichever prompted first, a
+  // verdict of "via none: no delivery transport is listening", and exit 1 — a
+  // false RED on a fully working setup, and permanent, since the single record
+  // can only ever name one of them.
+  //
+  // Per-session keying makes the evidence real: each lead's own invocation
+  // leaves its own record, so "no record for this lead" genuinely means no hook
+  // invocation. Records stay bounded by SESSIONS, not prompts (a session
+  // overwrites its own record in place), and expired ones are reaped on the
+  // next write.
+  if (input.hostSessionId) return input.hostSessionId;
+  // No host session id: a manual/non-hook invocation. Fall back so the record
+  // still has a stable home. Hash rather than embed the workspace path: paths
+  // contain separators and can exceed a filename's length budget.
+  // `workspaceHash` is the same canonical derivation `workspacePaths()` uses
+  // (workspace-paths.ts) — imported rather than re-derived so the two can never
+  // silently diverge.
+  return transport === 'channel'
+    ? `pid-${String(process.pid)}`
+    : workspaceHash(input.workspacePath);
 }
 
 /** The fields a caller supplies; the rest are captured from the environment. */

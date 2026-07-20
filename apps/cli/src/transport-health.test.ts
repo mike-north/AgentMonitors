@@ -412,6 +412,50 @@ describe('computeTransportHealth', () => {
     });
   });
 
+  describe('multi-session hook coverage (issue #425 review, round 6 follow-up)', () => {
+    it('does NOT report a gap when every active lead has its own hook record', () => {
+      // The false RED this keying change fixes, reproduced end to end before
+      // the fix: two active leads that had BOTH just run `hook deliver`
+      // successfully still reported `[hook-lead-uncovered]` against whichever
+      // prompted first, a verdict of "via none: no delivery transport is
+      // listening", and exit 1 — permanently, because a workspace-keyed record
+      // can only ever name one of them.
+      const health = computeTransportHealth(
+        input({
+          leadHostSessionIds: ['lead-a', 'lead-b'],
+          heartbeats: [
+            heartbeat('hook', { hostSessionId: 'lead-a' }),
+            heartbeat('hook', { hostSessionId: 'lead-b' }),
+          ],
+        }),
+      );
+
+      const hook = find(health.transports, 'hook');
+      expect(codesOf(hook)).not.toContain('hook-lead-uncovered');
+      expect(hook.healthy).toBe(true);
+      expect(health.deliveryWillReachThisSession).toBe('hook');
+      expect(health.deliverable).toBe(true);
+    });
+
+    it('still reports the GENUINE gap when a lead has no hook record', () => {
+      // The fix must not blunt the finding it came from: a lead that has never
+      // had a hook invocation is still surfaced, by name.
+      const health = computeTransportHealth(
+        input({
+          leadHostSessionIds: ['lead-a', 'lead-b'],
+          heartbeats: [heartbeat('hook', { hostSessionId: 'lead-a' })],
+        }),
+      );
+
+      const hook = find(health.transports, 'hook');
+      expect(codesOf(hook)).toContain('hook-lead-uncovered');
+      expect(
+        hook.problems.find((p) => p.code === 'hook-lead-uncovered')?.detail,
+      ).toContain('lead-b');
+      expect(health.deliverable).toBe(false);
+    });
+  });
+
   describe('no ACTIVE lead recipient (issue #425 review, round 3)', () => {
     // `hook` is keyed per WORKSPACE, not per session (`heartbeatKey`), so a
     // heartbeat left by a session that has since closed stays within its 24h

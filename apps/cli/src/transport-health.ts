@@ -735,12 +735,12 @@ function buildTransport(
   // explicitly rather than issuing a workspace-wide clean bill of health that
   // only one of several recipients actually earned.
   //
-  // `hook` has at most one record on disk (workspace-keyed, overwritten per
-  // prompt — see `heartbeatKey`), so `matches` here has at most one entry;
-  // "uncovered" for hook therefore means "every active lead other than the
-  // one this single record names", not "no record found at all". That is
-  // still a real, actionable gap: a second lead's hook may simply never have
-  // fired.
+  // Both transports are keyed per host session (see `heartbeatKey`), so
+  // `matches` can hold one record per active lead and "uncovered" means the
+  // same thing for each: an active lead with no evidence this transport has
+  // ever fired for it. Hook records were previously workspace-keyed, which
+  // capped `matches` at one and made a healthy multi-session workspace
+  // indistinguishable from a genuine gap.
   const matchedLeadIds = new Set(
     matches
       .map((candidate) => candidate.hostSessionId)
@@ -767,12 +767,12 @@ function buildTransport(
         : {
             code: 'hook-lead-uncovered',
             detail:
-              `The hook heartbeat for this workspace names a different active ` +
-              `lead session, not ${String(uncoveredLeadIds.length)} other one(s) ` +
-              `here (${uncoveredLeadIds.join(', ')}): hooks re-resolve per prompt, ` +
-              `so this only proves SOME lead's hook has fired in this workspace, ` +
-              `never that every active lead's has — those session(s) may have no ` +
-              `hook invocation at all yet.`,
+              `No hook heartbeat matches ${String(uncoveredLeadIds.length)} ` +
+              `other active lead session(s) here (${uncoveredLeadIds.join(', ')}): ` +
+              `the hook transport has fired for at least one active lead in this ` +
+              `workspace, but there is no evidence it has ever fired for these — ` +
+              `so a workspace-wide "hooks are healthy" verdict would be true for ` +
+              `one recipient and silently false for the others.`,
             remediation:
               'Submit a prompt in each of those Claude Code sessions so `UserPromptSubmit` runs `agentmonitors hook deliver` and records its heartbeat. If it does not, the plugin hooks are not installed for that session.',
           },
