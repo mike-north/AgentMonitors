@@ -34,6 +34,17 @@ import { renderHookDelivery } from './hook-deliver-render.js';
 
 const tempRoots: string[] = [];
 
+// Both real transports (`hook deliver`, `channel serve`) always have a
+// resolved daemon socket path on hand and thread it into every rendered
+// action step (issue #358, PR #445 review finding 4) — a copy-pasted
+// recovery command must never fall back to a stale `$AGENTMONITORS_SOCKET`.
+// Exercising the renderers with no `socketPath` (as this suite previously
+// did) asserts a string neither production surface ever actually emits, so
+// every render call below passes this stable path and every expectation
+// includes its `--socket` clause.
+const TEST_SOCKET_PATH = '/tmp/agentmon-delivery-text-test.sock';
+const SOCKET_CLAUSE = ` --socket '${TEST_SOCKET_PATH}'`;
+
 afterEach(() => {
   for (const root of tempRoots.splice(0)) {
     rmSync(root, { recursive: true, force: true });
@@ -58,8 +69,8 @@ function expectedReminder(): string {
  */
 function expectedHookActionStep(sessionId: string): string {
   return (
-    ` Run \`agentmonitors events list --session ${sessionId} --unread\` ` +
-    `to see them, then \`agentmonitors events ack --session ${sessionId}\` once handled.`
+    ` Run \`agentmonitors events list --session ${sessionId}${SOCKET_CLAUSE} --unread\` ` +
+    `to see them, then \`agentmonitors events ack --session ${sessionId}${SOCKET_CLAUSE}\` once handled.`
   );
 }
 
@@ -73,7 +84,7 @@ function expectedHookActionStep(sessionId: string): string {
 function expectedChannelActionStep(sessionId: string): string {
   return (
     ' Run ' +
-    `\`agentmonitors events list --session ${sessionId} --unread\` ` +
+    `\`agentmonitors events list --session ${sessionId}${SOCKET_CLAUSE} --unread\` ` +
     'to see them, then call the agentmon_ack tool with the event_id values of the ones you handled.'
   );
 }
@@ -159,7 +170,9 @@ describe('delivered text is self-sufficient and transport-attributed (issues #43
 
     // 2. HOOK transport: owns attribution → prepends its label, and appends
     //    its OWN CLI action step after the semantic body.
-    const hookOut = renderHookDelivery(claim, 'UserPromptSubmit');
+    const hookOut = renderHookDelivery(claim, 'UserPromptSubmit', {
+      socketPath: TEST_SOCKET_PATH,
+    });
     const hookCtx = hookOut?.hookSpecificOutput.additionalContext ?? '';
     expect(hookCtx).toBe(
       `AgentMon: ${expectedReminder()}${expectedHookActionStep(h.sessionId)}`,
@@ -168,7 +181,9 @@ describe('delivered text is self-sufficient and transport-attributed (issues #43
     // 3. CHANNEL transport: adds NO attribution — the tag already names the
     //    source. It appends its OWN `agentmon_ack`-pointing action step, never
     //    the hook's CLI ack verb.
-    const { content, meta } = renderChannelEvent(claim);
+    const { content, meta } = renderChannelEvent(claim, {
+      socketPath: TEST_SOCKET_PATH,
+    });
     expect(content).toBe(
       `${expectedReminder()}${expectedChannelActionStep(h.sessionId)}`,
     );
@@ -183,12 +198,12 @@ describe('delivered text is self-sufficient and transport-attributed (issues #43
     //    acknowledge paths.
     for (const surface of [hookCtx, content]) {
       expect(surface).toContain(
-        `agentmonitors events list --session ${h.sessionId} --unread`,
+        `agentmonitors events list --session ${h.sessionId}${SOCKET_CLAUSE} --unread`,
       );
       expect(surface).not.toContain('inbox');
     }
     expect(hookCtx).toContain(
-      `agentmonitors events ack --session ${h.sessionId}`,
+      `agentmonitors events ack --session ${h.sessionId}${SOCKET_CLAUSE}`,
     );
     expect(content).not.toContain('events ack');
   });
@@ -208,12 +223,13 @@ describe('delivered text is self-sufficient and transport-attributed (issues #43
     expect(first).not.toBeNull();
     if (!first) throw new Error('expected a first reminder claim');
     const deliveredText =
-      renderHookDelivery(first, 'UserPromptSubmit')?.hookSpecificOutput
-        .additionalContext ?? '';
+      renderHookDelivery(first, 'UserPromptSubmit', {
+        socketPath: TEST_SOCKET_PATH,
+      })?.hookSpecificOutput.additionalContext ?? '';
 
     // (a) The ORIGINAL delivery text contained the completion instruction.
     expect(deliveredText).toContain(
-      `agentmonitors events ack --session ${h.sessionId}`,
+      `agentmonitors events ack --session ${h.sessionId}${SOCKET_CLAUSE}`,
     );
 
     // (b) The recipient acts but does NOT ack. A newer event fires...
@@ -250,10 +266,11 @@ describe('delivered text is self-sufficient and transport-attributed (issues #43
     expect(recap.events.length).toBeGreaterThan(0); // recap injects bodies
 
     const ctx =
-      renderHookDelivery(recap, 'SessionStart')?.hookSpecificOutput
-        .additionalContext ?? '';
+      renderHookDelivery(recap, 'SessionStart', {
+        socketPath: TEST_SOCKET_PATH,
+      })?.hookSpecificOutput.additionalContext ?? '';
     expect(ctx).toContain(
-      `When handled, acknowledge: agentmonitors events ack --session ${h.sessionId}`,
+      `When handled, acknowledge: agentmonitors events ack --session ${h.sessionId}${SOCKET_CLAUSE}`,
     );
     // Once per BATCH, not once per event (006 §5.1 injection-size concern).
     expect(ctx.split('When handled, acknowledge:').length - 1).toBe(1);
@@ -283,12 +300,14 @@ describe('delivered text is self-sufficient and transport-attributed (issues #43
     if (!renderedEvent) throw new Error('expected one rendered event');
 
     const ctx =
-      renderHookDelivery(claim, 'PreToolUse', { moreDeferred: true })
-        ?.hookSpecificOutput.additionalContext ?? '';
+      renderHookDelivery(claim, 'PreToolUse', {
+        moreDeferred: true,
+        socketPath: TEST_SOCKET_PATH,
+      })?.hookSpecificOutput.additionalContext ?? '';
 
     // The instruction names ONLY the rendered event's id.
     expect(ctx).toContain(
-      `agentmonitors events ack --session ${h.sessionId} --event-ids ${renderedEvent.eventId}`,
+      `agentmonitors events ack --session ${h.sessionId}${SOCKET_CLAUSE} --event-ids ${renderedEvent.eventId}`,
     );
     // It must never claim to ack a second id — only one event was rendered.
     expect(ctx).not.toContain(`${renderedEvent.eventId},`);
@@ -315,10 +334,11 @@ describe('delivered text is self-sufficient and transport-attributed (issues #43
     const ids = recap.events.map((event) => event.eventId).join(',');
 
     const ctx =
-      renderHookDelivery(recap, 'SessionStart')?.hookSpecificOutput
-        .additionalContext ?? '';
+      renderHookDelivery(recap, 'SessionStart', {
+        socketPath: TEST_SOCKET_PATH,
+      })?.hookSpecificOutput.additionalContext ?? '';
     expect(ctx).toContain(
-      `When handled, acknowledge: agentmonitors events ack --session ${h.sessionId} --event-ids ${ids}`,
+      `When handled, acknowledge: agentmonitors events ack --session ${h.sessionId}${SOCKET_CLAUSE} --event-ids ${ids}`,
     );
   });
 });
