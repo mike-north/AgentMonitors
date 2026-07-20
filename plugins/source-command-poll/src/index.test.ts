@@ -892,16 +892,24 @@ describe('source-command-poll', () => {
 
     // Regression test for issue #302: `Buffer.subarray` returns a VIEW onto its
     // source rather than a copy. Slicing the trailing window straight off the
-    // `Buffer.concat(...)` result (without `Buffer.from(...)` copying it) keeps
-    // the whole concatenated backing store alive — `stderrRetained.length` would
-    // report the capped 8000 bytes while `stderrRetained.buffer.byteLength`
-    // (the actual retained allocation) could still be far larger, silently
+    // `Buffer.concat(...)` result without copying it keeps the whole
+    // concatenated backing store alive — `stderrRetained.length` would report
+    // the capped 8000 bytes while `stderrRetained.buffer.byteLength` (the
+    // actual retained allocation) could still be far larger, silently
     // defeating the retention cap this feature promises. Asserting on the
     // backing `ArrayBuffer`, not just the `Buffer` view's `length`, is what
     // actually proves the cap holds.
+    //
+    // The copy is made via `Buffer.allocUnsafeSlow` + `.copy()`, not
+    // `Buffer.from(view)`: `Buffer.from` was observed to produce a
+    // non-exact-size backing allocation on some Node builds (byteLength 65536
+    // in CI vs. 8000 locally on the same Node major) — its internal pooling
+    // heuristics are environment-dependent. `allocUnsafeSlow` always allocates
+    // a fresh, non-pooled buffer of exactly the requested size, which is
+    // deterministic across environments.
     it('retains only the capped bytes in the backing ArrayBuffer, not a view onto the full concat (issue #302)', async () => {
       const stderrRetentionCapBytes = 8000; // STDERR_RETENTION_CAP_BYTES (index.ts)
-      const fromSpy = vi.spyOn(Buffer, 'from');
+      const allocUnsafeSlowSpy = vi.spyOn(Buffer, 'allocUnsafeSlow');
       try {
         const bigChunkChars = 64_000; // >> STDERR_RETENTION_CAP_BYTES (8000)
         const command = nodeArgv(
@@ -920,23 +928,21 @@ describe('source-command-poll', () => {
         expect(payload.error).toMatch(/timed out/i);
 
         // The retained stderr buffer is created via the copy-on-cap-exceeded
-        // `Buffer.from` path (added for issue #302). This does NOT assert a
-        // single `Buffer.from` call: pipe/stream chunk boundaries are not
+        // `Buffer.allocUnsafeSlow` path (added for issue #302). This does NOT
+        // assert a single call: pipe/stream chunk boundaries are not
         // guaranteed to match `process.stderr.write()` calls, so the
         // 64,000-byte write may arrive as more than one `data` event, and the
-        // correct implementation calls `Buffer.from` once per over-cap
-        // chunk. What must hold regardless of how the write is chunked is
-        // that every retained copy is bounded at the cap.
-        expect(fromSpy).toHaveBeenCalled();
-        for (const result of fromSpy.mock.results) {
+        // correct implementation allocates once per over-cap chunk. What must
+        // hold regardless of how the write is chunked is that every retained
+        // copy is bounded — exactly, not just at-most — at the cap.
+        expect(allocUnsafeSlowSpy).toHaveBeenCalled();
+        for (const result of allocUnsafeSlowSpy.mock.results) {
           const retained = result.value as Buffer;
           expect(retained.length).toBe(stderrRetentionCapBytes);
-          expect(retained.buffer.byteLength).toBeLessThanOrEqual(
-            stderrRetentionCapBytes,
-          );
+          expect(retained.buffer.byteLength).toBe(stderrRetentionCapBytes);
         }
       } finally {
-        fromSpy.mockRestore();
+        allocUnsafeSlowSpy.mockRestore();
       }
     });
   });

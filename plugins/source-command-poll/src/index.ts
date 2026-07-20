@@ -321,13 +321,24 @@ async function runCommand(scope: ScopeConfig): Promise<ExecOutcome> {
       // backing store alive for as long as `stderrRetained` is referenced,
       // silently defeating the retention cap (a `stderrRetained.length` of
       // 8000 could still pin an arbitrarily large `.buffer.byteLength`). Copy
-      // the trailing window with `Buffer.from` whenever it's over the cap so
-      // only the bounded bytes are retained.
+      // the trailing window whenever it's over the cap so only the bounded
+      // bytes are retained.
+      //
+      // `Buffer.from(view)` is NOT a reliable exact-size copy: its pooling
+      // heuristics are environment-dependent (observed byteLength 8000
+      // locally vs. 65536 in CI on the same Node major), so it can silently
+      // defeat the cap it's meant to enforce. `Buffer.allocUnsafeSlow` always
+      // allocates a fresh, non-pooled backing store of exactly the requested
+      // size, so `.copy()` into it is deterministic across Node versions.
       const combined = Buffer.concat([stderrRetained, chunk]);
-      stderrRetained =
-        combined.length > STDERR_RETENTION_CAP_BYTES
-          ? Buffer.from(combined.subarray(-STDERR_RETENTION_CAP_BYTES))
-          : combined;
+      if (combined.length > STDERR_RETENTION_CAP_BYTES) {
+        const tail = combined.subarray(-STDERR_RETENTION_CAP_BYTES);
+        const copy = Buffer.allocUnsafeSlow(tail.length);
+        tail.copy(copy);
+        stderrRetained = copy;
+      } else {
+        stderrRetained = combined;
+      }
     });
 
     function clearTimers(): void {
