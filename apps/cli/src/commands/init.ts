@@ -666,8 +666,11 @@ async function runBootstrap(options: BootstrapOptions): Promise<void> {
   console.log(
     '    the next time you open a Claude Code session (SessionStart lazy-boots the daemon).',
   );
+  // Point manual users at the backgrounded form (issue #389 P1). The bare
+  // `daemon run` this used to print occupies the terminal it was started
+  // from, leaving the reader to discover `& disown` and log redirection.
   console.log(
-    `  • Otherwise, start the daemon yourself:  agentmonitors daemon run ${options.dir}`,
+    `  • Otherwise, start the daemon yourself:  agentmonitors daemon run ${options.dir} --detach`,
   );
   console.log(
     `  • Or run a one-shot tick now:  agentmonitors daemon once ${options.dir}`,

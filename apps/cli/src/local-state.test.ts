@@ -101,6 +101,43 @@ describe('local-state', () => {
     }
   });
 
+  // ---------------------------------------------------------------------
+  // lastBootFailureAt (issue #389 review finding 6): distinguishes
+  // "this session's own lazy boot failed" from "no session has ever
+  // started here" — both otherwise look identical (enabled, no socket).
+  // ---------------------------------------------------------------------
+
+  it('round-trips lastBootFailureAt', () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-ls-'));
+    try {
+      const failedAt = '2026-07-19T14:00:00.000Z';
+      writeLocalState(ws, {
+        enabled: true,
+        reapAfterMs: DEFAULT_REAP_AFTER_MS,
+        lastBootFailureAt: failedAt,
+      });
+      const state = readLocalState(ws);
+      expect(state.lastBootFailureAt).toBe(failedAt);
+      // Never persisted alongside a socket in real usage (session.ts writes
+      // the marker WITHOUT socket/db on failure) — but the parser itself
+      // makes no such assumption, so this is purely a marker roundtrip.
+      expect(state.socket).toBeUndefined();
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it('omits lastBootFailureAt from the written file (and reads back undefined) when absent', () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-ls-'));
+    try {
+      writeLocalState(ws, { enabled: true, socket: '/x/a.sock' });
+      const state = readLocalState(ws);
+      expect(state.lastBootFailureAt).toBeUndefined();
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
   it('round-trips a socket/db path containing a space', () => {
     const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-ls-'));
     try {

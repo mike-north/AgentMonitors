@@ -9,6 +9,162 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-07-19 — `daemon run --detach`'s log `fchmod` is a fail-closed exception to the §3.1 warn-and-continue rule, not an oversight (002 §3.1) — Refs #389
+
+Round-7 review follow-up. `openLogFd`'s final `fchmodSync` on the opened log descriptor already
+closed the descriptor and threw an actionable error when `fchmod` failed (e.g. `EPERM` because a
+pre-existing `--log` file is owned by another user). The review correctly flagged that this reads
+as contradicting §3.1's general "degrade gracefully where the artifact is not ours" rule — warn
+once to stderr and continue on `EPERM`/`EACCES` — which was written for artifacts the daemon merely
+tightens incidentally to a write that happens regardless (hook-state files, the database, sockets,
+directories).
+
+That general rule was never meant to cover this case, and the spec did not say so explicitly. The
+`--detach` log is different in kind: whether it can be made owner-only gates whether the daemon
+starts logging at all, and once started the log accumulates workspace paths and monitor-failure
+details for the process's lifetime. Continuing to write those into a file the daemon cannot secure
+to `0600` would be strictly worse than refusing to start — it is the one artifact in this section
+where the mode check is the whole point of the operation, not incidental to it. §3.1 now states
+this fail-closed behavior as its own bullet, and calls out the exception explicitly from the
+warn-and-continue bullet so the two are not read as contradictory.
+`apps/cli/src/open-log-fd-fail-closed.test.ts` adds a regression asserting the fail-closed outcome
+(descriptor closed, spawn refused) by forcing `fchmodSync` to throw.
+
+## 2026-07-19 — `daemon run --detach`'s `--log` parent-directory tightening is default-location-only, and its log file fails closed against a symlinked path (002 §3.1) — Refs #389
+
+Round-5/round-6 review follow-up to the entry directly below, which said every log parent "now
+uses `ensurePrivateDir`" and "a permissive pre-existing directory is tightened" unconditionally.
+That was true only for the default (Agent-Monitors-owned) location; a custom `--log` path's parent
+may be a directory the user owns for other reasons (a repo checkout, a shared logs directory), and
+unconditionally chmod-ing it to `0700` silently stripped group/other access — a functional
+regression, not a hardening. `openLogFd` now takes an `isDefaultLocation` flag: a _missing_ parent
+is always created `0700` (there is no pre-existing mode to preserve either way), but an _existing_
+parent is tightened only at the default location; a pre-existing custom parent is left exactly as
+found, mirroring the existing `--socket`-directory precedent.
+
+Separately, `restrictExistingPathMode` correctly no-ops on a symlinked log path (refusing to
+tighten or follow it), but the subsequent `openSync(logPath, 'a')` still followed the symlink,
+appending the daemon's stdout/stderr into whatever it pointed at without ever securing that
+target's mode — defeating the owner-only file invariant this section otherwise guarantees. The
+final open now uses `O_NOFOLLOW` (failing with `ELOOP`, reported as a clean spawn error, when the
+last path component is a symlink) and `fchmod`s the resulting descriptor rather than the path, so a
+planted symlink at the log path can no longer redirect the daemon's output onto an unintended
+target.
+
+## 2026-07-19 — `daemon run --detach`'s log/parent-dir creation is owner-only from birth, and its ready-timeout report now states whether cleanup succeeded (002 §3.1, 005 §9.2) — Refs #389
+
+Round-4 review follow-up, two independent findings.
+
+**Log/dir creation followed the process umask.** `openLogFd` used a plain `mkdirSync`/`openSync`
+for `--log`'s parent directory and file. Under a common `umask 022` this created the parent `0755`
+and the log `0644` — readable by every other local user — for a file that carries the daemon's
+stdout/stderr (workspace paths, socket paths, monitor failure messages). It now uses
+`ensurePrivateDir` (the same AgentMon-owned-directory helper every other runtime-data directory
+uses) for the parent, `restrictExistingPathMode` to tighten a pre-existing log file before appending
+to it, and `PRIVATE_FILE_MODE` (`0600`) on open — so the file is owner-only from birth regardless of
+umask, and a permissive artifact left by an earlier version is migrated forward on the next boot,
+matching the rest of 002 §3.1's local-data permission model.
+
+**The ready-timeout/spawn-error branch discarded `terminateSpawnedDetachedDaemon`'s result.** 005
+§9.2 item 5 already promises "the error message states whether the cleanup succeeded" — the
+unproven-identity branch (the prior 2026-07-19 entry above) honors that, but the ready-timeout/
+spawn-error branch `await`ed the same cleanup call and dropped its return value, so its own report
+could never say whether the spawned child was actually confirmed gone. Both non-success `--detach`
+branches now share one formatter (`describeSpawnedCleanupOutcome`) so the wording — and its cleanup
+-succeeded/cleanup-FAILED unit coverage — cannot drift between them again.
+
+## 2026-07-19 — `daemon run --detach` never reports a failure while leaving its child running (005 §9.2) — Refs #389
+
+Review follow-up. `--detach`'s unproven-identity branch reported failure and returned **without
+terminating the child it had spawned**. If our child was in fact the daemon that successfully bound
+the socket but `daemon status` never proved it (persistent status errors, or no pid reported), the
+command told the user it was not started, exited non-zero, and left an unowned daemon serving —
+indefinitely under `--reap-after-ms 0` — so the retry its own error message suggested then collided
+with the process that invocation orphaned.
+
+Every non-success `--detach` outcome (readiness timeout, spawn error, race loss, unproven identity)
+now terminates the spawned process and **confirms it is gone** — `SIGTERM`, escalating to `SIGKILL`
+if it has not exited within a short grace window — before returning, and the error message states
+whether that cleanup succeeded. Only the pid THIS invocation spawned is ever signalled: a daemon
+proven to be serving under a different pid belongs to a concurrent lazy boot and is left untouched.
+
+## 2026-07-19 — Manual-CLI ergonomics: `daemon run --detach`, an always-on no-socket diagnostic on `hook deliver`, and `events` help that names the required `--session` (005 §3, §9.2, §11.1, §12.2/§12.2.1) — Refs #389
+
+Three independent papercuts on the "drive the CLI directly, no plugin" path, all surfaced by a blind
+usability evaluation. None blocks success alone; together they cost a first-time manual user a
+"is this broken?" moment each.
+
+**P1 — `daemon run` gained `--detach` (005 §9.2, §3).** `init` tells manual users to "start the
+daemon yourself: `agentmonitors daemon run`", which then blocks their terminal — leaving `& disown`
+and log redirection to be discovered. The issue allowed either a real flag or documenting the shell
+idiom; the flag is what shipped, because the daemon already has a supported detached-spawn path
+(`spawnDetachedDaemon()`, used by the hook-driven lazy boot) and reusing it keeps one background
+daemon story instead of two. `--detach` re-invokes `daemon run` (without `--detach`) as a detached
+`unref`'d child with every value resolved by the parent and passed explicitly, appends the child's
+output to `--log` (default `<workspace data dir>/daemon.log`), waits up to 15s for the socket to
+answer, and prints the pid/socket/log. It composes with `--reap-after-ms 0` — the supported way to
+keep a daemon alive while no agent session is open — and reports "reaping disabled" for that pair.
+The already-running guard runs before anything is backgrounded. `init`'s next-steps line now names
+the `--detach` form. This is deliberately **additive** and independent of the open question in #435
+about whether a channel-attached session should count as reaper activity; it changes no reaping rule.
+
+**P2 — `hook deliver` warns on stderr when no per-workspace socket is configured (005 §12.2 step 3,
+§12.2.1).** That branch previously returned empty stdout + exit 0 with the explanation gated behind
+`--debug`, making it indistinguishable from "nothing pending" — a state that never self-resolves.
+It joins the always-on stderr diagnostics (now four, not three). A workspace that is **not enabled**
+remains silent on both streams: that is an opt-out, not a misconfiguration. `hook deliver`'s stdout
+stays byte-identical in every mode (the hook wire contract, 006 §5.1) — an explicit non-goal to change.
+
+**P3 — `events list`/`events ack` summaries name the required `--session` (005 §11.1).** `events
+--help` renders only the summary line per subcommand, so the requirement was discoverable only by
+running the command and reading commander's `required option '--session <id>' not specified`. Both
+summaries now say `(requires --session <id>)`. `--session` remains **required** on both — a non-goal
+to relax; only the documentation changed.
+
+## 2026-07-19 — `daemon run --detach` verifies the daemon it spawned actually won the socket, kills an unmanaged child on timeout, `--log` requires `--detach`, and the no-socket warning gets a boot-failed variant (005 §9.2, §9.3, §12.2/§12.2.1) — Refs #389
+
+PR review follow-ups on the `--detach`/no-socket-diagnostic work above.
+
+**Finding 1 — identity check on `--detach` success.** The readiness wait only proved SOME daemon
+answers on the socket, not that it is the child THIS invocation spawned: concurrent lazy-boot
+elsewhere (`session start`'s check-then-spawn has no cross-process pre-spawn lock; only the
+bind-time startup lock serializes) can make the spawned child lose the race and exit while a
+different daemon answers. `daemon status`'s response (005 §9.3) now carries `pid` and `reapAfterMs`
+— additive fields, CLI-layer only (not a core `RuntimeStatus` change) — so `--detach` can compare the
+serving pid against its own spawned pid and, on a mismatch, report the OTHER daemon's actual pid and
+reap setting instead of assuming success.
+
+**Finding 2 — ready-timeout no longer leaves the child unmanaged.** On a genuine readiness timeout
+the spawned child (whose pid is now known) is sent `SIGTERM` before the command exits, and a
+synchronous spawn failure (`ENOENT`/`EACCES`) is now raced against the readiness poll and reported
+immediately with the real cause, rather than waiting out the full 15s and pointing at a log file the
+daemon never got the chance to write.
+
+**Finding 3 — `--log` without `--detach` now errors.** It was previously accepted and silently
+ignored outside the detach branch — the same "silently ignored flag" papercut class the parent
+change exists to close.
+
+**Finding 4 — the `--reap-after-ms 0` persistence test was tautological.** It asserted survival at
+2,500ms, but the boot-grace window is 10,000ms — every freshly booted daemon survives 2.5s
+regardless of whether the flag ever reached it. Fixed by asserting the CONFIGURATION directly via
+`daemon status`'s new `reapAfterMs` field (finding 1's addition) instead of a timing window.
+
+**Finding 6 — the no-socket warning's "manual path only" framing was incomplete (005 §12.2.1).** A
+`session start` lazy boot that times out mid-session leaves the workspace enabled with no socket
+persisted — the SAME shape as a workspace that has never had a session start at all, and reachable
+from the automated path, not just manual invocation. `.local.md` gained a `lastBootFailureAt` marker
+(written on boot-timeout, cleared on the next successful boot) so `hook deliver` can tell the two
+apart and give each an accurate remediation — the never-configured message is unchanged; the
+boot-failed variant leads with automatic retry rather than "run daemon run --detach yourself."
+
+**Finding 7 — the spawn-then-poll readiness loop had three near-identical copies.** `daemon run
+--detach`, `session start`'s lazy boot, and `verify --use-workspace-daemon` each hand-rolled the same
+poll-until-`daemonAvailable` loop with slightly different timeout/poll constants. Extracted into one
+`waitForDaemonAvailable(socketPath, timeoutMs, pollMs?)` next to `daemonAvailable`
+(`daemon-ipc.ts`); each call site keeps its own pre-existing timeout/poll values — no behavior change.
+
+Finding 5 (test teardown pid fallback) is test-infrastructure-only, no spec change.
+
 ## 2026-07-19 — `verify`'s materialize/deliver stages carry a fresh deadline past a late observe resolution instead of inheriting an already-expired one (005 §16 step 6, Budget) — Refs #442
 
 The round-19 fix (below) extends the observe stage's own deadline past the single-interval `detect`

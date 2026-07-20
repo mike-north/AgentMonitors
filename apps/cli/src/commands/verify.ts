@@ -29,6 +29,7 @@ import {
   daemonAvailable,
   DaemonUnsupportedRequestError,
   resolveSocketPath,
+  waitForDaemonAvailable,
 } from '../daemon-ipc.js';
 import { readLocalState } from '../local-state.js';
 import { resolveManualDaemonSocketPath } from '../manual-daemon.js';
@@ -534,11 +535,15 @@ async function useWorkspaceDaemon(
       db,
       pollMs: 1_000,
     });
-    const deadline = Date.now() + BOOT_TIMEOUT_MS;
-    while (Date.now() < deadline && !(await daemonAvailable(socketPath))) {
-      await delay(POLL_INTERVAL_MS);
-    }
-    if (!(await daemonAvailable(socketPath))) {
+    // Shared with `daemon run --detach` and `session start`'s lazy boot
+    // (issue #389 review finding 7).
+    if (
+      !(await waitForDaemonAvailable(
+        socketPath,
+        BOOT_TIMEOUT_MS,
+        POLL_INTERVAL_MS,
+      ))
+    ) {
       throw new DaemonDied(null, 'workspace daemon failed to start', 'boot');
     }
   }

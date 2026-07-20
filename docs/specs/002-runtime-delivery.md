@@ -836,9 +836,38 @@ artifacts on startup** (BP4, [000 §5](./000-principles.md)).
 - **Directories — `0700` (`rwx------`):** the per-workspace data directory, session directories
   (which hold hook state), the socket directory the daemon creates, and the startup-lock directory.
 - **Files — `0600` (`rw-------`):** the SQLite database, its `-wal`/`-shm`/`-journal` sidecars,
-  hook-state files, the startup-lock pid file, and the `.claude/agentmonitors.local.md` coordination
-  file. (The `.claude` directory itself belongs to the host tool and is **not** re-moded — only the
-  coordination file we own is.)
+  hook-state files, the startup-lock pid file, the `.claude/agentmonitors.local.md` coordination
+  file, and `daemon run --detach`'s `--log` file. (The `.claude` directory itself belongs to the
+  host tool and is **not** re-moded — only the coordination file we own is.)
+- **The `--detach` log's parent directory is Agent-Monitors-owned only conditionally.** A _missing_
+  parent (default or a missing ancestor under a custom `--log`) is always created `0700` — the
+  runtime is the one creating it, so there is no pre-existing mode to preserve. A pre-existing
+  parent is only tightened when it is the **default** location (the workspace data directory); a
+  pre-existing **custom** `--log` parent (e.g. a repo checkout or a shared logs directory the user
+  chose) is left exactly as it is, mirroring the existing `--socket`-directory treatment above — the
+  runtime does not own it and silently removing group/other access would be a functional regression,
+  not a hardening.
+- **The `--detach` log FILE is always owner-only and fail-closed against a symlinked path**,
+  regardless of whether its parent is the default or a custom location: it is created `0600` if
+  missing and tightened via `restrictExistingPathMode` if it already exists as a regular file, but
+  when the path is a symlink, tightening intentionally no-ops (never touches the mode of the
+  symlink or its target) — and the runtime does **not** then fall back to opening through the link.
+  The final open uses `O_NOFOLLOW` (`ELOOP` if the last path component is a symlink) and `fchmod`s
+  the resulting descriptor rather than the path, so a planted symlink at the log path is refused
+  (surfaced as a clean spawn failure) instead of silently appending the daemon's output into
+  whatever it points at.
+- **The `--detach` log's `fchmod` is fail-closed, not warn-and-continue.** If that final `fchmod`
+  on the opened descriptor itself fails — e.g. `EPERM`/`EACCES` because a pre-existing `--log` file
+  is owned by another user and open-for-append succeeded but tightening did not — the runtime
+  closes the descriptor and refuses to start the detached daemon, reporting an actionable error
+  naming the path and the underlying cause. This is a deliberate exception to "degrade gracefully"
+  below: that rule covers artifacts the runtime silently _tightens_ without changing whether the
+  triggering operation proceeds (a socket, a directory, a hook-state file, the database — all of
+  which need only to be written, not to gate anything). The log file is different: whether it can
+  be made owner-only gates whether the daemon starts logging at all, and the log carries workspace
+  paths and monitor-failure details for the lifetime of the process. Starting to write those details
+  into a file the daemon cannot secure is worse than refusing to start; the caller can point `--log`
+  at a file it owns, or remove the existing one, and retry.
 - **Sockets:** the Unix domain socket is **bound under a restricted (`0o077`) umask so it is born
   `0600`** (Node binds a Unix socket synchronously inside `listen()`, so the umask window closes
   before the socket is observable), then re-chmod'd `0600` after bind as defense-in-depth, and —
@@ -869,7 +898,10 @@ artifacts on startup** (BP4, [000 §5](./000-principles.md)).
   continue, leaving the mode unchanged — they do **not** throw. The daemon must never die because an
   artifact it was asked to write is not one it can chmod; correspondingly, a single malformed or
   unexpected IPC request is answered with an error response, never allowed to crash the daemon
-  process ([§10.4](#104-ipc-wire-protocol)).
+  process ([§10.4](#104-ipc-wire-protocol)). This rule governs artifacts the daemon tightens
+  incidentally to an already-necessary write; it does **not** cover the `--detach` log file's own
+  `fchmod`, which is fail-closed per the bullet above — there the mode check gates whether the
+  daemon starts at all, not merely whether a write that would happen regardless succeeds.
 - **Windows.** POSIX modes are not meaningful; the helpers create the paths without mode enforcement.
 
 Verified: `libs/core/src/security/local-permissions.ts` — `ensurePrivateDir`,
@@ -877,8 +909,16 @@ Verified: `libs/core/src/security/local-permissions.ts` — `ensurePrivateDir`,
 `libs/core/src/inbox/db.ts` — `createDb`; `libs/core/src/hook-bridge/bridge.ts` +
 `libs/core/src/runtime/service.ts` — hook-state writes; `apps/cli/src/daemon-ipc.ts` — socket,
 startup lock, and the long-socket-path fallback ([§10.3](#103-socket-path-resolution));
-`apps/cli/src/local-state.ts` — coordination file; tests: `local-permissions.test.ts`,
-`inbox/db-permissions.test.ts`, `hook-bridge/bridge.test.ts`, `daemon-ipc.test.ts`, and the
+`apps/cli/src/local-state.ts` — coordination file; `apps/cli/src/detached-spawn.ts` — `openLogFd`
+(the `--detach` log: a missing parent always created `0700`, an existing parent tightened only at
+the default location, and the log file itself created `0600`/tightened via
+`restrictExistingPathMode` before every append, then opened `O_NOFOLLOW` with the descriptor
+`fchmod`'d — never the path — so neither the ambient umask, a pre-existing permissive file/dir from
+an earlier run, nor a symlink planted at the log path leaves it world-readable or writes through to
+an unintended target; a descriptor `fchmod` failure closes the descriptor and fails the spawn rather
+than warning and continuing); tests:
+`local-permissions.test.ts`, `inbox/db-permissions.test.ts`, `hook-bridge/bridge.test.ts`,
+`daemon-ipc.test.ts`, `detached-spawn.test.ts`, `open-log-fd-fail-closed.test.ts`, and the
 real-binary UAT in `apps/cli/src/commands/cli.integration.test.ts`.
 
 ## 4. Notify Dispatch

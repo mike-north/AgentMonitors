@@ -12149,3 +12149,126 @@ Bad schedule scope.
     }
   }, 30_000);
 });
+
+// ---------------------------------------------------------------------------
+// Issue #389 P2: an enabled workspace with no per-workspace socket produced
+// empty stdout + exit 0 — indistinguishable from "nothing pending" — with the
+// explanation gated behind `--debug`. It now joins the always-on stderr
+// diagnostics, while `hook deliver`'s STDOUT stays byte-identical (the hook
+// wire contract, 006 §5.1, is a hard non-goal to change).
+// ---------------------------------------------------------------------------
+describe('hook deliver: always-on no-socket stderr diagnostic (issue #389 P2)', () => {
+  it('help documents the always-on no-socket stderr diagnostic', () => {
+    const result = run(['hook', 'deliver', '--help']);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('Always-on STDERR diagnostics');
+    expect(result.stdout).toContain('no per-workspace socket configured');
+  });
+
+  it('enabled workspace with no socket: warns on stderr without --debug, stdout stays empty, exit 0', () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-389-nosocket-'));
+    mkdirSync(path.join(ws, '.claude', 'monitors'), { recursive: true });
+    const db = path.join(ws, 'nosocket.db');
+
+    // Enabled, but NO `socket:` line — exactly the state a manual user is in
+    // before anything has started a daemon for this workspace.
+    writeLocalState(ws, { enabled: true, db, reapAfterMs: 30_000 });
+
+    try {
+      const result = runWithStdinCapture(
+        ['hook', 'deliver'],
+        { CLAUDE_PROJECT_DIR: ws, AGENTMONITORS_DB: db },
+        JSON.stringify({
+          session_id: 'nosocket-host',
+          hook_event_name: 'UserPromptSubmit',
+          cwd: ws,
+        }),
+        ws,
+      );
+
+      expect(result.exitCode).toBe(0);
+      // Hard non-goal: the wire surface must stay byte-identical (empty).
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toContain(
+        'hook deliver: no per-workspace socket configured',
+      );
+      expect(result.stderr).toContain('agentmonitors daemon run --detach');
+      // Exactly one diagnostic line, not a diagnosis dump.
+      expect(result.stderr.trimEnd().split('\n')).toHaveLength(1);
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  // Negative: a workspace that is not enabled at all is a different (and
+  // deliberately silent) branch — enabling this diagnostic there would fire on
+  // every hook invocation in every unmonitored repo.
+  it('workspace that is not enabled: stays silent on both streams', () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-389-disabled-'));
+    mkdirSync(path.join(ws, '.claude', 'monitors'), { recursive: true });
+    const db = path.join(ws, 'disabled.db');
+    writeLocalState(ws, { enabled: false, db, reapAfterMs: 30_000 });
+
+    try {
+      const result = runWithStdinCapture(
+        ['hook', 'deliver'],
+        { CLAUDE_PROJECT_DIR: ws, AGENTMONITORS_DB: db },
+        JSON.stringify({
+          session_id: 'disabled-host',
+          hook_event_name: 'UserPromptSubmit',
+          cwd: ws,
+        }),
+        ws,
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toBe('');
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// Issue #389 P3: `events --help` listed `list [options]` with no hint that
+// `--session <id>` is mandatory, so the requirement was discoverable only by
+// running the command and reading commander's error. `--session` stays
+// required (non-goal to change); the help now says so.
+// ---------------------------------------------------------------------------
+describe('events help names the required --session option (issue #389 P3)', () => {
+  // Commander hard-wraps subcommand summaries at the terminal width, so the
+  // requirement can land split across two lines. Collapse whitespace before
+  // asserting, or this test measures the wrap point rather than the wording.
+  const collapse = (text: string): string => text.replace(/\s+/g, ' ');
+
+  it('`events --help` says --session is required in the list subcommand summary', () => {
+    const result = run(['events', '--help']);
+    expect(result.exitCode).toBe(0);
+    expect(collapse(result.stdout)).toContain(
+      'List events for a session (requires --session <id>)',
+    );
+  });
+
+  it('`events --help` says the same for the ack subcommand summary', () => {
+    const result = run(['events', '--help']);
+    expect(collapse(result.stdout)).toContain(
+      'Acknowledge one or more events for a session (requires --session <id>)',
+    );
+  });
+
+  it('`events list --help` marks --session required', () => {
+    const result = run(['events', 'list', '--help']);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('--session <id>');
+    expect(result.stdout).toContain('required');
+  });
+
+  // Non-goal guard: documenting the requirement must not relax it.
+  it('omitting --session still fails', () => {
+    const result = run(['events', 'list']);
+    expect(result.exitCode).not.toBe(0);
+    expect(`${result.stdout}${result.stderr}`).toContain(
+      "required option '--session <id>'",
+    );
+  });
+});

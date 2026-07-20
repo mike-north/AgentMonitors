@@ -10,6 +10,18 @@ export interface LocalState {
   socket?: string;
   db?: string;
   reapAfterMs?: number;
+  /**
+   * ISO timestamp of the most recent time THIS workspace's own lazy-boot
+   * (`session start`'s check-then-spawn) gave up waiting for the daemon to
+   * answer, persisted WITHOUT `socket` (issue #389 review finding 6). Distinguishes
+   * "enabled, no socket, because the automated boot just failed" from "enabled,
+   * no socket, because no session has ever started here" — both look identical
+   * on `enabled`/`socket` alone, but `hook deliver`'s always-on no-socket
+   * warning owes a different remediation to each (see
+   * `hook-deliver-warnings.ts` `describeBootFailedNoSocketWarning`). Cleared
+   * (omitted) the next time `session start` succeeds.
+   */
+  lastBootFailureAt?: string;
 }
 
 const DEFAULT_REAP_AFTER_MS = 5 * 60 * 1000;
@@ -72,6 +84,9 @@ export function readLocalState(workspacePath: string): LocalState {
     ...(typeof data['socket'] === 'string' ? { socket: data['socket'] } : {}),
     ...(typeof data['db'] === 'string' ? { db: data['db'] } : {}),
     reapAfterMs: typeof reap === 'number' ? reap : DEFAULT_REAP_AFTER_MS,
+    ...(typeof data['last-boot-failure-at'] === 'string'
+      ? { lastBootFailureAt: data['last-boot-failure-at'] }
+      : {}),
   };
 }
 
@@ -92,6 +107,9 @@ export function writeLocalState(
     ...(state.socket ? [`socket: ${state.socket}`] : []),
     ...(state.db ? [`db: ${state.db}`] : []),
     `reap-after-ms: ${String(state.reapAfterMs ?? DEFAULT_REAP_AFTER_MS)}`,
+    ...(state.lastBootFailureAt
+      ? [`last-boot-failure-at: ${state.lastBootFailureAt}`]
+      : []),
     '---',
     '',
     '> Local AgentMon coordination state. Gitignored; safe to delete (it is regenerated).',

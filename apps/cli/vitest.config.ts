@@ -15,6 +15,7 @@ export default defineConfig({
       ...configDefaults.exclude,
       '**/concurrent-spawn.test.ts',
       '**/detached-spawn.test.ts',
+      '**/daemon-detach.integration.test.ts',
       '**/verify.integration.test.ts',
     ],
   },

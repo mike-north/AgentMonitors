@@ -33,6 +33,10 @@ vi.mock('../local-state.js', () => ({
 vi.mock('../daemon-ipc.js', () => ({
   daemonAvailable: vi.fn(),
   resolveSocketPath: vi.fn((socket: string) => socket),
+  // Not exercised directly by any case here (every case mocks `daemonAvailable`
+  // to resolve `true`, so `session.ts`'s boot-wait branch is never entered),
+  // but stubbed so the mocked module still has the shape `session.ts` imports.
+  waitForDaemonAvailable: vi.fn(),
 }));
 vi.mock('../detached-spawn.js', () => ({
   spawnDetachedDaemon: vi.fn(),
@@ -52,7 +56,7 @@ vi.mock('../runtime-client.js', () => ({
 import { runSessionStartAction } from './session.js';
 import { readHookPayload } from '../hook-payload.js';
 import { readLocalState, writeLocalState } from '../local-state.js';
-import { daemonAvailable } from '../daemon-ipc.js';
+import { daemonAvailable, waitForDaemonAvailable } from '../daemon-ipc.js';
 import {
   claimDeliveryClient,
   commitDeliveryClient,
@@ -65,6 +69,7 @@ const readHookPayloadMock = vi.mocked(readHookPayload);
 const readLocalStateMock = vi.mocked(readLocalState);
 const writeLocalStateMock = vi.mocked(writeLocalState);
 const daemonAvailableMock = vi.mocked(daemonAvailable);
+const waitForDaemonAvailableMock = vi.mocked(waitForDaemonAvailable);
 const openSessionClientMock = vi.mocked(openSessionClient);
 const reserveMock = vi.mocked(reserveDeliveryClient);
 const commitMock = vi.mocked(commitDeliveryClient);
@@ -257,5 +262,32 @@ describe("session start's actual Commander action (issue #442, round-18 review)"
     expect(commitMock).not.toHaveBeenCalled();
     expect(releaseMock).not.toHaveBeenCalled();
     expect(claimMock).not.toHaveBeenCalled();
+  });
+
+  // Issue #389 review finding 6: a lazy boot that times out must record
+  // `lastBootFailureAt` (WITHOUT persisting `socket`/`db`) so a later `hook
+  // deliver` in this same, still-unbooted workspace can tell "the automated
+  // boot just failed, and will retry" from "no session has ever started
+  // here" — see `describeBootFailedNoSocketWarning` (`hook-deliver-warnings.ts`).
+  it('records lastBootFailureAt (without socket/db) when the lazy boot times out', async () => {
+    readLocalStateMock.mockReturnValue({ enabled: true });
+    daemonAvailableMock.mockResolvedValue(false);
+    waitForDaemonAvailableMock.mockResolvedValue(false);
+    const exitCodeBefore = process.exitCode;
+
+    try {
+      await runSessionStartAction();
+    } finally {
+      process.exitCode = exitCodeBefore;
+    }
+
+    expect(writeLocalStateMock).toHaveBeenCalledTimes(1);
+    const written = writeLocalStateMock.mock.calls[0]?.[1];
+    expect(written?.lastBootFailureAt).toEqual(expect.any(String));
+    expect(written?.socket).toBeUndefined();
+    expect(written?.db).toBeUndefined();
+    // The client that would have opened the session never runs — the boot
+    // never came up.
+    expect(openSessionClientMock).not.toHaveBeenCalled();
   });
 });

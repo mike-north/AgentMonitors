@@ -1,6 +1,20 @@
 import { spawn } from 'node:child_process';
+import {
+  closeSync,
+  constants as fsConstants,
+  fchmodSync,
+  mkdirSync,
+  openSync,
+} from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import {
+  ensurePrivateDir,
+  isErrnoException,
+  PRIVATE_DIR_MODE,
+  PRIVATE_FILE_MODE,
+  restrictExistingPathMode,
+} from '@agentmonitors/core';
 
 export interface SpawnDaemonOptions {
   monitorsDir: string;
@@ -9,6 +23,34 @@ export interface SpawnDaemonOptions {
   db: string;
   pollMs?: number;
   reapAfterMs?: number;
+  /**
+   * Append the detached daemon's stdout+stderr to this file instead of
+   * discarding them (issue #389 P1). Hook-driven boots leave this unset — the
+   * daemon's log is noise there — but a user who ran `daemon run --detach`
+   * explicitly asked for a background daemon and needs somewhere to look when
+   * it misbehaves. The file (and its parent directory) is created if missing.
+   */
+  logPath?: string;
+  /**
+   * Whether {@link logPath} is Agent Monitors' own default location (the
+   * workspace data dir), as opposed to a user-supplied `--log <path>`.
+   *
+   * A missing parent directory is created owner-only (`0700`) either way — we
+   * are the one creating it, so there is no pre-existing mode to preserve.
+   * What this flag actually gates is a pre-existing parent: the default
+   * parent is Agent-Monitors-owned, so it is tightened (via
+   * {@link ensurePrivateDir}) if it already exists looser. A custom `--log`
+   * path may point into a directory the user owns for their own reasons (a
+   * repo checkout, a shared logs directory), so a pre-existing custom parent
+   * is left exactly as it is — the same treatment `ensureSocketDir` already
+   * gives a user-chosen `--socket` directory. See {@link openLogFd}.
+   *
+   * Defaults to `false` (treat as a custom path) when {@link logPath} is set
+   * without this flag, so a caller that forgets to pass it gets the safer,
+   * non-tightening behavior rather than silently chmod-ing a directory it
+   * does not own.
+   */
+  logPathIsDefault?: boolean;
 }
 
 /**
@@ -35,12 +77,35 @@ export function cliEntry(): string {
   return path.join(packageRoot, 'dist', 'index.cjs');
 }
 
+export interface SpawnedDaemon {
+  /**
+   * The child's pid, or `undefined` when the OS never assigned one (a spawn
+   * that failed synchronously — vanishingly rare; the async `error` case
+   * below is the common failure mode and is reported via {@link spawnError}
+   * instead).
+   */
+  pid: number | undefined;
+  /**
+   * Resolves with the spawn error if the child's `error` event fires (e.g.
+   * `ENOENT`/`EACCES` — the OS never actually started the process), or never
+   * settles if the child spawns successfully. Lets a caller waiting for the
+   * daemon to answer on its socket (issue #389 review finding 2) race this
+   * against that wait to fail fast and report the REAL cause, rather than
+   * waiting out the full readiness timeout and pointing at a log file the
+   * daemon never got a chance to write.
+   */
+  spawnError: Promise<Error>;
+}
+
 /**
  * Spawn `agentmonitors daemon run` as a DETACHED background process so it
- * outlives the short-lived hook that booted it. stdio is fully ignored and the
+ * outlives the short-lived hook (or foreground command) that booted it. stdio
+ * is discarded — or appended to {@link SpawnDaemonOptions.logPath} — and the
  * child is unref'd so the parent can exit immediately.
  */
-export function spawnDetachedDaemon(options: SpawnDaemonOptions): void {
+export function spawnDetachedDaemon(
+  options: SpawnDaemonOptions,
+): SpawnedDaemon {
   const args = [
     cliEntry(),
     'daemon',
@@ -58,19 +123,152 @@ export function spawnDetachedDaemon(options: SpawnDaemonOptions): void {
     args.push('--reap-after-ms', String(options.reapAfterMs));
   }
 
-  const child = spawn(process.execPath, args, {
-    detached: true,
-    stdio: 'ignore',
-    env: {
-      ...process.env,
-      AGENTMONITORS_DB: options.db,
-      AGENTMONITORS_SOCKET: options.socket,
-    },
-  });
-  // Attach the error listener BEFORE unref so that an async OS-level spawn
-  // failure (e.g. ENOENT, EACCES) surfaces to stderr rather than being swallowed.
-  child.on('error', (e) => {
-    console.error(`Failed to spawn daemon: ${e.message}`);
-  });
-  child.unref();
+  // Open the log in APPEND mode so repeated detached boots for one workspace
+  // accumulate rather than truncating the previous run's crash output.
+  const logFd =
+    options.logPath === undefined
+      ? undefined
+      : openLogFd(options.logPath, options.logPathIsDefault ?? false);
+  try {
+    const child = spawn(process.execPath, args, {
+      detached: true,
+      stdio:
+        logFd === undefined ? 'ignore' : ['ignore', logFd, logFd, 'ignore'],
+      env: {
+        ...process.env,
+        AGENTMONITORS_DB: options.db,
+        AGENTMONITORS_SOCKET: options.socket,
+      },
+    });
+    // Attach the error listener BEFORE unref so that an async OS-level spawn
+    // failure (e.g. ENOENT, EACCES) surfaces to stderr rather than being
+    // swallowed — AND so a caller can await `spawnError` to react to it (issue
+    // #389 review finding 2), instead of only ever seeing it as an unrelated
+    // console line.
+    const spawnError = new Promise<Error>((resolve) => {
+      child.on('error', (e) => {
+        console.error(`Failed to spawn daemon: ${e.message}`);
+        resolve(e);
+      });
+    });
+    child.unref();
+    return { pid: child.pid, spawnError };
+  } finally {
+    // The child holds its own duplicated descriptor; the parent's copy must be
+    // released or a short-lived parent would leak it for its remaining life.
+    if (logFd !== undefined) closeSync(logFd);
+  }
+}
+
+/**
+ * Open the detached daemon's log for appending under Agent Monitors' owner-only
+ * runtime-data policy (002 §3.1), NOT the ambient umask.
+ *
+ * The log captures the daemon's stdout/stderr — workspace paths, socket paths,
+ * and monitor failure messages — so under a common `umask 022` a plain
+ * `openSync(path, 'a')` would create it `0644` and leave it readable by every
+ * other local user. `PRIVATE_FILE_MODE` has no group/other bits, so a
+ * permissive umask has nothing to strip and the file comes out owner-only from
+ * birth. The log FILE is always secured this way — tightened if it already
+ * exists, created `0600` if it does not — regardless of whether `logPath` is
+ * the default location or a custom `--log` path: it is ours either way, and we
+ * are about to append the daemon's diagnostics to it.
+ *
+ * File identity is fail-closed against a symlinked log path (round-6 review
+ * 3611641504): `restrictExistingPathMode` intentionally no-ops on a symlink
+ * rather than tightening or following it, so a plain follow-up
+ * `openSync(logPath, 'a')` would still append the daemon's output through the
+ * link onto whatever it points at — and that target's mode is never touched,
+ * defeating the owner-only invariant entirely. Instead the final open uses
+ * `O_NOFOLLOW` (refusing to traverse a symlink final path component; `ELOOP`
+ * if it is one) and `fchmod`s the resulting descriptor rather than the path,
+ * closing the same lstat→chmod/open TOCTOU window {@link restrictExistingPathMode}
+ * closes for its own tighten. A symlinked `logPath` is reported as a clean
+ * spawn failure instead of silently writing through it.
+ *
+ * The PARENT directory gets different treatment depending on `isDefaultLocation`
+ * (round-5 review 3611604829) — mirroring `ensureSocketDir`'s existing split
+ * between the Agent-Monitors-owned default socket directory and a
+ * user-chosen `--socket` one:
+ *
+ * - A MISSING parent (any missing ancestor) is always created owner-only
+ *   (`0700`) either way — we are the one creating it, so there is no
+ *   pre-existing mode to preserve, default location or not.
+ * - An EXISTING parent is only tightened when `isDefaultLocation` is true
+ *   (the Agent-Monitors-owned workspace data dir). A pre-existing CUSTOM
+ *   `--log` parent — possibly a directory the user owns for their own
+ *   reasons, e.g. a repo checkout or a shared logs directory — is left
+ *   exactly as it is; silently removing its group/other access would be a
+ *   functional regression, not a hardening.
+ *
+ * Exported (this package has no api-extractor rollup) purely so its mode
+ * regression tests can call it directly instead of round-tripping through a
+ * real detached daemon spawn (round-4 review 3611294358).
+ */
+export function openLogFd(logPath: string, isDefaultLocation: boolean): number {
+  const parent = path.dirname(logPath);
+  if (isDefaultLocation) {
+    // Creates a missing parent 0700 AND tightens an existing looser one.
+    ensurePrivateDir(parent);
+  } else {
+    // `mkdirSync({ recursive: true })` is a no-op — and critically does NOT
+    // chmod — when `parent` already exists, so a pre-existing custom parent's
+    // mode is left completely untouched. A MISSING one is still created
+    // owner-only: we are its creator either way.
+    mkdirSync(parent, { recursive: true, mode: PRIVATE_DIR_MODE });
+  }
+  restrictExistingPathMode(logPath, PRIVATE_FILE_MODE);
+  // Open with O_NOFOLLOW so a symlinked logPath fails closed (ELOOP) instead
+  // of silently appending through it, then fchmod the descriptor — not the
+  // path — so there is no lstat/open gap an attacker could swap a symlink
+  // into. `restrictExistingPathMode` above already refused to touch a
+  // symlink's mode; this refuses to write through one too.
+  let fd: number;
+  try {
+    fd = openSync(
+      logPath,
+      fsConstants.O_WRONLY |
+        fsConstants.O_APPEND |
+        fsConstants.O_CREAT |
+        fsConstants.O_NOFOLLOW,
+      PRIVATE_FILE_MODE,
+    );
+  } catch (err) {
+    // POSIX raises ELOOP for O_NOFOLLOW against a symlink; some BSDs raise
+    // EMLINK for the O_CREAT combination. Both mean "that path is a symlink",
+    // and treating EMLINK as an unexpected error would surface this as an
+    // opaque failure on those platforms instead of the actionable message.
+    if (
+      isErrnoException(err) &&
+      (err.code === 'ELOOP' || err.code === 'EMLINK')
+    ) {
+      throw new Error(
+        `Refusing to write the detached daemon's log through a symlink at ${logPath}. ` +
+          'Remove the symlink (or point --log at a regular file) and retry.',
+        { cause: err },
+      );
+    }
+    throw err;
+  }
+  try {
+    fchmodSync(fd, PRIVATE_FILE_MODE);
+  } catch (err) {
+    // Two reasons this must not simply propagate. First, the descriptor would
+    // leak for the life of the process. Second, a bare EPERM ("operation not
+    // permitted") gives no hint why the daemon refused to start — say the
+    // pre-existing `--log` file is owned by another user, so we can open it
+    // for append but cannot make it owner-only. Fail closed with the reason:
+    // the log carries workspace paths and monitor failures, so writing it to
+    // a file we cannot secure is exactly what this policy exists to prevent.
+    closeSync(fd);
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `Refusing to write the detached daemon's log to ${logPath}: it could ` +
+        `not be made owner-only (0600) — ${message}. The log carries ` +
+        'workspace paths and monitor failure details. Point --log at a file ' +
+        'you own, or remove the existing one.',
+      { cause: err },
+    );
+  }
+  return fd;
 }
