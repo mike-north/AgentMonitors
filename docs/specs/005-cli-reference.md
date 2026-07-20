@@ -1222,7 +1222,14 @@ disambiguates: `unread` (never surfaced), `claimed` (surfaced once, still unackn
 
 **TOON output (`--format toon`):** encodes the `MonitorEventRecord[]` array using `@toon-format/toon` `encode()`. Decodes losslessly to the JSON value.
 
-**Text output (`--format text`):** one line per event: `<id>  <monitorId>  <urgency>  <deliveryState>  <title>`
+**Text output (`--format text`):** one line per event: `<id>  <monitorId>  <urgency>  <deliveryState>  <title>`,
+with a trailing `  <summary>` appended when the event's per-object `summary` (002 §5.1) says
+something the monitor's authored `title` (002 §5.4) doesn't already — i.e. `summary` differs from
+both `title` and `body`. `title` names what the monitor is _for_; it's identical across every row
+from a multi-object source (e.g. a `file-fingerprint` glob watching several files), so without this
+suffix those rows would render as indistinguishable duplicates. Mirrors the delivery transports'
+`buildEventBlock` detail line (006). `--format json`/`--format toon` are unaffected — `summary` is
+already a field on the returned `MonitorEventRecord`.
 
 **JSON output (`--format json`):** `MonitorEventRecord[]` array. Each element carries a
 `deliveryState?: 'unread' | 'claimed' | 'acknowledged'` field reporting the **requesting session's**

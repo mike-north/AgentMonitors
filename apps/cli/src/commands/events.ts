@@ -120,8 +120,26 @@ const eventsListCommand = eventsCommand
           // printed as its own column so `--unread` output doesn't read as
           // "never seen" -- --unread matches acknowledgedAt IS NULL, which
           // INCLUDES claimed-but-unacknowledged events.
+          //
+          // `event.title` is the monitor's authored name (002 §5.4, issue
+          // #449) -- it says what the monitor is FOR, not which object moved.
+          // A multi-object source (e.g. file-fingerprint watching a glob)
+          // emits one row per object, all sharing that same title, so without
+          // the per-object `summary` those rows would render as
+          // indistinguishable duplicates. Mirror `buildEventBlock`'s detail
+          // line (delivery-event-render.ts): append `summary` only when it
+          // says something the title doesn't already -- i.e. differs from
+          // both `title` and `body` (the latter guards against a source that
+          // supplies only `title` + `body`, where materialization derives
+          // the absent `summary` from `body`, 002 §5.1).
+          const detail =
+            event.summary &&
+            event.summary !== event.title &&
+            event.summary !== event.body
+              ? `  ${event.summary}`
+              : '';
           console.log(
-            `${event.id}  ${event.monitorId}  ${event.urgency}  ${event.deliveryState ?? 'unread'}  ${event.title}`,
+            `${event.id}  ${event.monitorId}  ${event.urgency}  ${event.deliveryState ?? 'unread'}  ${event.title}${detail}`,
           );
         }
       } catch (error) {

@@ -40,17 +40,30 @@ const MONITOR_ID = 'my-prs';
 const MONITOR_NAME = 'My PRs — CI, review feedback, state changes';
 
 /**
- * A long argv in the shape that produced the bug: a `sh -c` pipeline whose tail
- * is a `jq` program. `command-poll` defaults `objectKey` to the joined argv, so
+ * A `jq`-shaped tail argument, standing in for the real ~250-character jq
+ * program from the reported bug. It is inert: the Node program below never
+ * reads `process.argv`, so this trailing element is never executed — a real
+ * subprocess (no shell, no `jq`/`cat` binary dependency) whose stdout still
+ * reflects `dataFile`'s current content, matching the command-poll source
+ * suite's hermetic pattern (plugins/source-command-poll/src/index.test.ts,
+ * "bounds the argv in title/summary … (issue #449)").
+ */
+const JQ_TAIL =
+  `jq:[.[] | {number, state, draft: .isDraft, ` +
+  `review: (if (.reviewDecision // "") == "" then "NONE" else .reviewDecision end), ` +
+  `ci: (if (.statusCheckRollup // [] | length) == 0 then "NONE" else "PASSING" end)}]`;
+
+/**
+ * An argv in the shape that produced the bug: a long, jq-flavored trailing
+ * argument. `command-poll` defaults `objectKey` to the joined argv, so
  * pre-fix this whole string was the delivered title.
  */
 function longCommand(dataFile: string): string[] {
   return [
-    'sh',
-    '-c',
-    `cat ${dataFile} | jq -c '[.[] | {number, state, draft: .isDraft, ` +
-      `review: (if (.reviewDecision // "") == "" then "NONE" else .reviewDecision end), ` +
-      `ci: (if (.statusCheckRollup // [] | length) == 0 then "NONE" else "PASSING" end)}]'`,
+    process.execPath,
+    '-e',
+    `process.stdout.write(require('fs').readFileSync(${JSON.stringify(dataFile)}, 'utf8'))`,
+    JQ_TAIL,
   ];
 }
 
@@ -200,8 +213,8 @@ describe('issue #449: delivered event title is the monitor name, not the raw com
       expect(lines[headerIndex + 1]).toBe(MONITOR_NAME);
       // And the ~250-character jq program appears nowhere in delivered text:
       // the source's own line survives only in its bounded form.
-      expect(rendered).not.toContain(harness.command[2]);
-      expect(rendered).toContain('Command output changed: sh -c cat ');
+      expect(rendered).not.toContain(JQ_TAIL);
+      expect(rendered).toContain('Command output changed: ');
     }
   });
 
@@ -215,13 +228,13 @@ describe('issue #449: delivered event title is the monitor name, not the raw com
     // …but the interpolated objectKey is bounded (003 §2.8), so a 200-character
     // argv can no longer become the headline.
     expect(title.length).toBeLessThan(90);
-    expect(title).not.toContain(harness.command[2]);
+    expect(title).not.toContain(JQ_TAIL);
     expect(title.endsWith('…')).toBe(true);
 
     const { hook, channel } = renderBothTransports(claim);
     for (const rendered of [hook, channel]) {
-      expect(rendered).toContain('Command output changed: sh -c cat ');
-      expect(rendered).not.toContain(harness.command[2]);
+      expect(rendered).toContain('Command output changed: ');
+      expect(rendered).not.toContain(JQ_TAIL);
     }
   });
 
