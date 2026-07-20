@@ -395,9 +395,28 @@ export function isTransportHeartbeat(
     'updatedAt',
   ];
   if (!strings.every((key) => typeof record[key] === 'string')) return false;
-  if (typeof record['pid'] !== 'number') return false;
-  if (typeof record['ttlMs'] !== 'number') return false;
-  if (typeof record['schemaVersion'] !== 'number') return false;
+
+  // Numeric fields must be SEMANTICALLY valid, not merely `typeof === 'number'`
+  // (issue #425 review). JSON has no `Infinity` literal, but `1e309` overflows
+  // and `JSON.parse` hands back `Infinity` — which a bare typeof check accepts.
+  // An infinite `ttlMs` then makes `isHeartbeatStale`'s `age > ttlMs` false
+  // forever: the record is immortal, never reported stale, and never reaped, so
+  // a dead transport reads as `running` permanently. That is precisely the
+  // never-expires failure this module hardens against elsewhere (the
+  // future-`updatedAt` clamp), reached through a different field. `NaN` is
+  // equally poisonous — every comparison against it is `false`.
+  //
+  // `ttlMs` must additionally be POSITIVE: a zero or negative lease is not a
+  // lease, and a negative one would report a record stale the instant it was
+  // written.
+  const ttlMs = record['ttlMs'];
+  if (typeof ttlMs !== 'number' || !Number.isFinite(ttlMs) || ttlMs <= 0) {
+    return false;
+  }
+  const pid = record['pid'];
+  if (!Number.isInteger(pid)) return false;
+  const schemaVersion = record['schemaVersion'];
+  if (!Number.isInteger(schemaVersion)) return false;
   if (record['transport'] !== 'hook' && record['transport'] !== 'channel') {
     return false;
   }

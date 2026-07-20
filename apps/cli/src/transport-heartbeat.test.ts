@@ -340,6 +340,49 @@ describe('isTransportHeartbeat', () => {
     ).toBe(false);
   });
 
+  it.each([
+    ['an infinite ttl (JSON 1e309 overflows to Infinity)', Infinity],
+    ['a negative-infinite ttl', -Infinity],
+    ['a NaN ttl', NaN],
+    ['a zero ttl (not a lease)', 0],
+    ['a negative ttl (stale the instant it is written)', -1000],
+  ])('rejects %s', (_label, ttlMs) => {
+    // An infinite lease makes `isHeartbeatStale`'s `age > ttlMs` false forever:
+    // the record is immortal, never reported stale, and never reaped, so a dead
+    // transport reads as `running` permanently (issue #425 review).
+    expect(isTransportHeartbeat({ ...valid, ttlMs })).toBe(false);
+  });
+
+  it.each([
+    ['a non-integer pid', 1.5],
+    ['an infinite pid', Infinity],
+    ['a NaN schemaVersion', NaN],
+  ])('rejects %s', (_label, _value) => {
+    const key = _label.includes('schemaVersion') ? 'schemaVersion' : 'pid';
+    expect(isTransportHeartbeat({ ...valid, [key]: _value })).toBe(false);
+  });
+
+  it('survives a PERSISTED non-finite lease without treating it as live', () => {
+    // End to end through the real registry: `1e309` is valid JSON that parses
+    // to `Infinity`, so this is reachable from a hand-edited or
+    // future-version record, not just a synthetic object.
+    mkdirSync(transportRegistryDir(), { recursive: true });
+    // Built as TEXT, not via `JSON.stringify`: stringify turns `Infinity` into
+    // `null`, which the guard would reject for the wrong reason and let this
+    // test pass vacuously. `1e309` is legal JSON that parses to `Infinity`.
+    const raw = `{"schemaVersion":1,"transport":"channel","pid":1,"cliPath":"/bin/agentmonitors","execPath":"/bin/node","version":"1.0.0","home":"/home/me","dataRoot":"/home/me/.local/share","workspacePath":"${WORKSPACE}","socketPath":"${SOCKET}","startedAt":"2026-07-19T00:00:00.000Z","updatedAt":"2026-07-19T00:00:00.000Z","ttlMs":1e309}`;
+    // Guard the guard: prove the fixture really does parse to a non-finite
+    // lease, so a failure here means the validation regressed, not the fixture.
+    expect((JSON.parse(raw) as { ttlMs: number }).ttlMs).toBe(Infinity);
+
+    writeFileSync(
+      path.join(transportRegistryDir(), 'channel-immortal.json'),
+      raw,
+    );
+    // Rejected at the guard, so it never reaches the health surface at all.
+    expect(readTransportHeartbeats()).toEqual([]);
+  });
+
   it('rejects a non-numeric ttl', () => {
     expect(isTransportHeartbeat({ ...valid, ttlMs: '30s' })).toBe(false);
   });
