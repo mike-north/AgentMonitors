@@ -13,6 +13,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -175,6 +176,41 @@ describe.skipIf(process.platform === 'win32')(
 
       expect(readFileSync(logPath, 'utf-8')).toBe('first boot\nsecond boot\n');
       expect(modeOf(logPath)).toBe(PRIVATE_FILE_MODE);
+    });
+
+    it('refuses to append through a symlinked log path under the default location, and leaves the target untouched (round-6 review 3611641504)', () => {
+      // Reproduces the regression: `restrictExistingPathMode` correctly
+      // no-ops on a symlink, but the old plain `openSync(logPath, 'a')`
+      // still followed it, appending daemon output into whatever the link
+      // pointed at without ever touching that target's mode.
+      const target = path.join(tmpDir, 'target.log');
+      writeFileSync(target, 'not the daemon log\n');
+      chmodSync(target, 0o644);
+      const logPath = path.join(tmpDir, 'daemon.log');
+      symlinkSync(target, logPath);
+
+      expect(() => openLogFd(logPath, true)).toThrow(/symlink/i);
+
+      // The symlink target must be neither written to nor have its mode
+      // changed — the identity check must fail closed before either
+      // side effect.
+      expect(readFileSync(target, 'utf-8')).toBe('not the daemon log\n');
+      expect(modeOf(target)).toBe(0o644);
+    });
+
+    it('refuses to append through a symlinked log path under a custom --log parent (round-6 review 3611641504)', () => {
+      const parent = path.join(tmpDir, 'custom-parent');
+      mkdirSync(parent, { recursive: true });
+      const target = path.join(tmpDir, 'target.log');
+      writeFileSync(target, 'not the daemon log\n');
+      chmodSync(target, 0o644);
+      const logPath = path.join(parent, 'daemon.log');
+      symlinkSync(target, logPath);
+
+      expect(() => openLogFd(logPath, false)).toThrow(/symlink/i);
+
+      expect(readFileSync(target, 'utf-8')).toBe('not the daemon log\n');
+      expect(modeOf(target)).toBe(0o644);
     });
   },
 );

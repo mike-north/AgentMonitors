@@ -1,9 +1,16 @@
 import { spawn } from 'node:child_process';
-import { closeSync, mkdirSync, openSync } from 'node:fs';
+import {
+  closeSync,
+  constants as fsConstants,
+  fchmodSync,
+  mkdirSync,
+  openSync,
+} from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import {
   ensurePrivateDir,
+  isErrnoException,
   PRIVATE_DIR_MODE,
   PRIVATE_FILE_MODE,
   restrictExistingPathMode,
@@ -167,6 +174,18 @@ export function spawnDetachedDaemon(
  * the default location or a custom `--log` path: it is ours either way, and we
  * are about to append the daemon's diagnostics to it.
  *
+ * File identity is fail-closed against a symlinked log path (round-6 review
+ * 3611641504): `restrictExistingPathMode` intentionally no-ops on a symlink
+ * rather than tightening or following it, so a plain follow-up
+ * `openSync(logPath, 'a')` would still append the daemon's output through the
+ * link onto whatever it points at — and that target's mode is never touched,
+ * defeating the owner-only invariant entirely. Instead the final open uses
+ * `O_NOFOLLOW` (refusing to traverse a symlink final path component; `ELOOP`
+ * if it is one) and `fchmod`s the resulting descriptor rather than the path,
+ * closing the same lstat→chmod/open TOCTOU window {@link restrictExistingPathMode}
+ * closes for its own tighten. A symlinked `logPath` is reported as a clean
+ * spawn failure instead of silently writing through it.
+ *
  * The PARENT directory gets different treatment depending on `isDefaultLocation`
  * (round-5 review 3611604829) — mirroring `ensureSocketDir`'s existing split
  * between the Agent-Monitors-owned default socket directory and a
@@ -199,5 +218,31 @@ export function openLogFd(logPath: string, isDefaultLocation: boolean): number {
     mkdirSync(parent, { recursive: true, mode: PRIVATE_DIR_MODE });
   }
   restrictExistingPathMode(logPath, PRIVATE_FILE_MODE);
-  return openSync(logPath, 'a', PRIVATE_FILE_MODE);
+  // Open with O_NOFOLLOW so a symlinked logPath fails closed (ELOOP) instead
+  // of silently appending through it, then fchmod the descriptor — not the
+  // path — so there is no lstat/open gap an attacker could swap a symlink
+  // into. `restrictExistingPathMode` above already refused to touch a
+  // symlink's mode; this refuses to write through one too.
+  let fd: number;
+  try {
+    fd = openSync(
+      logPath,
+      fsConstants.O_WRONLY |
+        fsConstants.O_APPEND |
+        fsConstants.O_CREAT |
+        fsConstants.O_NOFOLLOW,
+      PRIVATE_FILE_MODE,
+    );
+  } catch (err) {
+    if (isErrnoException(err) && err.code === 'ELOOP') {
+      throw new Error(
+        `Refusing to write the detached daemon's log through a symlink at ${logPath}. ` +
+          'Remove the symlink (or point --log at a regular file) and retry.',
+        { cause: err },
+      );
+    }
+    throw err;
+  }
+  fchmodSync(fd, PRIVATE_FILE_MODE);
+  return fd;
 }

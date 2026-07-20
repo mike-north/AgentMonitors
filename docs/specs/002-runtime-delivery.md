@@ -839,6 +839,23 @@ artifacts on startup** (BP4, [000 §5](./000-principles.md)).
   hook-state files, the startup-lock pid file, the `.claude/agentmonitors.local.md` coordination
   file, and `daemon run --detach`'s `--log` file. (The `.claude` directory itself belongs to the
   host tool and is **not** re-moded — only the coordination file we own is.)
+- **The `--detach` log's parent directory is Agent-Monitors-owned only conditionally.** A _missing_
+  parent (default or a missing ancestor under a custom `--log`) is always created `0700` — the
+  runtime is the one creating it, so there is no pre-existing mode to preserve. A pre-existing
+  parent is only tightened when it is the **default** location (the workspace data directory); a
+  pre-existing **custom** `--log` parent (e.g. a repo checkout or a shared logs directory the user
+  chose) is left exactly as it is, mirroring the existing `--socket`-directory treatment above — the
+  runtime does not own it and silently removing group/other access would be a functional regression,
+  not a hardening.
+- **The `--detach` log FILE is always owner-only and fail-closed against a symlinked path**,
+  regardless of whether its parent is the default or a custom location: it is created `0600` if
+  missing and tightened via `restrictExistingPathMode` if it already exists as a regular file, but
+  when the path is a symlink, tightening intentionally no-ops (never touches the mode of the
+  symlink or its target) — and the runtime does **not** then fall back to opening through the link.
+  The final open uses `O_NOFOLLOW` (`ELOOP` if the last path component is a symlink) and `fchmod`s
+  the resulting descriptor rather than the path, so a planted symlink at the log path is refused
+  (surfaced as a clean spawn failure) instead of silently appending the daemon's output into
+  whatever it points at.
 - **Sockets:** the Unix domain socket is **bound under a restricted (`0o077`) umask so it is born
   `0600`** (Node binds a Unix socket synchronously inside `listen()`, so the umask window closes
   before the socket is observable), then re-chmod'd `0600` after bind as defense-in-depth, and —
@@ -878,9 +895,12 @@ Verified: `libs/core/src/security/local-permissions.ts` — `ensurePrivateDir`,
 `libs/core/src/runtime/service.ts` — hook-state writes; `apps/cli/src/daemon-ipc.ts` — socket,
 startup lock, and the long-socket-path fallback ([§10.3](#103-socket-path-resolution));
 `apps/cli/src/local-state.ts` — coordination file; `apps/cli/src/detached-spawn.ts` — `openLogFd`
-(the `--detach` log: its parent directory via `ensurePrivateDir`, and the file itself created
-`0600` and tightened via `restrictExistingPathMode` before every append, so neither the ambient
-umask nor a pre-existing permissive file/dir from an earlier run leaves it world-readable); tests:
+(the `--detach` log: a missing parent always created `0700`, an existing parent tightened only at
+the default location, and the log file itself created `0600`/tightened via
+`restrictExistingPathMode` before every append, then opened `O_NOFOLLOW` with the descriptor
+`fchmod`'d — never the path — so neither the ambient umask, a pre-existing permissive file/dir from
+an earlier run, nor a symlink planted at the log path leaves it world-readable or writes through to
+an unintended target); tests:
 `local-permissions.test.ts`, `inbox/db-permissions.test.ts`, `hook-bridge/bridge.test.ts`,
 `daemon-ipc.test.ts`, `detached-spawn.test.ts`, and the real-binary UAT in
 `apps/cli/src/commands/cli.integration.test.ts`.
