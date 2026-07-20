@@ -919,14 +919,22 @@ describe('source-command-poll', () => {
         };
         expect(payload.error).toMatch(/timed out/i);
 
-        // The retained stderr buffer is created via exactly one `Buffer.from`
-        // call (the copy-on-cap-exceeded path added for issue #302).
-        expect(fromSpy).toHaveBeenCalledTimes(1);
-        const retained = fromSpy.mock.results[0]?.value as Buffer;
-        expect(retained.length).toBe(stderrRetentionCapBytes);
-        expect(retained.buffer.byteLength).toBeLessThanOrEqual(
-          stderrRetentionCapBytes,
-        );
+        // The retained stderr buffer is created via the copy-on-cap-exceeded
+        // `Buffer.from` path (added for issue #302). This does NOT assert a
+        // single `Buffer.from` call: pipe/stream chunk boundaries are not
+        // guaranteed to match `process.stderr.write()` calls, so the
+        // 64,000-byte write may arrive as more than one `data` event, and the
+        // correct implementation calls `Buffer.from` once per over-cap
+        // chunk. What must hold regardless of how the write is chunked is
+        // that every retained copy is bounded at the cap.
+        expect(fromSpy).toHaveBeenCalled();
+        for (const result of fromSpy.mock.results) {
+          const retained = result.value as Buffer;
+          expect(retained.length).toBe(stderrRetentionCapBytes);
+          expect(retained.buffer.byteLength).toBeLessThanOrEqual(
+            stderrRetentionCapBytes,
+          );
+        }
       } finally {
         fromSpy.mockRestore();
       }
