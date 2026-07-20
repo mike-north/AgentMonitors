@@ -124,25 +124,26 @@ const cases: readonly ParityCase[] = [
     input: { command: [process.execPath, '-e', ''], timeout: 30 },
     expectValid: false,
   },
+  // Issue #304 review, third round: the schema `pattern` used to accept an
+  // unbounded digit run per unit, so "25d" passed authoring-time
+  // `validateScope` while the parser rejected it at runtime — a genuine
+  // parity bug, not the "deliberate, narrow, documented gap" the previous
+  // round's comment claimed. `OPERATION_TIMEOUT_PATTERN` now bounds each
+  // unit's digit run to `Math.floor(MAX_OPERATION_TIMEOUT_MS / unitMs)`, so
+  // both layers reject "25d" together; see the dedicated bound coverage in
+  // `libs/core/src/notify/notifier.test.ts`.
+  {
+    label: 'timeout "24d" (at the maximum setTimeout delay) is accepted',
+    input: { command: [process.execPath, '-e', ''], timeout: '24d' },
+    expectValid: true,
+  },
+  {
+    label:
+      'timeout "25d" (exceeds the maximum setTimeout delay) is rejected by both schema and parser',
+    input: { command: [process.execPath, '-e', ''], timeout: '25d' },
+    expectValid: false,
+  },
 ];
-
-// Issue #304 review, second round: "25d" exceeds Node's 32-bit setTimeout max
-// (2,147,483,647ms) and would otherwise silently fire almost immediately
-// instead of the author's intended 25-day deadline. The JSON Schema
-// `pattern` (a pure string grammar) cannot express this numeric upper bound,
-// so the schema still ACCEPTS "25d" while the parser rejects it — a
-// deliberate, narrow, documented gap between the two, not a parity bug. Kept
-// as its own assertion rather than a `cases` row, since `expectParity` treats
-// schema/parser disagreement as a failure by design (see its docstring).
-describe('command-poll timeout upper bound (issue #304 review, second round)', () => {
-  it('the parser rejects "25d" even though the schema pattern alone accepts it', async () => {
-    const input = { command: [process.execPath, '-e', ''], timeout: '25d' };
-    expect(validateScope(input, source.scopeSchema)).toEqual([]);
-    await expect(
-      source.observe(input, { now: new Date('2024-01-15T00:00:00.000Z') }),
-    ).rejects.toThrow(/exceeds the maximum supported deadline/);
-  });
-});
 
 describe('command-poll schema ↔ parser parity', () => {
   it.each(cases.map((c) => [c.label, c] as const))(

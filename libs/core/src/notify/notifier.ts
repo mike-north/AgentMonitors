@@ -40,16 +40,6 @@ export function parseDuration(duration: string): number {
 export const DEFAULT_OPERATION_TIMEOUT_MS = 30_000;
 
 /**
- * JSON Schema `pattern` for a source's `timeout` scope field: one or more
- * digits, with **no leading zero** — so the value can never parse to a
- * zero-length duration (`"0s"`, `"0m"`, `"0h"`, `"0d"` are all rejected, see
- * {@link parseOperationTimeoutMs}) — followed by exactly one of `s`, `m`,
- * `h`, `d`. Shared by `api-poll` and `command-poll` (issue #304 review) so the
- * grammar can't drift between the two copies.
- */
-export const OPERATION_TIMEOUT_PATTERN = '^[1-9]\\d*[smhd]$';
-
-/**
  * The largest delay Node's `setTimeout`/`setInterval` can schedule: a 32-bit
  * signed integer of milliseconds (`2_147_483_647`, ~24.8 days). A longer
  * value silently overflows to a 1ms timer (with a `TimeoutOverflowWarning` on
@@ -60,6 +50,103 @@ export const OPERATION_TIMEOUT_PATTERN = '^[1-9]\\d*[smhd]$';
  * @see https://nodejs.org/api/timers.html#settimeoutcallback-delay-args
  */
 export const MAX_OPERATION_TIMEOUT_MS = 2_147_483_647;
+
+/**
+ * Build a regex fragment (no anchors) matching the decimal string form of
+ * every integer in `[1, max]`, with **no leading zeros** — e.g.
+ * `digitRangeFragment(24)` matches `"1"`..`"24"` but neither `"0"` nor `"25"`.
+ * Internal to {@link OPERATION_TIMEOUT_PATTERN}'s construction (issue #304
+ * review, third round): a hand-written pattern per unit would have to encode
+ * `Math.floor(MAX_OPERATION_TIMEOUT_MS / unitMs)` and would silently drift
+ * from {@link MAX_OPERATION_TIMEOUT_MS} on the next edit, so the pattern is
+ * derived from the same numeric bound the parser enforces instead.
+ *
+ * Standard digit-DP range-to-regex construction: for each digit-length
+ * shorter than `max`, the full range is `[1-9]` followed by any digits; for
+ * `max`'s own digit length, {@link zeroRangeFragment} recursively bounds the
+ * trailing digits once the shared leading digits are fixed.
+ */
+function digitRangeFragment(max: number): string {
+  const digits = String(max);
+  const branches: string[] = [];
+  for (let length = 1; length < digits.length; length++) {
+    branches.push(length === 1 ? '[1-9]' : `[1-9][0-9]{${String(length - 1)}}`);
+  }
+  const first = digits[0];
+  const rest = digits.slice(1);
+  if (!first) throw new Error('unreachable: digits is non-empty');
+  if (rest.length === 0) {
+    branches.push(`[1-${first}]`);
+  } else if (first === '1') {
+    branches.push(`1${zeroRangeFragment(rest)}`);
+  } else {
+    const lower = String.fromCharCode(first.charCodeAt(0) - 1);
+    branches.push(`[1-${lower}][0-9]{${String(rest.length)}}`);
+    branches.push(`${first}${zeroRangeFragment(rest)}`);
+  }
+  return `(?:${branches.join('|')})`;
+}
+
+/**
+ * Regex fragment matching every integer in `[0, Number(digits)]`, rendered
+ * with exactly `digits.length` digit positions (leading zeros allowed in
+ * this fixed-width representation — it only ever appears as a fixed-length
+ * suffix of {@link digitRangeFragment}'s leading digits). Recursion helper;
+ * not useful standalone.
+ */
+function zeroRangeFragment(digits: string): string {
+  if (digits.length === 1) {
+    return digits === '0' ? '0' : `[0-${digits}]`;
+  }
+  const first = digits[0];
+  const rest = digits.slice(1);
+  if (!first) throw new Error('unreachable: digits is non-empty');
+  const branches: string[] = [];
+  if (first !== '0') {
+    const lower = String.fromCharCode(first.charCodeAt(0) - 1);
+    branches.push(
+      lower === '0'
+        ? `0[0-9]{${String(rest.length)}}`
+        : `[0-${lower}][0-9]{${String(rest.length)}}`,
+    );
+  }
+  branches.push(`${first}${zeroRangeFragment(rest)}`);
+  return `(?:${branches.join('|')})`;
+}
+
+/** Milliseconds per unit, matching {@link parseDuration}'s switch. */
+const OPERATION_TIMEOUT_UNIT_MS: Record<'s' | 'm' | 'h' | 'd', number> = {
+  s: 1000,
+  m: 60_000,
+  h: 3_600_000,
+  d: 86_400_000,
+};
+
+/**
+ * JSON Schema `pattern` for a source's `timeout` scope field: one or more
+ * digits, with **no leading zero** — so the value can never parse to a
+ * zero-length duration (`"0s"`, `"0m"`, `"0h"`, `"0d"` are all rejected, see
+ * {@link parseOperationTimeoutMs}) — followed by exactly one of `s`, `m`,
+ * `h`, `d`. Shared by `api-poll` and `command-poll` (issue #304 review) so the
+ * grammar can't drift between the two copies.
+ *
+ * Each unit's digit run is additionally bounded to
+ * `Math.floor(MAX_OPERATION_TIMEOUT_MS / <unit's ms-per-unit>)` (issue #304
+ * review, third round): a raw `\d*` digit run let a value like `"25d"` pass
+ * authoring-time schema validation while {@link parseOperationTimeoutMs}
+ * rejected it at runtime, so the schema and the parser disagreed on what a
+ * valid config looked like. Deriving the per-unit bound from
+ * {@link MAX_OPERATION_TIMEOUT_MS} (via {@link digitRangeFragment}) keeps the
+ * two in permanent agreement instead of hand-duplicating four magic numbers.
+ */
+export const OPERATION_TIMEOUT_PATTERN = `^(?:${(
+  Object.entries(OPERATION_TIMEOUT_UNIT_MS) as ['s' | 'm' | 'h' | 'd', number][]
+)
+  .map(
+    ([unit, unitMs]) =>
+      `${digitRangeFragment(Math.floor(MAX_OPERATION_TIMEOUT_MS / unitMs))}${unit}`,
+  )
+  .join('|')})$`;
 
 /**
  * Resolve a source's `timeout` scope field into milliseconds (issue #304

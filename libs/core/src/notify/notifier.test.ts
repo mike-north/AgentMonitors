@@ -3,6 +3,7 @@ import type { Observation } from '../observation/types.js';
 import {
   DEFAULT_OPERATION_TIMEOUT_MS,
   MAX_OPERATION_TIMEOUT_MS,
+  OPERATION_TIMEOUT_PATTERN,
   createDebounceNotifier,
   createImmediateNotifier,
   createThrottleNotifier,
@@ -120,6 +121,65 @@ describe('parseOperationTimeoutMs', () => {
     expect(parseOperationTimeoutMs('24d')).toBeLessThanOrEqual(
       MAX_OPERATION_TIMEOUT_MS,
     );
+  });
+});
+
+// Issue #304 review, third round: the schema `pattern` used to accept an
+// unbounded digit run per unit (`\d*`), so a value like `timeout: "25d"`
+// passed authoring-time `validateScope` while `parseOperationTimeoutMs`
+// rejected it at runtime — schema and parser disagreed on the accepted set.
+// The pattern now bounds each unit's digit run to
+// `Math.floor(MAX_OPERATION_TIMEOUT_MS / <unit ms>)`, derived from the same
+// numeric bound the parser enforces, so the two can never drift apart again.
+describe('OPERATION_TIMEOUT_PATTERN numeric bound', () => {
+  const pattern = new RegExp(OPERATION_TIMEOUT_PATTERN);
+
+  // Math.floor(MAX_OPERATION_TIMEOUT_MS / msPerUnit) for each unit —
+  // hand-derived from the published 2_147_483_647ms bound, not copied from
+  // the implementation, so a regression in the generator is caught here.
+  const maxByUnit = { s: 2_147_483, m: 35_791, h: 596, d: 24 } as const;
+
+  it.each(Object.entries(maxByUnit))(
+    'accepts the exact per-unit maximum for "%s" but rejects one more',
+    (unit, max) => {
+      expect(pattern.test(`${String(max)}${unit}`)).toBe(true);
+      expect(pattern.test(`${String(max + 1)}${unit}`)).toBe(false);
+    },
+  );
+
+  it.each(Object.entries(maxByUnit))(
+    'agrees with parseOperationTimeoutMs at the "%s" boundary',
+    (unit, max) => {
+      // At the boundary: schema accepts, parser does not throw.
+      expect(() => parseOperationTimeoutMs(`${max}${unit}`)).not.toThrow();
+      // One past the boundary: schema rejects, parser throws — both layers
+      // now agree on every input instead of a documented narrow gap.
+      expect(pattern.test(`${String(max + 1)}${unit}`)).toBe(false);
+      expect(() => parseOperationTimeoutMs(`${max + 1}${unit}`)).toThrow(
+        /exceeds the maximum supported deadline/,
+      );
+    },
+  );
+
+  it('still accepts every 1-2 digit value for every unit (small-value regression)', () => {
+    for (const unit of Object.keys(maxByUnit)) {
+      expect(pattern.test(`1${unit}`)).toBe(true);
+      expect(pattern.test(`9${unit}`)).toBe(true);
+      expect(pattern.test(`10${unit}`)).toBe(true);
+    }
+  });
+
+  it('still rejects zero-length and leading-zero values for every unit', () => {
+    for (const unit of Object.keys(maxByUnit)) {
+      expect(pattern.test(`0${unit}`)).toBe(false);
+      expect(pattern.test(`01${unit}`)).toBe(false);
+    }
+  });
+
+  it('rejects an obviously oversized value for every unit', () => {
+    for (const unit of Object.keys(maxByUnit)) {
+      expect(pattern.test(`999999999${unit}`)).toBe(false);
+    }
   });
 });
 

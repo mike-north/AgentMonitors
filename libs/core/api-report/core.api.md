@@ -1196,7 +1196,7 @@ export interface OpenSessionInput {
 }
 
 // @public
-export const OPERATION_TIMEOUT_PATTERN = "^[1-9]\\d*[smhd]$";
+export const OPERATION_TIMEOUT_PATTERN: string;
 
 // @public
 export function parseDuration(duration: string): number;
