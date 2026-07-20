@@ -1,6 +1,7 @@
 import path from 'node:path';
 import type { HookDeliveryDiagnosis } from '@agentmonitors/core';
 import {
+  HEARTBEAT_FUTURE_TOLERANCE_MS,
   isHeartbeatStale,
   type TransportHeartbeat,
   type TransportName,
@@ -89,7 +90,18 @@ export type TransportProblemCode =
    * a server is there), but it can never count as this session's listening
    * method.
    */
-  | 'channel-session-unmatched';
+  | 'channel-session-unmatched'
+  /**
+   * At least one ACTIVE lead session in this workspace has NO channel
+   * heartbeat matching it at all — a different active lead's channel is up,
+   * but this one has nobody listening for it. Proving "at least one active
+   * lead is covered" is not the same as proving every one of them is (issue
+   * #425 review, round 5): with two active leads and a healthy channel for
+   * only one, the workspace-wide aggregate previously reported `deliverable:
+   * true` for the whole workspace, silently hiding that the other lead has no
+   * channel listener whatsoever.
+   */
+  | 'channel-lead-uncovered';
 
 /**
  * Problems that belong to the delivery pipeline as a whole rather than to one
@@ -108,6 +120,32 @@ const SHARED_PROBLEM_CODES: readonly TransportProblemCode[] = [
 /** Whether a problem is pipeline-wide (report once) or transport-owned. */
 export function isSharedProblem(code: TransportProblemCode): boolean {
   return SHARED_PROBLEM_CODES.includes(code);
+}
+
+/**
+ * Advisory codes that are reported but never count against `healthy` or the
+ * listening method: informational facts, not defects (see the doc comments on
+ * `heartbeatProblems` for why each one specifically must not cry wolf).
+ */
+const ADVISORY_PROBLEM_CODES: readonly TransportProblemCode[] = [
+  'channel-registration-unverified',
+  'version-skew',
+];
+
+/**
+ * Whether a problem disqualifies a transport from counting as a **listening
+ * method** for `deliveryWillReachThisSession` (issue #425 review, round 5) —
+ * neither a pipeline-wide fact reported once at the verdict instead
+ * ({@link isSharedProblem} — a down daemon or muted reminders don't mean the
+ * transport itself isn't listening) nor an advisory (informational, never a
+ * defect). Distinct from `healthy`, whose `blocking` filter deliberately DOES
+ * count pipeline-wide problems (a transport is not `healthy` while the daemon
+ * behind it is down), because `healthy` and "is a listening method" answer
+ * different questions — see the file's own docstring on why `reach` and
+ * `deliverable` are kept separate.
+ */
+function disqualifiesFromListening(code: TransportProblemCode): boolean {
+  return !isSharedProblem(code) && !ADVISORY_PROBLEM_CODES.includes(code);
 }
 
 export interface TransportProblem {
@@ -418,6 +456,33 @@ function freshness(heartbeat: TransportHeartbeat): number {
 }
 
 /**
+ * Freshness key for choosing the REPRESENTATIVE record in {@link buildTransport}
+ * (the one whose `boundTo`/`version`/`lastDelivery` are shown). Unlike
+ * {@link freshness}, this ALSO treats an out-of-tolerance future timestamp as
+ * oldest, not merely an unparseable one.
+ *
+ * `freshness` alone is not enough here: a far-future `updatedAt` (clock skew,
+ * or an untrusted/forged record) parses to a real, large finite number, so a
+ * plain freshest-wins comparison ranks it ahead of a genuinely current record
+ * — the exact defect `isHeartbeatStale` already treats as stale (issue #425
+ * review, round 5), but which a representative-selection tie-break keyed on
+ * raw `Date.parse` had not been taught to distrust. Both corruption modes —
+ * unparseable and implausibly-future — must sort as oldest so a valid current
+ * record is never shadowed by one that only LOOKS newer.
+ */
+function representativeFreshness(
+  heartbeat: TransportHeartbeat,
+  now: Date,
+): number {
+  const parsed = Date.parse(heartbeat.updatedAt);
+  if (Number.isNaN(parsed)) return Number.NEGATIVE_INFINITY;
+  if (now.getTime() - parsed < -HEARTBEAT_FUTURE_TOLERANCE_MS) {
+    return Number.NEGATIVE_INFINITY;
+  }
+  return parsed;
+}
+
+/**
  * Every heartbeat that describes the transport serving THIS diagnosis, freshest
  * first. Returns all of them, not one: collapsing to a single record is how a
  * broken session hides behind a healthy sibling (see {@link buildTransport}).
@@ -574,14 +639,21 @@ function buildTransport(
   sharedProblems: readonly TransportProblem[],
 ): TransportStatus {
   const matches = selectHeartbeats(transport, input);
-  // Report the record with the MOST problems, not merely the freshest (issue
-  // #425 review). With two registered leads — one healthy channel refreshed a
-  // moment ago, one slightly older channel bound to the wrong workspace —
-  // "freshest wins" returned the healthy record and declared delivery healthy
-  // while the other live session was silently broken. Ranking by problem count
-  // keeps the broken session visible; ties fall back to freshest, so the
-  // all-healthy case still reports the record a reader expects. Every match's
-  // problems are unioned below, so nothing is dropped either way.
+  // Choose the representative by FRESHNESS first, corrupt/future-out-of-
+  // tolerance timestamps sorting as oldest (issue #425 review, round 5) — not
+  // by problem count. Ranking by problem count first (the prior approach) was
+  // meant to keep a broken session visible in the two-active-lead case, but it
+  // backfired on a corrupt record: an unparseable `updatedAt` contributes its
+  // own `heartbeat-stale` problem, so "most problems wins" could make THAT
+  // corrupt record the representative even with a perfectly valid, current
+  // record also present — reporting `running: false` for a transport that is
+  // actually up. A broken sibling is never hidden by this change: every
+  // match's problems are unioned below regardless of which one is chosen as
+  // representative, so choosing the freshest non-corrupt record for
+  // `boundTo`/`version`/`lastDelivery` costs nothing but fixes the corrupt-
+  // record-wins defect. Ties (including the all-healthy case) still fall back
+  // to problem count so a genuinely tied broken record is not silently
+  // preferred over a healthy one for representative purposes.
   const ranked = matches
     .map((candidate) => ({
       heartbeat: candidate,
@@ -589,8 +661,9 @@ function buildTransport(
     }))
     .sort(
       (a, b) =>
-        b.problems.length - a.problems.length ||
-        freshness(b.heartbeat) - freshness(a.heartbeat),
+        representativeFreshness(b.heartbeat, input.now) -
+          representativeFreshness(a.heartbeat, input.now) ||
+        b.problems.length - a.problems.length,
     );
   const heartbeat = ranked[0]?.heartbeat;
   if (!heartbeat) {
@@ -612,6 +685,40 @@ function buildTransport(
     (entry) => entry.problems,
   );
 
+  // A channel record matching SOME active lead sessions does not prove it
+  // matches ALL of them (issue #425 review, round 5): with two active leads
+  // and a healthy channel heartbeat for only one, the prior check ("at least
+  // one active lead has a matching channel heartbeat") was satisfied and
+  // reported a clean `deliverable: true`, `channel.healthy: true` verdict for
+  // the whole workspace while the other active lead had no channel listener
+  // at all. Surface every uncovered active lead explicitly rather than
+  // issuing a workspace-wide clean bill of health that only one of several
+  // recipients actually earned.
+  if (transport === 'channel') {
+    const matchedLeadIds = new Set(
+      matches
+        .map((candidate) => candidate.hostSessionId)
+        .filter((id): id is string => id !== undefined),
+    );
+    const uncoveredLeadIds = input.leadHostSessionIds.filter(
+      (id) => !matchedLeadIds.has(id),
+    );
+    if (uncoveredLeadIds.length > 0) {
+      problems.push({
+        code: 'channel-lead-uncovered',
+        detail:
+          `No channel heartbeat matches ${String(uncoveredLeadIds.length)} ` +
+          `other active lead session(s) here (${uncoveredLeadIds.join(', ')}): ` +
+          `a channel is reporting for at least one active lead in this ` +
+          `workspace, but not for these — they have no channel listener at ` +
+          `all, so a workspace-wide "channel is healthy" verdict would be ` +
+          `true for one recipient and silently false for the others.`,
+        remediation:
+          'Start (or reconnect) a Claude Code session with the AgentMon plugin loaded as a channel for each of those host sessions, or rely on the hook transport, which delivers without one.',
+      });
+    }
+  }
+
   // Shared problems are recorded on every configured transport so a consumer
   // reading `transports[].problems[]` alone — the shape the JSON contract
   // exposes — sees the reasons this transport cannot deliver, not just its own
@@ -619,9 +726,7 @@ function buildTransport(
   problems.push(...sharedProblems);
 
   const blocking = problems.filter(
-    (problem) =>
-      problem.code !== 'channel-registration-unverified' &&
-      problem.code !== 'version-skew',
+    (problem) => !ADVISORY_PROBLEM_CODES.includes(problem.code),
   );
 
   return {
@@ -679,19 +784,28 @@ export function computeTransportHealth(
   // A transport that is present and within its lease is *listening*, even if
   // the daemon behind it is down or its reminders are muted — those are
   // separate, separately-reported facts. Conflating them here is exactly the
-  // "one generic unhealthy" collapse this surface exists to avoid.
+  // "one generic unhealthy" collapse this surface exists to avoid, which is
+  // why PIPELINE-wide problems (`isSharedProblem`) never disqualify a
+  // transport from being the listening method.
+  //
+  // Every other, TRANSPORT-owned blocking problem DOES disqualify it — not
+  // just the four codes previously hand-listed here (issue #425 review,
+  // round 5). That hardcoded list omitted `heartbeat-stale` and the new
+  // `channel-lead-uncovered`: a stale SIBLING record's problem (unioned into
+  // `problems` alongside a fresh representative's) or an uncovered active
+  // lead could leave `transport.running` true and neither excluded code
+  // present, so the transport still counted as the listening method and the
+  // overall verdict read "(healthy)" even though a live sibling session had
+  // nothing reaching it. Deriving this from the same non-shared/non-advisory
+  // problem set `buildTransport` already uses for `healthy` keeps the two
+  // definitions from drifting apart again the next time a new problem code is
+  // added.
   const listening = hasActiveLead
     ? transports.filter(
         (transport) =>
           transport.running &&
-          !transport.problems.some(
-            (problem) =>
-              problem.code === 'workspace-mismatch' ||
-              problem.code === 'environment-mismatch' ||
-              problem.code === 'socket-mismatch' ||
-              // A channel serving no active lead here is not a listening
-              // method for this session, however healthy it looks.
-              problem.code === 'channel-session-unmatched',
+          !transport.problems.some((problem) =>
+            disqualifiesFromListening(problem.code),
           ),
       )
     : [];

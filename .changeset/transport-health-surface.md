@@ -74,3 +74,17 @@ See docs/specs/006-agent-integration.md §12 and docs/specs/005-cli-reference.md
 - Session-id-first heartbeat matching is now restricted to the channel transport; the hook transport
   (no per-session identity) always matches by workspace.
 - Idle `transport:<name>` checks now always carry a remediation, in both text and `--json`.
+- `doctor` now derives its ACTIVE lead-session set once and uses it consistently everywhere: a
+  session a prior `session close` marked `dormant` no longer reads as still-open on the
+  `lead-session`/`daemon-reachable` checks, the per-monitor rollup, or the JSON `leadSession` field —
+  it is `idle`/exit 0, matching a workspace with no lead session ever registered.
+- **A new `channel-lead-uncovered` problem code** names every active lead session a channel record
+  exists for the workspace but not for that specific lead — proving one active lead is covered is no
+  longer treated as proof the whole workspace is.
+- A stale sibling's problem can no longer hide behind a healthy representative: any transport-owned
+  blocking problem on ANY matched heartbeat (not just the record chosen as representative) now
+  excludes that transport from `deliveryWillReachThisSession`.
+- Representative-record selection (`boundTo`/`version`/`lastDelivery`) is now freshness-first, with
+  both unparseable and implausibly-future timestamps sorting as oldest, so a corrupt or forged record
+  can no longer become the representative over a valid, current one. Every matching record's problems
+  are still unioned regardless of which one is chosen.

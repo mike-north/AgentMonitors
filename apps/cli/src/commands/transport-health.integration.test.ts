@@ -700,13 +700,31 @@ This monitor fires on a schedule.
   }, 30_000);
 
   // --- Closed session: a fresh heartbeat is not an ACTIVE recipient (issue
-  // #425 review, round 3) --------------------------------------------------
+  // #425 review, round 3, exit-code contract corrected round 5) -----------
   // `hook` is keyed per WORKSPACE, not per session (`heartbeatKey`), so its
   // record stays within its 24h TTL — and looks "running" — long after the
   // one lead session in this workspace has closed. Without gating on an
   // ACTIVE lead, `doctor` reported `deliverable: true` / "via hook" for a
   // recipient that no longer has a live process to receive anything.
-  it('reports no live session — not "via hook" — once the only lead session has closed', async () => {
+  //
+  // A closed session is NOT a live degradation, though — it is the SAME
+  // "nothing is open right now" state as the ordinary no-lead-session idle
+  // case (005 §15: "no lead session at all" → `idle`/exit 0, even for a
+  // transport that DID report in during some past session). Round 4's
+  // review had this exiting 1/`fail`, reasoning a running heartbeat with no
+  // recipient was a "real degradation" — but that contradicted the spec text
+  // it shipped alongside, and every OTHER check gated on "is a session
+  // currently open" (`lead-session`, `daemon-reachable`, the per-monitor
+  // rollup) already treats a closed session identically to no session ever
+  // having existed. `hasLeadSession` used to mean "any lead session EVER
+  // registered", so it stayed `true` after close (the record is merely
+  // marked `dormant`, not deleted) while `leadHostSessionIds` was correctly
+  // filtered to ACTIVE — the two disagreeing is what let `daemon-reachable`
+  // read the closed session as still-open while `transport:hook`/
+  // `delivery-verdict` did not. Filtering to ACTIVE sessions consistently
+  // across every gate (round 5) makes a closed session `idle`/exit 0 like any
+  // other no-session-open state.
+  it('reports no live session as idle — not a fail — once the only lead session has closed', async () => {
     const fixture = transportFixture('closed-session');
     const daemon = await startDaemon(
       fixture.monitorsRoot,
@@ -727,6 +745,7 @@ This monitor fires on a schedule.
         fixture.dir,
       );
       expect(before.stdout).toContain('delivery to THIS session → via hook');
+      expect(before.exitCode).toBe(0);
 
       const closed = runWithEnv(
         ['session', 'close', sessionId, '--format', 'json'],
@@ -752,11 +771,12 @@ This monitor fires on a schedule.
         'delivery to THIS session → via hook',
       );
       expect(result.stdout).toContain('no live session');
-      // A closed session is a real, live degradation (a transport is running
-      // with nobody to deliver to) rather than the ordinary idle "nothing has
-      // ever registered" case, so `delivery-verdict` must FAIL, not sit idle.
-      expect(result.stdout).toContain('✗ delivery-verdict');
-      expect(result.exitCode).toBe(1);
+      // A closed session is the ordinary "nothing is open right now" idle
+      // state, not a live degradation — 005 §15's exit-code contract, and the
+      // same treatment `lead-session`/`daemon-reachable` already give it.
+      expect(result.stdout).toContain('◇ delivery-verdict');
+      expect(result.stdout).not.toContain('✗ delivery-verdict');
+      expect(result.exitCode).toBe(0);
 
       const json = runWithEnv(
         ['doctor', '--workspace', fixture.dir, '--format', 'json'],
@@ -764,10 +784,92 @@ This monitor fires on a schedule.
         fixture.dir,
       );
       const payload = JSON.parse(json.stdout) as {
+        leadSession: boolean;
         deliveryWillReachThisSession: string;
         deliverable: boolean;
+        ok: boolean;
       };
+      expect(payload.leadSession).toBe(false);
       expect(payload.deliveryWillReachThisSession).toBe('none');
+      expect(payload.deliverable).toBe(false);
+      expect(payload.ok).toBe(true);
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+    }
+  }, 30_000);
+
+  // --- One of several active leads has no channel listener (issue #425
+  // review, round 5) --------------------------------------------------------
+  // Proving "at least one active lead has a matching channel heartbeat" is
+  // not the same as proving every one of them does. With two active leads and
+  // a channel heartbeat for only one, the prior selection reported a clean
+  // workspace-wide `deliverable: true` / channel-healthy verdict, silently
+  // hiding that the SECOND active lead has no channel listener whatsoever.
+  it('surfaces an active lead with no channel listener instead of a clean workspace-wide verdict', async () => {
+    const fixture = transportFixture('uncovered-lead');
+    const daemon = await startDaemon(
+      fixture.monitorsRoot,
+      fixture.dir,
+      fixture.env,
+      fixture.socketPath,
+    );
+    try {
+      const coveredHost = 'uncovered-lead-covered';
+      const uncoveredHost = 'uncovered-lead-uncovered';
+      const openedCovered = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          coveredHost,
+          '--workspace',
+          fixture.dir,
+          '--format',
+          'json',
+        ],
+        fixture.env,
+        fixture.dir,
+      );
+      expect(openedCovered.exitCode).toBe(0);
+      const openedUncovered = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          uncoveredHost,
+          '--workspace',
+          fixture.dir,
+          '--format',
+          'json',
+        ],
+        fixture.env,
+        fixture.dir,
+      );
+      expect(openedUncovered.exitCode).toBe(0);
+
+      // Only the first active lead gets a channel heartbeat; the second has
+      // none at all.
+      seedHeartbeat(fixture, 'channel', { hostSessionId: coveredHost });
+
+      const result = runWithEnv(
+        ['doctor', '--workspace', fixture.dir, '--format', 'json'],
+        fixture.env,
+        fixture.dir,
+      );
+      const payload = JSON.parse(result.stdout) as {
+        transports: {
+          name: string;
+          healthy: boolean;
+          problems: { code: string }[];
+        }[];
+        deliverable: boolean;
+      };
+      const channel = payload.transports.find((t) => t.name === 'channel');
+      expect(channel?.problems.map((p) => p.code)).toContain(
+        'channel-lead-uncovered',
+      );
+      expect(channel?.healthy).toBe(false);
       expect(payload.deliverable).toBe(false);
     } finally {
       daemon.stop();

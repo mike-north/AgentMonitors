@@ -1757,6 +1757,7 @@ transports** section above the checks, built from the transport heartbeats each 
 | `reminders-suppressed`            | Transports are up but reminders are **muted** by `coalesced-until-ack` (002 §9.2/§9.3)                                                     |
 | `heartbeat-stale`                 | A transport registered but its lease lapsed — presumed killed without cleanup                                                              |
 | `channel-session-unmatched`       | A channel server is running for this workspace but serves no ACTIVE lead session here — somebody else's listener                           |
+| `channel-lead-uncovered`          | At least one OTHER active lead session has no matching channel heartbeat at all, even though this one does                                 |
 | `version-skew`                    | Advisory: a long-lived transport is still serving an older CLI build than this one                                                         |
 | `channel-registration-unverified` | Advisory: the host never confirms channel registration; prove delivery end to end                                                          |
 | `delivery-diagnosis-unavailable`  | The daemon's suppression check itself failed for one or more lead sessions — **not** the same as "checked, nothing suppressed" (see below) |

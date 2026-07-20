@@ -1542,8 +1542,50 @@ heartbeat clobber another's and a reader judge the wrong session's binding.
    (`delivery-diagnosis-unavailable`, 005 §15) rather than silently treating a failed check the same
    as a check that ran and found nothing — the latter is exactly the false-green issue #425 review
    round 4 found.
+6. "One active lead is covered" is not "every active lead is covered", and "the representative record
+   is fine" is not "every matching record is fine" (issue #425 review, round 5) — see §12.5.
 
-### 12.5 What a heartbeat cannot prove
+### 12.5 Every active lead, not just one — and never a corrupt record (issue #425 review, round 5)
+
+A fifth review round found that "ACTIVE leads only" (round 3) still let a workspace-wide aggregate
+misreport per-session facts as a clean bill of health, and that a corrupt or forged record could win
+representative selection over a valid one:
+
+- **`hasLeadSession` must mean ACTIVE, consistently, everywhere.** `MonitorDoctorReport.leadSessions`
+  includes sessions a prior `session close` already marked `dormant` — durable records the store keeps,
+  not sessions with a live host process. `computeTransportHealth`'s own `leadHostSessionIds` input
+  (round 3) was already filtered to active sessions, but `doctor`'s OTHER gates (`lead-session`,
+  `daemon-reachable`'s idle/fail split, the per-monitor rollup, the JSON `leadSession` field, and the
+  delivery-diagnosis fetch) read the unfiltered `hasLeadSession`/`leadSessions` instead — so a closed
+  session's leftover, in-TTL heartbeat could read `deliveryWillReachThisSession: 'none'` while
+  `lead-session` still reported `pass` for the same run. The ACTIVE lead-session set must be derived
+  exactly once and threaded through every one of these consistently; a closed session is `idle`/exit 0
+  everywhere, the same as a workspace with no lead session ever registered.
+- **A channel record matching one active lead does not prove it matches all of them.** With two active
+  leads and a channel heartbeat for only one, "at least one active lead has a matching channel
+  heartbeat" is satisfied — the round-4 fix's own bar — while the SECOND active lead has no channel
+  listener whatsoever. `channel-lead-uncovered` (005 §15) names every active lead a channel record
+  exists for the workspace but not for that lead, and is blocking: it is unioned into the channel's
+  problems and, per below, excludes the channel from the listening method.
+- **A transport-owned blocking problem on ANY matched record — not just the representative one —
+  disqualifies the listening method.** A stale sibling session's `heartbeat-stale` (or the
+  `channel-lead-uncovered` problem above) is unioned into `problems` regardless of which record is
+  chosen as representative, but "is this transport the listening method" must derive from that SAME
+  union, not from the representative record's own staleness alone — otherwise a fresh, healthy
+  representative can mask a broken sibling and still report `deliveryWillReachThisSession: 'channel'`,
+  `deliverable: true`, and a verdict ending in "(healthy)".
+- **Representative selection is freshness-first, not problem-count-first, and both unparseable and
+  out-of-tolerance-future timestamps sort as oldest.** Round 4 picked the record with the MOST problems
+  as representative, specifically so a broken sibling would be shown rather than hidden — but an
+  unparseable `updatedAt` contributes its own `heartbeat-stale` problem, so that same rule could make a
+  CORRUPT record the representative even alongside a valid, current one, reporting `running: false` for
+  a transport that is actually up. Representative selection is now freshness-first (ties broken by
+  problem count), with a corrupt or implausibly-future timestamp — the same conservative direction
+  `isHeartbeatStale` already applies — sorting as oldest either way. Nothing is hidden by this: every
+  matching record's problems are still unioned into the transport's `problems` regardless of which one
+  is chosen as representative.
+
+### 12.6 What a heartbeat cannot prove
 
 During the channels research preview, Claude Code loads the plugin's channel MCP server as a _plain_
 MCP server unless the session was started with

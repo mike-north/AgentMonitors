@@ -226,6 +226,147 @@ describe('computeTransportHealth', () => {
     });
   });
 
+  describe('representative selection vs. problem aggregation (issue #425 review, round 5)', () => {
+    it('does not let a corrupt (unparseable) record become representative over a valid, current one', () => {
+      // Regression: representative selection previously ranked by problem
+      // count FIRST — an unparseable `updatedAt` contributes its own
+      // `heartbeat-stale` problem, so "most problems wins" made the CORRUPT
+      // record the representative even with a perfectly healthy, current
+      // record also present, reporting `running: false` for a transport that
+      // is actually up.
+      const health = computeTransportHealth(
+        input({
+          heartbeats: [
+            heartbeat('hook', {
+              updatedAt: 'not-a-real-timestamp',
+              pid: 999,
+            }),
+            heartbeat('hook', {
+              updatedAt: '2026-07-19T11:59:59.000Z',
+              pid: 111,
+            }),
+          ],
+        }),
+      );
+      const hook = find(health.transports, 'hook');
+      expect(hook.boundTo?.pid).toBe(111);
+      expect(hook.running).toBe(true);
+      // The corrupt record's problem still surfaces — it is not dropped,
+      // merely not chosen as representative.
+      expect(codesOf(hook)).toContain('heartbeat-stale');
+    });
+
+    it('does not let a far-future (corrupt-clock) record shadow a valid current listener', () => {
+      // Regression: representative selection compared raw `Date.parse`
+      // values, which rank a far-future timestamp as "freshest" even though
+      // `isHeartbeatStale` independently treats it as stale (clock skew or a
+      // forged record). A far-future record could therefore win representative
+      // selection over a genuinely current one purely because it LOOKS newer.
+      const farFuture = new Date(
+        NOW.getTime() + 10 * 60 * 60 * 1000,
+      ).toISOString();
+      const health = computeTransportHealth(
+        input({
+          leadHostSessionIds: [],
+          heartbeats: [
+            heartbeat('channel', {
+              hostSessionId: 'session-current',
+              updatedAt: '2026-07-19T11:59:59.000Z',
+              pid: 111,
+            }),
+            heartbeat('channel', {
+              hostSessionId: 'session-corrupt-clock',
+              updatedAt: farFuture,
+              pid: 999,
+            }),
+          ],
+        }),
+      );
+      const channel = find(health.transports, 'channel');
+      expect(channel.boundTo?.pid).toBe(111);
+      expect(channel.running).toBe(true);
+      expect(codesOf(channel)).toContain('heartbeat-stale');
+    });
+  });
+
+  describe('every active lead must be covered, not merely one (issue #425 review, round 5)', () => {
+    it('flags an active lead with no matching channel heartbeat instead of reporting a clean workspace-wide verdict', () => {
+      // Regression: "at least one active lead has a matching channel
+      // heartbeat" was previously treated as proof the channel is healthy
+      // workspace-wide. With two active leads and a channel heartbeat for
+      // only one, the second lead had no channel listener at all and nothing
+      // said so.
+      const health = computeTransportHealth(
+        input({
+          leadHostSessionIds: ['session-covered', 'session-uncovered'],
+          heartbeats: [
+            heartbeat('channel', { hostSessionId: 'session-covered' }),
+          ],
+        }),
+      );
+      const channel = find(health.transports, 'channel');
+      expect(codesOf(channel)).toContain('channel-lead-uncovered');
+      expect(
+        channel.problems.find(
+          (problem) => problem.code === 'channel-lead-uncovered',
+        )?.detail,
+      ).toContain('session-uncovered');
+      expect(channel.healthy).toBe(false);
+      // A partially-covered channel must not read as this session's clean
+      // listening method — the whole point is that ONE recipient is silently
+      // uncovered.
+      expect(health.deliveryWillReachThisSession).not.toBe('channel');
+      expect(health.deliverable).toBe(false);
+    });
+
+    it('reports no uncovered leads when every active lead has a matching channel heartbeat', () => {
+      const health = computeTransportHealth(
+        input({
+          leadHostSessionIds: ['session-a', 'session-b'],
+          heartbeats: [
+            heartbeat('channel', { hostSessionId: 'session-a' }),
+            heartbeat('channel', { hostSessionId: 'session-b' }),
+          ],
+        }),
+      );
+      const channel = find(health.transports, 'channel');
+      expect(codesOf(channel)).not.toContain('channel-lead-uncovered');
+    });
+  });
+
+  describe('a stale sibling must not hide behind a healthy representative (issue #425 review, round 5)', () => {
+    it('excludes the channel from the listening method when a matched active lead is stale, even though the representative is fresh', () => {
+      // Regression: `running` reflected only the representative (fresh)
+      // record, so a stale SIBLING session's `heartbeat-stale` problem
+      // (unioned into `problems`) made `channel.healthy` false but did not
+      // stop the channel from still being counted as the listening method —
+      // `deliveryWillReachThisSession` read `channel` and `deliverable` read
+      // `true`, a false green for the workspace as a whole.
+      const health = computeTransportHealth(
+        input({
+          leadHostSessionIds: ['session-fresh', 'session-stale'],
+          heartbeats: [
+            heartbeat('channel', {
+              hostSessionId: 'session-fresh',
+              updatedAt: '2026-07-19T11:59:59.000Z',
+            }),
+            heartbeat('channel', {
+              hostSessionId: 'session-stale',
+              updatedAt: new Date(NOW.getTime() - 60 * 60 * 1000).toISOString(),
+            }),
+          ],
+          // Only the channel is exercised here; hook stays out of the input
+          // so `reach`/`deliverable` reflect the channel alone.
+        }),
+      );
+      const channel = find(health.transports, 'channel');
+      expect(codesOf(channel)).toContain('heartbeat-stale');
+      expect(channel.healthy).toBe(false);
+      expect(health.deliveryWillReachThisSession).not.toBe('channel');
+      expect(health.deliverable).toBe(false);
+    });
+  });
+
   describe('no ACTIVE lead recipient (issue #425 review, round 3)', () => {
     // `hook` is keyed per WORKSPACE, not per session (`heartbeatKey`), so a
     // heartbeat left by a session that has since closed stays within its 24h

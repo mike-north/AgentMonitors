@@ -2,6 +2,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Command, Option } from 'commander';
 import type {
+  AgentSessionRecord,
   DoctorMonitorRollup,
   HookDeliveryDiagnosis,
   MonitorDoctorReport,
@@ -145,14 +146,27 @@ function rollupLine(
  * Build the ordered check sequence (criterion 1). The report supplies every
  * durable-state fact; `enabled` and `daemonRunning` are CLI-only inputs. Each
  * check drives the exit code: any `fail` makes doctor exit non-zero.
+ *
+ * `activeLeadSessions` is the workspace's lead sessions filtered to
+ * `status === 'active'` (issue #425 review, round 5) — `report.leadSessions`
+ * includes sessions a prior `session close` already marked `dormant`, and a
+ * dormant session is not a live recipient. Every check below that gates on
+ * "is an agent session currently open" must agree on that same active set, or
+ * a closed session reads as `pass`/`fail` on one check and `idle` on the
+ * sibling check that already accounts for it (`daemon-reachable` previously
+ * did; `lead-session`, the per-monitor rollup, and the JSON `leadSession`
+ * field did not, which is what let a closed session's dormant record cross
+ * the CLI boundary as if it were still live).
  */
 function buildChecks(
   report: MonitorDoctorReport,
+  activeLeadSessions: readonly AgentSessionRecord[],
   enabled: boolean,
   daemonRunning: boolean,
   socketPath: string,
   daemonErrorMessage?: string,
 ): DoctorCheck[] {
+  const hasActiveLeadSession = activeLeadSessions.length > 0;
   const checks: DoctorCheck[] = [];
 
   // 1. project enabled
@@ -247,7 +261,7 @@ function buildChecks(
           status: 'pass',
           detail: `Daemon is running (socket: ${socketPath}).`,
         }
-      : report.hasLeadSession
+      : hasActiveLeadSession
         ? {
             name: 'daemon-reachable',
             status: 'fail',
@@ -265,16 +279,16 @@ function buildChecks(
   // 5. lead session present for this workspace. Same `idle` treatment as
   // `daemon-reachable` above and for the same reason (issue #373).
   checks.push(
-    report.hasLeadSession
+    hasActiveLeadSession
       ? {
           name: 'lead-session',
           status: 'pass',
-          detail: `${String(report.leadSessions.length)} lead session(s) registered for this workspace.`,
+          detail: `${String(activeLeadSessions.length)} active lead session(s) registered for this workspace.`,
         }
       : {
           name: 'lead-session',
           status: 'idle',
-          detail: `No lead session is registered for workspace "${report.workspacePath}" (expected when no agent session is currently open).`,
+          detail: `No lead session is currently open for workspace "${report.workspacePath}" (expected when no agent session is currently open).`,
           remediation: leadSessionRemediation(report.workspacePath),
         },
   );
@@ -282,7 +296,7 @@ function buildChecks(
   // 6. per-monitor health (criterion 2 rollup embedded in each check line)
   for (const monitor of report.monitors) {
     const name = `monitor:${monitor.id}`;
-    const rollup = rollupLine(monitor, report.hasLeadSession);
+    const rollup = rollupLine(monitor, hasActiveLeadSession);
     if (!monitor.valid) {
       checks.push({
         name,
@@ -540,6 +554,7 @@ function renderText(
  */
 function toJson(
   report: MonitorDoctorReport,
+  hasActiveLeadSession: boolean,
   checks: DoctorCheck[],
   workspace: string,
   daemonRunning: boolean,
@@ -556,7 +571,11 @@ function toJson(
     workspace,
     monitorsDir: report.monitorsDir,
     daemon: { running: daemonRunning, socketPath },
-    leadSession: report.hasLeadSession,
+    // ACTIVE lead sessions only (issue #425 review, round 5): `report.leadSessions`
+    // includes sessions a prior `session close` already marked `dormant`, which
+    // is not a live recipient — see `buildChecks`'s doc comment for why every
+    // gate in this command must agree on the same active set.
+    leadSession: hasActiveLeadSession,
     // Delivery-transport health (issue #425). `deliveryWillReachThisSession`
     // names the listening METHOD; `deliverable` answers "will anything actually
     // arrive right now" — they differ precisely in the suppression case, which
@@ -644,16 +663,25 @@ interface DeliveryDiagnosisResult {
  * its session id in `unavailableSessionIds`, which the caller threads into
  * {@link computeTransportHealth} as an explicit, named advisory so `deliverable`
  * can never read `true` while the check was skipped.
+ *
+ * Takes the caller's ACTIVE lead sessions, not the whole report (issue #425
+ * review, round 5): `MonitorDoctorReport.leadSessions` includes sessions a
+ * prior `session close` already marked `dormant`, which have no live host
+ * process to answer for. Diagnosing a dormant session's suppression state
+ * either hangs the RPC on a session that will never respond or, worse,
+ * spuriously flags it `unavailable` and forces `deliverable: false` for a
+ * session nobody is asking about anymore — every caller must pass the same
+ * active set `buildChecks`/`computeTransportHealth` use.
  */
 // Exported for unit testing (doctor.test.ts) — not part of the CLI's public
 // surface, which is `doctorCommand` alone.
 export async function gatherDeliveryDiagnoses(
-  report: MonitorDoctorReport,
+  leadSessions: readonly AgentSessionRecord[],
   socketPath: string,
 ): Promise<DeliveryDiagnosisResult> {
   const diagnoses: HookDeliveryDiagnosis[] = [];
   const unavailableSessionIds = new Set<string>();
-  for (const session of report.leadSessions) {
+  for (const session of leadSessions) {
     for (const lifecycle of ['turn-interruptible', 'turn-idle'] as const) {
       try {
         diagnoses.push(
@@ -753,8 +781,24 @@ export const doctorCommand = new Command('doctor')
           );
         }
 
+        // ACTIVE leads only (issue #425 review, round 3, tightened round 5):
+        // `report.leadSessions` is every lead session ever registered for this
+        // workspace, including ones a prior `session.close` already marked
+        // `dormant`. A dormant session has no live host process to deliver
+        // to, so counting it let a merely-fresh heartbeat (its TTL had not
+        // yet lapsed, or a NEW session's hook already refreshed the
+        // per-workspace hook record) report `deliverable: true` for a
+        // recipient nothing can actually reach. Derived ONCE here and threaded
+        // through every check/diagnosis/JSON field that gates on "is a
+        // session currently open" — see `buildChecks`'s doc comment for why a
+        // second, independently-filtered copy is exactly the bug this fixes.
+        const activeLeadSessions = report.leadSessions.filter(
+          (session) => session.status === 'active',
+        );
+
         const checks = buildChecks(
           report,
+          activeLeadSessions,
           state.enabled,
           daemonRunning,
           socketPath,
@@ -767,24 +811,16 @@ export const doctorCommand = new Command('doctor')
         // fallback state cannot compute it. When it is unavailable the surface
         // reports the down daemon instead, which is the dominant problem anyway.
         const { diagnoses, unavailableSessionIds } = daemonRunning
-          ? await gatherDeliveryDiagnoses(report, socketPath)
+          ? await gatherDeliveryDiagnoses(activeLeadSessions, socketPath)
           : { diagnoses: [], unavailableSessionIds: [] };
         const health = computeTransportHealth({
           workspacePath: workspace,
           socketPath,
           daemonRunning,
           ...(daemonErrorMessage ? { daemonErrorMessage } : {}),
-          // ACTIVE leads only (issue #425 review, round 3): `leadSessions` is
-          // every lead session ever registered for this workspace, including
-          // ones a prior `session.close` already marked `dormant`. A dormant
-          // session has no live host process to deliver to, so counting its
-          // host session id here let a merely-fresh heartbeat (its TTL had not
-          // yet lapsed, or a NEW session's hook already refreshed the
-          // per-workspace hook record) report `deliverable: true` for a
-          // recipient nothing can actually reach.
-          leadHostSessionIds: report.leadSessions
-            .filter((session) => session.status === 'active')
-            .map((session) => session.hostSessionId),
+          leadHostSessionIds: activeLeadSessions.map(
+            (session) => session.hostSessionId,
+          ),
           heartbeats: readTransportHeartbeats(report.generatedAt),
           diagnoses,
           diagnosisUnavailableSessionIds: unavailableSessionIds,
@@ -799,12 +835,14 @@ export const doctorCommand = new Command('doctor')
           expectedDataRoot: resolveDataRoot(),
           now: report.generatedAt,
         });
-        checks.push(...transportChecks(health, report.hasLeadSession));
+        const hasActiveLeadSession = activeLeadSessions.length > 0;
+        checks.push(...transportChecks(health, hasActiveLeadSession));
 
         console.log(
           json
             ? toJson(
                 report,
+                hasActiveLeadSession,
                 checks,
                 workspace,
                 daemonRunning,

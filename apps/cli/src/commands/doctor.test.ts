@@ -1,7 +1,4 @@
-import type {
-  AgentSessionRecord,
-  MonitorDoctorReport,
-} from '@agentmonitors/core';
+import type { AgentSessionRecord } from '@agentmonitors/core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { diagnoseHookDeliveryClient } from '../runtime-client.js';
 import { gatherDeliveryDiagnoses } from './doctor.js';
@@ -17,6 +14,16 @@ import { gatherDeliveryDiagnoses } from './doctor.js';
  * green. This now surfaces as `unavailableSessionIds`, which `doctor` threads
  * into `computeTransportHealth` as an explicit advisory (transport-health.test.ts
  * covers the resulting verdict).
+ *
+ * Round 5: `gatherDeliveryDiagnoses` now takes the caller's lead-session list
+ * directly rather than the whole `MonitorDoctorReport` — the caller
+ * (`doctorCommand`) is responsible for filtering to ACTIVE sessions before
+ * calling in, the same active set used for `computeTransportHealth`'s
+ * `leadHostSessionIds` and every gate in `buildChecks`. Diagnosing a dormant
+ * session's suppression state would otherwise either hang the RPC on a
+ * session with no live host process to answer, or spuriously flag it
+ * unavailable and force `deliverable: false` for a session nobody is asking
+ * about anymore.
  *
  * @see ../../../docs/specs/006-agent-integration.md §12 (transport health)
  */
@@ -51,21 +58,6 @@ function leadSession(id: string): AgentSessionRecord {
   };
 }
 
-function report(sessions: AgentSessionRecord[]): MonitorDoctorReport {
-  return {
-    generatedAt: new Date('2026-07-19T12:00:00.000Z'),
-    monitorsDir: '/workspace/.claude/monitors',
-    workspacePath: '/workspace',
-    monitorsDirExists: true,
-    monitors: [],
-    invalidCount: 0,
-    duplicateIds: [],
-    parseErrors: [],
-    leadSessions: sessions,
-    hasLeadSession: sessions.length > 0,
-  };
-}
-
 const SOCKET = '/tmp/agentmonitors-doctor-test.sock';
 
 describe('gatherDeliveryDiagnoses', () => {
@@ -80,7 +72,7 @@ describe('gatherDeliveryDiagnoses', () => {
     );
 
     const result = await gatherDeliveryDiagnoses(
-      report([leadSession('session-a')]),
+      [leadSession('session-a')],
       SOCKET,
     );
 
@@ -104,7 +96,7 @@ describe('gatherDeliveryDiagnoses', () => {
     });
 
     const result = await gatherDeliveryDiagnoses(
-      report([leadSession('session-a')]),
+      [leadSession('session-a')],
       SOCKET,
     );
 
@@ -121,7 +113,7 @@ describe('gatherDeliveryDiagnoses', () => {
     );
 
     const result = await gatherDeliveryDiagnoses(
-      report([leadSession('session-a')]),
+      [leadSession('session-a')],
       SOCKET,
     );
 
@@ -130,7 +122,7 @@ describe('gatherDeliveryDiagnoses', () => {
   });
 
   it('returns no unavailable sessions when there are no lead sessions', async () => {
-    const result = await gatherDeliveryDiagnoses(report([]), SOCKET);
+    const result = await gatherDeliveryDiagnoses([], SOCKET);
     expect(result.diagnoses).toEqual([]);
     expect(result.unavailableSessionIds).toEqual([]);
   });
