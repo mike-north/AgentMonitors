@@ -174,6 +174,14 @@ function describeCadence(
 }
 const NORMAL_INBOX_PROMPT = 'AgentMon messages are available. Read the inbox.';
 const IDLE_INBOX_PROMPT = 'AgentMon has inbox updates ready for review.';
+/**
+ * Appended to a `turn-interruptible` high-urgency delivery's message when a
+ * normal-urgency reminder is ALSO due in the same call (issue #441 —
+ * cross-monitor coalescing). Reuses the exact {@link NORMAL_INBOX_PROMPT}
+ * wording so a session that greps for that string still finds it, just as
+ * one more line of the same message rather than a separate delivery.
+ */
+const COALESCED_NORMAL_SUFFIX = `\n\n${NORMAL_INBOX_PROMPT}`;
 
 function unreadDetailsCommand(sessionId: string): string {
   return `agentmonitors events list --session ${sessionId} --unread --format json`;
@@ -1956,6 +1964,21 @@ export class AgentMonitorRuntime {
           now.getTime() - event.createdAt.getTime() >=
           DEFAULT_HIGH_URGENCY_SETTLE_MS,
       );
+
+      // Cross-monitor coalescing window (issue #441): computed up front so a
+      // normal-urgency reminder that is ALSO due this call can be folded into
+      // a settled-high delivery below, instead of preempted to a SEPARATE,
+      // later turn-interruptible call. Two monitors watching overlapping
+      // state (e.g. a high-urgency label monitor and a normal-urgency
+      // review-queue monitor both firing off the same underlying change)
+      // previously interrupted the session twice for one action; this makes
+      // it one batch when both land in the same settle window. The guard
+      // itself (coalesced-until-ack, issue #333) is unchanged.
+      const normalPending = this.pendingForClaim(sessionId, 'normal');
+      const normalReminderDue =
+        normalPending.length > 0 &&
+        normalPending.length === unreadNormal.length;
+
       if (settledHigh.length > 0) {
         // Per-recipient `net` collapse (G10 PR-B, 002 §1.1.7): deliver only the
         // newest event per object for a `net` monitor; the older intermediates
@@ -2001,9 +2024,24 @@ export class AgentMonitorRuntime {
           sessionId,
           surfacedIds,
         );
+        const highMessage = summarizeEvents(
+          surfacedHigh.map((event) => ({
+            title: event.title,
+            summary: recipientSummary(event, digests),
+          })),
+        );
+        // Coalesce a due normal reminder into THIS delivery (see the
+        // `normalReminderDue` comment above). The `events` array still
+        // carries only the high-urgency summaries — each retains its own
+        // `urgency: 'high'` (never downgraded) and the normal events stay
+        // undetailed exactly as a pure normal reminder would render them
+        // (never escalated into full event summaries) — only the batch's
+        // candidate set and message grow to include the coalesced reminder.
         return {
           sessionId,
-          candidates: surfacedCandidates,
+          candidates: normalReminderDue
+            ? [...surfacedCandidates, ...normalPending]
+            : surfacedCandidates,
           isRecap: false,
           claim: {
             sessionId,
@@ -2011,12 +2049,9 @@ export class AgentMonitorRuntime {
             mode: 'delivery',
             urgency: 'high',
             unreadCounts: sessionUnreadCounts,
-            message: summarizeEvents(
-              surfacedHigh.map((event) => ({
-                title: event.title,
-                summary: recipientSummary(event, digests),
-              })),
-            ),
+            message: normalReminderDue
+              ? `${highMessage}${COALESCED_NORMAL_SUFFIX}`
+              : highMessage,
             events: surfacedHigh.map((event) =>
               toDeliveryEventSummary(event, digests, perRecipientDiffs),
             ),
@@ -2024,11 +2059,7 @@ export class AgentMonitorRuntime {
         };
       }
 
-      const normalPending = this.pendingForClaim(sessionId, 'normal');
-      if (
-        normalPending.length > 0 &&
-        normalPending.length === unreadNormal.length
-      ) {
+      if (normalReminderDue) {
         return {
           sessionId,
           candidates: normalPending,

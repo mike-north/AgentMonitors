@@ -1285,6 +1285,50 @@ Each element of the `events` array is a `DeliveryEventSummary` which carries: `e
 
 Verified: `libs/core/src/runtime/service.ts` — `claimDelivery()` turn-interruptible high branch: `settledHigh` filters by age, payload includes `summarizeEvents(...)` and a full `events` array with `body: event.body` and the recipient-specific `diffText` (`perRecipientDiffsForSession`, falling back to `MonitorEventRecord.diffText`).
 
+#### 9.1.1 Cross-monitor coalescing window (issue #441)
+
+> **Status: current** (issue #441). Two monitors watching overlapping state — e.g. a high-urgency
+> label monitor and a normal-urgency review-queue monitor both firing off the same underlying
+> change — previously interrupted a session TWICE for one action: a settled-high delivery in one
+> `turn-interruptible` call, then, once the high events were claimed, a SEPARATE normal-reminder
+> delivery in a later call (the two branches below returned from the same decision function, but
+> the high branch always returned early, leaving the normal reminder for the next call).
+
+When a settled high-urgency batch (§9.1) is due **and** a normal-urgency reminder (§9.2) is
+simultaneously due in the SAME `claimDelivery`/`reserveDelivery` decision, the runtime **MUST**
+fold both into ONE `DeliveryClaim` rather than returning the high batch and deferring the normal
+reminder to a later call:
+
+- The claim's `events` array is unchanged from a pure high-urgency delivery — it still carries only
+  the settled high-urgency `DeliveryEventSummary` entries (§9.1). A normal reminder never gains
+  per-event detail from being coalesced; it stays a generic prompt appended to the message, exactly
+  as it would render on its own (§9.2).
+- The claim's `message` is the high-urgency summary (`summarizeEvents(...)`) followed by the normal
+  reminder text (`NORMAL_INBOX_PROMPT`) on its own line — one message, one channel tag / hook
+  injection, listing both.
+- The claim's top-level `urgency` **MUST** remain `'high'` — the most urgent band present in the
+  batch. Coalescing **MUST NOT** downgrade the reported urgency because a lower-urgency reminder
+  rode along, and **MUST NOT** escalate the normal reminder's own semantics (its events are not
+  surfaced as high-urgency `DeliveryEventSummary` entries, and its own `urgency` field, where it
+  appears at all, is never rewritten). This composes with issue #451's snapshot-at-materialization
+  contract: coalescing decides only WHEN two already-materialized bands are delivered together,
+  never re-derives an event's own urgency or body.
+- Both the surfaced high-urgency events and the coalesced normal-urgency events are marked claimed
+  in the SAME `applyDelivery` call, so a subsequent `claimDelivery` call does not re-deliver the
+  normal reminder as a second interrupt for the same action.
+- The `normalPending.length === unreadNormal.length` coalesced-until-ack guard (§9.2) is unchanged
+  and still gates whether a normal reminder is due at all; this section only changes WHERE a due
+  normal reminder is delivered (folded into a concurrent high delivery) when both are due together.
+- **Scope note:** this coalescing is specific to `turn-interruptible` (high + normal). Low-urgency
+  reminders fire at the separate `turn-idle` lifecycle (§9.3) and are not folded in — a lifecycle
+  boundary, not a settle-window artifact, separates them, so there is no equivalent "same call"
+  moment to coalesce across. Two monitors that both materialize `high`-urgency events for the
+  session are already coalesced by §9.1 (`settledHigh` pools ALL pending high events for the
+  session regardless of which monitor produced them) — this section closes the remaining gap: high
+  coalescing WITH a concurrently-due normal reminder.
+
+Verified: `libs/core/src/runtime/service.ts` — `decideDelivery()`'s `turn-interruptible` branch computes `normalReminderDue` before the settled-high branch and, when both are due, folds `normalPending` into the high branch's `candidates` and appends `COALESCED_NORMAL_SUFFIX` to the returned claim's `message`, while the claim's `events` and `urgency: 'high'` are unchanged from a pure high delivery. Proven by the "coalesces a due normal-urgency reminder into the same turn-interruptible delivery as a settled high-urgency batch (issue #441 cross-monitor coalescing)" and "does not escalate a normal-only reminder to high when no high-urgency event is pending (issue #441 urgency-mixing guard)" cases in `libs/core/src/runtime/service.test.ts`.
+
 ### 9.2 Normal urgency
 
 At `turn-interruptible`, normal-urgency events are delivered as a generic inbox reminder (`NORMAL_INBOX_PROMPT = 'AgentMon messages are available. Read the inbox.'`) only if all unread normal-urgency events are still unclaimed. This coalesces multiple normal events into one reminder until the session acknowledges them. The `events` array is empty in this case.

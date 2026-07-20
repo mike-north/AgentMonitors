@@ -260,6 +260,151 @@ Handle it.
     expect(hookState.unread.high).toBe(1);
   });
 
+  // Issue #441: two monitors watching overlapping state (e.g. a high-urgency
+  // label monitor and a normal-urgency review-queue monitor both firing off
+  // the same underlying change) previously interrupted the session TWICE for
+  // one action — a settled-high delivery in one turn-interruptible call, then
+  // (once the high events were claimed) a separate normal-reminder delivery
+  // in a LATER call. This proves the fix: both are due in the SAME
+  // settle-window call and now surface as ONE delivery.
+  it('coalesces a due normal-urgency reminder into the same turn-interruptible delivery as a settled high-urgency batch (issue #441 cross-monitor coalescing)', () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const db = createDb(':memory:');
+    const runtime = new AgentMonitorRuntime(
+      new RuntimeStore(db),
+      new SourceRegistry(),
+      [claudeCodeAdapter],
+    );
+
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-session-coalesce',
+        workspacePath: rootDir,
+      }),
+    );
+
+    const store = new RuntimeStore(db);
+    // Two DIFFERENT monitors, mirroring the dogfooded #441 scenario: a
+    // high-urgency "merge-queue" monitor and a normal-urgency
+    // "pr-review-queue" monitor, both firing for the same underlying PR
+    // action and both materializing within the same settle window.
+    store.insertEvent({
+      workspacePath: rootDir,
+      monitorId: 'merge-queue',
+      sourceName: 'manual',
+      urgency: 'high',
+      title: 'PR #123 ready to merge',
+      body: 'Merge PR #123.',
+      summary: 'PR #123 ready to merge',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey: 'pr/123',
+      queryScope: {},
+      tags: ['pr'],
+      // Aged past the 15s high-urgency settle window, same as the sibling
+      // "claims high-urgency deliveries" test above.
+      createdAt: new Date(Date.now() - 20_000),
+    });
+    store.insertEvent({
+      workspacePath: rootDir,
+      monitorId: 'pr-review-queue',
+      sourceName: 'manual',
+      urgency: 'normal',
+      title: 'PR #123 needs review',
+      body: 'Review PR #123.',
+      summary: 'PR #123 needs review',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey: 'pr/123',
+      queryScope: {},
+      tags: ['pr'],
+      createdAt: new Date(Date.now() - 5_000),
+    });
+
+    const claim = runtime.claimDelivery(session.id, 'turn-interruptible');
+
+    // ONE claim covering both monitors' events, not the first of two.
+    expect(claim?.mode).toBe('delivery');
+    // The batch's top-level urgency is never downgraded by the coalesced
+    // normal event — it stays 'high', the most urgent band present.
+    expect(claim?.urgency).toBe('high');
+    // Per 002 §9.2, a normal reminder still carries no per-event detail —
+    // coalescing folds its TEXT into the message, it does not escalate the
+    // normal event into a full DeliveryEventSummary.
+    expect(claim?.events).toHaveLength(1);
+    expect(claim?.events[0]?.monitorId).toBe('merge-queue');
+    // Each surfaced event keeps its OWN authored urgency — not corrupted by
+    // being batched with a different band.
+    expect(claim?.events[0]?.urgency).toBe('high');
+    expect(claim?.message).toContain('PR #123 ready to merge');
+    expect(claim?.message).toContain(
+      'AgentMon messages are available. Read the inbox.',
+    );
+
+    // The real proof this is a REDUCTION, not just a relabeling: a second
+    // turn-interruptible claim immediately after returns NOTHING — both the
+    // high event and the normal reminder were claimed together in the first
+    // call, so there is no leftover second interrupt for the same action.
+    expect(runtime.claimDelivery(session.id, 'turn-interruptible')).toBeNull();
+
+    const hookState = JSON.parse(readFileSync(session.hookStatePath, 'utf-8'));
+    expect(hookState.unread.high).toBe(1);
+    expect(hookState.unread.normal).toBe(1);
+  });
+
+  // Issue #441: the coalescing window must not corrupt urgency bands in
+  // either direction. A pure normal-only delivery (no high event pending)
+  // must still surface as 'normal', never escalated by the coalescing change.
+  it('does not escalate a normal-only reminder to high when no high-urgency event is pending (issue #441 urgency-mixing guard)', () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const db = createDb(':memory:');
+    const runtime = new AgentMonitorRuntime(
+      new RuntimeStore(db),
+      new SourceRegistry(),
+      [claudeCodeAdapter],
+    );
+
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-session-normal-only',
+        workspacePath: rootDir,
+      }),
+    );
+
+    const store = new RuntimeStore(db);
+    store.insertEvent({
+      workspacePath: rootDir,
+      monitorId: 'pr-review-queue',
+      sourceName: 'manual',
+      urgency: 'normal',
+      title: 'PR #123 needs review',
+      body: 'Review PR #123.',
+      summary: 'PR #123 needs review',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey: 'pr/123',
+      queryScope: {},
+      tags: ['pr'],
+      createdAt: new Date(Date.now() - 5_000),
+    });
+
+    const claim = runtime.claimDelivery(session.id, 'turn-interruptible');
+    expect(claim?.mode).toBe('delivery');
+    expect(claim?.urgency).toBe('normal');
+    expect(claim?.events).toHaveLength(0);
+    expect(claim?.message).toBe(
+      'AgentMon messages are available. Read the inbox.',
+    );
+  });
+
   // Issue #407: `verify --use-workspace-daemon` must retract the events its own
   // scratch file produced against the persistent workspace daemon (a create AND
   // a delete), so a later session never sees them. The retraction removes ONE
