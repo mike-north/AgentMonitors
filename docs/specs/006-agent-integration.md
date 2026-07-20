@@ -1467,6 +1467,15 @@ daemon's outage, the same class of mis-attribution the daemon-unreachable/transp
 
 ### 12.2 Leases, not just timestamps
 
+**Reaping is a WRITE-path responsibility, never a read.** An expired record is removed only when a
+transport writes its own heartbeat — a live process re-registering, which is the genuine
+reconciliation event. Reads never mutate the registry. Folding GC into the read made the health
+surface destroy the evidence of the failure it had just reported: the first `doctor` reported a
+stale channel and exited non-zero, and the second — with the same active lead, the same daemon, and
+nothing recovered — found no record, took the "no transport has ever reported in" branch, and exited 0. A dead server appeared fixed purely because somebody looked at it, and `doctor` mutated state,
+which 005 §15 says it never does. A lapsed transport therefore keeps reporting its failure on every
+health check until something actually re-registers.
+
 Every record carries an explicit `ttlMs` alongside `updatedAt`. A server killed without cleanup
 (SIGKILL, host crash) leaves its file behind, so a reader must be able to judge the record dead
 **without trusting the writer to have removed it**. Expressing the bound as an owner-declared TTL

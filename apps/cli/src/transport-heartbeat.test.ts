@@ -19,6 +19,7 @@ import {
   isHeartbeatStale,
   isTransportHeartbeat,
   readTransportHeartbeats,
+  reapExpiredHeartbeats,
   removeTransportHeartbeat,
   transportRegistryDir,
   writeTransportHeartbeat,
@@ -470,16 +471,20 @@ describe('opportunistic registry GC (issue #425 review)', () => {
     // Well past the 30s lease — simulates an uncleanly-killed process (SIGKILL,
     // host crash) that never called `removeTransportHeartbeat`.
     const readAt = new Date('2026-07-19T12:00:00.000Z');
-    const firstRead = readTransportHeartbeats(readAt);
-    // Still returned on the read that observed it stale: this pass's caller
-    // gets an accurate "it was stale" finding, not a silent absence.
-    expect(firstRead).toHaveLength(1);
-    expect(firstRead[0]?.hostSessionId).toBe('host-1');
 
-    // But the backing file is gone: the NEXT read sees a clean absence
-    // instead of the same dead record forever (the bug: doctor turned
-    // permanently red for one uncleanly-killed channel server).
-    expect(readTransportHeartbeats(readAt)).toHaveLength(0);
+    // A READ NEVER REAPS (issue #425 review). Repeated reads keep returning
+    // the dead record, so a lapsed transport keeps reporting the failure on
+    // every health check instead of the diagnostic erasing its own evidence.
+    for (const pass of [1, 2, 3]) {
+      const records = readTransportHeartbeats();
+      expect(records, `read #${String(pass)}`).toHaveLength(1);
+      expect(records[0]?.hostSessionId).toBe('host-1');
+    }
+
+    // Only the WRITE path reaps — a live process re-registering is the real
+    // reconciliation event, not a bystander looking at the registry.
+    reapExpiredHeartbeats(readAt);
+    expect(readTransportHeartbeats()).toHaveLength(0);
   });
 
   it('does not reap a record that is still within its lease', () => {
@@ -492,8 +497,10 @@ describe('opportunistic registry GC (issue #425 review)', () => {
     });
 
     const soonAfter = new Date('2026-07-19T11:00:05.000Z');
-    expect(readTransportHeartbeats(soonAfter)).toHaveLength(1);
-    expect(readTransportHeartbeats(soonAfter)).toHaveLength(1);
+    reapExpiredHeartbeats(soonAfter);
+    expect(readTransportHeartbeats()).toHaveLength(1);
+    reapExpiredHeartbeats(soonAfter);
+    expect(readTransportHeartbeats()).toHaveLength(1);
   });
 
   it('also reaps opportunistically on a write, not only a read', () => {

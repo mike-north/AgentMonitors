@@ -456,6 +456,52 @@ This monitor fires on a schedule.
     }
   }, 30_000);
 
+  // --- Regression: a lapsed transport must stay reported across runs --------
+  it('keeps reporting a lapsed transport on a SECOND doctor run (the diagnostic must not erase its own evidence)', async () => {
+    // Reaping expired records from the READ path made `doctor` destroy the
+    // proof of the failure it had just reported (issue #425 review): the first
+    // run said `[heartbeat-stale]` and exited 1, and the second — same active
+    // lead, same daemon, nothing recovered — found no record, took the "no
+    // transport has ever reported in" branch and exited 0. A dead channel
+    // server looked fixed purely because somebody had looked at it. It also
+    // made `doctor` mutate state, which 005 §15 says it never does.
+    const fixture = transportFixture('stale-persists');
+    const daemon = await startDaemon(
+      fixture.monitorsRoot,
+      fixture.dir,
+      fixture.env,
+      fixture.socketPath,
+    );
+    try {
+      openLeadSession(fixture);
+      seedHeartbeat(fixture, 'channel', {
+        updatedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+      });
+
+      // Three consecutive invocations: the verdict must be identical every
+      // time, because nothing about the world changed between them.
+      for (const pass of [1, 2, 3]) {
+        const result = runWithEnv(
+          ['doctor', '--workspace', fixture.dir],
+          fixture.env,
+          fixture.dir,
+        );
+        expect(result.stdout, `run #${String(pass)}`).toContain(
+          '[heartbeat-stale]',
+        );
+        expect(result.stdout, `run #${String(pass)}`).toContain(
+          'channel: stale',
+        );
+        expect(result.stdout, `run #${String(pass)}`).not.toContain(
+          'channel: not reporting',
+        );
+      }
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+    }
+  }, 30_000);
+
   // --- Negative control: no transport has reported in -----------------------
   it('reports "via none" without inventing a failure when nothing has registered', () => {
     const fixture = transportFixture('none');

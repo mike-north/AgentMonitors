@@ -821,7 +821,11 @@ export const doctorCommand = new Command('doctor')
           leadHostSessionIds: activeLeadSessions.map(
             (session) => session.hostSessionId,
           ),
-          heartbeats: readTransportHeartbeats(report.generatedAt),
+          // A PURE read (issue #425 review): `doctor` never reaps. Reaping
+          // here let the diagnostic erase its own evidence — a second run
+          // found no record and exited 0 with nothing actually recovered —
+          // and contradicted 005 §15's "diagnoses only, never mutates".
+          heartbeats: readTransportHeartbeats(),
           diagnoses,
           diagnosisUnavailableSessionIds: unavailableSessionIds,
           cliVersion: getCliVersion(),

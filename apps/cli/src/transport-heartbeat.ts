@@ -346,7 +346,7 @@ export function writeTransportHeartbeat(
   // leave them sitting until the next `doctor` run. Best-effort: a failed scan
   // here must not turn "write my own heartbeat" into a thrown error.
   try {
-    readTransportHeartbeats(now);
+    reapExpiredHeartbeats(now);
   } catch {
     // Never throws (see the function doc above).
   }
@@ -435,7 +435,7 @@ export function isTransportHeartbeat(
  * `now` (as most tests that only care about the current record set do) skips
  * GC entirely — a plain read, no side effects.
  */
-export function readTransportHeartbeats(now?: Date): TransportHeartbeat[] {
+export function readTransportHeartbeats(): TransportHeartbeat[] {
   let names: string[];
   try {
     names = readdirSync(transportRegistryDir());
@@ -445,23 +445,66 @@ export function readTransportHeartbeats(now?: Date): TransportHeartbeat[] {
   const records: TransportHeartbeat[] = [];
   for (const name of names) {
     if (!name.endsWith('.json')) continue;
-    const filePath = path.join(transportRegistryDir(), name);
     try {
-      const parsed: unknown = JSON.parse(readFileSync(filePath, 'utf-8'));
+      const parsed: unknown = JSON.parse(
+        readFileSync(path.join(transportRegistryDir(), name), 'utf-8'),
+      );
       if (
         isTransportHeartbeat(parsed) &&
         parsed.schemaVersion === TRANSPORT_HEARTBEAT_SCHEMA_VERSION
       ) {
         records.push(parsed);
-        if (now !== undefined && isHeartbeatStale(parsed, now)) {
-          rmSync(filePath, { force: true });
-        }
       }
     } catch {
       continue;
     }
   }
   return records;
+}
+
+/**
+ * Reap records whose lease expired as of `now`. **Write path only.**
+ *
+ * Deliberately NOT folded into {@link readTransportHeartbeats} (issue #425
+ * review). Reaping during a read made the diagnostic destroy its own evidence:
+ * the first `agentmonitors doctor` reported `[heartbeat-stale]` and exited 1,
+ * and the second — with the lead session and daemon completely unchanged, and
+ * nothing recovered — found no record at all, took the "no transport has ever
+ * reported in" branch, and exited 0. A dead channel server looked fixed purely
+ * because someone had looked at it. It also made `doctor` mutate state, which
+ * 005 §15 explicitly says it never does.
+ *
+ * A stale record is therefore durable: it keeps reporting the failure on every
+ * health check until a transport actually WRITES again, which is the real
+ * reconciliation event — a live process re-registering — rather than a
+ * bystander's read.
+ *
+ * Never throws: reaping is best-effort housekeeping and must not turn "write my
+ * own heartbeat" into a failure.
+ */
+export function reapExpiredHeartbeats(now: Date): void {
+  let names: string[];
+  try {
+    names = readdirSync(transportRegistryDir());
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue;
+    const filePath = path.join(transportRegistryDir(), name);
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(filePath, 'utf-8'));
+      if (
+        isTransportHeartbeat(parsed) &&
+        parsed.schemaVersion === TRANSPORT_HEARTBEAT_SCHEMA_VERSION &&
+        isHeartbeatStale(parsed, now)
+      ) {
+        rmSync(filePath, { force: true });
+      }
+    } catch {
+      continue;
+    }
+  }
 }
 
 /**
