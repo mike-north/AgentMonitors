@@ -1392,6 +1392,7 @@ When the document changes, act on it.
     /** A `fetch` mock streaming the given chunks with no `Content-Length` header. */
     function mockStreamingChunks(
       chunks: Uint8Array[],
+      onCancel?: () => void,
     ): ReturnType<typeof vi.fn> {
       return vi.fn(() => {
         let index = 0;
@@ -1410,6 +1411,10 @@ When the document changes, act on it.
               },
               releaseLock: () => {
                 // no-op
+              },
+              cancel: () => {
+                onCancel?.();
+                return Promise.resolve();
               },
             }),
           },
@@ -1686,6 +1691,29 @@ When the document changes, act on it.
             { now: new Date() },
           ),
         ).rejects.toThrow(/exceeding the .*-byte cap/);
+      });
+
+      it('cancels the locked reader when the streamed cap is exceeded', async () => {
+        // Copilot review (issue #304): the streamed-oversize branch aborts the
+        // controller but previously left the reader itself un-cancelled,
+        // asymmetric with the declared-Content-Length path's
+        // `response.body?.cancel()`. Assert the reader is released too.
+        const chunk = new Uint8Array(6 * 1024 * 1024);
+        let cancelled = false;
+        vi.stubGlobal(
+          'fetch',
+          mockStreamingChunks([chunk, chunk], () => {
+            cancelled = true;
+          }),
+        );
+
+        await expect(
+          source.observe(
+            { url: 'https://api.example.com/huge-chunked' },
+            { now: new Date() },
+          ),
+        ).rejects.toThrow(/exceeding the .*-byte cap/);
+        expect(cancelled).toBe(true);
       });
 
       it('a body within the cap is read normally', async () => {

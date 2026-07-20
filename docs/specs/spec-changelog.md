@@ -164,6 +164,7 @@ poll-until-`daemonAvailable` loop with slightly different timeout/poll constants
 (`daemon-ipc.ts`); each call site keeps its own pre-existing timeout/poll values — no behavior change.
 
 Finding 5 (test teardown pid fallback) is test-infrastructure-only, no spec change.
+
 ## 2026-07-19 — Composite part-count/part-`id` caps, rendered-artifact byte budget (003 §4.9, 004 §3.2) — Refs #304
 
 Third round of review follow-ups on the #304 bounds, in the same PR before merge.
@@ -200,7 +201,6 @@ timeout`; at the new 50-part cap and the default 30s timeout, that ceiling is `c
 `plugins/source-api-poll/src/index.test.ts`, "composite cumulative byte budget (issue #304 review,
 second + third round)", "composite part-count and part-id bounds (issue #304 review, third
 round)".)
-
 
 ## 2026-07-19 — Composite cumulative byte budget, `timeout` non-string/leading-zero/overflow validation (003 §4.1/§4.9, 004 §3.2) — Refs #304
 
@@ -246,7 +246,6 @@ second round)"; `libs/core/src/notify/notifier.ts`, `parseOperationTimeoutMs`,
 `MAX_OPERATION_TIMEOUT_MS`; `libs/core/src/notify/notifier.test.ts`;
 `plugins/source-command-poll/src/schema-parity.test.ts`.)
 
-
 ## 2026-07-19 — `api-poll`/`command-poll` timeout hardening and composite fail-fast fix (003 §4.9/§11.1) — Refs #304
 
 Follow-up review fixes on top of the #304 bounds below, in the same PR before merge.
@@ -291,7 +290,6 @@ Follow-up review fixes on top of the #304 bounds below, in the same PR before me
 `plugins/source-api-poll/src/index.test.ts`; `plugins/source-api-poll/src/map-with-concurrency.test.ts`;
 `plugins/source-command-poll/src/index.ts`; `plugins/source-command-poll/src/schema-parity.test.ts`.)
 
-
 ## 2026-07-19 — `api-poll` bounds request duration, response size, and composite concurrency (003 §4.9) — Refs #304
 
 Fixes a P1 daemon-availability defect: `api-poll` could wait forever on a stalled connection or
@@ -313,7 +311,6 @@ memory.
   behavior. This is deliberately unlike `command-poll`'s stdout cap (§11.2), which truncates and
   still treats the capped output as a valid result — a stalled/incomplete HTTP body is not a
   meaningful baseline the way capped command output is.
-
 
 ## 2026-07-19 — `verify`'s materialize/deliver stages carry a fresh deadline past a late observe resolution instead of inheriting an already-expired one (005 §16 step 6, Budget) — Refs #442
 

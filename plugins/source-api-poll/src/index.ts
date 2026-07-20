@@ -518,6 +518,16 @@ async function readBoundedBody(
       total += value.byteLength;
       if (total > MAX_RESPONSE_BYTES) {
         controller.abort();
+        try {
+          // Best-effort release of the locked reader, mirroring
+          // `abortAndReleaseBody`'s `response.body?.cancel()` on the
+          // declared-Content-Length path — keeps both oversize paths
+          // symmetric rather than relying on `controller.abort()` alone to
+          // eventually free the connection.
+          await reader.cancel();
+        } catch {
+          // Best-effort release; see comment above.
+        }
         oversizeRejection = new Error(
           oversizeMessage(url, `streamed ${String(total)} bytes`),
         );
