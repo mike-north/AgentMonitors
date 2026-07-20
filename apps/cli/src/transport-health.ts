@@ -81,7 +81,15 @@ export type TransportProblemCode =
    * could be silently active. `deliverable` must not read `true` while this is
    * present (issue #425 review, round 4).
    */
-  | 'delivery-diagnosis-unavailable';
+  | 'delivery-diagnosis-unavailable'
+  /**
+   * A channel heartbeat exists for this workspace, but it belongs to no ACTIVE
+   * lead session — another session's server, a non-lead session's, or one whose
+   * session has since ended. The record is still shown (the reader needs to know
+   * a server is there), but it can never count as this session's listening
+   * method.
+   */
+  | 'channel-session-unmatched';
 
 /**
  * Problems that belong to the delivery pipeline as a whole rather than to one
@@ -392,61 +400,119 @@ function diagnosisUnavailableProblems(
  * re-resolve on every prompt and self-heal with no action needed. So `hook`
  * always matches by workspace only; only `channel` tries session id first.
  */
-function selectHeartbeat(
+/**
+ * NaN-safe freshness key for ordering heartbeats.
+ *
+ * The registry is untrusted input and `isTransportHeartbeat` only proves
+ * `updatedAt` is a *string*, so an unparseable value is reachable. `Date.parse`
+ * then yields `NaN`, every comparison involving it is `false`, and the
+ * resulting inconsistent comparator can leave a corrupt record ahead of a valid
+ * newer one — hiding the record that actually describes the live transport.
+ * Unparseable sorts as oldest instead, so a valid record always wins when one
+ * exists (a corrupt record still surfaces if it is all we have, and
+ * `isHeartbeatStale` independently treats it as stale).
+ */
+function freshness(heartbeat: TransportHeartbeat): number {
+  const parsed = Date.parse(heartbeat.updatedAt);
+  return Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed;
+}
+
+/**
+ * Every heartbeat that describes the transport serving THIS diagnosis, freshest
+ * first. Returns all of them, not one: collapsing to a single record is how a
+ * broken session hides behind a healthy sibling (see {@link buildTransport}).
+ *
+ * The fallback rule is transport-SPECIFIC, and getting it wrong produces the
+ * worst possible output — a false clean bill of health:
+ *
+ * - The **channel** is session-scoped (one long-lived server per host session),
+ *   so "no record matches a lead session of this workspace" means no channel is
+ *   serving the sessions being diagnosed, full stop. Falling back to any
+ *   same-workspace channel record would adopt a server belonging to a DIFFERENT
+ *   (or non-lead, or already-ended) session and report it as this session's
+ *   healthy, deliverable transport — and would do so even when the workspace
+ *   has no lead sessions at all.
+ * - The **hook** transport has no per-session identity by construction (a fresh
+ *   process per prompt, keyed per workspace), so the workspace-keyed record IS
+ *   its identity and the workspace match is correct there — and only there.
+ */
+function selectHeartbeats(
   transport: TransportName,
   input: TransportHealthInput,
-): TransportHeartbeat | undefined {
+): TransportHeartbeat[] {
   const candidates = input.heartbeats.filter(
     (heartbeat) => heartbeat.transport === transport,
   );
-  const byWorkspace = candidates.filter(
+  const sameWorkspace = candidates.filter(
     (heartbeat) =>
       path.resolve(heartbeat.workspacePath) ===
       path.resolve(input.workspacePath),
   );
-  const pool =
-    transport === 'channel'
-      ? (() => {
-          const sessionMatches = candidates.filter(
-            (heartbeat) =>
-              heartbeat.hostSessionId !== undefined &&
-              input.leadHostSessionIds.includes(heartbeat.hostSessionId),
-          );
-          return sessionMatches.length > 0 ? sessionMatches : byWorkspace;
-        })()
-      : byWorkspace;
-  // Most recently refreshed wins: with several sessions in one workspace, the
-  // freshest record is the one whose health a user is actually asking about.
-  return [...pool].sort(
-    (a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt),
-  )[0];
-}
-
-function buildTransport(
-  transport: TransportName,
-  input: TransportHealthInput,
-  sharedProblems: readonly TransportProblem[],
-): TransportStatus {
-  const heartbeat = selectHeartbeat(transport, input);
-  if (!heartbeat) {
-    return {
-      name: transport,
-      configured: false,
-      running: false,
-      healthy: false,
-      lastDelivery: null,
-      problems: [],
-    };
+  if (transport !== 'channel') {
+    return [...sameWorkspace].sort((a, b) => freshness(b) - freshness(a));
   }
 
+  const sessionMatches = candidates.filter(
+    (heartbeat) =>
+      heartbeat.hostSessionId !== undefined &&
+      input.leadHostSessionIds.includes(heartbeat.hostSessionId),
+  );
+  // No session match: still SHOW any same-workspace channel record — a reader
+  // diagnosing silence needs to know a server is running — but mark it
+  // unmatched so it can never be counted as this session's listening method.
+  // Hiding it entirely would lose a real fact; counting it would be the false
+  // clean bill of health.
+  const pool = sessionMatches.length > 0 ? sessionMatches : sameWorkspace;
+  return [...pool].sort((a, b) => freshness(b) - freshness(a));
+}
+
+/**
+ * Every problem a SINGLE heartbeat record exhibits.
+ *
+ * Extracted so {@link buildTransport} can evaluate every matching record rather
+ * than only a representative one — with several lead sessions, a broken
+ * session's problems must survive alongside a healthy sibling's rather than
+ * being replaced by them (issue #425 review).
+ *
+ * Channel problems are prefixed with the host session id they belong to: once
+ * several sessions can contribute, "the channel is bound to the wrong
+ * workspace" is unactionable without saying WHICH session is.
+ */
+function heartbeatProblems(
+  heartbeat: TransportHeartbeat,
+  transport: TransportName,
+  input: TransportHealthInput,
+): TransportProblem[] {
+  const session =
+    transport === 'channel' && heartbeat.hostSessionId
+      ? `[session ${heartbeat.hostSessionId}] `
+      : '';
+  const problems: TransportProblem[] = bindingProblems(heartbeat, input).map(
+    (problem) => ({ ...problem, detail: `${session}${problem.detail}` }),
+  );
   const stale = isHeartbeatStale(heartbeat, input.now);
-  const problems: TransportProblem[] = [...bindingProblems(heartbeat, input)];
+
+  if (
+    transport === 'channel' &&
+    (heartbeat.hostSessionId === undefined ||
+      !input.leadHostSessionIds.includes(heartbeat.hostSessionId))
+  ) {
+    problems.push({
+      code: 'channel-session-unmatched',
+      detail:
+        `${session}This channel server is running for this workspace, but its host ` +
+        `session is not an active lead session here. It is somebody else's ` +
+        `listener: nothing it receives reaches the session being diagnosed.`,
+      remediation:
+        'Start a Claude Code session in this workspace with the AgentMon plugin loaded as a channel, or rely on the hook transport, which delivers without one.',
+    });
+  }
 
   if (stale) {
     problems.push({
       code: 'heartbeat-stale',
       detail:
-        `The ${transport} transport last reported at ${heartbeat.updatedAt} ` +
+        `${session}The ${transport} transport last reported at ${heartbeat.updatedAt} ` +
         `(pid ${String(heartbeat.pid)}), beyond its ${String(heartbeat.ttlMs)}ms ` +
         `lease. It is presumed dead — a server killed without cleanup leaves ` +
         `exactly this trace.`,
@@ -458,18 +524,16 @@ function buildTransport(
   }
 
   if (heartbeat.version !== input.cliVersion) {
-    // Informational, not blocking (like `channel-registration-unverified`
-    // below) — see the `blocking` filter. The hook transport's heartbeat
-    // legitimately carries the PRE-upgrade version for up to its 24h TTL after
-    // every CLI release (it only refreshes on the next prompt), so treating
-    // this as a failure made `doctor` exit 1 for up to a day after every
-    // single upgrade — the exact cry-wolf outcome issue #373 exists to
-    // prevent, and directly contradicted the hook remediation's own "No
-    // action needed" wording.
+    // Informational, not blocking (see the `blocking` filter in
+    // `buildTransport`). The hook transport's heartbeat legitimately carries
+    // the PRE-upgrade version for up to its 24h TTL after every CLI release (it
+    // only refreshes on the next prompt), so treating this as a failure made
+    // `doctor` exit 1 for up to a day after every single upgrade — the exact
+    // cry-wolf outcome issue #373 exists to prevent.
     problems.push({
       code: 'version-skew',
       detail:
-        `The ${transport} transport is running @agentmonitors/cli ` +
+        `${session}The ${transport} transport is running @agentmonitors/cli ` +
         `${heartbeat.version} (${heartbeat.cliPath}), but this command is ` +
         `${input.cliVersion}. A long-lived transport keeps serving the build it ` +
         `started with, so a fix you just installed may not be in effect there. ` +
@@ -492,7 +556,7 @@ function buildTransport(
     problems.push({
       code: 'channel-registration-unverified',
       detail:
-        'The channel server is connected, but whether the host actually ' +
+        `${session}The channel server is connected, but whether the host actually ` +
         'registered it as a channel cannot be observed from this side: Claude ' +
         'Code drops channel events silently, with no error to the server, when ' +
         'the plugin is loaded as a plain MCP server. Confirm delivery end to ' +
@@ -500,6 +564,53 @@ function buildTransport(
       remediation: `Prove it with \`agentmonitors verify <monitor>\`. If channel events never arrive, start the session with \`claude ${CHANNEL_DEV_FLAG}\` (or add the plugin to the approved channel allowlist); the hook transport keeps delivering meanwhile.`,
     });
   }
+
+  return problems;
+}
+
+function buildTransport(
+  transport: TransportName,
+  input: TransportHealthInput,
+  sharedProblems: readonly TransportProblem[],
+): TransportStatus {
+  const matches = selectHeartbeats(transport, input);
+  // Report the record with the MOST problems, not merely the freshest (issue
+  // #425 review). With two registered leads — one healthy channel refreshed a
+  // moment ago, one slightly older channel bound to the wrong workspace —
+  // "freshest wins" returned the healthy record and declared delivery healthy
+  // while the other live session was silently broken. Ranking by problem count
+  // keeps the broken session visible; ties fall back to freshest, so the
+  // all-healthy case still reports the record a reader expects. Every match's
+  // problems are unioned below, so nothing is dropped either way.
+  const ranked = matches
+    .map((candidate) => ({
+      heartbeat: candidate,
+      problems: heartbeatProblems(candidate, transport, input),
+    }))
+    .sort(
+      (a, b) =>
+        b.problems.length - a.problems.length ||
+        freshness(b.heartbeat) - freshness(a.heartbeat),
+    );
+  const heartbeat = ranked[0]?.heartbeat;
+  if (!heartbeat) {
+    return {
+      name: transport,
+      configured: false,
+      running: false,
+      healthy: false,
+      lastDelivery: null,
+      problems: [],
+    };
+  }
+
+  const stale = isHeartbeatStale(heartbeat, input.now);
+  // Union every matching record's problems, each already labelled with the
+  // session it belongs to, so a second broken session is reported rather than
+  // hidden behind the representative record chosen above.
+  const problems: TransportProblem[] = ranked.flatMap(
+    (entry) => entry.problems,
+  );
 
   // Shared problems are recorded on every configured transport so a consumer
   // reading `transports[].problems[]` alone — the shape the JSON contract
@@ -577,7 +688,10 @@ export function computeTransportHealth(
             (problem) =>
               problem.code === 'workspace-mismatch' ||
               problem.code === 'environment-mismatch' ||
-              problem.code === 'socket-mismatch',
+              problem.code === 'socket-mismatch' ||
+              // A channel serving no active lead here is not a listening
+              // method for this session, however healthy it looks.
+              problem.code === 'channel-session-unmatched',
           ),
       )
     : [];

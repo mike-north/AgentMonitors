@@ -1756,9 +1756,19 @@ transports** section above the checks, built from the transport heartbeats each 
 | `environment-mismatch`            | The transport resolved a different `HOME` / data root, so it reads a different db                                                          |
 | `reminders-suppressed`            | Transports are up but reminders are **muted** by `coalesced-until-ack` (002 §9.2/§9.3)                                                     |
 | `heartbeat-stale`                 | A transport registered but its lease lapsed — presumed killed without cleanup                                                              |
+| `channel-session-unmatched`       | A channel server is running for this workspace but serves no ACTIVE lead session here — somebody else's listener                           |
 | `version-skew`                    | Advisory: a long-lived transport is still serving an older CLI build than this one                                                         |
 | `channel-registration-unverified` | Advisory: the host never confirms channel registration; prove delivery end to end                                                          |
 | `delivery-diagnosis-unavailable`  | The daemon's suppression check itself failed for one or more lead sessions — **not** the same as "checked, nothing suppressed" (see below) |
+
+**`pipelineProblems[]` (issue #425 review, round 4).** Pipeline-wide problems appear in **two**
+places in `--json`, deliberately: once in the top-level `pipelineProblems[]`, and again inside
+`problems[]` of every **configured** transport. The duplication is what lets a consumer read either
+one alone and still be correct — a caller inspecting a single transport sees why _that_ transport
+cannot deliver, while a caller reading the verdict sees each pipeline problem exactly once.
+`pipelineProblems[]` is the authoritative list: it is present even when NO transport is configured,
+which is precisely the case where the per-transport copies do not exist and a muted or daemon-less
+workspace would otherwise look merely idle. Text output renders them once, below the transport rows.
 
 `daemon-unreachable`, `reminders-suppressed`, and `delivery-diagnosis-unavailable` are
 **pipeline-wide** — they block the hook and channel paths alike — so they are recorded on every
@@ -1861,6 +1871,13 @@ remediation on failures), and a closing `Summary: <n> passed, <n> failed, <n> sk
       ]
     }
   ],
+  "pipelineProblems": [
+    {
+      "code": "<problem code>",
+      "detail": "<string>",
+      "remediation": "<string>"
+    }
+  ],
   "deliveryWillReachThisSession": "hook|channel|both|none",
   "deliverable": false,
   "verdict": "<string>",
@@ -1891,6 +1908,16 @@ remediation on failures), and a closing `Summary: <n> passed, <n> failed, <n> sk
   "summary": { "passed": 0, "failed": 0, "skipped": 0, "idle": 0 }
 }
 ```
+
+**Multi-session channel selection (issue #425 review, round 4).** The channel is session-scoped, so
+`transports[]`'s channel entry is derived from **every** heartbeat matching an active lead session of
+this workspace, not just the freshest one: with two leads — one healthy channel and one bound to the
+wrong workspace — reporting only the freshest hid a live broken session behind a healthy sibling.
+Problems from every matching record are unioned and prefixed with the host session id they belong to,
+and the representative `boundTo`/`version` is the record with the MOST problems (ties broken by
+freshness), so a broken session is never masked. A channel record for this workspace that matches no
+active lead session is still reported (`configured: true`) but carries `channel-session-unmatched`
+and can never count toward `deliveryWillReachThisSession`.
 
 `checks[]` always appears in the fixed order above (`project-enabled`, `monitors-directory`,
 `monitors-valid`, `daemon-reachable`, `lead-session`, one `monitor:<id>` per discovered monitor,

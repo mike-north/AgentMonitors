@@ -142,6 +142,90 @@ describe('computeTransportHealth', () => {
     });
   });
 
+  describe('multi-session channel selection (issue #425 review, round 4)', () => {
+    it('keeps a broken session visible instead of hiding it behind a healthy sibling', () => {
+      // Two registered leads: one channel refreshed a moment ago and correctly
+      // bound, one slightly older and bound to the wrong workspace. Picking the
+      // freshest record reported delivery as healthy while a live session was
+      // silently receiving nothing.
+      const health = computeTransportHealth(
+        input({
+          leadHostSessionIds: ['session-ok', 'session-broken'],
+          heartbeats: [
+            heartbeat('channel', {
+              hostSessionId: 'session-ok',
+              updatedAt: '2026-07-19T11:59:59.000Z',
+            }),
+            heartbeat('channel', {
+              hostSessionId: 'session-broken',
+              workspacePath: '/somewhere/else',
+              updatedAt: '2026-07-19T11:59:50.000Z',
+            }),
+          ],
+        }),
+      );
+
+      const channel = find(health.transports, 'channel');
+      expect(codesOf(channel)).toContain('workspace-mismatch');
+      expect(channel.healthy).toBe(false);
+      // The problem names WHICH session is broken — unactionable otherwise.
+      expect(
+        channel.problems.find(
+          (problem) => problem.code === 'workspace-mismatch',
+        )?.detail,
+      ).toContain('session-broken');
+    });
+
+    it("does not adopt a channel belonging to a non-lead session as this session's transport", () => {
+      const health = computeTransportHealth(
+        input({
+          leadHostSessionIds: ['my-session'],
+          heartbeats: [heartbeat('channel', { hostSessionId: 'someone-else' })],
+        }),
+      );
+
+      const channel = find(health.transports, 'channel');
+      // Still SHOWN — a reader diagnosing silence needs to know a server is
+      // there — but never counted as this session's listening method.
+      expect(channel.configured).toBe(true);
+      expect(codesOf(channel)).toContain('channel-session-unmatched');
+      expect(channel.healthy).toBe(false);
+      expect(health.deliveryWillReachThisSession).toBe('none');
+      expect(health.deliverable).toBe(false);
+    });
+
+    it('orders records NaN-safely so an unparseable timestamp sorts as oldest', () => {
+      // `Date.parse` yields NaN for a corrupt record, and a NaN comparator is
+      // inconsistent — it could leave the corrupt record ahead of a real one.
+      // Both records here are stale (an unparseable timestamp is treated as
+      // stale), so they carry the SAME problem profile and the freshness
+      // tiebreak decides: the parseable record must win.
+      const staleButParseable = '2026-07-19T10:00:00.000Z';
+      const health = computeTransportHealth(
+        input({
+          heartbeats: [
+            // Identical in every respect that could add a problem — only the
+            // timestamp differs — so the freshness tiebreak alone decides.
+            heartbeat('hook', {
+              updatedAt: 'not-a-date',
+              pid: 111,
+              ttlMs: 1_000,
+            }),
+            heartbeat('hook', {
+              updatedAt: staleButParseable,
+              pid: 222,
+              ttlMs: 1_000,
+            }),
+          ],
+        }),
+      );
+      const hook = find(health.transports, 'hook');
+      expect(hook.boundTo?.pid).toBe(222);
+      // Neither record is silently dropped: the corrupt one is still flagged.
+      expect(codesOf(hook)).toContain('heartbeat-stale');
+    });
+  });
+
   describe('no ACTIVE lead recipient (issue #425 review, round 3)', () => {
     // `hook` is keyed per WORKSPACE, not per session (`heartbeatKey`), so a
     // heartbeat left by a session that has since closed stays within its 24h

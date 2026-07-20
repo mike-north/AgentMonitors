@@ -45,6 +45,15 @@ lastDelivery, problems[] }` plus top-level `deliveryWillReachThisSession`, `deli
   plain MCP server, and never tells the server, so "connected" cannot prove registration. It points
   at `agentmonitors verify` and the dev-flag remediation.
 
+- **`--json` exposes a top-level `pipelineProblems[]`** alongside `transports[]`. Pipeline-wide
+  problems (a down daemon, muted reminders, an unevaluable suppression check) appear both there and
+  in each configured transport's `problems[]`, so a consumer reading either alone is still correct;
+  `pipelineProblems[]` is authoritative because it is present even when no transport is configured.
+- **A channel serving no active lead session is shown but never counted.** It is reported with
+  `channel-session-unmatched` rather than adopted as this session's listening method, and problems
+  from every matching lead session are unioned (prefixed with the session id) so a broken session is
+  not hidden behind a healthy one.
+
 See docs/specs/006-agent-integration.md §12 and docs/specs/005-cli-reference.md §15.
 
 **Review fixes (before first release):**
