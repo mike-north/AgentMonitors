@@ -1487,16 +1487,16 @@ watch:
     strategy: json-diff
 ```
 
-| Field                           | Type             | Required | Default         | Description                                                                      |
-| ------------------------------- | ---------------- | -------- | --------------- | -------------------------------------------------------------------------------- |
-| `command`                       | `string[]`       | Yes      | —               | Argv array; `command[0]` is the executable (resolved via `PATH`). `minItems: 1`. |
-| `interval`                      | duration string  | No       | runtime default | Poll cadence hint; owned by the scheduling engine, same as `api-poll`.           |
-| `cwd`                           | `string`         | No       | see below       | Working directory for the child process.                                         |
-| `env`                           | `object<string>` | No       | `{}`            | Literal env vars merged over the inherited daemon environment.                   |
+| Field                           | Type             | Required | Default         | Description                                                                                                                                                            |
+| ------------------------------- | ---------------- | -------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `command`                       | `string[]`       | Yes      | —               | Argv array; `command[0]` is the executable (resolved via `PATH`). `minItems: 1`.                                                                                       |
+| `interval`                      | duration string  | No       | runtime default | Poll cadence hint; owned by the scheduling engine, same as `api-poll`.                                                                                                 |
+| `cwd`                           | `string`         | No       | see below       | Working directory for the child process.                                                                                                                               |
+| `env`                           | `object<string>` | No       | `{}`            | Literal env vars merged over the inherited daemon environment.                                                                                                         |
 | `timeout`                       | duration string  | No       | `30s`           | Wall-clock limit; expiry is an **execution failure** (§11.5). Parsed via core's shared `parseOperationTimeoutMs` (§4.9) — a zero-length value (`"0s"`, …) is rejected. |
-| `key`                           | `string`         | No       | joined argv     | Overrides the observation `objectKey` (§11.4).                                   |
-| `change-detection.strategy`     | enum             | No       | `text-diff`     | `text-diff` \| `json-diff` \| `exit-code` (§11.3).                               |
-| `change-detection.ignore-paths` | `string[]`       | No       | `[]`            | Plain `json-diff` paths removed before comparison (§11.3).                       |
+| `key`                           | `string`         | No       | joined argv     | Overrides the observation `objectKey` (§11.4).                                                                                                                         |
+| `change-detection.strategy`     | enum             | No       | `text-diff`     | `text-diff` \| `json-diff` \| `exit-code` (§11.3).                                                                                                                     |
+| `change-detection.ignore-paths` | `string[]`       | No       | `[]`            | Plain `json-diff` paths removed before comparison (§11.3).                                                                                                             |
 
 **`cwd` resolution** (issue #444 review, finding 826): an **absolute** `cwd` is used as-is, unchanged.
 A **relative** `cwd` resolves against the runtime workspace/config root for a project monitor — the
@@ -1796,7 +1796,9 @@ baked into the file. Baking in an absolute path broke on the very first tick aft
 relocated or shared to a different checkout path (a scaffolded `MONITOR.md` can be committed and shared,
 same as any other project file); resolving it at runtime instead means the scaffolded file has no
 project-root-shaped state to go stale. The author preset applies the same auto-scoping rule to identity:
-`--author @me` resolves against the current `gh` authentication rather than a baked-in login.
+`--author @me` resolves against the current `gh` authentication rather than a baked-in login. The
+reviewer preset resolves the same identity explicitly, via `gh api user --jq '{login}'`, to exclude the
+current user's own PRs from the review queue (see "The two presets must not overlap" below).
 
 #### Field selection is what makes the transitions observable
 
@@ -1807,14 +1809,15 @@ diff strategy — decides which real-world events become interrupts.
 carried as a field — it decides membership instead: a PR stays in the set only while its decision is
 empty or `REVIEW_REQUIRED`, so a decision landing removes the PR (one benign fire) rather than churning
 a value inside the set. Filtering also drops drafts, `changeset-release/*` heads (the release/Version
-PR is never agent-reviewable), and PRs with failing CI (see "The two presets must not overlap" above —
-this is the clause that keeps `pr-review` and `my-prs` disjoint). Reviewer scoping is a configurable
-`--search` qualifier rather than a hardcoded exclusion — `gh pr list` has no `--author`-exclusion flag,
-and `-author:@me`/`review-requested:@me` are each wrong for some workflow (see "Reviewer scoping is
-workflow-dependent and therefore selectable" below for the full set of alternatives and why). The
-default is `--search 'review-requested:@me'`. Because drafts are filtered rather than reported, "a
-draft was marked ready" surfaces as the PR _appearing_ in the set. `updatedAt` is deliberately excluded:
-including it would fire on every push and comment.
+PR is never agent-reviewable), PRs authored by the current `gh` identity (see "The two presets must not
+overlap" above — this, not `--search`, is the clause that keeps `pr-review` and `my-prs` disjoint), and
+PRs with failing CI. Reviewer scoping (which PRs among those authored by _someone else_ actually need
+**your** review) is a separate, configurable `--search` qualifier — `-author:@me`/`review-requested:@me`
+are each wrong for some workflow (see "Reviewer scoping is workflow-dependent and therefore selectable"
+below for the full set of alternatives and why). The default is `--search 'review-requested:@me'`.
+Because drafts are filtered rather than reported, "a draft was marked ready" surfaces as the PR
+_appearing_ in the set. `updatedAt` is deliberately excluded: including it would fire on every push and
+comment.
 
 `my-prs` fetches **three separate** `gh pr list` calls — `--state open --limit 30`, `--state merged
 --limit 20`, `--state closed --limit 20` — rather than one `--state all --limit N` call, and unions the
@@ -1920,54 +1923,50 @@ reproducible by construction: two monitors watching overlapping state deliver se
 separate turns, for one real event — across a 5-PR merge train that was ~15 interrupt/ack round-trips
 describing work the session had just done itself.
 
-**The server-side `--search` scope alone does not prevent this.** It does under the default —
-`review-requested:@me` cannot match a PR you authored, since GitHub forbids requesting review from
-yourself, so `pr-review` and `my-prs` (`--author @me`) hold disjoint PR sets. It does **not** hold
-under the label-driven model, which is precisely the one required when author and reviewer share an
-identity.
+**The server-side `--search` scope is NOT what makes this hold** (PR #446 review, thread
+`discussion_r3615190027`, following on from `discussion_r3611245632`/`discussion_r3611245636`). An
+earlier revision relied on it: `review-requested:@me` cannot match a PR you authored, since GitHub
+forbids requesting review from yourself, so under the _default_ scope `pr-review` and `my-prs`
+(`--author @me`) held disjoint PR sets. It did **not** hold under the label-driven or unscoped
+alternatives this same scaffold ships as ready-to-edit options — the ones required when author and
+reviewer share an identity — so a PR you authored yourself could enter `pr-review`'s payload too, and a
+single CI transition on it then diffed on **both** independently-scheduled monitors in the same tick:
+one dismissible "no longer review-ready" removal from `pr-review`, one actionable entry into `my-prs` —
+issue #441's interrupt-multiplier, reproduced by construction for anyone who followed this file's own
+label-driven guidance.
 
-Disjointness therefore lives in the payload filters, where it holds for every scoping model. The two
-memberships partition by **readiness**:
+**Disjointness now lives in the payload filters instead, and holds permanently, not just at a
+snapshot.** `pr-review`'s `--jq` reduction resolves the current `gh` identity once per tick
+(`gh api user --jq '{login}'`, joined by `&&`) and drops any PR whose `author.login` matches it —
+_before_ any other filter runs, regardless of `--search`. Authorship of a PR never changes, so a PR you
+authored can never belong to `pr-review`'s payload on ANY tick, under ANY scope; it can only ever belong
+to `my-prs`. The two memberships now partition by **role first, then readiness**:
 
-| PR state                    | `pr-review`  | `my-prs`               |
-| --------------------------- | ------------ | ---------------------- |
-| green, non-draft, undecided | ✅ review it | —                      |
-| failing CI                  | —            | ✅ `ci-failing`        |
-| changes requested           | —            | ✅ `changes-requested` |
-| draft                       | —            | ✅ `draft`             |
-| approved / decided          | —            | —                      |
-| merged / closed (within 6h) | —            | ✅ `merged`/`closed`   |
+| PR state                    | `pr-review` (not authored by you) | `my-prs` (authored by you) |
+| --------------------------- | --------------------------------- | -------------------------- |
+| green, non-draft, undecided | ✅ review it                      | —                          |
+| failing CI                  | —                                 | ✅ `ci-failing`            |
+| changes requested           | —                                 | ✅ `changes-requested`     |
+| draft                       | —                                 | ✅ `draft`                 |
+| approved / decided          | —                                 | —                          |
+| merged / closed (within 6h) | —                                 | ✅ `merged`/`closed`       |
 
-The load-bearing clause is that `pr-review` **excludes PRs with failing checks**. A red PR is not
-review-ready — it belongs to its author until CI is green, and `my-prs` already classifies it
-`ci-failing`. Without that clause both presets claim a red, undecided, non-draft PR. Measured
-directly: before the exclusion, PRs `[1, 2]` were in `pr-review` while `[2, 3, 4]` were in `my-prs`,
-overlapping on 2; after, `[1]` and `[2, 3, 4]` are disjoint. `apps/cli/src/commands/pr-alerting-presets.test.ts`
-asserts every plausible PR state lands in at most one payload, and that assertion fails if the
-exclusion is removed.
+Because a PR is a member of exactly one preset's role partition for its entire lifetime, **no PR can
+ever cross between the two payloads.** A PR that leaves `pr-review` (reviewed, merged, closed, pulled
+back to draft) was never eligible to enter `my-prs`, and vice versa; only its readiness within its own
+preset's payload changes. This closes what an earlier revision of this section documented as an
+"accepted residual" — a single CI failure or merge producing one diff on each monitor in the same tick —
+which is no longer reachable under any scoping model, not merely reduced.
+`apps/cli/src/commands/pr-alerting-presets.test.ts` pins this directly: a red, undecided PR authored by
+the current identity is claimed by `my-prs` only, under every state in the readiness table above, across
+a same-PR CI-failure transition that an earlier revision's regression test showed firing on both
+monitors.
 
-One residual, by nature rather than by defect: **static membership disjointness does not imply
-glitch-free crossing.** `pr-review` and `my-prs` are two independently scheduled `command-poll`
-monitors, each diffing its own payload against its own prior baseline — nothing coordinates them — so a
-single real-world event that moves a PR across the readiness partition still produces one diff on EACH
-monitor in the same tick. Two transitions do this:
-
-- **A PR merges**: `pr-review` sees `[PR] -> []` (no longer open); `my-prs` sees `[] -> [PR, needs:
-merged]`.
-- **CI on an undecided PR goes red**: `pr-review` sees `[PR] -> []` (no longer review-ready, per the
-  exclusion above); `my-prs` sees `[] -> [PR, needs: ci-failing]`.
-
-Under the default scope (`review-requested:@me`) neither case can fire on your own PR at all — GitHub
-forbids requesting your own review, so `pr-review` never claims a PR `my-prs` also claims, and this
-residual is unreachable. Under a same-identity scope (the label-driven model, or an unscoped queue) it
-is reachable: one benign removal plus one actionable entry for the same event — one extra dismissible
-fire, not the N-round-trip multiplier #441 measured. `apps/cli/src/commands/pr-alerting-presets.test.ts`
-pins the CI-crossing shape directly (a dual-monitor transition regression asserting the exact `[PR]->[]`
-/ `[]->[PR, needs: ci-failing]` pair), so a change that makes this fire for a different, undocumented
-reason is still caught. No redesign coordinates the two monitors to collapse this into a single alert:
-cross-monitor coalescing at the delivery layer (#441) would reduce it further but is complementary — the
-presets are designed not to be redundant in the first place, which is #441's own preferred remedy, and
-is exactly what the exclusion above already does for every OTHER PR state.
+A second, independent clause keeps `pr-review` itself correct for the (more common) case of a PR
+authored by someone else: it **excludes PRs with failing checks**. A red PR by a third party is not
+review-ready — it belongs to its author, who (if using this same daemon) sees it under their own
+`my-prs`, not this reviewer's. Measured directly: before this clause, PRs `[1, 2]` were in `pr-review`
+while `[2, 3, 4]` were in `my-prs`, overlapping on 2; after, `[1]` and `[2, 3, 4]` are disjoint.
 
 #### Membership, not full state — and why both presets are `high`
 
@@ -1996,9 +1995,21 @@ one-per-resolved-item confirmations rather than a storm, and both monitor bodies
 so they are cheap for an agent to dismiss.
 
 The rule this yields for any `json-diff` monitor: **`high` is defensible when the payload is filtered
-so that every _entering_ transition is actionable.** The residual leaving-transitions are the
-unavoidable cost of a symmetric diff; the design goal is to bound them to one per resolved item, not
-to zero.
+so that entering transitions are actionable far more often than not, and every _leaving_ transition is
+a cheap, explicitly-named confirmation rather than a storm.** This is deliberately not stated as an
+absolute "every entering transition is actionable" — `my-prs` has one documented exception: a PR
+**opened directly as a draft** enters `needs: draft` exactly like a ready PR pulled back to draft does
+(both are `false -> true`, or an entering-membership transition on the very first tick), and
+`command-poll`'s stateless `json-diff` polling carries no history that would let the reduction tell
+"the author's own deliberate first action" apart from "someone pulled a decided PR back." This one is
+accepted rather than engineered around: the alert is not spurious (there IS a new open draft an author
+might otherwise forget), only differently urgent than the phrasing implies, and the `my-prs` body
+already tells the author how to disambiguate ("if you did not just put it there, someone pulled it
+back"). `apps/cli/src/commands/pr-alerting-presets.test.ts` pins this as a characterization test rather
+than leaving it unasserted, so a change to the reduction's `draft` handling cannot silently drift from
+this documented shape. The residual leaving-transitions (a resolved item confirming its own departure)
+are the unavoidable cost of a symmetric diff; the design goal is to bound them to one per resolved item,
+not to zero.
 
 #### Degradation when `gh` is unusable
 

@@ -114,12 +114,17 @@ const COMMAND_POLL_DEFAULT_COMMAND_BLOCK =
  * contract above intact for a multi-call fetch.
  *
  * `reduceJq` runs as a separate `jq -sc` stage over the fetch's raw stdout,
- * not as `gh`'s own `--jq` flag: `-s`/`--slurp` folds however many
- * top-level JSON arrays `fetchCmd` printed (one per `gh` call) into one
- * array-of-arrays, so `reduceJq` always starts with `add` to flatten it
- * back to a single array of PRs — for a one-call `fetchCmd` this is a
- * no-op (`[[...]] | add == [...]`), so `reduceJq` bodies are unchanged
- * from when they ran as `gh --jq`.
+ * not as `gh`'s own `--jq` flag: `-s`/`--slurp` folds however many top-level
+ * JSON values `fetchCmd` printed (one per `gh` call) into one array of those
+ * values, in call order. When every call prints a JSON array of the same
+ * shape ({@link MY_PRS_FETCH}'s three `gh pr list` calls), `reduceJq` starts
+ * with `add` to flatten the array-of-arrays back to a single array of PRs —
+ * for a one-call `fetchCmd` this is a no-op (`[[...]] | add == [...]`), so
+ * that `reduceJq` body is unchanged from when it ran as `gh --jq`. When the
+ * calls print DIFFERENT shapes ({@link PR_REVIEW_FETCH}'s `gh api user`
+ * object followed by its `gh pr list` array), `reduceJq` instead selects each
+ * value by `type` (see {@link PR_REVIEW_REDUCE}) — `add` would be a type
+ * error over a mixed object/array slurp.
  */
 function ghPresetScript(
   preset: string,
@@ -274,14 +279,17 @@ const PR_REVIEW_SCOPE_COMMENT =
   '  #                          author and reviewer are the same identity.\n' +
   '  #   (empty --search)       unscoped: every open PR. Fine for a small repo\n' +
   '  #                          where you review everything; at scale unrelated\n' +
-  '  #                          PRs consume the 30-row window.\n';
+  '  #                          PRs consume the 30-row window.\n' +
+  '  # PRs you authored yourself never enter this list, whichever --search you\n' +
+  '  # choose (enforced in the --jq below, not just by --search), so this list\n' +
+  '  # never overlaps the my-prs preset — see my-prs for your own PRs.\n';
 
 /**
  * `--type pr-review`'s `gh` query: PRs in the current repo that are **actually
  * awaiting review right now** — open, non-draft, not a `changeset-release/*`
  * release PR, not yet decided (`reviewDecision` empty or `REVIEW_REQUIRED`),
- * within the configured reviewer scope ({@link PR_REVIEW_DEFAULT_SCOPE}), and
- * **not failing CI**.
+ * within the configured reviewer scope ({@link PR_REVIEW_DEFAULT_SCOPE}), **not
+ * authored by the current `gh` identity**, and **not failing CI**.
  *
  * Membership is the signal, which is what lets this preset run at `high`
  * urgency (see the template's urgency comment). Every PR *entering* this set
@@ -291,24 +299,65 @@ const PR_REVIEW_SCOPE_COMMENT =
  * PR (one benign fire) instead of churning a value inside the set. `updatedAt`
  * is deliberately absent: it would fire on every push and comment.
  *
- * **Excluding red PRs is what keeps this payload disjoint from `my-prs`**, and
- * it holds under *every* reviewer-scoping model — including the label-driven
- * one, where author and reviewer are the same identity so a server-side author
- * exclusion is impossible. A red PR is not review-ready; it belongs to its
- * author, and `my-prs` already classifies it `ci-failing`. Without this clause
- * both presets claim a red, undecided, non-draft PR, so enabling both would
- * deliver two alerts for one transition — issue #441's measured
- * interrupt-multiplier, reproduced by construction.
+ * **The self-authored exclusion is what keeps this payload disjoint from
+ * `my-prs` — structurally, under *every* reviewer-scoping model** (PR #446
+ * review, thread `discussion_r3615190027`). A prior revision relied on
+ * `gh pr list`'s `--search` qualifier for this: `review-requested:@me` cannot
+ * match a PR you authored (GitHub forbids requesting your own review), so
+ * disjointness held under the *default* scope, but not under the label-driven
+ * or unscoped alternatives this same template scaffolds — the only options
+ * that work when author and reviewer share an identity. Because the exclusion
+ * lived only in `--search`, a PR you authored yourself could enter BOTH
+ * presets' payloads under those scopes, and a single CI transition on it then
+ * diffed on both independently-scheduled monitors in the same tick: one
+ * dismissible "no longer review-ready" removal from `pr-review`, one
+ * actionable entry into `my-prs` — issue #441's interrupt-multiplier,
+ * reproduced by construction for anyone who followed the label-driven
+ * guidance this file itself scaffolds.
+ *
+ * The fix moves the exclusion into the `--jq` reduction, where it holds
+ * regardless of `--search`: `gh api user --jq '{login}'` resolves the current
+ * identity ONCE per tick (joined by `&&`, same short-circuit-on-failure
+ * contract as {@link MY_PRS_FETCH}'s multi-call chain), and
+ * {@link PR_REVIEW_REDUCE} drops any PR whose `author.login` matches it before
+ * any other filter runs. A PR can now belong to at most one preset's payload
+ * for its entire lifetime — authorship never changes — so the two payloads
+ * cannot merely be disjoint at a snapshot, they cannot cross between each
+ * other at all: `my-prs`, not `pr-review`, is the only queue an authored PR
+ * can ever appear in, on any tick, under any scope.
+ *
+ * **Excluding red PRs is a second, independent disjointness clause** for the
+ * (common) case of PRs authored by someone else: a red PR is not
+ * review-ready — it belongs to its author, and `my-prs` already classifies it
+ * `ci-failing` for them. Without this clause a red, undecided, non-draft PR
+ * authored by a third party would still be claimed by `pr-review` alone
+ * (never by this repo's own `my-prs`, since that preset is scoped to `--author
+ * @me`), so this clause is about correctness of the reviewer queue itself,
+ * not cross-preset disjointness.
  */
 const PR_REVIEW_FETCH =
+  "gh api user --jq '{login}' && " +
   'gh pr list --state open --limit 30 ' +
   `--search '${PR_REVIEW_DEFAULT_SCOPE}' ` +
   '--json number,title,isDraft,reviewDecision,headRefName,author,statusCheckRollup';
 
+/**
+ * `reduceJq` for {@link PR_REVIEW_FETCH}. Slurped input is `[{login: "..."},
+ * [...prs]]` — one JSON object (from `gh api user`) followed by one JSON array
+ * (from `gh pr list`) — rather than {@link MY_PRS_REDUCE}'s multiple same-shaped
+ * arrays, so this cannot start with `add` (folding an object and an array with
+ * `add` is a type error). Selecting by `type` rather than by slurp position
+ * (`.[0]`/`.[1]`) is deliberate: it stays correct even if `fetchCmd`'s two
+ * calls were ever reordered, since `jq -s` preserves each call's own
+ * originally-printed value, not a merged stream.
+ */
 const PR_REVIEW_REDUCE =
-  'add | [.[] | select(.isDraft == false ' +
+  '(.[] | select(type == "object") | .login) as $me | ' +
+  '(.[] | select(type == "array")) as $raw | ' +
+  '$raw | [.[] | select(.isDraft == false ' +
   'and (.headRefName | startswith("changeset-release/") | not) ' +
   'and (((.reviewDecision // "") == "") or (.reviewDecision == "REVIEW_REQUIRED")) ' +
+  'and (.author.login != $me) ' +
   'and ([.statusCheckRollup[]? | select(((.conclusion // .state // "") | ascii_upcase) as $c ' +
   '| $c == "FAILURE" or $c == "TIMED_OUT" or $c == "CANCELLED" or $c == "ERROR" ' +
   'or $c == "ACTION_REQUIRED" or $c == "STARTUP_FAILURE")] | length) == 0) ' +
@@ -355,10 +404,22 @@ const PR_REVIEW_REDUCE =
  * states, so on an active repository terminal PRs can consume most of the window (measured live: 15 of
  * 20 slots at `--limit 20`) and age a still-open PR out of the query entirely — after which its CI
  * going red would silently produce no event, forever, until it happened to re-enter the window. Three
- * separate calls each get their OWN `--limit`, so open coverage (`--limit 30`, generous for one
- * author's concurrent PRs) can never be displaced by terminal history, and terminal coverage
- * (`--limit 20` each for `merged`/`closed`) only needs to outlast the 6-hour terminal window, not
- * compete with open PRs at all. The three raw arrays are unioned by {@link ghPresetScript}'s `jq -sc`
+ * separate calls each get their OWN `--limit`, so open coverage can never be displaced by terminal
+ * history, and terminal coverage (`--limit 20` each for `merged`/`closed`) only needs to outlast the
+ * 6-hour terminal window, not compete with open PRs at all.
+ *
+ * **Open coverage is `--limit 1000`** ({@link MY_PRS_OPEN_LIMIT}), not `30` (issue #444 review,
+ * finding 989's follow-up: `--limit 30` still evicted an older still-open PR once an author had more
+ * than 30 concurrently open). `gh pr list --limit` auto-paginates past its 100-per-page GraphQL cap, so
+ * a value this large is not "a bigger bounded window" in the same sense the old `30` was — it is, for
+ * any workflow a single human or agent author could actually sustain, complete coverage of every open
+ * PR they have. This is deliberately **not** claimed as a mathematical guarantee: an author with more
+ * than 1000 simultaneously open PRs (not a realistic operating point for this preset) would still see
+ * the oldest evicted, same failure shape as before at a vastly higher threshold. The terminal calls stay
+ * at `--limit 20` each: their coverage requirement is bounded by construction (outlast the 6-hour
+ * terminal window, not "never miss a PR"), so widening them buys nothing.
+ *
+ * The three raw arrays are unioned by {@link ghPresetScript}'s `jq -sc`
  * stage; `reviewDecision`/`state` never overlap a PR across the three states, so `unique_by(.number)`
  * in {@link MY_PRS_REDUCE} is a defensive no-op against real `gh` output — it only matters against a
  * test stub that (deliberately, to keep transition fixtures simple) returns the same fixture for every
@@ -368,8 +429,11 @@ const MY_PRS_JSON_FIELDS =
   'number,title,url,state,isDraft,reviewDecision,statusCheckRollup,' +
   'latestReviews,comments,mergedAt,closedAt,author';
 
+/** See {@link MY_PRS_FETCH}'s doc comment for why this is 1000, not a small bounded window. */
+const MY_PRS_OPEN_LIMIT = 1000;
+
 const MY_PRS_FETCH =
-  `gh pr list --author @me --state open --limit 30 --json ${MY_PRS_JSON_FIELDS} && ` +
+  `gh pr list --author @me --state open --limit ${String(MY_PRS_OPEN_LIMIT)} --json ${MY_PRS_JSON_FIELDS} && ` +
   `gh pr list --author @me --state merged --limit 20 --json ${MY_PRS_JSON_FIELDS} && ` +
   `gh pr list --author @me --state closed --limit 20 --json ${MY_PRS_JSON_FIELDS}`;
 
@@ -494,8 +558,10 @@ anything that *appears* here is waiting on you.
   it was merged, closed, or pulled back to draft. No action: it is no longer
   waiting on you.
 
-Release PRs (\`changeset-release/*\` heads) never enter this list, and by default
-neither do PRs you were not asked to review.
+Release PRs (\`changeset-release/*\` heads) never enter this list, and neither do
+PRs you authored yourself — always, regardless of which \`--search\` scope below
+is active — so this list never overlaps \`my-prs\`; see that preset for your own
+PRs. By default it also excludes PRs you were not asked to review.
 
 **If this monitor never fires, check the reviewer scoping before assuming there
 is nothing to review.** An empty result looks exactly like "no PRs need you". The

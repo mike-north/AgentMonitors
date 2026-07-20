@@ -89,10 +89,19 @@ function writeExecutable(file: string, contents: string): void {
  * tests, whose fixtures are already in the reduced shape the preset's `--jq`
  * program emits, so the assertion is about *which transitions fire*, not about
  * the reduction (that is covered separately below, against raw `gh` JSON).
+ *
+ * Answers a `gh api ...` call (pr-review's identity resolution — see
+ * {@link stubGhApplyingJq}'s doc comment) with `{"login": identityLogin}`
+ * rather than the fixture, for the same reason: without this, pr-review's
+ * two-call fetch would slurp two copies of the fixture instead of an
+ * `[identity, prs]` pair.
  */
-function stubGhEchoingFixture(): string {
+function stubGhEchoingFixture(identityLogin = 'octocat'): string {
   const dir = tempDir('stub');
-  writeExecutable(path.join(dir, 'gh'), '#!/bin/sh\ncat "$AM444_FIXTURE"\n');
+  writeExecutable(
+    path.join(dir, 'gh'),
+    `#!/bin/sh\nif [ "$1" = "api" ]; then\n  printf '{"login":"${identityLogin}"}\\n'\n  exit 0\nfi\ncat "$AM444_FIXTURE"\n`,
+  );
   return dir;
 }
 
@@ -101,17 +110,26 @@ function stubGhEchoingFixture(): string {
  * `gh pr list --json` output and pipes it through the preset's own `--jq`
  * program using the real `jq` binary. This is what proves the shipped jq
  * reduction actually maps GitHub's payload onto the diffed shape.
+ *
+ * `pr-review`'s fetch now runs `gh api user --jq '{login}'` before `gh pr
+ * list` (PR #446 review, thread `r3615190027`) to resolve the current `gh`
+ * identity for its self-authored-PR exclusion — the stub answers that call
+ * with `{"login": identityLogin}` and falls back to the raw fixture for
+ * every other `gh` invocation. `my-prs` never calls `gh api`, so this branch
+ * is inert for every my-prs-only test in this file; `identityLogin` defaults
+ * to `'octocat'` to match `rawMyPr`'s default author (representing "me").
  */
-function stubGhApplyingJq(): string {
+function stubGhApplyingJq(identityLogin = 'octocat'): string {
   const dir = tempDir('stub-jq');
   writeExecutable(
     path.join(dir, 'gh'),
     // The shipped presets apply `--jq` as a SEPARATE `jq -sc` stage over
     // `gh`'s raw stdout (see `ghPresetScript`'s `reduceJq` parameter), not
     // as a `gh --jq` flag, so the stub's only job is to hand back the raw
-    // fixture verbatim — the real reduction runs for real, in the script
-    // under test, via the real `jq` binary already required by `hasJq`.
-    '#!/bin/sh\ncat "$AM444_FIXTURE"\n',
+    // fixture verbatim for a `gh pr list` call — the real reduction runs for
+    // real, in the script under test, via the real `jq` binary already
+    // required by `hasJq`.
+    `#!/bin/sh\nif [ "$1" = "api" ]; then\n  printf '{"login":"${identityLogin}"}\\n'\n  exit 0\nfi\ncat "$AM444_FIXTURE"\n`,
   );
   return dir;
 }
@@ -283,7 +301,14 @@ describe('the presets’ jq reduction over raw gh output', () => {
     return;
   }
 
-  /** A raw `gh pr list --json ...` element for the `pr-review` preset. */
+  /**
+   * A raw `gh pr list --json ...` element for the `pr-review` preset,
+   * authored by someone OTHER than the current identity (`'contributor'`,
+   * distinct from `rawMyPr`'s `'octocat'` — see {@link stubGhApplyingJq}'s
+   * default `identityLogin`) — the ordinary case: a PR you did not write,
+   * that needs your review. Tests of the self-authored-exclusion itself pass
+   * an explicit `author: { login: 'octocat' }` override.
+   */
   function rawReviewPr(overrides: Record<string, unknown> = {}): unknown {
     return {
       number: 7,
@@ -291,7 +316,12 @@ describe('the presets’ jq reduction over raw gh output', () => {
       isDraft: false,
       reviewDecision: '',
       headRefName: 'fix/thing',
-      author: { id: 'MDQ6', is_bot: false, login: 'octocat', name: 'Octo Cat' },
+      author: {
+        id: 'MDQ7',
+        is_bot: false,
+        login: 'contributor',
+        name: 'A Contributor',
+      },
       ...overrides,
     };
   }
@@ -1007,14 +1037,23 @@ describe('the presets’ jq reduction over raw gh output', () => {
    * state: one merge delivered a high-urgency interrupt, an ack, a normal
    * reminder, and another ack — ~15 round-trips across a 5-PR merge train.
    * Shipping two presets that a user is expected to enable together makes that
-   * reproducible by construction unless their payloads are disjoint.
+   * reproducible by construction unless their payloads are disjoint — not just
+   * at a snapshot, but permanently, since PR authorship never changes.
    *
    * The server-side `--search` scope alone does NOT guarantee disjointness: it
    * does under the default (`review-requested:@me` cannot match your own PR,
    * since GitHub forbids requesting review from yourself), but not under the
    * label-driven model, which is the only one that works when author and
    * reviewer share an identity. Disjointness therefore has to hold in the
-   * payload filters, which is what these assert.
+   * payload filters — specifically, `pr-review`'s self-authored-PR exclusion
+   * (PR #446 review, thread `r3615190027`), which `stubGhApplyingJq`'s default
+   * `identityLogin` ('octocat', matching `rawMyPr`'s author) and
+   * `rawReviewPr`'s default author ('contributor', a DIFFERENT identity)
+   * exist specifically to exercise: a fixture merging `rawMyPr` and
+   * `rawReviewPr` with an explicit `author: { login: 'octocat' }` override
+   * represents "a PR that is mine, but would otherwise also match the
+   * reviewer queue" — the exact shape issue #441's interrupt-multiplier
+   * needs to reproduce.
    */
   describe('the two presets do not overlap (issue #441 interrupt multiplier)', () => {
     let reviewScope: Scope;
@@ -1025,6 +1064,17 @@ describe('the presets’ jq reduction over raw gh output', () => {
       mineScope = presetScope('my-prs');
       stub = stubGhApplyingJq();
     });
+
+    /** `rawMyPr`/`rawReviewPr` fields merged onto one PR authored by the
+     * current identity — the only shape that could ever cross between the
+     * two payloads before the self-authored exclusion existed. */
+    function myOwnPr(pr: Record<string, unknown>): unknown {
+      return {
+        ...(rawMyPr(pr) as object),
+        ...(rawReviewPr(pr) as object),
+        author: { login: 'octocat' },
+      };
+    }
 
     /** Every PR state that could plausibly land in either payload. */
     const states: { label: string; pr: Record<string, unknown> }[] = [
@@ -1042,11 +1092,9 @@ describe('the presets’ jq reduction over raw gh output', () => {
     ];
 
     it.each(states)(
-      'a PR that is $label appears in at most one payload',
+      'a PR that is $label, authored by the current identity, appears in at most one payload',
       async ({ pr }) => {
-        const raw = fixtureOf([
-          { ...(rawMyPr(pr) as object), ...(rawReviewPr(pr) as object) },
-        ]);
+        const raw = fixtureOf([myOwnPr(pr)]);
         const inReview = JSON.parse(
           (await observe(reviewScope, stub, raw)).stdout,
         ) as unknown[];
@@ -1057,81 +1105,67 @@ describe('the presets’ jq reduction over raw gh output', () => {
       },
     );
 
-    // The specific overlap that existed before: a red, undecided, non-draft PR
-    // was claimed by BOTH. It now belongs to its author only — a red PR is not
-    // review-ready.
-    it('gives a red undecided PR to my-prs only, never to the review queue', async () => {
+    it('excludes a PR authored by the current identity from the review queue, even when otherwise review-ready (PR #446 review, thread r3615190027)', async () => {
+      const raw = fixtureOf([myOwnPr(QUIET)]);
+      expect(
+        JSON.parse((await observe(reviewScope, stub, raw)).stdout),
+      ).toEqual([]);
+      expect(JSON.parse((await observe(mineScope, stub, raw)).stdout)).toEqual(
+        [],
+      ); // QUIET is green/non-draft/undecided: `needs: none` in my-prs too.
+    });
+
+    // A red, undecided, non-draft PR authored by someone ELSE: `pr-review`
+    // excludes it on its own second clause (failing CI, independent of
+    // authorship — see the preset's own doc comment). `my-prs` never sees a
+    // third-party PR like this in production at all — `--author @me` filters
+    // it server-side before `gh` prints anything — so there is nothing
+    // meaningful to assert against `mineScope` here (the stub, unlike real
+    // `gh`, does not enforce `--author`; that flag's presence is asserted at
+    // the argv level in "preset portability guarantees" instead).
+    it('gives a red undecided PR authored by someone else to neither preset via the review queue', async () => {
       const raw = fixtureOf([
-        {
-          ...(rawMyPr({
-            statusCheckRollup: [checkRun('build', 'FAILURE')],
-          }) as object),
-          ...(rawReviewPr({
-            statusCheckRollup: [checkRun('build', 'FAILURE')],
-          }) as object),
-        },
+        rawReviewPr({ statusCheckRollup: [checkRun('build', 'FAILURE')] }),
       ]);
       expect(
         JSON.parse((await observe(reviewScope, stub, raw)).stdout),
       ).toEqual([]);
-      expect(
-        JSON.parse((await observe(mineScope, stub, raw)).stdout),
-      ).toHaveLength(1);
     });
 
     /**
-     * Regression/characterization test for PR #446 review, thread
-     * `discussion_r3615190027`. Static membership disjointness (asserted
-     * above) does NOT imply glitch-free crossing: `pr-review` and `my-prs`
-     * are two independent `command-poll` monitors, each diffing its own
-     * payload against its own prior baseline, so a single CI failure that
-     * moves a PR across the readiness partition still produces ONE diff on
-     * EACH monitor in the same tick — `pr-review` sees `[PR] -> []`,
-     * `my-prs` sees `[] -> [PR, needs: ci-failing]` — and both fire.
+     * Regression test for PR #446 review, thread `discussion_r3615190027`.
+     * An earlier revision's disjointness held only at a snapshot: `pr-review`
+     * and `my-prs` are two independently scheduled `command-poll` monitors,
+     * each diffing its own payload against its own prior baseline, so a
+     * single real-world event that moved a PR across the OLD readiness-only
+     * partition could still produce one diff on EACH monitor in the same
+     * tick under a same-identity reviewer scope — `pr-review` losing the PR,
+     * `my-prs` gaining it, both firing for one CI failure.
      *
-     * This is the SAME class of residual double-fire 003 §11.9 already
-     * documents for a PR merging (`[PR] -> []` on `pr-review`, `[] ->
-     * [PR, needs: merged]` on `my-prs`) under a same-identity reviewer
-     * scope: one dismissible removal plus one actionable entry for the same
-     * real-world event, not the N-round-trip multiplier issue #441
-     * measured. It is reachable only when a reviewer-scoping model does NOT
-     * exclude the current user's own PRs from `pr-review` (the label-driven
-     * model, or an unscoped queue) — under the DEFAULT `review-requested:@me`
-     * scope this never fires on your own PR at all, since GitHub forbids
-     * requesting your own review (verified above: `gives a red undecided PR
-     * to my-prs only`, same fixture, same scope, only `my-prs` claims it).
-     *
-     * No redesign coordinates the two monitors to suppress this: they are
-     * independently scheduled `command-poll` instances with no shared
-     * state, by design (issue #441's own preferred remedy is not shipping
-     * redundant payloads in the first place, which this pair already does —
-     * see "the two presets do not overlap" above). This test exists so a
-     * regression that makes the crossing fire on BOTH monitors for a
-     * DIFFERENT reason (e.g. pr-review stops excluding red PRs) is still
-     * caught, and so the accepted, documented shape of this one residual
-     * case doesn't silently drift.
+     * That crossing is no longer reachable, under ANY scoping model: a PR
+     * authored by the current identity can never enter `pr-review`'s payload
+     * on any tick (the exclusion in {@link PR_REVIEW_REDUCE} — see
+     * `init.ts` — runs before every other filter and does not depend on
+     * `--search`), so it was never eligible to leave it either. `pr-review`
+     * therefore never even fires across this transition; only `my-prs`,
+     * which is the PR's only possible home, does.
      */
-    it('a CI failure that crosses the readiness partition fires once per monitor, not a multiplier (PR #446 review, thread r3615190027)', async () => {
-      const green = {
-        ...(rawMyPr(QUIET) as object),
-        ...(rawReviewPr(QUIET) as object),
-      };
-      const red = {
-        ...(rawMyPr({
-          statusCheckRollup: [checkRun('build', 'FAILURE')],
-        }) as object),
-        ...(rawReviewPr({
-          statusCheckRollup: [checkRun('build', 'FAILURE')],
-        }) as object),
-      };
+    it('a CI failure on the current identity’s own PR fires only my-prs, never pr-review (PR #446 review, thread r3615190027)', async () => {
+      const green = myOwnPr(QUIET);
+      const red = myOwnPr({
+        statusCheckRollup: [checkRun('build', 'FAILURE')],
+      });
 
       const reviewBaseline = await observe(
         reviewScope,
         stub,
         fixtureOf([green]),
       );
-      const mineBaseline = await observe(mineScope, stub, fixtureOf([]));
-      expect(JSON.parse(reviewBaseline.stdout)).toHaveLength(1);
+      const mineBaseline = await observe(mineScope, stub, fixtureOf([green]));
+      // pr-review never claims this PR — not even at baseline, since it is
+      // authored by the current identity regardless of readiness.
+      expect(JSON.parse(reviewBaseline.stdout)).toEqual([]);
+      // Green/undecided/non-draft is `needs: none` in my-prs too.
       expect(JSON.parse(mineBaseline.stdout)).toEqual([]);
 
       const reviewAfter = await observe(
@@ -1147,10 +1181,11 @@ describe('the presets’ jq reduction over raw gh output', () => {
         mineBaseline.state,
       );
 
-      // pr-review: [PR] -> [] — one dismissible "no longer needs review" fire.
-      expect(reviewAfter.titles).toEqual([CHANGED_REVIEW]);
+      // pr-review: [] -> [] — the PR was never eligible, so there is nothing
+      // to lose, and nothing fires.
+      expect(reviewAfter.titles).toEqual([]);
       expect(JSON.parse(reviewAfter.stdout)).toEqual([]);
-      // my-prs: [] -> [PR, needs: ci-failing] — one actionable fire.
+      // my-prs: [] -> [PR, needs: ci-failing] — the only fire for this event.
       expect(mineAfter.titles).toEqual([CHANGED]);
       const [entry] = JSON.parse(mineAfter.stdout) as { needs: string }[];
       expect(entry?.needs).toBe('ci-failing');
@@ -1180,7 +1215,7 @@ describe('the presets’ jq reduction over raw gh output', () => {
           number: 7,
           title: 'fix: thing',
           headRefName: 'fix/thing',
-          author: 'octocat',
+          author: 'contributor',
         },
       ]);
     });
@@ -1544,6 +1579,21 @@ describe('reviewer scoping (PR #446 review, thread 1)', () => {
       'gh pr list --state open --search "review-requested:@me"',
     );
   });
+
+  /**
+   * PR #446 review, thread `discussion_r3615190027`: `--search` alone does
+   * NOT guarantee `pr-review`/`my-prs` disjointness (label-driven and
+   * unscoped both fail to exclude the current identity's own PRs). The fix
+   * resolves the current `gh` identity once per tick, unconditionally,
+   * regardless of which `--search` qualifier is scaffolded or later edited
+   * — this argv-level assertion is what would catch a regression that
+   * dropped that call while leaving the rest of the shipped `--search`
+   * argument untouched (the jq-level exclusion itself is exercised in "the
+   * two presets do not overlap" above).
+   */
+  it('always resolves the current identity, independent of the --search scope', () => {
+    expect(commandOf('pr-review')).toContain("gh api user --jq '{login}'");
+  });
 });
 
 describe('delivered alert readability (issue #449 guard)', () => {
@@ -1594,7 +1644,12 @@ describe('delivered alert readability (issue #449 guard)', () => {
         isDraft: false,
         reviewDecision: '',
         headRefName: 'fix/thing',
-        author: { login: 'octocat' },
+        // Distinct from stubGhEchoingFixture's default identity ('octocat',
+        // matching 'my-prs' above): a pr-review fixture authored by the
+        // current identity would now be excluded (PR #446 review, thread
+        // r3615190027), which is not what this readability-only test is
+        // about.
+        author: { login: 'contributor' },
         statusCheckRollup: [],
       },
     ],
