@@ -1,5 +1,8 @@
 import path from 'node:path';
-import type { HookDeliveryDiagnosis } from '@agentmonitors/core';
+import type {
+  HookDeliveryDiagnosis,
+  HookDeliveryHold,
+} from '@agentmonitors/core';
 import {
   HEARTBEAT_FUTURE_TOLERANCE_MS,
   isHeartbeatStale,
@@ -361,12 +364,48 @@ function bindingProblems(
 }
 
 /**
+ * Whether a suppressing hold's `claimedEventIds` is a real, trustworthy array
+ * of ids rather than absent or malformed.
+ *
+ * `HookDeliveryHold.claimedEventIds` is optional precisely because a
+ * `HookDeliveryDiagnosis` can arrive over the daemon IPC boundary from a build
+ * that predates the field (issue #425 review, round 7): an older daemon still
+ * supports `hook.diagnose` (so it doesn't hit {@link diagnosisUnavailableProblems})
+ * but serializes a hold with no `claimedEventIds` key at all. Without this
+ * check, `.flatMap((entry) => entry.hold.claimedEventIds)` would contribute a
+ * literal `undefined` per missing entry (flatMap keeps a non-array return value
+ * as a single element rather than dropping it), `Array.prototype.join` renders
+ * that as an empty string, and the remediation would print a malformed
+ * `--event-ids  --socket ...` — worse than the documented "omit the flag,
+ * fall back to the daemon's ack-all default" behavior for a genuinely empty
+ * `[]`, because it looks like a scoped, safe command while actually being
+ * broken. An empty array is a valid, deliberate signal (`settle-window` always
+ * has one); only a non-array, or an array containing something other than a
+ * non-empty string, is untrustworthy.
+ */
+function hasValidClaimedEventIds(
+  hold: HookDeliveryHold,
+): hold is HookDeliveryHold & { claimedEventIds: string[] } {
+  return (
+    Array.isArray(hold.claimedEventIds) &&
+    hold.claimedEventIds.every((id) => typeof id === 'string' && id.length > 0)
+  );
+}
+
+/**
  * Collect the currently-active reminder suppressions across every lead session.
  *
  * Reported once as a transport-level problem rather than per session: the guard
  * is a property of the delivery pipeline both transports share (`reserve` and
  * `claim` consult the same gate), so attributing it to one transport would
  * imply the other still works. It does not.
+ *
+ * A session whose suppressing hold(s) lack trustworthy `claimedEventIds`
+ * (round 7) is never folded into this problem's blanket-ack-avoiding
+ * remediation and never silently treated as "nothing suppressed" either — it
+ * is instead reported via {@link diagnosisUnavailableProblems}'s
+ * `delivery-diagnosis-unavailable` code, since the exact scope of what is
+ * suppressed cannot be safely determined for it.
  */
 function suppressionProblems(input: TransportHealthInput): TransportProblem[] {
   const suppressed = input.diagnoses.flatMap((diagnosis) =>
@@ -380,16 +419,22 @@ function suppressionProblems(input: TransportHealthInput): TransportProblem[] {
   );
   if (suppressed.length === 0) return [];
 
-  const sessions = [...new Set(suppressed.map((entry) => entry.sessionId))];
-  const detail =
-    `Delivery is up, but reminders are currently MUTED on ` +
-    `${String(sessions.length)} lead session(s): ` +
-    suppressed
-      .map((entry) => `${entry.sessionId}: ${entry.hold.message}`)
-      .join(' ');
+  const trustworthy = suppressed.filter((entry) =>
+    hasValidClaimedEventIds(entry.hold),
+  );
 
-  return [
-    {
+  const problems: TransportProblem[] = [];
+
+  if (trustworthy.length > 0) {
+    const sessions = [...new Set(trustworthy.map((entry) => entry.sessionId))];
+    const detail =
+      `Delivery is up, but reminders are currently MUTED on ` +
+      `${String(sessions.length)} lead session(s): ` +
+      trustworthy
+        .map((entry) => `${entry.sessionId}: ${entry.hold.message}`)
+        .join(' ');
+
+    problems.push({
       code: 'reminders-suppressed',
       detail,
       // Scoped to the CLAIMED event ids this diagnosis actually named, and to
@@ -400,18 +445,18 @@ function suppressionProblems(input: TransportHealthInput): TransportProblem[] {
       // could clear unseen work far beyond what suppressed the reminder.
       // Omitting `--socket` similarly risks acknowledging against a
       // different daemon than the one this `doctor` run diagnosed, when a
-      // non-default socket is in play. `claimedEventIds` can be empty only if
-      // a caller constructed a hold outside `diagnoseHookDelivery` (the pure
-      // classifier defaults it to `[]`); the flag is simply omitted then,
-      // falling back to the daemon's own "ack all unread" default rather than
-      // rendering an empty `--event-ids`.
+      // non-default socket is in play. `claimedEventIds` can be a trustworthy
+      // EMPTY array only if a caller constructed a hold outside
+      // `diagnoseHookDelivery` (the pure classifier defaults it to `[]`); the
+      // flag is simply omitted then, falling back to the daemon's own "ack
+      // all unread" default rather than rendering an empty `--event-ids`.
       remediation: sessions
         .map((sessionId) => {
           const ids = [
             ...new Set(
-              suppressed
+              trustworthy
                 .filter((entry) => entry.sessionId === sessionId)
-                .flatMap((entry) => entry.hold.claimedEventIds),
+                .flatMap((entry) => entry.hold.claimedEventIds ?? []),
             ),
           ];
           const eventIdsFlag =
@@ -423,8 +468,31 @@ function suppressionProblems(input: TransportHealthInput): TransportProblem[] {
           );
         })
         .join(' '),
-    },
-  ];
+    });
+  }
+
+  const untrustworthy = suppressed.filter(
+    (entry) => !hasValidClaimedEventIds(entry.hold),
+  );
+  if (untrustworthy.length > 0) {
+    const sessions = [
+      ...new Set(untrustworthy.map((entry) => entry.sessionId)),
+    ];
+    problems.push({
+      code: 'delivery-diagnosis-unavailable',
+      detail:
+        `Reminders appear suppressed on ${String(sessions.length)} lead ` +
+        `session(s) (${sessions.join(', ')}), but the exact claimed event ` +
+        `ids could not be determined — the daemon reported a suppression ` +
+        `hold without them (most likely an older daemon build that predates ` +
+        `that field). A scoped acknowledgement cannot be safely offered, so ` +
+        `this cannot be reported as deliverable.`,
+      remediation:
+        'Upgrade the daemon to the current CLI build (`agentmonitors daemon run` after stopping any older one), then re-run `agentmonitors doctor`.',
+    });
+  }
+
+  return problems;
 }
 
 /**
@@ -456,28 +524,6 @@ function diagnosisUnavailableProblems(
   ];
 }
 
-/**
- * Pick the heartbeat that describes THIS session's transport.
- *
- * Selection order matters for detecting the misbinding case, but it must only
- * apply to a SESSION-SCOPED transport. `channel serve` is one long-lived
- * process per host session, so matching it by host session id **first, across
- * every workspace** is precisely what turns "my session's channel is
- * listening to another workspace" from an invisible absence into a reported
- * `workspace-mismatch`.
- *
- * `hook deliver`, by contrast, is a fresh short-lived process per PROMPT with
- * no stable per-session identity of its own — its record is keyed and
- * overwritten per WORKSPACE (see `heartbeatKey`), so any session's most recent
- * prompt in this workspace is a valid match for every lead session here. If
- * session-id-first matching were applied to it too, a session whose hook last
- * fired in workspace A — now leading workspace B, before its first prompt
- * there — would find no session match in B, fall through to a workspace match
- * that also fails (the record still says A), and report a false
- * `workspace-mismatch` with "restart the transport" — even though hooks
- * re-resolve on every prompt and self-heal with no action needed. So `hook`
- * always matches by workspace only; only `channel` tries session id first.
- */
 /**
  * NaN-safe freshness key for ordering heartbeats.
  *
@@ -537,9 +583,15 @@ function representativeFreshness(
  *   (or non-lead, or already-ended) session and report it as this session's
  *   healthy, deliverable transport — and would do so even when the workspace
  *   has no lead sessions at all.
- * - The **hook** transport has no per-session identity by construction (a fresh
- *   process per prompt, keyed per workspace), so the workspace-keyed record IS
- *   its identity and the workspace match is correct there — and only there.
+ * - The **hook** transport keys its record by host session id too, when one is
+ *   known (`heartbeatKey`, issue #425 review, round 6 follow-up), so several
+ *   active leads in one workspace each leave their own record. But `hook` has
+ *   no cross-workspace identity of its own the way `channel` does — a fresh
+ *   process per prompt with nothing to misresolve a DIFFERENT workspace with
+ *   — so there is no analogous misbinding case to detect, and every
+ *   same-workspace record is returned rather than session-matched-first: the
+ *   caller ({@link buildTransport}'s uncovered-lead check) needs the full set
+ *   of lead ids that have EVER fired hook here, not just one representative.
  */
 function selectHeartbeats(
   transport: TransportName,
@@ -878,7 +930,16 @@ export function computeTransportHealth(
   const suppressed = sharedProblems.some(
     (problem) => problem.code === 'reminders-suppressed',
   );
-  const diagnosisUnavailable = input.diagnosisUnavailableSessionIds.length > 0;
+  // Derived from the actual problem set, not only `input.diagnosisUnavailableSessionIds`
+  // (the daemon-call-threw case doctor supplies): `suppressionProblems` can
+  // independently emit this same code when a suppressing hold's
+  // `claimedEventIds` could not be trusted (round 7), and that must equally
+  // block `deliverable` — reading from the shared code list keeps the two
+  // sources from drifting apart the way `disqualifiesFromListening` already
+  // does for the listening-method check above.
+  const diagnosisUnavailable = sharedProblems.some(
+    (problem) => problem.code === 'delivery-diagnosis-unavailable',
+  );
   const deliverable =
     hasActiveLead &&
     reach !== 'none' &&

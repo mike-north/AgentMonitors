@@ -794,6 +794,122 @@ describe('computeTransportHealth', () => {
       expect(remediation).toContain(`--socket ${SOCKET}`);
     });
 
+    describe('a hold with untrustworthy claimedEventIds is never an ack-all fallback (issue #425 review, round 7)', () => {
+      // Distinct from the `[]` case above: `[]` is a genuinely EMPTY, valid
+      // array (e.g. `settle-window`, or a hand-built test caller), and the
+      // documented fallback is to omit `--event-ids` there. This describes
+      // the field being ABSENT or malformed on the wire — an older daemon
+      // build that predates `claimedEventIds` still supports `hook.diagnose`
+      // and returns the pre-change hold shape with no `claimedEventIds` key
+      // at all. Before the fix, `flatMap` contributed a literal `undefined`
+      // per such hold, `Array.prototype.join` rendered it as an empty string,
+      // and the remediation printed a malformed
+      // `--event-ids  --socket ...` — worse than the `[]` fallback, since it
+      // LOOKS like a safe, scoped command while actually being broken.
+      function suppressedHoldMissingIds(
+        sessionId: string,
+      ): HookDeliveryDiagnosis {
+        return {
+          sessionId,
+          lifecycle: 'turn-interruptible',
+          unreadCounts: { low: 0, normal: 11, high: 0, total: 11 },
+          holds: [
+            {
+              urgency: 'normal',
+              reason: 'coalesced-until-ack',
+              unreadCount: 11,
+              pendingCount: 10,
+              // No `claimedEventIds` key at all — simulates an older daemon
+              // build's wire shape, not a deliberately empty array.
+              message:
+                'Normal-urgency reminder at turn-interruptible is suppressed: 1 of 11 unread normal event(s) are already claimed (coalesced-until-ack).',
+            },
+          ],
+        };
+      }
+
+      it('reports delivery-diagnosis-unavailable instead of a broken or blanket ack command', () => {
+        const health = computeTransportHealth(
+          input({ diagnoses: [suppressedHoldMissingIds('session-abc')] }),
+        );
+
+        const codes = health.pipelineProblems.map((problem) => problem.code);
+        expect(codes).toContain('delivery-diagnosis-unavailable');
+        expect(codes).not.toContain('reminders-suppressed');
+
+        const remediation = health.remediation.join(' ');
+        // Never the malformed double-space/empty-ids form...
+        expect(remediation).not.toMatch(/--event-ids\s+--socket/);
+        // ...and never a blanket ack-all fallback either (issue #425 review,
+        // round 7's explicit "never as an ack-all fallback").
+        expect(remediation).not.toContain(
+          'agentmonitors events ack --session session-abc',
+        );
+        expect(remediation).toContain('Upgrade the daemon');
+      });
+
+      it('blocks deliverable, matching the existing check-never-ran contract', () => {
+        const health = computeTransportHealth(
+          input({ diagnoses: [suppressedHoldMissingIds('session-abc')] }),
+        );
+        expect(health.deliverable).toBe(false);
+        expect(health.verdict).toContain('could not be determined');
+      });
+
+      it('keeps a trustworthy session scoped while an untrustworthy sibling session is reported separately', () => {
+        const health = computeTransportHealth(
+          input({
+            diagnoses: [
+              suppressedDiagnosis('session-trusted'),
+              suppressedHoldMissingIds('session-untrusted'),
+            ],
+          }),
+        );
+
+        const codes = health.pipelineProblems.map((problem) => problem.code);
+        expect(codes).toContain('reminders-suppressed');
+        expect(codes).toContain('delivery-diagnosis-unavailable');
+
+        const remediation = health.remediation.join(' ');
+        expect(remediation).toContain('--event-ids session-trusted-claimed-1');
+        expect(remediation).not.toContain('session-untrusted-claimed');
+        expect(remediation).not.toContain(
+          'agentmonitors events ack --session session-untrusted',
+        );
+      });
+
+      it('treats an array containing a non-string entry as equally untrustworthy', () => {
+        const health = computeTransportHealth(
+          input({
+            diagnoses: [
+              {
+                sessionId: 'session-abc',
+                lifecycle: 'turn-interruptible',
+                unreadCounts: { low: 0, normal: 11, high: 0, total: 11 },
+                holds: [
+                  {
+                    urgency: 'normal',
+                    reason: 'coalesced-until-ack',
+                    unreadCount: 11,
+                    pendingCount: 10,
+                    // @ts-expect-error deliberately malformed to simulate an
+                    // untrusted wire payload (a plain `number` where every
+                    // real element is a non-empty `string`).
+                    claimedEventIds: [42],
+                    message: 'suppressed',
+                  },
+                ],
+              },
+            ],
+          }),
+        );
+
+        const codes = health.pipelineProblems.map((problem) => problem.code);
+        expect(codes).toContain('delivery-diagnosis-unavailable');
+        expect(codes).not.toContain('reminders-suppressed');
+      });
+    });
+
     it('exposes a down daemon as a pipeline problem, not only per transport', () => {
       const health = computeTransportHealth(
         input({ heartbeats: [], daemonRunning: false }),

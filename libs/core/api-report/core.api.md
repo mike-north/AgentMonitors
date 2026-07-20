@@ -424,7 +424,7 @@ export interface HookDeliveryDiagnosis {
 
 // @public
 export interface HookDeliveryHold {
-    claimedEventIds: string[];
+    claimedEventIds?: string[];
     message: string;
     pendingCount: number;
     // (undocumented)

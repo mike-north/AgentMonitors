@@ -60,8 +60,19 @@ export interface HookDeliveryHold {
    * unread event on the session, which would also clear unrelated,
    * never-surfaced work (issue #425 review, round 6). Empty for
    * `settle-window`, where nothing is claimed yet.
+   *
+   * Optional — not just "possibly empty" — because a `HookDeliveryDiagnosis`
+   * can arrive over the daemon IPC boundary from a build that predates this
+   * field (issue #425 review, round 7): an older daemon serializes a
+   * `HookDeliveryHold` with no `claimedEventIds` key at all, and this type
+   * only describes what THIS build produces, not what a remote peer actually
+   * sent. Making it required would also have been a breaking change to this
+   * already-published `@agentmonitors/core` interface with no accompanying
+   * major/minor changeset. A consumer must treat `undefined` the same as any
+   * other untrustworthy shape — never assume it means "nothing claimed" (that
+   * is what an empty array means).
    */
-  claimedEventIds: string[];
+  claimedEventIds?: string[];
   /** Human-readable explanation naming the mechanism and the remedy. */
   message: string;
 }

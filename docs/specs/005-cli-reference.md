@@ -1787,6 +1787,15 @@ suppression was active had never actually been answered — a false green. `deli
 makes that distinction explicit and, unlike the two advisory codes above, IS blocking: `deliverable`
 can never be `true` while it is present, precisely because "unknown" must not be reported as "healthy".
 
+**A hold with untrustworthy `claimedEventIds` is also `delivery-diagnosis-unavailable` (issue #425
+review, round 7).** `HookDeliveryHold.claimedEventIds` (round 6, above) is optional on the
+`@agentmonitors/core` type, because a diagnosis crosses the daemon IPC boundary and can arrive from a
+build that predates the field. A suppressing hold whose `claimedEventIds` is not a real array of
+non-empty strings is reported this way — never folded into `reminders-suppressed`'s scoped ack
+command (which would render a malformed, blank `--event-ids  --socket ...` flag) and never as a
+fallback to the unscoped, blanket `agentmonitors events ack --session <id>` the round-6 fix exists to
+avoid. See 006 §12.7.
+
 `version-skew` and `channel-registration-unverified` are the two **advisory, non-blocking** codes: both
 are reported when present, but neither counts toward a transport's `healthy` field, its `fail` status,
 or the overall `deliverable` verdict. `version-skew` was blocking through issue #373; it was made
