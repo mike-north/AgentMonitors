@@ -129,6 +129,24 @@ describe('assertPackageCleanRemovesDistAndTemp', () => {
     ).toThrow(/must also remove "temp"/);
   });
 
+  // Regression fixture for the post-#454 review finding: splitting on
+  // `/(&&|\|\||;|\n)/` yields an EMPTY command segment between `||` and an
+  // immediately following newline (`"rm -rf dist ||\nrm -rf temp"` splits
+  // to `['rm -rf dist ', '||', '', '\n', 'rm -rf temp']`). The pre-fix
+  // guard's operator-token branch unconditionally overwrote
+  // `precedingOperator` with that newline, discarding the pending `||` and
+  // wrongly marking the `rm -rf temp` guaranteed — even though a real shell
+  // still treats the newline as part of the `||` continuation and skips
+  // the second command whenever the first succeeds.
+  it('rejects "temp" removed only via `||` immediately followed by a newline (guard false-accept #3)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'rm -rf dist ||\nrm -rf temp' } },
+        'test-package',
+      ),
+    ).toThrow(/must also remove "temp"/);
+  });
+
   // The real proof: every actual, on-disk package discovered by
   // `findApiExtractorPackageDirs` must satisfy the contract. If any future
   // package's `clean` script drifts back to a `dist`-only shape, this
@@ -238,6 +256,42 @@ describe('assertRootCleanRunsWorkspaceCleanAndReset', () => {
         scripts: {
           clean:
             'NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace && NX_TUI=false nx reset',
+        },
+      }),
+    ).not.toThrow();
+  });
+
+  // Regression fixture for the post-#454 review finding: `findFlagValue`
+  // (pre-fix) matched only the FIRST `--flag=value` token with exact
+  // equality, so a valid `nx run-many` invocation carrying a REPEATED
+  // `--exclude` flag (e.g. `--exclude=website --exclude=agentmonitors-workspace`,
+  // a legitimate shape `nx` itself supports for excluding multiple
+  // projects) false-REJECTED, because only the first occurrence
+  // (`website`) was ever inspected and the workspace-root project name was
+  // never checked.
+  it('accepts a root "clean" script with the workspace root excluded via a repeated `--exclude` flag', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'NX_TUI=false nx run-many --target=clean --exclude=website --exclude=agentmonitors-workspace && NX_TUI=false nx reset',
+        },
+      }),
+    ).not.toThrow();
+  });
+
+  // Regression fixture for the post-#454 review finding: the pre-fix
+  // `\b`-bounded-regex replacement compared `--target=`'s raw value with
+  // exact string equality, so a valid comma-joined `nx` target list
+  // (`--target=clean,other`, which legitimately also runs the `clean`
+  // target) false-REJECTED because the raw value `"clean,other"` never
+  // equals `"clean"`.
+  it('accepts a root "clean" script with a comma-joined `--target=clean,other`', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'NX_TUI=false nx run-many --target=clean,other --exclude=agentmonitors-workspace && NX_TUI=false nx reset',
         },
       }),
     ).not.toThrow();

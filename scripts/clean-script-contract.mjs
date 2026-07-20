@@ -157,7 +157,14 @@ function splitChainedCommands(script) {
 
   for (const token of script.split(/(&&|\|\||;|\n)/)) {
     if (token === '&&' || token === '||' || token === ';' || token === '\n') {
-      precedingOperator = token;
+      // Only record a NEW pending operator if there isn't already one
+      // awaiting a real command — an empty segment between two operator
+      // tokens (e.g. the newline right after `||` in `dist ||\ntemp`)
+      // must not let a weaker/different operator overwrite an already
+      // `||`-gated pending operator. The empty segment is a no-op in a
+      // real shell; the operator that actually gates the next command is
+      // whichever one appeared FIRST since the last real command.
+      precedingOperator ??= token;
       continue;
     }
     const command = token.trim();
@@ -182,21 +189,44 @@ function tokenize(command) {
 }
 
 /**
- * Extract the value of an exact `--flagName=value` token from a command's
- * tokens, or `undefined` if the flag isn't present. Exact flag-name match
- * only — deliberately not a `\b`-bounded regex, which matches a word
- * boundary right before a hyphen and so would wrongly treat
- * `--target=clean-old` as satisfying a check for `--target=clean` (issue
- * #443 post-merge review).
+ * Extract the raw values of EVERY exact `--flagName=value` token in a
+ * command's tokens (a repeatable flag like `nx run-many --exclude=` may
+ * legitimately appear more than once — `--exclude=a --exclude=b` excludes
+ * BOTH `a` and `b`). Exact flag-name match only — deliberately not a
+ * `\b`-bounded regex, which matches a word boundary right before a hyphen
+ * and so would wrongly treat `--target=clean-old` as satisfying a check for
+ * `--target=clean` (issue #443 post-merge review).
  *
  * @param {string[]} tokens
  * @param {string} flagName
- * @returns {string | undefined}
+ * @returns {string[]} raw values, one per occurrence, in token order
  */
-function findFlagValue(tokens, flagName) {
+function findFlagValues(tokens, flagName) {
   const prefix = `--${flagName}=`;
-  const token = tokens.find((candidate) => candidate.startsWith(prefix));
-  return token === undefined ? undefined : token.slice(prefix.length);
+  return tokens
+    .filter((candidate) => candidate.startsWith(prefix))
+    .map((token) => token.slice(prefix.length));
+}
+
+/**
+ * Every comma-separated member across ALL occurrences of a `--flagName=`
+ * token, flattened into a single set — e.g. two `--exclude=a --exclude=b`
+ * tokens, or one `--target=clean,other` token, both yield the full
+ * membership the flag actually carries. A single occurrence's own value is
+ * ALSO comma-split, since a real `nx` flag like `--target=` accepts a
+ * comma-joined list in one token (issue #443 post-merge review: an earlier
+ * exact-equality check against a single occurrence's raw value false-
+ * rejected `--target=clean,other` and never merged repeated `--exclude=`
+ * occurrences at all).
+ *
+ * @param {string[]} tokens
+ * @param {string} flagName
+ * @returns {Set<string>}
+ */
+function findFlagValueSet(tokens, flagName) {
+  return new Set(
+    findFlagValues(tokens, flagName).flatMap((value) => value.split(',')),
+  );
 }
 
 /**
@@ -239,8 +269,10 @@ function containsTokens(command, ...expectedTokens) {
 
 /**
  * Whether a command is an `nx run-many --target=clean` invocation, using
- * exact token/flag-value matching (see {@link findFlagValue}) rather than
- * a `\b`-bounded regex.
+ * exact token/flag-value matching (see {@link findFlagValueSet}) rather
+ * than a `\b`-bounded regex. `--target=` accepts a comma-joined list
+ * (`--target=clean,other`), so this checks `clean` is a MEMBER of that set,
+ * not that the raw value is exactly `"clean"`.
  *
  * @param {string} command
  * @returns {boolean}
@@ -248,7 +280,7 @@ function containsTokens(command, ...expectedTokens) {
 function isNxRunManyCleanCommand(command) {
   return (
     containsTokens(command, 'nx', 'run-many') &&
-    findFlagValue(tokenize(command), 'target') === 'clean'
+    findFlagValueSet(tokenize(command), 'target').has('clean')
   );
 }
 
@@ -356,10 +388,8 @@ export function assertRootCleanRunsWorkspaceCleanAndReset(pkg) {
   const runManyCommand = commands[runManyIndex].command;
   const runManyTokens = tokenize(runManyCommand);
 
-  const excludeValue = findFlagValue(runManyTokens, 'exclude');
-  const excludedProjects =
-    excludeValue === undefined ? [] : excludeValue.split(',');
-  if (!excludedProjects.includes(WORKSPACE_ROOT_PROJECT_NAME)) {
+  const excludedProjects = findFlagValueSet(runManyTokens, 'exclude');
+  if (!excludedProjects.has(WORKSPACE_ROOT_PROJECT_NAME)) {
     throw new Error(
       'root "clean" script\'s `nx run-many --target=clean` must exclude ' +
         `"${WORKSPACE_ROOT_PROJECT_NAME}" (the workspace root project has no ` +
