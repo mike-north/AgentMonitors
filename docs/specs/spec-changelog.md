@@ -164,6 +164,7 @@ poll-until-`daemonAvailable` loop with slightly different timeout/poll constants
 (`daemon-ipc.ts`); each call site keeps its own pre-existing timeout/poll values — no behavior change.
 
 Finding 5 (test teardown pid fallback) is test-infrastructure-only, no spec change.
+
 ## 2026-07-19 — Transport-health review fixes round 4: future-timestamp staleness, symlink-safe writes, delivery-diagnosis-unavailable (006 §12; 005 §15) — Refs #425
 
 A further round of review on the delivery-transport health surface found three defects, two of which
