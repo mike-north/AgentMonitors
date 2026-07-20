@@ -202,6 +202,9 @@ export interface DeclareEphemeralMonitorInput {
 }
 
 // @public
+export const DEFAULT_OPERATION_TIMEOUT_MS = 30000;
+
+// @public
 export function defaultNotifyConfigForUrgency(urgency: Urgency, notify?: NotifyConfig): NotifyConfig | undefined;
 
 // @public (undocumented)
@@ -589,6 +592,9 @@ export interface KeyedCollectionResult {
 
 // @public
 export type KeyedSnapshot = Record<string, unknown>;
+
+// @public
+export const MAX_OPERATION_TIMEOUT_MS = 2147483647;
 
 // @public (undocumented)
 export interface MonitorDefinition {
@@ -1190,6 +1196,9 @@ export interface OpenSessionInput {
 }
 
 // @public
+export const OPERATION_TIMEOUT_PATTERN: string;
+
+// @public
 export function parseDuration(duration: string): number;
 
 // @public (undocumented)
@@ -1210,6 +1219,9 @@ export function parseMonitor(content: string, filePath: string): ParseOutcome;
 
 // @public
 export function parseMonitorFile(filePath: string): ParseOutcome;
+
+// @public
+export function parseOperationTimeoutMs(rawTimeout: unknown): number;
 
 // @public (undocumented)
 export type ParseOutcome = ParseResult | ParseError;

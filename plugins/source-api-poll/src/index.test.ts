@@ -8,10 +8,14 @@ import {
   SourceRegistry,
   claudeCodeAdapter,
   createDb,
+  validateWatchScope,
 } from '@agentmonitors/core';
 import source from './index.js';
 import {
   buildCompositeObservation,
+  framedPartByteLength,
+  MAX_COMPOSITE_PARTS,
+  MAX_PART_ID_LENGTH,
   parseCompositeConfig,
   renderCompositeSnapshot,
 } from './composite.js';
@@ -1290,6 +1294,1027 @@ When the document changes, act on it.
       expect(latest?.snapshotText).toContain('TITLE: Draft');
       expect(latest?.snapshotText).toContain('one');
       expect(latest?.snapshotText).toContain('two v3 CHANGED');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Issue #304: `api-poll` can wait forever or consume unbounded memory. These
+  // tests exercise the three bounds directly: a request/body deadline, a
+  // streamed byte cap (with a trusted Content-Length early check), and bounded
+  // composite concurrency. Each bound must errored-observation the tick — no
+  // partial body baselined, no `nextState` advance.
+  // ---------------------------------------------------------------------------
+  describe('request/body bounds (issue #304)', () => {
+    // Issue #304 review, finding 6c: these deadline/concurrency tests
+    // previously burned real wall-clock seconds (`timeout: '1s'` × 3, a real
+    // `setTimeout(…, 20)` in the composite-concurrency test below) while this
+    // same file already establishes the fake-timer pattern (see `composite ×
+    // runtime integration`). Fake timers also make the abort boundary exact
+    // instead of merely "eventually settles".
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    function makeAbortError(): Error {
+      const err = new Error('The operation was aborted');
+      err.name = 'AbortError';
+      return err;
+    }
+
+    /** A `fetch` mock whose headers never arrive until the caller's signal aborts. */
+    function mockNeverRespondingFetch(): ReturnType<typeof vi.fn> {
+      return vi.fn(
+        (_url: string, init: RequestInit) =>
+          new Promise((_resolve, reject) => {
+            const signal = init.signal;
+            if (!signal) throw new Error('test requires an AbortSignal');
+            signal.addEventListener('abort', () => {
+              reject(makeAbortError());
+            });
+          }),
+      );
+    }
+
+    /**
+     * A `fetch` mock whose headers resolve immediately (2xx) but whose body
+     * stream never completes a read — mimicking a stalled/trickling chunked
+     * response — until the caller's signal aborts.
+     */
+    function mockHangingBodyFetch(): ReturnType<typeof vi.fn> {
+      return vi.fn((_url: string, init: RequestInit) =>
+        Promise.resolve({
+          status: 200,
+          headers: { get: () => null },
+          body: {
+            getReader: () => ({
+              read: () =>
+                new Promise((_resolve, reject) => {
+                  const signal = init.signal;
+                  if (!signal) throw new Error('test requires an AbortSignal');
+                  if (signal.aborted) {
+                    reject(makeAbortError());
+                    return;
+                  }
+                  signal.addEventListener('abort', () => {
+                    reject(makeAbortError());
+                  });
+                }),
+              releaseLock: () => {
+                // no-op
+              },
+            }),
+          },
+        }),
+      );
+    }
+
+    /**
+     * A `fetch` mock whose headers resolve immediately (2xx) but whose body
+     * stream never completes a read until the caller's signal aborts, then
+     * rejects with a raw `TypeError: terminated` — the shape undici produces
+     * under an HTTP/2 or socket-teardown race (issue #304 review, finding
+     * 4) — rather than the `AbortError` `mockHangingBodyFetch` above
+     * produces. Exercises the `controller.signal.aborted` fallback in
+     * `fetchBody`'s catch clause directly, since `isAbortError` alone would
+     * not classify this rejection as a timeout.
+     */
+    function mockHangingBodyFetchNonAbortRejection(): ReturnType<typeof vi.fn> {
+      return vi.fn((_url: string, init: RequestInit) =>
+        Promise.resolve({
+          status: 200,
+          headers: { get: () => null },
+          body: {
+            getReader: () => ({
+              read: () =>
+                new Promise((_resolve, reject) => {
+                  const signal = init.signal;
+                  if (!signal) throw new Error('test requires an AbortSignal');
+                  const rejectTerminated = (): void => {
+                    reject(new TypeError('terminated'));
+                  };
+                  if (signal.aborted) {
+                    rejectTerminated();
+                    return;
+                  }
+                  signal.addEventListener('abort', rejectTerminated);
+                }),
+              releaseLock: () => {
+                // no-op
+              },
+            }),
+          },
+        }),
+      );
+    }
+
+    /** A `fetch` mock returning a declared `Content-Length` header, no streaming body. */
+    function mockDeclaredContentLength(
+      declaredBytes: number,
+    ): ReturnType<typeof vi.fn> {
+      return vi.fn(() =>
+        Promise.resolve({
+          status: 200,
+          headers: {
+            get: (name: string) =>
+              name.toLowerCase() === 'content-length'
+                ? String(declaredBytes)
+                : null,
+          },
+          text: () => Promise.resolve('should never be read'),
+        }),
+      );
+    }
+
+    /** A `fetch` mock streaming the given chunks with no `Content-Length` header. */
+    function mockStreamingChunks(
+      chunks: Uint8Array[],
+      onCancel?: () => void,
+    ): ReturnType<typeof vi.fn> {
+      return vi.fn(() => {
+        let index = 0;
+        return Promise.resolve({
+          status: 200,
+          headers: { get: () => null },
+          body: {
+            getReader: () => ({
+              read: () => {
+                if (index >= chunks.length) {
+                  return Promise.resolve({ done: true, value: undefined });
+                }
+                const value = chunks[index];
+                index += 1;
+                return Promise.resolve({ done: false, value });
+              },
+              releaseLock: () => {
+                // no-op
+              },
+              cancel: () => {
+                onCancel?.();
+                return Promise.resolve();
+              },
+            }),
+          },
+        });
+      });
+    }
+
+    describe('request/body deadline', () => {
+      it('aborts and errors the observation when headers never arrive', async () => {
+        vi.stubGlobal('fetch', mockNeverRespondingFetch());
+
+        const observePromise = source.observe(
+          { url: 'https://api.example.com/never-responds', timeout: '1s' },
+          { now: new Date() },
+        );
+        // Attach the rejection assertion BEFORE advancing timers — vitest's
+        // `expect(...).rejects` synchronously attaches a handler to
+        // `observePromise`, which must happen before the promise actually
+        // rejects (which `advanceTimersByTimeAsync` triggers) or Node reports
+        // an unhandled rejection in the gap.
+        const assertion = expect(observePromise).rejects.toThrow(
+          /timed out after 1000ms/,
+        );
+        await vi.advanceTimersByTimeAsync(1000);
+        await assertion;
+      });
+
+      it('aborts and errors the observation when the body stalls mid-stream', async () => {
+        vi.stubGlobal('fetch', mockHangingBodyFetch());
+
+        const observePromise = source.observe(
+          { url: 'https://api.example.com/stalls', timeout: '1s' },
+          { now: new Date() },
+        );
+        const assertion = expect(observePromise).rejects.toThrow(
+          /timed out after 1000ms/,
+        );
+        await vi.advanceTimersByTimeAsync(1000);
+        await assertion;
+      });
+
+      // Issue #304 review, finding 4 (regression): a stalled read that
+      // rejects with a non-`AbortError` after the deadline fires must still
+      // be normalized to the documented "timed out" message via the
+      // `controller.signal.aborted` fallback — not surfaced as the raw
+      // `TypeError: terminated` undici can produce under this race.
+      it('normalizes a non-Abort rejection after the deadline fires to the documented timeout error', async () => {
+        vi.stubGlobal('fetch', mockHangingBodyFetchNonAbortRejection());
+
+        const observePromise = source.observe(
+          { url: 'https://api.example.com/terminated-race', timeout: '1s' },
+          { now: new Date() },
+        );
+        const assertion = expect(observePromise).rejects.toThrow(
+          /timed out after 1000ms/,
+        );
+        await vi.advanceTimersByTimeAsync(1000);
+        await assertion;
+        // The raw undici error is preserved as `cause` even though the
+        // surfaced message is normalized (mirrors the AbortError path).
+        try {
+          await observePromise;
+          expect.unreachable('observe() must reject');
+        } catch (err) {
+          expect(err).toBeInstanceOf(Error);
+          expect((err as Error).cause).toBeInstanceOf(TypeError);
+          expect((err as Error).cause as TypeError).toMatchObject({
+            message: 'terminated',
+          });
+        }
+      });
+
+      it('a request that completes within the deadline is unaffected', async () => {
+        vi.stubGlobal(
+          'fetch',
+          vi.fn().mockResolvedValue({
+            text: () => Promise.resolve('fast response'),
+            status: 200,
+          }),
+        );
+
+        const result = await source.observe(
+          { url: 'https://api.example.com/fast', timeout: '1s' },
+          { now: new Date() },
+        );
+        expect(result.observations).toHaveLength(0);
+        expect(result.nextState).toBeDefined();
+      });
+
+      it('rejects an invalid timeout override', async () => {
+        await expect(
+          source.observe(
+            { url: 'https://api.example.com/x', timeout: 'soon' },
+            { now: new Date() },
+          ),
+        ).rejects.toThrow(/Invalid duration: "soon"/);
+      });
+
+      // Issue #304 review, finding 5: a zero-length timeout aborts every
+      // request before it can ever complete, which is never a meaningful
+      // configuration — reject it at parse time via the shared
+      // `parseOperationTimeoutMs` helper (core), same as `"soon"` above.
+      it('rejects a "0s" timeout override', async () => {
+        await expect(
+          source.observe(
+            { url: 'https://api.example.com/x', timeout: '0s' },
+            { now: new Date() },
+          ),
+        ).rejects.toThrow(/Invalid timeout: "0s"/);
+      });
+
+      // Issue #304 review, second round: a present but non-string `timeout`
+      // (a number here) previously fell back silently to the default
+      // instead of being rejected as a misconfiguration.
+      it('rejects a non-string timeout override instead of silently defaulting', async () => {
+        await expect(
+          source.observe(
+            { url: 'https://api.example.com/x', timeout: 123 },
+            { now: new Date() },
+          ),
+        ).rejects.toThrow(/Invalid timeout: expected a string/);
+      });
+
+      // Issue #304 review, second round: the schema pattern (`[1-9]\d*`)
+      // rejects a leading zero, but `parseDuration`'s own `\d+` digit group
+      // previously accepted it — a schema/parser mismatch.
+      it('rejects a leading-zero timeout override ("01s")', async () => {
+        await expect(
+          source.observe(
+            { url: 'https://api.example.com/x', timeout: '01s' },
+            { now: new Date() },
+          ),
+        ).rejects.toThrow(/A leading zero is not allowed/);
+      });
+
+      // Issue #304 review, second round: "25d" (2,160,000,000ms) exceeds
+      // Node's 32-bit signed setTimeout max (2,147,483,647ms) — without a
+      // bound this would silently overflow to a near-instant timer instead
+      // of the author's intended 25-day deadline.
+      it('rejects a timeout override exceeding the maximum setTimeout delay ("25d")', async () => {
+        await expect(
+          source.observe(
+            { url: 'https://api.example.com/x', timeout: '25d' },
+            { now: new Date() },
+          ),
+        ).rejects.toThrow(/exceeds the maximum supported deadline/);
+      });
+
+      it('does not advance nextState past a timed-out tick', async () => {
+        vi.stubGlobal(
+          'fetch',
+          vi.fn().mockResolvedValue({
+            text: () => Promise.resolve('baseline body'),
+            status: 200,
+          }),
+        );
+        const url = 'https://api.example.com/recovers';
+        const baseline = await source.observe({ url }, { now: new Date() });
+
+        vi.stubGlobal('fetch', mockNeverRespondingFetch());
+        const timedOutPromise = source.observe(
+          { url, timeout: '1s' },
+          { previousState: baseline.nextState, now: new Date() },
+        );
+        const assertion = expect(timedOutPromise).rejects.toThrow(/timed out/);
+        await vi.advanceTimersByTimeAsync(1000);
+        await assertion;
+
+        // A subsequent successful poll still diffs against the ORIGINAL baseline
+        // (the runtime never persisted a `nextState` from the errored tick).
+        vi.stubGlobal(
+          'fetch',
+          vi.fn().mockResolvedValue({
+            text: () => Promise.resolve('changed body'),
+            status: 200,
+          }),
+        );
+        const recovered = await source.observe(
+          { url },
+          { previousState: baseline.nextState, now: new Date() },
+        );
+        expect(recovered.observations).toHaveLength(1);
+      });
+    });
+
+    describe('byte cap', () => {
+      it('rejects a declared Content-Length above the cap without reading the body', async () => {
+        const mockFetch = mockDeclaredContentLength(50 * 1024 * 1024);
+        vi.stubGlobal('fetch', mockFetch);
+
+        await expect(
+          source.observe(
+            { url: 'https://api.example.com/huge-declared' },
+            { now: new Date() },
+          ),
+        ).rejects.toThrow(/exceeding the .*-byte cap/);
+      });
+
+      // Issue #304 review, finding 1: the declared-Content-Length rejection
+      // threw without `controller.abort()` or `response.body.cancel()`,
+      // leaking the connection — undici kept the socket open with the
+      // unconsumed body pending. One leak per tick (×5 in composite mode).
+      it('aborts the request and releases the connection on a declared-oversize rejection', async () => {
+        let capturedSignal: AbortSignal | undefined;
+        let bodyCancelCalls = 0;
+        vi.stubGlobal(
+          'fetch',
+          vi.fn((_url: string, init: RequestInit) => {
+            capturedSignal = init.signal ?? undefined;
+            return Promise.resolve({
+              status: 200,
+              headers: {
+                get: (name: string) =>
+                  name.toLowerCase() === 'content-length'
+                    ? String(50 * 1024 * 1024)
+                    : null,
+              },
+              body: {
+                cancel: () => {
+                  bodyCancelCalls += 1;
+                  return Promise.resolve();
+                },
+              },
+              text: () => Promise.resolve('should never be read'),
+            });
+          }),
+        );
+
+        await expect(
+          source.observe(
+            { url: 'https://api.example.com/huge-declared-leak' },
+            { now: new Date() },
+          ),
+        ).rejects.toThrow(/exceeding the .*-byte cap/);
+
+        expect(capturedSignal?.aborted).toBe(true);
+        expect(bodyCancelCalls).toBe(1);
+      });
+
+      // Issue #304 review, finding 2: the body cap (and full buffering) was
+      // enforced BEFORE resolveStrategy, but `status-code` monitors never
+      // need the body at all — the status transition IS the watched object.
+      // A >10MiB endpoint that used to observe 200 → 503 fine regressed to
+      // erroring on every tick once the cap was added.
+      it('status-code strategy is exempt from the byte cap — observes a status transition on an over-cap endpoint without erroring', async () => {
+        const overCapBytes = 50 * 1024 * 1024;
+        let bodyReadAttempted = false;
+
+        function mockOversizeStatusEndpoint(
+          status: number,
+        ): ReturnType<typeof vi.fn> {
+          return vi.fn(() =>
+            Promise.resolve({
+              status,
+              headers: {
+                get: (name: string) =>
+                  name.toLowerCase() === 'content-length'
+                    ? String(overCapBytes)
+                    : null,
+              },
+              body: {
+                cancel: () => Promise.resolve(),
+                getReader: () => {
+                  bodyReadAttempted = true;
+                  throw new Error('status-code must never read the body');
+                },
+              },
+              text: () => {
+                bodyReadAttempted = true;
+                return Promise.reject(
+                  new Error('status-code must never read the body'),
+                );
+              },
+            }),
+          );
+        }
+
+        const config = {
+          url: 'https://api.example.com/huge-artifact',
+          'change-detection': { strategy: 'status-code' },
+        };
+
+        vi.stubGlobal('fetch', mockOversizeStatusEndpoint(200));
+        const baseline = await source.observe(config, { now: new Date() });
+        expect(baseline.observations).toHaveLength(0);
+
+        vi.stubGlobal('fetch', mockOversizeStatusEndpoint(503));
+        const changed = await source.observe(config, {
+          previousState: baseline.nextState,
+          now: new Date(),
+        });
+        expect(changed.observations).toHaveLength(1);
+        expect(bodyReadAttempted).toBe(false);
+      });
+
+      it('caps a chunked body with no Content-Length via streamed counting', async () => {
+        // No single chunk exceeds the cap on its own, but the running total does
+        // — proving the streamed count (not any one chunk) is the authority.
+        const chunk = new Uint8Array(6 * 1024 * 1024);
+        vi.stubGlobal('fetch', mockStreamingChunks([chunk, chunk]));
+
+        await expect(
+          source.observe(
+            { url: 'https://api.example.com/huge-chunked' },
+            { now: new Date() },
+          ),
+        ).rejects.toThrow(/exceeding the .*-byte cap/);
+      });
+
+      it('cancels the locked reader when the streamed cap is exceeded', async () => {
+        // Copilot review (issue #304): the streamed-oversize branch aborts the
+        // controller but previously left the reader itself un-cancelled,
+        // asymmetric with the declared-Content-Length path's
+        // `response.body?.cancel()`. Assert the reader is released too.
+        const chunk = new Uint8Array(6 * 1024 * 1024);
+        let cancelled = false;
+        vi.stubGlobal(
+          'fetch',
+          mockStreamingChunks([chunk, chunk], () => {
+            cancelled = true;
+          }),
+        );
+
+        await expect(
+          source.observe(
+            { url: 'https://api.example.com/huge-chunked' },
+            { now: new Date() },
+          ),
+        ).rejects.toThrow(/exceeding the .*-byte cap/);
+        expect(cancelled).toBe(true);
+      });
+
+      it('a body within the cap is read normally', async () => {
+        const encoder = new TextEncoder();
+        vi.stubGlobal(
+          'fetch',
+          mockStreamingChunks([
+            encoder.encode('{"data":'),
+            encoder.encode('"small"}'),
+          ]),
+        );
+
+        const result = await source.observe(
+          { url: 'https://api.example.com/small' },
+          { now: new Date() },
+        );
+        expect(result.observations).toHaveLength(0);
+        expect(result.nextState).toBeDefined();
+      });
+    });
+
+    describe('composite concurrency (003 §2.6)', () => {
+      it('bounds simultaneous in-flight part requests', async () => {
+        const partCount = 12;
+        let active = 0;
+        let maxActive = 0;
+
+        vi.stubGlobal(
+          'fetch',
+          vi.fn(async (input: string) => {
+            active += 1;
+            maxActive = Math.max(maxActive, active);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            active -= 1;
+            return {
+              status: 200,
+              text: () => Promise.resolve(`body for ${input}`),
+            };
+          }),
+        );
+
+        const config = {
+          'change-detection': {
+            composite: {
+              'object-key': 'many-parts',
+              parts: Array.from({ length: partCount }, (_, i) => ({
+                id: `part-${String(i)}`,
+                url: `https://api.example.com/parts/${String(i)}`,
+              })),
+            },
+          },
+        };
+
+        const observePromise = source.observe(config, { now: new Date() });
+        // Several sequential 20ms batches (12 parts, 5 at a time) — run every
+        // pending fake timer to completion rather than a single fixed
+        // advance, since each batch's `setTimeout` is only scheduled once the
+        // previous batch's slot frees up.
+        await vi.runAllTimersAsync();
+        await observePromise;
+
+        // Bounded well below "all N parts at once" — proves concurrency is
+        // capped, not merely finite.
+        expect(maxActive).toBeLessThan(partCount);
+        expect(maxActive).toBeLessThanOrEqual(5);
+      });
+
+      it('a slow/never-responding part still errors the whole composite via its own deadline', async () => {
+        vi.stubGlobal('fetch', mockNeverRespondingFetch());
+
+        const config = {
+          'change-detection': {
+            composite: {
+              'object-key': 'stalled-part',
+              parts: [{ id: 'only', url: 'https://api.example.com/stalled' }],
+            },
+          },
+          timeout: '1s',
+        };
+
+        const observePromise = source.observe(config, { now: new Date() });
+        const assertion = expect(observePromise).rejects.toThrow(
+          /timed out after 1000ms/,
+        );
+        await vi.advanceTimersByTimeAsync(1000);
+        await assertion;
+      });
+    });
+
+    // Issue #304 review, second round: the 5-worker concurrency limit above
+    // bounds how many parts are IN FLIGHT at once, but nothing previously
+    // bounded the SUM of all fetched part bodies — a composite with many
+    // small parts, each individually far under `MAX_RESPONSE_BYTES` (10 MiB),
+    // could still assemble and baseline a snapshot many times that size
+    // every tick (the reported case: 12 x 1 MiB parts = 12.5 MB with no
+    // aggregate bound). `MAX_COMPOSITE_BYTES` bounds the cumulative total
+    // across every part in the SAME composite — and, since the third round,
+    // sums the RENDERED framed section (`## <id>\n<body>`) rather than the
+    // raw body, so id-framing overhead counts toward the budget too.
+    describe('composite cumulative byte budget (issue #304 review, second + third round)', () => {
+      const MAX_COMPOSITE_BYTES = 10 * 1024 * 1024;
+
+      /** A `fetch` mock returning a fixed-size body for every part URL. */
+      function mockFixedSizeBody(sizeBytes: number): ReturnType<typeof vi.fn> {
+        const body = 'a'.repeat(sizeBytes);
+        return vi.fn(() =>
+          Promise.resolve({
+            status: 200,
+            text: () => Promise.resolve(body),
+          }),
+        );
+      }
+
+      it('errors the whole composite once cumulative part bytes exceed the budget', async () => {
+        // 3 parts x 4 MiB = 12 MiB, well past the 10 MiB cumulative budget —
+        // each part is individually far under the single-response 10 MiB
+        // per-part cap, so only the AGGREGATE check catches this.
+        const partSize = 4 * 1024 * 1024;
+        vi.stubGlobal('fetch', mockFixedSizeBody(partSize));
+
+        const config = {
+          'change-detection': {
+            composite: {
+              'object-key': 'huge-composite',
+              parts: [
+                { id: 'a', url: 'https://api.example.com/parts/a' },
+                { id: 'b', url: 'https://api.example.com/parts/b' },
+                { id: 'c', url: 'https://api.example.com/parts/c' },
+              ],
+            },
+          },
+        };
+
+        await expect(
+          source.observe(config, { now: new Date() }),
+        ).rejects.toThrow(
+          new RegExp(
+            `exceeded the ${String(MAX_COMPOSITE_BYTES)}-byte cumulative rendered-artifact budget`,
+          ),
+        );
+      });
+
+      // `renderCompositeSnapshot` joins framed sections with a `\n\n`
+      // separator that the running per-part `framedPartByteLength` sum never
+      // counts (issue #304 review, fourth round: a reviewer-measured 2-byte
+      // undercount on a 50-part fixture let an over-budget artifact pass).
+      // The boundary fixtures below assert the FINAL rendered byte length —
+      // `Buffer.byteLength(renderCompositeSnapshot(...))`, exactly what
+      // `index.ts`'s final check computes — sits at or one over the budget,
+      // not just the pre-separator running sum.
+      const SEPARATOR_BYTES = Buffer.byteLength('\n\n', 'utf8');
+
+      it('a composite whose cumulative RENDERED bytes sit exactly at the budget succeeds (boundary)', async () => {
+        // Two same-length (1-char) ids contribute identical framing overhead
+        // (`framedPartByteLength` sums the SAME `## <id>\n<body>` text
+        // `renderCompositeSnapshot` emits), so body size is chosen so the
+        // FINAL rendered total — including the single `\n\n` separator
+        // between the two sorted parts — lands EXACTLY at the budget.
+        const overheadPerPart = framedPartByteLength({ id: 'a', body: '' });
+        const bodySize =
+          (MAX_COMPOSITE_BYTES - 2 * overheadPerPart - SEPARATOR_BYTES) / 2;
+        vi.stubGlobal('fetch', mockFixedSizeBody(bodySize));
+
+        const config = {
+          'change-detection': {
+            composite: {
+              'object-key': 'exact-budget-composite',
+              parts: [
+                { id: 'a', url: 'https://api.example.com/parts/a' },
+                { id: 'b', url: 'https://api.example.com/parts/b' },
+              ],
+            },
+          },
+        };
+
+        // Sanity-check the fixture math against the same render function the
+        // source uses, so a future change to the framing format fails this
+        // test's setup rather than silently shifting the boundary by a byte.
+        const body = 'a'.repeat(bodySize);
+        expect(
+          Buffer.byteLength(
+            renderCompositeSnapshot([
+              { id: 'a', body },
+              { id: 'b', body },
+            ]),
+            'utf8',
+          ),
+        ).toBe(MAX_COMPOSITE_BYTES);
+
+        const result = await source.observe(config, { now: new Date() });
+        expect(result.observations).toHaveLength(0);
+        expect(result.nextState).toBeDefined();
+      });
+
+      it('a composite whose cumulative RENDERED bytes are one byte over the budget throws (boundary)', async () => {
+        // Same exact-budget pair as the previous test, except part "b"'s
+        // body is one byte longer — the same two-part shape (same single
+        // `\n\n` separator, already counted in the exact-budget fixture)
+        // with the smallest possible perturbation that pushes the FINAL
+        // rendered total exactly one byte past the budget.
+        const overheadPerPart = framedPartByteLength({ id: 'a', body: '' });
+        const bodySize =
+          (MAX_COMPOSITE_BYTES - 2 * overheadPerPart - SEPARATOR_BYTES) / 2;
+        vi.stubGlobal(
+          'fetch',
+          vi.fn((input: string) => {
+            const size =
+              input === 'https://api.example.com/parts/b'
+                ? bodySize + 1
+                : bodySize;
+            return Promise.resolve({
+              status: 200,
+              text: () => Promise.resolve('a'.repeat(size)),
+            });
+          }),
+        );
+
+        const renderedBytes = Buffer.byteLength(
+          renderCompositeSnapshot([
+            { id: 'a', body: 'a'.repeat(bodySize) },
+            { id: 'b', body: 'a'.repeat(bodySize + 1) },
+          ]),
+          'utf8',
+        );
+        expect(renderedBytes).toBe(MAX_COMPOSITE_BYTES + 1);
+
+        const config = {
+          'change-detection': {
+            composite: {
+              'object-key': 'over-budget-by-one-composite',
+              parts: [
+                { id: 'a', url: 'https://api.example.com/parts/a' },
+                { id: 'b', url: 'https://api.example.com/parts/b' },
+              ],
+            },
+          },
+        };
+
+        await expect(
+          source.observe(config, { now: new Date() }),
+        ).rejects.toThrow(
+          new RegExp(
+            `exceeded the ${String(MAX_COMPOSITE_BYTES)}-byte cumulative rendered-artifact budget`,
+          ),
+        );
+      });
+
+      it('an empty-body part with an oversized id inflates the rendered artifact through framing alone', () => {
+        // Issue #304 review, third round, reviewer repro #2: a single
+        // empty-body part with an 11 MiB id produced an 11.5 MB baseline
+        // under the (pre-fix) body-only counter, which never counted a
+        // single byte for this part. `MAX_PART_ID_LENGTH` now rejects the
+        // oversized id at PARSE time, before any fetch — this asserts the
+        // parser-level rejection directly (the runtime-integration variant
+        // below exercises the same repro through `source.observe`).
+        const oversizedId = 'x'.repeat(11 * 1024 * 1024);
+        expect(() =>
+          parseCompositeConfig({
+            composite: {
+              'object-key': 'oversized-id-composite',
+              parts: [{ id: oversizedId, url: 'https://api.example.com/a' }],
+            },
+          }),
+        ).toThrow(
+          new RegExp(
+            `id must not exceed ${String(MAX_PART_ID_LENGTH)} characters`,
+          ),
+        );
+      });
+
+      // Issue #304 review, fifth round: the id-length check previously ran
+      // `Array.from(id).length`, materializing one array element per code
+      // point of the (unbounded, author-supplied) id BEFORE the length was
+      // even read — the reviewer's own 11 MiB ASCII-id repro above peaked
+      // around 149 MB RSS in Node merely to reject the config, amplifying
+      // the exact availability failure `MAX_PART_ID_LENGTH` exists to bound.
+      // The fix counts code points via a plain `for...of` and returns as
+      // soon as the running count exceeds the limit, so rejecting a huge id
+      // is O(limit), not O(id.length). A 50 MiB id (far larger than the 11
+      // MiB repro) must still reject near-instantly; a generous 500ms bound
+      // catches a regression back to the O(length) allocation without being
+      // flaky on a loaded CI runner.
+      it('rejects a far larger (50 MiB) oversized id without materializing it (near-instant rejection)', () => {
+        const hugeId = 'x'.repeat(50 * 1024 * 1024);
+        const start = performance.now();
+        expect(() =>
+          parseCompositeConfig({
+            composite: {
+              'object-key': 'huge-id-composite',
+              parts: [{ id: hugeId, url: 'https://api.example.com/a' }],
+            },
+          }),
+        ).toThrow(
+          new RegExp(
+            `id must not exceed ${String(MAX_PART_ID_LENGTH)} characters`,
+          ),
+        );
+        expect(performance.now() - start).toBeLessThan(500);
+      });
+    });
+
+    // Issue #304 review, third round: the cumulative BYTE budget bounds
+    // aggregate size, but bounds neither the number of parts (and therefore
+    // requests/worst-case tick duration, 003 §4.9) nor a single part's id
+    // length (which inflates the rendered artifact through framing alone,
+    // independent of any response body). `MAX_COMPOSITE_PARTS` and
+    // `MAX_PART_ID_LENGTH` close both gaps, enforced identically in the
+    // JSON Schema (authoring-time `agentmonitors validate`) and the parser
+    // (defense in depth for a hand-edited MONITOR.md, 002 §2.2).
+    describe('composite part-count and part-id bounds (issue #304 review, third round)', () => {
+      it('parseCompositeConfig rejects more than MAX_COMPOSITE_PARTS entries', () => {
+        const parts = Array.from(
+          { length: MAX_COMPOSITE_PARTS + 1 },
+          (_, i) => ({
+            id: `part-${String(i)}`,
+            url: `https://api.example.com/parts/${String(i)}`,
+          }),
+        );
+        expect(() =>
+          parseCompositeConfig({
+            composite: { 'object-key': 'too-many-parts', parts },
+          }),
+        ).toThrow(
+          new RegExp(`must not exceed ${String(MAX_COMPOSITE_PARTS)} entries`),
+        );
+      });
+
+      it('parseCompositeConfig accepts exactly MAX_COMPOSITE_PARTS entries (boundary)', () => {
+        const parts = Array.from({ length: MAX_COMPOSITE_PARTS }, (_, i) => ({
+          id: `part-${String(i)}`,
+          url: `https://api.example.com/parts/${String(i)}`,
+        }));
+        const config = parseCompositeConfig({
+          composite: { 'object-key': 'exactly-max-parts', parts },
+        });
+        expect(config?.parts).toHaveLength(MAX_COMPOSITE_PARTS);
+      });
+
+      it('parseCompositeConfig rejects a part id longer than MAX_PART_ID_LENGTH', () => {
+        const overlongId = 'x'.repeat(MAX_PART_ID_LENGTH + 1);
+        expect(() =>
+          parseCompositeConfig({
+            composite: {
+              'object-key': 'overlong-id',
+              parts: [{ id: overlongId, url: 'https://api.example.com/a' }],
+            },
+          }),
+        ).toThrow(
+          new RegExp(
+            `id must not exceed ${String(MAX_PART_ID_LENGTH)} characters`,
+          ),
+        );
+      });
+
+      it('parseCompositeConfig accepts a part id exactly MAX_PART_ID_LENGTH long (boundary)', () => {
+        const exactId = 'x'.repeat(MAX_PART_ID_LENGTH);
+        const config = parseCompositeConfig({
+          composite: {
+            'object-key': 'exact-id-length',
+            parts: [{ id: exactId, url: 'https://api.example.com/a' }],
+          },
+        });
+        expect(config?.parts[0]?.id).toHaveLength(MAX_PART_ID_LENGTH);
+      });
+
+      // Issue #304 review, fourth round: `id.length` counts UTF-16 CODE
+      // UNITS, but the JSON Schema `maxLength` keyword (and `@cfworker/json-
+      // schema`'s implementation of it, `ucs2length`) counts Unicode CODE
+      // POINTS. For an astral-plane character (e.g. most emoji, outside the
+      // Basic Multilingual Plane), one code point is a UTF-16 SURROGATE PAIR
+      // — 2 code units. A 200-emoji id is 200 code points (passes the
+      // schema's `maxLength: 256`, so `agentmonitors validate` accepted it)
+      // but 400 UTF-16 code units, so the pre-fix `id.length` check here
+      // wrongly rejected a config the schema had already blessed. The parser
+      // now counts `Array.from(id).length` (code points), matching the
+      // schema.
+      it('parseCompositeConfig counts part ids in Unicode code points, not UTF-16 code units (astral emoji)', () => {
+        const emojiId = '\u{1F600}'.repeat(200); // 200 code points, 400 UTF-16 units
+        expect(emojiId.length).toBe(400);
+        expect(Array.from(emojiId).length).toBe(200);
+
+        const config = parseCompositeConfig({
+          composite: {
+            'object-key': 'emoji-id-composite',
+            parts: [{ id: emojiId, url: 'https://api.example.com/a' }],
+          },
+        });
+        expect(config?.parts[0]?.id).toBe(emojiId);
+      });
+
+      it('parseCompositeConfig rejects an id with one more than MAX_PART_ID_LENGTH emoji code points (astral boundary)', () => {
+        const emojiId = '\u{1F600}'.repeat(MAX_PART_ID_LENGTH + 1);
+        expect(Array.from(emojiId).length).toBe(MAX_PART_ID_LENGTH + 1);
+
+        expect(() =>
+          parseCompositeConfig({
+            composite: {
+              'object-key': 'overlong-emoji-id',
+              parts: [{ id: emojiId, url: 'https://api.example.com/a' }],
+            },
+          }),
+        ).toThrow(
+          new RegExp(
+            `id must not exceed ${String(MAX_PART_ID_LENGTH)} characters \\(got ${String(MAX_PART_ID_LENGTH + 1)}\\)`,
+          ),
+        );
+      });
+
+      it('scopeSchema accepts a 200-code-point emoji id via validateWatchScope (schema/parser parity)', () => {
+        // Confirms `validateWatchScope` (the JSON Schema path, used by
+        // authoring-time `agentmonitors validate`) and `parseCompositeConfig`
+        // (the runtime parser, used by `tick()`, 002 §2.2) agree on this
+        // astral-character id: both must accept it, or a config that passes
+        // authoring-time validation would still fail at runtime.
+        const emojiId = '\u{1F600}'.repeat(200);
+        const errors = validateWatchScope(
+          {
+            'change-detection': {
+              composite: {
+                'object-key': 'emoji-id-composite',
+                parts: [{ id: emojiId, url: 'https://api.example.com/a' }],
+              },
+            },
+          },
+          source.scopeSchema,
+        );
+        expect(errors).toHaveLength(0);
+
+        const config = parseCompositeConfig({
+          composite: {
+            'object-key': 'emoji-id-composite',
+            parts: [{ id: emojiId, url: 'https://api.example.com/a' }],
+          },
+        });
+        expect(config?.parts[0]?.id).toBe(emojiId);
+      });
+
+      it('scopeSchema rejects more than MAX_COMPOSITE_PARTS entries via validateWatchScope', () => {
+        const parts = Array.from(
+          { length: MAX_COMPOSITE_PARTS + 1 },
+          (_, i) => ({
+            id: `part-${String(i)}`,
+            url: `https://api.example.com/parts/${String(i)}`,
+          }),
+        );
+        const errors = validateWatchScope(
+          {
+            'change-detection': {
+              composite: { 'object-key': 'too-many-parts', parts },
+            },
+          },
+          source.scopeSchema,
+        );
+        expect(errors.length).toBeGreaterThan(0);
+      });
+
+      it('scopeSchema rejects a part id longer than MAX_PART_ID_LENGTH via validateWatchScope', () => {
+        const overlongId = 'x'.repeat(MAX_PART_ID_LENGTH + 1);
+        const errors = validateWatchScope(
+          {
+            'change-detection': {
+              composite: {
+                'object-key': 'overlong-id',
+                parts: [{ id: overlongId, url: 'https://api.example.com/a' }],
+              },
+            },
+          },
+          source.scopeSchema,
+        );
+        expect(errors.length).toBeGreaterThan(0);
+      });
+
+      it('reviewer repro: 100,000 empty-body parts are rejected at parse (part-count cap), never issuing a single request', async () => {
+        // Issue #304 review, third round, reviewer repro #1: 100,000
+        // empty-body parts (0 cumulative body bytes) completed 100,000
+        // requests and produced a 1,699,998-byte baseline under the
+        // (pre-fix) body-only budget, which never tripped. `MAX_COMPOSITE_PARTS`
+        // rejects this at config-parse time, before `observe()` issues a
+        // single fetch.
+        const fetchMock = vi.fn(() =>
+          Promise.resolve({ status: 200, text: () => Promise.resolve('') }),
+        );
+        vi.stubGlobal('fetch', fetchMock);
+
+        const parts = Array.from({ length: 100_000 }, (_, i) => ({
+          id: `p${String(i)}`,
+          url: `https://api.example.com/parts/${String(i)}`,
+        }));
+        const config = {
+          'change-detection': {
+            composite: { 'object-key': 'reviewer-repro-1', parts },
+          },
+        };
+
+        await expect(
+          source.observe(config, { now: new Date() }),
+        ).rejects.toThrow(
+          new RegExp(`must not exceed ${String(MAX_COMPOSITE_PARTS)} entries`),
+        );
+        expect(fetchMock).not.toHaveBeenCalled();
+      });
+
+      it('reviewer repro: an empty-body part with an 11 MiB id is rejected at parse, never issuing a request', async () => {
+        // Issue #304 review, third round, reviewer repro #2: one empty-body
+        // part with an 11 MiB id produced an 11,534,340-byte baseline
+        // without tripping the (pre-fix) body-only budget check.
+        // `MAX_PART_ID_LENGTH` rejects this at config-parse time.
+        const fetchMock = vi.fn(() =>
+          Promise.resolve({ status: 200, text: () => Promise.resolve('') }),
+        );
+        vi.stubGlobal('fetch', fetchMock);
+
+        const oversizedId = 'x'.repeat(11 * 1024 * 1024);
+        const config = {
+          'change-detection': {
+            composite: {
+              'object-key': 'reviewer-repro-2',
+              parts: [{ id: oversizedId, url: 'https://api.example.com/a' }],
+            },
+          },
+        };
+
+        await expect(
+          source.observe(config, { now: new Date() }),
+        ).rejects.toThrow(
+          new RegExp(
+            `id must not exceed ${String(MAX_PART_ID_LENGTH)} characters`,
+          ),
+        );
+        expect(fetchMock).not.toHaveBeenCalled();
+      });
     });
   });
 });
