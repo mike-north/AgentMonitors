@@ -800,6 +800,84 @@ describe('the presets’ jq reduction over raw gh output', () => {
     });
   });
 
+  /**
+   * Issue #441 measured what happens when two monitors watch overlapping
+   * state: one merge delivered a high-urgency interrupt, an ack, a normal
+   * reminder, and another ack — ~15 round-trips across a 5-PR merge train.
+   * Shipping two presets that a user is expected to enable together makes that
+   * reproducible by construction unless their payloads are disjoint.
+   *
+   * The server-side `--search` scope alone does NOT guarantee disjointness: it
+   * does under the default (`review-requested:@me` cannot match your own PR,
+   * since GitHub forbids requesting review from yourself), but not under the
+   * label-driven model, which is the only one that works when author and
+   * reviewer share an identity. Disjointness therefore has to hold in the
+   * payload filters, which is what these assert.
+   */
+  describe('the two presets do not overlap (issue #441 interrupt multiplier)', () => {
+    let reviewScope: Scope;
+    let mineScope: Scope;
+    let stub: string;
+    beforeAll(() => {
+      reviewScope = presetScope('pr-review');
+      mineScope = presetScope('my-prs');
+      stub = stubGhApplyingJq();
+    });
+
+    /** Every PR state that could plausibly land in either payload. */
+    const states: { label: string; pr: Record<string, unknown> }[] = [
+      { label: 'green + undecided', pr: { ...QUIET } },
+      {
+        label: 'ci failing',
+        pr: { statusCheckRollup: [checkRun('build', 'FAILURE')] },
+      },
+      {
+        label: 'changes requested',
+        pr: { ...QUIET, reviewDecision: 'CHANGES_REQUESTED' },
+      },
+      { label: 'draft', pr: { ...QUIET, isDraft: true } },
+      { label: 'approved', pr: { ...QUIET, reviewDecision: 'APPROVED' } },
+    ];
+
+    it.each(states)(
+      'a PR that is $label appears in at most one payload',
+      async ({ pr }) => {
+        const raw = fixtureOf([
+          { ...(rawMyPr(pr) as object), ...(rawReviewPr(pr) as object) },
+        ]);
+        const inReview = JSON.parse(
+          (await observe(reviewScope, stub, raw)).stdout,
+        ) as unknown[];
+        const inMine = JSON.parse(
+          (await observe(mineScope, stub, raw)).stdout,
+        ) as unknown[];
+        expect(inReview.length + inMine.length).toBeLessThanOrEqual(1);
+      },
+    );
+
+    // The specific overlap that existed before: a red, undecided, non-draft PR
+    // was claimed by BOTH. It now belongs to its author only — a red PR is not
+    // review-ready.
+    it('gives a red undecided PR to my-prs only, never to the review queue', async () => {
+      const raw = fixtureOf([
+        {
+          ...(rawMyPr({
+            statusCheckRollup: [checkRun('build', 'FAILURE')],
+          }) as object),
+          ...(rawReviewPr({
+            statusCheckRollup: [checkRun('build', 'FAILURE')],
+          }) as object),
+        },
+      ]);
+      expect(
+        JSON.parse((await observe(reviewScope, stub, raw)).stdout),
+      ).toEqual([]);
+      expect(
+        JSON.parse((await observe(mineScope, stub, raw)).stdout),
+      ).toHaveLength(1);
+    });
+  });
+
   describe('`--type pr-review` reviewer queue', () => {
     let scope: Scope;
     let stub: string;

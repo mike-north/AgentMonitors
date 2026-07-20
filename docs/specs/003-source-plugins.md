@@ -1882,6 +1882,46 @@ scaffolded body therefore names it prominently and gives the exact command to ch
 `monitor test` warning when the configured scope returns zero rows on a first run — needs support in
 those commands and is **not** implemented here; it is the natural follow-up.
 
+#### The two presets must not overlap
+
+Shipping two presets a user may enable together makes issue #441's measured interrupt-multiplier
+reproducible by construction: two monitors watching overlapping state deliver separate alerts, in
+separate turns, for one real event — across a 5-PR merge train that was ~15 interrupt/ack round-trips
+describing work the session had just done itself.
+
+**The server-side `--search` scope alone does not prevent this.** It does under the default —
+`review-requested:@me` cannot match a PR you authored, since GitHub forbids requesting review from
+yourself, so `pr-review` and `my-prs` (`--author @me`) hold disjoint PR sets. It does **not** hold
+under the label-driven model, which is precisely the one required when author and reviewer share an
+identity.
+
+Disjointness therefore lives in the payload filters, where it holds for every scoping model. The two
+memberships partition by **readiness**:
+
+| PR state                    | `pr-review`  | `my-prs`               |
+| --------------------------- | ------------ | ---------------------- |
+| green, non-draft, undecided | ✅ review it | —                      |
+| failing CI                  | —            | ✅ `ci-failing`        |
+| changes requested           | —            | ✅ `changes-requested` |
+| draft                       | —            | ✅ `draft`             |
+| approved / decided          | —            | —                      |
+| merged / closed (within 6h) | —            | ✅ `merged`/`closed`   |
+
+The load-bearing clause is that `pr-review` **excludes PRs with failing checks**. A red PR is not
+review-ready — it belongs to its author until CI is green, and `my-prs` already classifies it
+`ci-failing`. Without that clause both presets claim a red, undecided, non-draft PR. Measured
+directly: before the exclusion, PRs `[1, 2]` were in `pr-review` while `[2, 3, 4]` were in `my-prs`,
+overlapping on 2; after, `[1]` and `[2, 3, 4]` are disjoint. `apps/cli/src/commands/pr-alerting-presets.test.ts`
+asserts every plausible PR state lands in at most one payload, and that assertion fails if the
+exclusion is removed.
+
+One residual, by nature rather than by defect: a PR merging leaves `pr-review` (no longer open) and
+enters `my-prs` as `merged`. Under the default scope those are different PRs, so nothing doubles.
+Under a same-identity scope it is one benign removal plus one actionable entry for the same merge —
+one extra dismissible fire, not the multiplier #441 measured. Cross-monitor coalescing at the delivery
+layer (#441) reduces this further but is complementary: the presets are designed not to be redundant
+in the first place, which is #441's own preferred remedy.
+
 #### Membership, not full state — and why both presets are `high`
 
 Both presets emit a **membership set**: a PR appears only while it needs something from its audience,

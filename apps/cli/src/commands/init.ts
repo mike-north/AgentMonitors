@@ -246,28 +246,39 @@ const PR_REVIEW_SCOPE_COMMENT =
   '  #                          PRs consume the 30-row window.\n';
 
 /**
- * `--type pr-review`'s `gh` query: open, non-draft PRs in the current repo,
- * excluding the current `gh` user's own PRs (`--search '-author:@me'` —
- * GitHub search-qualifier negation; `gh pr list` has no `--author`-exclusion
- * flag, only single-value inclusion). Without this, a PR the reviewer opens
- * themselves would appear in their own review queue: `my-prs` already covers
- * it, and "review your own PR" is not an action the body's "act as the
- * reviewer, do not self-merge" framing makes sense for. `changeset-release/*`
- * heads are excluded — the release/Version PR is never agent-reviewable.
- * Fields are chosen so `json-diff` fires on exactly the reviewer-relevant
- * transitions and nothing else: a PR entering the set (newly opened, or a
- * draft marked ready — drafts are filtered out, so "marked ready" *is* an
- * appearance), leaving it (merged/closed/converted back to draft), or
- * flipping `reviewDecision`. `updatedAt` is deliberately absent: including it
- * would fire on every push and comment.
+ * `--type pr-review`'s `gh` query: PRs in the current repo that are **actually
+ * awaiting review right now** — open, non-draft, not a `changeset-release/*`
+ * release PR, not yet decided (`reviewDecision` empty or `REVIEW_REQUIRED`),
+ * within the configured reviewer scope ({@link PR_REVIEW_DEFAULT_SCOPE}), and
+ * **not failing CI**.
+ *
+ * Membership is the signal, which is what lets this preset run at `high`
+ * urgency (see the template's urgency comment). Every PR *entering* this set
+ * needs reviewing: newly opened, or a draft marked ready — drafts are excluded,
+ * so "marked ready" surfaces as an appearance. `reviewDecision` is encoded as
+ * membership rather than carried as a field, so a decision landing removes the
+ * PR (one benign fire) instead of churning a value inside the set. `updatedAt`
+ * is deliberately absent: it would fire on every push and comment.
+ *
+ * **Excluding red PRs is what keeps this payload disjoint from `my-prs`**, and
+ * it holds under *every* reviewer-scoping model — including the label-driven
+ * one, where author and reviewer are the same identity so a server-side author
+ * exclusion is impossible. A red PR is not review-ready; it belongs to its
+ * author, and `my-prs` already classifies it `ci-failing`. Without this clause
+ * both presets claim a red, undecided, non-draft PR, so enabling both would
+ * deliver two alerts for one transition — issue #441's measured
+ * interrupt-multiplier, reproduced by construction.
  */
 const PR_REVIEW_QUERY =
   'gh pr list --state open --limit 30 ' +
   `--search '${PR_REVIEW_DEFAULT_SCOPE}' ` +
-  '--json number,title,isDraft,reviewDecision,headRefName,author ' +
+  '--json number,title,isDraft,reviewDecision,headRefName,author,statusCheckRollup ' +
   "--jq '[.[] | select(.isDraft == false " +
   'and (.headRefName | startswith("changeset-release/") | not) ' +
-  'and (((.reviewDecision // "") == "") or (.reviewDecision == "REVIEW_REQUIRED"))) ' +
+  'and (((.reviewDecision // "") == "") or (.reviewDecision == "REVIEW_REQUIRED")) ' +
+  'and ([.statusCheckRollup[]? | select(((.conclusion // .state // "") | ascii_upcase) as $c ' +
+  '| $c == "FAILURE" or $c == "TIMED_OUT" or $c == "CANCELLED" or $c == "ERROR" ' +
+  'or $c == "ACTION_REQUIRED" or $c == "STARTUP_FAILURE")] | length) == 0) ' +
   '| {number, title, headRefName, author: .author.login}] ' +
   "| sort_by(.number)'";
 
