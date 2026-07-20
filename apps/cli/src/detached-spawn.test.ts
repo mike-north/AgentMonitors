@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, it, expect } from 'vitest';
 import {
   chmodSync,
   closeSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -176,6 +177,35 @@ describe.skipIf(process.platform === 'win32')(
 
       expect(readFileSync(logPath, 'utf-8')).toBe('first boot\nsecond boot\n');
       expect(modeOf(logPath)).toBe(PRIVATE_FILE_MODE);
+    });
+
+    it('refuses a symlink pointing at a not-yet-existing target, creating nothing (dangling link)', () => {
+      // The nastier variant of the same vector: with a DANGLING link the old
+      // `openSync(logPath, 'a')` would CREATE the target through the link,
+      // planting a new file wherever it pointed rather than merely appending
+      // to an existing one. O_NOFOLLOW must refuse before anything is made.
+      const target = path.join(tmpDir, 'not-yet-there.txt');
+      const logPath = path.join(tmpDir, 'dangling-daemon.log');
+      symlinkSync(target, logPath);
+
+      expect(() => openLogFd(logPath, false)).toThrow(/symlink/i);
+
+      expect(existsSync(target)).toBe(false);
+    });
+
+    it('still opens and secures an ordinary regular file (O_NOFOLLOW does not break the normal path)', () => {
+      // Positive counterpart to the refusals: the symlink guard must not
+      // regress the case every real run takes.
+      const logPath = path.join(tmpDir, 'regular.log');
+      writeFileSync(logPath, 'existing\n');
+      chmodSync(logPath, 0o666);
+
+      const fd = openLogFd(logPath, false);
+      writeFileSync(fd, 'appended\n');
+      closeSync(fd);
+
+      expect(modeOf(logPath)).toBe(PRIVATE_FILE_MODE);
+      expect(readFileSync(logPath, 'utf-8')).toBe('existing\nappended\n');
     });
 
     it('refuses to append through a symlinked log path under the default location, and leaves the target untouched (round-6 review 3611641504)', () => {

@@ -234,7 +234,14 @@ export function openLogFd(logPath: string, isDefaultLocation: boolean): number {
       PRIVATE_FILE_MODE,
     );
   } catch (err) {
-    if (isErrnoException(err) && err.code === 'ELOOP') {
+    // POSIX raises ELOOP for O_NOFOLLOW against a symlink; some BSDs raise
+    // EMLINK for the O_CREAT combination. Both mean "that path is a symlink",
+    // and treating EMLINK as an unexpected error would surface this as an
+    // opaque failure on those platforms instead of the actionable message.
+    if (
+      isErrnoException(err) &&
+      (err.code === 'ELOOP' || err.code === 'EMLINK')
+    ) {
       throw new Error(
         `Refusing to write the detached daemon's log through a symlink at ${logPath}. ` +
           'Remove the symlink (or point --log at a regular file) and retry.',
@@ -243,6 +250,25 @@ export function openLogFd(logPath: string, isDefaultLocation: boolean): number {
     }
     throw err;
   }
-  fchmodSync(fd, PRIVATE_FILE_MODE);
+  try {
+    fchmodSync(fd, PRIVATE_FILE_MODE);
+  } catch (err) {
+    // Two reasons this must not simply propagate. First, the descriptor would
+    // leak for the life of the process. Second, a bare EPERM ("operation not
+    // permitted") gives no hint why the daemon refused to start — say the
+    // pre-existing `--log` file is owned by another user, so we can open it
+    // for append but cannot make it owner-only. Fail closed with the reason:
+    // the log carries workspace paths and monitor failures, so writing it to
+    // a file we cannot secure is exactly what this policy exists to prevent.
+    closeSync(fd);
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `Refusing to write the detached daemon's log to ${logPath}: it could ` +
+        `not be made owner-only (0600) — ${message}. The log carries ` +
+        'workspace paths and monitor failure details. Point --log at a file ' +
+        'you own, or remove the existing one.',
+      { cause: err },
+    );
+  }
   return fd;
 }
