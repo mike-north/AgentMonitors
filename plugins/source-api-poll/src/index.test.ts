@@ -1371,6 +1371,45 @@ When the document changes, act on it.
       );
     }
 
+    /**
+     * A `fetch` mock whose headers resolve immediately (2xx) but whose body
+     * stream never completes a read until the caller's signal aborts, then
+     * rejects with a raw `TypeError: terminated` — the shape undici produces
+     * under an HTTP/2 or socket-teardown race (issue #304 review, finding
+     * 4) — rather than the `AbortError` `mockHangingBodyFetch` above
+     * produces. Exercises the `controller.signal.aborted` fallback in
+     * `fetchBody`'s catch clause directly, since `isAbortError` alone would
+     * not classify this rejection as a timeout.
+     */
+    function mockHangingBodyFetchNonAbortRejection(): ReturnType<typeof vi.fn> {
+      return vi.fn((_url: string, init: RequestInit) =>
+        Promise.resolve({
+          status: 200,
+          headers: { get: () => null },
+          body: {
+            getReader: () => ({
+              read: () =>
+                new Promise((_resolve, reject) => {
+                  const signal = init.signal;
+                  if (!signal) throw new Error('test requires an AbortSignal');
+                  const rejectTerminated = (): void => {
+                    reject(new TypeError('terminated'));
+                  };
+                  if (signal.aborted) {
+                    rejectTerminated();
+                    return;
+                  }
+                  signal.addEventListener('abort', rejectTerminated);
+                }),
+              releaseLock: () => {
+                // no-op
+              },
+            }),
+          },
+        }),
+      );
+    }
+
     /** A `fetch` mock returning a declared `Content-Length` header, no streaming body. */
     function mockDeclaredContentLength(
       declaredBytes: number,
@@ -1454,6 +1493,37 @@ When the document changes, act on it.
         );
         await vi.advanceTimersByTimeAsync(1000);
         await assertion;
+      });
+
+      // Issue #304 review, finding 4 (regression): a stalled read that
+      // rejects with a non-`AbortError` after the deadline fires must still
+      // be normalized to the documented "timed out" message via the
+      // `controller.signal.aborted` fallback — not surfaced as the raw
+      // `TypeError: terminated` undici can produce under this race.
+      it('normalizes a non-Abort rejection after the deadline fires to the documented timeout error', async () => {
+        vi.stubGlobal('fetch', mockHangingBodyFetchNonAbortRejection());
+
+        const observePromise = source.observe(
+          { url: 'https://api.example.com/terminated-race', timeout: '1s' },
+          { now: new Date() },
+        );
+        const assertion = expect(observePromise).rejects.toThrow(
+          /timed out after 1000ms/,
+        );
+        await vi.advanceTimersByTimeAsync(1000);
+        await assertion;
+        // The raw undici error is preserved as `cause` even though the
+        // surfaced message is normalized (mirrors the AbortError path).
+        try {
+          await observePromise;
+          expect.unreachable('observe() must reject');
+        } catch (err) {
+          expect(err).toBeInstanceOf(Error);
+          expect((err as Error).cause).toBeInstanceOf(TypeError);
+          expect((err as Error).cause as TypeError).toMatchObject({
+            message: 'terminated',
+          });
+        }
       });
 
       it('a request that completes within the deadline is unaffected', async () => {

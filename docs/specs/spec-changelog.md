@@ -165,6 +165,37 @@ poll-until-`daemonAvailable` loop with slightly different timeout/poll constants
 
 Finding 5 (test teardown pid fallback) is test-infrastructure-only, no spec change.
 
+## 2026-07-19 — Composite byte-budget exact-render check and Unicode-code-point `id`-length parity (003 §4.9) — Refs #304
+
+Fourth round of review follow-ups on the #304 bounds, in the same PR before merge, closing two gaps
+left open by the round below.
+
+- **The cumulative byte budget still undercounted the final artifact.** `framedPartByteLength`
+  tallies each part's framed section (`## <id>\n<body>`) as it is observed, but
+  `renderCompositeSnapshot` also inserts `\n\n` separators between sections when assembling the
+  final artifact — bytes the running per-part tally never counted. A reviewer reproduced the gap
+  directly against the real helpers: a fixture built to sit exactly at the 10 MiB budget by the
+  summed-helper math rendered to 10,485,762 bytes against the running tally's 10,485,760, a 2-byte
+  (98 bytes at the 50-part cap) undercount that let an over-budget composite through.
+  `observeComposite` now performs a final `Buffer.byteLength` check on the actual rendered artifact
+  (separators included) before accepting the observation — exact regardless of part order or count
+  — and the boundary fixtures were re-derived to assert the final RENDERED byte length at and one
+  byte over the budget, not the pre-render running tally.
+- **The part-`id` length check counted UTF-16 code units, not Unicode code points**, while the
+  JSON Schema `maxLength` keyword (and `agentmonitors validate`) counts code points — so a
+  200-emoji `id` (200 code points, `id.length === 400` in UTF-16) passed schema validation and then
+  was wrongly rejected by `source.observe`, an authoring-time-green/runtime-red split. The parser
+  now counts code points (`Array.from(id).length`) to match the schema's `ucs2length` semantics; new
+  parity tests cover a 200-emoji `id` accepted by both surfaces and a 257-code-point `id` rejected
+  at the boundary by both.
+
+(Verified: `plugins/source-api-poll/src/composite.ts`, `renderCompositeSnapshot`;
+`plugins/source-api-poll/src/index.ts`, `observeComposite`; `plugins/source-api-poll/src/index.test.ts`,
+"a composite whose cumulative RENDERED bytes sit exactly at the budget succeeds (boundary)",
+"parseCompositeConfig counts part ids in Unicode code points, not UTF-16 code units (astral emoji)",
+"parseCompositeConfig rejects an id with one more than MAX_PART_ID_LENGTH emoji code points (astral
+boundary)".)
+
 ## 2026-07-19 — Composite part-count/part-`id` caps, rendered-artifact byte budget (003 §4.9, 004 §3.2) — Refs #304
 
 Third round of review follow-ups on the #304 bounds, in the same PR before merge.
@@ -184,9 +215,13 @@ Third round of review follow-ups on the #304 bounds, in the same PR before merge
   Both reviewer repro shapes above are now rejected at config-parse time, before `observe()` issues
   a single request.
 - **The cumulative byte budget now sums each part's RENDERED framed section** (`## <id>\n<body>`,
-  matching `renderCompositeSnapshot` exactly via the new `framedPartByteLength` helper) rather than
-  the raw response body, so id-framing overhead counts toward the same 10 MiB figure too — closing
-  the gap the part-count/id-length caps don't already close on their own.
+  via the new `framedPartByteLength` helper) rather than the raw response body, so id-framing
+  overhead counts toward the same 10 MiB figure too — closing the gap the part-count/id-length caps
+  don't already close on their own. `framedPartByteLength` is a running per-part tally taken during
+  observation, before `renderCompositeSnapshot` assembles the final artifact; it does **not** by
+  itself match the renderer's output byte-for-byte, because the renderer also inserts `\n\n`
+  separators between sections that this per-part helper has no reason to count. A follow-up entry
+  below closes that remaining gap with an exact check on the final rendered artifact.
 - **The part-count cap also bounds worst-case tick duration** (§4.9): with the existing 5-worker
   composite concurrency bound, a composite resolves or fails in at most `ceil(parts / 5) *
 timeout`; at the new 50-part cap and the default 30s timeout, that ceiling is `ceil(50 / 5) * 30s
