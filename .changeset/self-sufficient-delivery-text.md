@@ -25,8 +25,9 @@ with the recipient's real session id interpolated.
 - **Deliveries that inject event bodies now say how to finish.** A high-urgency delivery and the
   `SessionStart` recap each carry a single per-batch line naming the acknowledge command for that
   session. Because claiming is not acknowledging, a session that handled its delivery but never
-  acknowledged previously had every later normal-urgency reminder silently suppressed by the
-  coalesced-until-ack rule, with the remediation visible only in `monitor explain`.
+  acknowledged previously had that same band's own later reminder silently suppressed by the
+  band-scoped coalesced-until-ack rule (an unacknowledged claim never suppresses a different,
+  unrelated urgency band's reminder), with the remediation visible only in `monitor explain`.
 - No change to notify/debounce timing, urgency bands, coalescing behavior, or the
   unread/claimed/acknowledged model. The legacy `inbox` CLI surface is untouched.
 

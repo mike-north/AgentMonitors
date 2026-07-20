@@ -237,9 +237,12 @@ content the hook path injects**, not a lesser summary. Two claim shapes render d
 - **Reminder claim** (`normal`/`low` — no event bodies, only a coalesced advisory `message`):
   `content` renders that generic message, sanitized for tag safety, **plus this transport's own
   action step** appended after it (§5.1.1, PR #445 review finding 2) — the runtime's message alone no
-  longer names a CLI verb, so the channel appends "Call the agentmon_ack tool, or run `agentmonitors
-events list --session <id> --socket <path> --unread` for details." rather than repeating the hook's
-  `events ack` command, which a channel-connected agent has no use for. This combined string is still
+  longer names a CLI verb, so the channel appends "Run `agentmonitors events list --session <id>
+--socket <path> --unread` to see them, then call the agentmon_ack tool with the event_id values of
+  the ones you handled." Inspection is a **prerequisite**, not an "or" alternative to acking (§5.1.1,
+  PR #445 review, round 2, finding 2) — a no-argument `agentmon_ack` call acknowledges every unread
+  event across every urgency band, so the wording sequences list-then-scoped-ack rather than
+  presenting the tool call as a shortcut around inspection. This combined string is still
   bounded by {@link MAX_CHANNEL_CONTENT} (PR #445 review finding 5) — latent today since the reminder
   is short, but this was previously the one render path in the file without the #442
   defense-in-depth ceiling — with **no** body injection.
@@ -634,12 +637,18 @@ adapter. Adding a new surface means choosing its attribution there, not editing 
 
 **The acknowledge instruction.** A body-injection delivery (settled high-urgency events at
 `turn-interruptible`, or the `post-compact` recap surfaced at `SessionStart`) **claims** the events it
-renders — and claiming is never acknowledging (BP2 / SP4). Until the recipient acknowledges, the
-coalesced-until-ack rule ([002 §9.2](./002-runtime-delivery.md#92-normal-urgency)) suppresses every
-subsequent normal-urgency reminder for that session. Previously the delivered payload named no way to
-acknowledge, so an agent that fully handled the delivered work still left its own channel silently
-muted; the remediation existed only in `monitor explain`, which nobody runs while things appear fine
-(issue #434 — the delivery-side twin of the silent-degradation family in issue #425).
+renders — and claiming is never acknowledging (BP2 / SP4). The coalesced-until-ack rule
+([002 §9.2](./002-runtime-delivery.md#92-normal-urgency)) is **band-scoped**: it compares a band's own
+claimed-but-unacknowledged events against that SAME band's unread total
+(`normalPending.length === unreadNormal.length`; the low-urgency guard, §9.3, is the identical pattern
+against its own band). Leaving a claim unacknowledged therefore suppresses only the reminder for
+whichever band(s) the claimed events actually belong to — an unacknowledged `high`-urgency (or
+mixed-band recap) claim does **not**, on its own, block a NEW `normal`-urgency reminder from firing for
+unrelated, still-unclaimed `normal` events in the same session; the two coexist. Previously the
+delivered payload named no way to acknowledge, so an agent that fully handled the delivered work still
+left that claimed band's own future reminder silently muted; the remediation existed only in
+`monitor explain`, which nobody runs while things appear fine (issue #434 — the delivery-side twin of
+the silent-degradation family in issue #425).
 
 Therefore the hook transport's body-injection header **MUST** carry a completion instruction naming
 the acknowledge command with the recipient's **real session id** and an explicit **`--socket

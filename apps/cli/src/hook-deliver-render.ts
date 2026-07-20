@@ -551,6 +551,17 @@ export interface PackedHookBlocks {
  * mismatch can still be released and retried while the rows are only leased,
  * not yet claimed — mirroring the channel transport's
  * `reserveSizedChannelDelivery`/`resolveChannelClaimFit` pattern exactly.
+ *
+ * `deferredMarker` defaults to this session's {@link buildHookDeferredMarker}
+ * output, which is correct for every `reserveSizedHookDelivery` call site
+ * (only ever `turn-interruptible`, never a recap). `renderHookDelivery`,
+ * however, MUST pass its own already-selected marker explicitly: a
+ * `post-compact` recap claim appends the LONGER {@link buildHookRecapMarker}
+ * instead, and this function reserving room for the shorter deferred marker
+ * while the caller then appends the longer recap marker on top let the
+ * rendered `additionalContext` exceed `cap` (PR #445 review, finding
+ * 3611418583) — reserving against the marker that will ACTUALLY be appended
+ * is the only way `includedCount` stays truthful for both lifecycles.
  */
 export function resolveHookClaimFit(
   events: DeliveryEventSummary[],
@@ -558,6 +569,7 @@ export function resolveHookClaimFit(
   socketPath: string | undefined,
   moreDeferred: boolean,
   cap: number = MAX_ADDITIONAL_CONTEXT,
+  deferredMarker: string = buildHookDeferredMarker(sessionId, socketPath),
 ): HookClaimFit {
   const blocks = events.map(buildEventBlock);
   const whole = resolveHookHeaderPacking(
@@ -570,7 +582,6 @@ export function resolveHookClaimFit(
   if (whole.includedCount === blocks.length && !moreDeferred) {
     return { fits: true, includedCount: blocks.length, whole, reserved: whole };
   }
-  const deferredMarker = buildHookDeferredMarker(sessionId, socketPath);
   const reserved = resolveHookHeaderPacking(
     events,
     blocks,
@@ -763,6 +774,13 @@ export function renderHookDelivery(
     options.socketPath,
     moreDeferred,
     MAX_ADDITIONAL_CONTEXT,
+    // Reserve against the marker THIS render will actually append below
+    // (`deferredMarker`, already lifecycle-aware — the recap marker for a
+    // `post-compact` claim, the shorter deferred marker otherwise) rather
+    // than `resolveHookClaimFit`'s own default, which always assumes the
+    // deferred marker regardless of lifecycle (PR #445 review, finding
+    // 3611418583).
+    deferredMarker,
   );
 
   let additionalContext: string;

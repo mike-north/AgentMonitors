@@ -887,6 +887,37 @@ describe('renderHookDelivery post-compact recap marker (issue #442, round-9 revi
     );
   });
 
+  // (PR #445 review, finding 3611418583) `resolveHookClaimFit` used to always
+  // reserve room for `buildHookDeferredMarker`'s length, regardless of which
+  // marker `renderHookDelivery` would actually append — but a recap appends
+  // the LONGER `buildHookRecapMarker` instead. A two-event recap whose combined
+  // whole blocks don't all fit under the FULL cap, but DO fit once room is
+  // reserved for the (too-short) deferred marker, could then overflow once the
+  // longer recap marker was appended on top of that under-reserved packing.
+  // `bodyA` at 3546 chars is the smallest size that genuinely overflows the
+  // pre-fix code (verified by brute-force search over the boundary region);
+  // sizes below that still pass even without the fix, so they would not
+  // reproduce this bug.
+  it('a two-event recap boundary case does not overflow the cap once the longer recap marker is appended', () => {
+    const bodyA = 'a'.repeat(3546);
+    const bodyB = 'b'.repeat(1000);
+    const out = renderHookDelivery(
+      makeRecapClaim({
+        sessionId: 'session-recap-boundary',
+        events: [
+          recapEvent({ eventId: 'e1', monitorId: 'mon-a', body: bodyA }),
+          recapEvent({ eventId: 'e2', monitorId: 'mon-b', body: bodyB }),
+        ],
+      }),
+      'SessionStart',
+      { socketPath: '/tmp/agentmon.sock' },
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx.length).toBeLessThanOrEqual(4000);
+    expect(ctx).toContain('[truncated');
+    expect(ctx).toContain('will reappear on future recaps');
+  });
+
   it('a recap that fits entirely under the cap carries no marker at all', () => {
     const out = renderHookDelivery(makeRecapClaim(), 'SessionStart');
     const ctx = out?.hookSpecificOutput.additionalContext ?? '';

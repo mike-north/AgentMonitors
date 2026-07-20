@@ -260,6 +260,87 @@ Handle it.
     expect(hookState.unread.high).toBe(1);
   });
 
+  // 006 §5.1.1 (PR #445 review): the coalesced-until-ack guard is BAND-scoped —
+  // it compares a band's own claimed-but-unacknowledged events against that SAME
+  // band's unread total (`normalPending.length === unreadNormal.length`), never
+  // across bands. A prior revision of 006 wrongly claimed that leaving a
+  // high-urgency (or recap) claim unacknowledged suppresses "every subsequent
+  // normal-urgency reminder for that session" — this regression test proves the
+  // two coexist: claiming (never acking) a settled high-urgency event does NOT
+  // block a separate, unrelated, still-unclaimed normal-urgency event's own
+  // coalesced reminder from firing on the very next `turn-interruptible` claim.
+  it('an unacknowledged high-urgency claim does not suppress a same-session normal-urgency reminder (cross-band independence)', () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const db = createDb(':memory:');
+    const registry = new SourceRegistry();
+    const runtime = new AgentMonitorRuntime(new RuntimeStore(db), registry, [
+      claudeCodeAdapter,
+    ]);
+
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-session-cross-band',
+        workspacePath: rootDir,
+      }),
+    );
+
+    const store = new RuntimeStore(db);
+    // A settled (past the debounce window) high-urgency event.
+    store.insertEvent({
+      workspacePath: rootDir,
+      monitorId: 'urgent-monitor',
+      sourceName: 'manual',
+      urgency: 'high',
+      title: 'CI failed',
+      body: 'CI failed on the default branch',
+      summary: 'CI failed on the default branch',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey: 'ci/default',
+      queryScope: { pipeline: 'default' },
+      tags: ['ci'],
+      createdAt: new Date(Date.now() - 20_000),
+    });
+    // A wholly unrelated, still-unclaimed normal-urgency event.
+    store.insertEvent({
+      workspacePath: rootDir,
+      monitorId: 'docs-monitor',
+      sourceName: 'manual',
+      urgency: 'normal',
+      title: 'Docs changed',
+      body: 'Docs changed',
+      summary: 'Docs changed',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey: 'docs/readme',
+      queryScope: { path: 'readme.md' },
+      tags: [],
+      createdAt: new Date(),
+    });
+
+    // First claim: the settled high-urgency event takes priority (§9.1) and is
+    // claimed — but NOT acknowledged.
+    const highClaim = runtime.claimDelivery(session.id, 'turn-interruptible');
+    expect(highClaim?.mode).toBe('delivery');
+    expect(highClaim?.urgency).toBe('high');
+
+    // Second claim, same session, high claim still unacknowledged: the
+    // completely separate normal-urgency event is still unclaimed, so its own
+    // band-local guard (`normalPending.length === unreadNormal.length`) holds
+    // and the coalesced reminder fires — proving the unacked high claim did
+    // NOT durably suppress it.
+    const normalClaim = runtime.claimDelivery(session.id, 'turn-interruptible');
+    expect(normalClaim).not.toBeNull();
+    expect(normalClaim?.mode).toBe('delivery');
+    expect(normalClaim?.urgency).toBe('normal');
+    expect(normalClaim?.events).toEqual([]);
+  });
+
   // Issue #407: `verify --use-workspace-daemon` must retract the events its own
   // scratch file produced against the persistent workspace daemon (a create AND
   // a delete), so a later session never sees them. The retraction removes ONE
