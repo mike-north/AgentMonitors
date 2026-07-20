@@ -147,19 +147,123 @@ describe('assertPackageCleanRemovesDistAndTemp', () => {
     ).toThrow(/must also remove "temp"/);
   });
 
-  // Regression fixture for the round-2 #454 review finding: a command
-  // reachable only via an unresolved `||` branch was still marked
-  // `guaranteed: true` once re-joined by a subsequent `&&` — `cmd2` here
-  // only runs if `rm -rf dist` FAILED, so `rm -rf temp` (joined to `cmd2`
-  // by `&&`) is only reachable on that same failure path, not the normal
-  // success path.
-  it('rejects "temp" removed only via `cmd1 || cmd2 && rm -rf temp` (guard false-accept #4: unresolved `||` reachability not propagated through `&&`)', () => {
+  // Regression fixture for the round-3 #454 review finding
+  // (`adaptive-parser-001`): `&&` and `||` have EQUAL precedence and are
+  // LEFT-ASSOCIATIVE in real POSIX shell — `/bin/sh -c "true || echo
+  // skipped && echo ran"` runs the final command, because `&&` looks back
+  // through the skipped `echo skipped` to the STATUS OF THE LAST COMMAND
+  // THAT ACTUALLY RAN (`true`, which succeeded), not to the skipped
+  // command's own (never-executed) status. So `rm -rf dist || echo
+  // recovering && rm -rf temp` DOES reliably remove `temp` on the normal
+  // (successful `rm -rf dist`) path: `echo recovering` is skipped, but
+  // `rm -rf temp`'s `&&` still sees `rm -rf dist`'s success. An earlier
+  // version of this guard AND this very fixture both modeled `&&`/`||` as
+  // chaining only the immediately preceding command's reachability, which
+  // false-REJECTED this real left-associative shape.
+  it('accepts "temp" removed via `rm -rf dist || echo recovering && rm -rf temp` (left-associative &&/|| precedence)', () => {
     expect(() =>
       assertPackageCleanRemovesDistAndTemp(
         { scripts: { clean: 'rm -rf dist || echo recovering && rm -rf temp' } },
         'test-package',
       ),
+    ).not.toThrow();
+  });
+
+  // Regression fixture for the round-3 #454 review finding
+  // (`adaptive-parser-001`): the flip side of the left-associative fixture
+  // above — treating every command except the literal `false` builtin as
+  // successful let a deterministically-failing `exit 1` (which the pre-fix
+  // `commandAlwaysFails` didn't recognize) make its `&&`-chained
+  // `rm -rf dist temp` look guaranteed, even though `exit 1` prevents it
+  // from ever running.
+  it('rejects "temp" removed only via `exit 1 && rm -rf dist temp` (adaptive-parser-001: `exit <nonzero>` must be recognized as always-failing)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'exit 1 && rm -rf dist temp' } },
+        'test-package',
+      ),
+    ).toThrow(/must run `rm -rf`/);
+  });
+
+  // Regression fixture for the round-3 #454 review finding
+  // (`adaptive-parser-002`): a lone `&` (background) was previously
+  // recognized only as the LAST character of the whole command string, so
+  // a MID-chain `rm -rf dist temp & echo done` was accepted as one
+  // ordinary (non-backgrounded) command — but the shell backgrounds
+  // `rm -rf dist temp` and moves on to `echo done` immediately, without
+  // waiting for the removal to complete.
+  it('rejects "temp" removed only via a mid-chain backgrounded `rm -rf dist temp & echo done` (adaptive-parser-002)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'rm -rf dist temp & echo done' } },
+        'test-package',
+      ),
+    ).toThrow(/must run `rm -rf`/);
+  });
+
+  // Regression fixture for the round-3 #454 review finding
+  // (`adaptive-parser-003`): an unquoted `#` starts a comment only when it
+  // BEGINS a word, not in the middle of one — `/bin/sh` passes
+  // `temp#suffix` as a single literal operand (never as `temp`), so a
+  // clean script whose only `temp` mention is glued to a trailing `#...`
+  // never actually removes a directory literally named `temp`.
+  it('rejects `rm -rf dist temp#suffix` — a mid-word `#` is not a comment (adaptive-parser-003)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'rm -rf dist temp#suffix' } },
+        'test-package',
+      ),
     ).toThrow(/must also remove "temp"/);
+  });
+
+  // Regression fixture for the round-3 #454 review finding
+  // (`adaptive-parser-004`): quote tracking must be escape-aware. Inside a
+  // double-quoted string, `\"` is an ESCAPED quote — it stays part of the
+  // string content and does NOT close the quote (only an unescaped `"`
+  // does). A quote tracker that closes on any `"` regardless of a
+  // preceding backslash would wrongly expose the `rm -rf dist temp`
+  // embedded later in this single `echo` argument as a real, executable
+  // command — it is never anything but string content.
+  it('rejects "rm -rf dist temp" reachable only through an escaped-quote double-quoted string (adaptive-parser-004)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        {
+          scripts: {
+            clean: 'echo "prefix \\" && rm -rf dist temp"',
+          },
+        },
+        'test-package',
+      ),
+    ).toThrow(/must run `rm -rf`/);
+  });
+
+  // Second escape-awareness fixture (adaptive-parser-004): an UNQUOTED
+  // backslash-escaped separator (`\;`) is also just an escaped literal
+  // character, not a real command separator — `echo prefix\; rm -rf dist
+  // temp` is entirely ONE `echo` command (its arguments happen to include
+  // the words `rm`, `-rf`, `dist`, `temp`, but they're never invoked as a
+  // command).
+  it('rejects "rm -rf dist temp" reachable only via an escaped `\\;` separator (adaptive-parser-004)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'echo prefix\\; rm -rf dist temp' } },
+        'test-package',
+      ),
+    ).toThrow(/must run `rm -rf`/);
+  });
+
+  // Regression fixture for the round-3 #454 review finding
+  // (`adaptive-parser-006`): exact `rm`/`-rf` word matching still accepted
+  // a THIRD word that is itself a control/option flag — `rm -rf --help
+  // dist temp` satisfies the `rm`/`-rf` prefix exactly, but the real `rm`
+  // binary exits after printing help instead of deleting `dist`/`temp`.
+  it('rejects `rm -rf --help dist temp` — a control flag turns removal into a no-op (adaptive-parser-006)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'rm -rf --help dist temp' } },
+        'test-package',
+      ),
+    ).toThrow(/must run `rm -rf`/);
   });
 
   // Regression fixture for the round-2 #454 review finding: a backslash
@@ -519,6 +623,98 @@ describe('assertRootCleanRunsWorkspaceCleanAndReset', () => {
         scripts: {
           clean:
             'NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace --help && NX_TUI=false nx reset --help',
+        },
+      }),
+    ).toThrow(/must invoke `nx run-many --target=clean`/);
+  });
+
+  // Regression fixture for the round-3 #454 review finding
+  // (`adaptive-parser-001`): left-associative equal-precedence `&&`/`||` —
+  // see the package-level fixture above for the full explanation. Skipping
+  // `echo recovering` must NOT stop `nx reset`'s `&&` from seeing
+  // `run-many`'s own (successful) status.
+  it('accepts `run-many || echo recovering && reset` (left-associative &&/|| precedence)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace || echo recovering && NX_TUI=false nx reset',
+        },
+      }),
+    ).not.toThrow();
+  });
+
+  it('rejects `exit 1 && run-many && reset` (adaptive-parser-001: `exit <nonzero>` must be recognized as always-failing)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'exit 1 && NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace && NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/must invoke `nx run-many --target=clean`/);
+  });
+
+  // Regression fixture for the round-3 #454 review finding
+  // (`adaptive-parser-002`): a lone `&` is a control operator wherever it
+  // appears, not just as the final character — `run-many & echo done`
+  // backgrounds `run-many` and moves straight on to `echo done`, so the
+  // fan-out clean is never guaranteed to have finished (`nx reset` on the
+  // next line still runs, but that alone isn't the required contract).
+  it('rejects a mid-chain backgrounded `run-many & echo done` (adaptive-parser-002)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace & echo done\nNX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/must invoke `nx run-many --target=clean`/);
+  });
+
+  // Regression fixture for the round-3 #454 review finding
+  // (`adaptive-parser-003`): an unquoted `#` starts a comment only at the
+  // start of a word — a `#` glued onto the end of `--exclude=`'s value is
+  // just more of that value, not a comment marker, so the exclusion never
+  // actually matches the workspace root project name.
+  it('rejects `--exclude=agentmonitors-workspace#suffix` — a mid-word `#` is not a comment (adaptive-parser-003)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace#suffix\nNX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(new RegExp(`must exclude\\s+"${WORKSPACE_ROOT_PROJECT_NAME}"`));
+  });
+
+  // Regression fixture for the round-3 #454 review finding
+  // (`adaptive-parser-004`): escape-aware quote tracking — an escaped `\"`
+  // inside a double-quoted string keeps it open, so both required
+  // invocations here are still only ever inside a single `echo` argument,
+  // never executed.
+  it('rejects both required invocations reachable only through an escaped-quote double-quoted string (adaptive-parser-004)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'echo "prefix \\" NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace && NX_TUI=false nx reset"',
+        },
+      }),
+    ).toThrow(/must invoke `nx run-many --target=clean`/);
+  });
+
+  // Regression fixture for the round-3 #454 review finding
+  // (`adaptive-parser-005`): the no-op-flag check must compare against
+  // quote-REMOVED words — a quoted `"--help"` passes the exact same argv
+  // token to `nx` as an unquoted `--help` would, so it must be caught the
+  // same way.
+  it('rejects `nx run-many ... "--help" && nx reset "--help"` — quoted no-op flags (adaptive-parser-005)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace "--help" && NX_TUI=false nx reset "--help"',
         },
       }),
     ).toThrow(/must invoke `nx run-many --target=clean`/);

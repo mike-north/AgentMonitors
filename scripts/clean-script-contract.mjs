@@ -113,182 +113,282 @@ export function findApiExtractorPackageDirs(root = REPO_ROOT) {
 }
 
 /**
- * @typedef {{ command: string, guaranteed: boolean }} ChainedCommand
+ * @typedef {'&&' | '||' | ';' | '\n' | '&'} ShellOperator
  */
 
 /**
- * Remove shell constructs that would otherwise corrupt naive
- * &&/||/;/newline splitting (round-2 #454 review findings):
+ * @typedef {{ words: string[] }} LexedCommand
+ */
+
+/**
+ * @typedef {{ words: string[], guaranteed: boolean }} ChainedCommand
+ */
+
+/**
+ * Lex a (deliberately narrow, non-pipe, non-subshell) shell script into a
+ * flat stream alternating {@link LexedCommand} word-lists and
+ * {@link ShellOperator} tokens — a SINGLE quote/escape/comment-aware pass.
  *
- * - Backslash-immediately-followed-by-newline is a line CONTINUATION —
- *   the shell joins the two physical lines into one logical line and the
- *   newline never acts as a command separator. Left unhandled, splitting
- *   on a bare `\n` treats the escaped newline in e.g.
- *   `rm -rf dist ||\` + newline + `  rm -rf temp` as a real separator,
- *   which discards the pending `||` and wrongly marks `rm -rf temp`
- *   `guaranteed`.
- * - `#` starts a comment to end-of-line — everything after it (including
- *   any `&&`/`nx reset`) never executes, so it must never be scanned for
- *   operators or required commands.
+ * This replaces three previously separate passes (comment/continuation
+ * stripping, then &&/||/;/newline splitting, then per-command whitespace
+ * tokenizing), each of which needed the exact same quote/escape state to
+ * tell an operator/comment/word-boundary apart from literal text but
+ * couldn't share it — round-3 #454 review findings: escape-UNAWARE quote
+ * tracking closed a double-quoted string early on `\"` (an escaped quote,
+ * which real double-quote rules keep literal and open), and `#` was
+ * recognized as a comment mid-word instead of only at the start of one. A
+ * single pass with one shared quote/escape state can't develop that kind
+ * of pass-to-pass drift.
  *
- * Both are quote-aware: neither applies inside a single- or
- * double-quoted string (a literal `#` or `\`-newline inside `'...'`/`"..."`
- * is just string content, not shell syntax).
+ * Scope, deliberately NOT full POSIX: no pipes (`|`), no subshells
+ * (`(...)`), no command substitution, no parameter/glob expansion. This
+ * guard only ever needs to classify the small set of shell forms that
+ * appear in this repo's own `clean` scripts (`&&`/`||`/`;`/newline/`&`
+ * -chained, optionally quoted `rm -rf`/`nx` invocations) — a
+ * general-purpose shell parser would validate a far larger grammar than
+ * this guard will ever exercise, at the cost of being much harder to
+ * verify by inspection than this bounded, single-purpose lexer.
+ *
+ * Word rules implemented (POSIX `sh` quote-removal semantics, scoped to
+ * the constructs above):
+ * - Unquoted whitespace separates words.
+ * - An unquoted `#` starts a comment to end-of-physical-line, but ONLY
+ *   when it begins a word (preceded by whitespace, an operator, or the
+ *   start of the script) — a `#` in the middle of a word (e.g.
+ *   `temp#suffix`) is ordinary text, exactly as `/bin/sh` treats it.
+ * - Inside `'...'`, every character (including `\`) is literal; there is
+ *   no escaping.
+ * - Inside `"..."`, characters are literal EXCEPT a backslash immediately
+ *   before `"`, `\`, `$`, `` ` ``, or a newline — only those five are
+ *   escapable inside double quotes, per POSIX; a backslash before any
+ *   other character stays a literal backslash. A `\"` therefore keeps the
+ *   quoted string OPEN (the quote is not closed by an escaped `"`).
+ * - Outside quotes, a backslash escapes exactly the next character,
+ *   stripping any special meaning it would otherwise have (including
+ *   `;`/`&`/`|`/`#`/a quote character) — except a backslash immediately
+ *   before a newline, which is a line CONTINUATION: both characters are
+ *   discarded and the two physical lines become one logical line.
+ * - `&&`, `||`, `;`, a bare newline, and a lone (non-`&&`) `&` are each
+ *   unquoted control operators, recognized wherever they appear — not
+ *   just at the end of a line/command (round-3 #454 review finding: a
+ *   lone `&` was previously recognized only as the LAST character of the
+ *   whole script, so `rm -rf dist temp & echo done` was accepted as one
+ *   ordinary command instead of a backgrounded `rm -rf` followed by a
+ *   fresh, unconditional `echo`).
  *
  * @param {string} script
- * @returns {string}
+ * @returns {(LexedCommand | ShellOperator)[]}
  */
-function stripCommentsAndLineContinuations(script) {
-  let result = '';
+function lexShellLike(script) {
+  /** @type {(LexedCommand | ShellOperator)[]} */
+  const out = [];
+  /** @type {string[]} */
+  let words = [];
+  let word = '';
+  let wordOpen = false;
   /** @type {"'" | '"' | undefined} */
   let quote;
+  // Only used to decide whether an unquoted `#` starts a comment — true at
+  // script start, right after whitespace, or right after an operator.
+  let atWordStart = true;
+
+  const flushWord = () => {
+    if (wordOpen) {
+      words.push(word);
+      word = '';
+      wordOpen = false;
+    }
+  };
+  /** @param {ShellOperator} [operator] */
+  const flushCommand = (operator) => {
+    flushWord();
+    if (words.length > 0) {
+      out.push({ words });
+    }
+    words = [];
+    if (operator !== undefined) {
+      out.push(operator);
+    }
+    atWordStart = true;
+  };
 
   for (let i = 0; i < script.length; i++) {
     const ch = script[i];
 
-    if (quote) {
-      result += ch;
-      if (ch === quote) {
+    if (quote === "'") {
+      if (ch === "'") {
         quote = undefined;
+      } else {
+        word += ch;
       }
+      wordOpen = true;
+      continue;
+    }
+
+    if (quote === '"') {
+      if (ch === '"') {
+        quote = undefined;
+        wordOpen = true;
+        continue;
+      }
+      const next = script[i + 1];
+      if (ch === '\\' && next === '\n') {
+        i++; // line continuation, even inside a double-quoted string
+        continue;
+      }
+      if (
+        ch === '\\' &&
+        (next === '"' || next === '\\' || next === '$' || next === '`')
+      ) {
+        word += next;
+        wordOpen = true;
+        i++;
+        continue;
+      }
+      word += ch;
+      wordOpen = true;
+      continue;
+    }
+
+    // Unquoted.
+    if (ch === '\\') {
+      if (script[i + 1] === '\n') {
+        i++; // line continuation
+        continue;
+      }
+      if (i + 1 < script.length) {
+        word += script[i + 1];
+        wordOpen = true;
+        atWordStart = false;
+        i++;
+        continue;
+      }
+      // Trailing lone backslash at end of script: nothing to escape, keep
+      // it as literal text rather than throwing it away.
+      word += ch;
+      wordOpen = true;
+      atWordStart = false;
       continue;
     }
 
     if (ch === "'" || ch === '"') {
       quote = ch;
-      result += ch;
+      wordOpen = true;
+      atWordStart = false;
       continue;
     }
 
-    if (ch === '\\' && script[i + 1] === '\n') {
-      i++; // consume both the backslash and the newline: no-op
-      continue;
-    }
-
-    if (ch === '#') {
+    if (ch === '#' && atWordStart) {
       while (i < script.length && script[i] !== '\n') {
         i++;
       }
-      i--; // step back so the newline itself is still seen as a separator
+      i--; // let the newline itself still be seen as a separator below
       continue;
     }
 
-    result += ch;
-  }
-
-  return result;
-}
-
-/**
- * Tokenize a (comment/continuation-stripped) script into alternating
- * command-text segments and `&&`/`||`/`;`/newline operator tokens —
- * quote-aware, so an operator character INSIDE a single- or double-quoted
- * string (e.g. the `;` in `echo 'a; rm -rf dist; b'`) is treated as
- * ordinary command text, not a real separator (round-2 #454 review
- * finding: a naive `.split(/(&&|\|\||;|\n)/)` split commands out of quoted
- * string literals that never execute as shell syntax at all).
- *
- * @param {string} script
- * @returns {string[]}
- */
-function tokenizeShellLike(script) {
-  const stripped = stripCommentsAndLineContinuations(script);
-  const tokens = [];
-  let buffer = '';
-  /** @type {"'" | '"' | undefined} */
-  let quote;
-
-  for (let i = 0; i < stripped.length; i++) {
-    const ch = stripped[i];
-
-    if (quote) {
-      buffer += ch;
-      if (ch === quote) {
-        quote = undefined;
-      }
+    if (ch === ' ' || ch === '\t' || ch === '\r') {
+      flushWord();
+      atWordStart = true;
       continue;
     }
 
-    if (ch === "'" || ch === '"') {
-      quote = ch;
-      buffer += ch;
-      continue;
-    }
-
-    if (ch === '&' && stripped[i + 1] === '&') {
-      tokens.push(buffer, '&&');
-      buffer = '';
+    if (ch === '&' && script[i + 1] === '&') {
+      flushCommand('&&');
       i++;
       continue;
     }
 
-    if (ch === '|' && stripped[i + 1] === '|') {
-      tokens.push(buffer, '||');
-      buffer = '';
+    if (ch === '|' && script[i + 1] === '|') {
+      flushCommand('||');
       i++;
       continue;
     }
 
-    if (ch === ';' || ch === '\n') {
-      tokens.push(buffer, ch);
-      buffer = '';
+    if (ch === '&') {
+      flushCommand('&');
       continue;
     }
 
-    buffer += ch;
-  }
-  tokens.push(buffer);
+    if (ch === ';') {
+      flushCommand(';');
+      continue;
+    }
 
-  return tokens;
+    if (ch === '\n') {
+      flushCommand('\n');
+      continue;
+    }
+
+    word += ch;
+    wordOpen = true;
+    atWordStart = false;
+  }
+
+  flushCommand();
+  return out;
 }
 
 /**
- * Whether a command's literal text is one this guard knows the exit
- * status of without running it. Only `false` matters in practice: it lets
- * an adversarial `false && required-command` chain look identical to a
- * `guaranteed: true` chain to a splitter that (correctly, for every real
- * `rm -rf`/`nx` invocation this guard validates) optimistically assumes a
- * command it doesn't specially recognize succeeds — round-2 #454 review
- * finding: `false && NX_TUI=false nx run-many ... && NX_TUI=false nx
- * reset` was accepted even though `false` deterministically fails, so
- * NEITHER `&&`-chained command after it ever runs.
+ * Whether a command's word list is one this guard knows the exit status of
+ * without running it. Only "always fails" matters in practice: it lets an
+ * adversarial `false && required-command` (or `exit 1 && required-command`)
+ * chain look identical to a `guaranteed: true` chain to logic that
+ * (correctly, for every real `rm -rf`/`nx` invocation this guard validates)
+ * optimistically assumes an unrecognized command succeeds.
  *
- * @param {string} command
+ * @param {string[]} words
  * @returns {boolean}
  */
-function commandAlwaysFails(command) {
-  return command === 'false';
+function commandAlwaysFails(words) {
+  if (words.length === 1 && words[0] === 'false') {
+    return true;
+  }
+  // `exit <nonzero literal>` deterministically fails the same way — round-3
+  // #454 review finding: only recognizing the literal `false` builtin left
+  // `exit 1 && rm -rf dist temp` (which never actually removes anything)
+  // indistinguishable from a real guaranteed chain.
+  if (words.length === 2 && words[0] === 'exit' && /^-?\d+$/.test(words[1])) {
+    return Number(words[1]) !== 0;
+  }
+  return false;
 }
 
 /**
  * Split a shell script string into its individual chained commands (on
- * `&&`, `||`, `;`, or a newline), each tagged with whether it is
- * `guaranteed` to run — i.e. reachable on the path where every command
- * this guard doesn't know to always-fail (see {@link commandAlwaysFails})
- * succeeds, AND not merely backgrounded.
+ * `&&`, `||`, `;`, a newline, or a lone `&`), each tagged with whether it
+ * is `guaranteed` to run.
  *
- * A command joined by `;` or a newline always runs, regardless of the
- * previous command's exit status — it starts a fresh, unconditional
- * reachability chain. A command joined by `&&` only runs if the PRECEDING
- * command was both reachable and (assumed to have) succeeded — so a
- * command reachable only via an unresolved `||` branch, or chained after a
- * command that always fails, is never `guaranteed` even if joined onward
- * by `&&` (round-2 #454 review finding: `cmd1 || cmd2 && cmd3` previously
- * marked `cmd3` `guaranteed: true`, though it's only reachable through
- * `cmd2`, itself only reachable if `cmd1` failed). A command joined by
- * `||` only runs if the preceding command was reachable and FAILED —
- * `guaranteed: false` for every command this guard treats as
- * succeeding — so e.g. `rm -rf dist || rm -rf temp` must NOT be accepted
- * as removing both `dist` and `temp`: a successful first `rm -rf dist`
- * skips the second command entirely.
+ * `guaranteed` models a single, deterministic execution path: every
+ * command this guard doesn't specifically recognize (see
+ * {@link commandAlwaysFails}) is optimistically assumed to succeed (true
+ * for every real `rm -rf`/`nx` invocation this guard validates), and the
+ * resulting exit status is carried forward as `lastStatus` — INCLUDING
+ * across a skipped command, whose own (never-executed) status must never
+ * overwrite it. `&&` only runs its right-hand command when `lastStatus` is
+ * `'success'`; `||` only when it's `'fail'`; `;`/newline/`&` don't gate
+ * anything — the following command always runs, on a fresh, unconditional
+ * chain.
  *
- * A trailing lone `&` (background — distinct from `&&`, which is stripped
- * out as an operator above and never reaches this check) marks a command
- * `guaranteed: false` regardless of reachability: the shell does not wait
- * for a backgrounded command to complete before the script (and this
- * guard's synchronous before/after contract) moves on, so e.g.
- * `rm -rf dist temp &` is never a reliable removal (round-2 #454 review
- * finding).
+ * This single `lastStatus` — rather than each command's OWN immediately
+ * preceding reachability — is what makes `&&`/`||` genuinely left-
+ * associative with equal precedence, matching real POSIX shell semantics
+ * (round-3 #454 review finding, `adaptive-parser-001`): given
+ * `cmd1 || cmd2 && cmd3`, if `cmd1` succeeds, `cmd2` is skipped but `cmd3`
+ * still runs — its `&&` looks back through the skip to `cmd1`'s status,
+ * not to `cmd2`'s (which never executed). A model that instead tracked
+ * only "was the IMMEDIATELY PRECEDING command guaranteed-and-successful"
+ * would wrongly reject that reachable `cmd3`.
+ *
+ * A lone `&` (background — distinct from `&&`) marks the command
+ * immediately before it `guaranteed: false` regardless of its own
+ * reachability, since the shell does not wait for a backgrounded command
+ * to complete before continuing — e.g. `rm -rf dist temp &` is never a
+ * reliable removal — and then behaves like `;`/newline for what follows:
+ * an unconditional, freshly-reachable next command (round-3 #454 review
+ * finding, `adaptive-parser-002`: a lone `&` was previously recognized
+ * only as the LAST character of the whole script, so a mid-chain
+ * `rm -rf dist temp & echo done` was accepted as a single, non-backgrounded
+ * command).
  *
  * Mirrors the split delimiters (though not the guaranteed/unguaranteed
  * distinction) in `api-report-ci-wiring.mjs`'s `splitChainedCommands` —
@@ -299,185 +399,97 @@ function commandAlwaysFails(command) {
  * @returns {ChainedCommand[]}
  */
 function splitChainedCommands(script) {
+  /** @type {ChainedCommand[]} */
   const commands = [];
   /** @type {'&&' | '||' | undefined} */
-  let precedingOperator;
-  let prevReachable = true;
-  let prevSucceeds = true;
+  let pendingOperator;
+  /** @type {'success' | 'fail'} */
+  let lastStatus = 'success'; // vacuous: only consulted once a command has run
 
-  for (const token of tokenizeShellLike(script)) {
-    if (token === '&&' || token === '||' || token === ';' || token === '\n') {
-      if (token === ';' || token === '\n') {
-        // A fresh statement always eventually runs regardless of the
-        // previous command's exit status — but ONLY if there isn't
-        // already a pending `&&`/`||` awaiting a real command (an empty
-        // segment between two operator tokens, e.g. the newline right
-        // after `||` in `dist ||\ntemp`, must not let the newline
-        // override the still-pending `||`).
-        if (precedingOperator === undefined) {
-          prevReachable = true;
-          prevSucceeds = true;
-        }
-        continue;
+  for (const token of lexShellLike(script)) {
+    if (token === ';' || token === '\n') {
+      // A fresh statement always eventually runs regardless of the
+      // previous command's exit status — but ONLY if there isn't already
+      // a pending `&&`/`||` awaiting a real command. A `;`/newline
+      // immediately after `&&`/`||` (e.g. the newline right after `||` in
+      // `dist ||\ntemp`) is benign whitespace within that still-pending
+      // operator's continuation, not a reset of it.
+      continue;
+    }
+
+    if (token === '&') {
+      // Background the command just pushed (distinct from `&&`, handled
+      // below), then behave exactly like `;`/newline for what follows.
+      const last = commands[commands.length - 1];
+      if (last) {
+        last.guaranteed = false;
       }
-      // Only record a NEW pending operator if there isn't already one
-      // awaiting a real command, for the same empty-segment reason above.
-      precedingOperator ??= token;
+      pendingOperator = undefined;
       continue;
     }
 
-    const command = token.trim();
-    if (command.length === 0) {
+    if (token === '&&' || token === '||') {
+      // Only record a NEW pending operator if there isn't already one
+      // awaiting a real command, for the same empty-segment reason noted
+      // above for `;`/newline.
+      pendingOperator ??= token;
       continue;
     }
+
+    const { words } = token;
 
     let reachable;
-    if (precedingOperator === '&&') {
-      reachable = prevReachable && prevSucceeds;
-    } else if (precedingOperator === '||') {
-      reachable = prevReachable && !prevSucceeds;
+    if (pendingOperator === '&&') {
+      reachable = lastStatus === 'success';
+    } else if (pendingOperator === '||') {
+      reachable = lastStatus === 'fail';
     } else {
-      reachable = true; // first command, or a fresh `;`/newline statement
+      reachable = true; // first command, or a fresh `;`/newline/`&` statement
     }
 
-    const backgrounded = /(^|[^&])&$/.test(command);
-    const finalCommand = backgrounded ? command.slice(0, -1).trim() : command;
+    commands.push({ words, guaranteed: reachable });
 
-    commands.push({
-      command: finalCommand,
-      guaranteed: reachable && !backgrounded,
-    });
-
-    prevReachable = reachable;
-    prevSucceeds = !commandAlwaysFails(finalCommand);
-    precedingOperator = undefined;
+    if (reachable) {
+      lastStatus = commandAlwaysFails(words) ? 'fail' : 'success';
+    }
+    // If NOT reachable (this command was skipped), `lastStatus` carries
+    // forward UNCHANGED — see the function doc for why.
+    pendingOperator = undefined;
   }
 
   return commands;
 }
 
 /**
- * Split a single shell command into its whitespace-separated tokens —
- * quote-aware, so a single- or double-quoted span (which a real shell
- * never field-splits, regardless of the whitespace it contains) stays
- * fused into ONE token rather than being sliced into separate bare words.
- * Without this, `echo 'nx run-many --target=clean ...'` would whitespace-
- * split into isolated `nx`/`run-many`/etc. tokens indistinguishable from a
- * REAL, unquoted `nx run-many` invocation — round-2 #454 review finding:
- * an `nx run-many`/`nx reset` pair that only ever appears as a quoted
- * `echo` argument (never actually executed) was still accepted, because
- * every downstream check ({@link containsTokens}, {@link
- * findFlagValueSet}, etc.) only ever inspects this function's token list.
+ * Whether a command's word list begins with exactly the given word
+ * sequence, e.g. `startsWithTokens(['NX_TUI=false','nx','reset'],
+ * 'NX_TUI=false', 'nx', 'reset')`. Exact per-word comparison, not a
+ * `\b`-bounded regex, so a `reset-old` word can never satisfy a check for
+ * the `reset` word.
  *
- * @param {string} command
- * @returns {string[]}
- */
-function tokenize(command) {
-  const tokens = [];
-  let buffer = '';
-  /** @type {"'" | '"' | undefined} */
-  let quote;
-
-  for (const ch of command) {
-    if (quote) {
-      buffer += ch;
-      if (ch === quote) {
-        quote = undefined;
-      }
-      continue;
-    }
-    if (ch === "'" || ch === '"') {
-      quote = ch;
-      buffer += ch;
-      continue;
-    }
-    if (/\s/.test(ch)) {
-      if (buffer.length > 0) {
-        tokens.push(buffer);
-        buffer = '';
-      }
-      continue;
-    }
-    buffer += ch;
-  }
-  if (buffer.length > 0) {
-    tokens.push(buffer);
-  }
-
-  return tokens;
-}
-
-/**
- * Extract the raw values of EVERY exact `--flagName=value` token in a
- * command's tokens (a repeatable flag like `nx run-many --exclude=` may
- * legitimately appear more than once — `--exclude=a --exclude=b` excludes
- * BOTH `a` and `b`). Exact flag-name match only — deliberately not a
- * `\b`-bounded regex, which matches a word boundary right before a hyphen
- * and so would wrongly treat `--target=clean-old` as satisfying a check for
- * `--target=clean` (issue #443 post-merge review).
- *
- * @param {string[]} tokens
- * @param {string} flagName
- * @returns {string[]} raw values, one per occurrence, in token order
- */
-function findFlagValues(tokens, flagName) {
-  const prefix = `--${flagName}=`;
-  return tokens
-    .filter((candidate) => candidate.startsWith(prefix))
-    .map((token) => token.slice(prefix.length));
-}
-
-/**
- * Every comma-separated member across ALL occurrences of a `--flagName=`
- * token, flattened into a single set — e.g. two `--exclude=a --exclude=b`
- * tokens, or one `--target=clean,other` token, both yield the full
- * membership the flag actually carries. A single occurrence's own value is
- * ALSO comma-split, since a real `nx` flag like `--target=` accepts a
- * comma-joined list in one token (issue #443 post-merge review: an earlier
- * exact-equality check against a single occurrence's raw value false-
- * rejected `--target=clean,other` and never merged repeated `--exclude=`
- * occurrences at all).
- *
- * @param {string[]} tokens
- * @param {string} flagName
- * @returns {Set<string>}
- */
-function findFlagValueSet(tokens, flagName) {
-  return new Set(
-    findFlagValues(tokens, flagName).flatMap((value) => value.split(',')),
-  );
-}
-
-/**
- * Whether a command's tokens begin with exactly the given token sequence,
- * e.g. `startsWithTokens('NX_TUI=false nx reset', 'NX_TUI=false', 'nx',
- * 'reset')`. Exact per-token comparison, not a `\b`-bounded regex, so a
- * `reset-old` token can never satisfy a check for the `reset` token.
- *
- * @param {string} command
- * @param {...string} expectedTokens
+ * @param {string[]} words
+ * @param {...string} expectedWords
  * @returns {boolean}
  */
-function startsWithTokens(command, ...expectedTokens) {
-  const tokens = tokenize(command);
-  return expectedTokens.every((expected, index) => tokens[index] === expected);
+function startsWithTokens(words, ...expectedWords) {
+  return expectedWords.every((expected, index) => words[index] === expected);
 }
 
 /**
- * Whether a command contains the given token sequence contiguously
- * anywhere within it (not just at the start) — e.g. `containsTokens('NX_TUI=false nx reset', 'nx', 'reset')`.
- * Exact per-token comparison for the same reason as {@link startsWithTokens}.
+ * Whether a command's word list contains the given word sequence
+ * contiguously anywhere within it (not just at the start) — e.g.
+ * `containsTokens(['NX_TUI=false','nx','reset'], 'nx', 'reset')`. Exact
+ * per-word comparison for the same reason as {@link startsWithTokens}.
  *
- * @param {string} command
- * @param {...string} expectedTokens
+ * @param {string[]} words
+ * @param {...string} expectedWords
  * @returns {boolean}
  */
-function containsTokens(command, ...expectedTokens) {
-  const tokens = tokenize(command);
-  for (let start = 0; start + expectedTokens.length <= tokens.length; start++) {
+function containsTokens(words, ...expectedWords) {
+  for (let start = 0; start + expectedWords.length <= words.length; start++) {
     if (
-      expectedTokens.every(
-        (expected, offset) => tokens[start + offset] === expected,
+      expectedWords.every(
+        (expected, offset) => words[start + offset] === expected,
       )
     ) {
       return true;
@@ -487,59 +499,116 @@ function containsTokens(command, ...expectedTokens) {
 }
 
 /**
+ * Extract the raw values of EVERY exact `--flagName=value` word in a
+ * command's words (a repeatable flag like `nx run-many --exclude=` may
+ * legitimately appear more than once — `--exclude=a --exclude=b` excludes
+ * BOTH `a` and `b`). Exact flag-name match only — deliberately not a
+ * `\b`-bounded regex, which matches a word boundary right before a hyphen
+ * and so would wrongly treat `--target=clean-old` as satisfying a check for
+ * `--target=clean` (issue #443 post-merge review).
+ *
+ * @param {string[]} words
+ * @param {string} flagName
+ * @returns {string[]} raw values, one per occurrence, in word order
+ */
+function findFlagValues(words, flagName) {
+  const prefix = `--${flagName}=`;
+  return words
+    .filter((candidate) => candidate.startsWith(prefix))
+    .map((word) => word.slice(prefix.length));
+}
+
+/**
+ * Every comma-separated member across ALL occurrences of a `--flagName=`
+ * word, flattened into a single set — e.g. two `--exclude=a --exclude=b`
+ * words, or one `--target=clean,other` word, both yield the full
+ * membership the flag actually carries. A single occurrence's own value is
+ * ALSO comma-split, since a real `nx` flag like `--target=` accepts a
+ * comma-joined list in one word (issue #443 post-merge review: an earlier
+ * exact-equality check against a single occurrence's raw value false-
+ * rejected `--target=clean,other` and never merged repeated `--exclude=`
+ * occurrences at all).
+ *
+ * @param {string[]} words
+ * @param {string} flagName
+ * @returns {Set<string>}
+ */
+function findFlagValueSet(words, flagName) {
+  return new Set(
+    findFlagValues(words, flagName).flatMap((value) => value.split(',')),
+  );
+}
+
+/**
  * Flags that make the real `nx` CLI print help/usage text (or otherwise
  * skip actually running the target) and exit 0 without performing the
  * work — so a command carrying one of these is a no-op impersonating a
  * real `nx run-many --target=clean`/`nx reset` invocation (round-2 #454
  * review finding: `nx run-many --target=clean ... --help && nx reset
  * --help` was accepted even though `nx` prints help and returns for both,
- * running neither the per-project clean nor the cache reset).
+ * running neither the per-project clean nor the cache reset). Compared
+ * against already quote-removed words (see {@link lexShellLike}), so a
+ * quoted `"--help"` is caught exactly like an unquoted one (round-3 #454
+ * review finding, `adaptive-parser-005`: comparing quote-PRESERVING source
+ * text let a quoted control flag slip past, even though real shell quote
+ * removal passes the exact same argv token `nx` itself acts on).
  */
 const NX_NOOP_FLAGS = new Set(['--help', '-h', '--dry-run']);
 
 /**
- * Whether a command's tokens carry any {@link NX_NOOP_FLAGS} entry —
- * exact per-token match, same rationale as {@link startsWithTokens}.
+ * Whether a command's words carry any {@link NX_NOOP_FLAGS} entry — exact
+ * per-word match, same rationale as {@link startsWithTokens}.
  *
- * @param {string[]} tokens
+ * @param {string[]} words
  * @returns {boolean}
  */
-function hasNxNoopFlag(tokens) {
-  return tokens.some((token) => NX_NOOP_FLAGS.has(token));
+function hasNxNoopFlag(words) {
+  return words.some((word) => NX_NOOP_FLAGS.has(word));
 }
 
 /**
  * Whether a command is an `nx run-many --target=clean` invocation, using
- * exact token/flag-value matching (see {@link findFlagValueSet}) rather
+ * exact word/flag-value matching (see {@link findFlagValueSet}) rather
  * than a `\b`-bounded regex. `--target=` accepts a comma-joined list
  * (`--target=clean,other`), so this checks `clean` is a MEMBER of that set,
  * not that the raw value is exactly `"clean"`. Also rejects a
  * {@link NX_NOOP_FLAGS} invocation masquerading as the real thing.
  *
- * @param {string} command
+ * @param {string[]} words
  * @returns {boolean}
  */
-function isNxRunManyCleanCommand(command) {
-  const tokens = tokenize(command);
+function isNxRunManyCleanCommand(words) {
   return (
-    containsTokens(command, 'nx', 'run-many') &&
-    findFlagValueSet(tokens, 'target').has('clean') &&
-    !hasNxNoopFlag(tokens)
+    containsTokens(words, 'nx', 'run-many') &&
+    findFlagValueSet(words, 'target').has('clean') &&
+    !hasNxNoopFlag(words)
   );
 }
 
 /**
  * Whether a command is exactly an `rm -rf` invocation (`rm` then `-rf` as
- * separate, exact tokens) — not a `\b`-bounded regex, which matches a word
+ * separate, exact words) with no further control/option flags among its
+ * remaining words — not a `\b`-bounded regex, which matches a word
  * boundary right before a hyphen and so wrongly accepted `rm -rf-old dist
  * temp` as an `rm -rf` call (round-2 #454 review finding: `rm` itself
  * rejects `-rf-old` as an unsupported option and removes nothing).
  *
- * @param {string} command
+ * The trailing-flag check closes a related hole (round-3 #454 review
+ * finding, `adaptive-parser-006`): `rm -rf --help dist temp` and
+ * `rm -rf --version dist temp` both satisfy `rm`/`-rf` exactly, but the
+ * real `rm` binary exits after printing control output instead of
+ * deleting anything — so a bare `-`-prefixed word anywhere among the
+ * "targets" makes this reject the command rather than count `dist`/`temp`
+ * as removed.
+ *
+ * @param {string[]} words
  * @returns {boolean}
  */
-function isRmRfCommand(command) {
-  return startsWithTokens(command, 'rm', '-rf');
+function isRmRfCommand(words) {
+  return (
+    startsWithTokens(words, 'rm', '-rf') &&
+    words.slice(2).every((word) => !word.startsWith('-'))
+  );
 }
 
 /**
@@ -572,10 +641,10 @@ export function assertPackageCleanRemovesDistAndTemp(pkg, label) {
   // `rm -rf temp` reachable only via `rm -rf dist || rm -rf temp` does NOT
   // reliably remove `temp`, since a successful `rm -rf dist` (the normal
   // case) skips it entirely.
-  const rmCommands = splitChainedCommands(clean)
-    .filter((entry) => entry.guaranteed && isRmRfCommand(entry.command))
-    .map((entry) => entry.command);
-  if (rmCommands.length === 0) {
+  const rmCommandWords = splitChainedCommands(clean)
+    .filter((entry) => entry.guaranteed && isRmRfCommand(entry.words))
+    .map((entry) => entry.words);
+  if (rmCommandWords.length === 0) {
     throw new Error(
       `${label} "clean" script must run \`rm -rf\` unconditionally (not only ` +
         `after a prior command fails via \`||\`) — got: ${JSON.stringify(clean)} (issue #443)`,
@@ -583,7 +652,7 @@ export function assertPackageCleanRemovesDistAndTemp(pkg, label) {
   }
 
   const removedTargets = new Set(
-    rmCommands.flatMap((command) => command.split(/\s+/).slice(2)),
+    rmCommandWords.flatMap((words) => words.slice(2)),
   );
 
   if (!removedTargets.has('dist')) {
@@ -634,7 +703,7 @@ export function assertRootCleanRunsWorkspaceCleanAndReset(pkg) {
   );
 
   const runManyIndex = commands.findIndex((entry) =>
-    isNxRunManyCleanCommand(entry.command),
+    isNxRunManyCleanCommand(entry.words),
   );
   if (runManyIndex === -1) {
     throw new Error(
@@ -643,28 +712,26 @@ export function assertRootCleanRunsWorkspaceCleanAndReset(pkg) {
         `fan the per-project clean out across the workspace — got: ${JSON.stringify(clean)} (issue #443)`,
     );
   }
-  const runManyCommand = commands[runManyIndex].command;
-  const runManyTokens = tokenize(runManyCommand);
+  const runManyWords = commands[runManyIndex].words;
 
-  const excludedProjects = findFlagValueSet(runManyTokens, 'exclude');
+  const excludedProjects = findFlagValueSet(runManyWords, 'exclude');
   if (!excludedProjects.has(WORKSPACE_ROOT_PROJECT_NAME)) {
     throw new Error(
       'root "clean" script\'s `nx run-many --target=clean` must exclude ' +
         `"${WORKSPACE_ROOT_PROJECT_NAME}" (the workspace root project has no ` +
-        `"clean" target of its own) — got: ${JSON.stringify(runManyCommand)} (issue #443)`,
+        `"clean" target of its own) — got: ${JSON.stringify(runManyWords.join(' '))} (issue #443)`,
     );
   }
-  if (!startsWithTokens(runManyCommand, 'NX_TUI=false', 'nx', 'run-many')) {
+  if (!startsWithTokens(runManyWords, 'NX_TUI=false', 'nx', 'run-many')) {
     throw new Error(
       'root "clean" script\'s `nx run-many --target=clean` invocation must ' +
-        `itself be scoped with "NX_TUI=false" — got: ${JSON.stringify(runManyCommand)} (issue #443)`,
+        `itself be scoped with "NX_TUI=false" — got: ${JSON.stringify(runManyWords.join(' '))} (issue #443)`,
     );
   }
 
   const resetIndex = commands.findIndex(
     (entry) =>
-      containsTokens(entry.command, 'nx', 'reset') &&
-      !hasNxNoopFlag(tokenize(entry.command)),
+      containsTokens(entry.words, 'nx', 'reset') && !hasNxNoopFlag(entry.words),
   );
   if (resetIndex === -1) {
     throw new Error(
@@ -673,7 +740,7 @@ export function assertRootCleanRunsWorkspaceCleanAndReset(pkg) {
         `clean, to reset the Nx cache/daemon — got: ${JSON.stringify(clean)} (issue #443)`,
     );
   }
-  const resetCommand = commands[resetIndex].command;
+  const resetWords = commands[resetIndex].words;
 
   if (resetIndex < runManyIndex) {
     throw new Error(
@@ -682,11 +749,11 @@ export function assertRootCleanRunsWorkspaceCleanAndReset(pkg) {
     );
   }
 
-  if (!startsWithTokens(resetCommand, 'NX_TUI=false', 'nx', 'reset')) {
+  if (!startsWithTokens(resetWords, 'NX_TUI=false', 'nx', 'reset')) {
     throw new Error(
       'root "clean" script\'s `nx reset` invocation must itself be scoped ' +
         'with "NX_TUI=false" — a shared prefix earlier in the chain does ' +
-        `not count once the commands are reordered or split — got: ${JSON.stringify(resetCommand)} (issue #443)`,
+        `not count once the commands are reordered or split — got: ${JSON.stringify(resetWords.join(' '))} (issue #443)`,
     );
   }
 }
