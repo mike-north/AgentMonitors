@@ -642,13 +642,19 @@ renders — and claiming is never acknowledging (BP2 / SP4). The coalesced-until
 claimed-but-unacknowledged events against that SAME band's unread total
 (`normalPending.length === unreadNormal.length`; the low-urgency guard, §9.3, is the identical pattern
 against its own band). Leaving a claim unacknowledged therefore suppresses only the reminder for
-whichever band(s) the claimed events actually belong to — an unacknowledged `high`-urgency (or
-mixed-band recap) claim does **not**, on its own, block a NEW `normal`-urgency reminder from firing for
-unrelated, still-unclaimed `normal` events in the same session; the two coexist. Previously the
-delivered payload named no way to acknowledge, so an agent that fully handled the delivered work still
-left that claimed band's own future reminder silently muted; the remediation existed only in
-`monitor explain`, which nobody runs while things appear fine (issue #434 — the delivery-side twin of
-the silent-degradation family in issue #425).
+whichever band(s) the claimed events actually belong to — a `high`-**only** claim touches no
+`normal`/`low` row at all, so it does **not**, on its own, block a NEW `normal`-urgency reminder from
+firing for unrelated, still-unclaimed `normal` events in the same session; the two coexist. A
+**mixed-band** `post-compact` recap is different: if it claims an old `normal` (or `low`) event
+alongside `high` events, that `normal` row stays claimed-but-unacknowledged, so `normalPending`
+(claimed-but-unacked) no longer equals `unreadNormal` (total unread) once a fresh, unrelated `normal`
+event later arrives — the band-scoped equality guard therefore suppresses THAT band's next
+`turn-interruptible` reminder too, until the recap's `normal`/`low` events are acknowledged. In short:
+suppression is band-scoped, not high/recap-vs-normal/low-scoped — a claim suppresses exactly the
+band(s) it actually touched. Previously the delivered payload named no way to acknowledge, so an
+agent that fully handled the delivered work still left that claimed band's own future reminder
+silently muted; the remediation existed only in `monitor explain`, which nobody runs while things
+appear fine (issue #434 — the delivery-side twin of the silent-degradation family in issue #425).
 
 Therefore the hook transport's body-injection header **MUST** carry a completion instruction naming
 the acknowledge command with the recipient's **real session id** and an explicit **`--socket

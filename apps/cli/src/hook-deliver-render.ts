@@ -305,10 +305,13 @@ function appendMarkerWithinCap(
  * (issue #434). A body-injection delivery (settled high-urgency events, or the
  * `post-compact` recap) CLAIMS the events it renders — but claiming is not
  * acknowledgment (BP2 / SP4), and until the recipient acknowledges, the
- * `coalesced-until-ack` rule (002 §9.2) suppresses every subsequent
- * normal-urgency reminder for the session. The delivered payload used to name
+ * `coalesced-until-ack` rule (002 §9.2) suppresses only the reminder for the
+ * band(s) the claimed events actually belong to (006 §5.1.1) — a `high`-only
+ * claim never suppresses a `normal`/`low` reminder, but a mixed-band recap
+ * that also claims an old `normal`/`low` event DOES suppress that band's next
+ * reminder until it too is acknowledged. The delivered payload used to name
  * no way to acknowledge, so an agent that fully handled the work still left the
- * channel silently muted — the remediation lived only in `monitor explain`,
+ * claimed band silently muted — the remediation lived only in `monitor explain`,
  * which nobody runs while things appear fine. This line closes that loop, in
  * the delivered context itself.
  *
@@ -415,17 +418,21 @@ interface HeaderPacked {
  * header's own length depends on how many ids it lists, which depends on how
  * much room is left for blocks, which depends on the header's length.
  *
- * Solved by iterative narrowing: start by assuming every candidate event is
- * included (the longest possible header, the most conservative starting
- * guess), pack against it, and if fewer blocks actually fit than guessed,
- * retry with the header narrowed to name only that many ids (shorter header,
- * more room). `includedCount` is a monotone function of the guessed id
- * count restricted to the integers `[0, events.length]`, so this converges to
- * a genuine fixed point (header names exactly what's included) within at
- * most `events.length + 1` iterations; the loop bound below is exactly that,
- * so a pathological non-convergent case (unreachable at these string sizes)
- * falls back to the narrowest, always-self-consistent header — naming no ids
- * — rather than looping forever or naming an id that didn't actually fit.
+ * **Tests each candidate `k` directly rather than iterating a fixed-point
+ * guess (PR #445 review, round-6 finding — the prior iterative-narrowing
+ * approach could oscillate: `guess=2` packs 1, the shorter 1-id header then
+ * packs 2, `guess` bounces 2→1→2→1… without ever landing on a `k` where the
+ * header's named ids equal what's included, falling through to a header that
+ * names FEWER ids than the blocks actually rendered — an under-scoped
+ * `--event-ids` that lets a compliant ack silently drop unrendered rows).**
+ * Descends `k` from `events.length` to `0` and, for each, builds the header
+ * naming exactly `events.slice(0, k)` and packs ONLY `blocks.slice(0, k)` — so
+ * `packed.includedCount` can never exceed `k` (the input array itself holds no
+ * more), and the candidate is self-consistent exactly when all `k` of those
+ * blocks fit (`packed.includedCount === k`). `k = 0` (empty header, zero
+ * blocks) is always self-consistent, so the descent is guaranteed to return
+ * before exhausting the loop — no fixed-point search, no oscillation, no
+ * under-scoped header.
  */
 function resolveHookHeaderPacking(
   events: DeliveryEventSummary[],
@@ -434,20 +441,20 @@ function resolveHookHeaderPacking(
   cap: number,
   socketPath: string | undefined,
 ): HeaderPacked {
-  let guess = events.length;
-  for (let i = 0; i <= events.length; i++) {
-    const eventIds = events.slice(0, guess).map((event) => event.eventId);
+  for (let k = events.length; k >= 0; k--) {
+    const eventIds = events.slice(0, k).map((event) => event.eventId);
     const header = buildHeader(sessionId, eventIds, socketPath);
-    const packed = packWholeBlocks(header, blocks, cap);
-    if (packed.includedCount === guess) {
-      return { text: packed.text, includedCount: packed.includedCount, header };
+    const packed = packWholeBlocks(header, blocks.slice(0, k), cap);
+    if (packed.includedCount === k) {
+      return { text: packed.text, includedCount: k, header };
     }
-    guess = packed.includedCount;
   }
-  /* c8 ignore start -- defensive fallback, unreachable at realistic id/cap sizes */
-  const header = buildHeader(sessionId, [], socketPath);
-  const packed = packWholeBlocks(header, blocks, cap);
-  return { text: packed.text, includedCount: packed.includedCount, header };
+  /* c8 ignore start -- k=0 (no ids named, no blocks attempted) always matches
+   * `packed.includedCount === k`, so the loop above always returns by then;
+   * this is unreachable and exists only to satisfy the return-type checker. */
+  throw new Error(
+    'unreachable: resolveHookHeaderPacking did not converge at k=0',
+  );
   /* c8 ignore stop */
 }
 

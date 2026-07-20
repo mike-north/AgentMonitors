@@ -341,6 +341,104 @@ Handle it.
     expect(normalClaim?.events).toEqual([]);
   });
 
+  // 006 §5.1.1 (PR #445 review, round 6 — discussion_r3615219860): the
+  // cross-band-independence guard above is TRUE ONLY for a `high`-only claim.
+  // A `post-compact` recap claims the FULL unread set across every band
+  // (`applyDelivery`'s `candidates: unread`), so a mixed-band recap that
+  // claims an OLD normal-urgency event alongside high-urgency events leaves
+  // that normal row claimed-but-unacknowledged. This regression proves the
+  // band-scoped guard (`normalPending.length === unreadNormal.length`) then
+  // correctly SUPPRESSES the next turn-interruptible normal reminder once a
+  // fresh, unrelated normal event arrives — because `unreadNormal` (2, the old
+  // recap-claimed row plus the new one) no longer equals `normalPending` (1,
+  // only the new unclaimed row) — a prior revision of 006 wrongly claimed a
+  // mixed-band recap claim "does not, on its own, block" this reminder.
+  it('a mixed-band post-compact recap claim suppresses the next normal-urgency reminder for a fresh, unrelated normal event (mixed-band recap suppression)', () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const db = createDb(':memory:');
+    const registry = new SourceRegistry();
+    const runtime = new AgentMonitorRuntime(new RuntimeStore(db), registry, [
+      claudeCodeAdapter,
+    ]);
+
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-session-mixed-recap',
+        workspacePath: rootDir,
+      }),
+    );
+
+    const store = new RuntimeStore(db);
+    // An OLD normal-urgency event, unread since before the recap.
+    store.insertEvent({
+      workspacePath: rootDir,
+      monitorId: 'docs-monitor',
+      sourceName: 'manual',
+      urgency: 'normal',
+      title: 'Docs changed',
+      body: 'Docs changed',
+      summary: 'Docs changed',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey: 'docs/readme',
+      queryScope: { path: 'readme.md' },
+      tags: [],
+      createdAt: new Date(Date.now() - 20_000),
+    });
+    // A settled high-urgency event, so the recap is genuinely mixed-band.
+    store.insertEvent({
+      workspacePath: rootDir,
+      monitorId: 'urgent-monitor',
+      sourceName: 'manual',
+      urgency: 'high',
+      title: 'CI failed',
+      body: 'CI failed on the default branch',
+      summary: 'CI failed on the default branch',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey: 'ci/default',
+      queryScope: { pipeline: 'default' },
+      tags: ['ci'],
+      createdAt: new Date(Date.now() - 20_000),
+    });
+
+    // The recap claims BOTH the old normal event and the high event (the FULL
+    // unread set), but acknowledges neither.
+    const recapClaim = runtime.claimDelivery(session.id, 'post-compact');
+    expect(recapClaim?.mode).toBe('recap');
+
+    // A fresh, wholly unrelated normal-urgency event arrives after the recap.
+    store.insertEvent({
+      workspacePath: rootDir,
+      monitorId: 'other-docs-monitor',
+      sourceName: 'manual',
+      urgency: 'normal',
+      title: 'Other docs changed',
+      body: 'Other docs changed',
+      summary: 'Other docs changed',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey: 'docs/other',
+      queryScope: { path: 'other.md' },
+      tags: [],
+      createdAt: new Date(),
+    });
+
+    // The recap-claimed normal row is still unacknowledged, so `unreadNormal`
+    // is 2 while only the fresh event is unclaimed (`normalPending` is 1) —
+    // the band-scoped guard therefore withholds the reminder (returns null),
+    // NOT fires it, until the recap-claimed normal row is acknowledged.
+    const normalClaim = runtime.claimDelivery(session.id, 'turn-interruptible');
+    expect(normalClaim).toBeNull();
+  });
+
   // Issue #407: `verify --use-workspace-daemon` must retract the events its own
   // scratch file produced against the persistent workspace daemon (a create AND
   // a delete), so a later session never sees them. The retraction removes ONE

@@ -1033,6 +1033,55 @@ describe('packEventsUnderCap', () => {
     expect(noSocketFit).toBe(2);
     expect(withSocketFit).toBe(1);
   });
+
+  // (PR #445 review, round-6 finding — discussion_r3611292875) the prior
+  // fixed-point-guess header packing was anti-monotone at this boundary: two
+  // 26-character event ids with ~1,774-character bodies, reserved against the
+  // deferred marker (`moreDeferred: true`, matching the real render path when
+  // more high-urgency work exists beyond this claimed pair), made `guess=2`
+  // pack only 1 block, then the resulting shorter (1-id) header packed 2
+  // blocks, bouncing 2→1→2→1… without ever landing on a `k` where the
+  // header's named ids equal the rendered block count — falling through to
+  // the narrowest (0-id) header while BOTH blocks still rendered, so
+  // `--event-ids` silently omitted every id and a compliant agent's ack could
+  // fall back to the no-id "ack everything" form. `renderHookDelivery` must
+  // render a header whose `--event-ids` count exactly matches the number of
+  // `### ` event blocks actually included — proving the fixed point converges
+  // rather than oscillating.
+  it('names exactly the rendered event ids at the fixed-point oscillation boundary (issue #442/#445)', () => {
+    const events: DeliveryEventSummary[] = [
+      makeEvent('a'.repeat(22), 'x'.repeat(1774)),
+      makeEvent('b'.repeat(22), 'y'.repeat(1774)),
+    ];
+    expect(events[0]?.eventId.length).toBe(26);
+    expect(events[1]?.eventId.length).toBe(26);
+
+    const out = renderHookDelivery(
+      makeClaim({ urgency: 'high', events, message: '2 monitors fired' }),
+      'PreToolUse',
+      { moreDeferred: true },
+    );
+    expect(out).not.toBeNull();
+    const text = out?.hookSpecificOutput.additionalContext ?? '';
+
+    const ackLine = text
+      .split('\n')
+      .find((line) => line.includes('acknowledge:'));
+    expect(ackLine).toBeDefined();
+    const namedIds = ackLine?.includes('--event-ids')
+      ? /--event-ids (\S+)/
+          .exec(ackLine)?.[1]
+          ?.split(',')
+          .filter((id) => id.length > 0)
+      : [];
+
+    const renderedBlockCount = (text.match(/### /g) ?? []).length;
+    // Self-consistency: the ack instruction must name exactly the ids of the
+    // blocks actually rendered — never fewer (an under-scoped ack that could
+    // fall back to acknowledging everything unread) and never more (an
+    // over-scoped ack naming an id that was never shown).
+    expect(namedIds).toHaveLength(renderedBlockCount);
+  });
 });
 
 // (issue #269) the "monitors exist but this project is not enabled" advisory
