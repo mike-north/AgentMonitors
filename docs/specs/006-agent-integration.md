@@ -639,17 +639,21 @@ adapter. Adding a new surface means choosing its attribution there, not editing 
 `turn-interruptible`, or the `post-compact` recap surfaced at `SessionStart`) **claims** the events it
 renders — and claiming is never acknowledging (BP2 / SP4). The coalesced-until-ack rule
 ([002 §9.2](./002-runtime-delivery.md#92-normal-urgency)) is **band-scoped**: it compares a band's own
-claimed-but-unacknowledged events against that SAME band's unread total
-(`normalPending.length === unreadNormal.length`; the low-urgency guard, §9.3, is the identical pattern
-against its own band). Leaving a claim unacknowledged therefore suppresses only the reminder for
-whichever band(s) the claimed events actually belong to — a `high`-**only** claim touches no
-`normal`/`low` row at all, so it does **not**, on its own, block a NEW `normal`-urgency reminder from
-firing for unrelated, still-unclaimed `normal` events in the same session; the two coexist. A
-**mixed-band** `post-compact` recap is different: if it claims an old `normal` (or `low`) event
-alongside `high` events, that `normal` row stays claimed-but-unacknowledged, so `normalPending`
-(claimed-but-unacked) no longer equals `unreadNormal` (total unread) once a fresh, unrelated `normal`
-event later arrives — the band-scoped equality guard therefore suppresses THAT band's next
-`turn-interruptible` reminder too, until the recap's `normal`/`low` events are acknowledged. In short:
+pending/**unclaimed** count against that SAME band's unread total, where the unread total is the
+superset that also contains any claimed-but-unacknowledged row
+(`normalPending.length === unreadNormal.length`, where `normalPending` holds only not-yet-claimed
+`normal` rows and `unreadNormal` holds every unread `normal` row regardless of claim state; the
+low-urgency guard, §9.3, is the identical pattern against its own band). Leaving a claim unacknowledged
+therefore suppresses only the reminder for whichever band(s) the claimed events actually belong to — a
+`high`-**only** claim touches no `normal`/`low` row at all, so it does **not**, on its own, block a NEW
+`normal`-urgency reminder from firing for unrelated, still-unclaimed `normal` events in the same
+session; the two coexist. A **mixed-band** `post-compact` recap is different: if it claims an old
+`normal` (or `low`) event alongside `high` events, that `normal` row stays claimed-but-unacknowledged —
+present in `unreadNormal` but absent from `normalPending` — so once a fresh, unrelated `normal` event
+later arrives, `normalPending` (1, the fresh unclaimed row) no longer equals `unreadNormal` (2, the
+fresh row plus the still-claimed recap row) — the band-scoped equality guard therefore suppresses THAT
+band's next `turn-interruptible` reminder too, until the recap's `normal`/`low` events are
+acknowledged. In short:
 suppression is band-scoped, not high/recap-vs-normal/low-scoped — a claim suppresses exactly the
 band(s) it actually touched. Previously the delivered payload named no way to acknowledge, so an
 agent that fully handled the delivered work still left that claimed band's own future reminder
