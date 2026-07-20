@@ -107,17 +107,16 @@ export type TransportProblemCode =
   | 'channel-lead-uncovered'
   /**
    * At least one ACTIVE lead session in this workspace has NO evidence the
-   * hook transport has ever fired for it — the single hook heartbeat this
-   * workspace has on disk names a DIFFERENT lead's host session id (issue
-   * #425 review, round 6). `hook`'s record is deliberately per-workspace, not
-   * per-session (see `heartbeatKey`), so unlike `channel-lead-uncovered` this
-   * can never be resolved by finding a second matching record — there is only
-   * ever one. With active leads `a` and `b` and a hook heartbeat carrying
-   * `a`'s session id, the record is still real evidence that hooks are wired
-   * up in this workspace, but it is silent on whether `b`'s hook has EVER
-   * fired: a freshly opened or script-registered `b` can have no hook
-   * invocation at all while `a`'s activity makes the workspace-wide aggregate
-   * read `deliverable: true`.
+   * hook transport has ever fired for it (issue #425 review, round 6). Like
+   * `channel`, `hook` now keys its record by host session id when one is
+   * known (`heartbeatKey`, round 6 follow-up), so each active lead's own
+   * invocation leaves its own record rather than overwriting one shared
+   * workspace-wide file. With active leads `a` and `b` and a hook heartbeat
+   * only for `a`, the record is real evidence that hooks are wired up in this
+   * workspace, but it is silent on whether `b`'s hook has EVER fired: a
+   * freshly opened or script-registered `b` can have no hook invocation at
+   * all while `a`'s activity makes the workspace-wide aggregate read
+   * `deliverable: true`.
    */
   | 'hook-lead-uncovered';
 
@@ -364,8 +363,20 @@ function bindingProblems(
 }
 
 /**
- * Whether a suppressing hold's `claimedEventIds` is a real, trustworthy array
- * of ids rather than absent or malformed.
+ * Whether a suppressing hold's `claimedEventIds` is a real, trustworthy,
+ * NON-EMPTY array of ids rather than absent, empty, or malformed.
+ *
+ * Only ever called on `already-claimed` / `coalesced-until-ack` holds (see
+ * {@link suppressionProblems}'s filter) — `settle-window` holds, the one
+ * reason an empty `claimedEventIds` is legitimate, never reach this function.
+ * For the two reasons this IS called on, `classifyReminderHold` only ever
+ * returns a hold when `claimedCount > 0`, so a real hold from this build
+ * always names at least one id; an empty array here can only mean the value
+ * came from something other than that classifier — a malformed daemon
+ * response, or a hand-built `HookDeliveryHold` — and must be treated exactly
+ * like a missing one (issue #425 review, round 8), not folded into the
+ * scoped-remediation branch, where an empty `ids` list renders the flag as
+ * omitted and silently falls back to acknowledging every unread event.
  *
  * `HookDeliveryHold.claimedEventIds` is optional precisely because a
  * `HookDeliveryDiagnosis` can arrive over the daemon IPC boundary from a build
@@ -376,18 +387,16 @@ function bindingProblems(
  * literal `undefined` per missing entry (flatMap keeps a non-array return value
  * as a single element rather than dropping it), `Array.prototype.join` renders
  * that as an empty string, and the remediation would print a malformed
- * `--event-ids  --socket ...` — worse than the documented "omit the flag,
- * fall back to the daemon's ack-all default" behavior for a genuinely empty
- * `[]`, because it looks like a scoped, safe command while actually being
- * broken. An empty array is a valid, deliberate signal (`settle-window` always
- * has one); only a non-array, or an array containing something other than a
- * non-empty string, is untrustworthy.
+ * `--event-ids  --socket ...` — worse than the ack-all fallback it would have
+ * produced for a genuinely untrustworthy value, because it looks like a
+ * scoped, safe command while actually being broken.
  */
 function hasValidClaimedEventIds(
   hold: HookDeliveryHold,
 ): hold is HookDeliveryHold & { claimedEventIds: string[] } {
   return (
     Array.isArray(hold.claimedEventIds) &&
+    hold.claimedEventIds.length > 0 &&
     hold.claimedEventIds.every((id) => typeof id === 'string' && id.length > 0)
   );
 }
@@ -445,11 +454,11 @@ function suppressionProblems(input: TransportHealthInput): TransportProblem[] {
       // could clear unseen work far beyond what suppressed the reminder.
       // Omitting `--socket` similarly risks acknowledging against a
       // different daemon than the one this `doctor` run diagnosed, when a
-      // non-default socket is in play. `claimedEventIds` can be a trustworthy
-      // EMPTY array only if a caller constructed a hold outside
-      // `diagnoseHookDelivery` (the pure classifier defaults it to `[]`); the
-      // flag is simply omitted then, falling back to the daemon's own "ack
-      // all unread" default rather than rendering an empty `--event-ids`.
+      // non-default socket is in play. Every entry here already passed
+      // {@link hasValidClaimedEventIds} (round 8), which requires a NON-EMPTY
+      // array — a hold with an empty or missing `claimedEventIds` is routed
+      // to `untrustworthy` below instead, so `ids` is always non-empty here
+      // and `--event-ids` is never omitted for a genuinely suppressing hold.
       remediation: sessions
         .map((sessionId) => {
           const ids = [
@@ -588,10 +597,20 @@ function representativeFreshness(
  *   active leads in one workspace each leave their own record. But `hook` has
  *   no cross-workspace identity of its own the way `channel` does — a fresh
  *   process per prompt with nothing to misresolve a DIFFERENT workspace with
- *   — so there is no analogous misbinding case to detect, and every
- *   same-workspace record is returned rather than session-matched-first: the
- *   caller ({@link buildTransport}'s uncovered-lead check) needs the full set
- *   of lead ids that have EVER fired hook here, not just one representative.
+ *   — so matching stays same-workspace-only rather than cross-workspace-first.
+ *   Same-workspace is not the same as "evidence for THIS diagnosis", though
+ *   (issue #425 review, round 8): a closed or non-lead session's still-in-TTL
+ *   record lives in the same registry entry set as an active lead's, and a
+ *   direct probe showed it poisoning the aggregate — injecting `socket-mismatch`
+ *   and flipping a healthy active lead's `reach`/`deliverable` to `none`/`false`
+ *   purely because an unrelated session's stale record shared the workspace.
+ *   Records naming an ACTIVE lead are preferred, same as `channel`; every
+ *   same-workspace record is returned only as a fallback when none of them
+ *   match an active lead, so a workspace with hook evidence but no lead
+ *   currently open still shows what it has rather than reporting "not
+ *   configured" ({@link buildTransport}'s uncovered-lead check still needs the
+ *   full set of ACTIVE lead ids that have fired hook here, not one
+ *   representative).
  */
 function selectHeartbeats(
   transport: TransportName,
@@ -606,7 +625,14 @@ function selectHeartbeats(
       path.resolve(input.workspacePath),
   );
   if (transport !== 'channel') {
-    return [...sameWorkspace].sort((a, b) => freshness(b) - freshness(a));
+    const activeLeadMatches = sameWorkspace.filter(
+      (heartbeat) =>
+        heartbeat.hostSessionId !== undefined &&
+        input.leadHostSessionIds.includes(heartbeat.hostSessionId),
+    );
+    const pool =
+      activeLeadMatches.length > 0 ? activeLeadMatches : sameWorkspace;
+    return [...pool].sort((a, b) => freshness(b) - freshness(a));
   }
 
   const sessionMatches = candidates.filter(
@@ -882,13 +908,16 @@ export function computeTransportHealth(
   const transports = [hook, channel];
 
   // A running heartbeat is not, on its own, an ACTIVE recipient (issue #425
-  // review, round 3). `hook` is keyed per-workspace, not per-session, so a
-  // fresh record left by a session that has since CLOSED still reads as
-  // "running" for the rest of its 24h lease — and `channel`'s own session-id
-  // match falls back to a workspace match (`selectHeartbeat` above) once
-  // there are no live leads to match by session at all. Either way, a
-  // transport can look perfectly healthy while there is nobody left for it to
-  // deliver to. Gate `reach`/`deliverable` on there being at least one
+  // review, round 3). At the time this was written `hook` was keyed per
+  // workspace, not per session, so a fresh record left by a session that had
+  // since CLOSED still read as "running" for the rest of its 24h lease — and
+  // `channel`'s own session-id match falls back to a workspace match
+  // (`selectHeartbeats` above) once there are no live leads to match by
+  // session at all. Both transports are session-keyed now (round 6 follow-up
+  // for `hook`, round 8 for filtering its selection to active leads), which
+  // narrows but does not eliminate the gap this gate exists for: a same-
+  // workspace fallback record (no active-lead match at all) is still nobody
+  // currently active. Gate `reach`/`deliverable` on there being at least one
   // currently-active lead host session (the caller supplies ACTIVE leads
   // only — see `doctor.ts`) before even asking which transport is listening.
   const hasActiveLead = input.leadHostSessionIds.length > 0;

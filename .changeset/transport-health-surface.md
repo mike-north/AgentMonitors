@@ -24,8 +24,9 @@ presented identically (silence) and needed completely different fixes.
 - **`doctor` gains a "Delivery transports" section**, two `transport:<name>` checks, and a
   `delivery-verdict` check. Each failure mode is reported with its own code and its own remediation,
   never collapsed into a generic "unhealthy": `daemon-unreachable`, `workspace-mismatch`,
-  `socket-mismatch`, `environment-mismatch`, `reminders-suppressed` (naming
-  `agentmonitors events ack --session <id>`), `heartbeat-stale`, and `version-skew`.
+  `socket-mismatch`, `environment-mismatch`, `reminders-suppressed` (naming a scoped
+  `agentmonitors events ack --session <id> --event-ids <ids> --socket <socket>`, never a blanket
+  `--session <id>` alone), `heartbeat-stale`, and `version-skew`.
 - **The verdict separates "which method is listening" from "will anything arrive right now."**
   `deliveryWillReachThisSession` names the method (`hook` / `channel` / `both` / `none`);
   `deliverable` is the answer a user actually wants. They diverge exactly in the suppression case —
@@ -105,3 +106,11 @@ See docs/specs/006-agent-integration.md §12 and docs/specs/005-cli-reference.md
   back and the socket `doctor` itself resolved, instead of a blanket
   `agentmonitors events ack --session <id>` that would acknowledge every unread row on the session
   (including events never claimed or seen) against whichever daemon the default socket resolves to.
+- `hook` heartbeat selection is now filtered to active lead sessions, matching `channel`: a closed
+  or non-lead session's still-in-TTL record in the same workspace can no longer poison a healthy
+  active lead's aggregate with problems (e.g. `socket-mismatch`) that belong to somebody else's
+  session.
+- An empty `claimedEventIds` array on an `already-claimed`/`coalesced-until-ack` hold is now treated
+  as untrustworthy, the same as a missing one, instead of falling back to the unscoped
+  `agentmonitors events ack --session <id>` command — such a hold necessarily claims at least one
+  event, so an empty array can only come from a malformed or hand-built value.

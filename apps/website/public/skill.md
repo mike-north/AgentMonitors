@@ -420,9 +420,12 @@ and, when delivery is currently blocked, which of these it is — each with its 
   you're waiting on. Usually means the session was launched from somewhere other than the repo.
   Start a session from the repo directory.
 - **`reminders-suppressed`** — everything is up, but reminders are **muted**: an earlier unread
-  event is already claimed, so new ones won't surface (`coalesced-until-ack`). Clear it with
-  `agentmonitors events ack --session <id>`. This one is worth knowing about, because nothing
-  looks broken while it is happening.
+  event is already claimed, so new ones won't surface (`coalesced-until-ack`). `doctor`'s own
+  `remediation[]` names the exact fix — `agentmonitors events ack --session <id> --event-ids
+  <ids> --socket <socket>`, scoped to precisely the claimed events holding the reminder back and
+  the daemon `doctor` diagnosed. Don't run a bare `--session <id>` yourself: with no `--event-ids`
+  it acknowledges *every* unread event for that session, including work never claimed or surfaced.
+  This one is worth knowing about, because nothing looks broken while it is happening.
 - **`heartbeat-stale`** — a channel server registered but stopped reporting; reconnect the MCP
   server or start a new session.
 

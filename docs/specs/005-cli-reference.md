@@ -1758,7 +1758,7 @@ transports** section above the checks, built from the transport heartbeats each 
 | `heartbeat-stale`                 | A transport registered but its lease lapsed — presumed killed without cleanup                                                              |
 | `channel-session-unmatched`       | A channel server is running for this workspace but serves no ACTIVE lead session here — somebody else's listener                           |
 | `channel-lead-uncovered`          | At least one OTHER active lead session has no matching channel heartbeat at all, even though this one does                                 |
-| `hook-lead-uncovered`             | At least one active lead session has no evidence in the (single, workspace-keyed) hook heartbeat, even though another lead's does          |
+| `hook-lead-uncovered`             | At least one active lead session has no matching hook heartbeat at all, even though another active lead's does                             |
 | `version-skew`                    | Advisory: a long-lived transport is still serving an older CLI build than this one                                                         |
 | `channel-registration-unverified` | Advisory: the host never confirms channel registration; prove delivery end to end                                                          |
 | `delivery-diagnosis-unavailable`  | The daemon's suppression check itself failed for one or more lead sessions — **not** the same as "checked, nothing suppressed" (see below) |
@@ -1788,13 +1788,15 @@ makes that distinction explicit and, unlike the two advisory codes above, IS blo
 can never be `true` while it is present, precisely because "unknown" must not be reported as "healthy".
 
 **A hold with untrustworthy `claimedEventIds` is also `delivery-diagnosis-unavailable` (issue #425
-review, round 7).** `HookDeliveryHold.claimedEventIds` (round 6, above) is optional on the
+review, rounds 7–8).** `HookDeliveryHold.claimedEventIds` (round 6, above) is optional on the
 `@agentmonitors/core` type, because a diagnosis crosses the daemon IPC boundary and can arrive from a
-build that predates the field. A suppressing hold whose `claimedEventIds` is not a real array of
-non-empty strings is reported this way — never folded into `reminders-suppressed`'s scoped ack
-command (which would render a malformed, blank `--event-ids  --socket ...` flag) and never as a
+build that predates the field. A suppressing hold whose `claimedEventIds` is not a real, NON-EMPTY
+array of non-empty strings is reported this way — never folded into `reminders-suppressed`'s scoped
+ack command (which would render a malformed, blank `--event-ids  --socket ...` flag) and never as a
 fallback to the unscoped, blanket `agentmonitors events ack --session <id>` the round-6 fix exists to
-avoid. See 006 §12.7.
+avoid. An empty array is untrustworthy here too (round 8): an `already-claimed`/`coalesced-until-ack`
+hold necessarily claims at least one event, so `[]` can only come from a malformed or hand-built
+value, not from a real suppression. See 006 §12.7.
 
 `version-skew` and `channel-registration-unverified` are the two **advisory, non-blocking** codes: both
 are reported when present, but neither counts toward a transport's `healthy` field, its `fail` status,

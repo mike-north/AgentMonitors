@@ -572,10 +572,12 @@ export function isHeartbeatStale(
   // the small clock-skew tolerance above, that can only be a corrupt record or
   // a writer with a badly wrong clock — and treating a future timestamp as
   // "infinitely fresh" is the wrong failure mode: it would never age past its
-  // TTL, so `readTransportHeartbeats`' opportunistic GC would never reap it,
-  // and `doctor` would keep reporting a possibly-dead transport as `running`
-  // forever (issue #425 review, round 4). Report it as stale instead — the
-  // same conservative direction as the unparseable-timestamp case above.
+  // TTL, so `reapExpiredHeartbeats`' write-path GC (round 7 — reads are
+  // deliberately pure, see `readTransportHeartbeats` above) would never reap
+  // it, and `doctor` would keep reporting a possibly-dead transport as
+  // `running` forever (issue #425 review, round 4). Report it as stale
+  // instead — the same conservative direction as the unparseable-timestamp
+  // case above.
   if (age < -HEARTBEAT_FUTURE_TOLERANCE_MS) return true;
   return age > heartbeat.ttlMs;
 }

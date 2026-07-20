@@ -588,9 +588,7 @@ describe('opportunistic registry GC (issue #425 review)', () => {
       now: new Date('2026-07-19T11:05:00.000Z'),
     });
 
-    const records = readTransportHeartbeats(
-      new Date('2026-07-19T11:05:00.000Z'),
-    );
+    const records = readTransportHeartbeats();
     expect(records.map((record) => record.transport).sort()).toEqual([
       'channel',
     ]);

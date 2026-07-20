@@ -1523,18 +1523,29 @@ run `hook deliver` successfully still produced only one file (the second prompt 
 so the every-active-lead-covered rule (§12.5) could never tell that genuine gap apart from a
 perfectly healthy multi-session workspace — whichever lead prompted second always read as uncovered.
 
-**Session-id-first _matching/fallback_, however, still applies only to `channel`.** `channel serve` is
-one long-lived process per host session, so matching its record by host session id — across EVERY
+**Cross-workspace matching, however, still applies only to `channel`.** `channel serve` is one
+long-lived process per host session, so matching its record by host session id — across EVERY
 workspace, not just this one — is exactly what detects the misbinding case above (§12.1 case 2): a
 session whose channel record names a different workspace entirely. `hook` has no analogous
 cross-workspace identity to misresolve — it is a fresh process per prompt with nothing that persists
-between workspaces — so its heartbeats are still selected by same-workspace match only, and ALL
-same-workspace records are returned (not narrowed to one), because it is the full set of lead ids
-with a hook record here — not a single representative — that the every-active-lead-covered rule needs.
-Applying `channel`'s cross-workspace-first, single-match selection to `hook` too would let a session
-whose hook last fired in workspace A — now leading workspace B, before its first prompt there — find
-no matching record in B's workspace-filtered set at first prompt, when in fact that is the ordinary,
-self-healing "not fired yet" case (`hook-lead-uncovered`, §12.5), not a misbinding.
+between workspaces — so its heartbeats are still matched same-workspace-only.
+
+**Within that same-workspace pool, `hook` selection is now filtered to ACTIVE leads first, matching
+`channel` (issue #425 review, round 8).** Same-workspace is not the same as "evidence for THIS
+diagnosis": a closed or non-lead session's still-in-TTL record lives in the same registry entry set
+as an active lead's own record, and returning every same-workspace record unfiltered let it poison
+the active aggregate — a direct probe with one healthy active-lead record plus one closed-session
+record bound to an obsolete socket produced `socket-mismatch` and flipped a healthy workspace's
+`reach`/`deliverable` to `none`/`false`. Records naming an ACTIVE lead are preferred; every
+same-workspace record is returned only as a fallback when none of them match an active lead, so a
+workspace with hook evidence but no lead currently open still shows what it has rather than reporting
+"not configured". The every-active-lead-covered rule (§12.5) still needs the full set of ACTIVE lead
+ids that have fired hook here, not a single representative — filtering to active-lead matches when
+they exist does not reduce that to one, since several active leads each leave their own record.
+Applying `channel`'s cross-workspace-first selection to `hook` too would let a session whose hook
+last fired in workspace A — now leading workspace B, before its first prompt there — find no matching
+record in B's workspace-filtered set at first prompt, when in fact that is the ordinary, self-healing
+"not fired yet" case (`hook-lead-uncovered`, §12.5), not a misbinding.
 
 A transport running under a genuinely different `HOME`/`XDG_DATA_HOME` resolves a different data root
 and is invisible from here. That case is reported honestly as an **absence** whose wording names the
@@ -1624,24 +1635,33 @@ channel unhealthy, and it points at `agentmonitors verify` (an end-to-end proof)
 remediation. A future active probe — emit a synthetic channel event, confirm the claim/ack lands back
 in the store within a bound — would upgrade this from advisory to detection.
 
-### 12.7 A hold's `claimedEventIds` is optional, and its absence is never an ack-all fallback (issue #425 review, round 7)
+### 12.7 A hold's `claimedEventIds` is optional, and neither its absence nor emptiness is ever an ack-all fallback (issue #425 review, rounds 7–8)
 
 `HookDeliveryHold.claimedEventIds` (round 6, §12.4 item 3 / 005 §15 "reminders-suppressed") is
 **optional** on the `@agentmonitors/core` public type, not required. A `HookDeliveryDiagnosis`
 crosses the daemon IPC boundary, so it can arrive from a build that predates the field entirely — the
 type describes what THIS build produces, not what a remote peer actually sent on the wire.
 
-`doctor` must treat a suppressing hold whose `claimedEventIds` is not a real array of non-empty
-strings as **diagnosis-unavailable for that session** (`delivery-diagnosis-unavailable`, §12.4 item
-5), never as:
+`doctor` must treat a suppressing (`already-claimed` / `coalesced-until-ack`) hold whose
+`claimedEventIds` is not a real, NON-EMPTY array of non-empty strings as **diagnosis-unavailable for
+that session** (`delivery-diagnosis-unavailable`, §12.4 item 5), never as:
 
 - **A broken command.** Folding a missing field into the same ids list as a genuinely populated one
-  renders a malformed, blank `--event-ids  --socket ...` flag — worse than the documented
-  empty-array fallback, because it looks like a safe, scoped command while actually being broken.
+  renders a malformed, blank `--event-ids  --socket ...` flag — worse than treating it as untrustworthy,
+  because it looks like a safe, scoped command while actually being broken.
 - **An ack-all fallback.** Falling back to a bare `agentmonitors events ack --session <id>` (no
   `--event-ids`) would re-introduce exactly the blanket-acknowledgement defect round 6 fixed:
-  clearing every unread row for the session, including work the agent never claimed or saw.
+  clearing every unread row for the session, including work the agent never claimed or saw. This
+  applies equally to a MISSING field (round 7) and to an EMPTY array (round 8): `classifyReminderHold`
+  only ever returns an `already-claimed`/`coalesced-until-ack` hold when at least one event is
+  claimed, so a real hold from this build always names at least one id — an empty array reaching
+  `doctor` can only mean the value came from something other than that classifier (a malformed daemon
+  response, or a hand-built `HookDeliveryHold`) and must be treated exactly like a missing one, not
+  folded into the scoped-remediation branch where an empty list renders as "omit the flag" and
+  silently falls back to acknowledging every unread event.
 
-An empty array (`[]`) remains a valid, deliberate signal — `settle-window` always reports one — and
-continues to fall back to the documented "omit `--event-ids`" behavior. Only a missing/non-array
-value, or an array containing something other than a non-empty string, is untrustworthy.
+An empty array (`[]`) IS still a valid, deliberate signal for `settle-window` holds — nothing is
+claimed while pending work merely waits out the settle window — but `settle-window` never reaches
+this check at all: only `already-claimed`/`coalesced-until-ack` holds are suppressing holds, and for
+those two reasons an empty array is never legitimate. Only a real, non-empty array of non-empty
+strings is trustworthy.

@@ -981,9 +981,8 @@ This monitor fires on a schedule.
       );
       expect(openedUncovered.exitCode).toBe(0);
 
-      // The single, workspace-keyed hook heartbeat names only the covered
-      // lead — hooks are per-workspace, not per-session, so there is never a
-      // second file to check.
+      // Only the covered lead's hook heartbeat is seeded, so the uncovered
+      // lead has no per-session record of its own to match.
       seedHeartbeat(fixture, 'hook', { hostSessionId: coveredHost });
 
       const result = runWithEnv(

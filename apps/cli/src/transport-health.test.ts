@@ -339,7 +339,7 @@ describe('computeTransportHealth', () => {
   });
 
   describe('the every-active-lead-covered rule applies to hook too, not only channel (issue #425 review, round 6)', () => {
-    it('flags an active lead with no evidence in the (single, workspace-keyed) hook heartbeat', () => {
+    it('flags an active lead with no evidence in the hook heartbeat', () => {
       // Regression: hook heartbeats already carry `hostSessionId`, but
       // coverage was only checked for `channel`. With two active leads and a
       // hook heartbeat naming only one of them, `computeTransportHealth`
@@ -418,8 +418,8 @@ describe('computeTransportHealth', () => {
       // the fix: two active leads that had BOTH just run `hook deliver`
       // successfully still reported `[hook-lead-uncovered]` against whichever
       // prompted first, a verdict of "via none: no delivery transport is
-      // listening", and exit 1 — permanently, because a workspace-keyed record
-      // can only ever name one of them.
+      // listening", and exit 1 — permanently, because the OLD workspace-keyed
+      // record could only ever name one of them.
       const health = computeTransportHealth(
         input({
           leadHostSessionIds: ['lead-a', 'lead-b'],
@@ -453,6 +453,37 @@ describe('computeTransportHealth', () => {
         hook.problems.find((p) => p.code === 'hook-lead-uncovered')?.detail,
       ).toContain('lead-b');
       expect(health.deliverable).toBe(false);
+    });
+
+    it('does not let a closed or non-lead session’s same-workspace hook record poison a healthy active lead (issue #425 review, round 8)', () => {
+      // Regression: `selectHeartbeats` returned EVERY same-workspace hook
+      // record unfiltered, so a fresh record left by a session that has since
+      // closed (or was never a lead) was unioned into the active aggregate
+      // alongside a perfectly healthy active lead's own record. A direct
+      // probe with one healthy active-lead record plus one closed-session
+      // record bound to an obsolete socket produced `socket-mismatch`,
+      // `hook.healthy: false`, `reach: 'none'`, and `deliverable: false` for a
+      // workspace where the only currently-open session was working fine.
+      const health = computeTransportHealth(
+        input({
+          leadHostSessionIds: ['lead-active'],
+          heartbeats: [
+            heartbeat('hook', { hostSessionId: 'lead-active' }),
+            heartbeat('hook', {
+              hostSessionId: 'session-closed',
+              socketPath:
+                '/data/agentmonitors/workspaces/stale/agentmonitors.sock',
+            }),
+          ],
+        }),
+      );
+
+      const hook = find(health.transports, 'hook');
+      expect(codesOf(hook)).not.toContain('socket-mismatch');
+      expect(codesOf(hook)).not.toContain('hook-lead-uncovered');
+      expect(hook.healthy).toBe(true);
+      expect(health.deliveryWillReachThisSession).toBe('hook');
+      expect(health.deliverable).toBe(true);
     });
   });
 
@@ -782,29 +813,37 @@ describe('computeTransportHealth', () => {
       );
     });
 
-    it('omits `--event-ids` (falls back to the daemon default) when a hold carries no claimed ids', () => {
-      // Defensive: `diagnoseHookDelivery` always supplies real ids, but the
-      // pure classifier defaults to `[]` for a hand-built caller. Rendering
-      // an empty `--event-ids ` flag would be worse than omitting it.
+    it('treats an empty claimedEventIds array as untrustworthy, never an ack-all fallback (issue #425 review, round 8)', () => {
+      // `classifyReminderHold` only ever returns a hold for these two reasons
+      // when `claimedCount > 0`, so a real hold from this build always names
+      // at least one id — an empty array here can only come from something
+      // other than that classifier (a malformed daemon response, or a
+      // hand-built caller) and must be treated exactly like a missing one.
+      // Before this fix, `[]` was accepted as "trustworthy but empty" and
+      // `--event-ids` was silently omitted, falling back to the daemon's
+      // ack-all default: `agentmonitors events ack --session <id>` with no
+      // scoping — the exact blanket acknowledgement round 6 exists to avoid.
       const health = computeTransportHealth(
         input({ diagnoses: [suppressedDiagnosis('session-abc', [])] }),
       );
+      const codes = health.pipelineProblems.map((problem) => problem.code);
+      expect(codes).toContain('delivery-diagnosis-unavailable');
+      expect(codes).not.toContain('reminders-suppressed');
       const remediation = health.remediation.join(' ');
-      expect(remediation).not.toContain('--event-ids');
-      expect(remediation).toContain(`--socket ${SOCKET}`);
+      expect(remediation).not.toContain(
+        'agentmonitors events ack --session session-abc',
+      );
+      expect(health.deliverable).toBe(false);
     });
 
     describe('a hold with untrustworthy claimedEventIds is never an ack-all fallback (issue #425 review, round 7)', () => {
-      // Distinct from the `[]` case above: `[]` is a genuinely EMPTY, valid
-      // array (e.g. `settle-window`, or a hand-built test caller), and the
-      // documented fallback is to omit `--event-ids` there. This describes
-      // the field being ABSENT or malformed on the wire — an older daemon
-      // build that predates `claimedEventIds` still supports `hook.diagnose`
-      // and returns the pre-change hold shape with no `claimedEventIds` key
-      // at all. Before the fix, `flatMap` contributed a literal `undefined`
-      // per such hold, `Array.prototype.join` rendered it as an empty string,
-      // and the remediation printed a malformed
-      // `--event-ids  --socket ...` — worse than the `[]` fallback, since it
+      // A hold missing `claimedEventIds` entirely simulates the wire shape
+      // from an older daemon build that predates the field — an ABSENT key,
+      // not a deliberately empty array (round 8 treats both the same way; see
+      // the empty-array test above). Before the fix, `flatMap` contributed a
+      // literal `undefined` per such hold, `Array.prototype.join` rendered it
+      // as an empty string, and the remediation printed a malformed
+      // `--event-ids  --socket ...` — worse than an ack-all fallback, since it
       // LOOKS like a safe, scoped command while actually being broken.
       function suppressedHoldMissingIds(
         sessionId: string,
