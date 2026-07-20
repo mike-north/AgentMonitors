@@ -2053,6 +2053,36 @@ When the document changes, act on it.
           ),
         );
       });
+
+      // Issue #304 review, fifth round: the id-length check previously ran
+      // `Array.from(id).length`, materializing one array element per code
+      // point of the (unbounded, author-supplied) id BEFORE the length was
+      // even read — the reviewer's own 11 MiB ASCII-id repro above peaked
+      // around 149 MB RSS in Node merely to reject the config, amplifying
+      // the exact availability failure `MAX_PART_ID_LENGTH` exists to bound.
+      // The fix counts code points via a plain `for...of` and returns as
+      // soon as the running count exceeds the limit, so rejecting a huge id
+      // is O(limit), not O(id.length). A 50 MiB id (far larger than the 11
+      // MiB repro) must still reject near-instantly; a generous 500ms bound
+      // catches a regression back to the O(length) allocation without being
+      // flaky on a loaded CI runner.
+      it('rejects a far larger (50 MiB) oversized id without materializing it (near-instant rejection)', () => {
+        const hugeId = 'x'.repeat(50 * 1024 * 1024);
+        const start = performance.now();
+        expect(() =>
+          parseCompositeConfig({
+            composite: {
+              'object-key': 'huge-id-composite',
+              parts: [{ id: hugeId, url: 'https://api.example.com/a' }],
+            },
+          }),
+        ).toThrow(
+          new RegExp(
+            `id must not exceed ${String(MAX_PART_ID_LENGTH)} characters`,
+          ),
+        );
+        expect(performance.now() - start).toBeLessThan(500);
+      });
     });
 
     // Issue #304 review, third round: the cumulative BYTE budget bounds

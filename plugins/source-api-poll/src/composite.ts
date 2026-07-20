@@ -53,6 +53,30 @@ export const MAX_COMPOSITE_PARTS = 50;
  */
 export const MAX_PART_ID_LENGTH = 256;
 
+/**
+ * Count `value`'s Unicode code points, stopping (and returning early) as soon
+ * as the count exceeds `limit` — never counting past `limit + 1`.
+ *
+ * Issue #304 review, fifth round: the previous `Array.from(id).length`
+ * materializes a full array with one element per code point before the
+ * length is even read, so rejecting an oversized `id` allocated memory
+ * proportional to the (unbounded, author-supplied) id itself — the review's
+ * own 11 MiB ASCII-id repro peaked around 149 MB RSS in Node merely to
+ * reject the config, amplifying the exact availability failure this guard
+ * exists to bound. Iterating `value` directly (a plain `for...of` over a
+ * string walks code points one at a time, respecting surrogate pairs,
+ * without building an array) and returning as soon as the count exceeds
+ * `limit` makes rejecting an oversized id O(`limit`), not O(`value.length`).
+ */
+function countCodePointsUpTo(value: string, limit: number): number {
+  let count = 0;
+  for (const _codePoint of value) {
+    count++;
+    if (count > limit) return count;
+  }
+  return count;
+}
+
 /** Author config for composite mode (the `change-detection.composite` block). */
 export interface CompositeConfig {
   /**
@@ -135,9 +159,12 @@ export function parseCompositeConfig(
     // units. A 200-emoji id is 200 code points (passes the schema's
     // `maxLength: 256`) but 400 UTF-16 code units, so `id.length` (400) wrongly
     // rejected it here even though authoring-time `agentmonitors validate`
-    // (schema-only) had already accepted it. `Array.from(id).length` iterates
-    // by code point (respecting surrogate pairs), matching the schema's count.
-    const idLength = Array.from(id).length;
+    // (schema-only) had already accepted it. `countCodePointsUpTo` iterates
+    // by code point (respecting surrogate pairs), matching the schema's
+    // count, and — issue #304 review, fifth round — stops as soon as the
+    // count exceeds `MAX_PART_ID_LENGTH` instead of materializing every code
+    // point of an unbounded id first (see its doc comment).
+    const idLength = countCodePointsUpTo(id, MAX_PART_ID_LENGTH);
     if (idLength > MAX_PART_ID_LENGTH) {
       throw new Error(
         `change-detection.composite.parts[${String(index)}].id must not exceed ${String(MAX_PART_ID_LENGTH)} characters (got ${String(idLength)})`,
