@@ -94,7 +94,7 @@ describe.skipIf(process.platform === 'win32')(
     it('creates a fresh log file 0600 and its missing parent dir 0700 under the default (nested) path', () => {
       const logPath = path.join(tmpDir, '.claude', 'daemon', 'daemon.log');
 
-      const fd = openLogFd(logPath);
+      const fd = openLogFd(logPath, true);
       closeSync(fd);
 
       expect(modeOf(logPath)).toBe(PRIVATE_FILE_MODE);
@@ -107,14 +107,17 @@ describe.skipIf(process.platform === 'win32')(
     it('creates a fresh log file 0600 and its missing parent dir 0700 under a custom (flat) path', () => {
       const logPath = path.join(tmpDir, 'custom.log');
 
-      const fd = openLogFd(logPath);
+      // A MISSING custom parent is still created owner-only — we are the one
+      // creating it, so there is no pre-existing mode to preserve. Only a
+      // pre-existing custom parent is left alone (see the next two tests).
+      const fd = openLogFd(logPath, false);
       closeSync(fd);
 
       expect(modeOf(logPath)).toBe(PRIVATE_FILE_MODE);
       expect(modeOf(path.dirname(logPath))).toBe(PRIVATE_DIR_MODE);
     });
 
-    it('tightens a pre-existing world-readable parent dir and log file (migration from an earlier version)', () => {
+    it('tightens a pre-existing world-readable parent dir and log file under the default path (migration from an earlier version)', () => {
       const parent = path.join(tmpDir, 'legacy');
       const logPath = path.join(parent, 'daemon.log');
       mkdirSync(parent, { recursive: true });
@@ -124,7 +127,7 @@ describe.skipIf(process.platform === 'win32')(
       expect(modeOf(parent)).toBe(0o755);
       expect(modeOf(logPath)).toBe(0o644);
 
-      const fd = openLogFd(logPath);
+      const fd = openLogFd(logPath, true);
       closeSync(fd);
 
       expect(modeOf(parent)).toBe(PRIVATE_DIR_MODE);
@@ -134,14 +137,39 @@ describe.skipIf(process.platform === 'win32')(
       expect(readFileSync(logPath, 'utf-8')).toBe('previous run output\n');
     });
 
+    it('leaves a pre-existing custom --log parent mode untouched, while still tightening the log file (round-5 review 3611604829)', () => {
+      // A custom `--log` parent is not necessarily Agent-Monitors-owned — it
+      // could be a repo checkout or a shared logs directory a collaborator
+      // also needs group access to. Reproduces the exact regression: a 0755
+      // workspace root must NOT become 0700 just because `--log` points a
+      // file inside it.
+      const parent = path.join(tmpDir, 'workspace-root');
+      const logPath = path.join(parent, 'daemon.log');
+      mkdirSync(parent, { recursive: true });
+      chmodSync(parent, 0o755);
+      writeFileSync(logPath, 'previous run output\n');
+      chmodSync(logPath, 0o644);
+      expect(modeOf(parent)).toBe(0o755);
+
+      const fd = openLogFd(logPath, false);
+      closeSync(fd);
+
+      // The custom parent's mode is completely unchanged...
+      expect(modeOf(parent)).toBe(0o755);
+      // ...but the log FILE itself is still secured and its prior content
+      // preserved, exactly as the default-location case above.
+      expect(modeOf(logPath)).toBe(PRIVATE_FILE_MODE);
+      expect(readFileSync(logPath, 'utf-8')).toBe('previous run output\n');
+    });
+
     it('appends rather than truncating a pre-existing log across repeated detached boots', () => {
       const logPath = path.join(tmpDir, 'daemon.log');
 
-      const first = openLogFd(logPath);
+      const first = openLogFd(logPath, true);
       writeFileSync(first, 'first boot\n');
       closeSync(first);
 
-      const second = openLogFd(logPath);
+      const second = openLogFd(logPath, true);
       writeFileSync(second, 'second boot\n');
       closeSync(second);
 

@@ -1,9 +1,10 @@
 import { spawn } from 'node:child_process';
-import { closeSync, openSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import {
   ensurePrivateDir,
+  PRIVATE_DIR_MODE,
   PRIVATE_FILE_MODE,
   restrictExistingPathMode,
 } from '@agentmonitors/core';
@@ -23,6 +24,26 @@ export interface SpawnDaemonOptions {
    * it misbehaves. The file (and its parent directory) is created if missing.
    */
   logPath?: string;
+  /**
+   * Whether {@link logPath} is Agent Monitors' own default location (the
+   * workspace data dir), as opposed to a user-supplied `--log <path>`.
+   *
+   * A missing parent directory is created owner-only (`0700`) either way — we
+   * are the one creating it, so there is no pre-existing mode to preserve.
+   * What this flag actually gates is a pre-existing parent: the default
+   * parent is Agent-Monitors-owned, so it is tightened (via
+   * {@link ensurePrivateDir}) if it already exists looser. A custom `--log`
+   * path may point into a directory the user owns for their own reasons (a
+   * repo checkout, a shared logs directory), so a pre-existing custom parent
+   * is left exactly as it is — the same treatment `ensureSocketDir` already
+   * gives a user-chosen `--socket` directory. See {@link openLogFd}.
+   *
+   * Defaults to `false` (treat as a custom path) when {@link logPath} is set
+   * without this flag, so a caller that forgets to pass it gets the safer,
+   * non-tightening behavior rather than silently chmod-ing a directory it
+   * does not own.
+   */
+  logPathIsDefault?: boolean;
 }
 
 /**
@@ -98,7 +119,9 @@ export function spawnDetachedDaemon(
   // Open the log in APPEND mode so repeated detached boots for one workspace
   // accumulate rather than truncating the previous run's crash output.
   const logFd =
-    options.logPath === undefined ? undefined : openLogFd(options.logPath);
+    options.logPath === undefined
+      ? undefined
+      : openLogFd(options.logPath, options.logPathIsDefault ?? false);
   try {
     const child = spawn(process.execPath, args, {
       detached: true,
@@ -139,22 +162,42 @@ export function spawnDetachedDaemon(
  * `openSync(path, 'a')` would create it `0644` and leave it readable by every
  * other local user. `PRIVATE_FILE_MODE` has no group/other bits, so a
  * permissive umask has nothing to strip and the file comes out owner-only from
- * birth.
+ * birth. The log FILE is always secured this way — tightened if it already
+ * exists, created `0600` if it does not — regardless of whether `logPath` is
+ * the default location or a custom `--log` path: it is ours either way, and we
+ * are about to append the daemon's diagnostics to it.
  *
- * The parent directory is created (or tightened, if it already exists looser)
- * via {@link ensurePrivateDir} — the same AgentMon-owned-location helper every
- * other runtime-data directory uses (session dirs, the socket directory), so
- * this creation site can't drift from that policy. The log file itself IS
- * tightened when it already exists — it is ours, we are about to append the
- * daemon's diagnostics to it, and a looser file left by an earlier version (or
- * by a run before this policy existed) must not stay world-readable.
+ * The PARENT directory gets different treatment depending on `isDefaultLocation`
+ * (round-5 review 3611604829) — mirroring `ensureSocketDir`'s existing split
+ * between the Agent-Monitors-owned default socket directory and a
+ * user-chosen `--socket` one:
+ *
+ * - A MISSING parent (any missing ancestor) is always created owner-only
+ *   (`0700`) either way — we are the one creating it, so there is no
+ *   pre-existing mode to preserve, default location or not.
+ * - An EXISTING parent is only tightened when `isDefaultLocation` is true
+ *   (the Agent-Monitors-owned workspace data dir). A pre-existing CUSTOM
+ *   `--log` parent — possibly a directory the user owns for their own
+ *   reasons, e.g. a repo checkout or a shared logs directory — is left
+ *   exactly as it is; silently removing its group/other access would be a
+ *   functional regression, not a hardening.
  *
  * Exported (this package has no api-extractor rollup) purely so its mode
  * regression tests can call it directly instead of round-tripping through a
  * real detached daemon spawn (round-4 review 3611294358).
  */
-export function openLogFd(logPath: string): number {
-  ensurePrivateDir(path.dirname(logPath));
+export function openLogFd(logPath: string, isDefaultLocation: boolean): number {
+  const parent = path.dirname(logPath);
+  if (isDefaultLocation) {
+    // Creates a missing parent 0700 AND tightens an existing looser one.
+    ensurePrivateDir(parent);
+  } else {
+    // `mkdirSync({ recursive: true })` is a no-op — and critically does NOT
+    // chmod — when `parent` already exists, so a pre-existing custom parent's
+    // mode is left completely untouched. A MISSING one is still created
+    // owner-only: we are its creator either way.
+    mkdirSync(parent, { recursive: true, mode: PRIVATE_DIR_MODE });
+  }
   restrictExistingPathMode(logPath, PRIVATE_FILE_MODE);
   return openSync(logPath, 'a', PRIVATE_FILE_MODE);
 }

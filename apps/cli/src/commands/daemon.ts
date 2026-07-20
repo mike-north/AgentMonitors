@@ -657,10 +657,18 @@ Foreground vs background:
       // combination) — is passed through explicitly, so the backgrounded
       // daemon is the same daemon the foreground run would have been.
       if (options.detach === true) {
-        const logPath =
-          options.log === undefined
-            ? path.join(workspacePaths(workspace).dir, 'daemon.log')
-            : path.resolve(options.log);
+        // Whether `--log` was left unset (the default, Agent-Monitors-owned
+        // workspace-data-dir location) or explicitly pointed elsewhere — this
+        // flows into `spawnDetachedDaemon`/`openLogFd` so a MISSING custom
+        // parent directory is created plainly rather than tightened to
+        // `0700`, and a pre-existing custom parent is never chmod'd at all
+        // (round-5 review 3611604829): a user-chosen `--log` path is not
+        // necessarily ours to lock down.
+        const optionsLog = options.log;
+        const logPathIsDefault = optionsLog === undefined;
+        const logPath = logPathIsDefault
+          ? path.join(workspacePaths(workspace).dir, 'daemon.log')
+          : path.resolve(optionsLog);
         // Opening the log touches the filesystem (mkdir/chmod/open), so a
         // permission error or an unwritable `--log` path must surface as the
         // CLI's normal one-line error + non-zero exit, never a raw stack
@@ -675,6 +683,7 @@ Foreground vs background:
             pollMs,
             reapAfterMs,
             logPath,
+            logPathIsDefault,
           });
         } catch (error) {
           const message =
