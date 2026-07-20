@@ -147,6 +147,94 @@ describe('assertPackageCleanRemovesDistAndTemp', () => {
     ).toThrow(/must also remove "temp"/);
   });
 
+  // Regression fixture for the round-2 #454 review finding: a command
+  // reachable only via an unresolved `||` branch was still marked
+  // `guaranteed: true` once re-joined by a subsequent `&&` — `cmd2` here
+  // only runs if `rm -rf dist` FAILED, so `rm -rf temp` (joined to `cmd2`
+  // by `&&`) is only reachable on that same failure path, not the normal
+  // success path.
+  it('rejects "temp" removed only via `cmd1 || cmd2 && rm -rf temp` (guard false-accept #4: unresolved `||` reachability not propagated through `&&`)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'rm -rf dist || echo recovering && rm -rf temp' } },
+        'test-package',
+      ),
+    ).toThrow(/must also remove "temp"/);
+  });
+
+  // Regression fixture for the round-2 #454 review finding: a backslash
+  // immediately followed by a newline is a shell line CONTINUATION (the
+  // two physical lines are joined into one logical line), so the `||`
+  // still gates `rm -rf temp` exactly as it would on a single line — the
+  // pre-fix splitter treated the escaped newline as a real separator,
+  // discarding the pending `||` and wrongly marking `rm -rf temp`
+  // `guaranteed`.
+  it('rejects "temp" removed only via `||` across a backslash-newline continuation (guard false-accept #5)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'rm -rf dist ||\\\n  rm -rf temp' } },
+        'test-package',
+      ),
+    ).toThrow(/must also remove "temp"/);
+  });
+
+  // Regression fixture for the round-2 #454 review finding: everything
+  // after an unquoted `#` is a shell comment and never executes, so a
+  // required command hidden behind one must not count.
+  it('rejects "temp" removed only inside a shell comment (guard false-accept #6)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'rm -rf dist # && rm -rf temp' } },
+        'test-package',
+      ),
+    ).toThrow(/must also remove "temp"/);
+  });
+
+  // Regression fixture for the round-2 #454 review finding: quoting is
+  // shell syntax, not command text — `rm -rf dist temp` inside a
+  // single-quoted `echo` argument is a STRING, never actually invoked as a
+  // command. A naive delimiter split (ignoring quotes) would also
+  // incorrectly split the embedded `;` characters into separate bogus
+  // "commands".
+  it('rejects "rm -rf dist temp" that only appears as quoted text, never executed (guard false-accept #7)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        {
+          scripts: {
+            clean: "echo 'prefix; rm -rf dist temp; suffix'",
+          },
+        },
+        'test-package',
+      ),
+    ).toThrow(/must run `rm -rf`/);
+  });
+
+  // Regression fixture for the round-2 #454 review finding: `\b`-bounded
+  // matching (or naive prefix matching) let `-rf-old` masquerade as `-rf`
+  // — but the real `rm` binary rejects `-rf-old` as an unsupported option
+  // and removes nothing.
+  it('rejects `rm -rf-old dist temp` masquerading as `rm -rf` (guard false-accept #8)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'rm -rf-old dist temp' } },
+        'test-package',
+      ),
+    ).toThrow(/must run `rm -rf`/);
+  });
+
+  // Regression fixture for the round-2 #454 review finding: a backgrounded
+  // `rm -rf` (trailing lone `&`, not `&&`) returns immediately without
+  // waiting for the removal to complete, so `clean` can return (or a
+  // subsequent step can run) before `dist`/`temp` are actually gone.
+  it('rejects `rm -rf dist temp &` backgrounded cleanup (guard false-accept #9)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'rm -rf dist temp &' } },
+        'test-package',
+      ),
+    ).toThrow(/must run `rm -rf`/);
+  });
+
   // The real proof: every actual, on-disk package discovered by
   // `findApiExtractorPackageDirs` must satisfy the contract. If any future
   // package's `clean` script drifts back to a `dist`-only shape, this
@@ -360,6 +448,80 @@ describe('assertRootCleanRunsWorkspaceCleanAndReset', () => {
         },
       }),
     ).toThrow(/must also run `nx reset`/);
+  });
+
+  // Regression fixture for the round-2 #454 review finding: `false`
+  // deterministically fails, so NEITHER `&&`-chained command after it ever
+  // runs — a splitter that optimistically assumes every unrecognized
+  // command succeeds (correct for `rm -rf`/real `nx` invocations) must
+  // still special-case the literal `false` builtin, or this adversarial
+  // shape looks identical to a real `guaranteed: true` chain.
+  it('rejects `false && run-many && reset` (guard false-accept #10: `&&` after a deterministically-failing command)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'false && NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace && NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/must invoke `nx run-many --target=clean`/);
+  });
+
+  // Regression fixture for the round-2 #454 review finding: a backslash
+  // immediately followed by a newline is a shell line CONTINUATION, so
+  // `run-many ||\` + newline + `reset` still gates `nx reset` on run-many
+  // FAILING, exactly as `run-many || reset` on one line would.
+  it('rejects `nx reset` reachable only via `||` across a backslash-newline continuation (guard false-accept #11)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace ||\\\n NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/must also run `nx reset`/);
+  });
+
+  // Regression fixture for the round-2 #454 review finding: everything
+  // after an unquoted `#` is a shell comment and never executes.
+  it('rejects `nx reset` hidden behind a shell comment (guard false-accept #12)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace # && NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/must also run `nx reset`/);
+  });
+
+  // Regression fixture for the round-2 #454 review finding: quoted text is
+  // not executed shell syntax — both required invocations here are only
+  // ever a single-quoted `echo` argument.
+  it('rejects both required invocations that only appear as quoted text, never executed (guard false-accept #13)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            "echo 'NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace && NX_TUI=false nx reset'",
+        },
+      }),
+    ).toThrow(/must invoke `nx run-many --target=clean`/);
+  });
+
+  // Regression fixture for the round-2 #454 review finding: the real `nx`
+  // CLI exits 0 after printing help for `--help`/`--dry-run`, without
+  // running the target or performing a reset — a control flag turns both
+  // required invocations into successful no-ops.
+  it('rejects `nx run-many ... --help && nx reset --help` no-op invocations (guard false-accept #14)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace --help && NX_TUI=false nx reset --help',
+        },
+      }),
+    ).toThrow(/must invoke `nx run-many --target=clean`/);
   });
 
   // The real proof: the actual, on-disk root package.json.
