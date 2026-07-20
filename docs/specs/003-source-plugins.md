@@ -1046,14 +1046,14 @@ memory, or amplify the local SQLite database (P1 daemon availability). `api-poll
 bounds below, each covered by a documented default with — for the deadline — a validated
 per-monitor override:
 
-| Bound                                                       | Default                                            | Override                                                                                                                                                           |
-| ----------------------------------------------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Request/body deadline                                       | `30s`                                              | `timeout` (scope field, duration string `^[1-9]\d*[smhd]$`, e.g. `"1m"`); at most `2147483647`ms (~24.8 days) — the largest delay Node's `setTimeout` can schedule |
-| Response body size cap (per part)                           | 10 MiB (10 × 1024 × 1024 bytes)                    | not configurable; not enforced at all for `change-detection.strategy: status-code`                                                                                 |
-| Composite cumulative artifact-byte budget                   | 10 MiB, summed across ALL parts' rendered sections | not configurable                                                                                                                                                   |
-| Composite concurrency                                       | 5 parts in flight at once                          | not configurable                                                                                                                                                   |
-| Composite part count (issue #304 review, third round)       | 50 `parts` entries max                             | not configurable                                                                                                                                                   |
-| Composite part `id` length (issue #304 review, third round) | 256 characters max                                 | not configurable                                                                                                                                                   |
+| Bound                                                       | Default                                            | Override                                                                                                                                                                     |
+| ----------------------------------------------------------- | -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Request/body deadline                                       | `30s`                                              | `timeout` (scope field, duration string, `OPERATION_TIMEOUT_PATTERN`, e.g. `"1m"`); at most `2147483647`ms (~24.8 days) — the largest delay Node's `setTimeout` can schedule |
+| Response body size cap (per part)                           | 10 MiB (10 × 1024 × 1024 bytes)                    | not configurable; not enforced at all for `change-detection.strategy: status-code`                                                                                           |
+| Composite cumulative artifact-byte budget                   | 10 MiB, summed across ALL parts' rendered sections | not configurable                                                                                                                                                             |
+| Composite concurrency                                       | 5 parts in flight at once                          | not configurable                                                                                                                                                             |
+| Composite part count (issue #304 review, third round)       | 50 `parts` entries max                             | not configurable                                                                                                                                                             |
+| Composite part `id` length (issue #304 review, third round) | 256 characters max                                 | not configurable                                                                                                                                                             |
 
 **Request/body deadline.** A single `AbortController`-backed timer, started when the request is
 issued, bounds the ENTIRE exchange — connecting, receiving headers, and streaming the body to
@@ -1077,26 +1077,27 @@ grammar and default cannot drift between the two plugins). A _present_ value tha
 (a number, `null`, …) is a misconfiguration, not "omitted", and is rejected rather than silently
 defaulted:
 
-> `Invalid timeout: expected a string matching ^[1-9]\d*[smhd]$ (e.g. "30s"), got <type>.`
+> `Invalid timeout: expected a string matching <OPERATION_TIMEOUT_PATTERN> (e.g. "30s"), got <type>.`
 
 A present string is parsed with `parseDuration`, so a malformed value throws the same descriptive
 `Invalid duration: "<value>". Expected format: <number><s|m|h|d>` error as every other duration
 field. Three values `parseDuration` alone would accept are rejected up front, so the parser and the
-JSON Schema `pattern` for `timeout` (`^[1-9]\d*[smhd]$`) always agree:
+JSON Schema `pattern` for `timeout` (`OPERATION_TIMEOUT_PATTERN`) always agree:
 
 - A **zero-length** value (`"0s"`, `"0m"`, `"0h"`, `"0d"`) — which would abort every request before
   it could ever complete — is rejected with `Invalid timeout: "<value>". A zero-length timeout is
 not allowed; specify at least 1 unit (e.g. "1s").`.
-- A **leading-zero** value (`"01s"`, `"007m"`, …) — the schema pattern's `[1-9]\d*` already rejects
-  these, but `parseDuration`'s own `\d+` digit group would otherwise accept them, a schema/parser
-  mismatch — is rejected with `Invalid timeout: "<value>". A leading zero is not allowed; use "1s"
-instead of "01s" …`.
+- A **leading-zero** value (`"01s"`, `"007m"`, …) — the schema pattern already rejects these, but
+  `parseDuration`'s own `\d+` digit group would otherwise accept them, a schema/parser mismatch —
+  is rejected with `Invalid timeout: "<value>". A leading zero is not allowed; use "1s" instead of
+"01s" …`.
 - A value exceeding **`2147483647`ms** (~24.8 days, e.g. `"25d"`) — the largest delay Node's
   `setTimeout` can schedule; a longer value silently overflows to a near-instant timer instead of
   the author's intended deadline — is rejected with `Invalid timeout: "<value>" (<ms>ms) exceeds
-the maximum supported deadline of 2147483647ms (~24.8 days) …`. The JSON Schema `pattern` cannot
-  express this numeric upper bound (it is a pure string grammar), so this one check is
-  parser-only — a documented, narrow gap, not a parity bug.
+the maximum supported deadline of 2147483647ms (~24.8 days) …`. `OPERATION_TIMEOUT_PATTERN` bounds
+  each unit's digit run to `Math.floor(2147483647 / <unit's ms-per-unit>)` — `2147483`s, `35791`m,
+  `596`h, `24`d — so the schema rejects an over-bound value like `"25d"` at authoring time too,
+  instead of the narrower, parser-only check an earlier round of this contract shipped with.
 
 In composite mode (§2.6), the **same** deadline applies independently to **each** part — a failing
 part errors the whole composite immediately (see **Composite concurrency** below) without starving
