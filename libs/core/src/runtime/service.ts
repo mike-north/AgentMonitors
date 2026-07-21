@@ -1713,9 +1713,11 @@ export class AgentMonitorRuntime {
 
   /**
    * Acknowledge events for a session. Omitting `eventIds` acknowledges every
-   * unread event for the session **except** one currently leased by an
-   * outstanding delivery reservation (issue #300) — that row is left unread
-   * so it can still be redelivered if the reservation is released rather
+   * unread event for the session **except all rows** currently leased by an
+   * outstanding delivery reservation (issue #300) — `reservedEventIds`
+   * returns every candidate held by every live reservation for this session,
+   * so more than one row can be excluded at once. Those rows are left unread
+   * so they can still be redelivered if a reservation is released rather
    * than committed.
    */
   acknowledgeSession(sessionId: string, eventIds?: string[]): void {

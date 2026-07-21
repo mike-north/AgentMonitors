@@ -501,10 +501,10 @@ agentmonitors events ack --session 01hz3k9x2pabcdefg
 
 No `--format` flag — errors always go to stderr.
 
-Omitting `--event-ids` acknowledges every unread event for the session **except** one still
-leased by an in-flight delivery push (for example, a channel message that is still being
-surfaced) — that row is left unread so it can still be redelivered, and becomes eligible for a
-future no-`--event-ids` ack once the push resolves.
+Omitting `--event-ids` acknowledges every unread event for the session **except** any still
+leased by in-flight delivery pushes (for example, channel messages that are still being
+surfaced) — those rows are left unread so they can still be redelivered, and each becomes
+eligible for a future no-`--event-ids` ack once its push resolves.
 
 ---
 

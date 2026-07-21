@@ -323,7 +323,7 @@ To close the unread→acknowledged loop in-session, the channel server **MAY** b
       "event_ids": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "Event IDs from the <channel event_id=...> tags. Omit to ack all unread.",
+        "description": "Event IDs from the <channel event_id=...> tags. Omit to ack all unread (rows leased by an in-flight delivery push are left unread).",
       },
     },
   },

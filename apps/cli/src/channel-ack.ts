@@ -3,8 +3,8 @@ export const ACK_TOOL = {
   name: 'agentmon_ack',
   description:
     'Acknowledge AgentMon events surfaced in this session. Pass the event_id values from the ' +
-    '<channel event_id="..."> tags; omit event_ids to acknowledge all unread events, except one ' +
-    'still leased by an in-flight delivery push, which is left unread until that push resolves.',
+    '<channel event_id="..."> tags; omit event_ids to acknowledge all unread events, except any ' +
+    'still leased by an in-flight delivery push, which are left unread until each push resolves.',
   inputSchema: {
     type: 'object' as const,
     properties: {
@@ -13,7 +13,7 @@ export const ACK_TOOL = {
         items: { type: 'string' },
         description:
           'Event IDs from the <channel event_id="..."> tags. Omit to acknowledge all unread ' +
-          '(a row leased by an in-flight delivery push is left unread).',
+          '(rows leased by an in-flight delivery push are left unread).',
       },
     },
   },
@@ -22,8 +22,8 @@ export const ACK_TOOL = {
 export interface AckArgs {
   /**
    * Event IDs to acknowledge; omitted means "all unread for this session"
-   * except a row currently leased by an in-flight delivery reservation,
-   * which is left unread until that reservation resolves (issue #300).
+   * except any rows currently leased by an in-flight delivery reservation,
+   * which are left unread until each reservation resolves (issue #300).
    */
   eventIds?: string[];
 }

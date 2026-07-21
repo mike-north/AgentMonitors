@@ -141,8 +141,13 @@ tool call:
 | ----------------------------------- | ------------------------------------------------------ | ----------------------------------------------------------------------- |
 | Mid-session delivery                | `<channel source="agentmonitors" ...>` push          | `agentmonitors hook deliver` (already wired to `UserPromptSubmit`)     |
 | Acknowledge events                  | `agentmon_ack({ event_ids: [...] })` tool call         | `agentmonitors events ack --session <id> --event-ids <id1>,<id2>`       |
-| Acknowledge everything unread       | `agentmon_ack({})` (omit `event_ids`)                 | `agentmonitors events ack --session <id>` (omit `--event-ids`)         |
+| Acknowledge everything unread<sup>†</sup> | `agentmon_ack({})` (omit `event_ids`)            | `agentmonitors events ack --session <id>` (omit `--event-ids`)         |
 | Inspect what's pending              | Reading the rendered `<channel>` tag                  | `agentmonitors events list --session <id> --unread`                     |
+
+<sup>†</sup> Omitting `event_ids`/`--event-ids` acknowledges every unread event **except** any
+rows currently leased by an in-flight delivery push (for example, a channel message still being
+surfaced) — those rows are left unread until the push resolves. See the CLI reference's
+[`events ack`](/docs/cli-reference#events-ack) exception for details.
 
 `--event-ids` takes a **comma-separated** list, e.g. `--event-ids 01J...A,01J...B` — it is split on
 `,` (and each id trimmed), so space-separated ids (`--event-ids 01J...A 01J...B`) are **not**

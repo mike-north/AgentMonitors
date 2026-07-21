@@ -1273,11 +1273,11 @@ agentmonitors events ack --session <id> [options]
 Prints `Acknowledged events.` on success. No `--format` flag; error output goes to stderr.
 
 **Exception — rows leased by an in-flight delivery reservation:** omitting `--event-ids`
-acknowledges every unread row for the session **except** one currently held by an outstanding
-delivery reservation (issue #300) — for example, a channel push still mid-surfacing that event.
-That row is left unread so it can still be redelivered if the reservation is released instead of
-committed; it becomes eligible for a future no-`--event-ids` ack once the reservation resolves.
-`monitor explain`/`hook deliver --debug` report this state as `reserved-in-flight`, never
+acknowledges every unread row for the session **except** any currently held by outstanding
+delivery reservations (issue #300) — for example, a channel push still mid-surfacing one or more
+events. Those rows are left unread so they can still be redelivered if their reservation is
+released instead of committed; each becomes eligible for a future no-`--event-ids` ack once its
+reservation resolves. `monitor explain`/`hook deliver --debug` report this state as `reserved-in-flight`, never
 `already-claimed`, and never recommend `events ack` for it.
 
 ---
@@ -1558,8 +1558,8 @@ channel plugin, not run by hand.
 host session id is available, it resolves the AgentMon session via `session.open` (idempotent) and,
 every `--poll-ms`, calls `claimDelivery('turn-interruptible')`; each returned `DeliveryClaim` is
 rendered into a `<channel>` event (006 §4.2). It also exposes the **`agentmon_ack`** tool: the agent
-calls it with `event_ids` (or none, to ack all unread except a row leased by an in-flight delivery
-reservation — see §11.2's exception) and it routes through `events.ack` for the
+calls it with `event_ids` (or none, to ack all unread except any rows leased by in-flight delivery
+reservations — see §11.2's exception) and it routes through `events.ack` for the
 bound session (006 §4.3). It reuses the claim path, so claimed-state and cross-transport dedup with
 the hook-state surface are automatic. A missing/unreachable daemon is handled quietly (the hook-state
 path still delivers durably); the server shuts down when stdin closes (MCP disconnect). With no host

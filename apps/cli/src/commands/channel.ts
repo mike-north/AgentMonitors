@@ -493,7 +493,8 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
         'Read each one and act on the work it describes. The tag meta carries urgency, ' +
         'event_count, and (for a single event) monitor_id and event_id. When you have ' +
         'handled events, call the agentmon_ack tool with their event_id values (or no ' +
-        'arguments to acknowledge all unread).',
+        'arguments to acknowledge all unread, except any rows still leased by an ' +
+        'in-flight delivery push, which stay unread until that push resolves).',
     },
   );
 
