@@ -1,10 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Observation } from '../observation/types.js';
 import {
+  DEFAULT_OPERATION_TIMEOUT_MS,
+  MAX_OPERATION_TIMEOUT_MS,
+  OPERATION_TIMEOUT_PATTERN,
   createDebounceNotifier,
   createImmediateNotifier,
   createThrottleNotifier,
   parseDuration,
+  parseOperationTimeoutMs,
 } from './notifier.js';
 
 const obs = (title: string): Observation => ({ title });
@@ -32,6 +36,150 @@ describe('parseDuration', () => {
 
   it('throws on missing unit', () => {
     expect(() => parseDuration('5')).toThrow('Invalid duration');
+  });
+});
+
+// Issue #304 review, findings 5 + 6: `api-poll` and `command-poll` each
+// hand-maintained an identical `timeout` scope-field default/parse/pattern —
+// this is the shared helper both now call.
+describe('parseOperationTimeoutMs', () => {
+  it('falls back to the shared default when the raw value is undefined', () => {
+    expect(parseOperationTimeoutMs(undefined)).toBe(
+      DEFAULT_OPERATION_TIMEOUT_MS,
+    );
+  });
+
+  // Issue #304 review, second round: a present-but-wrong-type `timeout`
+  // (a number, `null`, an object, …) is a misconfiguration, not "omitted" —
+  // it must be rejected rather than silently treated as the default. Only
+  // `undefined` (genuinely omitted) falls back.
+  it('rejects a present non-string raw value instead of silently defaulting', () => {
+    expect(() => parseOperationTimeoutMs(42)).toThrow(
+      /Invalid timeout: expected a string matching/,
+    );
+  });
+
+  it('rejects a present `null` raw value the same way', () => {
+    expect(() => parseOperationTimeoutMs(null)).toThrow(/got null/);
+  });
+
+  it('parses a present string via parseDuration', () => {
+    expect(parseOperationTimeoutMs('5m')).toBe(300_000);
+  });
+
+  it('rejects "0s" — a zero-length deadline is never meaningful', () => {
+    expect(() => parseOperationTimeoutMs('0s')).toThrow(
+      /Invalid timeout: "0s"/,
+    );
+  });
+
+  it('rejects "0m", "0h", and "0d" the same way as "0s"', () => {
+    for (const zero of ['0m', '0h', '0d']) {
+      expect(() => parseOperationTimeoutMs(zero)).toThrow(
+        /A zero-length timeout is not allowed/,
+      );
+    }
+  });
+
+  it('propagates the underlying parseDuration error for a malformed value', () => {
+    expect(() => parseOperationTimeoutMs('soon')).toThrow(
+      /Invalid duration: "soon"/,
+    );
+  });
+
+  // Issue #304 review, second round: the schema `pattern` (`[1-9]\d*`) has
+  // always rejected a leading zero, but `parseDuration`'s own `\d+` digit
+  // group happily accepted it — a schema/parser mismatch. Reject it here too
+  // so both layers agree (a deliberate validation tightening, documented in
+  // the affected packages' changesets).
+  it('rejects a leading-zero duration ("01s") even though parseDuration alone would accept it', () => {
+    expect(() => parseOperationTimeoutMs('01s')).toThrow(
+      /A leading zero is not allowed/,
+    );
+  });
+
+  it('rejects "007m" the same way as "01s"', () => {
+    expect(() => parseOperationTimeoutMs('007m')).toThrow(
+      /A leading zero is not allowed/,
+    );
+  });
+
+  // Issue #304 review, second round: "25d" (2,160,000,000ms) exceeds Node's
+  // 32-bit signed setTimeout max (2,147,483,647ms, ~24.8 days) and would
+  // otherwise silently overflow to a ~1ms timer instead of the author's
+  // intended 25-day deadline.
+  it('rejects a duration exceeding the maximum setTimeout delay ("25d")', () => {
+    expect(() => parseOperationTimeoutMs('25d')).toThrow(
+      /exceeds the maximum supported deadline/,
+    );
+  });
+
+  it('accepts a duration exactly at the maximum setTimeout delay', () => {
+    // 2_147_483_647ms is just under 24d20h31m23.647s; "24d" (2,073,600,000ms)
+    // is comfortably under the max and a round, human-authored value.
+    expect(parseOperationTimeoutMs('24d')).toBe(2_073_600_000);
+    expect(parseOperationTimeoutMs('24d')).toBeLessThanOrEqual(
+      MAX_OPERATION_TIMEOUT_MS,
+    );
+  });
+});
+
+// Issue #304 review, third round: the schema `pattern` used to accept an
+// unbounded digit run per unit (`\d*`), so a value like `timeout: "25d"`
+// passed authoring-time `validateScope` while `parseOperationTimeoutMs`
+// rejected it at runtime — schema and parser disagreed on the accepted set.
+// The pattern now bounds each unit's digit run to
+// `Math.floor(MAX_OPERATION_TIMEOUT_MS / <unit ms>)`, derived from the same
+// numeric bound the parser enforces, so the two can never drift apart again.
+describe('OPERATION_TIMEOUT_PATTERN numeric bound', () => {
+  const pattern = new RegExp(OPERATION_TIMEOUT_PATTERN);
+
+  // Math.floor(MAX_OPERATION_TIMEOUT_MS / msPerUnit) for each unit —
+  // hand-derived from the published 2_147_483_647ms bound, not copied from
+  // the implementation, so a regression in the generator is caught here.
+  const maxByUnit = { s: 2_147_483, m: 35_791, h: 596, d: 24 } as const;
+
+  it.each(Object.entries(maxByUnit))(
+    'accepts the exact per-unit maximum for "%s" but rejects one more',
+    (unit, max) => {
+      expect(pattern.test(`${String(max)}${unit}`)).toBe(true);
+      expect(pattern.test(`${String(max + 1)}${unit}`)).toBe(false);
+    },
+  );
+
+  it.each(Object.entries(maxByUnit))(
+    'agrees with parseOperationTimeoutMs at the "%s" boundary',
+    (unit, max) => {
+      // At the boundary: schema accepts, parser does not throw.
+      expect(() => parseOperationTimeoutMs(`${max}${unit}`)).not.toThrow();
+      // One past the boundary: schema rejects, parser throws — both layers
+      // now agree on every input instead of a documented narrow gap.
+      expect(pattern.test(`${String(max + 1)}${unit}`)).toBe(false);
+      expect(() => parseOperationTimeoutMs(`${max + 1}${unit}`)).toThrow(
+        /exceeds the maximum supported deadline/,
+      );
+    },
+  );
+
+  it('still accepts every 1-2 digit value for every unit (small-value regression)', () => {
+    for (const unit of Object.keys(maxByUnit)) {
+      expect(pattern.test(`1${unit}`)).toBe(true);
+      expect(pattern.test(`9${unit}`)).toBe(true);
+      expect(pattern.test(`10${unit}`)).toBe(true);
+    }
+  });
+
+  it('still rejects zero-length and leading-zero values for every unit', () => {
+    for (const unit of Object.keys(maxByUnit)) {
+      expect(pattern.test(`0${unit}`)).toBe(false);
+      expect(pattern.test(`01${unit}`)).toBe(false);
+    }
+  });
+
+  it('rejects an obviously oversized value for every unit', () => {
+    for (const unit of Object.keys(maxByUnit)) {
+      expect(pattern.test(`999999999${unit}`)).toBe(false);
+    }
   });
 });
 

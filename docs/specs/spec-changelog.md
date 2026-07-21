@@ -74,6 +74,40 @@ added — it is now omitted for either match. A Markdown inline-code span illust
 had also been split across a line break by prior wrapping, which renders incorrectly; it is now a
 single line.
 
+## 2026-07-20 — `OPERATION_TIMEOUT_PATTERN` now bounds each unit numerically, closing the last schema/parser `timeout` gap; `api-poll`'s composite `id`-length rejection no longer allocates (003 §4.1/§4.9) — Refs #304
+
+Round-6 review follow-up. Two prior entries in this file (2026-07-19, "Composite cumulative byte
+budget, `timeout` non-string/leading-zero/overflow validation" and "`api-poll` bounds request
+duration...") describe the schema/parser gap this entry closes as "deliberate" and "documented" —
+that framing was wrong: an author-visible authoring/runtime split (`agentmonitors validate` accepts
+`timeout: "25d"`, `source.observe` then rejects it) is a parity bug regardless of how clearly it is
+documented, not an acceptable design point. `OPERATION_TIMEOUT_PATTERN` previously used a raw
+`[1-9]\d*` digit run per unit — a pure string grammar that could not express
+`parseOperationTimeoutMs`'s `MAX_OPERATION_TIMEOUT_MS` numeric ceiling. The pattern is now built
+from `Math.floor(MAX_OPERATION_TIMEOUT_MS / <unit's ms-per-unit>)` per unit (`2147483`s, `35791`m,
+`596`h, `24`d) via a standard digit-range-to-regex construction, so the schema and the parser reject
+exactly the same set of `timeout` values — `"25d"` now fails `agentmonitors validate` too, at
+authoring time, instead of only at runtime. 003 §4.1 and §4.9 no longer cite the pattern's old
+literal regex text (`^[1-9]\d*[smhd]$`), which is stale now that the pattern is unit-specific and
+numerically bounded; they instead name `OPERATION_TIMEOUT_PATTERN` and state its derivation. See
+`libs/core/src/notify/notifier.test.ts` for the per-unit boundary coverage (exact maximum accepted,
+one more rejected, for all four units) and
+`plugins/source-command-poll/src/schema-parity.test.ts` for the closed-gap parity case.
+
+Separately, `plugins/source-api-poll/src/composite.ts`'s `MAX_PART_ID_LENGTH` check (added in the
+2026-07-19 "Composite part-count/part-`id` caps" entry below) counted a part `id`'s Unicode code
+points via `Array.from(id).length`, which materializes one array element per code point BEFORE the
+length is even read — an 11 MiB `id` (the round-3 reviewer's own repro for _why_ the cap exists)
+still allocated roughly its own size in memory just to be rejected, undermining the cap's own
+purpose. It now counts via a plain `for...of` loop that returns as soon as the running count exceeds
+`MAX_PART_ID_LENGTH`, making rejection O(`MAX_PART_ID_LENGTH`) instead of O(`id.length`).
+
+The four `@agentmonitors/source-api-poll` Changesets accumulated across this issue's review rounds
+(request/response bounds, composite byte budget, composite part/id bounds, and review-fix
+follow-ups) are also consolidated into one, reclassified `minor` — the new `timeout` scope field is
+additive authoring surface, matching this repository's precedent for the earlier `api-poll`
+composite option.
+
 ## 2026-07-19 — `daemon run --detach`'s log `fchmod` is a fail-closed exception to the §3.1 warn-and-continue rule, not an oversight (002 §3.1) — Refs #389
 
 Round-7 review follow-up. `openLogFd`'s final `fchmodSync` on the opened log descriptor already
@@ -283,6 +317,188 @@ diagnostics has to protect delivered text too; `objectKey`/`payload.url` keep th
 Not addressed here: issue #449's third item, a semantic diff hint for `json-diff` `diffText` (the
 "PR #443 became MERGED, PR #447 appeared" rendering). That is the presentation half of #440 and
 remains open.
+
+## 2026-07-19 — Composite byte-budget exact-render check and Unicode-code-point `id`-length parity (003 §4.9) — Refs #304
+
+Fourth round of review follow-ups on the #304 bounds, in the same PR before merge, closing two gaps
+left open by the round below.
+
+- **The cumulative byte budget still undercounted the final artifact.** `framedPartByteLength`
+  tallies each part's framed section (`## <id>\n<body>`) as it is observed, but
+  `renderCompositeSnapshot` also inserts `\n\n` separators between sections when assembling the
+  final artifact — bytes the running per-part tally never counted. A reviewer reproduced the gap
+  directly against the real helpers: a fixture built to sit exactly at the 10 MiB budget by the
+  summed-helper math rendered to 10,485,762 bytes against the running tally's 10,485,760, a 2-byte
+  (98 bytes at the 50-part cap) undercount that let an over-budget composite through.
+  `observeComposite` now performs a final `Buffer.byteLength` check on the actual rendered artifact
+  (separators included) before accepting the observation — exact regardless of part order or count
+  — and the boundary fixtures were re-derived to assert the final RENDERED byte length at and one
+  byte over the budget, not the pre-render running tally.
+- **The part-`id` length check counted UTF-16 code units, not Unicode code points**, while the
+  JSON Schema `maxLength` keyword (and `agentmonitors validate`) counts code points — so a
+  200-emoji `id` (200 code points, `id.length === 400` in UTF-16) passed schema validation and then
+  was wrongly rejected by `source.observe`, an authoring-time-green/runtime-red split. The parser
+  now counts code points (`Array.from(id).length`) to match the schema's `ucs2length` semantics; new
+  parity tests cover a 200-emoji `id` accepted by both surfaces and a 257-code-point `id` rejected
+  at the boundary by both.
+
+(Verified: `plugins/source-api-poll/src/composite.ts`, `renderCompositeSnapshot`;
+`plugins/source-api-poll/src/index.ts`, `observeComposite`; `plugins/source-api-poll/src/index.test.ts`,
+"a composite whose cumulative RENDERED bytes sit exactly at the budget succeeds (boundary)",
+"parseCompositeConfig counts part ids in Unicode code points, not UTF-16 code units (astral emoji)",
+"parseCompositeConfig rejects an id with one more than MAX_PART_ID_LENGTH emoji code points (astral
+boundary)".)
+
+## 2026-07-19 — Composite part-count/part-`id` caps, rendered-artifact byte budget (003 §4.9, 004 §3.2) — Refs #304
+
+Third round of review follow-ups on the #304 bounds, in the same PR before merge.
+
+- **The cumulative byte budget only bounded response-body bytes** — not the assembled composite
+  ARTIFACT, part count, request count, or worst-case tick duration. A reviewer reproduced two shapes
+  that sailed past it entirely: 100,000 empty-body parts (0 cumulative body bytes) completing
+  100,000 requests and producing a 1,699,998-byte baseline, and a single empty-body part with an
+  11 MiB `id` producing an 11,534,340-byte baseline — `renderCompositeSnapshot` frames every part
+  with `## <id>\n` regardless of body size, and neither the byte counter nor anything else bounded
+  that framing overhead or the number of parts.
+- **`change-detection.composite.parts` is now capped at 50 entries and each part's `id` at 256
+  characters** (§4.9), enforced identically in the JSON Schema (`maxItems`/`maxLength`, so
+  `agentmonitors validate`/`monitor test`/`watch declare` reject an over-limit config at authoring
+  time) and the parser (`parseCompositeConfig`, defense in depth for a hand-edited `MONITOR.md` that
+  skipped validation — 002 §2.2's tick-time isolation still applies as the last line of defense).
+  Both reviewer repro shapes above are now rejected at config-parse time, before `observe()` issues
+  a single request.
+- **The cumulative byte budget now sums each part's RENDERED framed section** (`## <id>\n<body>`,
+  via the new `framedPartByteLength` helper) rather than the raw response body, so id-framing
+  overhead counts toward the same 10 MiB figure too — closing the gap the part-count/id-length caps
+  don't already close on their own. `framedPartByteLength` is a running per-part tally taken during
+  observation, before `renderCompositeSnapshot` assembles the final artifact; it does **not** by
+  itself match the renderer's output byte-for-byte, because the renderer also inserts `\n\n`
+  separators between sections that this per-part helper has no reason to count. A follow-up entry
+  below closes that remaining gap with an exact check on the final rendered artifact.
+- **The part-count cap also bounds worst-case tick duration** (§4.9): with the existing 5-worker
+  composite concurrency bound, a composite resolves or fails in at most `ceil(parts / 5) *
+timeout`; at the new 50-part cap and the default 30s timeout, that ceiling is `ceil(50 / 5) * 30s
+= 300s` (5 minutes) — a documented, known bound rather than an unbounded function of `parts.length`.
+- **004 §3.2** gained required-scenario rows for the part-count/part-`id` caps (including both
+  reviewer repro shapes) and renamed the existing cumulative-budget row to reflect the
+  rendered-artifact (not body-only) semantics.
+
+(Verified: `plugins/source-api-poll/src/composite.ts`, `MAX_COMPOSITE_PARTS`,
+`MAX_PART_ID_LENGTH`, `framedPartByteLength`, `parseCompositeConfig`;
+`plugins/source-api-poll/src/index.ts`, `MAX_COMPOSITE_BYTES`, `observeComposite`, `scopeSchema`;
+`plugins/source-api-poll/src/index.test.ts`, "composite cumulative byte budget (issue #304 review,
+second + third round)", "composite part-count and part-id bounds (issue #304 review, third
+round)".)
+
+## 2026-07-19 — Composite cumulative byte budget, `timeout` non-string/leading-zero/overflow validation (003 §4.1/§4.9, 004 §3.2) — Refs #304
+
+Second round of review follow-ups on the #304 bounds, in the same PR before merge.
+
+- **Composite cumulative body-byte budget (§4.9).** The per-part 10 MiB cap and the 5-worker
+  concurrency bound each addressed a different risk, but neither bounded the AGGREGATE size of an
+  assembled composite: a composite with many small parts (the reported case: 12 × 1 MiB parts,
+  each individually far under the per-part cap) could still assemble and baseline a
+  `snapshotText`/`nextState` many times the size of any single-URL monitor's response, persisted
+  every tick. `api-poll` now tracks the running sum of every fetched part's body length across one
+  composite and fails the whole observation — aborting every other in-flight part via the same
+  shared `AbortSignal` the concurrency bound already uses — once the total exceeds the same 10 MiB
+  figure (reused as a cumulative budget, not a second configurable knob).
+- **`timeout` rejects a present non-string value instead of silently defaulting (§4.9/§11.1).**
+  `parseOperationTimeoutMs` previously treated ANY non-string `timeout` — including a genuinely
+  present but wrong-typed one (`timeout: 123`, `timeout: null`) — the same as an omitted field,
+  silently falling back to the 30s default. Only `undefined` (truly omitted) now defaults; any
+  other non-string value throws a descriptive error.
+- **`timeout` rejects a leading zero, matching the schema pattern (§4.9/§11.1).** The JSON Schema
+  `pattern` (`^[1-9]\d*[smhd]$`) has always required a non-zero leading digit, but
+  `parseOperationTimeoutMs` called `parseDuration` directly, whose own `\d+` digit group happily
+  accepted a leading zero (`"01s"`) — a schema/parser mismatch where a schema-valid config could
+  behave differently than the same string parsed standalone. The parser now rejects a leading zero
+  too, a deliberate validation tightening (also applies to `command-poll`, which shares the same
+  helper — see its changeset).
+- **`timeout` rejects a value exceeding Node's `setTimeout` max (§4.9/§11.1).** A duration like
+  `"25d"` (2,160,000,000ms) exceeds the 32-bit signed `setTimeout` maximum
+  (`2_147_483_647`ms, ~24.8 days); Node does not throw for an over-range delay, it silently
+  overflows to a ~1ms timer (with a `TimeoutOverflowWarning`), firing almost immediately instead of
+  the author's intended deadline. `parseOperationTimeoutMs` now rejects any value above the max.
+  The JSON Schema `pattern` is a pure string grammar and cannot express this numeric bound, so this
+  one check is parser-only — a documented, narrow schema/parser gap, not a parity bug.
+- **§4.1's scope example and optional-field inventory now include `timeout`** (previously present
+  in the schema and §4.9 but missing from the canonical example/field list), and 004 §3.2 gained
+  required-scenario rows for the request/body deadline, the body cap's `status-code` exemption, and
+  composite concurrency/fail-fast/cumulative-budget, closing a traceability gap between the #304
+  bounds and their required-test-scenario inventory.
+
+(Verified: `plugins/source-api-poll/src/index.ts`, `MAX_COMPOSITE_BYTES`, `observeComposite`;
+`plugins/source-api-poll/src/index.test.ts`, "composite cumulative byte budget (issue #304 review,
+second round)"; `libs/core/src/notify/notifier.ts`, `parseOperationTimeoutMs`,
+`MAX_OPERATION_TIMEOUT_MS`; `libs/core/src/notify/notifier.test.ts`;
+`plugins/source-command-poll/src/schema-parity.test.ts`.)
+
+## 2026-07-19 — `api-poll`/`command-poll` timeout hardening and composite fail-fast fix (003 §4.9/§11.1) — Refs #304
+
+Follow-up review fixes on top of the #304 bounds below, in the same PR before merge.
+
+- **`status-code` is exempt from the byte cap (§4.9).** The response byte cap was enforced before
+  `resolveStrategy`, so a `status-code` monitor watching a large endpoint (the body is irrelevant to
+  that strategy — only the status transition is watched) regressed to erroring on every tick once
+  the cap shipped. `api-poll` now skips reading the body entirely when
+  `change-detection.strategy` is explicitly `status-code`, releasing the unread response back to
+  the connection pool instead of buffering or counting it — cheaper, and exempt from the cap by
+  construction. The inferred-strategy path (§4.2) is unaffected: inference never resolves to
+  `status-code`, so it always reads the body.
+- **Declared-Content-Length rejection no longer leaks the connection (§4.9).** The early-rejection
+  path threw without aborting the request or releasing the response body, unlike the streamed-count
+  path (which already aborted); undici kept the socket open with the unconsumed body pending — one
+  leaked connection per tick, multiplied by up to 5 in composite mode. Both oversize paths now abort
+  symmetrically.
+- **Composite concurrency fails fast and cancels doomed siblings (§4.9).** The bounded worker pool
+  only checked a shared failure flag _between_ items, so a part that failed instantly (e.g. a 401)
+  still waited for every other in-flight sibling to reach its own full per-part deadline before the
+  composite surfaced the failure — re-lengthening exactly the tick this bound exists to shorten. The
+  pool (now its own module, `map-with-concurrency.ts`) races a dedicated failure promise against the
+  worker pool and hands every part a shared `AbortSignal`, so the batch rejects the instant the
+  first part fails and cancels every other in-flight part instead of letting them run to completion.
+- **Mid-body abort classification hardened (§4.9).** `readBoundedBody`'s catch now also checks
+  `controller.signal.aborted` (mirroring `fetchBody`'s own fallback), so an HTTP/2 or
+  socket-teardown race that rejects a mid-body read with a raw `TypeError: terminated` (instead of
+  the `AbortError` the timer itself produces) is still classified as the documented "timed out"
+  error rather than leaking the raw undici error.
+- **Zero-length `timeout` is rejected (§4.9/§11.1).** `timeout: "0s"` (or `"0m"`/`"0h"`/`"0d"`)
+  previously passed both the JSON Schema `pattern` and `parseDuration`, producing a deadline that
+  aborts every request/command before it can ever complete. A new core-level helper,
+  `parseOperationTimeoutMs` (exported next to `parseDuration`, alongside
+  `DEFAULT_OPERATION_TIMEOUT_MS` and the updated `OPERATION_TIMEOUT_PATTERN`,
+  `^[1-9]\d*[smhd]$`), now backs the `timeout` field for **both** `api-poll` and `command-poll` —
+  replacing each plugin's previously hand-maintained, byte-for-byte-identical copy of the
+  default/parse/pattern — and rejects a zero-length value up front with a descriptive error at
+  both validation and observe time.
+
+(Verified: `libs/core/src/notify/notifier.ts`, `parseOperationTimeoutMs`; `libs/core/src/notify/notifier.test.ts`;
+`plugins/source-api-poll/src/index.ts`; `plugins/source-api-poll/src/map-with-concurrency.ts`;
+`plugins/source-api-poll/src/index.test.ts`; `plugins/source-api-poll/src/map-with-concurrency.test.ts`;
+`plugins/source-command-poll/src/index.ts`; `plugins/source-command-poll/src/schema-parity.test.ts`.)
+
+## 2026-07-19 — `api-poll` bounds request duration, response size, and composite concurrency (003 §4.9) — Refs #304
+
+Fixes a P1 daemon-availability defect: `api-poll` could wait forever on a stalled connection or
+body, buffer an unbounded response into memory, and fan out an unbounded number of concurrent
+requests in composite mode — any of which could wedge a tick, delay unrelated monitors, or exhaust
+memory.
+
+- **New §4.9 (request/body deadline, response size cap, composite concurrency).** A single
+  `AbortController`-backed deadline (default `30s`, override via the new `timeout` scope field,
+  duration string) now bounds the entire request/response exchange — not just the initial `fetch()`
+  — including a stalled/trickling chunked body. A 10 MiB response body cap is enforced twice: an
+  early rejection against a (trusted-but-not-authoritative) declared `Content-Length`, and a
+  streamed running count that is the real authority. Composite mode (§2.6) now runs at most 5 parts
+  concurrently (a bounded worker pool) instead of starting every part at once via `Promise.all`,
+  with the same per-part deadline and byte cap as a single-URL monitor.
+- **Errored-observation semantics preserved.** Both the deadline and the byte cap throw (not
+  truncate-and-continue) — the runtime records an `errored` observation, `nextState` never advances,
+  and any prior baseline is preserved, matching the existing non-2xx (§4.8) and network-error (§4.6)
+  behavior. This is deliberately unlike `command-poll`'s stdout cap (§11.2), which truncates and
+  still treats the capped output as a valid result — a stalled/incomplete HTTP body is not a
+  meaningful baseline the way capped command output is.
 
 ## 2026-07-19 — `verify`'s materialize/deliver stages carry a fresh deadline past a late observe resolution instead of inheriting an already-expired one (005 §16 step 6, Budget) — Refs #442
 
@@ -769,6 +985,25 @@ semantics as the hook-deliver transport, not a lesser summary.
 
 No change to runtime notify/debounce timing, urgency bands, projection, the unread/claimed/
 acknowledged model, or the reserve → commit/release transport-state semantics (§4.5.1).
+
+## 2026-07-19 — `command-poll` drains excess stdout/stderr instead of killing the command (003 §11.2) — Refs #302
+
+Clarifies the drain-not-kill contract for `command-poll`'s 1 MiB stdout cap, and documents an
+independent stderr retention cap. An earlier implementation used `execFile({ maxBuffer })`, which
+kills the child the instant either stream crosses the cap and reports the overflow as a truncated
+success with a fabricated zero exit code — losing the command's real exit status, mislabeling
+stderr-only overflow as stdout truncation, and potentially baselining a command that never actually
+finished its side effects. §11.2 now states explicitly that neither stream's retention cap is ever a
+kill trigger: both streams are consumed as they arrive (never buffered to completion), stdout retains
+its leading 1 MiB, stderr is bounded independently to a small cap sized for diagnostics, and the
+command always runs to its real completion with its real exit code reported.
+
+- No schema or persisted-shape change — `payload`/`snapshot`/`nextState` still carry
+  `{ command, exitCode, strategy, stdout, truncated }`; only the mechanics behind that `exitCode` and
+  `truncated` are now spelled out.
+- §11.7 gains four verification bullets: an overflow-then-side-effect-then-nonzero-exit case, a
+  large-stderr/small-stdout case, a simultaneous-large-stdout-and-stderr case, and a
+  keeps-writing-past-both-caps case that must still resolve promptly rather than hang the tick.
 
 ## 2026-07-18 — Channel transport commits claims only after a successful push: reserve → commit/release (006 §4.5.1) — Refs #300
 

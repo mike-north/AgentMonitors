@@ -96,6 +96,10 @@ export type {
 // Notification
 export {
   parseDuration,
+  parseOperationTimeoutMs,
+  DEFAULT_OPERATION_TIMEOUT_MS,
+  OPERATION_TIMEOUT_PATTERN,
+  MAX_OPERATION_TIMEOUT_MS,
   createImmediateNotifier,
   createDebounceNotifier,
   createThrottleNotifier,
