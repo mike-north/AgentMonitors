@@ -81,18 +81,18 @@ The interface definition (verified: `libs/core/src/observation/types.ts`):
 
 Each `Observation` **MAY** include the following fields (verified: `libs/core/src/observation/types.ts`):
 
-| Field          | Type                                  | Description                                                                |
-| -------------- | ------------------------------------- | -------------------------------------------------------------------------- |
-| `title`        | `string`                              | **Required.** Human-readable title for the inbox item.                     |
-| `body`         | `string?`                             | Optional body/description.                                                 |
-| `summary`      | `string?`                             | Optional short summary for lightweight delivery surfaces.                  |
-| `payload`      | `unknown?`                            | Raw source payload, preserved for later querying.                          |
-| `snapshotText` | `string?`                             | Optional textual snapshot for diffing and timeline views.                  |
-| `objectKey`    | `string?`                             | Source-defined stable object identity (e.g., a PR number, file path, URL). |
-| `queryScope`   | `Record<string, string \| string[]>?` | Source-defined query metadata used for read-time scoping.                  |
-| `changeKind`   | `ChangeKind?`                         | The lifecycle transition this observation reports (see below).             |
-| `salience`     | `Urgency?`                            | Source-classified per-observation salience (`low` \| `normal` \| `high`).  |
-| `snapshot`     | `unknown?`                            | Point-in-time snapshot metadata captured at fire time.                     |
+| Field          | Type                                  | Description                                                                                                                                                                                                                                                               |
+| -------------- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `title`        | `string`                              | **Required.** The source's own headline. NOT necessarily the delivered event title: the runtime uses the monitor's authored `name` when it has one and falls back to this ([002 §5.4](./002-runtime-delivery.md#54-event-title)). Write it to read well as that fallback. |
+| `body`         | `string?`                             | Optional body/description.                                                                                                                                                                                                                                                |
+| `summary`      | `string?`                             | Optional short per-object text. This is the DETAIL LINE both injecting transports render beneath the title ([006 §4.2.1](./006-agent-integration.md)), so for a named monitor it — not `title` — names the object that moved.                                             |
+| `payload`      | `unknown?`                            | Raw source payload, preserved for later querying.                                                                                                                                                                                                                         |
+| `snapshotText` | `string?`                             | Optional textual snapshot for diffing and timeline views.                                                                                                                                                                                                                 |
+| `objectKey`    | `string?`                             | Source-defined stable object identity (e.g., a PR number, file path, URL).                                                                                                                                                                                                |
+| `queryScope`   | `Record<string, string \| string[]>?` | Source-defined query metadata used for read-time scoping.                                                                                                                                                                                                                 |
+| `changeKind`   | `ChangeKind?`                         | The lifecycle transition this observation reports (see below).                                                                                                                                                                                                            |
+| `salience`     | `Urgency?`                            | Source-classified per-observation salience (`low` \| `normal` \| `high`).                                                                                                                                                                                                 |
+| `snapshot`     | `unknown?`                            | Point-in-time snapshot metadata captured at fire time.                                                                                                                                                                                                                    |
 
 `ChangeKind` is a **source-agnostic** vocabulary so consumers reason about change uniformly across
 sources: `created` (object entered scope), `modified` (changed while in scope), `deleted` (destroyed
@@ -302,6 +302,50 @@ reasoning inside the source — outside this contract.
 Shape stage. The motivating case is the E8 OmniFocus composite (§2.6): the source surfaces each task's
 raw `due`/`defer-until`/`priority` and child states; the runtime derives `past due`/`due soon`/
 `revealed`/`urgent`.
+
+### 2.8 An `objectKey` is an identity, not a headline
+
+> **Status: current.** Resolves issue [#449](https://github.com/mike-north/AgentMonitors/issues/449).
+>
+> Verified: `libs/core/src/observation/display.ts` (`displayObjectKey`) with
+> `libs/core/src/observation/display.test.ts`; applied by `plugins/source-command-poll/src/index.ts`,
+> `plugins/source-api-poll/src/index.ts`, and `libs/core/src/observation/keyed-collection.ts`.
+
+An `objectKey` exists to give an observed object a **stable identity**, and is free to be as long as
+identity requires — `command-poll` defaults it to the joined argv (§11.4), which for a `jq`-backed
+poller is hundreds of characters.
+
+A source that interpolates a **configuration-identity** `objectKey` into human-facing observation
+text — `title`, `summary` — **MUST** bound it with the shared helper `displayObjectKey`, which
+returns the key unchanged at or below 60 UTF-16 code units and otherwise a prefix followed by `…`,
+cut at a **grapheme-cluster boundary** so truncation can never emit a lone surrogate or split a flag
+or ZWJ sequence (the result may therefore be shorter than the bound). The untruncated key remains on
+the observation's `objectKey` and in `payload`, so debugging and querying lose nothing.
+
+A _configuration-identity_ key is one whose content is the monitor's own configuration rather than
+the identity of a distinct observed object: `command-poll`'s joined argv (§11.4) and `api-poll`'s URL
+(§4.4). Those are the cases where the key is long _because of how the monitor is written_, and where
+a head-truncated prefix stays informative.
+
+**Deliberately out of scope** (each is unbounded today, and that is the intended current behavior,
+not an oversight):
+
+- **Path-like keys** — `file-fingerprint`'s absolute file path (§3.4) and `incoming-changes`'
+  repository-relative path (§6.2). A path's informative part is its **tail** (the basename), so the
+  head-truncation this helper performs would destroy exactly the part a reader needs. Bounding these
+  requires a path-aware ellipsis (`…/deep/dir/file.ts`), tracked as follow-up work.
+- **Per-item keys in keyed collections** (§12) — the item key is the informative half of
+  `<scope>#<key>`, so only the monitor-scope half is bounded; the item key is always rendered whole.
+- **The `api-poll` composite fallback `objectKey`** (§2.6), which is author-supplied and expected to
+  be a short label.
+
+Consequently a nameless monitor's fallback headline is bounded **for the configuration-identity
+sources only**; a nameless `file-fingerprint` monitor can still headline with a long absolute path.
+
+The motivating failure: a delivered event whose headline was ~400 characters of the monitor's own
+`jq` program. Delivered text is an agent's action surface and lands in a context window on every
+delivery ([002 §5.4](./002-runtime-delivery.md#54-event-title)); an unbounded implementation detail
+in that position conveys nothing and crowds out what does.
 
 ## 3. Bundled Source: `file-fingerprint`
 
@@ -864,6 +908,7 @@ watch:
   headers:
     Accept: application/json
   interval: 5m
+  timeout: 30s
   auth:
     type: bearer
     token-env: API_TOKEN
@@ -880,7 +925,8 @@ watch:
   interval: 5m
 ```
 
-Required field: `url` (string). Important optional fields: `method`, `headers`, `interval`, `auth`, `change-detection`.
+Required field: `url` (string). Important optional fields: `method`, `headers`, `interval`, `auth`, `timeout`
+(request/body deadline, default `30s` — see §4.9), `change-detection`.
 
 `interval` is declared in the scope schema with pattern `^\d+[smhd]$` but is used by the scheduling engine, not by the plugin directly (verified: scope schema comment at `plugins/source-api-poll/src/index.ts` line 131).
 
@@ -961,8 +1007,13 @@ Auth is configured via the `auth.type` field.
 
 When a change is detected, the source emits one observation (verified: `plugins/source-api-poll/src/index.ts` lines 175–196):
 
-- `title`: `"API response changed: <url>"`
-- `summary`: `"API response changed: <url>"`
+- `title`: `"API response changed: <url>"` — `<url>` is **redacted** (userinfo, query, and fragment
+  stripped, the same treatment warning text gets) and then bounded per
+  [§2.8](#28-an-objectkey-is-an-identity-not-a-headline); overridden by the monitor's authored
+  `name` at materialization ([002 §5.4](./002-runtime-delivery.md#54-event-title)). Redaction is
+  required because title/summary are durably persisted and delivered to agents, and a polled URL
+  routinely carries a token; the author's exact URL stays on `objectKey`/`payload.url`.
+- `summary`: `"API response changed: <url>"` (identically redacted and bounded)
 - `payload`: `{ url, status, strategy, body }`
 - `snapshotText`: response body as a string (always set; no binary check)
 - `objectKey`: `<url>`
@@ -1036,6 +1087,173 @@ Baseline established. The "api-poll" source requires a prior baseline before it 
   HTTP 200 (1234 bytes)
 Running a second observation to demonstrate change detection...
 ```
+
+### 4.9 Request duration, response size, and composite concurrency bounds (issue #304)
+
+A stalled or huge endpoint must not wedge a whole tick, delay unrelated monitors, exhaust daemon
+memory, or amplify the local SQLite database (P1 daemon availability). `api-poll` enforces the six
+bounds below, each covered by a documented default with — for the deadline — a validated
+per-monitor override:
+
+| Bound                                                       | Default                                            | Override                                                                                                                                                                     |
+| ----------------------------------------------------------- | -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Request/body deadline                                       | `30s`                                              | `timeout` (scope field, duration string, `OPERATION_TIMEOUT_PATTERN`, e.g. `"1m"`); at most `2147483647`ms (~24.8 days) — the largest delay Node's `setTimeout` can schedule |
+| Response body size cap (per part)                           | 10 MiB (10 × 1024 × 1024 bytes)                    | not configurable; not enforced at all for `change-detection.strategy: status-code`                                                                                           |
+| Composite cumulative artifact-byte budget                   | 10 MiB, summed across ALL parts' rendered sections | not configurable                                                                                                                                                             |
+| Composite concurrency                                       | 5 parts in flight at once                          | not configurable                                                                                                                                                             |
+| Composite part count (issue #304 review, third round)       | 50 `parts` entries max                             | not configurable                                                                                                                                                             |
+| Composite part `id` length (issue #304 review, third round) | 256 characters max                                 | not configurable                                                                                                                                                             |
+
+**Request/body deadline.** A single `AbortController`-backed timer, started when the request is
+issued, bounds the ENTIRE exchange — connecting, receiving headers, and streaming the body to
+completion — not just the initial `fetch()` call. A server that never sends headers and a
+server that sends headers promptly but then stalls or trickles a chunked body are both aborted at
+the same deadline. On abort, the source throws:
+
+> `api-poll request to <url> timed out after <timeoutMs>ms`
+
+exactly like a network-level failure (§4.6): the runtime records an **`errored`** observation, no
+`nextState` advance, and any prior baseline is preserved. Under an HTTP/2 or socket-teardown race,
+undici can reject a mid-body read with a raw `TypeError: terminated` instead of the `AbortError`
+this source's own timer produces; that race is still classified as the same "timed out" error
+(checked via `controller.signal.aborted`, not just the caught error's type), so a caller never sees
+the raw undici error leak through.
+
+`timeout` defaults to `30s` when omitted — meaning `config['timeout']` is `undefined` — (matching
+`command-poll`'s default, 003 §11.1) and is resolved by core's shared `parseOperationTimeoutMs`
+helper (exported next to `parseDuration`, and used by both `api-poll` and `command-poll` so the
+grammar and default cannot drift between the two plugins). A _present_ value that is not a string
+(a number, `null`, …) is a misconfiguration, not "omitted", and is rejected rather than silently
+defaulted:
+
+> `Invalid timeout: expected a string matching <OPERATION_TIMEOUT_PATTERN> (e.g. "30s"), got <type>.`
+
+A present string is parsed with `parseDuration`, so a malformed value throws the same descriptive
+`Invalid duration: "<value>". Expected format: <number><s|m|h|d>` error as every other duration
+field. Three values `parseDuration` alone would accept are rejected up front, so the parser and the
+JSON Schema `pattern` for `timeout` (`OPERATION_TIMEOUT_PATTERN`) always agree:
+
+- A **zero-length** value (`"0s"`, `"0m"`, `"0h"`, `"0d"`) — which would abort every request before
+  it could ever complete — is rejected with `Invalid timeout: "<value>". A zero-length timeout is
+not allowed; specify at least 1 unit (e.g. "1s").`.
+- A **leading-zero** value (`"01s"`, `"007m"`, …) — the schema pattern already rejects these, but
+  `parseDuration`'s own `\d+` digit group would otherwise accept them, a schema/parser mismatch —
+  is rejected with `Invalid timeout: "<value>". A leading zero is not allowed; use "1s" instead of
+"01s" …`.
+- A value exceeding **`2147483647`ms** (~24.8 days, e.g. `"25d"`) — the largest delay Node's
+  `setTimeout` can schedule; a longer value silently overflows to a near-instant timer instead of
+  the author's intended deadline — is rejected with `Invalid timeout: "<value>" (<ms>ms) exceeds
+the maximum supported deadline of 2147483647ms (~24.8 days) …`. `OPERATION_TIMEOUT_PATTERN` bounds
+  each unit's digit run to `Math.floor(2147483647 / <unit's ms-per-unit>)` — `2147483`s, `35791`m,
+  `596`h, `24`d — so the schema rejects an over-bound value like `"25d"` at authoring time too,
+  instead of the narrower, parser-only check an earlier round of this contract shipped with.
+
+In composite mode (§2.6), the **same** deadline applies independently to **each** part — a failing
+part errors the whole composite immediately (see **Composite concurrency** below) without starving
+or serializing the others.
+
+**Response body size cap.** The cap is enforced twice, because `Content-Length` is not
+authoritative:
+
+1. **Early rejection.** If the response declares a `Content-Length` header above the cap, the
+   source aborts the request and releases the (unread) response body back to the connection pool,
+   then throws before reading any body bytes:
+
+   > `api-poll response from <url> declares Content-Length <n> bytes, exceeding the 10485760-byte cap`
+
+2. **Streamed counting (the authority).** Regardless of what — or whether — `Content-Length` was
+   declared (it is absent under chunked transfer encoding, and can simply be wrong), every chunk
+   read from the response body stream is counted; once the running total exceeds the cap, the
+   source aborts the in-flight request and throws:
+
+   > `api-poll response from <url> streamed <n> bytes, exceeding the 10485760-byte cap`
+
+Either path is a thrown error (not a truncated result): the runtime records an `errored`
+observation, exactly as for the deadline. `api-poll` never baselines or persists a partial or
+oversized body — unlike `command-poll`'s stdout cap (003 §11.2), which truncates and still treats
+the capped output as a valid, diffable result. The difference matches the failure mode: a huge
+command output is still meaningful once capped, but treating a stalled/incomplete HTTP body as a
+successful baseline would silently corrupt future diffs.
+
+**`status-code` is exempt from the byte cap.** `change-detection.strategy: status-code` never
+inspects the response body — the status transition IS the watched object (§4.2, §4.8) — so
+`api-poll` skips reading the body entirely for it: the response is released back to the connection
+pool via `cancel()` without buffering or counting a single byte. This is strictly cheaper than the
+body-diffing strategies AND means a `status-code` monitor watching a large endpoint (e.g. a big
+static artifact whose availability is being tracked) is never subject to the 10 MiB cap — it can
+still observe a `200 → 503` transition even though the response body, if read, would exceed the
+cap. This exemption applies only when `change-detection.strategy` is written explicitly as
+`status-code`; an omitted strategy is inferred from the response `Content-Type` (§4.2) and can only
+resolve to a body-diffing strategy, so the body is always read in the inferred case.
+
+**Composite concurrency.** Composite mode (§2.6) issues one call per `parts` entry within a single
+`observe()`. Without a bound, a composite with many parts starts every request at once, multiplying
+both the stalled-connection risk and memory pressure this issue exists to bound. `api-poll` runs at
+most 5 part-fetches concurrently; when there are more than 5 parts, each completed fetch's slot is
+immediately taken by the next queued part (a bounded worker pool, not fixed batches of 5). Every
+part still gets the same request/body deadline and byte cap as a single-URL monitor. A failing part
+(non-2xx per §4.8, timeout, or oversize) fails the whole composite observation **immediately** —
+the pool races a dedicated failure promise against the worker pool, so the batch rejects the moment
+the first part fails rather than waiting for other in-flight parts to reach their own deadline —
+and aborts every other in-flight part via a shared `AbortSignal` instead of letting them run to
+completion. Either way `nextState` never advances and the prior baseline is preserved; the
+concurrency bound changes only how many requests are in flight at once and how fast a doomed batch
+surfaces its failure, not the composite's all-or-nothing semantics.
+
+**Composite cumulative artifact-byte budget.** The per-part 10 MiB cap (above) bounds any ONE
+part's response body; the 5-worker concurrency bound (above) bounds how many parts are in flight
+AT ONCE — but neither bounds the aggregate size of the assembled composite. A composite with many
+small parts, each individually far under the per-part cap (e.g. 12 parts × 1 MiB), could still
+assemble and baseline a `snapshotText`/`nextState` many times larger than any single-URL monitor's
+response, persisted every tick. `api-poll` therefore also tracks the running SUM of every part's
+**rendered** section — the `## <id>\n<body>` text `renderCompositeSnapshot` emits for it, not just
+its raw response body — across the whole composite; once that running total exceeds the same
+10 MiB figure (reused, not a second configurable knob), the source throws:
+
+> `api-poll composite "<objectKey>" exceeded the 10485760-byte cumulative rendered-artifact budget
+after part "<partId>" (<n> bytes across the composite's framed parts fetched so far) — reduce the
+number/size of parts or split into multiple monitors`
+
+This fails the whole composite exactly like a non-2xx or oversized part: `mapWithConcurrency`
+aborts every other in-flight part via the shared `AbortSignal`, `nextState` never advances, and the
+prior baseline is preserved.
+
+**Composite part count and part-`id` length (issue #304 review, third round).** The byte budget
+above bounds aggregate _size_, but bounds neither the number of parts nor a single part's `id`
+length — and a reviewer showed both matter independently of body size: 100,000 empty-body parts (0
+cumulative body bytes) completed 100,000 requests and produced a 1,699,998-byte baseline without
+tripping the (then body-only) budget, and a single empty-body part with an 11 MiB `id` produced an
+11,534,340-byte baseline the same way, since `renderCompositeSnapshot` frames every part with
+`## <id>\n` regardless of how large the body is. `api-poll` therefore also caps:
+
+- `change-detection.composite.parts` at **50 entries** — rejected in both the JSON Schema
+  (`maxItems`, so `agentmonitors validate`/`monitor test`/`watch declare` catch it at authoring
+  time) and the parser (`change-detection.composite.parts must not exceed 50 entries (got <n>)`,
+  defense in depth for a hand-edited `MONITOR.md` that skipped validation — 002 §2.2).
+- each part's `id` at **256 characters** — rejected the same way in both the schema (`maxLength`)
+  and the parser (`change-detection.composite.parts[<i>].id must not exceed 256 characters (got
+<n>)`).
+
+Both are structural rejections at config-parse time, before `observe()` issues a single request —
+neither reviewer repro shape above ever reaches the network under this bound. The part-count cap
+also bounds **worst-case tick duration**: with `MAX_COMPOSITE_CONCURRENCY` (5) workers, a composite
+takes at most `ceil(parts / 5) * timeout` to resolve or fail, so at the 50-part cap and the default
+30s timeout, one composite's worst case is `ceil(50 / 5) * 30s = 300s` (5 minutes) — a known,
+documented ceiling rather than an unbounded function of how many parts an author (or a
+misconfigured/compromised MONITOR.md) declares.
+
+(Verified: `plugins/source-api-poll/src/index.ts`, `MAX_RESPONSE_BYTES`, `MAX_COMPOSITE_BYTES`,
+`MAX_COMPOSITE_CONCURRENCY`, `readBoundedBody`, `fetchBody`, `observeComposite`;
+`plugins/source-api-poll/src/composite.ts`, `MAX_COMPOSITE_PARTS`, `MAX_PART_ID_LENGTH`,
+`framedPartByteLength`, `parseCompositeConfig`;
+`libs/core/src/notify/notifier.ts`, `parseOperationTimeoutMs`, `DEFAULT_OPERATION_TIMEOUT_MS`,
+`OPERATION_TIMEOUT_PATTERN`, `MAX_OPERATION_TIMEOUT_MS`;
+`plugins/source-api-poll/src/map-with-concurrency.ts`;
+`plugins/source-api-poll/src/index.test.ts`, "request/body bounds (issue #304)",
+"composite cumulative byte budget (issue #304 review, second + third round)",
+"composite part-count and part-id bounds (issue #304 review, third round)";
+`plugins/source-api-poll/src/map-with-concurrency.test.ts`;
+`libs/core/src/notify/notifier.test.ts`.)
 
 ## 5. Bundled Source: `schedule`
 
@@ -1269,16 +1487,16 @@ watch:
     strategy: json-diff
 ```
 
-| Field                           | Type             | Required | Default                  | Description                                                                      |
-| ------------------------------- | ---------------- | -------- | ------------------------ | -------------------------------------------------------------------------------- |
-| `command`                       | `string[]`       | Yes      | —                        | Argv array; `command[0]` is the executable (resolved via `PATH`). `minItems: 1`. |
-| `interval`                      | duration string  | No       | runtime default          | Poll cadence hint; owned by the scheduling engine, same as `api-poll`.           |
-| `cwd`                           | `string`         | No       | daemon working directory | Working directory for the child process.                                         |
-| `env`                           | `object<string>` | No       | `{}`                     | Literal env vars merged over the inherited daemon environment.                   |
-| `timeout`                       | duration string  | No       | `30s`                    | Wall-clock limit; expiry is an **execution failure** (§11.5).                    |
-| `key`                           | `string`         | No       | joined argv              | Overrides the observation `objectKey` (§11.4).                                   |
-| `change-detection.strategy`     | enum             | No       | `text-diff`              | `text-diff` \| `json-diff` \| `exit-code` (§11.3).                               |
-| `change-detection.ignore-paths` | `string[]`       | No       | `[]`                     | Plain `json-diff` paths removed before comparison (§11.3).                       |
+| Field                           | Type             | Required | Default                  | Description                                                                                                                                                            |
+| ------------------------------- | ---------------- | -------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `command`                       | `string[]`       | Yes      | —                        | Argv array; `command[0]` is the executable (resolved via `PATH`). `minItems: 1`.                                                                                       |
+| `interval`                      | duration string  | No       | runtime default          | Poll cadence hint; owned by the scheduling engine, same as `api-poll`.                                                                                                 |
+| `cwd`                           | `string`         | No       | daemon working directory | Working directory for the child process.                                                                                                                               |
+| `env`                           | `object<string>` | No       | `{}`                     | Literal env vars merged over the inherited daemon environment.                                                                                                         |
+| `timeout`                       | duration string  | No       | `30s`                    | Wall-clock limit; expiry is an **execution failure** (§11.5). Parsed via core's shared `parseOperationTimeoutMs` (§4.9) — a zero-length value (`"0s"`, …) is rejected. |
+| `key`                           | `string`         | No       | joined argv              | Overrides the observation `objectKey` (§11.4).                                                                                                                         |
+| `change-detection.strategy`     | enum             | No       | `text-diff`              | `text-diff` \| `json-diff` \| `exit-code` (§11.3).                                                                                                                     |
+| `change-detection.ignore-paths` | `string[]`       | No       | `[]`                     | Plain `json-diff` paths removed before comparison (§11.3).                                                                                                             |
 
 **`command` MUST be an argv array; a shell string form MUST NOT be accepted.** The child is spawned
 directly (`execFile` semantics, `shell: false`): there is no word-splitting, globbing, quoting, or
@@ -1312,6 +1530,18 @@ One execution per due tick (`observe()` only — no `watch()` in v1, per #81): s
 SIGKILL after a 5s grace). `stdout` capture is capped at **1 MiB**; output beyond the cap is
 discarded and the result is marked `truncated: true` (a truncated result still diffs — but see the
 validation note in §11.7).
+
+**Excess output is drained, never a reason to kill the command** (issue #302). Both `stdout` and
+`stderr` are consumed as they stream, not buffered to completion: `stdout` retains only its leading
+**1 MiB** (`STDOUT_CAP_BYTES`) — the same leading bytes on every capture, so two truncated captures
+of identical leading content diff as unchanged (§11.7 AC6) — and bytes past the cap are still read
+off the pipe and discarded, never left to back up. `stderr` is retained independently, bounded to a
+small fixed cap sized around the diagnostic tail (§11.5) rather than the full 1 MiB stdout cap, since
+its only use is failure diagnostics, never diffing (§11.3). Neither cap is a kill trigger: a command that writes 50 MiB of stdout still runs to its real
+completion — side effects included — and its actual exit code is reported. This replaces an earlier
+implementation that used `execFile({ maxBuffer })`, which killed the child the moment either stream
+crossed the cap and fabricated a synthetic zero exit code — silently discarding the real exit status
+and any side effects the command had not yet completed.
 
 **The timeout escalation targets the command's entire process tree, not just the direct child**
 (issue #303). A supported command may itself invoke a shell that backgrounds a worker
@@ -1376,7 +1606,10 @@ are validation errors so misplaced or misspelled options do not silently no-op.
 
 Mirrors `api-poll` (§4.4–4.5):
 
-- `title` / `summary`: `"Command output changed: <objectKey>"`
+- `title` / `summary`: `"Command output changed: <objectKey>"`, with `<objectKey>` bounded per
+  [§2.8](#28-an-objectkey-is-an-identity-not-a-headline). The runtime overrides the delivered
+  `title` with the monitor's authored `name` when it has one ([002 §5.4](./002-runtime-delivery.md#54-event-title));
+  this source title is what a **nameless** monitor falls back to, and remains the `summary` either way.
 - `objectKey`: the `key` field if set, otherwise the argv joined with single spaces
   (`ofocus today --json`)
 - `payload`: `{ command, exitCode, strategy, stdout, truncated }` — **never `env`**
@@ -1458,6 +1691,17 @@ issue #86's AC1–AC7):
 - Output exceeding the 1 MiB cap sets `truncated: true` and still produces stable diffs (two
   truncated captures of identical leading content do not report change) (AC6: _"marks truncated and
   produces stable diffs across identical leading content"_).
+- Excess output on either stream never kills the command (issue #302): a command that writes past
+  the stdout cap still performs a side effect _after_ the overflow and reports its real, nonzero
+  exit code (_">1 MiB stdout: a marker side effect after the overflow still lands, and the real exit
+  code (7) is reported"_); a command that writes past stderr's independent cap with only a small
+  stdout still reports intact stdout and the real exit code (_">1 MiB stderr with small stdout:
+  stdout is captured intact and the real exit code is reported"_); a command exceeding the cap on
+  **both** streams simultaneously behaves the same way (_"simultaneous large stdout and stderr: both
+  are drained and the real exit code is reported"_); and a command that keeps writing well past both
+  caps still resolves promptly rather than hanging the tick (_"a command that keeps writing far past
+  the cap on both streams still resolves promptly"_) — all four verified in the _"drains excess
+  output without killing the process"_ describe block.
 - `timeout` kills a hung child within the grace period and leaves no orphan process (AC6: _"a
   timed-out child leaves no orphan (killed within the grace window)"_, mirroring the daemon-test
   no-orphan discipline).

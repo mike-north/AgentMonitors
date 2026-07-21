@@ -171,7 +171,31 @@ export interface DeliveryEventSummary {
   eventId: string;
   monitorId: string;
   title: string;
+  /**
+   * The recipient-visible summary (G14, 002 §1.1.8): the Interpret digest when
+   * one was produced for this recipient's delta, otherwise the deterministic
+   * `MonitorEventRecord.summary` → `body` → `title` fallback chain
+   * (`recipientSummary` in `service.ts`). A digest is a **prose reading of the
+   * change**, not necessarily the object's identity — for a `prose`-form
+   * monitor watching many objects, two distinct objects can legitimately
+   * produce indistinguishable or identity-free digest text. Transports that
+   * need to name WHICH object an event is about (e.g. a multi-object source
+   * delivering under one shared authored title, 002 §5.4) MUST use {@link
+   * objectDetail}, not this field.
+   */
   summary: string;
+  /**
+   * The deterministic per-object source detail (`MonitorEventRecord.summary`,
+   * never replaced by an Interpret digest): what names the specific object
+   * this event is about, independent of any agentic summarization. Always
+   * populated by the runtime (`toDeliveryEventSummary`) for a real delivery;
+   * optional here only so a hand-constructed `DeliveryEventSummary` (e.g. in a
+   * test) may omit it. A transport rendering per-object identity — such as
+   * `buildEventBlock`'s detail line — MUST prefer this over {@link summary},
+   * since `summary` can be an Interpret digest that carries no object
+   * identity at all (issue #449 review).
+   */
+  objectDetail?: string;
   urgency: Urgency;
   createdAt: string;
   /**

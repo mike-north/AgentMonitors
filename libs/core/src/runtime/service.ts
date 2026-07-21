@@ -472,6 +472,11 @@ function toDeliveryEventSummary(
     monitorId: event.monitorId,
     title: event.title,
     summary: recipientSummary(event, digests),
+    // The deterministic per-object detail, deliberately NOT digest-preferring
+    // (unlike `summary` above): a transport naming which object this event is
+    // about must not lose identity to a digest that carries none (issue #449
+    // review).
+    objectDetail: event.summary,
     urgency: event.urgency,
     createdAt: event.createdAt.toISOString(),
     body: event.body,
@@ -683,6 +688,21 @@ export class AgentMonitorRuntime {
       );
     }
 
+    // 3b. Reject a whitespace-only `displayName` (issue #449 review): it is an
+    //     ephemeral monitor's ONLY naming affordance (no frontmatter file), and it
+    //     flows into `frontmatter.name` on every tick reconstruction
+    //     (`ephemeralRecordToMonitor` below). A present-but-blank name would
+    //     silently win over the source title there (002 §5.4's precedence) and
+    //     durably headline every delivered event with whitespace. Mirrors the
+    //     same rejection `monitorFrontmatterSchema`'s `name` field applies to a
+    //     persistent monitor's frontmatter.
+    if (input.displayName?.trim() === '') {
+      throw new Error(
+        'Invalid ephemeral monitor declaration: --display-name must contain ' +
+          'non-whitespace characters when present.',
+      );
+    }
+
     // 4. Assign the namespaced runtime identity (007 §4.3) and persist.
     const id = `${EPHEMERAL_MONITOR_ID_PREFIX}${session.id}/${ulid()}`;
     const record = this.store.insertEphemeralMonitor({
@@ -756,6 +776,13 @@ export class AgentMonitorRuntime {
     const frontmatter = monitorFrontmatterSchema.parse({
       watch: { ...record.scope, type: record.sourceName },
       urgency: urgencyBand,
+      // An explicit `--display-name` IS the authored name for an ephemeral
+      // monitor — its only naming affordance, since it has no frontmatter file.
+      // It must reach `frontmatter.name` (not just `displayName`) so the event
+      // title rule (002 §5.4) treats ephemeral and persistent monitors
+      // identically (007 §4.6). Absent, `name` stays unset and the source title
+      // remains the fallback, exactly as for a nameless persistent monitor.
+      ...(record.displayName ? { name: record.displayName } : {}),
     });
     return {
       id: record.id,
@@ -3438,7 +3465,17 @@ export class AgentMonitorRuntime {
         monitorId: input.monitor.id,
         sourceName: input.sourceName,
         urgency: input.effectiveUrgency,
-        title: input.observation.title,
+        // The delivered headline is the monitor's AUTHORED name when it has one
+        // (002 §5.4, issue #449). A source title is written from the source's
+        // point of view and often embeds a configuration detail — `command-poll`
+        // interpolates its `objectKey`, which defaults to the joined argv, so an
+        // unnamed jq-heavy poller announced itself with ~400 characters of its
+        // own implementation. The author's `name` is the one human-written string
+        // that says what the monitor is FOR, so it wins. Fallback when `name` is
+        // absent: the source-provided title, unchanged. The source title is never
+        // lost — it remains the `summary` below (sources set both), and the raw
+        // command stays in `payload.command` / `objectKey` for debugging.
+        title: input.monitor.frontmatter.name ?? input.observation.title,
         body: input.observation.body ?? input.monitor.instructions,
         summary:
           input.observation.summary ??

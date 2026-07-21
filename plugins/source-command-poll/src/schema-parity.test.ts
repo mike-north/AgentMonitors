@@ -93,6 +93,56 @@ const cases: readonly ParityCase[] = [
     input: {},
     expectValid: false,
   },
+  {
+    label: 'timeout "1s" is accepted',
+    input: { command: [process.execPath, '-e', ''], timeout: '1s' },
+    expectValid: true,
+  },
+  // Issue #304 review, finding 5 + 6: the `timeout` scope field is now parsed
+  // by the same shared `parseOperationTimeoutMs` (core) that `api-poll` uses,
+  // and its JSON Schema `pattern` (`OPERATION_TIMEOUT_PATTERN`) was updated in
+  // lockstep — a zero-length deadline must be rejected by BOTH, not just one.
+  {
+    label: 'timeout "0s" is rejected (zero-length deadline)',
+    input: { command: [process.execPath, '-e', ''], timeout: '0s' },
+    expectValid: false,
+  },
+  // Issue #304 review, second round: the schema `pattern` (`[1-9]\d*`) has
+  // always rejected a leading zero, but the parser's `parseOperationTimeoutMs`
+  // (via `parseDuration`'s own `\d+` digit group) previously accepted it —
+  // a schema/parser mismatch. Both now reject it.
+  {
+    label: 'timeout "01s" is rejected (leading zero)',
+    input: { command: [process.execPath, '-e', ''], timeout: '01s' },
+    expectValid: false,
+  },
+  // Issue #304 review, second round: a present non-string `timeout` (here a
+  // number) was previously silently treated as "omitted" by the parser while
+  // the schema already rejected it — both now reject it.
+  {
+    label: 'timeout 30 (number, not a string) is rejected',
+    input: { command: [process.execPath, '-e', ''], timeout: 30 },
+    expectValid: false,
+  },
+  // Issue #304 review, third round: the schema `pattern` used to accept an
+  // unbounded digit run per unit, so "25d" passed authoring-time
+  // `validateScope` while the parser rejected it at runtime — a genuine
+  // parity bug, not the "deliberate, narrow, documented gap" the previous
+  // round's comment claimed. `OPERATION_TIMEOUT_PATTERN` now bounds each
+  // unit's digit run to `Math.floor(MAX_OPERATION_TIMEOUT_MS / unitMs)`, so
+  // both layers reject "25d" together; see the dedicated bound coverage in
+  // `libs/core/src/notify/notifier.test.ts`.
+  {
+    label: 'timeout "24d" (at the maximum setTimeout delay) is accepted',
+    input: { command: [process.execPath, '-e', ''], timeout: '24d' },
+    expectValid: true,
+  },
+  {
+    label:
+      'timeout "25d" (exceeds the maximum setTimeout delay) is rejected by both schema and parser',
+    input: { command: [process.execPath, '-e', ''], timeout: '25d' },
+    expectValid: false,
+  },
 ];
 
 describe('command-poll schema ↔ parser parity', () => {

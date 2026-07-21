@@ -237,7 +237,9 @@ describe('file-fingerprint workspace isolation (issue #345 / #307)', () => {
     const gammaEvent = restartEvents.find(
       (event) => event.objectKey === path.join(project2, 'p2-gamma.ts'),
     );
-    expect(gammaEvent?.title).toMatch(/created/i);
+    // The per-object text lives on `summary`; `title` is the monitor's
+    // authored name since issue #449 (002 §5.4).
+    expect(gammaEvent?.summary).toMatch(/created/i);
     for (const event of restartEvents) {
       expect(eventText(event)).not.toContain('p1-');
     }

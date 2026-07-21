@@ -12,7 +12,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type {
   ObservationContext,
   ObservationResult,
@@ -83,6 +83,19 @@ describe('source-command-poll', () => {
       await expect(
         source.observe({ command: 'git status | grep main' }, ctx()),
       ).rejects.toThrow(/\["sh", "-c", "git status \| grep main"\]/);
+    });
+
+    // Issue #304 review, finding 5 + 6: `command-poll` shares the `timeout`
+    // scope-field parsing (`parseOperationTimeoutMs`) with `api-poll` — a
+    // zero-length deadline aborts the command before it can ever complete,
+    // which is never a meaningful configuration.
+    it('rejects a "0s" timeout override', async () => {
+      await expect(
+        source.observe(
+          { command: nodeArgv('process.stdout.write("ok")'), timeout: '0s' },
+          ctx(),
+        ),
+      ).rejects.toThrow(/Invalid timeout: "0s"/);
     });
 
     it('accepts an explicit sh -c argv form (the supported pipeline idiom)', async () => {
@@ -701,7 +714,8 @@ describe('source-command-poll', () => {
       expect(baseline.nextState).toMatchObject({ truncated: true });
 
       // A second run with identical leading content (also 2 MiB of "a") must NOT
-      // report a change — the capped slice is identical.
+      // report a change — the capped slice is identical, over the bounded retained
+      // stdout (the same leading STDOUT_CAP_BYTES survive both runs).
       const second = await source.observe(
         { command: bigOutput },
         ctx(baseline.nextState),
@@ -712,6 +726,237 @@ describe('source-command-poll', () => {
       const state = second.nextState as { stdout: string; truncated: boolean };
       expect(state.stdout.length).toBe(1024 * 1024);
       expect(state.truncated).toBe(true);
+    });
+  });
+
+  // Drain, don't kill: a command producing more than the cap on either stream must
+  // still run to completion and report its real exit status (issue #302).
+  describe('drains excess output without killing the process (003 §11.2, issue #302)', () => {
+    it('>1 MiB stdout: a marker side effect after the overflow still lands, and the real exit code (7) is reported', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'am-302-stdout-'));
+      const markerFile = join(dir, 'marker');
+      try {
+        // Emit 2 MiB of stdout — well past the 1 MiB cap — THEN perform a side
+        // effect and exit nonzero. If the old execFile({ maxBuffer }) behavior were
+        // still in play, the child would be SIGKILLed the moment it crossed the
+        // cap: the marker would never be written and the real exit code (7) would
+        // never be observed (a killed process has no exit code, and the old code
+        // fabricated 0). Both landing proves the process ran to real completion.
+        // `process.exitCode` (not `process.exit()`) so Node waits for the
+        // stdout stream to actually drain before the process terminates — an
+        // explicit `process.exit()` right after a large write truncates output
+        // at whatever the pipe had buffered, which would make this test flaky
+        // for reasons unrelated to the source's own draining behavior.
+        const command = nodeArgv(
+          `process.stdout.write("a".repeat(2 * 1024 * 1024)); ` +
+            `require("fs").writeFileSync(${JSON.stringify(markerFile)}, "done"); ` +
+            `process.exitCode = 7`,
+        );
+
+        const result = await source.observe({ command }, ctx());
+
+        expect(readFileSync(markerFile, 'utf8')).toBe('done');
+        const state = result.nextState as {
+          exitCode: number;
+          truncated: boolean;
+          stdout: string;
+        };
+        expect(state.exitCode).toBe(7);
+        expect(state.truncated).toBe(true);
+        expect(state.stdout.length).toBe(1024 * 1024);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('>1 MiB stderr with small stdout: stdout is captured intact and the real exit code is reported', async () => {
+      // A large stderr volume must never affect stdout capture or cause a failure —
+      // stderr's retention cap is independent of stdout's (issue #302).
+      const command = nodeArgv(
+        `process.stderr.write("e".repeat(2 * 1024 * 1024)); ` +
+          `process.stdout.write("small-stdout"); ` +
+          `process.exitCode = 3`,
+      );
+
+      const result = await source.observe({ command }, ctx());
+
+      const state = result.nextState as {
+        exitCode: number;
+        truncated: boolean;
+        stdout: string;
+      };
+      expect(state.exitCode).toBe(3);
+      // stdout never crossed its own cap — not truncated.
+      expect(state.truncated).toBe(false);
+      expect(state.stdout).toBe('small-stdout');
+    });
+
+    it('simultaneous large stdout and stderr: both are drained and the real exit code is reported', async () => {
+      const command = nodeArgv(
+        `process.stderr.write("e".repeat(2 * 1024 * 1024)); ` +
+          `process.stdout.write("a".repeat(2 * 1024 * 1024)); ` +
+          `process.exitCode = 5`,
+      );
+
+      const result = await source.observe({ command }, ctx());
+
+      const state = result.nextState as {
+        exitCode: number;
+        truncated: boolean;
+        stdout: string;
+      };
+      expect(state.exitCode).toBe(5);
+      expect(state.truncated).toBe(true);
+      expect(state.stdout.length).toBe(1024 * 1024);
+    });
+
+    // Negative test: a command that would exceed the cap on both streams AND keeps
+    // writing well past it must still resolve promptly, not hang the tick waiting
+    // for a kill or for buffers to "settle" — draining, not blocking, is what keeps
+    // this bounded.
+    it('a command that keeps writing far past the cap on both streams still resolves promptly', async () => {
+      const command = nodeArgv(
+        `process.stderr.write("e".repeat(4 * 1024 * 1024)); ` +
+          `process.stdout.write("a".repeat(4 * 1024 * 1024)); ` +
+          `process.exitCode = 0`,
+      );
+
+      // Resolving at all (rather than hanging until the 30s default timeout)
+      // proves the child was drained, not blocked on a full pipe buffer waiting
+      // for us to read. A wall-clock upper bound here was flaky under CI load,
+      // so timing isn't asserted directly — `ctx()`'s test timeout is the
+      // enforcement backstop.
+      const result = await source.observe({ command }, ctx());
+      const state = result.nextState as {
+        exitCode: number;
+        truncated: boolean;
+      };
+      expect(state.exitCode).toBe(0);
+      expect(state.truncated).toBe(true);
+    });
+
+    // Regression test for issue #302: the stderr diagnostic tail is exposed via
+    // the `stderrTail` failure payload, sliced to the last `STDERR_TAIL_CHARS`
+    // (2000) characters of the last `STDERR_RETENTION_CAP_BYTES` (8000) retained
+    // bytes. A whole-chunk eviction scheme (`chunks.shift()` while
+    // `chunks.length > 1`) drops the *entire* oldest chunk once the retained
+    // total exceeds the cap — so a large leading chunk followed by a tiny final
+    // chunk loses everything but that tiny chunk, instead of the correct
+    // trailing window spanning both. The per-chunk `Buffer.concat(...).subarray(
+    // -cap)` form used here stays byte-accurate regardless of how the writes are
+    // chunked.
+    it('big-chunk-then-tiny-chunk: the failure stderrTail is the full 2000-char trailing window (issue #302)', async () => {
+      const bigChunkChars = 9000; // > STDERR_RETENTION_CAP_BYTES (8000)
+      const tinyChunkChars = 7;
+      const command = nodeArgv(
+        `process.stderr.write(Buffer.alloc(${String(bigChunkChars)}, 'A'), () => { ` +
+          `setTimeout(() => { ` +
+          `process.stderr.write('B'.repeat(${String(tinyChunkChars)}), () => { ` +
+          `setTimeout(() => {}, 60000); ` +
+          `}); ` +
+          `}, 50); ` +
+          `});`,
+      );
+
+      const result = await source.observe({ command, timeout: '1s' }, ctx());
+
+      expect(result.observations).toHaveLength(1);
+      const payload = result.observations[0]?.payload as {
+        error: string;
+        stderrTail: string;
+      };
+      expect(payload.error).toMatch(/timed out/i);
+      // Full 2000-char trailing window: 1993 trailing `A`s from the big chunk,
+      // followed by all 7 `B`s from the tiny final chunk — never just the 7
+      // characters of the last chunk alone.
+      expect(payload.stderrTail).toHaveLength(2000);
+      expect(payload.stderrTail).toBe(
+        'A'.repeat(2000 - tinyChunkChars) + 'B'.repeat(tinyChunkChars),
+      );
+    });
+
+    it('a single ~8x-over-cap chunk followed by one tiny chunk still yields the correct bounded tail (issue #302)', async () => {
+      // The first (and, in isolation, only) chunk is ~8x STDERR_RETENTION_CAP_BYTES
+      // (8000) on its own — the buggy `chunks.length > 1` guard never trims a
+      // solitary chunk no matter how far over the cap it is, and then evicts it
+      // WHOLE (rather than trimming) the moment a second chunk arrives.
+      const bigChunkChars = 64_000;
+      const command = nodeArgv(
+        `process.stderr.write(Buffer.alloc(${String(bigChunkChars)}, 'C'), () => { ` +
+          `setTimeout(() => { ` +
+          `process.stderr.write('D', () => { ` +
+          `setTimeout(() => {}, 60000); ` +
+          `}); ` +
+          `}, 50); ` +
+          `});`,
+      );
+
+      const result = await source.observe({ command, timeout: '1s' }, ctx());
+
+      expect(result.observations).toHaveLength(1);
+      const payload = result.observations[0]?.payload as {
+        error: string;
+        stderrTail: string;
+      };
+      expect(payload.error).toMatch(/timed out/i);
+      expect(payload.stderrTail).toHaveLength(2000);
+      expect(payload.stderrTail).toBe('C'.repeat(1999) + 'D');
+    });
+
+    // Regression test for issue #302: `Buffer.subarray` returns a VIEW onto its
+    // source rather than a copy. Slicing the trailing window straight off the
+    // `Buffer.concat(...)` result without copying it keeps the whole
+    // concatenated backing store alive — `stderrRetained.length` would report
+    // the capped 8000 bytes while `stderrRetained.buffer.byteLength` (the
+    // actual retained allocation) could still be far larger, silently
+    // defeating the retention cap this feature promises. Asserting on the
+    // backing `ArrayBuffer`, not just the `Buffer` view's `length`, is what
+    // actually proves the cap holds.
+    //
+    // The copy is made via `Buffer.allocUnsafeSlow` + `.copy()`, not
+    // `Buffer.from(view)`: `Buffer.from` was observed to produce a
+    // non-exact-size backing allocation on some Node builds (byteLength 65536
+    // in CI vs. 8000 locally on the same Node major) — its internal pooling
+    // heuristics are environment-dependent. `allocUnsafeSlow` always allocates
+    // a fresh, non-pooled buffer of exactly the requested size, which is
+    // deterministic across environments.
+    it('retains only the capped bytes in the backing ArrayBuffer, not a view onto the full concat (issue #302)', async () => {
+      const stderrRetentionCapBytes = 8000; // STDERR_RETENTION_CAP_BYTES (index.ts)
+      const allocUnsafeSlowSpy = vi.spyOn(Buffer, 'allocUnsafeSlow');
+      try {
+        const bigChunkChars = 64_000; // >> STDERR_RETENTION_CAP_BYTES (8000)
+        const command = nodeArgv(
+          `process.stderr.write(Buffer.alloc(${String(bigChunkChars)}, 'E'), () => { ` +
+            `setTimeout(() => {}, 60000); ` +
+            `});`,
+        );
+
+        const result = await source.observe({ command, timeout: '1s' }, ctx());
+
+        expect(result.observations).toHaveLength(1);
+        const payload = result.observations[0]?.payload as {
+          error: string;
+          stderrTail: string;
+        };
+        expect(payload.error).toMatch(/timed out/i);
+
+        // The retained stderr buffer is created via the copy-on-cap-exceeded
+        // `Buffer.allocUnsafeSlow` path (added for issue #302). This does NOT
+        // assert a single call: pipe/stream chunk boundaries are not
+        // guaranteed to match `process.stderr.write()` calls, so the
+        // 64,000-byte write may arrive as more than one `data` event, and the
+        // correct implementation allocates once per over-cap chunk. What must
+        // hold regardless of how the write is chunked is that every retained
+        // copy is bounded — exactly, not just at-most — at the cap.
+        expect(allocUnsafeSlowSpy).toHaveBeenCalled();
+        for (const result of allocUnsafeSlowSpy.mock.results) {
+          const retained = result.value as Buffer;
+          expect(retained.length).toBe(stderrRetentionCapBytes);
+          expect(retained.buffer.byteLength).toBe(stderrRetentionCapBytes);
+        }
+      } finally {
+        allocUnsafeSlowSpy.mockRestore();
+      }
     });
   });
 
@@ -745,6 +990,32 @@ describe('source-command-poll', () => {
       expect(keyed.observations[0]?.title).toBe(
         'Command output changed: my-key',
       );
+    });
+
+    // Issue #449: a long argv is an identity, not a headline. `objectKey` keeps
+    // the full joined argv, but the human-facing title/summary bound it (003
+    // §2.8) so a jq-heavy poller cannot make its own implementation the alert.
+    it('bounds the argv in title/summary while objectKey and payload keep it whole (issue #449)', async () => {
+      // A long trailing argument stands in for the reported jq program: the
+      // program ignores it, but it lands in the joined-argv objectKey.
+      const jqTail = 'jq:'.concat('[.[] | {number, state}]'.repeat(12));
+      const argv = [...nodeArgv('process.stdout.write("a")'), jqTail];
+      const baseline = await source.observe({ command: argv }, ctx());
+      const changedArgv = [...nodeArgv('process.stdout.write("b")'), jqTail];
+      const changed = await source.observe(
+        { command: changedArgv },
+        ctx(baseline.nextState),
+      );
+
+      const obs = changed.observations[0];
+      expect(obs?.title).toMatch(/^Command output changed: /);
+      // 60-char bound + the fixed "Command output changed: " prefix.
+      expect(obs?.title).toHaveLength('Command output changed: '.length + 60);
+      expect(obs?.title).not.toContain(jqTail);
+      expect(obs?.summary).toBe(obs?.title);
+      // Debugging loses nothing: identity and payload carry the full argv.
+      expect(obs?.objectKey).toBe(changedArgv.join(' '));
+      expect(obs?.payload).toMatchObject({ command: changedArgv });
     });
 
     // 003 §11.4: snapshot.command is the argv array, not the objectKey string.

@@ -1222,7 +1222,31 @@ disambiguates: `unread` (never surfaced), `claimed` (surfaced once, still unackn
 
 **TOON output (`--format toon`):** encodes the `MonitorEventRecord[]` array using `@toon-format/toon` `encode()`. Decodes losslessly to the JSON value.
 
-**Text output (`--format text`):** one line per event: `<id>  <monitorId>  <urgency>  <deliveryState>  <title>`
+**Text output (`--format text`):** one line per event: `<id>  <monitorId>  <urgency>  <deliveryState>  <title>`,
+with a trailing `  <summary>` appended when the event's per-object `summary` (002 §5.1) says
+something the monitor's authored `title` (002 §5.4) doesn't already — i.e. `summary` differs from
+`title`. `title` names what the monitor is _for_; it's identical across every row from a
+multi-object source (e.g. a `file-fingerprint` glob watching several files), so without this
+suffix those rows would render as indistinguishable duplicates.
+
+Deliberately **NOT** also suppressed when `summary` equals `body`, unlike the delivery transports'
+`buildEventBlock` detail line (006): that second guard exists there because the rendered block
+template ALSO prints `body` on its own line below the detail, so an equal summary/body would
+duplicate it. This `--format text` row never renders `event.body` at all, so there is no duplicate
+to guard against — suppressing on `summary === body` here would just drop the only per-object
+detail a `{ title, body }`-only observation has (issue #449 review).
+
+Every human-text field in the row (`monitorId`, `title`, the `summary` suffix) is
+**source-/author-controlled and untrusted** — a monitor's authored `name` (frontmatter) or a
+source's own `title`/`summary` can carry a raw CR, LF, Unicode line/paragraph separator, or a
+terminal escape sequence. Each field is passed through a control-safe single-line transform before
+interpolation: CR/LF and the Unicode LINE/PARAGRAPH SEPARATOR collapse to a single space (keeping
+the row one physical line); every other C0/C1 control character, DEL, and TAB is escaped to a
+visible `\uXXXX` form rather than silently dropped or passed through raw — so a hostile payload
+cannot forge an extra row or emit a raw escape sequence to the terminal, and is visible rather than
+silently absorbed (issue #449 review). `--format json`/`--format toon` are unaffected — `summary`
+is already a field on the returned `MonitorEventRecord`, and those formats do not risk row-forging
+in the same way.
 
 **JSON output (`--format json`):** `MonitorEventRecord[]` array. Each element carries a
 `deliveryState?: 'unread' | 'claimed' | 'acknowledged'` field reporting the **requesting session's**

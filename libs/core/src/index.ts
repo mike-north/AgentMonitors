@@ -73,6 +73,7 @@ export type {
 // Observation sources
 export { SourceRegistry } from './observation/registry.js';
 export { generateMonitorSchema } from './observation/schema-generator.js';
+export { displayObjectKey } from './observation/display.js';
 export type {
   ChangeKind,
   JsonSchema,
@@ -95,6 +96,10 @@ export type {
 // Notification
 export {
   parseDuration,
+  parseOperationTimeoutMs,
+  DEFAULT_OPERATION_TIMEOUT_MS,
+  OPERATION_TIMEOUT_PATTERN,
+  MAX_OPERATION_TIMEOUT_MS,
   createImmediateNotifier,
   createDebounceNotifier,
   createThrottleNotifier,

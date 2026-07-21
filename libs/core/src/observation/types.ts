@@ -54,11 +54,31 @@ export type ChangeKind = 'created' | 'modified' | 'deleted' | 'descoped';
  * @see docs/specs/002-runtime-delivery.md §5.2
  */
 export interface Observation {
-  /** Human-readable title for the inbox item */
+  /**
+   * The source's own headline for this observation.
+   *
+   * This is **not** necessarily the delivered event title. The runtime chooses
+   * that at materialization: the monitor's authored `name` when it has one,
+   * otherwise this string unchanged (002 §5.4). A source therefore writes a
+   * title that reads well as the FALLBACK headline for a nameless monitor.
+   *
+   * A source interpolating a configuration-identity `objectKey` here (a joined
+   * argv, a URL) bounds it with `displayObjectKey` (003 §2.8).
+   */
   title: string;
   /** Optional body/description */
   body?: string;
-  /** Optional short summary for lightweight delivery surfaces */
+  /**
+   * Optional short per-object text for lightweight delivery surfaces.
+   *
+   * This is what both injecting transports render as the DETAIL LINE beneath the
+   * title (006 §4.2.1), so for a monitor with an authored `name` it — not
+   * {@link Observation.title} — is the string that names which object moved. A
+   * source that supplies a `summary` distinct from its `title` is choosing that
+   * text as the surfaced one; the title then appears only for a nameless
+   * monitor (the compatibility table in 002 §5.4). When omitted, the runtime
+   * derives it from `body`, else `title` (002 §5.1).
+   */
   summary?: string;
   /** Raw source payload, preserved for later querying */
   payload?: unknown;

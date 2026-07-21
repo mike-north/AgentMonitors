@@ -1,6 +1,8 @@
+import { Validator, type Schema } from '@cfworker/json-schema';
 import { describe, expect, it } from 'vitest';
 import { generateMonitorSchema } from './schema-generator.js';
 import type { ObservationSource } from './types.js';
+import { monitorFrontmatterSchema } from '../schema/monitor-schema.js';
 
 function makeSource(
   name: string,
@@ -156,5 +158,74 @@ describe('generateMonitorSchema', () => {
     const typeProp = watchProperties.type as Record<string, unknown>;
     expect(typeProp.enum).toEqual([]);
     expect(schema.allOf).toEqual([]);
+  });
+
+  // Regression (issue #449 review): `monitorFrontmatterSchema` rejects a
+  // whitespace-only `name` (see monitor-schema.test.ts, "rejects a
+  // whitespace-only name"), but the generated editor/authoring schema used to
+  // emit only `minLength: 1`, which a whitespace-only string satisfies. That
+  // let `agentmonitors schema generate` and editor validation accept a
+  // `name: "   "` the authoritative parser then rejects at runtime. Proves the
+  // two stay in parity by running the exact same inputs through both.
+  describe('name field parity with monitorFrontmatterSchema', () => {
+    const schema = generateMonitorSchema([
+      makeSource('file-fingerprint', {
+        type: 'object',
+        properties: { globs: { type: 'array', items: { type: 'string' } } },
+        required: ['globs'],
+      }),
+    ]);
+    const validator = new Validator(schema as unknown as Schema, '7', false);
+
+    function monitorWithName(name: string): Record<string, unknown> {
+      return {
+        name,
+        watch: { type: 'file-fingerprint', globs: ['x'] },
+      };
+    }
+
+    function frontmatterWithName(name: string): Record<string, unknown> {
+      return {
+        name,
+        watch: { type: 'file-fingerprint', globs: ['x'] },
+        urgency: 'normal',
+      };
+    }
+
+    it('both reject a whitespace-only name', () => {
+      const generated = validator.validate(monitorWithName('   '));
+      const authoritative = monitorFrontmatterSchema.safeParse(
+        frontmatterWithName('   '),
+      );
+      expect(generated.valid).toBe(false);
+      expect(authoritative.success).toBe(false);
+    });
+
+    it('both reject an empty-string name', () => {
+      const generated = validator.validate(monitorWithName(''));
+      const authoritative = monitorFrontmatterSchema.safeParse(
+        frontmatterWithName(''),
+      );
+      expect(generated.valid).toBe(false);
+      expect(authoritative.success).toBe(false);
+    });
+
+    it('both accept a name with visible content', () => {
+      const generated = validator.validate(monitorWithName('PR queue'));
+      const authoritative = monitorFrontmatterSchema.safeParse(
+        frontmatterWithName('PR queue'),
+      );
+      expect(generated.valid).toBe(true);
+      expect(authoritative.success).toBe(true);
+    });
+
+    it('both accept a name with leading/trailing whitespace but visible content', () => {
+      const generated = validator.validate(monitorWithName('  PR queue  '));
+      const authoritative = monitorFrontmatterSchema.safeParse(
+        frontmatterWithName('  PR queue  '),
+      );
+      expect(generated.valid).toBe(true);
+      expect(authoritative.success).toBe(true);
+    });
   });
 });

@@ -202,6 +202,9 @@ export interface DeclareEphemeralMonitorInput {
 }
 
 // @public
+export const DEFAULT_OPERATION_TIMEOUT_MS = 30000;
+
+// @public
 export function defaultNotifyConfigForUrgency(urgency: Urgency, notify?: NotifyConfig): NotifyConfig | undefined;
 
 // @public (undocumented)
@@ -232,7 +235,7 @@ export interface DeliveryEventSummary {
     eventId: string;
     // (undocumented)
     monitorId: string;
-    // (undocumented)
+    objectDetail?: string;
     summary: string;
     // (undocumented)
     title: string;
@@ -269,7 +272,10 @@ export interface DerivedFactRule {
 export function diffKeyedCollection(parsedOutput: unknown, config: KeyedCollectionConfig, monitorObjectKey: string, previousSnapshot: KeyedSnapshot | undefined, observationFields?: {
     payload?: Record<string, unknown>;
     queryScope?: Record<string, string | string[]>;
-}): KeyedCollectionResult;
+}, displayScope?: string): KeyedCollectionResult;
+
+// @public
+export function displayObjectKey(objectKey: string): string;
 
 // @public
 export interface DoctorDeliveryCounts {
@@ -591,6 +597,9 @@ export interface KeyedCollectionResult {
 // @public
 export type KeyedSnapshot = Record<string, unknown>;
 
+// @public
+export const MAX_OPERATION_TIMEOUT_MS = 2147483647;
+
 // @public (undocumented)
 export interface MonitorDefinition {
     displayName: string;
@@ -761,7 +770,7 @@ export type MonitorFrontmatter = z.infer<typeof monitorFrontmatterSchema>;
 
 // @public (undocumented)
 export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
-    name: z.ZodOptional<z.ZodString>;
+    name: z.ZodOptional<z.ZodEffects<z.ZodString, string, string>>;
     watch: z.ZodObject<{
         type: z.ZodString;
     }, "strip", z.ZodUnknown, z.objectOutputType<{
@@ -1191,6 +1200,9 @@ export interface OpenSessionInput {
 }
 
 // @public
+export const OPERATION_TIMEOUT_PATTERN: string;
+
+// @public
 export function parseDuration(duration: string): number;
 
 // @public (undocumented)
@@ -1211,6 +1223,9 @@ export function parseMonitor(content: string, filePath: string): ParseOutcome;
 
 // @public
 export function parseMonitorFile(filePath: string): ParseOutcome;
+
+// @public
+export function parseOperationTimeoutMs(rawTimeout: unknown): number;
 
 // @public (undocumented)
 export type ParseOutcome = ParseResult | ParseError;
