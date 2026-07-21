@@ -182,13 +182,13 @@ const PR_REVIEW_URGENCY_COMMENT =
   '# would not learn WHICH PR needs review until session recap.\n';
 
 /**
- * `my-prs`'s urgency-rationale comment; see {@link PR_REVIEW_URGENCY_COMMENT}.
- * `normal` here is a deliberate reversal of the intuitive call (field-tested
- * live, not merely reasoned about): `json-diff` is symmetric, so a PR
- * *leaving* an actionable state diffs exactly as much as one *entering* it —
- * CI recovering, a merge, and a new PR of one's own all fire identically to
- * the transitions that would justify `high`, and no payload shaping rescues
- * that (003 §11.9).
+ * `my-prs`'s urgency-rationale comment, above `urgency: high` in the
+ * template; see {@link PR_REVIEW_URGENCY_COMMENT}. `high` is earned here by
+ * the payload filter: only PRs that need the author to act are in the list
+ * at all, so an ordinary CI run (queued -> running -> passing) produces no
+ * event, and `normal`'s coalesce-until-ack + no-mid-session-body behavior
+ * (002 §9.2/§9.3) was tried in the field and does not work for this preset
+ * (003 §11.9).
  */
 const MY_PRS_URGENCY_COMMENT =
   '# high, earned by the payload filter above: only PRs that need YOU to do\n' +

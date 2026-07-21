@@ -1747,8 +1747,11 @@ describe('gh environment/temp-file hardening (PR #446 review, thread 3)', () => 
       { now: new Date('2026-01-15T10:05:00.000Z') },
     );
 
-    const leftoverStderrFiles = readdirSync(tmp).filter(
-      (name) => name.includes('agentmonitors-') && name.endsWith('.stderr'),
+    // The errfile is created by `mktemp "${TMPDIR:-/tmp}/agentmonitors-<preset>-XXXXXX"`
+    // (no `.stderr` suffix) — match on the `agentmonitors-` prefix only, or a
+    // leaked mktemp file would slip past a `.stderr`-suffix filter undetected.
+    const leftoverStderrFiles = readdirSync(tmp).filter((name) =>
+      name.includes('agentmonitors-'),
     );
     expect(leftoverStderrFiles).toEqual([]);
   });
@@ -2045,11 +2048,11 @@ describe('preset portability guarantees (issue #444)', () => {
     },
   );
 
-  // Neither preset is `high`, and for my-prs that is a deliberate reversal of
-  // the intuitive call. json-diff is symmetric, so benign transitions (CI
-  // recovering, a PR merging, your own new PR appearing) fire exactly like
-  // actionable ones; `high` would therefore interrupt mid-turn on good news —
-  // the interrupt-storm anti-pattern (#441). See 002 §9 and 003 §11.9.
+  // Both presets are `high`, which is only safe because the payload for each
+  // is a MEMBERSHIP set filtered to PRs that actually need action right now:
+  // a PR that has been decided leaves the set instead of churning a field
+  // inside it, so there is no benign per-push or per-comment traffic to
+  // interrupt on. See 002 §9 and 003 §11.9.
   it('both presets are high urgency', () => {
     expect(TEMPLATES['my-prs'] ?? '').toMatch(/^urgency: high$/m);
     expect(TEMPLATES['pr-review'] ?? '').toMatch(/^urgency: high$/m);
