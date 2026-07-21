@@ -12,7 +12,6 @@ import {
   OPERATION_TIMEOUT_PATTERN,
   diffKeyedCollection,
   displayObjectKey,
-  parseDuration,
   parseKeyedCollectionConfig,
   parseOperationTimeoutMs,
 } from '@agentmonitors/core';
