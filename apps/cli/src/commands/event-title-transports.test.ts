@@ -30,6 +30,7 @@ import {
   claudeCodeAdapter,
   createDb,
   type DeliveryClaim,
+  type InterpretAdapter,
 } from '@agentmonitors/core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { registerCoreSources } from '../sources.js';
@@ -85,13 +86,30 @@ interface Harness {
   command: string[];
 }
 
+interface ScaffoldOptions {
+  /**
+   * `payload.form: prose` (G14, 002 §1.1.8): the only form that drives the
+   * Interpret stage. Omitted for the plain title-fallback tests, which have
+   * no need of a digest.
+   */
+  payloadForm?: 'prose';
+  /**
+   * A fake {@link InterpretAdapter} (never a real model shell-out in CI). Only
+   * meaningful together with `payloadForm: 'prose'`.
+   */
+  interpretAdapter?: InterpretAdapter;
+}
+
 /**
  * Scaffold a workspace with one real `command-poll` monitor reading `data.json`.
  * `urgency: high` is what makes a claim carry event BODIES (normal/low deliver a
  * generic mid-session reminder, 002 §9.2), which is where the title is visible.
  * `name` is omitted entirely when `monitorName` is undefined — the fallback case.
  */
-function scaffold(monitorName: string | undefined): Harness {
+function scaffold(
+  monitorName: string | undefined,
+  options: ScaffoldOptions = {},
+): Harness {
   const workspace = mkdtempSync(path.join(tmpdir(), 'agentmon-title-'));
   tempRoots.push(workspace);
   const dataFile = path.join(workspace, 'data.json');
@@ -112,6 +130,9 @@ function scaffold(monitorName: string | undefined): Harness {
       `  command: ${JSON.stringify(command)}`,
       '  interval: 1s',
       'urgency: high',
+      ...(options.payloadForm === undefined
+        ? []
+        : ['payload:', `  form: ${options.payloadForm}`]),
       'notify:',
       '  strategy: debounce',
       '  settle-for: 1s',
@@ -128,7 +149,12 @@ function scaffold(monitorName: string | undefined): Harness {
   const db = createDb(path.join(workspace, 'agentmon.db'));
   const store = new RuntimeStore(db);
   return {
-    runtime: new AgentMonitorRuntime(store, registry, [claudeCodeAdapter]),
+    runtime: new AgentMonitorRuntime(
+      store,
+      registry,
+      [claudeCodeAdapter],
+      options.interpretAdapter,
+    ),
     // A second store over the SAME db, the pattern used elsewhere for reading
     // durable state the claim payload does not expose.
     store: new RuntimeStore(db),
@@ -252,5 +278,51 @@ describe('issue #449: delivered event title is the monitor name, not the raw com
     expect(stored?.objectKey).toBe(harness.command.join(' '));
     // And the source's own detail is not lost — it is the summary.
     expect(stored?.summary).toMatch(/^Command output changed: /);
+  });
+
+  // Regression (issue #449 review, 2026-07-21): the prior review round required
+  // a real runtime claim with a distinct Interpret digest — driven through BOTH
+  // real transports, not just the shared `buildEventBlock` unit. A `prose`
+  // monitor's `summary` is the Interpret digest (G14, 002 §1.1.8), which shares
+  // no text with the deterministic per-object `objectDetail`; a transport that
+  // dropped either would either lose object identity or silently discard a
+  // successful agentic digest.
+  it('a named, multi-object prose monitor renders BOTH the deterministic object detail AND the distinct Interpret digest, on both real transports (issue #449 review)', async () => {
+    const digest = 'The status page reported a brief outage.';
+    const fake: InterpretAdapter = {
+      name: 'fake-interpret',
+      interpret() {
+        return Promise.resolve({ decision: 'deliver', digest });
+      },
+    };
+    const harness = scaffold(MONITOR_NAME, {
+      payloadForm: 'prose',
+      interpretAdapter: fake,
+    });
+    const claim = await deliverOneChange(harness);
+
+    // Core-owned: objectDetail is the deterministic per-object text (never
+    // digest-replaced, 002 §5.4); summary is the recipient-visible digest —
+    // and the two are distinct here, on purpose.
+    const objectDetail = claim.events[0]?.objectDetail ?? '';
+    const summary = claim.events[0]?.summary ?? '';
+    expect(objectDetail).toMatch(/^Command output changed: /);
+    expect(summary).toBe(digest);
+    expect(summary).not.toBe(objectDetail);
+
+    const { hook, channel } = renderBothTransports(claim);
+    for (const rendered of [hook, channel]) {
+      const lines = rendered.split('\n');
+      const headerIndex = lines.findIndex((line) =>
+        line.startsWith(`### ${MONITOR_ID} (`),
+      );
+      expect(headerIndex).toBeGreaterThanOrEqual(0);
+      // Name first (the title), then the deterministic object identity, then
+      // the distinct Interpret digest — neither dropped, in this exact order
+      // (`buildEventBlock`, 002 §5.4 / issue #449 review).
+      expect(lines[headerIndex + 1]).toBe(MONITOR_NAME);
+      expect(lines[headerIndex + 2]).toBe(objectDetail);
+      expect(lines[headerIndex + 3]).toBe(digest);
+    }
   });
 });
