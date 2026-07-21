@@ -78,6 +78,32 @@ function runWithEnv(
   }
 }
 
+function runWithStdin(
+  args: string[],
+  env: Record<string, string>,
+  input: string,
+  cwd?: string,
+): RunResult {
+  const opts: ExecFileSyncOptions = {
+    encoding: 'utf-8',
+    env: { ...process.env, ...env },
+    cwd,
+    input,
+    timeout: 60_000,
+  };
+  try {
+    const stdout = execFileSync('node', [CLI_PATH, ...args], opts) as string;
+    return { stdout, stderr: '', exitCode: 0 };
+  } catch (err) {
+    const e = err as { stdout: string; stderr: string; status: number };
+    return {
+      stdout: (e.stdout ?? '') as string,
+      stderr: (e.stderr ?? '') as string,
+      exitCode: e.status ?? 1,
+    };
+  }
+}
+
 interface DaemonHandle {
   stop: () => void;
   waitForExit: () => Promise<void>;
@@ -1069,10 +1095,42 @@ This monitor fires on a schedule.
       );
       expect(openedB.exitCode).toBe(0);
 
-      // BOTH active leads get their own hook heartbeat — as they would after
-      // both had genuinely submitted a prompt.
-      seedHeartbeat(fixture, 'hook', { hostSessionId: hostA });
-      seedHeartbeat(fixture, 'hook', { hostSessionId: hostB });
+      // BOTH active leads get their own hook heartbeat by running the REAL
+      // `hook deliver` with a `UserPromptSubmit` payload on stdin — exactly
+      // what `UserPromptSubmit` invokes in a live session — rather than
+      // `seedHeartbeat`'s hand-written JSON record (issue #425 review, round
+      // 11). A hand-seeded record proves `computeTransportHealth`'s
+      // aggregation logic in isolation, but it cannot catch a regression in
+      // the WIRING this test exists to protect: if `hook deliver` stopped
+      // forwarding `hostSessionId` from the payload, if `heartbeatKey`
+      // regressed to per-workspace keying, or if `sanitizeKey`'s hash suffix
+      // collided for two real session ids, every hand-seeded assertion above
+      // would stay green while the production path silently broke. Driving
+      // both sessions through the real command is what actually proves "two
+      // active leads that each genuinely submitted a prompt are both
+      // covered".
+      const deliverA = runWithStdin(
+        ['hook', 'deliver'],
+        fixture.env,
+        JSON.stringify({
+          session_id: hostA,
+          hook_event_name: 'UserPromptSubmit',
+          cwd: fixture.dir,
+        }),
+        fixture.dir,
+      );
+      expect(deliverA.exitCode).toBe(0);
+      const deliverB = runWithStdin(
+        ['hook', 'deliver'],
+        fixture.env,
+        JSON.stringify({
+          session_id: hostB,
+          hook_event_name: 'UserPromptSubmit',
+          cwd: fixture.dir,
+        }),
+        fixture.dir,
+      );
+      expect(deliverB.exitCode).toBe(0);
 
       const result = runWithEnv(
         ['doctor', '--workspace', fixture.dir, '--format', 'json'],
