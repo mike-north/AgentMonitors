@@ -31,6 +31,12 @@ by its `agentmon_ack` tool.
   acknowledged previously had that same band's own later reminder silently suppressed by the
   band-scoped coalesced-until-ack rule (an unacknowledged claim never suppresses a different,
   unrelated urgency band's reminder), with the remediation visible only in `monitor explain`.
+- **Acknowledging a whole session no longer risks a row an in-flight channel push is still
+  mid-surfacing.** `AgentMonitorRuntime.acknowledgeSession(sessionId)` (no explicit `eventIds`) now
+  excludes rows currently leased by an outstanding delivery reservation (issue #300). The reminder-
+  suppression diagnosis (`monitor explain`, `hook deliver --debug`) also gains a `reserved-in-flight`
+  `HookDeliveryHoldReason`/`ReminderSuppressionReason` for this case, so a live lease is never
+  reported (or explained) as something `events ack` can or should clear.
 - No change to notify/debounce timing, urgency bands, coalescing behavior, or the
   unread/claimed/acknowledged model. The legacy `inbox` CLI surface is untouched.
 

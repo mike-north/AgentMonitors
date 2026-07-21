@@ -1494,6 +1494,9 @@ export class AgentMonitorRuntime {
             // pending here or the reminder-suppression diagnosis would disagree
             // with what a real claim would decide.
             pendingCount: this.pendingForClaim(sessionId, urgency).length,
+            // Split out from claimedCount (round 10): a leased row is NOT a
+            // durable claim and must never be reported as one an ack can clear.
+            leasedCount: this.leasedPendingCount(sessionId, urgency),
           });
         }
       }
@@ -1709,8 +1712,22 @@ export class AgentMonitorRuntime {
   }
 
   acknowledgeSession(sessionId: string, eventIds?: string[]): void {
-    const ids =
-      eventIds ?? this.store.unreadEventsForSession(sessionId).map((e) => e.id);
+    let ids = eventIds;
+    if (!ids) {
+      // Exclude rows currently LEASED by an in-flight channel-push reservation
+      // (issue #300, PR #445 review round 10): acknowledging a leased-but-
+      // unclaimed row before the push resolves can permanently lose it — if
+      // the push later rejects/disconnects, `releaseDelivery` returns the row
+      // to `pending`, but it would already be (wrongly) acknowledged and would
+      // never redeliver. A scoped ack (explicit `eventIds`, e.g. from a hook
+      // body-injection instruction) is a deliberate caller choice naming rows
+      // it actually saw and is NOT filtered here.
+      const reserved = this.reservations.reservedEventIds(sessionId);
+      ids = this.store
+        .unreadEventsForSession(sessionId)
+        .filter((event) => !reserved.has(event.id))
+        .map((event) => event.id);
+    }
     this.store.acknowledgeEvents(sessionId, ids);
     this.refreshHookState(sessionId);
   }
@@ -1952,6 +1969,25 @@ export class AgentMonitorRuntime {
     const reserved = this.reservations.reservedEventIds(sessionId);
     if (reserved.size === 0) return pending;
     return pending.filter((event) => !reserved.has(event.id));
+  }
+
+  /**
+   * The count of a band's pending (unclaimed) events that are currently held
+   * out of {@link pendingForClaim} because they are LEASED by an outstanding
+   * reservation (006 §4, issue #300; PR #445 review round 10) — i.e. an
+   * in-flight channel push is mid-surfacing them, not a durable claim. Callers
+   * that explain WHY a coalesced reminder is held (`monitor explain`,
+   * {@link diagnoseHookDelivery}) need this split out from truly-claimed rows:
+   * a lease resolves itself (commit → claimed, or release/expiry → pending
+   * again) and must never be presented as something an `events ack` can or
+   * should clear.
+   */
+  private leasedPendingCount(sessionId: string, urgency?: Urgency): number {
+    const reserved = this.reservations.reservedEventIds(sessionId);
+    if (reserved.size === 0) return 0;
+    return this.store
+      .pendingEventsForSession(sessionId, urgency)
+      .filter((event) => reserved.has(event.id)).length;
   }
 
   /**
@@ -2297,13 +2333,16 @@ export class AgentMonitorRuntime {
       ).length;
       if (settledHighCount === 0) {
         const pendingNormal = this.pendingForClaim(sessionId, 'normal');
+        const leasedNormal = this.leasedPendingCount(sessionId, 'normal');
         // Claimed-ids must be derived from the store's actually-claimed set
         // (`pendingEventsForSession`, unaffected by an in-flight channel
         // lease), not from `pendingForClaim` (lease-filtered): a reserved
         // event is unread and unclaimed — `claimDelivery` has not run for it
         // — so treating it as "claimed" here would let the round-13 review's
         // scoped-ack remediation acknowledge a never-surfaced event, making it
-        // permanently unclaimable once the reservation later releases.
+        // permanently unclaimable once the reservation later releases. The
+        // separate `leasedCount` lets the classifier tell a pure in-flight
+        // lease (reserved-in-flight, never ack) apart from a real claim.
         const unclaimedNormal = this.store.pendingEventsForSession(
           sessionId,
           'normal',
@@ -2313,19 +2352,24 @@ export class AgentMonitorRuntime {
           unreadCounts.normal,
           pendingNormal.length,
           claimedIds(unreadNormal, unclaimedNormal),
+          leasedNormal,
         );
         if (normalHold) holds.push(normalHold);
       }
     } else if (lifecycle === 'turn-idle') {
       const pendingLow = this.pendingForClaim(sessionId, 'low');
+      const leasedLow = this.leasedPendingCount(sessionId, 'low');
       // See the `normal` branch above: claimed-ids must come from the
-      // lease-unaware store set, not the lease-filtered `pendingForClaim`.
+      // lease-unaware store set, not the lease-filtered `pendingForClaim`,
+      // and the lease count is threaded separately so a pure lease reads as
+      // reserved-in-flight rather than a claim.
       const unclaimedLow = this.store.pendingEventsForSession(sessionId, 'low');
       const lowHold = classifyReminderHold(
         'low',
         unreadCounts.low,
         pendingLow.length,
         claimedIds(unreadLow, unclaimedLow),
+        leasedLow,
       );
       if (lowHold) holds.push(lowHold);
     }

@@ -63,22 +63,61 @@ describe('diagnoseReminderSuppression', () => {
     expect(finding?.message).toContain('does not restore it');
   });
 
-  it('reports `already-claimed` when the sole unread normal row is leased, not claimed (issue #300, PR #445 review round 8)', () => {
-    // `pendingCount` is lease-aware (fed from `pendingForClaim`, which excludes
-    // rows held by an in-flight channel-push reservation) — so a leased-but-
-    // unclaimed row looks identical to a truly claimed one to this function:
-    // unreadCount=1, pendingCount=0 either way. Pinning this documents the
-    // known overlap rather than leaving it silently undocumented.
+  // Regression (PR #445 review round 10, issue #300): a row LEASED by an
+  // in-flight channel-push reservation is not durably claimed — it resolves
+  // itself (commit → claimed, or release/expiry → pending again). Round 8
+  // documented this as indistinguishable from `already-claimed`, which round
+  // 10 proved unsafe: the shared vocabulary recommended `events ack`, and
+  // acknowledging a leased-but-unseen row before the push resolves can
+  // permanently lose it if the push then fails. Callers (the runtime) now
+  // pass `leasedCount` explicitly so this is reported distinctly.
+  it('reports `reserved-in-flight` (never ack) when the sole unread normal row is leased, not claimed (issue #300, round 10)', () => {
     const counts: ReminderSessionCounts[] = [
-      { sessionId: 's1', urgency: 'normal', unreadCount: 1, pendingCount: 0 },
+      {
+        sessionId: 's1',
+        urgency: 'normal',
+        unreadCount: 1,
+        pendingCount: 0,
+        leasedCount: 1,
+      },
     ];
     const findings = diagnoseReminderSuppression(counts);
     expect(findings).toHaveLength(1);
     expect(findings[0]).toMatchObject({
       unreadCount: 1,
-      claimedCount: 1,
-      reason: 'already-claimed',
+      claimedCount: 0,
+      leasedCount: 1,
+      reason: 'reserved-in-flight',
     });
+    expect(findings[0]?.message).toContain(
+      'in-flight channel-push reservation',
+    );
+    expect(findings[0]?.message).not.toContain('agentmonitors events ack');
+    expect(findings[0]?.message).not.toMatch(/\back\b/i);
+  });
+
+  it('reports `coalesced-until-ack` (not `already-claimed`) when a normal band mixes a durable claim with a live lease (issue #300, round 10)', () => {
+    const counts: ReminderSessionCounts[] = [
+      {
+        sessionId: 's1',
+        urgency: 'normal',
+        unreadCount: 2,
+        pendingCount: 0,
+        leasedCount: 1,
+      },
+    ];
+    const findings = diagnoseReminderSuppression(counts);
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      unreadCount: 2,
+      claimedCount: 1,
+      leasedCount: 1,
+      reason: 'coalesced-until-ack',
+    });
+    expect(findings[0]?.message).toContain('agentmonitors events ack');
+    expect(findings[0]?.message).toContain(
+      'in-flight channel-push reservation',
+    );
   });
 
   it('reports `coalesced-until-ack` when unread normal events mix claimed and unclaimed (§9.2)', () => {

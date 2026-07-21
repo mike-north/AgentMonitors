@@ -11726,16 +11726,19 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
     }
   }, 30_000);
 
-  // PR #445 review round 8 (comment 3618177636): `pendingForClaim` (issue
-  // #300) hides a leased-but-unclaimed row from `normalPending`, so it looks
+  // PR #445 review round 8 (comment 3618177636) found `pendingForClaim` (issue
+  // #300) hides a leased-but-unclaimed row from `normalPending`, so it looked
   // IDENTICAL to a truly claimed row to the `already-claimed` reminder
-  // diagnosis — a leased, unclaimed, unread normal row is reported the same
-  // way a genuinely claimed one would be. This is documented (not fixed, since
-  // distinguishing it needs a new public `HookDeliveryHoldReason` variant),
-  // and pinned here against the REAL reservation state machine so the
-  // documented overlap can't silently regress into a different (wrong) reason
-  // or an unsuppressed reminder.
-  it('a mid-push leased row reads as `already-claimed` to `monitor explain`, exactly like a truly claimed row (issue #300, PR #445 review round 8)', async () => {
+  // diagnosis. Round 10 (discussion_r3619783264) proved that overlap unsafe:
+  // the shared `already-claimed` vocabulary recommends `events ack`, and
+  // `acknowledgeSession` (no explicit ids — the literal remedy the message
+  // pointed at) would then sweep the still-leased row, permanently losing it
+  // if the in-flight push later fails and the lease releases. This is now
+  // FIXED: a pure lease is reported via a distinct `reserved-in-flight`
+  // reason with `claimedCount: 0`, and `acknowledgeSession` excludes leased
+  // rows from its implicit "ack everything unread" set. Pinned here against
+  // the REAL reservation state machine.
+  it('a mid-push leased row reads as `reserved-in-flight` (never `already-claimed`, never ack-recommending) to `monitor explain`, and surviving an ack-all is safe (issue #300, PR #445 review round 10)', async () => {
     const f = await setupChannelCycle('leased-explain');
     try {
       let explainDuringLease: {
@@ -11750,6 +11753,7 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
               lifecycle: string;
               unreadCount: number;
               claimedCount: number;
+              leasedCount: number;
               reason: string;
               message: string;
             }[];
@@ -11761,9 +11765,9 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
         f.socket,
         async () => {
           // The channel's reservation is held here (before commit) — the row
-          // is leased, not claimed, but `pendingForClaim` excludes it either
-          // way. `explainMonitor` must still report it via the same
-          // `already-claimed` reason a truly claimed row gets.
+          // is leased, not claimed. `explainMonitor` must now distinguish it
+          // from a truly claimed row: `reserved-in-flight`, claimedCount 0,
+          // and no ack recommendation.
           const explain = runWithEnv(
             [
               'monitor',
@@ -11785,6 +11789,15 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
           explainDuringLease = JSON.parse(
             explain.stdout,
           ) as typeof explainDuringLease;
+
+          // The literal remedy an agent might run against the whole session
+          // while the push is still in flight must NOT lose this row.
+          const ackAll = runWithEnv(
+            ['events', 'ack', '--session', f.sessionId, '--socket', f.socket],
+            f.env,
+            f.ws,
+          );
+          expect(ackAll.exitCode).toBe(0);
         },
       );
 
@@ -11800,14 +11813,22 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
         urgency: 'normal',
         lifecycle: 'turn-interruptible',
         unreadCount: 1,
-        claimedCount: 1,
-        reason: 'already-claimed',
+        claimedCount: 0,
+        leasedCount: 1,
+        reason: 'reserved-in-flight',
       });
-      // The reason for suppression is genuinely a lease, not an acknowledged-
-      // pending claim — but the message vocabulary is shared (documented
-      // overlap, not a bug), and must not promise a fresh event restores it.
-      expect(findings?.[0]?.message).toContain('already claimed');
+      // A pure lease must never invite an ack — acknowledging it before the
+      // push resolves is exactly the data-loss trap round 10 found.
+      expect(findings?.[0]?.message).not.toContain('agentmonitors events ack');
+      expect(findings?.[0]?.message).not.toMatch(/\back\b/i);
       expect(findings?.[0]?.message).not.toContain('fresh');
+
+      // The ack-all run above must NOT have acknowledged the leased row: the
+      // channel push (still in flight during the explain/ack calls) commits
+      // after this block, and the row must genuinely surface as claimed, not
+      // silently vanish as already-acknowledged.
+      expect(deliveryStateOf(f)).toBe('claimed');
+      expect(unreadCount(f)).toBe(1);
     } finally {
       await teardown(f);
     }

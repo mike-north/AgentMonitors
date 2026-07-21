@@ -883,9 +883,19 @@ hold reason for anything not yet deliverable:
 - `settle-window` — pending high-urgency work exists but is not yet past the 15s claim-time settle
   window (§9.1 of [002](./002-runtime-delivery.md)).
 - `already-claimed` / `coalesced-until-ack` — the coalesced normal/low reminder ([002 §9.2/§9.3](./002-runtime-delivery.md))
-  is currently suppressed. This is the SAME vocabulary `monitor explain`'s reminder-suppression
-  diagnosis uses ([002 §10.7](./002-runtime-delivery.md), issue #333) — both surfaces explain the
-  identical coalescing guard and MUST agree on what to call it.
+  is currently suppressed by one or more DURABLY claimed (not yet acknowledged) rows of that band.
+  This is the SAME vocabulary `monitor explain`'s reminder-suppression diagnosis uses
+  ([002 §10.7](./002-runtime-delivery.md), issue #333) — both surfaces explain the identical
+  coalescing guard and MUST agree on what to call it. Acknowledging (`agentmonitors events ack`)
+  is the correct remedy for both.
+- `reserved-in-flight` — the coalesced reminder is suppressed, but NO row of the band is durably
+  claimed; at least one is instead currently LEASED by an in-flight channel-push reservation
+  (issue #300, PR #445 review round 10). A lease is not a claim — it resolves itself (the push
+  commits it as claimed, or fails/expires and returns it to pending) — so, unlike the other two
+  reasons, this one MUST NOT be presented alongside an acknowledge instruction: acknowledging a
+  leased-but-unseen row before the push resolves can permanently lose it if the push then fails.
+  `acknowledgeSession`'s implicit "ack everything unread" path excludes leased rows for the same
+  reason.
 - `deferred-by-cap` — settled high-urgency events existed but some were deferred by the transport's
   own 4000-char cap (§5.5); a hold reason owned by this transport, not the runtime.
 

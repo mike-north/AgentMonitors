@@ -1458,11 +1458,16 @@ monitor through the persisted pipeline state and returns stages for:
 5. Materialization: recent `monitor_events`
 6. Projection and delivery: `session_event_state` joined to `agent_sessions`, reported as
    `unread`, `claimed`, or `acknowledged`. When a session's unread normal/low events are already
-   claimed (so the coalesced turn-interruptible/turn-idle reminder of §9.2/§9.3 is currently
-   suppressed), this stage additionally reports a `reminderSuppression` finding per session-and-band
-   naming the reason — `already-claimed` or `coalesced-until-ack` — so a `null` claim is explainable
-   rather than silent (issue #333). The stage stays `ok` (the events are projected and claimed
-   correctly; the paused reminder is expected behavior, not a fault).
+   claimed OR leased (so the coalesced turn-interruptible/turn-idle reminder of §9.2/§9.3 is
+   currently suppressed), this stage additionally reports a `reminderSuppression` finding per
+   session-and-band naming the reason — `already-claimed` or `coalesced-until-ack` when at least one
+   unread event of the band is durably claimed, or `reserved-in-flight` (issue #300, PR #445 review
+   round 10) when none is durably claimed but at least one is LEASED by an in-flight channel-push
+   reservation — so a `null` claim is explainable rather than silent (issue #333). A lease is not a
+   claim and resolves itself, so `reserved-in-flight` findings never recommend `events ack`;
+   acknowledging a leased-but-unseen row before the push resolves could otherwise lose it
+   permanently if the push then fails. The stage stays `ok` (the events are projected and
+   claimed/leased correctly; the paused reminder is expected behavior, not a fault).
 
 Each stage carries a `status` of `ok`, `pending`, `healthy`, or `failure`:
 
