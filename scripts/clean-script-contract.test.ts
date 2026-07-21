@@ -339,6 +339,89 @@ describe('assertPackageCleanRemovesDistAndTemp', () => {
     ).toThrow(/must run `rm -rf`/);
   });
 
+  // Regression fixture for the round-4 #454 review finding (Copilot +
+  // adaptive-parser-001): an `exit` command's STATUS doesn't matter — a
+  // reached `exit` (even `exit 0`, which "succeeds") terminates the whole
+  // script immediately, so nothing chained after it via `&&` ever runs.
+  it('rejects "rm -rf dist temp" reachable only via `exit 0 && rm -rf dist temp` (round-4: exit terminates the script)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'exit 0 && rm -rf dist temp' } },
+        'test-package',
+      ),
+    ).toThrow(/must run `rm -rf`/);
+  });
+
+  // Regression fixture for the round-4 #454 review finding: a lone `&`
+  // backgrounds the ENTIRE preceding AND/OR list, not just the single
+  // command immediately before it — `rm -rf dist temp && echo done &
+  // echo next` backgrounds BOTH `rm -rf dist temp` and `echo done` as one
+  // asynchronous compound list, so the removal is never guaranteed
+  // complete by the time `echo next` (or anything after it) runs.
+  it('rejects "rm -rf dist temp" backgrounded via `rm -rf dist temp && echo done & echo next` (round-4: `&` backgrounds the whole AND/OR list)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        {
+          scripts: { clean: 'rm -rf dist temp && echo done & echo next' },
+        },
+        'test-package',
+      ),
+    ).toThrow(/must run `rm -rf`/);
+  });
+
+  // Regression fixture for the round-4 #454 review finding: an unescaped
+  // `$`/backtick (parameter/command expansion) is out of this lexer's
+  // scope and must be rejected fail-closed, not silently lexed as literal
+  // text — `rm -rf "$flag" dist temp` could expand `$flag` to `--help` (or
+  // anything else) at real shell runtime, hiding a no-op behind a
+  // syntactically-valid-looking `rm -rf` invocation.
+  it('rejects a clean script containing unescaped `$` expansion (round-4: parameter expansion is out of scope, fails closed)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        {
+          scripts: { clean: 'flag=--help; rm -rf "$flag" dist temp' },
+        },
+        'test-package',
+      ),
+    ).toThrow(/unsupported shell construct/);
+  });
+
+  // Regression fixture for the round-4 #454 review finding: an unterminated
+  // quote is a genuine shell syntax error (`/bin/sh` itself rejects it),
+  // not text the lexer should silently close on end-of-script.
+  it('rejects a clean script with an unterminated quote (round-4: fail closed on unterminated quote)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'rm -rf dist temp "' } },
+        'test-package',
+      ),
+    ).toThrow(/unterminated/);
+  });
+
+  // Regression fixture for the round-4 #454 review finding: a leading `&&`
+  // has no preceding command to gate — `/bin/sh` rejects this as a syntax
+  // error rather than treating `rm -rf dist temp` as guaranteed.
+  it('rejects a clean script beginning with a dangling `&&` (round-4: fail closed on leading operator)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: '&& rm -rf dist temp' } },
+        'test-package',
+      ),
+    ).toThrow(/dangling "&&"/);
+  });
+
+  // Regression fixture for the round-4 #454 review finding: a trailing
+  // `&&` has no following command to run — `/bin/sh` rejects this as a
+  // syntax error.
+  it('rejects a clean script ending with a dangling `&&` (round-4: fail closed on trailing operator)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'rm -rf dist temp &&' } },
+        'test-package',
+      ),
+    ).toThrow(/dangling "&&"/);
+  });
+
   // The real proof: every actual, on-disk package discovered by
   // `findApiExtractorPackageDirs` must satisfy the contract. If any future
   // package's `clean` script drifts back to a `dist`-only shape, this
@@ -718,6 +801,90 @@ describe('assertRootCleanRunsWorkspaceCleanAndReset', () => {
         },
       }),
     ).toThrow(/must invoke `nx run-many --target=clean`/);
+  });
+
+  // Regression fixture for the round-4 #454 review finding (Copilot +
+  // adaptive-parser-001): `exit 0` "succeeds", but a REACHED `exit`
+  // terminates the whole script — nothing chained after it via `&&` ever
+  // runs, so `run-many`/`reset` here are unreachable syntax garbage, not a
+  // real guaranteed chain.
+  it('rejects `exit 0 && run-many && reset` (round-4: exit terminates the script even on a "successful" status)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'exit 0 && NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace && NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/must invoke `nx run-many --target=clean`/);
+  });
+
+  // Regression fixture for the round-4 #454 review finding: a lone `&`
+  // backgrounds the ENTIRE preceding AND/OR list — `run-many && echo done &
+  // reset` backgrounds BOTH `run-many` and `echo done` as one asynchronous
+  // list, so the fan-out clean is never guaranteed complete by the time
+  // `reset` (freshly reachable after the `&`) runs.
+  it('rejects `run-many && echo done & reset` (round-4: `&` backgrounds the whole preceding AND/OR list)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace && echo done & NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/must invoke `nx run-many --target=clean`/);
+  });
+
+  // Regression fixture for the round-4 #454 review finding: unescaped `$`
+  // expansion must fail closed rather than being lexed as literal text.
+  it('rejects a root clean script containing unescaped `$` expansion (round-4: parameter expansion is out of scope, fails closed)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'flag=--help; NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace "$flag" && NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/unsupported shell construct/);
+  });
+
+  // Regression fixture for the round-4 #454 review finding: an
+  // unterminated quote is a genuine shell syntax error.
+  it('rejects a root clean script with an unterminated quote (round-4: fail closed on unterminated quote)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace && NX_TUI=false nx reset "',
+        },
+      }),
+    ).toThrow(/unterminated/);
+  });
+
+  // Regression fixture for the round-4 #454 review finding: a leading `&&`
+  // has no preceding command to gate.
+  it('rejects a root clean script beginning with a dangling `&&` (round-4: fail closed on leading operator)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            '&& NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace && NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/dangling "&&"/);
+  });
+
+  // Regression fixture for the round-4 #454 review finding: a trailing
+  // `&&` has no following command to run.
+  it('rejects a root clean script ending with a dangling `&&` (round-4: fail closed on trailing operator)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace && NX_TUI=false nx reset &&',
+        },
+      }),
+    ).toThrow(/dangling "&&"/);
   });
 
   // The real proof: the actual, on-disk root package.json.

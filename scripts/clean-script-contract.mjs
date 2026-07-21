@@ -245,6 +245,21 @@ function lexShellLike(script) {
         i++;
         continue;
       }
+      // An UNESCAPED `$`/backtick inside a double-quoted string is real
+      // parameter/command substitution syntax, not literal text — POSIX
+      // `sh` expands it. This lexer's documented scope explicitly excludes
+      // expansion (see the module doc), so rather than silently swallowing
+      // it as inert text (which would let e.g. `"$flag"` accept whatever
+      // literal argv the real shell expands it to, including a no-op
+      // control flag — round-4 #454 review finding), fail closed: reject
+      // the whole script as an unsupported construct.
+      if (ch === '$' || ch === '`') {
+        throw new Error(
+          `unsupported shell construct in clean script: unescaped "${ch}" ` +
+            `(parameter/command expansion) inside a double-quoted string is ` +
+            `not supported by this guard's lexer — got: ${JSON.stringify(script)}`,
+        );
+      }
       word += ch;
       wordOpen = true;
       continue;
@@ -276,6 +291,19 @@ function lexShellLike(script) {
       wordOpen = true;
       atWordStart = false;
       continue;
+    }
+
+    // An unquoted/unescaped `$`/backtick is also real expansion syntax
+    // outside quotes — same fail-closed rationale as the double-quoted
+    // case above (round-4 #454 review finding: `flag=--help; rm -rf $flag
+    // dist temp` would otherwise be lexed as the four literal words
+    // `rm`/`-rf`/`$flag`/`dist`/`temp`, hiding the real expanded argv).
+    if (ch === '$' || ch === '`') {
+      throw new Error(
+        `unsupported shell construct in clean script: unescaped "${ch}" ` +
+          `(parameter/command expansion) is not supported by this guard's ` +
+          `lexer — got: ${JSON.stringify(script)}`,
+      );
     }
 
     if (ch === '#' && atWordStart) {
@@ -324,8 +352,109 @@ function lexShellLike(script) {
     atWordStart = false;
   }
 
+  // A quote left open at end-of-script is a genuine shell syntax error —
+  // `/bin/sh` itself rejects it (exit status 2) rather than treating the
+  // rest of the (nonexistent) script as quoted text. Flushing the partial
+  // word as though the quote had closed would instead silently accept
+  // whatever commands happen to precede the unterminated quote as real,
+  // executed commands (round-4 #454 review finding: `rm -rf dist temp "`
+  // was accepted this way).
+  if (quote !== undefined) {
+    throw new Error(
+      `unsupported/invalid shell syntax in clean script: unterminated ${quote === '"' ? 'double' : 'single'}-quoted string — got: ${JSON.stringify(script)}`,
+    );
+  }
+
   flushCommand();
+  validateNoDanglingControlOperators(out);
   return out;
+}
+
+/**
+ * Fail closed on shell syntax this lexer's bounded grammar cannot make
+ * sense of: a leading `&&`/`||`/lone-`&` (no preceding command for `&&`/
+ * `||` to gate, or for a lone `&` to background), an `&&`/`||` left
+ * trailing with nothing after it to gate (unlike `&&`/`||`, a TRAILING
+ * lone `&` is ordinary, valid shell syntax — `rm -rf dist temp &` legally
+ * backgrounds the preceding command as a complete statement with nothing
+ * required after it), or two `&&`/`||`/`&` back-to-back with no real
+ * command between them. `/bin/sh` itself rejects every one of these
+ * (except the valid trailing `&`) with a syntax error rather than running
+ * anything — silently ignoring them (as a naive split/flatten would)
+ * accepts scripts where a required command is actually unreachable syntax
+ * garbage, not a real guaranteed step (round-4 #454 review finding: both
+ * `&& rm -rf dist temp` and `rm -rf dist temp &&` were accepted).
+ *
+ * A `;`/newline immediately before/after/between these is transparent —
+ * it's benign whitespace within `&&`/`||`'s own continuation (see
+ * {@link splitChainedCommands}), not itself a command boundary.
+ *
+ * @param {(LexedCommand | ShellOperator)[]} tokens
+ */
+function validateNoDanglingControlOperators(tokens) {
+  /** @param {ShellOperator} operator */
+  const isChainingOperator = (operator) =>
+    operator === '&&' || operator === '||' || operator === '&';
+  /** @param {ShellOperator} operator */
+  const requiresFollowingCommand = (operator) =>
+    operator === '&&' || operator === '||';
+
+  let firstIndex = 0;
+  while (
+    firstIndex < tokens.length &&
+    (tokens[firstIndex] === ';' || tokens[firstIndex] === '\n')
+  ) {
+    firstIndex++;
+  }
+  const first = tokens[firstIndex];
+  if (
+    first !== undefined &&
+    typeof first !== 'object' &&
+    isChainingOperator(first)
+  ) {
+    throw new Error(
+      `invalid shell syntax in clean script: begins with a dangling "${first}" ` +
+        'operator with no preceding command',
+    );
+  }
+
+  let lastIndex = tokens.length - 1;
+  while (
+    lastIndex >= 0 &&
+    (tokens[lastIndex] === ';' || tokens[lastIndex] === '\n')
+  ) {
+    lastIndex--;
+  }
+  const last = tokens[lastIndex];
+  if (
+    last !== undefined &&
+    typeof last !== 'object' &&
+    requiresFollowingCommand(last)
+  ) {
+    throw new Error(
+      `invalid shell syntax in clean script: ends with a dangling "${last}" ` +
+        'operator with no following command',
+    );
+  }
+
+  /** @type {ShellOperator | undefined} */
+  let pendingChainingOperator;
+  for (const token of tokens) {
+    if (token === ';' || token === '\n') {
+      continue; // transparent — see the function doc
+    }
+    if (typeof token !== 'object' && isChainingOperator(token)) {
+      if (pendingChainingOperator !== undefined) {
+        throw new Error(
+          `invalid shell syntax in clean script: "${pendingChainingOperator}" ` +
+            `immediately followed by "${token}" with no command between them`,
+        );
+      }
+      pendingChainingOperator = token;
+      continue;
+    }
+    pendingChainingOperator = undefined;
+  }
 }
 
 /**
@@ -351,6 +480,25 @@ function commandAlwaysFails(words) {
     return Number(words[1]) !== 0;
   }
   return false;
+}
+
+/**
+ * Whether a command's word list is the `exit` builtin, with or without a
+ * status argument. Distinct from {@link commandAlwaysFails}: `exit`'s
+ * defining effect isn't its exit STATUS (an `exit 0` succeeds exactly like
+ * any other successful command) — it's that a REACHED `exit` terminates
+ * the whole script immediately, so nothing chained after it (via `&&`,
+ * `||`, `;`, a newline, or `&`) ever runs, regardless of that command's own
+ * operator (round-4 #454 review finding: `exit 0 && rm -rf dist temp` and
+ * `exit 0 && <run-many> && <reset>` were both accepted, because a
+ * zero-status `exit` looked identical to any other successful command to
+ * logic that only tracked `lastStatus`).
+ *
+ * @param {string[]} words
+ * @returns {boolean}
+ */
+function isExitCommand(words) {
+  return words[0] === 'exit';
 }
 
 /**
@@ -390,6 +538,24 @@ function commandAlwaysFails(words) {
  * `rm -rf dist temp & echo done` was accepted as a single, non-backgrounded
  * command).
  *
+ * A REACHED `exit` (see {@link isExitCommand}) terminates the whole script:
+ * every command chained after it — via ANY operator, not just `&&`/`||` —
+ * never runs, so all of them are pushed `guaranteed: false` regardless of
+ * what their own operator would otherwise imply (round-4 #454 review
+ * finding: `exit 0 && rm -rf dist temp` was previously accepted, because
+ * `exit 0`'s zero status looked exactly like any other successful
+ * command's).
+ *
+ * A lone `&` backgrounds the ENTIRE preceding AND/OR list (every command
+ * chained by `&&`/`||` since the last unconditional `;`/newline/`&`
+ * boundary), not merely the single command immediately before it — POSIX
+ * backgrounds the whole compound list as one asynchronous job (round-4
+ * #454 review finding: `rm -rf dist temp && echo done & echo next` only
+ * marked `echo done` non-guaranteed, leaving the earlier `rm -rf dist temp`
+ * wrongly counted as guaranteed even though it's part of the same
+ * backgrounded list and may still be running when the foreground
+ * continuation proceeds).
+ *
  * Mirrors the split delimiters (though not the guaranteed/unguaranteed
  * distinction) in `api-report-ci-wiring.mjs`'s `splitChainedCommands` —
  * kept local so this module has no import-time dependency on that one's
@@ -405,6 +571,15 @@ function splitChainedCommands(script) {
   let pendingOperator;
   /** @type {'success' | 'fail'} */
   let lastStatus = 'success'; // vacuous: only consulted once a command has run
+  // Index (into `commands`) where the CURRENT AND/OR list began — every
+  // command from here to the end is chained by `&&`/`||` off one another,
+  // with no intervening unconditional `;`/newline/`&` boundary. Reset to
+  // `commands.length` every time a command starts a fresh, unconditional
+  // statement, so a lone `&` can background the whole list at once.
+  let currentListStart = 0;
+  // Once a REACHED `exit` command is seen, the script has terminated —
+  // every subsequent command (however it's chained) never runs.
+  let terminated = false;
 
   for (const token of lexShellLike(script)) {
     if (token === ';' || token === '\n') {
@@ -418,13 +593,14 @@ function splitChainedCommands(script) {
     }
 
     if (token === '&') {
-      // Background the command just pushed (distinct from `&&`, handled
-      // below), then behave exactly like `;`/newline for what follows.
-      const last = commands[commands.length - 1];
-      if (last) {
-        last.guaranteed = false;
+      // Background the WHOLE current AND/OR list (every command since
+      // `currentListStart`), then behave exactly like `;`/newline for what
+      // follows: the next command starts a fresh, unconditional statement.
+      for (let i = currentListStart; i < commands.length; i++) {
+        commands[i].guaranteed = false;
       }
       pendingOperator = undefined;
+      currentListStart = commands.length;
       continue;
     }
 
@@ -439,18 +615,25 @@ function splitChainedCommands(script) {
     const { words } = token;
 
     let reachable;
-    if (pendingOperator === '&&') {
+    if (terminated) {
+      // Nothing after a reached `exit` ever runs, no matter its operator.
+      reachable = false;
+    } else if (pendingOperator === '&&') {
       reachable = lastStatus === 'success';
     } else if (pendingOperator === '||') {
       reachable = lastStatus === 'fail';
     } else {
       reachable = true; // first command, or a fresh `;`/newline/`&` statement
+      currentListStart = commands.length; // this command starts a new list
     }
 
     commands.push({ words, guaranteed: reachable });
 
     if (reachable) {
       lastStatus = commandAlwaysFails(words) ? 'fail' : 'success';
+      if (isExitCommand(words)) {
+        terminated = true;
+      }
     }
     // If NOT reachable (this command was skipped), `lastStatus` carries
     // forward UNCHANGED — see the function doc for why.
