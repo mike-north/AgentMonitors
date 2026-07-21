@@ -687,17 +687,18 @@ describe('computeTransportHealth', () => {
     });
 
     it('never matches a hook record by host session id across workspaces (issue #425 review)', () => {
-      // The hook transport has no per-session identity of its own — its
-      // record is keyed and overwritten per WORKSPACE (a fresh short-lived
-      // process per prompt), so a record belonging to THIS host session but a
+      // Hook records are keyed per session in the registry (issue #425
+      // review, round 6 follow-up), but `selectHeartbeats` still matches hook
+      // candidates by SAME-WORKSPACE first, never by host session id across a
+      // workspace boundary. A record belonging to THIS host session but a
       // DIFFERENT workspace is stale evidence about a workspace this session
-      // no longer leads, not a live mismatch. Session-id-first matching is
-      // only correct for the long-lived, per-session `channel` transport;
-      // applying it to `hook` too would report a false `workspace-mismatch`
-      // (with "restart the transport" remediation) for a session that simply
-      // has not yet submitted its first prompt in ITS current workspace —
-      // even though hooks re-resolve and self-heal on every prompt with no
-      // action needed.
+      // no longer leads, not a live mismatch — a fresh short-lived `hook
+      // deliver` process re-resolves and self-heals on every prompt with no
+      // action needed. Session-id-first cross-workspace matching is only
+      // correct for the long-lived `channel` transport; applying it to `hook`
+      // too would report a false `workspace-mismatch` (with "restart the
+      // transport" remediation) for a session that simply has not yet
+      // submitted its first prompt in ITS current workspace.
       const health = computeTransportHealth(
         input({
           workspacePath: '/repos/workspace-b',

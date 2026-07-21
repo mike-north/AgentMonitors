@@ -788,8 +788,8 @@ export const doctorCommand = new Command('doctor')
         // workspace, including ones a prior `session.close` already marked
         // `dormant`. A dormant session has no live host process to deliver
         // to, so counting it let a merely-fresh heartbeat (its TTL had not
-        // yet lapsed, or a NEW session's hook already refreshed the
-        // per-workspace hook record) report `deliverable: true` for a
+        // yet lapsed, or a NEW session's hook already left its own record)
+        // report `deliverable: true` for a
         // recipient nothing can actually reach. Derived ONCE here and threaded
         // through every check/diagnosis/JSON field that gates on "is a
         // session currently open" — see `buildChecks`'s doc comment for why a

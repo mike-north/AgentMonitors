@@ -110,7 +110,7 @@ export interface TransportHeartbeat {
   workspacePath: string;
   /** Daemon socket path the writer bound to. */
   socketPath: string;
-  /** Host session id, when the transport is session-scoped (channel). */
+  /** Host session id, when known — both transports are session-scoped. */
   hostSessionId?: string;
   /** AgentMon session id the transport resolved, once it has one. */
   sessionId?: string;
@@ -185,13 +185,15 @@ function heartbeatPath(transport: TransportName, key: string): string {
 /**
  * The registry key for a transport's record.
  *
- * `channel serve` is one long-lived process per host session, so its record is
- * keyed by host session id — that is exactly what lets `doctor` ask "is *my*
- * session's channel bound to *my* workspace?" and detect a cross-workspace
- * binding. `hook deliver`, by contrast, is a fresh short-lived process per
- * prompt with no stable identity of its own; keying it per-process would
- * accumulate garbage, so its record is per-workspace and each invocation
- * overwrites the last (the newest activity is the only interesting one).
+ * Both transports are keyed by host session id when one is known: `channel
+ * serve` is one long-lived process per host session, and `hook deliver` — a
+ * fresh short-lived process per prompt — is keyed per SESSION rather than
+ * per process, so a session's own record survives across prompts and is
+ * overwritten in place by that session's next invocation, not by another
+ * session's. Per-session keying is exactly what lets `doctor` ask "is *my*
+ * session's transport bound to *my* workspace?" and "has *every* active lead
+ * left its own evidence?" — see {@link heartbeatKey}'s body for why hook was
+ * changed from per-workspace to per-session keying.
  */
 export function heartbeatKey(
   transport: TransportName,

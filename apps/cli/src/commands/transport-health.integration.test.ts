@@ -282,9 +282,15 @@ This monitor fires on a schedule.
       ttlMs: 30_000,
       ...overrides,
     };
-    const key = transport === 'channel' ? hostSessionId : 'workspace';
+    // Both transports are keyed per host session in the real registry
+    // (`heartbeatKey`, issue #425 review, round 6 follow-up) — using distinct
+    // filenames per session here, rather than a shared literal name, is load
+    // bearing: two hook heartbeats seeded for two different sessions must
+    // land in two different files, or the second seed would silently
+    // overwrite the first and no test could ever prove two active leads are
+    // simultaneously covered.
     writeFileSync(
-      path.join(registry, `${transport}-${key}.json`),
+      path.join(registry, `${transport}-${hostSessionId}.json`),
       JSON.stringify(record, null, 2),
       'utf-8',
     );
@@ -1004,6 +1010,90 @@ This monitor fires on a schedule.
       );
       expect(hook?.healthy).toBe(false);
       expect(payload.deliverable).toBe(false);
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+    }
+  }, 30_000);
+
+  // --- Positive control: TWO active leads, each covered by its OWN hook
+  // record (issue #425 review round 10) --------------------------------------
+  // The round-6-follow-up production fix (per-session hook keying) is only
+  // proven by the negative case above, where a SECOND lead's record is
+  // deliberately withheld — that alone can't tell "per-session keying works"
+  // apart from "a wiring regression makes every hook record collide into one
+  // file", because a collision would still leave exactly one record on disk,
+  // which is indistinguishable from the uncovered lead's absent one. This
+  // case seeds both leads' hook heartbeats and asserts BOTH records survive
+  // and the workspace is fully deliverable — a coverage collapse back to a
+  // single shared record would fail it.
+  it('reports full hook coverage when every active lead has its own hook record', async () => {
+    const fixture = transportFixture('hook-multi-lead-covered');
+    const daemon = await startDaemon(
+      fixture.monitorsRoot,
+      fixture.dir,
+      fixture.env,
+      fixture.socketPath,
+    );
+    try {
+      const hostA = 'hook-multi-lead-covered-a';
+      const hostB = 'hook-multi-lead-covered-b';
+      const openedA = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          hostA,
+          '--workspace',
+          fixture.dir,
+          '--format',
+          'json',
+        ],
+        fixture.env,
+        fixture.dir,
+      );
+      expect(openedA.exitCode).toBe(0);
+      const openedB = runWithEnv(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          hostB,
+          '--workspace',
+          fixture.dir,
+          '--format',
+          'json',
+        ],
+        fixture.env,
+        fixture.dir,
+      );
+      expect(openedB.exitCode).toBe(0);
+
+      // BOTH active leads get their own hook heartbeat — as they would after
+      // both had genuinely submitted a prompt.
+      seedHeartbeat(fixture, 'hook', { hostSessionId: hostA });
+      seedHeartbeat(fixture, 'hook', { hostSessionId: hostB });
+
+      const result = runWithEnv(
+        ['doctor', '--workspace', fixture.dir, '--format', 'json'],
+        fixture.env,
+        fixture.dir,
+      );
+      const payload = JSON.parse(result.stdout) as {
+        transports: {
+          name: string;
+          healthy: boolean;
+          problems: { code: string }[];
+        }[];
+        deliverable: boolean;
+      };
+      const hook = payload.transports.find((t) => t.name === 'hook');
+      expect(hook?.problems.map((p) => p.code)).not.toContain(
+        'hook-lead-uncovered',
+      );
+      expect(hook?.healthy).toBe(true);
+      expect(payload.deliverable).toBe(true);
+      expect(result.exitCode).toBe(0);
     } finally {
       daemon.stop();
       await daemon.waitForExit();
