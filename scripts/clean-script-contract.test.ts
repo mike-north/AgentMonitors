@@ -422,6 +422,102 @@ describe('assertPackageCleanRemovesDistAndTemp', () => {
     ).toThrow(/dangling "&&"/);
   });
 
+  // Regression fixture requested by Copilot's round-4 #454 review comment:
+  // `exit 0;` (not just `exit 0 &&`) must also be covered — `/bin/sh` exits
+  // immediately on a reached `exit`, so nothing after it, chained by ANY
+  // operator, ever runs.
+  it('rejects "rm -rf dist temp" reachable only via `exit 0; rm -rf dist temp` (exit terminates regardless of the following operator)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'exit 0; rm -rf dist temp' } },
+        'test-package',
+      ),
+    ).toThrow(/must run `rm -rf`/);
+  });
+
+  // Regression fixture for the round-5 #454 review finding: an
+  // assignment-prefixed `exit` (`X=1 exit 0`) is still the `exit` builtin —
+  // POSIX allows any number of leading `NAME=value` words before a special
+  // builtin, and the assignment doesn't change its script-terminating
+  // effect.
+  it('rejects "rm -rf dist temp" reachable only via `X=1 exit 0 && rm -rf dist temp` (assignment-prefixed exit still terminates)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'X=1 exit 0 && rm -rf dist temp' } },
+        'test-package',
+      ),
+    ).toThrow(/must run `rm -rf`/);
+  });
+
+  // Regression fixture for the round-5 #454 review finding: `false` is not
+  // the only way to invoke a deterministically-failing command — any path
+  // form of the real `false` utility (`/bin/false`, `/usr/bin/false`, …)
+  // fails identically, so a `&&`-chained required command after it is
+  // exactly as unreachable as after the bare `false` builtin.
+  it('rejects "rm -rf dist temp" reachable only via `/usr/bin/false && rm -rf dist temp` (path-qualified `false` still always fails)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: '/usr/bin/false && rm -rf dist temp' } },
+        'test-package',
+      ),
+    ).toThrow(/must run `rm -rf`/);
+  });
+
+  // Regression fixture for the round-5 #454 review finding: `exit 0 &`
+  // backgrounds `exit` into a SUBSHELL — a special builtin running inside a
+  // subshell only terminates that subshell, not the main script, so the
+  // unconditional `rm -rf dist temp` afterwards still runs and must be
+  // accepted (this is the inverse of the other `exit` fixtures: a
+  // previously over-strict guard wrongly REJECTED this valid script).
+  it('accepts "rm -rf dist temp" reachable via `exit 0 & rm -rf dist temp` (a backgrounded exit only terminates its own subshell)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'exit 0 & rm -rf dist temp' } },
+        'test-package',
+      ),
+    ).not.toThrow();
+  });
+
+  // Regression fixture for the round-5 #454 review finding: a leading `;`
+  // has no preceding command to separate — `/bin/sh -n` rejects it as a
+  // syntax error, but earlier code treated a leading `;` as transparent,
+  // identically to a benign leading newline.
+  it('rejects a clean script beginning with a dangling `;` (fail closed on a leading separator with no preceding command)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: '; rm -rf dist temp' } },
+        'test-package',
+      ),
+    ).toThrow(/dangling ";"/);
+  });
+
+  // Regression fixture for the round-5 #454 review finding: `;` cannot
+  // complete a pending `&&`/`||`'s right-hand side the way a newline can —
+  // `/bin/sh -n` rejects `true &&; rm -rf dist temp` with a syntax error,
+  // but earlier code treated the `;` as benign continuation whitespace.
+  it('rejects a clean script with `&&` immediately followed by `;` (fail closed — only a newline may continue a pending `&&`/`||`)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'true &&; rm -rf dist temp' } },
+        'test-package',
+      ),
+    ).toThrow(/"&&" immediately followed by ";"/);
+  });
+
+  // Regression fixture for the round-5 #454 review finding: an unquoted
+  // `<`/`>` is real I/O redirection, out of this lexer's scope — folding it
+  // into ordinary argv would accept `rm -rf dist temp < /nonexistent`, even
+  // though `/bin/sh` fails the redirection (no such file) BEFORE `rm` ever
+  // runs.
+  it("rejects a clean script containing an unquoted redirection operator (fails closed — redirection is out of this lexer's scope)", () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'rm -rf dist temp < /nonexistent' } },
+        'test-package',
+      ),
+    ).toThrow(/unsupported shell construct/);
+  });
+
   // The real proof: every actual, on-disk package discovered by
   // `findApiExtractorPackageDirs` must satisfy the contract. If any future
   // package's `clean` script drifts back to a `dist`-only shape, this
@@ -885,6 +981,105 @@ describe('assertRootCleanRunsWorkspaceCleanAndReset', () => {
         },
       }),
     ).toThrow(/dangling "&&"/);
+  });
+
+  // Regression fixture requested by Copilot's round-4 #454 review comment:
+  // `exit 0;` (not just `exit 0 &&`) must also be covered.
+  it('rejects `exit 0; run-many; reset` (exit terminates regardless of the following operator)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'exit 0; NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace; NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/must invoke `nx run-many --target=clean`/);
+  });
+
+  // Regression fixture for the round-5 #454 review finding: an
+  // assignment-prefixed `exit` (`X=1 exit 0`) is still the `exit` builtin
+  // and still terminates the script.
+  it('rejects `X=1 exit 0 && run-many && reset` (assignment-prefixed exit still terminates)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'X=1 exit 0 && NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace && NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/must invoke `nx run-many --target=clean`/);
+  });
+
+  // Regression fixture for the round-5 #454 review finding: any path form
+  // of the real `false` utility (not just the bare `false` word) fails
+  // identically, so it must gate a following `&&` exactly like `false`
+  // does.
+  it('rejects `/usr/bin/false && run-many && reset` (path-qualified `false` still always fails)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            '/usr/bin/false && NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace && NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/must invoke `nx run-many --target=clean`/);
+  });
+
+  // Regression fixture for the round-5 #454 review finding: `exit 0 &`
+  // backgrounds `exit` into a subshell, so the unconditional `run-many`/
+  // `reset` afterwards still runs and must be ACCEPTED — the inverse of
+  // the other `exit` fixtures (a previously over-strict guard wrongly
+  // rejected this valid script).
+  it('accepts `exit 0 & run-many && reset` (a backgrounded exit only terminates its own subshell)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'exit 0 & NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace && NX_TUI=false nx reset',
+        },
+      }),
+    ).not.toThrow();
+  });
+
+  // Regression fixture for the round-5 #454 review finding: a leading `;`
+  // has no preceding command to separate and is invalid syntax.
+  it('rejects a root clean script beginning with a dangling `;`', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            '; NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace && NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/dangling ";"/);
+  });
+
+  // Regression fixture for the round-5 #454 review finding: only a newline
+  // may continue a pending `&&`/`||` — a `;` immediately after cannot.
+  it('rejects a root clean script with `&&` immediately followed by `;`', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'true &&; NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace && NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/"&&" immediately followed by ";"/);
+  });
+
+  // Regression fixture for the round-5 #454 review finding: an unquoted
+  // `<`/`>` is real I/O redirection, out of this lexer's scope — folding
+  // it into ordinary argv would let a failed redirection's target words
+  // masquerade as real required-command argv.
+  it('rejects a root clean script containing an unquoted redirection operator', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace < /nonexistent && NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/unsupported shell construct/);
   });
 
   // The real proof: the actual, on-disk root package.json.
