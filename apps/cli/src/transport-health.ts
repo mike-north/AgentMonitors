@@ -367,16 +367,20 @@ function bindingProblems(
  * NON-EMPTY array of ids rather than absent, empty, or malformed.
  *
  * Only ever called on `already-claimed` / `coalesced-until-ack` holds (see
- * {@link suppressionProblems}'s filter) — `settle-window` holds, the one
- * reason an empty `claimedEventIds` is legitimate, never reach this function.
- * For the two reasons this IS called on, `classifyReminderHold` only ever
- * returns a hold when `claimedCount > 0`, so a real hold from this build
- * always names at least one id; an empty array here can only mean the value
- * came from something other than that classifier — a malformed daemon
- * response, or a hand-built `HookDeliveryHold` — and must be treated exactly
- * like a missing one (issue #425 review, round 8), not folded into the
- * scoped-remediation branch, where an empty `ids` list renders the flag as
- * omitted and silently falls back to acknowledging every unread event.
+ * {@link suppressionProblems}'s filter) — `settle-window` holds are one
+ * legitimate source of an empty `claimedEventIds`; never reaching this
+ * function. A second, from-this-build source is a hold entirely held back
+ * by an in-flight channel LEASE rather than an actual claim: `claimedCount`
+ * (derived from the lease-aware `pendingCount`) counts a merely-reserved,
+ * still-unclaimed row as held, but `claimedEventIds` — since the issue #425
+ * review round 13 fix — is derived independently from the store's true
+ * claimed/unclaimed set, so it correctly omits that row. `claimedCount > 0`
+ * therefore no longer implies a non-empty `claimedEventIds`. Either source of
+ * an empty array — that one, or a malformed daemon response / a hand-built
+ * `HookDeliveryHold` from an older build (issue #425 review, round 8) — must
+ * be treated the same: not folded into the scoped-remediation branch, where
+ * an empty `ids` list renders the flag as omitted and silently falls back to
+ * acknowledging every unread event.
  *
  * `HookDeliveryHold.claimedEventIds` is optional precisely because a
  * `HookDeliveryDiagnosis` can arrive over the daemon IPC boundary from a build

@@ -2260,21 +2260,35 @@ export class AgentMonitorRuntime {
       ).length;
       if (settledHighCount === 0) {
         const pendingNormal = this.pendingForClaim(sessionId, 'normal');
+        // Claimed-ids must be derived from the store's actually-claimed set
+        // (`pendingEventsForSession`, unaffected by an in-flight channel
+        // lease), not from `pendingForClaim` (lease-filtered): a reserved
+        // event is unread and unclaimed — `claimDelivery` has not run for it
+        // — so treating it as "claimed" here would let the round-13 review's
+        // scoped-ack remediation acknowledge a never-surfaced event, making it
+        // permanently unclaimable once the reservation later releases.
+        const unclaimedNormal = this.store.pendingEventsForSession(
+          sessionId,
+          'normal',
+        );
         const normalHold = classifyReminderHold(
           'normal',
           unreadCounts.normal,
           pendingNormal.length,
-          claimedIds(unreadNormal, pendingNormal),
+          claimedIds(unreadNormal, unclaimedNormal),
         );
         if (normalHold) holds.push(normalHold);
       }
     } else if (lifecycle === 'turn-idle') {
       const pendingLow = this.pendingForClaim(sessionId, 'low');
+      // See the `normal` branch above: claimed-ids must come from the
+      // lease-unaware store set, not the lease-filtered `pendingForClaim`.
+      const unclaimedLow = this.store.pendingEventsForSession(sessionId, 'low');
       const lowHold = classifyReminderHold(
         'low',
         unreadCounts.low,
         pendingLow.length,
-        claimedIds(unreadLow, pendingLow),
+        claimedIds(unreadLow, unclaimedLow),
       );
       if (lowHold) holds.push(lowHold);
     }
