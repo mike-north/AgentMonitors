@@ -200,7 +200,9 @@ content the hook path injects**, not a lesser summary. Two claim shapes render d
 
   ```text
   ### <monitor_id> (<urgency>)
-  <title>
+  <title — the monitor's authored name, 002 §5.4>
+  <objectDetail — the source's per-object text, omitted when identical to the title OR the body>
+  <digest — the recipient-visible summary (Interpret digest when produced), omitted when identical to the title, the body, OR the objectDetail line above>
 
   <body — the monitor author's instructions for this event>
 
@@ -208,7 +210,22 @@ content the hook path injects**, not a lesser summary. Two claim shapes render d
   <bounded diffText — the change summary>
   ```
 
-  The `Changes:` section appears only when the event carries a non-empty `diffText`. The change
+  The detail line is `DeliveryEventSummary.objectDetail` — the source's **deterministic** per-object
+  text, never an Interpret digest (002 §1.1.8) — and it is what names the specific object that moved
+  (`` `Incoming change: docs/specs/001.md (modified)` ``). It is omitted in two cases: when it repeats
+  the title, which happens for a monitor with no authored `name` (002 §5.4's fallback); and when it
+  repeats the body, which happens when a source supplies only `title` + `body` and materialization
+  derives the absent `Observation.summary` from `body` (002 §5.1) — without this second check the body
+  would render twice, once as the detail line and once below it. An additional digest line renders
+  `DeliveryEventSummary.summary` — the recipient-visible field, which is an Interpret digest when one
+  was produced for this recipient (§1.1.6/§1.1.8 of 002) — whenever it says something the lines above
+  do not: it is omitted when it equals the title, the body, OR the `objectDetail` line (the common
+  case where no digest was produced and `summary` degrades to the same deterministic chain as
+  `objectDetail`, which would otherwise duplicate that line). This keeps both a multi-object source's
+  object identity AND a successful Interpret summarization in the delivered text — dropping either
+  would either silently lose which object an event is about, or silently discard the digest a
+  multi-object `prose` monitor relies on (issue #449 review). The `Changes:` section appears only
+  when the event carries a non-empty `diffText`. The change
   summary is **bounded** per event (currently 800 chars) with an explicit elision marker
   (`… (change summary truncated)`) — a raw diff can be arbitrarily large and the tag body lands in
   the agent's context window (§4.6). This is exactly the block the hook-deliver transport renders

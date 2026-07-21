@@ -11,6 +11,7 @@ import type {
 import {
   OPERATION_TIMEOUT_PATTERN,
   diffKeyedCollection,
+  displayObjectKey,
   parseKeyedCollectionConfig,
   parseOperationTimeoutMs,
 } from '@agentmonitors/core';
@@ -608,8 +609,8 @@ function changedObservation(
   result: ExecResult,
 ): Observation {
   return {
-    title: `Command output changed: ${scope.objectKey}`,
-    summary: `Command output changed: ${scope.objectKey}`,
+    title: `Command output changed: ${displayObjectKey(scope.objectKey)}`,
+    summary: `Command output changed: ${displayObjectKey(scope.objectKey)}`,
     payload: {
       command: scope.command,
       exitCode: result.exitCode,
@@ -838,8 +839,8 @@ function failingObservation(
   outcome: Extract<ExecOutcome, { kind: 'failure' }>,
 ): Observation {
   return {
-    title: `Command failing: ${scope.objectKey}`,
-    summary: `Command failing: ${scope.objectKey}`,
+    title: `Command failing: ${displayObjectKey(scope.objectKey)}`,
+    summary: `Command failing: ${displayObjectKey(scope.objectKey)}`,
     payload: {
       command: scope.command,
       error: outcome.error,
@@ -854,8 +855,8 @@ function failingObservation(
 /** Health observation for the `failing → ok` edge (003 §11.5). */
 function recoveredObservation(scope: ScopeConfig): Observation {
   return {
-    title: `Command recovered: ${scope.objectKey}`,
-    summary: `Command recovered: ${scope.objectKey}`,
+    title: `Command recovered: ${displayObjectKey(scope.objectKey)}`,
+    summary: `Command recovered: ${displayObjectKey(scope.objectKey)}`,
     payload: { command: scope.command },
     objectKey: scope.objectKey,
     queryScope: { command: scope.objectKey },

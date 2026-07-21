@@ -394,9 +394,12 @@ Tell the agent an incoming change landed.
   assert.equal(incomingEvents.length, 1);
   const incomingEvent = incomingEvents[0];
   assert.ok(incomingEvent);
-  // spec 003 §6.2: title is "Incoming change: <path> (<changeKind>)"
+  // spec 002 §5.4: the event title is the monitor's authored name
+  assert.equal(incomingEvent.title, 'Watch incoming');
+  // spec 003 §6.2: the source's own text — "Incoming change: <path>
+  // (<changeKind>)" — is carried by summary
   assert.equal(
-    incomingEvent.title,
+    incomingEvent.summary,
     'Incoming change: tracked/file.txt (modified)',
   );
   // spec 003 §2.3 + §6.2: runtime copies changeKind into queryScope.changeKind

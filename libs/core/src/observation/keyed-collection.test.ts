@@ -411,3 +411,138 @@ describe('diffKeyedCollection — key handling', () => {
     ).toThrow(/not unique/);
   });
 });
+
+// Issue #449 review: the scope-half truncation branch had no direct coverage —
+// the suite only used the short `mon` scope, so reverting the bound would have
+// stayed green. A `command-poll` collection's scope is the joined argv, which is
+// exactly the unbounded case (003 §2.8).
+describe('diffKeyedCollection — long monitor scope in display text (003 §2.8)', () => {
+  /** A joined-argv-shaped scope well past the 60-char display bound. */
+  const LONG_SCOPE = `sh -c gh pr list --json number,state --jq ${'[.[] | {number}]'.repeat(6)}`;
+
+  function diffWithScope(
+    previous: unknown,
+    current: unknown,
+  ): ReturnType<typeof diffKeyedCollection> {
+    const base = diffKeyedCollection(
+      previous,
+      TASKS_CONFIG,
+      LONG_SCOPE,
+      undefined,
+    );
+    return diffKeyedCollection(
+      current,
+      TASKS_CONFIG,
+      LONG_SCOPE,
+      base.snapshot,
+    );
+  }
+
+  it('bounds the scope half of the title while keeping the item key whole', () => {
+    const result = diffWithScope(
+      { tasks: [{ id: 'pr-443', state: 'OPEN' }] },
+      { tasks: [{ id: 'pr-443', state: 'MERGED' }] },
+    );
+
+    const obs = result.observations[0];
+    expect(obs).toBeDefined();
+    // The scope is truncated in DISPLAY text…
+    expect(obs?.title).not.toContain(LONG_SCOPE);
+    expect(obs?.title).toContain('…');
+    // …but the informative per-item key is never cut off by it.
+    expect(obs?.title?.endsWith('#pr-443')).toBe(true);
+    expect(obs?.summary).toBe(obs?.title);
+    // …while the full `<scope>#<key>` identity is preserved untouched.
+    expect(obs?.objectKey).toBe(`${LONG_SCOPE}#pr-443`);
+    expect(obs?.queryScope?.['objectKey']).toBe(`${LONG_SCOPE}#pr-443`);
+  });
+
+  it('keeps a long item key whole even though the scope is bounded', () => {
+    const longKey = `pr-${'9'.repeat(80)}`;
+    const result = diffWithScope(
+      { tasks: [{ id: longKey, state: 'OPEN' }] },
+      { tasks: [{ id: longKey, state: 'MERGED' }] },
+    );
+
+    const obs = result.observations[0];
+    // The item key is the informative half — it is never truncated, even when
+    // it alone exceeds the scope bound.
+    expect(obs?.title?.endsWith(`#${longKey}`)).toBe(true);
+    expect(obs?.objectKey).toBe(`${LONG_SCOPE}#${longKey}`);
+  });
+});
+
+describe('diffKeyedCollection — displayScope credential redaction (issue #449 review)', () => {
+  // A credential-bearing monitor scope, mirroring api-poll's URL-as-scope
+  // shape. Regression: the older behavior always interpolated
+  // `monitorObjectKey` itself into the display title/summary, so a
+  // keyed-collection observation from a URL-scoped source (api-poll) would
+  // leak userinfo/query credentials into durable, delivered text even though
+  // the equivalent non-collection branch had already been redacted.
+  const RAW_SCOPE =
+    'https://user:pass@status.example.com/incidents?token=secret#frag';
+  const REDACTED_SCOPE = 'https://status.example.com/incidents';
+
+  function diffWithDisplayScope(
+    previous: unknown,
+    current: unknown,
+  ): ReturnType<typeof diffKeyedCollection> {
+    const base = diffKeyedCollection(
+      previous,
+      TASKS_CONFIG,
+      RAW_SCOPE,
+      undefined,
+      undefined,
+      REDACTED_SCOPE,
+    );
+    return diffKeyedCollection(
+      current,
+      TASKS_CONFIG,
+      RAW_SCOPE,
+      base.snapshot,
+      undefined,
+      REDACTED_SCOPE,
+    );
+  }
+
+  it('renders title/summary from the redacted displayScope, never the raw credential-bearing scope', () => {
+    const result = diffWithDisplayScope(
+      { tasks: [{ id: 'incident-1', state: 'OPEN' }] },
+      { tasks: [{ id: 'incident-1', state: 'RESOLVED' }] },
+    );
+
+    const obs = result.observations[0];
+    expect(obs).toBeDefined();
+    expect(obs?.title).toBe(
+      'Item changed: https://status.example.com/incidents#incident-1',
+    );
+    expect(obs?.summary).toBe(obs?.title);
+    for (const secret of ['user:pass', 'token=secret', 'frag']) {
+      expect(obs?.title).not.toContain(secret);
+      expect(obs?.summary).not.toContain(secret);
+    }
+  });
+
+  it('preserves the full raw scope (with credentials) in objectKey/queryScope for identity, not display', () => {
+    const result = diffWithDisplayScope(
+      { tasks: [{ id: 'incident-1', state: 'OPEN' }] },
+      { tasks: [{ id: 'incident-1', state: 'RESOLVED' }] },
+    );
+
+    const obs = result.observations[0];
+    expect(obs?.objectKey).toBe(`${RAW_SCOPE}#incident-1`);
+    expect(obs?.queryScope?.['objectKey']).toBe(`${RAW_SCOPE}#incident-1`);
+  });
+
+  it('defaults displayScope to monitorObjectKey when omitted (no accidental redaction of a non-credential scope)', () => {
+    const result = diffKeyedCollection(
+      { tasks: [{ id: 'incident-1', state: 'RESOLVED' }] },
+      TASKS_CONFIG,
+      'plain-scope',
+      { 'incident-1': { id: 'incident-1', state: 'OPEN' } },
+    );
+
+    const obs = result.observations[0];
+    expect(obs?.title).toBe('Item changed: plain-scope#incident-1');
+  });
+});

@@ -235,7 +235,7 @@ export interface DeliveryEventSummary {
     eventId: string;
     // (undocumented)
     monitorId: string;
-    // (undocumented)
+    objectDetail?: string;
     summary: string;
     // (undocumented)
     title: string;
@@ -272,7 +272,10 @@ export interface DerivedFactRule {
 export function diffKeyedCollection(parsedOutput: unknown, config: KeyedCollectionConfig, monitorObjectKey: string, previousSnapshot: KeyedSnapshot | undefined, observationFields?: {
     payload?: Record<string, unknown>;
     queryScope?: Record<string, string | string[]>;
-}): KeyedCollectionResult;
+}, displayScope?: string): KeyedCollectionResult;
+
+// @public
+export function displayObjectKey(objectKey: string): string;
 
 // @public
 export interface DoctorDeliveryCounts {
@@ -766,7 +769,7 @@ export type MonitorFrontmatter = z.infer<typeof monitorFrontmatterSchema>;
 
 // @public (undocumented)
 export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
-    name: z.ZodOptional<z.ZodString>;
+    name: z.ZodOptional<z.ZodEffects<z.ZodString, string, string>>;
     watch: z.ZodObject<{
         type: z.ZodString;
     }, "strip", z.ZodUnknown, z.objectOutputType<{

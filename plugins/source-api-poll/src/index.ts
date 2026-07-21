@@ -9,6 +9,7 @@ import type {
 import {
   OPERATION_TIMEOUT_PATTERN,
   diffKeyedCollection,
+  displayObjectKey,
   parseKeyedCollectionConfig,
   parseOperationTimeoutMs,
 } from '@agentmonitors/core';
@@ -752,8 +753,12 @@ function isParseableJson(body: string): boolean {
 
 /**
  * Remove URL components that commonly carry credentials or request-scoped
- * tokens before embedding a URL in a non-fatal warning. The source should still
- * fetch the author's exact URL; only diagnostic text gets the redacted form.
+ * tokens before embedding a URL in **any** human-facing text: a non-fatal
+ * warning, and the observation `title`/`summary`, which are durably persisted on
+ * every event and rendered into agent deliveries (002 §5.4). The source should
+ * still fetch the author's exact URL, and the untouched URL remains on
+ * `payload.url` / `objectKey` for debugging; only text a human or agent reads
+ * gets the redacted form.
  */
 function redactUrlForWarning(url: string): string {
   try {
@@ -1033,9 +1038,17 @@ const source: ObservationSource = {
       const result = diffKeyedCollection(
         JSON.parse(body),
         collection,
+        // The exact URL is kept as identity: `objectKey`/`queryScope.objectKey`
+        // must stay stable and precise for dedup/querying (issue #449 review).
         url,
         prev?.keyedSnapshot,
         { payload: { url }, queryScope: { url } },
+        // Display-safe override (userinfo/query/fragment stripped): without
+        // this, `diffKeyedCollection` interpolates the raw `url` above into
+        // every per-object observation's human-facing `title`/`summary`
+        // (`<scope>#<key>`), leaking credentials into durable, delivered text
+        // the same way the non-collection branch below was fixed to avoid.
+        redactUrlForWarning(url),
       );
       const curr: CachedResponse = {
         body,
@@ -1052,8 +1065,11 @@ const source: ObservationSource = {
       return {
         observations: [
           {
-            title: `API response changed: ${url}`,
-            summary: `API response changed: ${url}`,
+            // Redacted (userinfo/query/fragment stripped) AND bounded: this
+            // text is persisted on the event and delivered to agents, so a URL
+            // carrying a token must not leak into it (issue #449 review).
+            title: `API response changed: ${displayObjectKey(redactUrlForWarning(url))}`,
+            summary: `API response changed: ${displayObjectKey(redactUrlForWarning(url))}`,
             payload: {
               url,
               status: status,

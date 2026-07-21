@@ -1143,6 +1143,52 @@ This makes snapshot history an object-level concern rather than a monitor-level 
 > `session_event_state.diff_text`; the shared object-level diff here is its degenerate
 > single-baseline case (a recipient at the shared baseline gets a byte-identical span).
 
+### 5.4 Event title
+
+> **Status: current.** Resolves issue [#449](https://github.com/mike-north/AgentMonitors/issues/449).
+>
+> Verified: `libs/core/src/runtime/service.ts` — `processObservation()`;
+> `libs/core/src/runtime/event-title.test.ts` (the core rule) and
+> `apps/cli/src/commands/event-title-transports.test.ts` (the same title on both transports).
+
+The runtime — not the source — decides a materialized event's `title`:
+
+1. the monitor's **authored `name`** (frontmatter, [001 §3](./001-monitor-definition.md)) when present;
+2. otherwise the source-provided observation `title`, unchanged.
+
+A source's title is written from the source's point of view and routinely embeds a configuration
+detail (`command-poll` interpolates its `objectKey`, which defaults to the joined argv). The author's
+`name` is the one human-written string that says what the monitor is _for_, so it is the headline the
+recipient sees. Source identity always remains on `objectKey` / `payload`.
+
+**What happens to the source's `title` depends on whether the observation carries its own `summary`
+(the compatibility contract):**
+
+| Observation                                                  | Named monitor delivers                                                                                                                                   | Nameless monitor delivers                     |
+| ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| `title` only, or `title` == `summary` (every bundled source) | title = `name`; detail line = source title (via the derived `summary`, §5.1)                                                                             | title = source title; no detail line          |
+| `title` + a **distinct** `summary`                           | title = `name`; detail line = `summary` — the source's `title` string does **not** appear in delivered text                                              | title = source title; detail line = `summary` |
+| `title` + `body`, no `summary`                               | title = `name`; detail line suppressed (the derived summary equals the body, which the block already renders — [006 §4.2.1](./006-agent-integration.md)) | title = source title; body below              |
+
+So for a **named** monitor whose source sets a title and a _different_ summary, the source's title is
+genuinely dropped from delivered text. This is intended, not an accident: `summary` is defined as the
+short per-object text for lightweight delivery surfaces ([003 §2.1](./003-source-plugins.md)), so a
+source that supplies one has already said which string it wants surfaced. A source that wants its
+title preserved should make `summary` carry that text — which is what every bundled source does.
+
+Both injecting transports render the detail line beneath the title
+([006 §4.2.1](./006-agent-integration.md)) — so a per-object source still names the object that
+moved, and the delivered text stays self-sufficient.
+
+Because the title is chosen once at materialization, it is **transport-independent** — the hook and
+channel renderers ([006 §4/§5](./006-agent-integration.md)) cannot diverge on it — and it is what
+`events list` and history display too.
+
+Sources bound a **configuration-identity** `objectKey` they interpolate into their own title/summary
+([003 §2.8](./003-source-plugins.md#28-an-objectkey-is-an-identity-not-a-headline)), so a nameless
+monitor's fallback title is bounded for those sources; path-like keys are deliberately excluded there
+and remain unbounded.
+
 ## 6. Session Projection
 
 Persisted events are not directly tied to one session. They are projected into matching sessions via `session_event_state`. When an event is inserted, the runtime **MUST** project it into matching **lead** sessions only.
@@ -1235,7 +1281,7 @@ Verified: `libs/core/src/runtime/types.ts` — `AgentLifecycleEvent` (lines 9–
 
 At `turn-interruptible`, the runtime **MUST** deliver all pending high-urgency events that have aged past the 15-second settle window (`DEFAULT_HIGH_URGENCY_SETTLE_MS`). The delivery payload **MUST** summarize the concrete events (titles and summaries), not just emit a generic reminder. The `DeliveryClaim` will have `mode: 'delivery'` and include a populated `events` array.
 
-Each element of the `events` array is a `DeliveryEventSummary` which carries: `eventId`, `monitorId`, `title`, `summary`, `urgency`, `createdAt` (ISO-8601 string), `body`, and `diffText`. The `body` field is the raw monitor body-instructions (`MonitorEventRecord.body`, set from `observation.body ?? monitor.instructions`). It carries what the agent should **do** when the monitor fires, so a delivery transport (e.g. hook, MCP channel) can surface the instructions, not just the title/summary. The optional `diffText` field is the change summary — what actually changed at the observed source — and is **recipient-specific**: it is `session_event_state.diff_text`, the diff THIS recipient's own baseline cursor produces against the shared observation, not necessarily the shared latest-snapshot delta. The shared `MonitorEventRecord.diffText` is used only as a legacy fallback when a pre-G10 row's per-recipient column is `null`. `diffText` is absent when the event carried no diff at all (neither the per-recipient nor the shared value is present); a transport that surfaces it MUST bound it, since a raw diff can be arbitrarily large (issue #436).
+Each element of the `events` array is a `DeliveryEventSummary` which carries: `eventId`, `monitorId`, `title`, `summary`, `objectDetail` (optional), `urgency`, `createdAt` (ISO-8601 string), `body`, and `diffText`. The `body` field is the raw monitor body-instructions (`MonitorEventRecord.body`, set from `observation.body ?? monitor.instructions`). It carries what the agent should **do** when the monitor fires, so a delivery transport (e.g. hook, MCP channel) can surface the instructions, not just the title/summary. `summary` is the **recipient-visible** field (§1.1.8): the per-recipient Interpret digest when one was produced, otherwise the deterministic `MonitorEventRecord.summary` → `body` → `title` fallback chain — a digest is a prose reading of the change and is not guaranteed to name which object it is about. `objectDetail` is the **deterministic**, never-digest-replaced per-object detail (`MonitorEventRecord.summary`); a transport rendering per-object identity (e.g. `buildEventBlock`'s detail line, §5.4) MUST prefer it over `summary`, since `summary` can carry no object identity at all for a multi-object `prose` monitor. `objectDetail` is optional only so a hand-constructed `DeliveryEventSummary` (e.g. a test) may omit it; the runtime always populates it for a real delivery. The optional `diffText` field is the change summary — what actually changed at the observed source — and is **recipient-specific**: it is `session_event_state.diff_text`, the diff THIS recipient's own baseline cursor produces against the shared observation, not necessarily the shared latest-snapshot delta. The shared `MonitorEventRecord.diffText` is used only as a legacy fallback when a pre-G10 row's per-recipient column is `null`. `diffText` is absent when the event carried no diff at all (neither the per-recipient nor the shared value is present); a transport that surfaces it MUST bound it, since a raw diff can be arbitrarily large (issue #436).
 
 Verified: `libs/core/src/runtime/service.ts` — `claimDelivery()` turn-interruptible high branch: `settledHigh` filters by age, payload includes `summarizeEvents(...)` and a full `events` array with `body: event.body` and the recipient-specific `diffText` (`perRecipientDiffsForSession`, falling back to `MonitorEventRecord.diffText`).
 

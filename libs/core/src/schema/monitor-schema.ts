@@ -292,6 +292,10 @@ export const monitorFrontmatterSchema = z
     name: z
       .string()
       .min(1, 'Monitor name must be non-empty when present')
+      .refine(
+        (value) => value.trim().length > 0,
+        'Monitor name must contain non-whitespace characters when present',
+      )
       .optional(),
     watch: watchSchema,
     // Optional: an omitted `urgency` defaults to the degenerate band

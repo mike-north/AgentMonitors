@@ -81,18 +81,18 @@ The interface definition (verified: `libs/core/src/observation/types.ts`):
 
 Each `Observation` **MAY** include the following fields (verified: `libs/core/src/observation/types.ts`):
 
-| Field          | Type                                  | Description                                                                |
-| -------------- | ------------------------------------- | -------------------------------------------------------------------------- |
-| `title`        | `string`                              | **Required.** Human-readable title for the inbox item.                     |
-| `body`         | `string?`                             | Optional body/description.                                                 |
-| `summary`      | `string?`                             | Optional short summary for lightweight delivery surfaces.                  |
-| `payload`      | `unknown?`                            | Raw source payload, preserved for later querying.                          |
-| `snapshotText` | `string?`                             | Optional textual snapshot for diffing and timeline views.                  |
-| `objectKey`    | `string?`                             | Source-defined stable object identity (e.g., a PR number, file path, URL). |
-| `queryScope`   | `Record<string, string \| string[]>?` | Source-defined query metadata used for read-time scoping.                  |
-| `changeKind`   | `ChangeKind?`                         | The lifecycle transition this observation reports (see below).             |
-| `salience`     | `Urgency?`                            | Source-classified per-observation salience (`low` \| `normal` \| `high`).  |
-| `snapshot`     | `unknown?`                            | Point-in-time snapshot metadata captured at fire time.                     |
+| Field          | Type                                  | Description                                                                                                                                                                                                                                                               |
+| -------------- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `title`        | `string`                              | **Required.** The source's own headline. NOT necessarily the delivered event title: the runtime uses the monitor's authored `name` when it has one and falls back to this ([002 §5.4](./002-runtime-delivery.md#54-event-title)). Write it to read well as that fallback. |
+| `body`         | `string?`                             | Optional body/description.                                                                                                                                                                                                                                                |
+| `summary`      | `string?`                             | Optional short per-object text. This is the DETAIL LINE both injecting transports render beneath the title ([006 §4.2.1](./006-agent-integration.md)), so for a named monitor it — not `title` — names the object that moved.                                             |
+| `payload`      | `unknown?`                            | Raw source payload, preserved for later querying.                                                                                                                                                                                                                         |
+| `snapshotText` | `string?`                             | Optional textual snapshot for diffing and timeline views.                                                                                                                                                                                                                 |
+| `objectKey`    | `string?`                             | Source-defined stable object identity (e.g., a PR number, file path, URL).                                                                                                                                                                                                |
+| `queryScope`   | `Record<string, string \| string[]>?` | Source-defined query metadata used for read-time scoping.                                                                                                                                                                                                                 |
+| `changeKind`   | `ChangeKind?`                         | The lifecycle transition this observation reports (see below).                                                                                                                                                                                                            |
+| `salience`     | `Urgency?`                            | Source-classified per-observation salience (`low` \| `normal` \| `high`).                                                                                                                                                                                                 |
+| `snapshot`     | `unknown?`                            | Point-in-time snapshot metadata captured at fire time.                                                                                                                                                                                                                    |
 
 `ChangeKind` is a **source-agnostic** vocabulary so consumers reason about change uniformly across
 sources: `created` (object entered scope), `modified` (changed while in scope), `deleted` (destroyed
@@ -302,6 +302,50 @@ reasoning inside the source — outside this contract.
 Shape stage. The motivating case is the E8 OmniFocus composite (§2.6): the source surfaces each task's
 raw `due`/`defer-until`/`priority` and child states; the runtime derives `past due`/`due soon`/
 `revealed`/`urgent`.
+
+### 2.8 An `objectKey` is an identity, not a headline
+
+> **Status: current.** Resolves issue [#449](https://github.com/mike-north/AgentMonitors/issues/449).
+>
+> Verified: `libs/core/src/observation/display.ts` (`displayObjectKey`) with
+> `libs/core/src/observation/display.test.ts`; applied by `plugins/source-command-poll/src/index.ts`,
+> `plugins/source-api-poll/src/index.ts`, and `libs/core/src/observation/keyed-collection.ts`.
+
+An `objectKey` exists to give an observed object a **stable identity**, and is free to be as long as
+identity requires — `command-poll` defaults it to the joined argv (§11.4), which for a `jq`-backed
+poller is hundreds of characters.
+
+A source that interpolates a **configuration-identity** `objectKey` into human-facing observation
+text — `title`, `summary` — **MUST** bound it with the shared helper `displayObjectKey`, which
+returns the key unchanged at or below 60 UTF-16 code units and otherwise a prefix followed by `…`,
+cut at a **grapheme-cluster boundary** so truncation can never emit a lone surrogate or split a flag
+or ZWJ sequence (the result may therefore be shorter than the bound). The untruncated key remains on
+the observation's `objectKey` and in `payload`, so debugging and querying lose nothing.
+
+A _configuration-identity_ key is one whose content is the monitor's own configuration rather than
+the identity of a distinct observed object: `command-poll`'s joined argv (§11.4) and `api-poll`'s URL
+(§4.4). Those are the cases where the key is long _because of how the monitor is written_, and where
+a head-truncated prefix stays informative.
+
+**Deliberately out of scope** (each is unbounded today, and that is the intended current behavior,
+not an oversight):
+
+- **Path-like keys** — `file-fingerprint`'s absolute file path (§3.4) and `incoming-changes`'
+  repository-relative path (§6.2). A path's informative part is its **tail** (the basename), so the
+  head-truncation this helper performs would destroy exactly the part a reader needs. Bounding these
+  requires a path-aware ellipsis (`…/deep/dir/file.ts`), tracked as follow-up work.
+- **Per-item keys in keyed collections** (§12) — the item key is the informative half of
+  `<scope>#<key>`, so only the monitor-scope half is bounded; the item key is always rendered whole.
+- **The `api-poll` composite fallback `objectKey`** (§2.6), which is author-supplied and expected to
+  be a short label.
+
+Consequently a nameless monitor's fallback headline is bounded **for the configuration-identity
+sources only**; a nameless `file-fingerprint` monitor can still headline with a long absolute path.
+
+The motivating failure: a delivered event whose headline was ~400 characters of the monitor's own
+`jq` program. Delivered text is an agent's action surface and lands in a context window on every
+delivery ([002 §5.4](./002-runtime-delivery.md#54-event-title)); an unbounded implementation detail
+in that position conveys nothing and crowds out what does.
 
 ## 3. Bundled Source: `file-fingerprint`
 
@@ -963,8 +1007,13 @@ Auth is configured via the `auth.type` field.
 
 When a change is detected, the source emits one observation (verified: `plugins/source-api-poll/src/index.ts` lines 175–196):
 
-- `title`: `"API response changed: <url>"`
-- `summary`: `"API response changed: <url>"`
+- `title`: `"API response changed: <url>"` — `<url>` is **redacted** (userinfo, query, and fragment
+  stripped, the same treatment warning text gets) and then bounded per
+  [§2.8](#28-an-objectkey-is-an-identity-not-a-headline); overridden by the monitor's authored
+  `name` at materialization ([002 §5.4](./002-runtime-delivery.md#54-event-title)). Redaction is
+  required because title/summary are durably persisted and delivered to agents, and a polled URL
+  routinely carries a token; the author's exact URL stays on `objectKey`/`payload.url`.
+- `summary`: `"API response changed: <url>"` (identically redacted and bounded)
 - `payload`: `{ url, status, strategy, body }`
 - `snapshotText`: response body as a string (always set; no binary check)
 - `objectKey`: `<url>`
@@ -1557,7 +1606,10 @@ are validation errors so misplaced or misspelled options do not silently no-op.
 
 Mirrors `api-poll` (§4.4–4.5):
 
-- `title` / `summary`: `"Command output changed: <objectKey>"`
+- `title` / `summary`: `"Command output changed: <objectKey>"`, with `<objectKey>` bounded per
+  [§2.8](#28-an-objectkey-is-an-identity-not-a-headline). The runtime overrides the delivered
+  `title` with the monitor's authored `name` when it has one ([002 §5.4](./002-runtime-delivery.md#54-event-title));
+  this source title is what a **nameless** monitor falls back to, and remains the `summary` either way.
 - `objectKey`: the `key` field if set, otherwise the argv joined with single spaces
   (`ofocus today --json`)
 - `payload`: `{ command, exitCode, strategy, stdout, truncated }` — **never `env`**
