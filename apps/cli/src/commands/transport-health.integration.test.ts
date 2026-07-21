@@ -757,11 +757,11 @@ This monitor fires on a schedule.
 
   // --- Closed session: a fresh heartbeat is not an ACTIVE recipient (issue
   // #425 review, round 3, exit-code contract corrected round 5) -----------
-  // `hook` is keyed per WORKSPACE, not per session (`heartbeatKey`), so its
-  // record stays within its 24h TTL — and looks "running" — long after the
-  // one lead session in this workspace has closed. Without gating on an
-  // ACTIVE lead, `doctor` reported `deliverable: true` / "via hook" for a
-  // recipient that no longer has a live process to receive anything.
+  // `hook` is keyed per SESSION (`heartbeatKey`), so a now-closed session's
+  // record stays within its 24h TTL — and looks "running" — long after that
+  // session has closed. Without gating on an ACTIVE lead, `doctor` reported
+  // `deliverable: true` / "via hook" for a recipient that no longer has a
+  // live process to receive anything.
   //
   // A closed session is NOT a live degradation, though — it is the SAME
   // "nothing is open right now" state as the ordinary no-lead-session idle

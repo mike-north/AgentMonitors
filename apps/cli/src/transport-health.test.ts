@@ -488,12 +488,12 @@ describe('computeTransportHealth', () => {
   });
 
   describe('no ACTIVE lead recipient (issue #425 review, round 3)', () => {
-    // `hook` is keyed per WORKSPACE, not per session (`heartbeatKey`), so a
-    // heartbeat left by a session that has since closed stays within its 24h
-    // TTL — and reads as `running` — long after there is nobody left to
-    // deliver to. `doctor` is responsible for supplying ONLY active leads
-    // (`leadHostSessionIds`); this suite proves `computeTransportHealth`
-    // actually honors that contract rather than trusting `running` alone.
+    // `hook` is keyed per SESSION (`heartbeatKey`), so a heartbeat left by a
+    // now-closed session stays within its 24h TTL — and reads as `running` —
+    // long after that session is gone. `doctor` is responsible for supplying
+    // ONLY active leads (`leadHostSessionIds`); this suite proves
+    // `computeTransportHealth` actually honors that contract rather than
+    // trusting `running` alone.
     it('reports via none / not deliverable when a fresh heartbeat exists but no lead session is active', () => {
       const health = computeTransportHealth(input({ leadHostSessionIds: [] }));
 
