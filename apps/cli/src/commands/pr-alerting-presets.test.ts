@@ -72,6 +72,22 @@ function presetScope(type: 'pr-review' | 'my-prs'): Scope {
   return scope;
 }
 
+/**
+ * Clones `scope` (a `pr-review` scope from {@link presetScope}) with its
+ * scaffolded `search='review-requested:@me'` shell-variable assignment
+ * replaced, simulating the ONE edit `PR_REVIEW_SCOPE_COMMENT` instructs an
+ * author to make to switch reviewer-scoping models. Used to exercise the
+ * scope-conditional team-request clause (`discussion_r3624450049`) under a
+ * scope other than the default, without hand-writing a second script.
+ */
+function withSearchScope(scope: Scope, search: string): Scope {
+  const command = scope['command'] as string[];
+  const edited = command.map((token) =>
+    token.replace("search='review-requested:@me'", `search='${search}'`),
+  );
+  return { ...scope, command: edited };
+}
+
 function tempDir(prefix: string): string {
   const dir = mkdtempSync(path.join(tmpdir(), `am444-${prefix}-`));
   createdTempDirs.push(dir);
@@ -1440,6 +1456,32 @@ describe('the presets’ jq reduction over raw gh output', () => {
       expect(entries).toHaveLength(1);
       expect(entries[0]?.number).toBe(7);
     });
+
+    /**
+     * PR #446 review, thread `discussion_r3624450049`: the team-request
+     * override above is only sound while `--search` itself already
+     * establishes viewer relevance (the default `review-requested:@me`).
+     * This scaffold also ships `label:needs-review` and an unscoped search as
+     * supported alternatives (`PR_REVIEW_SCOPE_COMMENT`), and under either of
+     * those the fetched `reviewRequests` can name a team the viewer isn't
+     * even on. Simulates switching `search=` to the label-driven alternative
+     * by editing the ONE variable assignment the scaffolded comment
+     * instructs an author to change — the same edit a real user would make.
+     */
+    it('drops an APPROVED PR with only a team review request once the scope is no longer the default', async () => {
+      const labelScopedScope = withSearchScope(scope, 'label:needs-review');
+      const result = await observe(
+        labelScopedScope,
+        stub,
+        fixtureOf([
+          rawReviewPr({
+            reviewDecision: 'APPROVED',
+            reviewRequests: [{ slug: 'platform' }],
+          }),
+        ]),
+      );
+      expect(JSON.parse(result.stdout)).toEqual([]);
+    });
   });
 });
 
@@ -1805,19 +1847,25 @@ describe('reviewer scoping (PR #446 review, thread 1)', () => {
    * non-release PR — including the user's own and unrelated ones — despite
    * being defined as *the current reviewer's* queue. Draft/release filtering
    * lives in the `--jq`, so only an argv-level assertion catches its absence.
+   *
+   * The scope now flows through a `search=` shell variable (read by both
+   * `--search "$search"` and the `--jq`'s scope-conditional team-request
+   * clause — see `discussion_r3624450049`) rather than being inlined
+   * directly into `--search`, so this asserts against the variable
+   * assignment, not the flag's own argument text.
    */
   it('scopes the reviewer queue to a reviewer, not to every open PR', () => {
     const command = commandOf('pr-review');
-    expect(command).toContain('--search');
+    expect(command).toContain('--search "$search"');
     // One of the documented reviewer-scoping qualifiers must be present; a
-    // bare `--search ''` or a missing flag is exactly the unscoped defect.
+    // bare `search=''` or a missing assignment is exactly the unscoped defect.
     expect(command).toMatch(
-      /--search\s+'?(review-requested:@me|-author:@me|label:[\w-]+)/,
+      /search='?(review-requested:@me|-author:@me|label:[\w-]+)/,
     );
   });
 
   it('defaults to explicit review requests', () => {
-    expect(commandOf('pr-review')).toContain("--search 'review-requested:@me'");
+    expect(commandOf('pr-review')).toContain("search='review-requested:@me'");
   });
 
   /**

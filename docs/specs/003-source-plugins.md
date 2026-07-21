@@ -1811,28 +1811,37 @@ on any change to the WHOLE diffed payload, including a field mutating on an entr
 remains, a member — a retitle would otherwise re-fire the `high`-urgency interrupt for a PR nothing
 actually happened to. `reviewDecision` is **not** carried as a field either — it decides membership
 instead: a PR stays in the set while its decision is empty or `REVIEW_REQUIRED`, **or** while the
-resolved identity's own `login` is still listed in `reviewRequests`, **or** `reviewRequests` still lists
-a pending team request (PR #446 review, thread `discussion_r3617759232`: `reviewDecision` is a
-repository-wide, branch-protection-derived verdict, so a multi-approval repository can show `APPROVED`
-once ONE reviewer approves while THIS viewer's own request is still outstanding — `reviewRequests` is
-the per-viewer signal that keeps the PR visible in that case). The team-request clause is a distinct,
-necessary addition (PR #446 review, thread `discussion_r3624050268`): `reviewRequests` is a union that
-includes `Team`/`EnterpriseTeam` entries, which expose a team `slug`/`name` rather than a `login` — `gh`
-never expands a team request out to individual member logins in this field, even though `--search
-review-requested:@me` itself does resolve team membership when selecting which PRs to fetch. A plain
-`.login == $me` check can therefore never match a team-requested PR, so any `reviewRequests` entry
-lacking a `login` field is treated as a still-pending team request once the fetch itself is already
-scoped by `--search`. So a decision landing removes the PR (one benign fire) rather than churning a
-value inside the set, EXCEPT when this viewer's own direct or team-based request is still open. Filtering also drops drafts, `changeset-release/*` heads (the release/Version
-PR is never agent-reviewable), PRs authored by the current `gh` identity (see "The two presets must not
-overlap" above — this, not `--search`, is the clause that keeps `pr-review` and `my-prs` disjoint), and
-PRs with failing CI. Reviewer scoping (which PRs among those authored by _someone else_ actually need
-**your** review) is a separate, configurable `--search` qualifier — `-author:@me`/`review-requested:@me`
-are each wrong for some workflow (see "Reviewer scoping is workflow-dependent and therefore selectable"
-below for the full set of alternatives and why). The default is `--search 'review-requested:@me'`.
-Because drafts are filtered rather than reported, "a draft was marked ready" surfaces as the PR
-_appearing_ in the set. `updatedAt` is deliberately excluded: including it would fire on every push and
-comment.
+resolved identity's own `login` is still listed in `reviewRequests`, **or** — only under the default
+scope — `reviewRequests` still lists a pending team request (PR #446 review, thread
+`discussion_r3617759232`: `reviewDecision` is a repository-wide, branch-protection-derived verdict, so a
+multi-approval repository can show `APPROVED` once ONE reviewer approves while THIS viewer's own request
+is still outstanding — `reviewRequests` is the per-viewer signal that keeps the PR visible in that case).
+The team-request clause is a distinct, necessary addition (PR #446 review, thread
+`discussion_r3624050268`): `reviewRequests` is a union that includes `Team`/`EnterpriseTeam` entries,
+which expose a team `slug`/`name` rather than a `login` — `gh` never expands a team request out to
+individual member logins in this field, even though `--search review-requested:@me` itself does resolve
+team membership when selecting which PRs to fetch. A plain `.login == $me` check can therefore never
+match a team-requested PR, so a `reviewRequests` entry lacking a `login` field is treated as a
+still-pending team request relevant to this viewer — **but only while the active `--search` scope is
+still the default `review-requested:@me`** (PR #446 review, thread `discussion_r3624450049`): this
+scaffold also ships `label:needs-review` and an unscoped search as supported alternatives (see
+"Reviewer scoping is workflow-dependent and therefore selectable" below), and under either of those the
+fetched `reviewRequests` can name a team the viewer is not even on — the fetch is no longer what
+established relevance, so the same login-less entry no longer implies "this viewer's team". The scope
+comparison and the `--search` argument itself both read one shell variable
+(`search='review-requested:@me'`, editable in place — see the scaffold's REVIEWER SCOPING comment), so
+switching scopes keeps the two in lockstep without a second edit. So a decision landing removes the PR
+(one benign fire) rather than churning a value inside the set, EXCEPT when this viewer's own direct
+request, or (under the default scope) team-based request, is still open. Filtering also drops drafts,
+`changeset-release/*` heads (the release/Version PR is never agent-reviewable), PRs authored by the
+current `gh` identity (see "The two presets must not overlap" above — this, not `--search`, is the
+clause that keeps `pr-review` and `my-prs` disjoint), and PRs with failing CI. Reviewer scoping (which
+PRs among those authored by _someone else_ actually need **your** review) is a separate, configurable
+`--search` qualifier — `-author:@me`/`review-requested:@me` are each wrong for some workflow (see
+"Reviewer scoping is workflow-dependent and therefore selectable" below for the full set of alternatives
+and why). The default is `review-requested:@me`. Because drafts are filtered rather than reported, "a
+draft was marked ready" surfaces as the PR _appearing_ in the set. `updatedAt` is deliberately excluded:
+including it would fire on every push and comment.
 
 The current identity is resolved via `gh api user`, a bare endpoint with no repository context to infer
 a host from — it defaults to `github.com` even when the daemon runs from inside a GitHub Enterprise
@@ -1951,17 +1960,26 @@ is wrong twice over: it alerts on work the reviewer does not own, and unrelated 
 **There is no single filter that is correct for every workflow**, so the scaffold ships a documented
 default plus ready-to-uncomment alternatives, each with the case it applies to:
 
-| `--search` scope       | Correct for                                                                                                                                          | Returns nothing when                                           |
-| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| `review-requested:@me` | **Default.** Teams with explicit review requests. Includes team-assigned requests — GitHub expands a team request to its members for this qualifier. | Solo maintainer; or author and reviewer are the same identity. |
-| `-author:@me`          | "I review everyone else's work."                                                                                                                     | Every PR is authored by you.                                   |
-| `label:needs-review`   | Label-driven review handoff.                                                                                                                         | The label is not applied.                                      |
-| (empty)                | Small repo where you review everything.                                                                                                              | Never — but unrelated PRs consume the window.                  |
+| `--search` scope       | Correct for                                                                                                                                          | Returns nothing when                                           | Pending team requests keep an already-decided PR visible?                     |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `review-requested:@me` | **Default.** Teams with explicit review requests. Includes team-assigned requests — GitHub expands a team request to its members for this qualifier. | Solo maintainer; or author and reviewer are the same identity. | Yes — the fetch itself already scoped `reviewRequests` to the viewer's teams. |
+| `-author:@me`          | "I review everyone else's work."                                                                                                                     | Every PR is authored by you.                                   | No — see below.                                                               |
+| `label:needs-review`   | Label-driven review handoff.                                                                                                                         | The label is not applied.                                      | No — see below.                                                               |
+| (empty)                | Small repo where you review everything.                                                                                                              | Never — but unrelated PRs consume the window.                  | No — see below.                                                               |
 
 Measured against this repository: unscoped returns 6 open PRs, `review-requested:@me` returns 0, and
 no open PR carries a requested reviewer — because PRs are opened and reviewed under one identity and
 GitHub does not permit requesting review from yourself. The same cause makes `-author:@me` empty here.
 Label-driven scoping is the only one that works in that case.
+
+**The last column matters because the team-request clause above is scope-conditional, not
+unconditional** (PR #446 review, thread `discussion_r3624450049`). `reviewRequests` is only guaranteed
+to name teams the viewer belongs to when the fetch itself was scoped by `review-requested:@me` — under
+any of the three alternatives, a fetched PR's `reviewRequests` can list a team the viewer is not on at
+all, so treating every login-less entry as "this viewer's team" would wrongly keep an unrelated,
+already-`APPROVED` PR in the queue. Switching `search=` away from the default therefore also narrows
+membership to the direct-login and undecided/failing-CI clauses; a pending team request alone no longer
+keeps a decided PR visible.
 
 **The empty case is silent**, and that is the residual risk: a mis-scoped filter is indistinguishable
 from "nothing needs review", the same silent-degradation class as a monitor that never fires. The

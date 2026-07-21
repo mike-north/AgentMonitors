@@ -73,16 +73,18 @@ const COMMAND_POLL_DEFAULT_COMMAND_BLOCK =
  * `$$` is the `sh` process's own PID — not `-$$`, which would signal the whole
  * process group and reach siblings this monitor does not own.
  *
- * `unset GH_TOKEN GITHUB_TOKEN GH_REPO` (below, once per script) scrubs three inherited overrides
- * before invoking `gh`. `GH_TOKEN`/`GITHUB_TOKEN` each give unconditional precedence over
- * keyring/`gh auth login` credentials (`GH_TOKEN` takes priority over `GITHUB_TOKEN` when both are
- * set), so a daemon process that happens to have either exported (a common shell-startup leftover)
- * would make `@me` — and therefore both presets — silently resolve against the wrong identity, with no
- * error to surface it. `GH_REPO` overrides which repository `gh pr list` targets outright, which would
- * silently defeat the working-directory-based auto-scoping below. Scrubbing all three is the same fix
- * this repo's own tooling applies to every non-interactive `gh` invocation. `unset` rather than
- * `env -u` per call is what makes this scrub apply uniformly across a multi-call `fetchCmd` (see
- * {@link ghPresetScript}) — `env -u ... cmd1 && cmd2` would only wrap `cmd1`.
+ * `unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GH_REPO` (below, once per
+ * script) scrubs five inherited overrides before invoking `gh`. `GH_TOKEN`/`GITHUB_TOKEN` each give
+ * unconditional precedence over keyring/`gh auth login` credentials on github.com (`GH_TOKEN` takes
+ * priority over `GITHUB_TOKEN` when both are set); `GH_ENTERPRISE_TOKEN`/`GITHUB_ENTERPRISE_TOKEN` do
+ * the same for a GHES host (PR #446 review, thread `discussion_r3624050247`) — so a daemon process
+ * that happens to have any of the four exported (a common shell-startup leftover) would make `@me` —
+ * and therefore both presets — silently resolve against the wrong identity, with no error to surface
+ * it. `GH_REPO` overrides which repository `gh pr list` targets outright, which would silently defeat
+ * the working-directory-based auto-scoping below. Scrubbing all five is the same fix this repo's own
+ * tooling applies to every non-interactive `gh` invocation. `unset` rather than `env -u` per call is
+ * what makes this scrub apply uniformly across a multi-call `fetchCmd` (see {@link ghPresetScript}) —
+ * `env -u ... cmd1 && cmd2` would only wrap `cmd1`.
  *
  * Only the failure branch's `2>"$errfile"` sees `gh`'s stderr: the success path's `out=$(...)`
  * captures stdout alone, so a one-time `gh` warning or `GH_DEBUG` chatter on an otherwise-successful
@@ -130,8 +132,12 @@ function ghPresetScript(
   preset: string,
   fetchCmd: string,
   reduceJq: string,
+  options: { preamble?: string; jqArgs?: string } = {},
 ): string {
   const failureMessage = `printf 'agentmonitors %s: the GitHub CLI query failed, so PR alerting is NOT running.\\nFix one of these, then re-run: agentmonitors monitor test <this file>\\n  1. Install the GitHub CLI: https://cli.github.com\\n  2. Authenticate it: gh auth login\\n  3. Install jq: https://jqlang.org (both gh and jq are required)\\n  4. Run the daemon from inside a git repo that has a GitHub remote.\\n' '${preset}' >&2`;
+  const preamble =
+    options.preamble === undefined ? '' : `${options.preamble}\n`;
+  const jqArgs = options.jqArgs === undefined ? '' : `${options.jqArgs} `;
   return `errfile=$(mktemp "\${TMPDIR:-/tmp}/agentmonitors-${preset}-XXXXXX" 2>/dev/null) || {
   ${failureMessage}
   kill -TERM $$
@@ -146,7 +152,7 @@ if ! command -v jq >/dev/null 2>&1; then
   kill -TERM $$
   exit 1
 fi
-if raw=$(${fetchCmd} 2>"$errfile") && out=$(printf '%s\\n' "$raw" | jq -sc '${reduceJq}' 2>>"$errfile"); then
+${preamble}if raw=$(${fetchCmd} 2>"$errfile") && out=$(printf '%s\\n' "$raw" | jq -sc ${jqArgs}'${reduceJq}' 2>>"$errfile"); then
   printf '%s\\n' "$out"
 else
   cat "$errfile" >&2
@@ -264,30 +270,51 @@ const TERMINAL_WINDOW_SECONDS = 21600;
 const PR_REVIEW_DEFAULT_SCOPE = 'review-requested:@me';
 
 /**
+ * The single shell-variable assignment an author edits to switch
+ * {@link PR_REVIEW_FETCH}'s reviewer scope, declared once at script top level
+ * (outside the `fetchCmd` subshell, so both the `gh pr list --search`
+ * argument and {@link PR_REVIEW_REDUCE}'s scope-conditional team-request
+ * clause read the SAME value — see {@link PR_REVIEW_REDUCE}'s doc comment on
+ * `discussion_r3624450049`). Editing only the string literal that used to be
+ * inlined into the `--search` flag left the `--jq`'s team-request handling
+ * unaware of which scope was actually running; threading it through one
+ * variable instead means an author who switches to `label:needs-review` or
+ * an empty (unscoped) search gets scope-correct team-request behavior for
+ * free, without touching the `--jq`.
+ */
+const PR_REVIEW_SEARCH_PREAMBLE = `search='${PR_REVIEW_DEFAULT_SCOPE}'`;
+
+/**
  * The scaffolded comment block above `pr-review`'s `command:`, listing the
  * reviewer-scoping alternatives so an author in any of the four workflows can
  * get a working monitor by editing one string rather than rewriting the `--jq`.
  */
 const PR_REVIEW_SCOPE_COMMENT =
-  "  # REVIEWER SCOPING — the --search '...' inside the command below decides\n" +
-  '  # WHOSE review queue this is. There is no filter that is correct for every\n' +
-  '  # workflow; the default suits explicit team review requests. If this monitor\n' +
-  '  # never fires, this is almost certainly why — check with:\n' +
+  "  # REVIEWER SCOPING — the search='...' line inside the command below decides\n" +
+  '  # WHOSE review queue this is (it feeds both the --search flag and the --jq\n' +
+  '  # below, so editing it here is the only edit you need). There is no filter\n' +
+  '  # that is correct for every workflow; the default suits explicit team review\n' +
+  '  # requests. If this monitor never fires, this is almost certainly why — check\n' +
+  '  # with:\n' +
   '  #   gh pr list --state open --search "review-requested:@me"\n' +
-  '  # and if that prints nothing while open PRs exist, switch to one of:\n' +
+  '  # and if that prints nothing while open PRs exist, switch search= to one of:\n' +
   '  #   review-requested:@me   (default) explicit review requests — includes\n' +
   '  #                          team-assigned requests, since GitHub expands a\n' +
-  '  #                          team request to its members for this qualifier.\n' +
-  '  #                          Matches NOTHING for a solo maintainer, or when\n' +
-  '  #                          PRs are authored and reviewed under one identity.\n' +
+  '  #                          team request to its members for this qualifier,\n' +
+  '  #                          and only this default keeps a PR in the queue on\n' +
+  '  #                          a pending TEAM request alone once some other\n' +
+  "  #                          reviewer approval already satisfies the repo's\n" +
+  '  #                          decision. Matches NOTHING for a solo maintainer,\n' +
+  '  #                          or when PRs are authored and reviewed under one\n' +
+  '  #                          identity.\n' +
   '  #   -author:@me            "I review everyone else\'s work". Matches nothing\n' +
   '  #                          when every PR is authored by you.\n' +
   '  #   label:needs-review     label-driven. The only option that works when\n' +
   '  #                          author and reviewer are the same identity.\n' +
-  '  #   (empty --search)       unscoped: every open PR. Fine for a small repo\n' +
+  '  #   (empty search=)        unscoped: every open PR. Fine for a small repo\n' +
   '  #                          where you review everything; at scale unrelated\n' +
   '  #                          PRs consume the 30-row window.\n' +
-  '  # PRs you authored yourself never enter this list, whichever --search you\n' +
+  '  # PRs you authored yourself never enter this list, whichever scope you\n' +
   '  # choose (enforced in the --jq below, not just by --search), so this list\n' +
   '  # never overlaps the my-prs preset — see my-prs for your own PRs.\n';
 
@@ -378,16 +405,31 @@ const PR_REVIEW_SCOPE_COMMENT =
  * can never match a team-requested PR, and once `reviewDecision` moves past
  * `REVIEW_REQUIRED` (a different reviewer's approval satisfying a
  * multi-approval policy) such a PR would silently drop out of the queue
- * while the viewer's own team-based request is still outstanding. Any
- * `reviewRequests` entry lacking a `login` field is treated as a team
- * request and, since the fetch itself is already scoped by `--search`, is
- * assumed relevant to the current viewer.
+ * while the viewer's own team-based request is still outstanding.
+ *
+ * **That team-request override is only sound while the active search
+ * actually establishes viewer relevance** (PR #446 review, thread
+ * `discussion_r3624450049`). Treating EVERY login-less `reviewRequests` entry
+ * as "this viewer's team" was correct under the default
+ * {@link PR_REVIEW_DEFAULT_SCOPE}, since `review-requested:@me` itself only
+ * ever fetches PRs where a team the viewer belongs to was requested — but
+ * this same template also scaffolds `label:needs-review` and an unscoped
+ * search as supported alternatives (see {@link PR_REVIEW_SCOPE_COMMENT}),
+ * and under either of those a fetched PR's team request can belong to a team
+ * the viewer isn't even on. Applying the override unconditionally there kept
+ * an unrelated, already-decided PR in the viewer's own high-urgency queue.
+ * {@link PR_REVIEW_REDUCE} therefore only trusts a login-less
+ * `reviewRequests` entry when `$scope` — the same
+ * {@link PR_REVIEW_SEARCH_PREAMBLE} variable `gh pr list --search` itself
+ * reads — is still the default `review-requested:@me`; under any other
+ * scope, a team request no longer keeps a decided PR in the queue on its
+ * own, and only the direct-login and undecided/red-CI clauses apply.
  */
 const PR_REVIEW_FETCH =
   "host=$(gh repo view --json url --jq '.url' | sed -E 's#^https?://([^/]+)/.*$#\\1#') && " +
   'gh api user --hostname "$host" --jq \'{login}\' && ' +
   'gh pr list --state open --limit 30 ' +
-  `--search '${PR_REVIEW_DEFAULT_SCOPE}' ` +
+  '--search "$search" ' +
   '--json number,title,isDraft,reviewDecision,headRefName,author,statusCheckRollup,reviewRequests';
 
 /**
@@ -402,13 +444,22 @@ const PR_REVIEW_FETCH =
  *
  * A PR stays in the set when EITHER its `reviewDecision` has not yet passed
  * `REVIEW_REQUIRED`, OR the resolved identity's own `login` is still listed
- * in `reviewRequests`, OR `reviewRequests` still lists a pending TEAM request
- * (an entry with no `login` field — see {@link PR_REVIEW_FETCH}'s doc comment
- * on `discussion_r3624050268`) — these clauses are what keep a PR visible
- * when a multi-approval repository's `reviewDecision` already reads
- * `APPROVED` from someone else while this viewer's own (direct or
- * team-based) request is still outstanding (PR #446 review, threads
- * `discussion_r3617759232` and `discussion_r3624050268`).
+ * in `reviewRequests`, OR — **only while `$scope` is still the default
+ * `review-requested:@me`** — `reviewRequests` still lists a pending TEAM
+ * request (an entry with no `login` field — see {@link PR_REVIEW_FETCH}'s doc
+ * comment on `discussion_r3624050268` and `discussion_r3624450049`). The
+ * first two clauses keep a PR visible when a multi-approval repository's
+ * `reviewDecision` already reads `APPROVED` from someone else while this
+ * viewer's own (direct or team-based) request is still outstanding (PR #446
+ * review, thread `discussion_r3617759232`); the scope guard on the third
+ * clause is what keeps a team request from a DIFFERENT team than the
+ * viewer's own from wrongly extending that same protection once the
+ * scaffolded `label:needs-review` or unscoped alternative is in use, where
+ * `reviewRequests` was never filtered to the viewer's teams in the first
+ * place (`discussion_r3624450049`). `$scope` is threaded in as a jq `--arg`
+ * from the same `search` shell variable `gh pr list --search` itself reads
+ * (see {@link PR_REVIEW_SEARCH_PREAMBLE}), so editing that one variable keeps
+ * the `--search` argument and this clause's scope check in lockstep.
  *
  * `title` is deliberately NOT projected into the reduced entry (PR #446
  * review, thread `discussion_r3617759355`): it is mutable presentation data,
@@ -426,7 +477,8 @@ const PR_REVIEW_REDUCE =
   'and (((.reviewDecision // "") == "") ' +
   'or (.reviewDecision == "REVIEW_REQUIRED") ' +
   'or (([.reviewRequests[]? | .login] | index($me)) != null) ' +
-  'or ([.reviewRequests[]? | select(has("login") | not)] | length > 0)) ' +
+  `or ($scope == "${PR_REVIEW_DEFAULT_SCOPE}" ` +
+  'and ([.reviewRequests[]? | select(has("login") | not)] | length > 0))) ' +
   'and (.author.login != $me) ' +
   'and ([.statusCheckRollup[]? | select(((.conclusion // .state // "") | ascii_upcase) as $c ' +
   '| $c == "FAILURE" or $c == "TIMED_OUT" or $c == "CANCELLED" or $c == "ERROR" ' +
@@ -664,7 +716,13 @@ ${PR_REVIEW_SCOPE_COMMENT}  command:
     - sh
     - -c
     - |
-${yamlBlockScalar(ghPresetScript('pr-review', PR_REVIEW_FETCH, PR_REVIEW_REDUCE), '      ')}
+${yamlBlockScalar(
+  ghPresetScript('pr-review', PR_REVIEW_FETCH, PR_REVIEW_REDUCE, {
+    preamble: PR_REVIEW_SEARCH_PREAMBLE,
+    jqArgs: '--arg scope "$search"',
+  }),
+  '      ',
+)}
   interval: 5m
   change-detection:
     strategy: json-diff
