@@ -518,6 +518,123 @@ describe('assertPackageCleanRemovesDistAndTemp', () => {
     ).toThrow(/unsupported shell construct/);
   });
 
+  // Regression fixture for the round-6 #454 review finding: two adjacent
+  // `;` separators with no command between them is a `/bin/sh -n` syntax
+  // error (outside a `case` clause), but earlier code checked each `;`
+  // only against its immediate neighbor and accepted this.
+  it('rejects a clean script with two adjacent `;` separators (fail closed — `;;` is invalid outside `case`)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'rm -rf dist temp;;' } },
+        'test-package',
+      ),
+    ).toThrow(/multiple statement separators/);
+  });
+
+  // Regression fixture for the round-6 #454 review finding: a `;` already
+  // terminates the previous statement, so a `&&`/`||` immediately following
+  // it has nothing real to its left to chain off of — `/bin/sh -n` rejects
+  // this, but earlier code only checked a pending `&&`/`||` followed by
+  // `;`, not the reverse ordering.
+  it('rejects a clean script with `;` immediately followed by `&&` (fail closed)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'rm -rf dist temp; && true' } },
+        'test-package',
+      ),
+    ).toThrow(/not immediately preceded by a command/);
+  });
+
+  // Regression fixture for the round-6 #454 review finding: a bare newline
+  // that already terminated the previous statement cannot be followed
+  // directly by `&&`/`||` either — only a newline appearing AFTER a
+  // pending `&&`/`||` (continuing ITS right-hand side, e.g. `dist ||\ntemp`
+  // elsewhere in this file) is transparent.
+  it('rejects a clean script with a newline immediately followed by `&&` (fail closed)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'rm -rf dist temp\n&& true' } },
+        'test-package',
+      ),
+    ).toThrow(/not immediately preceded by a command/);
+  });
+
+  // Regression fixture for the round-6 #454 review finding: this lexer's
+  // bounded grammar deliberately excludes if/for/while/case/function
+  // compound-command syntax (see the module doc's "Scope" paragraph) —
+  // treating `if`/`then`/`fi` as ordinary command words instead of
+  // rejecting them let a required `rm -rf` that only runs on a conditional
+  // branch (here, an always-false `if`) be wrongly counted as
+  // unconditionally guaranteed.
+  it("rejects a clean script using `if`/`then`/`fi` compound syntax (fails closed — compound commands are out of this lexer's scope)", () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'if false; then\nrm -rf dist temp\nfi' } },
+        'test-package',
+      ),
+    ).toThrow(/reserved word/);
+  });
+
+  // Regression fixture for the round-6 #454 review finding: a reached
+  // `exec` REPLACES the current shell process with the given command
+  // rather than returning to it, so anything chained after it in the
+  // original script never runs — `exec /usr/bin/false` deterministically
+  // fails and replaces the shell, but earlier code didn't recognize `exec`
+  // as script-terminating at all, so the required `rm -rf dist temp` was
+  // wrongly counted as reachable.
+  it('rejects "rm -rf dist temp" reachable only via `exec /usr/bin/false; rm -rf dist temp` (a reached `exec` terminates the script)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'exec /usr/bin/false; rm -rf dist temp' } },
+        'test-package',
+      ),
+    ).toThrow(/must run `rm -rf`/);
+  });
+
+  // Mirrors the round-5 `exit 0 &` fixture above: backgrounding `exec`
+  // forks it into a SUBSHELL, so it only replaces THAT subshell, not the
+  // main script — the foreground `rm -rf dist temp` still runs
+  // unconditionally afterwards.
+  it('accepts "rm -rf dist temp" reachable via `exec /usr/bin/false & rm -rf dist temp` (a backgrounded exec only terminates its own subshell)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'exec /usr/bin/false & rm -rf dist temp' } },
+        'test-package',
+      ),
+    ).not.toThrow();
+  });
+
+  // Regression fixture for the round-6 #454 review finding: this guard has
+  // no basis for assuming an UNRECOGNIZED command's exit status — earlier
+  // code optimistically treated every command except a small hardcoded
+  // failure set as successful, so a nested shell invocation whose own exit
+  // status this bounded lexer can't evaluate (`/bin/sh -c "exit 1"`, which
+  // really does fail) let a required `&&`-chained command look guaranteed.
+  it('rejects "rm -rf dist temp" reachable only via `/bin/sh -c "exit 1" && rm -rf dist temp` (an unrecognized command\'s status is never assumed successful)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: '/bin/sh -c "exit 1" && rm -rf dist temp' } },
+        'test-package',
+      ),
+    ).toThrow(/must run `rm -rf`/);
+  });
+
+  // Regression fixture for the round-6 #454 review finding: an actual
+  // carriage return (U+000D) is NOT shell whitespace — `/bin/sh` keeps it
+  // as a literal character joined into the surrounding word, but earlier
+  // code treated it exactly like a space/tab and split `temp\rjunk` into
+  // separate `temp`/`junk` words, letting `temp` be recognized as removed
+  // even though the real shell's single `temp\rjunk` operand leaves
+  // `temp/` completely untouched.
+  it('rejects "temp" removed only when a literal carriage return splits it from trailing text (fail closed — CR is not shell whitespace)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'rm -rf dist temp\rjunk' } },
+        'test-package',
+      ),
+    ).toThrow(/must also remove "temp"/);
+  });
+
   // The real proof: every actual, on-disk package discovered by
   // `findApiExtractorPackageDirs` must satisfy the contract. If any future
   // package's `clean` script drifts back to a `dist`-only shape, this
@@ -1080,6 +1197,92 @@ describe('assertRootCleanRunsWorkspaceCleanAndReset', () => {
         },
       }),
     ).toThrow(/unsupported shell construct/);
+  });
+
+  // Regression fixture for the round-6 #454 review finding: two adjacent
+  // `;` separators with no command between them, mirroring the package
+  // fixture above.
+  it('rejects a root clean script with two adjacent `;` separators', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace;; NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/multiple statement separators/);
+  });
+
+  // Regression fixture for the round-6 #454 review finding: a `;` already
+  // terminates the previous statement, so an immediately-following `&&`
+  // has nothing real to its left, mirroring the package fixture above.
+  it('rejects a root clean script with `;` immediately followed by `&&`', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace; && NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/not immediately preceded by a command/);
+  });
+
+  // Regression fixture for the round-6 #454 review finding: a bare newline
+  // that already terminated the previous statement cannot be followed
+  // directly by `&&` either, mirroring the package fixture above.
+  it('rejects a root clean script with a newline immediately followed by `&&`', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace\n&& NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/not immediately preceded by a command/);
+  });
+
+  // Regression fixture for the round-6 #454 review finding: a reached
+  // `exec` terminates the whole script, mirroring the package fixture
+  // above — `exec /usr/bin/false` replaces the shell before either
+  // required Nx invocation ever runs.
+  it('rejects a root clean script reachable only via `exec /usr/bin/false; <run-many> && <reset>`', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'exec /usr/bin/false; NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace && NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/must invoke `nx run-many --target=clean`/);
+  });
+
+  // Regression fixture for the round-6 #454 review finding: an
+  // unrecognized command's exit status is never assumed successful,
+  // mirroring the package fixture above.
+  it('rejects a root clean script reachable only via `/bin/sh -c "exit 1" && <run-many> && <reset>`', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            '/bin/sh -c "exit 1" && NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace && NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/must invoke `nx run-many --target=clean`/);
+  });
+
+  // Regression fixture for the round-6 #454 review finding: an actual
+  // carriage return is not shell whitespace, mirroring the package fixture
+  // above — it stays part of the `--exclude=` flag's value, so the
+  // required workspace-root project name is never matched exactly.
+  it('rejects a root clean script whose `--exclude=` value is split from the workspace project name only by a literal carriage return', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace\rsuffix && NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/must exclude/);
   });
 
   // The real proof: the actual, on-disk root package.json.

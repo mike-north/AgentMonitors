@@ -329,7 +329,15 @@ function lexShellLike(script) {
       continue;
     }
 
-    if (ch === ' ' || ch === '\t' || ch === '\r') {
+    // A real carriage return is NOT shell whitespace — `/bin/sh` treats it as
+    // an ordinary literal word character exactly like any other non-special
+    // byte (round-6 #454 review finding): a JSON-sourced clean script whose
+    // parsed value contains a literal `\r` (e.g. `rm -rf dist temp\rjunk`)
+    // was previously split into separate `temp` and `junk` words by treating
+    // `\r` like a space/tab, letting `temp` be recognized as removed even
+    // though the real shell passes `temp\rjunk` as ONE operand and `rm`
+    // leaves `temp/` untouched. Only space and tab are unquoted whitespace.
+    if (ch === ' ' || ch === '\t') {
       flushWord();
       atWordStart = true;
       continue;
@@ -382,7 +390,81 @@ function lexShellLike(script) {
 
   flushCommand();
   validateNoDanglingControlOperators(out);
+  validateNoReservedCompoundSyntax(out);
   return out;
+}
+
+/**
+ * Shell reserved words that introduce compound-command grammar (`if`/`for`/
+ * `while`/`case`/function definitions/brace or subshell grouping) this
+ * lexer's documented scope explicitly excludes — see the module doc's "Scope,
+ * deliberately NOT full POSIX" paragraph. Recognizing only `&&`/`||`/`;`/
+ * newline/`&` as control structure means a compound command is otherwise
+ * accepted as if its reserved words were ordinary command words, hiding
+ * conditional execution this guard has no model for (round-6 #454 review
+ * finding): `if false; then\n rm -rf dist temp\nfi` lexes as the plain
+ * commands `if false`, `rm -rf dist temp`, and `fi`, with the `rm -rf`
+ * counted as unconditionally guaranteed even though it only runs when the
+ * (here, always-false) `if` condition holds. Fail closed instead.
+ */
+const SHELL_RESERVED_WORDS = new Set([
+  'if',
+  'then',
+  'elif',
+  'else',
+  'fi',
+  'for',
+  'while',
+  'until',
+  'do',
+  'done',
+  'case',
+  'esac',
+  'function',
+  'select',
+  'in',
+  '{',
+  '}',
+  '(',
+  ')',
+]);
+
+/**
+ * Fail closed if any lexed command's FIRST word is a
+ * {@link SHELL_RESERVED_WORDS} entry — this bounded lexer never models the
+ * compound-command grammar those words introduce (see
+ * {@link SHELL_RESERVED_WORDS}'s doc), so treating them as an ordinary
+ * command name would silently accept scripts whose actual execution is
+ * conditional on a construct this guard can't reason about.
+ *
+ * Deliberately checked against ONLY the first word of each lexed command,
+ * not every word: a reserved word is exclusively special in "command name"
+ * position (the start of a new simple command or compound-command clause) —
+ * every one of these words this lexer ever sees elsewhere in a command's
+ * word list is ordinary argument TEXT, e.g. `echo done` (an entirely benign
+ * `echo` invocation whose argument happens to be the literal string `done`)
+ * must NOT be rejected the way `for x; do rm -rf dist temp; done` (where
+ * `done` truly is the reserved word closing the loop, and is consequently
+ * lexed as the FIRST word of its own command once split on the preceding
+ * `;`) must be.
+ *
+ * @param {(LexedCommand | ShellOperator)[]} tokens
+ */
+function validateNoReservedCompoundSyntax(tokens) {
+  for (const token of tokens) {
+    if (typeof token !== 'object') {
+      continue;
+    }
+    const head = token.words[0];
+    if (head !== undefined && SHELL_RESERVED_WORDS.has(head)) {
+      throw new Error(
+        `unsupported shell construct in clean script: reserved word "${head}" ` +
+          '(compound-command syntax such as if/for/while/case/function/' +
+          "grouping) is not supported by this guard's lexer — got word list " +
+          `${JSON.stringify(token.words)}`,
+      );
+    }
+  }
 }
 
 /**
@@ -415,89 +497,139 @@ function lexShellLike(script) {
  * treated `;` identically to a benign newline in both positions and
  * accepted them.
  *
+ * This validates every "gap" — the run of operator tokens between two
+ * consecutive commands, or before the first/after the last command — against
+ * the POSIX grammar's `separator`/`and_or` productions (round-6 #454 review
+ * finding): a gap containing `&&`/`||` is valid ONLY if that operator is the
+ * gap's very FIRST token (nothing, not even a `;` or a newline, may separate
+ * it from the command it chains off of) and only bare newlines follow it —
+ * `/bin/sh -n` rejects both `true; && echo hi` (a `;` before the `&&`) and a
+ * `&&`/`||` on its own line after a fully-terminated previous statement
+ * (`true\n&& echo hi`), which earlier code (checking only immediate
+ * token-to-token adjacency) accepted. A gap containing no `&&`/`||` (just
+ * `;`/`&`/newlines) is valid only if it has AT MOST ONE non-newline token,
+ * and — when present — that token is the gap's first token (a newline
+ * before it means the previous statement was already fully terminated, so
+ * the separator has nothing left to terminate): `/bin/sh -n` rejects both
+ * `rm -rf dist temp;;` (two `;` with no command between) and
+ * `echo hi\n;` (a `;` stranded after an already-terminating newline),
+ * which earlier code — only ever comparing a token to its IMMEDIATE
+ * predecessor/successor rather than validating the whole gap — accepted.
+ *
  * @param {(LexedCommand | ShellOperator)[]} tokens
  */
 function validateNoDanglingControlOperators(tokens) {
-  /** @param {ShellOperator} operator */
-  const isChainingOperator = (operator) =>
-    operator === '&&' || operator === '||' || operator === '&';
-  /** @param {ShellOperator} operator */
-  const requiresFollowingCommand = (operator) =>
-    operator === '&&' || operator === '||';
+  /** @param {ShellOperator | undefined} token */
+  const isAndOr = (token) => token === '&&' || token === '||';
 
-  // Only a leading newline is benign (blank lines before the first real
-  // command) — a leading `;` has no preceding command of its own to
-  // terminate and is invalid syntax in its own right.
-  let firstIndex = 0;
-  while (firstIndex < tokens.length && tokens[firstIndex] === '\n') {
-    firstIndex++;
-  }
-  const first = tokens[firstIndex];
-  if (first === ';') {
-    throw new Error(
-      'invalid shell syntax in clean script: begins with a dangling ";" ' +
-        'separator with no preceding command',
-    );
-  }
-  if (
-    first !== undefined &&
-    typeof first !== 'object' &&
-    isChainingOperator(first)
-  ) {
-    throw new Error(
-      `invalid shell syntax in clean script: begins with a dangling "${first}" ` +
-        'operator with no preceding command',
-    );
-  }
-
-  // A trailing `;` (unlike a leading one) IS valid, ordinary shell syntax
-  // (`echo hi;` terminates a real preceding command), so both `;` and `\n`
-  // stay transparent at the end.
-  let lastIndex = tokens.length - 1;
-  while (
-    lastIndex >= 0 &&
-    (tokens[lastIndex] === ';' || tokens[lastIndex] === '\n')
-  ) {
-    lastIndex--;
-  }
-  const last = tokens[lastIndex];
-  if (
-    last !== undefined &&
-    typeof last !== 'object' &&
-    requiresFollowingCommand(last)
-  ) {
-    throw new Error(
-      `invalid shell syntax in clean script: ends with a dangling "${last}" ` +
-        'operator with no following command',
-    );
-  }
-
-  /** @type {ShellOperator | undefined} */
-  let pendingChainingOperator;
-  for (const token of tokens) {
-    if (token === '\n') {
-      continue; // benign — see the function doc
+  /**
+   * @param {ShellOperator[]} gap
+   * @param {boolean} hasPrecedingCommand
+   * @param {boolean} hasFollowingCommand
+   */
+  const validateGap = (gap, hasPrecedingCommand, hasFollowingCommand) => {
+    if (gap.length === 0) {
+      return;
     }
-    if (token === ';') {
-      if (pendingChainingOperator !== undefined) {
+
+    const andOrIndex = gap.findIndex(isAndOr);
+    if (andOrIndex !== -1) {
+      const operator = gap[andOrIndex];
+      if (andOrIndex !== 0) {
         throw new Error(
-          `invalid shell syntax in clean script: "${pendingChainingOperator}" ` +
-            'immediately followed by ";" with no command between them',
+          `invalid shell syntax in clean script: "${operator}" is not ` +
+            'immediately preceded by a command — a separator or newline ' +
+            'from an already-terminated statement appears between them',
         );
       }
-      continue; // an ordinary separator between two real commands
-    }
-    if (typeof token !== 'object' && isChainingOperator(token)) {
-      if (pendingChainingOperator !== undefined) {
+      const extra = gap.slice(1).find((candidate) => candidate !== '\n');
+      if (extra !== undefined) {
         throw new Error(
-          `invalid shell syntax in clean script: "${pendingChainingOperator}" ` +
-            `immediately followed by "${token}" with no command between them`,
+          `invalid shell syntax in clean script: "${operator}" immediately ` +
+            `followed by "${extra}" with no command between them`,
         );
       }
-      pendingChainingOperator = token;
-      continue;
+      if (!hasPrecedingCommand) {
+        throw new Error(
+          `invalid shell syntax in clean script: begins with a dangling ` +
+            `"${operator}" operator with no preceding command`,
+        );
+      }
+      if (!hasFollowingCommand) {
+        throw new Error(
+          `invalid shell syntax in clean script: ends with a dangling ` +
+            `"${operator}" operator with no following command`,
+        );
+      }
+      return;
     }
-    pendingChainingOperator = undefined;
+
+    // No `&&`/`||` in this gap: just `;`/`&`/newlines. POSIX allows at most
+    // ONE `;`/`&` separator between two commands, and it must precede any
+    // newlines in the gap (a newline BEFORE it means the previous statement
+    // was already terminated on its own, leaving the separator dangling).
+    const separators = gap.filter((token) => token === ';' || token === '&');
+    if (separators.length > 1) {
+      throw new Error(
+        'invalid shell syntax in clean script: multiple statement ' +
+          `separators (${separators.map((token) => `"${token}"`).join(', ')}) ` +
+          'with no command between them',
+      );
+    }
+    if (separators.length === 1) {
+      const separator = separators[0];
+      if (gap[0] !== separator) {
+        throw new Error(
+          `invalid shell syntax in clean script: "${separator}" separator ` +
+            'preceded by a newline from an already-terminated statement, ' +
+            'with no command between them',
+        );
+      }
+      if (!hasPrecedingCommand) {
+        throw new Error(
+          `invalid shell syntax in clean script: begins with a dangling ` +
+            `"${separator}" separator with no preceding command`,
+        );
+      }
+      // A trailing `;`/`&` (unlike a trailing `&&`/`||`) IS valid, ordinary
+      // shell syntax (`echo hi;`/`echo hi &` both terminate a real preceding
+      // command with nothing required after them).
+    }
+  };
+
+  /** @type {number[]} */
+  const commandIndices = [];
+  tokens.forEach((token, index) => {
+    if (typeof token === 'object') {
+      commandIndices.push(index);
+    }
+  });
+
+  const firstCommandIndex =
+    commandIndices.length > 0 ? commandIndices[0] : tokens.length;
+  validateGap(
+    /** @type {ShellOperator[]} */ (tokens.slice(0, firstCommandIndex)),
+    false,
+    commandIndices.length > 0,
+  );
+
+  for (let i = 0; i + 1 < commandIndices.length; i++) {
+    validateGap(
+      /** @type {ShellOperator[]} */ (
+        tokens.slice(commandIndices[i] + 1, commandIndices[i + 1])
+      ),
+      true,
+      true,
+    );
+  }
+
+  if (commandIndices.length > 0) {
+    const lastCommandIndex = commandIndices[commandIndices.length - 1];
+    validateGap(
+      /** @type {ShellOperator[]} */ (tokens.slice(lastCommandIndex + 1)),
+      true,
+      false,
+    );
   }
 }
 
@@ -538,10 +670,10 @@ function skipLeadingAssignments(words) {
  * @param {string[]} words
  * @returns {boolean}
  */
-function commandAlwaysFails(words) {
+function commandKnownStatus(words) {
   const [head, ...rest] = skipLeadingAssignments(words);
   if (head === undefined) {
-    return false;
+    return 'unknown';
   }
   // Any invocation of the `false` utility deterministically fails,
   // regardless of its path form (`false`, `/bin/false`, `/usr/bin/false`,
@@ -551,36 +683,64 @@ function commandAlwaysFails(words) {
   // guaranteed chain even though `/usr/bin/false` fails identically to the
   // builtin.
   if (head.split('/').pop() === 'false') {
-    return true;
+    return 'fail';
   }
   // `exit <nonzero literal>` deterministically fails the same way — round-3
   // #454 review finding: only recognizing the literal `false` builtin left
   // `exit 1 && rm -rf dist temp` (which never actually removes anything)
   // indistinguishable from a real guaranteed chain.
   if (head === 'exit' && rest.length === 1 && /^-?\d+$/.test(rest[0])) {
-    return Number(rest[0]) !== 0;
+    return Number(rest[0]) !== 0 ? 'fail' : 'success';
   }
-  return false;
+  // Utility command names this guard trusts to succeed when actually
+  // reached — every real invocation this guard itself validates (`rm -rf`,
+  // any `nx` subcommand) plus the trivially-always-successful POSIX
+  // builtins `true` and `:`. Any OTHER command's status is `'unknown'`
+  // (round-6 #454 review finding): optimistically treating every
+  // unrecognized command as successful let an adversarial
+  // `<unrecognized-command> && required-command` chain (e.g.
+  // `/bin/sh -c "exit 1" && rm -rf dist temp`, whose OWN nested exit status
+  // this lexer's bounded grammar can't evaluate) look identical to a real
+  // `guaranteed: true` chain, even though this guard has no actual basis for
+  // assuming that command's outcome.
+  if (head === 'rm' || head === 'nx' || head === 'true' || head === ':') {
+    return 'success';
+  }
+  return 'unknown';
 }
 
 /**
- * Whether a command's word list is the `exit` builtin, with or without a
- * status argument, ignoring any leading assignment-word prefix (see
- * {@link skipLeadingAssignments}). Distinct from {@link commandAlwaysFails}:
- * `exit`'s defining effect isn't its exit STATUS (an `exit 0` succeeds
- * exactly like any other successful command) — it's that a REACHED `exit`
- * terminates the whole script immediately, so nothing chained after it (via
- * `&&`, `||`, `;`, a newline, or `&`) ever runs, regardless of that
- * command's own operator (round-4 #454 review finding: `exit 0 && rm -rf
- * dist temp` and `exit 0 && <run-many> && <reset>` were both accepted,
- * because a zero-status `exit` looked identical to any other successful
- * command to logic that only tracked `lastStatus`).
+ * Whether a command's word list is `exit` or `exec <command...>`, ignoring
+ * any leading assignment-word prefix (see {@link skipLeadingAssignments}).
+ * Distinct from {@link commandKnownStatus}: a terminating command's defining
+ * effect isn't its exit STATUS (an `exit 0` succeeds exactly like any other
+ * successful command) — it's that a REACHED `exit`/`exec` terminates the
+ * whole script immediately, so nothing chained after it (via `&&`, `||`,
+ * `;`, a newline, or `&`) ever runs, regardless of that command's own
+ * operator (round-4 #454 review finding: `exit 0 && rm -rf dist temp` and
+ * `exit 0 && <run-many> && <reset>` were both accepted, because a
+ * zero-status `exit` looked identical to any other successful command to
+ * logic that only tracked `lastStatus`; round-6 #454 review finding:
+ * `exec /usr/bin/false; rm -rf dist temp` was accepted the same way, since
+ * `exec` wasn't recognized as terminating at all).
  *
  * @param {string[]} words
  * @returns {boolean}
  */
-function isExitCommand(words) {
-  return skipLeadingAssignments(words)[0] === 'exit';
+function isTerminatingCommand(words) {
+  const stripped = skipLeadingAssignments(words);
+  if (stripped[0] === 'exit') {
+    return true;
+  }
+  // `exec <command...>` REPLACES the current shell process with the given
+  // command rather than returning to it, so — like a reached `exit` —
+  // anything chained after it in the ORIGINAL script never runs, no matter
+  // whether the exec'd command itself succeeds or fails (round-6 #454
+  // review finding: `exec /usr/bin/false; rm -rf dist temp` was previously
+  // accepted, because `exec ...` looked like any other ordinary,
+  // non-terminating command). A bare `exec` with no following words merely
+  // applies redirections to the current shell and does NOT terminate.
+  return stripped[0] === 'exec' && stripped.length > 1;
 }
 
 /**
@@ -590,7 +750,7 @@ function isExitCommand(words) {
  *
  * `guaranteed` models a single, deterministic execution path: every
  * command this guard doesn't specifically recognize (see
- * {@link commandAlwaysFails}) is optimistically assumed to succeed (true
+ * {@link commandKnownStatus}) is optimistically assumed to succeed (true
  * for every real `rm -rf`/`nx` invocation this guard validates), and the
  * resulting exit status is carried forward as `lastStatus` — INCLUDING
  * across a skipped command, whose own (never-executed) status must never
@@ -620,18 +780,21 @@ function isExitCommand(words) {
  * `rm -rf dist temp & echo done` was accepted as a single, non-backgrounded
  * command).
  *
- * A REACHED `exit` (see {@link isExitCommand}) terminates the whole script:
- * every command chained after it — via ANY operator, not just `&&`/`||` —
- * never runs, so all of them are pushed `guaranteed: false` regardless of
- * what their own operator would otherwise imply (round-4 #454 review
- * finding: `exit 0 && rm -rf dist temp` was previously accepted, because
- * `exit 0`'s zero status looked exactly like any other successful
- * command's) — EXCEPT when the very next token is a lone `&`: that forks
- * the `exit` into a background SUBSHELL, and a special builtin running
- * inside a subshell only ends the subshell, not the main script (round-5
- * #454 review finding: `exit 0 & rm -rf dist temp` was previously wrongly
- * REJECTED as though `exit 0` terminated the foreground script, when real
- * `/bin/sh` still runs `rm -rf dist temp` unconditionally afterwards).
+ * A REACHED terminating command (see {@link isTerminatingCommand}, `exit`
+ * or `exec <command...>`) terminates the whole script: every command
+ * chained after it — via ANY operator, not just `&&`/`||` — never runs, so
+ * all of them are pushed `guaranteed: false` regardless of what their own
+ * operator would otherwise imply (round-4 #454 review finding: `exit 0 &&
+ * rm -rf dist temp` was previously accepted, because `exit 0`'s zero status
+ * looked exactly like any other successful command's; round-6 #454 review
+ * finding: `exec /usr/bin/false; rm -rf dist temp` was accepted the same
+ * way) — EXCEPT when the very next token is a lone `&`: that forks the
+ * terminating command into a background SUBSHELL, and a special builtin or
+ * `exec` running inside a subshell only ends the subshell, not the main
+ * script (round-5 #454 review finding: `exit 0 & rm -rf dist temp` was
+ * previously wrongly REJECTED as though `exit 0` terminated the foreground
+ * script, when real `/bin/sh` still runs `rm -rf dist temp` unconditionally
+ * afterwards).
  *
  * A lone `&` backgrounds the ENTIRE preceding AND/OR list (every command
  * chained by `&&`/`||` since the last unconditional `;`/newline/`&`
@@ -656,7 +819,11 @@ function splitChainedCommands(script) {
   const commands = [];
   /** @type {'&&' | '||' | undefined} */
   let pendingOperator;
-  /** @type {'success' | 'fail'} */
+  // `'unknown'` (round-6 #454 review finding) models a command whose exit
+  // status this guard has no basis for assuming — neither `&&` nor `||`
+  // ever treats a following command as `guaranteed` off an `'unknown'`
+  // predecessor, since the real shell might take either branch.
+  /** @type {'success' | 'fail' | 'unknown'} */
   let lastStatus = 'success'; // vacuous: only consulted once a command has run
   // Index (into `commands`) where the CURRENT AND/OR list began — every
   // command from here to the end is chained by `&&`/`||` off one another,
@@ -664,24 +831,25 @@ function splitChainedCommands(script) {
   // `commands.length` every time a command starts a fresh, unconditional
   // statement, so a lone `&` can background the whole list at once.
   let currentListStart = 0;
-  // Once a REACHED `exit` command is CONFIRMED to terminate the script (see
-  // `pendingExit` below), every subsequent command (however it's chained)
-  // never runs.
+  // Once a REACHED terminating command (see {@link isTerminatingCommand} —
+  // `exit` or `exec <command...>`) is CONFIRMED to terminate the script (see
+  // `pendingTermination` below), every subsequent command (however it's
+  // chained) never runs.
   let terminated = false;
-  // Set the moment a reached `exit` command is pushed, but NOT yet
+  // Set the moment a reached terminating command is pushed, but NOT yet
   // confirmed as terminating — see the function doc's `&` exception
-  // (round-5 #454 review finding): a `&` immediately after `exit` forks it
-  // into a background SUBSHELL, and a special builtin like `exit` running
-  // inside a subshell only ends that subshell, not the main script, so
-  // `exit 0 & rm -rf dist temp` must NOT be treated as terminated. Anything
-  // else following (`&&`, `||`, `;`, a newline, or end of script) confirms
-  // the exit ran in the foreground and did terminate the script.
-  let pendingExit = false;
+  // (round-5 #454 review finding): a `&` immediately after `exit`/`exec`
+  // forks it into a background SUBSHELL, and a special builtin or `exec`
+  // running inside a subshell only ends that subshell, not the main script,
+  // so `exit 0 & rm -rf dist temp` must NOT be treated as terminated.
+  // Anything else following (`&&`, `||`, `;`, a newline, or end of script)
+  // confirms it ran in the foreground and did terminate the script.
+  let pendingTermination = false;
 
   for (const token of lexShellLike(script)) {
-    if (pendingExit && token !== '&') {
+    if (pendingTermination && token !== '&') {
       terminated = true;
-      pendingExit = false;
+      pendingTermination = false;
     }
 
     if (token === ';' || token === '\n') {
@@ -698,9 +866,9 @@ function splitChainedCommands(script) {
       // Background the WHOLE current AND/OR list (every command since
       // `currentListStart`), then behave exactly like `;`/newline for what
       // follows: the next command starts a fresh, unconditional statement.
-      // `pendingExit` is deliberately cleared WITHOUT setting `terminated`
-      // — see the function doc.
-      pendingExit = false;
+      // `pendingTermination` is deliberately cleared WITHOUT setting
+      // `terminated` — see the function doc.
+      pendingTermination = false;
       for (let i = currentListStart; i < commands.length; i++) {
         commands[i].guaranteed = false;
       }
@@ -721,7 +889,7 @@ function splitChainedCommands(script) {
 
     let reachable;
     if (terminated) {
-      // Nothing after a reached, confirmed-terminating `exit` ever runs,
+      // Nothing after a reached, confirmed-terminating command ever runs,
       // no matter its operator.
       reachable = false;
     } else if (pendingOperator === '&&') {
@@ -736,9 +904,9 @@ function splitChainedCommands(script) {
     commands.push({ words, guaranteed: reachable });
 
     if (reachable) {
-      lastStatus = commandAlwaysFails(words) ? 'fail' : 'success';
-      if (isExitCommand(words)) {
-        pendingExit = true;
+      lastStatus = commandKnownStatus(words);
+      if (isTerminatingCommand(words)) {
+        pendingTermination = true;
       }
     }
     // If NOT reachable (this command was skipped), `lastStatus` carries
