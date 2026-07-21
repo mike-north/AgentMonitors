@@ -68,15 +68,18 @@ specifics without acknowledging first, use `urgency: high`.
 
 **`high` and recap deliveries also need an explicit ack, and acking un-mutes the reminder.** Claiming
 a `high`-urgency delivery (or a `post-compact` recap) marks the events it renders **claimed**, not
-**acknowledged**. The coalesced-until-ack guard is **band-scoped**: it compares a band's own
-claimed-but-unacknowledged events against that same band's unread total, so an unacknowledged claim
-suppresses the reminder only for the band(s) the claimed events actually belong to. A `high`-only
-claim therefore does not block a NEW `normal`/`low` reminder from firing for unrelated,
-still-unclaimed events in the same session — the two coexist. Because of this, every `high`/recap
-delivery carries its own one-line acknowledge instruction naming the exact ids it just showed you
-(e.g. `agentmonitors events ack --session <id> --event-ids <id1>,<id2>`) — run it once you've
-handled what it showed. Acking is what turns the coalesced reminder back on for the affected band's
-next `normal`/`low` event.
+**acknowledged**. The coalesced-until-ack guard is **band-scoped**: it compares a band's own **pending
+and currently claimable** count — unclaimed rows, minus any momentarily held by an in-flight
+channel-push reservation — against that same band's unread total (which also contains any
+claimed-but-unacknowledged or leased-but-unclaimed row), so an unacknowledged claim suppresses the
+reminder only for the band(s) the claimed events actually belong to. A `high`-only claim therefore does
+not block a NEW `normal`/`low` reminder from firing for unrelated, still-unclaimed events in the same
+session — the two coexist. A fresh unclaimed event of an already-suppressed band does not restore its
+reminder either: acknowledging the outstanding claim is the only thing that does. Because of this, every
+`high`/recap delivery carries its own one-line acknowledge instruction naming the exact ids it just
+showed you (e.g. `agentmonitors events ack --session <id> --event-ids <id1>,<id2>`) — run it once you've
+handled what it showed. Acking is what turns the coalesced reminder back on for the affected band's next
+`normal`/`low` event.
 
 _Governing spec: 002 §9.1 (high), §9.2 (normal), §9.3 (low), §9.4 (recap)._
 

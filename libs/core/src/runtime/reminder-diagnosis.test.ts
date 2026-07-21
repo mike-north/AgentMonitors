@@ -55,6 +55,30 @@ describe('diagnoseReminderSuppression', () => {
     expect(finding?.message).toContain('already claimed');
     expect(finding?.message).toContain('coalesced-until-ack');
     expect(finding?.message).toContain('agentmonitors events ack --session s1');
+    // Regression (PR #445 review round 8): the guard is ack-only. The message
+    // must not promise a fresh/new unclaimed event restores the reminder —
+    // it may correctly say the OPPOSITE (that one arriving does NOT restore
+    // it), so assert there is no false "or a fresh event" recovery clause.
+    expect(finding?.message).not.toMatch(/acknowledged.*or a (fresh|new)/);
+    expect(finding?.message).toContain('does not restore it');
+  });
+
+  it('reports `already-claimed` when the sole unread normal row is leased, not claimed (issue #300, PR #445 review round 8)', () => {
+    // `pendingCount` is lease-aware (fed from `pendingForClaim`, which excludes
+    // rows held by an in-flight channel-push reservation) — so a leased-but-
+    // unclaimed row looks identical to a truly claimed one to this function:
+    // unreadCount=1, pendingCount=0 either way. Pinning this documents the
+    // known overlap rather than leaving it silently undocumented.
+    const counts: ReminderSessionCounts[] = [
+      { sessionId: 's1', urgency: 'normal', unreadCount: 1, pendingCount: 0 },
+    ];
+    const findings = diagnoseReminderSuppression(counts);
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      unreadCount: 1,
+      claimedCount: 1,
+      reason: 'already-claimed',
+    });
   });
 
   it('reports `coalesced-until-ack` when unread normal events mix claimed and unclaimed (§9.2)', () => {

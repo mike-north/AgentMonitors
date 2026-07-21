@@ -28,8 +28,13 @@ import type { DeliveryLifecycle, SessionUnreadCounts } from './types.js';
  * - `settle-window` — high-urgency only: pending (unclaimed) events exist but
  *   none has aged past the claim-time settle threshold yet (002 §9.1).
  * - `already-claimed` — normal/low only: every unread event of the band is
- *   already claimed, so the coalesced reminder (002 §9.2/§9.3) will not re-fire
- *   until acknowledgment or a fresh unclaimed event.
+ *   already claimed (or leased by an in-flight channel-push reservation, issue
+ *   #300 — `pendingCount` is lease-aware, so a leased-but-unclaimed row is
+ *   indistinguishable from a truly claimed one here), so the coalesced reminder
+ *   (002 §9.2/§9.3) will not re-fire until acknowledgment (or, for the leased
+ *   case, until the lease is released and the row is claimed and acknowledged).
+ *   A fresh unclaimed event of the same band arriving in the meantime does NOT
+ *   restore it.
  * - `coalesced-until-ack` — normal/low only: a mix of claimed and unclaimed
  *   unread events exists; the claimed ones hold the coalesced reminder back
  *   even though a newer unclaimed event is also pending.
@@ -117,7 +122,7 @@ export function classifyReminderHold(
   const ackHint = 'agentmonitors events ack';
   const message =
     reason === 'already-claimed'
-      ? `${label}-urgency reminder at ${lifecycle} is suppressed: all ${String(unreadCount)} unread ${urgency} event(s) are already claimed (coalesced-until-ack). It re-fires once they are acknowledged (\`${ackHint}\`) or a fresh unclaimed ${urgency} event arrives.`
+      ? `${label}-urgency reminder at ${lifecycle} is suppressed: all ${String(unreadCount)} unread ${urgency} event(s) are already claimed (coalesced-until-ack). It re-fires once they are acknowledged (\`${ackHint}\`) — a fresh unclaimed ${urgency} event arriving in the meantime does not restore it.`
       : `${label}-urgency reminder at ${lifecycle} is suppressed: ${String(claimedCount)} of ${String(unreadCount)} unread ${urgency} event(s) are already claimed (coalesced-until-ack). It re-fires only once every unread ${urgency} event is unclaimed — acknowledge the claimed ones (\`${ackHint}\`).`;
 
   return {

@@ -48,6 +48,10 @@ describe('classifyReminderHold', () => {
     expect(hold?.message).toContain('already claimed');
     expect(hold?.message).toContain('coalesced-until-ack');
     expect(hold?.message).toContain('agentmonitors events ack');
+    // Regression (PR #445 review round 8): the guard is ack-only — the
+    // message must not promise a fresh/new unclaimed event restores it.
+    expect(hold?.message).not.toMatch(/acknowledged.*or a (fresh|new)/);
+    expect(hold?.message).toContain('does not restore it');
   });
 
   it('defaults `claimedEventIds` to an empty array when the caller omits it', () => {

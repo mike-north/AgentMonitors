@@ -11465,6 +11465,7 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
     sessionId: string;
     env: Record<string, string>;
     eventId: string;
+    monitorsDir: string;
   }
 
   // Boot a real daemon with ONE settled normal-urgency event projected into a
@@ -11567,7 +11568,7 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
     }
     expect(eventId).not.toBe('');
 
-    return { ws, socket, sessionId, env, eventId };
+    return { ws, socket, sessionId, env, eventId, monitorsDir };
   }
 
   function deliveryStateOf(f: ChannelCycleFixture): string | undefined {
@@ -11720,6 +11721,93 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
       // Surfaced exactly once (by the channel), and now claimed.
       expect(deliveryStateOf(f)).toBe('claimed');
       expect(unreadCount(f)).toBe(1);
+    } finally {
+      await teardown(f);
+    }
+  }, 30_000);
+
+  // PR #445 review round 8 (comment 3618177636): `pendingForClaim` (issue
+  // #300) hides a leased-but-unclaimed row from `normalPending`, so it looks
+  // IDENTICAL to a truly claimed row to the `already-claimed` reminder
+  // diagnosis — a leased, unclaimed, unread normal row is reported the same
+  // way a genuinely claimed one would be. This is documented (not fixed, since
+  // distinguishing it needs a new public `HookDeliveryHoldReason` variant),
+  // and pinned here against the REAL reservation state machine so the
+  // documented overlap can't silently regress into a different (wrong) reason
+  // or an unsuppressed reminder.
+  it('a mid-push leased row reads as `already-claimed` to `monitor explain`, exactly like a truly claimed row (issue #300, PR #445 review round 8)', async () => {
+    const f = await setupChannelCycle('leased-explain');
+    try {
+      let explainDuringLease: {
+        stages: {
+          id: string;
+          status: string;
+          reason: string;
+          details?: {
+            reminderSuppression?: {
+              sessionId: string;
+              urgency: string;
+              lifecycle: string;
+              unreadCount: number;
+              claimedCount: number;
+              reason: string;
+              message: string;
+            }[];
+          };
+        }[];
+      } | null = null;
+      const outcome = await runChannelDeliveryCycle(
+        f.sessionId,
+        f.socket,
+        async () => {
+          // The channel's reservation is held here (before commit) — the row
+          // is leased, not claimed, but `pendingForClaim` excludes it either
+          // way. `explainMonitor` must still report it via the same
+          // `already-claimed` reason a truly claimed row gets.
+          const explain = runWithEnv(
+            [
+              'monitor',
+              'explain',
+              'watch-files',
+              '--dir',
+              path.dirname(f.monitorsDir),
+              '--workspace',
+              f.ws,
+              '--socket',
+              f.socket,
+              '--format',
+              'json',
+            ],
+            f.env,
+            f.ws,
+          );
+          expect(explain.exitCode).toBe(0);
+          explainDuringLease = JSON.parse(
+            explain.stdout,
+          ) as typeof explainDuringLease;
+        },
+      );
+
+      expect(outcome).toBe('surfaced');
+      const delivery = explainDuringLease?.stages.find(
+        (stage) => stage.id === 'delivery',
+      );
+      expect(delivery).toBeDefined();
+      const findings = delivery?.details?.reminderSuppression;
+      expect(findings).toHaveLength(1);
+      expect(findings?.[0]).toMatchObject({
+        sessionId: f.sessionId,
+        urgency: 'normal',
+        lifecycle: 'turn-interruptible',
+        unreadCount: 1,
+        claimedCount: 1,
+        reason: 'already-claimed',
+      });
+      // The reason for suppression is genuinely a lease, not an acknowledged-
+      // pending claim — but the message vocabulary is shared (documented
+      // overlap, not a bug), and must not promise a fresh event restores it.
+      expect(findings?.[0]?.message).toContain('already claimed');
+      expect(findings?.[0]?.message).not.toContain('fresh');
     } finally {
       await teardown(f);
     }

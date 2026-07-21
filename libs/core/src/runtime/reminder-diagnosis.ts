@@ -8,7 +8,10 @@ import type { DeliveryLifecycle } from './types.js';
  * unread events of that urgency are still unclaimed**. Once any unread event of
  * that urgency has been claimed (its `firstNotifiedAt` is set) but not yet
  * acknowledged, the reminder is suppressed — it does not re-fire until the
- * claimed events are acknowledged or a fresh unclaimed event arrives.
+ * claimed events are acknowledged. A fresh unclaimed event of the same band
+ * arriving in the meantime does NOT restore it: the band-scoped equality guard
+ * (unread count === pending count) stays unequal as long as any claimed row
+ * remains in the unread total, regardless of how many new unclaimed rows join it.
  *
  * This is the exact trap a blind study subject hit: a first
  * `hook claim --lifecycle turn-interruptible` surfaced the reminder AND claimed
@@ -96,7 +99,8 @@ function buildMessage(
     return (
       `${head} all ${String(unreadCount)} unread ${urgency} event(s) are already claimed ` +
       `(coalesced-until-ack). The generic inbox reminder does not re-fire until they are ` +
-      `acknowledged (\`${ackCmd}\`) or a new unclaimed ${urgency} event arrives.`
+      `acknowledged (\`${ackCmd}\`) — a new unclaimed ${urgency} event arriving in the meantime ` +
+      `does not restore it.`
     );
   }
   return (

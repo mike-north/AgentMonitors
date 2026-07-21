@@ -639,11 +639,13 @@ adapter. Adding a new surface means choosing its attribution there, not editing 
 `turn-interruptible`, or the `post-compact` recap surfaced at `SessionStart`) **claims** the events it
 renders — and claiming is never acknowledging (BP2 / SP4). The coalesced-until-ack rule
 ([002 §9.2](./002-runtime-delivery.md#92-normal-urgency)) is **band-scoped**: it compares a band's own
-pending/**unclaimed** count against that SAME band's unread total, where the unread total is the
-superset that also contains any claimed-but-unacknowledged row
-(`normalPending.length === unreadNormal.length`, where `normalPending` holds only not-yet-claimed
-`normal` rows and `unreadNormal` holds every unread `normal` row regardless of claim state; the
-low-urgency guard, §9.3, is the identical pattern against its own band). Leaving a claim unacknowledged
+pending count against that SAME band's unread total, where the unread total is the superset that also
+contains any claimed-but-unacknowledged row (`normalPending.length === unreadNormal.length`, where
+`normalPending` holds `normal` rows that are both **not-yet-claimed and currently claimable** — a row
+held by an in-flight channel-push reservation is unclaimed but leased, so `pendingForClaim` (issue
+#300) excludes it from `normalPending` too, and `unreadNormal` holds every unread `normal` row
+regardless of claim OR lease state; the low-urgency guard, §9.3, is the identical pattern against its
+own band). Leaving a claim unacknowledged
 therefore suppresses only the reminder for whichever band(s) the claimed events actually belong to — a
 `high`-**only** claim touches no `normal`/`low` row at all, so it does **not**, on its own, block a NEW
 `normal`-urgency reminder from firing for unrelated, still-unclaimed `normal` events in the same
