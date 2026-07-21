@@ -205,7 +205,7 @@ const eventsAckCommand = eventsCommand
   .option('--socket <path>', 'Unix domain socket path for the daemon')
   .option(
     '--event-ids <ids>',
-    'Comma-separated event ids; omit to ack all unread',
+    'Comma-separated event ids; omit to ack all unread (except a row leased by an in-flight delivery reservation)',
   )
   .action(
     async (options: {

@@ -17,7 +17,6 @@ export class AgentMonitorRuntime {
         sessionDormancyMs?: number;
         deliveryReservationTtlMs?: number;
     });
-    // (undocumented)
     acknowledgeSession(sessionId: string, eventIds?: string[]): void;
     // (undocumented)
     adapter(name: string): AgentRuntimeAdapter;

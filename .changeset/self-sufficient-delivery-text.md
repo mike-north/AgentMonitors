@@ -1,5 +1,5 @@
 ---
-'@agentmonitors/core': patch
+'@agentmonitors/core': minor
 '@agentmonitors/cli': patch
 'agentmonitors': patch
 ---
