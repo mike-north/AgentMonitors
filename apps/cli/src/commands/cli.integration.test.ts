@@ -11215,6 +11215,168 @@ describe('hooks-only delivery parity (issue #270)', () => {
       rmSync(ws, { recursive: true, force: true });
     }
   }, 30_000);
+
+  // Issue #449 review: `events list --format text` documents one record per
+  // line. Before this fix, the monitor's authored `name` (and the source
+  // title/summary) were interpolated verbatim, so a raw CR/LF forged a second
+  // output row and a raw ESC sequence reached the terminal unescaped. This
+  // reproduces both against a REAL daemon: an authored name carrying a CRLF
+  // and a color-changing ANSI escape.
+  it('events list --format text does not let a CRLF forge a row or a raw ESC reach the terminal', async () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-inject-'));
+    const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-file');
+    mkdirSync(monitorsDir, { recursive: true });
+
+    const watched = path.join(ws, 'a.txt');
+    writeFileSync(watched, 'initial', 'utf-8');
+    // A double-quoted YAML scalar with explicit escapes: \r\n (a real CRLF)
+    // and \x1b (a real ESC / CSI-introducer byte) once parsed. No raw control
+    // byte is written to disk by this test — the escape sequences are plain
+    // ASCII in the file, exactly as an attacker-controlled MONITOR.md would
+    // author them.
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      [
+        '---',
+        'name: "evil\\r\\n999  forged-monitor  high  unread  FORGED ROW\\x1b[31m"',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs:',
+        '    - "a.txt"',
+        `  cwd: ${JSON.stringify(ws)}`,
+        '  interval: "1s"',
+        'urgency: normal',
+        '---',
+        'React to the change.',
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+
+    const socket = path.join(
+      '/tmp',
+      `agentmon-inj-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    const db = path.join(ws, 'inject.db');
+    const hostSessionId = `inject-${Date.now()}`;
+    writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 30_000 });
+
+    const env: Record<string, string> = {
+      CLAUDE_PROJECT_DIR: ws,
+      AGENTMONITORS_DB: db,
+      AGENTMONITORS_SOCKET: socket,
+    };
+
+    try {
+      const start = runWithStdin(
+        ['session', 'start'],
+        env,
+        JSON.stringify({
+          session_id: hostSessionId,
+          hook_event_name: 'SessionStart',
+          cwd: ws,
+        }),
+        ws,
+      );
+      expect(start.exitCode).toBe(0);
+      expect(await daemonAvailable(socket)).toBe(true);
+
+      const sessions = JSON.parse(
+        runWithEnv(
+          ['session', 'list', '--socket', socket, '--format', 'json'],
+          env,
+          ws,
+        ).stdout,
+      ) as { id: string; hostSessionId: string }[];
+      const registered = sessions.find(
+        (s) => s.hostSessionId === hostSessionId,
+      );
+      expect(registered).toBeDefined();
+      const sessionId = registered?.id ?? '';
+
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
+      writeFileSync(watched, 'changed', 'utf-8');
+
+      const listText = () =>
+        runWithEnv(
+          [
+            'events',
+            'list',
+            '--session',
+            sessionId,
+            '--unread',
+            '--format',
+            'text',
+            '--socket',
+            socket,
+          ],
+          env,
+          ws,
+        );
+      const listJson = () =>
+        runWithEnv(
+          [
+            'events',
+            'list',
+            '--session',
+            sessionId,
+            '--unread',
+            '--format',
+            'json',
+            '--socket',
+            socket,
+          ],
+          env,
+          ws,
+        );
+
+      const eventDeadline = Date.now() + 10_000;
+      let jsonEvents: { title: string }[] = [];
+      while (Date.now() < eventDeadline) {
+        const r = listJson();
+        if (r.exitCode === 0) {
+          jsonEvents = JSON.parse(r.stdout) as { title: string }[];
+          if (jsonEvents.length >= 1) break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      expect(jsonEvents.length).toBeGreaterThanOrEqual(1);
+      // The raw authored name (over the durable/JSON surface, which carries
+      // it verbatim by design) really does contain the CRLF + ESC bytes this
+      // test targets.
+      expect(jsonEvents[0]?.title).toContain('\r\n');
+
+      const textResult = listText();
+      expect(textResult.exitCode).toBe(0);
+      const lines = textResult.stdout.trim().split('\n');
+      // The CRLF must NOT have forged a second physical line.
+      expect(lines).toHaveLength(1);
+      // No raw ESC byte reaches the printed text.
+      expect(textResult.stdout).not.toContain('\x1b');
+      // The escaped/visible form is present instead, proving the hostile
+      // payload was rendered visibly rather than silently dropped.
+      expect(textResult.stdout).toContain('\\u001b');
+
+      const end = runWithStdin(
+        ['session', 'end'],
+        env,
+        JSON.stringify({
+          session_id: hostSessionId,
+          hook_event_name: 'SessionEnd',
+          cwd: ws,
+        }),
+        ws,
+      );
+      expect(end.exitCode).toBe(0);
+    } finally {
+      try {
+        await callDaemon('stop', {}, { socketPath: socket });
+      } catch {
+        // already stopped — ignore
+      }
+      rmSync(ws, { recursive: true, force: true });
+    }
+  }, 30_000);
 });
 
 // ---------------------------------------------------------------------------

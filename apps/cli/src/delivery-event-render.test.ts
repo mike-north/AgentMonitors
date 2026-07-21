@@ -204,6 +204,64 @@ describe('buildEventBlock', () => {
     const block = buildEventBlock(makeEvent(), sanitize);
     expect(block).toBe('### M1 (HIGH)\nT1\nS1\n\nA BODY');
   });
+
+  // Regression (issue #449 review): `summary` prefers the Interpret digest
+  // (G14, 002 §1.1.8) when one was produced for the recipient's delta, and a
+  // digest is a prose reading of the change that carries no guaranteed object
+  // identity. `objectDetail` is the deterministic per-object text and must be
+  // what names the object here, even when `summary` has been replaced by a
+  // digest that shares no text with either.
+  it('names the object from objectDetail, not the (possibly digest-replaced) summary', () => {
+    const block = buildEventBlock(
+      makeEvent({
+        summary: 'The status page reported a brief outage.', // fake digest
+        objectDetail: 'Incoming change: docs/specs/001.md (modified)',
+      }),
+      identity,
+    );
+    expect(block).toBe(
+      '### m1 (high)\nt1\nIncoming change: docs/specs/001.md (modified)\n\na body',
+    );
+    // The digest text must not appear anywhere in the rendered block: a named
+    // multi-object prose delivery must not silently drop object identity.
+    expect(block).not.toContain('brief outage');
+  });
+
+  it('falls back to summary when objectDetail is absent (a hand-constructed DeliveryEventSummary)', () => {
+    const block = buildEventBlock(
+      makeEvent({ summary: 'legacy summary text' }),
+      identity,
+    );
+    expect(block).toContain('legacy summary text');
+  });
+
+  it('objectDetail participates in the same title/body dedup as summary did', () => {
+    // Identical to title -> omitted.
+    expect(
+      buildEventBlock(
+        makeEvent({ objectDetail: 't1', summary: 'digest text' }),
+        identity,
+      ),
+    ).not.toContain('digest text');
+    expect(
+      buildEventBlock(
+        makeEvent({ objectDetail: 't1', summary: 'digest text' }),
+        identity,
+      ),
+    ).toBe('### m1 (high)\nt1\n\na body');
+    // Identical to body -> omitted (source supplied only title + body).
+    expect(
+      buildEventBlock(
+        makeEvent({
+          title: 'Alert',
+          objectDetail: 'Do the work',
+          summary: 'digest text',
+          body: 'Do the work',
+        }),
+        identity,
+      ),
+    ).toBe('### m1 (high)\nAlert\n\nDo the work');
+  });
 });
 
 describe('packWholeBlocks', () => {

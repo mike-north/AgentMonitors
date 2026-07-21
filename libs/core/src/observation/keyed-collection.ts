@@ -292,12 +292,22 @@ function keyValueOf(element: unknown, keyField: string): string {
  * @param config - The collection config (path / key / ignore-paths).
  * @param monitorObjectKey - The source's object identity (the URL for `api-poll`,
  *   the joined argv / `key` for `command-poll`); per-object keys are
- *   `<monitorObjectKey>#<key-value>`.
+ *   `<monitorObjectKey>#<key-value>`. This value is used verbatim for identity
+ *   (`objectKey`, `queryScope.objectKey`) — pass {@link displayScope} to control
+ *   what appears in human-facing `title`/`summary` text instead (issue #449
+ *   review: `api-poll`'s URL can carry credentials that must not reach identity
+ *   AND display alike, but identity must stay exact for stable dedup/query).
  * @param previousSnapshot - The prior keyed snapshot, or `undefined` on the baseline
  *   run (which records the snapshot and emits nothing).
  * @param observationFields - Optional extra fields merged into each emitted
  *   observation's `payload`/`snapshot`/`queryScope` (e.g. the source url/command), so
  *   the per-object observation carries the same context the blob observation would.
+ * @param displayScope - Optional display-safe override for the monitor-scope half
+ *   of the `title`/`summary` text (still bounded via {@link displayObjectKey}).
+ *   Defaults to `monitorObjectKey`. Use this when the identity value is not safe
+ *   to render verbatim (e.g. a URL with userinfo/query credentials) — pass an
+ *   already-redacted string here while `monitorObjectKey` keeps the exact value
+ *   for identity.
  *
  * @throws if `path` does not select exactly one array (authoring/observe-time error).
  */
@@ -310,6 +320,7 @@ export function diffKeyedCollection(
     payload?: Record<string, unknown>;
     queryScope?: Record<string, string | string[]>;
   },
+  displayScope: string = monitorObjectKey,
 ): KeyedCollectionResult {
   const resolved = resolveDottedPath(parsedOutput, config.path);
   if (!Array.isArray(resolved)) {
@@ -344,8 +355,11 @@ export function diffKeyedCollection(
     // Bound only the monitor-scope half of the key in human-facing text — the
     // per-item `keyValue` is the informative part and is always kept whole, so a
     // long scope (e.g. `command-poll`'s joined argv) can't push it out of the
-    // headline. `objectKey` below keeps the full identity (issue #449).
-    const title = `${titleVerb(changeKind)}: ${displayObjectKey(monitorObjectKey)}#${keyValue}`;
+    // headline. `objectKey` above keeps the full identity (issue #449), built
+    // from `monitorObjectKey` — NOT `displayScope` — so a caller passing a
+    // redacted `displayScope` (api-poll's URL) doesn't lose identity/dedup
+    // stability to the redacted form.
+    const title = `${titleVerb(changeKind)}: ${displayObjectKey(displayScope)}#${keyValue}`;
     observations.push({
       title,
       summary: title,

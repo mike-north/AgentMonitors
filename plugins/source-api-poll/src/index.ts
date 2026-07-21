@@ -642,9 +642,17 @@ const source: ObservationSource = {
       const result = diffKeyedCollection(
         JSON.parse(body),
         collection,
+        // The exact URL is kept as identity: `objectKey`/`queryScope.objectKey`
+        // must stay stable and precise for dedup/querying (issue #449 review).
         url,
         prev?.keyedSnapshot,
         { payload: { url }, queryScope: { url } },
+        // Display-safe override (userinfo/query/fragment stripped): without
+        // this, `diffKeyedCollection` interpolates the raw `url` above into
+        // every per-object observation's human-facing `title`/`summary`
+        // (`<scope>#<key>`), leaking credentials into durable, delivered text
+        // the same way the non-collection branch below was fixed to avoid.
+        redactUrlForWarning(url),
       );
       const curr: CachedResponse = {
         body,

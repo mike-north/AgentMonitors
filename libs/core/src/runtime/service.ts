@@ -472,6 +472,11 @@ function toDeliveryEventSummary(
     monitorId: event.monitorId,
     title: event.title,
     summary: recipientSummary(event, digests),
+    // The deterministic per-object detail, deliberately NOT digest-preferring
+    // (unlike `summary` above): a transport naming which object this event is
+    // about must not lose identity to a digest that carries none (issue #449
+    // review).
+    objectDetail: event.summary,
     urgency: event.urgency,
     createdAt: event.createdAt.toISOString(),
     body: event.body,
@@ -680,6 +685,21 @@ export class AgentMonitorRuntime {
         `Invalid ephemeral monitor declaration: ${parsed.error.issues
           .map((issue) => issue.message)
           .join('; ')}`,
+      );
+    }
+
+    // 3b. Reject a whitespace-only `displayName` (issue #449 review): it is an
+    //     ephemeral monitor's ONLY naming affordance (no frontmatter file), and it
+    //     flows into `frontmatter.name` on every tick reconstruction
+    //     (`ephemeralRecordToMonitor` below). A present-but-blank name would
+    //     silently win over the source title there (002 §5.4's precedence) and
+    //     durably headline every delivered event with whitespace. Mirrors the
+    //     same rejection `monitorFrontmatterSchema`'s `name` field applies to a
+    //     persistent monitor's frontmatter.
+    if (input.displayName?.trim() === '') {
+      throw new Error(
+        'Invalid ephemeral monitor declaration: --display-name must contain ' +
+          'non-whitespace characters when present.',
       );
     }
 

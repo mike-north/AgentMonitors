@@ -315,6 +315,43 @@ describe('Interpret stage (G14, 002 §1.1.8)', () => {
     expect(digestEvent).toBeDefined();
   });
 
+  // Regression (issue #449 review): a digest is a prose reading of the
+  // change, not necessarily a naming of WHICH object it is about. Before this
+  // fix, a transport rendering per-object identity read `DeliveryEventSummary
+  // .summary` — the same field the digest just replaced — so a named
+  // multi-object `prose` delivery could surface no object identity at all.
+  // `objectDetail` must stay the deterministic source text regardless of
+  // whether Interpret produced a digest for this event.
+  it('(b) objectDetail stays the deterministic source summary even when summary carries the Interpret digest', async () => {
+    const DIGEST = 'Something changed — see details.';
+    const fake = fakeAdapter(() => ({ decision: 'deliver', digest: DIGEST }));
+    const { runtime, monitorsDir, rootDir } = setup(
+      'prose',
+      scriptedSource(['v1', 'v2']),
+      fake,
+    );
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'sess-object-detail',
+        workspacePath: rootDir,
+      }),
+    );
+
+    await runtime.tick(monitorsDir, rootDir); // baseline
+    await pause();
+    await runtime.tick(monitorsDir, rootDir); // delta -> interpret -> deliver
+
+    const claim = runtime.claimDelivery(session.id, 'post-compact');
+    expect(claim).not.toBeNull();
+    const event = claim?.events.find((e) => e.summary === DIGEST);
+    expect(event).toBeDefined();
+    // The deterministic per-object detail (scriptedSource's own `summary`,
+    // 'Scripted change') survives untouched — it is NOT overwritten by the
+    // digest, and it differs from the digest text.
+    expect(event?.objectDetail).toBe('Scripted change');
+    expect(event?.objectDetail).not.toBe(DIGEST);
+  });
+
   it('(b) the adapter is called ONCE per event even when multiple sessions share the same delta', async () => {
     // Regression for Copilot comment 3418449196: runInterpret previously called
     // the adapter once per projected session with identical inputs, causing N

@@ -573,6 +573,27 @@ describe('ephemeral monitors — lifecycle (007 §4.4, criterion 3)', () => {
     expect(event?.title).toBe('changed: foo');
   });
 
+  // Regression (issue #449 review): a present-but-whitespace-only display name
+  // is an ephemeral monitor's ONLY naming affordance, so if it were accepted it
+  // would win 002 §5.4's title precedence and durably headline every delivered
+  // event with blank text. Reject it at declaration time, matching the
+  // whitespace-only rejection `monitorFrontmatterSchema.name` applies to a
+  // persistent monitor's frontmatter.
+  it('rejects a whitespace-only display name at declaration', () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'am-eph-blank-name-'));
+    tempDirs.push(root);
+    const { runtime } = makeHarness(':memory:', root);
+    const session = openLead(runtime, root, 'host-blank-name');
+    expect(() =>
+      runtime.declareEphemeralMonitor({
+        sessionId: session.id,
+        source: 'test-ephemeral',
+        scope: { target: 'foo' },
+        displayName: '   ',
+      }),
+    ).toThrow(/display-name.*non-whitespace/i);
+  });
+
   it('does NOT resurrect after the session has ended (restart-safety)', async () => {
     const root = mkdtempSync(path.join(tmpdir(), 'am-eph-nores-'));
     tempDirs.push(root);

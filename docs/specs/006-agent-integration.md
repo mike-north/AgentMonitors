@@ -201,7 +201,7 @@ content the hook path injects**, not a lesser summary. Two claim shapes render d
   ```text
   ### <monitor_id> (<urgency>)
   <title — the monitor's authored name, 002 §5.4>
-  <summary — the source's per-object text, omitted when identical to the title>
+  <objectDetail — the source's per-object text, omitted when identical to the title OR the body>
 
   <body — the monitor author's instructions for this event>
 
@@ -209,10 +209,14 @@ content the hook path injects**, not a lesser summary. Two claim shapes render d
   <bounded diffText — the change summary>
   ```
 
-  The `<summary>` line is what names the specific object that moved (`Incoming change:
-docs/specs/001.md (modified)`); it is omitted only when it repeats the title, which happens for a
-  monitor with no authored `name` (002 §5.4's fallback). The `Changes:` section appears only when the
-  event carries a non-empty `diffText`. The change
+  The detail line is `DeliveryEventSummary.objectDetail` — the source's **deterministic** per-object
+  text, never an Interpret digest (002 §1.1.8) — and it is what names the specific object that moved
+  (`` `Incoming change: docs/specs/001.md (modified)` ``). It is omitted in two cases: when it repeats
+  the title, which happens for a monitor with no authored `name` (002 §5.4's fallback); and when it
+  repeats the body, which happens when a source supplies only `title` + `body` and materialization
+  derives the absent `Observation.summary` from `body` (002 §5.1) — without this second check the body
+  would render twice, once as the detail line and once below it. The `Changes:` section appears only
+  when the event carries a non-empty `diffText`. The change
   summary is **bounded** per event (currently 800 chars) with an explicit elision marker
   (`… (change summary truncated)`) — a raw diff can be arbitrarily large and the tag body lands in
   the agent's context window (§4.6). This is exactly the block the hook-deliver transport renders

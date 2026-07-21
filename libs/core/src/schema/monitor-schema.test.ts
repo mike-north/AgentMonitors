@@ -174,6 +174,19 @@ describe('monitorFrontmatterSchema', () => {
       expect(result.success).toBe(false);
     });
 
+    // Regression (issue #449 review): `.min(1)` alone passes a whitespace-only
+    // string (length > 0), which would then win the 002 §5.4 title-precedence
+    // race over the source title and durably headline every delivered event
+    // with blank/whitespace text.
+    it('rejects a whitespace-only name', () => {
+      const result = monitorFrontmatterSchema.safeParse({
+        name: '   ',
+        watch: { type: 'file-fingerprint', globs: ['x'] },
+        urgency: 'normal',
+      });
+      expect(result.success).toBe(false);
+    });
+
     it('rejects missing watch', () => {
       const { watch: _, ...rest } = validMinimal;
       const result = monitorFrontmatterSchema.safeParse(rest);
