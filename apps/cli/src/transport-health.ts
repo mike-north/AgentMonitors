@@ -497,11 +497,13 @@ function suppressionProblems(input: TransportHealthInput): TransportProblem[] {
         `Reminders appear suppressed on ${String(sessions.length)} lead ` +
         `session(s) (${sessions.join(', ')}), but the exact claimed event ` +
         `ids could not be determined — the daemon reported a suppression ` +
-        `hold without them (most likely an older daemon build that predates ` +
-        `that field). A scoped acknowledgement cannot be safely offered, so ` +
-        `this cannot be reported as deliverable.`,
+        `hold without them. This can happen on an older daemon build that ` +
+        `predates the \`claimedEventIds\` field, or on a current build when ` +
+        `the hold is entirely due to an in-flight channel lease that has not ` +
+        `yet settled into a claim. A scoped acknowledgement cannot be safely ` +
+        `offered, so this cannot be reported as deliverable.`,
       remediation:
-        'Upgrade the daemon to the current CLI build (`agentmonitors daemon run` after stopping any older one), then re-run `agentmonitors doctor`.',
+        'Upgrade the daemon to the current CLI build (`agentmonitors daemon run` after stopping any older one) if it predates the `claimedEventIds` field, then re-run `agentmonitors doctor`. If the daemon is already current, this is likely an in-flight channel lease still settling into a claim — re-run `agentmonitors doctor` after it settles.',
     });
   }
 

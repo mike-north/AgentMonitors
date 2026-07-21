@@ -886,6 +886,18 @@ describe('computeTransportHealth', () => {
           'agentmonitors events ack --session session-abc',
         );
         expect(remediation).toContain('Upgrade the daemon');
+        // An empty/missing claimedEventIds isn't only an older-daemon symptom
+        // — an in-flight channel lease (still-unclaimed, not yet a claim) can
+        // produce the same shape on a current build (issue #425 review, PR
+        // #453 Copilot round). The detail/remediation must not tell a reader
+        // on a current daemon that upgrading is the fix.
+        const detail = health.pipelineProblems
+          .filter(
+            (problem) => problem.code === 'delivery-diagnosis-unavailable',
+          )
+          .map((problem) => problem.detail)
+          .join(' ');
+        expect(detail + remediation).toMatch(/lease/i);
       });
 
       it('blocks deliverable, matching the existing check-never-ran contract', () => {
