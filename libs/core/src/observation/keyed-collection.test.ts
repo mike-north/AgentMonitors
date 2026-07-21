@@ -471,3 +471,78 @@ describe('diffKeyedCollection — long monitor scope in display text (003 §2.8)
     expect(obs?.objectKey).toBe(`${LONG_SCOPE}#${longKey}`);
   });
 });
+
+describe('diffKeyedCollection — displayScope credential redaction (issue #449 review)', () => {
+  // A credential-bearing monitor scope, mirroring api-poll's URL-as-scope
+  // shape. Regression: the older behavior always interpolated
+  // `monitorObjectKey` itself into the display title/summary, so a
+  // keyed-collection observation from a URL-scoped source (api-poll) would
+  // leak userinfo/query credentials into durable, delivered text even though
+  // the equivalent non-collection branch had already been redacted.
+  const RAW_SCOPE =
+    'https://user:pass@status.example.com/incidents?token=secret#frag';
+  const REDACTED_SCOPE = 'https://status.example.com/incidents';
+
+  function diffWithDisplayScope(
+    previous: unknown,
+    current: unknown,
+  ): ReturnType<typeof diffKeyedCollection> {
+    const base = diffKeyedCollection(
+      previous,
+      TASKS_CONFIG,
+      RAW_SCOPE,
+      undefined,
+      undefined,
+      REDACTED_SCOPE,
+    );
+    return diffKeyedCollection(
+      current,
+      TASKS_CONFIG,
+      RAW_SCOPE,
+      base.snapshot,
+      undefined,
+      REDACTED_SCOPE,
+    );
+  }
+
+  it('renders title/summary from the redacted displayScope, never the raw credential-bearing scope', () => {
+    const result = diffWithDisplayScope(
+      { tasks: [{ id: 'incident-1', state: 'OPEN' }] },
+      { tasks: [{ id: 'incident-1', state: 'RESOLVED' }] },
+    );
+
+    const obs = result.observations[0];
+    expect(obs).toBeDefined();
+    expect(obs?.title).toBe(
+      'Item changed: https://status.example.com/incidents#incident-1',
+    );
+    expect(obs?.summary).toBe(obs?.title);
+    for (const secret of ['user:pass', 'token=secret', 'frag']) {
+      expect(obs?.title).not.toContain(secret);
+      expect(obs?.summary).not.toContain(secret);
+    }
+  });
+
+  it('preserves the full raw scope (with credentials) in objectKey/queryScope for identity, not display', () => {
+    const result = diffWithDisplayScope(
+      { tasks: [{ id: 'incident-1', state: 'OPEN' }] },
+      { tasks: [{ id: 'incident-1', state: 'RESOLVED' }] },
+    );
+
+    const obs = result.observations[0];
+    expect(obs?.objectKey).toBe(`${RAW_SCOPE}#incident-1`);
+    expect(obs?.queryScope?.['objectKey']).toBe(`${RAW_SCOPE}#incident-1`);
+  });
+
+  it('defaults displayScope to monitorObjectKey when omitted (no accidental redaction of a non-credential scope)', () => {
+    const result = diffKeyedCollection(
+      { tasks: [{ id: 'incident-1', state: 'RESOLVED' }] },
+      TASKS_CONFIG,
+      'plain-scope',
+      { 'incident-1': { id: 'incident-1', state: 'OPEN' } },
+    );
+
+    const obs = result.observations[0];
+    expect(obs?.title).toBe('Item changed: plain-scope#incident-1');
+  });
+});

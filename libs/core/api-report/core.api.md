@@ -269,7 +269,7 @@ export interface DerivedFactRule {
 export function diffKeyedCollection(parsedOutput: unknown, config: KeyedCollectionConfig, monitorObjectKey: string, previousSnapshot: KeyedSnapshot | undefined, observationFields?: {
     payload?: Record<string, unknown>;
     queryScope?: Record<string, string | string[]>;
-}): KeyedCollectionResult;
+}, displayScope?: string): KeyedCollectionResult;
 
 // @public
 export function displayObjectKey(objectKey: string): string;

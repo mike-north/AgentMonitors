@@ -42,7 +42,12 @@ export function generateMonitorSchema(
     // required — otherwise editor tooling would flag a valid minimal monitor.
     required: ['watch'],
     properties: {
-      name: { type: 'string', minLength: 1 },
+      // `pattern` requires at least one non-whitespace character, mirroring
+      // the authoritative parser's `.refine` (`monitorFrontmatterSchema`,
+      // issue #449 review): `minLength: 1` alone would let editor validation
+      // and `agentmonitors schema generate` accept a whitespace-only
+      // `name: "   "` that runtime parsing then rejects.
+      name: { type: 'string', minLength: 1, pattern: '\\S' },
       watch: {
         type: 'object',
         required: ['type'],

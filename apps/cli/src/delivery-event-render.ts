@@ -178,6 +178,7 @@ export function appendMarkerWithinCap(
  * ### <monitorId> (<urgency>)
  * <title>
  * <objectDetail>
+ * <digest>
  *
  * <body>
  *
@@ -190,7 +191,15 @@ export function appendMarkerWithinCap(
  * never an Interpret digest, 002 §1.1.8) and is emitted only when it differs
  * from both the title and the body (they are identical for a monitor with no
  * authored `name`, which falls back to the source title; and derived from
- * `body` when a source supplies only `title` + `body`, 002 §5.1).
+ * `body` when a source supplies only `title` + `body`, 002 §5.1). `<digest>` is
+ * the recipient-visible `DeliveryEventSummary.summary` — an Interpret digest
+ * when one was produced for this recipient (002 §1.1.6/§1.1.8) — and is emitted
+ * on its own additional line whenever it says something `<objectDetail>`
+ * doesn't already (i.e. it differs from the title, body, AND the object detail
+ * line): dropping it would silently discard a successful prose summarization,
+ * but re-emitting it verbatim when it equals `objectDetail` (the common case —
+ * no digest was produced, so `summary` degrades to the same deterministic
+ * chain) would just duplicate the line above (issue #449 review).
  *
  * The `Changes:` section is emitted only when the event carries a non-empty
  * `diffText`; the bounded diff is capped at {@link MAX_EVENT_DIFF} with an
@@ -229,14 +238,28 @@ export function buildEventBlock(
   // Falls back to `summary` only for a hand-constructed `DeliveryEventSummary`
   // (e.g. a test) that omits the newer field.
   const objectDetail = sanitize(event.objectDetail ?? event.summary);
+  const digest = sanitize(event.summary);
+  const detailLines: string[] = [];
   // Also skip when the detail IS the body: materialization derives an absent
   // `Observation.summary` from `body` (002 §5.1), so a source that supplies only
   // `title` + `body` would otherwise render its body twice — once here and once
   // in the template below (issue #449 review).
-  const detail =
-    objectDetail && objectDetail !== title && objectDetail !== body
-      ? `\n${objectDetail}`
-      : '';
+  if (objectDetail && objectDetail !== title && objectDetail !== body) {
+    detailLines.push(objectDetail);
+  }
+  // Distinct from `objectDetail` too: when no digest was produced, `summary`
+  // degrades to the same deterministic chain as `objectDetail` (see
+  // `recipientSummary`/`toDeliveryEventSummary` in `service.ts`), so the two
+  // are equal and this would otherwise duplicate the line above.
+  if (
+    digest &&
+    digest !== title &&
+    digest !== body &&
+    digest !== objectDetail
+  ) {
+    detailLines.push(digest);
+  }
+  const detail = detailLines.length > 0 ? `\n${detailLines.join('\n')}` : '';
   let block = `### ${id} (${urgency})\n${title}${detail}\n\n${body}`;
   if (event.diffText && event.diffText.trim().length > 0) {
     const diff = sanitize(boundDiff(event.diffText));

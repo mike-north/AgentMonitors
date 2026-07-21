@@ -68,8 +68,8 @@ describe('singleLineSafe', () => {
     expect(singleLineSafe(`a${C1_CSI}b`)).toBe('a\\u009bb');
   });
 
-  it('preserves a plain tab (not a line-forging or rendering hazard)', () => {
-    expect(singleLineSafe(`a${TAB}b`)).toBe(`a${TAB}b`);
+  it('escapes a raw TAB (U+0009) instead of leaving it as a rendering hazard (issue #449 review: TAB can still shift the visual column layout of the row)', () => {
+    expect(singleLineSafe(`a${TAB}b`)).toBe('a\\u0009b');
   });
 
   it('handles a string combining line-break and other control characters', () => {

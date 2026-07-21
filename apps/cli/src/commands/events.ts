@@ -54,13 +54,16 @@ function collectTag(value: string, previous: string[]): string[] {
  * collapse to a single space (readable, keeps the row a single physical
  * line); every other C0/C1 control character (DEL included) is escaped to a
  * visible `\uXXXX` form instead of being dropped, so a hostile payload is
- * visible rather than silently absorbed. The regexes below are built entirely
- * from `\uXXXX` escapes -- no literal control byte lives in this source file.
+ * visible rather than silently absorbed. TAB (U+0009) is a C0 control too --
+ * left raw it can still shift the visual column layout of the row -- so it is
+ * escaped here rather than treated as a line-break character (issue #449
+ * review). The regexes below are built entirely from `\uXXXX` escapes -- no
+ * literal control byte lives in this source file.
  */
 const LINE_BREAK_CHARS = new RegExp('[\\r\\n\\u2028\\u2029]+', 'g');
 const OTHER_CONTROL_CHARS = new RegExp(
   // eslint-disable-next-line no-control-regex -- deliberately matching C0/C1 controls to escape them (see doc comment above)
-  '[\\u0000-\\u0008\\u000B-\\u001F\\u007F-\\u009F]',
+  '[\\u0000-\\u0009\\u000B-\\u001F\\u007F-\\u009F]',
   'g',
 );
 export function singleLineSafe(value: string): string {

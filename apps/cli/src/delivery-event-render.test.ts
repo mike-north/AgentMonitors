@@ -211,20 +211,21 @@ describe('buildEventBlock', () => {
   // identity. `objectDetail` is the deterministic per-object text and must be
   // what names the object here, even when `summary` has been replaced by a
   // digest that shares no text with either.
-  it('names the object from objectDetail, not the (possibly digest-replaced) summary', () => {
+  it('names the object from objectDetail AND surfaces a distinct digest, dropping neither (issue #449 review)', () => {
     const block = buildEventBlock(
       makeEvent({
-        summary: 'The status page reported a brief outage.', // fake digest
+        summary: 'The status page reported a brief outage.', // Interpret digest
         objectDetail: 'Incoming change: docs/specs/001.md (modified)',
       }),
       identity,
     );
+    // Object identity (deterministic, never digest-replaced) renders first...
     expect(block).toBe(
-      '### m1 (high)\nt1\nIncoming change: docs/specs/001.md (modified)\n\na body',
+      '### m1 (high)\nt1\nIncoming change: docs/specs/001.md (modified)\nThe status page reported a brief outage.\n\na body',
     );
-    // The digest text must not appear anywhere in the rendered block: a named
-    // multi-object prose delivery must not silently drop object identity.
-    expect(block).not.toContain('brief outage');
+    // ...and the digest is NOT dropped: a named multi-object prose delivery
+    // must not silently discard a successful Interpret summarization.
+    expect(block).toContain('brief outage');
   });
 
   it('falls back to summary when objectDetail is absent (a hand-constructed DeliveryEventSummary)', () => {
@@ -235,21 +236,17 @@ describe('buildEventBlock', () => {
     expect(block).toContain('legacy summary text');
   });
 
-  it('objectDetail participates in the same title/body dedup as summary did', () => {
-    // Identical to title -> omitted.
+  it('objectDetail participates in the same title/body dedup as summary did, and a distinct digest still renders on its own additional line', () => {
+    // objectDetail identical to title -> omitted, but the distinct digest is
+    // still surfaced (it says something objectDetail/title do not).
     expect(
       buildEventBlock(
         makeEvent({ objectDetail: 't1', summary: 'digest text' }),
         identity,
       ),
-    ).not.toContain('digest text');
-    expect(
-      buildEventBlock(
-        makeEvent({ objectDetail: 't1', summary: 'digest text' }),
-        identity,
-      ),
-    ).toBe('### m1 (high)\nt1\n\na body');
-    // Identical to body -> omitted (source supplied only title + body).
+    ).toBe('### m1 (high)\nt1\ndigest text\n\na body');
+    // Identical to body -> objectDetail omitted (source supplied only title +
+    // body), digest still rendered since it differs from both.
     expect(
       buildEventBlock(
         makeEvent({
@@ -260,7 +257,21 @@ describe('buildEventBlock', () => {
         }),
         identity,
       ),
-    ).toBe('### m1 (high)\nAlert\n\nDo the work');
+    ).toBe('### m1 (high)\nAlert\ndigest text\n\nDo the work');
+  });
+
+  it('does not duplicate the line when the digest equals objectDetail (no digest was produced, both fall back to the same deterministic chain)', () => {
+    expect(
+      buildEventBlock(
+        makeEvent({
+          objectDetail: 'Incoming change: docs/specs/001.md (modified)',
+          summary: 'Incoming change: docs/specs/001.md (modified)',
+        }),
+        identity,
+      ),
+    ).toBe(
+      '### m1 (high)\nt1\nIncoming change: docs/specs/001.md (modified)\n\na body',
+    );
   });
 });
 
