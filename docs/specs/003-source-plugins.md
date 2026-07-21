@@ -1805,10 +1805,18 @@ current user's own PRs from the review queue (see "The two presets must not over
 `json-diff` fires on any semantic change to the command's stdout, so the `--jq` reduction — not the
 diff strategy — decides which real-world events become interrupts.
 
-`pr-review` projects each PR to `{number, title, headRefName, author}`. `reviewDecision` is **not**
-carried as a field — it decides membership instead: a PR stays in the set only while its decision is
-empty or `REVIEW_REQUIRED`, so a decision landing removes the PR (one benign fire) rather than churning
-a value inside the set. Filtering also drops drafts, `changeset-release/*` heads (the release/Version
+`pr-review` projects each PR to `{number, headRefName, author}`. `title` is deliberately NOT projected
+(PR #446 review, thread `discussion_r3617759355`): it is mutable presentation data, and `json-diff` fires
+on any change to the WHOLE diffed payload, including a field mutating on an entry that is already, and
+remains, a member — a retitle would otherwise re-fire the `high`-urgency interrupt for a PR nothing
+actually happened to. `reviewDecision` is **not** carried as a field either — it decides membership
+instead: a PR stays in the set while its decision is empty or `REVIEW_REQUIRED`, **or** while the
+resolved identity is still listed in `reviewRequests` (PR #446 review, thread `discussion_r3617759232`:
+`reviewDecision` is a repository-wide, branch-protection-derived verdict, so a multi-approval repository
+can show `APPROVED` once ONE reviewer approves while THIS viewer's own request is still outstanding —
+`reviewRequests` is the per-viewer signal that keeps the PR visible in that case). So a decision landing
+removes the PR (one benign fire) rather than churning a value inside the set, EXCEPT when this viewer's
+own request is still open. Filtering also drops drafts, `changeset-release/*` heads (the release/Version
 PR is never agent-reviewable), PRs authored by the current `gh` identity (see "The two presets must not
 overlap" above — this, not `--search`, is the clause that keeps `pr-review` and `my-prs` disjoint), and
 PRs with failing CI. Reviewer scoping (which PRs among those authored by _someone else_ actually need
@@ -1819,12 +1827,22 @@ Because drafts are filtered rather than reported, "a draft was marked ready" sur
 _appearing_ in the set. `updatedAt` is deliberately excluded: including it would fire on every push and
 comment.
 
-`my-prs` fetches **three separate** `gh pr list` calls — `--state open --limit 30`, `--state merged
---limit 20`, `--state closed --limit 20` — rather than one `--state all --limit N` call, and unions the
-three raw arrays before reducing (issue #444 review, finding 989). Keeping merged and closed PRs in the
-combined result is what makes their terminal state **nameable**: "merged, clean up the branch" and
-"closed unmerged, find out why" are different instructions, and `--state open` alone collapses both into
-an indistinguishable disappearance — exactly the trap the issue's acceptance criteria call out.
+The current identity is resolved via `gh api user`, a bare endpoint with no repository context to infer
+a host from — it defaults to `github.com` even when the daemon runs from inside a GitHub Enterprise
+checkout, which would either fail outright on GHES or, worse, compare a dotcom login against Enterprise
+PR authors that can never match, silently readmitting the current user's own PRs into the queue (PR #446
+review, thread `discussion_r3617759108`). The fetch therefore first asks `gh repo view` — which DOES
+resolve host from the working directory, the same mechanism `gh pr list` itself relies on for repository
+scoping — for the current repository's URL, extracts its host, and passes it explicitly via
+`gh api user --hostname`.
+
+`my-prs` fetches **three separate** `gh pr list` calls — `--state open --limit 1000`, `--state merged
+--search "merged:>=$cutoff" --limit 100`, `--state closed --search "closed:>=$cutoff -is:merged" --limit
+100` — rather than one `--state all --limit N` call, and unions the three raw arrays before reducing
+(issue #444 review, finding 989). Keeping merged and closed PRs in the combined result is what makes
+their terminal state **nameable**: "merged, clean up the branch" and "closed unmerged, find out why" are
+different instructions, and `--state open` alone collapses both into an indistinguishable disappearance
+— exactly the trap the issue's acceptance criteria call out.
 
 A single `--state all --limit N` call was tried first and rejected: `--limit` applies to a
 **newest-created-first** list, and under `--state all` merged/closed history consumes slots from the
@@ -1833,14 +1851,35 @@ going red would produce no event, silently, until the PR happened to re-enter th
 a repository that keeps merging). Observed live on an active repository, terminal rows held 15 of 20
 slots at `--limit 20`; widening the shared limit only moves the same failure threshold further out, it
 does not remove it. Three separate calls fix this structurally rather than statistically: each state
-gets its OWN `--limit`, so open coverage (`--limit 30`, generous for one author's concurrent PRs) can
-never be displaced by terminal volume, and terminal coverage (`--limit 20` each) only has to outlast the
-6-hour terminal window below, not compete with open PRs for room. The three arrays cannot overlap on a
-real repository (a PR is never simultaneously `OPEN`, `MERGED`, and `CLOSED`), so the union needs no
-deduplication in production; the reduction's `unique_by(.number)` is defense-in-depth only
-(`apps/cli/src/commands/pr-alerting-presets.test.ts` covers the eviction fix directly: a still-open,
-ci-failing PR stays visible behind 99 newer merged PRs, which the single-call design would have
-evicted).
+gets its OWN `--limit`, so open coverage can never be displaced by terminal volume. **Open coverage is
+`--limit 1000`** (issue #444 review, finding 989's follow-up: `--limit 30` still evicted an older
+still-open PR once an author had more than 30 concurrently open). `gh pr list --limit` auto-paginates
+past its 100-per-page GraphQL cap, so a value this large is, for any workflow a single human or agent
+author could actually sustain, complete coverage of every open PR they have — but it is deliberately
+**not** claimed as a mathematical guarantee: an author with more than 1000 simultaneously open PRs (not
+a realistic operating point for this preset) would still see the oldest evicted, same failure shape at a
+vastly higher threshold (PR #446 review, 21:43 round: this residual gap is real and knowingly not
+re-solved here).
+
+**Terminal coverage (`merged`/`closed`) is scoped by a `merged:`/`closed:` search date range, not by
+`--limit` plus creation-order** (PR #446 review, thread `discussion_r3617759463`). Without `--search`,
+`gh pr list` orders newest-**created**-first — not newest-merged/closed-first — so an older PR (created
+long ago, merged or closed only just now) can sit behind however many newer-CREATED terminal PRs exist
+and never be fetched within a fixed `--limit`, silently missing it from the 6-hour terminal window this
+preset advertises. The fetch instead computes `cutoff` (now minus the terminal window, once per tick,
+portably: it tries GNU `date -d @epoch` and falls back to BSD/macOS `date -r epoch`) and scopes each
+terminal call directly to `merged:>=$cutoff` / `closed:>=$cutoff`, independent of creation order or
+volume. Passing `--search` also changes `--state closed`'s own semantics: `gh` then routes the request
+through GitHub's search API, whose `is:closed` qualifier — unlike the plain GraphQL `states: CLOSED` enum
+`--state closed` uses alone — matches merged PRs too, so the closed call's search string explicitly adds
+`-is:merged` to keep that lane exclusively unmerged closures (the merged call needs no equivalent
+exclusion).
+
+The three arrays cannot overlap on a real repository (a PR is never simultaneously `OPEN`, `MERGED`, and
+`CLOSED`), so the union needs no deduplication in production; the reduction's `unique_by(.number)` is
+defense-in-depth only (`apps/cli/src/commands/pr-alerting-presets.test.ts` covers the eviction fix
+directly: a still-open, ci-failing PR stays visible behind 99 newer merged PRs, which the single-call
+design would have evicted).
 
 Each PR is then reduced to a single `needs` verdict and **dropped entirely when it is `none`**:
 

@@ -90,17 +90,21 @@ function writeExecutable(file: string, contents: string): void {
  * program emits, so the assertion is about *which transitions fire*, not about
  * the reduction (that is covered separately below, against raw `gh` JSON).
  *
- * Answers a `gh api ...` call (pr-review's identity resolution — see
- * {@link stubGhApplyingJq}'s doc comment) with `{"login": identityLogin}`
- * rather than the fixture, for the same reason: without this, pr-review's
- * two-call fetch would slurp two copies of the fixture instead of an
- * `[identity, prs]` pair.
+ * Answers a `gh repo view ...` call with `repoUrl` (plain, unquoted — matching
+ * real `gh ... --jq '.url'` raw-string output) and a `gh api ...` call
+ * (pr-review's identity resolution — see {@link stubGhApplyingJq}'s doc
+ * comment) with `{"login": identityLogin}` rather than the fixture, for the
+ * same reason: without this, pr-review's multi-call fetch would slurp extra
+ * values instead of the exact `[identity, prs]` pair it expects.
  */
-function stubGhEchoingFixture(identityLogin = 'octocat'): string {
+function stubGhEchoingFixture(
+  identityLogin = 'octocat',
+  repoUrl = 'https://github.com/acme/app',
+): string {
   const dir = tempDir('stub');
   writeExecutable(
     path.join(dir, 'gh'),
-    `#!/bin/sh\nif [ "$1" = "api" ]; then\n  printf '{"login":"${identityLogin}"}\\n'\n  exit 0\nfi\ncat "$AM444_FIXTURE"\n`,
+    `#!/bin/sh\nif [ "$1" = "repo" ]; then\n  printf '%s\\n' '${repoUrl}'\n  exit 0\nfi\nif [ "$1" = "api" ]; then\n  printf '{"login":"${identityLogin}"}\\n'\n  exit 0\nfi\ncat "$AM444_FIXTURE"\n`,
   );
   return dir;
 }
@@ -111,15 +115,21 @@ function stubGhEchoingFixture(identityLogin = 'octocat'): string {
  * program using the real `jq` binary. This is what proves the shipped jq
  * reduction actually maps GitHub's payload onto the diffed shape.
  *
- * `pr-review`'s fetch now runs `gh api user --jq '{login}'` before `gh pr
- * list` (PR #446 review, thread `r3615190027`) to resolve the current `gh`
- * identity for its self-authored-PR exclusion — the stub answers that call
- * with `{"login": identityLogin}` and falls back to the raw fixture for
- * every other `gh` invocation. `my-prs` never calls `gh api`, so this branch
- * is inert for every my-prs-only test in this file; `identityLogin` defaults
- * to `'octocat'` to match `rawMyPr`'s default author (representing "me").
+ * `pr-review`'s fetch resolves the repository host via `gh repo view` (PR #446
+ * review, thread `discussion_r3617759108`) and then runs `gh api user
+ * --hostname "$host" --jq '{login}'` (thread `r3615190027`) before `gh pr
+ * list`, to resolve the current `gh` identity for its self-authored-PR
+ * exclusion — the stub answers `gh repo view` with `repoUrl` (plain,
+ * unquoted, matching real `--jq '.url'` raw-string output), `gh api ...` with
+ * `{"login": identityLogin}`, and falls back to the raw fixture for every
+ * other `gh` invocation. `my-prs` never calls either, so both branches are
+ * inert for every my-prs-only test in this file; `identityLogin` defaults to
+ * `'octocat'` to match `rawMyPr`'s default author (representing "me").
  */
-function stubGhApplyingJq(identityLogin = 'octocat'): string {
+function stubGhApplyingJq(
+  identityLogin = 'octocat',
+  repoUrl = 'https://github.com/acme/app',
+): string {
   const dir = tempDir('stub-jq');
   writeExecutable(
     path.join(dir, 'gh'),
@@ -129,7 +139,7 @@ function stubGhApplyingJq(identityLogin = 'octocat'): string {
     // fixture verbatim for a `gh pr list` call — the real reduction runs for
     // real, in the script under test, via the real `jq` binary already
     // required by `hasJq`.
-    `#!/bin/sh\nif [ "$1" = "api" ]; then\n  printf '{"login":"${identityLogin}"}\\n'\n  exit 0\nfi\ncat "$AM444_FIXTURE"\n`,
+    `#!/bin/sh\nif [ "$1" = "repo" ]; then\n  printf '%s\\n' '${repoUrl}'\n  exit 0\nfi\nif [ "$1" = "api" ]; then\n  printf '{"login":"${identityLogin}"}\\n'\n  exit 0\nfi\ncat "$AM444_FIXTURE"\n`,
   );
   return dir;
 }
@@ -411,7 +421,6 @@ describe('the presets’ jq reduction over raw gh output', () => {
       expect(JSON.parse(red.stdout)).toEqual([
         {
           number: 101,
-          title: 'feat: add widget',
           url: 'https://github.com/acme/app/pull/101',
           needs: 'ci-failing',
           failingChecks: ['build'],
@@ -419,6 +428,10 @@ describe('the presets’ jq reduction over raw gh output', () => {
           commentCount: 0,
         },
       ]);
+      // title is deliberately absent from the diffed payload — see the
+      // retitle-while-actionable regression below (PR #446 review, thread
+      // discussion_r3617759355).
+      expect(red.stdout).not.toContain('feat: add widget');
     });
 
     it('fires when reviewDecision becomes CHANGES_REQUESTED', async () => {
@@ -603,7 +616,6 @@ describe('the presets’ jq reduction over raw gh output', () => {
       expect(JSON.parse(merged.stdout)).toEqual([
         {
           number: 101,
-          title: 'feat: add widget',
           url: 'https://github.com/acme/app/pull/101',
           needs: 'merged',
         },
@@ -810,6 +822,54 @@ describe('the presets’ jq reduction over raw gh output', () => {
         baseline.state,
       );
       expect(next.titles).toEqual([CHANGED]);
+    });
+
+    /**
+     * PR #446 review, 21:43 round (main review body): 003 §11.9 had drifted
+     * to describe the OLD `--limit 30` bound while the implementation and
+     * 004 already say `1000`, and the test above (99 merged rows, but only
+     * ONE open row) passed unchanged under either bound — it never actually
+     * proved the query carries the new limit. This is the exact argv
+     * assertion the review accepted as an alternative to a 31+-concurrent-
+     * open fixture.
+     */
+    it('requests the open-state call with the documented 1000 bound, not the superseded 30', () => {
+      const command = (presetScope('my-prs')['command'] as string[]).join(' ');
+      expect(command).toContain('--state open --limit 1000');
+      expect(command).not.toMatch(/--state open --limit 30\b/);
+    });
+  });
+
+  /**
+   * PR #446 review, thread `discussion_r3617759463`: `gh pr list` without
+   * `--search` orders newest-CREATED-first, not newest-merged/closed-first,
+   * so a fixed `--limit` on the merged/closed calls can miss an OLDER PR that
+   * only just entered the terminal window. The fetch now scopes those two
+   * calls to a `merged:`/`closed:` search date range computed from
+   * {@link TERMINAL_WINDOW_SECONDS} instead, which this argv-level assertion
+   * proves is actually wired up (the REDUCE-level time-bound tests above
+   * exercise the jq filter, not the fetch query that feeds it).
+   */
+  describe('`--type my-prs` terminal fetch is date-scoped, not order-and-limit-scoped (PR #446 review, thread discussion_r3617759463)', () => {
+    it('computes a portable cutoff and scopes both terminal calls to it', () => {
+      const command = (presetScope('my-prs')['command'] as string[]).join(' ');
+      // Portable cutoff: tries GNU `date -d @epoch` first, falls back to
+      // BSD/macOS `date -r epoch` — the same script must run on both.
+      expect(command).toContain('date -u -d @"$cutoff_epoch"');
+      expect(command).toContain('date -u -r "$cutoff_epoch"');
+      expect(command).toContain('--state merged --search "merged:>=$cutoff"');
+      expect(command).toContain(
+        '--state closed --search "closed:>=$cutoff -is:merged"',
+      );
+    });
+
+    // `-is:merged` on the closed lane specifically guards against the
+    // reviewer's measured `gh` behavior: once `--search` is present, `gh`
+    // routes through the search API, whose `is:closed` qualifier (unlike the
+    // plain `--state closed` GraphQL filter alone) also matches merged PRs.
+    it('excludes merged PRs from the closed-state search, not just the open one', () => {
+      const command = (presetScope('my-prs')['command'] as string[]).join(' ');
+      expect(command).toMatch(/closed:>=\$cutoff -is:merged/);
     });
   });
 
@@ -1030,6 +1090,27 @@ describe('the presets’ jq reduction over raw gh output', () => {
       );
       expect(titles).toEqual([]);
     });
+
+    // PR #446 review, thread `discussion_r3617759355`: the prior retitle test
+    // above only covers a QUIET PR that is ABSENT from the payload before and
+    // after — it cannot catch a title change churning an entry that is
+    // already, and remains, a MEMBER, which is exactly what json-diff (a
+    // whole-payload diff) would otherwise re-fire on.
+    it('does NOT fire when an already-actionable PR is retitled', async () => {
+      const ciFailing = {
+        ...QUIET,
+        statusCheckRollup: [checkRun('build', 'FAILURE')],
+      };
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([rawMyPr(ciFailing)]),
+        fixtureOf([
+          rawMyPr({ ...ciFailing, title: 'feat: add widget (renamed)' }),
+        ]),
+      );
+      expect(titles).toEqual([]);
+    });
   });
 
   /**
@@ -1213,11 +1294,13 @@ describe('the presets’ jq reduction over raw gh output', () => {
       expect(JSON.parse(result.stdout)).toEqual([
         {
           number: 7,
-          title: 'fix: thing',
           headRefName: 'fix/thing',
           author: 'contributor',
         },
       ]);
+      // title is deliberately absent — see the retitle-while-in-queue
+      // regression below (PR #446 review, thread discussion_r3617759355).
+      expect(result.stdout).not.toContain('fix: thing');
     });
 
     it('fires when a draft is marked ready', async () => {
@@ -1272,6 +1355,64 @@ describe('the presets’ jq reduction over raw gh output', () => {
         fixtureOf([rawReviewPr({ ...reviewed, title: 'fix: thing (v2)' })]),
       );
       expect(titles).toEqual([]);
+    });
+
+    // PR #446 review, thread `discussion_r3617759355`: the test above only
+    // covers a retitle on a PR that is ABSENT from the queue both before and
+    // after (already reviewed). It cannot catch a title change churning a
+    // still-actionable member, which is what json-diff would otherwise
+    // re-fire on.
+    it('does NOT fire when a still-undecided, in-queue PR is retitled', async () => {
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([rawReviewPr()]),
+        fixtureOf([rawReviewPr({ title: 'fix: thing (renamed)' })]),
+      );
+      expect(titles).toEqual([]);
+    });
+
+    /**
+     * PR #446 review, thread `discussion_r3617759232`: `reviewDecision` is a
+     * repository-wide, branch-protection-derived verdict. A repo requiring
+     * two approvals can show `reviewDecision: 'APPROVED'` once ONE reviewer
+     * approves, while a SECOND reviewer's request — this identity's own — is
+     * still outstanding. Reducing membership to `reviewDecision` alone would
+     * drop the PR from the queue while it still needs this viewer
+     * specifically; `reviewRequests` is the per-viewer signal that keeps it
+     * visible.
+     */
+    it('keeps a PR in the queue when reviewDecision reads APPROVED but this identity is still a requested reviewer', async () => {
+      const result = await observe(
+        scope,
+        stub,
+        fixtureOf([
+          rawReviewPr({
+            reviewDecision: 'APPROVED',
+            reviewRequests: [{ login: 'octocat' }],
+          }),
+        ]),
+      );
+      const entries = JSON.parse(result.stdout) as { number: number }[];
+      expect(entries).toHaveLength(1);
+      expect(entries[0]?.number).toBe(7);
+    });
+
+    it('drops a PR once reviewDecision reads APPROVED and this identity is no longer a requested reviewer', async () => {
+      const titles = await transition(
+        scope,
+        stub,
+        fixtureOf([
+          rawReviewPr({
+            reviewDecision: 'REVIEW_REQUIRED',
+            reviewRequests: [{ login: 'octocat' }],
+          }),
+        ]),
+        fixtureOf([
+          rawReviewPr({ reviewDecision: 'APPROVED', reviewRequests: [] }),
+        ]),
+      );
+      expect(titles).toEqual([CHANGED_REVIEW]);
     });
   });
 });
@@ -1524,6 +1665,73 @@ describe('gh environment/temp-file hardening (PR #446 review, thread 3)', () => 
       );
     }
   });
+
+  /**
+   * A stub `gh` that fails loudly — reporting the wrong host it was actually
+   * called with — unless `gh api user`'s `--hostname` matches `expectedHost`.
+   * A real `gh` would instead silently query `api.github.com`, either failing
+   * outright on GHES or comparing a dotcom login against Enterprise PR
+   * authors that can never match (PR #446 review, thread
+   * `discussion_r3617759108`).
+   */
+  function stubGhAssertingHostname(
+    expectedHost: string,
+    repoUrl: string,
+  ): string {
+    const dir = tempDir('stub-hostname-check');
+    writeExecutable(
+      path.join(dir, 'gh'),
+      [
+        '#!/bin/sh',
+        'if [ "$1" = "repo" ]; then',
+        `  printf '%s\\n' '${repoUrl}'`,
+        '  exit 0',
+        'fi',
+        'if [ "$1" = "api" ]; then',
+        '  host=""',
+        '  while [ $# -gt 0 ]; do',
+        '    if [ "$1" = "--hostname" ]; then host="$2"; fi',
+        '    shift',
+        '  done',
+        `  if [ "$host" != "${expectedHost}" ]; then`,
+        `    echo "wrong host: got [$host], expected [${expectedHost}]" >&2`,
+        '    exit 1',
+        '  fi',
+        '  printf \'{"login":"octocat"}\\n\'',
+        '  exit 0',
+        'fi',
+        'cat "$AM444_FIXTURE"',
+        '',
+      ].join('\n'),
+    );
+    return dir;
+  }
+
+  it('resolves gh api user against the current repository’s own Enterprise host, not github.com', async () => {
+    const scope = presetScope('pr-review');
+    const fixtureFile = path.join(tempDir('fixture'), 'fixture.json');
+    writeFileSync(fixtureFile, fixtureOf([]), 'utf-8');
+    const result = await commandPoll.observe(
+      {
+        ...scope,
+        env: {
+          PATH: pathWith(
+            stubGhAssertingHostname(
+              'github.example.com',
+              'https://github.example.com/acme/app',
+            ),
+          ),
+          AM444_FIXTURE: fixtureFile,
+        },
+      },
+      { now: new Date('2026-01-15T10:00:00.000Z') },
+    );
+    // A first-ever run baselines silently either way; the assertion that
+    // matters is that the stub's wrong-host branch never fired — if it had,
+    // this run would surface `Command failing: pr-review` instead of
+    // baselining quietly.
+    expect(result.observations).toEqual([]);
+  });
 });
 
 describe('reviewer scoping (PR #446 review, thread 1)', () => {
@@ -1592,7 +1800,25 @@ describe('reviewer scoping (PR #446 review, thread 1)', () => {
    * two presets do not overlap" above).
    */
   it('always resolves the current identity, independent of the --search scope', () => {
-    expect(commandOf('pr-review')).toContain("gh api user --jq '{login}'");
+    expect(commandOf('pr-review')).toContain(
+      'gh api user --hostname "$host" --jq \'{login}\'',
+    );
+  });
+
+  /**
+   * PR #446 review, thread `discussion_r3617759108`: `gh api user` (a bare,
+   * repo-less endpoint) does not auto-detect a host the way `gh pr list`'s
+   * own repository resolution does — it defaults to `github.com` even inside
+   * a GitHub Enterprise checkout. The fetch must resolve `gh api user`'s host
+   * from the SAME repository `gh pr list` targets (via `gh repo view`, which
+   * does resolve host from the working directory) rather than hardcoding
+   * `github.com` or omitting `--hostname` entirely.
+   */
+  it('resolves the identity-lookup host from the current repository, not a hardcoded github.com', () => {
+    const command = commandOf('pr-review');
+    expect(command).toContain('gh repo view');
+    expect(command).toContain('--hostname "$host"');
+    expect(command).not.toMatch(/--hostname\s+github\.com/);
   });
 });
 

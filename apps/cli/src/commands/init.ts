@@ -326,6 +326,20 @@ const PR_REVIEW_SCOPE_COMMENT =
  * other at all: `my-prs`, not `pr-review`, is the only queue an authored PR
  * can ever appear in, on any tick, under any scope.
  *
+ * **The identity lookup targets the SAME host `gh pr list` resolves the
+ * repository against, not `github.com` unconditionally** (PR #446 review,
+ * thread `discussion_r3617759108`). `gh api user` (a bare, repo-less
+ * endpoint) does not auto-detect a host the way `gh pr list`'s own
+ * repository resolution does — it defaults to `github.com` even when run
+ * from inside a GitHub Enterprise checkout, so on GHES it either fails
+ * outright or, worse, resolves a dotcom login and compares it against
+ * Enterprise PR authors that can never match, quietly readmitting the
+ * current user's own PRs into the review queue. The fetch therefore first
+ * asks `gh repo view` — which DOES resolve host from the working directory,
+ * the same mechanism `gh pr list` itself relies on — for the current
+ * repository's URL, extracts its host, and passes that explicitly via `gh
+ * api user --hostname`.
+ *
  * **Excluding red PRs is a second, independent disjointness clause** for the
  * (common) case of PRs authored by someone else: a red PR is not
  * review-ready — it belongs to its author, and `my-prs` already classifies it
@@ -334,12 +348,28 @@ const PR_REVIEW_SCOPE_COMMENT =
  * (never by this repo's own `my-prs`, since that preset is scoped to `--author
  * @me`), so this clause is about correctness of the reviewer queue itself,
  * not cross-preset disjointness.
+ *
+ * **Membership also survives a repo-wide `reviewDecision` that a DIFFERENT
+ * reviewer's approval already satisfied** (PR #446 review, thread
+ * `discussion_r3617759232`). `reviewDecision` is a branch-protection-derived,
+ * repository-wide verdict — GitHub can and does show a PR under "Requesting a
+ * code review from you" even once `reviewDecision` reads `APPROVED`, when the
+ * repository requires more than one approval and this viewer's own request is
+ * still unresolved. Reducing membership to `reviewDecision` alone would drop
+ * that PR from the queue while it still needs THIS viewer specifically. The
+ * `--json` fetch therefore also carries `reviewRequests`, and
+ * {@link PR_REVIEW_REDUCE} keeps a PR whose `reviewDecision` has moved past
+ * `REVIEW_REQUIRED` as long as the resolved identity still appears in that
+ * list (a per-team review request that expanded to this user still shows the
+ * user's own `login`, so this is a strict superset of the plain-`login`
+ * check, not merely equivalent to it for direct requests).
  */
 const PR_REVIEW_FETCH =
-  "gh api user --jq '{login}' && " +
+  "host=$(gh repo view --json url --jq '.url' | sed -E 's#^https?://([^/]+)/.*$#\\1#') && " +
+  'gh api user --hostname "$host" --jq \'{login}\' && ' +
   'gh pr list --state open --limit 30 ' +
   `--search '${PR_REVIEW_DEFAULT_SCOPE}' ` +
-  '--json number,title,isDraft,reviewDecision,headRefName,author,statusCheckRollup';
+  '--json number,title,isDraft,reviewDecision,headRefName,author,statusCheckRollup,reviewRequests';
 
 /**
  * `reduceJq` for {@link PR_REVIEW_FETCH}. Slurped input is `[{login: "..."},
@@ -350,18 +380,35 @@ const PR_REVIEW_FETCH =
  * (`.[0]`/`.[1]`) is deliberate: it stays correct even if `fetchCmd`'s two
  * calls were ever reordered, since `jq -s` preserves each call's own
  * originally-printed value, not a merged stream.
+ *
+ * A PR stays in the set when EITHER its `reviewDecision` has not yet passed
+ * `REVIEW_REQUIRED`, OR the resolved identity is still listed in
+ * `reviewRequests` — the latter clause is what keeps a PR visible when a
+ * multi-approval repository's `reviewDecision` already reads `APPROVED` from
+ * someone else while this viewer's own request is still outstanding (PR #446
+ * review, thread `discussion_r3617759232`).
+ *
+ * `title` is deliberately NOT projected into the reduced entry (PR #446
+ * review, thread `discussion_r3617759355`): it is mutable presentation data,
+ * and `json-diff` fires on ANY change to the whole diffed payload — including
+ * a field mutating on an entry that is already, and remains, a member. A
+ * retitle would therefore re-fire the `high`-urgency interrupt for a PR
+ * nothing actually happened to. `headRefName` and `author` already identify
+ * which PR and branch to look at.
  */
 const PR_REVIEW_REDUCE =
   '(.[] | select(type == "object") | .login) as $me | ' +
   '(.[] | select(type == "array")) as $raw | ' +
   '$raw | [.[] | select(.isDraft == false ' +
   'and (.headRefName | startswith("changeset-release/") | not) ' +
-  'and (((.reviewDecision // "") == "") or (.reviewDecision == "REVIEW_REQUIRED")) ' +
+  'and (((.reviewDecision // "") == "") ' +
+  'or (.reviewDecision == "REVIEW_REQUIRED") ' +
+  'or (([.reviewRequests[]? | .login] | index($me)) != null)) ' +
   'and (.author.login != $me) ' +
   'and ([.statusCheckRollup[]? | select(((.conclusion // .state // "") | ascii_upcase) as $c ' +
   '| $c == "FAILURE" or $c == "TIMED_OUT" or $c == "CANCELLED" or $c == "ERROR" ' +
   'or $c == "ACTION_REQUIRED" or $c == "STARTUP_FAILURE")] | length) == 0) ' +
-  '| {number, title, headRefName, author: .author.login}] ' +
+  '| {number, headRefName, author: .author.login}] ' +
   '| sort_by(.number)';
 
 /**
@@ -405,8 +452,7 @@ const PR_REVIEW_REDUCE =
  * 20 slots at `--limit 20`) and age a still-open PR out of the query entirely — after which its CI
  * going red would silently produce no event, forever, until it happened to re-enter the window. Three
  * separate calls each get their OWN `--limit`, so open coverage can never be displaced by terminal
- * history, and terminal coverage (`--limit 20` each for `merged`/`closed`) only needs to outlast the
- * 6-hour terminal window, not compete with open PRs at all.
+ * history.
  *
  * **Open coverage is `--limit 1000`** ({@link MY_PRS_OPEN_LIMIT}), not `30` (issue #444 review,
  * finding 989's follow-up: `--limit 30` still evicted an older still-open PR once an author had more
@@ -415,12 +461,29 @@ const PR_REVIEW_REDUCE =
  * any workflow a single human or agent author could actually sustain, complete coverage of every open
  * PR they have. This is deliberately **not** claimed as a mathematical guarantee: an author with more
  * than 1000 simultaneously open PRs (not a realistic operating point for this preset) would still see
- * the oldest evicted, same failure shape as before at a vastly higher threshold. The terminal calls stay
- * at `--limit 20` each: their coverage requirement is bounded by construction (outlast the 6-hour
- * terminal window, not "never miss a PR"), so widening them buys nothing.
+ * the oldest evicted, same failure shape as before at a vastly higher threshold (PR #446 review,
+ * 21:43 round: this residual gap is real and intentionally not re-solved here — see 003 §11.9 for the
+ * documented boundary).
+ *
+ * **The merged/closed calls filter by a `merged:`/`closed:` search date range, not by relying on
+ * `--limit` plus creation-order** (PR #446 review, thread `discussion_r3617759463`). `gh pr list`
+ * without `--search` orders results newest-**created**-first, not newest-merged/closed-first, so an
+ * older PR (created long ago, merged or closed only just now) can sit behind however many
+ * newer-CREATED terminal PRs exist and never be fetched within a fixed `--limit`, silently dropping it
+ * out of the 6-hour terminal window this preset advertises. Computing `cutoff` (now minus
+ * {@link TERMINAL_WINDOW_SECONDS}) once per tick and passing `merged:>=$cutoff` /
+ * `closed:>=$cutoff` scopes each call directly to the window that matters, independent of creation
+ * order or volume. The date arithmetic tries GNU `date -d @epoch` first and falls back to BSD/macOS
+ * `date -r epoch`, so the same script runs on both a Linux daemon host and a local macOS one.
+ *
+ * Passing `--search` also changes how `--state closed` behaves: `gh` routes a `--search`-bearing query
+ * through GitHub's search API, whose `is:closed` qualifier — unlike the plain GraphQL `states: CLOSED`
+ * enum `--state closed` uses alone — matches merged PRs too, so the closed call's own search string
+ * explicitly adds `-is:merged` to keep the closed lane exclusively unmerged closures (the merged call
+ * needs no equivalent exclusion; it wants merged PRs).
  *
  * The three raw arrays are unioned by {@link ghPresetScript}'s `jq -sc`
- * stage; `reviewDecision`/`state` never overlap a PR across the three states, so `unique_by(.number)`
+ * stage; a PR is never simultaneously open, merged, and closed, so `unique_by(.number)`
  * in {@link MY_PRS_REDUCE} is a defensive no-op against real `gh` output — it only matters against a
  * test stub that (deliberately, to keep transition fixtures simple) returns the same fixture for every
  * call.
@@ -432,11 +495,33 @@ const MY_PRS_JSON_FIELDS =
 /** See {@link MY_PRS_FETCH}'s doc comment for why this is 1000, not a small bounded window. */
 const MY_PRS_OPEN_LIMIT = 1000;
 
-const MY_PRS_FETCH =
-  `gh pr list --author @me --state open --limit ${String(MY_PRS_OPEN_LIMIT)} --json ${MY_PRS_JSON_FIELDS} && ` +
-  `gh pr list --author @me --state merged --limit 20 --json ${MY_PRS_JSON_FIELDS} && ` +
-  `gh pr list --author @me --state closed --limit 20 --json ${MY_PRS_JSON_FIELDS}`;
+/**
+ * Portable "now minus {@link TERMINAL_WINDOW_SECONDS}, as an ISO-8601 UTC
+ * timestamp" computation, shared by {@link MY_PRS_FETCH}'s merged/closed
+ * calls. `date -d @epoch` is GNU-only; `date -r epoch` is BSD/macOS-only —
+ * trying the GNU form first and falling back on failure covers both a Linux
+ * daemon host and a local macOS one with the same script.
+ */
+const MY_PRS_CUTOFF_PREAMBLE =
+  `cutoff_epoch=$(( $(date -u +%s) - ${String(TERMINAL_WINDOW_SECONDS)} )) && ` +
+  'cutoff=$(date -u -d @"$cutoff_epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null ' +
+  '|| date -u -r "$cutoff_epoch" +%Y-%m-%dT%H:%M:%SZ) && ';
 
+const MY_PRS_FETCH =
+  MY_PRS_CUTOFF_PREAMBLE +
+  `gh pr list --author @me --state open --limit ${String(MY_PRS_OPEN_LIMIT)} --json ${MY_PRS_JSON_FIELDS} && ` +
+  `gh pr list --author @me --state merged --search "merged:>=$cutoff" --limit 100 --json ${MY_PRS_JSON_FIELDS} && ` +
+  `gh pr list --author @me --state closed --search "closed:>=$cutoff -is:merged" --limit 100 --json ${MY_PRS_JSON_FIELDS}`;
+
+/**
+ * `reduceJq` for {@link MY_PRS_FETCH}. `title` is deliberately NOT projected
+ * into the reduced entry (PR #446 review, thread `discussion_r3617759355`):
+ * it is mutable presentation data, and `json-diff` fires on ANY change to the
+ * whole diffed payload, including a field mutating on an entry that is
+ * already, and remains, a member. A retitle would re-fire the `high`-urgency
+ * interrupt for a PR nothing actually happened to — `url` already identifies
+ * exactly which PR an entry is about.
+ */
 const MY_PRS_REDUCE =
   'add | unique_by(.number) | [.[] ' +
   '| (.author.login) as $me ' +
@@ -454,7 +539,7 @@ const MY_PRS_REDUCE =
   'elif .isDraft then "draft" ' +
   'else "none" end) as $needs ' +
   '| select($needs != "none") ' +
-  '| {number, title, url, needs: $needs} ' +
+  '| {number, url, needs: $needs} ' +
   '+ (if $needs == "merged" or $needs == "closed" then {} ' +
   'else {failingChecks: $failing, ' +
   'reviews: ([.latestReviews[]? | {by: .author.login, state, at: .submittedAt}] ' +
