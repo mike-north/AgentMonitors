@@ -1811,12 +1811,19 @@ on any change to the WHOLE diffed payload, including a field mutating on an entr
 remains, a member — a retitle would otherwise re-fire the `high`-urgency interrupt for a PR nothing
 actually happened to. `reviewDecision` is **not** carried as a field either — it decides membership
 instead: a PR stays in the set while its decision is empty or `REVIEW_REQUIRED`, **or** while the
-resolved identity is still listed in `reviewRequests` (PR #446 review, thread `discussion_r3617759232`:
-`reviewDecision` is a repository-wide, branch-protection-derived verdict, so a multi-approval repository
-can show `APPROVED` once ONE reviewer approves while THIS viewer's own request is still outstanding —
-`reviewRequests` is the per-viewer signal that keeps the PR visible in that case). So a decision landing
-removes the PR (one benign fire) rather than churning a value inside the set, EXCEPT when this viewer's
-own request is still open. Filtering also drops drafts, `changeset-release/*` heads (the release/Version
+resolved identity's own `login` is still listed in `reviewRequests`, **or** `reviewRequests` still lists
+a pending team request (PR #446 review, thread `discussion_r3617759232`: `reviewDecision` is a
+repository-wide, branch-protection-derived verdict, so a multi-approval repository can show `APPROVED`
+once ONE reviewer approves while THIS viewer's own request is still outstanding — `reviewRequests` is
+the per-viewer signal that keeps the PR visible in that case). The team-request clause is a distinct,
+necessary addition (PR #446 review, thread `discussion_r3624050268`): `reviewRequests` is a union that
+includes `Team`/`EnterpriseTeam` entries, which expose a team `slug`/`name` rather than a `login` — `gh`
+never expands a team request out to individual member logins in this field, even though `--search
+review-requested:@me` itself does resolve team membership when selecting which PRs to fetch. A plain
+`.login == $me` check can therefore never match a team-requested PR, so any `reviewRequests` entry
+lacking a `login` field is treated as a still-pending team request once the fetch itself is already
+scoped by `--search`. So a decision landing removes the PR (one benign fire) rather than churning a
+value inside the set, EXCEPT when this viewer's own direct or team-based request is still open. Filtering also drops drafts, `changeset-release/*` heads (the release/Version
 PR is never agent-reviewable), PRs authored by the current `gh` identity (see "The two presets must not
 overlap" above — this, not `--search`, is the clause that keeps `pr-review` and `my-prs` disjoint), and
 PRs with failing CI. Reviewer scoping (which PRs among those authored by _someone else_ actually need
@@ -1837,8 +1844,8 @@ scoping — for the current repository's URL, extracts its host, and passes it e
 `gh api user --hostname`.
 
 `my-prs` fetches **three separate** `gh pr list` calls — `--state open --limit 1000`, `--state merged
---search "merged:>=$cutoff" --limit 100`, `--state closed --search "closed:>=$cutoff -is:merged" --limit
-100` — rather than one `--state all --limit N` call, and unions the three raw arrays before reducing
+--search "merged:>=$cutoff" --limit 1000`, `--state closed --search "closed:>=$cutoff -is:merged" --limit
+1000` — rather than one `--state all --limit N` call, and unions the three raw arrays before reducing
 (issue #444 review, finding 989). Keeping merged and closed PRs in the combined result is what makes
 their terminal state **nameable**: "merged, clean up the branch" and "closed unmerged, find out why" are
 different instructions, and `--state open` alone collapses both into an indistinguishable disappearance
@@ -1874,6 +1881,14 @@ through GitHub's search API, whose `is:closed` qualifier — unlike the plain Gr
 `--state closed` uses alone — matches merged PRs too, so the closed call's search string explicitly adds
 `-is:merged` to keep that lane exclusively unmerged closures (the merged call needs no equivalent
 exclusion).
+
+Each terminal call's own `--limit` is **1000**, matching the open-PR `--limit`'s "complete coverage
+for any realistic workflow, not a mathematical guarantee" rationale (PR #446 review, thread
+`discussion_r3624050272`): the date-range `--search` fixes which 6-hour window is queried, but the call
+itself was still capped at 100 rows, so an author who merged or closed more than 100 of their own PRs
+inside that single window would still silently lose the oldest of them. Raising the bound to 1000
+matches the open-PR threshold's reasoning exactly — not a realistic operating point for this preset —
+without pretending either bound is a mathematical guarantee.
 
 The three arrays cannot overlap on a real repository (a PR is never simultaneously `OPEN`, `MERGED`, and
 `CLOSED`), so the union needs no deduplication in production; the reduction's `unique_by(.number)` is
@@ -2067,16 +2082,29 @@ process group.
 
 The wrapper takes three further precautions the shell alone can silently violate:
 
-- **`unset GH_TOKEN GITHUB_TOKEN GH_REPO`** scrubs three inherited overrides, once, before any `gh`
-  call the script makes. `GH_TOKEN`/`GITHUB_TOKEN` each give unconditional precedence over keyring/
-  `gh auth login` credentials, so a daemon process with either exported (a common shell-startup
-  leftover) would make `@me` — and therefore both presets — silently resolve against the wrong identity,
-  with `gh` exiting 0 either way (issue #444 review, finding 2). `GH_REPO` overrides which repository
+- **`unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GH_REPO`** scrubs five
+  inherited overrides, once, before any `gh` call the script makes. `GH_TOKEN`/`GITHUB_TOKEN` each give
+  unconditional precedence over keyring/`gh auth login` credentials on `github.com`, so a daemon process
+  with either exported (a common shell-startup leftover) would make `@me` — and therefore both presets —
+  silently resolve against the wrong identity, with `gh` exiting 0 either way (issue #444 review, finding
+  2). `GH_ENTERPRISE_TOKEN`/`GITHUB_ENTERPRISE_TOKEN` are the exact GHES-host equivalent (`gh help
+environment`): they take the same unconditional precedence whenever the resolved host is a GitHub
+  Enterprise Server, so leaving either set would recreate the identical silent-wrong-identity failure on
+  any enterprise checkout (PR #446 review, thread `discussion_r3624050247`) — scrubbing only the
+  dotcom pair would have left that host class exposed. `GH_REPO` overrides which repository
   `gh pr list` targets outright, which would silently defeat the working-directory-based repository
   auto-scoping above. `unset` rather than `env -u` per invocation is what makes the scrub apply
   uniformly across `my-prs`'s multi-call fetch (see "Open-PR coverage is fetched separately from
   terminal history" below): `env -u ... cmd1 && cmd2` would only wrap `cmd1`, leaving `cmd2`/`cmd3`
   exposed to a leaked override.
+- **`jq` is validated as an explicit runtime dependency, not merely assumed present.** The `--jq`
+  reduction stage (below) shells out to a second binary distinct from `gh`; before either preset's
+  fetch runs, the wrapper checks `command -v jq` and, if absent, surfaces the same loud
+  `Command failing: <key>` remedy `gh` failures use — now naming `jq` alongside `gh` as a required
+  install — rather than letting a bare `jq: command not found` (which pointed only at fixing `gh`,
+  misleading an author who already has `gh` installed and authenticated) reach the daemon (PR #446
+  review, thread `discussion_r3624050282`). 005 documents `jq` as a required prerequisite alongside the
+  GitHub CLI for the same reason.
 - **`--jq` runs as a separate `jq -sc` pipeline stage over the fetch's raw stdout, not as a `gh --jq`
   flag.** This is what lets `my-prs`'s fetch be more than one `gh` call: `-s`/`--slurp` folds however
   many top-level JSON arrays the fetch printed into one array-of-arrays, and the reduction always opens

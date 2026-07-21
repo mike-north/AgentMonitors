@@ -241,10 +241,13 @@ scaffolded username. A scaffolded preset is therefore correct in any checkout an
 before it runs — the intent of these presets is that PR alerting takes one command rather than ~20
 hand-written lines of `gh` argv.
 
-Both require the [GitHub CLI](https://cli.github.com) on the daemon's `PATH`, authenticated
-(`gh auth login`) — with an inherited `GITHUB_TOKEN` scrubbed before every invocation, since `gh` would
-otherwise give it unconditional precedence over that auth and silently resolve `@me` against the wrong
-identity. When `gh` is missing, unauthenticated, or run outside a GitHub repository, the monitor emits
+Both require the [GitHub CLI](https://cli.github.com) **and** [`jq`](https://jqlang.org) on the daemon's
+`PATH` — `gh` authenticated (`gh auth login`), `jq` used as a separate reduction stage over `gh`'s raw
+output — with inherited `GH_TOKEN`/`GITHUB_TOKEN`/`GH_ENTERPRISE_TOKEN`/`GITHUB_ENTERPRISE_TOKEN`/
+`GH_REPO` scrubbed before every invocation, since `gh` would otherwise give a leaked token unconditional
+precedence over that auth (on `github.com` or a GitHub Enterprise Server host alike) and silently resolve
+`@me` against the wrong identity, or `GH_REPO` against the wrong repository. When `gh` or `jq` is
+missing, `gh` is unauthenticated, or the command runs outside a GitHub repository, the monitor emits
 a `Command failing: <key>` event on its **first** tick whose `stderrTail` carries both `gh`'s own
 message and the remedy — it never degrades into a silent, never-firing baseline. See
 [003 §11.9](./003-source-plugins.md) for the field selection, the urgency rationale, and the failure

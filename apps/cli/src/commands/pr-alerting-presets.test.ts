@@ -1414,6 +1414,32 @@ describe('the presets’ jq reduction over raw gh output', () => {
       );
       expect(titles).toEqual([CHANGED_REVIEW]);
     });
+
+    /**
+     * PR #446 review, thread `discussion_r3624050268`: `reviewRequests` is a
+     * union that includes `Team`/`EnterpriseTeam` requests, which expose a
+     * team `slug`/`name` rather than a `login` — `gh` never expands a team
+     * request out to individual member logins in this field. A plain
+     * `.login == $me` check can therefore never match a team-requested PR,
+     * so once `reviewDecision` reads `APPROVED` (a different reviewer
+     * satisfying the policy) the PR must NOT be dropped while a team request
+     * is still pending.
+     */
+    it('keeps a PR in the queue when reviewDecision reads APPROVED but a team review request is still pending', async () => {
+      const result = await observe(
+        scope,
+        stub,
+        fixtureOf([
+          rawReviewPr({
+            reviewDecision: 'APPROVED',
+            reviewRequests: [{ slug: 'platform' }],
+          }),
+        ]),
+      );
+      const entries = JSON.parse(result.stdout) as { number: number }[];
+      expect(entries).toHaveLength(1);
+      expect(entries[0]?.number).toBe(7);
+    });
   });
 });
 
@@ -1506,6 +1532,35 @@ describe('graceful degradation when gh is unusable (issue #444)', () => {
     },
   );
 
+  /**
+   * A `PATH` with a working `gh` stub and `sh`, but deliberately no `jq` —
+   * neither the real system `jq` (excluded by never appending `/usr/bin:/bin`
+   * the way {@link pathWith} does) nor a stubbed one. `--jq` is a second,
+   * undeclared runtime dependency distinct from `gh` (PR #446 review, thread
+   * `discussion_r3624050282`): before this fix, a jq-less host got a
+   * `Command failing` remedy that named only `gh`, misleading an author who
+   * already has `gh` installed and authenticated.
+   */
+  function pathWithGhButNoJq(): string {
+    const dir = tempDir('nogh-jq');
+    symlinkSync('/bin/sh', path.join(dir, 'sh'));
+    writeExecutable(path.join(dir, 'gh'), '#!/bin/sh\necho "[]"\n');
+    return dir;
+  }
+
+  it.each(['my-prs', 'pr-review'] as const)(
+    '%s surfaces an actionable failure naming jq (not just gh) when jq is missing',
+    async (type) => {
+      const scope = presetScope(type);
+      const { observations } = await observeRaw(scope, pathWithGhButNoJq());
+      expect(observations).toHaveLength(1);
+      expect(observations[0]?.title).toBe(`Command failing: ${type}`);
+      const stderrTail = String(observations[0]?.payload?.['stderrTail'] ?? '');
+      expect(stderrTail).toContain('jq');
+      expect(stderrTail).toContain('https://jqlang.org');
+    },
+  );
+
   it('my-prs surfaces an actionable failure when gh is present but unauthenticated', async () => {
     const scope = presetScope('my-prs');
     const { observations } = await observeRaw(
@@ -1556,10 +1611,13 @@ describe('graceful degradation when gh is unusable (issue #444)', () => {
 describe('gh environment/temp-file hardening (PR #446 review, thread 3)', () => {
   /**
    * A stub `gh` that fails loudly — reporting exactly which variable leaked —
-   * if `GH_TOKEN`, `GITHUB_TOKEN`, or `GH_REPO` reach it. A real `gh` would
+   * if `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`,
+   * `GITHUB_ENTERPRISE_TOKEN`, or `GH_REPO` reach it. A real `gh` would
    * instead silently honor whichever leaked, resolving `@me`/the repository
    * against the wrong identity with no error (issue #444 review, finding 2;
-   * PR #446 review thread 3).
+   * PR #446 review thread 3; `GH_ENTERPRISE_TOKEN`/`GITHUB_ENTERPRISE_TOKEN`
+   * added per thread `discussion_r3624050247` — the GHES-host equivalent of
+   * the same precedence rule).
    */
   function stubGhAssertingScrubbedEnv(): string {
     const dir = tempDir('stub-scrub-check');
@@ -1567,8 +1625,8 @@ describe('gh environment/temp-file hardening (PR #446 review, thread 3)', () => 
       path.join(dir, 'gh'),
       [
         '#!/bin/sh',
-        'if [ -n "$GH_TOKEN" ] || [ -n "$GITHUB_TOKEN" ] || [ -n "$GH_REPO" ]; then',
-        '  echo "leaked: GH_TOKEN=$GH_TOKEN GITHUB_TOKEN=$GITHUB_TOKEN GH_REPO=$GH_REPO" >&2',
+        'if [ -n "$GH_TOKEN" ] || [ -n "$GITHUB_TOKEN" ] || [ -n "$GH_ENTERPRISE_TOKEN" ] || [ -n "$GITHUB_ENTERPRISE_TOKEN" ] || [ -n "$GH_REPO" ]; then',
+        '  echo "leaked: GH_TOKEN=$GH_TOKEN GITHUB_TOKEN=$GITHUB_TOKEN GH_ENTERPRISE_TOKEN=$GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN=$GITHUB_ENTERPRISE_TOKEN GH_REPO=$GH_REPO" >&2',
         '  exit 1',
         'fi',
         'cat "$AM444_FIXTURE"',
@@ -1579,7 +1637,7 @@ describe('gh environment/temp-file hardening (PR #446 review, thread 3)', () => 
   }
 
   it.each(['my-prs', 'pr-review'] as const)(
-    '%s scrubs GH_TOKEN, GITHUB_TOKEN, and GH_REPO before invoking gh',
+    '%s scrubs GH_TOKEN, GITHUB_TOKEN, GH_ENTERPRISE_TOKEN, GITHUB_ENTERPRISE_TOKEN, and GH_REPO before invoking gh',
     async (type) => {
       const scope = presetScope(type);
       const fixtureFile = path.join(tempDir('fixture'), 'fixture.json');
@@ -1592,6 +1650,8 @@ describe('gh environment/temp-file hardening (PR #446 review, thread 3)', () => 
             AM444_FIXTURE: fixtureFile,
             GH_TOKEN: 'poison-gh-token',
             GITHUB_TOKEN: 'poison-github-token',
+            GH_ENTERPRISE_TOKEN: 'poison-enterprise-token',
+            GITHUB_ENTERPRISE_TOKEN: 'poison-github-enterprise-token',
             GH_REPO: 'someone-else/other-repo',
           },
         },
@@ -1600,8 +1660,8 @@ describe('gh environment/temp-file hardening (PR #446 review, thread 3)', () => 
       // A first-ever run baselines silently either way; the assertion that
       // matters is that no leaked variable ever triggered the stub's failure
       // branch — if it had, this run would surface `Command failing: <type>`
-      // instead of baselining quietly. Dropping any one of the three `-u`
-      // flags in `ghPresetScript` reintroduces the leak this guards against.
+      // instead of baselining quietly. Dropping any one of the five `unset`
+      // targets in `ghPresetScript` reintroduces the leak this guards against.
       expect(result.observations).toEqual([]);
     },
   );

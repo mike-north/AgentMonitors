@@ -131,14 +131,21 @@ function ghPresetScript(
   fetchCmd: string,
   reduceJq: string,
 ): string {
-  const failureMessage = `printf 'agentmonitors %s: the GitHub CLI query failed, so PR alerting is NOT running.\\nFix one of these, then re-run: agentmonitors monitor test <this file>\\n  1. Install the GitHub CLI: https://cli.github.com\\n  2. Authenticate it: gh auth login\\n  3. Run the daemon from inside a git repo that has a GitHub remote.\\n' '${preset}' >&2`;
+  const failureMessage = `printf 'agentmonitors %s: the GitHub CLI query failed, so PR alerting is NOT running.\\nFix one of these, then re-run: agentmonitors monitor test <this file>\\n  1. Install the GitHub CLI: https://cli.github.com\\n  2. Authenticate it: gh auth login\\n  3. Install jq: https://jqlang.org (both gh and jq are required)\\n  4. Run the daemon from inside a git repo that has a GitHub remote.\\n' '${preset}' >&2`;
   return `errfile=$(mktemp "\${TMPDIR:-/tmp}/agentmonitors-${preset}-XXXXXX" 2>/dev/null) || {
   ${failureMessage}
   kill -TERM $$
   exit 1
 }
 trap 'rm -f "$errfile"' EXIT
-unset GH_TOKEN GITHUB_TOKEN GH_REPO
+unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GH_REPO
+if ! command -v jq >/dev/null 2>&1; then
+  printf 'jq: command not found\\n' >"$errfile"
+  cat "$errfile" >&2
+  ${failureMessage}
+  kill -TERM $$
+  exit 1
+fi
 if raw=$(${fetchCmd} 2>"$errfile") && out=$(printf '%s\\n' "$raw" | jq -sc '${reduceJq}' 2>>"$errfile"); then
   printf '%s\\n' "$out"
 else
@@ -359,10 +366,22 @@ const PR_REVIEW_SCOPE_COMMENT =
  * that PR from the queue while it still needs THIS viewer specifically. The
  * `--json` fetch therefore also carries `reviewRequests`, and
  * {@link PR_REVIEW_REDUCE} keeps a PR whose `reviewDecision` has moved past
- * `REVIEW_REQUIRED` as long as the resolved identity still appears in that
- * list (a per-team review request that expanded to this user still shows the
- * user's own `login`, so this is a strict superset of the plain-`login`
- * check, not merely equivalent to it for direct requests).
+ * `REVIEW_REQUIRED` as long as either the resolved identity's own `login`
+ * still appears in that list, OR the list still contains a still-pending
+ * TEAM request (PR #446 review, thread `discussion_r3624050268`).
+ * `reviewRequests` is a union of requested-reviewer shapes: a direct user
+ * request exposes `login`, but a `Team`/`EnterpriseTeam` request exposes only
+ * a team `slug`/`name` — `gh` never expands a team request back out to its
+ * individual members' logins in this field, even though `--search
+ * review-requested:@me` itself DOES resolve team membership when selecting
+ * which PRs to fetch in the first place. So a plain `.login == $me` check
+ * can never match a team-requested PR, and once `reviewDecision` moves past
+ * `REVIEW_REQUIRED` (a different reviewer's approval satisfying a
+ * multi-approval policy) such a PR would silently drop out of the queue
+ * while the viewer's own team-based request is still outstanding. Any
+ * `reviewRequests` entry lacking a `login` field is treated as a team
+ * request and, since the fetch itself is already scoped by `--search`, is
+ * assumed relevant to the current viewer.
  */
 const PR_REVIEW_FETCH =
   "host=$(gh repo view --json url --jq '.url' | sed -E 's#^https?://([^/]+)/.*$#\\1#') && " +
@@ -382,11 +401,14 @@ const PR_REVIEW_FETCH =
  * originally-printed value, not a merged stream.
  *
  * A PR stays in the set when EITHER its `reviewDecision` has not yet passed
- * `REVIEW_REQUIRED`, OR the resolved identity is still listed in
- * `reviewRequests` — the latter clause is what keeps a PR visible when a
- * multi-approval repository's `reviewDecision` already reads `APPROVED` from
- * someone else while this viewer's own request is still outstanding (PR #446
- * review, thread `discussion_r3617759232`).
+ * `REVIEW_REQUIRED`, OR the resolved identity's own `login` is still listed
+ * in `reviewRequests`, OR `reviewRequests` still lists a pending TEAM request
+ * (an entry with no `login` field — see {@link PR_REVIEW_FETCH}'s doc comment
+ * on `discussion_r3624050268`) — these clauses are what keep a PR visible
+ * when a multi-approval repository's `reviewDecision` already reads
+ * `APPROVED` from someone else while this viewer's own (direct or
+ * team-based) request is still outstanding (PR #446 review, threads
+ * `discussion_r3617759232` and `discussion_r3624050268`).
  *
  * `title` is deliberately NOT projected into the reduced entry (PR #446
  * review, thread `discussion_r3617759355`): it is mutable presentation data,
@@ -403,7 +425,8 @@ const PR_REVIEW_REDUCE =
   'and (.headRefName | startswith("changeset-release/") | not) ' +
   'and (((.reviewDecision // "") == "") ' +
   'or (.reviewDecision == "REVIEW_REQUIRED") ' +
-  'or (([.reviewRequests[]? | .login] | index($me)) != null)) ' +
+  'or (([.reviewRequests[]? | .login] | index($me)) != null) ' +
+  'or ([.reviewRequests[]? | select(has("login") | not)] | length > 0)) ' +
   'and (.author.login != $me) ' +
   'and ([.statusCheckRollup[]? | select(((.conclusion // .state // "") | ascii_upcase) as $c ' +
   '| $c == "FAILURE" or $c == "TIMED_OUT" or $c == "CANCELLED" or $c == "ERROR" ' +
@@ -496,6 +519,22 @@ const MY_PRS_JSON_FIELDS =
 const MY_PRS_OPEN_LIMIT = 1000;
 
 /**
+ * Row cap for each of the merged/closed `gh pr list` calls in
+ * {@link MY_PRS_FETCH}, matching {@link MY_PRS_OPEN_LIMIT}'s "complete
+ * coverage for any realistic workflow, not a mathematical guarantee"
+ * rationale (PR #446 review, thread `discussion_r3624050272`). The date-range
+ * `--search` already scopes each call to the {@link TERMINAL_WINDOW_SECONDS}
+ * window regardless of creation order, but the call is still capped at 100
+ * rows — an author who merges or closes more than 100 of their own PRs
+ * within that single 6-hour window would still silently lose the oldest of
+ * them. `gh pr list --limit` auto-paginates past its 100-per-page GraphQL
+ * cap, so raising this bound is not "a bigger page", it is complete coverage
+ * for any author who could plausibly land 1000 merges/closes in 6 hours —
+ * not a realistic operating point for this preset.
+ */
+const MY_PRS_TERMINAL_LIMIT = 1000;
+
+/**
  * Portable "now minus {@link TERMINAL_WINDOW_SECONDS}, as an ISO-8601 UTC
  * timestamp" computation, shared by {@link MY_PRS_FETCH}'s merged/closed
  * calls. `date -d @epoch` is GNU-only; `date -r epoch` is BSD/macOS-only —
@@ -510,8 +549,8 @@ const MY_PRS_CUTOFF_PREAMBLE =
 const MY_PRS_FETCH =
   MY_PRS_CUTOFF_PREAMBLE +
   `gh pr list --author @me --state open --limit ${String(MY_PRS_OPEN_LIMIT)} --json ${MY_PRS_JSON_FIELDS} && ` +
-  `gh pr list --author @me --state merged --search "merged:>=$cutoff" --limit 100 --json ${MY_PRS_JSON_FIELDS} && ` +
-  `gh pr list --author @me --state closed --search "closed:>=$cutoff -is:merged" --limit 100 --json ${MY_PRS_JSON_FIELDS}`;
+  `gh pr list --author @me --state merged --search "merged:>=$cutoff" --limit ${String(MY_PRS_TERMINAL_LIMIT)} --json ${MY_PRS_JSON_FIELDS} && ` +
+  `gh pr list --author @me --state closed --search "closed:>=$cutoff -is:merged" --limit ${String(MY_PRS_TERMINAL_LIMIT)} --json ${MY_PRS_JSON_FIELDS}`;
 
 /**
  * `reduceJq` for {@link MY_PRS_FETCH}. `title` is deliberately NOT projected
