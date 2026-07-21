@@ -278,8 +278,9 @@ explain watch-file --dir .claude/monitors --format text` before filing.
 
 **Expected observation:** Claude Code's transcript shows the `agentmon_ack` tool call and its
 result text — `"Requested acknowledgement of 1 event(s); ids not projected to this session are
-ignored."` for an explicit id, or `"Acknowledged all unread events for this session."` for the
-no-argument form (`apps/cli/src/commands/channel.ts`).
+ignored."` for an explicit id, or `"Acknowledged all unread events for this session, except any
+rows still leased by an in-flight delivery push."` for the no-argument form
+(`buildAckResultText` in `apps/cli/src/channel-ack.ts`, used by `apps/cli/src/commands/channel.ts`).
 
 **12. Verify the acknowledged state via the CLI (the authoritative check).**
 

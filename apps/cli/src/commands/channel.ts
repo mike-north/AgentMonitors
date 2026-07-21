@@ -28,7 +28,11 @@ import {
   renderChannelEvent,
   resolveChannelClaimFit,
 } from '../channel-render.js';
-import { ACK_TOOL, parseAckArgs } from '../channel-ack.js';
+import {
+  ACK_TOOL,
+  buildAckResultText,
+  parseAckArgs,
+} from '../channel-ack.js';
 import { getCliVersion } from '../cli-version.js';
 import {
   CHANNEL_HEARTBEAT_TTL_MS,
@@ -540,12 +544,7 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
         parsed.args.eventIds,
         socketPath,
       );
-      // events.ack silently ignores ids not projected to this session and does
-      // not report a count, so for explicit ids we frame the result as a request
-      // (some ids may be unknown/stale); the all-unread path is unambiguous.
-      const text = parsed.args.eventIds
-        ? `Requested acknowledgement of ${String(parsed.args.eventIds.length)} event(s); ids not projected to this session are ignored.`
-        : 'Acknowledged all unread events for this session.';
+      const text = buildAckResultText(parsed.args.eventIds);
       return { content: [{ type: 'text', text }] };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

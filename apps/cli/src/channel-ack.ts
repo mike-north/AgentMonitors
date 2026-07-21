@@ -33,6 +33,23 @@ export type AckParseResult =
   | { ok: false; error: string };
 
 /**
+ * Build the `agentmon_ack` tool result text for a successful acknowledge call.
+ *
+ * Extracted as its own function (rather than inlined at the call site) so the
+ * shipped result text, `ACK_TOOL`'s advertised description/schema, and the
+ * public 005/006 wording contracts all trace to one place — the no-`eventIds`
+ * path deliberately excludes rows still leased by an in-flight delivery
+ * reservation (issue #300, `acknowledgeSession`'s TSDoc in
+ * `libs/core/src/runtime/service.ts`), so the result text must say so rather
+ * than claiming it acknowledged "all unread" unconditionally.
+ */
+export function buildAckResultText(eventIds?: string[]): string {
+  return eventIds
+    ? `Requested acknowledgement of ${String(eventIds.length)} event(s); ids not projected to this session are ignored.`
+    : 'Acknowledged all unread events for this session, except any rows still leased by an in-flight delivery push.';
+}
+
+/**
  * Validate the arguments passed to an `agentmon_ack` tool call. Arguments arrive
  * as untrusted `unknown` from the MCP boundary, so the shape is checked
  * defensively before any IPC call.
