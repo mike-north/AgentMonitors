@@ -91,10 +91,11 @@ const COMMAND_POLL_DEFAULT_COMMAND_BLOCK =
  * run can never leak into the diffed JSON (which would otherwise degrade `json-diff` to a raw-text
  * comparison of the polluted string). `$errfile` is created with `mktemp` (private, mode 0600, and
  * collision-proof — no predictable PID-based path for a shared `/tmp` to pre-seed with a symlink) and
- * removed by an `EXIT` trap rather than explicit `rm -f` calls on each branch, so it is also cleaned up
- * on a `kill -TERM $$` self-signal (the failure branch below) or an external `SIGTERM` from
- * `command-poll`'s own timeout escalation (003 §11.2/§11.7) — a signal a shell with no trap for that
- * signal still runs its `EXIT` trap for, per POSIX. `SIGKILL` cannot be trapped by any shell, so that
+ * removed by an `EXIT` trap for ordinary exits, plus an explicit `rm -f` before each `kill -TERM $$`
+ * self-signal: death by an untrapped signal does NOT run the `EXIT` trap in most `sh`
+ * implementations, so the self-signal branches must clean up first. An external `SIGTERM` from
+ * `command-poll`'s timeout escalation (003 §11.2/§11.7) can still strand the file, as can
+ * `SIGKILL` — the same limit every
  * one remaining escalation step is the only path a stale file can survive under — the same limit every
  * `mktemp`-based script has.
  *
@@ -148,6 +149,7 @@ unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GH_REPO
 if ! command -v jq >/dev/null 2>&1; then
   printf 'jq: command not found\\n' >"$errfile"
   cat "$errfile" >&2
+  rm -f "$errfile"
   ${failureMessage}
   kill -TERM $$
   exit 1
@@ -156,6 +158,7 @@ ${preamble}if raw=$(${fetchCmd} 2>"$errfile") && out=$(printf '%s\\n' "$raw" | j
   printf '%s\\n' "$out"
 else
   cat "$errfile" >&2
+  rm -f "$errfile"
   ${failureMessage}
   kill -TERM $$
   exit 1
