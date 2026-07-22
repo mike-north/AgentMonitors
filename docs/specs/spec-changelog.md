@@ -334,6 +334,7 @@ Two findings from PR #446's `pullrequestreview-4747480111`/`pullrequestreview-47
   (`GH_TOKEN GITHUB_TOKEN GH_REPO`)**, but the shipped script actually scrubs five, also unsetting
   `GH_ENTERPRISE_TOKEN`/`GITHUB_ENTERPRISE_TOKEN` (added to close the Enterprise-token identity-mismatch
   finding from a prior round). The doc comment is corrected to name and explain all five.
+
 ## 2026-07-20 — `pr-review`/`my-prs` close four PR #446 21:43-round blockers: Enterprise host resolution, per-viewer review requests, mutable-title churn, and date-scoped terminal coverage (003 §11.9, 004 §3.6) — Refs #444, #446
 
 Four inline findings from PR #446's `pullrequestreview-4739187751` review, plus the review body's
@@ -373,6 +374,7 @@ closed` through the search API, whose `is:closed` also matches merged PRs. The f
   to be closed — see 003 §11.9 for the documented boundary.
 
 004 §3.6's scenario table gains rows for all four fixes.
+
 ## 2026-07-20 — `pr-review` structurally excludes the current identity's own PRs, closing the last PR-alerting cross-monitor firing (003 §11.9, 004 §3.6) — Refs #444, #446
 
 PR #446 review, thread `discussion_r3615190027`, the last open finding: a prior revision's
