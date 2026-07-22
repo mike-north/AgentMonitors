@@ -16,13 +16,16 @@ import {
   CHANNEL_HEARTBEAT_TTL_MS,
   HOOK_HEARTBEAT_TTL_MS,
   TRANSPORT_HEARTBEAT_SCHEMA_VERSION,
+  heartbeatMatchesBinding,
   isHeartbeatStale,
   isTransportHeartbeat,
   readTransportHeartbeats,
+  readTransportHeartbeatsResult,
   reapExpiredHeartbeats,
   removeTransportHeartbeat,
   transportRegistryDir,
   writeTransportHeartbeat,
+  type TransportHeartbeat,
 } from './transport-heartbeat.js';
 
 /**
@@ -782,3 +785,135 @@ describe.skipIf(process.platform === 'win32')(
     });
   },
 );
+
+describe('readTransportHeartbeatsResult (PR #461 finding 1)', () => {
+  it('reports readFailed: false and an empty list when the registry directory has never been created', () => {
+    expect(readTransportHeartbeatsResult()).toEqual({
+      records: [],
+      readFailed: false,
+    });
+  });
+
+  it('reports readFailed: false when the registry exists but is empty', () => {
+    mkdirSync(transportRegistryDir(), { recursive: true });
+    expect(readTransportHeartbeatsResult()).toEqual({
+      records: [],
+      readFailed: false,
+    });
+  });
+
+  it('reports readFailed: true when the registry directory itself cannot be listed', () => {
+    // Replace the registry directory with a plain file: `readdirSync` on a
+    // non-directory throws `ENOTDIR`, the same shape of failure as a
+    // permissions error (EACCES) or a too-many-open-files error (EMFILE) — all
+    // are "the directory listing failed", which is exactly the case this
+    // result must distinguish from "the directory listing succeeded and found
+    // nothing".
+    mkdirSync(path.dirname(transportRegistryDir()), { recursive: true });
+    writeFileSync(transportRegistryDir(), 'not a directory', 'utf-8');
+
+    expect(readTransportHeartbeatsResult()).toEqual({
+      records: [],
+      readFailed: true,
+    });
+  });
+
+  it('a single corrupt FILE inside a readable registry is skipped, not a registry-level read failure', () => {
+    mkdirSync(transportRegistryDir(), { recursive: true });
+    writeFileSync(
+      path.join(transportRegistryDir(), 'channel-corrupt.json'),
+      'not json',
+      'utf-8',
+    );
+    writeTransportHeartbeat({
+      transport: 'hook',
+      workspacePath: WORKSPACE,
+      socketPath: SOCKET,
+    });
+
+    const result = readTransportHeartbeatsResult();
+    expect(result.readFailed).toBe(false);
+    expect(result.records).toHaveLength(1);
+  });
+
+  it('readTransportHeartbeats() stays contract-unchanged: [] on a directory-level read failure', () => {
+    mkdirSync(path.dirname(transportRegistryDir()), { recursive: true });
+    writeFileSync(transportRegistryDir(), 'not a directory', 'utf-8');
+
+    expect(readTransportHeartbeats()).toEqual([]);
+  });
+});
+
+describe('heartbeatMatchesBinding (PR #461 finding 2)', () => {
+  function heartbeat(
+    overrides: Partial<TransportHeartbeat> = {},
+  ): TransportHeartbeat {
+    return {
+      schemaVersion: TRANSPORT_HEARTBEAT_SCHEMA_VERSION,
+      transport: 'channel',
+      pid: 1234,
+      cliPath: '/usr/local/bin/agentmonitors',
+      execPath: process.execPath,
+      version: '9.9.9',
+      home: '/home/test',
+      dataRoot: dataHome,
+      workspacePath: WORKSPACE,
+      socketPath: SOCKET,
+      startedAt: '2026-07-19T12:00:00.000Z',
+      updatedAt: '2026-07-19T12:00:00.000Z',
+      ttlMs: CHANNEL_HEARTBEAT_TTL_MS,
+      ...overrides,
+    };
+  }
+
+  it('matches when workspacePath and socketPath are identical', () => {
+    expect(
+      heartbeatMatchesBinding(heartbeat(), {
+        workspacePath: WORKSPACE,
+        socketPath: SOCKET,
+      }),
+    ).toBe(true);
+  });
+
+  it('matches through a trailing slash on either side', () => {
+    expect(
+      heartbeatMatchesBinding(heartbeat({ workspacePath: `${WORKSPACE}/` }), {
+        workspacePath: WORKSPACE,
+        socketPath: SOCKET,
+      }),
+    ).toBe(true);
+    expect(
+      heartbeatMatchesBinding(heartbeat(), {
+        workspacePath: `${WORKSPACE}/`,
+        socketPath: SOCKET,
+      }),
+    ).toBe(true);
+  });
+
+  it('matches through `.`/`..` segments that resolve to the same path', () => {
+    expect(
+      heartbeatMatchesBinding(
+        heartbeat({ workspacePath: `${WORKSPACE}/nested/../` }),
+        { workspacePath: `${WORKSPACE}/`, socketPath: SOCKET },
+      ),
+    ).toBe(true);
+  });
+
+  it('does not match a different workspacePath', () => {
+    expect(
+      heartbeatMatchesBinding(heartbeat(), {
+        workspacePath: '/repos/other',
+        socketPath: SOCKET,
+      }),
+    ).toBe(false);
+  });
+
+  it('does not match a different socketPath, even with the same workspacePath', () => {
+    expect(
+      heartbeatMatchesBinding(heartbeat(), {
+        workspacePath: WORKSPACE,
+        socketPath: '/tmp/other-daemon.sock',
+      }),
+    ).toBe(false);
+  });
+});

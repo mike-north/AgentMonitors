@@ -5,6 +5,7 @@ import type {
 } from '@agentmonitors/core';
 import {
   HEARTBEAT_FUTURE_TOLERANCE_MS,
+  heartbeatMatchesBinding,
   isHeartbeatStale,
   type TransportHeartbeat,
   type TransportName,
@@ -317,30 +318,48 @@ function bindingProblems(
     'server) so it re-resolves `CLAUDE_PROJECT_DIR`; for hooks, the next ' +
     'prompt re-resolves automatically.';
 
+  // `heartbeatMatchesBinding` is the single shared definition of "does this
+  // heartbeat belong to this workspace/socket" (issue #435 review, PR #461),
+  // used here as a fast path AND in the daemon's reap-lease check — so the two
+  // can never silently diverge on what counts as a mismatch. When it's false,
+  // the two branches below attribute the mismatch to the right code: a
+  // workspace difference is checked directly (also via `path.resolve`, for the
+  // same tolerance to trailing slashes and `.`/`..` segments); anything else is
+  // therefore a socket difference, since workspace has already been confirmed
+  // to match.
   if (
-    path.resolve(heartbeat.workspacePath) !== path.resolve(input.workspacePath)
+    !heartbeatMatchesBinding(heartbeat, {
+      workspacePath: input.workspacePath,
+      socketPath: input.socketPath,
+    })
   ) {
-    problems.push({
-      code: 'workspace-mismatch',
-      detail:
-        `The ${heartbeat.transport} transport for this host session is bound to ` +
-        `workspace "${heartbeat.workspacePath}", but the monitors you are asking ` +
-        `about live in "${input.workspacePath}". Events for this workspace are ` +
-        `not being delivered to that session — it is listening somewhere else.`,
-      remediation: reconnect,
-    });
-  } else if (heartbeat.socketPath !== input.socketPath) {
-    // Only meaningful when the workspace matches: a different workspace
-    // legitimately has a different socket, and reporting both would read as two
-    // problems where there is one.
-    problems.push({
-      code: 'socket-mismatch',
-      detail:
-        `The ${heartbeat.transport} transport is bound to daemon socket ` +
-        `"${heartbeat.socketPath}", but this workspace now resolves to ` +
-        `"${input.socketPath}". It is polling a different (likely dead) daemon.`,
-      remediation: reconnect,
-    });
+    if (
+      path.resolve(heartbeat.workspacePath) !==
+      path.resolve(input.workspacePath)
+    ) {
+      problems.push({
+        code: 'workspace-mismatch',
+        detail:
+          `The ${heartbeat.transport} transport for this host session is bound to ` +
+          `workspace "${heartbeat.workspacePath}", but the monitors you are asking ` +
+          `about live in "${input.workspacePath}". Events for this workspace are ` +
+          `not being delivered to that session — it is listening somewhere else.`,
+        remediation: reconnect,
+      });
+    } else {
+      // Workspace matches, so — per `heartbeatMatchesBinding`'s AND
+      // semantics — the mismatch this branch is reached for can only be the
+      // socket. Reporting both here would read as two problems where there
+      // is one.
+      problems.push({
+        code: 'socket-mismatch',
+        detail:
+          `The ${heartbeat.transport} transport is bound to daemon socket ` +
+          `"${heartbeat.socketPath}", but this workspace now resolves to ` +
+          `"${input.socketPath}". It is polling a different (likely dead) daemon.`,
+        remediation: reconnect,
+      });
+    }
   }
 
   if (

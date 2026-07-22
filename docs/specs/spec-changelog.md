@@ -19,6 +19,90 @@ it never has. The verdict, its surrounding CLI-reference prose, and the getting-
 say `delivery to active sessions in this workspace → via {hook | channel | both | none}`, matching
 what the check actually answers. No logic, problem codes, or exit codes changed — wording only.
 
+## 2026-07-22 — PR #461 review round 2: registry read failures fail closed, and one shared binding predicate (002 §10.2, 006 §12.8) — Refs #435
+
+Two more follow-up fixes to the Option A contract below, found in a second round of review of PR #461:
+
+- **A transport-registry read failure now fails CLOSED, not open.** `readTransportHeartbeats()`
+  already treated any `readdirSync` failure (a transient `EMFILE`/`EACCES`, etc.) the same as an
+  empty registry, returning `[]`. That is the right behavior for `doctor`/`transport-health`, but the
+  reaper was reusing the same function, so a transient read failure made `channelAttached` false —
+  letting the idle clock advance toward reaping a possibly-**live** channel, the exact #435 failure
+  this lease exists to prevent. A new `readTransportHeartbeatsResult()` (`apps/cli/src/transport-
+heartbeat.ts`) returns `{ records, readFailed }`, distinguishing a genuinely unreadable directory
+  (`readFailed: true`) from a missing (`ENOENT`, never-run) or empty one (`readFailed: false`);
+  `readTransportHeartbeats()` is now a thin, contract-unchanged wrapper over it. The daemon's reap
+  check uses the new function directly and treats `readFailed` the same as an attached channel for
+  that tick only — never asserting a session was seen — so the very next tick re-scans from scratch
+  and a genuinely absent channel resumes normal reaping as soon as reads succeed again. Verified by a
+  new `daemon-reaper-lease.integration.test.ts` case (replaces the registry directory with a plain
+  file to force `ENOTDIR`) and `transport-heartbeat.test.ts` unit cases for the read-result
+  distinction.
+- **One shared "does this heartbeat match this binding" predicate.** The workspace+socket comparison
+  existed divergently: the reaper's `channelAttached` filter compared both via `path.resolve`, while
+  `transport-health`'s socket-mismatch check compared `socketPath` as a raw string — so a trailing
+  slash or a `./` segment could read as matched in one place and mismatched in the other. Both now
+  call one exported `heartbeatMatchesBinding(heartbeat, { workspacePath, socketPath })`
+  (`transport-heartbeat.ts`), which resolves both fields on both sides (no symlink/realpath
+  resolution — tracked separately). In `transport-health`, this only widens normalization tolerance
+  for the socket comparison (a raw-equal pair remains equal after resolving); the `workspace-
+mismatch`/`socket-mismatch` codes stay distinct. Verified by new `heartbeatMatchesBinding` unit
+  cases (trailing slash, `.`/`..` segments) in `transport-heartbeat.test.ts`.
+
+## 2026-07-22 — PR #461 review: heartbeat lease tightened to the reaper's own socket, and never sets hasSeenSession (002 §10.2, 006 §12.8) — Refs #435
+
+Two follow-up tightenings to the Option A contract below, found in review of PR #461:
+
+- **Same-socket, not just same-workspace.** The `channelAttached` check now additionally compares
+  `heartbeat.socketPath` against the reaper's OWN `socketPath`, not only `heartbeat.workspacePath`
+  against its own workspace path. Two daemon instances can independently resolve the same
+  `workspacePath` (e.g. an orphaned daemon from a prior boot, bound to a stale socket); without the
+  socket comparison a live channel keeping a _different_ daemon alive would wrongly suppress reaping
+  on _this_ one. Verified by a new `daemon-reaper-lease.integration.test.ts` case: a channel heartbeat
+  naming a different socket does not exempt.
+- **A channel-only exemption never sets `hasSeenSession`.** `shouldReap` previously set
+  `nextHasSeenSession: true` whenever EITHER `openCount > 0` OR `channelAttached`, conflating "a real
+  session opened" with "a channel is merely attached." `hasSeenSession` specifically gates the
+  boot-grace window (`max(reapAfterMs, bootGraceMs)`); a channel can attach before any session ever
+  registers, and if it then detaches cleanly before one does, the boot-grace window must still apply
+  on the next check — not fall through to the shorter post-session `reapAfterMs` as if a session had
+  already been seen. Verified by a new `reap-decision.test.ts` case.
+- The reaper also now skips reading the transport registry entirely when reaping is disabled
+  (`--reap-after-ms 0`), since `shouldReap` short-circuits on that case regardless of
+  `channelAttached` — avoiding a pointless registry scan on every tick of a daemon that will never
+  reap.
+
+## 2026-07-22 — A live channel heartbeat suppresses daemon reaping (002 §10.2, 006 §12.8) — Refs #435 (Option A)
+
+Closes the structural gap #435 named: spec 006 sells the channel as the push surface for an **idle**
+agent, but 002 makes daemon lifetime a function of hook activity, and an idle listener fires no
+hooks. Composed, those two contracts guarantee the daemon is dead by the time an event should fire —
+the session goes dormant, the active-session count reaches zero, the daemon reaps (`--reap-after-ms`,
+default 5 min), monitors stop ticking, and the channel is permanently silent.
+
+Option A makes a **non-stale `channel` heartbeat** count as reaper activity, so a channel-attached
+session keeps its daemon alive and ticking even while dormant. The exemption is the heartbeat's
+owner-declared **TTL lease** (issue #425, `isHeartbeatStale`), re-evaluated against `now` on every
+reap check — never a static "a channel is registered" flag — so a channel server that dies uncleanly
+stops counting within its (short) TTL and reaping resumes. That is the guard that stops an orphaned
+channel server (issue #426) pinning the daemon alive forever: an active expiring lease, not a
+permanent pin. Only the `channel` transport qualifies; the `hook` transport's 24h "wired-up" TTL
+would keep the daemon alive for a day after a session ended, and its self-healing per-prompt process
+needs no persistent daemon between prompts.
+
+- **002 §10.2** states the new reaping contract (channel heartbeat counts as activity; TTL-gated;
+  channel-only; the pure `shouldReap` takes a `channelAttached` boolean while the reaper does the
+  registry I/O).
+- **006 §12.8** states it from the channel-availability side, consuming the lease primitive §12.2
+  already anticipated.
+- Verified end to end by `daemon-reaper-lease.integration.test.ts` against a real daemon with a real
+  short reap window and real heartbeat records: a live channel keeps a dormant-session daemon alive
+  and still firing a monitor past the reap window; a stale lease lets reaping resume; a live hook
+  heartbeat does not exempt.
+
+This is Option A of the #435 = A + B decision. Option B (a supported persistent-daemon mode,
+`daemon run --detach --reap-after-ms 0`) is separate.
+
 ## 2026-07-21 — Transport-health review round 11: two-lead hook coverage test now drives real `hook deliver` (006 §12.3, 005 §15) — Refs #425
 
 Round 10's positive two-covered-lead case still seeded both hook heartbeats with

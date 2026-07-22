@@ -1682,3 +1682,52 @@ claimed while pending work merely waits out the settle window — but `settle-wi
 this check at all: only `already-claimed`/`coalesced-until-ack` holds are suppressing holds, and for
 those two reasons an empty array is never legitimate. Only a real, non-empty array of non-empty
 strings is trustworthy.
+
+### 12.8 The lease keeps the daemon alive for an idle channel-attached session (issue #435 Option A)
+
+The heartbeat is not only a diagnostic input for the health surface — it is the mechanism that keeps
+the daemon alive for the channel's core use case. Spec 006 sells the channel as the push surface for
+an **idle** agent, while 002 makes daemon lifetime a function of hook activity; those two contracts,
+uncombined, compose to "push works only while the session is active enough not to need it." An idle
+listener fires no hooks, so its session goes dormant, the daemon reaps (`--reap-after-ms`, default
+5 min), monitors stop ticking, and the channel goes permanently silent — the exact failure observed
+in the 2026-07-18 dogfood (issue #435).
+
+Option A resolves this using the lease this section already anticipated (§12.2: "a lease primitive a
+later daemon-lifetime policy can consume directly"): **a non-stale `channel` heartbeat for a
+workspace counts as reaper activity**, so the daemon stays alive and ticking while a channel server
+is attached, even after the session it serves has gone dormant. The reaping contract itself lives in
+[002 §10.2](./002-runtime-delivery.md); the properties that matter to the channel transport are:
+
+- **It is the TTL lease, not a registration flag.** Staleness is re-evaluated against `now` on every
+  reap check, so a channel server that dies uncleanly stops counting within its (short, tens-of-
+  seconds) TTL and reaping resumes. An orphaned channel server (issue #426) can therefore never pin
+  the daemon alive forever — the whole reason the channel's TTL is short (§12.2) rather than the
+  hook's day-long one.
+- **Only the `channel` transport qualifies.** A `hook` heartbeat's 24h TTL would keep the daemon
+  alive for a day after a session ended; the hook path is self-healing and needs no persistent
+  daemon between prompts, so it never exempts.
+- **The channel writer must keep the lease fresh.** `channel serve` already rewrites its heartbeat on
+  every poll (default 3s) — an order of magnitude inside the 30s TTL — and removes it on clean
+  shutdown, so an attached, healthy channel continuously renews the lease while a cleanly-closed one
+  releases it immediately (§12.2.1).
+- **The heartbeat must name THIS daemon's own socket, not merely this workspace.** Two daemon
+  instances can independently resolve the same `workspacePath` (e.g. a stale/orphaned daemon left
+  from a prior boot). The reaper therefore compares `heartbeat.socketPath` against its own socket
+  path, not only `heartbeat.workspacePath` against its own — otherwise a channel keeping a _different_
+  daemon alive would wrongly suppress reaping on _this_ one.
+- **A channel-only exemption never sets `hasSeenSession`.** That flag specifically means an actual
+  session has been open, and gates the boot-grace window ([002 §10.2](./002-runtime-delivery.md)). A
+  channel can attach before any session registers; if it then detaches cleanly before a session ever
+  opens, the daemon must still apply `max(reapAfterMs, bootGraceMs)` on the next check, not the
+  shorter post-session `reapAfterMs` as if a session had already been seen.
+- **A registry read failure (transient `EMFILE`/`EACCES`/etc. on the transport registry directory)
+  fails CLOSED, not open:** it is treated as "attached" for that tick only — never as "no channel
+  attached" — because a scan that could not run cannot prove a live channel absent, and defaulting
+  to "absent" would let the idle clock advance toward reaping a possibly-live channel, which is
+  exactly the failure this lease exists to prevent; the next tick re-scans from scratch, so a
+  genuinely absent channel resumes normal reaping as soon as reads succeed again.
+- **The workspace/socket binding comparison is one shared predicate** (`heartbeatMatchesBinding`,
+  `apps/cli/src/transport-heartbeat.ts`), used both here and by `transport-health`'s binding checks,
+  so "does this heartbeat belong to this daemon/workspace" cannot silently diverge between the two
+  call sites.
