@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { ACK_TOOL, buildAckResultText, parseAckArgs } from './channel-ack.js';
+import {
+  ACK_TOOL,
+  buildAckResultText,
+  LEASED_ROW_EXCEPTION,
+  parseAckArgs,
+} from './channel-ack.js';
+import { CHANNEL_SERVER_INSTRUCTIONS } from './commands/channel.js';
 
 describe('ACK_TOOL', () => {
   it('declares a valid agentmon_ack tool descriptor', () => {
@@ -48,7 +54,7 @@ describe('buildAckResultText', () => {
   // reservation was in flight.
   it('names the leased-row exception when no event ids are given', () => {
     expect(buildAckResultText(undefined)).toBe(
-      'Acknowledged all unread events for this session, except any rows still leased by an in-flight delivery push.',
+      `Acknowledged all unread events for this session, ${LEASED_ROW_EXCEPTION}.`,
     );
   });
 
@@ -74,17 +80,21 @@ describe('buildAckResultText', () => {
   });
 
   // Parity guard for PR #445 review round 13 (discussion_r3624690058): the
-  // shipped tool result, the advertised tool description, and the input-schema
-  // hint for the omitted-ID path all describe the SAME leased-row exception in
-  // separate strings. They must not drift so that one surface keeps promising
-  // an unconditional "all unread" ack while another correctly carves out
-  // leased rows.
-  it('states the leased-row exception consistently across the tool result, description, and schema', () => {
-    const LEASED_EXCEPTION = 'leased by an in-flight delivery';
-    expect(buildAckResultText(undefined)).toContain(LEASED_EXCEPTION);
-    expect(ACK_TOOL.description).toContain(LEASED_EXCEPTION);
+  // shipped tool result, the advertised tool description, the input-schema
+  // hint for the omitted-ID path, AND the channel server's own MCP
+  // `instructions` string (a fourth, independent literal in
+  // `commands/channel.ts`) all describe the SAME leased-row exception. They
+  // must not drift so that one surface keeps promising an unconditional "all
+  // unread" ack while another correctly carves out leased rows. All four
+  // interpolate the single exported {@link LEASED_ROW_EXCEPTION} constant, so
+  // this asserts against that constant rather than a re-typed substring —
+  // drift is now a compile-time impossibility, not just a test-time one.
+  it('states the leased-row exception consistently across the tool result, description, schema, and channel server instructions', () => {
+    expect(buildAckResultText(undefined)).toContain(LEASED_ROW_EXCEPTION);
+    expect(ACK_TOOL.description).toContain(LEASED_ROW_EXCEPTION);
     expect(ACK_TOOL.inputSchema.properties.event_ids.description).toContain(
-      'leased by an in-flight delivery',
+      LEASED_ROW_EXCEPTION,
     );
+    expect(CHANNEL_SERVER_INSTRUCTIONS).toContain(LEASED_ROW_EXCEPTION);
   });
 });
