@@ -16,6 +16,22 @@
 export interface ShouldReapInput {
   /** Number of active sessions for this workspace right now. */
   openCount: number;
+  /**
+   * Whether a **live** (non-stale) channel-transport heartbeat exists for this
+   * workspace right now (issue #435 Option A). A channel server is a
+   * long-lived process attached to a session that pushes monitor events into
+   * an otherwise-idle agent — the exact case the daemon must stay alive for.
+   * It fires no hooks, so without this the daemon reaps ~5 min after the last
+   * prompt and the channel goes permanently silent (issue #435).
+   *
+   * This is derived from the heartbeat's owner-declared TTL lease
+   * (`isHeartbeatStale`), NOT a static "a channel exists" flag: when the
+   * channel process dies without cleanup, its lease expires within the TTL and
+   * this flips to `false`, so reaping resumes and an orphaned server (issue
+   * #426) can never pin the daemon alive forever. The caller does the I/O
+   * (reading and staleness-checking the registry); this function stays pure.
+   */
+  channelAttached: boolean;
   /** Whether at least one session has ever been open during this daemon's lifetime. */
   hasSeenSession: boolean;
   /** Timestamp (ms) when the daemon first became idle in the current idle run, or null if active. */
@@ -55,8 +71,12 @@ export function shouldReap(s: ShouldReapInput): ShouldReapOutput {
     };
   }
 
-  // Sessions are active — reset idle tracking and record that we've seen one.
-  if (s.openCount > 0) {
+  // Active — reset idle tracking and record that we've seen a session. Either
+  // an open session OR a live channel heartbeat counts as activity (issue #435
+  // Option A): a channel-attached session pushing into an idle agent is
+  // precisely why the daemon must not reap, and the channel's lease is what
+  // makes this safe (a dead server's lease expires and this goes false again).
+  if (s.openCount > 0 || s.channelAttached) {
     return {
       reap: false,
       nextIdleSince: null,

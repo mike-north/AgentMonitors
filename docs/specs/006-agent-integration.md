@@ -1682,3 +1682,32 @@ claimed while pending work merely waits out the settle window — but `settle-wi
 this check at all: only `already-claimed`/`coalesced-until-ack` holds are suppressing holds, and for
 those two reasons an empty array is never legitimate. Only a real, non-empty array of non-empty
 strings is trustworthy.
+
+### 12.8 The lease keeps the daemon alive for an idle channel-attached session (issue #435 Option A)
+
+The heartbeat is not only a diagnostic input for the health surface — it is the mechanism that keeps
+the daemon alive for the channel's core use case. Spec 006 sells the channel as the push surface for
+an **idle** agent, while 002 makes daemon lifetime a function of hook activity; those two contracts,
+uncombined, compose to "push works only while the session is active enough not to need it." An idle
+listener fires no hooks, so its session goes dormant, the daemon reaps (`--reap-after-ms`, default
+5 min), monitors stop ticking, and the channel goes permanently silent — the exact failure observed
+in the 2026-07-18 dogfood (issue #435).
+
+Option A resolves this using the lease this section already anticipated (§12.2: "a lease primitive a
+later daemon-lifetime policy can consume directly"): **a non-stale `channel` heartbeat for a
+workspace counts as reaper activity**, so the daemon stays alive and ticking while a channel server
+is attached, even after the session it serves has gone dormant. The reaping contract itself lives in
+[002 §10.2](./002-runtime-delivery.md); the properties that matter to the channel transport are:
+
+- **It is the TTL lease, not a registration flag.** Staleness is re-evaluated against `now` on every
+  reap check, so a channel server that dies uncleanly stops counting within its (short, tens-of-
+  seconds) TTL and reaping resumes. An orphaned channel server (issue #426) can therefore never pin
+  the daemon alive forever — the whole reason the channel's TTL is short (§12.2) rather than the
+  hook's day-long one.
+- **Only the `channel` transport qualifies.** A `hook` heartbeat's 24h TTL would keep the daemon
+  alive for a day after a session ended; the hook path is self-healing and needs no persistent
+  daemon between prompts, so it never exempts.
+- **The channel writer must keep the lease fresh.** `channel serve` already rewrites its heartbeat on
+  every poll (default 3s) — an order of magnitude inside the 30s TTL — and removes it on clean
+  shutdown, so an attached, healthy channel continuously renews the lease while a cleanly-closed one
+  releases it immediately (§12.2.1).

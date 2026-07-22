@@ -17,6 +17,10 @@ import {
 } from '../daemon-ipc.js';
 import { daemonStatusClient, daemonTickClient } from '../runtime-client.js';
 import { shouldReap, BOOT_GRACE_MS } from '../reap-decision.js';
+import {
+  isHeartbeatStale,
+  readTransportHeartbeats,
+} from '../transport-heartbeat.js';
 import { resolveManualDaemonSocketPath } from '../manual-daemon.js';
 import { resolveWorkspaceDbPath } from '../workspace-db-path.js';
 import { workspacePaths } from '../workspace-paths.js';
@@ -438,6 +442,8 @@ export async function runLoop(
       // logged and skipped, not left to escape the loop and kill the daemon
       // the way the protected tick above already handles its own errors.
       try {
+        const now = Date.now();
+        const nowDate = new Date(now);
         const workspaceSessions = runtime
           .listSessions()
           .filter((s) => s.workspacePath === workspacePath);
@@ -445,11 +451,39 @@ export async function runLoop(
           (s) => s.status === 'active',
         ).length;
         const anySession = workspaceSessions.length > 0;
+        // A live channel-transport heartbeat for this workspace suppresses
+        // reaping (issue #435 Option A). Only the CHANNEL transport: it is the
+        // long-lived process that pushes into an idle agent and fires no hooks
+        // to keep the daemon alive. The hook transport is short-lived and
+        // self-healing (a fresh process per prompt), and its heartbeat's 24h
+        // "wired-up" TTL would wrongly pin the daemon for a day after a session
+        // ended — so a hook heartbeat must NOT count here.
+        //
+        // Staleness is evaluated against `now` on every check, so a channel
+        // server that died without cleanup stops counting within its TTL (the
+        // lease expires) and normal reaping resumes — the guard that prevents an
+        // orphaned channel server (issue #426) from pinning the daemon alive.
+        const channelAttached = readTransportHeartbeats().some(
+          (heartbeat) =>
+            heartbeat.transport === 'channel' &&
+            path.resolve(heartbeat.workspacePath) ===
+              path.resolve(workspacePath) &&
+            !isHeartbeatStale(heartbeat, nowDate),
+        );
+        // The daemon READS the registry to decide, but never reaps it: GC is a
+        // write-path responsibility (006 §12.2) — a lapsed record is removed
+        // only when a transport re-registers, so `doctor` keeps reporting the
+        // failure until something recovers. A stale record is already inert to
+        // the decision above (`!isHeartbeatStale` excludes it), so leaving it in
+        // place costs nothing and preserves the evidence the health surface
+        // needs (issue #425 review). Deleting it here would both violate that
+        // contract and erase what `doctor` must still show.
         const decision = shouldReap({
           openCount,
+          channelAttached,
           hasSeenSession: hasSeenSession || anySession,
           idleSince,
-          now: Date.now(),
+          now,
           reapAfterMs,
           bootGraceMs: BOOT_GRACE_MS,
         });
