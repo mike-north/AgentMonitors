@@ -17,7 +17,6 @@ export class AgentMonitorRuntime {
         sessionDormancyMs?: number;
         deliveryReservationTtlMs?: number;
     });
-    // (undocumented)
     acknowledgeSession(sessionId: string, eventIds?: string[]): void;
     // (undocumented)
     adapter(name: string): AgentRuntimeAdapter;
@@ -153,7 +152,7 @@ export type ChangeDetectionStrategy = 'json-diff' | 'text-diff' | 'exit-code' | 
 export type ChangeKind = 'created' | 'modified' | 'deleted' | 'descoped';
 
 // @public
-export function classifyReminderHold(urgency: 'normal' | 'low', unreadCount: number, pendingCount: number, claimedEventIds?: string[]): HookDeliveryHold | null;
+export function classifyReminderHold(urgency: 'normal' | 'low', unreadCount: number, pendingCount: number, claimedEventIds?: string[], leasedCount?: number): HookDeliveryHold | null;
 
 // @public
 export function classifySettleWindowHold(pendingHighCreatedAt: readonly Date[], unreadCount: number, now: Date, settleMs: number): HookDeliveryHold | null;
@@ -431,6 +430,7 @@ export interface HookDeliveryDiagnosis {
 // @public
 export interface HookDeliveryHold {
     claimedEventIds?: string[];
+    leasedCount?: number;
     message: string;
     pendingCount: number;
     // (undocumented)
@@ -442,7 +442,7 @@ export interface HookDeliveryHold {
 }
 
 // @public
-export type HookDeliveryHoldReason = 'settle-window' | 'already-claimed' | 'coalesced-until-ack';
+export type HookDeliveryHoldReason = 'settle-window' | 'already-claimed' | 'coalesced-until-ack' | 'reserved-in-flight';
 
 // @public (undocumented)
 export interface HookState {

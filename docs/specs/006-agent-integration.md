@@ -235,9 +235,17 @@ content the hook path injects**, not a lesser summary. Two claim shapes render d
   WHOLE blocks under its own, much larger content ceiling — §5.5 below).
 
 - **Reminder claim** (`normal`/`low` — no event bodies, only a coalesced advisory `message`):
-  `content` renders that generic message as-is, aside from the same tag-safety sanitization applied
-  above — this shape needs no packing (a coalesced message is already small), same as the
-  body-injection claim (002 §9.2) — with **no** body injection.
+  `content` renders that generic message, sanitized for tag safety, **plus this transport's own
+  action step** appended after it (§5.1.1, PR #445 review finding 2) — the runtime's message alone no
+  longer names a CLI verb, so the channel appends "Run `agentmonitors events list --session <id>
+--socket <path> --unread` to see them, then call the agentmon_ack tool with the event_id values of
+  the ones you handled." Inspection is a **prerequisite**, not an "or" alternative to acking (§5.1.1,
+  PR #445 review, round 2, finding 2) — a no-argument `agentmon_ack` call acknowledges every unread
+  event across every urgency band, so the wording sequences list-then-scoped-ack rather than
+  presenting the tool call as a shortcut around inspection. This combined string is still
+  bounded by {@link MAX_CHANNEL_CONTENT} (PR #445 review finding 5) — latent today since the reminder
+  is short, but this was previously the one render path in the file without the #442
+  defense-in-depth ceiling — with **no** body injection.
 
 `renderChannelEvent` renders **every event in the `DeliveryClaim` it is given**, in the common case —
 it never drops a WHOLE block to fit a cap. The channel surface IS bounded (§5.5), but primarily by
@@ -315,7 +323,7 @@ To close the unread→acknowledged loop in-session, the channel server **MAY** b
       "event_ids": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "Event IDs from the <channel event_id=...> tags. Omit to ack all unread.",
+        "description": "Event IDs from the <channel event_id=...> tags. Omit to acknowledge all unread, except any rows still leased by an in-flight delivery push, which stay unread until that push resolves.",
       },
     },
   },
@@ -542,9 +550,17 @@ shape:
 - **`hookEventName`** — echoes the event that fired the hook (e.g. `"PostToolUse"`,
   `"UserPromptSubmit"`). Taken from the stdin payload's `hook_event_name`; it must match the firing
   event or the host ignores the `additionalContext`.
-- **`additionalContext`** — the rendered delivery: a lead line followed by one block per event
-  with the monitor id, urgency, title, and the monitor's **body-instructions** (`DeliveryEventSummary.body`).
-  Capped at 4000 characters. Unlike the channel transport (§4.6), this is a plain JSON string
+- **`additionalContext`** — the rendered delivery, one of two shapes (§5.1.1):
+  - **Body injection** (settled `high`-urgency events, or the `post-compact` recap) — an attributed
+    lead line, a one-line acknowledge instruction, then one block per event with the monitor id,
+    urgency, title, and the monitor's **body-instructions** (`DeliveryEventSummary.body`).
+  - **Reminder-only** (`normal`/`low` claims with no event bodies) — a single attributed line
+    carrying the runtime's semantic reminder message PLUS this transport's own session+socket-scoped
+    action step (§5.1.1) appended directly after it. No header and no per-event blocks; §5.1.1's
+    per-batch completion instruction is **not** repeated here — the reminder's own action step already
+    names the acknowledge command.
+
+  Both shapes are capped at 4000 characters. Unlike the channel transport (§4.6), this is a plain JSON string
   (`JSON.stringify` escapes it) and is **not** tag-delimited, so `<`, `>`, `[`, `]`, `;`, and
   newlines are preserved verbatim — a monitor body is trusted, user-authored markdown that
   legitimately contains code and links. Only raw C0/C1 control characters (except tab/newline) are
@@ -603,6 +619,144 @@ shape:
 
 When there is nothing pending, the command **MUST** print nothing and exit 0 in every format — an
 empty stdout is the signal to Claude Code to proceed silently.
+
+### 5.1.1 Attribution is transport-owned; delivered text is self-sufficient (issues #438, #434)
+
+**Attribution belongs to the delivery surface, not to the message.** The runtime emits an
+unattributed, semantic `DeliveryClaim.message` ([002 §9.2](./002-runtime-delivery.md#92-normal-urgency));
+each transport then decides its own prefix:
+
+| Transport         | Prefix       | Why                                                                                                                                       |
+| ----------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| Hook-deliver (§5) | `AgentMon: ` | `additionalContext` is injected into the agent's context window **unlabeled** — nothing else identifies the source.                       |
+| Channel (§4)      | none         | The enclosing `<channel source="agentmonitors">` tag already names the source; a prefix here would **double-attribute** the same message. |
+
+A transport **MUST NOT** rely on the runtime to supply its label, and the runtime **MUST NOT** embed
+one. This is also what keeps the core host-agnostic: per-surface phrasing lives in the transport /
+adapter. Adding a new surface means choosing its attribution there, not editing the runtime.
+
+**The acknowledge instruction.** A body-injection delivery (settled high-urgency events at
+`turn-interruptible`, or the `post-compact` recap surfaced at `SessionStart`) **claims** the events it
+renders — and claiming is never acknowledging (BP2 / SP4). The coalesced-until-ack rule
+([002 §9.2](./002-runtime-delivery.md#92-normal-urgency)) is **band-scoped**: it compares a band's own
+pending count against that SAME band's unread total, where the unread total is the superset that also
+contains any claimed-but-unacknowledged row (`normalPending.length === unreadNormal.length`, where
+`normalPending` holds `normal` rows that are both **not-yet-claimed and currently claimable** — a row
+held by an in-flight channel-push reservation is unclaimed but leased, so `pendingForClaim` (issue
+#300) excludes it from `normalPending` too, and `unreadNormal` holds every unread `normal` row
+regardless of claim OR lease state; the low-urgency guard, §9.3, is the identical pattern against its
+own band). Leaving a claim unacknowledged
+therefore suppresses only the reminder for whichever band(s) the claimed events actually belong to — a
+`high`-**only** claim touches no `normal`/`low` row at all, so it does **not**, on its own, block a NEW
+`normal`-urgency reminder from firing for unrelated, still-unclaimed `normal` events in the same
+session; the two coexist. A **mixed-band** `post-compact` recap is different: if it claims an old
+`normal` (or `low`) event alongside `high` events, that `normal` row stays claimed-but-unacknowledged —
+present in `unreadNormal` but absent from `normalPending` — so once a fresh, unrelated `normal` event
+later arrives, `normalPending` (1, the fresh unclaimed row) no longer equals `unreadNormal` (2, the
+fresh row plus the still-claimed recap row) — the band-scoped equality guard therefore suppresses THAT
+band's next `turn-interruptible` reminder too, until the recap's `normal`/`low` events are
+acknowledged. In short:
+suppression is band-scoped, not high/recap-vs-normal/low-scoped — a claim suppresses exactly the
+band(s) it actually touched. Previously the delivered payload named no way to acknowledge, so an
+agent that fully handled the delivered work still left that claimed band's own future reminder
+silently muted; the remediation existed only in `monitor explain`, which nobody runs while things
+appear fine (issue #434 — the delivery-side twin of the silent-degradation family in issue #425).
+
+Therefore the hook transport's body-injection header **MUST** carry a completion instruction naming
+the acknowledge command with the recipient's **real session id** and an explicit **`--socket
+<path>`** (PR #445 review, round 2, finding 1 — BLOCKER; see below):
+
+```text
+AgentMon: monitored changes are pending — consider handling them before continuing.
+When handled, acknowledge: agentmonitors events ack --session <id> --socket <path> --event-ids <id1>,<id2>
+
+### <monitor-id> (<urgency>)
+...
+```
+
+**Scoped to the ids actually rendered, not "ack everything unread" (PR #445 review, finding 1 —
+BLOCKER).** `agentmonitors events ack --session <id>` with no `--event-ids` acknowledges **every**
+unread event for the session, across every urgency band. A capped high-urgency delivery genuinely
+defers some events beyond what fits under the 4000-char cap (§5.1) — they stay pending and re-deliver
+at the next context event ([§5.5](#55-unread-recoverability-truncation-and-partial-delivery)) — and a
+`post-compact` recap's own `events` array is only its rendered slice (up to 10, [002
+§9.4](./002-runtime-delivery.md#94-recap)) of a FULL unread set the recap decision actually claims at
+commit time. A compliant agent that ran the blanket instruction after handling only what it was shown
+would silently acknowledge — and thereby permanently drop from ordinary redelivery — events it never
+saw: exactly the event-loss-during-batching class this project's review priorities rank first,
+reintroduced by instruction text. The instruction therefore **MUST** interpolate `--event-ids`
+(comma-separated, matching the CLI's own flag syntax) naming exactly the event ids THIS render
+included — never the full candidate/claimed set, which can be larger for a recap.
+
+Constraints:
+
+- **Once per delivery batch, not per event.** It lives in the shared header, so a delivery carrying
+  N event blocks still renders exactly one instruction line naming all N ids.
+- **The header's own length now varies with how many ids it names AND with the resolved socket
+  path's length**, which in turn depends on how many blocks fit under the header — a fixed point.
+  Every sizing path that packs whole event blocks under the cap (`packEventsUnderCap`,
+  `resolveHookClaimFit`, `renderHookDelivery`) resolves this by iterative narrowing: assume the full
+  candidate set is included (the longest header), pack, and if fewer blocks actually fit than
+  assumed, retry with the header narrowed to name only that many ids (shorter header, more room)
+  until the header is self-consistent with what it renders.
+- **Carries an explicit `--socket <path>` (PR #445 review, round 2, finding 1 — BLOCKER).** A prior
+  revision left this instruction socket-less, reasoning it was merely an advisory next step. But
+  `agentmonitors events ack` resolves its daemon socket **env-first**
+  (`resolveManualDaemonSocketPath`, issue #335) — the same class of bug the truncation-recovery
+  markers already guard against (issue #358): a copy-pasted ack run under a stale
+  `$AGENTMONITORS_SOCKET` silently scopes the acknowledge to the **wrong** daemon, leaving the real
+  session's events unread and unmuted while the recipient believes it acknowledged them. The
+  instruction now threads the same resolved `socketPath` already carried by every other marker in
+  this transport (`hook.ts`'s `socketPath`), so every recovery **and** ack command in a given
+  delivery points at the same daemon.
+- **Reminder-only deliveries do not repeat it.** A `normal`/`low` claim has no body-injection header;
+  the transport instead appends its own action step directly to the runtime's semantic message
+  ([002 §9.2](./002-runtime-delivery.md#92-normal-urgency)) — see below.
+
+**Reminder-only deliveries: verb ownership is transport-owned too (PR #445 review, finding 2 —
+BLOCKER).** The runtime's `DeliveryClaim.message` for a `normal`/`low` reminder claim is now purely
+semantic and transport-neutral — `Monitored changes are pending.` — carrying **no** CLI verb baked in.
+An earlier revision embedded the concrete `agentmonitors events list`/`events ack` commands directly in
+this shared message, but the channel transport pushes it verbatim into its `<channel>` tag body, and a
+channel-connected agent acknowledges through the `agentmon_ack` MCP tool (§4.3), not the CLI — baking
+one transport's verb into the transport-neutral message put conflicting instructions on the channel
+surface. Each transport now appends its **own** action step, socket-scoped (PR #445 review, finding 4):
+
+```text
+AgentMon: Monitored changes are pending. Run `agentmonitors events list --session <id> --socket <path> --unread` to see them, then `agentmonitors events ack --session <id> --socket <path>` once handled.
+```
+
+for the hook transport (`hook-deliver-render.ts`'s `buildHookReminderActionStep`), and
+
+```text
+Monitored changes are pending. Run `agentmonitors events list --session <id> --socket <path> --unread` to see them, then call the agentmon_ack tool with the event_id values of the ones you handled.
+```
+
+for the channel transport (`channel-render.ts`'s `buildChannelReminderActionStep`), which never repeats
+the hook's CLI ack verb.
+
+**Inspection is a prerequisite, not an "or" alternative (PR #445 review, round 2, finding 2 —
+BLOCKER).** A prior revision of the channel action step presented `agentmon_ack` as an alternative to
+listing details — "Call the agentmon_ack tool, **or** run `events list` ... for details." But the
+`agentmon_ack` MCP tool, called with **no** `event_ids`, acknowledges **every** unread event for the
+session across every urgency band (`channel-ack.ts`'s `ACK_TOOL`/`parseAckArgs`: omitting `event_ids`
+means "all unread" — the same blanket-ack shape the per-batch hook instruction above was already
+fixed to avoid, finding 1). Read literally, the "or" phrasing's **most direct** path — call
+`agentmon_ack` with no arguments — silently acknowledges unseen, cross-band work the recipient never
+inspected: e.g. a `low`-urgency reminder's bare ack call also clears unread `high`-urgency events. The
+corrected wording sequences the two steps: list this session's unread events **first**, **then** call
+`agentmon_ack` naming exactly the `event_id` values of the ones actually handled — never the bare,
+no-argument form.
+
+Neither reminder action step scopes `--event-ids`/`event_ids` to a specific list in its own advertised
+recovery command: this claim only ever fires when EVERY unread event of its own urgency band is
+unclaimed (the guard in [002 §9.2](./002-runtime-delivery.md#92-normal-urgency)), so — unlike the
+per-batch instruction above — there is no narrower id list within the band the _runtime_ can supply
+up front; the channel step's corrected wording instead defers that scoping decision to the recipient,
+instructing it to inspect first and then ack only what it actually handled.
+
+Verified by `apps/cli/src/delivery-text.integration.test.ts` (one runtime claim, both transports) and
+the renderer cases in `apps/cli/src/hook-deliver-render.test.ts`.
 
 ### 5.2 Behavior
 
@@ -729,9 +883,19 @@ hold reason for anything not yet deliverable:
 - `settle-window` — pending high-urgency work exists but is not yet past the 15s claim-time settle
   window (§9.1 of [002](./002-runtime-delivery.md)).
 - `already-claimed` / `coalesced-until-ack` — the coalesced normal/low reminder ([002 §9.2/§9.3](./002-runtime-delivery.md))
-  is currently suppressed. This is the SAME vocabulary `monitor explain`'s reminder-suppression
-  diagnosis uses ([002 §10.7](./002-runtime-delivery.md), issue #333) — both surfaces explain the
-  identical coalescing guard and MUST agree on what to call it.
+  is currently suppressed by one or more DURABLY claimed (not yet acknowledged) rows of that band.
+  This is the SAME vocabulary `monitor explain`'s reminder-suppression diagnosis uses
+  ([002 §10.7](./002-runtime-delivery.md), issue #333) — both surfaces explain the identical
+  coalescing guard and MUST agree on what to call it. Acknowledging (`agentmonitors events ack`)
+  is the correct remedy for both.
+- `reserved-in-flight` — the coalesced reminder is suppressed, but NO row of the band is durably
+  claimed; at least one is instead currently LEASED by an in-flight channel-push reservation
+  (issue #300, PR #445 review round 10). A lease is not a claim — it resolves itself (the push
+  commits it as claimed, or fails/expires and returns it to pending) — so, unlike the other two
+  reasons, this one MUST NOT be presented alongside an acknowledge instruction: acknowledging a
+  leased-but-unseen row before the push resolves can permanently lose it if the push then fails.
+  `acknowledgeSession`'s implicit "ack everything unread" path excludes leased rows for the same
+  reason.
 - `deferred-by-cap` — settled high-urgency events existed but some were deferred by the transport's
   own 4000-char cap (§5.5); a hold reason owned by this transport, not the runtime.
 
@@ -1287,6 +1451,24 @@ Transport and integration tests should be able to prove:
   observed-not-contracted, so re-verify alongside the channel-probe diagnostic on new host versions.
 - Decide whether the channel server should open a synthetic workspace-lead session when channels are
   used **without** the hook-driven `session open` flow, or require the hook flow as a precondition.
+- **Deferred, not rejected (issue #434): should `hook deliver` auto-acknowledge events claimed by a
+  PREVIOUS delivery to the same session when a NEWER delivery is surfaced?** That would make the
+  coalesced-until-ack loop self-healing without any agent cooperation. It is deliberately **not**
+  built here. Auto-acking on delivery would collapse two of the three distinct delivery states
+  (unread / claimed / acknowledged, [002 §9.4](./002-runtime-delivery.md)) into one: "acknowledged"
+  would come to mean "a later delivery happened," not "a recipient handled this," which is precisely
+  the distinction acknowledgment exists to carry (BP2 / SP4) and which `events list --unread`,
+  `doctor`, and `monitor explain` all report against. It also silently discards the evidence that
+  work was surfaced and dropped — the signal issue #425's transport-health surface depends on. The
+  cheaper, non-destructive half of the fix (telling the recipient how to acknowledge, §5.1.1) is what
+  ships instead; whether to additionally auto-ack is a deliberate model change that needs an explicit
+  decision alongside issue #435, not an implementation detail of the delivery renderer.
+- **Follow-ups from issue #438, deliberately out of scope of the wording fix:** a channel-native
+  `agentmon_inbox` tool (list unread + claim, so a channel-connected agent completes the loop without
+  shelling out) and an agent-invocable `/agentmonitors:inbox` slash command or skill. Both are
+  genuinely useful and are **enabled** by the per-transport seam §5.1.1 establishes — each surface can
+  now name its own best verb — but both add host-specific surface area well beyond the delivered-text
+  contract, so they are tracked separately rather than bundled into it.
 - **Multi-host (§11):** the concrete per-host lifecycle-hook names, session-identity signals, and
   workspace-binding mechanisms for Codex and Cursor (CLI + desktop) are **not yet pinned** — they
   **MUST** be confirmed with a per-host probe diagnostic (the `experiments/channel-probe` pattern

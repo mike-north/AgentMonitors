@@ -1272,6 +1272,14 @@ agentmonitors events ack --session <id> [options]
 
 Prints `Acknowledged events.` on success. No `--format` flag; error output goes to stderr.
 
+**Exception — rows leased by an in-flight delivery reservation:** omitting `--event-ids`
+acknowledges every unread row for the session **except** any currently held by outstanding
+delivery reservations (issue #300) — for example, a channel push still mid-surfacing one or more
+events. Those rows are left unread so they can still be redelivered if their reservation is
+released instead of committed; each becomes eligible for a future no-`--event-ids` ack once its
+reservation resolves. `monitor explain`/`hook deliver --debug` report this state as `reserved-in-flight`, never
+`already-claimed`, and never recommend `events ack` for it.
+
 ---
 
 ## §12 `hook` — Claim hook-delivery payloads
@@ -1303,7 +1311,9 @@ Claims a pending delivery payload for a session at the specified lifecycle point
 **Text output (`--format text`):**
 
 - If no pending delivery: `No pending delivery.`
-- If delivery present: prints `claim.message`.
+- If delivery present: prints `claim.message` **verbatim** — the runtime's unattributed semantic
+  body ([002 §9.2](./002-runtime-delivery.md#92-normal-urgency)). No transport attribution is added
+  here; `hook claim` is a diagnostic view of the claim, not a delivery surface.
 
 ---
 
@@ -1357,7 +1367,7 @@ wire JSON. The example below is pretty-printed for readability; the command emit
   "continue": true,
   "hookSpecificOutput": {
     "hookEventName": "PostToolUse",
-    "additionalContext": "AgentMon: monitored changes are pending — consider handling them before continuing.\n\n### watch-src (high)\n..."
+    "additionalContext": "AgentMon: monitored changes are pending — consider handling them before continuing.\nWhen handled, acknowledge: agentmonitors events ack --session <id> --socket <path> --event-ids <ids>\n\n### watch-src (high)\n..."
   }
 }
 ```
@@ -1369,10 +1379,15 @@ wire JSON. The example below is pretty-printed for readability; the command emit
   "continue": true,
   "hookSpecificOutput": {
     "hookEventName": "UserPromptSubmit",
-    "additionalContext": "AgentMon messages are available. Read the inbox."
+    "additionalContext": "AgentMon: Monitored changes are pending. Run `agentmonitors events list --session <id> --socket <path> --unread` to see them, then `agentmonitors events ack --session <id> --socket <path>` once handled."
   }
 }
 ```
+
+The `AgentMon: ` prefix is added by **this transport**, not by the runtime: the claim's own
+`message` is the unattributed semantic body ([002 §9.2](./002-runtime-delivery.md#92-normal-urgency)),
+and the channel transport renders that same body with no prefix at all
+([006 §5](./006-agent-integration.md)).
 
 **No output** when nothing is pending (empty stdout + exit 0).
 
@@ -1492,9 +1507,11 @@ mode it is additionally named on stderr rather than silently disappearing.
 
 Note: for a derived `turn-interruptible` lifecycle, `normal` urgency produces `events: []` (reminder
 only — no body injection); `low` does likewise at `turn-idle`. "Reminder only" is **not** silence:
-the command emits a hook JSON object whose `additionalContext` is the claim's advisory `message`
-(e.g. `"AgentMon messages are available. Read the inbox."` — the same line `hook claim` surfaces), so
-a default (`normal`-urgency) monitor produces a visible mid-turn reminder. Body text is surfaced only
+the command emits a hook JSON object whose `additionalContext` is this transport's attribution
+prefix followed by the claim's advisory `message` (the same unattributed line `hook claim --format text`
+surfaces — see [002 §9.2](./002-runtime-delivery.md#92-normal-urgency) for its normative wording), so
+a default (`normal`-urgency) monitor produces a visible mid-turn reminder that names the exact
+commands to run, including the acknowledge step. Body text is surfaced only
 for **high-urgency settled events** and **`post-compact`** (`SessionStart`) recap. The claimed rows
 are not acknowledged, so the event stays unread and re-discoverable via `events list --unread`.
 Over-cap context is truncated at a code-point boundary with an explicit `[truncated …]` marker; the
@@ -1541,7 +1558,8 @@ channel plugin, not run by hand.
 host session id is available, it resolves the AgentMon session via `session.open` (idempotent) and,
 every `--poll-ms`, calls `claimDelivery('turn-interruptible')`; each returned `DeliveryClaim` is
 rendered into a `<channel>` event (006 §4.2). It also exposes the **`agentmon_ack`** tool: the agent
-calls it with `event_ids` (or none, to ack all unread) and it routes through `events.ack` for the
+calls it with `event_ids` (or none, to ack all unread except any rows leased by in-flight delivery
+reservations — see §11.2's exception) and it routes through `events.ack` for the
 bound session (006 §4.3). It reuses the claim path, so claimed-state and cross-transport dedup with
 the hook-state surface are automatic. A missing/unreachable daemon is handled quietly (the hook-state
 path still delivers durably); the server shuts down when stdin closes (MCP disconnect). With no host

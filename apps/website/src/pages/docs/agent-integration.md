@@ -34,8 +34,8 @@ event materialized ──▶ projected into lead session(s) ──▶ delivery l
 | `post-compact`         | Session start, as a recap of unread events        |
 
 Claiming a delivery marks the underlying events **claimed** — it does not **acknowledge** them.
-Acknowledgement (`agentmonitors events ack`, or the MCP `agentmon_ack` tool) is always a separate,
-explicit step, so a claimed-but-unhandled event stays discoverable.
+Acknowledgement (`agentmonitors events ack --session <id>`, or the MCP `agentmon_ack` tool) is
+always a separate, explicit step, so a claimed-but-unhandled event stays discoverable.
 
 _Governing spec: [`docs/specs/002-runtime-delivery.md`](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/002-runtime-delivery.md)
 §6 (session projection), §7 (unread/claimed/acknowledged), §9 (delivery lifecycles)._
@@ -48,21 +48,38 @@ decides which lifecycle a monitor's events surface at, and how much detail is in
 | Urgency   | Surfaces at            | Timing                                                              | What's included                                             |
 | --------- | ----------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------ |
 | `high`    | `turn-interruptible`   | After a **15 s settle window** — not instant                          | The concrete events: titles, summaries, and full body text  |
-| `normal`  | `turn-interruptible`   | **Coalesced-until-ack**: one reminder for the whole unread batch, then silent until it's acknowledged | A generic reminder only ("AgentMon messages are available. Read the inbox.") — no per-event detail |
-| `low`     | `turn-idle`            | **Coalesced-until-ack**: one reminder for the whole unread batch, then silent until it's acknowledged | A generic reminder only ("AgentMon has inbox updates ready for review.") — no per-event detail |
+| `normal`  | `turn-interruptible`   | **Coalesced-until-ack**: one reminder for the whole unread batch, then silent until it's acknowledged | A reminder only — no per-event detail — naming the exact action to take next: on the hook transport, the `agentmonitors events list`/`events ack` commands; on the channel transport, listing the unread events and then calling the `agentmon_ack` tool with their ids |
+| `low`     | `turn-idle`            | **Coalesced-until-ack**: one reminder for the whole unread batch, then silent until it's acknowledged | The same reminder as `normal` — no per-event detail |
 
 Regardless of urgency, **every unread event is recapped at `post-compact`** (session start, after
 a context compaction) with up to the 10 most recent events shown in full — titles, summaries, and
 body text. This is the safety net: nothing that settles while an agent is away goes unseen forever.
 
 The reminder-vs-detail split for `normal`/`low` matters in practice: a `normal` (or `low`) change
-nudges the agent exactly **once** — a single coalesced reminder ("read the inbox") covering every
-currently-unread event of that urgency — and then goes quiet. It does **not** re-nudge for each
-additional `normal`/`low` event that arrives; the path only speaks again once the outstanding
-events are acknowledged (`agentmonitors events ack`). The agent still has to go look
-(`agentmonitors events list --unread`) to see what changed — the reminder never carries per-event
-detail. Only `high` urgency injects the actual event content directly into the turn. If you want
-the agent to react to specifics without acknowledging first, use `urgency: high`.
+nudges the agent exactly **once** — a single coalesced reminder, self-sufficient and naming the
+exact next action for its transport, covering every currently-unread event of that urgency — and
+then goes quiet. It does **not** re-nudge for each additional `normal`/`low` event that arrives; the
+path only speaks again once the outstanding events are acknowledged (on the hook transport,
+`agentmonitors events ack --session <id>`; on the channel transport, the `agentmon_ack` tool). The
+agent still has to go look — `agentmonitors events list --session <id> --unread` on the hook
+transport — to see what changed; the reminder never carries per-event detail. Only `high` urgency
+injects the actual event content directly into the turn. If you want the agent to react to
+specifics without acknowledging first, use `urgency: high`.
+
+**`high` and recap deliveries also need an explicit ack, and acking un-mutes the reminder.** Claiming
+a `high`-urgency delivery (or a `post-compact` recap) marks the events it renders **claimed**, not
+**acknowledged**. The coalesced-until-ack guard is **band-scoped**: it compares a band's own **pending
+and currently claimable** count — unclaimed rows, minus any momentarily held by an in-flight
+channel-push reservation — against that same band's unread total (which also contains any
+claimed-but-unacknowledged or leased-but-unclaimed row), so an unacknowledged claim suppresses the
+reminder only for the band(s) the claimed events actually belong to. A `high`-only claim therefore does
+not block a NEW `normal`/`low` reminder from firing for unrelated, still-unclaimed events in the same
+session — the two coexist. A fresh unclaimed event of an already-suppressed band does not restore its
+reminder either: acknowledging the outstanding claim is the only thing that does. Because of this, every
+`high`/recap delivery carries its own one-line acknowledge instruction naming the exact ids it just
+showed you (e.g. `agentmonitors events ack --session <id> --event-ids <id1>,<id2>`) — run it once you've
+handled what it showed. Acking is what turns the coalesced reminder back on for the affected band's next
+`normal`/`low` event.
 
 _Governing spec: 002 §9.1 (high), §9.2 (normal), §9.3 (low), §9.4 (recap)._
 
@@ -124,8 +141,13 @@ tool call:
 | ----------------------------------- | ------------------------------------------------------ | ----------------------------------------------------------------------- |
 | Mid-session delivery                | `<channel source="agentmonitors" ...>` push          | `agentmonitors hook deliver` (already wired to `UserPromptSubmit`)     |
 | Acknowledge events                  | `agentmon_ack({ event_ids: [...] })` tool call         | `agentmonitors events ack --session <id> --event-ids <id1>,<id2>`       |
-| Acknowledge everything unread       | `agentmon_ack({})` (omit `event_ids`)                 | `agentmonitors events ack --session <id>` (omit `--event-ids`)         |
+| Acknowledge everything unread<sup>†</sup> | `agentmon_ack({})` (omit `event_ids`)            | `agentmonitors events ack --session <id>` (omit `--event-ids`)         |
 | Inspect what's pending              | Reading the rendered `<channel>` tag                  | `agentmonitors events list --session <id> --unread`                     |
+
+<sup>†</sup> Omitting `event_ids`/`--event-ids` acknowledges every unread event **except** any
+rows currently leased by an in-flight delivery push (for example, a channel message still being
+surfaced) — those rows are left unread until the push resolves. See the CLI reference's
+[`events ack`](/docs/cli-reference#events-ack) exception for details.
 
 `--event-ids` takes a **comma-separated** list, e.g. `--event-ids 01J...A,01J...B` — it is split on
 `,` (and each id trimmed), so space-separated ids (`--event-ids 01J...A 01J...B`) are **not**

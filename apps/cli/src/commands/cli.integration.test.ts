@@ -9135,10 +9135,15 @@ describe('hook deliver', () => {
       };
       expect(output.continue).toBe(true);
       expect(output.hookSpecificOutput.hookEventName).toBe('UserPromptSubmit');
-      expect(output.hookSpecificOutput.additionalContext).toContain(
-        'AgentMon messages are available.',
-      );
-      expect(output.hookSpecificOutput.additionalContext).not.toContain('### ');
+      // issue #438: transport-owned attribution (hook prepends its label) + a
+      // self-sufficient, actionable next step. issue #434: the acknowledge step
+      // travels in the delivered payload. No bare "inbox" reference.
+      const reminderCtx = output.hookSpecificOutput.additionalContext;
+      expect(reminderCtx).toContain('AgentMon: Monitored changes are pending.');
+      expect(reminderCtx).toContain('agentmonitors events list --session ');
+      expect(reminderCtx).toContain('agentmonitors events ack --session ');
+      expect(reminderCtx).not.toContain('inbox');
+      expect(reminderCtx).not.toContain('### ');
       expect(output).not.toHaveProperty('permissionDecision');
     } finally {
       daemon.stop();
@@ -9258,8 +9263,12 @@ describe('hook deliver', () => {
       expect(deliverResult.stdout.trim()).not.toBe('');
       expect(() => JSON.parse(deliverResult.stdout)).toThrow();
       expect(deliverResult.stdout).toContain(
-        'AgentMon messages are available.',
+        'AgentMon: Monitored changes are pending.',
       );
+      expect(deliverResult.stdout).toContain(
+        'agentmonitors events ack --session ',
+      );
+      expect(deliverResult.stdout).not.toContain('inbox');
       expect(deliverResult.stdout).not.toContain('hookSpecificOutput');
       expect(deliverResult.stdout).not.toContain('### ');
     } finally {
@@ -9682,8 +9691,14 @@ describe('hook deliver', () => {
 // surfaces on the first claim; (2) after a claim, the reminder is suppressed and
 // `monitor explain` NAMES the reason (already-claimed / coalesced-until-ack).
 describe('hook claim normal-urgency reminder + suppression diagnosis (issue #333)', () => {
-  const NORMAL_INBOX_PROMPT =
-    'AgentMon messages are available. Read the inbox.';
+  /**
+   * The coalesced reminder body the runtime emits (002 §9.2, issues
+   * #438/#434, PR #445 review finding 2), written out here from the spec
+   * rather than read back from the implementation: a SEMANTIC, transport- and
+   * verb-neutral message — no product-name attribution and no CLI verb, both
+   * transport-owned — with no reference to the legacy `inbox` model.
+   */
+  const reminderMessage = (): string => 'Monitored changes are pending.';
 
   it('first turn-interruptible claim surfaces the reminder; a prior claim suppresses it; monitor explain names why', async () => {
     const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-333-'));
@@ -9812,7 +9827,11 @@ describe('hook claim normal-urgency reminder + suppression diagnosis (issue #333
       expect(firstClaim).not.toBeNull();
       expect(firstClaim?.mode).toBe('delivery');
       expect(firstClaim?.urgency).toBe('normal');
-      expect(firstClaim?.message).toBe(NORMAL_INBOX_PROMPT);
+      expect(firstClaim?.message).toBe(reminderMessage());
+      // The runtime's own message carries NO product-name attribution — that is
+      // owned by each transport (issue #438).
+      expect(firstClaim?.message).not.toContain('AgentMon');
+      expect(firstClaim?.message).not.toContain('inbox');
       expect(firstClaim?.events).toEqual([]); // §9.2: reminder carries no events
 
       // The divergent precondition from the study transcript: the first claim
@@ -10341,7 +10360,7 @@ describe('hook deliver --debug diagnosis (issue #334)', () => {
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);
       writeFileSync(watchedFile, 'changed content', 'utf-8');
 
-      const unreadFor = (hostSessionId: string) => {
+      const sessionIdFor = (hostSessionId: string): string | undefined => {
         const sessionsResult = runWithEnv(
           ['session', 'list', '--format', 'json'],
           env,
@@ -10351,14 +10370,20 @@ describe('hook deliver --debug diagnosis (issue #334)', () => {
           id: string;
           hostSessionId: string;
         }[];
-        const session = sessions.find((s) => s.hostSessionId === hostSessionId);
-        if (!session) return [];
+        return sessions.find((s) => s.hostSessionId === hostSessionId)?.id;
+      };
+
+      // Reuses sessionIdFor's own session lookup (PR #445 review, cleanup
+      // 7d) rather than re-running an independent `session list` query.
+      const unreadFor = (hostSessionId: string) => {
+        const sessionId = sessionIdFor(hostSessionId);
+        if (!sessionId) return [];
         const result = runWithEnv(
           [
             'events',
             'list',
             '--session',
-            session.id,
+            sessionId,
             '--unread',
             '--format',
             'json',
@@ -10401,14 +10426,36 @@ describe('hook deliver --debug diagnosis (issue #334)', () => {
 
       expect(plain.exitCode).toBe(0);
       expect(debugRun.exitCode).toBe(0);
-      // The core regression guard: stdout is byte-identical in every mode.
-      expect(debugRun.stdout).toBe(plain.stdout);
+
+      // The two runs are two DIFFERENT lead sessions (each needs its own
+      // unclaimed projection to surface a reminder at all), and the delivered
+      // reminder now interpolates the recipient's real session id (issue #438)
+      // — so the one legitimate difference between the two payloads is that
+      // id. Normalize it away, then assert the rest is byte-identical: that is
+      // the actual regression guard (issue #334 — `--debug` must never write
+      // diagnosis to stdout).
+      const sessionIdA = sessionIdFor(hostA);
+      const sessionIdB = sessionIdFor(hostB);
+      expect(sessionIdA).toBeDefined();
+      expect(sessionIdB).toBeDefined();
+      const normalize = (out: string, sessionId: string): string =>
+        out.split(sessionId).join('<session>');
+      expect(normalize(debugRun.stdout, sessionIdB ?? '')).toBe(
+        normalize(plain.stdout, sessionIdA ?? ''),
+      );
+
       expect(plain.stdout.trim()).not.toBe('');
       expect(JSON.parse(plain.stdout)).toMatchObject({
         continue: true,
         hookSpecificOutput: {
           hookEventName: 'UserPromptSubmit',
-          additionalContext: 'AgentMon messages are available. Read the inbox.',
+          // issue #438/#434, PR #445 review findings 2/4: transport-owned
+          // attribution + self-sufficient, session+socket-scoped actionable
+          // text including the acknowledge step.
+          additionalContext:
+            `AgentMon: Monitored changes are pending. ` +
+            `Run \`agentmonitors events list --session ${sessionIdA ?? ''} --socket '${socket}' --unread\` to see them, ` +
+            `then \`agentmonitors events ack --session ${sessionIdA ?? ''} --socket '${socket}'\` once handled.`,
         },
       });
       // Only the debug run writes diagnosis — to stderr, never stdout.
@@ -11418,6 +11465,7 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
     sessionId: string;
     env: Record<string, string>;
     eventId: string;
+    monitorsDir: string;
   }
 
   // Boot a real daemon with ONE settled normal-urgency event projected into a
@@ -11520,7 +11568,7 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
     }
     expect(eventId).not.toBe('');
 
-    return { ws, socket, sessionId, env, eventId };
+    return { ws, socket, sessionId, env, eventId, monitorsDir };
   }
 
   function deliveryStateOf(f: ChannelCycleFixture): string | undefined {
@@ -11671,6 +11719,114 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
       expect(outcome).toBe('surfaced');
       expect(concurrentClaim).toBeNull();
       // Surfaced exactly once (by the channel), and now claimed.
+      expect(deliveryStateOf(f)).toBe('claimed');
+      expect(unreadCount(f)).toBe(1);
+    } finally {
+      await teardown(f);
+    }
+  }, 30_000);
+
+  // PR #445 review round 8 (comment 3618177636) found `pendingForClaim` (issue
+  // #300) hides a leased-but-unclaimed row from `normalPending`, so it looked
+  // IDENTICAL to a truly claimed row to the `already-claimed` reminder
+  // diagnosis. Round 10 (discussion_r3619783264) proved that overlap unsafe:
+  // the shared `already-claimed` vocabulary recommends `events ack`, and
+  // `acknowledgeSession` (no explicit ids — the literal remedy the message
+  // pointed at) would then sweep the still-leased row, permanently losing it
+  // if the in-flight push later fails and the lease releases. This is now
+  // FIXED: a pure lease is reported via a distinct `reserved-in-flight`
+  // reason with `claimedCount: 0`, and `acknowledgeSession` excludes leased
+  // rows from its implicit "ack everything unread" set. Pinned here against
+  // the REAL reservation state machine.
+  it('a mid-push leased row reads as `reserved-in-flight` (never `already-claimed`, never ack-recommending) to `monitor explain`, and surviving an ack-all is safe (issue #300, PR #445 review round 10)', async () => {
+    const f = await setupChannelCycle('leased-explain');
+    try {
+      let explainDuringLease: {
+        stages: {
+          id: string;
+          status: string;
+          reason: string;
+          details?: {
+            reminderSuppression?: {
+              sessionId: string;
+              urgency: string;
+              lifecycle: string;
+              unreadCount: number;
+              claimedCount: number;
+              leasedCount: number;
+              reason: string;
+              message: string;
+            }[];
+          };
+        }[];
+      } | null = null;
+      const outcome = await runChannelDeliveryCycle(
+        f.sessionId,
+        f.socket,
+        async () => {
+          // The channel's reservation is held here (before commit) — the row
+          // is leased, not claimed. `explainMonitor` must now distinguish it
+          // from a truly claimed row: `reserved-in-flight`, claimedCount 0,
+          // and no ack recommendation.
+          const explain = runWithEnv(
+            [
+              'monitor',
+              'explain',
+              'watch-files',
+              '--dir',
+              path.dirname(f.monitorsDir),
+              '--workspace',
+              f.ws,
+              '--socket',
+              f.socket,
+              '--format',
+              'json',
+            ],
+            f.env,
+            f.ws,
+          );
+          expect(explain.exitCode).toBe(0);
+          explainDuringLease = JSON.parse(
+            explain.stdout,
+          ) as typeof explainDuringLease;
+
+          // The literal remedy an agent might run against the whole session
+          // while the push is still in flight must NOT lose this row.
+          const ackAll = runWithEnv(
+            ['events', 'ack', '--session', f.sessionId, '--socket', f.socket],
+            f.env,
+            f.ws,
+          );
+          expect(ackAll.exitCode).toBe(0);
+        },
+      );
+
+      expect(outcome).toBe('surfaced');
+      const delivery = explainDuringLease?.stages.find(
+        (stage) => stage.id === 'delivery',
+      );
+      expect(delivery).toBeDefined();
+      const findings = delivery?.details?.reminderSuppression;
+      expect(findings).toHaveLength(1);
+      expect(findings?.[0]).toMatchObject({
+        sessionId: f.sessionId,
+        urgency: 'normal',
+        lifecycle: 'turn-interruptible',
+        unreadCount: 1,
+        claimedCount: 0,
+        leasedCount: 1,
+        reason: 'reserved-in-flight',
+      });
+      // A pure lease must never invite an ack — acknowledging it before the
+      // push resolves is exactly the data-loss trap round 10 found.
+      expect(findings?.[0]?.message).not.toContain('agentmonitors events ack');
+      expect(findings?.[0]?.message).not.toMatch(/\back\b/i);
+      expect(findings?.[0]?.message).not.toContain('fresh');
+
+      // The ack-all run above must NOT have acknowledged the leased row: the
+      // channel push (still in flight during the explain/ack calls) commits
+      // after this block, and the row must genuinely surface as claimed, not
+      // silently vanish as already-acknowledged.
       expect(deliveryStateOf(f)).toBe('claimed');
       expect(unreadCount(f)).toBe(1);
     } finally {

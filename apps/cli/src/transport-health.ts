@@ -388,18 +388,18 @@ function bindingProblems(
  * Only ever called on `already-claimed` / `coalesced-until-ack` holds (see
  * {@link suppressionProblems}'s filter) — `settle-window` holds are one
  * legitimate source of an empty `claimedEventIds`; never reaching this
- * function. A second, from-this-build source is a hold entirely held back
- * by an in-flight channel LEASE rather than an actual claim: `claimedCount`
- * (derived from the lease-aware `pendingCount`) counts a merely-reserved,
- * still-unclaimed row as held, but `claimedEventIds` — since the issue #425
- * review round 13 fix — is derived independently from the store's true
- * claimed/unclaimed set, so it correctly omits that row. `claimedCount > 0`
- * therefore no longer implies a non-empty `claimedEventIds`. Either source of
- * an empty array — that one, or a malformed daemon response / a hand-built
- * `HookDeliveryHold` from an older build (issue #425 review, round 8) — must
- * be treated the same: not folded into the scoped-remediation branch, where
- * an empty `ids` list renders the flag as omitted and silently falls back to
- * acknowledging every unread event.
+ * function. A hold entirely held back by an in-flight channel LEASE is no
+ * longer a second source of that (PR #445 review, round 10): it now carries
+ * its own `reserved-in-flight` reason instead of `already-claimed` /
+ * `coalesced-until-ack`, so {@link suppressionProblems}'s filter excludes it
+ * before this function is ever called on it — see `reason ===
+ * 'reserved-in-flight'` in `libs/core/src/runtime/reminder-diagnosis.ts` and
+ * `hook-delivery-diagnosis.ts`. The only remaining source of an empty array
+ * reaching here is a malformed daemon response / a hand-built
+ * `HookDeliveryHold` from an older build (issue #425 review, round 8), which
+ * must be treated the same as a missing one: not folded into the
+ * scoped-remediation branch, where an empty `ids` list renders the flag as
+ * omitted and silently falls back to acknowledging every unread event.
  *
  * `HookDeliveryHold.claimedEventIds` is optional precisely because a
  * `HookDeliveryDiagnosis` can arrive over the daemon IPC boundary from a build
@@ -516,13 +516,14 @@ function suppressionProblems(input: TransportHealthInput): TransportProblem[] {
         `Reminders appear suppressed on ${String(sessions.length)} lead ` +
         `session(s) (${sessions.join(', ')}), but the exact claimed event ` +
         `ids could not be determined — the daemon reported a suppression ` +
-        `hold without them. This can happen on an older daemon build that ` +
-        `predates the \`claimedEventIds\` field, or on a current build when ` +
-        `the hold is entirely due to an in-flight channel lease that has not ` +
-        `yet settled into a claim. A scoped acknowledgement cannot be safely ` +
-        `offered, so this cannot be reported as deliverable.`,
+        `hold without them. A hold entirely due to an in-flight channel ` +
+        `lease reports its own \`reserved-in-flight\` reason and never ` +
+        `reaches this check, so this can only mean the daemon build ` +
+        `predates the \`claimedEventIds\` field. A scoped acknowledgement ` +
+        `cannot be safely offered, so this cannot be reported as ` +
+        `deliverable.`,
       remediation:
-        'Upgrade the daemon to the current CLI build (`agentmonitors daemon run` after stopping any older one) if it predates the `claimedEventIds` field, then re-run `agentmonitors doctor`. If the daemon is already current, this is likely an in-flight channel lease still settling into a claim — re-run `agentmonitors doctor` after it settles.',
+        'Upgrade the daemon to the current CLI build (`agentmonitors daemon run` after stopping any older one), then re-run `agentmonitors doctor`.',
     });
   }
 

@@ -255,7 +255,29 @@ Tell the agent the local API changed.
   const claim = runtime.claimDelivery(session.id, 'turn-interruptible');
   assert.ok(claim);
   assert.equal(claim.urgency, 'normal');
-  assert.equal(claim.message, 'AgentMon messages are available. Read the inbox.');
+  // 002 §9.2 (issues #438/#434, revised by PR #445 review finding 2): a
+  // prior revision of this assertion (matching a prior revision of
+  // \`reminderMessage\`) required the runtime's reminder body to embed BOTH
+  // runnable commands directly. That embedding was itself the defect finding
+  // 2 identified: the channel transport pushed that string verbatim into its
+  // \`<channel>\` tag, so a channel-connected agent — who acknowledges via the
+  // \`agentmon_ack\` MCP tool, not the CLI — received a conflicting CLI ack
+  // instruction it had no use for. The runtime's message is now semantic and
+  // transport/verb-NEUTRAL; each transport (only \`@agentmonitors/cli\`, not
+  // exercised by this core-only smoke test) supplies its own concrete,
+  // session-scoped action step — including which commands to run — on top of
+  // this shared sentence, so asserting the exact commands belongs in
+  // \`apps/cli\`'s transport-level tests
+  // (\`delivery-text.integration.test.ts\`), not here.
+  assert.equal(claim.message, 'Monitored changes are pending.');
+  assert.ok(
+    !claim.message.toLowerCase().includes('inbox'),
+    \`expected reminder not to reference the legacy inbox, got: \${claim.message}\`,
+  );
+  assert.ok(
+    !claim.message.includes('AgentMon'),
+    \`expected reminder to be unattributed (no "AgentMon" prefix), got: \${claim.message}\`,
+  );
 
   const hookState = JSON.parse(readFileSync(hookStatePath, 'utf8'));
   assert.equal(hookState.sessionId, session.id);
