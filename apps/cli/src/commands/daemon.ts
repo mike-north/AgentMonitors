@@ -463,13 +463,30 @@ export async function runLoop(
         // server that died without cleanup stops counting within its TTL (the
         // lease expires) and normal reaping resumes — the guard that prevents an
         // orphaned channel server (issue #426) from pinning the daemon alive.
-        const channelAttached = readTransportHeartbeats().some(
-          (heartbeat) =>
-            heartbeat.transport === 'channel' &&
-            path.resolve(heartbeat.workspacePath) ===
-              path.resolve(workspacePath) &&
-            !isHeartbeatStale(heartbeat, nowDate),
-        );
+        //
+        // Skipped entirely when reaping is disabled (`reapAfterMs <= 0`):
+        // `shouldReap` short-circuits on that case regardless of
+        // `channelAttached`, so scanning and parsing every file in the
+        // machine-wide transport registry on every tick would be pure
+        // wasted I/O with a disabled reaper (which can have many transports
+        // across many workspaces on a busy machine).
+        const channelAttached =
+          reapAfterMs > 0 &&
+          readTransportHeartbeats().some(
+            (heartbeat) =>
+              heartbeat.transport === 'channel' &&
+              path.resolve(heartbeat.workspacePath) ===
+                path.resolve(workspacePath) &&
+              // A heartbeat's socketPath must also match THIS daemon's own
+              // socket. Two different daemon instances can independently
+              // resolve the SAME workspacePath (e.g. a stale/orphaned daemon
+              // from a prior boot bound to a different socket) — without this
+              // check, a live channel bound to a *different* daemon would
+              // wrongly suppress reaping on THIS one, which is the daemon the
+              // channel is not actually keeping alive.
+              path.resolve(heartbeat.socketPath) === path.resolve(socketPath) &&
+              !isHeartbeatStale(heartbeat, nowDate),
+          );
         // The daemon READS the registry to decide, but never reaps it: GC is a
         // write-path responsibility (006 §12.2) — a lapsed record is removed
         // only when a transport re-registers, so `doctor` keeps reporting the

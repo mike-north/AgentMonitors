@@ -71,16 +71,33 @@ export function shouldReap(s: ShouldReapInput): ShouldReapOutput {
     };
   }
 
-  // Active — reset idle tracking and record that we've seen a session. Either
-  // an open session OR a live channel heartbeat counts as activity (issue #435
-  // Option A): a channel-attached session pushing into an idle agent is
-  // precisely why the daemon must not reap, and the channel's lease is what
-  // makes this safe (a dead server's lease expires and this goes false again).
-  if (s.openCount > 0 || s.channelAttached) {
+  // An open session is unambiguous activity: reset idle tracking and record
+  // that a session has been seen — this is what the boot-grace window is
+  // gating on (a real session registered).
+  if (s.openCount > 0) {
     return {
       reap: false,
       nextIdleSince: null,
       nextHasSeenSession: true,
+    };
+  }
+
+  // A live channel heartbeat ALSO counts as activity (issue #435 Option A): a
+  // channel-attached session pushing into an idle agent is precisely why the
+  // daemon must not reap, and the channel's lease is what makes this safe (a
+  // dead server's lease expires and this goes false again). It must NOT set
+  // `hasSeenSession`, though: that flag specifically means a SESSION has been
+  // open, and gates the boot-grace window. A channel can attach before any
+  // session ever registers (e.g. `channel serve` starting first), and if it
+  // then shuts down cleanly before the first session opens, the daemon must
+  // still apply `max(reapAfterMs, bootGraceMs)` — not fall through to the
+  // shorter post-session `reapAfterMs` window as if a session had already been
+  // seen.
+  if (s.channelAttached) {
+    return {
+      reap: false,
+      nextIdleSince: null,
+      nextHasSeenSession: s.hasSeenSession,
     };
   }
 

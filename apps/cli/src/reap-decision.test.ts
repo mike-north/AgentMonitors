@@ -218,7 +218,10 @@ describe('shouldReap', () => {
 
   it('a live channel also holds an orphan daemon (no session ever seen) alive', () => {
     // Even before any session registers, a live channel is real activity — the
-    // boot-grace orphan reap must not fire while it is attached.
+    // boot-grace orphan reap must not fire while it is attached. It must NOT,
+    // however, mark hasSeenSession true: no session has actually opened yet,
+    // and the boot-grace window still needs to apply once the channel
+    // detaches (see the next test).
     const result = shouldReap({
       openCount: 0,
       channelAttached: true,
@@ -229,8 +232,32 @@ describe('shouldReap', () => {
       bootGraceMs: 10_000,
     });
     expect(result.reap).toBe(false);
-    expect(result.nextHasSeenSession).toBe(true);
+    expect(result.nextHasSeenSession).toBe(false);
   });
+
+  it(
+    'still honors boot-grace after a channel lease ends cleanly before any ' +
+      'session ever opened (regression: a channel-only lease must not set ' +
+      'hasSeenSession)',
+    () => {
+      // A channel attaches and later detaches cleanly (channelAttached flips
+      // false) WITHOUT a session ever having opened. If the channel lease had
+      // incorrectly set hasSeenSession=true, the daemon would fall through to
+      // the short post-session reapAfterMs window here and reap immediately —
+      // instead it must still honor max(reapAfterMs, bootGraceMs).
+      const result = shouldReap({
+        openCount: 0,
+        channelAttached: false,
+        hasSeenSession: false, // never set by the earlier channel-only ticks
+        idleSince: BASE_NOW - 5_000, // > reapAfterMs, < bootGraceMs
+        now: BASE_NOW,
+        reapAfterMs: 1_000,
+        bootGraceMs: 10_000,
+      });
+      expect(result.reap).toBe(false);
+      expect(result.nextIdleSince).toBe(BASE_NOW - 5_000);
+    },
+  );
 
   it('still honors reapAfterMs 0 (disabled) regardless of channel state', () => {
     // Disabling reaping outright short-circuits before the activity check, so

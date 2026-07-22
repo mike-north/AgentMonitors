@@ -32,7 +32,7 @@ import { writeLocalState } from '../local-state.js';
  * the child is not CPU-starved by concurrent workers.
  *
  * @see ../../../docs/specs/002-runtime-delivery.md §10.2 (idle self-termination)
- * @see ../../../docs/specs/006-agent-integration.md §12.3 (channel keeps the daemon alive)
+ * @see ../../../docs/specs/006-agent-integration.md §12.8 (channel keeps the daemon alive)
  */
 
 const CLI_PATH = path.resolve(
@@ -206,8 +206,17 @@ function openThenCloseSession(hostSessionId: string): void {
   expect(closed.exitCode).toBe(0);
 }
 
-/** Write a channel heartbeat record to the registry exactly as `channel serve` would. */
-function seedChannelHeartbeat(hostSessionId: string, updatedAt: Date): void {
+/**
+ * Write a channel heartbeat record to the registry exactly as `channel serve`
+ * would. Defaults to THIS test's own daemon socket; `socketPathOverride` lets
+ * a caller simulate a heartbeat bound to a DIFFERENT daemon instance (PR #461
+ * finding 1).
+ */
+function seedChannelHeartbeat(
+  hostSessionId: string,
+  updatedAt: Date,
+  socketPathOverride?: string,
+): void {
   const registry = path.join(dataHome, 'agentmonitors', 'transports');
   mkdirSync(registry, { recursive: true });
   const record = {
@@ -220,7 +229,7 @@ function seedChannelHeartbeat(hostSessionId: string, updatedAt: Date): void {
     home: process.env['HOME'] ?? '/tmp',
     dataRoot: dataHome,
     workspacePath: workspace,
-    socketPath,
+    socketPath: socketPathOverride ?? socketPath,
     hostSessionId,
     startedAt: new Date(updatedAt.getTime() - 60_000).toISOString(),
     updatedAt: updatedAt.toISOString(),
@@ -364,4 +373,41 @@ describe('daemon reaper heartbeat lease (issue #435 Option A)', () => {
       await daemon.waitForExit(5_000);
     }
   }, 30_000);
+
+  it(
+    'a live channel heartbeat bound to a DIFFERENT daemon socket does NOT ' +
+      'suppress reaping (PR #461 finding 1: same workspace, different socket)',
+    async () => {
+      // Two daemon instances can independently resolve the SAME workspacePath
+      // (e.g. an orphaned daemon from a prior boot bound to a stale socket).
+      // A channel heartbeat naming that OTHER daemon's socket is not keeping
+      // THIS daemon alive, so it must not suppress THIS daemon's reaping.
+      const daemon = await startDaemon();
+      let reaped = false;
+      try {
+        openThenCloseSession('other-daemon-listener');
+        const otherSocketPath = path.join(
+          '/tmp',
+          `am-reaper-lease-other-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+        );
+        seedChannelHeartbeat(
+          'other-daemon-listener',
+          new Date(),
+          otherSocketPath,
+        );
+
+        const exit = await daemon.waitForExit(8_000);
+        reaped = exit !== null;
+        expect(
+          reaped,
+          'daemon must reap when the only channel lease names a different socket',
+        ).toBe(true);
+        expect(exit).toBe(0);
+      } finally {
+        if (!reaped) daemon.stop();
+        await daemon.waitForExit(5_000);
+      }
+    },
+    30_000,
+  );
 });

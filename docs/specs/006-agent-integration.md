@@ -1711,3 +1711,13 @@ is attached, even after the session it serves has gone dormant. The reaping cont
   every poll (default 3s) — an order of magnitude inside the 30s TTL — and removes it on clean
   shutdown, so an attached, healthy channel continuously renews the lease while a cleanly-closed one
   releases it immediately (§12.2.1).
+- **The heartbeat must name THIS daemon's own socket, not merely this workspace.** Two daemon
+  instances can independently resolve the same `workspacePath` (e.g. a stale/orphaned daemon left
+  from a prior boot). The reaper therefore compares `heartbeat.socketPath` against its own socket
+  path, not only `heartbeat.workspacePath` against its own — otherwise a channel keeping a _different_
+  daemon alive would wrongly suppress reaping on _this_ one.
+- **A channel-only exemption never sets `hasSeenSession`.** That flag specifically means an actual
+  session has been open, and gates the boot-grace window ([002 §10.2](./002-runtime-delivery.md)). A
+  channel can attach before any session registers; if it then detaches cleanly before a session ever
+  opens, the daemon must still apply `max(reapAfterMs, bootGraceMs)` on the next check, not the
+  shorter post-session `reapAfterMs` as if a session had already been seen.
