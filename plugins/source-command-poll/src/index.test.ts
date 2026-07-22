@@ -9,7 +9,13 @@
  * genuinely exercised — not a hand-built approximation. Dates are fixed; no network.
  */
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -145,6 +151,102 @@ describe('source-command-poll', () => {
       expect(payload.stdout).toBe(metachars);
       expect(payload.stdout).toContain('$(whoami)');
       expect(payload.stdout).toContain('rm -rf /tmp/x');
+    });
+  });
+
+  /**
+   * `cwd` resolution (003 §11.1, issue #444 review finding 826): a scaffolded
+   * `MONITOR.md` that omits `cwd` must resolve the child process's working
+   * directory from the **runtime** `workspacePath`, not a value baked into
+   * the file at scaffold time — otherwise relocating or sharing the project
+   * directory silently breaks the monitor (`Command failing`) with no fix
+   * short of re-scaffolding. `pwd` (no shell involved — `argv[0]` directly)
+   * proves the actual spawned cwd, not just that the child ran.
+   */
+  describe('cwd resolution (003 §11.1)', () => {
+    /** The first-ever run always baselines silently (003 §11.4): read the
+     * spawned cwd back from `nextState.stdout` rather than a diffed
+     * observation, which needs a second tick to appear. */
+    function stdoutOf(result: ObservationResult): string {
+      const state = result.nextState as { stdout?: string } | undefined;
+      return (state?.stdout ?? '').trim();
+    }
+
+    it('defaults to workspacePath when cwd is omitted', async () => {
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), 'am-cwd-')));
+      try {
+        const result = await source.observe(
+          { command: ['pwd'] },
+          { now: NOW, workspacePath: dir },
+        );
+        expect(stdoutOf(result)).toBe(dir);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('resolves a relative cwd against workspacePath', async () => {
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), 'am-cwd-')));
+      try {
+        mkdirSync(join(dir, 'sub'));
+        const result = await source.observe(
+          { command: ['pwd'], cwd: 'sub' },
+          { now: NOW, workspacePath: dir },
+        );
+        expect(stdoutOf(result)).toBe(join(dir, 'sub'));
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('honors an absolute cwd as-is, ignoring workspacePath', async () => {
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), 'am-cwd-')));
+      try {
+        const result = await source.observe(
+          { command: ['pwd'], cwd: dir },
+          { now: NOW, workspacePath: '/nonexistent/decoy' },
+        );
+        expect(stdoutOf(result)).toBe(dir);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    /**
+     * The core of the portability guarantee: the SAME monitor state (no
+     * `cwd` in scope) resolves to a DIFFERENT actual working directory once
+     * `workspacePath` changes — simulating the project directory having been
+     * relocated or shared to another machine's checkout path between polls.
+     * A baked-in absolute `cwd` would resolve to the stale, pre-relocation
+     * path instead, and the finding's reproduction (`Command failing`) would
+     * follow the very next tick.
+     */
+    it('follows workspacePath across a relocation, with no state baked into the monitor', async () => {
+      const before = realpathSync(
+        mkdtempSync(join(tmpdir(), 'am-cwd-before-')),
+      );
+      const after = realpathSync(mkdtempSync(join(tmpdir(), 'am-cwd-after-')));
+      try {
+        const first = await source.observe(
+          { command: ['pwd'] },
+          { now: NOW, workspacePath: before },
+        );
+        expect(stdoutOf(first)).toBe(before);
+
+        const second = await source.observe(
+          { command: ['pwd'] },
+          { now: NOW, workspacePath: after, previousState: first.nextState },
+        );
+        expect(stdoutOf(second)).toBe(after);
+      } finally {
+        rmSync(before, { recursive: true, force: true });
+        rmSync(after, { recursive: true, force: true });
+      }
+    });
+
+    it('falls back to the daemon working directory for a user-level monitor (no workspacePath)', async () => {
+      const result = await source.observe({ command: ['pwd'] }, ctx());
+      expect(stdoutOf(result)).toBe(process.cwd());
     });
   });
 

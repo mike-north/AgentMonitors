@@ -411,6 +411,123 @@ added — it is now omitted for either match. A Markdown inline-code span illust
 had also been split across a line break by prior wrapping, which renders incorrectly; it is now a
 single line.
 
+## 2026-07-21 — `pr-review`'s pending-team-request override is scope-conditional, and the `GH_ENTERPRISE_TOKEN`/`GITHUB_ENTERPRISE_TOKEN` scrub is documented accurately (003 §11.9, 004 §3.6) — Refs #444, #446
+
+Two findings from PR #446's `pullrequestreview-4747480111`/`pullrequestreview-4747299707` review round:
+
+- **Treating every login-less `reviewRequests` entry as a still-pending request from the viewer's own
+  team was only sound under the default `review-requested:@me` scope** (`discussion_r3624450049`).
+  `pr-review` also scaffolds `label:needs-review` and an unscoped search as supported alternatives, and
+  under either of those the fetched `reviewRequests` can list a team the viewer does not belong to at
+  all — the fetch itself is no longer what established viewer relevance. Reproduced with an
+  `APPROVED`, non-viewer-team-requested PR under the label-driven scope: the prior unconditional clause
+  wrongly kept it in the queue. The reviewer-scoping shell variable is now a single `search='...'`
+  assignment (rather than a value inlined directly into `--search`), read by both the `gh pr list
+--search "$search"` argument and a new `--arg scope "$search"` passed to the `--jq` reduction, so the
+  team-request clause now only applies `and ($scope == "review-requested:@me")`. Editing that one
+  variable to switch scopes keeps the `--search` argument and the jq's scope check in lockstep, with no
+  second edit required. 003 §11.9's field-selection paragraph and reviewer-scoping table, and 004 §3.6's
+  scenario table, are updated to describe the scope-conditional rule; a new
+  `apps/cli/src/commands/pr-alerting-presets.test.ts` regression drops an `APPROVED` PR with only a
+  team review request once `search=` is switched to `label:needs-review`.
+- **The `unset` doc comment claimed the wrapper scrubs three inherited overrides
+  (`GH_TOKEN GITHUB_TOKEN GH_REPO`)**, but the shipped script actually scrubs five, also unsetting
+  `GH_ENTERPRISE_TOKEN`/`GITHUB_ENTERPRISE_TOKEN` (added to close the Enterprise-token identity-mismatch
+  finding from a prior round). The doc comment is corrected to name and explain all five.
+
+## 2026-07-20 — `pr-review`/`my-prs` close four PR #446 21:43-round blockers: Enterprise host resolution, per-viewer review requests, mutable-title churn, and date-scoped terminal coverage (003 §11.9, 004 §3.6) — Refs #444, #446
+
+Four inline findings from PR #446's `pullrequestreview-4739187751` review, plus the review body's
+spec-drift/proof-test ask about `my-prs`'s open-PR limit:
+
+- **`gh api user`'s identity lookup defaulted to `github.com` even on GitHub Enterprise**
+  (`discussion_r3617759108`). `gh api user` is a bare, repo-less endpoint — it does not auto-detect
+  a host the way `gh pr list`'s own repository resolution does. On a GHES checkout this either fails
+  outright or, worse, compares a dotcom login against Enterprise PR authors that can never match,
+  silently readmitting the current user's own PRs into the review queue. The fetch now asks `gh repo
+view` (which DOES resolve host from the working directory) for the repository's URL, extracts its
+  host, and passes it explicitly via `gh api user --hostname`.
+- **A repo-wide `reviewDecision` could drop a PR from `pr-review` while THIS viewer's own review
+  request was still outstanding** (`discussion_r3617759232`) — a multi-approval repository can show
+  `reviewDecision: APPROVED` once one reviewer approves, while GitHub still lists the PR under
+  "Requesting a code review from you" for a second. The fetch now also selects `reviewRequests`, and
+  the reduction keeps a PR whose decision has moved past `REVIEW_REQUIRED` as long as the resolved
+  identity is still listed there.
+- **`title` was mutable presentation data inside a `high`-urgency membership snapshot**
+  (`discussion_r3617759355`) — `json-diff` fires on any change to the whole diffed payload, so
+  retitling a PR that was already, and remained, a member re-fired the interrupt for a PR nothing
+  had actually happened to. `title` is no longer projected into either preset's reduced entry;
+  `headRefName`/`author` (pr-review) and `url` (my-prs) already identify which PR an entry is about.
+- **`my-prs`'s merged/closed calls relied on `--limit` plus `gh`'s newest-created-first ordering**,
+  which can miss an older PR that only just entered the 6-hour terminal window
+  (`discussion_r3617759463`), and — once `--search` is added to fix that — `gh` routes `--state
+closed` through the search API, whose `is:closed` also matches merged PRs. The fetch now computes
+  a portable `cutoff` (GNU `date -d @epoch`, falling back to BSD/macOS `date -r epoch`) once per
+  tick and scopes each terminal call to `merged:>=$cutoff` / `closed:>=$cutoff -is:merged`,
+  independent of creation order or volume.
+- **003 §11.9 still described `my-prs`'s open-state call as `--limit 30`** after a prior delta
+  raised it to `1000`, and the terminal-volume test that was supposed to prove the new bound (99
+  merged rows, one open row) passed unchanged under either limit — it never actually exercised the
+  argv. 003 is corrected to `--limit 1000`, and a new argv-level test in
+  `apps/cli/src/commands/pr-alerting-presets.test.ts` asserts the shipped command carries `--limit
+1000`, not `30`. The residual gap above 1000 concurrently open PRs is unchanged and is not claimed
+  to be closed — see 003 §11.9 for the documented boundary.
+
+004 §3.6's scenario table gains rows for all four fixes.
+
+## 2026-07-20 — `pr-review` structurally excludes the current identity's own PRs, closing the last PR-alerting cross-monitor firing (003 §11.9, 004 §3.6) — Refs #444, #446
+
+PR #446 review, thread `discussion_r3615190027`, the last open finding: a prior revision's
+`pr-review`/`my-prs` disjointness held only under the default `--search 'review-requested:@me'`
+scope — under the label-driven or unscoped alternatives this same scaffold ships as ready-to-edit
+options (the ones required when author and reviewer share an identity), a PR you authored yourself
+could still enter `pr-review`'s payload, and a single CI transition on it then diffed on **both**
+independently-scheduled monitors in the same tick. An earlier delta documented this as an "accepted
+residual"; the reviewer correctly rejected that framing — reclassifying a bug as documented behavior
+does not make the duplicate alert disappear.
+
+The fix moves the exclusion from `--search` (server-side, scope-dependent) into the `--jq` reduction
+(local, unconditional): `pr-review`'s fetch now runs `gh api user --jq '{login}'` before `gh pr
+list`, and the reduction drops any PR whose `author.login` matches the resolved identity before any
+other filter runs, regardless of which `--search` qualifier is active. Because PR authorship never
+changes, a PR now belongs to at most one preset's payload for its entire lifetime — the two payloads
+partition by **role first, then readiness** — so no PR can ever cross between them. This closes the
+crossing entirely rather than reducing its frequency: 003 §11.9's "The two presets must not overlap"
+section is rewritten to describe the new mechanism and remove the "residual" framing; 004 §3.6's
+scenario table gets a row for the new structural guarantee, replacing the row that pinned the
+old residual's exact shape.
+
+Two other threads closed in the same delta, both from the same final review round
+(pull request review `pullrequestreview-4738740767`):
+
+- **`my-prs`'s open-PR coverage was still capped at `--limit 30`** even after a prior delta split
+  open/merged/closed into three separate `gh pr list` calls (issue #444 review, finding 989) — an
+  author with more than 30 concurrently open PRs could still have an older one silently evicted, and
+  its later CI failure or review feedback would go unobserved. The open-state call now uses
+  `--limit 1000` (not claimed as a mathematical guarantee — an author who genuinely sustains over a
+  thousand simultaneously open PRs would hit the same failure shape at a much higher threshold, which
+  is not this preset's realistic operating range); the terminal `merged`/`closed` calls stay at
+  `--limit 20` each, since their coverage requirement (outlast the 6-hour terminal window) is bounded
+  by construction and does not benefit from widening.
+- **A PR opened directly as a draft enters `my-prs`'s `needs: draft` membership exactly like a PR
+  pulled back to draft does**, which 003 previously described as contradicting an absolute "every
+  entering transition is actionable" invariant. `command-poll`'s stateless `json-diff` polling has no
+  history that would let the reduction distinguish "the author's own deliberate first action" from
+  "someone pulled a decided PR back," so this is accepted rather than engineered around (a prior delta
+  already pinned it as a characterization test). 003 §"Membership, not full state" now states the
+  narrower, accurate invariant — entering transitions are actionable far more often than not, with
+  this one documented, non-spurious exception — instead of the absolute claim the exception
+  contradicted.
+
+Test coverage: `apps/cli/src/commands/pr-alerting-presets.test.ts`'s "the two presets do not overlap"
+block now constructs its cross-payload fixtures with an explicit current-identity author override
+(`rawReviewPr`'s own default author changed to a distinct, non-current identity — 'contributor' — so
+the reviewer-queue-only tests keep exercising the ordinary "someone else's PR" case) and asserts the
+CI-crossing transition fires `my-prs` alone, never `pr-review`, replacing the prior test that pinned
+the two-monitor double-fire as expected. A new argv-level test in "reviewer scoping" asserts the `gh
+api user` identity call is present unconditionally. `stubGhApplyingJq`/`stubGhEchoingFixture` both
+gained an `identityLogin` parameter so they can answer `pr-review`'s new second `gh` call.
+
 ## 2026-07-20 — `OPERATION_TIMEOUT_PATTERN` now bounds each unit numerically, closing the last schema/parser `timeout` gap; `api-poll`'s composite `id`-length rejection no longer allocates (003 §4.1/§4.9) — Refs #304
 
 Round-6 review follow-up. Two prior entries in this file (2026-07-19, "Composite cumulative byte
@@ -600,6 +717,300 @@ poll-until-`daemonAvailable` loop with slightly different timeout/poll constants
 (`daemon-ipc.ts`); each call site keeps its own pre-existing timeout/poll values — no behavior change.
 
 Finding 5 (test teardown pid fallback) is test-infrastructure-only, no spec change.
+
+## 2026-07-20 — PR-alerting presets: 003's field-selection paragraph re-aligned with the shipped `gh` query, and two further review findings closed (003 §11.9, 004 §3.6) — Refs #444, #446
+
+003 §11.9's "Field selection is what makes the transitions observable" section still described a
+superseded `pr-review` shape: `{number, title, headRefName, reviewDecision, author}` projected via
+`--search '-author:@me'`. The shipped query (since the prior entry's reviewer-scoping fix) projects
+`{number, title, headRefName, author}` — `reviewDecision` decides membership rather than being carried
+as a field — and scopes via the configurable `--search`, defaulting to `review-requested:@me`. The
+paragraph is corrected to match, and the adjacent "per-reviewer list" description is updated from
+`{by, state}` to `{by, state, at}` to reflect the repeat-feedback fix from the prior entry.
+
+Two further PR #446 review findings, addressed in the same delta:
+
+**`GH_TOKEN`/`GH_REPO` were not scrubbed.** The shell wrapper unset only `GITHUB_TOKEN`, but `gh` gives
+`GH_TOKEN` higher precedence still, and `GH_REPO` overrides repository selection outright — either
+inherited variable could silently redirect a preset to the wrong identity or repository despite `@me`
+and the explicit `cwd:`. The wrapper now scrubs all three (`env -u GH_TOKEN -u GITHUB_TOKEN -u
+GH_REPO`). The wrapper's stderr temp file also moved from a predictable `$$`-PID-based path (removed by
+explicit `rm -f` on each branch, so a `SIGKILL` between creation and either branch could leak it) to an
+`mktemp`-created private file removed by an `EXIT` trap, which additionally survives the wrapper's own
+`kill -TERM $$` self-signal and `command-poll`'s `SIGTERM` timeout escalation.
+
+**`my-prs`'s `commentCount` churned on the author's own replies and bot comments.** Since `commentCount`
+growing is one of the signals that re-fires an already-actionable entry, every self-reply or bot status
+comment produced a spurious high-urgency interrupt. The count now excludes comments whose author is the
+PR's own author (`author.login`, now fetched alongside the other fields) or whose login ends `[bot]`.
+
+Not addressed in this delta, evaluated and left open with rationale (PR #446 review):
+
+- **A newly-opened draft PR enters `my-prs`'s `draft` membership**, which is a benign, self-caused
+  transition rather than a true "someone acted on your PR" signal. This is a structural limit of
+  stateless `json-diff` polling: distinguishing "just created as a draft" from "pulled back to draft
+  after being ready" requires state `command-poll` does not carry between ticks. The scaffolded body
+  already tells the author how to tell the two apart ("If you did not just put it there, someone pulled
+  it back"), and `apps/cli/src/commands/pr-alerting-presets.test.ts` gained a characterization test
+  pinning this documented, accepted shape so it can't silently drift.
+
+004 §3 gained a new §3.6 mapping the presets' required scenarios (reviewer scoping, disjointness,
+environment/temp-file hardening, terminal time-bounding, `commentCount` filtering, graceful
+degradation, portability) to `apps/cli/src/commands/pr-alerting-presets.test.ts`'s describe blocks, per
+§6's spec-change checklist.
+
+## 2026-07-20 — `command-poll`'s `cwd` resolves against the runtime workspace root; `my-prs` fetches open/merged/closed separately; the CI-crossing double-fire is characterized, not silently left undocumented (003 §3.1, §11.1, §11.9) — Refs #444, #446
+
+Three further PR #446 review findings closed on top of the entries above, all against exact head
+`66741b0`:
+
+**A scaffolded preset's `cwd:` was bound to the checkout path `init` ran from** (finding 826) — the
+prior entry's own "not addressed" list called this out as inherent to the design, but the real fix
+turned out to be a small, well-precedented core change rather than a `cwd:` tradeoff: 003 §11.1 now
+resolves an **omitted** `cwd` (and, for a relative `cwd`, its base) against the runtime workspace/config
+root for a project monitor — the same base `file-fingerprint` already resolves a relative `cwd`/`globs`
+against (§3.1) — instead of the daemon's own process working directory. `command-poll`'s `resolveCwd`
+(`plugins/source-command-poll/src/index.ts`) implements this; `agentmonitors init` no longer seeds an
+absolute `cwd:` into either preset at all (the `seedPresetCwd` scaffold-time mechanism is removed
+outright), so a scaffolded `MONITOR.md` has no project-root-shaped state to go stale when the project is
+relocated, cloned elsewhere, or shared to a teammate's checkout.
+
+**`my-prs`'s `--state all --limit 60` could still evict an old, still-open PR** (finding 989) once
+enough newer PRs (open or terminal) existed, silencing its later CI/review activity — the prior entry
+left this open as "real design work." §11.9's "Field selection" section is now split into three
+separate `gh pr list` calls (`--state open --limit 30`, `--state merged --limit 20`, `--state closed
+--limit 20`), each with its own `--limit` so terminal history can never displace open coverage, unioned
+by a `jq -sc 'add | unique_by(.number) | ...'` stage that now runs the `--jq` reduction as a pipeline
+step over the fetch's raw stdout rather than as `gh`'s own `--jq` flag (the mechanism that makes a
+multi-call fetch possible at all — `-s`/`--slurp` folds however many arrays the fetch printed back into
+one). `pr-review`'s single-call fetch is unaffected in shape; both presets now share the same
+fetch/reduce split in `ghPresetScript`.
+
+**A CI failure crossing the `pr-review`/`my-prs` readiness partition still fires both monitors**
+(discussion `r3615190027`): static membership disjointness (the prior "disjoint by construction" entry
+below) does not imply glitch-free crossing — `pr-review` sees `[PR] -> []`, `my-prs` sees `[] -> [PR,
+needs: ci-failing]`, and both independently-scheduled `command-poll` monitors fire once each in the same
+tick, for the same real event. This is the same residual class §11.9 already documented for a PR
+merging under a same-identity reviewer scope (one dismissible removal plus one actionable entry, not
+issue #441's N-round-trip multiplier) — reachable only when a reviewer-scoping model does not exclude
+the current user's own PRs from `pr-review` (the label-driven model, or an unscoped queue); it cannot
+fire on your own PR under the default `review-requested:@me` scope at all, since GitHub forbids
+requesting your own review. No cross-monitor coordination is added to suppress it: the two presets are
+independently scheduled instances with no shared state by design, and issue #441's own preferred remedy
+— not shipping redundant payloads — is exactly what "the two presets do not overlap" already does. §11.9
+is updated to state this explicitly for the CI-failure case (previously only the merge case was
+documented), and `apps/cli/src/commands/pr-alerting-presets.test.ts` gained a dual-monitor transition
+regression that pins the exact `[PR]->[]` / `[]->[PR, needs: ci-failing]` shape so a future change that
+makes this fire for a DIFFERENT, undocumented reason is still caught.
+
+004 §3.6 is updated to reflect the three-call `my-prs` fetch and the `cwd` portability guarantee; 005 §2's
+"Repository auto-scoping" paragraph is updated to match (no more `cwd:` in either scaffolded preset).
+
+## 2026-07-20 — PR-alerting presets are disjoint by construction, so enabling both is not an interrupt multiplier (003 §11.9) — Refs #444, #441
+
+Shipping two presets a user may enable together risked reproducing #441's measured
+interrupt-multiplier by construction. Measured directly with both presets' `--jq` run over the same
+raw PR set: `pr-review` held `[1, 2]` while `my-prs` held `[2, 3, 4]` — PR 2 (red CI, undecided,
+non-draft) was claimed by **both**, so every transition on it would deliver two alerts.
+
+The server-side `--search` scope does not fix this in general. It does under the default
+(`review-requested:@me` cannot match a PR you authored, since GitHub forbids requesting review from
+yourself), but not under the label-driven model — which is exactly the model required when author and
+reviewer share an identity, the case this whole workflow runs in.
+
+`pr-review` now **excludes PRs with failing checks**, which makes the two memberships partition by
+readiness under every scoping model: a red PR is not review-ready, it belongs to its author, and
+`my-prs` already classifies it `ci-failing`. Re-measured after the change: `[1]` versus `[2, 3, 4]`,
+disjoint. A test asserts every plausible PR state lands in at most one payload and fails if the
+exclusion is removed.
+
+Residual, by nature rather than defect: a PR merging leaves `pr-review` and enters `my-prs` as
+`merged`. Under the default scope those are different PRs. Under a same-identity scope it is one
+benign removal plus one actionable entry for the same merge — one dismissible fire, not a multiplier.
+Delivery-layer cross-monitor coalescing (#441) is complementary; per #441's own guidance the
+authoring-level fix is preferred and is what this does.
+
+## 2026-07-19 — PR-alerting presets: selectable reviewer scoping, a review-revision signal, and time-bounded terminal states (003 §11.9, 005 §2) — Refs #444
+
+Three review findings, each of which defeated one of the goals the presets exist to serve.
+
+**1. The reviewer preset was not scoped to a reviewer.** It returned every open, non-draft,
+non-release PR — including the user's own — so it alerted on work the reviewer did not own, and
+unrelated rows could consume the 30-row window and hide a real request. Reviewer scoping is
+**workflow-dependent**, so the fix is a documented default (`--search 'review-requested:@me'`, the
+semantically exact reading, which also covers team-assigned requests) plus `-author:@me`,
+`label:needs-review`, and unscoped scaffolded as ready-to-edit alternatives. Measured against this
+repository: unscoped returns 6 open PRs, `review-requested:@me` returns 0, and no open PR carries a
+requested reviewer — PRs are authored and reviewed under one identity, and GitHub does not permit
+requesting review from yourself, which also makes `-author:@me` empty here. Hardcoding any single
+filter would take the preset from "too many PRs" to "zero PRs, ever" for some workflow. The empty
+case is **silent** — indistinguishable from "nothing needs review" — so the scaffolded body names it
+and gives the exact command to check; a `validate`/`monitor test` warning on a zero-row first run
+needs support in those commands and is recorded as the follow-up rather than claimed.
+
+**2. Repeat feedback from the same reviewer was invisible.** Reducing each latest review to
+`{by, state}` meant a second `CHANGES_REQUESTED` from the same reviewer left `reviewDecision`, the
+reduced array, and `commentCount` all unchanged — so `json-diff` emitted nothing even though new
+blocking feedback had landed, breaking the single most important author-side trigger. Reviews now
+carry `at` (`submittedAt`), which is fixed at submission and therefore a revision signal that cannot
+churn between polls, and are sorted by `(by, at, state)` so ordering cannot flap the diff.
+
+**3. Terminal states are now time-bounded to 6h** after `mergedAt`/`closedAt`, rather than lingering
+until they fall out of `--limit`. Unbounded, every new merge evicted an older terminal row from the
+window and emitted a spurious removal diff — a spurious interrupt at `high` urgency. Time-bounding
+makes each terminal PR produce exactly one entry and one predictable drop-off, independent of
+`--limit`. The bound reads `mergedAt`/`closedAt`, never `updatedAt`, so post-merge activity cannot
+extend it, and **no timestamp is emitted into the payload**: a timestamp in the diffed output changes
+on essentially every poll and fires continuously. `fromdateiso8601` errors outright on fractional
+seconds, so the query strips them and treats an unparseable timestamp as current (fail-open — a stale
+row beats a missed merge alert).
+
+Separately: the presets set an explicit `key:`, which is what keeps the delivered event title short
+(`Command output changed: my-prs`) instead of the joined argv — a `command-poll` monitor that omits
+`key:` gets its entire `gh` command and `--jq` program as the alert headline. Making the title use the
+monitor's authored `name` is a source-level change affecting every `command-poll` monitor and is
+tracked as issue #449, not done here; a regression guard keeps the presets from drifting back to the
+raw-argv title.
+
+## 2026-07-19 — PR-alerting presets become actionable-only membership sets at `high` urgency (003 §11.9, 005 §2) — Refs #444
+
+Field testing a dogfooded author-side monitor overturned the `normal`-urgency choice recorded below.
+Detection worked — three `monitor_events` materialized — but delivery was **suppressed on all four
+lead sessions**, so the author was never told CI had failed. Two independent mechanisms cause this:
+
+1. **Normal reminders are coalesced-until-acknowledgment** (002 §9.2). The implemented guard is
+   `normalPending.length === unreadNormal.length`: every unread normal event must be unclaimed, so a
+   single claimed-but-unacked normal event from **any** monitor suppresses the reminder for **all** of
+   them. In an active session that is nearly always true, making a `normal` PR monitor structurally
+   unreliable exactly when its audience has been working.
+2. **Normal carries no event body mid-session** (002 §9.2/§9.3). Normal and low deliver a generic
+   reminder with an empty `events` array; bodies arrive only at recap.
+
+`high` is only safe if the payload cannot fire on non-events, so both presets now emit a **membership
+set of actionable items** rather than full state. `my-prs` reduces each PR to a `needs` verdict
+(`ci-failing`, `changes-requested`, `draft`, `merged`, `closed`) and drops it entirely when `none`;
+`pr-review` admits only undecided, non-draft, non-release PRs authored by someone else. A green,
+non-draft, undecided PR is absent, so an ordinary CI run produces no event. Encoding draft as
+_membership_ rather than as a diffed `isDraft` field is what keeps both directions of draft↔ready
+firing.
+
+**Generalized rule:** `high` is defensible for a `json-diff` monitor when the payload is filtered so
+that every _entering_ transition is actionable. `json-diff` is symmetric, so entries _leaving_ the set
+(CI recovering, a review answered, a draft marked ready, a terminal PR aging out) also fire; the goal
+is to bound those to one per resolved item, not to zero, and to name them in the monitor body so they
+are cheap to dismiss. The presets no longer claim every fire is actionable.
+
+**This reverses the `--state open` decision recorded in the entry below.** That change fixed a real
+window-eviction risk, but it also collapsed `MERGED` and `CLOSED` into an indistinguishable
+disappearance — and "merged, clean up the branch" versus "closed unmerged, find out why" are
+different instructions the acceptance criteria require distinguishing. `--state all --limit 60`
+restores nameable terminal states while addressing the eviction concern by widening the window
+(measured ~3.5s per poll against a real repository; terminal PRs held 15 of 20 slots at `--limit 20`,
+which is what motivated the widening). The residual risk — a still-open PR older than 60 newer PRs
+aging out of the query — is documented in 003 §11.9 rather than silently accepted.
+
+Note also that 002 §9.2's prose claims the coalesced reminder re-fires when "a fresh unclaimed normal
+event arrives". The implemented guard does not do that: a fresh unclaimed event makes the two counts
+unequal, keeping the reminder suppressed. The field observation matches the code, not the prose. That
+inaccuracy is tracked separately and is not corrected here.
+
+## 2026-07-19 — PR-alerting presets: correct the `cwd` claim, exclude own PRs, fix the recency window, GITHUB_TOKEN, stderr, and curated names (003 §11.9, 005 §2) — Refs #444
+
+Review of the presets added below (same date, same issue) surfaced eight defects, all fixed here:
+
+1. **`cwd` claim was wrong.** `command-poll`'s effective `cwd` defaults to the **daemon's own** process
+   working directory, never a "workspace/config root" — the daemon could be launched from anywhere. The
+   original text (and `init.ts`'s comment, and this PR's changeset) all said otherwise. Fixed by having
+   `init` scaffold an explicit, absolute `cwd:` (the project root `init` was run from) into both
+   presets, and correcting every doc/comment that repeated the wrong claim. See the corrected item 1 of
+   the entry directly below.
+2. **`GITHUB_TOKEN` precedence.** `gh` gives an inherited `GITHUB_TOKEN` unconditional precedence over
+   keyring/`gh auth login` credentials, so a daemon environment with one exported would silently
+   resolve `@me` against the wrong identity. The generated wrapper now runs `gh` via `env -u
+GITHUB_TOKEN`.
+3. **`pr-review` included the user's own PRs.** Added `--search '-author:@me'` (GitHub search-qualifier
+   negation — `gh pr list` has no `--author`-exclusion flag) so a PR the reviewer opens themselves no
+   longer double-fires against both presets.
+4. **`my-prs`'s sliding window could silently drop an open PR.** `--state all --limit 10` lets an older
+   still-open PR age out once enough newer PRs (including merged/closed ones) exist; once evicted, its
+   CI going red produced no event. Changed to `--state open --limit 30`: only actually-open PRs compete
+   for the cap, and leaving the open set (merge or close) now surfaces as a removal, same as
+   `pr-review`. Trade-off: `state` can no longer read `MERGED`/`CLOSED` from real `gh` output (it is
+   still carried for shape symmetry), so the body now says to check the PR directly to tell which.
+5. **`2>&1` on the success path could pollute the diffed JSON.** A one-time `gh` warning would have
+   merged into stdout and degraded `json-diff` to a raw-text comparison. The wrapper now redirects
+   stderr to a per-invocation temp file only consulted on the failure branch.
+6. **The named scaffold path clobbered curated preset names.** `init pr-review --type pr-review`
+   derived `name: Pr review` from the positional, overwriting the template's own `name: PRs awaiting my
+review`. The derived-name seed is now skipped for preset types (`--name` still overrides), and
+   005 §2's "re-type the name" workaround text is removed since it's no longer needed.
+7. **The interactive prompt modeled presets as source types**, contradicting 005 §2's own "not source
+   types" claim. The prompt and its error now list source types and presets as separate categories.
+8. **`--urgency` seeding could contradict the rationale comment above it.** Seeding a different urgency
+   left the preset-specific "why this value" comment attached to the wrong value. `seedUrgency` now
+   swaps in a generalized comment when the seeded value differs, mirroring `seedCommand`'s existing
+   #388 pattern.
+
+Test coverage added: an end-to-end scaffold-then-parse test for both presets (with and without
+`--urgency`), a CI-only failure (not skip) when the jq suite's `jq` binary is missing, and cleanup of
+the test file's temp directories and a dead `MONITOR.md` write that nothing ever read.
+
+## 2026-07-19 — Repo-scoped PR-alerting presets: `init --type pr-review` and `--type my-prs` (003 §11.9, 005 §2) — Refs #444
+
+Added two ready-made `command-poll` presets to `init --type`, one per pull-request role: `pr-review`
+(reviewer — open, non-draft PRs awaiting review, excluding `changeset-release/*` heads) and `my-prs`
+(author — CI, review feedback, and state changes on the current `gh` user's own PRs). Both are new
+`TEMPLATES` entries only; no source, schema, or runtime behavior changed.
+
+Three contract points are now specified rather than left to the author of each hand-written monitor:
+
+1. **Repository auto-scoping is achieved by omission of `--repo`, plus an explicit scaffolded `cwd:`.**
+   `gh` resolves the repository from its working directory, and `command-poll`'s effective `cwd`
+   defaults to the **daemon's own** process working directory (003 §11.1) — not a "workspace/config
+   root", which an earlier draft of this entry, `init.ts`'s own comment, 003 §11.9, 005 §2, and this
+   PR's changeset all incorrectly claimed (corrected below, 2026-07-19). `init` scaffolds an explicit,
+   absolute `cwd:` (the project root it was run from) into both presets specifically to fix that: it is
+   what then lets omitting `--repo` scope `gh` correctly, regardless of where the daemon is later
+   launched from. Interpolating an owner/name at scaffold time is explicitly rejected — it would
+   hardcode what `cwd:` makes portable. `--author @me` applies the same auto-scoping rule to identity.
+2. **Which fields are diffed is the real product decision.** `json-diff` fires on any semantic change
+   to stdout, so the `--jq` reduction decides what becomes an interrupt. `my-prs` reduces
+   `statusCheckRollup` to only the _failing_ check names, which is what makes green→red fire while
+   the queued/in-progress churn of a normal CI run stays silent; diffing the rollup whole would
+   interrupt once per check, per push.
+3. **A broken `gh` is a loud failure, not a silent baseline.** 003 §11.2/§11.5 classify a nonzero exit
+   _with output_ as a normal result, so a preset that merely `exit 1`-ed on `gh` failure would record
+   the error text as its first baseline and never fire again. Both presets instead terminate by
+   signal (`kill -TERM $$`) after writing a remedy to stderr, which §11.5 classifies as an execution
+   failure: `Command failing: <key>` is emitted on the very first tick, the remedy travels in
+   `stderrTail`, any prior baseline is preserved, the alert is edge-triggered, and recovery emits
+   `Command recovered: <key>`.
+
+Both presets are `normal` urgency, and the `my-prs` case establishes a general rule (002 §9, 003
+§11.9). The intuitive call is `high` — a stalled PR of one's own is interrupt-worthy — but
+`json-diff` is **symmetric**: a PR leaving an actionable state diffs exactly as much as one entering
+it, so CI recovering red→green, a PR merging, and one's own new PR appearing all fire too. Filtering
+the payload down to only actionable PRs does not fix this; it relocates the benign fire from "a field
+changed" to "an entry was removed", which the diff reports identically. Since no payload design makes
+every fire actionable, `high` would interrupt mid-turn on good news (#441). Generalized: **`high` is
+only defensible for a `json-diff` monitor when the watched value cannot transition back to a benign
+state**, because at the diff layer recovery is indistinguishable from breakage.
+
+Two field traps are recorded rather than left for the next author to rediscover. `reviewDecision` is
+the empty string, not `null`, when there is no decision, so a `// "NONE"` coalesce is a silent no-op.
+And `--limit` makes the query a recency window, not a set: an old PR aging out produces a removal
+diff that is not a transition, which the monitor body calls out explicitly.
+
+Collapsing `statusCheckRollup` to a single `PASSING`/`PENDING`/`FAILING` verdict was considered and
+rejected: it is quieter than the raw array but reintroduces the churn one level up, firing twice on
+every ordinary push (`PASSING → PENDING → PASSING`) even when CI never breaks. Reducing to failing
+check _names_ stays silent across that whole cycle — asserted directly — and names the failing check
+in the delivered event.
+
+Known limitation, recorded rather than worked around: `gh pr list` exposes no review-thread data, so
+inline review comments that do not move `reviewDecision` are invisible to `my-prs`. A first-class
+`source-github-pr` plugin modelling PR transitions semantically remains the north star and would
+close that gap; these presets deliver the capability without it.
 
 ## 2026-07-19 — Transport-health review fixes round 4: future-timestamp staleness, symlink-safe writes, delivery-diagnosis-unavailable (006 §12; 005 §15) — Refs #425
 

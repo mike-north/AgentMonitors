@@ -1258,6 +1258,100 @@ describe('init', () => {
     expect(parsed.monitors[0]?.name).toBe('TS source watcher');
   });
 
+  // Issue #444 review, finding 9(a): drive the REAL scaffold path (not the raw
+  // TEMPLATES string) for both PR-alerting presets, with and without
+  // --urgency, and assert the written file both parses cleanly and keeps its
+  // curated name — the line-anchored `name:`/`urgency:` seed regexes against
+  // an unquoted multi-word preset name are precisely where scaffold-time drift
+  // would bite, and nothing previously ran them through the actual CLI.
+  it.each(['pr-review', 'my-prs'] as const)(
+    '%s scaffolds a parseable monitor with its curated name preserved (issue #444, finding 9a)',
+    (type) => {
+      const dir = path.join(tempDir, `init-preset-${type}`);
+      mkdirSync(dir, { recursive: true });
+      const monitorsDir = path.join(dir, 'monitors');
+      const created = run(
+        ['init', type, '--dir', monitorsDir, '--type', type],
+        dir,
+      );
+      expect(created.exitCode).toBe(0);
+      const monitor = readFileSync(
+        path.join(monitorsDir, type, 'MONITOR.md'),
+        'utf-8',
+      );
+      // The positional <name> must NOT have clobbered the template's own
+      // curated name (finding 6) — e.g. never a derived `name: Pr review`.
+      expect(monitor).not.toMatch(/^name: Pr review$/m);
+      expect(monitor).not.toMatch(/^name: My prs$/m);
+      const curatedName =
+        type === 'pr-review' ? 'PRs awaiting my review' : 'My pull requests';
+      expect(monitor).toContain(`name: ${curatedName}`);
+      // No `cwd:` is seeded at scaffold time (issue #444 review, finding
+      // 826, superseding the prior finding-1 fix that baked one in):
+      // `command-poll` now resolves an omitted `cwd` against the runtime
+      // workspace/config root itself (003 §11.1), so the scaffolded file
+      // carries no project-root-shaped state that would go stale if the
+      // project were relocated after scaffolding.
+      expect(monitor).not.toMatch(/^\s*cwd:/m);
+
+      const validated = run(['validate', monitorsDir, '--format', 'json'], dir);
+      expect(validated.exitCode).toBe(0);
+      const parsed = JSON.parse(validated.stdout) as {
+        valid: number;
+        invalid: number;
+        monitors: { name: string }[];
+      };
+      expect(parsed.valid).toBe(1);
+      expect(parsed.invalid).toBe(0);
+      expect(parsed.monitors[0]?.name).toBe(curatedName);
+    },
+  );
+
+  it.each(['pr-review', 'my-prs'] as const)(
+    '%s scaffolds a parseable monitor when --urgency overrides the default (issue #444, finding 9a)',
+    (type) => {
+      const dir = path.join(tempDir, `init-preset-urgency-${type}`);
+      mkdirSync(dir, { recursive: true });
+      const monitorsDir = path.join(dir, 'monitors');
+      const created = run(
+        [
+          'init',
+          type,
+          '--dir',
+          monitorsDir,
+          '--type',
+          type,
+          '--urgency',
+          'low',
+        ],
+        dir,
+      );
+      expect(created.exitCode).toBe(0);
+      const monitor = readFileSync(
+        path.join(monitorsDir, type, 'MONITOR.md'),
+        'utf-8',
+      );
+      expect(monitor).toMatch(/^urgency: low$/m);
+      // Finding 8: the preset-specific rationale comment (which explained the
+      // template's *default* value) must not survive above a seeded value it
+      // no longer describes. Asserted via the generalized replacement plus the
+      // rationale's distinctive phrase, rather than the comment's opening
+      // words — the latter would silently stop testing anything if the
+      // rationale were ever reworded.
+      expect(monitor).toContain('# urgency overridden via --urgency');
+      expect(monitor).not.toContain('coalesced-until-ack');
+
+      const validated = run(['validate', monitorsDir, '--format', 'json'], dir);
+      expect(validated.exitCode).toBe(0);
+      const parsed = JSON.parse(validated.stdout) as {
+        valid: number;
+        invalid: number;
+      };
+      expect(parsed.valid).toBe(1);
+      expect(parsed.invalid).toBe(0);
+    },
+  );
+
   // Issue #388 AC (a): --command seeds watch.command verbatim for command-poll,
   // one argv token per flag (including a leading-dash token like --porcelain,
   // which the collector must preserve, not swallow as another flag). The seeded

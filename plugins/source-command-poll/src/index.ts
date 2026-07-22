@@ -1,4 +1,5 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
+import path from 'node:path';
 import type {
   JsonSchema,
   KeyedCollectionConfig,
@@ -229,6 +230,33 @@ function killProcessTree(
 }
 
 /**
+ * Resolve the child process's effective working directory (003 §11.1).
+ *
+ * A **relative** `cwd` is resolved against `workspacePath` — the runtime
+ * workspace/config root the daemon threads through {@link ObservationContext}
+ * for a project monitor — the same base `file-fingerprint` already resolves a
+ * relative `cwd` against (003 §3). An **absolute** `cwd` is honored as-is
+ * (unchanged from before). When `cwd` is omitted entirely, a project monitor
+ * now defaults to `workspacePath` rather than the daemon's own process
+ * working directory: a scaffolded `MONITOR.md` that omits `cwd` therefore
+ * targets the right directory regardless of where the daemon happens to be
+ * launched from, or whether the project was relocated or shared after
+ * scaffolding — the daemon always resolves `workspacePath` itself from where
+ * `MONITOR.md` was found, never from a value baked into the file (issue #444
+ * review, finding 826). A user-level monitor (no `workspacePath`) falls back
+ * to the pre-existing default, the daemon's own process working directory —
+ * unchanged, since there is no project root to resolve against.
+ */
+function resolveCwd(
+  cwd: string | undefined,
+  workspacePath: string | undefined,
+): string | undefined {
+  if (cwd === undefined) return workspacePath;
+  if (path.isAbsolute(cwd)) return cwd;
+  return workspacePath === undefined ? cwd : path.resolve(workspacePath, cwd);
+}
+
+/**
  * Spawn `command` directly (never a shell — `spawn` with `shell: false`), draining
  * stdout and stderr as they stream rather than buffering to completion, enforcing
  * `timeout` with a SIGTERM→SIGKILL escalation targeted at the command's **entire
@@ -240,7 +268,10 @@ function killProcessTree(
  * real completion (side effects and all); the caps only bound what is *kept*, never
  * what is *drained*, so the reported exit code is always the command's actual one.
  */
-async function runCommand(scope: ScopeConfig): Promise<ExecOutcome> {
+async function runCommand(
+  scope: ScopeConfig,
+  effectiveCwd: string | undefined,
+): Promise<ExecOutcome> {
   return new Promise<ExecOutcome>((resolve) => {
     const [file, ...args] = scope.command;
     const isWindows = process.platform === 'win32';
@@ -250,7 +281,7 @@ async function runCommand(scope: ScopeConfig): Promise<ExecOutcome> {
       file!,
       args,
       {
-        cwd: scope.cwd,
+        cwd: effectiveCwd,
         // `env` is merged over the inherited daemon environment (003 §11.1).
         env: scope.env ? { ...process.env, ...scope.env } : process.env,
         shell: false,
@@ -644,7 +675,8 @@ const scopeSchema: JsonSchema = {
     },
     cwd: {
       type: 'string',
-      description: 'Working directory for the child process',
+      description:
+        'Working directory for the child process. A relative path resolves against the runtime workspace/config root; an absolute path is used as-is. Omitted entirely, a project monitor defaults to the workspace/config root (a user-level monitor falls back to the daemon process working directory).',
     },
     env: {
       type: 'object',
@@ -747,8 +779,9 @@ const source: ObservationSource = {
     const prev = isCommandState(context.previousState)
       ? context.previousState
       : undefined;
+    const effectiveCwd = resolveCwd(scope.cwd, context.workspacePath);
 
-    const outcome = await runCommand(scope);
+    const outcome = await runCommand(scope, effectiveCwd);
 
     // ---- Execution failure path (003 §11.5) -------------------------------------
     if (outcome.kind === 'failure') {
