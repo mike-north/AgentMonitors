@@ -161,7 +161,7 @@ const ADVISORY_PROBLEM_CODES: readonly TransportProblemCode[] = [
  * different questions — see the file's own docstring on why `reach` and
  * `deliverable` are kept separate.
  */
-function disqualifiesFromListening(code: TransportProblemCode): boolean {
+export function disqualifiesFromListening(code: TransportProblemCode): boolean {
   return !isSharedProblem(code) && !ADVISORY_PROBLEM_CODES.includes(code);
 }
 
@@ -540,36 +540,25 @@ function diagnosisUnavailableProblems(
 }
 
 /**
- * NaN-safe freshness key for ordering heartbeats.
+ * NaN- and future-skew-safe freshness key for ordering heartbeats, used both
+ * by {@link selectHeartbeats} (freshest-first pool ordering) and by
+ * {@link buildTransport} (choosing the REPRESENTATIVE record whose
+ * `boundTo`/`version`/`lastDelivery` are shown).
  *
  * The registry is untrusted input and `isTransportHeartbeat` only proves
  * `updatedAt` is a *string*, so an unparseable value is reachable. `Date.parse`
  * then yields `NaN`, every comparison involving it is `false`, and the
- * resulting inconsistent comparator can leave a corrupt record ahead of a valid
- * newer one — hiding the record that actually describes the live transport.
- * Unparseable sorts as oldest instead, so a valid record always wins when one
- * exists (a corrupt record still surfaces if it is all we have, and
- * `isHeartbeatStale` independently treats it as stale).
- */
-function freshness(heartbeat: TransportHeartbeat): number {
-  const parsed = Date.parse(heartbeat.updatedAt);
-  return Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed;
-}
-
-/**
- * Freshness key for choosing the REPRESENTATIVE record in {@link buildTransport}
- * (the one whose `boundTo`/`version`/`lastDelivery` are shown). Unlike
- * {@link freshness}, this ALSO treats an out-of-tolerance future timestamp as
- * oldest, not merely an unparseable one.
- *
- * `freshness` alone is not enough here: a far-future `updatedAt` (clock skew,
- * or an untrusted/forged record) parses to a real, large finite number, so a
- * plain freshest-wins comparison ranks it ahead of a genuinely current record
- * — the exact defect `isHeartbeatStale` already treats as stale (issue #425
- * review, round 5), but which a representative-selection tie-break keyed on
- * raw `Date.parse` had not been taught to distrust. Both corruption modes —
- * unparseable and implausibly-future — must sort as oldest so a valid current
- * record is never shadowed by one that only LOOKS newer.
+ * resulting inconsistent comparator can leave a corrupt record ahead of a
+ * valid newer one — hiding the record that actually describes the live
+ * transport. A far-future `updatedAt` (clock skew, or an untrusted/forged
+ * record) is a second corruption mode: it parses to a real, large finite
+ * number, so a plain freshest-wins comparison would rank it ahead of a
+ * genuinely current record — the exact defect `isHeartbeatStale` already
+ * treats as stale (issue #425 review, round 5). Both corruption modes —
+ * unparseable and implausibly-future — sort as oldest, so a valid current
+ * record is never shadowed by one that only LOOKS newer (a corrupt record
+ * still surfaces if it is all we have, and `isHeartbeatStale` independently
+ * treats it as stale).
  */
 function representativeFreshness(
   heartbeat: TransportHeartbeat,
@@ -638,7 +627,11 @@ function selectHeartbeats(
     );
     const pool =
       activeLeadMatches.length > 0 ? activeLeadMatches : sameWorkspace;
-    return [...pool].sort((a, b) => freshness(b) - freshness(a));
+    return [...pool].sort(
+      (a, b) =>
+        representativeFreshness(b, input.now) -
+        representativeFreshness(a, input.now),
+    );
   }
 
   const sessionMatches = candidates.filter(
@@ -652,7 +645,11 @@ function selectHeartbeats(
   // Hiding it entirely would lose a real fact; counting it would be the false
   // clean bill of health.
   const pool = sessionMatches.length > 0 ? sessionMatches : sameWorkspace;
-  return [...pool].sort((a, b) => freshness(b) - freshness(a));
+  return [...pool].sort(
+    (a, b) =>
+      representativeFreshness(b, input.now) -
+      representativeFreshness(a, input.now),
+  );
 }
 
 /**
@@ -1040,14 +1037,14 @@ function buildVerdict(
     // remediation for a problem that has nothing to do with the transport.
     const anyConfigured = transports.some((transport) => transport.configured);
     const base = anyConfigured
-      ? 'delivery to THIS session → via none: there is no live session for this workspace — a transport has reported in previously, but no lead session is currently open for it to deliver to.'
-      : 'delivery to THIS session → via none (no lead session is registered for this workspace; no transport has reported in).';
+      ? 'delivery to active sessions in this workspace → via none: there is no live session for this workspace — a transport has reported in previously, but no lead session is currently open for it to deliver to.'
+      : 'delivery to active sessions in this workspace → via none (no lead session is registered for this workspace; no transport has reported in).';
     return `${base}${mutedClause}`;
   }
   if (reach === 'none') {
-    return `delivery to THIS session → via none: no delivery transport is listening for this workspace.${mutedClause}`;
+    return `delivery to active sessions in this workspace → via none: no delivery transport is listening for this workspace.${mutedClause}`;
   }
-  const base = `delivery to THIS session → via ${reach}`;
+  const base = `delivery to active sessions in this workspace → via ${reach}`;
   if (!input.daemonRunning) {
     return `${base}, but NOT deliverable: the daemon for this workspace is not running.`;
   }

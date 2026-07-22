@@ -29,6 +29,7 @@ import {
 } from '../transport-heartbeat.js';
 import {
   computeTransportHealth,
+  disqualifiesFromListening,
   isSharedProblem,
   type DeliveryTransportHealth,
   type TransportStatus,
@@ -425,11 +426,8 @@ function transportChecks(
     // daemon or muted reminders, which the `delivery-verdict` check below
     // reports once instead of repeating them on every row as if they were
     // independent failures.
-    const blocking = transport.problems.filter(
-      (problem) =>
-        problem.code !== 'channel-registration-unverified' &&
-        problem.code !== 'version-skew' &&
-        !isSharedProblem(problem.code),
+    const blocking = transport.problems.filter((problem) =>
+      disqualifiesFromListening(problem.code),
     );
 
     if (blocking.length === 0) {
@@ -681,19 +679,30 @@ export async function gatherDeliveryDiagnoses(
   leadSessions: readonly AgentSessionRecord[],
   socketPath: string,
 ): Promise<DeliveryDiagnosisResult> {
-  const diagnoses: HookDeliveryDiagnosis[] = [];
   const unavailableSessionIds = new Set<string>();
-  for (const session of leadSessions) {
-    for (const lifecycle of ['turn-interruptible', 'turn-idle'] as const) {
+  const pairs = leadSessions.flatMap((session) =>
+    (['turn-interruptible', 'turn-idle'] as const).map((lifecycle) => ({
+      session,
+      lifecycle,
+    })),
+  );
+  const results = await Promise.all(
+    pairs.map(async ({ session, lifecycle }) => {
       try {
-        diagnoses.push(
-          await diagnoseHookDeliveryClient(session.id, lifecycle, socketPath),
+        return await diagnoseHookDeliveryClient(
+          session.id,
+          lifecycle,
+          socketPath,
         );
       } catch {
         unavailableSessionIds.add(session.id);
+        return undefined;
       }
-    }
-  }
+    }),
+  );
+  const diagnoses = results.filter(
+    (diagnosis): diagnosis is HookDeliveryDiagnosis => diagnosis !== undefined,
+  );
   return { diagnoses, unavailableSessionIds: [...unavailableSessionIds] };
 }
 

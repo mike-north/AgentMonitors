@@ -1667,7 +1667,7 @@ ad-hoc stitching of `daemon status`, `monitor explain`, `events list`, and `sess
 It runs a named sequence of checks for the current workspace and prints a per-monitor rollup.
 
 As of issue #425 it also answers a second question the checks above cannot: **"what is the listening
-method for this session, and is it healthy right now?"** — see "Delivery transports" below.
+method for this workspace, and is it healthy right now?"** — see "Delivery transports" below.
 
 **`doctor` diagnoses only — it never mutates state.** There is no `--fix` (a later issue may add
 remediation). It does **not** check host-plugin installation (whether the Claude Code plugin is
@@ -1831,11 +1831,14 @@ blocking made `doctor` exit non-zero for up to a day after every single upgrade,
 outcome issue #373 exists to prevent, and it directly contradicted the hook remediation's own "No
 action needed" wording.
 
-The section closes with a single verdict line: `delivery to THIS session → via {hook | channel |
-both | none}`, plus whether it is deliverable **right now**. Those are deliberately two different
-answers: a transport whose reminders are currently suppressed is still the listening _method_, but
-nothing will actually arrive — reporting only the method is what let a real CI failure go
-undelivered while every surface looked green.
+The section closes with a single verdict line: `delivery to active sessions in this workspace → via
+{hook | channel | both | none}`, plus whether it is deliverable **right now**. The verdict is
+scoped to the workspace, not to the invoking session specifically — `doctor` has no per-session
+attribution, only the workspace-wide picture the transport registry and lead session give it.
+Deliverability and listening method are also deliberately two different answers: a transport whose
+reminders are currently suppressed is still the listening _method_, but nothing will actually
+arrive — reporting only the method is what let a real CI failure go undelivered while every surface
+looked green.
 
 **Exit code.** A `transport:<name>` check is `fail` only for a transport that DID report in, is
 genuinely broken (misbound, stale — advisory codes never count), **and a lead session is currently

@@ -403,14 +403,14 @@ for reading back its persisted state.
 ### First: is anything still listening?
 
 `verify` proves delivery works **once**, at setup time. It does not stay true. Before digging into
-a specific monitor, check whether a delivery transport is still listening for this session at all:
+a specific monitor, check whether a delivery transport is still listening for this workspace at all:
 
 ```bash
 agentmonitors doctor
 ```
 
 Read the **Delivery transports** section and its verdict line
-(`delivery to THIS session → via {hook | channel | both | none}`). It names the listening method
+(`delivery to active sessions in this workspace → via {hook | channel | both | none}`). It names the listening method
 and, when delivery is currently blocked, which of these it is — each with its own fix:
 
 - **`daemon-unreachable`** — there is no daemon for this workspace (it was reaped, or never

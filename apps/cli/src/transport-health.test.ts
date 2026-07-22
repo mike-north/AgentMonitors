@@ -121,7 +121,9 @@ describe('computeTransportHealth', () => {
 
       expect(health.deliveryWillReachThisSession).toBe('both');
       expect(health.deliverable).toBe(true);
-      expect(health.verdict).toContain('delivery to THIS session → via both');
+      expect(health.verdict).toContain(
+        'delivery to active sessions in this workspace → via both',
+      );
       expect(health.verdict).toContain('healthy');
       expect(find(health.transports, 'hook').healthy).toBe(true);
       expect(find(health.transports, 'channel').healthy).toBe(true);

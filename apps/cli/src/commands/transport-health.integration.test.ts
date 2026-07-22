@@ -406,7 +406,9 @@ This monitor fires on a schedule.
       );
 
       expect(result.stdout).toContain('hook: running');
-      expect(result.stdout).toContain('delivery to THIS session → via hook');
+      expect(result.stdout).toContain(
+        'delivery to active sessions in this workspace → via hook',
+      );
       expect(result.stdout).toContain('✓ transport:hook');
       expect(result.stdout).not.toContain('[daemon-unreachable]');
       expect(result.stdout).not.toContain('[workspace-mismatch]');
@@ -776,7 +778,9 @@ This monitor fires on a schedule.
       // The misbound channel is excluded from the listening method; the hook
       // transport is still the one that would reach this session.
       expect(payload.deliveryWillReachThisSession).toBe('hook');
-      expect(payload.verdict).toContain('delivery to THIS session');
+      expect(payload.verdict).toContain(
+        'delivery to active sessions in this workspace',
+      );
       expect(payload.remediation.length).toBeGreaterThan(0);
       // `pipelineProblems` is present even when empty: an absent key would be
       // indistinguishable from "nothing was checked".
@@ -832,7 +836,9 @@ This monitor fires on a schedule.
         fixture.env,
         fixture.dir,
       );
-      expect(before.stdout).toContain('delivery to THIS session → via hook');
+      expect(before.stdout).toContain(
+        'delivery to active sessions in this workspace → via hook',
+      );
       expect(before.exitCode).toBe(0);
 
       const closed = runWithEnv(
@@ -856,7 +862,7 @@ This monitor fires on a schedule.
       expect(result.stdout).toContain('hook: running');
       expect(result.stdout).toContain('via none');
       expect(result.stdout).not.toContain(
-        'delivery to THIS session → via hook',
+        'delivery to active sessions in this workspace → via hook',
       );
       expect(result.stdout).toContain('no live session');
       // A closed session is the ordinary "nothing is open right now" idle
