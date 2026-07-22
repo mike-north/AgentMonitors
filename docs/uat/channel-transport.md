@@ -233,7 +233,8 @@ identical mechanism that delivers this repo's own `agentmonitors` monitors into 
 </channel>
 ```
 
-Note the `event_id` — you need it for step 11 (or omit it there to ack all unread).
+Note the `event_id` — you need it for step 11 (or omit it there to ack all unread except any
+rows still leased by an in-flight delivery push).
 
 **Failure mode:** nothing arrives 30s past the event's `createdAt` from step 7 (ten polls). First
 re-check step 7's `events list` output — if the event is not even `unread` there, this is a
@@ -272,7 +273,8 @@ reappearing) is a dedup regression — capture the full JSON output and `agentmo
 explain watch-file --dir .claude/monitors --format text` before filing.
 
 **11. Acknowledge via the in-session tool.** Ask Claude to call the `agentmon_ack` tool with the
-`event_id` from step 8 (or with no arguments, to acknowledge all unread):
+`event_id` from step 8 (or with no arguments, to acknowledge all unread except any rows still
+leased by an in-flight delivery push):
 
 > Call `agentmon_ack` with `event_ids: ["<event_id from step 8>"]`.
 

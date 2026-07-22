@@ -72,4 +72,19 @@ describe('buildAckResultText', () => {
       'Requested acknowledgement of 0 event(s); ids not projected to this session are ignored.',
     );
   });
+
+  // Parity guard for PR #445 review round 13 (discussion_r3624690058): the
+  // shipped tool result, the advertised tool description, and the input-schema
+  // hint for the omitted-ID path all describe the SAME leased-row exception in
+  // separate strings. They must not drift so that one surface keeps promising
+  // an unconditional "all unread" ack while another correctly carves out
+  // leased rows.
+  it('states the leased-row exception consistently across the tool result, description, and schema', () => {
+    const LEASED_EXCEPTION = 'leased by an in-flight delivery';
+    expect(buildAckResultText(undefined)).toContain(LEASED_EXCEPTION);
+    expect(ACK_TOOL.description).toContain(LEASED_EXCEPTION);
+    expect(ACK_TOOL.inputSchema.properties.event_ids.description).toContain(
+      'leased by an in-flight delivery',
+    );
+  });
 });
