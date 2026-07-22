@@ -15,6 +15,7 @@ import {
   acknowledgeEventsClient,
   commitDeliveryClient,
   openSessionClient,
+  previewCoalescedReminderClient,
   previewSettledHighDeliveryClient,
   releaseDeliveryClient,
   reserveDeliveryClient,
@@ -164,6 +165,15 @@ export type ChannelDeliveryOutcome =
 const MAX_CHANNEL_RESERVE_ATTEMPTS = 3;
 
 /**
+ * How much channel `content` room to reserve for a coalesced normal-urgency
+ * reminder (issue #441 cross-monitor coalescing; PR #456 review finding 4) —
+ * mirrors `hook.ts`'s identical `reminderFooterLength`. See its doc comment.
+ */
+function reminderFooterLength(reminder: string | undefined): number {
+  return reminder ? reminder.length + 2 : 0;
+}
+
+/**
  * Reserve a `turn-interruptible` delivery sized to fit under the channel's
  * content ceiling, tolerating the preview↔reserve race (006 §5.5, issue #442).
  *
@@ -254,10 +264,11 @@ export async function reserveSizedChannelDelivery(
   let forcedCap: number | undefined;
   for (let attempt = 1; attempt <= MAX_CHANNEL_RESERVE_ATTEMPTS; attempt++) {
     const isLastAttempt = attempt === MAX_CHANNEL_RESERVE_ATTEMPTS;
-    const highPreview = await previewSettledHighDeliveryClient(
-      boundSession,
-      socketPath,
-    );
+    const [highPreview, coalescedReminder] = await Promise.all([
+      previewSettledHighDeliveryClient(boundSession, socketPath),
+      previewCoalescedReminderClient(boundSession, socketPath),
+    ]);
+    const reminderReserve = reminderFooterLength(coalescedReminder);
 
     let maxEvents: number | undefined;
     let moreDeferred = false;
@@ -269,7 +280,10 @@ export async function reserveSizedChannelDelivery(
       maxEvents = 1;
       moreDeferred = highPreview.length > 1;
     } else if (highPreview.length > 0) {
-      let fit = packChannelEventsUnderCap(highPreview);
+      let fit = packChannelEventsUnderCap(
+        highPreview,
+        MAX_CHANNEL_CONTENT - reminderReserve,
+      );
       if (forcedCap !== undefined) fit = Math.min(fit, forcedCap);
       fit = Math.max(1, fit);
       maxEvents = fit;
@@ -318,10 +332,17 @@ export async function reserveSizedChannelDelivery(
     // alone (no `moreDeferred` awareness) let such a claim through, so
     // `renderChannelEvent` silently dropped a committed block while
     // `meta.event_count` still reported the full committed count.
+    // Reserve room for the ACTUAL claim's own coalesced reminder (issue #441,
+    // PR #456 review finding 4) — reading it off `reservation.claim` (not the
+    // earlier preview) is exact and immune to the preview↔reserve
+    // substitution race the rest of this function guards against.
+    const claimCap =
+      MAX_CHANNEL_CONTENT -
+      reminderFooterLength(reservation.claim.coalescedReminder);
     const fit = resolveChannelClaimFit(
       reservation.claim.events,
       moreDeferred,
-      MAX_CHANNEL_CONTENT,
+      claimCap,
     );
     if (fit.fits) {
       // Re-check for the candidate-set-growth race (issue #442, PR #442
@@ -365,7 +386,7 @@ export async function reserveSizedChannelDelivery(
       const finalFit = resolveChannelClaimFit(
         reservation.claim.events,
         true,
-        MAX_CHANNEL_CONTENT,
+        claimCap,
       );
       if (finalFit.fits) {
         return { reservation, moreDeferred: true };

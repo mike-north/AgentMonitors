@@ -372,6 +372,12 @@ export interface RenderChannelEventOptions {
  * bounded inside
  * {@link buildEventBlock} (006 §4.6, currently 800 chars each), so no single
  * untrusted diff is dumped wholesale regardless of packing.
+ *
+ * When `claim.coalescedReminder` is set (issue #441 cross-monitor coalescing:
+ * a due normal-urgency reminder was folded into this settled-high batch), its
+ * text is appended as a sanitized, cap-reserved footer after the packed event
+ * blocks — mirroring `renderHookDelivery`'s identical handling (PR #456 review
+ * finding 2).
  */
 export function renderChannelEvent(
   claim: DeliveryClaim,
@@ -393,19 +399,39 @@ export function renderChannelEvent(
     const blocks = claim.events.map((event) =>
       buildEventBlock(event, contentValue),
     );
+    // A coalesced normal-urgency reminder (issue #441, PR #456 review finding
+    // 2): reserved BEFORE packing event blocks (not appended after) so its own
+    // length never pushes the render over `MAX_CHANNEL_CONTENT`. Mirrors
+    // `renderHookDelivery`'s identical footer — see its doc comment for why
+    // this is required at all (`claim.events`/`claim.message` carry no
+    // representation of the coalesced reminder on their own, yet
+    // `claimDelivery` claims the coalesced normal rows alongside the surfaced
+    // high events). Per #445's wording contract (002 §9.2 / 006 §5.1.1) the
+    // runtime emits ONLY the transport-neutral reminder body; this transport
+    // appends its OWN acknowledge step ({@link buildChannelReminderActionStep},
+    // pointing at the `agentmon_ack` MCP tool — never the hook's CLI ack verb),
+    // exactly as the reminder-only branch below does, so the coalesced reminder
+    // is self-sufficient and actionable on the channel surface too.
+    const reminderFooter = claim.coalescedReminder
+      ? `\n\n${contentValue(claim.coalescedReminder)}${buildChannelReminderActionStep(
+          claim.sessionId,
+          options.socketPath,
+        )}`
+      : '';
+    const effectiveCap = MAX_CHANNEL_CONTENT - reminderFooter.length;
     const fit = resolveChannelClaimFit(
       claim.events,
       moreDeferred,
-      MAX_CHANNEL_CONTENT,
+      effectiveCap,
     );
     if (fit.whole.includedCount === blocks.length && !moreDeferred) {
       // Every claimed block fits and nothing was deferred → no marker.
-      content = fit.whole.text;
+      content = fit.whole.text + reminderFooter;
     } else if (fit.reserved.includedCount >= 1) {
       // A marker is needed (some claimed blocks did not fit here, and/or the
       // caller deferred more): repack reserving marker room so no INCLUDED
       // block is cut.
-      content = fit.reserved.text + CHANNEL_DEFERRED_MARKER;
+      content = fit.reserved.text + CHANNEL_DEFERRED_MARKER + reminderFooter;
     } else {
       // Even the first block alone exceeds (cap − marker): mid-truncate it
       // at a code-point boundary. This is the ONLY case a durable event is
@@ -446,7 +472,9 @@ export function renderChannelEvent(
       const marker = moreDeferred
         ? truncatedMarker + CHANNEL_DEFERRED_MARKER
         : truncatedMarker;
-      content = appendMarkerWithinCap(firstBlock, MAX_CHANNEL_CONTENT, marker);
+      content =
+        appendMarkerWithinCap(firstBlock, effectiveCap, marker) +
+        reminderFooter;
     }
   } else {
     // Reminder claim (`normal`/`low`, no events): the runtime's semantic
@@ -478,8 +506,21 @@ export function renderChannelEvent(
   // packing, that is always exactly `claim.events.length`, so the count
   // genuinely equals the surfaced set even when some settled-high events were
   // deferred to a later poll.
-  const eventCount =
-    claim.events.length > 0 ? claim.events.length : claim.unreadCounts.total;
+  //
+  // Coalesced case (issue #441, PR #456 review): when `claim.coalescedReminder`
+  // is set, the claimed set is `events` (the surfaced high events) PLUS the
+  // folded-in normal rows the reminder refers to (`coalescedNormalCount`) —
+  // `claimDelivery` claims both. Reporting `events.length` alone would
+  // under-report the claimed set and invite a scoped ack (via the event_id
+  // values in `event_count`'s neighboring meta) that leaves the coalesced
+  // normal rows claimed-but-unacknowledged, durably muting the session's
+  // normal reminders (`service.ts`'s `normalPending.length ===
+  // unreadNormal.length` gate never re-fires until they're acked).
+  const eventCount = claim.coalescedReminder
+    ? claim.events.length + (claim.coalescedNormalCount ?? 0)
+    : claim.events.length > 0
+      ? claim.events.length
+      : claim.unreadCounts.total;
 
   const meta: Record<string, string> = {
     lifecycle: claim.lifecycle,
@@ -489,9 +530,13 @@ export function renderChannelEvent(
   if (claim.urgency) {
     meta['urgency'] = claim.urgency;
   }
-  // Per-event routing only makes sense for a single concrete event; a coalesced
-  // claim is summarized at the claim level.
-  if (claim.events.length === 1) {
+  // Per-event routing only makes sense for a single concrete event that is
+  // ALSO the claim's entire claimed set — a coalesced claim (even one with
+  // exactly one high event) always claims additional normal rows alongside
+  // it, so it is summarized at the claim level, never routed to that one
+  // event's own monitor_id/event_id (issue #441, PR #456 review: a scoped ack
+  // built from a single-event's ids would leave the coalesced rows unacked).
+  if (claim.events.length === 1 && !claim.coalescedReminder) {
     const event = claim.events[0];
     if (event) {
       meta['monitor_id'] = event.monitorId;

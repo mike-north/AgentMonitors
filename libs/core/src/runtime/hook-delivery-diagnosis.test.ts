@@ -18,6 +18,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  classifyCoalescingWithheldHold,
   classifyReminderHold,
   classifySettleWindowHold,
 } from './hook-delivery-diagnosis.js';
@@ -170,5 +171,50 @@ describe('classifySettleWindowHold', () => {
     const hold = classifySettleWindowHold([newer, older], 2, NOW, SETTLE_MS);
     expect(hold?.settleRemainingMs).toBe(7_000);
     expect(hold?.pendingCount).toBe(2);
+  });
+});
+
+// Issue #441 cross-monitor coalescing (PR #456 review findings 1 & 3):
+// `decideDelivery` now withholds a fully-due normal reminder while a
+// concurrent high-urgency event is pending but unsettled, so it can coalesce
+// into that delivery once it settles instead of firing standalone first.
+describe('classifyCoalescingWithheldHold', () => {
+  it('reports a `settle-window` hold on the normal band when the reminder is fully due but high-urgency work is pending and unsettled', () => {
+    const hold = classifyCoalescingWithheldHold(1, 1, 1, 0);
+    expect(hold).toMatchObject({
+      urgency: 'normal',
+      reason: 'settle-window',
+      unreadCount: 1,
+      pendingCount: 1,
+    });
+    expect(hold?.message).toContain('settle window');
+    expect(hold?.message).toContain('coalesced');
+  });
+
+  it('reports no hold when there is no pending high-urgency work (the reminder fires standalone)', () => {
+    expect(classifyCoalescingWithheldHold(1, 1, 0, 0)).toBeNull();
+  });
+
+  it('reports no hold once high-urgency work has settled (it coalesces the reminder instead of withholding it)', () => {
+    expect(classifyCoalescingWithheldHold(1, 1, 1, 1)).toBeNull();
+  });
+
+  it('reports no hold when the reminder is not otherwise fully due (a claimed row already blocks it — classifyReminderHold explains that case)', () => {
+    // unread=2, pending=1: some claimed. classifyCoalescingWithheldHold defers
+    // to classifyReminderHold's coalesced-until-ack for this shape.
+    expect(classifyCoalescingWithheldHold(2, 1, 1, 0)).toBeNull();
+  });
+
+  it('reports no hold when the reminder’s only unread row is leased (pending < unread) — defers to classifyReminderHold’s reserved-in-flight (issue #441 × #300)', () => {
+    // unread=1, pending=0 (the single unread normal row is lease-excluded from
+    // `pendingForClaim`), pendingHigh=1, settledHigh=0. reminderDue is false
+    // (0 ≠ 1), so this classifier returns null and the lease is diagnosed by
+    // classifyReminderHold as reserved-in-flight instead — matching
+    // `decideDelivery`, which does not coalesce a leased normal row.
+    expect(classifyCoalescingWithheldHold(1, 0, 1, 0)).toBeNull();
+  });
+
+  it('reports no hold when there is no unread normal work at all', () => {
+    expect(classifyCoalescingWithheldHold(0, 0, 1, 0)).toBeNull();
   });
 });

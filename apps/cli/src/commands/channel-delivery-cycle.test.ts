@@ -24,6 +24,7 @@ vi.mock('../runtime-client.js', () => ({
   reserveDeliveryClient: vi.fn(),
   commitDeliveryClient: vi.fn(),
   releaseDeliveryClient: vi.fn(),
+  previewCoalescedReminderClient: vi.fn(),
   previewSettledHighDeliveryClient: vi.fn(),
 }));
 
@@ -42,6 +43,7 @@ import {
   reserveDeliveryClient,
   commitDeliveryClient,
   releaseDeliveryClient,
+  previewCoalescedReminderClient,
   previewSettledHighDeliveryClient,
 } from '../runtime-client.js';
 
@@ -49,6 +51,7 @@ const reserveMock = vi.mocked(reserveDeliveryClient);
 const commitMock = vi.mocked(commitDeliveryClient);
 const releaseMock = vi.mocked(releaseDeliveryClient);
 const previewMock = vi.mocked(previewSettledHighDeliveryClient);
+const previewReminderMock = vi.mocked(previewCoalescedReminderClient);
 
 const CLAIM: DeliveryClaim = {
   sessionId: 'session-1',
@@ -90,6 +93,8 @@ beforeEach(() => {
   // omitted, matching this file's pre-existing reservations/claims.
   previewMock.mockReset();
   previewMock.mockResolvedValue([]);
+  previewReminderMock.mockReset();
+  previewReminderMock.mockResolvedValue(undefined);
 });
 
 describe('runChannelDeliveryCycle branching (issue #300)', () => {

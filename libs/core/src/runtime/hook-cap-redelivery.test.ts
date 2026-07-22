@@ -136,6 +136,68 @@ describe('capped high-urgency claim + preview (issue #299)', () => {
     expect(h.store.pendingEventsForSession(session, 'high')).toHaveLength(3);
   });
 
+  // Issue #441 cross-monitor coalescing (PR #456 review finding 4):
+  // `previewCoalescedReminder` must agree byte-for-byte with the eventual
+  // claim's `coalescedReminder`, so a length-bounded transport can reserve
+  // room for it BEFORE sizing how many event blocks fit.
+  it('previewCoalescedReminder agrees with the eventual claim, and previewing claims nothing', () => {
+    const h = setup();
+    const session = openLead(h, 'sess-preview-reminder');
+    materializeHigh(h, 'mon-a', 'a', 'body A');
+    h.store.insertEvent({
+      workspacePath: h.workspace,
+      monitorId: 'mon-normal',
+      sourceName: 'manual',
+      urgency: 'normal',
+      title: 'Normal fired',
+      body: 'normal-body',
+      summary: 'normal-body',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey: 'normal-obj',
+      queryScope: {},
+      tags: [],
+      createdAt: nextTime(),
+    });
+
+    const previewed = h.runtime.previewCoalescedReminder(session);
+    expect(previewed).toBe('Monitored changes are pending.');
+
+    // Previewing claims nothing — the high event is still pending, and so is
+    // the normal event (a real claim then coalesces both).
+    expect(h.store.pendingEventsForSession(session, 'high')).toHaveLength(1);
+    expect(h.store.pendingEventsForSession(session, 'normal')).toHaveLength(1);
+
+    const claim = h.runtime.claimDelivery(session, 'turn-interruptible');
+    expect(claim?.coalescedReminder).toBe(previewed);
+  });
+
+  it('previewCoalescedReminder returns undefined when no settled high-urgency work is pending to coalesce into', () => {
+    const h = setup();
+    const session = openLead(h, 'sess-no-high');
+    h.store.insertEvent({
+      workspacePath: h.workspace,
+      monitorId: 'mon-normal',
+      sourceName: 'manual',
+      urgency: 'normal',
+      title: 'Normal fired',
+      body: 'normal-body',
+      summary: 'normal-body',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey: 'normal-obj',
+      queryScope: {},
+      tags: [],
+      createdAt: nextTime(),
+    });
+
+    expect(h.runtime.previewCoalescedReminder(session)).toBeUndefined();
+  });
+
   it('claims ONLY the capped subset; the deferred remainder re-delivers at the next claim', () => {
     const h = setup();
     const session = openLead(h, 'sess-cap');

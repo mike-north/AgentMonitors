@@ -48,6 +48,7 @@ vi.mock('../runtime-client.js', () => ({
   diagnoseHookDeliveryClient: vi.fn(),
   listSessionsClient: vi.fn(),
   openSessionClient: vi.fn(),
+  previewCoalescedReminderClient: vi.fn().mockResolvedValue(undefined),
   previewSettledHighDeliveryClient: vi.fn(),
   releaseDeliveryClient: vi.fn(),
   reserveDeliveryClient: vi.fn(),

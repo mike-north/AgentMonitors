@@ -524,6 +524,35 @@ existing `sessionsForWorkspace(null)` projection path. Project-level monitors ar
 definition → N workspace-scoped instances) is tracked in issue #258 and is out of scope for
 this release.
 
+### 6.2 Overlapping monitors multiply interrupts (authoring anti-pattern, issue #441)
+
+Two monitors that watch **overlapping** underlying state — the same command's output filtered two
+different ways, or two queries over the same collection (e.g. "PRs with a ready-to-merge label" and
+"all open PRs") — turn ONE real-world change into multiple deliveries. The runtime coalesces
+events **within** a monitor (§4 of [002](./002-runtime-delivery.md#4-notify-dispatch)) and, as of
+issue #441, coalesces a due normal-urgency reminder into the same `turn-interruptible` delivery as a
+settled high-urgency batch when both are due in the same call
+([002 §9.1.1](./002-runtime-delivery.md#911-cross-monitor-coalescing-window-issue-441)).
+It does **not**, and cannot, collapse two independently-authored monitor definitions into one — each
+monitor still materializes its own `monitor_events` row for the same underlying change, so a session
+still receives N separate pieces of durable state (even where delivery coalescing reduces how many
+of those pieces interrupt in the same turn).
+
+**Author one monitor whose body branches on what changed, rather than two monitors that each cover
+part of the same state.** Concretely:
+
+- If the same underlying signal should produce different guidance depending on a property of the
+  observed object (e.g. "if labeled ready-to-merge, do X; otherwise, if it needs review, do Y"),
+  author ONE monitor over the full set with a body that branches, not two monitors over disjoint-in-
+  intent-but-overlapping-in-practice subsets.
+- If two monitors genuinely need different urgencies or cadences (the usual reason to split), scope
+  their queries/filters to be **disjoint** — e.g. the normal-urgency monitor's filter explicitly
+  excludes what the high-urgency monitor already covers — so a single underlying change is observed
+  by exactly one of them, not both.
+- This is a manual authoring discipline today; `agentmonitors validate` does not yet detect
+  overlapping monitors (a `command-poll`-argv-prefix heuristic is a plausible future check, not yet
+  implemented — see the `setup-monitors` skill's authoring guidance for the same anti-pattern).
+
 ## 7. Authoring Examples
 
 ### 7.1 File mutation monitor

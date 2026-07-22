@@ -58,6 +58,7 @@ const daemonMethodSchema = z.enum([
   'hook.commit',
   'hook.release',
   'hook.preview',
+  'hook.previewReminder',
   'hook.diagnose',
   'history.list',
   'monitor.explain',
@@ -797,6 +798,12 @@ function handleRequest(
       return Promise.resolve(
         runtime.previewSettledHighDelivery(params.sessionId),
       );
+    }
+    case 'hook.previewReminder': {
+      const params = hookPreviewParamsSchema.parse(request.params);
+      return Promise.resolve({
+        reminder: runtime.previewCoalescedReminder(params.sessionId) ?? null,
+      });
     }
     case 'hook.diagnose': {
       const params = hookDiagnoseParamsSchema.parse(request.params);

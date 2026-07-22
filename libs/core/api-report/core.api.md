@@ -39,6 +39,7 @@ export class AgentMonitorRuntime {
     listSessions(): AgentSessionRecord[];
     // (undocumented)
     openSession(input: OpenSessionInput): AgentSessionRecord;
+    previewCoalescedReminder(sessionId: string): string | undefined;
     previewSettledHighDelivery(sessionId: string): DeliveryEventSummary[];
     // (undocumented)
     refreshHookState(sessionId: string): SessionHookState;
@@ -208,6 +209,8 @@ export function defaultNotifyConfigForUrgency(urgency: Urgency, notify?: NotifyC
 
 // @public (undocumented)
 export interface DeliveryClaim {
+    coalescedNormalCount?: number;
+    coalescedReminder?: string;
     // (undocumented)
     events: DeliveryEventSummary[];
     // (undocumented)

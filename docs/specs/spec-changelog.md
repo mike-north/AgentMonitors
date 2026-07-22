@@ -9,6 +9,22 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-07-22 — Channel `event_count`/`monitor_id`/`event_id` meta corrected for cross-monitor-coalesced claims (006 §4.2) — Refs #441, #456
+
+For a `DeliveryClaim` with `coalescedReminder` set (issue #441 cross-monitor coalescing), the channel
+renderer's single-event routing branch (`claim.events.length === 1`) previously still fired,
+reporting `monitor_id`/`event_id` for that one surfaced high event and an `event_count` of `1` —
+under-reporting the actual claimed set, which also includes the coalesced normal-urgency rows
+`claimDelivery` claims alongside it. An MCP consumer following the "call `agentmon_ack` with their
+`event_id` values" contract would scope its ack to that single event, leaving the coalesced normal
+rows claimed-but-unacknowledged and durably muting the session's normal reminders (002 §9.2's
+`normalPending.length === unreadNormal.length` gate never re-fires while they sit claimed). A new
+`DeliveryClaim.coalescedNormalCount` field records how many normal rows were folded in; the channel
+renderer now gates per-event routing on `claim.events.length === 1 && !claim.coalescedReminder`, and
+reports `event_count` as `events.length + coalescedNormalCount` whenever `coalescedReminder` is
+present. The hook-deliver transport has no equivalent meta/debug surface, so the same trap does not
+exist there. §4.2's meta table now documents both corrections.
+
 ## 2026-07-22 — The leased-row ack exception now derives from one exported constant across all four surfaces (006 §4.3) — Refs #438, #434, PR #445 review round 14
 
 Round 13 (below) made the ack tool result text, `ACK_TOOL`'s description, and its `event_ids` schema
@@ -345,6 +361,68 @@ failure):
   out-of-tolerance-future timestamps both sorting as oldest) from problem aggregation (unchanged: every
   matching record's problems are still unioned regardless of which one is chosen as representative), so
   a broken sibling's problems are never hidden either way.
+
+## 2026-07-21 — Cross-monitor coalescing hardening: withhold a due normal reminder until concurrent high-urgency work settles, and surface the coalesced reminder to bounded transports (002 §9.1.1) — Refs #441
+
+PR #456 review found the first #441 fix (below) still preserved the two-interrupt failure and
+introduced a claimed-but-unrendered gap:
+
+1. **Preempt-then-preempt-again, not fixed.** With a settled-high batch and a due normal reminder
+   created TOGETHER, an immediate `turn-interruptible` call reached the normal-alone branch (because
+   `settledHigh` was still empty — the high event had not aged past its 15s settle window yet),
+   firing the reminder standalone; a LATER call then delivered the high batch separately — the exact
+   two-interrupt failure #441 set out to fix, just reordered. Fixed: `decideDelivery` now withholds
+   a fully-due normal reminder whenever ANY high-urgency work is pending (settled or not), so it
+   fires standalone only once no high-urgency work is pending at all — otherwise it waits and
+   coalesces into the settled-high delivery once that work settles, in the SAME call.
+2. **Claimed but never rendered (006 §5.5 violation).** `applyDelivery` claimed the coalesced normal
+   rows alongside the surfaced high events, but both bounded transports (hook-deliver, channel) only
+   ever rendered `events`/`message` — and neither consults `message` once `events` is non-empty — so
+   the coalesced reminder text was claimed but never surfaced anywhere. Fixed: `DeliveryClaim` gained
+   an optional `coalescedReminder: string` field, populated only when a reminder was folded in; both
+   `renderHookDelivery` and `renderChannelEvent` render it as a cap-reserved footer after the packed
+   event block(s).
+3. **Sizing couldn't see the coalesced reminder.** A length-bounded transport previously sized how
+   many event blocks fit purely from `previewSettledHighDelivery`, with no way to reserve room for a
+   reminder appended afterward — risking either an over-cap render or a truncated-away reminder
+   (another claimed-but-unrendered case). Fixed: added `previewCoalescedReminder` (core) /
+   `previewCoalescedReminderClient` (CLI), which both `hook.ts` and `channel.ts` now call alongside
+   the settled-high preview to reserve footer room before sizing, and the post-reservation fit checks
+   size against the ACTUAL claim's `coalescedReminder` (not the earlier preview) for exactness.
+4. **Stale diagnosis precedence.** `diagnoseHookDelivery` unconditionally skipped its normal-reminder
+   hold check whenever settled high-urgency work existed, on the assumption settled-high always
+   preempts the reminder — true only when the reminder is otherwise fully due (it then coalesces).
+   It is false whenever the coalesced-until-ack guard (#333) is ALREADY blocking the reminder on its
+   own, independent of any concurrent high-urgency work — that genuine hold went unreported. Fixed:
+   the ordinary `already-claimed`/`coalesced-until-ack` check (`classifyReminderHold`) is now always
+   evaluated, and a new `classifyCoalescingWithheldHold` reports the settle-window-withheld case (item
+   1 above) as its own `settle-window`-reasoned hold on the `normal` band.
+
+Also fixed the two Copilot-flagged doc issues from the same review: 001 §6.2's cross-reference now
+points at 002 §9.1.1 (not §9.1), and §9.1.1 no longer claims "one channel tag / hook injection,
+listing both" as if `events`/`message` alone conveyed the coalesced reminder — it now documents the
+dedicated `coalescedReminder` field bounded transports must render explicitly.
+
+## 2026-07-19 — Cross-monitor delivery coalescing: a due normal reminder folds into a concurrent settled-high delivery instead of a separate later interrupt (002 §9.1.1) — Refs #441
+
+Two monitors watching overlapping state (a high-urgency label monitor and a normal-urgency
+review-queue monitor both firing off the same underlying change) previously interrupted a session
+TWICE for one action: `decideDelivery`'s `turn-interruptible` branch always returned early once a
+settled high-urgency batch was found, leaving a simultaneously-due normal reminder for a SEPARATE,
+later `claimDelivery` call — one interrupt, one ack, then a second interrupt, then a second ack, for
+work the session had already handled. Added 002 §9.1.1: when both a settled high batch and a due
+normal reminder are decided in the SAME call, they are folded into ONE `DeliveryClaim` — the
+`events` array and top-level `urgency: 'high'` are unchanged from a pure high delivery (never
+downgraded), the normal reminder's text is appended to the message (never escalated into per-event
+detail), and both event sets are claimed together so there is no leftover second interrupt. Also
+added 001 §6.2 and the `setup-monitors` skill's authoring guidance: the runtime cannot coalesce two
+_independently-authored_ monitor definitions into one, so overlapping monitors should be merged into
+one branching monitor or scoped disjointly by the author.
+
+Deliberately out of scope for this change (see the #441 decision-brief comment on the issue for the
+full writeup): the ack-race closure (an ack-all sweep racing a sibling monitor's event materializing
+one tick later) and self-caused-event suppression — both are three-state-model / attribution
+decisions reserved for Mike, not mechanical fixes.
 
 ## 2026-07-21 — Preserve BOTH object identity and the Interpret digest in a delivered event block; TAB is an escaped control character in `events list --format text` (002 §1.1.6/§1.1.8, 005 §11.1, 006 §4.2.1) — Refs #449
 

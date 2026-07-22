@@ -671,6 +671,14 @@ export interface RenderHookDeliveryOptions {
  *   guaranteed across EVERY commit outcome, not merely the sole recourse for
  *   an uncommitted one; the marker itself asserts only that outcome-agnostic
  *   fact, never a specific claimed/redelivery direction (round-10 review).
+ *   When `claim.coalescedReminder` is set (issue #441 cross-monitor
+ *   coalescing: a due normal-urgency reminder was folded into this
+ *   settled-high batch), its text is appended as a sanitized, cap-reserved
+ *   footer AFTER the packed event blocks — `claim.events`/`claim.message`
+ *   carry no representation of it on their own, and `claimDelivery` claims
+ *   the coalesced normal rows alongside the surfaced high events, so omitting
+ *   this footer would claim-but-never-render them (006 §5.5, PR #456 review
+ *   finding 2).
  * - **Reminder line** — a `normal`/`low` turn-boundary claim carries no event
  *   bodies (`events: []`) but a populated `message` (the same advisory line
  *   `hook claim` surfaces). It renders that message as a sanitized, length-capped
@@ -775,12 +783,43 @@ export function renderHookDelivery(
   // land in both places identically), which is exactly the class of drift
   // issue #442 hit once already.
   const moreDeferred = options.moreDeferred ?? false;
+
+  // A coalesced normal-urgency reminder (issue #441, PR #456 review finding 2):
+  // `claim.coalescedReminder` is set only when `decideDelivery` folded a due
+  // normal reminder into this settled-high batch. `claim.events` carries no
+  // representation of it, and `claim.message` is never consulted in this
+  // (body-injection) branch — so without this footer the coalesced reminder
+  // was claimed (the caller claims `normalPending` alongside the surfaced high
+  // events) but never actually rendered anywhere, violating 006 §5.5's
+  // claimed-set-equals-rendered-set invariant. Per #445's wording contract
+  // (002 §9.2 / 006 §5.1.1) the runtime emits ONLY the transport-neutral
+  // reminder body; this transport appends its OWN concrete, session+socket-
+  // scoped acknowledge step ({@link buildHookReminderActionStep}) — exactly as
+  // the reminder-only branch above does — so the coalesced reminder is
+  // self-sufficient and actionable, never a bare "changes are pending" line
+  // with no way to act. Reserved as a fixed suffix BEFORE sizing the event
+  // blocks (see `effectiveCap`) so its own length never pushes the render over
+  // `MAX_ADDITIONAL_CONTEXT`, nor truncates the reminder away (006 §5.5). When
+  // no reminder is coalesced, `reminderFooter` is empty and `effectiveCap`
+  // equals `MAX_ADDITIONAL_CONTEXT`, so a pure high-urgency delivery renders
+  // byte-identically to before.
+  const reminderFooter = claim.coalescedReminder
+    ? `\n\n${sanitize(claim.coalescedReminder)}${buildHookReminderActionStep(
+        claim.sessionId,
+        options.socketPath,
+      )}`
+    : '';
+  const effectiveCap = MAX_ADDITIONAL_CONTEXT - reminderFooter.length;
+
+  // Sized against `effectiveCap` (the cap already net of the coalesced footer)
+  // so a fit computed here still leaves room for the footer appended to every
+  // branch below.
   const fit = resolveHookClaimFit(
     claim.events,
     claim.sessionId,
     options.socketPath,
     moreDeferred,
-    MAX_ADDITIONAL_CONTEXT,
+    effectiveCap,
     // Reserve against the marker THIS render will actually append below
     // (`deferredMarker`, already lifecycle-aware — the recap marker for a
     // `post-compact` claim, the shorter deferred marker otherwise) rather
@@ -793,14 +832,14 @@ export function renderHookDelivery(
   let additionalContext: string;
   if (fit.whole.includedCount === claim.events.length && !moreDeferred) {
     // Every claimed event fits and nothing was deferred → no marker.
-    additionalContext = fit.whole.text;
+    additionalContext = fit.whole.text + reminderFooter;
   } else if (fit.reserved.includedCount >= 1) {
     // A marker is needed (some claimed blocks did not fit here, and/or the caller
     // deferred more). `fit.reserved` already reserved room for the deferred
     // marker AND named exactly the events it includes in its own header — this
     // branch only fires when at least one WHOLE block was genuinely left
     // pending (unclaimed), which is exactly what that marker promises.
-    additionalContext = fit.reserved.text + deferredMarker;
+    additionalContext = fit.reserved.text + deferredMarker + reminderFooter;
   } else {
     // Even the first block alone exceeds (cap − marker): mid-truncate block 0
     // at a code-point boundary. This is the ONLY case a durable event is shown
@@ -838,11 +877,14 @@ export function renderHookDelivery(
       moreDeferred && claimedUnreadMarker !== deferredMarker
         ? claimedUnreadMarker + deferredMarker
         : claimedUnreadMarker;
-    additionalContext = appendMarkerWithinCap(
-      soleEventHeader + firstBlock,
-      MAX_ADDITIONAL_CONTEXT,
-      marker,
-    );
+    // Sized against `effectiveCap`, not `MAX_ADDITIONAL_CONTEXT`, so the
+    // coalesced reminder footer appended after this still fits under the cap.
+    additionalContext =
+      appendMarkerWithinCap(
+        soleEventHeader + firstBlock,
+        effectiveCap,
+        marker,
+      ) + reminderFooter;
   }
 
   return {

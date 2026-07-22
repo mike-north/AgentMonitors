@@ -167,14 +167,24 @@ multi-values flattened):
 - **`meta`** (`Record<string,string>`): routing/context attributes. Keys **MUST** be identifiers
   (`[A-Za-z0-9_]`); hyphens are silently dropped by the host, so kebab fields are converted:
 
-  | meta key      | value                                                 | notes                                                                                                                 |
-  | ------------- | ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-  | `monitor_id`  | the monitor's ID                                      | single-event claims only                                                                                              |
-  | `urgency`     | `low` \| `normal` \| `high`                           |                                                                                                                       |
-  | `object_key`  | the event `objectKey`                                 | sanitized (§4.6)                                                                                                      |
-  | `event_id`    | the durable event ID                                  | passed back by the ack tool (§4.3); single-event claims only                                                          |
-  | `event_count` | number of pending events, stringified                 | coalesced events for a body-injection claim; the session's **unread total** for a reminder claim (§4.2.1) — never `0` |
-  | `lifecycle`   | `turn-interruptible` \| `turn-idle` \| `post-compact` |                                                                                                                       |
+  | meta key      | value                                                 | notes                                                                                                                                                                                                                                                                                                                               |
+  | ------------- | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+  | `monitor_id`  | the monitor's ID                                      | single-event claims only, and only when `coalescedReminder` is absent (below)                                                                                                                                                                                                                                                       |
+  | `urgency`     | `low` \| `normal` \| `high`                           |                                                                                                                                                                                                                                                                                                                                     |
+  | `object_key`  | the event `objectKey`                                 | sanitized (§4.6)                                                                                                                                                                                                                                                                                                                    |
+  | `event_id`    | the durable event ID                                  | passed back by the ack tool (§4.3); single-event claims only, and only when `coalescedReminder` is absent (below)                                                                                                                                                                                                                   |
+  | `event_count` | number of pending events, stringified                 | coalesced events for a body-injection claim; the session's **unread total** for a reminder claim (§4.2.1) — never `0`; for a cross-monitor-coalesced claim (`coalescedReminder` set, issue #441), `events.length + coalescedNormalCount` — the surfaced high events PLUS the folded-in normal rows, since both are claimed together |
+  | `lifecycle`   | `turn-interruptible` \| `turn-idle` \| `post-compact` |                                                                                                                                                                                                                                                                                                                                     |
+
+  **Cross-monitor-coalesced claims** (`DeliveryClaim.coalescedReminder` set, issue #441 §4.2.1 below):
+  `monitor_id`/`event_id` are **never** emitted, even when `events.length === 1` — a coalesced claim
+  always claims additional normal-urgency rows alongside its high event(s) (`claimDelivery` claims
+  `surfacedCandidates` **and** `normalPending` together), so routing per-event meta to that one
+  event's own IDs would invite a scoped ack (via `agentmon_ack`) that leaves the coalesced normal rows
+  claimed-but-unacknowledged — durably muting the session's normal reminders until they are acked
+  (002 §9.2's `normalPending.length === unreadNormal.length` gate never re-fires while they sit
+  claimed). Such a claim is always summarized at the claim level, identically to a claim with
+  multiple events.
 
 The `source` attribute on the rendered `<channel>` tag is set by the host from the MCP server name
 (e.g. `agentmonitors`), not by `meta`.
@@ -232,7 +242,12 @@ content the hook path injects**, not a lesser summary. Two claim shapes render d
   into `additionalContext` (§5.1); the only per-transport difference is content sanitization (the
   channel strips `<>[]` for tag safety, §4.6; the hook path preserves them) and the ceiling each
   applies (the hook path bounds a single turn's `additionalContext` at 4000 chars; the channel packs
-  WHOLE blocks under its own, much larger content ceiling — §5.5 below).
+  WHOLE blocks under its own, much larger content ceiling — §5.5 below). When the claim carries a
+  coalesced normal-urgency reminder (`coalescedReminder` set, 002 §9.1.1), a cap-reserved footer is
+  appended after the packed blocks: the runtime's transport-neutral reminder body **plus this
+  transport's own acknowledge action step** (the `agentmon_ack` phrasing, identical to the reminder
+  claim below — §5.1.1), so the coalesced reminder is self-sufficient and actionable rather than a
+  bare "changes are pending" line.
 
 - **Reminder claim** (`normal`/`low` — no event bodies, only a coalesced advisory `message`):
   `content` renders that generic message, sanitized for tag safety, **plus this transport's own

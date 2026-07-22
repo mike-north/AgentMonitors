@@ -111,7 +111,26 @@ watch:
 
 5. Ask only for fields required by the chosen source. Prefer defaults for everything else.
    Add `notify:` only when the user asks for batching/throttling behavior.
-6. Edit `.claude/monitors/<id>/MONITOR.md` (or a flat `.claude/monitors/<id>.md`). Use the monitor
+6. **Avoid overlapping monitors (issue #441).** Before scaffolding a new monitor, check whether an
+   existing one already watches the same or overlapping state — e.g. two `command-poll` monitors in
+   the same directory running near-identical commands (same argv prefix), or two monitors that both
+   fire off the same underlying change (a label-based monitor and an all-items monitor over the same
+   collection). Two monitors watching overlapping state turn ONE real-world action into multiple
+   interrupts: the runtime coalesces same-urgency events and (as of #441) coalesces a due
+   normal-urgency reminder into the same delivery as a settled high-urgency batch, but it cannot
+   collapse two *separate* monitor definitions into one — each still materializes its own event.
+   **Prefer one monitor whose body branches on what changed** over two monitors that each cover part
+   of the same state:
+   - If a user's intent is "notify me about ready-to-merge PRs AND about PRs needing review", author
+     ONE monitor over the full PR set with a body that says what to do for EACH case, rather than a
+     `merge-queue` monitor plus a separate `pr-review-queue` monitor — unless the two truly need
+     different urgencies (see the urgency table above) or different watch cadences, in which case
+     scope the monitors to be **disjoint** (e.g. the normal-urgency monitor's query/filter excludes
+     what the high-urgency monitor already covers) instead of leaving them to overlap.
+   - A future `agentmonitors validate` heuristic may warn when two `command-poll` monitors in the
+     same directory share a command argv prefix (tracked, not yet implemented) — until then, this is
+     a manual check when authoring or reviewing a directory of monitors.
+7. Edit `.claude/monitors/<id>/MONITOR.md` (or a flat `.claude/monitors/<id>.md`). Use the monitor
    body for the user's judgment and instructions, not facts already captured in `watch:`.
 
 Example body style:

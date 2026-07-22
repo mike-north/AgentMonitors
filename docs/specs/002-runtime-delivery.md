@@ -1285,6 +1285,90 @@ Each element of the `events` array is a `DeliveryEventSummary` which carries: `e
 
 Verified: `libs/core/src/runtime/service.ts` — `claimDelivery()` turn-interruptible high branch: `settledHigh` filters by age, payload includes `summarizeEvents(...)` and a full `events` array with `body: event.body` and the recipient-specific `diffText` (`perRecipientDiffsForSession`, falling back to `MonitorEventRecord.diffText`).
 
+#### 9.1.1 Cross-monitor coalescing window (issue #441)
+
+> **Status: current** (issue #441, hardened by PR #456 review). Two monitors watching overlapping
+> state — e.g. a high-urgency label monitor and a normal-urgency review-queue monitor both firing
+> off the same underlying change — previously interrupted a session TWICE for one action: a
+> settled-high delivery in one `turn-interruptible` call, then, once the high events were claimed, a
+> SEPARATE normal-reminder delivery in a later call. A first fix attempt still preserved the
+> two-interrupt failure whenever the normal reminder was due BEFORE the sibling high event settled —
+> it fired standalone immediately, and the high batch (and its own coalescing) only arrived on a
+> LATER call once it settled. This section describes the corrected behavior: the normal reminder is
+> **withheld** whenever ANY high-urgency work is genuinely pending (settled or not), and only ever
+> fires standalone once no high-urgency work is pending at all.
+
+When a settled high-urgency batch (§9.1) is due **and** a normal-urgency reminder (§9.2) is
+simultaneously due in the SAME `claimDelivery`/`reserveDelivery` decision, the runtime **MUST**
+fold both into ONE `DeliveryClaim` rather than returning the high batch and deferring the normal
+reminder to a later call:
+
+- The claim's `events` array is unchanged from a pure high-urgency delivery — it still carries only
+  the settled high-urgency `DeliveryEventSummary` entries (§9.1). A normal reminder never gains
+  per-event detail from being coalesced; it stays a generic prompt, exactly as it would render on
+  its own (§9.2).
+- The claim's `message` is the high-urgency summary (`summarizeEvents(...)`) followed by the normal
+  reminder text on its own line (`COALESCED_NORMAL_SUFFIX`, the transport-neutral `reminderMessage()`
+  body of §9.2 — no product prefix, no CLI/tool verb).
+- The claim carries a separate, optional `coalescedReminder: string` field, set to the SAME
+  `reminderMessage()` body, whenever (and only whenever) a due normal reminder was folded in.
+  **This field exists because neither `events` nor `message` is, on its own, enough for a
+  length-bounded (events-rendering) transport to notice the coalesced reminder**: the hook-deliver
+  and channel transports render `events` as concrete per-event blocks and never consult `message`
+  once `events` is non-empty (§5.1, §5.5, §6). Before `coalescedReminder` existed, `claimDelivery`
+  claimed the coalesced normal rows alongside the surfaced high events, but neither bounded
+  transport rendered them anywhere — a claimed-but-unrendered violation of the claimed-set-equals-
+  rendered-set invariant (§5.5). Both bounded transports **MUST** render `coalescedReminder`,
+  sanitized, as a footer appended AFTER the packed event block(s), **and MUST append their own
+  transport-owned acknowledge action step to that footer** — exactly as the standalone reminder of
+  §9.2 does (the hook transport's `agentmonitors events ack`, the channel transport's `agentmon_ack`
+  tool; [006 §5.1.1](006-agent-integration.md#511-attribution-is-transport-owned-delivered-text-is-self-sufficient-issues-438-434)).
+  The runtime's `coalescedReminder` carries only the transport-neutral body, so without this the
+  coalesced reminder would be self-insufficient (a "changes are pending" line with no way to act),
+  the exact trap §9.2's self-sufficiency contract exists to prevent. See §5.1 and §6 for the exact
+  rendering and cap-sizing contract. A transport that renders `message` directly instead of `events`
+  (e.g. `hook claim --format text`) needs no separate handling — the reminder is already part of
+  `message` there.
+- The claim's top-level `urgency` **MUST** remain `'high'` — the most urgent band present in the
+  batch. Coalescing **MUST NOT** downgrade the reported urgency because a lower-urgency reminder
+  rode along, and **MUST NOT** escalate the normal reminder's own semantics (its events are not
+  surfaced as high-urgency `DeliveryEventSummary` entries, and its own `urgency` field, where it
+  appears at all, is never rewritten). This composes with issue #451's snapshot-at-materialization
+  contract: coalescing decides only WHEN two already-materialized bands are delivered together,
+  never re-derives an event's own urgency or body.
+- Both the surfaced high-urgency events and the coalesced normal-urgency events are marked claimed
+  in the SAME `applyDelivery` call, so a subsequent `claimDelivery` call does not re-deliver the
+  normal reminder as a second interrupt for the same action.
+- **A normal reminder that is otherwise fully due MUST NOT fire standalone while ANY high-urgency
+  event is pending (unclaimed) but not yet settled.** Firing it standalone here would preempt this
+  turn, and the high batch (with its own coalescing) would only surface on a LATER
+  `turn-interruptible` call once it settles — reproducing the exact two-interrupt failure this
+  section exists to fix, just shifted from (high-then-normal) to (normal-then-high). The reminder is
+  instead withheld until there is no pending high-urgency work at all; once the pending high event
+  settles, it is folded into that SAME delivery per the bullets above.
+- The `normalPending.length === unreadNormal.length` coalesced-until-ack guard (§9.2) is unchanged
+  and still gates whether a normal reminder is due at all; this section only changes WHERE (and, per
+  the bullet above, WHEN) a due normal reminder is delivered.
+- A length-bounded transport sizing how many whole high-urgency event blocks fit under its cap
+  **MUST** also account for a pending coalesced reminder — its own doc comment/API
+  (`previewCoalescedReminder`/`previewCoalescedReminderClient`) exists precisely so sizing can
+  reserve room for it BEFORE packing event blocks, not just after (see §5.1/§5.5).
+- **Scope note:** this coalescing is specific to `turn-interruptible` (high + normal). Low-urgency
+  reminders fire at the separate `turn-idle` lifecycle (§9.3) and are not folded in — a lifecycle
+  boundary, not a settle-window artifact, separates them, so there is no equivalent "same call"
+  moment to coalesce across. Two monitors that both materialize `high`-urgency events for the
+  session are already coalesced by §9.1 (`settledHigh` pools ALL pending high events for the
+  session regardless of which monitor produced them) — this section closes the remaining gap: high
+  coalescing WITH a concurrently-due normal reminder.
+- `hook deliver --debug`'s diagnosis (§10.7-adjacent `diagnoseHookDelivery`, issue #334) mirrors this
+  precedence: it reports a `settle-window`-reasoned hold on the `normal` band when a fully-due
+  reminder is being withheld by a concurrent unsettled high-urgency event, and independently still
+  reports the ordinary `already-claimed`/`coalesced-until-ack` hold (§9.2) whenever a claimed row
+  blocks the reminder on its own — including on a turn where settled high-urgency work is ALSO being
+  delivered (the coalescing guard blocking coalescing does not mean nothing is held).
+
+Verified: `libs/core/src/runtime/service.ts` — `decideDelivery()`'s `turn-interruptible` branch computes `normalReminderDue` before the settled-high branch; when both are due it folds `normalPending` into the high branch's `candidates`, appends `COALESCED_NORMAL_SUFFIX` to the claim's `message`, and sets `coalescedReminder`; when a fully-due reminder exists but `highUnread.length > 0` with nothing settled, it returns no delivery (withheld) rather than firing the reminder standalone. `previewCoalescedReminder` (core) / `previewCoalescedReminderClient` (CLI) mirror the same due-check read-only for transport sizing. `diagnoseHookDelivery`'s `classifyCoalescingWithheldHold` (`hook-delivery-diagnosis.ts`) reports the withheld-by-settle-window case; `classifyReminderHold` is now evaluated unconditionally (not gated on `settledHighCount === 0`). `renderHookDelivery` (`apps/cli/src/hook-deliver-render.ts`) and `renderChannelEvent` (`apps/cli/src/channel-render.ts`) render `claim.coalescedReminder` as a cap-reserved footer after the packed event block(s). Proven by the "coalesces a due normal-urgency reminder..." / "holds a due normal-urgency reminder while a sibling high-urgency event is still inside its settle window, then coalesces both once it settles (issue #441 review finding 1)" / urgency-mixing-guard cases in `libs/core/src/runtime/service.test.ts`; the `previewCoalescedReminder` cases in `libs/core/src/runtime/hook-cap-redelivery.test.ts`; the withheld/coalesced-until-ack-alongside-settled-high cases in `libs/core/src/runtime/diagnose-hook-delivery.test.ts` and `hook-delivery-diagnosis.test.ts`; and the reminder-footer rendering/sizing cases in `apps/cli/src/hook-deliver-render.test.ts` and `apps/cli/src/channel-render.test.ts`.
+
 ### 9.2 Normal urgency
 
 At `turn-interruptible`, normal-urgency events are delivered as a coalesced reminder only if all unread normal-urgency events are still unclaimed. This coalesces multiple normal events into one reminder until the session acknowledges them. The `events` array is empty in this case.

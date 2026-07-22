@@ -25,8 +25,12 @@ import type { DeliveryLifecycle, SessionUnreadCounts } from './types.js';
 
 /**
  * Why a band of unread events is not deliverable right now:
- * - `settle-window` — high-urgency only: pending (unclaimed) events exist but
- *   none has aged past the claim-time settle threshold yet (002 §9.1).
+ * - `settle-window` — high-urgency: pending (unclaimed) events exist but
+ *   none has aged past the claim-time settle threshold yet (002 §9.1). Also
+ *   emitted for a normal-urgency reminder (issue #441 cross-monitor
+ *   coalescing; {@link classifyCoalescingWithheldHold}) that is due but held
+ *   back by concurrent, still-unsettled high-urgency work it will be
+ *   coalesced into once that work settles.
  * - `already-claimed` — normal/low only: every unread event of the band is
  *   already durably claimed, so the coalesced reminder (002 §9.2/§9.3) will not
  *   re-fire until acknowledgment. A fresh unclaimed event of the same band
@@ -212,5 +216,62 @@ export function classifySettleWindowHold(
       `High-urgency delivery at turn-interruptible is held: ${String(pendingCount)} ` +
       `pending event(s) are within the ${String(settleSeconds)}s settle window ` +
       `(~${String(remainingSeconds)}s remaining before the oldest becomes deliverable).`,
+  };
+}
+
+/**
+ * Classify whether a due normal-urgency reminder is currently withheld
+ * because concurrent high-urgency work is still inside its settle window
+ * (issue #441 cross-monitor coalescing; PR #456 review findings 1 & 3).
+ * `decideDelivery`'s `turn-interruptible` branch no longer fires a due normal
+ * reminder standalone while ANY high-urgency work is genuinely pending and
+ * unsettled — it withholds the reminder so it can be folded into the SAME
+ * call once that high-urgency work settles, instead of firing separately now
+ * and preempting a later, separate high-urgency interrupt (the exact
+ * two-interrupt failure #441 fixes).
+ *
+ * This is a DIFFERENT hold from {@link classifyReminderHold}'s
+ * `already-claimed`/`coalesced-until-ack`/`reserved-in-flight` reasons, which
+ * apply regardless of any concurrent high-urgency work (a claimed or leased
+ * unread row blocks the reminder on its own). Both are evaluated independently
+ * by `diagnoseHookDelivery` and are mutually exclusive by construction: this
+ * function fires only when `reminderDue` (`pendingCount === unreadCount`), and
+ * because the caller passes the LEASE-FILTERED pending count for `pendingCount`,
+ * that equality can hold only when NO unread normal row is claimed AND none is
+ * leased (`claimedCount = unreadCount - pendingCount - leasedCount = 0` forces
+ * both to zero). In exactly that state {@link classifyReminderHold} returns
+ * `null` (nothing claimed or leased to hold). Conversely, a single leased
+ * normal row makes `pendingCount < unreadCount`, so `reminderDue` is false here
+ * and the diagnosis defers to {@link classifyReminderHold}'s `reserved-in-flight`
+ * verdict — matching `decideDelivery`, whose `normalReminderDue` gate uses the
+ * same lease-filtered equality and likewise neither fires nor coalesces the
+ * reminder while a normal row is leased.
+ *
+ * Returns `null` when the reminder is not otherwise due (nothing unread, or
+ * some of it already claimed or leased), or when there is no unsettled pending
+ * high-urgency work to withhold it (settled high-urgency work coalesces the
+ * reminder into itself instead — see `decideDelivery` — and no pending
+ * high-urgency work at all means the reminder fires standalone).
+ */
+export function classifyCoalescingWithheldHold(
+  unreadCount: number,
+  pendingCount: number,
+  pendingHighCount: number,
+  settledHighCount: number,
+): HookDeliveryHold | null {
+  const reminderDue = pendingCount > 0 && pendingCount === unreadCount;
+  if (!reminderDue) return null;
+  if (pendingHighCount === 0 || settledHighCount > 0) return null;
+
+  return {
+    urgency: 'normal',
+    reason: 'settle-window',
+    unreadCount,
+    pendingCount,
+    message:
+      `Normal-urgency reminder at turn-interruptible is withheld: concurrent ` +
+      `high-urgency work is still inside its settle window (issue #441 ` +
+      `cross-monitor coalescing). It will be coalesced into that delivery ` +
+      `once the high-urgency work settles, rather than firing separately now.`,
   };
 }

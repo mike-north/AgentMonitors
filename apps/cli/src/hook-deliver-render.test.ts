@@ -189,6 +189,69 @@ describe('renderHookDelivery', () => {
     expect(out).not.toHaveProperty('permissionDecision');
   });
 
+  // Issue #441 cross-monitor coalescing (PR #456 review finding 2): a claim
+  // with `events` populated must ALSO surface `coalescedReminder` when set —
+  // `claimDelivery` claims the coalesced normal rows alongside the surfaced
+  // high events, so omitting this would claim-but-never-render them (006
+  // §5.5).
+  it('appends the coalesced reminder footer, with this transport’s own ack action step, after the packed event block(s)', () => {
+    const out = renderHookDelivery(
+      makeClaim({
+        coalescedReminder: 'Monitored changes are pending.',
+      }),
+      'PreToolUse',
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).toContain('watch-src');
+    expect(ctx).toContain('Review the diff; flag risky changes.');
+    expect(ctx).toContain('Monitored changes are pending.');
+    // The runtime's coalesced reminder is transport-neutral; the hook transport
+    // appends its OWN concrete, session-scoped acknowledge step (issue #445
+    // wording contract, 002 §9.2 / 006 §5.1.1) so the coalesced reminder is
+    // self-sufficient and actionable, not a bare "changes are pending" line.
+    expect(ctx).toContain('agentmonitors events list --session s1 --unread');
+    expect(ctx).toContain('agentmonitors events ack --session s1');
+    // The footer comes AFTER the event block, not interleaved with it.
+    expect(
+      ctx.indexOf('Review the diff') <
+        ctx.indexOf('Monitored changes are pending.'),
+    ).toBe(true);
+  });
+
+  it('does not render a coalesced-reminder footer when the field is absent (ordinary high-only claim, unchanged)', () => {
+    const out = renderHookDelivery(makeClaim(), 'PreToolUse');
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).not.toContain('Monitored changes are pending');
+  });
+
+  it('reserves room for the coalesced reminder footer so the total render never exceeds the cap', () => {
+    const longBody = 'x'.repeat(3_900);
+    const out = renderHookDelivery(
+      makeClaim({
+        coalescedReminder: 'Monitored changes are pending.',
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'watch-src',
+            title: 'Files changed',
+            summary: 'Files changed',
+            body: longBody,
+            urgency: 'high',
+            createdAt: '2026-06-04T00:00:00.000Z',
+          },
+        ],
+      }),
+      'PreToolUse',
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx.length).toBeLessThanOrEqual(4000);
+    // The reminder must still be present, not silently dropped to make room —
+    // `renderHookDelivery` reserves for it BEFORE packing the event block.
+    expect(ctx).toContain('Monitored changes are pending.');
+    // …including its ack action step, which is part of the reserved footer.
+    expect(ctx).toContain('agentmonitors events ack --session s1');
+  });
+
   // (c.2 — issue #198, AC4) a post-compact recap claim carries events with
   // bodies; the renderer still injects the full per-event block(s) verbatim —
   // the reminder-only path (events:[]) must not change this behavior.
