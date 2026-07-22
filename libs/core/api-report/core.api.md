@@ -210,6 +210,7 @@ export function defaultNotifyConfigForUrgency(urgency: Urgency, notify?: NotifyC
 
 // @public (undocumented)
 export interface DeliveryClaim {
+    coalescedNormalCount?: number;
     coalescedReminder?: string;
     // (undocumented)
     events: DeliveryEventSummary[];

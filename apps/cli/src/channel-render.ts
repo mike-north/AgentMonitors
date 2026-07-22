@@ -429,8 +429,21 @@ export function renderChannelEvent(
   // packing, that is always exactly `claim.events.length`, so the count
   // genuinely equals the surfaced set even when some settled-high events were
   // deferred to a later poll.
-  const eventCount =
-    claim.events.length > 0 ? claim.events.length : claim.unreadCounts.total;
+  //
+  // Coalesced case (issue #441, PR #456 review): when `claim.coalescedReminder`
+  // is set, the claimed set is `events` (the surfaced high events) PLUS the
+  // folded-in normal rows the reminder refers to (`coalescedNormalCount`) —
+  // `claimDelivery` claims both. Reporting `events.length` alone would
+  // under-report the claimed set and invite a scoped ack (via the event_id
+  // values in `event_count`'s neighboring meta) that leaves the coalesced
+  // normal rows claimed-but-unacknowledged, durably muting the session's
+  // normal reminders (`service.ts`'s `normalPending.length ===
+  // unreadNormal.length` gate never re-fires until they're acked).
+  const eventCount = claim.coalescedReminder
+    ? claim.events.length + (claim.coalescedNormalCount ?? 0)
+    : claim.events.length > 0
+      ? claim.events.length
+      : claim.unreadCounts.total;
 
   const meta: Record<string, string> = {
     lifecycle: claim.lifecycle,
@@ -440,9 +453,13 @@ export function renderChannelEvent(
   if (claim.urgency) {
     meta['urgency'] = claim.urgency;
   }
-  // Per-event routing only makes sense for a single concrete event; a coalesced
-  // claim is summarized at the claim level.
-  if (claim.events.length === 1) {
+  // Per-event routing only makes sense for a single concrete event that is
+  // ALSO the claim's entire claimed set — a coalesced claim (even one with
+  // exactly one high event) always claims additional normal rows alongside
+  // it, so it is summarized at the claim level, never routed to that one
+  // event's own monitor_id/event_id (issue #441, PR #456 review: a scoped ack
+  // built from a single-event's ids would leave the coalesced rows unacked).
+  if (claim.events.length === 1 && !claim.coalescedReminder) {
     const event = claim.events[0];
     if (event) {
       meta['monitor_id'] = event.monitorId;

@@ -254,6 +254,60 @@ describe('renderChannelEvent', () => {
     expect(content).not.toContain('AgentMon messages are available');
   });
 
+  // Issue #441 cross-monitor coalescing / PR #456 review finding "meta":
+  // `claimDelivery` claims the coalesced normal rows ALONGSIDE the single
+  // surfaced high event, so the claim-level meta must never route to that
+  // one event's own monitor_id/event_id (an MCP consumer told to ack that
+  // scoped event_id would leave the coalesced normal rows claimed-but-unacked,
+  // durably muting the session's normal reminders). `event_count` must equal
+  // the FULL claimed set (the one high event plus the coalesced rows), not
+  // `events.length` alone.
+  it('summarizes a coalesced claim with exactly one high event at the claim level, not per-event', () => {
+    const { meta } = renderChannelEvent(
+      makeClaim({
+        coalescedReminder: 'AgentMon messages are available. Read the inbox.',
+        coalescedNormalCount: 2,
+      }),
+    );
+    expect(meta.monitor_id).toBeUndefined();
+    expect(meta.event_id).toBeUndefined();
+    // 1 surfaced high event + 2 coalesced normal rows = 3 claimed.
+    expect(meta.event_count).toBe('3');
+  });
+
+  it('includes the coalesced normal rows in event_count for a multi-high coalesced claim', () => {
+    const { meta } = renderChannelEvent(
+      makeClaim({
+        coalescedReminder: 'AgentMon messages are available. Read the inbox.',
+        coalescedNormalCount: 2,
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'm1',
+            title: 't1',
+            summary: 's1',
+            urgency: 'high',
+            createdAt: 'x',
+            body: 'b1',
+          },
+          {
+            eventId: 'e2',
+            monitorId: 'm2',
+            title: 't2',
+            summary: 's2',
+            urgency: 'high',
+            createdAt: 'y',
+            body: 'b2',
+          },
+        ],
+      }),
+    );
+    expect(meta.monitor_id).toBeUndefined();
+    expect(meta.event_id).toBeUndefined();
+    // 2 surfaced high events + 2 coalesced normal rows = 4 claimed.
+    expect(meta.event_count).toBe('4');
+  });
+
   it('reserves room for the coalesced reminder footer so content never exceeds MAX_CHANNEL_CONTENT', () => {
     const bigDiff = '+ added line\n'.repeat(2_000); // well past the per-event bound
     const { content } = renderChannelEvent(

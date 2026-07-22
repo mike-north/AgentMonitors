@@ -257,6 +257,22 @@ export interface DeliveryClaim {
    * claimed-set-equals-rendered-set violation (006 §5.5).
    */
   coalescedReminder?: string;
+  /**
+   * The number of normal-urgency rows folded into this claim alongside
+   * `coalescedReminder` (issue #441 cross-monitor coalescing) — i.e.
+   * `normalPending.length` from `decideDelivery`'s coalescing branch. Present
+   * ONLY when `coalescedReminder` is set; `undefined` otherwise.
+   *
+   * The claimed set for a coalesced delivery is `events.length + coalescedNormalCount`
+   * (the surfaced high events PLUS the folded-in normal rows), not
+   * `events.length` alone — `events` carries only the high-urgency summaries
+   * (PR #456 review). A transport reporting a claimed-set count
+   * (e.g. a channel tag's `event_count`) MUST include this term whenever
+   * `coalescedReminder` is present, or it under-reports the set actually
+   * claimed and risks inviting a scoped ack that leaves the coalesced normal
+   * rows claimed-but-unacknowledged.
+   */
+  coalescedNormalCount?: number;
 }
 
 /**

@@ -2062,7 +2062,10 @@ export class AgentMonitorRuntime {
             // notice on its own — see the field's own doc comment
             // (`types.ts`) for why this must be rendered explicitly.
             ...(normalReminderDue
-              ? { coalescedReminder: NORMAL_INBOX_PROMPT }
+              ? {
+                  coalescedReminder: NORMAL_INBOX_PROMPT,
+                  coalescedNormalCount: normalPending.length,
+                }
               : {}),
           },
         };

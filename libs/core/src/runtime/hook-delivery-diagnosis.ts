@@ -25,8 +25,12 @@ import type { DeliveryLifecycle, SessionUnreadCounts } from './types.js';
 
 /**
  * Why a band of unread events is not deliverable right now:
- * - `settle-window` — high-urgency only: pending (unclaimed) events exist but
- *   none has aged past the claim-time settle threshold yet (002 §9.1).
+ * - `settle-window` — high-urgency: pending (unclaimed) events exist but
+ *   none has aged past the claim-time settle threshold yet (002 §9.1). Also
+ *   emitted for a normal-urgency reminder (issue #441 cross-monitor
+ *   coalescing; {@link classifyCoalescingWithheldHold}) that is due but held
+ *   back by concurrent, still-unsettled high-urgency work it will be
+ *   coalesced into once that work settles.
  * - `already-claimed` — normal/low only: every unread event of the band is
  *   already claimed, so the coalesced reminder (002 §9.2/§9.3) will not re-fire
  *   until acknowledgment or a fresh unclaimed event.
