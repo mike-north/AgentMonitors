@@ -231,6 +231,29 @@ export async function previewSettledHighDeliveryClient(
 }
 
 /**
+ * Preview the coalesced normal-urgency reminder text a `turn-interruptible`
+ * claim would append to a settled-high delivery for this session RIGHT NOW,
+ * WITHOUT claiming anything (issue #441 cross-monitor coalescing; PR #456
+ * review finding 4). A length-bounded transport MUST call this alongside
+ * {@link previewSettledHighDeliveryClient} and reserve room for the returned
+ * text (when non-`undefined`) BEFORE sizing how many whole high-urgency event
+ * blocks fit — the reminder is appended AFTER the packed blocks, so sizing
+ * against the blocks alone risks a claim that overflows the cap once the
+ * reminder is appended, or truncates it away (006 §5.5).
+ */
+export async function previewCoalescedReminderClient(
+  sessionId: string,
+  socketPath?: string,
+): Promise<string | undefined> {
+  const result = await callDaemon<{ reminder: string | null }>(
+    'hook.previewReminder',
+    { sessionId },
+    socketPath ? { socketPath } : {},
+  );
+  return result.reminder ?? undefined;
+}
+
+/**
  * Diagnose (read-only) why a `claimDelivery(sessionId, lifecycle)` call would
  * or would not surface anything right now (issue #334). Used exclusively by
  * `hook deliver --debug` to write a stderr diagnosis alongside the unchanged

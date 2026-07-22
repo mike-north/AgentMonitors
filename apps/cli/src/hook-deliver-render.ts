@@ -459,6 +459,14 @@ export interface RenderHookDeliveryOptions {
  *   guaranteed across EVERY commit outcome, not merely the sole recourse for
  *   an uncommitted one; the marker itself asserts only that outcome-agnostic
  *   fact, never a specific claimed/redelivery direction (round-10 review).
+ *   When `claim.coalescedReminder` is set (issue #441 cross-monitor
+ *   coalescing: a due normal-urgency reminder was folded into this
+ *   settled-high batch), its text is appended as a sanitized, cap-reserved
+ *   footer AFTER the packed event blocks — `claim.events`/`claim.message`
+ *   carry no representation of it on their own, and `claimDelivery` claims
+ *   the coalesced normal rows alongside the surfaced high events, so omitting
+ *   this footer would claim-but-never-render them (006 §5.5, PR #456 review
+ *   finding 2).
  * - **Reminder line** — a `normal`/`low` turn-boundary claim carries no event
  *   bodies (`events: []`) but a populated `message` (the same advisory line
  *   `hook claim` surfaces). It renders that message as a sanitized, length-capped
@@ -544,12 +552,26 @@ export function renderHookDelivery(
 
   const moreDeferred = options.moreDeferred ?? false;
   const blocks = claim.events.map(buildEventBlock);
-  const whole = packWholeBlocks(HEADER, blocks, MAX_ADDITIONAL_CONTEXT);
+  // A coalesced normal-urgency reminder (issue #441, PR #456 review finding 2):
+  // `claim.coalescedReminder` is set only when `decideDelivery` folded a due
+  // normal reminder into this settled-high batch. `claim.events` carries no
+  // representation of it, and `claim.message` is never consulted in this
+  // (body-injection) branch — so without this footer the coalesced reminder
+  // was claimed (the caller claims `normalPending` alongside the surfaced high
+  // events) but never actually rendered anywhere, violating 006 §5.5's
+  // claimed-set-equals-rendered-set invariant. Reserved as a fixed suffix
+  // BEFORE packing event blocks (not appended after) so its own length is
+  // never the thing that pushes the render over `MAX_ADDITIONAL_CONTEXT`.
+  const reminderFooter = claim.coalescedReminder
+    ? `\n\n${sanitize(claim.coalescedReminder)}`
+    : '';
+  const effectiveCap = MAX_ADDITIONAL_CONTEXT - reminderFooter.length;
+  const whole = packWholeBlocks(HEADER, blocks, effectiveCap);
 
   let additionalContext: string;
   if (whole.includedCount === blocks.length && !moreDeferred) {
     // Every claimed event fits and nothing was deferred → no marker.
-    additionalContext = whole.text;
+    additionalContext = whole.text + reminderFooter;
   } else {
     // A marker is needed (some claimed blocks did not fit here, and/or the caller
     // deferred more). Repack reserving marker room so no INCLUDED block is cut.
@@ -559,10 +581,10 @@ export function renderHookDelivery(
     const reserved = packWholeBlocks(
       HEADER,
       blocks,
-      MAX_ADDITIONAL_CONTEXT - deferredMarker.length,
+      effectiveCap - deferredMarker.length,
     );
     if (reserved.includedCount >= 1) {
-      additionalContext = reserved.text + deferredMarker;
+      additionalContext = reserved.text + deferredMarker + reminderFooter;
     } else {
       // Even the first block alone exceeds (cap − marker): mid-truncate block 0
       // at a code-point boundary. This is the ONLY case a durable event is shown
@@ -593,11 +615,9 @@ export function renderHookDelivery(
         moreDeferred && claimedUnreadMarker !== deferredMarker
           ? claimedUnreadMarker + deferredMarker
           : claimedUnreadMarker;
-      additionalContext = appendMarkerWithinCap(
-        HEADER + firstBlock,
-        MAX_ADDITIONAL_CONTEXT,
-        marker,
-      );
+      additionalContext =
+        appendMarkerWithinCap(HEADER + firstBlock, effectiveCap, marker) +
+        reminderFooter;
     }
   }
 

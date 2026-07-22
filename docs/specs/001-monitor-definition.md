@@ -531,7 +531,8 @@ different ways, or two queries over the same collection (e.g. "PRs with a ready-
 "all open PRs") — turn ONE real-world change into multiple deliveries. The runtime coalesces
 events **within** a monitor (§4 of [002](./002-runtime-delivery.md#4-notify-dispatch)) and, as of
 issue #441, coalesces a due normal-urgency reminder into the same `turn-interruptible` delivery as a
-settled high-urgency batch when both are due in the same call ([002 §9.1](./002-runtime-delivery.md#91-high-urgency)).
+settled high-urgency batch when both are due in the same call
+([002 §9.1.1](./002-runtime-delivery.md#911-cross-monitor-coalescing-window-issue-441)).
 It does **not**, and cannot, collapse two independently-authored monitor definitions into one — each
 monitor still materializes its own `monitor_events` row for the same underlying change, so a session
 still receives N separate pieces of durable state (even where delivery coalescing reduces how many

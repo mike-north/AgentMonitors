@@ -11,6 +11,7 @@ import {
   commitDeliveryClient,
   diagnoseHookDeliveryClient,
   listSessionsClient,
+  previewCoalescedReminderClient,
   previewSettledHighDeliveryClient,
   releaseDeliveryClient,
   reserveDeliveryClient,
@@ -145,6 +146,22 @@ function lifecycleForEvent(
  */
 const MAX_HOOK_RESERVE_ATTEMPTS = 3;
 
+/**
+ * How much `additionalContext` room to reserve for a coalesced normal-urgency
+ * reminder (issue #441 cross-monitor coalescing; PR #456 review finding 4)
+ * BEFORE sizing how many whole high-urgency event blocks fit:
+ * `renderHookDelivery` appends `\n\n${reminder}` AFTER the packed blocks, so
+ * sizing against the blocks alone risks a claim that fits its events but
+ * overflows once the reminder is appended (or truncates the reminder away —
+ * either a 006 §5.5 claimed-but-unrendered violation). `undefined` reserves
+ * nothing. Computed from the RAW (unsanitized) reminder text — `sanitize`
+ * only ever REMOVES characters (control chars), so this is a safe, slightly
+ * conservative upper bound on the actual rendered footer's length.
+ */
+function reminderFooterLength(reminder: string | undefined): number {
+  return reminder ? reminder.length + 2 : 0;
+}
+
 /** The result of a successful {@link reserveSizedHookDelivery} call. */
 export interface SizedHookDelivery {
   reservation: DeliveryReservation;
@@ -255,11 +272,12 @@ export async function reserveSizedHookDelivery(
     let previewCount: number | undefined;
 
     if (lifecycle === 'turn-interruptible') {
-      const highPreview = await previewSettledHighDeliveryClient(
-        sessionId,
-        socketPath,
-      );
+      const [highPreview, coalescedReminder] = await Promise.all([
+        previewSettledHighDeliveryClient(sessionId, socketPath),
+        previewCoalescedReminderClient(sessionId, socketPath),
+      ]);
       previewCount = highPreview.length;
+      const reminderReserve = reminderFooterLength(coalescedReminder);
       if (isLastAttempt) {
         // Forward-progress fallback: repeated mismatches mean sizing keeps
         // racing with reservation. Force a single event so THIS attempt
@@ -270,7 +288,7 @@ export async function reserveSizedHookDelivery(
         let fit = packEventsUnderCap(
           highPreview,
           sessionId,
-          undefined,
+          MAX_ADDITIONAL_CONTEXT - reminderReserve,
           socketPath,
         );
         if (forcedCap !== undefined) fit = Math.min(fit, forcedCap);
@@ -325,12 +343,20 @@ export async function reserveSizedHookDelivery(
     // `renderHookDelivery` uses — so a claim that would still be shrunk by
     // the renderer's marker-reserving repack is caught here too, before any
     // durable claim is made.
+    // Reserve room for the ACTUAL claim's own coalesced reminder (issue #441,
+    // PR #456 review finding 4) — reading it off `reservation.claim` (not the
+    // earlier preview) is exact: it is the real, already-decided field this
+    // render will use, immune to the preview↔reserve substitution race the
+    // rest of this function guards against for event blocks.
+    const claimCap =
+      MAX_ADDITIONAL_CONTEXT -
+      reminderFooterLength(reservation.claim.coalescedReminder);
     const fit = resolveHookClaimFit(
       reservation.claim.events,
       sessionId,
       socketPath,
       moreDeferred,
-      MAX_ADDITIONAL_CONTEXT,
+      claimCap,
     );
     if (fit.fits) {
       // Re-check for the candidate-set-growth race (issue #442, PR #442
@@ -376,7 +402,7 @@ export async function reserveSizedHookDelivery(
         sessionId,
         socketPath,
         true,
-        MAX_ADDITIONAL_CONTEXT,
+        claimCap,
       );
       if (finalFit.fits) {
         return { reservation, moreDeferred: true, previewCount };

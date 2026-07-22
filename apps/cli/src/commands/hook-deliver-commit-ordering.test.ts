@@ -41,6 +41,7 @@ vi.mock('../runtime-client.js', () => ({
   commitDeliveryClient: vi.fn(),
   diagnoseHookDeliveryClient: vi.fn(),
   listSessionsClient: vi.fn(),
+  previewCoalescedReminderClient: vi.fn(),
   previewSettledHighDeliveryClient: vi.fn(),
   releaseDeliveryClient: vi.fn(),
   reserveDeliveryClient: vi.fn(),
@@ -54,6 +55,7 @@ import {
 } from './hook.js';
 import {
   commitDeliveryClient,
+  previewCoalescedReminderClient,
   previewSettledHighDeliveryClient,
   releaseDeliveryClient,
   reserveDeliveryClient,
@@ -61,6 +63,7 @@ import {
 import type { HookDeliveryOutput } from '../hook-deliver-render.js';
 
 const previewMock = vi.mocked(previewSettledHighDeliveryClient);
+const previewReminderMock = vi.mocked(previewCoalescedReminderClient);
 const reserveMock = vi.mocked(reserveDeliveryClient);
 const commitMock = vi.mocked(commitDeliveryClient);
 const releaseMock = vi.mocked(releaseDeliveryClient);
@@ -99,6 +102,8 @@ function claimWith(surfaced: DeliveryEventSummary[]): DeliveryClaim {
 
 beforeEach(() => {
   previewMock.mockReset();
+  previewReminderMock.mockReset();
+  previewReminderMock.mockResolvedValue(undefined);
   reserveMock.mockReset();
   commitMock.mockReset();
   releaseMock.mockReset();

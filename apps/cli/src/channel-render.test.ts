@@ -228,6 +228,55 @@ describe('renderChannelEvent', () => {
     expect(meta.event_id).toBeUndefined();
   });
 
+  // Issue #441 cross-monitor coalescing (PR #456 review finding 2): mirrors
+  // `renderHookDelivery`'s identical footer — `claim.coalescedReminder` must
+  // be surfaced explicitly whenever set, since `claim.events`/`claim.message`
+  // carry no representation of it on their own, and `claimDelivery` claims
+  // the coalesced normal rows alongside the surfaced high events (006 §5.5).
+  it('appends the coalesced reminder footer after the packed event block(s)', () => {
+    const { content } = renderChannelEvent(
+      makeClaim({
+        coalescedReminder: 'AgentMon messages are available. Read the inbox.',
+      }),
+    );
+    expect(content).toContain('package.json changed');
+    expect(content).toContain(
+      'AgentMon messages are available. Read the inbox.',
+    );
+    expect(
+      content.indexOf('package.json changed') <
+        content.indexOf('AgentMon messages are available'),
+    ).toBe(true);
+  });
+
+  it('does not render a coalesced-reminder footer when the field is absent (ordinary high-only claim, unchanged)', () => {
+    const { content } = renderChannelEvent(makeClaim());
+    expect(content).not.toContain('AgentMon messages are available');
+  });
+
+  it('reserves room for the coalesced reminder footer so content never exceeds MAX_CHANNEL_CONTENT', () => {
+    const bigDiff = '+ added line\n'.repeat(2_000); // well past the per-event bound
+    const { content } = renderChannelEvent(
+      makeClaim({
+        coalescedReminder: 'AgentMon messages are available. Read the inbox.',
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'build-drift',
+            title: 'package.json changed',
+            summary: 'package.json changed',
+            urgency: 'high',
+            createdAt: '2026-01-01T00:00:00.000Z',
+            body: 'Review whether build behavior needs updating.',
+            diffText: bigDiff,
+          },
+        ],
+      }),
+    );
+    expect(content.length).toBeLessThanOrEqual(MAX_CHANNEL_CONTENT);
+    expect(content).toContain('AgentMon messages are available');
+  });
+
   it('strips tag-breakout characters from content and meta', () => {
     const { content, meta } = renderChannelEvent(
       makeClaim({

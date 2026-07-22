@@ -322,6 +322,12 @@ export interface RenderChannelEventOptions {
  * bounded inside
  * {@link buildEventBlock} (006 §4.6, currently 800 chars each), so no single
  * untrusted diff is dumped wholesale regardless of packing.
+ *
+ * When `claim.coalescedReminder` is set (issue #441 cross-monitor coalescing:
+ * a due normal-urgency reminder was folded into this settled-high batch), its
+ * text is appended as a sanitized, cap-reserved footer after the packed event
+ * blocks — mirroring `renderHookDelivery`'s identical handling (PR #456 review
+ * finding 2).
  */
 export function renderChannelEvent(
   claim: DeliveryClaim,
@@ -343,19 +349,31 @@ export function renderChannelEvent(
     const blocks = claim.events.map((event) =>
       buildEventBlock(event, contentValue),
     );
+    // A coalesced normal-urgency reminder (issue #441, PR #456 review finding
+    // 2): reserved BEFORE packing event blocks (not appended after) so its own
+    // length never pushes the render over `MAX_CHANNEL_CONTENT`. Mirrors
+    // `renderHookDelivery`'s identical footer — see its doc comment for why
+    // this is required at all (`claim.events`/`claim.message` carry no
+    // representation of the coalesced reminder on their own, yet
+    // `claimDelivery` claims the coalesced normal rows alongside the surfaced
+    // high events).
+    const reminderFooter = claim.coalescedReminder
+      ? `\n\n${contentValue(claim.coalescedReminder)}`
+      : '';
+    const effectiveCap = MAX_CHANNEL_CONTENT - reminderFooter.length;
     const fit = resolveChannelClaimFit(
       claim.events,
       moreDeferred,
-      MAX_CHANNEL_CONTENT,
+      effectiveCap,
     );
     if (fit.whole.includedCount === blocks.length && !moreDeferred) {
       // Every claimed block fits and nothing was deferred → no marker.
-      content = fit.whole.text;
+      content = fit.whole.text + reminderFooter;
     } else if (fit.reserved.includedCount >= 1) {
       // A marker is needed (some claimed blocks did not fit here, and/or the
       // caller deferred more): repack reserving marker room so no INCLUDED
       // block is cut.
-      content = fit.reserved.text + CHANNEL_DEFERRED_MARKER;
+      content = fit.reserved.text + CHANNEL_DEFERRED_MARKER + reminderFooter;
     } else {
       // Even the first block alone exceeds (cap − marker): mid-truncate it
       // at a code-point boundary. This is the ONLY case a durable event is
@@ -396,7 +414,9 @@ export function renderChannelEvent(
       const marker = moreDeferred
         ? truncatedMarker + CHANNEL_DEFERRED_MARKER
         : truncatedMarker;
-      content = appendMarkerWithinCap(firstBlock, MAX_CHANNEL_CONTENT, marker);
+      content =
+        appendMarkerWithinCap(firstBlock, effectiveCap, marker) +
+        reminderFooter;
     }
   } else {
     content = contentValue(claim.message);

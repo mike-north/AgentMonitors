@@ -345,6 +345,12 @@ Handle it.
     expect(claim?.message).toContain(
       'AgentMon messages are available. Read the inbox.',
     );
+    // PR #456 review finding 2: `events`/`message` alone are not enough for a
+    // bounded (events-rendering) transport to notice the coalesced reminder —
+    // `coalescedReminder` carries it explicitly so a renderer can surface it.
+    expect(claim?.coalescedReminder).toBe(
+      'AgentMon messages are available. Read the inbox.',
+    );
 
     // The real proof this is a REDUCTION, not just a relabeling: a second
     // turn-interruptible claim immediately after returns NOTHING — both the
@@ -355,6 +361,103 @@ Handle it.
     const hookState = JSON.parse(readFileSync(session.hookStatePath, 'utf-8'));
     expect(hookState.unread.high).toBe(1);
     expect(hookState.unread.normal).toBe(1);
+  });
+
+  // PR #456 review (Mike, finding 1): a normal reminder due at the SAME time as
+  // a still-unsettled high-urgency event must NOT fire standalone before the
+  // high event settles — that recreates the exact two-interrupt failure #441
+  // set out to fix (a normal claim now, a SEPARATE high claim once it settles
+  // later). Uses fake timers to control the settle boundary precisely: a call
+  // BEFORE the boundary must surface nothing (holding both), and a call AFTER
+  // the boundary must surface ONE coalesced delivery.
+  it('holds a due normal-urgency reminder while a sibling high-urgency event is still inside its settle window, then coalesces both once it settles (issue #441 review finding 1)', () => {
+    vi.useFakeTimers();
+    const T0 = new Date('2026-07-14T12:00:00.000Z');
+    vi.setSystemTime(T0);
+    try {
+      const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+      tempDirs.push(rootDir);
+      const db = createDb(':memory:');
+      const runtime = new AgentMonitorRuntime(
+        new RuntimeStore(db),
+        new SourceRegistry(),
+        [claudeCodeAdapter],
+      );
+
+      const session = runtime.openSession(
+        claudeCodeAdapter.createSessionInput({
+          hostSessionId: 'claude-session-hold-then-coalesce',
+          workspacePath: rootDir,
+        }),
+      );
+
+      const store = new RuntimeStore(db);
+      // Both events created together, at T0 — mirrors Mike's exact repro:
+      // "With high and normal rows created together...".
+      store.insertEvent({
+        workspacePath: rootDir,
+        monitorId: 'merge-queue',
+        sourceName: 'manual',
+        urgency: 'high',
+        title: 'PR #123 ready to merge',
+        body: 'Merge PR #123.',
+        summary: 'PR #123 ready to merge',
+        payload: {},
+        snapshotMetadata: {},
+        snapshotText: null,
+        diffText: null,
+        objectKey: 'pr/123',
+        queryScope: {},
+        tags: ['pr'],
+        createdAt: T0,
+      });
+      store.insertEvent({
+        workspacePath: rootDir,
+        monitorId: 'pr-review-queue',
+        sourceName: 'manual',
+        urgency: 'normal',
+        title: 'PR #123 needs review',
+        body: 'Review PR #123.',
+        summary: 'PR #123 needs review',
+        payload: {},
+        snapshotMetadata: {},
+        snapshotText: null,
+        diffText: null,
+        objectKey: 'pr/123',
+        queryScope: {},
+        tags: ['pr'],
+        createdAt: T0,
+      });
+
+      // BEFORE the 15s settle boundary: the pre-fix bug fired the normal
+      // reminder alone here (`normal/events:0`), preempting this turn while
+      // the high event was still unsettled. It must now surface NOTHING —
+      // both stay held so they can be coalesced into ONE delivery later.
+      vi.setSystemTime(new Date(T0.getTime() + 5_000));
+      expect(
+        runtime.claimDelivery(session.id, 'turn-interruptible'),
+      ).toBeNull();
+
+      // AFTER the 15s settle boundary: the high event settles and the SAME
+      // due normal reminder coalesces into it — ONE delivery, not the
+      // pre-fix bug's second, separate `high/events:1` call.
+      vi.setSystemTime(new Date(T0.getTime() + 15_000));
+      const claim = runtime.claimDelivery(session.id, 'turn-interruptible');
+      expect(claim?.mode).toBe('delivery');
+      expect(claim?.urgency).toBe('high');
+      expect(claim?.events).toHaveLength(1);
+      expect(claim?.events[0]?.monitorId).toBe('merge-queue');
+      expect(claim?.coalescedReminder).toBe(
+        'AgentMon messages are available. Read the inbox.',
+      );
+
+      // Nothing left to interrupt a SECOND time for the same action.
+      expect(
+        runtime.claimDelivery(session.id, 'turn-interruptible'),
+      ).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   // Issue #441: the coalescing window must not corrupt urgency bands in

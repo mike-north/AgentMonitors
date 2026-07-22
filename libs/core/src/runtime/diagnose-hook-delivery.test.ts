@@ -214,12 +214,33 @@ describe('diagnoseHookDelivery', () => {
     expect(diagnosis.holds[0]?.claimedEventIds).not.toContain(unclaimedId);
   });
 
-  it('does not evaluate the normal-reminder hold when settled high-urgency work will preempt this turn (matches claimDelivery precedence)', () => {
+  // PR #456 review finding 3: a prior version of this diagnosis SUPPRESSED
+  // the normal-reminder hold check entirely whenever settled high-urgency
+  // work existed, on the theory that settled-high work always preempts the
+  // normal reminder — true only when the reminder is otherwise fully due (it
+  // then coalesces INTO the settled-high delivery, issue #441). It is false
+  // whenever the coalesced-until-ack guard (#333) is already blocking the
+  // reminder on its OWN — that hold is independent of any concurrent
+  // high-urgency work, and the settled-high delivery does not claim (or even
+  // touch) the blocked normal rows. This reproduces exactly that case:
+  // settled high-urgency work is pending AND a normal event is
+  // claimed-but-unacknowledged alongside a fresh unclaimed one — the
+  // `coalesced-until-ack` hold on the normal band must still be reported.
+  it('reports a `coalesced-until-ack` normal hold even while settled high-urgency work is ALSO pending (issue #441 review finding 3)', () => {
     vi.useFakeTimers();
     vi.setSystemTime(NOW);
     const h = setup();
-    const session = openLead(h, 'sess-preempt');
-    // A settled high event WILL deliver...
+    const session = openLead(h, 'sess-mixed-with-high');
+
+    // A normal event, claimed while no high-urgency work exists yet (fires
+    // standalone).
+    materialize(h, 'normal', 'mon-n', 'obj-n', NOW);
+    h.runtime.claimDelivery(session, 'turn-interruptible');
+    // A second, fresh normal event — unclaimed. Guard (#333) now blocks the
+    // reminder: not every unread normal event is unclaimed.
+    materialize(h, 'normal', 'mon-n2', 'obj-n2', NOW);
+    // A settled high event arrives too — `claimDelivery` would deliver it
+    // ALONE (the guard above blocks coalescing the normal rows into it).
     materialize(
       h,
       'high',
@@ -227,17 +248,58 @@ describe('diagnoseHookDelivery', () => {
       'obj-h',
       new Date(NOW.getTime() - SETTLE_MS),
     );
-    // ...and a normal event is already claimed (would otherwise report a hold).
-    materialize(h, 'normal', 'mon-n', 'obj-n', NOW);
-    h.runtime.claimDelivery(session, 'turn-interruptible'); // delivers high, claims it
-    materialize(h, 'normal', 'mon-n2', 'obj-n2', NOW); // stays pending
 
-    // Re-diagnose: no more settled high work, so normal is now evaluated.
     const diagnosis = h.runtime.diagnoseHookDelivery(
       session,
       'turn-interruptible',
     );
-    expect(diagnosis.holds.map((hold) => hold.urgency)).not.toContain('high');
+    const normalHold = diagnosis.holds.find(
+      (hold) => hold.urgency === 'normal',
+    );
+    expect(normalHold).toMatchObject({
+      urgency: 'normal',
+      reason: 'coalesced-until-ack',
+      unreadCount: 2,
+      pendingCount: 1,
+    });
+  });
+
+  // PR #456 review finding 1: a normal reminder that WOULD otherwise fire
+  // standalone (every unread event still unclaimed) is now withheld while
+  // sibling high-urgency work is pending but has not yet settled — it is
+  // coalesced into that delivery once it settles, in the SAME call, instead
+  // of firing separately now. The diagnosis must report this as a hold too
+  // (a NEW `settle-window` reason on the `normal` band, distinct from the
+  // `coalesced-until-ack` case above), or `--debug` would claim nothing is
+  // held while `claimDelivery` is genuinely withholding the reminder.
+  it('reports a `settle-window` normal hold when a fully-due reminder is withheld by a concurrent unsettled high-urgency event (issue #441 review finding 1/3)', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const h = setup();
+    const session = openLead(h, 'sess-withheld');
+
+    // Both fire together, unsettled: the reminder is fully due (every unread
+    // normal event unclaimed) but must be withheld until the high settles.
+    materialize(h, 'normal', 'mon-n', 'obj-n', NOW);
+    materialize(h, 'high', 'mon-h', 'obj-h', NOW);
+
+    const diagnosis = h.runtime.diagnoseHookDelivery(
+      session,
+      'turn-interruptible',
+    );
+    const normalHold = diagnosis.holds.find(
+      (hold) => hold.urgency === 'normal',
+    );
+    expect(normalHold).toMatchObject({
+      urgency: 'normal',
+      reason: 'settle-window',
+      unreadCount: 1,
+      pendingCount: 1,
+    });
+    expect(normalHold?.message).toContain('settle window');
+
+    // Confirms `claimDelivery` genuinely agrees: nothing surfaces yet.
+    expect(h.runtime.claimDelivery(session, 'turn-interruptible')).toBeNull();
   });
 
   it('diagnoses the low band at turn-idle only (002 §9.3)', () => {

@@ -16,3 +16,15 @@ coalesced reminder), the normal reminder's generic prompt is appended to the mes
 escalated into per-event detail), and both event sets are claimed together — so there is no leftover
 second interrupt for the same action. A normal-only reminder (no high-urgency event pending) is
 unaffected and still reports `urgency: 'normal'`.
+
+Also: a due normal reminder is now withheld (not fired standalone) while sibling high-urgency work
+is still pending but unsettled, so it coalesces into that delivery once it settles instead of
+preempting a separate, later high-urgency interrupt. `DeliveryClaim` gained an optional
+`coalescedReminder: string` field carrying the coalesced text explicitly — `events`/`message` alone
+were not enough for the hook-deliver/channel transports to notice it, which meant the coalesced
+normal rows were claimed but never rendered. Both transports now render it as a footer after the
+packed event block(s), and a new `previewCoalescedReminder`/`previewCoalescedReminderClient` lets a
+length-bounded transport reserve room for it before sizing how many event blocks fit.
+`diagnoseHookDelivery` (`hook deliver --debug`) also now reports this withheld state, and correctly
+reports the pre-existing coalesced-until-ack hold even when settled high-urgency work is
+simultaneously being delivered.

@@ -174,3 +174,52 @@ export function classifySettleWindowHold(
       `(~${String(remainingSeconds)}s remaining before the oldest becomes deliverable).`,
   };
 }
+
+/**
+ * Classify whether a due normal-urgency reminder is currently withheld
+ * because concurrent high-urgency work is still inside its settle window
+ * (issue #441 cross-monitor coalescing; PR #456 review findings 1 & 3).
+ * `decideDelivery`'s `turn-interruptible` branch no longer fires a due normal
+ * reminder standalone while ANY high-urgency work is genuinely pending and
+ * unsettled — it withholds the reminder so it can be folded into the SAME
+ * call once that high-urgency work settles, instead of firing separately now
+ * and preempting a later, separate high-urgency interrupt (the exact
+ * two-interrupt failure #441 fixes).
+ *
+ * This is a DIFFERENT hold from {@link classifyReminderHold}'s
+ * `already-claimed`/`coalesced-until-ack` reasons, which apply regardless of
+ * any concurrent high-urgency work (a claimed-but-unacknowledged row blocks
+ * the reminder on its own). Both are evaluated independently by
+ * `diagnoseHookDelivery` — they are mutually exclusive in practice, since
+ * this function only fires when the reminder is otherwise fully due (every
+ * unread normal event is still unclaimed), the exact case where
+ * {@link classifyReminderHold} would return `null`.
+ *
+ * Returns `null` when the reminder is not otherwise due (nothing unread, or
+ * some of it already claimed), or when there is no unsettled pending
+ * high-urgency work to withhold it (settled high-urgency work coalesces the
+ * reminder into itself instead — see `decideDelivery` — and no pending
+ * high-urgency work at all means the reminder fires standalone).
+ */
+export function classifyCoalescingWithheldHold(
+  unreadCount: number,
+  pendingCount: number,
+  pendingHighCount: number,
+  settledHighCount: number,
+): HookDeliveryHold | null {
+  const reminderDue = pendingCount > 0 && pendingCount === unreadCount;
+  if (!reminderDue) return null;
+  if (pendingHighCount === 0 || settledHighCount > 0) return null;
+
+  return {
+    urgency: 'normal',
+    reason: 'settle-window',
+    unreadCount,
+    pendingCount,
+    message:
+      `Normal-urgency reminder at turn-interruptible is withheld: concurrent ` +
+      `high-urgency work is still inside its settle window (issue #441 ` +
+      `cross-monitor coalescing). It will be coalesced into that delivery ` +
+      `once the high-urgency work settles, rather than firing separately now.`,
+  };
+}

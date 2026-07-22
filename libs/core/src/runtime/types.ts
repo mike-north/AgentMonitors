@@ -238,6 +238,25 @@ export interface DeliveryClaim {
   message: string;
   unreadCounts: SessionUnreadCounts;
   events: DeliveryEventSummary[];
+  /**
+   * The coalesced normal-urgency reminder text (issue #441 cross-monitor
+   * coalescing), present ONLY when a due normal reminder was folded into this
+   * `events`-carrying settled-high batch — i.e. `message` was extended with
+   * this same text, and the caller (`claimDelivery`/`commitDelivery`) claimed
+   * the coalesced normal rows alongside the surfaced high events. `undefined`
+   * for every other claim (a plain high batch, a standalone reminder, or a
+   * recap), and never populated on a claim where `events` is empty (that
+   * shape already carries the reminder in `message`).
+   *
+   * `events` and `message` carry NO representation of this text on their own
+   * — `events` holds only high-urgency `DeliveryEventSummary` rows, and a
+   * body-injection transport (the hook-deliver and channel renderers) never
+   * reads `message` when `events.length > 0`. A bounded transport MUST render
+   * this field explicitly whenever it is present, or the coalesced normal
+   * rows are claimed but never actually surfaced anywhere — a
+   * claimed-set-equals-rendered-set violation (006 §5.5).
+   */
+  coalescedReminder?: string;
 }
 
 /**
