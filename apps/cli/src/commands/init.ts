@@ -194,9 +194,10 @@ const PR_REVIEW_URGENCY_COMMENT =
  * (003 §11.9).
  */
 const MY_PRS_URGENCY_COMMENT =
-  '# high, earned by the payload filter above: only PRs that need YOU to do\n' +
-  '# something are in the list at all, so an ordinary CI run (queued -> running ->\n' +
-  '# passing) produces no event. `normal` was tried in the field and does not work\n' +
+  '# high, earned by the payload filter above: PRs are in the list only when they\n' +
+  '# need YOU to do something (one benign exception below), so an ordinary CI run\n' +
+  '# (queued -> running -> passing) produces no event. `normal` was tried in the\n' +
+  '# field and does not work\n' +
   '# here, for two compounding reasons (002 §9.2/§9.3):\n' +
   '#   1. Normal reminders are coalesced-until-ack. One claimed-but-unacked normal\n' +
   '#      event from ANY monitor suppresses the coalesced reminder for ALL of them,\n' +
@@ -204,10 +205,15 @@ const MY_PRS_URGENCY_COMMENT =
   '#      monitor goes silent exactly when the agent has been busy.\n' +
   '#   2. Normal delivers no event BODY mid-session; bodies arrive only at recap.\n' +
   '#      An author needs to know WHICH PR broke and HOW while still working.\n' +
-  '# Not every fire is actionable: a PR LEAVING the list (CI fixed, review\n' +
-  '# answered, draft marked ready) also diffs. Those are one-per-cycle\n' +
-  '# confirmations, not a storm, and the body below names them so they are cheap\n' +
-  '# to dismiss.\n';
+  '# Not every fire is actionable, and not every ENTERING one is either:\n' +
+  '#   - a PR LEAVING the list (CI fixed, review answered, draft marked ready)\n' +
+  '#     diffs as a one-per-cycle confirmation, not a task; and\n' +
+  '#   - a draft you just OPENED enters as `draft` even though nothing needs\n' +
+  '#     doing — in a single snapshot a freshly-opened draft is indistinguishable\n' +
+  '#     from one pulled back from ready, so it appears here; the diff (added vs.\n' +
+  '#     changed) and the body tell them apart.\n' +
+  '# Neither is a storm, and the body below names both so they are cheap to\n' +
+  '# dismiss. (This is the exception to "in the list only when they need you".)\n';
 
 /**
  * Generalized replacement for {@link PR_REVIEW_URGENCY_COMMENT} /
