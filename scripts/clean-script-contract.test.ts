@@ -668,6 +668,99 @@ describe('assertPackageCleanRemovesDistAndTemp', () => {
     ).toThrow(/must also remove "temp"/);
   });
 
+  // Regression fixture for the round-7 #454 review finding: a bare `rm`
+  // head word was previously trusted to succeed UNCONDITIONALLY, so a real
+  // `rm` invocation that itself FAILS (a nonexistent-file target exits 1)
+  // looked exactly like a guaranteed chain to logic that only checked the
+  // head word — verified against real `/bin/sh`: the required `rm -rf dist
+  // temp` never runs, and neither directory is removed.
+  it('rejects "rm -rf dist temp" reachable only via `rm nonexistentfile && rm -rf dist temp` (round-7: an unshaped `rm` invocation is not trusted to succeed)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'rm nonexistentfile && rm -rf dist temp' } },
+        'test-package',
+      ),
+    ).toThrow(/must run `rm -rf`/);
+  });
+
+  // Same finding, a second shape: `rm -q` is not `rm -rf` either, and is not
+  // trusted to succeed just because its head word is `rm`.
+  it('rejects "rm -rf dist temp" reachable only via `rm -q && rm -rf dist temp` (round-7: an unshaped `rm` invocation is not trusted to succeed)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'rm -q && rm -rf dist temp' } },
+        'test-package',
+      ),
+    ).toThrow(/must run `rm -rf`/);
+  });
+
+  // Regression fixture for the round-7 #454 review finding: a lone `|` was
+  // previously folded into the preceding command's argv as ordinary literal
+  // text instead of being recognized as a pipe — so `rm -rf dist | false`
+  // was accepted as a guaranteed `rm -rf` (its "targets" happened to include
+  // the literal words `|`/`false`, neither of which starts with `-`), even
+  // though the real pipeline's exit status is `false`'s, so the
+  // `&&`-chained `rm -rf temp` never actually runs. Verified against real
+  // `/bin/sh`: `dist` is removed (rm's own argv is just `dist`) but `temp`
+  // is not.
+  it('rejects "temp" removed only via `rm -rf dist | false && rm -rf temp` (round-7: an unquoted `|` must fail closed, not fold into the preceding argv)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'rm -rf dist | false && rm -rf temp' } },
+        'test-package',
+      ),
+    ).toThrow(/unsupported shell construct/);
+  });
+
+  // Regression fixture for the round-7 #454 review finding: leading
+  // `NAME=value` assignment words must be stripped before checking the `rm
+  // -rf` shape, exactly as `commandKnownStatus`'s trust check already does —
+  // `FOO=bar rm -rf dist temp` is still a real, guaranteed removal to
+  // `/bin/sh` (the assignment only scopes `FOO` into `rm`'s environment).
+  it('accepts an assignment-prefixed `FOO=bar rm -rf dist temp` (round-7: leading assignments are stripped before the `rm -rf` shape check)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'FOO=bar rm -rf dist temp' } },
+        'test-package',
+      ),
+    ).not.toThrow();
+  });
+
+  // Regression fixture for the round-7 #454 review finding: a single,
+  // leading `--` right after `-rf` is the POSIX end-of-options marker, not a
+  // flag — `rm -rf -- dist temp` really does remove both directories, but
+  // the trailing-flag check previously rejected any `-`-prefixed word among
+  // the "targets", including this one.
+  it('accepts `rm -rf -- dist temp` (round-7: a leading `--` end-of-options marker is not a control flag)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'rm -rf -- dist temp' } },
+        'test-package',
+      ),
+    ).not.toThrow();
+  });
+
+  // Control: `rm -rf --help dist temp` and `rm -rf --version dist temp`
+  // must still be rejected — the `--` exception above must not swallow real
+  // control flags.
+  it('still rejects `rm -rf --help dist temp` (round-7: the `--` exception must not relax the control-flag check)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'rm -rf --help dist temp' } },
+        'test-package',
+      ),
+    ).toThrow(/must run `rm -rf`/);
+  });
+
+  it('still rejects `rm -rf --version dist temp` (round-7: the `--` exception must not relax the control-flag check)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'rm -rf --version dist temp' } },
+        'test-package',
+      ),
+    ).toThrow(/must run `rm -rf`/);
+  });
+
   // The real proof: every actual, on-disk package discovered by
   // `findApiExtractorPackageDirs` must satisfy the contract. If any future
   // package's `clean` script drifts back to a `dist`-only shape, this
@@ -1347,6 +1440,58 @@ describe('assertRootCleanRunsWorkspaceCleanAndReset', () => {
         },
       }),
     ).toThrow(/must exclude/);
+  });
+
+  // Regression fixture for the round-7 #454 review finding: a bare `nx`
+  // head word was previously trusted to succeed UNCONDITIONALLY, regardless
+  // of shape — so an unvetted `nx run-many --target=nonexistent-target`
+  // (which a real `nx` CLI exits nonzero for, since there is no such
+  // target) looked exactly like a guaranteed step to logic that only
+  // checked the head word, wrongly letting the `&&`-chained real `nx
+  // run-many --target=clean`/`nx reset` be marked reachable even though the
+  // real `/bin/sh` chain would have already stopped at the failing step.
+  it('rejects the real required invocations reachable only after an unvetted `nx run-many --target=nonexistent-target` (round-7: an unshaped `nx` invocation is not trusted to succeed)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'nx run-many --target=nonexistent-target && NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace && NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/must invoke `nx run-many --target=clean`/);
+  });
+
+  // The positive control: a genuinely vetted `nx reset` step earlier in the
+  // chain IS trusted, so a real `&&`-chained requirement after it remains
+  // reachable.
+  it('accepts a real `nx reset` earlier in the chain still being trusted (round-7 positive control)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace && NX_TUI=false nx reset && NX_TUI=false nx reset',
+        },
+      }),
+    ).not.toThrow();
+  });
+
+  // Regression fixture for the round-7 #454 review finding: an unquoted `|`
+  // was previously folded into the preceding command's argv instead of
+  // being recognized as a pipe — so a root-shaped `nx run-many
+  // --target=clean ... | false && nx reset` was accepted as a guaranteed
+  // `run-many` (the pipe/`false` words became harmless extra argv to a
+  // command this guard only pattern-matches, not runs), even though the
+  // real pipeline's exit status is `false`'s, so the `&&`-chained `nx
+  // reset` never actually runs.
+  it('rejects `nx reset` reachable only via `nx run-many --target=clean ... | false && nx reset` (round-7: an unquoted `|` must fail closed)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace | false && NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/unsupported shell construct/);
   });
 
   // The real proof: the actual, on-disk root package.json.

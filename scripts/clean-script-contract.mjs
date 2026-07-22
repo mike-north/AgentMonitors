@@ -48,6 +48,7 @@ const IGNORED_DIR_NAMES = new Set([
   '.git',
   '.nx',
   '.claude',
+  '.worktrees',
   '.turbo',
   'dist',
   'temp',
@@ -353,6 +354,22 @@ function lexShellLike(script) {
       flushCommand('||');
       i++;
       continue;
+    }
+
+    // An unquoted, non-`||` lone `|` is a real pipe — out of this lexer's
+    // documented scope (see the module doc's "Scope" paragraph) and NOT
+    // safe to fold into the surrounding command's argv the way earlier code
+    // did: `nx run-many --target=clean ... | false && nx reset` was
+    // accepted as one long `nx run-many` invocation whose "argv" happened
+    // to include the literal words `|`/`false`, even though a real shell
+    // pipes `run-many`'s stdout into `false` and the WHOLE pipeline's exit
+    // status is `false`'s — so the following `&&`-chained `nx reset` never
+    // actually runs. Fail closed rather than silently accepting it.
+    if (ch === '|') {
+      throw new Error(
+        `unsupported shell construct in clean script: unquoted "|" ` +
+          `(pipes) is not supported by this guard's lexer — got: ${JSON.stringify(script)}`,
+      );
     }
 
     if (ch === '&') {
@@ -668,10 +685,11 @@ function skipLeadingAssignments(words) {
  * optimistically assumes an unrecognized command succeeds.
  *
  * @param {string[]} words
- * @returns {boolean}
+ * @returns {'success' | 'fail' | 'unknown'}
  */
 function commandKnownStatus(words) {
-  const [head, ...rest] = skipLeadingAssignments(words);
+  const stripped = skipLeadingAssignments(words);
+  const head = stripped[0];
   if (head === undefined) {
     return 'unknown';
   }
@@ -685,13 +703,11 @@ function commandKnownStatus(words) {
   if (head.split('/').pop() === 'false') {
     return 'fail';
   }
-  // `exit <nonzero literal>` deterministically fails the same way — round-3
-  // #454 review finding: only recognizing the literal `false` builtin left
-  // `exit 1 && rm -rf dist temp` (which never actually removes anything)
-  // indistinguishable from a real guaranteed chain.
-  if (head === 'exit' && rest.length === 1 && /^-?\d+$/.test(rest[0])) {
-    return Number(rest[0]) !== 0 ? 'fail' : 'success';
-  }
+  // `exit`'s own exit status is never consulted here: whether a reached
+  // `exit` is itself script-terminating (regardless of ITS status — see
+  // {@link isTerminatingCommand}) is what determines whether anything
+  // chained after it ever runs, not this function's return value.
+  //
   // Utility command names this guard trusts to succeed when actually
   // reached — every real invocation this guard itself validates (`rm -rf`,
   // any `nx` subcommand) plus the trivially-always-successful POSIX
@@ -703,8 +719,31 @@ function commandKnownStatus(words) {
   // this lexer's bounded grammar can't evaluate) look identical to a real
   // `guaranteed: true` chain, even though this guard has no actual basis for
   // assuming that command's outcome.
-  if (head === 'rm' || head === 'nx' || head === 'true' || head === ':') {
+  if (head === 'true' || head === ':') {
     return 'success';
+  }
+  // A bare `rm`/`nx` head word is trusted ONLY when the command actually
+  // satisfies the exact shape this guard itself validates elsewhere
+  // ({@link isRmRfCommand}, {@link isNxRunManyCleanCommand}, or an
+  // un-no-op'd `nx reset`) — round-7 #454 review finding: unconditionally
+  // trusting every `rm`/`nx` invocation regardless of shape let e.g.
+  // `rm nonexistentfile && rm -rf dist temp` (a real `rm` that itself FAILS
+  // — exit 1, "No such file or directory") or a pipe-mangled `rm -rf dist |
+  // false && rm -rf temp` look exactly like a real `guaranteed: true` chain
+  // to logic that only checked the head word, even though the required
+  // command after the `&&` never actually runs. A DIFFERENTLY-shaped
+  // `rm`/`nx` invocation (e.g. `rm somefile`, or an `nx` subcommand this
+  // guard doesn't specifically model) has no basis for assuming success and
+  // falls through to `'unknown'` below, exactly like any other unrecognized
+  // command.
+  if (head === 'rm') {
+    return isRmRfCommand(stripped) ? 'success' : 'unknown';
+  }
+  if (head === 'nx') {
+    return isNxRunManyCleanCommand(stripped) ||
+      (containsTokens(stripped, 'nx', 'reset') && !hasNxNoopFlag(stripped))
+      ? 'success'
+      : 'unknown';
   }
   return 'unknown';
 }
@@ -1052,14 +1091,24 @@ function hasNxNoopFlag(words) {
  * not that the raw value is exactly `"clean"`. Also rejects a
  * {@link NX_NOOP_FLAGS} invocation masquerading as the real thing.
  *
+ * Strips any leading `NAME=value` assignment words first (see
+ * {@link skipLeadingAssignments}), matching {@link isRmRfCommand} — round-7
+ * #454 review finding: an assignment-prefixed `FOO=bar nx run-many
+ * --target=clean ...` is still a real, guaranteed `nx run-many
+ * --target=clean` invocation to `/bin/sh` (the assignment only scopes `FOO`
+ * into `nx`'s environment), and this guard's OWN `commandKnownStatus` trust
+ * check already strips assignments before consulting this function, so the
+ * two must apply the same normalization consistently.
+ *
  * @param {string[]} words
  * @returns {boolean}
  */
 function isNxRunManyCleanCommand(words) {
+  const stripped = skipLeadingAssignments(words);
   return (
-    containsTokens(words, 'nx', 'run-many') &&
-    findFlagValueSet(words, 'target').has('clean') &&
-    !hasNxNoopFlag(words)
+    containsTokens(stripped, 'nx', 'run-many') &&
+    findFlagValueSet(stripped, 'target').has('clean') &&
+    !hasNxNoopFlag(stripped)
   );
 }
 
@@ -1077,16 +1126,33 @@ function isNxRunManyCleanCommand(words) {
  * real `rm` binary exits after printing control output instead of
  * deleting anything — so a bare `-`-prefixed word anywhere among the
  * "targets" makes this reject the command rather than count `dist`/`temp`
- * as removed.
+ * as removed. A single, leading `--` immediately after `-rf` is the
+ * exception (round-7 #454 review finding): POSIX `--` is the end-of-options
+ * marker, not a flag — `rm -rf -- dist temp` really does remove `dist` and
+ * `temp` exactly like `rm -rf dist temp` does, but the naive "no `-`-
+ * prefixed word among the targets" check rejected it as though `--` were an
+ * unrecognized option.
+ *
+ * Strips any leading `NAME=value` assignment words first (see
+ * {@link skipLeadingAssignments}) — round-7 #454 review finding:
+ * `FOO=bar rm -rf dist temp` is still a real, guaranteed `rm -rf` invocation
+ * to `/bin/sh` (the assignment only scopes `FOO` into `rm`'s environment),
+ * but the un-normalized word list starts with `FOO=bar`, not `rm`, so the
+ * exact `startsWithTokens(words, 'rm', '-rf')` check wrongly rejected it —
+ * `commandKnownStatus`'s trust check already strips assignments before
+ * consulting this function, so the two must apply the same normalization.
  *
  * @param {string[]} words
  * @returns {boolean}
  */
 function isRmRfCommand(words) {
-  return (
-    startsWithTokens(words, 'rm', '-rf') &&
-    words.slice(2).every((word) => !word.startsWith('-'))
-  );
+  const stripped = skipLeadingAssignments(words);
+  if (!startsWithTokens(stripped, 'rm', '-rf')) {
+    return false;
+  }
+  const rest = stripped.slice(2);
+  const targets = rest[0] === '--' ? rest.slice(1) : rest;
+  return targets.every((word) => !word.startsWith('-'));
 }
 
 /**
