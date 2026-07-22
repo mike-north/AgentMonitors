@@ -5150,8 +5150,11 @@ Handle it.
     expect(result.stdout).toContain('monitor:heartbeat');
     expect(result.stdout).toContain('source=schedule');
     expect(result.stdout).not.toContain('last-observed=never');
+    // The two transport rows are `skip` (no lead session is open, so nothing is
+    // expected to be listening) and the verdict is `idle` — issue #425 keeps
+    // the "nothing open yet" state out of the failure count entirely.
     expect(result.stdout).toMatch(
-      /Summary: \d+ passed, 0 failed, 0 skipped, 2 idle\./,
+      /Summary: \d+ passed, 0 failed, 2 skipped, 3 idle\./,
     );
   });
 
@@ -5612,6 +5615,12 @@ Handle it.
       'daemon-reachable',
       'lead-session',
       'monitor:heartbeat',
+      // Delivery-transport checks close the sequence (issue #425): they answer
+      // "what is listening?", which only makes sense after the workspace and
+      // per-monitor state above have been established.
+      'transport:hook',
+      'transport:channel',
+      'delivery-verdict',
     ]);
     // The daemon-reachable check is idle (not fail — issue #373) and still
     // carries a non-null remediation.
@@ -5620,7 +5629,11 @@ Handle it.
     );
     expect(daemonCheck?.status).toBe('idle');
     expect(daemonCheck?.remediation).toContain('agentmonitors daemon run');
-    expect(report.summary.idle).toBe(2);
+    // 2 pre-existing (daemon-reachable, lead-session) + 3 transport checks:
+    // with no lead session and no transport reporting in, all three are idle or
+    // skipped rather than failures — nothing is broken, nothing is open.
+    expect(report.summary.idle).toBe(3);
+    expect(report.summary.skipped).toBe(2);
     expect(report.summary.failed).toBe(0);
 
     // The per-monitor rollup shape is complete and read from persisted state.

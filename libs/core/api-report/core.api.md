@@ -153,7 +153,7 @@ export type ChangeDetectionStrategy = 'json-diff' | 'text-diff' | 'exit-code' | 
 export type ChangeKind = 'created' | 'modified' | 'deleted' | 'descoped';
 
 // @public
-export function classifyReminderHold(urgency: 'normal' | 'low', unreadCount: number, pendingCount: number): HookDeliveryHold | null;
+export function classifyReminderHold(urgency: 'normal' | 'low', unreadCount: number, pendingCount: number, claimedEventIds?: string[]): HookDeliveryHold | null;
 
 // @public
 export function classifySettleWindowHold(pendingHighCreatedAt: readonly Date[], unreadCount: number, now: Date, settleMs: number): HookDeliveryHold | null;
@@ -430,6 +430,7 @@ export interface HookDeliveryDiagnosis {
 
 // @public
 export interface HookDeliveryHold {
+    claimedEventIds?: string[];
     message: string;
     pendingCount: number;
     // (undocumented)
@@ -1743,7 +1744,12 @@ export function withRestrictedUmask<T>(fn: () => T): T;
 export function writeBridgeState(statePath: string, state: HookState): void;
 
 // @public
-export function writePrivateFileAtomic(filePath: string, contents: string): void;
+export function writePrivateFileAtomic(filePath: string, contents: string, options?: WritePrivateFileAtomicOptions): void;
+
+// @public
+export interface WritePrivateFileAtomicOptions {
+    tempSuffix?: string;
+}
 
 // (No @packageDocumentation comment for this package)
 

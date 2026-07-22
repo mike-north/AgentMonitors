@@ -230,6 +230,17 @@ export function withRestrictedUmask<T>(fn: () => T): T {
   }
 }
 
+/** Options for {@link writePrivateFileAtomic}. */
+export interface WritePrivateFileAtomicOptions {
+  /**
+   * Distinguishes the temp file used during the write, appended between
+   * `filePath` and the trailing `.tmp` (e.g. `.<pid>` so two writers racing
+   * on the same target don't create — and rename — the same temp path).
+   * Defaults to no suffix (`<filePath>.tmp`).
+   */
+  tempSuffix?: string;
+}
+
 /**
  * Atomically write `contents` to `filePath` with owner-only (`0600`) mode,
  * ensuring the containing directory is owner-only (`0700`) first.
@@ -243,9 +254,10 @@ export function withRestrictedUmask<T>(fn: () => T): T {
 export function writePrivateFileAtomic(
   filePath: string,
   contents: string,
+  options?: WritePrivateFileAtomicOptions,
 ): void {
   ensurePrivateDir(path.dirname(filePath));
-  const tmpPath = `${filePath}.tmp`;
+  const tmpPath = `${filePath}${options?.tempSuffix ?? ''}.tmp`;
   // The temp path is deterministic, so treat whatever sits there as hostile:
   // remove it (rm does not follow symlinks) and recreate with `O_EXCL`, which
   // refuses to follow a symlink planted between the two calls. A plain

@@ -25,6 +25,7 @@ import {
   type HookDeliveryOutput,
 } from '../hook-deliver-render.js';
 import { readHookPayload } from '../hook-payload.js';
+import { writeTransportHeartbeat } from '../transport-heartbeat.js';
 import {
   isManualDaemonConnectionError,
   manualDaemonErrorMessage,
@@ -835,6 +836,22 @@ Diagnosis:
         }
         debug(describeSessionMatch(match));
 
+        // Record that the hook transport reached this point for this workspace
+        // (issue #425). This is the ONLY durable evidence that the hook path is
+        // wired up at all: `hook deliver` spawns fresh per prompt and leaves no
+        // other trace, so without it `doctor` cannot distinguish "hooks are
+        // installed and simply had nothing to deliver" from "the plugin's hooks
+        // were never installed" — both are silence. Written here, after session
+        // resolution, so the record only exists once the transport has actually
+        // proven it can resolve a workspace, socket, and session. Never throws.
+        writeTransportHeartbeat({
+          transport: 'hook',
+          workspacePath,
+          socketPath,
+          hostSessionId,
+          sessionId: match.id,
+        });
+
         // Pending-by-urgency counts + per-band hold reasons (issue #334). Pure
         // read (never claims/mutates); computed ONLY when --debug is set, so
         // the non-debug path makes no extra daemon round trip.
@@ -940,6 +957,29 @@ Diagnosis:
           debug(describeCommitLapsed());
         }
         debug(describeClaim(claim ?? reservedClaim));
+
+        // Refresh the heartbeat, recording a delivery timestamp ONLY when
+        // `output` was non-null (issue #425 review). `lastDelivery` is what
+        // separates "the transport runs" from "the transport delivers": a
+        // hook that fires every prompt but has never surfaced anything is the
+        // signature of a workspace whose events are going elsewhere. If we
+        // reach this line, `writeAndCommitHookDelivery` did not throw, so a
+        // non-null `output` DID reach the host (a write failure always
+        // releases and re-throws, skipping straight to the outer catch below)
+        // — but `flow.output` can itself be `null` ("genuinely nothing to
+        // surface", see `HookDeliveryFlowResult`), in which case nothing was
+        // written and this call must NOT claim a delivery happened.
+        // `writeTransportHeartbeat` preserves whatever `lastDeliveryAt` the
+        // prior write already recorded when this call omits it, so an empty
+        // prompt no longer resets `last-delivery` back to `never`.
+        writeTransportHeartbeat({
+          transport: 'hook',
+          workspacePath,
+          socketPath,
+          hostSessionId,
+          sessionId: match.id,
+          ...(output !== null ? { lastDeliveryAt: new Date() } : {}),
+        });
       } catch (error) {
         // Any internal error is swallowed: a hook that throws would interrupt
         // the user's session (BP2 / always-exit-0 contract). Debug mode still

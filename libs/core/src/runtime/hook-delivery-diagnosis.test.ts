@@ -50,6 +50,17 @@ describe('classifyReminderHold', () => {
     expect(hold?.message).toContain('agentmonitors events ack');
   });
 
+  it('defaults `claimedEventIds` to an empty array when the caller omits it', () => {
+    // The caller (`diagnoseHookDelivery`) always supplies real ids; this
+    // default only guards a direct caller of the pure classifier.
+    expect(classifyReminderHold('normal', 1, 0)?.claimedEventIds).toEqual([]);
+  });
+
+  it('threads explicit `claimedEventIds` through unchanged (issue #425 review, round 6)', () => {
+    const hold = classifyReminderHold('normal', 1, 0, ['evt-1']);
+    expect(hold?.claimedEventIds).toEqual(['evt-1']);
+  });
+
   it('reports `coalesced-until-ack` when unread normal events mix claimed and unclaimed (§9.2)', () => {
     // unread=3, pending=1 → 2 claimed, 1 unclaimed — the claimed rows hold the
     // coalesced reminder back even though a fresh unclaimed event exists.

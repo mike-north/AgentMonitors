@@ -128,6 +128,8 @@ describe('diagnoseHookDelivery', () => {
       unreadCount: 1,
       pendingCount: 1,
       settleRemainingMs: 10_000,
+      // Nothing is claimed yet — the hold is purely "not aged in".
+      claimedEventIds: [],
     });
 
     // Read-only: nothing was claimed by diagnosing.
@@ -152,7 +154,7 @@ describe('diagnoseHookDelivery', () => {
   it('reports `already-claimed` for the normal reminder once its only unread event is claimed, and diagnosing never claims it itself (002 §9.2)', () => {
     const h = setup();
     const session = openLead(h, 'sess-normal');
-    materialize(h, 'normal', 'mon', 'obj-a', new Date());
+    const eventId = materialize(h, 'normal', 'mon', 'obj-a', new Date());
 
     // Diagnosing BEFORE any claim: the reminder would fire, so no hold.
     expect(
@@ -178,6 +180,10 @@ describe('diagnoseHookDelivery', () => {
       reason: 'already-claimed',
       unreadCount: 1,
       pendingCount: 0,
+      // Regression (issue #425 review, round 6): the exact claimed event id
+      // must be named, not merely a count, so a caller can acknowledge
+      // precisely this row instead of every unread event on the session.
+      claimedEventIds: [eventId],
     });
     expect(h.runtime.claimDelivery(session, 'turn-interruptible')).toBeNull(); // matches the diagnosis
   });
@@ -185,9 +191,9 @@ describe('diagnoseHookDelivery', () => {
   it('reports `coalesced-until-ack` when unread normal events mix claimed and unclaimed', () => {
     const h = setup();
     const session = openLead(h, 'sess-mixed');
-    materialize(h, 'normal', 'mon', 'obj-a', new Date());
+    const claimedId = materialize(h, 'normal', 'mon', 'obj-a', new Date());
     h.runtime.claimDelivery(session, 'turn-interruptible'); // claims obj-a
-    materialize(h, 'normal', 'mon', 'obj-b', new Date()); // fresh, unclaimed
+    const unclaimedId = materialize(h, 'normal', 'mon', 'obj-b', new Date()); // fresh, unclaimed
 
     const diagnosis = h.runtime.diagnoseHookDelivery(
       session,
@@ -200,7 +206,12 @@ describe('diagnoseHookDelivery', () => {
       reason: 'coalesced-until-ack',
       unreadCount: 2,
       pendingCount: 1,
+      // Only the CLAIMED event is named — the fresh unclaimed one must not
+      // be swept into a remediation scoped to "the events holding this
+      // reminder back".
+      claimedEventIds: [claimedId],
     });
+    expect(diagnosis.holds[0]?.claimedEventIds).not.toContain(unclaimedId);
   });
 
   it('does not evaluate the normal-reminder hold when settled high-urgency work will preempt this turn (matches claimDelivery precedence)', () => {
@@ -232,7 +243,7 @@ describe('diagnoseHookDelivery', () => {
   it('diagnoses the low band at turn-idle only (002 §9.3)', () => {
     const h = setup();
     const session = openLead(h, 'sess-low');
-    materialize(h, 'low', 'mon', 'obj-a', new Date());
+    const eventId = materialize(h, 'low', 'mon', 'obj-a', new Date());
     h.runtime.claimDelivery(session, 'turn-idle'); // fires + claims the low reminder
 
     const idle = h.runtime.diagnoseHookDelivery(session, 'turn-idle');
@@ -240,6 +251,7 @@ describe('diagnoseHookDelivery', () => {
     expect(idle.holds[0]).toMatchObject({
       urgency: 'low',
       reason: 'already-claimed',
+      claimedEventIds: [eventId],
     });
 
     // turn-interruptible has no low-band guard to report.

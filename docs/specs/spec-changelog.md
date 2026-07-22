@@ -9,6 +9,243 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-07-22 — Transport-health review round 12: verdict wording corrected to workspace scope (005 §15) — Refs #425
+
+The `doctor` verdict line said `delivery to THIS session → via {hook | channel | both | none}`, but
+the computation it summarizes is workspace-wide — `doctor` has no per-session attribution, only the
+transport registry and lead-session state for the whole workspace. A reader could take "THIS
+session" literally and expect the verdict to reflect their own invoking session specifically, which
+it never has. The verdict, its surrounding CLI-reference prose, and the getting-started skill doc now
+say `delivery to active sessions in this workspace → via {hook | channel | both | none}`, matching
+what the check actually answers. No logic, problem codes, or exit codes changed — wording only.
+
+## 2026-07-21 — Transport-health review round 11: two-lead hook coverage test now drives real `hook deliver` (006 §12.3, 005 §15) — Refs #425
+
+Round 10's positive two-covered-lead case still seeded both hook heartbeats with
+`seedHeartbeat`, a hand-written JSON record keyed by the caller-supplied `hostSessionId` — it never
+called `writeTransportHeartbeat` or invoked real `hook deliver`. That proves
+`computeTransportHealth`'s aggregation logic (given two per-session records, coverage is complete),
+but it cannot catch a regression in the WIRING the test exists to protect: if `hook deliver` stopped
+forwarding `session_id` from its `UserPromptSubmit` stdin payload into `hostSessionId`, if
+`heartbeatKey` regressed to per-workspace keying, or if `sanitizeKey`'s hash suffix collided for two
+real session ids, every assertion in the hand-seeded case would stay green while the production path
+silently broke. The test now opens both lead sessions and runs the real `agentmonitors hook deliver`
+against each, with a `UserPromptSubmit` payload naming its own `hostSessionId` on stdin, then asserts
+`doctor` reports full hook coverage and a deliverable, exit-0 verdict.
+
+## 2026-07-21 — Transport-health review round 10: remaining stale per-workspace hook source comments, coverage-collapse test gap (006 §12.3, 005 §15) — Refs #425
+
+Round 9's "two stale comments" claim was itself incomplete: it fixed the two TEST comments it named,
+but three SOURCE comments describing the superseded per-workspace hook model were still present and
+contradicted `heartbeatKey`'s per-session contract (006 §12.3) — `TransportHeartbeat.hostSessionId`'s
+JSDoc said only `channel` is session-scoped, `heartbeatKey`'s own doc comment described hook as
+"per-workspace... each invocation overwrites the last", and a `doctor.ts` comment referred to "the
+per-workspace hook record". All three are reworded to describe the per-session record every active
+lead now leaves. A fourth comment, in `transport-health.test.ts`'s cross-workspace matching test,
+correctly stated hook has "no per-session identity of its own" for the OLD model but was never
+updated when the storage keying changed; it now says hook records ARE per-session while
+`selectHeartbeats` still matches candidates by same-workspace only (the two are independent facts,
+and the test's assertions were already correct).
+
+Separately, `transport-health.integration.test.ts`'s `seedHeartbeat` fixture wrote every hook record
+to a literal `hook-workspace.json`, regardless of `hostSessionId` — so the suite could never seed two
+active leads' hook heartbeats and have both survive; a wiring regression that collapsed real
+`hook deliver` invocations back onto a single shared record would have left every test in the file
+green. The fixture now keys hook records by host session id, matching the real registry, and a new
+positive case seeds two active leads' hook heartbeats and asserts both survive with a fully
+deliverable, exit-0 verdict.
+
+## 2026-07-20 — Transport-health review round 9: remaining stale workspace-keyed hook comments in tests (006 §12.3, 005 §15) — Refs #425
+
+Round 8's "Corrected throughout" claim for the stale workspace-keyed hook description missed two
+comments: `transport-health.test.ts`'s "no ACTIVE lead recipient" `describe` block and
+`transport-health.integration.test.ts`'s "closed session" test both still said `hook` records are
+"keyed per WORKSPACE, not per session", contradicting `heartbeatKey`'s per-session contract (006
+§12.3) that both tests otherwise correctly exercise. Reworded both to describe a per-session record
+left by a now-closed session, matching the shipped behavior and the rest of round 8's corrections.
+
+## 2026-07-20 — Transport-health review round 8: hook selection filtered to active leads, empty `claimedEventIds` is untrustworthy, stale docs/tests (006 §12.3/§12.7, 005 §15) — Refs #425
+
+An eighth review round against the head that closed round 7 found one remaining false green, one
+remaining unsafe remediation branch, and documentation/tests that had fallen behind round-6/7's
+production fixes:
+
+- **`hook` selection returned every same-workspace record, including closed/non-lead sessions'
+  (blocker).** After the round-6-follow-up keyed `hook` per session, `selectHeartbeats` still
+  returned every heartbeat matching the workspace rather than narrowing to active leads first, the
+  way `channel` already did. A direct probe with one healthy active-lead record plus one
+  closed-session record bound to an obsolete socket produced `socket-mismatch`,
+  `hook.healthy: false`, `reach: 'none'`, and `deliverable: false` for a workspace where the only
+  currently-open session was working fine. Selection now prefers records naming an ACTIVE lead,
+  falling back to every same-workspace record only when none match — mirroring `channel`'s pattern
+  — so an inactive session's record can no longer poison the active aggregate. See 006 §12.3.
+- **An empty `claimedEventIds` array on a suppressing hold was accepted as "trustworthy but empty"
+  (blocker).** `hasValidClaimedEventIds` only checked `Array.isArray` and element types, so `[]`
+  passed and fell into the scoped-remediation branch, where an empty `ids` list renders
+  `--event-ids` as omitted — silently falling back to the unscoped, blanket
+  `agentmonitors events ack --session <id>` the round-6 fix exists to avoid.
+  `classifyReminderHold` only ever returns an `already-claimed`/`coalesced-until-ack` hold when at
+  least one event is claimed, so a real hold from this build always names at least one id; an empty
+  array reaching `doctor` can only be malformed or hand-built and is now routed to
+  `delivery-diagnosis-unavailable`, the same as a missing field. `settle-window`'s legitimate empty
+  array never reaches this check — only the two suppressing reasons do. See 006 §12.7 / 005 §15.
+- **Stale documentation and tests still described the superseded workspace-keyed hook model.**
+  006 §12.3's selection description, 005 §15's `hook-lead-uncovered` table row, source JSDoc on
+  `TransportProblemCode`/`computeTransportHealth`, and comments/test names in
+  `transport-health.test.ts` and `transport-health.integration.test.ts` all still said hook records
+  were "single" or "workspace-keyed", contradicting the per-session `heartbeatKey` behavior already
+  shipped. Corrected throughout.
+- **A stray comment still claimed `readTransportHeartbeats` performs opportunistic GC** in
+  `isHeartbeatStale`'s future-timestamp branch, despite reads being deliberately pure since the
+  round-7 write-path-only GC fix. Corrected to reference `reapExpiredHeartbeats`.
+- **A test called the two-argument pre-fix `readTransportHeartbeats(now)` signature**, which no
+  longer exists (reads take no arguments) — a TypeScript compile failure that would have prevented
+  the whole suite from running. Fixed to call the current zero-argument signature.
+- **The website skill guide and the original changeset text still named the unscoped
+  `agentmonitors events ack --session <id>`** as the `reminders-suppressed` remediation, contradicting
+  the scoped `--event-ids`/`--socket` command the round-6 fix and the changeset's own "Review fixes"
+  section already document. Corrected both.
+
+## 2026-07-20 — Transport-health review round 7: `claimedEventIds` is optional and its absence is never an ack-all fallback (006 §12.7, 005 §15) — Refs #425
+
+A review pass against the round-6 head found two related defects in the reminders-suppressed
+remediation, plus documented a hook-keying fix from a round-6 follow-up commit that had not yet
+reached the specs:
+
+- **`HookDeliveryHold.claimedEventIds` was required on the already-published `@agentmonitors/core`
+  public type (blocker).** The round-6 work added it as a required field with no accompanying
+  changeset. Worse, it didn't reflect reality: a `HookDeliveryDiagnosis` crosses the daemon IPC
+  boundary, so it can arrive from a build that predates the field, serializing a hold with no
+  `claimedEventIds` key at all despite the compile-time type. It is now optional, with a core
+  changeset.
+- **A hold with a missing/malformed `claimedEventIds` silently became an ack-all fallback (blocker).**
+  `.flatMap((entry) => entry.hold.claimedEventIds)` contributed a literal `undefined` per such hold
+  (flatMap keeps a non-array return value as one element rather than dropping it), and
+  `Array.prototype.join` rendered that as an empty string — producing a malformed, blank
+  `--event-ids  --socket ...` flag. That is worse than the documented "omit the flag" fallback for a
+  genuinely empty `[]` (a valid, deliberate signal from `settle-window`), because it looks like a
+  safe, scoped command while actually being broken. Such a session is now reported via
+  `delivery-diagnosis-unavailable` instead — never folded into `reminders-suppressed`'s scoped
+  command, and never a bare, unscoped `agentmonitors events ack --session <id>` either, which would
+  reintroduce the exact blanket-acknowledgement defect round 6 fixed. See 006 §12.7 / 005 §15.
+- **006 §12.3 still described `hook` as workspace-keyed and overwritten per prompt**, which a
+  round-6 follow-up commit (keying both transports by host session id when known, to fix a
+  permanent false RED where two active leads sharing one workspace-wide hook record could never
+  both read as covered) had already made stale. Corrected to describe per-session keying for both
+  transports, while keeping the (still-true) distinction that only `channel` does session-id-first,
+  cross-workspace _matching_ — `hook` has no cross-workspace identity to misresolve, so its
+  selection stays same-workspace-only and returns every matching record rather than one
+  representative.
+
+## 2026-07-20 — Transport-health review round 6: hook coverage, non-finite lease rejection, scoped ack remediation, stale GC docs (006 §12, 005 §15) — Refs #425
+
+A sixth review round against the head that closed round 5, plus the write-only GC fix above, found
+four more defects — three additional false greens/unsafe remediations, and one documentation
+contradiction the GC fix itself introduced:
+
+- **The every-active-lead-covered rule (round 5) only applied to `channel`, not `hook` (blocker).**
+  Hook heartbeats already carry `hostSessionId`, but `computeTransportHealth` ignored it and treated
+  one workspace-keyed hook record as valid evidence for every active lead. With active leads `a` and
+  `b` and a hook heartbeat naming only `a`, the result read `deliveryWillReachThisSession: 'hook'` and
+  `deliverable: true` for the whole workspace even though `b` had no hook invocation evidence at all —
+  the same false-green shape the round-5 `channel-lead-uncovered` code fixed for channel, one
+  transport over. Because `hook`'s single record is workspace-keyed (not session-keyed, by design —
+  see 006 §12.3), "uncovered" here means "every active lead other than the one this one record
+  names", not "no record at all". A symmetric `hook-lead-uncovered` problem code now reports every
+  such uncovered lead, and disqualifies `hook` from being the listening method while any are
+  uncovered (006 §12.4's problem-code list; 005 §15 `transport:hook` behavior).
+
+- **A persisted `ttlMs` of `1e309` (which `JSON.parse` overflows to `Infinity`) was accepted as a
+  valid lease (blocker).** `isTransportHeartbeat` only checked `typeof ttlMs === 'number'`, and
+  `Infinity` passes that check. `isHeartbeatStale`'s `age > ttlMs` is then `false` forever, so the
+  record never ages out and can never be reaped — the identical never-expires failure mode the
+  future-`updatedAt` clamp (round 4) already hardens against, reached through a different field.
+  `ttlMs` (and `pid`/`schemaVersion`) must now be finite; `ttlMs` must additionally be positive, since
+  a zero or negative lease is not a lease at all.
+
+- **The reminders-suppressed remediation was an unscoped, blanket acknowledgement (blocker).**
+  `agentmonitors events ack --session <id>` with no `--event-ids` acks EVERY unread row for that
+  session — including events the agent never claimed or even saw — and the remediation also omitted
+  `--socket`, so it could target a different daemon than the one this `doctor` invocation actually
+  diagnosed. `HookDeliveryDiagnosis`'s holds now carry the exact `claimedEventIds` responsible for the
+  suppression (computed in `diagnoseHookDelivery` as unread-minus-pending), and the rendered
+  remediation names those ids plus the resolved socket, so following the advice can never clear
+  unrelated unseen work or target the wrong daemon.
+
+- **The write-only GC fix left two contradicting "reaped on both read and write" paragraphs in the
+  specs.** 005 §15 and 006 §12.2 each still described the OLD read-and-write reaping contract
+  immediately alongside (006 §12.2, adjacent to) the new write-only rule, so the same head specified
+  mutually exclusive semantics for whether `doctor` mutates state. Both paragraphs — and the stale
+  `readTransportHeartbeats`/`doctor.ts` code comments describing an optional `now` parameter and
+  read-side deletion that no longer exist — are corrected to state the write-only contract
+  unambiguously.
+
+## 2026-07-20 — Heartbeat GC is write-path only; `doctor` never mutates the registry (006 §12.2, 005 §15) — Refs #425
+
+Opportunistic reaping ran on the READ path, so the health surface destroyed the evidence of the
+failure it had just reported. Two consecutive `doctor` runs, with the active lead and daemon
+unchanged and nothing recovered, disagreed: the first reported `[heartbeat-stale]` and exited 1; the
+second found no record at all, took the "no transport has ever reported in" branch, and exited 0. A
+dead channel server looked fixed purely because somebody had looked at it — and `doctor` was
+mutating state, which 005 §15 explicitly says it never does.
+
+Reaping now belongs solely to `writeTransportHeartbeat`: an expired record is removed when a
+transport re-registers, which is the real reconciliation event, not when a bystander reads the
+registry. `readTransportHeartbeats()` is a pure read. A lapsed transport keeps reporting its failure
+on every health check until something actually writes again. Guarded by a three-consecutive-run
+integration regression and a repeated-read unit test.
+
+## 2026-07-20 — Transport-health review round 5: dormant sessions no longer read as live, every active lead must be covered, corrupt timestamps can no longer become representative, a stale sibling can no longer hide behind a healthy one (006 §12; 005 §15) — Refs #425
+
+A fifth review round, against the exact head that closed round 4, found four more defects — all
+either a false clean bill of health, or the opposite (an idle state wrongly reading as a live
+failure):
+
+- **`doctor` treated a DORMANT lead session as if it were still open (blocker).** `hasLeadSession`
+  meant "any lead session ever registered for this workspace", not "is one currently active" — a
+  session a prior `session close` had already marked `dormant` still counted. This let a closed
+  session's leftover, in-TTL hook heartbeat cross the CLI boundary as live: `lead-session` read
+  `pass`, the per-monitor rollup showed delivery counts instead of the `lead-session=none` marker,
+  and the JSON `leadSession` field read `true` — even though `computeTransportHealth`'s own
+  `leadHostSessionIds` (round 3) already correctly excluded it, so `deliveryWillReachThisSession`
+  disagreed with every other field about whether a session was open. `gatherDeliveryDiagnoses` also
+  asked the daemon to diagnose the dormant session's suppression state, for no live process to answer.
+  Fixed by deriving the ACTIVE lead-session set exactly once in `doctorCommand` and threading it
+  through every check, the delivery-diagnosis fetch, the per-monitor rollup, and the JSON shape —
+  `gatherDeliveryDiagnoses` now takes that filtered list directly rather than the whole report. A
+  closed session is therefore `idle`/exit 0 everywhere, matching the pre-existing "no lead session at
+  all → idle" contract this doc already stated (§15 below), rather than the round-4 fix's `fail`/exit 1
+  for this same case, which contradicted it.
+- **Proving one active lead is covered is not proving all of them are (blocker; new problem code
+  `channel-lead-uncovered`).** With two active leads and a channel heartbeat matching only one, the
+  round-4 fix ("at least one active lead has a matching channel heartbeat") was satisfied and reported
+  a clean, workspace-wide `deliverable: true` / `channel.healthy: true` verdict — silently hiding that
+  the second active lead has no channel listener at all. Fixed by comparing the matched host-session
+  ids against the FULL active-lead set and reporting every uncovered one under a new, transport-owned,
+  blocking problem code, `channel-lead-uncovered`.
+- **A stale sibling's problem did not exclude the channel from the listening method (blocker).**
+  `deliveryWillReachThisSession`/`deliverable` were computed from a hand-maintained list of four
+  problem codes that disqualify a transport from counting as "listening" — a list that omitted
+  `heartbeat-stale` (and would have omitted `channel-lead-uncovered` above too). With a fresh,
+  healthy channel record for one active lead and a stale one for another, the union of both records'
+  problems already made `channel.healthy: false`, but the listening-method check still counted the
+  channel, so `deliveryWillReachThisSession` read `channel` and the verdict ended in "(healthy)"
+  regardless. Fixed by deriving "does this problem disqualify a transport from listening" from the
+  same non-shared/non-advisory problem classification `healthy` already uses, instead of a
+  separately-maintained code list that could (and did) drift out of sync.
+- **Representative selection could pick a corrupt or future-timestamped record over a valid current
+  one (blocker).** Round 4 ranked by problem count first, specifically so a broken sibling session
+  would be shown as the representative record rather than being hidden by a healthy one. That ranking
+  backfired on corruption: an unparseable `updatedAt` contributes its own `heartbeat-stale` problem,
+  so "most problems wins" could make a CORRUPT record the representative even alongside a perfectly
+  healthy, current one — reporting `running: false`/`reach: none` for a transport that is actually up.
+  A far-future timestamp had the mirror bug on a tie: its raw `Date.parse` value reads as "freshest"
+  even though `isHeartbeatStale` independently treats it as stale, letting it shadow a valid current
+  listener. Fixed by separating representative selection (now freshness-first, with unparseable AND
+  out-of-tolerance-future timestamps both sorting as oldest) from problem aggregation (unchanged: every
+  matching record's problems are still unioned regardless of which one is chosen as representative), so
+  a broken sibling's problems are never hidden either way.
+
 ## 2026-07-21 — Preserve BOTH object identity and the Interpret digest in a delivered event block; TAB is an escaped control character in `events list --format text` (002 §1.1.6/§1.1.8, 005 §11.1, 006 §4.2.1) — Refs #449
 
 Round-10 review follow-up to the 2026-07-20 `#449` entry below. The `objectDetail` fix in that
@@ -263,6 +500,168 @@ poll-until-`daemonAvailable` loop with slightly different timeout/poll constants
 (`daemon-ipc.ts`); each call site keeps its own pre-existing timeout/poll values — no behavior change.
 
 Finding 5 (test teardown pid fallback) is test-infrastructure-only, no spec change.
+
+## 2026-07-19 — Transport-health review fixes round 4: future-timestamp staleness, symlink-safe writes, delivery-diagnosis-unavailable (006 §12; 005 §15) — Refs #425
+
+A further round of review on the delivery-transport health surface found three defects, two of which
+change verdict semantics:
+
+- **A future `updatedAt` used to read as fresh forever (blocker).** `isHeartbeatStale` computed
+  `now - updatedAt > ttlMs`; a record whose `updatedAt` is ahead of `now` (clock skew, or a corrupt or
+  forged record) makes that difference negative, which is never `> ttlMs`. Such a record would never
+  age out — blocking the opportunistic GC introduced in the prior round, and letting `doctor` report a
+  dead or bogus transport as `running` indefinitely. Fixed by treating any `updatedAt` more than a
+  small clock-skew tolerance ahead of `now` as stale, the same conservative direction already used for
+  an unparseable timestamp.
+- **The heartbeat write followed a pre-planted symlink at its temp path.** The write used a plain
+  `writeFileSync` to a deterministic sibling temp path (`<target>.<pid>.tmp`) before renaming it into
+  place. Because the registry directory predates the 0700-owner-only migration in some installs, a
+  symlink planted there while it was still permissive would be followed, letting a routine heartbeat
+  refresh overwrite an arbitrary file the symlink points at. Fixed by mirroring
+  `writePrivateFileAtomic` (000, local-permissions.ts): remove whatever sits at the temp path first,
+  then (re)create it with `O_EXCL`, which refuses to follow a symlink planted between the two calls.
+- **A failed delivery-diagnosis call read as "checked, nothing suppressed" (blocker; new problem
+  code).** `doctor` asks the daemon's `hook.diagnose` RPC, per lead session, whether reminders are
+  currently suppressed. A thrown call (an older daemon rejecting it as unsupported, or a connection
+  error) was silently dropped, leaving the diagnosis set indistinguishable from a clean "not
+  suppressed" answer — so `deliverable` could read `true` even though the check never actually ran. A
+  new problem code, `delivery-diagnosis-unavailable`, makes the distinction explicit and, unlike the
+  existing advisory codes, is blocking: `deliverable` can never be `true` while it is present.
+
+## 2026-07-19 — Transport-health review fixes: registry GC, lead-session gating, non-blocking version-skew (006 §12; 005 §15) — Refs #425
+
+Review of the initial delivery-transport health surface (below) found several defects that made the
+surface report `fail` for a workspace with nothing genuinely broken, or blame the wrong side of a
+failure:
+
+- **Registry GC + lead-session gating (blocker).** Records were removed only on clean shutdown, so an
+  uncleanly-killed transport's heartbeat sat on disk forever, past its own TTL — and the
+  `transport:<name>` check applied the "no lead session → skip/idle" discipline only to a transport
+  that had never reported in, not to one whose stale heartbeat was found on this scan. One
+  uncleanly-killed channel server therefore failed every future `doctor` run in that workspace
+  permanently, including with no session open, contradicting §15's own "no lead session → both
+  transport checks are idle" text. Fixed by reaping expired-past-TTL records opportunistically on both
+  read and write, and by extending the lead-session gate to the configured-transport branch too.
+- **Hook `lastDeliveryAt` erased on the next empty prompt (blocker).** Hook heartbeat writes were
+  whole-record overwrites; the first per-invocation write (before delivery is known) omitted
+  `lastDeliveryAt`, silently resetting it to `never` on any subsequent prompt with nothing pending.
+  Fixed by making the write read-modify-write on that one field, and by recording it only when
+  `flow.output` was actually non-null (written to the host), not on every reservation that merely
+  committed.
+- **`version-skew` made informational, not blocking.** It made `doctor` exit non-zero for up to the
+  hook's 24h TTL after every single CLI upgrade — the hook heartbeat legitimately carries the
+  pre-upgrade version until the next prompt — directly contradicting its own "No action needed"
+  remediation. Now behaves like `channel-registration-unverified`: reported, never blocking.
+- **Registry key collisions.** The sanitized heartbeat key collapsed distinct raw ids to the same
+  filename (`run:1`/`run_1`, or two ids differing only past the 96-char truncation point). Fixed by
+  appending a short hash of the raw id.
+- **Channel heartbeat coupled to poll completion.** Refreshing only after the reserve/commit/release
+  IPC settled let a daemon wedged past the channel's TTL blame the transport for the daemon's outage.
+  Fixed with an independent refresh timer.
+- **Session-id-first matching wrongly applied to `hook`.** Only `channel` (one long-lived process per
+  host session) should match by session id across workspaces; `hook` (a fresh per-prompt process with
+  no per-session identity, keyed per workspace) now matches by workspace only.
+- **Idle transport checks now always carry a remediation**, in both text and `--json`.
+- Cleanup: the XDG data-root and workspace-hash derivations, previously duplicated across
+  `workspace-paths.ts`, `transport-heartbeat.ts`, and `daemon-ipc.ts`, now have one canonical source
+  (`workspace-paths.ts`); `getCliVersion()` is memoized; `computeTransportHealth`'s `HOME`/data-root
+  comparison now takes `expectedHome`/`expectedDataRoot` as input instead of reading them live,
+  restoring the purity its own doc comment already claimed.
+
+## 2026-07-19 — Transport-health review round 4: multi-session channel selection, NaN-safe ordering, documented `pipelineProblems` (005 §15) — Refs #425
+
+Three ways the surface could still have issued a **false clean bill of health**, all closed:
+
+- **A broken session hidden behind a healthy sibling.** The channel entry was derived from the
+  freshest matching heartbeat alone. With two registered leads — one healthy channel, one bound to
+  the wrong workspace — that reported delivery as healthy while a live session silently received
+  nothing. It now evaluates EVERY heartbeat matching an active lead, unions their problems (each
+  prefixed with the host session id, since "the channel is misbound" is unactionable without saying
+  which session), and picks as representative the record with the MOST problems, ties broken by
+  freshness.
+- **A channel adopted from someone else's session.** A channel matching no active lead session was
+  falling back to any same-workspace record and being reported as this session's healthy, deliverable
+  transport — including when the workspace had no lead sessions at all. Such a record is still
+  _shown_ (a reader diagnosing silence needs to know a server is running) but now carries
+  `channel-session-unmatched` and can never count toward `deliveryWillReachThisSession`. The
+  workspace fallback remains correct for the session-less hook transport, and only there.
+- **A corrupt timestamp outranking a valid record.** Ordering used `Date.parse` directly; the
+  registry is untrusted and only proves `updatedAt` is a _string_, so `NaN` was reachable and made
+  the comparator inconsistent. Unparseable timestamps now sort as oldest.
+
+`pipelineProblems[]` is also now documented in the canonical `--json` shape, including _why_ it
+duplicates the per-transport copies: either can be read alone and be correct, and only the top-level
+list is present when no transport is configured — exactly the case where a muted or daemon-less
+workspace would otherwise look merely idle.
+
+## 2026-07-19 — Delivery-transport health surface + transport heartbeats (006 §12; 005 §15) — Refs #425
+
+Nothing answered "what transport will actually deliver monitor events to THIS session, and is it
+healthy?" Both transports can silently diverge from the workspace they serve, and every divergence
+presents identically — silence — while every existing surface reports green. Three distinct
+instances were observed in one day of dogfooding: (a) a reaped daemon with no session to revive it;
+(b) a channel server bound to the home-directory workspace because the session was launched from
+`$HOME`; and (c) correctly-materialized events whose reminders were withheld on every lead session
+by the `coalesced-until-ack` guard (002 §9.2/§9.3) — including a CI failure the agent was never told
+about. `monitor explain` diagnoses (c) correctly, but only if you think to run it, and nobody runs it
+while things appear fine.
+
+### 006 §12 — Transport health & heartbeats (_current_)
+
+New section. Each transport now writes a **heartbeat**: `channel serve` on startup and every poll
+(removed on clean shutdown), `hook deliver` per invocation once it resolves a session plus the
+delivery timestamp when it surfaces something. A record names the pid, resolved CLI path/version,
+`HOME`/data root, bound workspace and socket, host session id, and last delivery — precisely the
+values a long-lived channel server freezes at session start and that stop matching reality without
+any visible signal.
+
+Two design points are load-bearing and stated as contract, not implementation detail:
+
+- **Records carry an owner-declared TTL lease.** A server killed without cleanup leaves its file
+  behind, so a reader must judge it dead without trusting the writer to have removed it. Declaring
+  the bound in the record (rather than as a reader-side constant) keeps the judgement correct if a
+  future writer heartbeats on a different cadence, and gives a lease primitive a later
+  daemon-lifetime policy can consume directly. The channel's lease is short (tens of seconds); the
+  hook's spans a day, because there is no hook process between prompts and a short lease would
+  report a healthy setup as dead during any human pause.
+- **Records live in a machine-wide registry under the data root**, not the per-workspace directory.
+  Storing a channel heartbeat inside the workspace _it resolved_ would make failure mode (b)
+  undetectable by construction. A transport under a genuinely different `HOME`/`XDG_DATA_HOME` is
+  invisible from here and is reported as an **absence** whose wording names that possibility — never
+  as a clean bill of health.
+
+§12.4 states the surface's contract: name the listening method; report each cause **distinctly**
+(never one generic "unhealthy"); attach a concrete remediation to every problem; and separate "which
+method is listening" from "will anything actually arrive right now". §12.5 records what a heartbeat
+**cannot** prove: during the channels research preview the host drops channel events silently when
+the plugin is loaded as a plain MCP server and returns no error, so "connected" is not sufficient for
+healthy. That is surfaced as an explicitly-unverifiable advisory (pointing at `verify` and the
+dev-flag remediation) rather than asserting health we cannot prove or crying wolf; a future active
+probe would upgrade it to detection.
+
+Numbered §12 rather than inserted as §7 deliberately: renumbering would have invalidated existing
+`006 §7`–`§11` cross-references across the spec set, the roadmap, the glossary, and historical
+entries in this changelog.
+
+### 005 §15 — `doctor` reports delivery transports
+
+`doctor` gains a **Delivery transports** section, two `transport:<name>` checks, and a
+`delivery-verdict` check, with problem codes `daemon-unreachable`, `workspace-mismatch`,
+`socket-mismatch`, `environment-mismatch`, `reminders-suppressed`, `heartbeat-stale`,
+`version-skew`, and the `channel-registration-unverified` advisory. The prior statement that `doctor`
+"performs no MCP/channel checks" is removed as superseded.
+
+`deliveryWillReachThisSession` (the method) and `deliverable` (will anything arrive) are separate
+fields on purpose — the suppression case is exactly where they diverge, and collapsing them is what
+hid the undelivered CI failure. Pipeline-wide problems are recorded on every configured transport in
+`--json` but rendered once, at the verdict, so one down daemon does not read as one problem per
+transport.
+
+**Exit codes stay conservative.** A `transport:<name>` check is `fail` only for a transport that
+reported in and is genuinely broken. "A lead session exists but no transport has reported in yet" is
+`idle`, matching the existing `daemon-reachable`/`lead-session` idle discipline (issue #373): it is
+the ordinary state of a script-registered session or one that has not yet had its first prompt, and
+failing there would cry wolf on a setup about to be fine.
 
 ## 2026-07-19 — A delivered event's title is the monitor's authored `name`, and an `objectKey` is bounded in human-facing text (002 §5.4, 003 §2.8, §4.4, §11.4) — Refs #449
 

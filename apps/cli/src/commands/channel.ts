@@ -29,6 +29,12 @@ import {
   resolveChannelClaimFit,
 } from '../channel-render.js';
 import { ACK_TOOL, parseAckArgs } from '../channel-ack.js';
+import { getCliVersion } from '../cli-version.js';
+import {
+  CHANNEL_HEARTBEAT_TTL_MS,
+  removeTransportHeartbeat,
+  writeTransportHeartbeat,
+} from '../transport-heartbeat.js';
 
 const DEFAULT_POLL_MS = 3000;
 
@@ -475,7 +481,11 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
   // case" the deprecation notice points to, and what the reference channels use.
   // eslint-disable-next-line @typescript-eslint/no-deprecated -- see comment above
   const mcp = new Server(
-    { name: 'agentmonitors', version: '0.0.0' },
+    // Report the real package version, never a literal: this string is what a
+    // host (and anyone reading an MCP handshake log) uses to identify which
+    // build is serving the session, and a frozen `0.0.0` makes every release
+    // indistinguishable from every other.
+    { name: 'agentmonitors', version: getCliVersion() },
     {
       capabilities: { experimental: { 'claude/channel': {} }, tools: {} },
       instructions:
@@ -556,6 +566,65 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
     return;
   }
 
+  // Transport heartbeat (issue #425). `channel serve` is a long-lived process
+  // that FREEZES its environment — HOME, CLAUDE_PROJECT_DIR, the resolved
+  // socket, the CLI binary — at session start, and keeps looking connected long
+  // after any of them stops matching reality. Refreshing this record every poll
+  // is what lets `doctor` say "your channel is bound to workspace X / socket Y /
+  // version Z" instead of the silence that hid the 2026-07-18 misbinding.
+  //
+  // `startedAt` is captured once here so the record distinguishes "running
+  // since session start" from "respawned seconds ago" across refreshes.
+  const startedAt = new Date();
+  const heartbeatInput = {
+    transport: 'channel' as const,
+    workspacePath: workspace ?? process.cwd(),
+    socketPath,
+    ...(hostSessionId ? { hostSessionId } : {}),
+  };
+  // Track the last delivery across refreshes: each write is a whole record, so
+  // omitting this would erase a previously-reported delivery on the next poll.
+  let lastDeliveryAt: Date | undefined;
+  // Set the instant EOF/shutdown begins (before the heartbeat record is
+  // removed) and checked by every heartbeat write below. Without this, a poll
+  // already in flight when EOF arrives settles AFTER the EOF handler removes
+  // the heartbeat file, and its unconditional post-poll `heartbeat()` (below)
+  // recreates the very record the clean-shutdown path just deleted — a
+  // shut-down server would then read as "still listening" for the rest of the
+  // TTL (issue #425 review, round 3).
+  let shuttingDown = false;
+  const heartbeat = (): void => {
+    if (shuttingDown) {
+      return;
+    }
+    writeTransportHeartbeat({
+      ...heartbeatInput,
+      startedAt,
+      ...(sessionId ? { sessionId } : {}),
+      ...(lastDeliveryAt ? { lastDeliveryAt } : {}),
+    });
+  };
+  // Write immediately on startup, before the first poll: a channel server that
+  // can never reach its daemon must still be visible as "running but misbound"
+  // rather than absent — the absent case reads as "no channel at all", which
+  // points at the wrong fix entirely.
+  heartbeat();
+
+  // Independent refresh timer, NOT gated on the poll settling (issue #425
+  // review). Refreshing only from inside `poll` ties this transport's
+  // liveness signal to the daemon IPC's latency: a daemon wedged for longer
+  // than `CHANNEL_HEARTBEAT_TTL_MS` would let a live, correctly-bound server
+  // lapse to `heartbeat-stale` — blaming the TRANSPORT for the DAEMON's
+  // outage, exactly the mis-attribution `poll`'s own post-settle refresh
+  // (below) already avoids for the reserve/commit/release IPC itself. A third
+  // of the TTL comfortably re-arms the lease well before it could expire, and
+  // is independent of how long any single poll's round trip takes.
+  const heartbeatTimer = setInterval(
+    heartbeat,
+    Math.floor(CHANNEL_HEARTBEAT_TTL_MS / 3),
+  );
+  heartbeatTimer.unref();
+
   const poll = async (): Promise<void> => {
     try {
       const boundSession = await resolveSession();
@@ -573,6 +642,12 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
           });
         },
       );
+      if (outcome === 'surfaced' || outcome === 'surfaced-uncommitted') {
+        // Both outcomes mean the push actually reached the host; only the
+        // durable claim differs. `lastDelivery` answers "is this transport
+        // delivering", not "did the bookkeeping land", so both count.
+        lastDeliveryAt = new Date();
+      }
       if (outcome === 'surfaced-uncommitted') {
         // Rare: the push landed but the reservation lapsed before commit, so the
         // rows stay eligible for re-delivery (at-least-once). Note it on stderr;
@@ -588,6 +663,11 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
       // and retry.
       sessionId = undefined;
     }
+    // Refresh AFTER the poll settles, on the success and failure paths alike: a
+    // server that cannot reach its daemon is still alive and still bound, and
+    // reporting it as stale would blame the transport for the daemon's outage —
+    // two different problems with two different fixes.
+    heartbeat();
   };
 
   // Self-scheduling loop: the next poll is only armed after the current one
@@ -608,9 +688,20 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
   // cleanup can complete first.
   process.stdin.on('end', () => {
     stopped = true;
+    // Set BEFORE removing the record: an in-flight poll's `await` may still be
+    // pending and its `finally`-style post-settle `heartbeat()` call happens
+    // after this handler returns, so the guard must already be up before the
+    // record is deleted, or that later call recreates it.
+    shuttingDown = true;
     if (timer) {
       clearTimeout(timer);
     }
+    clearInterval(heartbeatTimer);
+    // Remove the heartbeat on a clean shutdown so `doctor` reports "no channel"
+    // immediately rather than "stale channel" for the whole TTL — the two point
+    // at different fixes. An unclean death (SIGKILL, host crash) leaves the
+    // record behind, which is exactly what the TTL is for.
+    removeTransportHeartbeat('channel', heartbeatInput);
     void mcp.close();
   });
 }

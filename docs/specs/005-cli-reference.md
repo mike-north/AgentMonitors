@@ -1666,10 +1666,12 @@ ad-hoc stitching of `daemon status`, `monitor explain`, `events list`, and `sess
 [setup-monitors skill](../../agent-plugins/agentmonitors/skills/setup-monitors/SKILL.md) formalizes.
 It runs a named sequence of checks for the current workspace and prints a per-monitor rollup.
 
+As of issue #425 it also answers a second question the checks above cannot: **"what is the listening
+method for this workspace, and is it healthy right now?"** — see "Delivery transports" below.
+
 **`doctor` diagnoses only — it never mutates state.** There is no `--fix` (a later issue may add
 remediation). It does **not** check host-plugin installation (whether the Claude Code plugin is
-installed is the host's side), and performs no MCP/channel checks. It never folds in or changes
-`monitor explain`.
+installed is the host's side). It never folds in or changes `monitor explain`.
 
 ### Usage
 
@@ -1723,14 +1725,16 @@ whether the daemon was actually live.
 `doctor` runs this ordered sequence, printing one line per check with a `pass` (`✓`), `fail` (`✗`),
 `skip` (`○`), or `idle` (`◇`) status and, on `fail`/`idle`, an actionable remediation:
 
-| Check                | Passes when                                                    | Remediation on failure                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| -------------------- | -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `project-enabled`    | `.claude/agentmonitors.local.md` has `enabled: true`           | Run `agentmonitors init --enable-only`, or create `.claude/agentmonitors.local.md` with `enabled: true` yourself — the **same** enable step the `SessionStart` monitors-found-but-disabled advisory names (006 §5.6, §2), so all three surfaces agree                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `monitors-directory` | the monitors directory exists                                  | Create the directory and scaffold a monitor with `agentmonitors init`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `monitors-valid`     | every discovered monitor validates (no scope/parse/dup errors) | Run `agentmonitors validate <dir>` and fix the reported errors (`skip` when there are no monitors)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `daemon-reachable`   | the `doctor.report` call reached a live daemon                 | Start it with `agentmonitors daemon run`, or let a Claude Code session start it automatically — `idle` when it doesn't and no lead session is registered (nothing is actually broken); **`fail`** when it doesn't but a lead session IS registered (issue #382 — an agent session is open with no daemon serving it, almost certainly a mid-session crash), see below                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `lead-session`       | a lead session is registered for this workspace                | Open a Claude Code session (the `SessionStart` hook runs `agentmonitors session start`, which lazy-boots the daemon and registers a lead session automatically); to do it by hand with no plugin, pipe a hook payload to that same command — `echo '{"session_id":"manual-cli-session","cwd":"<path>"}' \| agentmonitors session start`. It recommends `session start`, **not** `session open`, because `session open`'s `--host-session-id` is a required option with no meaningful value for a manual CLI user — a copy-pasted `session open` fails with `error: required option '--host-session-id' not specified` (issue #387). The failure `detail` and remediation both **name the exact workspace path searched** (issue #335), so a future db/socket-derivation mismatch is self-diagnosing: compare it directly against `agentmonitors session list`'s workspace column; `idle` (not `fail`) when no lead session is registered, see below |
-| `monitor:<id>`       | the monitor is valid and has been observed at least once       | Start the daemon (or wait for the next tick), then check `agentmonitors monitor history <id>`; `monitor test` dry-runs it (`skip` for an invalid monitor — see `monitors-valid`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| Check                | Passes when                                                                                           | Remediation on failure                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| -------------------- | ----------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `project-enabled`    | `.claude/agentmonitors.local.md` has `enabled: true`                                                  | Run `agentmonitors init --enable-only`, or create `.claude/agentmonitors.local.md` with `enabled: true` yourself — the **same** enable step the `SessionStart` monitors-found-but-disabled advisory names (006 §5.6, §2), so all three surfaces agree                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `monitors-directory` | the monitors directory exists                                                                         | Create the directory and scaffold a monitor with `agentmonitors init`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `monitors-valid`     | every discovered monitor validates (no scope/parse/dup errors)                                        | Run `agentmonitors validate <dir>` and fix the reported errors (`skip` when there are no monitors)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `daemon-reachable`   | the `doctor.report` call reached a live daemon                                                        | Start it with `agentmonitors daemon run`, or let a Claude Code session start it automatically — `idle` when it doesn't and no lead session is registered (nothing is actually broken); **`fail`** when it doesn't but a lead session IS registered (issue #382 — an agent session is open with no daemon serving it, almost certainly a mid-session crash), see below                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `lead-session`       | a lead session is registered for this workspace                                                       | Open a Claude Code session (the `SessionStart` hook runs `agentmonitors session start`, which lazy-boots the daemon and registers a lead session automatically); to do it by hand with no plugin, pipe a hook payload to that same command — `echo '{"session_id":"manual-cli-session","cwd":"<path>"}' \| agentmonitors session start`. It recommends `session start`, **not** `session open`, because `session open`'s `--host-session-id` is a required option with no meaningful value for a manual CLI user — a copy-pasted `session open` fails with `error: required option '--host-session-id' not specified` (issue #387). The failure `detail` and remediation both **name the exact workspace path searched** (issue #335), so a future db/socket-derivation mismatch is self-diagnosing: compare it directly against `agentmonitors session list`'s workspace column; `idle` (not `fail`) when no lead session is registered, see below |
+| `transport:<name>`   | the transport (`hook` / `channel`) is within its heartbeat lease and bound to this workspace's daemon | Reported per problem code (006 §12): re-resolve the workspace / respawn the transport; `idle` when it has never reported in with a lead session open, `skip` when it has never reported in and no lead session is open, and `idle` even when it HAS reported in (possibly with problems) if no lead session is currently open — nothing needs delivery right now, so a stale/misbound record from a past session is not a live failure                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `delivery-verdict`   | some transport is listening AND delivery is not currently blocked                                     | Names the specific blocker — a down daemon, a misbound transport, or reminders suppressed by `coalesced-until-ack`. The suppression remediation is scoped, never a blanket ack (issue #425 review, round 6): it names the exact claimed event ids holding the reminder back and the socket THIS `doctor` run resolved — `agentmonitors events ack --session <id> --event-ids <id1,id2,...> --socket <path>` — never a bare `--session <id>` with no `--event-ids`, which would acknowledge every unread row on the session, including events the agent never claimed or saw; `idle` when no lead session or no transport has reported in                                                                                                                                                                                                                                                                                                            |
+| `monitor:<id>`       | the monitor is valid and has been observed at least once                                              | Start the daemon (or wait for the next tick), then check `agentmonitors monitor history <id>`; `monitor test` dry-runs it (`skip` for an invalid monitor — see `monitors-valid`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
 Each `monitor:<id>` line embeds the per-monitor rollup (below).
 
@@ -1760,6 +1764,111 @@ not the exit code). A down daemon does not stop the rest of the diagnosis either
 rollup is still produced (from the in-process fallback) and the line explicitly says the daemon is
 down. Text and JSON summaries report a fourth `idle` count alongside `passed`/`failed`/`skipped`.
 
+### Delivery transports (issue #425)
+
+Both delivery transports (006 §3 hook-state, §4 channel, §5 `hook deliver`) can **silently diverge**
+from the workspace they are supposed to serve, and the failure is always the same symptom — nothing
+arrives — with completely different causes and fixes. `doctor` therefore prints a **Delivery
+transports** section above the checks, built from the transport heartbeats each transport writes
+(006 §12), and reports each cause **distinctly**; a generic "unhealthy" is explicitly not acceptable:
+
+| Problem code                      | Means                                                                                                                                      |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `daemon-unreachable`              | No daemon for this workspace: nothing can deliver, however healthy the transports                                                          |
+| `workspace-mismatch`              | This session's transport is bound to a **different workspace** than the monitors                                                           |
+| `socket-mismatch`                 | Same workspace, but bound to a different (usually dead) daemon socket                                                                      |
+| `environment-mismatch`            | The transport resolved a different `HOME` / data root, so it reads a different db                                                          |
+| `reminders-suppressed`            | Transports are up but reminders are **muted** by `coalesced-until-ack` (002 §9.2/§9.3)                                                     |
+| `heartbeat-stale`                 | A transport registered but its lease lapsed — presumed killed without cleanup                                                              |
+| `channel-session-unmatched`       | A channel server is running for this workspace but serves no ACTIVE lead session here — somebody else's listener                           |
+| `channel-lead-uncovered`          | At least one OTHER active lead session has no matching channel heartbeat at all, even though this one does                                 |
+| `hook-lead-uncovered`             | At least one active lead session has no matching hook heartbeat at all, even though another active lead's does                             |
+| `version-skew`                    | Advisory: a long-lived transport is still serving an older CLI build than this one                                                         |
+| `channel-registration-unverified` | Advisory: the host never confirms channel registration; prove delivery end to end                                                          |
+| `delivery-diagnosis-unavailable`  | The daemon's suppression check itself failed for one or more lead sessions — **not** the same as "checked, nothing suppressed" (see below) |
+
+**`pipelineProblems[]` (issue #425 review, round 4).** Pipeline-wide problems appear in **two**
+places in `--json`, deliberately: once in the top-level `pipelineProblems[]`, and again inside
+`problems[]` of every **configured** transport. The duplication is what lets a consumer read either
+one alone and still be correct — a caller inspecting a single transport sees why _that_ transport
+cannot deliver, while a caller reading the verdict sees each pipeline problem exactly once.
+`pipelineProblems[]` is the authoritative list: it is present even when NO transport is configured,
+which is precisely the case where the per-transport copies do not exist and a muted or daemon-less
+workspace would otherwise look merely idle. Text output renders them once, below the transport rows.
+
+`daemon-unreachable`, `reminders-suppressed`, and `delivery-diagnosis-unavailable` are
+**pipeline-wide** — they block the hook and channel paths alike — so they are recorded on every
+configured transport in `--json` but rendered **once**, at the verdict, rather than repeated per row
+as if they were independent failures.
+
+**`delivery-diagnosis-unavailable` (issue #425 review, round 4).** `doctor` asks the daemon's
+`hook.diagnose` RPC, per lead session, whether reminders are currently suppressed
+(`reminders-suppressed` above). That call can itself fail — e.g. an older daemon build that predates
+`hook.diagnose` and rejects it as unsupported, or a connection error mid-report — and before this fix
+a failed call was silently dropped, leaving the returned diagnosis set indistinguishable from "the
+check ran and found nothing suppressed". `deliverable` then read `true` even though whether a
+suppression was active had never actually been answered — a false green. `delivery-diagnosis-unavailable`
+makes that distinction explicit and, unlike the two advisory codes above, IS blocking: `deliverable`
+can never be `true` while it is present, precisely because "unknown" must not be reported as "healthy".
+
+**A hold with untrustworthy `claimedEventIds` is also `delivery-diagnosis-unavailable` (issue #425
+review, rounds 7–8).** `HookDeliveryHold.claimedEventIds` (round 6, above) is optional on the
+`@agentmonitors/core` type, because a diagnosis crosses the daemon IPC boundary and can arrive from a
+build that predates the field. A suppressing hold whose `claimedEventIds` is not a real, NON-EMPTY
+array of non-empty strings is reported this way — never folded into `reminders-suppressed`'s scoped
+ack command (which would render a malformed, blank `--event-ids  --socket ...` flag) and never as a
+fallback to the unscoped, blanket `agentmonitors events ack --session <id>` the round-6 fix exists to
+avoid. An empty array is untrustworthy here too (round 8): an `already-claimed`/`coalesced-until-ack`
+hold necessarily claims at least one event, so `[]` can only come from a malformed or hand-built
+value, not from a real suppression. See 006 §12.7.
+
+`version-skew` and `channel-registration-unverified` are the two **advisory, non-blocking** codes: both
+are reported when present, but neither counts toward a transport's `healthy` field, its `fail` status,
+or the overall `deliverable` verdict. `version-skew` was blocking through issue #373; it was made
+informational because the hook transport's heartbeat legitimately carries the pre-upgrade CLI version
+for up to its full 24h TTL after every release (it only refreshes on the next prompt) — treating it as
+blocking made `doctor` exit non-zero for up to a day after every single upgrade, the exact cry-wolf
+outcome issue #373 exists to prevent, and it directly contradicted the hook remediation's own "No
+action needed" wording.
+
+The section closes with a single verdict line: `delivery to active sessions in this workspace → via
+{hook | channel | both | none}`, plus whether it is deliverable **right now**. The verdict is
+scoped to the workspace, not to the invoking session specifically — `doctor` has no per-session
+attribution, only the workspace-wide picture the transport registry and lead session give it.
+Deliverability and listening method are also deliberately two different answers: a transport whose
+reminders are currently suppressed is still the listening _method_, but nothing will actually
+arrive — reporting only the method is what let a real CI failure go undelivered while every surface
+looked green.
+
+**Exit code.** A `transport:<name>` check is `fail` only for a transport that DID report in, is
+genuinely broken (misbound, stale — advisory codes never count), **and a lead session is currently
+registered for this workspace**. "A lead session exists but no transport has reported in yet" is
+`idle`, not `fail` — it is the ordinary state of a script-registered session or a freshly-opened one
+that has not yet had its first prompt, and failing there would cry wolf on a setup that is about to
+be fine. With no lead session at all, both transport checks are `idle`/`skip` and the verdict is
+`idle` — this now holds even for a transport that DID report in during some past session: a heartbeat
+left behind by an uncleanly-killed process (SIGKILL, host crash) is stale or misbound evidence about a
+session that is no longer open, not a live failure of anything happening now. Every `idle` transport
+check — configured or not — still carries a non-null `remediation` naming a concrete next step, never
+a bare status glyph.
+
+**Registry garbage collection.** The transport heartbeat registry (006 §12) is reaped opportunistically
+on the **write path only** — never on read. `doctor` (and every other reader) only ever reads the
+registry; a record found to be expired past its own declared TTL is reported accurately in that run's
+verdict (`[heartbeat-stale]`) but is never removed as a side effect of being read. Reaping instead
+happens the next time a transport actually WRITES a heartbeat (`writeTransportHeartbeat`, e.g. the
+next `channel serve` poll or `hook deliver` invocation anywhere on the machine) — a live process
+re-registering is the genuine reconciliation event; a bystander's read is not. Without this, a
+transport that dies without cleanup (SIGKILL, host crash — the exact case the TTL exists for) would
+leave its record on disk forever, and every future `doctor` run in that workspace would report
+`[heartbeat-stale]` permanently, including with no lead session ever open again — directly
+contradicting the "no lead session → idle" contract above. Reaping on the READ path instead of the
+write path was tried and reverted: it let `doctor` itself destroy the only evidence of the failure it
+had just reported (a first run reports `[heartbeat-stale]` and exits 1; a second run, with nothing
+recovered, would then find no record at all and report a clean idle/exit-0 verdict) — a dead transport
+looked fixed purely because someone had looked at it, and it made `doctor` mutate state, contradicting
+this section's own diagnoses-only contract.
+
 ### Per-monitor rollup
 
 For each monitor, `doctor` reports: **id**, **source type**, **urgency**, **cadence** (the cron
@@ -1785,6 +1894,43 @@ remediation on failures), and a closing `Summary: <n> passed, <n> failed, <n> sk
   "monitorsDir": "<path>",
   "daemon": { "running": false, "socketPath": "<path>" },
   "leadSession": false,
+  "transports": [
+    {
+      "name": "hook|channel",
+      "configured": true,
+      "running": true,
+      "healthy": false,
+      "boundTo": {
+        "workspacePath": "<path>",
+        "socketPath": "<path>",
+        "home": "<path>",
+        "dataRoot": "<path>",
+        "pid": 0,
+        "cliPath": "<path>",
+        "hostSessionId": "<string | absent>"
+      },
+      "version": "<string | null>",
+      "lastDelivery": "<iso8601 | null>",
+      "problems": [
+        {
+          "code": "<problem code>",
+          "detail": "<string>",
+          "remediation": "<string>"
+        }
+      ]
+    }
+  ],
+  "pipelineProblems": [
+    {
+      "code": "<problem code>",
+      "detail": "<string>",
+      "remediation": "<string>"
+    }
+  ],
+  "deliveryWillReachThisSession": "hook|channel|both|none",
+  "deliverable": false,
+  "verdict": "<string>",
+  "remediation": ["<string>"],
   "checks": [
     {
       "name": "project-enabled",
@@ -1812,9 +1958,21 @@ remediation on failures), and a closing `Summary: <n> passed, <n> failed, <n> sk
 }
 ```
 
+**Multi-session channel selection (issue #425 review, round 4).** The channel is session-scoped, so
+`transports[]`'s channel entry is derived from **every** heartbeat matching an active lead session of
+this workspace, not just the freshest one: with two leads — one healthy channel and one bound to the
+wrong workspace — reporting only the freshest hid a live broken session behind a healthy sibling.
+Problems from every matching record are unioned and prefixed with the host session id they belong to,
+and the representative `boundTo`/`version` is the record with the MOST problems (ties broken by
+freshness), so a broken session is never masked. A channel record for this workspace that matches no
+active lead session is still reported (`configured: true`) but carries `channel-session-unmatched`
+and can never count toward `deliveryWillReachThisSession`.
+
 `checks[]` always appears in the fixed order above (`project-enabled`, `monitors-directory`,
-`monitors-valid`, `daemon-reachable`, `lead-session`, then one `monitor:<id>` per discovered
-monitor). When `leadSession` is `false`, each monitor's `delivery` counts are all `0` and represent
+`monitors-valid`, `daemon-reachable`, `lead-session`, one `monitor:<id>` per discovered monitor,
+then `transport:hook`, `transport:channel`, `delivery-verdict`). `transports[]` is always exactly
+two entries, `hook` then `channel`, present even when neither has reported in (`configured: false`)
+— an absent key would be indistinguishable from a transport nobody checked. When `leadSession` is `false`, each monitor's `delivery` counts are all `0` and represent
 "no lead session". Errors (e.g. an unreadable store) use the standard `reportError()` shape
 (`{ "error": "..." }` to stdout in JSON mode, `Error: …` to stderr otherwise) and exit 1.
 

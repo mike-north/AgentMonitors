@@ -48,7 +48,10 @@ interface Harness {
 function makeHarness({
   urgency = 'high',
   reservationTtlMs,
-}: { urgency?: 'high' | 'normal'; reservationTtlMs?: number } = {}): Harness {
+}: {
+  urgency?: 'high' | 'normal' | 'low';
+  reservationTtlMs?: number;
+} = {}): Harness {
   const workspacePath = mkdtempSync(path.join(tmpdir(), 'agentmon-reserve-'));
   tempDirs.push(workspacePath);
   const db = createDb(':memory:');
@@ -314,4 +317,59 @@ describe('diagnostics and hook-state are lease-aware (issue #300)', () => {
       h.runtime.diagnoseHookDelivery(h.sessionId, 'turn-interruptible').holds,
     ).toHaveLength(0);
   });
+
+  /**
+   * Regression for issue #425 review round 13: `diagnoseHookDelivery` computed
+   * `claimedEventIds` as unread MINUS `pendingForClaim`, but `pendingForClaim`
+   * intentionally hides LEASED (reserved-but-not-yet-claimed) rows too — so a
+   * merely-leased event was misclassified as "claimed" and named in
+   * `claimedEventIds`. `doctor`'s scoped-ack remediation acknowledges exactly
+   * those ids; acknowledging a never-claimed, never-surfaced event makes it
+   * permanently unclaimable once the reservation later releases (`claimDelivery`
+   * finds it already acknowledged and never redelivers it). Proven here for
+   * both reminder bands the diagnosis covers: `normal` (`turn-interruptible`)
+   * and `low` (`turn-idle`).
+   */
+  it.each([
+    { urgency: 'normal', lifecycle: 'turn-interruptible' },
+    { urgency: 'low', lifecycle: 'turn-idle' },
+  ] as const)(
+    'a leased-but-unclaimed $urgency event is never named in claimedEventIds, so scoped-ack + release still redelivers it',
+    ({ urgency, lifecycle }) => {
+      const h = makeHarness({ urgency });
+
+      const reservation = h.runtime.reserveDelivery(h.sessionId, lifecycle);
+      if (!reservation) throw new Error('expected a reservation');
+
+      const holds = h.runtime.diagnoseHookDelivery(
+        h.sessionId,
+        lifecycle,
+      ).holds;
+      expect(holds).toHaveLength(1);
+      // The event is only LEASED, never claimed (`commitDelivery` never ran) —
+      // it must not be named as a "claimed" id a scoped ack should clear.
+      expect(holds[0]?.claimedEventIds ?? []).toEqual([]);
+
+      // Acknowledge exactly the (empty) scoped remediation id set doctor would
+      // build from `claimedEventIds` — this must be a no-op, not an
+      // acknowledge-everything fallback (an empty array is NOT `undefined`).
+      h.runtime.acknowledgeSession(
+        h.sessionId,
+        holds[0]?.claimedEventIds ?? [],
+      );
+
+      // Simulate the failed push this reservation represents: release it.
+      h.runtime.releaseDelivery(reservation.reservationId);
+
+      // The event must still be claimable — the bug this guards against would
+      // have acknowledged it above (unreadCount would drop to 0), so the
+      // reminder guard (pendingCount > 0 && pendingCount === unreadCount)
+      // would then see no unread work at all and return null instead.
+      expect(unreadCount(h)).toBe(1);
+      const redelivered = h.runtime.claimDelivery(h.sessionId, lifecycle);
+      expect(redelivered).not.toBeNull();
+      expect(redelivered?.urgency).toBe(urgency);
+      expect(deliveryState(h)).toBe('claimed');
+    },
+  );
 });
