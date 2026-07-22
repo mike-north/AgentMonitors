@@ -464,14 +464,18 @@ export async function runLoop(
         // lease expires) and normal reaping resumes — the guard that prevents an
         // orphaned channel server (issue #426) from pinning the daemon alive.
         //
-        // Skipped entirely when reaping is disabled (`reapAfterMs <= 0`):
-        // `shouldReap` short-circuits on that case regardless of
-        // `channelAttached`, so scanning and parsing every file in the
-        // machine-wide transport registry on every tick would be pure
-        // wasted I/O with a disabled reaper (which can have many transports
-        // across many workspaces on a busy machine).
+        // Skipped entirely unless the scan could actually change the decision
+        // (issue #435 review, PR #461): `shouldReap` short-circuits to
+        // `reap: false` — ignoring `channelAttached` — both when reaping is
+        // disabled (`reapAfterMs <= 0`) AND when a session is already active
+        // (`openCount > 0`). In either case, scanning and parsing every file in
+        // the machine-wide transport registry every tick is pure wasted I/O
+        // (that registry can hold many transports across many workspaces on a
+        // busy machine). The lease only matters when the daemon is otherwise
+        // about to reap: reaping enabled AND no open session.
         const channelAttached =
           reapAfterMs > 0 &&
+          openCount === 0 &&
           readTransportHeartbeats().some(
             (heartbeat) =>
               heartbeat.transport === 'channel' &&
