@@ -97,8 +97,9 @@ describe('classifyReminderHold', () => {
   // lease (claimedCount === 0, leasedCount > 0) must get the distinct
   // `reserved-in-flight` reason and never mention ack.
   it('reports `reserved-in-flight` (never ack) when the only held normal event is leased, not claimed (issue #300, round 10)', () => {
-    // unreadCount=1, pendingCount=0 (excluded because leased), leasedCount=1.
-    const hold = classifyReminderHold('normal', 1, 0, 1);
+    // unreadCount=1, pendingCount=0 (excluded because leased), no claimed ids,
+    // leasedCount=1.
+    const hold = classifyReminderHold('normal', 1, 0, [], 1);
     expect(hold).toMatchObject({
       urgency: 'normal',
       reason: 'reserved-in-flight',
@@ -113,15 +114,16 @@ describe('classifyReminderHold', () => {
   });
 
   it('reports `coalesced-until-ack` (not `already-claimed`) when a normal band mixes a durable claim with a live lease (issue #300, round 10)', () => {
-    // unreadCount=2, pendingCount=0, leasedCount=1 → claimedCount=1: a real
-    // claim is present, but the ack remedy must not claim to cover the leased
-    // row too.
-    const hold = classifyReminderHold('normal', 2, 0, 1);
+    // unreadCount=2, pendingCount=0, one claimed id, leasedCount=1 →
+    // claimedCount=1: a real claim is present, but the ack remedy must not
+    // claim to cover the leased row too.
+    const hold = classifyReminderHold('normal', 2, 0, ['evt-claimed'], 1);
     expect(hold).toMatchObject({
       urgency: 'normal',
       reason: 'coalesced-until-ack',
       unreadCount: 2,
       pendingCount: 0,
+      claimedEventIds: ['evt-claimed'],
       leasedCount: 1,
     });
     expect(hold?.message).toContain('1 of 2');
@@ -133,7 +135,7 @@ describe('classifyReminderHold', () => {
     // This case cannot actually occur through the runtime (a lease always
     // suppresses per the guard), but pins the boundary: claimedCount=0 and
     // leasedCount=0 together still means "fires".
-    expect(classifyReminderHold('normal', 1, 1, 0)).toBeNull();
+    expect(classifyReminderHold('normal', 1, 1, [], 0)).toBeNull();
   });
 });
 
