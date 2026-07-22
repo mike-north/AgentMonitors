@@ -788,13 +788,23 @@ function isTerminatingCommand(words) {
  * rm -rf dist temp` was previously accepted, because `exit 0`'s zero status
  * looked exactly like any other successful command's; round-6 #454 review
  * finding: `exec /usr/bin/false; rm -rf dist temp` was accepted the same
- * way) — EXCEPT when the very next token is a lone `&`: that forks the
- * terminating command into a background SUBSHELL, and a special builtin or
- * `exec` running inside a subshell only ends the subshell, not the main
- * script (round-5 #454 review finding: `exit 0 & rm -rf dist temp` was
- * previously wrongly REJECTED as though `exit 0` terminated the foreground
- * script, when real `/bin/sh` still runs `rm -rf dist temp` unconditionally
- * afterwards).
+ * way) — EXCEPT when the terminating command's own AND/OR list is
+ * backgrounded by a lone `&`: that forks the WHOLE list into a background
+ * SUBSHELL, and a special builtin or `exec` running inside a subshell only
+ * ends the subshell, not the main script. Whether the list is backgrounded
+ * isn't known until its terminator is seen, so a terminating command's
+ * whole-script effect is DEFERRED across the rest of its list rather than
+ * confirmed the instant the next token appears (round-6 #454 review
+ * finding): `exit 0 & rm -rf dist temp` (the terminating command backgrounded
+ * on its own) AND `exit 0 && true & rm -rf dist temp` (the whole
+ * `exit 0 && true` list backgrounded, with the foreground `rm` still running
+ * unconditionally afterwards) are both correctly accepted, where an earlier
+ * version — treating the `&&` after `exit` as immediately confirming
+ * termination, before the later `&` revealed the list was asynchronous —
+ * wrongly REJECTED the second. Within the terminating command's own list,
+ * every LATER command is `guaranteed: false` either way (a foreground
+ * `exit`/`exec` never returns to them; a backgrounded list is non-guaranteed
+ * regardless).
  *
  * A lone `&` backgrounds the ENTIRE preceding AND/OR list (every command
  * chained by `&&`/`||` since the last unconditional `;`/newline/`&`
@@ -831,34 +841,40 @@ function splitChainedCommands(script) {
   // `commands.length` every time a command starts a fresh, unconditional
   // statement, so a lone `&` can background the whole list at once.
   let currentListStart = 0;
-  // Once a REACHED terminating command (see {@link isTerminatingCommand} —
-  // `exit` or `exec <command...>`) is CONFIRMED to terminate the script (see
-  // `pendingTermination` below), every subsequent command (however it's
-  // chained) never runs.
-  let terminated = false;
-  // Set the moment a reached terminating command is pushed, but NOT yet
-  // confirmed as terminating — see the function doc's `&` exception
-  // (round-5 #454 review finding): a `&` immediately after `exit`/`exec`
-  // forks it into a background SUBSHELL, and a special builtin or `exec`
-  // running inside a subshell only ends that subshell, not the main script,
-  // so `exit 0 & rm -rf dist temp` must NOT be treated as terminated.
-  // Anything else following (`&&`, `||`, `;`, a newline, or end of script)
-  // confirms it ran in the foreground and did terminate the script.
-  let pendingTermination = false;
+  // Once a REACHED, FOREGROUND terminating command (see
+  // {@link isTerminatingCommand} — `exit` or `exec <command...>`) is
+  // CONFIRMED to terminate the script (see `listTerminationPending` below),
+  // every command in a LATER list (however it's chained) never runs.
+  let scriptTerminated = false;
+  // A reached terminating command occurred in the CURRENT AND/OR list, but
+  // whether it terminates the whole SCRIPT isn't known until that list's
+  // terminator is seen — round-5/round-6 #454 review finding. While pending,
+  // it already makes every LATER command in the same list unreachable (a
+  // foreground `exit`/`exec` never returns to them; a backgrounded list
+  // marks them non-guaranteed anyway). It resolves when the list ends:
+  // - terminator `&` → the whole list ran in a background SUBSHELL, so a
+  //   special builtin or `exec` inside it only ends that subshell, not the
+  //   main script (round-5: `exit 0 & rm -rf dist temp` still runs `rm`) —
+  //   cleared WITHOUT setting `scriptTerminated`. This deferral is what makes
+  //   `exit 0 && true & rm -rf dist temp` (the whole `exit 0 && true` list
+  //   backgrounded, foreground `rm` still runs) correctly accepted, rather
+  //   than treated as terminated the instant the `&&` after `exit` is seen.
+  // - terminator `;`/newline/end-of-script (a real foreground list boundary,
+  //   NOT a `&&`/`||` continuation) → it ran in the foreground and did
+  //   terminate the script, so `scriptTerminated` is set.
+  let listTerminationPending = false;
 
   for (const token of lexShellLike(script)) {
-    if (pendingTermination && token !== '&') {
-      terminated = true;
-      pendingTermination = false;
-    }
-
     if (token === ';' || token === '\n') {
-      // A fresh statement always eventually runs regardless of the
-      // previous command's exit status — but ONLY if there isn't already
-      // a pending `&&`/`||` awaiting a real command. A `;`/newline
-      // immediately after `&&`/`||` (e.g. the newline right after `||` in
-      // `dist ||\ntemp`) is benign whitespace within that still-pending
-      // operator's continuation, not a reset of it.
+      // A `;`/newline that is NOT continuing a still-pending `&&`/`||` (e.g.
+      // the newline right after `||` in `dist ||\ntemp`, which is benign
+      // whitespace within that operator's continuation) genuinely ends the
+      // current foreground AND/OR list. If that list reached a terminating
+      // command, the script really did terminate here.
+      if (pendingOperator === undefined && listTerminationPending) {
+        scriptTerminated = true;
+        listTerminationPending = false;
+      }
       continue;
     }
 
@@ -866,9 +882,9 @@ function splitChainedCommands(script) {
       // Background the WHOLE current AND/OR list (every command since
       // `currentListStart`), then behave exactly like `;`/newline for what
       // follows: the next command starts a fresh, unconditional statement.
-      // `pendingTermination` is deliberately cleared WITHOUT setting
-      // `terminated` — see the function doc.
-      pendingTermination = false;
+      // `listTerminationPending` is deliberately cleared WITHOUT setting
+      // `scriptTerminated` — see its declaration.
+      listTerminationPending = false;
       for (let i = currentListStart; i < commands.length; i++) {
         commands[i].guaranteed = false;
       }
@@ -888,9 +904,14 @@ function splitChainedCommands(script) {
     const { words } = token;
 
     let reachable;
-    if (terminated) {
-      // Nothing after a reached, confirmed-terminating command ever runs,
-      // no matter its operator.
+    if (scriptTerminated || listTerminationPending) {
+      // Nothing after a reached terminating command ever runs on the
+      // foreground path — whether it terminated a prior list
+      // (`scriptTerminated`) or is earlier in THIS list
+      // (`listTerminationPending`), and regardless of this command's own
+      // operator. (A command later backgrounded by a `&` is marked
+      // non-guaranteed by that `&` branch anyway, so forcing it here is
+      // consistent either way.)
       reachable = false;
     } else if (pendingOperator === '&&') {
       reachable = lastStatus === 'success';
@@ -906,7 +927,7 @@ function splitChainedCommands(script) {
     if (reachable) {
       lastStatus = commandKnownStatus(words);
       if (isTerminatingCommand(words)) {
-        pendingTermination = true;
+        listTerminationPending = true;
       }
     }
     // If NOT reachable (this command was skipped), `lastStatus` carries

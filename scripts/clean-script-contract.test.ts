@@ -478,6 +478,39 @@ describe('assertPackageCleanRemovesDistAndTemp', () => {
     ).not.toThrow();
   });
 
+  // Regression fixture for the round-6 #454 review finding: a lone `&`
+  // backgrounds the ENTIRE preceding AND/OR list, so when a terminating
+  // command sits INSIDE that list (not immediately before the `&`), the
+  // whole list — `exit 0 && true` here — runs in a background subshell and
+  // the `exit` only ends that subshell. The foreground `rm -rf dist temp`
+  // afterwards still runs unconditionally (verified against real `/bin/sh`:
+  // both directories are removed). An earlier guard treated the `&&` after
+  // `exit` as immediately terminating the whole script, before the later `&`
+  // revealed the list was asynchronous, and wrongly REJECTED this valid
+  // script — so a terminating command's whole-script effect must be deferred
+  // until its list's terminator is known.
+  it('accepts "rm -rf dist temp" after a backgrounded `exit 0 && true &` list (exit not immediately adjacent to `&`)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'exit 0 && true & rm -rf dist temp' } },
+        'test-package',
+      ),
+    ).not.toThrow();
+  });
+
+  // The inverse control: with NO trailing `&`, the same `exit 0 &&` foreground
+  // list DOES terminate the script, so the required `rm -rf dist temp` never
+  // runs and must still be rejected — proving the deferral above did not
+  // relax foreground-exit termination.
+  it('still rejects "rm -rf dist temp" reachable only via a FOREGROUND `exit 0 && rm -rf dist temp` (deferral must not relax foreground exit)', () => {
+    expect(() =>
+      assertPackageCleanRemovesDistAndTemp(
+        { scripts: { clean: 'exit 0 && rm -rf dist temp' } },
+        'test-package',
+      ),
+    ).toThrow(/must run `rm -rf`/);
+  });
+
   // Regression fixture for the round-5 #454 review finding: a leading `;`
   // has no preceding command to separate — `/bin/sh -n` rejects it as a
   // syntax error, but earlier code treated a leading `;` as transparent,
@@ -1156,6 +1189,37 @@ describe('assertRootCleanRunsWorkspaceCleanAndReset', () => {
         },
       }),
     ).not.toThrow();
+  });
+
+  // Regression fixture for the round-6 #454 review finding, mirroring the
+  // package fixture above: a lone `&` backgrounds the whole preceding
+  // `exit 0 && true` AND/OR list into a subshell, so the foreground
+  // `run-many`/`reset` afterwards still run unconditionally and must be
+  // ACCEPTED — the terminating command's whole-script effect is deferred
+  // until its list terminator (`&` here) is known.
+  it('accepts `exit 0 && true & run-many && reset` (exit inside a backgrounded list does not terminate the foreground script)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'exit 0 && true & NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace && NX_TUI=false nx reset',
+        },
+      }),
+    ).not.toThrow();
+  });
+
+  // The inverse control: without the trailing `&`, the `exit 0 &&` foreground
+  // list terminates the script before either required Nx invocation runs, so
+  // this must still be rejected.
+  it('still rejects a FOREGROUND `exit 0 && run-many && reset` (deferral must not relax foreground exit)', () => {
+    expect(() =>
+      assertRootCleanRunsWorkspaceCleanAndReset({
+        scripts: {
+          clean:
+            'exit 0 && NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace && NX_TUI=false nx reset',
+        },
+      }),
+    ).toThrow(/must invoke `nx run-many --target=clean`/);
   });
 
   // Regression fixture for the round-5 #454 review finding: a leading `;`
