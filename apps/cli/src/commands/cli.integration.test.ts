@@ -3357,6 +3357,165 @@ When the command output changes, review it.
       rmSync(dir, { recursive: true, force: true });
     }
   }, 30_000);
+
+  /**
+   * Regression test for issue #470: a `command-poll` child is spawned
+   * `detached` (its own process group, for issue #303's group-kill), but the
+   * SIGTERM→SIGKILL timeout escalation lived ONLY as `setTimeout` timers inside
+   * the daemon process. If the daemon dies abruptly (`kill -9`/crash/OOM) before
+   * a hung command's timeout fires, those timers die with it and the detached
+   * child reparents to launchd/init and survives INDEFINITELY — nothing left to
+   * reap it. For a long-running background daemon that is the reliability-fatal
+   * failure mode #470 exists to close.
+   *
+   * The fix makes the child SELF-BOUNDING: it carries its own OS-level watchdog
+   * inside its process group, so its liveness does not depend on the daemon. The
+   * proof that only that self-watchdog (not the daemon) reaps it: `kill -9` the
+   * daemon BEFORE its own per-observe timeout could fire, confirm the descendant
+   * is still alive immediately afterward (genuinely orphaned), then confirm it
+   * terminates ON ITS OWN within the watchdog deadline.
+   *
+   * @see https://github.com/mike-north/AgentMonitors/issues/470
+   */
+  it('a command-poll descendant self-terminates after the daemon is killed with SIGKILL mid-command (issue #470)', async () => {
+    if (process.platform === 'win32') return;
+
+    const dir = path.join(tempDir, 'daemon-470-self-bounding');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    const monitorDir = path.join(monitorsRoot, 'hung-cmd');
+    mkdirSync(monitorDir, { recursive: true });
+    const pidFile = path.join(dir, 'child.pid');
+
+    // A generous per-observe timeout (8s) so we have a wide margin to SIGKILL the
+    // daemon AFTER the command has started but well BEFORE its own timeout could
+    // fire — otherwise this would prove #303 (daemon-driven cleanup), not #470
+    // (self-cleanup after the daemon is gone). The self-watchdog deadline is
+    // timeout + SIGKILL grace (5s) + slack (2s) ≈ 15s.
+    writeFileSync(
+      path.join(monitorDir, 'MONITOR.md'),
+      `---
+name: Backgrounds a descendant
+watch:
+  type: command-poll
+  command:
+    - sh
+    - '-c'
+    - "sleep 300 & echo $! > ${pidFile}; wait"
+  timeout: 8s
+  interval: 5s
+urgency: normal
+---
+When the command output changes, review it.
+`,
+      'utf-8',
+    );
+
+    const socketPath = path.join(dir, 'agentmon.sock');
+    const child = spawn(
+      'node',
+      [
+        CLI_PATH,
+        'daemon',
+        'run',
+        monitorsRoot,
+        '--workspace',
+        dir,
+        '--poll-ms',
+        '300',
+        '--reap-after-ms',
+        '0',
+        '--socket',
+        socketPath,
+      ],
+      {
+        cwd: dir,
+        env: { ...process.env, AGENTMONITORS_DB: ':memory:' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    );
+
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf-8');
+    child.stderr.setEncoding('utf-8');
+    child.stdout.on('data', (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.on('data', (chunk: string) => {
+      stderr += chunk;
+    });
+
+    let grandchildPid = -1;
+    try {
+      const listenDeadline = Date.now() + 15_000;
+      while (
+        Date.now() < listenDeadline &&
+        !stdout.includes('AgentMon daemon listening')
+      ) {
+        if (child.exitCode !== null) {
+          throw new Error(
+            `Daemon exited early with code ${String(child.exitCode)}.\nSTDOUT:\n${stdout}\nSTDERR:\n${stderr}`,
+          );
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      expect(stdout).toContain('AgentMon daemon listening');
+
+      // Wait for the backgrounded `sleep`'s own pid — proves the monitor's
+      // command actually launched its descendant under the live daemon.
+      const pidFileDeadline = Date.now() + 10_000;
+      while (Date.now() < pidFileDeadline && !existsSync(pidFile)) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      expect(existsSync(pidFile)).toBe(true);
+      grandchildPid = Number(readFileSync(pidFile, 'utf-8').trim());
+      expect(Number.isInteger(grandchildPid)).toBe(true);
+      expect(isProcessAlive(grandchildPid)).toBe(true);
+
+      // Kill the daemon the way a crash/OOM would — SIGKILL is uncatchable, so
+      // the daemon's own timeout timers never run. This happens ~immediately
+      // after the command started, far inside its 8s timeout window.
+      child.kill('SIGKILL');
+      await new Promise<void>((resolve) => {
+        if (child.exitCode !== null || child.signalCode !== null) {
+          resolve();
+          return;
+        }
+        child.once('exit', () => resolve());
+      });
+
+      // The descendant is now a genuine orphan: its true parent (the daemon) is
+      // gone, yet it is STILL ALIVE — nothing daemon-side is left to reap it.
+      // (If the fix regressed to daemon-resident-only cleanup, it would live
+      // forever from here.)
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      expect(isProcessAlive(grandchildPid)).toBe(true);
+
+      // ...and yet it terminates on its own within the self-watchdog deadline
+      // (timeout 8s + grace 5s + slack 2s ≈ 15s), proving the killer lives in
+      // the child's own process group, not in the dead daemon. Generous poll
+      // ceiling absorbs CI scheduling jitter around the deadline.
+      const dead = await pollUntil(
+        () => !isProcessAlive(grandchildPid),
+        25_000,
+      );
+      expect(dead).toBe(true);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGKILL');
+      }
+      // Belt-and-suspenders: never leak the descendant out of the test even if
+      // an assertion above failed before the watchdog fired.
+      if (grandchildPid > 0 && isProcessAlive(grandchildPid)) {
+        try {
+          process.kill(grandchildPid, 'SIGKILL');
+        } catch {
+          // Already gone — the desired state.
+        }
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 45_000);
 });
 
 /**

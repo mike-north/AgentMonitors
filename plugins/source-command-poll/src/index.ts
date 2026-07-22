@@ -40,6 +40,120 @@ type ChangeStrategy = 'text-diff' | 'json-diff' | 'exit-code';
 /** Grace period between SIGTERM and SIGKILL on timeout (003 §11.2). */
 const SIGKILL_GRACE_MS = 5_000;
 
+/**
+ * Extra slack beyond the daemon-side SIGTERM→SIGKILL escalation window
+ * (`timeout` + {@link SIGKILL_GRACE_MS}) before the child's OWN watchdog fires
+ * (003 §11.2, issue #470). The daemon-resident timers stay authoritative in the
+ * normal case; the self-watchdog is a pure backstop that only matters when they
+ * cannot run — i.e. the daemon died — so it deliberately fires strictly AFTER
+ * the daemon would have, never racing the daemon's graceful SIGTERM.
+ */
+const SELF_WATCHDOG_SLACK_MS = 2_000;
+
+/** Identity tag: enables shell syntax highlighting/linting of the embedded script. */
+const sh = String.raw;
+
+/**
+ * A discoverable marker embedded in the self-watchdog's command line (003 §11.2,
+ * issue #470). It lets an out-of-band orphan sweep (issue #426) recognize a
+ * stray command-poll watchdog by its `ps`/`pgrep -f` signature, without having
+ * to match on `sleep` (far too broad).
+ */
+const WATCHDOG_MARKER = 'agentmonitors:command-poll-watchdog';
+
+/**
+ * POSIX self-watchdog script (003 §11.2, issue #470). A `command-poll` child is
+ * spawned `detached` (its own process group, for issue #303's group-kill), but
+ * the SIGTERM→SIGKILL timeout escalation lived only as `setTimeout` timers in the
+ * daemon. If the daemon dies abruptly — SIGKILL, crash, OOM — before a hung
+ * command's timeout fires, those timers die with it and the detached child
+ * reparents to launchd/init and survives **indefinitely**, with nothing left to
+ * reap it. For a long-running background daemon that is the reliability-fatal
+ * failure mode this closes.
+ *
+ * The fix is an INDEPENDENT sibling process, spawned `detached` alongside the
+ * command and given the command's process-group id: it sleeps until a backstop
+ * deadline, then SIGKILLs that whole group (`kill -KILL -<pgid>`). Because it is
+ * its own detached process, it survives the daemon's death and reaps the orphan
+ * on its own timer. Spawning it as a *sibling* — rather than wrapping the command
+ * in a shell — keeps the command spawned directly (`shell: false`), so every
+ * §11.1/§11.2/§11.5 semantic (no shell word-splitting, real spawn-failure errors,
+ * exact exit codes) is untouched.
+ *
+ * `$1` is the command's process-group id; `$2` is the whole-second deadline. The
+ * `kill` is best-effort (`2>/dev/null`): if the group already exited — the normal
+ * case, where the daemon's own escalation or the command's own completion got
+ * there first — the signal to an empty group is a harmless no-op.
+ */
+const SELF_WATCHDOG_SCRIPT = sh`
+# ${WATCHDOG_MARKER}
+pgid="$1"
+deadline="$2"
+sleep "$deadline"
+kill -KILL -"$pgid" 2>/dev/null
+`;
+
+/**
+ * Spawn the independent self-watchdog for a just-started command whose
+ * process-group id is `commandPgid` (003 §11.2, issue #470). Returns the
+ * watchdog child, or `undefined` if it could not be spawned (in which case this
+ * tick simply falls back to the daemon-resident timers — no worse than before).
+ *
+ * The watchdog is itself `detached` (its own process group) so that (a) it
+ * survives the daemon's death to do its job, and (b) it can later be reaped
+ * whole — script shell *and* its `sleep` child — via a single group signal,
+ * leaving no stray `sleep` behind. It is `unref`'d and its stdio ignored so it
+ * never keeps the daemon's event loop alive or holds a pipe open.
+ */
+function spawnSelfWatchdog(
+  commandPgid: number,
+  deadlineMs: number,
+): ChildProcess | undefined {
+  // Whole seconds — `sleep`'s only POSIX-guaranteed granularity — rounded UP so
+  // the self-watchdog can never fire earlier than the daemon's own escalation.
+  const deadlineSecs = Math.ceil(deadlineMs / 1000);
+  try {
+    const watchdog = spawn(
+      '/bin/sh',
+      [
+        '-c',
+        SELF_WATCHDOG_SCRIPT,
+        'sh',
+        String(commandPgid),
+        String(deadlineSecs),
+      ],
+      { detached: true, stdio: 'ignore' },
+    );
+    // A spawn error (e.g. no /bin/sh) must never surface as an unhandled 'error'
+    // event that crashes the daemon; degrade silently to daemon-only timing.
+    watchdog.once('error', () => {
+      /* best-effort backstop only */
+    });
+    watchdog.unref();
+    return watchdog;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Reap the self-watchdog once the command has resolved (003 §11.2, issue #470).
+ * Signals the watchdog's whole process GROUP (it is a detached group leader), so
+ * both the script shell and its backgrounded `sleep` die together — signaling
+ * only the shell's pid would orphan the `sleep` to linger out the full deadline.
+ * Best-effort: if it already fired and exited, the group is empty and the signal
+ * is a harmless no-op.
+ */
+function reapSelfWatchdog(watchdog: ChildProcess | undefined): void {
+  const pid = watchdog?.pid;
+  if (pid === undefined) return;
+  try {
+    process.kill(-pid, 'SIGKILL');
+  } catch {
+    // Already gone — the desired state.
+  }
+}
+
 /** Maximum retained stdout, in bytes (003 §11.2). Excess is drained, not kept. */
 const STDOUT_CAP_BYTES = 1024 * 1024;
 
@@ -267,6 +381,13 @@ function resolveCwd(
  * unconditionally, so the pipe keeps draining and the command always runs to its
  * real completion (side effects and all); the caps only bound what is *kept*, never
  * what is *drained*, so the reported exit code is always the command's actual one.
+ *
+ * On POSIX an independent, detached self-watchdog sibling (see
+ * {@link spawnSelfWatchdog}) is armed against this command's process group so the
+ * group is killed at a backstop deadline even if this daemon dies before the
+ * timeout fires — a detached child can otherwise reparent to launchd/init and
+ * orphan indefinitely (issue #470). The daemon-resident timers below remain
+ * authoritative in the normal case; the self-watchdog only fires when they cannot.
  */
 async function runCommand(
   scope: ScopeConfig,
@@ -287,13 +408,30 @@ async function runCommand(
         shell: false,
         // POSIX: leader of its own process group/session, so the timeout escalation
         // can signal the whole tree at once (`killProcessTree` above) instead of only
-        // the direct child (003 §11.7, issue #303). Windows has no equivalent flag;
-        // its tree-kill goes through `taskkill /T` instead, which does not depend on
-        // process-group membership.
+        // the direct child (003 §11.7, issue #303). This same group is what the
+        // independent self-watchdog (issue #470) targets. Windows has no equivalent
+        // flag; its tree-kill goes through `taskkill /T` instead, which does not
+        // depend on process-group membership.
         detached: !isWindows,
         stdio: ['ignore', 'pipe', 'pipe'],
       },
     );
+
+    // Self-bounding backstop (003 §11.2, issue #470): an INDEPENDENT detached
+    // sibling that group-kills this command if the daemon dies before its own
+    // timers can. On POSIX a detached child's process-group id equals its pid.
+    // Skipped on Windows (no process groups) and if the OS gave us no pid — in
+    // both cases the daemon-resident timers below remain the only bound, as
+    // before. Deadline is set strictly AFTER the daemon's own SIGTERM→SIGKILL
+    // window so the daemon stays authoritative in the normal case; the watchdog
+    // only ever fires when the daemon can't.
+    const selfWatchdog =
+      !isWindows && child.pid !== undefined
+        ? spawnSelfWatchdog(
+            child.pid,
+            scope.timeoutMs + SIGKILL_GRACE_MS + SELF_WATCHDOG_SLACK_MS,
+          )
+        : undefined;
 
     let settled = false;
     let timedOut = false;
@@ -386,6 +524,11 @@ async function runCommand(
       if (settled) return;
       settled = true;
       clearTimers();
+      // The command has resolved (success, failure, or timeout) — the daemon is
+      // alive to have gotten here, so its self-bounding backstop is no longer
+      // needed. Reap it promptly so its `sleep` never lingers out the deadline
+      // (issue #470). If it already fired, this is a harmless no-op.
+      reapSelfWatchdog(selfWatchdog);
       resolve(outcome);
     }
 

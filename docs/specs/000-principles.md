@@ -59,6 +59,8 @@ The current repository contains both public-facing docs and implementation code.
 
 **AP7: One pipeline, two authoring paths.** Ephemeral, agent-declared, session-scoped monitors and persistent `MONITOR.md` monitors are the same runtime machinery. Ephemeral monitors are an additional authoring and lifecycle path into the one pipeline, not a parallel system.
 
+**AP8: The daemon and any process it spawns must never outlive their purpose and must always be reap-able.** Every child the daemon (or a source, adapter, or transport it drives) spawns must be bounded and cleanable — and its liveness must not depend on the daemon staying alive to clean it up. Because Agent Monitors' entire value is running unattended in the background, a process that leaks or orphans on an abrupt daemon death (`kill -9`, crash, OOM) is a reliability defect, not a corner case: with nothing left to reap it, it accumulates until the user must restart. Cleanup that lives only in a parent which can die first is therefore insufficient by construction; a spawned child that could outlive the daemon must carry its own bound (e.g. an OS-level self-timeout that kills its own process group on its own timer), the daemon must sweep strays left by a prior instance on startup, and graceful shutdown must actively reap in-flight children. Concretely applied to `command-poll` in [003 §11.2](./003-source-plugins.md#112-execution-model) (issue #470); the general stray-reaping surface — across daemons, channel servers, and sockets — is issue #426.
+
 ## 5. Boundary Properties
 
 **BP1: Schedule matching is best-effort and non-backfilling.** A scheduled trigger fires only when a runtime tick lands in a matching time window. Missed windows are not replayed.
@@ -87,7 +89,7 @@ The current repository contains both public-facing docs and implementation code.
 | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
 | PP1–PP3, SP1–SP2, AP4                                       | [001 — Monitor Definition & Authoring](./001-monitor-definition.md)                                     |
 | PP1, PP4–PP7, PP9–PP10, SP3–SP5, AP1–AP3, AP7, BP1–BP2, BP4 | [002 — Runtime, Delivery & Persistence](./002-runtime-delivery.md)                                      |
-| PP3, PP6–PP7, AP4, BP3, NP3–NP4                             | [003 — Source Plugins](./003-source-plugins.md)                                                         |
+| PP3, PP6–PP7, AP4, AP8, BP3, NP3–NP4                        | [003 — Source Plugins](./003-source-plugins.md)                                                         |
 | PP7–PP8, AP4–AP6, BP3                                       | [004 — Validation & Testing](./004-validation-testing.md)                                               |
 | AP6, PP5, PP10                                              | [005 — CLI Reference](./005-cli-reference.md)                                                           |
 | PP4, PP9–PP10, AP1, AP3, AP6–AP7, BP2, NP5                  | [006 — Agent Integration & Delivery Transports](./006-agent-integration.md)                             |

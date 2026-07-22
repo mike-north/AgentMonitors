@@ -9,6 +9,27 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-07-22 — command-poll children are self-bounding; new reap-ability invariant AP8 (000, 003 §11.2/§11.7) — Refs #470
+
+`command-poll` spawns its command `detached` (own process group, for #303's group-kill) but enforced
+the `timeout` with SIGTERM→SIGKILL timers living _in the daemon process_. If the daemon died abruptly
+(`kill -9`, crash, OOM) before a hung command's timeout fired, those timers died with it and the
+detached child reparented to launchd/init and survived **indefinitely** — a reliability-fatal leak
+for a daemon whose whole purpose is running unattended.
+
+The fix makes the child **self-bounding**: on POSIX each execution now also arms an independent,
+`detached` self-watchdog sibling that is handed the command's process-group id, sleeps until a
+backstop deadline (`timeout` + SIGKILL-grace + slack), and then SIGKILLs that whole group
+(`kill -KILL -<pgid>`). Being its own detached process, it survives the daemon's death and reaps the
+orphan on its own timer; on normal completion the daemon reaps the watchdog promptly. The command
+itself is still spawned directly (`shell: false`) — the watchdog is a _sibling_, not a shell wrapper
+— so every §11.1/§11.2/§11.5 semantic (no shell word-splitting, real spawn-failure errors, exact
+exit codes) is unchanged. Windows keeps its daemon-resident `taskkill /T /F` (no process groups); the
+self-bounding backstop is POSIX-only. Updated 003 §11.2 (execution model) and §11.7 (validation
+implications, incl. the new `kill -9`-the-daemon regression test). Added **AP8** to 000: "the daemon
+and any process it spawns must never outlive their purpose and must always be reap-able." The general
+stray-reaping surface (startup sweep across daemons/channels/sockets, `gc`) remains issue #426.
+
 ## 2026-07-22 — Channel `event_count`/`monitor_id`/`event_id` meta corrected for cross-monitor-coalesced claims (006 §4.2) — Refs #441, #456
 
 For a `DeliveryClaim` with `coalescedReminder` set (issue #441 cross-monitor coalescing), the channel

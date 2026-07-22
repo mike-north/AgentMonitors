@@ -1578,6 +1578,29 @@ mode #303 fixes. A short bounded fallback (2s) applies the same principle to ord
 completions, so a well-formed command can never hang this call either; a normal command's streams
 close within milliseconds of exit, so this never adds latency in the common case.
 
+**The timeout must not depend on the daemon staying alive — the child is self-bounding** (issue
+#470, and AP8 in [000](./000-principles.md)). The SIGTERM→SIGKILL escalation above lives as timers
+_in the daemon process_. Because the command is spawned `detached` (its own process group), if the
+daemon dies abruptly — `kill -9`, crash, OOM — before a hung command's timeout fires, those timers
+die with it and the detached child reparents to launchd/init and survives **indefinitely**, with
+nothing left to reap it. For a long-running background daemon that is a reliability-fatal leak, not
+a corner case: leaked children accumulate until the user must restart. So on POSIX each execution
+also arms an **independent, `detached` self-watchdog sibling** — given the command's process-group
+id, it sleeps until a backstop deadline and then SIGKILLs that whole group (`kill -KILL -<pgid>`).
+Being its own detached process, it survives the daemon's death and reaps the orphan on its own
+timer; on normal completion (the daemon still alive) it is reaped promptly so its `sleep` never
+lingers. The backstop deadline is set strictly _after_ the daemon's own `timeout` + SIGKILL-grace
+window (plus a small slack), so the daemon-resident timers stay authoritative in the normal case and
+the self-watchdog only ever fires when they cannot. The invariant it guarantees: **`kill -9` the
+daemon mid-command and the command's whole process group still terminates on its own within
+`timeout` + grace + slack.** The watchdog is spawned as a _sibling_ (not a shell wrapper around the
+command) precisely so the command itself is still spawned directly (`shell: false`) and every
+§11.1/§11.2/§11.5 semantic — no shell word-splitting, real spawn-failure errors, exact exit codes —
+is preserved unchanged. Windows has no process groups and no portable in-group watchdog, so there
+the daemon-resident `taskkill /T /F` remains the only bound (a documented platform limitation); the
+self-bounding backstop is POSIX-only, which is the portable answer for the launchd/init reparenting
+that motivates #470.
+
 The **result** of an execution is `(exitCode, stdout)`. A **nonzero exit code with output is a
 valid result, not a failure** — many CLIs exit nonzero meaningfully (`grep`, linters, a task CLI
 whose backing app is closed). The failure category is reserved for executions that produce no
@@ -1725,6 +1748,15 @@ issue #86's AC1–AC7):
   (verified: `apps/cli/src/commands/cli.integration.test.ts` — _"a live daemon kills a backgrounded
   sh -c descendant on tick timeout, and shutdown leaves it dead"_), so the no-orphan property holds
   not just per-call but across the daemon's own shutdown.
+- A command-poll child is **self-bounding**: killing the daemon abruptly (`kill -9`) mid-command,
+  before its own timeout could fire, still leaves the command's whole process group terminating on
+  its own within `timeout` + grace + slack — it never orphans indefinitely (issue #470, AP8).
+  Verified end to end through a live `daemon run` subprocess:
+  `apps/cli/src/commands/cli.integration.test.ts` — _"a command-poll descendant self-terminates after
+  the daemon is killed with SIGKILL mid-command"_ first confirms the descendant is genuinely orphaned
+  (still alive immediately after the daemon is SIGKILLed, so nothing daemon-side is left to reap it),
+  then confirms it dies on its own within the self-watchdog deadline. Removing the self-watchdog makes
+  the test fail (the orphan never dies), proving it is not vacuous.
 - Registration + the `init --type command-poll` template + `validate` accepting/rejecting a
   `command-poll` monitor are covered at the CLI layer (AC7: verified:
   `apps/cli/src/commands/cli.integration.test.ts` — _"scaffolds a command-poll monitor that passes
