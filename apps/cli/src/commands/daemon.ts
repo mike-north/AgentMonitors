@@ -18,8 +18,9 @@ import {
 import { daemonStatusClient, daemonTickClient } from '../runtime-client.js';
 import { shouldReap, BOOT_GRACE_MS } from '../reap-decision.js';
 import {
+  heartbeatMatchesBinding,
   isHeartbeatStale,
-  readTransportHeartbeats,
+  readTransportHeartbeatsResult,
 } from '../transport-heartbeat.js';
 import { resolveManualDaemonSocketPath } from '../manual-daemon.js';
 import { resolveWorkspaceDbPath } from '../workspace-db-path.js';
@@ -473,24 +474,40 @@ export async function runLoop(
         // (that registry can hold many transports across many workspaces on a
         // busy machine). The lease only matters when the daemon is otherwise
         // about to reap: reaping enabled AND no open session.
+        const heartbeatScan =
+          reapAfterMs > 0 && openCount === 0
+            ? readTransportHeartbeatsResult()
+            : undefined;
+        // A registry-directory read failure (transient EMFILE/EACCES, etc.)
+        // must NOT be treated as "no channel attached": that is exactly the
+        // #435 failure this lease exists to prevent — a live channel simply
+        // wasn't observable this tick, not proven absent. Fail closed by
+        // treating a read failure the same as an attached channel for THIS
+        // tick only: it suppresses idle accumulation via `shouldReap`'s
+        // existing `channelAttached` branch without asserting a session was
+        // ever seen, and the very next tick re-scans from scratch, so a
+        // genuinely absent channel resumes normal reaping as soon as reads
+        // succeed again.
         const channelAttached =
-          reapAfterMs > 0 &&
-          openCount === 0 &&
-          readTransportHeartbeats().some(
-            (heartbeat) =>
-              heartbeat.transport === 'channel' &&
-              path.resolve(heartbeat.workspacePath) ===
-                path.resolve(workspacePath) &&
-              // A heartbeat's socketPath must also match THIS daemon's own
-              // socket. Two different daemon instances can independently
-              // resolve the SAME workspacePath (e.g. a stale/orphaned daemon
-              // from a prior boot bound to a different socket) — without this
-              // check, a live channel bound to a *different* daemon would
-              // wrongly suppress reaping on THIS one, which is the daemon the
-              // channel is not actually keeping alive.
-              path.resolve(heartbeat.socketPath) === path.resolve(socketPath) &&
-              !isHeartbeatStale(heartbeat, nowDate),
-          );
+          heartbeatScan !== undefined &&
+          (heartbeatScan.readFailed ||
+            heartbeatScan.records.some(
+              (heartbeat) =>
+                heartbeat.transport === 'channel' &&
+                // A heartbeat's workspace AND socket must both match THIS
+                // daemon's own binding (issue #435 review, PR #461): two
+                // different daemon instances can independently resolve the
+                // SAME workspacePath (e.g. a stale/orphaned daemon from a
+                // prior boot bound to a different socket) — without the
+                // socket check, a live channel bound to a *different* daemon
+                // would wrongly suppress reaping on THIS one, which is the
+                // daemon the channel is not actually keeping alive.
+                heartbeatMatchesBinding(heartbeat, {
+                  workspacePath,
+                  socketPath,
+                }) &&
+                !isHeartbeatStale(heartbeat, nowDate),
+            ));
         // The daemon READS the registry to decide, but never reaps it: GC is a
         // write-path responsibility (006 §12.2) — a lapsed record is removed
         // only when a transport re-registers, so `doctor` keeps reporting the

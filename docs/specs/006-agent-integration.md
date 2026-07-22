@@ -1721,3 +1721,13 @@ is attached, even after the session it serves has gone dormant. The reaping cont
   channel can attach before any session registers; if it then detaches cleanly before a session ever
   opens, the daemon must still apply `max(reapAfterMs, bootGraceMs)` on the next check, not the
   shorter post-session `reapAfterMs` as if a session had already been seen.
+- **A registry read failure (transient `EMFILE`/`EACCES`/etc. on the transport registry directory)
+  fails CLOSED, not open:** it is treated as "attached" for that tick only — never as "no channel
+  attached" — because a scan that could not run cannot prove a live channel absent, and defaulting
+  to "absent" would let the idle clock advance toward reaping a possibly-live channel, which is
+  exactly the failure this lease exists to prevent; the next tick re-scans from scratch, so a
+  genuinely absent channel resumes normal reaping as soon as reads succeed again.
+- **The workspace/socket binding comparison is one shared predicate** (`heartbeatMatchesBinding`,
+  `apps/cli/src/transport-heartbeat.ts`), used both here and by `transport-health`'s binding checks,
+  so "does this heartbeat belong to this daemon/workspace" cannot silently diverge between the two
+  call sites.

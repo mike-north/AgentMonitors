@@ -375,6 +375,52 @@ describe('daemon reaper heartbeat lease (issue #435 Option A)', () => {
   }, 30_000);
 
   it(
+    'a registry read failure fails CLOSED — no reap that tick, normal ' +
+      'reaping resumes once the registry is readable again (PR #461 finding 1)',
+    async () => {
+      // A transient EMFILE/EACCES on the transport registry DIRECTORY must not
+      // read as "no channel attached": that would let the idle clock advance
+      // toward reaping a possibly-LIVE channel, the exact #435 failure this
+      // lease exists to prevent. Simulate an unreadable registry directory by
+      // replacing it with a plain FILE: `readdirSync` on a non-directory throws
+      // `ENOTDIR`, the same shape of failure as a permissions error.
+      const daemon = await startDaemon();
+      let reaped = false;
+      try {
+        openThenCloseSession('registry-unreadable');
+        const registryDir = path.join(dataHome, 'agentmonitors', 'transports');
+        rmSync(registryDir, { recursive: true, force: true });
+        mkdirSync(path.dirname(registryDir), { recursive: true });
+        writeFileSync(registryDir, 'not a directory', 'utf-8');
+
+        // Past the 1s reap window with generous headroom: the daemon must NOT
+        // have reaped while the registry read keeps failing.
+        const exit = await daemon.waitForExit(5_000);
+        expect(
+          exit,
+          'daemon must NOT reap while the registry directory is unreadable',
+        ).toBeNull();
+        expect(daemon.child.exitCode).toBeNull();
+
+        // Recovery: once the registry is readable again (and genuinely empty —
+        // no channel), normal reaping resumes on the next tick.
+        rmSync(registryDir, { force: true });
+        const exitAfterRecovery = await daemon.waitForExit(8_000);
+        reaped = exitAfterRecovery !== null;
+        expect(
+          reaped,
+          'daemon must resume reaping once the registry is readable again',
+        ).toBe(true);
+        expect(exitAfterRecovery).toBe(0);
+      } finally {
+        if (!reaped) daemon.stop();
+        await daemon.waitForExit(5_000);
+      }
+    },
+    30_000,
+  );
+
+  it(
     'a live channel heartbeat bound to a DIFFERENT daemon socket does NOT ' +
       'suppress reaping (PR #461 finding 1: same workspace, different socket)',
     async () => {

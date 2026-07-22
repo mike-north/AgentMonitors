@@ -423,13 +423,32 @@ export function isTransportHeartbeat(
   );
 }
 
+/** Result of a registry scan that distinguishes "empty" from "unreadable". */
+export interface ReadTransportHeartbeatsResult {
+  records: TransportHeartbeat[];
+  /**
+   * Whether the registry DIRECTORY itself failed to read (e.g. a transient
+   * `EMFILE`/`EACCES`) — as opposed to the directory reading fine but
+   * containing zero, malformed, or future-schema files, none of which are a
+   * read failure. A caller that must not mistake "I couldn't prove there's no
+   * live transport" for "there is no live transport" (the daemon's reap check)
+   * needs this distinction; a caller that is content treating either case as
+   * "no transports" (`doctor`, `transport-health`) can ignore it and keep
+   * using {@link readTransportHeartbeats}.
+   */
+  readFailed: boolean;
+}
+
 /**
- * Read every heartbeat in the machine-wide registry.
+ * Read every heartbeat in the machine-wide registry, reporting whether the
+ * scan itself succeeded.
  *
- * Unreadable, malformed, or future-schema files are skipped rather than
- * throwing: one corrupt record must not blind `doctor` to every other
- * transport on the machine. A missing registry directory is simply an empty
- * list — the ordinary state before any transport has ever run.
+ * Unreadable, malformed, or future-schema individual FILES are skipped rather
+ * than throwing: one corrupt record must not blind a caller to every other
+ * transport on the machine. A missing registry directory is simply an empty,
+ * successful result — the ordinary state before any transport has ever run.
+ * Only a failure to list the directory itself (permissions, too-many-open-
+ * files, etc.) is reported via `readFailed`.
  *
  * **Pure — never mutates, never reaps** (issue #425 review, round 6). This
  * function takes no `now` and has no GC side effect; a stale-past-TTL record
@@ -445,12 +464,18 @@ export function isTransportHeartbeat(
  * "this transport is back" event, whereas a bystander merely reading the
  * registry is not, and must not be able to erase what it observes.
  */
-export function readTransportHeartbeats(): TransportHeartbeat[] {
+export function readTransportHeartbeatsResult(): ReadTransportHeartbeatsResult {
   let names: string[];
   try {
     names = readdirSync(transportRegistryDir());
-  } catch {
-    return [];
+  } catch (error) {
+    // A missing directory (ENOENT) is the ordinary state before any transport
+    // has ever run on this machine, NOT a read failure — every other error
+    // (EACCES, EMFILE, ENOTDIR, ...) means the listing genuinely could not be
+    // proven empty, which callers that fail closed (the reaper) must be able
+    // to tell apart from "confirmed nothing here".
+    const code = (error as NodeJS.ErrnoException).code;
+    return { records: [], readFailed: code !== 'ENOENT' };
   }
   const records: TransportHeartbeat[] = [];
   for (const name of names) {
@@ -466,10 +491,24 @@ export function readTransportHeartbeats(): TransportHeartbeat[] {
         records.push(parsed);
       }
     } catch {
+      // Per-file parse failure stays skipped — not a registry-level failure.
       continue;
     }
   }
-  return records;
+  return { records, readFailed: false };
+}
+
+/**
+ * Read every heartbeat in the machine-wide registry.
+ *
+ * A thin, contract-unchanged wrapper over
+ * {@link readTransportHeartbeatsResult} for callers that are fine treating a
+ * registry-level read failure the same as "no transports" (`doctor`,
+ * `transport-health`). The reaper needs the finer-grained result and calls
+ * {@link readTransportHeartbeatsResult} directly instead.
+ */
+export function readTransportHeartbeats(): TransportHeartbeat[] {
+  return readTransportHeartbeatsResult().records;
 }
 
 /**
@@ -524,6 +563,31 @@ export function reapExpiredHeartbeats(now: Date): void {
  * skew, it is a corrupt or forged record.
  */
 export const HEARTBEAT_FUTURE_TOLERANCE_MS = 5_000;
+
+/**
+ * Whether `heartbeat` is bound to the given workspace AND daemon socket.
+ *
+ * This is the single definition of "does this heartbeat belong to this
+ * daemon/workspace" (issue #435 review, PR #461): the daemon's reap check and
+ * `transport-health`'s socket-mismatch check each independently compared
+ * `workspacePath`/`socketPath`, one via `path.resolve` on both sides and the
+ * other via raw string equality, which meant a trailing slash or a `./`
+ * segment could make the same binding look matched in one place and
+ * mismatched in the other. `path.resolve` is applied to both sides on both
+ * fields so that kind of textual noise never causes a false mismatch.
+ * Symlink/realpath resolution is deliberately NOT applied here — a workspace
+ * or socket path reached through a symlink is tracked as a separate concern.
+ */
+export function heartbeatMatchesBinding(
+  heartbeat: TransportHeartbeat,
+  binding: { workspacePath: string; socketPath: string },
+): boolean {
+  return (
+    path.resolve(heartbeat.workspacePath) ===
+      path.resolve(binding.workspacePath) &&
+    path.resolve(heartbeat.socketPath) === path.resolve(binding.socketPath)
+  );
+}
 
 /** Whether a record's lease has expired as of `now`. */
 export function isHeartbeatStale(
