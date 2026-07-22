@@ -1,17 +1,8 @@
 import { createHash } from 'node:crypto';
-import {
-  closeSync,
-  constants as fsConstants,
-  openSync,
-  readFileSync,
-  readdirSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
-} from 'node:fs';
+import { readFileSync, readdirSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { ensurePrivateDir, PRIVATE_FILE_MODE } from '@agentmonitors/core';
+import { writePrivateFileAtomic } from '@agentmonitors/core';
 import { getCliVersion } from './cli-version.js';
 import { resolveDataRoot, workspaceHash } from './workspace-paths.js';
 
@@ -321,41 +312,16 @@ export function writeTransportHeartbeat(
   };
 
   try {
-    // Owner-only (0700), not the raw `mkdirSync` default: the registry dir
-    // otherwise inherits the process umask, so a permissive umask (e.g. 000)
-    // leaves every transport heartbeat — which carries a workspace path, a
-    // socket path, and a host session id — world-readable (issue #425 review,
-    // round 3). `ensurePrivateDir` is the established owner-only-directory
-    // helper (also used by the daemon socket dir and per-workspace data
-    // dirs), so this both creates missing ancestors at 0700 and tightens an
-    // already-existing, more-permissive directory left by an older build.
-    ensurePrivateDir(path.dirname(target));
-    // `${target}.<pid>.tmp`, not a fixed `.tmp`: two transports refreshing the
-    // same record concurrently would otherwise write the same temp file and
-    // could rename each other's partial content into place.
-    const tmp = `${target}.${String(process.pid)}.tmp`;
-    // The temp path is still deterministic (this pid's own prior crash could
-    // have left a stale file, or the registry directory predates the 0700
-    // migration and something planted a symlink there), so treat whatever
-    // sits there as hostile — mirroring `writePrivateFileAtomic`
-    // (local-permissions.ts): remove it (`rm` does not follow symlinks) and
-    // recreate with `O_EXCL`, which refuses to follow a symlink planted
-    // between the two calls. A plain `writeFileSync(tmp, ...)` would instead
-    // follow a pre-planted symlink and overwrite whatever it points at.
-    rmSync(tmp, { force: true });
-    const fd = openSync(
-      tmp,
-      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL,
-      PRIVATE_FILE_MODE,
-    );
-    try {
-      writeFileSync(fd, `${JSON.stringify(record, null, 2)}\n`, {
-        encoding: 'utf-8',
-      });
-    } finally {
-      closeSync(fd);
-    }
-    renameSync(tmp, target);
+    // Owner-only (0700) directory, `O_EXCL` temp file, then rename — the same
+    // atomic-write contract `writePrivateFileAtomic` (local-permissions.ts)
+    // uses for hook-state files, reused here rather than re-forked. The one
+    // difference is the temp suffix: `.<pid>`, not the helper's fixed default,
+    // because two transports refreshing the same record concurrently would
+    // otherwise write the same temp file and could rename each other's
+    // partial content into place.
+    writePrivateFileAtomic(target, `${JSON.stringify(record, null, 2)}\n`, {
+      tempSuffix: `.${String(process.pid)}`,
+    });
   } catch {
     return undefined;
   }

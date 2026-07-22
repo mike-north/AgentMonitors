@@ -1744,7 +1744,12 @@ export function withRestrictedUmask<T>(fn: () => T): T;
 export function writeBridgeState(statePath: string, state: HookState): void;
 
 // @public
-export function writePrivateFileAtomic(filePath: string, contents: string): void;
+export function writePrivateFileAtomic(filePath: string, contents: string, options?: WritePrivateFileAtomicOptions): void;
+
+// @public
+export interface WritePrivateFileAtomicOptions {
+    tempSuffix?: string;
+}
 
 // (No @packageDocumentation comment for this package)
 

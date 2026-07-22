@@ -186,6 +186,31 @@ describe.skipIf(isWindows)('local-permissions', () => {
       // The planted symlink was replaced, not preserved.
       expect(() => lstatSync(`${file}.tmp`)).toThrow();
     });
+
+    it('writes to a suffixed temp path when tempSuffix is given', () => {
+      const file = path.join(tmpDir, 'heartbeat.json');
+      writePrivateFileAtomic(file, 'suffixed', { tempSuffix: '.1234' });
+
+      expect(readFileSync(file, 'utf-8')).toBe('suffixed');
+      expect(modeOf(file)).toBe(PRIVATE_FILE_MODE);
+      // The suffixed temp file is cleaned up by the rename...
+      expect(() => statSync(`${file}.1234.tmp`)).toThrow();
+      // ...and no unsuffixed temp file was created either.
+      expect(() => statSync(`${file}.tmp`)).toThrow();
+    });
+
+    it('lets two concurrent writers with different suffixes avoid colliding on the same temp path', () => {
+      const file = path.join(tmpDir, 'concurrent.json');
+      // Simulates two transports racing to refresh the same heartbeat record
+      // (apps/cli/src/transport-heartbeat.ts): each writer's suffix is
+      // distinct, so neither can rename the other's in-progress temp file.
+      writePrivateFileAtomic(file, 'from-pid-1', { tempSuffix: '.1' });
+      writePrivateFileAtomic(file, 'from-pid-2', { tempSuffix: '.2' });
+
+      expect(readFileSync(file, 'utf-8')).toBe('from-pid-2');
+      expect(() => statSync(`${file}.1.tmp`)).toThrow();
+      expect(() => statSync(`${file}.2.tmp`)).toThrow();
+    });
   });
 
   describe('withRestrictedUmask', () => {

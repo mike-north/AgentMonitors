@@ -54,6 +54,7 @@ export {
   withRestrictedUmask,
   writePrivateFileAtomic,
 } from './security/local-permissions.js';
+export type { WritePrivateFileAtomicOptions } from './security/local-permissions.js';
 
 // Inbox
 export { createDb } from './inbox/db.js';
