@@ -166,12 +166,12 @@ fi`;
 }
 
 /**
- * `pr-review`'s urgency-rationale comment, above `urgency: normal` in the
+ * `pr-review`'s urgency-rationale comment, above `urgency: high` in the
  * template. Extracted to a constant (rather than inlined) so
  * {@link seedUrgency} can swap it out for {@link GENERALIZED_URGENCY_COMMENT}
  * when `--urgency` overrides the seeded value — otherwise a seeded
- * `--urgency high` would ship directly under a comment explaining why it is
- * `normal, not high` (mirrors {@link COMMAND_POLL_EXAMPLE_COMMENT}'s
+ * `--urgency normal` would ship directly under a comment explaining why it is
+ * `high, not normal` (mirrors {@link COMMAND_POLL_EXAMPLE_COMMENT}'s
  * issue-#388 swap pattern).
  */
 const PR_REVIEW_URGENCY_COMMENT =
