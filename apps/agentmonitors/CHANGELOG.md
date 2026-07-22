@@ -1,5 +1,420 @@
 # agentmonitors
 
+## 0.11.1
+
+### Patch Changes
+
+- 81ac973: Fix a delivery-loss defect in the Claude Code channel transport: it no longer marks a delivery
+  claimed before it has surfaced it. The channel now **reserves** the delivery, pushes it, and
+  **commits** the claim only after a successful push — releasing the reservation on a rejected or
+  disconnected push so the event stays unclaimed and re-delivers via the hook transport (or the next
+  poll). Previously a transient MCP disconnect permanently consumed the delivery, because the rows were
+  left claimed and the hook path suppressed them as cross-transport duplicates.
+  - New core `reserveDelivery` / `commitDelivery` / `releaseDelivery` (with an in-memory reservation
+    registry) and matching `hook.reserve` / `hook.commit` / `hook.release` daemon IPC. Reserving leases
+    the rows so a concurrent hook claim can't double-surface them; committing marks them claimed ("was
+    surfaced") — never acknowledged. `claimDelivery` is refactored into a shared decide + apply, leaving
+    the hook transport's behavior unchanged.
+  - If a push succeeds but the commit can't land (the lease lapsed mid-push, or the daemon restarted),
+    the rows re-deliver rather than being lost — at-least-once, never at-most-once — and the transport
+    reports that outcome distinctly instead of claiming success.
+  - Diagnostics and the hook-state projection are lease-aware: while a push is in flight they exclude
+    the reserved rows from "pending claimable work", staying consistent with the claim decision.
+  - No change to notify/debounce timing, urgency bands, or the unread/claimed/acknowledged model.
+
+  See docs/specs/006-agent-integration.md §4.5.1.
+
+- b474d10: Render the full event on the Claude Code channel surface. A high-urgency channel delivery previously
+  rendered only the event **title** into the `<channel>` tag body; the monitor body (the author's
+  instructions for what to do when the monitor fires) and the change summary never reached the agent,
+  so a pushed event forced the receiving agent to already know what the monitor meant and separately
+  run `events list` to see what changed — defeating push delivery.
+  - The channel tag body now renders the **same per-event block the hook-deliver transport injects**:
+    `### <monitor> (<urgency>)`, the title, the monitor body, and — when present — a `Changes:` section
+    carrying a bounded change summary (per-event cap with an explicit elision marker). Both transports
+    share one block builder, so the channel is a rendering surface over the same semantics, differing
+    only in content sanitization. Normal/low reminder claims still render their generic coalesced
+    message.
+  - The delivery summary a transport receives (`DeliveryEventSummary`) now carries an optional
+    `diffText` (the event's change summary), so a transport can surface _what changed_. This is an
+    additive `@agentmonitors/core` public-API change (minor bump — precedent: `DeliveryEventSummary.body`
+    in #60 and the `schedulingDefaults` export); existing consumers are unaffected. The surfaced
+    `diffText` is each recipient's **per-recipient** change summary (its own baseline span), not the
+    shared latest-snapshot delta — so two sessions at divergent cursors each receive the correct,
+    complete evidence (session isolation).
+  - The channel surface is now **bounded by packing WHOLE event blocks under a content ceiling before
+    reserving**, not by cutting an already-claimed render: `channel serve` previews the settled
+    high-urgency delivery, sizes how many whole blocks fit, and reserves/claims exactly that many —
+    mirroring how the hook-deliver transport sizes its `additionalContext` cap. The claimed set still
+    always equals the rendered set; any events that do not fit stay pending and re-deliver on a later
+    poll (only the per-event change summary was ever bounded before this).
+  - Two distinct situations can leave settled work out of a push, and each is now signposted with its
+    own marker: some settled-high events genuinely did not fit and stay pending — they **will**
+    re-deliver on a later poll (`... more monitor updates are pending; they will surface on a later
+poll`). The other, rarer case is a single event whose own block still exceeds the content ceiling
+    even alone; that one event is mid-truncated as PART OF the push, before the reservation is
+    committed, so at that point it is genuinely unknown whether the redelivery-suppressing commit that
+    follows will land — its marker stays outcome-neutral rather than promising a specific outcome
+    either way. It names the exact, directly-runnable recovery command for that session and socket
+    (`` `agentmonitors events list --session <id> --socket <path> --unread` `` — `events list` requires
+    `--session`, so a bare `--unread` form would fail, and the explicit `--socket` guards against a stale
+    `$AGENTMONITORS_SOCKET` silently querying the wrong workspace's daemon), pointing at the still-unread,
+    un-truncated copy of the full event (claiming an event is never the same as acknowledging it).
+  - A reminder tag's `event_count` now reports the pending unread total the reminder refers to, instead
+    of the confusing `0`.
+  - The hook-deliver transport's `additionalContext` blocks also grow by up to ~800 chars of change
+    summary per event now that `diffText` is rendered there too, so `packEventsUnderCap` fits fewer
+    events per delivery under the existing 4000-char cap than it did before this change — expected,
+    not a regression: the deferred remainder still re-delivers at the next context event.
+  - The hook-deliver transport uses the same **two distinct, session- and socket-scoped markers** as
+    the channel side: a genuinely-deferred-remainder marker ("more monitor updates are pending; ...
+    redeliver") and a claimed-unread marker for THIS claim's own content being cut (a single oversized
+    event, or a truncated reminder message) — not other pending work being deferred. Rendering now
+    happens BEFORE the reservation is committed, so the claimed-unread marker deliberately does not
+    assert a specific claimed/redelivery outcome (it stated "will not redeliver automatically" in an
+    earlier round, which was false whenever the following commit resolved null — and simply uncertain
+    whenever it rejected instead); it instead reads "the full copy stays unread", true regardless of
+    which of the three commit outcomes occurs. Both markers can now appear together in the same
+    `additionalContext` when the sole reserved event is itself oversized AND further, different
+    high-urgency work also stays genuinely pending beyond it — previously the claimed-unread marker
+    alone silently suppressed that second, real signal. The channel transport has the identical mixed
+    case and the identical fix: when the sole reserved event is itself oversized and further
+    high-urgency work also stays genuinely pending, `renderChannelEvent` now appends its deferral marker
+    alongside the truncation marker instead of the truncation marker alone, which previously silently
+    dropped the "more work is pending" signal on the channel side.
+  - Both transports now validate a `turn-interruptible` claim's fit against the SAME budget the renderer
+    uses **before ever durably claiming it**: `hook deliver` reserves (leases, does not claim), re-checks
+    the actual reserved claim's fit, and only then commits — closing a race where the sizing preview and
+    the eventual claim are separate round-trips and a concurrent caller could substitute different,
+    larger pending events into the same requested count, passing the count check but overflowing the
+    cap on an already-(and now irreversibly-)claimed row.
+  - `hook deliver` renders off the reservation's own (not-yet-committed) claim, writes it to stdout,
+    and only commits AFTER that write **fully** completes — awaited through the write's own completion
+    callback (or a stream `'error'` event, whichever fires first), never `stdout.write`'s synchronous
+    return value, which only signals backpressure. A write can return `true` immediately and still fail
+    asynchronously afterward (e.g. `EPIPE` once the reading end has closed); previously that async
+    failure could arrive after the reservation was already committed, silently losing the delivery. A
+    write failure (synchronous or asynchronous) now releases the reservation instead of committing.
+  - `agentmonitors session start`'s `SessionStart` post-compact recap now follows the identical
+    reserve → render → write → commit ordering: it reserves the `post-compact` delivery, renders it,
+    writes it to stdout **awaiting the write's full completion**, and only then commits — instead of
+    the prior direct `claimDelivery` call (the durable claim) made BEFORE anything was rendered or
+    written. A write failure now releases the reservation instead of committing, so nothing is
+    durably (re-)claimed when the recap never reached the agent.
+  - A reminder claim raced down from a settled-high sizing preview no longer inherits that preview's
+    stale `moreDeferred: true` — it is always reported `false` for an eventless reminder, mirroring the
+    channel transport's identical handling of the same preview↔reserve race.
+  - Both markers' `--socket <path>` clause is now rendered with a shared, transport-safe path escaper
+    (bash/zsh ANSI-C quoting, hex-escaping any byte outside a conservative safe set) instead of a plain
+    POSIX single-quote: a socket path is interpolated into the recovery command AFTER the surrounding
+    content's own tag-safety sanitization has already run, so a path containing `<`/`>`/`[`/`]` (or a
+    backtick / control character) could otherwise reintroduce those forbidden bytes into the pushed
+    content raw. The new escaping is both tag-safe and shell-round-trip-safe.
+
+  See docs/specs/006-agent-integration.md §4.2.1 and §5.5.
+
+- 784e627: Fix cross-monitor delivery coalescing (issue #441): two monitors watching overlapping state (e.g. a
+  high-urgency label monitor and a normal-urgency review-queue monitor both firing off the same
+  underlying change) previously interrupted a session TWICE for one action — a settled high-urgency
+  delivery in one `turn-interruptible` claim, then a separate normal-urgency reminder in a later one.
+
+  When both a settled high-urgency batch and a due normal-urgency reminder are decided in the same
+  `claimDelivery`/`reserveDelivery` call, they now fold into ONE `DeliveryClaim`: the `events` array
+  and top-level `urgency: 'high'` are unchanged from a pure high delivery (never downgraded by the
+  coalesced reminder), the normal reminder's generic prompt is appended to the message (never
+  escalated into per-event detail), and both event sets are claimed together — so there is no leftover
+  second interrupt for the same action. A normal-only reminder (no high-urgency event pending) is
+  unaffected and still reports `urgency: 'normal'`.
+
+  Also: a due normal reminder is now withheld (not fired standalone) while sibling high-urgency work
+  is still pending but unsettled, so it coalesces into that delivery once it settles instead of
+  preempting a separate, later high-urgency interrupt. `DeliveryClaim` gained an optional
+  `coalescedReminder: string` field carrying the coalesced text explicitly — `events`/`message` alone
+  were not enough for the hook-deliver/channel transports to notice it, which meant the coalesced
+  normal rows were claimed but never rendered. Both transports now render it as a footer after the
+  packed event block(s), and a new `previewCoalescedReminder`/`previewCoalescedReminderClient` lets a
+  length-bounded transport reserve room for it before sizing how many event blocks fit.
+  `diagnoseHookDelivery` (`hook deliver --debug`) also now reports this withheld state, and correctly
+  reports the pre-existing coalesced-until-ack hold even when settled high-urgency work is
+  simultaneously being delivered.
+
+- ba5a5a5: Harden `hook deliver --debug` so it never leaks a hostile stdin payload to the operator's
+  terminal/logs raw. The always-on unknown-session warning already control-safe-escaped and
+  length-bounded the untrusted `session_id` it renders; the `--debug` diagnosis path rendered the
+  same untrusted `session_id` / `hook_event_name` / `cwd` fields unescaped and unbounded on the
+  adjacent lines (`describePayload`, `describeUnmappedLifecycle`, `describeLifecycle`,
+  `describeWorkspace`, `describeWorkspaceDisabled`, `describeNoSessionMatch`). A hostile payload
+  (control characters, terminal escape sequences, U+2028/U+2029, or a multi-KB flood) reached stderr
+  raw whenever `--debug` was set. Both paths now share one rendering function
+  (`sanitizeUntrustedField`), so they cannot drift again. Only `--debug` stderr wording changes;
+  stdout and the exit code are unaffected in every mode.
+- dea1510: Fix two review-round-7 defects in the delivery-transport health surface (#425):
+  - **`HookDeliveryHold.claimedEventIds` is now optional**, not required. The transport-health work
+    in this release added it as a required field on this already-published `@agentmonitors/core`
+    public interface with no accompanying changeset — a breaking addition that also didn't reflect
+    reality: a `HookDeliveryDiagnosis` can arrive over the daemon IPC boundary from an older build
+    that predates the field, serializing a hold with no `claimedEventIds` key at all despite the
+    compile-time type.
+  - **`doctor`'s reminders-suppressed remediation no longer treats a missing `claimedEventIds` as an
+    ack-all fallback.** Previously, a suppressing hold with no `claimedEventIds` contributed a
+    literal `undefined` into the ids list, which rendered as a malformed, blank
+    `--event-ids  --socket ...` flag — worse than the documented "omit the flag" fallback for a
+    genuinely empty `[]`, since it looks like a safe, scoped command while actually being broken. A
+    session whose suppression evidence can't be trusted this way is now reported via the existing
+    `delivery-diagnosis-unavailable` code (with an upgrade-the-daemon remediation) instead, and
+    correctly blocks `deliverable` like every other diagnosis-unavailable case.
+
+  See docs/specs/006-agent-integration.md §12 and docs/specs/spec-changelog.md.
+
+- 97b0673: Use the monitor's authored name as a delivered event's title, instead of the source's
+  implementation detail. A `command-poll` monitor announced itself with its raw argv as both `title`
+  and `summary` — a GitHub poller with a large `jq` program produced a ~400-character headline that
+  was entirely its own implementation, on every delivery, while the author's perfectly good `name:`
+  appeared nowhere.
+  - The runtime now decides an event's `title` at materialization: the monitor's authored `name` when
+    present, otherwise the source-provided title unchanged (the documented fallback). Because the
+    choice happens once in the core, the hook and channel transports carry the identical headline.
+  - The source's own per-object text is not lost — it remains the event `summary`, and the full source
+    identity remains on `objectKey` and in `payload` for debugging and querying.
+  - Sources that interpolate a **configuration-identity** `objectKey` — `command-poll`'s joined argv
+    and `api-poll`'s URL — now bound it with the new `displayObjectKey` helper (unchanged at or below
+    60 code units, otherwise a prefix ending in `…`, cut at a grapheme-cluster boundary so truncation
+    never emits a lone surrogate or splits a flag/ZWJ sequence). Keyed-collection change detection
+    bounds only the monitor-scope half of a `<scope>#<key>` identity, so the informative per-item key
+    is always rendered whole. Path-like keys (`file-fingerprint`, `incoming-changes`) are deliberately
+    NOT bounded: a path's informative part is its tail, so head-truncation would destroy it; those need
+    a path-aware ellipsis, tracked separately. A nameless monitor's fallback title is therefore
+    headline-sized for the configuration-identity sources, not universally.
+  - Both injecting transports' shared per-event block now renders TWO possible detail lines beneath
+    the title: the source's deterministic per-object detail (`DeliveryEventSummary.objectDetail`,
+    never digest-replaced — omitted when identical to the title or the body), and, on its own
+    additional line, the recipient-visible digest (`DeliveryEventSummary.summary`, an Interpret digest
+    when one was produced — omitted when identical to the title, the body, OR the object-detail line).
+    This keeps a per-object source's delivery self-sufficient AND preserves a successful Interpret
+    summarization: a named multi-object `prose` monitor's delivery names which object moved without
+    silently discarding the digest.
+  - `api-poll` now redacts the URL in its observation title/summary (userinfo, query, and fragment
+    stripped — the same redaction its warning text already used) before bounding it, so a polled URL
+    carrying a token cannot leak into durably persisted, agent-delivered text. The exact URL remains on
+    `objectKey` and `payload.url`. The same redaction is threaded through `diffKeyedCollection`'s new
+    optional `displayScope` parameter, so a keyed-collection observation from a URL-scoped source gets
+    the identical protection as the non-collection branch.
+  - An ephemeral monitor's explicit `--display-name` now reaches the authored-name signal, so a named
+    ephemeral watch headlines with its display name exactly as a persistent monitor's `name:` does —
+    including after a daemon restart reconstructs the definition from its durable record. Both this
+    and a persistent monitor's frontmatter `name` now reject a whitespace-only value.
+  - `events list --format text` passes every source-/author-controlled field (`monitorId`, `title`,
+    the `summary` suffix) through a control-safe single-line transform before interpolation: CR/LF and
+    Unicode line/paragraph separators collapse to a space, and every other C0/C1 control character
+    (DEL and TAB included) is escaped to a visible `\uXXXX` form — a hostile payload can no longer
+    forge an extra row or emit a raw terminal escape sequence.
+  - `displayObjectKey` and `DeliveryEventSummary.objectDetail` are additive `@agentmonitors/core`
+    public API surface (minor bump); `diffKeyedCollection` gains an additive optional sixth parameter,
+    `displayScope`. Existing consumers are unaffected.
+
+  See docs/specs/002-runtime-delivery.md §5.4, §9.1 and docs/specs/003-source-plugins.md §2.8.
+
+- cba4f0b: Keep the daemon alive for an idle channel-attached session (issue #435 Option A).
+
+  The channel is the push surface for an idle agent, but the daemon's lifetime was a function of hook
+  activity — and an idle listener fires no hooks. Composed, those two facts guaranteed the daemon was
+  already reaped by the time a channel event should have fired: the session went dormant, the
+  active-session count reached zero, the daemon self-terminated after `--reap-after-ms` (default
+  5 min), monitors stopped ticking, and the channel went permanently silent exactly when it was needed.
+  - A **non-stale `channel`-transport heartbeat** for a workspace now counts as reaper activity, so a
+    channel-attached session keeps its daemon alive and ticking even after it has gone dormant.
+  - The exemption is the heartbeat's **TTL lease**, re-evaluated on every reap check — not a static
+    "a channel is registered" flag. A channel server that dies uncleanly stops counting within its
+    (short, 30s) TTL and reaping resumes, so an orphaned channel server can never pin the daemon alive
+    forever. It is an active expiring lease, not a permanent pin.
+  - Only the `channel` transport qualifies. The `hook` transport is self-healing (a fresh process per
+    prompt) and carries a 24h "wired-up" TTL that would otherwise keep the daemon alive for a day after
+    a session ended, so a hook heartbeat never exempts.
+  - The pure `shouldReap` decision takes a single `channelAttached` boolean; the daemon loop does the
+    registry read and staleness check, so the policy stays deterministically testable. Verified end to
+    end against a real daemon with a real short reap window: a live channel keeps a dormant-session
+    daemon alive and still firing a monitor past the reap window, a stale lease lets reaping resume,
+    and a live hook heartbeat does not exempt.
+
+  See docs/specs/002-runtime-delivery.md §10.2 and docs/specs/006-agent-integration.md §12.8.
+
+- 8084b10: Reject invalid IANA timezones on `schedule` monitors and the `rollup` notify strategy at authoring
+  time (`validate`, `monitor test`, `watch declare`), and defensively isolate a runtime timezone
+  failure to the affected monitor instead of aborting the whole daemon tick.
+
+  Previously, a typo'd `timezone` (e.g. `America/New_Yrok`) on a `schedule` monitor made
+  `Intl.DateTimeFormat` throw deep inside cron scheduling — and because that call happened outside the
+  per-monitor error isolation, it aborted the **entire** tick, silently stopping every other monitor
+  from running. Now:
+  - `validate`, `monitor test`, and `watch declare` reject an invalid `schedule` `scope.timezone` with
+    an actionable error naming the bad value (the `rollup` notify strategy's `timezone` was already
+    validated this way).
+  - If an invalid timezone reaches the runtime anyway (a hand-edited `MONITOR.md` that skipped
+    `validate`), it is isolated to that one monitor — recorded as an `errored` observation, surfaced in
+    `daemon once`/`daemon run` output, and reported by `monitor explain` as an observation-stage
+    failure — instead of crashing the tick or the diagnostic command. Every other monitor keeps
+    running unaffected.
+
+- 9e6cf2f: Make delivered monitor text self-sufficient, and let each transport own its own attribution.
+
+  The coalesced `normal`/`low` reminder used to read `AgentMon messages are available. Read the inbox.`
+  — which named a product on a surface that already identified it, pointed at the non-authoritative
+  legacy `inbox` model, and told the recipient nothing they could actually run. The runtime's own
+  message is now just the transport/verb-neutral semantic sentence:
+
+  ```
+  Monitored changes are pending.
+  ```
+
+  Each transport appends its own concrete, session- (and where applicable socket-) scoped action step:
+  the hook transport appends `agentmonitors events list --session <id> --unread` / `agentmonitors
+events ack --session <id>`, and the channel transport points at listing the unread events followed
+  by its `agentmon_ack` tool.
+  - **Attribution is transport-owned.** The runtime emits an unattributed, semantic message; the
+    hook transport prepends `AgentMon: ` (its injected context arrives unlabeled), and the channel
+    transport prepends nothing (its `<channel source="agentmonitors">` tag already names the source,
+    so the old prefix double-attributed every push). Adding a new delivery surface now means choosing
+    its attribution in that transport, not editing the runtime.
+  - **Deliveries that inject event bodies now say how to finish.** A high-urgency delivery and the
+    `SessionStart` recap each carry a single per-batch line naming the acknowledge command for that
+    session. Because claiming is not acknowledging, a session that handled its delivery but never
+    acknowledged previously had that same band's own later reminder silently suppressed by the
+    band-scoped coalesced-until-ack rule (an unacknowledged claim never suppresses a different,
+    unrelated urgency band's reminder), with the remediation visible only in `monitor explain`.
+  - **Acknowledging a whole session no longer risks a row an in-flight channel push is still
+    mid-surfacing.** `AgentMonitorRuntime.acknowledgeSession(sessionId)` (no explicit `eventIds`) now
+    excludes rows currently leased by an outstanding delivery reservation (issue #300). The reminder-
+    suppression diagnosis (`monitor explain`, `hook deliver --debug`) also gains a `reserved-in-flight`
+    `HookDeliveryHoldReason`/`ReminderSuppressionReason` for this case, so a live lease is never
+    reported (or explained) as something `events ack` can or should clear.
+  - No change to notify/debounce timing, urgency bands, coalescing behavior, or the
+    unread/claimed/acknowledged model. The legacy `inbox` CLI surface is untouched.
+
+  See docs/specs/002-runtime-delivery.md §9.2 and docs/specs/006-agent-integration.md §5.1.1.
+
+- dea1510: Add a delivery-transport health surface so a broken listening method is visible instead of silent.
+
+  A monitor can look completely healthy — events materialized on real transitions, monitor `explain`
+  clean — while nothing ever reaches the agent. Three distinct instances of this were observed in a
+  single day of dogfooding: a reaped daemon with no session to revive it, a channel server bound to
+  the home-directory workspace because the session was launched from `$HOME`, and correct events whose
+  reminders were withheld on every lead session by the `coalesced-until-ack` guard. All three
+  presented identically (silence) and needed completely different fixes.
+  - **Transport heartbeats.** `channel serve` records a heartbeat on startup and every poll (removing
+    it on clean shutdown); `hook deliver` records one per invocation once it resolves a session, plus
+    the delivery timestamp when it surfaces something. Each record names the pid, resolved CLI path
+    and version, `HOME`/data root, bound workspace and socket, host session id, and last delivery —
+    the values a long-lived transport freezes at session start and that silently stop matching
+    reality. Records carry an explicit TTL lease, so a server killed without cleanup is recognized as
+    dead without trusting it to have removed its own file. They live in a machine-wide registry under
+    the data root rather than the per-workspace directory, which is what makes a transport bound to
+    _another_ workspace findable at all.
+  - **`doctor` gains a "Delivery transports" section**, two `transport:<name>` checks, and a
+    `delivery-verdict` check. Each failure mode is reported with its own code and its own remediation,
+    never collapsed into a generic "unhealthy": `daemon-unreachable`, `workspace-mismatch`,
+    `socket-mismatch`, `environment-mismatch`, `reminders-suppressed` (naming a scoped
+    `agentmonitors events ack --session <id> --event-ids <ids> --socket <socket>`, never a blanket
+    `--session <id>` alone), `heartbeat-stale`, and `version-skew`.
+  - **The verdict separates "which method is listening" from "will anything arrive right now."**
+    `deliveryWillReachThisSession` names the method (`hook` / `channel` / `both` / `none`);
+    `deliverable` is the answer a user actually wants. They diverge exactly in the suppression case —
+    reporting only the method is what let a real CI failure go undelivered while every surface looked
+    green.
+  - **`--json` exposes** `transports[] { name, configured, running, healthy, boundTo, version,
+lastDelivery, problems[] }` plus top-level `deliveryWillReachThisSession`, `deliverable`,
+    `verdict`, and `remediation[]`. Pipeline-wide problems (a down daemon, muted reminders) are
+    recorded on every configured transport but rendered once, at the verdict.
+  - **Exit codes stay conservative.** A `transport:<name>` check fails only for a transport that
+    reported in and is genuinely broken. "A lead session exists but no transport has reported in yet"
+    is `idle` — the ordinary state of a script-registered or freshly-opened session.
+  - The channel MCP server now reports the **real package version** in its handshake instead of a
+    hardcoded `0.0.0`, so a host log identifies which build is serving the session.
+  - A live channel also carries a `channel-registration-unverified` **advisory** (not a defect): during
+    the channels research preview the host silently drops channel events when the plugin is loaded as a
+    plain MCP server, and never tells the server, so "connected" cannot prove registration. It points
+    at `agentmonitors verify` and the dev-flag remediation.
+  - **`--json` exposes a top-level `pipelineProblems[]`** alongside `transports[]`. Pipeline-wide
+    problems (a down daemon, muted reminders, an unevaluable suppression check) appear both there and
+    in each configured transport's `problems[]`, so a consumer reading either alone is still correct;
+    `pipelineProblems[]` is authoritative because it is present even when no transport is configured.
+  - **A channel serving no active lead session is shown but never counted.** It is reported with
+    `channel-session-unmatched` rather than adopted as this session's listening method, and problems
+    from every matching lead session are unioned (prefixed with the session id) so a broken session is
+    not hidden behind a healthy one.
+
+  See docs/specs/006-agent-integration.md §12 and docs/specs/005-cli-reference.md §15.
+
+  **Review fixes (before first release):**
+  - The transport registry is now reaped opportunistically on write only (never on read — see below),
+    so a transport that dies without cleanup no longer fails `doctor` in that workspace forever;
+    `transport:<name>` checks are also gated on a lead session being currently open, matching the "no
+    lead session → idle" contract.
+  - The hook transport's `lastDeliveryAt` is preserved across a refresh that has nothing new to report
+    (a read-modify-write), instead of resetting to `never` on the next empty prompt, and is recorded
+    only when a delivery actually wrote output to the host.
+  - `version-skew` is now informational, like `channel-registration-unverified` — it no longer fails a
+    transport or blocks the verdict.
+  - The heartbeat registry key now appends a short hash of the raw host session id, so two ids that
+    collapse to the same sanitized filename can no longer clobber each other's records.
+  - The channel heartbeat now refreshes on an independent timer instead of only after each poll
+    settles, so a wedged daemon can no longer make a live, correctly-bound channel server flap to
+    `heartbeat-stale`.
+  - Session-id-first heartbeat matching is now restricted to the channel transport; the hook transport
+    (no per-session identity) always matches by workspace.
+  - Idle `transport:<name>` checks now always carry a remediation, in both text and `--json`.
+  - `doctor` now derives its ACTIVE lead-session set once and uses it consistently everywhere: a
+    session a prior `session close` marked `dormant` no longer reads as still-open on the
+    `lead-session`/`daemon-reachable` checks, the per-monitor rollup, or the JSON `leadSession` field —
+    it is `idle`/exit 0, matching a workspace with no lead session ever registered.
+  - **A new `channel-lead-uncovered` problem code** names every active lead session a channel record
+    exists for the workspace but not for that specific lead — proving one active lead is covered is no
+    longer treated as proof the whole workspace is.
+  - A stale sibling's problem can no longer hide behind a healthy representative: any transport-owned
+    blocking problem on ANY matched heartbeat (not just the record chosen as representative) now
+    excludes that transport from `deliveryWillReachThisSession`.
+  - Representative-record selection (`boundTo`/`version`/`lastDelivery`) is now freshness-first, with
+    both unparseable and implausibly-future timestamps sorting as oldest, so a corrupt or forged record
+    can no longer become the representative over a valid, current one. Every matching record's problems
+    are still unioned regardless of which one is chosen.
+  - **Reaping is now a write-path-only responsibility.** `readTransportHeartbeats` never mutates: a
+    read-side reap previously let `doctor` destroy the evidence of the failure it had just reported (a
+    first run reports `[heartbeat-stale]` and exits 1; a second run, with nothing recovered, then found
+    no record at all and reported a clean idle/exit-0 verdict). A lapsed record now stays durable across
+    every `doctor` run until some transport actually writes a heartbeat again.
+  - **A new `hook-lead-uncovered` problem code** extends the every-active-lead-covered rule to `hook`:
+    with two active leads and a hook heartbeat naming only one of them, the other is now reported
+    explicitly instead of a workspace-wide `deliverable: true` masking that a second lead has no hook
+    invocation evidence at all.
+  - A persisted, semantically-invalid numeric heartbeat field (`ttlMs`/`pid`/`schemaVersion` as
+    `Infinity`, `NaN`, or non-positive) is now rejected rather than trusted — `JSON.parse` happily
+    overflows `1e309` to `Infinity`, which made a lease immortal and un-reapable.
+  - The `reminders-suppressed` remediation now names the exact claimed event ids holding the reminder
+    back and the socket `doctor` itself resolved, instead of a blanket
+    `agentmonitors events ack --session <id>` that would acknowledge every unread row on the session
+    (including events never claimed or seen) against whichever daemon the default socket resolves to.
+  - `hook` heartbeat selection is now filtered to active lead sessions, matching `channel`: a closed
+    or non-lead session's still-in-TTL record in the same workspace can no longer poison a healthy
+    active lead's aggregate with problems (e.g. `socket-mismatch`) that belong to somebody else's
+    session.
+  - An empty `claimedEventIds` array on an `already-claimed`/`coalesced-until-ack` hold is now treated
+    as untrustworthy, the same as a missing one, instead of falling back to the unscoped
+    `agentmonitors events ack --session <id>` command — such a hold necessarily claims at least one
+    event, so an empty array can only come from a malformed or hand-built value.
+
+- Updated dependencies [81ac973]
+- Updated dependencies [b474d10]
+- Updated dependencies [604c1e8]
+- Updated dependencies [784e627]
+- Updated dependencies [ba5a5a5]
+- Updated dependencies [dea1510]
+- Updated dependencies [74db101]
+- Updated dependencies [97b0673]
+- Updated dependencies [cba4f0b]
+- Updated dependencies [8084b10]
+- Updated dependencies [9e6cf2f]
+- Updated dependencies [dea1510]
+  - @agentmonitors/cli@0.11.0
+
 ## 0.11.0
 
 ### Minor Changes
