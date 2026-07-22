@@ -28,11 +28,7 @@ import {
   renderChannelEvent,
   resolveChannelClaimFit,
 } from '../channel-render.js';
-import {
-  ACK_TOOL,
-  buildAckResultText,
-  parseAckArgs,
-} from '../channel-ack.js';
+import { ACK_TOOL, buildAckResultText, parseAckArgs } from '../channel-ack.js';
 import { getCliVersion } from '../cli-version.js';
 import {
   CHANNEL_HEARTBEAT_TTL_MS,
