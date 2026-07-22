@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { DeliveryClaim } from '@agentmonitors/core';
+import { parseAckArgs } from './channel-ack.js';
 import {
   buildChannelTruncatedMarker,
   CHANNEL_DEFERRED_MARKER,
@@ -233,25 +234,31 @@ describe('renderChannelEvent', () => {
   // be surfaced explicitly whenever set, since `claim.events`/`claim.message`
   // carry no representation of it on their own, and `claimDelivery` claims
   // the coalesced normal rows alongside the surfaced high events (006 §5.5).
-  it('appends the coalesced reminder footer after the packed event block(s)', () => {
+  it('appends the coalesced reminder footer, with this transport’s own agentmon_ack action step, after the packed event block(s)', () => {
     const { content } = renderChannelEvent(
       makeClaim({
-        coalescedReminder: 'AgentMon messages are available. Read the inbox.',
+        coalescedReminder: 'Monitored changes are pending.',
       }),
     );
     expect(content).toContain('package.json changed');
+    expect(content).toContain('Monitored changes are pending.');
+    // The runtime's coalesced reminder is transport-neutral; the channel
+    // transport appends its OWN acknowledge step (the `agentmon_ack` tool, not
+    // the hook's CLI verb — issue #445 wording contract, 002 §9.2 / 006
+    // §5.1.1) so the coalesced reminder is self-sufficient on the channel too.
+    expect(content).toContain('agentmon_ack');
     expect(content).toContain(
-      'AgentMon messages are available. Read the inbox.',
+      'agentmonitors events list --session s1 --unread',
     );
     expect(
       content.indexOf('package.json changed') <
-        content.indexOf('AgentMon messages are available'),
+        content.indexOf('Monitored changes are pending.'),
     ).toBe(true);
   });
 
   it('does not render a coalesced-reminder footer when the field is absent (ordinary high-only claim, unchanged)', () => {
     const { content } = renderChannelEvent(makeClaim());
-    expect(content).not.toContain('AgentMon messages are available');
+    expect(content).not.toContain('Monitored changes are pending');
   });
 
   // Issue #441 cross-monitor coalescing / PR #456 review finding "meta":
@@ -265,7 +272,7 @@ describe('renderChannelEvent', () => {
   it('summarizes a coalesced claim with exactly one high event at the claim level, not per-event', () => {
     const { meta } = renderChannelEvent(
       makeClaim({
-        coalescedReminder: 'AgentMon messages are available. Read the inbox.',
+        coalescedReminder: 'Monitored changes are pending.',
         coalescedNormalCount: 2,
       }),
     );
@@ -278,7 +285,7 @@ describe('renderChannelEvent', () => {
   it('includes the coalesced normal rows in event_count for a multi-high coalesced claim', () => {
     const { meta } = renderChannelEvent(
       makeClaim({
-        coalescedReminder: 'AgentMon messages are available. Read the inbox.',
+        coalescedReminder: 'Monitored changes are pending.',
         coalescedNormalCount: 2,
         events: [
           {
@@ -312,7 +319,7 @@ describe('renderChannelEvent', () => {
     const bigDiff = '+ added line\n'.repeat(2_000); // well past the per-event bound
     const { content } = renderChannelEvent(
       makeClaim({
-        coalescedReminder: 'AgentMon messages are available. Read the inbox.',
+        coalescedReminder: 'Monitored changes are pending.',
         events: [
           {
             eventId: 'e1',
@@ -328,7 +335,9 @@ describe('renderChannelEvent', () => {
       }),
     );
     expect(content.length).toBeLessThanOrEqual(MAX_CHANNEL_CONTENT);
-    expect(content).toContain('AgentMon messages are available');
+    expect(content).toContain('Monitored changes are pending.');
+    // …including its ack action step, which is part of the reserved footer.
+    expect(content).toContain('agentmon_ack');
   });
 
   it('strips tag-breakout characters from content and meta', () => {
@@ -484,21 +493,107 @@ describe('renderChannelEvent', () => {
 
   // Issue #436: a normal-band reminder carries no concrete events, but its
   // event_count must reflect the pending events it refers to — NOT read "0"
-  // (which looks like a bug). 002 §9.2: reminders stay generic.
-  it('renders a reminder claim generically and counts the pending events it refers to', () => {
+  // (which looks like a bug). 002 §9.2: reminders carry no event bodies.
+  //
+  // Issue #438: attribution is transport-owned. The runtime emits a SEMANTIC
+  // message; this transport adds NO prefix, because the enclosing
+  // `<channel source="agentmonitors">` tag already names the source — an
+  // "AgentMon" prefix here would double-attribute.
+  it('renders a reminder claim with the runtime message plus the channel-owned agentmon_ack action step, unattributed, counting the pending events it refers to', () => {
+    // 002 §9.2 (PR #445 review, finding 2): the runtime's own message is now
+    // transport-neutral — no CLI verb baked in — so this transport supplies
+    // its OWN action step (`agentmon_ack`, not the hook's CLI ack command).
+    const semanticReminder = 'Monitored changes are pending.';
     const { content, meta } = renderChannelEvent(
       makeClaim({
         urgency: 'normal',
         events: [],
-        message: 'AgentMon messages are available. Read the inbox.',
+        message: semanticReminder,
         unreadCounts: { low: 0, normal: 3, high: 0, total: 3 },
       }),
     );
-    // Stays generic — no injected event bodies leak into a reminder.
-    expect(content).toBe('AgentMon messages are available. Read the inbox.');
+    // Verbatim — the channel adds no attribution of its own.
+    expect(content).toBe(
+      `${semanticReminder} Run ` +
+        '`agentmonitors events list --session s1 --unread` ' +
+        'to see them, then call the agentmon_ack tool with the event_id values of the ones you handled.',
+    );
+    expect(content.startsWith('AgentMon')).toBe(false);
+    // The channel never repeats the hook's CLI ack verb — that would give a
+    // channel-connected agent two conflicting acknowledge paths.
+    expect(content).not.toContain('events ack');
+    // No injected event bodies leak into a reminder.
     expect(content).not.toContain('### ');
     // The referent count is the pending total, not 0.
     expect(meta.event_count).toBe('3');
+  });
+
+  // PR #445 review, finding 2 (round 2, BLOCKER): a prior wording offered
+  // `agentmon_ack` as an "or" ALTERNATIVE to listing details — but calling
+  // `agentmon_ack` with no `event_ids` acknowledges EVERY unread event for the
+  // session (`channel-ack.ts`'s `parseAckArgs`: omitting `event_ids` means
+  // "all unread"), not just the ones this reminder refers to. The most
+  // literal reading of the old "or" phrasing — call the tool bare, with no
+  // arguments — would silently ack unseen cross-band work. This is a
+  // text-contract regression test: the reminder must never advertise the
+  // bare, no-argument `agentmon_ack` call as a valid path; it must instead
+  // present inspection (`events list --unread`) as a prerequisite step before
+  // naming `agentmon_ack`, and name it only with a "handled"/event_id-scoped
+  // qualifier.
+  it('never advertises a bare, no-argument agentmon_ack call as an alternative to listing details (PR #445 review, finding 2 regression)', () => {
+    const { content } = renderChannelEvent(
+      makeClaim({
+        urgency: 'normal',
+        events: [],
+        message: 'Monitored changes are pending.',
+        unreadCounts: { low: 0, normal: 3, high: 0, total: 3 },
+      }),
+    );
+    // The regressed phrasing this test guards against.
+    expect(content).not.toContain('Call the agentmon_ack tool, or run');
+    expect(content).not.toContain('for details.');
+    // Listing unread events is presented BEFORE the ack step, as a
+    // prerequisite, not an "or" alternative.
+    const listIndex = content.indexOf('events list');
+    const ackIndex = content.indexOf('agentmon_ack');
+    expect(listIndex).toBeGreaterThan(-1);
+    expect(ackIndex).toBeGreaterThan(listIndex);
+    // The ack step is qualified to the handled events, not a bare call.
+    expect(content).toContain(
+      'call the agentmon_ack tool with the event_id values of the ones you handled',
+    );
+  });
+
+  // Confirms the semantics this text contract depends on: `agentmon_ack`
+  // called with no `event_ids` genuinely acknowledges ALL unread events for
+  // the session, which is exactly why the reminder text above must never
+  // present the bare call as a safe "or" alternative to inspecting first.
+  it('parseAckArgs treats omitted event_ids as "acknowledge all unread" (channel-ack.ts)', () => {
+    const bare = parseAckArgs(undefined);
+    expect(bare).toEqual({ ok: true, args: {} });
+    // No `eventIds` on the parsed args is the tool's own signal, per
+    // `ACK_TOOL`'s description, to acknowledge every unread event — not a
+    // subset the caller inspected first.
+    expect(bare.ok && bare.args.eventIds).toBeUndefined();
+  });
+
+  // PR #445 review, findings 2/4: the channel's own action step is
+  // session+socket-scoped, mirroring the hook transport's identical
+  // reminder-step contract.
+  it('threads the resolved socket path into the reminder action step', () => {
+    const { content } = renderChannelEvent(
+      makeClaim({
+        sessionId: 'sess-reminder',
+        urgency: 'low',
+        events: [],
+        message: 'Monitored changes are pending.',
+        unreadCounts: { low: 1, normal: 0, high: 0, total: 1 },
+      }),
+      { socketPath: '/tmp/agentmon-real.sock' },
+    );
+    expect(content).toContain(
+      "agentmonitors events list --session sess-reminder --socket '/tmp/agentmon-real.sock' --unread",
+    );
   });
 });
 

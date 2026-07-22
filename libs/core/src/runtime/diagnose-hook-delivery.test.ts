@@ -302,6 +302,71 @@ describe('diagnoseHookDelivery', () => {
     expect(h.runtime.claimDelivery(session, 'turn-interruptible')).toBeNull();
   });
 
+  // Reconciliation regression (issue #441 × #300/#445): the coalescing-window
+  // fire gate (`normalPending.length === unreadNormal.length`) is LEASE-AWARE —
+  // `pendingForClaim` excludes a normal row reserved by an in-flight channel
+  // push. So when a normal reminder's only unread row is LEASED and a sibling
+  // high-urgency event is concurrently pending-and-unsettled, the reminder is
+  // NOT due (pending 0 ≠ unread 1): it is deferred by the lease, not withheld
+  // for coalescing. Both surfaces must agree — `decideDelivery` surfaces
+  // nothing, and the diagnosis names the normal band `reserved-in-flight`
+  // (NOT the `settle-window`/coalescing-withheld reason of the finding-1 case
+  // above, which requires a fully-due, unleased reminder). Once the lease
+  // resolves and the high settles, the SAME reminder coalesces normally.
+  it('defers a leased normal row to `reserved-in-flight` (not coalescing-withheld) while a sibling high-urgency event is unsettled, then coalesces once the lease resolves and the high settles (issue #441 × #300 reconciliation)', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    const h = setup();
+    const session = openLead(h, 'sess-leased-coalesce');
+
+    // A normal reminder becomes fully due with no high work yet, so reserving
+    // it leases its only unread normal row (the in-flight channel-push state).
+    materialize(h, 'normal', 'mon-n', 'obj-n', NOW);
+    const reservation = h.runtime.reserveDelivery(
+      session,
+      'turn-interruptible',
+    );
+    expect(reservation).not.toBeNull();
+    if (!reservation) throw new Error('expected a reservation to be created');
+
+    // A sibling high-urgency event arrives, still inside its settle window.
+    materialize(h, 'high', 'mon-h', 'obj-h', NOW);
+
+    // Fire decision: nothing surfaces — the leased normal row is not due, and
+    // the high is unsettled, so there is nothing to coalesce.
+    expect(h.runtime.claimDelivery(session, 'turn-interruptible')).toBeNull();
+
+    // Diagnosis: the normal band is `reserved-in-flight` (the lease defers it),
+    // NOT the coalescing-withheld `settle-window` reason — and it never
+    // recommends ack for a merely-leased row. The high band is `settle-window`.
+    const diagnosis = h.runtime.diagnoseHookDelivery(
+      session,
+      'turn-interruptible',
+    );
+    const normalHold = diagnosis.holds.find(
+      (hold) => hold.urgency === 'normal',
+    );
+    expect(normalHold).toMatchObject({
+      urgency: 'normal',
+      reason: 'reserved-in-flight',
+      unreadCount: 1,
+      pendingCount: 0,
+      leasedCount: 1,
+    });
+    expect(normalHold?.message).not.toContain('events ack');
+    const highHold = diagnosis.holds.find((hold) => hold.urgency === 'high');
+    expect(highHold?.reason).toBe('settle-window');
+
+    // Once the push fails/releases and the high settles, the SAME reminder
+    // coalesces into the now-settled high delivery in ONE call.
+    h.runtime.releaseDelivery(reservation.reservationId);
+    vi.setSystemTime(new Date(NOW.getTime() + SETTLE_MS));
+    const claim = h.runtime.claimDelivery(session, 'turn-interruptible');
+    expect(claim?.urgency).toBe('high');
+    expect(claim?.events).toHaveLength(1);
+    expect(claim?.coalescedReminder).toBe('Monitored changes are pending.');
+  });
+
   it('diagnoses the low band at turn-idle only (002 §9.3)', () => {
     const h = setup();
     const session = openLead(h, 'sess-low');

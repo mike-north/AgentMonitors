@@ -25,6 +25,22 @@ reports `event_count` as `events.length + coalescedNormalCount` whenever `coales
 present. The hook-deliver transport has no equivalent meta/debug surface, so the same trap does not
 exist there. §4.2's meta table now documents both corrections.
 
+## 2026-07-22 — The leased-row ack exception now derives from one exported constant across all four surfaces (006 §4.3) — Refs #438, #434, PR #445 review round 14
+
+Round 13 (below) made the ack tool result text, `ACK_TOOL`'s description, and its `event_ids` schema
+hint consistent, and added a parity test pinning them to a shared substring. It missed a fourth,
+independent literal describing the same exception: `channel serve`'s own MCP `instructions` string
+(`commands/channel.ts`, `runChannelServe`), which is what a channel-connected agent actually reads
+before ever calling the tool.
+
+`channel-ack.ts` now exports `LEASED_ROW_EXCEPTION`, the single wording for the "in-flight delivery
+lease" carve-out; `buildAckResultText`, `ACK_TOOL.description`, `ACK_TOOL.inputSchema.properties
+.event_ids.description`, and `commands/channel.ts`'s exported `CHANNEL_SERVER_INSTRUCTIONS` all
+interpolate it rather than each spelling out its own copy, so the four can no longer drift the way
+the schema hint once did. Updated 006 §4.3's example tool schema to match the unified wording. The
+parity test in `channel-ack.test.ts` now asserts all four surfaces against the exported constant
+directly, including the channel server's `instructions`.
+
 ## 2026-07-22 — Transport-health review round 12: verdict wording corrected to workspace scope (005 §15) — Refs #425
 
 The `doctor` verdict line said `delivery to THIS session → via {hook | channel | both | none}`, but
@@ -34,6 +50,90 @@ session" literally and expect the verdict to reflect their own invoking session 
 it never has. The verdict, its surrounding CLI-reference prose, and the getting-started skill doc now
 say `delivery to active sessions in this workspace → via {hook | channel | both | none}`, matching
 what the check actually answers. No logic, problem codes, or exit codes changed — wording only.
+
+## 2026-07-22 — PR #461 review round 2: registry read failures fail closed, and one shared binding predicate (002 §10.2, 006 §12.8) — Refs #435
+
+Two more follow-up fixes to the Option A contract below, found in a second round of review of PR #461:
+
+- **A transport-registry read failure now fails CLOSED, not open.** `readTransportHeartbeats()`
+  already treated any `readdirSync` failure (a transient `EMFILE`/`EACCES`, etc.) the same as an
+  empty registry, returning `[]`. That is the right behavior for `doctor`/`transport-health`, but the
+  reaper was reusing the same function, so a transient read failure made `channelAttached` false —
+  letting the idle clock advance toward reaping a possibly-**live** channel, the exact #435 failure
+  this lease exists to prevent. A new `readTransportHeartbeatsResult()` (`apps/cli/src/transport-
+heartbeat.ts`) returns `{ records, readFailed }`, distinguishing a genuinely unreadable directory
+  (`readFailed: true`) from a missing (`ENOENT`, never-run) or empty one (`readFailed: false`);
+  `readTransportHeartbeats()` is now a thin, contract-unchanged wrapper over it. The daemon's reap
+  check uses the new function directly and treats `readFailed` the same as an attached channel for
+  that tick only — never asserting a session was seen — so the very next tick re-scans from scratch
+  and a genuinely absent channel resumes normal reaping as soon as reads succeed again. Verified by a
+  new `daemon-reaper-lease.integration.test.ts` case (replaces the registry directory with a plain
+  file to force `ENOTDIR`) and `transport-heartbeat.test.ts` unit cases for the read-result
+  distinction.
+- **One shared "does this heartbeat match this binding" predicate.** The workspace+socket comparison
+  existed divergently: the reaper's `channelAttached` filter compared both via `path.resolve`, while
+  `transport-health`'s socket-mismatch check compared `socketPath` as a raw string — so a trailing
+  slash or a `./` segment could read as matched in one place and mismatched in the other. Both now
+  call one exported `heartbeatMatchesBinding(heartbeat, { workspacePath, socketPath })`
+  (`transport-heartbeat.ts`), which resolves both fields on both sides (no symlink/realpath
+  resolution — tracked separately). In `transport-health`, this only widens normalization tolerance
+  for the socket comparison (a raw-equal pair remains equal after resolving); the `workspace-
+mismatch`/`socket-mismatch` codes stay distinct. Verified by new `heartbeatMatchesBinding` unit
+  cases (trailing slash, `.`/`..` segments) in `transport-heartbeat.test.ts`.
+
+## 2026-07-22 — PR #461 review: heartbeat lease tightened to the reaper's own socket, and never sets hasSeenSession (002 §10.2, 006 §12.8) — Refs #435
+
+Two follow-up tightenings to the Option A contract below, found in review of PR #461:
+
+- **Same-socket, not just same-workspace.** The `channelAttached` check now additionally compares
+  `heartbeat.socketPath` against the reaper's OWN `socketPath`, not only `heartbeat.workspacePath`
+  against its own workspace path. Two daemon instances can independently resolve the same
+  `workspacePath` (e.g. an orphaned daemon from a prior boot, bound to a stale socket); without the
+  socket comparison a live channel keeping a _different_ daemon alive would wrongly suppress reaping
+  on _this_ one. Verified by a new `daemon-reaper-lease.integration.test.ts` case: a channel heartbeat
+  naming a different socket does not exempt.
+- **A channel-only exemption never sets `hasSeenSession`.** `shouldReap` previously set
+  `nextHasSeenSession: true` whenever EITHER `openCount > 0` OR `channelAttached`, conflating "a real
+  session opened" with "a channel is merely attached." `hasSeenSession` specifically gates the
+  boot-grace window (`max(reapAfterMs, bootGraceMs)`); a channel can attach before any session ever
+  registers, and if it then detaches cleanly before one does, the boot-grace window must still apply
+  on the next check — not fall through to the shorter post-session `reapAfterMs` as if a session had
+  already been seen. Verified by a new `reap-decision.test.ts` case.
+- The reaper also now skips reading the transport registry entirely when reaping is disabled
+  (`--reap-after-ms 0`), since `shouldReap` short-circuits on that case regardless of
+  `channelAttached` — avoiding a pointless registry scan on every tick of a daemon that will never
+  reap.
+
+## 2026-07-22 — A live channel heartbeat suppresses daemon reaping (002 §10.2, 006 §12.8) — Refs #435 (Option A)
+
+Closes the structural gap #435 named: spec 006 sells the channel as the push surface for an **idle**
+agent, but 002 makes daemon lifetime a function of hook activity, and an idle listener fires no
+hooks. Composed, those two contracts guarantee the daemon is dead by the time an event should fire —
+the session goes dormant, the active-session count reaches zero, the daemon reaps (`--reap-after-ms`,
+default 5 min), monitors stop ticking, and the channel is permanently silent.
+
+Option A makes a **non-stale `channel` heartbeat** count as reaper activity, so a channel-attached
+session keeps its daemon alive and ticking even while dormant. The exemption is the heartbeat's
+owner-declared **TTL lease** (issue #425, `isHeartbeatStale`), re-evaluated against `now` on every
+reap check — never a static "a channel is registered" flag — so a channel server that dies uncleanly
+stops counting within its (short) TTL and reaping resumes. That is the guard that stops an orphaned
+channel server (issue #426) pinning the daemon alive forever: an active expiring lease, not a
+permanent pin. Only the `channel` transport qualifies; the `hook` transport's 24h "wired-up" TTL
+would keep the daemon alive for a day after a session ended, and its self-healing per-prompt process
+needs no persistent daemon between prompts.
+
+- **002 §10.2** states the new reaping contract (channel heartbeat counts as activity; TTL-gated;
+  channel-only; the pure `shouldReap` takes a `channelAttached` boolean while the reaper does the
+  registry I/O).
+- **006 §12.8** states it from the channel-availability side, consuming the lease primitive §12.2
+  already anticipated.
+- Verified end to end by `daemon-reaper-lease.integration.test.ts` against a real daemon with a real
+  short reap window and real heartbeat records: a live channel keeps a dormant-session daemon alive
+  and still firing a monitor past the reap window; a stale lease lets reaping resume; a live hook
+  heartbeat does not exempt.
+
+This is Option A of the #435 = A + B decision. Option B (a supported persistent-daemon mode,
+`daemon run --detach --reap-after-ms 0`) is separate.
 
 ## 2026-07-21 — Transport-health review round 11: two-lead hook coverage test now drives real `hook deliver` (006 §12.3, 005 §15) — Refs #425
 
@@ -976,6 +1076,291 @@ memory.
   behavior. This is deliberately unlike `command-poll`'s stdout cap (§11.2), which truncates and
   still treats the capped output as a valid result — a stalled/incomplete HTTP body is not a
   meaningful baseline the way capped command output is.
+
+## 2026-07-21 — Every public surface consistently describes the no-`--event-ids`/no-`event_ids` ack as excluding ALL currently leased rows, plural (005 §11.2, 006 §4.3) — Refs #438, #434, PR #445 review round 12
+
+Round 10 added the leased-row exception to `acknowledgeSession`'s default "ack everything unread"
+path, but the shipped wording across the CLI's `--event-ids` help, the `agentmon_ack` MCP tool
+description (`channel-ack.ts`'s `ACK_TOOL`), `channel serve`'s server `instructions`, and the public
+005/006 docs and website pages said "except **one** row" / "**a** row" — singular. That undersells
+the actual behavior: `AgentMonitorRuntime.acknowledgeSession`'s exclusion set comes from
+`reservedEventIds(sessionId)`, which returns every candidate held by every live reservation for the
+session, so more than one row can be excluded from a single no-argument ack at once (e.g. two
+concurrent channel pushes each mid-surfacing a different event). `channel serve`'s advertised MCP
+server `instructions` previously omitted the exception entirely, telling a channel-connected agent
+that the no-argument form acknowledges all unread with no carve-out.
+
+Corrected every surface that described this exception (or omitted it) to describe **all currently
+leased rows** rather than a single row: `service.ts`'s `acknowledgeSession` doc comment,
+`channel-ack.ts`'s `ACK_TOOL` description and `AckArgs` doc comment, `commands/events.ts`'s
+`--event-ids` help text, `commands/channel.ts`'s MCP server `instructions`, 005 §11.2's `events ack`
+exception paragraph and the `channel serve` behavior note, 006 §4.3's example tool schema, and the
+website's CLI reference and agent-integration capability table (with a footnote pointing at the
+exception).
+
+## 2026-07-21 — A leased-but-unclaimed reminder hold gets its own `reserved-in-flight` reason and can no longer be acknowledged away (002 §10.7, 006 §5.2) — Refs #438, #434, PR #445 review round 10
+
+Round 8 documented (but did not fix) that a row LEASED by an in-flight channel-push reservation
+(issue #300) reads identically to a truly claimed row to the reminder-suppression diagnosis — both
+report `already-claimed`/`coalesced-until-ack`, and both messages recommend `agentmonitors events
+ack`. Round 10 proved that overlap unsafe rather than merely misleading: `acknowledgeSession`'s
+implicit "ack everything unread" path (the literal remedy the shared message recommends) would sweep
+the still-leased row too. `acknowledgeEvents` sets `acknowledgedAt` without requiring
+`firstNotifiedAt`, so if the in-flight push then rejects/disconnects and the lease releases the row
+back to `pending`, the row is already (wrongly) acknowledged and can never redeliver — event loss.
+
+Fixed on both sides:
+
+1. **Diagnosis** (`hook-delivery-diagnosis.ts`, `reminder-diagnosis.ts`): `HookDeliveryHoldReason`
+   and `ReminderSuppressionReason` gain a `reserved-in-flight` variant, reported whenever a band has
+   no durably claimed row but at least one leased row (`claimedCount === 0 && leasedCount > 0`). Its
+   message never mentions `events ack`. A mix of a durable claim and a live lease still reports
+   `coalesced-until-ack` (ack remains the correct remedy for the claimed portion) but now names the
+   leased portion separately so it isn't implied to need the same action. `HookDeliveryHold` and
+   `ReminderSuppressionFinding` both gain a `leasedCount` field.
+2. **The actual bug**: `AgentMonitorRuntime.acknowledgeSession(sessionId)` (no explicit `eventIds`)
+   now excludes rows currently leased by an outstanding reservation from its default "every unread
+   event" set. A scoped ack (explicit `eventIds`, e.g. a hook body-injection's per-batch instruction)
+   is unaffected — it names rows the caller actually saw. Regression: reserving a delivery, calling
+   `acknowledgeSession` with no ids, then releasing the reservation proves the row is still `unread`
+   and re-claimable, never silently lost.
+
+Updated 006 §5.2's `--debug` hold-reason list and 002 §10.7's `monitor explain` description to name
+`reserved-in-flight` and its no-ack constraint.
+
+## 2026-07-20 — `normalPending` is lease-aware (not merely "not-yet-claimed"), and the false "fresh event" recovery clause is removed from every normative surface (002 §9.2/§9.3/§13.3, 006 §5.1.1) — Refs #438, #434, PR #445 review round 8
+
+Two follow-on defects found on round 8 of reviewing the same change.
+
+**1. §9.2/§9.3/§13.3 promised a fresh unclaimed event restores a suppressed reminder.** They do not:
+starting from one claimed-but-unacknowledged row (`normalPending = 0`, `unreadNormal = 1`), a fresh
+unclaimed row makes it `1` and `2` — the equality guard (`normalPending.length === unreadNormal.length`)
+stays unsatisfied until the claimed row is specifically acknowledged, regardless of how many new
+unclaimed rows arrive. Removed the "or a fresh unclaimed event arrives" alternative from §9.2, §9.3, and
+the §13.3 worked example, and from the matching prose/messages in `reminder-diagnosis.ts` and
+`hook-delivery-diagnosis.ts` (both diagnostics' `coalesced-until-ack` branch already stated the correct,
+ack-only condition — only the `already-claimed` branch carried the false alternative).
+
+**2. §5.1.1 described `normalPending` as merely "not-yet-claimed."** `pendingForClaim` (issue #300) also
+excludes rows held by an in-flight channel-push reservation, so an unread, unclaimed, but currently
+leased row is absent from `normalPending` too — proven by the committed reservation regression, which
+shows a concurrent reminder stays suppressed until the lease releases. Reworded §5.1.1 to describe
+`normalPending` as pending **and currently claimable (not leased)**. This also means both diagnostics'
+`claimedCount = unreadCount - pendingCount` reports a leased-but-unclaimed row as `already-claimed`
+alongside truly claimed rows; documented that lease-aware overlap in both modules' doc comments rather
+than distinguishing it with a new reason (a public-API change to `HookDeliveryHoldReason`), and pinned
+the leased case with a dedicated regression.
+
+## 2026-07-20 — The coalesced-until-ack guard's band comparison no longer mislabels the pending side as claimed (006 §5.1.1) — Refs #438, #434, PR #445 review round 7
+
+One follow-on defect found on round 7 of reviewing the same change.
+
+**1. §5.1.1 described `normalPending` as the claimed-but-unacknowledged set.** `pendingForClaim`
+delegates to `pendingEventsForSession`, which requires `first_notified_at IS NULL` — so `normalPending`
+holds only not-yet-claimed rows. `unreadNormal` is the superset that additionally contains any
+claimed-but-unacknowledged row. The mixed-recap conclusion in the prior correction (round 6, above) was
+correct — `normalPending` is 1 (the fresh unclaimed row) while `unreadNormal` is 2 (that row plus the
+still-claimed recap row) — but describing the LHS as "claimed" could mislead an implementer into
+reversing the guard. Reworded lines 624-633 to say the runtime compares the band's pending/unclaimed
+count against its total unread count, and that claimed-but-unacknowledged rows appear only in the
+latter.
+
+## 2026-07-20 — The header-packing fixed-point search no longer oscillates into an under-scoped ack, and the coalesced-until-ack guard's mixed-recap case is documented correctly (006 §5.1.1) — Refs #438, #434, PR #445 review round 6
+
+Two more follow-on defects found on round 6 of reviewing the same change.
+
+**1. `resolveHookHeaderPacking`'s fixed-point-guess search could oscillate, under-scoping `--event-ids`
+(BLOCKER).** The prior iterative-narrowing search re-guessed the next candidate id count from the
+PREVIOUS candidate's packed-block count; at a specific boundary (two ~26-character event ids with
+~1,774-character bodies, reserved against the deferred marker) this bounced between guesses (`guess=2`
+packs 1 block; the resulting shorter 1-id header then packs 2 blocks; `guess` returns to 2, repeating)
+without ever landing on a self-consistent `k`, so the loop exhausted and fell back to the narrowest
+(0-id) header while BOTH blocks still rendered — an ack instruction naming zero ids for two rendered
+events, which a compliant agent could only satisfy with the no-id "ack everything" form, silently
+dropping unrelated deferred/recap rows into that same blanket ack. Resolved by testing each candidate
+`k` directly (descending from `events.length` to `0`, packing only `blocks.slice(0, k)` against the
+header built for `events.slice(0, k)`) rather than iterating a guess derived from the previous
+candidate's result — `k = 0` is always self-consistent (no ids, no blocks), so the search is guaranteed
+to terminate at a header whose named ids exactly match what's rendered. Regression test:
+`hook-deliver-render.test.ts` reproduces the exact oscillation boundary and asserts the rendered
+`--event-ids` count always equals the rendered `### ` block count.
+
+**2. §5.1.1's coalesced-until-ack correction overgeneralized the high-only case to mixed-band recaps.**
+The prior correction (round 5, below) stated an unacknowledged `high`-urgency **or mixed-band recap**
+claim does not block a new `normal`-urgency reminder. That's true for a `high`-only claim (it touches
+no `normal`/`low` row), but wrong for a mixed-band recap: if a `post-compact` recap claims an old
+`normal` (or `low`) event alongside `high` events, that row stays claimed-but-unacknowledged, so
+`normalPending` no longer equals `unreadNormal` once a fresh, unrelated `normal` event later arrives —
+the band-scoped equality guard suppresses that band's next `turn-interruptible` reminder too, until the
+recap's `normal`/`low` events are acknowledged. A current-head `service.ts` probe reproduced
+`normalPending=1`, `unreadNormal=2`, and a `null` claim. Corrected `006-agent-integration.md` to
+distinguish the high-only case from the mixed-recap case, and updated the stale `hook-deliver-render.ts`
+doc comment making the same overgeneralization; the public website (`agent-integration.md`) already
+scoped this correctly to "a `high`-only claim." Added a regression test (`service.test.ts`, "mixed-band
+recap suppression") reproducing the exact scenario above.
+
+## 2026-07-20 — Recap sizing reserves against the marker actually appended, the channel reminder's action step is sequenced list-then-ack everywhere, and the coalesced-until-ack guard's band scope is documented correctly (002 §9.2, 006 §4.2.1, §5.1.1) — Refs #438, #434, PR #445 review round 3
+
+Three more follow-on defects found on round 3 of reviewing the same change.
+
+**1. `resolveHookClaimFit` sized against the wrong marker for a `post-compact` recap (BLOCKER).**
+`resolveHookClaimFit` defaulted to reserving room for `buildHookDeferredMarker`'s length regardless of
+lifecycle, but `renderHookDelivery`'s recap branch appends the LONGER `buildHookRecapMarker` on top of
+that packing instead. Reserving against the shorter marker while appending the longer one could let a
+multi-event recap's rendered `additionalContext` exceed `MAX_ADDITIONAL_CONTEXT` (4000 chars). Resolved
+by threading the lifecycle-specific marker `renderHookDelivery` will actually append into
+`resolveHookClaimFit` as an explicit parameter, so `includedCount` stays truthful for both lifecycles.
+Regression test: a two-event recap boundary case (`hook-deliver-render.test.ts`) with a body length of
+3546 chars — the smallest size that genuinely overflows the cap under the pre-fix packing.
+
+**2. A stale channel-transport example still showed the bare-ack "OR" wording (§4.2.1) swept.** Round 2
+(below) fixed the channel reminder's rendered text and its spec prose, but left an illustrative example
+in `experiments/channel-uat/README.md` quoting the old "Call the agentmon_ack tool, or run `events
+list` ... for details" shape. Updated to the current list-then-scoped-ack wording so no reader copies
+the superseded phrasing.
+
+**3. The coalesced-until-ack suppression's spec prose and changeset overclaimed cross-band scope
+(§5.1.1).** Both `docs/specs/006-agent-integration.md` and the `self-sufficient-delivery-text`
+changeset described an unacknowledged claim as suppressing "every subsequent"/"every later"
+normal-urgency reminder for the session — but the guard
+(`normalPending.length === unreadNormal.length`; the low-urgency guard, §9.3, is the identical pattern)
+is band-scoped: it compares a band's own claimed-but-unacknowledged events against that SAME band's
+unread total. An unacknowledged `high`-urgency (or mixed-band recap) claim does not, on its own, block a
+NEW `normal`-urgency reminder from firing for unrelated, still-unclaimed `normal` events in the same
+session — the two coexist. Corrected both the spec prose and the changeset; added a regression test
+(`service.test.ts`, "cross-band independence") proving an unacked high-urgency claim does not suppress a
+same-session normal-urgency reminder.
+
+## 2026-07-19 — The per-batch ack instruction is socket-scoped, and the channel reminder's action step no longer offers a blanket-ack shortcut (002 §9.2, 006 §5.1.1) — Refs #438, #434, PR #445 review round 2
+
+Two more follow-on defects found on round 2 of reviewing the same change, both in the same
+delivered-instruction-text family as round 1 (below).
+
+**1. The high/recap ack instruction omitted `--socket` (BLOCKER).** Round 1 fixed the reminder action
+step's `events list`/`events ack` recovery commands to carry an explicit `--socket <path>` (finding 3,
+below) but left the SEPARATE per-batch ack instruction — `When handled, acknowledge: agentmonitors
+events ack --session <id> --event-ids <id1>,<id2>` — socket-less, reasoning it was "merely advisory."
+But `agentmonitors events ack` resolves its daemon socket env-first
+(`resolveManualDaemonSocketPath`, issue #335), the identical class of bug issue #358 already
+identified for the truncation-recovery markers: a copy-pasted ack run under a stale
+`$AGENTMONITORS_SOCKET` silently scopes the acknowledge to the WRONG daemon, leaving the real
+session's events unread and unmuted while the recipient believes it acknowledged them. Resolved by
+threading the same resolved `socketPath` already carried by every other marker in the hook transport
+into the ack instruction too: `agentmonitors events ack --session <id> --socket <path> --event-ids
+<id1>,<id2>`.
+
+**2. The channel reminder's action step offered `agentmon_ack` as an "OR" alternative to inspecting
+details, not a prerequisite (BLOCKER).** The prior wording — "Call the agentmon_ack tool, or run
+`events list` ... for details." — reads as two independent, equally valid paths. But `agentmon_ack`
+called with no `event_ids` acknowledges EVERY unread event for the session across every urgency band
+(`channel-ack.ts`'s `ACK_TOOL`/`parseAckArgs`: omitting `event_ids` means "all unread") — the exact
+blanket-ack shape finding 1 of round 1 already fixed for the hook transport's per-batch instruction. The
+most literal reading of the "or" phrasing — call `agentmon_ack` bare, with no arguments — silently
+acknowledges unseen, cross-band work the recipient never inspected (e.g. a `low`-urgency reminder's
+bare ack call also clears unread `high`-urgency events). Resolved by sequencing the two steps instead
+of presenting them as alternatives: list this session's unread events FIRST, THEN call `agentmon_ack`
+naming only the `event_id` values of the ones actually handled — never the bare, no-argument form.
+
+Updated 002 §9.2 (clarified that neither reminder action step is id-scoped, and how each transport's
+step differs) and 006 §5.1.1 (socket-scoped ack instruction; corrected channel reminder wording,
+inspection as a prerequisite not an alternative).
+
+## 2026-07-19 — The per-batch ack instruction is scoped to the rendered ids, and the reminder's action step is transport-owned (002 §9.2, 006 §5.1.1/§4.2.1) — Refs #438, #434, PR #445 review
+
+Two follow-on defects found reviewing the change directly above, both re-introducing the
+event-loss-during-batching class this project's review priorities rank first, via instruction text
+rather than code.
+
+**1. The per-batch ack instruction was a blanket "ack everything unread" (BLOCKER).** `agentmonitors
+events ack --session <id>` with no `--event-ids` acknowledges EVERY unread event for the session,
+across every urgency band — but a capped `high`-urgency delivery genuinely defers events beyond the
+4000-char cap (they stay pending and re-deliver next context event, 006 §5.5), and a `post-compact`
+recap's rendered `events` (up to 10, 002 §9.4) can be a strict subset of the FULL unread set the recap
+decision actually claims at commit time. A compliant agent that ran the delivered instruction verbatim
+after handling only the rendered batch would silently acknowledge — and thereby permanently drop from
+ordinary redelivery — events it never saw.
+
+Resolved by scoping the instruction to exactly the ids THIS render included:
+`agentmonitors events ack --session <id> --event-ids <id1>,<id2>` (comma-separated, matching the CLI's
+own flag syntax). Because the header's own length now varies with how many ids it names, which
+depends on how many blocks fit under it, every sizing path (`packEventsUnderCap`,
+`resolveHookClaimFit`, `renderHookDelivery`) resolves the resulting fixed point by iterative narrowing
+until the header is self-consistent with what it actually renders. The reminder-only path (a
+`normal`/`low` claim) is unaffected: it only ever fires when EVERY unread event of its own band is
+unclaimed, so there is no narrower id list within the band to scope to there.
+
+**2. The runtime's reminder message baked in one transport's CLI verb (BLOCKER).** `reminderMessage()`
+embedded the concrete `agentmonitors events list`/`events ack` commands directly in the shared,
+transport-neutral message — but the channel transport pushes that string verbatim into its
+`<channel>` tag body, while a channel-connected agent acknowledges through the `agentmon_ack` MCP tool
+(006 §4.3), not the CLI. This put conflicting acknowledge instructions on the channel surface: a
+channel agent following the pushed CLI command would fail (no binary/socket), leaving the
+coalesced-until-ack mute in place — the exact defect #434 exists to fix, reintroduced on the second
+transport.
+
+Resolved at the seam this PR's parent change established: `reminderMessage()` now returns only the
+bare semantic fact — `"Monitored changes are pending."` — and each transport appends its OWN concrete
+action step. The hook transport names `agentmonitors events list`/`events ack` directly, now with an
+explicit `--socket <path>` (see below); the channel transport points at its `agentmon_ack` tool
+instead, offering the `events list` recovery command only as a fallback for inspecting detail.
+
+**3. Reminder recovery commands omitted `--socket`, unlike the truncation markers in the same
+payload.** The #442 truncation/recovery markers embed the resolved `--socket <path>` specifically
+because `events list`/`events ack` resolve their daemon socket env-first and can hit a stale or wrong
+daemon; the reminder action step omitted it. Both transports' reminder action steps now carry the same
+explicit `--socket <path>` clause.
+
+**4. The channel's reminder branch was the one render path without a content ceiling.** Every other
+`channel-render.ts` branch bounds its output at `MAX_CHANNEL_CONTENT` (defense-in-depth since #442);
+the reminder branch did not. Latent today (the reminder is short) but now closed for consistency.
+
+Updated 002 §9.2 (message contract + a new note on why the reminder is not id-scoped), 006 §5.1.1
+(scoped ack instruction + transport-owned reminder action step) and §4.2.1 (channel's reminder
+rendering + ceiling).
+
+## 2026-07-19 — Delivered text is self-sufficient, and attribution is transport-owned (002 §9.2/§9.3, 005 §12, 006 §5.1.1) — Refs #438, #434
+
+Two defects observed in the same dogfood session, both in what a recipient actually reads.
+
+**1. The coalesced reminder was vague, legacy-flavored, and double-attributed (#438).** The normal/low
+reminder body was a fixed string, `'AgentMon messages are available. Read the inbox.'`, carrying three
+problems at once: it embedded a product name, which the channel surface then repeated (its
+`<channel source="agentmonitors">` tag already names the source); it pointed at the legacy `inbox`
+model, explicitly non-authoritative per 002 §12, so the instruction had no runnable referent; and it
+was not actionable — neither an agent nor a human could tell what to run.
+
+Resolved by splitting the concern along the transport seam. The runtime now emits an **unattributed,
+transport/verb-neutral, semantic** message built by `reminderMessage()` — just "Monitored changes are
+pending." — with no CLI commands and no session id embedded. Each transport supplies its own concrete
+action step, scoped with the session id (and, where applicable, the resolved socket path) it already
+has on hand: the hook transport appends `agentmonitors events list --session <id> --unread` /
+`agentmonitors events ack --session <id>` commands, the channel transport points at its `agentmon_ack`
+tool. **Attribution became transport-owned:** the hook transport prepends `AgentMon: ` (its
+`additionalContext` arrives unlabeled), the channel prepends nothing. 002 §9.2 states the wording
+contract normatively (no product name, no `inbox` reference, self-sufficient down to the ack step);
+§9.3 now shares it, so the low band no longer has separate prose. The legacy `inbox` CLI surface is
+untouched.
+
+**2. Nothing in a delivered payload said how to acknowledge (#434).** A body-injection delivery claims
+the events it renders, and claiming is not acknowledging — so under the coalesced-until-ack rule
+(002 §9.2), a session that handled its delivery fully but never acked had every subsequent
+normal-urgency reminder suppressed. Observed live: a monitor fired 5 more times over ~90 minutes with
+the session never re-notified. The remediation existed only in `monitor explain`, which nobody runs
+while things appear fine — the delivery-side twin of #425's silent-drop family.
+
+Resolved by adding a one-line acknowledge instruction to the hook transport's body-injection header
+(006 §5.1.1), emitted **once per delivery batch** and kept terse for the 4000-char injection budget;
+it covers both the `turn-interruptible` high-urgency delivery and the `SessionStart` (`post-compact`)
+recap. Reminder-only deliveries do not repeat it — their ack step is already in the runtime's semantic
+message. The channel does not render it either: a channel agent acks via the `agentmon_ack` tool.
+
+**Deliberately deferred, with rationale recorded in 006 §10:** (a) auto-acknowledging events claimed
+by a previous delivery when a newer one is surfaced (#434's "consider, don't necessarily build") — it
+would collapse the unread/claimed/acknowledged distinction into "a later delivery happened" and
+discard exactly the signal #425's transport-health surface needs, so it is a deliberate model change
+to decide alongside #435, not a renderer detail; (b) #438's channel-native `agentmon_inbox` tool and
+the `/agentmonitors:inbox` slash command — both enabled by this seam, both host-specific surface area
+beyond the delivered-text contract.
 
 ## 2026-07-19 — `verify`'s materialize/deliver stages carry a fresh deadline past a late observe resolution instead of inheriting an already-expired one (005 §16 step 6, Budget) — Refs #442
 

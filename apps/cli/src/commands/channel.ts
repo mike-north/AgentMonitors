@@ -29,7 +29,12 @@ import {
   renderChannelEvent,
   resolveChannelClaimFit,
 } from '../channel-render.js';
-import { ACK_TOOL, parseAckArgs } from '../channel-ack.js';
+import {
+  ACK_TOOL,
+  buildAckResultText,
+  LEASED_ROW_EXCEPTION,
+  parseAckArgs,
+} from '../channel-ack.js';
 import { getCliVersion } from '../cli-version.js';
 import {
   CHANNEL_HEARTBEAT_TTL_MS,
@@ -479,6 +484,19 @@ export async function runChannelDeliveryCycle(
 }
 
 /**
+ * The MCP `instructions` string advertised by the channel server. Exported so
+ * the parity test in `channel-ack.test.ts` can prove this fourth surface never
+ * drifts from {@link LEASED_ROW_EXCEPTION} the way the schema hint's stale
+ * wording once did (PR #445 review, round 13).
+ */
+export const CHANNEL_SERVER_INSTRUCTIONS =
+  'AgentMon delivers monitor events here as <channel source="agentmonitors" ...>. ' +
+  'Read each one and act on the work it describes. The tag meta carries urgency, ' +
+  'event_count, and (for a single event) monitor_id and event_id. When you have ' +
+  'handled events, call the agentmon_ack tool with their event_id values (or no ' +
+  `arguments to acknowledge all unread, ${LEASED_ROW_EXCEPTION}).`;
+
+/**
  * Run the channel as a two-way MCP server. Outbound: poll the daemon for settled
  * `turn-interruptible` deliveries and push each into the session as a `<channel>`
  * event. Each poll RESERVES the delivery, pushes it, and COMMITS the claim only
@@ -509,12 +527,7 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
     { name: 'agentmonitors', version: getCliVersion() },
     {
       capabilities: { experimental: { 'claude/channel': {} }, tools: {} },
-      instructions:
-        'AgentMon delivers monitor events here as <channel source="agentmonitors" ...>. ' +
-        'Read each one and act on the work it describes. The tag meta carries urgency, ' +
-        'event_count, and (for a single event) monitor_id and event_id. When you have ' +
-        'handled events, call the agentmon_ack tool with their event_id values (or no ' +
-        'arguments to acknowledge all unread).',
+      instructions: CHANNEL_SERVER_INSTRUCTIONS,
     },
   );
 
@@ -560,12 +573,7 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
         parsed.args.eventIds,
         socketPath,
       );
-      // events.ack silently ignores ids not projected to this session and does
-      // not report a count, so for explicit ids we frame the result as a request
-      // (some ids may be unknown/stale); the all-unread path is unambiguous.
-      const text = parsed.args.eventIds
-        ? `Requested acknowledgement of ${String(parsed.args.eventIds.length)} event(s); ids not projected to this session are ignored.`
-        : 'Acknowledged all unread events for this session.';
+      const text = buildAckResultText(parsed.args.eventIds);
       return { content: [{ type: 'text', text }] };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

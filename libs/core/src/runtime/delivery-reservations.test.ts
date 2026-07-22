@@ -307,6 +307,14 @@ describe('diagnostics and hook-state are lease-aware (issue #300)', () => {
     ).holds;
     expect(holds).toHaveLength(1);
     expect(holds[0]?.urgency).toBe('normal');
+    // Regression (PR #445 review round 10, issue #300): the lease is not a
+    // durable claim — it must be reported as `reserved-in-flight`, never
+    // `already-claimed`, and the message must never recommend `events ack`
+    // (acknowledging a still-leased row before the push resolves would
+    // permanently lose it if the push then fails).
+    expect(holds[0]?.reason).toBe('reserved-in-flight');
+    expect(holds[0]?.leasedCount).toBe(1);
+    expect(holds[0]?.message).not.toContain('agentmonitors events ack');
     expect(
       h.runtime.claimDelivery(h.sessionId, 'turn-interruptible'),
     ).toBeNull();
@@ -372,4 +380,57 @@ describe('diagnostics and hook-state are lease-aware (issue #300)', () => {
       expect(deliveryState(h)).toBe('claimed');
     },
   );
+
+  // Regression (PR #445 review round 10, issue #300): `acknowledgeSession`
+  // (no explicit eventIds — the "ack everything unread" path a diagnostic
+  // message might send a user to) must NOT sweep a row that is currently only
+  // LEASED by an outstanding reservation. If it did, a subsequent
+  // `releaseDelivery` (rejected/disconnected push) would return the row to
+  // `pending` already (wrongly) acknowledged — permanently unable to
+  // redeliver, even though the runtime's own recovery path expects a released
+  // lease to make the row claimable again.
+  it('acknowledgeSession (no eventIds) does not acknowledge a row that is only leased, not claimed', () => {
+    const h = makeHarness({ urgency: 'normal' });
+
+    const reservation = h.runtime.reserveDelivery(
+      h.sessionId,
+      'turn-interruptible',
+    );
+    if (!reservation) throw new Error('expected a reservation');
+
+    // Simulate the literal remedy a user might run against the whole session
+    // while the push is still in flight.
+    h.runtime.acknowledgeSession(h.sessionId);
+
+    // The leased row must still be unread (not acknowledged) ...
+    expect(deliveryState(h)).toBe('unread');
+    expect(unreadCount(h)).toBe(1);
+
+    // ... so when the push then fails and the lease is released, the row is
+    // genuinely still pending and claimable — not lost. (A `normal` claim
+    // renders as the coalesced reminder — no per-event bodies — so assert via
+    // delivery state/claim outcome rather than `events`.)
+    h.runtime.releaseDelivery(reservation.reservationId);
+    expect(deliveryState(h)).toBe('unread');
+    const fallback = h.runtime.claimDelivery(h.sessionId, 'turn-interruptible');
+    expect(fallback).not.toBeNull();
+    expect(deliveryState(h)).toBe('claimed');
+  });
+
+  it('acknowledgeSession with an explicit eventIds still acknowledges a caller-named leased row (scoped ack is a deliberate opt-in)', () => {
+    const h = makeHarness({ urgency: 'normal' });
+
+    const reservation = h.runtime.reserveDelivery(
+      h.sessionId,
+      'turn-interruptible',
+    );
+    if (!reservation) throw new Error('expected a reservation');
+
+    const [event] = h.runtime.listEvents({ sessionId: h.sessionId });
+    if (!event) throw new Error('expected the seeded event');
+
+    h.runtime.acknowledgeSession(h.sessionId, [event.id]);
+
+    expect(deliveryState(h)).toBe('acknowledged');
+  });
 });

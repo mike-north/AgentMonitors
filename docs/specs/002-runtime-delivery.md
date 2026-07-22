@@ -1308,9 +1308,10 @@ reminder to a later call:
   per-event detail from being coalesced; it stays a generic prompt, exactly as it would render on
   its own (§9.2).
 - The claim's `message` is the high-urgency summary (`summarizeEvents(...)`) followed by the normal
-  reminder text (`NORMAL_INBOX_PROMPT`) on its own line.
+  reminder text on its own line (`COALESCED_NORMAL_SUFFIX`, the transport-neutral `reminderMessage()`
+  body of §9.2 — no product prefix, no CLI/tool verb).
 - The claim carries a separate, optional `coalescedReminder: string` field, set to the SAME
-  `NORMAL_INBOX_PROMPT` text, whenever (and only whenever) a due normal reminder was folded in.
+  `reminderMessage()` body, whenever (and only whenever) a due normal reminder was folded in.
   **This field exists because neither `events` nor `message` is, on its own, enough for a
   length-bounded (events-rendering) transport to notice the coalesced reminder**: the hook-deliver
   and channel transports render `events` as concrete per-event blocks and never consult `message`
@@ -1318,7 +1319,13 @@ reminder to a later call:
   claimed the coalesced normal rows alongside the surfaced high events, but neither bounded
   transport rendered them anywhere — a claimed-but-unrendered violation of the claimed-set-equals-
   rendered-set invariant (§5.5). Both bounded transports **MUST** render `coalescedReminder`,
-  sanitized, as a footer appended AFTER the packed event block(s) — see §5.1 and §6 for the exact
+  sanitized, as a footer appended AFTER the packed event block(s), **and MUST append their own
+  transport-owned acknowledge action step to that footer** — exactly as the standalone reminder of
+  §9.2 does (the hook transport's `agentmonitors events ack`, the channel transport's `agentmon_ack`
+  tool; [006 §5.1.1](006-agent-integration.md#511-attribution-is-transport-owned-delivered-text-is-self-sufficient-issues-438-434)).
+  The runtime's `coalescedReminder` carries only the transport-neutral body, so without this the
+  coalesced reminder would be self-insufficient (a "changes are pending" line with no way to act),
+  the exact trap §9.2's self-sufficiency contract exists to prevent. See §5.1 and §6 for the exact
   rendering and cap-sizing contract. A transport that renders `message` directly instead of `events`
   (e.g. `hook claim --format text`) needs no separate handling — the reminder is already part of
   `message` there.
@@ -1364,19 +1371,36 @@ Verified: `libs/core/src/runtime/service.ts` — `decideDelivery()`'s `turn-inte
 
 ### 9.2 Normal urgency
 
-At `turn-interruptible`, normal-urgency events are delivered as a generic inbox reminder (`NORMAL_INBOX_PROMPT = 'AgentMon messages are available. Read the inbox.'`) only if all unread normal-urgency events are still unclaimed. This coalesces multiple normal events into one reminder until the session acknowledges them. The `events` array is empty in this case.
+At `turn-interruptible`, normal-urgency events are delivered as a coalesced reminder only if all unread normal-urgency events are still unclaimed. This coalesces multiple normal events into one reminder until the session acknowledges them. The `events` array is empty in this case.
 
-**The reminder is coalesced-until-acknowledgment (issue #333).** Delivering the reminder claims the underlying events (`markClaimed` sets `firstNotifiedAt`; §9.4 — claiming never acknowledges), so once any unread normal event has been claimed-but-not-acknowledged, the `normalPending.length === unreadNormal.length` guard no longer holds and the reminder is **suppressed** — it does not re-fire until the claimed events are acknowledged **or** a fresh unclaimed normal event arrives. A second `hook claim --lifecycle turn-interruptible` after the first therefore correctly returns `null`. This is intended coalescing, **not** a lost signal: the events stay unread (re-discoverable via `events list --unread`) and durable. Because a silent `null` is indistinguishable from "nothing was ever pending," this suppression **MUST** be inspectable rather than presented as silence (the silent-failure-honesty invariant, [§1.1.8](#118-interpret-a-cheap-agentic-digest-via-the-users-own-ai-tool), capability C12): `monitor explain`'s projection-and-delivery stage ([§10.7](#107-monitor-pipeline-diagnosis)) names the suppression reason (`already-claimed` when every unread event of the band is claimed; `coalesced-until-ack` when a mix of claimed and unclaimed events holds the coalesced reminder back).
+**Reminder wording contract (issues #438, #434; revised by PR #445 review, finding 2).** The runtime emits a **semantic, transport- and verb-neutral** reminder body, built by `reminderMessage()`:
 
-Verified: `libs/core/src/runtime/service.ts` — the `normalPending.length === unreadNormal.length` guard in `claimDelivery`; `NORMAL_INBOX_PROMPT` constant. The suppression diagnosis is `diagnoseReminderSuppression` (`libs/core/src/runtime/reminder-diagnosis.ts`), surfaced by the `delivery` stage of `explainMonitor`. Proven by `libs/core/src/runtime/reminder-diagnosis.test.ts`, the "normal-urgency reminder suppression is explainable (issue #333)" case in `libs/core/src/runtime/service.test.ts`, and the real-daemon/IPC "hook claim normal-urgency reminder + suppression diagnosis (issue #333)" case in `apps/cli/src/commands/cli.integration.test.ts`.
+```
+Monitored changes are pending.
+```
+
+Two properties are **normative**:
+
+1. **No product-name attribution.** The runtime **MUST NOT** embed a product name (e.g. `AgentMon`) in the reminder body. Attribution is a property of the delivery **surface**, and is owned by each transport ([006 §5](006-agent-integration.md)): the hook transport prepends its own label because its `additionalContext` arrives in the agent's context window unlabeled; the channel transport prepends **nothing**, because its `<channel source="agentmonitors">` tag already names the source. A product name in the body double-attributed the channel. This also keeps the core host-agnostic — per-surface phrasing lives in the adapter/transport, never in the runtime.
+2. **No reference to the legacy `inbox` model.** `inbox_items` is explicitly non-authoritative ([§12](#12-legacy-inbox-model)); the authoritative path is events/session projection. The former wording (`'AgentMon messages are available. Read the inbox.'`) steered recipients toward a deprecated concept with no runnable referent, and **MUST NOT** reappear in any authoritative delivery string. (The legacy `inbox` CLI surface itself is unchanged.)
+
+**Self-sufficiency and the acknowledge step are transport-owned (revised by PR #445 review, finding 2).** An earlier revision of this function also embedded the concrete `agentmonitors events list`/`events ack` CLI commands directly in the shared message — but the channel transport pushes this string verbatim into its `<channel>` tag body, and a channel-connected agent acknowledges through the `agentmon_ack` MCP tool ([006 §4.3](006-agent-integration.md)), not the CLI. Baking one transport's verb into the transport-neutral message put conflicting instructions on the channel surface. Each transport now appends its **own** concrete, runnable next step — including the acknowledge step, with the recipient's real session id interpolated (the transport has it on the `DeliveryClaim`/its own render options) — on top of this shared sentence: the hook transport names `agentmonitors events list`/`events ack` directly, with an explicit `--socket <path>` ([006 §5.1.1](006-agent-integration.md#511-attribution-is-transport-owned-delivered-text-is-self-sufficient-issues-438-434)); the channel transport points at its `agentmon_ack` tool instead. Including the ack step somewhere in the delivered payload is what keeps the coalescing rule below from becoming a silent trap: a recipient that does exactly what the delivery asks also clears the suppression (issue #434) — this is a property of the **overall rendered payload**, not this shared message alone.
+
+The same body is used for the low-urgency reminder (§9.3); urgency is carried in the claim's `urgency` field and in the transports' metadata, not in the prose.
+
+**The reminder is coalesced-until-acknowledgment (issue #333).** Because this rule makes acknowledgment the ONLY thing that un-mutes the band, the delivered payload itself must name the ack step — see each transport's own action step above and, for body-injection deliveries that carry no reminder prose, the per-batch ack instruction in [006 §5](006-agent-integration.md) (issue #434). Delivering the reminder claims the underlying events (`markClaimed` sets `firstNotifiedAt`; §9.4 — claiming never acknowledges), so once any unread normal event has been claimed-but-not-acknowledged, the `normalPending.length === unreadNormal.length` guard no longer holds and the reminder is **suppressed** — it does not re-fire until the claimed events are acknowledged. A fresh, unrelated unclaimed normal event arriving in the meantime does **not** restore the reminder: it grows both `normalPending` (by one) and `unreadNormal` (by one, since the still-claimed row remains in the unread total), so the two counts stay unequal until the claimed row is specifically acknowledged. A second `hook claim --lifecycle turn-interruptible` after the first therefore correctly returns `null`. This is intended coalescing, **not** a lost signal: the events stay unread (re-discoverable via `events list --unread`) and durable. Because a silent `null` is indistinguishable from "nothing was ever pending," this suppression **MUST** be inspectable rather than presented as silence (the silent-failure-honesty invariant, [§1.1.8](#118-interpret-a-cheap-agentic-digest-via-the-users-own-ai-tool), capability C12): `monitor explain`'s projection-and-delivery stage ([§10.7](#107-monitor-pipeline-diagnosis)) names the suppression reason (`already-claimed` when every unread event of the band is claimed; `coalesced-until-ack` when a mix of claimed and unclaimed events holds the coalesced reminder back).
+
+**Reminder acknowledgment is not id-scoped (unlike §9.1's per-batch ack instruction below).** This reminder claim only ever fires when every unread event of its own urgency band is unclaimed (the `normalPending.length === unreadNormal.length` / low-band equivalent guard) — so unlike a capped `high`-urgency delivery or a `post-compact` recap (whose rendered `events` can be a strict subset of what a delivery actually claims), there is no narrower id list within the band to scope the ack to. A blanket `events ack --session <id>` (no `--event-ids`), or an `agentmon_ack` call with no `event_ids`, run in response to this reminder would still ack events of OTHER urgency bands the recipient never saw, though. The two transports' reminder action steps handle this differently (revised by PR #445 review, round 2, finding 2 — BLOCKER): the hook transport's step names the un-scoped ack CLI verb directly ([006 §5.1.1](006-agent-integration.md#511-attribution-is-transport-owned-delivered-text-is-self-sufficient-issues-438-434)); the channel transport's step, instead of presenting its `agentmon_ack` tool as an "or" alternative to inspecting, instructs the recipient to list this session's unread events **first** and then call `agentmon_ack` naming only the ids it actually handled — never the bare, no-argument form, which would otherwise silently ack unseen cross-band work. Neither step can supply a narrower id list itself (there is none within the band, per above); the corrected channel wording instead defers correct scoping to the recipient's own post-inspection choice.
+
+Verified: `libs/core/src/runtime/service.ts` — the `normalPending.length === unreadNormal.length` guard in `claimDelivery`; the `reminderMessage()` builder. The wording contract is proven end-to-end (one runtime claim, both transports) by `apps/cli/src/delivery-text.integration.test.ts`. The suppression diagnosis is `diagnoseReminderSuppression` (`libs/core/src/runtime/reminder-diagnosis.ts`), surfaced by the `delivery` stage of `explainMonitor`. Proven by `libs/core/src/runtime/reminder-diagnosis.test.ts`, the "normal-urgency reminder suppression is explainable (issue #333)" case in `libs/core/src/runtime/service.test.ts`, and the real-daemon/IPC "hook claim normal-urgency reminder + suppression diagnosis (issue #333)" case in `apps/cli/src/commands/cli.integration.test.ts`.
 
 ### 9.3 Low urgency
 
-At `turn-idle`, low-urgency events are delivered as a generic reminder (`IDLE_INBOX_PROMPT = 'AgentMon has inbox updates ready for review.'`) only if all unread low-urgency events are still unclaimed. The `events` array is empty.
+At `turn-idle`, low-urgency events are delivered as a coalesced reminder only if all unread low-urgency events are still unclaimed. The `events` array is empty. The reminder body is the same `reminderMessage()` the normal band uses, and is bound by the identical wording contract (§9.2): semantic, transport/verb-neutral, and `inbox`-free — self-sufficiency and the ack step come from each transport's own action step.
 
-The low-urgency reminder is coalesced-until-acknowledgment exactly as the normal reminder is (§9.2): once an unread low event is claimed-but-not-acknowledged, the reminder is suppressed until acknowledgment or a fresh unclaimed low event, and the same `monitor explain` diagnosis (§10.7) names the reason (issue #333).
+The low-urgency reminder is coalesced-until-acknowledgment exactly as the normal reminder is (§9.2): once an unread low event is claimed-but-not-acknowledged, the reminder is suppressed until that claimed event is acknowledged — a fresh unclaimed low event arriving in the meantime does not restore it, for the same reason given in §9.2 — and the same `monitor explain` diagnosis (§10.7) names the reason (issue #333).
 
-Verified: `libs/core/src/runtime/service.ts` — the `shouldSendLow` guard in `claimDelivery`; `IDLE_INBOX_PROMPT` constant. Suppression diagnosis: `diagnoseReminderSuppression` (`libs/core/src/runtime/reminder-diagnosis.ts`), proven for the `low`/`turn-idle` band by `libs/core/src/runtime/reminder-diagnosis.test.ts`.
+Verified: `libs/core/src/runtime/service.ts` — the `shouldSendLow` guard in `claimDelivery`; the shared `reminderMessage()` builder. Suppression diagnosis: `diagnoseReminderSuppression` (`libs/core/src/runtime/reminder-diagnosis.ts`), proven for the `low`/`turn-idle` band by `libs/core/src/runtime/reminder-diagnosis.test.ts`.
 
 ### 9.4 Recap
 
@@ -1416,6 +1440,14 @@ Verified: `apps/cli/src/runtime-client.ts` — `daemonTickClient()`: constructs 
 **Tick logging:** after each tick the loop logs a line when the tick emitted events **or** had one or more errored observations (§2.5); a clean no-change tick logs nothing. The line is `Emitted M event(s) from N monitor(s).`, and when errored it becomes `Emitted M event(s) from N monitor(s), K errored:` followed by one indented `  <monitorId>: <message>` line per errored monitor — the same surfacing as `daemon once` so a broken source is never hidden behind a silent loop.
 
 **Idle reaping:** the daemon monitors active sessions for the workspace. After each tick it counts sessions with `status === 'active'` and `workspacePath === workspacePath`. If this count stays zero continuously for `--reap-after-ms` milliseconds (default `300000`; `0` disables), the daemon stops itself cleanly. This is the primary self-termination mechanism for daemons booted by `session start`.
+
+**A live channel-transport heartbeat counts as activity (issue #435 Option A).** A channel server (`agentmonitors channel serve`, [006 §12](./006-agent-integration.md)) is the push surface for an **idle** agent — it delivers monitor events into a session that is no longer prompting, and so fires no hooks. Without this exemption those two contracts compose to "push works only while the session is active enough not to need it": the idle session goes dormant, the active-session count reaches zero, the daemon reaps ~`reap-after-ms` later, monitors stop ticking, and the channel is permanently silent exactly when it is needed (issue #435). So the reaper additionally treats a workspace as active — resetting the idle clock, exactly as an open session does — whenever a **non-stale** `channel` heartbeat exists for it. Precisely:
+
+- The exemption is keyed on the heartbeat's owner-declared **TTL lease** ([006 §12.2](./006-agent-integration.md), `isHeartbeatStale`), evaluated fresh against `now` on every reap check — **not** a static "a channel is registered" flag. When the channel process dies without cleanup, its lease expires within the TTL and it stops counting, so normal reaping resumes. This is the guard that prevents an orphaned channel server ([issue #426](https://github.com/mike-north/AgentMonitors/issues/426)) from pinning the daemon alive forever; the exemption is an **active expiring lease**, never a permanent pin.
+- Only the **`channel`** transport qualifies. The `hook` transport is short-lived and self-healing (a fresh process per prompt) and carries a 24h "wired-up" TTL; letting it suppress reaping would keep the daemon alive for a day after a session ended. A `hook` heartbeat therefore never exempts.
+- The heartbeat must match **both** the reaper's `workspacePath` **and its own daemon's `socketPath`**. Two daemon instances can independently resolve the same `workspacePath` (e.g. an orphaned daemon left over from a prior boot, bound to a stale socket) — without the socket comparison, a live channel keeping a _different_ daemon alive would wrongly suppress reaping on _this_ one, which the channel is not actually pinning.
+- A channel-only exemption **never sets** the reaper's `hasSeenSession` flag — only an actually-open session does. `hasSeenSession` specifically gates the boot-grace window (`max(reapAfterMs, bootGraceMs)`); a channel can attach before any session has registered, and if it detaches cleanly before one ever does, the boot-grace window must still apply on the next reap check rather than falling through to the shorter post-session `reapAfterMs`.
+- The reaper does the registry I/O (reading and staleness-checking heartbeats) and is skipped entirely when reaping is disabled (`--reap-after-ms 0`) — `shouldReap` short-circuits on that case regardless of `channelAttached`, so there is no reason to scan the machine-wide transport registry on every tick of a daemon that will never reap. The pure `shouldReap` decision ([`apps/cli/src/reap-decision.ts`](../../apps/cli/src/reap-decision.ts)) takes a single `channelAttached` boolean, so the policy stays deterministically testable. Verified end to end by `apps/cli/src/commands/daemon-reaper-lease.integration.test.ts` (a live channel keeps a dormant-session daemon alive and still ticking; a stale lease lets reaping resume; a live hook heartbeat does not exempt; a heartbeat naming a different daemon's socket does not exempt).
 
 **Per-workspace isolation:** socket and db paths are derived from the workspace path via `workspacePaths()` in `apps/cli/src/workspace-paths.ts`, which hashes `resolve(workspacePath)` (SHA-256, first 16 hex chars) under `XDG_DATA_HOME ?? ~/.local/share/agentmonitors/workspaces/<hash>/`. Two sessions in the same repo share one daemon; two distinct repos get isolated daemons. This applies **regardless of how the daemon was started**: both `session start`'s lazy boot and a _directly_-invoked `agentmonitors daemon run`/`daemon once` — with no `--socket`/`AGENTMONITORS_DB`/`AGENTMONITORS_SOCKET` overrides — resolve to the same per-workspace paths for an enabled workspace (`resolveWorkspaceDbPath()` in `apps/cli/src/workspace-db-path.ts`, and the equivalent socket fallback in `resolveManualDaemonSocketPath()`). Prior to issue #335, only the lazy-boot path applied this convention; a directly-invoked `daemon run` (the Getting Started guide's own documented usage) silently bound to the bare global default instead, so `doctor` — which always assumed the per-workspace convention — read an empty, unrelated database and disagreed with `session list`/`daemon status` about whether a lead session existed, despite all three describing the exact same live daemon.
 
@@ -1518,11 +1550,16 @@ monitor through the persisted pipeline state and returns stages for:
 5. Materialization: recent `monitor_events`
 6. Projection and delivery: `session_event_state` joined to `agent_sessions`, reported as
    `unread`, `claimed`, or `acknowledged`. When a session's unread normal/low events are already
-   claimed (so the coalesced turn-interruptible/turn-idle reminder of §9.2/§9.3 is currently
-   suppressed), this stage additionally reports a `reminderSuppression` finding per session-and-band
-   naming the reason — `already-claimed` or `coalesced-until-ack` — so a `null` claim is explainable
-   rather than silent (issue #333). The stage stays `ok` (the events are projected and claimed
-   correctly; the paused reminder is expected behavior, not a fault).
+   claimed OR leased (so the coalesced turn-interruptible/turn-idle reminder of §9.2/§9.3 is
+   currently suppressed), this stage additionally reports a `reminderSuppression` finding per
+   session-and-band naming the reason — `already-claimed` or `coalesced-until-ack` when at least one
+   unread event of the band is durably claimed, or `reserved-in-flight` (issue #300, PR #445 review
+   round 10) when none is durably claimed but at least one is LEASED by an in-flight channel-push
+   reservation — so a `null` claim is explainable rather than silent (issue #333). A lease is not a
+   claim and resolves itself, so `reserved-in-flight` findings never recommend `events ack`;
+   acknowledging a leased-but-unseen row before the push resolves could otherwise lose it
+   permanently if the push then fails. The stage stays `ok` (the events are projected and
+   claimed/leased correctly; the paused reminder is expected behavior, not a fault).
 
 Each stage carries a `status` of `ok`, `pending`, `healthy`, or `failure`:
 
@@ -1651,7 +1688,7 @@ Note: the `inbox_items` table does not share rows with `monitor_events`. They ar
 
 1. a low-urgency event is persisted and projected into a session
 2. `turn-interruptible` returns `null` (low urgency is not delivered here)
-3. `turn-idle` evaluates `shouldSendLow`: `pendingEventsForSession(sessionId, 'low').length > 0` and all low-urgency unread events are still unclaimed → returns a `DeliveryClaim` with `message: IDLE_INBOX_PROMPT`
+3. `turn-idle` evaluates `shouldSendLow`: `pendingEventsForSession(sessionId, 'low').length > 0` and all low-urgency unread events are still unclaimed → returns a `DeliveryClaim` with `message: reminderMessage()` (§9.2's wording contract); the delivering transport then appends its own session-scoped action step
 4. the event remains unread until explicitly acknowledged
 
 **What this example proves:** `low` urgency is real runtime behavior, not schema-only metadata; idle-time delivery differs intentionally from interruptible delivery.
@@ -1659,8 +1696,8 @@ Note: the `inbox_items` table does not share rows with `monitor_events`. They ar
 ### 13.3 Coalesced normal reminder, then its suppression (issue #333)
 
 1. a `urgency: normal` monitor emits a change; the event is persisted and projected into a lead session (unread, unclaimed)
-2. `turn-interruptible` evaluates the §9.2 guard — all unread normal events are unclaimed → returns a `DeliveryClaim` with `message: NORMAL_INBOX_PROMPT` and an empty `events` array, **and claims the event** (`markClaimed` sets `firstNotifiedAt`; not acknowledged)
-3. a **second** `turn-interruptible` claim finds the event unread-but-claimed → the guard no longer holds → returns `null` (the coalesced reminder does not nag again until acknowledgment or a fresh unclaimed normal event)
+2. `turn-interruptible` evaluates the §9.2 guard — all unread normal events are unclaimed → returns a `DeliveryClaim` with `message: reminderMessage()` and an empty `events` array; the delivering transport appends its own action step naming the ack command, so the recipient can avoid step 3's mute, **and claims the event** (`markClaimed` sets `firstNotifiedAt`; not acknowledged)
+3. a **second** `turn-interruptible` claim finds the event unread-but-claimed → the guard no longer holds → returns `null` (the coalesced reminder does not nag again until the claimed event is acknowledged — a fresh unclaimed normal event arriving in the meantime does not restore it, §9.2)
 4. `monitor explain <id>` reports the `delivery` stage as `ok` with a `reminderSuppression` finding naming the reason (`already-claimed`), so the `null` is explainable rather than silent
 
 **What this example proves:** the normal reminder fires on the first claim (it is _not_ silently swallowed); coalescing-until-acknowledgment means a repeat claim is intentionally quiet; claiming is not acknowledgment (the event stays unread and durable); and the "why nothing surfaced" answer is inspectable via `monitor explain`, never presented as bare silence. This is the resolution of the blind-study S3 F2 report: a first-run subject who claimed once, then claimed again, saw `null` the second time and mistook intended coalescing for a broken delivery path.

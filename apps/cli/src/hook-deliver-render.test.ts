@@ -73,16 +73,19 @@ describe('renderHookDelivery', () => {
     ).toBeNull();
   });
 
-  // (b.2 — issue #198, AC1) a NORMAL-urgency turn-interruptible claim carries
-  // events:[] but a populated reminder message. It must render a non-empty
-  // additionalContext (the reminder line), NOT null — otherwise a default
-  // monitor is silent mid-session.
-  it('renders a reminder line for a normal-urgency claim with no event bodies', () => {
+  // (b.2 — issue #198, AC1 / issue #438) a NORMAL-urgency turn-interruptible
+  // claim carries events:[] but a populated reminder message. It must render a
+  // non-empty additionalContext (the reminder line), NOT null — otherwise a
+  // default monitor is silent mid-session. The runtime emits a SEMANTIC message
+  // with no product-name prefix; this transport OWNS attribution and prepends
+  // its own label (the hook's additionalContext arrives unlabeled).
+  it('renders an attributed, actionable reminder line for a normal-urgency claim with no event bodies', () => {
     const out = renderHookDelivery(
       makeClaim({
         urgency: 'normal',
         events: [],
-        message: 'AgentMon messages are available. Read the inbox.',
+        // The runtime's actual (verb-neutral, PR #445 review finding 2) message.
+        message: 'Monitored changes are pending.',
         unreadCounts: { low: 0, normal: 1, high: 0, total: 1 },
       }),
       'UserPromptSubmit',
@@ -92,21 +95,29 @@ describe('renderHookDelivery', () => {
     expect(out?.hookSpecificOutput.hookEventName).toBe('UserPromptSubmit');
     const ctx = out?.hookSpecificOutput.additionalContext ?? '';
     expect(ctx.trim()).not.toBe('');
-    expect(ctx).toContain('AgentMon messages are available. Read the inbox.');
+    // Transport-owned attribution (issue #438): the hook prepends its label.
+    expect(ctx).toContain('AgentMon: Monitored changes are pending.');
+    // Self-sufficient, actionable next steps with the real session id (issue
+    // #438) — including the acknowledge step (issue #434).
+    expect(ctx).toContain('agentmonitors events list --session s1 --unread');
+    expect(ctx).toContain('agentmonitors events ack --session s1');
+    // No reference to the legacy `inbox` model anywhere in delivered text.
+    expect(ctx).not.toContain('inbox');
     // Reminder only — no body-injection block markers leak in.
     expect(ctx).not.toContain('### ');
     // Advisory only — no permissionDecision field.
     expect(out).not.toHaveProperty('permissionDecision');
   });
 
-  // (b.3 — issue #198, AC2) the same for LOW urgency (turn-idle reminder).
-  it('renders a reminder line for a low-urgency claim with no event bodies', () => {
+  // (b.3 — issue #198, AC2 / issue #438) the same for LOW urgency (turn-idle
+  // reminder).
+  it('renders an attributed, actionable reminder line for a low-urgency claim with no event bodies', () => {
     const out = renderHookDelivery(
       makeClaim({
         urgency: 'low',
         lifecycle: 'turn-idle',
         events: [],
-        message: 'AgentMon has inbox updates ready for review.',
+        message: 'Monitored changes are pending.',
         unreadCounts: { low: 1, normal: 0, high: 0, total: 1 },
       }),
       'UserPromptSubmit',
@@ -114,8 +125,33 @@ describe('renderHookDelivery', () => {
     expect(out).not.toBeNull();
     const ctx = out?.hookSpecificOutput.additionalContext ?? '';
     expect(ctx.trim()).not.toBe('');
-    expect(ctx).toContain('AgentMon has inbox updates ready for review.');
+    expect(ctx).toContain('AgentMon: Monitored changes are pending.');
+    expect(ctx).toContain('agentmonitors events ack --session s1');
+    expect(ctx).not.toContain('inbox');
     expect(ctx).not.toContain('### ');
+  });
+
+  // (PR #445 review, finding 4) the reminder's action step carries an
+  // explicit `--socket <path>` — like the truncation-recovery markers — so a
+  // copy-pasted command can't silently query a stale `$AGENTMONITORS_SOCKET`.
+  it('threads the resolved socket path into the reminder action step', () => {
+    const out = renderHookDelivery(
+      makeClaim({
+        sessionId: 's1',
+        urgency: 'normal',
+        events: [],
+        message: 'Monitored changes are pending.',
+      }),
+      'UserPromptSubmit',
+      { socketPath: '/tmp/agentmon-real.sock' },
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).toContain(
+      "agentmonitors events list --session s1 --socket '/tmp/agentmon-real.sock' --unread",
+    );
+    expect(ctx).toContain(
+      "agentmonitors events ack --session s1 --socket '/tmp/agentmon-real.sock'",
+    );
   });
 
   // (b.4 — issue #198, AC1) the reminder text is sanitized (control characters
@@ -125,13 +161,15 @@ describe('renderHookDelivery', () => {
       makeClaim({
         urgency: 'normal',
         events: [],
-        message: 'AgentMon messages are available.\x00 Read the inbox.',
+        message: 'Monitored changes are pending.\x00 Run the listed command.',
       }),
       'UserPromptSubmit',
     );
     const ctx = out?.hookSpecificOutput.additionalContext ?? '';
     expect(ctx).not.toContain('\x00');
-    expect(ctx).toContain('AgentMon messages are available. Read the inbox.');
+    expect(ctx).toContain(
+      'AgentMon: Monitored changes are pending. Run the listed command.',
+    );
     expect(() => JSON.parse(JSON.stringify(out))).not.toThrow();
   });
 
@@ -156,35 +194,41 @@ describe('renderHookDelivery', () => {
   // `claimDelivery` claims the coalesced normal rows alongside the surfaced
   // high events, so omitting this would claim-but-never-render them (006
   // §5.5).
-  it('appends the coalesced reminder footer after the packed event block(s)', () => {
+  it('appends the coalesced reminder footer, with this transport’s own ack action step, after the packed event block(s)', () => {
     const out = renderHookDelivery(
       makeClaim({
-        coalescedReminder: 'AgentMon messages are available. Read the inbox.',
+        coalescedReminder: 'Monitored changes are pending.',
       }),
       'PreToolUse',
     );
     const ctx = out?.hookSpecificOutput.additionalContext ?? '';
     expect(ctx).toContain('watch-src');
     expect(ctx).toContain('Review the diff; flag risky changes.');
-    expect(ctx).toContain('AgentMon messages are available. Read the inbox.');
+    expect(ctx).toContain('Monitored changes are pending.');
+    // The runtime's coalesced reminder is transport-neutral; the hook transport
+    // appends its OWN concrete, session-scoped acknowledge step (issue #445
+    // wording contract, 002 §9.2 / 006 §5.1.1) so the coalesced reminder is
+    // self-sufficient and actionable, not a bare "changes are pending" line.
+    expect(ctx).toContain('agentmonitors events list --session s1 --unread');
+    expect(ctx).toContain('agentmonitors events ack --session s1');
     // The footer comes AFTER the event block, not interleaved with it.
     expect(
       ctx.indexOf('Review the diff') <
-        ctx.indexOf('AgentMon messages are available'),
+        ctx.indexOf('Monitored changes are pending.'),
     ).toBe(true);
   });
 
   it('does not render a coalesced-reminder footer when the field is absent (ordinary high-only claim, unchanged)', () => {
     const out = renderHookDelivery(makeClaim(), 'PreToolUse');
     const ctx = out?.hookSpecificOutput.additionalContext ?? '';
-    expect(ctx).not.toContain('AgentMon messages are available');
+    expect(ctx).not.toContain('Monitored changes are pending');
   });
 
   it('reserves room for the coalesced reminder footer so the total render never exceeds the cap', () => {
     const longBody = 'x'.repeat(3_900);
     const out = renderHookDelivery(
       makeClaim({
-        coalescedReminder: 'AgentMon messages are available. Read the inbox.',
+        coalescedReminder: 'Monitored changes are pending.',
         events: [
           {
             eventId: 'e1',
@@ -203,7 +247,9 @@ describe('renderHookDelivery', () => {
     expect(ctx.length).toBeLessThanOrEqual(4000);
     // The reminder must still be present, not silently dropped to make room —
     // `renderHookDelivery` reserves for it BEFORE packing the event block.
-    expect(ctx).toContain('AgentMon messages are available');
+    expect(ctx).toContain('Monitored changes are pending.');
+    // …including its ack action step, which is part of the reserved footer.
+    expect(ctx).toContain('agentmonitors events ack --session s1');
   });
 
   // (c.2 — issue #198, AC4) a post-compact recap claim carries events with
@@ -233,6 +279,152 @@ describe('renderHookDelivery', () => {
     const ctx = out?.hookSpecificOutput.additionalContext ?? '';
     expect(ctx).toContain('### watch-src');
     expect(ctx).toContain('Review the diff; flag risky changes.');
+  });
+
+  // (c.3 — issue #434) a body-injection delivery CLAIMS the events it renders,
+  // but claiming is not acknowledgment — until the recipient acknowledges, the
+  // coalesced-until-ack rule (002 §9.2) mutes every later normal reminder. So
+  // the delivered payload MUST name the ack step, with the real session id, ONCE
+  // per batch (not per event).
+  it('includes a single ack instruction in a high-urgency delivery (issue #434)', () => {
+    const out = renderHookDelivery(
+      makeClaim({
+        sessionId: 'sess-434',
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'watch-a',
+            title: 'A changed',
+            summary: 's',
+            body: 'body a',
+            urgency: 'high',
+            createdAt: '2026-06-04T00:00:00.000Z',
+          },
+          {
+            eventId: 'e2',
+            monitorId: 'watch-b',
+            title: 'B changed',
+            summary: 's',
+            body: 'body b',
+            urgency: 'high',
+            createdAt: '2026-06-04T00:00:01.000Z',
+          },
+        ],
+      }),
+      'UserPromptSubmit',
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).toContain(
+      'When handled, acknowledge: agentmonitors events ack --session sess-434',
+    );
+    // PR #445 review, finding 1 (BLOCKER): the instruction is scoped to the
+    // ids actually rendered — never a blanket "ack everything unread".
+    expect(ctx).toContain(
+      'When handled, acknowledge: agentmonitors events ack --session sess-434 --event-ids e1,e2',
+    );
+    // Emitted once per batch, not once per event.
+    const occurrences = ctx.split('When handled, acknowledge:').length - 1;
+    expect(occurrences).toBe(1);
+    // Both event bodies still injected.
+    expect(ctx).toContain('body a');
+    expect(ctx).toContain('body b');
+  });
+
+  // (c.4 — issue #434) the SessionStart recap likewise carries the ack
+  // instruction: the recap re-shows unread events until acknowledged, so the
+  // completion step must travel with it.
+  it('includes the ack instruction in a post-compact recap (issue #434)', () => {
+    const out = renderHookDelivery(
+      makeClaim({
+        sessionId: 'sess-recap',
+        mode: 'recap',
+        urgency: undefined,
+        lifecycle: 'post-compact',
+        message: 'Recap of recent activity since your last recap:',
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'watch-src',
+            title: 'Files changed',
+            summary: 'Files changed',
+            body: 'Review the diff.',
+            urgency: 'normal',
+            createdAt: '2026-06-04T00:00:00.000Z',
+          },
+        ],
+      }),
+      'SessionStart',
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).toContain(
+      'When handled, acknowledge: agentmonitors events ack --session sess-recap --event-ids e1',
+    );
+  });
+
+  // PR #445 review, finding 1 (BLOCKER): the ack instruction resolves its
+  // daemon socket env-first (issue #335), the SAME class of bug as the
+  // truncation-recovery markers (issue #358) — a copy-pasted ack with no
+  // `--socket` under a stale `$AGENTMONITORS_SOCKET` silently scopes the ack
+  // to the WRONG daemon, leaving the real session's events unread and
+  // unmuted. The resolved socket (already threaded into every other marker in
+  // this file) must reach this instruction too.
+  it('threads the resolved socket path into the high-urgency ack instruction', () => {
+    const out = renderHookDelivery(
+      makeClaim({
+        sessionId: 'sess-434',
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'watch-a',
+            title: 'A changed',
+            summary: 's',
+            body: 'body a',
+            urgency: 'high',
+            createdAt: '2026-06-04T00:00:00.000Z',
+          },
+        ],
+      }),
+      'UserPromptSubmit',
+      { socketPath: '/tmp/agentmon-real.sock' },
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).toContain(
+      "When handled, acknowledge: agentmonitors events ack --session sess-434 --socket '/tmp/agentmon-real.sock' --event-ids e1",
+    );
+  });
+
+  // PR #445 review, finding 1 (BLOCKER): the same for a post-compact recap —
+  // the recap re-shows unread events until acknowledged, and re-runs at every
+  // SessionStart, so its own copy-pasted ack instruction is just as
+  // vulnerable to a stale `$AGENTMONITORS_SOCKET` as the turn-interruptible
+  // path above.
+  it('threads the resolved socket path into the post-compact recap ack instruction', () => {
+    const out = renderHookDelivery(
+      makeClaim({
+        sessionId: 'sess-recap',
+        mode: 'recap',
+        urgency: undefined,
+        lifecycle: 'post-compact',
+        message: 'Recap of recent activity since your last recap:',
+        events: [
+          {
+            eventId: 'e1',
+            monitorId: 'watch-src',
+            title: 'Files changed',
+            summary: 'Files changed',
+            body: 'Review the diff.',
+            urgency: 'normal',
+            createdAt: '2026-06-04T00:00:00.000Z',
+          },
+        ],
+      }),
+      'SessionStart',
+      { socketPath: '/tmp/agentmon-real.sock' },
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx).toContain(
+      "When handled, acknowledge: agentmonitors events ack --session sess-recap --socket '/tmp/agentmon-real.sock' --event-ids e1",
+    );
   });
 
   // hookEventName is echoed exactly
@@ -758,6 +950,37 @@ describe('renderHookDelivery post-compact recap marker (issue #442, round-9 revi
     );
   });
 
+  // (PR #445 review, finding 3611418583) `resolveHookClaimFit` used to always
+  // reserve room for `buildHookDeferredMarker`'s length, regardless of which
+  // marker `renderHookDelivery` would actually append — but a recap appends
+  // the LONGER `buildHookRecapMarker` instead. A two-event recap whose combined
+  // whole blocks don't all fit under the FULL cap, but DO fit once room is
+  // reserved for the (too-short) deferred marker, could then overflow once the
+  // longer recap marker was appended on top of that under-reserved packing.
+  // `bodyA` at 3546 chars is the smallest size that genuinely overflows the
+  // pre-fix code (verified by brute-force search over the boundary region);
+  // sizes below that still pass even without the fix, so they would not
+  // reproduce this bug.
+  it('a two-event recap boundary case does not overflow the cap once the longer recap marker is appended', () => {
+    const bodyA = 'a'.repeat(3546);
+    const bodyB = 'b'.repeat(1000);
+    const out = renderHookDelivery(
+      makeRecapClaim({
+        sessionId: 'session-recap-boundary',
+        events: [
+          recapEvent({ eventId: 'e1', monitorId: 'mon-a', body: bodyA }),
+          recapEvent({ eventId: 'e2', monitorId: 'mon-b', body: bodyB }),
+        ],
+      }),
+      'SessionStart',
+      { socketPath: '/tmp/agentmon.sock' },
+    );
+    const ctx = out?.hookSpecificOutput.additionalContext ?? '';
+    expect(ctx.length).toBeLessThanOrEqual(4000);
+    expect(ctx).toContain('[truncated');
+    expect(ctx).toContain('will reappear on future recaps');
+  });
+
   it('a recap that fits entirely under the cap carries no marker at all', () => {
     const out = renderHookDelivery(makeRecapClaim(), 'SessionStart');
     const ctx = out?.hookSpecificOutput.additionalContext ?? '';
@@ -872,6 +1095,55 @@ describe('packEventsUnderCap', () => {
     );
     expect(noSocketFit).toBe(2);
     expect(withSocketFit).toBe(1);
+  });
+
+  // (PR #445 review, round-6 finding — discussion_r3611292875) the prior
+  // fixed-point-guess header packing was anti-monotone at this boundary: two
+  // 26-character event ids with ~1,774-character bodies, reserved against the
+  // deferred marker (`moreDeferred: true`, matching the real render path when
+  // more high-urgency work exists beyond this claimed pair), made `guess=2`
+  // pack only 1 block, then the resulting shorter (1-id) header packed 2
+  // blocks, bouncing 2→1→2→1… without ever landing on a `k` where the
+  // header's named ids equal the rendered block count — falling through to
+  // the narrowest (0-id) header while BOTH blocks still rendered, so
+  // `--event-ids` silently omitted every id and a compliant agent's ack could
+  // fall back to the no-id "ack everything" form. `renderHookDelivery` must
+  // render a header whose `--event-ids` count exactly matches the number of
+  // `### ` event blocks actually included — proving the fixed point converges
+  // rather than oscillating.
+  it('names exactly the rendered event ids at the fixed-point oscillation boundary (issue #442/#445)', () => {
+    const events: DeliveryEventSummary[] = [
+      makeEvent('a'.repeat(22), 'x'.repeat(1774)),
+      makeEvent('b'.repeat(22), 'y'.repeat(1774)),
+    ];
+    expect(events[0]?.eventId.length).toBe(26);
+    expect(events[1]?.eventId.length).toBe(26);
+
+    const out = renderHookDelivery(
+      makeClaim({ urgency: 'high', events, message: '2 monitors fired' }),
+      'PreToolUse',
+      { moreDeferred: true },
+    );
+    expect(out).not.toBeNull();
+    const text = out?.hookSpecificOutput.additionalContext ?? '';
+
+    const ackLine = text
+      .split('\n')
+      .find((line) => line.includes('acknowledge:'));
+    expect(ackLine).toBeDefined();
+    const namedIds = ackLine?.includes('--event-ids')
+      ? /--event-ids (\S+)/
+          .exec(ackLine)?.[1]
+          ?.split(',')
+          .filter((id) => id.length > 0)
+      : [];
+
+    const renderedBlockCount = (text.match(/### /g) ?? []).length;
+    // Self-consistency: the ack instruction must name exactly the ids of the
+    // blocks actually rendered — never fewer (an under-scoped ack that could
+    // fall back to acknowledging everything unread) and never more (an
+    // over-scoped ack naming an id that was never shown).
+    expect(namedIds).toHaveLength(renderedBlockCount);
   });
 });
 

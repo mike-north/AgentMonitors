@@ -37,6 +37,7 @@ export default defineConfig({
       // its own, so it belongs with the other process-spawning suites.
       '**/channel-shutdown.integration.test.ts',
       '**/transport-health.integration.test.ts',
+      '**/daemon-reaper-lease.integration.test.ts',
     ],
   },
 });

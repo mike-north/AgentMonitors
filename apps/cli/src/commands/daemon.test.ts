@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AgentMonitorRuntime } from '@agentmonitors/core';
@@ -13,7 +13,15 @@ import {
   waitForDetachIdentityProof,
 } from './daemon.js';
 import { callDaemon, daemonAvailable } from '../daemon-ipc.js';
+import { transportRegistryDir } from '../transport-heartbeat.js';
 import type { SpawnedDaemon } from '../detached-spawn.js';
+
+// Spies (not fully mocks — real fs behavior passes through) on `node:fs` so a
+// single test below can assert `readdirSync` is never called with the
+// transport registry path. Declared with `vi.mock(..., { spy: true })` (hoisted
+// by vitest to the top of the module) since ESM module namespaces are otherwise
+// non-configurable and cannot be `vi.spyOn`'d directly per-test.
+vi.mock('node:fs', { spy: true });
 
 const tempRoots: string[] = [];
 
@@ -102,6 +110,121 @@ describe('runLoop — idle-reaping errors do not crash the daemon (issue #398)',
 
     listSessionsSpy.mockRestore();
     errorSpy.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR #461 review finding 4: the reaper's channel-heartbeat check must not scan
+// the machine-wide transport registry at all when reaping is disabled
+// (`--reap-after-ms 0`) — `shouldReap` short-circuits on that case regardless
+// of `channelAttached`, so the registry `readdirSync` is pure wasted I/O with
+// a disabled reaper. Asserted via a spy on the real `readdirSync` rather than
+// a fake/mocked registry: the property under test is "is the directory read
+// at all", not the read's result.
+// ---------------------------------------------------------------------------
+describe('runLoop — reap registry scan runs only when the lease could matter (PR #461 finding 4)', () => {
+  it('never reads the transport registry directory when reaping is disabled', async () => {
+    const dir = tempDir();
+    const monitorsDir = path.join(dir, '.claude', 'monitors');
+    mkdirSync(monitorsDir, { recursive: true });
+    const socketPath = path.join(dir, 'agentmon.sock');
+    const registryDir = transportRegistryDir();
+    const readdirSpy = vi.mocked(readdirSync);
+    readdirSpy.mockClear();
+
+    const loopPromise = runLoop(
+      monitorsDir,
+      dir,
+      20,
+      socketPath,
+      0,
+      ':memory:',
+    );
+
+    try {
+      const deadline = Date.now() + 2000;
+      // Give the loop a few iterations' worth of time to prove the absence,
+      // not just the first tick.
+      while (
+        Date.now() < deadline &&
+        !(await daemonAvailable(socketPath).catch(() => false))
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const registryReads = readdirSpy.mock.calls.filter(
+        (call) => call[0] === registryDir,
+      );
+      expect(registryReads).toHaveLength(0);
+    } finally {
+      await callDaemon('stop', {}, { socketPath }).catch(() => undefined);
+      await loopPromise;
+      // `vi.restoreAllMocks()` in the top-level `afterEach` restores the
+      // `readdirSync` spy after this test — no manual restore needed here.
+    }
+  });
+
+  // The other half of the same finding (PR #461 thread 3632150387): the scan is
+  // ALSO wasted while a session is active. `shouldReap` short-circuits to
+  // `reap: false` on `openCount > 0` before it ever consults `channelAttached`,
+  // so a channel lease cannot change the outcome then — reading the registry
+  // every tick with an active session is pure I/O for a value that is ignored.
+  it('never reads the transport registry directory while a session is active (reaping enabled)', async () => {
+    const dir = tempDir();
+    const monitorsDir = path.join(dir, '.claude', 'monitors');
+    mkdirSync(monitorsDir, { recursive: true });
+    const socketPath = path.join(dir, 'agentmon.sock');
+    const registryDir = transportRegistryDir();
+    const readdirSpy = vi.mocked(readdirSync);
+
+    // Reaping ENABLED this time — so only an open session, not `reapAfterMs`,
+    // can gate the scan away.
+    const loopPromise = runLoop(
+      monitorsDir,
+      dir,
+      20,
+      socketPath,
+      60_000,
+      ':memory:',
+    );
+
+    try {
+      const deadline = Date.now() + 2000;
+      while (
+        Date.now() < deadline &&
+        !(await daemonAvailable(socketPath).catch(() => false))
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+
+      // Open an ACTIVE session for this workspace, so `openCount > 0`.
+      await callDaemon(
+        'session.open',
+        {
+          adapter: 'claude-code',
+          hostSessionId: 'active-session',
+          agentIdentity: 'claude',
+          workspacePath: dir,
+          hookStatePath: path.join(dir, 'hook-state.json'),
+        },
+        { socketPath },
+      );
+
+      // Clear only AFTER the session is open, so startup reads (unrelated) do
+      // not count; then prove the reaper does not touch the registry across
+      // several subsequent ticks while the session stays active.
+      readdirSpy.mockClear();
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      const registryReads = readdirSpy.mock.calls.filter(
+        (call) => call[0] === registryDir,
+      );
+      expect(registryReads).toHaveLength(0);
+    } finally {
+      await callDaemon('stop', {}, { socketPath }).catch(() => undefined);
+      await loopPromise;
+    }
   });
 });
 

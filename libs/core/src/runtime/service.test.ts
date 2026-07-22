@@ -342,15 +342,14 @@ Handle it.
     // being batched with a different band.
     expect(claim?.events[0]?.urgency).toBe('high');
     expect(claim?.message).toContain('PR #123 ready to merge');
-    expect(claim?.message).toContain(
-      'AgentMon messages are available. Read the inbox.',
-    );
+    // The runtime's coalesced reminder is the transport-neutral reminderMessage()
+    // body (002 §9.2, PR #445 wording contract) — no product prefix, no CLI/tool
+    // verb; each transport appends its own acknowledge step at render time.
+    expect(claim?.message).toContain('Monitored changes are pending.');
     // PR #456 review finding 2: `events`/`message` alone are not enough for a
     // bounded (events-rendering) transport to notice the coalesced reminder —
     // `coalescedReminder` carries it explicitly so a renderer can surface it.
-    expect(claim?.coalescedReminder).toBe(
-      'AgentMon messages are available. Read the inbox.',
-    );
+    expect(claim?.coalescedReminder).toBe('Monitored changes are pending.');
 
     // The real proof this is a REDUCTION, not just a relabeling: a second
     // turn-interruptible claim immediately after returns NOTHING — both the
@@ -447,9 +446,7 @@ Handle it.
       expect(claim?.urgency).toBe('high');
       expect(claim?.events).toHaveLength(1);
       expect(claim?.events[0]?.monitorId).toBe('merge-queue');
-      expect(claim?.coalescedReminder).toBe(
-        'AgentMon messages are available. Read the inbox.',
-      );
+      expect(claim?.coalescedReminder).toBe('Monitored changes are pending.');
 
       // Nothing left to interrupt a SECOND time for the same action.
       expect(
@@ -503,9 +500,196 @@ Handle it.
     expect(claim?.mode).toBe('delivery');
     expect(claim?.urgency).toBe('normal');
     expect(claim?.events).toHaveLength(0);
-    expect(claim?.message).toBe(
-      'AgentMon messages are available. Read the inbox.',
+    expect(claim?.message).toBe('Monitored changes are pending.');
+  });
+
+  // 006 §5.1.1 (PR #445 review): the coalesced-until-ack guard is BAND-scoped —
+  // it compares a band's own claimed-but-unacknowledged events against that SAME
+  // band's unread total (`normalPending.length === unreadNormal.length`), never
+  // across bands. A prior revision of 006 wrongly claimed that leaving a
+  // high-urgency (or recap) claim unacknowledged suppresses "every subsequent
+  // normal-urgency reminder for that session" — this regression test proves the
+  // two coexist: claiming (never acking) a settled high-urgency event does NOT
+  // block a separate, unrelated, still-unclaimed normal-urgency event's own
+  // coalesced reminder from firing on a later `turn-interruptible` claim.
+  //
+  // The normal event is inserted AFTER the high claim (not concurrently), so
+  // this exercises the cross-band-independence property specifically — a
+  // concurrently-due normal reminder instead coalesces into the settled-high
+  // delivery (issue #441 §9.1.1, covered by the coalescing test above), which
+  // would also (correctly) not suppress it, just via a different delivery shape.
+  it('an unacknowledged high-urgency claim does not suppress a same-session normal-urgency reminder (cross-band independence)', () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const db = createDb(':memory:');
+    const registry = new SourceRegistry();
+    const runtime = new AgentMonitorRuntime(new RuntimeStore(db), registry, [
+      claudeCodeAdapter,
+    ]);
+
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-session-cross-band',
+        workspacePath: rootDir,
+      }),
     );
+
+    const store = new RuntimeStore(db);
+    // A settled (past the debounce window) high-urgency event.
+    store.insertEvent({
+      workspacePath: rootDir,
+      monitorId: 'urgent-monitor',
+      sourceName: 'manual',
+      urgency: 'high',
+      title: 'CI failed',
+      body: 'CI failed on the default branch',
+      summary: 'CI failed on the default branch',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey: 'ci/default',
+      queryScope: { pipeline: 'default' },
+      tags: ['ci'],
+      createdAt: new Date(Date.now() - 20_000),
+    });
+
+    // First claim: the settled high-urgency event takes priority (§9.1) and is
+    // claimed — but NOT acknowledged. No normal event exists yet, so nothing
+    // coalesces into it.
+    const highClaim = runtime.claimDelivery(session.id, 'turn-interruptible');
+    expect(highClaim?.mode).toBe('delivery');
+    expect(highClaim?.urgency).toBe('high');
+    expect(highClaim?.coalescedReminder).toBeUndefined();
+
+    // A wholly unrelated normal-urgency event arrives AFTER the high was
+    // claimed (so the settled-high delivery could not have coalesced it).
+    store.insertEvent({
+      workspacePath: rootDir,
+      monitorId: 'docs-monitor',
+      sourceName: 'manual',
+      urgency: 'normal',
+      title: 'Docs changed',
+      body: 'Docs changed',
+      summary: 'Docs changed',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey: 'docs/readme',
+      queryScope: { path: 'readme.md' },
+      tags: [],
+      createdAt: new Date(),
+    });
+
+    // Second claim, same session, high claim still unacknowledged: the
+    // completely separate normal-urgency event is still unclaimed, so its own
+    // band-local guard (`normalPending.length === unreadNormal.length`) holds
+    // and the coalesced reminder fires — proving the unacked high claim did
+    // NOT durably suppress it.
+    const normalClaim = runtime.claimDelivery(session.id, 'turn-interruptible');
+    expect(normalClaim).not.toBeNull();
+    expect(normalClaim?.mode).toBe('delivery');
+    expect(normalClaim?.urgency).toBe('normal');
+    expect(normalClaim?.events).toEqual([]);
+  });
+
+  // 006 §5.1.1 (PR #445 review, round 6 — discussion_r3615219860): the
+  // cross-band-independence guard above is TRUE ONLY for a `high`-only claim.
+  // A `post-compact` recap claims the FULL unread set across every band
+  // (`applyDelivery`'s `candidates: unread`), so a mixed-band recap that
+  // claims an OLD normal-urgency event alongside high-urgency events leaves
+  // that normal row claimed-but-unacknowledged. This regression proves the
+  // band-scoped guard (`normalPending.length === unreadNormal.length`) then
+  // correctly SUPPRESSES the next turn-interruptible normal reminder once a
+  // fresh, unrelated normal event arrives — because `unreadNormal` (2, the old
+  // recap-claimed row plus the new one) no longer equals `normalPending` (1,
+  // only the new unclaimed row) — a prior revision of 006 wrongly claimed a
+  // mixed-band recap claim "does not, on its own, block" this reminder.
+  it('a mixed-band post-compact recap claim suppresses the next normal-urgency reminder for a fresh, unrelated normal event (mixed-band recap suppression)', () => {
+    const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
+    tempDirs.push(rootDir);
+    const db = createDb(':memory:');
+    const registry = new SourceRegistry();
+    const runtime = new AgentMonitorRuntime(new RuntimeStore(db), registry, [
+      claudeCodeAdapter,
+    ]);
+
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'claude-session-mixed-recap',
+        workspacePath: rootDir,
+      }),
+    );
+
+    const store = new RuntimeStore(db);
+    // An OLD normal-urgency event, unread since before the recap.
+    store.insertEvent({
+      workspacePath: rootDir,
+      monitorId: 'docs-monitor',
+      sourceName: 'manual',
+      urgency: 'normal',
+      title: 'Docs changed',
+      body: 'Docs changed',
+      summary: 'Docs changed',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey: 'docs/readme',
+      queryScope: { path: 'readme.md' },
+      tags: [],
+      createdAt: new Date(Date.now() - 20_000),
+    });
+    // A settled high-urgency event, so the recap is genuinely mixed-band.
+    store.insertEvent({
+      workspacePath: rootDir,
+      monitorId: 'urgent-monitor',
+      sourceName: 'manual',
+      urgency: 'high',
+      title: 'CI failed',
+      body: 'CI failed on the default branch',
+      summary: 'CI failed on the default branch',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey: 'ci/default',
+      queryScope: { pipeline: 'default' },
+      tags: ['ci'],
+      createdAt: new Date(Date.now() - 20_000),
+    });
+
+    // The recap claims BOTH the old normal event and the high event (the FULL
+    // unread set), but acknowledges neither.
+    const recapClaim = runtime.claimDelivery(session.id, 'post-compact');
+    expect(recapClaim?.mode).toBe('recap');
+
+    // A fresh, wholly unrelated normal-urgency event arrives after the recap.
+    store.insertEvent({
+      workspacePath: rootDir,
+      monitorId: 'other-docs-monitor',
+      sourceName: 'manual',
+      urgency: 'normal',
+      title: 'Other docs changed',
+      body: 'Other docs changed',
+      summary: 'Other docs changed',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey: 'docs/other',
+      queryScope: { path: 'other.md' },
+      tags: [],
+      createdAt: new Date(),
+    });
+
+    // The recap-claimed normal row is still unacknowledged, so `unreadNormal`
+    // is 2 while only the fresh event is unclaimed (`normalPending` is 1) —
+    // the band-scoped guard therefore withholds the reminder (returns null),
+    // NOT fires it, until the recap-claimed normal row is acknowledged.
+    const normalClaim = runtime.claimDelivery(session.id, 'turn-interruptible');
+    expect(normalClaim).toBeNull();
   });
 
   // Issue #407: `verify --use-workspace-daemon` must retract the events its own
@@ -1187,7 +1371,12 @@ Handle it.
     const claim = runtime.claimDelivery(session.id, 'turn-idle');
     expect(claim?.mode).toBe('delivery');
     expect(claim?.urgency).toBe('low');
-    expect(claim?.message).toBe('AgentMon has inbox updates ready for review.');
+    // 002 §9.3 (issues #438/#434, PR #445 review finding 2): a semantic,
+    // transport- and verb-neutral body — no product-name prefix, no CLI verb,
+    // no reference to the legacy `inbox` model. Each transport supplies its
+    // own concrete, session-scoped action step (`apps/cli`'s
+    // `hook-deliver-render.ts`/`channel-render.ts`).
+    expect(claim?.message).toBe('Monitored changes are pending.');
   });
 
   it('coalesces normal-urgency reminders until unread events are acknowledged', () => {
@@ -5298,9 +5487,11 @@ Daily digest.
 // @see ../../../../docs/specs/002-runtime-delivery.md §10.7 (monitor explain
 //   projection-and-delivery diagnosis)
 describe('normal-urgency reminder suppression is explainable (issue #333)', () => {
-  // 002 §9.2: the generic reminder message for the normal band.
-  const NORMAL_INBOX_PROMPT =
-    'AgentMon messages are available. Read the inbox.';
+  // 002 §9.2 (issues #438/#434, PR #445 review finding 2): the coalesced
+  // reminder body for the normal band — semantic and transport/verb-neutral
+  // (no product-name attribution, no CLI verb; both are transport-owned),
+  // free of the legacy `inbox` model.
+  const reminderMessage = (): string => 'Monitored changes are pending.';
 
   function stubStatefulSource(name: string): ObservationSource {
     return {
@@ -5389,7 +5580,11 @@ describe('normal-urgency reminder suppression is explainable (issue #333)', () =
       const first = runtime.claimDelivery(session.id, 'turn-interruptible');
       expect(first?.mode).toBe('delivery');
       expect(first?.urgency).toBe('normal');
-      expect(first?.message).toBe(NORMAL_INBOX_PROMPT);
+      expect(first?.message).toBe(reminderMessage());
+      // Attribution is transport-owned (issue #438): the runtime's own message
+      // never carries the product name.
+      expect(first?.message).not.toContain('AgentMon');
+      expect(first?.message).not.toContain('inbox');
       expect(first?.events).toEqual([]); // §9.2: no per-event payloads
 
       // The divergent precondition from the study: that first claim marked the

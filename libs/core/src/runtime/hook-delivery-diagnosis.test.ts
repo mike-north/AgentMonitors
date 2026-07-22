@@ -49,6 +49,10 @@ describe('classifyReminderHold', () => {
     expect(hold?.message).toContain('already claimed');
     expect(hold?.message).toContain('coalesced-until-ack');
     expect(hold?.message).toContain('agentmonitors events ack');
+    // Regression (PR #445 review round 8): the guard is ack-only — the
+    // message must not promise a fresh/new unclaimed event restores it.
+    expect(hold?.message).not.toMatch(/acknowledged.*or a (fresh|new)/);
+    expect(hold?.message).toContain('does not restore it');
   });
 
   it('defaults `claimedEventIds` to an empty array when the caller omits it', () => {
@@ -83,6 +87,56 @@ describe('classifyReminderHold', () => {
     });
     expect(hold?.message).toContain('turn-idle');
     expect(hold?.message).toContain('Low-urgency reminder');
+  });
+
+  // Regression (PR #445 review round 10, issue #300): a row LEASED by an
+  // in-flight channel-push reservation is not durably claimed — it resolves
+  // itself (commit → claimed, or release/expiry → pending again). Conflating
+  // it with `already-claimed` was proven unsafe: the round-8 shared vocabulary
+  // recommended `events ack`, but acknowledging a leased-but-unseen row before
+  // the push resolves can permanently lose it if the push then fails. A pure
+  // lease (claimedCount === 0, leasedCount > 0) must get the distinct
+  // `reserved-in-flight` reason and never mention ack.
+  it('reports `reserved-in-flight` (never ack) when the only held normal event is leased, not claimed (issue #300, round 10)', () => {
+    // unreadCount=1, pendingCount=0 (excluded because leased), no claimed ids,
+    // leasedCount=1.
+    const hold = classifyReminderHold('normal', 1, 0, [], 1);
+    expect(hold).toMatchObject({
+      urgency: 'normal',
+      reason: 'reserved-in-flight',
+      unreadCount: 1,
+      pendingCount: 0,
+      leasedCount: 1,
+    });
+    expect(hold?.message).toContain('turn-interruptible');
+    expect(hold?.message).toContain('in-flight channel-push reservation');
+    expect(hold?.message).not.toContain('agentmonitors events ack');
+    expect(hold?.message).not.toMatch(/\back\b/i);
+  });
+
+  it('reports `coalesced-until-ack` (not `already-claimed`) when a normal band mixes a durable claim with a live lease (issue #300, round 10)', () => {
+    // unreadCount=2, pendingCount=0, one claimed id, leasedCount=1 →
+    // claimedCount=1: a real claim is present, but the ack remedy must not
+    // claim to cover the leased row too.
+    const hold = classifyReminderHold('normal', 2, 0, ['evt-claimed'], 1);
+    expect(hold).toMatchObject({
+      urgency: 'normal',
+      reason: 'coalesced-until-ack',
+      unreadCount: 2,
+      pendingCount: 0,
+      claimedEventIds: ['evt-claimed'],
+      leasedCount: 1,
+    });
+    expect(hold?.message).toContain('1 of 2');
+    expect(hold?.message).toContain('agentmonitors events ack');
+    expect(hold?.message).toContain('in-flight channel-push reservation');
+  });
+
+  it('reports no hold when a leased normal row coexists with a genuinely unclaimed one (nothing claimed, nothing leased-only-blocking)', () => {
+    // This case cannot actually occur through the runtime (a lease always
+    // suppresses per the guard), but pins the boundary: claimedCount=0 and
+    // leasedCount=0 together still means "fires".
+    expect(classifyReminderHold('normal', 1, 1, [], 0)).toBeNull();
   });
 });
 
@@ -149,6 +203,15 @@ describe('classifyCoalescingWithheldHold', () => {
     // unread=2, pending=1: some claimed. classifyCoalescingWithheldHold defers
     // to classifyReminderHold's coalesced-until-ack for this shape.
     expect(classifyCoalescingWithheldHold(2, 1, 1, 0)).toBeNull();
+  });
+
+  it('reports no hold when the reminder’s only unread row is leased (pending < unread) — defers to classifyReminderHold’s reserved-in-flight (issue #441 × #300)', () => {
+    // unread=1, pending=0 (the single unread normal row is lease-excluded from
+    // `pendingForClaim`), pendingHigh=1, settledHigh=0. reminderDue is false
+    // (0 ≠ 1), so this classifier returns null and the lease is diagnosed by
+    // classifyReminderHold as reserved-in-flight instead — matching
+    // `decideDelivery`, which does not coalesce a leased normal row.
+    expect(classifyCoalescingWithheldHold(1, 0, 1, 0)).toBeNull();
   });
 
   it('reports no hold when there is no unread normal work at all', () => {

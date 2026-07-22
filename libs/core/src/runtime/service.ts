@@ -173,16 +173,59 @@ function describeCadence(
   if (typeof interval === 'string') return `every ${interval}`;
   return `every ${String(Math.round(nextPollMs / 1000))}s`;
 }
-const NORMAL_INBOX_PROMPT = 'AgentMon messages are available. Read the inbox.';
-const IDLE_INBOX_PROMPT = 'AgentMon has inbox updates ready for review.';
+/**
+ * Semantic, transport-neutral body for a coalesced normal/low-urgency reminder
+ * (002 §9.2/§9.3). This is the message a `DeliveryClaim` with no event bodies
+ * carries.
+ *
+ * Two properties, each fixing a defect of the former `NORMAL_INBOX_PROMPT`
+ * (`'AgentMon messages are available. Read the inbox.'`, issue #438):
+ *
+ * 1. **No product-name attribution.** Attribution is a property of the delivery
+ *    SURFACE, owned by each transport — the hook adapter prefixes its own label
+ *    (its `additionalContext` arrives unlabeled), while the channel adds none
+ *    (its `<channel source="agentmonitors">` tag already names the source).
+ *    Emitting "AgentMon" here double-attributed the channel. So the runtime,
+ *    per the host-agnostic-core rule, emits only the semantic message.
+ * 2. **No reference to the legacy `inbox` model.** `inbox_items` is
+ *    non-authoritative (002 §12); the authoritative path is
+ *    events/session-projection. "Read the inbox" pointed at a deprecated
+ *    concept with no runnable referent.
+ *
+ * **No CLI verb, either (PR #445 review, finding 2).** A prior revision of
+ * this function also embedded the concrete `agentmonitors events list`/`ack`
+ * commands — but the CHANNEL transport pushes this string verbatim into its
+ * `<channel>` tag body, and a channel-connected agent acknowledges through the
+ * `agentmon_ack` MCP tool (`channel.ts`), not the CLI. Baking one transport's
+ * verb into the shared, transport-neutral message put conflicting
+ * instructions on the channel surface. Each transport now supplies its OWN
+ * concrete action step, with its OWN sessionId/socket already available on the
+ * `DeliveryClaim`/render options: the hook transport appends
+ * `agentmonitors events list`/`ack` commands (`hook-deliver-render.ts`'s
+ * `buildHookReminderActionStep`); the channel transport points at its
+ * `agentmon_ack` tool (`channel-render.ts`). This keeps the runtime
+ * host-agnostic (AP6) while still leaving each delivered payload
+ * self-sufficient and actionable (issue #438) — the acknowledge step just
+ * moves from this shared sentence to each transport's own phrasing (issue
+ * #434 is unaffected: every transport's phrasing still names it).
+ */
+function reminderMessage(): string {
+  return 'Monitored changes are pending.';
+}
+
 /**
  * Appended to a `turn-interruptible` high-urgency delivery's message when a
  * normal-urgency reminder is ALSO due in the same call (issue #441 —
- * cross-monitor coalescing). Reuses the exact {@link NORMAL_INBOX_PROMPT}
- * wording so a session that greps for that string still finds it, just as
- * one more line of the same message rather than a separate delivery.
+ * cross-monitor coalescing). Reuses the exact transport-neutral
+ * {@link reminderMessage} body so the coalesced reminder reads identically to a
+ * standalone normal reminder — just one more line of the same message rather
+ * than a separate delivery. Per #445's wording contract (002 §9.2 / 006
+ * §5.1.1) this shared suffix carries ONLY the semantic body — no product
+ * prefix, no CLI/tool verb. Each transport appends its own acknowledge action
+ * step (hook: `agentmonitors events ack`; channel: `agentmon_ack`) from the
+ * claim's `coalescedReminder` field when it renders the footer.
  */
-const COALESCED_NORMAL_SUFFIX = `\n\n${NORMAL_INBOX_PROMPT}`;
+const COALESCED_NORMAL_SUFFIX = `\n\n${reminderMessage()}`;
 
 function unreadDetailsCommand(sessionId: string): string {
   return `agentmonitors events list --session ${sessionId} --unread --format json`;
@@ -1466,6 +1509,9 @@ export class AgentMonitorRuntime {
             // pending here or the reminder-suppression diagnosis would disagree
             // with what a real claim would decide.
             pendingCount: this.pendingForClaim(sessionId, urgency).length,
+            // Split out from claimedCount (round 10): a leased row is NOT a
+            // durable claim and must never be reported as one an ack can clear.
+            leasedCount: this.leasedPendingCount(sessionId, urgency),
           });
         }
       }
@@ -1680,9 +1726,32 @@ export class AgentMonitorRuntime {
     };
   }
 
+  /**
+   * Acknowledge events for a session. Omitting `eventIds` acknowledges every
+   * unread event for the session **except all rows** currently leased by an
+   * outstanding delivery reservation (issue #300) — `reservedEventIds`
+   * returns every candidate held by every live reservation for this session,
+   * so more than one row can be excluded at once. Those rows are left unread
+   * so they can still be redelivered if a reservation is released rather
+   * than committed.
+   */
   acknowledgeSession(sessionId: string, eventIds?: string[]): void {
-    const ids =
-      eventIds ?? this.store.unreadEventsForSession(sessionId).map((e) => e.id);
+    let ids = eventIds;
+    if (!ids) {
+      // Exclude rows currently LEASED by an in-flight channel-push reservation
+      // (issue #300, PR #445 review round 10): acknowledging a leased-but-
+      // unclaimed row before the push resolves can permanently lose it — if
+      // the push later rejects/disconnects, `releaseDelivery` returns the row
+      // to `pending`, but it would already be (wrongly) acknowledged and would
+      // never redeliver. A scoped ack (explicit `eventIds`, e.g. from a hook
+      // body-injection instruction) is a deliberate caller choice naming rows
+      // it actually saw and is NOT filtered here.
+      const reserved = this.reservations.reservedEventIds(sessionId);
+      ids = this.store
+        .unreadEventsForSession(sessionId)
+        .filter((event) => !reserved.has(event.id))
+        .map((event) => event.id);
+    }
     this.store.acknowledgeEvents(sessionId, ids);
     this.refreshHookState(sessionId);
   }
@@ -1927,6 +1996,25 @@ export class AgentMonitorRuntime {
   }
 
   /**
+   * The count of a band's pending (unclaimed) events that are currently held
+   * out of {@link pendingForClaim} because they are LEASED by an outstanding
+   * reservation (006 §4, issue #300; PR #445 review round 10) — i.e. an
+   * in-flight channel push is mid-surfacing them, not a durable claim. Callers
+   * that explain WHY a coalesced reminder is held (`monitor explain`,
+   * {@link diagnoseHookDelivery}) need this split out from truly-claimed rows:
+   * a lease resolves itself (commit → claimed, or release/expiry → pending
+   * again) and must never be presented as something an `events ack` can or
+   * should clear.
+   */
+  private leasedPendingCount(sessionId: string, urgency?: Urgency): number {
+    const reserved = this.reservations.reservedEventIds(sessionId);
+    if (reserved.size === 0) return 0;
+    return this.store
+      .pendingEventsForSession(sessionId, urgency)
+      .filter((event) => reserved.has(event.id)).length;
+  }
+
+  /**
    * Decide the pending delivery for a session at a lifecycle point WITHOUT
    * mutating the store (issue #300). Mirrors the prior `claimDelivery` branch
    * logic exactly, but (a) reads pending sets through {@link pendingForClaim} so
@@ -2063,7 +2151,7 @@ export class AgentMonitorRuntime {
             // (`types.ts`) for why this must be rendered explicitly.
             ...(normalReminderDue
               ? {
-                  coalescedReminder: NORMAL_INBOX_PROMPT,
+                  coalescedReminder: reminderMessage(),
                   coalescedNormalCount: normalPending.length,
                 }
               : {}),
@@ -2092,7 +2180,7 @@ export class AgentMonitorRuntime {
             mode: 'delivery',
             urgency: 'normal',
             unreadCounts: sessionUnreadCounts,
-            message: NORMAL_INBOX_PROMPT,
+            message: reminderMessage(),
             events: [],
           },
         };
@@ -2117,7 +2205,7 @@ export class AgentMonitorRuntime {
           mode: 'delivery',
           urgency: 'low',
           unreadCounts: sessionUnreadCounts,
-          message: IDLE_INBOX_PROMPT,
+          message: reminderMessage(),
           events: [],
         },
       };
@@ -2275,7 +2363,7 @@ export class AgentMonitorRuntime {
     const normalPending = this.pendingForClaim(sessionId, 'normal');
     const normalReminderDue =
       normalPending.length > 0 && normalPending.length === unreadNormal.length;
-    return normalReminderDue ? NORMAL_INBOX_PROMPT : undefined;
+    return normalReminderDue ? reminderMessage() : undefined;
   }
 
   /**
@@ -2356,23 +2444,37 @@ export class AgentMonitorRuntime {
           DEFAULT_HIGH_URGENCY_SETTLE_MS,
       ).length;
       const pendingNormal = this.pendingForClaim(sessionId, 'normal');
+      const leasedNormal = this.leasedPendingCount(sessionId, 'normal');
       // Claimed-ids must be derived from the store's actually-claimed set
       // (`pendingEventsForSession`, unaffected by an in-flight channel lease),
       // not from `pendingForClaim` (lease-filtered): a reserved event is unread
       // and unclaimed — `claimDelivery` has not run for it — so treating it as
       // "claimed" here would let the scoped-ack remediation acknowledge a
       // never-surfaced event, making it permanently unclaimable once the
-      // reservation later releases.
+      // reservation later releases. The separate `leasedCount` lets the
+      // classifier tell a pure in-flight lease (reserved-in-flight, never ack)
+      // apart from a real claim.
       const unclaimedNormal = this.store.pendingEventsForSession(
         sessionId,
         'normal',
       );
-      // Independent of settledHighCount: either the reminder is withheld by a
-      // CONCURRENT unsettled high batch (#441), or it is withheld by its own
-      // claimed rows (#333) — never both at once, since the coalescing hold only
-      // applies when the reminder is otherwise fully due (every unread normal
-      // event still unclaimed), the exact case where `classifyReminderHold`
-      // returns null.
+      // Two independent, mutually-exclusive reasons can withhold the normal
+      // reminder — evaluated unconditionally (not gated on settledHighCount),
+      // since each classifier returns null outside the state it owns:
+      //   • classifyCoalescingWithheldHold (#441) fires ONLY when the reminder
+      //     is otherwise fully due — `pendingNormal.length === unreadCounts.normal`,
+      //     the exact lease-aware gate `decideDelivery` uses — but concurrent
+      //     high-urgency work is still unsettled, so the reminder is held to be
+      //     coalesced into that batch once it settles. `pendingNormal` is
+      //     lease-filtered, so this equality can hold only when NO normal row is
+      //     claimed AND none is leased; in that state classifyReminderHold
+      //     necessarily returns null (nothing to hold).
+      //   • Otherwise a claimed row (coalesced-until-ack/already-claimed) or a
+      //     leased row (reserved-in-flight) makes the reminder not-due, the
+      //     coalescing hold returns null, and classifyReminderHold names the
+      //     real reason. A leased normal row thus defers to reserved-in-flight,
+      //     matching `decideDelivery`, which likewise neither fires nor
+      //     coalesces the reminder while a normal row is leased.
       const normalHold =
         classifyCoalescingWithheldHold(
           unreadCounts.normal,
@@ -2385,18 +2487,23 @@ export class AgentMonitorRuntime {
           unreadCounts.normal,
           pendingNormal.length,
           claimedIds(unreadNormal, unclaimedNormal),
+          leasedNormal,
         );
       if (normalHold) holds.push(normalHold);
     } else if (lifecycle === 'turn-idle') {
       const pendingLow = this.pendingForClaim(sessionId, 'low');
+      const leasedLow = this.leasedPendingCount(sessionId, 'low');
       // See the `normal` branch above: claimed-ids must come from the
-      // lease-unaware store set, not the lease-filtered `pendingForClaim`.
+      // lease-unaware store set, not the lease-filtered `pendingForClaim`,
+      // and the lease count is threaded separately so a pure lease reads as
+      // reserved-in-flight rather than a claim.
       const unclaimedLow = this.store.pendingEventsForSession(sessionId, 'low');
       const lowHold = classifyReminderHold(
         'low',
         unreadCounts.low,
         pendingLow.length,
         claimedIds(unreadLow, unclaimedLow),
+        leasedLow,
       );
       if (lowHold) holds.push(lowHold);
     }

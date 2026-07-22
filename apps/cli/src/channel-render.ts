@@ -5,6 +5,7 @@ import {
   escapeShellPath,
   packEventsUnderCap as packSharedEventsUnderCap,
   packWholeBlocks,
+  truncateWithMarker,
   type PackedBlocks,
 } from './delivery-event-render.js';
 
@@ -148,6 +149,48 @@ export function buildChannelTruncatedMarker(
 }
 
 /**
+ * The action step this transport appends to a reminder-only (`normal`/`low`)
+ * claim's semantic `message` (PR #445 review, finding 2). The runtime's
+ * `reminderMessage()` (`libs/core/src/runtime/service.ts`) states only the
+ * transport-neutral fact that changes are pending; each transport supplies
+ * its own concrete next step. Unlike the hook transport (whose reminder step
+ * names `agentmonitors events ack` directly, `hook-deliver-render.ts`'s
+ * `buildHookReminderActionStep`), a channel-connected agent acknowledges
+ * through the `agentmon_ack` MCP tool the server's own `instructions` already
+ * describe (`channel.ts`).
+ *
+ * **Inspection is a PREREQUISITE, not an alternative (PR #445 review, finding
+ * 2, round 2).** A prior wording offered `agentmon_ack` as an "or" alternative
+ * to listing details — but `agentmon_ack` called with no `event_ids`
+ * acknowledges EVERY unread event for the session (`channel-ack.ts`'s
+ * `ACK_TOOL`/`parseAckArgs`: omitting `event_ids` means "all unread"), not
+ * just the ones this reminder refers to. Read literally, the "or" phrasing's
+ * most direct path — call `agentmon_ack` with no arguments — silently
+ * acknowledges unrelated, never-seen cross-band events (e.g. a `low`-urgency
+ * reminder's blanket ack also clearing unread `high`-urgency work the
+ * recipient never inspected). The corrected instruction sequences the two
+ * steps instead: list this session's unread events first, THEN call
+ * `agentmon_ack` with exactly the `event_id` values of the ones actually
+ * handled — never the bare, no-argument form. The `events list` command
+ * carries an explicit `--socket <path>` (issue #358, PR #445 review finding
+ * 4) so it can't silently query a stale `$AGENTMONITORS_SOCKET`.
+ */
+function buildChannelReminderActionStep(
+  sessionId: string,
+  socketPath: string | undefined,
+): string {
+  const safeSessionId = metaValue(sessionId);
+  const socketClause = socketPath
+    ? ` --socket ${escapeShellPath(socketPath)}`
+    : '';
+  return (
+    ' Run ' +
+    `\`agentmonitors events list --session ${safeSessionId}${socketClause} --unread\` ` +
+    'to see them, then call the agentmon_ack tool with the event_id values of the ones you handled.'
+  );
+}
+
+/**
  * How many WHOLE high-urgency event blocks (from `events`, oldest-first) a
  * channel push can render under {@link MAX_CHANNEL_CONTENT} (006 §5.5). Mirrors
  * the hook-deliver transport's `packEventsUnderCap` (`hook-deliver-render.ts`,
@@ -275,7 +318,14 @@ export interface RenderChannelEventOptions {
  * differing only in per-transport content sanitization. A reminder claim
  * (`normal`/`low`, which carries no event bodies — only a coalesced advisory
  * `message`) renders that message as-is (subject to the same tag-safety
- * sanitization as the body-injection path), staying generic (002 §9.2).
+ * sanitization as the body-injection path).
+ *
+ * Attribution is transport-owned (issue #438): the runtime emits a SEMANTIC
+ * reminder `message` with no product-name prefix, and this transport adds
+ * NONE — the enclosing `<channel source="agentmonitors">` tag already names
+ * the source, so an "AgentMon" prefix here would double-attribute. (The hook
+ * transport, whose `additionalContext` arrives unlabeled, prepends its own
+ * label instead — see `hook-deliver-render.ts`'s `HOOK_ATTRIBUTION_PREFIX`.)
  *
  * **The channel surface IS bounded (006 §5.5), primarily by packing WHOLE
  * event blocks under {@link MAX_CHANNEL_CONTENT} BEFORE reserving, not by
@@ -356,9 +406,17 @@ export function renderChannelEvent(
     // this is required at all (`claim.events`/`claim.message` carry no
     // representation of the coalesced reminder on their own, yet
     // `claimDelivery` claims the coalesced normal rows alongside the surfaced
-    // high events).
+    // high events). Per #445's wording contract (002 §9.2 / 006 §5.1.1) the
+    // runtime emits ONLY the transport-neutral reminder body; this transport
+    // appends its OWN acknowledge step ({@link buildChannelReminderActionStep},
+    // pointing at the `agentmon_ack` MCP tool — never the hook's CLI ack verb),
+    // exactly as the reminder-only branch below does, so the coalesced reminder
+    // is self-sufficient and actionable on the channel surface too.
     const reminderFooter = claim.coalescedReminder
-      ? `\n\n${contentValue(claim.coalescedReminder)}`
+      ? `\n\n${contentValue(claim.coalescedReminder)}${buildChannelReminderActionStep(
+          claim.sessionId,
+          options.socketPath,
+        )}`
       : '';
     const effectiveCap = MAX_CHANNEL_CONTENT - reminderFooter.length;
     const fit = resolveChannelClaimFit(
@@ -419,7 +477,26 @@ export function renderChannelEvent(
         reminderFooter;
     }
   } else {
-    content = contentValue(claim.message);
+    // Reminder claim (`normal`/`low`, no events): the runtime's semantic
+    // message plus this transport's own action step (agentmon_ack, not the
+    // hook's CLI ack verb — see `buildChannelReminderActionStep`). Bounded by
+    // {@link MAX_CHANNEL_CONTENT} like every other branch here (PR #445
+    // review, finding 5) — latent today (the reminder is short), but this was
+    // previously the one render path in the file without the #442
+    // defense-in-depth ceiling. If truncation is ever needed, this is THIS
+    // claim's own content being cut (not other pending work deferred), so it
+    // uses {@link buildChannelTruncatedMarker} — mirroring the hook
+    // transport's identical choice for its reminder-truncation case
+    // (`hook-deliver-render.ts`'s `buildHookClaimedUnreadMarker` usage).
+    const actionStep = buildChannelReminderActionStep(
+      claim.sessionId,
+      options.socketPath,
+    );
+    content = truncateWithMarker(
+      `${contentValue(claim.message)}${actionStep}`,
+      MAX_CHANNEL_CONTENT,
+      buildChannelTruncatedMarker(claim.sessionId, options.socketPath),
+    );
   }
 
   // A reminder claim carries no concrete events (`events: []`), so `event_count`

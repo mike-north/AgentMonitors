@@ -1001,6 +1001,42 @@ describe('computeTransportHealth', () => {
       );
       expect(settling.deliverable).toBe(true);
     });
+
+    it('stays healthy when the only hold is a pure in-flight channel lease (`reserved-in-flight`, PR #445 review round 10)', () => {
+      // A `reserved-in-flight` hold means NO row of the band is durably
+      // claimed yet — only leased by an in-flight channel push — so it must
+      // never be folded into `already-claimed`/`coalesced-until-ack`'s
+      // suppression handling, and it must never route through the
+      // untrustworthy-`claimedEventIds` branch either: the hold is excluded
+      // from `suppressionProblems`'s filter entirely, before
+      // `hasValidClaimedEventIds` is ever consulted.
+      const health = computeTransportHealth(
+        input({
+          diagnoses: [
+            {
+              sessionId: 'session-abc',
+              lifecycle: 'turn-interruptible',
+              unreadCounts: { low: 0, normal: 1, high: 0, total: 1 },
+              holds: [
+                {
+                  urgency: 'normal',
+                  reason: 'reserved-in-flight',
+                  unreadCount: 1,
+                  pendingCount: 0,
+                  leasedCount: 1,
+                  message:
+                    'Normal-urgency reminder at turn-interruptible is held: 1 of 1 unread normal event(s) are being surfaced by an in-flight channel-push reservation (reserved-in-flight). No action needed — it will be claimed shortly, or become claimable again if that push fails.',
+                },
+              ],
+            },
+          ],
+        }),
+      );
+      const codes = health.pipelineProblems.map((problem) => problem.code);
+      expect(codes).not.toContain('reminders-suppressed');
+      expect(codes).not.toContain('delivery-diagnosis-unavailable');
+      expect(health.deliverable).toBe(true);
+    });
   });
 
   // Regression: `doctor` used to swallow a thrown `hook.diagnose` (e.g. an

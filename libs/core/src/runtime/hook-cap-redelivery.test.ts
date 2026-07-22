@@ -163,7 +163,7 @@ describe('capped high-urgency claim + preview (issue #299)', () => {
     });
 
     const previewed = h.runtime.previewCoalescedReminder(session);
-    expect(previewed).toBe('AgentMon messages are available. Read the inbox.');
+    expect(previewed).toBe('Monitored changes are pending.');
 
     // Previewing claims nothing — the high event is still pending, and so is
     // the normal event (a real claim then coalesces both).
