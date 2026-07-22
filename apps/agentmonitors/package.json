@@ -1,7 +1,7 @@
 {
   "name": "agentmonitors",
   "description": "Install the Agent Monitors CLI under the short, unscoped name. Thin launcher for @agentmonitors/cli.",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "engines": {
     "node": ">=24"
   },

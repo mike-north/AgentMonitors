@@ -1,5 +1,310 @@
 # @agentmonitors/core
 
+## 0.13.0
+
+### Minor Changes
+
+- b474d10: Render the full event on the Claude Code channel surface. A high-urgency channel delivery previously
+  rendered only the event **title** into the `<channel>` tag body; the monitor body (the author's
+  instructions for what to do when the monitor fires) and the change summary never reached the agent,
+  so a pushed event forced the receiving agent to already know what the monitor meant and separately
+  run `events list` to see what changed — defeating push delivery.
+  - The channel tag body now renders the **same per-event block the hook-deliver transport injects**:
+    `### <monitor> (<urgency>)`, the title, the monitor body, and — when present — a `Changes:` section
+    carrying a bounded change summary (per-event cap with an explicit elision marker). Both transports
+    share one block builder, so the channel is a rendering surface over the same semantics, differing
+    only in content sanitization. Normal/low reminder claims still render their generic coalesced
+    message.
+  - The delivery summary a transport receives (`DeliveryEventSummary`) now carries an optional
+    `diffText` (the event's change summary), so a transport can surface _what changed_. This is an
+    additive `@agentmonitors/core` public-API change (minor bump — precedent: `DeliveryEventSummary.body`
+    in #60 and the `schedulingDefaults` export); existing consumers are unaffected. The surfaced
+    `diffText` is each recipient's **per-recipient** change summary (its own baseline span), not the
+    shared latest-snapshot delta — so two sessions at divergent cursors each receive the correct,
+    complete evidence (session isolation).
+  - The channel surface is now **bounded by packing WHOLE event blocks under a content ceiling before
+    reserving**, not by cutting an already-claimed render: `channel serve` previews the settled
+    high-urgency delivery, sizes how many whole blocks fit, and reserves/claims exactly that many —
+    mirroring how the hook-deliver transport sizes its `additionalContext` cap. The claimed set still
+    always equals the rendered set; any events that do not fit stay pending and re-deliver on a later
+    poll (only the per-event change summary was ever bounded before this).
+  - Two distinct situations can leave settled work out of a push, and each is now signposted with its
+    own marker: some settled-high events genuinely did not fit and stay pending — they **will**
+    re-deliver on a later poll (`... more monitor updates are pending; they will surface on a later
+poll`). The other, rarer case is a single event whose own block still exceeds the content ceiling
+    even alone; that one event is mid-truncated as PART OF the push, before the reservation is
+    committed, so at that point it is genuinely unknown whether the redelivery-suppressing commit that
+    follows will land — its marker stays outcome-neutral rather than promising a specific outcome
+    either way. It names the exact, directly-runnable recovery command for that session and socket
+    (`` `agentmonitors events list --session <id> --socket <path> --unread` `` — `events list` requires
+    `--session`, so a bare `--unread` form would fail, and the explicit `--socket` guards against a stale
+    `$AGENTMONITORS_SOCKET` silently querying the wrong workspace's daemon), pointing at the still-unread,
+    un-truncated copy of the full event (claiming an event is never the same as acknowledging it).
+  - A reminder tag's `event_count` now reports the pending unread total the reminder refers to, instead
+    of the confusing `0`.
+  - The hook-deliver transport's `additionalContext` blocks also grow by up to ~800 chars of change
+    summary per event now that `diffText` is rendered there too, so `packEventsUnderCap` fits fewer
+    events per delivery under the existing 4000-char cap than it did before this change — expected,
+    not a regression: the deferred remainder still re-delivers at the next context event.
+  - The hook-deliver transport uses the same **two distinct, session- and socket-scoped markers** as
+    the channel side: a genuinely-deferred-remainder marker ("more monitor updates are pending; ...
+    redeliver") and a claimed-unread marker for THIS claim's own content being cut (a single oversized
+    event, or a truncated reminder message) — not other pending work being deferred. Rendering now
+    happens BEFORE the reservation is committed, so the claimed-unread marker deliberately does not
+    assert a specific claimed/redelivery outcome (it stated "will not redeliver automatically" in an
+    earlier round, which was false whenever the following commit resolved null — and simply uncertain
+    whenever it rejected instead); it instead reads "the full copy stays unread", true regardless of
+    which of the three commit outcomes occurs. Both markers can now appear together in the same
+    `additionalContext` when the sole reserved event is itself oversized AND further, different
+    high-urgency work also stays genuinely pending beyond it — previously the claimed-unread marker
+    alone silently suppressed that second, real signal. The channel transport has the identical mixed
+    case and the identical fix: when the sole reserved event is itself oversized and further
+    high-urgency work also stays genuinely pending, `renderChannelEvent` now appends its deferral marker
+    alongside the truncation marker instead of the truncation marker alone, which previously silently
+    dropped the "more work is pending" signal on the channel side.
+  - Both transports now validate a `turn-interruptible` claim's fit against the SAME budget the renderer
+    uses **before ever durably claiming it**: `hook deliver` reserves (leases, does not claim), re-checks
+    the actual reserved claim's fit, and only then commits — closing a race where the sizing preview and
+    the eventual claim are separate round-trips and a concurrent caller could substitute different,
+    larger pending events into the same requested count, passing the count check but overflowing the
+    cap on an already-(and now irreversibly-)claimed row.
+  - `hook deliver` renders off the reservation's own (not-yet-committed) claim, writes it to stdout,
+    and only commits AFTER that write **fully** completes — awaited through the write's own completion
+    callback (or a stream `'error'` event, whichever fires first), never `stdout.write`'s synchronous
+    return value, which only signals backpressure. A write can return `true` immediately and still fail
+    asynchronously afterward (e.g. `EPIPE` once the reading end has closed); previously that async
+    failure could arrive after the reservation was already committed, silently losing the delivery. A
+    write failure (synchronous or asynchronous) now releases the reservation instead of committing.
+  - `agentmonitors session start`'s `SessionStart` post-compact recap now follows the identical
+    reserve → render → write → commit ordering: it reserves the `post-compact` delivery, renders it,
+    writes it to stdout **awaiting the write's full completion**, and only then commits — instead of
+    the prior direct `claimDelivery` call (the durable claim) made BEFORE anything was rendered or
+    written. A write failure now releases the reservation instead of committing, so nothing is
+    durably (re-)claimed when the recap never reached the agent.
+  - A reminder claim raced down from a settled-high sizing preview no longer inherits that preview's
+    stale `moreDeferred: true` — it is always reported `false` for an eventless reminder, mirroring the
+    channel transport's identical handling of the same preview↔reserve race.
+  - Both markers' `--socket <path>` clause is now rendered with a shared, transport-safe path escaper
+    (bash/zsh ANSI-C quoting, hex-escaping any byte outside a conservative safe set) instead of a plain
+    POSIX single-quote: a socket path is interpolated into the recovery command AFTER the surrounding
+    content's own tag-safety sanitization has already run, so a path containing `<`/`>`/`[`/`]` (or a
+    backtick / control character) could otherwise reintroduce those forbidden bytes into the pushed
+    content raw. The new escaping is both tag-safe and shell-round-trip-safe.
+
+  See docs/specs/006-agent-integration.md §4.2.1 and §5.5.
+
+- dea1510: Fix two review-round-7 defects in the delivery-transport health surface (#425):
+  - **`HookDeliveryHold.claimedEventIds` is now optional**, not required. The transport-health work
+    in this release added it as a required field on this already-published `@agentmonitors/core`
+    public interface with no accompanying changeset — a breaking addition that also didn't reflect
+    reality: a `HookDeliveryDiagnosis` can arrive over the daemon IPC boundary from an older build
+    that predates the field, serializing a hold with no `claimedEventIds` key at all despite the
+    compile-time type.
+  - **`doctor`'s reminders-suppressed remediation no longer treats a missing `claimedEventIds` as an
+    ack-all fallback.** Previously, a suppressing hold with no `claimedEventIds` contributed a
+    literal `undefined` into the ids list, which rendered as a malformed, blank
+    `--event-ids  --socket ...` flag — worse than the documented "omit the flag" fallback for a
+    genuinely empty `[]`, since it looks like a safe, scoped command while actually being broken. A
+    session whose suppression evidence can't be trusted this way is now reported via the existing
+    `delivery-diagnosis-unavailable` code (with an upgrade-the-daemon remediation) instead, and
+    correctly blocks `deliverable` like every other diagnosis-unavailable case.
+
+  See docs/specs/006-agent-integration.md §12 and docs/specs/spec-changelog.md.
+
+- fde6b6a: Harden `parseOperationTimeoutMs`'s `timeout` scope-field validation (issue #304 review, second
+  round): a present but non-string value (e.g. `timeout: 123` or `timeout: null`) is now rejected
+  instead of silently falling back to the default like a genuinely omitted field; a leading-zero
+  duration (`"01s"`) is now rejected, matching the JSON Schema `pattern`'s `[1-9]\d*` grammar (a
+  deliberate validation tightening — `parseDuration`'s own digit group previously accepted it); and a
+  duration exceeding Node's 32-bit `setTimeout` maximum (`2_147_483_647`ms, ~24.8 days — e.g. `"25d"`)
+  is now rejected instead of silently overflowing to a near-instant timer. Also exports the new
+  `MAX_OPERATION_TIMEOUT_MS` constant next to `DEFAULT_OPERATION_TIMEOUT_MS`.
+- 97b0673: Use the monitor's authored name as a delivered event's title, instead of the source's
+  implementation detail. A `command-poll` monitor announced itself with its raw argv as both `title`
+  and `summary` — a GitHub poller with a large `jq` program produced a ~400-character headline that
+  was entirely its own implementation, on every delivery, while the author's perfectly good `name:`
+  appeared nowhere.
+  - The runtime now decides an event's `title` at materialization: the monitor's authored `name` when
+    present, otherwise the source-provided title unchanged (the documented fallback). Because the
+    choice happens once in the core, the hook and channel transports carry the identical headline.
+  - The source's own per-object text is not lost — it remains the event `summary`, and the full source
+    identity remains on `objectKey` and in `payload` for debugging and querying.
+  - Sources that interpolate a **configuration-identity** `objectKey` — `command-poll`'s joined argv
+    and `api-poll`'s URL — now bound it with the new `displayObjectKey` helper (unchanged at or below
+    60 code units, otherwise a prefix ending in `…`, cut at a grapheme-cluster boundary so truncation
+    never emits a lone surrogate or splits a flag/ZWJ sequence). Keyed-collection change detection
+    bounds only the monitor-scope half of a `<scope>#<key>` identity, so the informative per-item key
+    is always rendered whole. Path-like keys (`file-fingerprint`, `incoming-changes`) are deliberately
+    NOT bounded: a path's informative part is its tail, so head-truncation would destroy it; those need
+    a path-aware ellipsis, tracked separately. A nameless monitor's fallback title is therefore
+    headline-sized for the configuration-identity sources, not universally.
+  - Both injecting transports' shared per-event block now renders TWO possible detail lines beneath
+    the title: the source's deterministic per-object detail (`DeliveryEventSummary.objectDetail`,
+    never digest-replaced — omitted when identical to the title or the body), and, on its own
+    additional line, the recipient-visible digest (`DeliveryEventSummary.summary`, an Interpret digest
+    when one was produced — omitted when identical to the title, the body, OR the object-detail line).
+    This keeps a per-object source's delivery self-sufficient AND preserves a successful Interpret
+    summarization: a named multi-object `prose` monitor's delivery names which object moved without
+    silently discarding the digest.
+  - `api-poll` now redacts the URL in its observation title/summary (userinfo, query, and fragment
+    stripped — the same redaction its warning text already used) before bounding it, so a polled URL
+    carrying a token cannot leak into durably persisted, agent-delivered text. The exact URL remains on
+    `objectKey` and `payload.url`. The same redaction is threaded through `diffKeyedCollection`'s new
+    optional `displayScope` parameter, so a keyed-collection observation from a URL-scoped source gets
+    the identical protection as the non-collection branch.
+  - An ephemeral monitor's explicit `--display-name` now reaches the authored-name signal, so a named
+    ephemeral watch headlines with its display name exactly as a persistent monitor's `name:` does —
+    including after a daemon restart reconstructs the definition from its durable record. Both this
+    and a persistent monitor's frontmatter `name` now reject a whitespace-only value.
+  - `events list --format text` passes every source-/author-controlled field (`monitorId`, `title`,
+    the `summary` suffix) through a control-safe single-line transform before interpolation: CR/LF and
+    Unicode line/paragraph separators collapse to a space, and every other C0/C1 control character
+    (DEL and TAB included) is escaped to a visible `\uXXXX` form — a hostile payload can no longer
+    forge an extra row or emit a raw terminal escape sequence.
+  - `displayObjectKey` and `DeliveryEventSummary.objectDetail` are additive `@agentmonitors/core`
+    public API surface (minor bump); `diffKeyedCollection` gains an additive optional sixth parameter,
+    `displayScope`. Existing consumers are unaffected.
+
+  See docs/specs/002-runtime-delivery.md §5.4, §9.1 and docs/specs/003-source-plugins.md §2.8.
+
+- 9e6cf2f: Make delivered monitor text self-sufficient, and let each transport own its own attribution.
+
+  The coalesced `normal`/`low` reminder used to read `AgentMon messages are available. Read the inbox.`
+  — which named a product on a surface that already identified it, pointed at the non-authoritative
+  legacy `inbox` model, and told the recipient nothing they could actually run. The runtime's own
+  message is now just the transport/verb-neutral semantic sentence:
+
+  ```
+  Monitored changes are pending.
+  ```
+
+  Each transport appends its own concrete, session- (and where applicable socket-) scoped action step:
+  the hook transport appends `agentmonitors events list --session <id> --unread` / `agentmonitors
+events ack --session <id>`, and the channel transport points at listing the unread events followed
+  by its `agentmon_ack` tool.
+  - **Attribution is transport-owned.** The runtime emits an unattributed, semantic message; the
+    hook transport prepends `AgentMon: ` (its injected context arrives unlabeled), and the channel
+    transport prepends nothing (its `<channel source="agentmonitors">` tag already names the source,
+    so the old prefix double-attributed every push). Adding a new delivery surface now means choosing
+    its attribution in that transport, not editing the runtime.
+  - **Deliveries that inject event bodies now say how to finish.** A high-urgency delivery and the
+    `SessionStart` recap each carry a single per-batch line naming the acknowledge command for that
+    session. Because claiming is not acknowledging, a session that handled its delivery but never
+    acknowledged previously had that same band's own later reminder silently suppressed by the
+    band-scoped coalesced-until-ack rule (an unacknowledged claim never suppresses a different,
+    unrelated urgency band's reminder), with the remediation visible only in `monitor explain`.
+  - **Acknowledging a whole session no longer risks a row an in-flight channel push is still
+    mid-surfacing.** `AgentMonitorRuntime.acknowledgeSession(sessionId)` (no explicit `eventIds`) now
+    excludes rows currently leased by an outstanding delivery reservation (issue #300). The reminder-
+    suppression diagnosis (`monitor explain`, `hook deliver --debug`) also gains a `reserved-in-flight`
+    `HookDeliveryHoldReason`/`ReminderSuppressionReason` for this case, so a live lease is never
+    reported (or explained) as something `events ack` can or should clear.
+  - No change to notify/debounce timing, urgency bands, coalescing behavior, or the
+    unread/claimed/acknowledged model. The legacy `inbox` CLI surface is untouched.
+
+  See docs/specs/002-runtime-delivery.md §9.2 and docs/specs/006-agent-integration.md §5.1.1.
+
+- fde6b6a: Export `parseOperationTimeoutMs`, `DEFAULT_OPERATION_TIMEOUT_MS`, and `OPERATION_TIMEOUT_PATTERN`
+  next to `parseDuration`, centralizing the `timeout` scope-field default/parse/pattern that
+  `api-poll` and `command-poll` had each hand-maintained as an identical copy. The helper also
+  rejects a zero-length duration (`"0s"`, `"0m"`, `"0h"`, `"0d"`) even though `parseDuration` itself
+  accepts one — a zero-length request/command deadline is never a meaningful configuration.
+- c8d16cd: Fix `diffText` for `change-detection.strategy: json-diff` objects to render a structural diff
+  (added/removed/changed elements or key paths) instead of a compact-JSON line diff. Previously, a
+  single-line JSON snapshot (e.g. `gh pr list --json` output) losing or gaining one array element
+  rendered as a whole-line remove-all/add-all, since the line-based renderer saw the entire array
+  serialized onto one line. `json-diff` objects now render via the new `buildJsonDiff`, which diffs
+  arrays of objects by element identity (a stable-key heuristic, then deep-equality matching) with an
+  index-based fallback for non-object arrays, bounded to 20 diff entries, each rendered value and path
+  segment bounded and escaped, and a final total-output cap. New public exports: `buildDiff` and the
+  `ChangeDetectionStrategy` type of its `strategy` parameter. `text-diff`/`exit-code`/omitted-strategy
+  objects are unaffected.
+- dea1510: `writePrivateFileAtomic` accepts an optional `tempSuffix` option, distinguishing the temp file used
+  during the atomic write (default: none, same as before). `apps/cli`'s transport-heartbeat writer
+  previously re-forked this exact atomic-write sequence (owner-only directory, `O_EXCL` temp file,
+  rename) solely to use a `.<pid>` temp suffix instead of the fixed one, so two transports refreshing
+  the same heartbeat record concurrently wouldn't race on the same temp path. It now calls the shared
+  helper instead of maintaining its own copy.
+
+### Patch Changes
+
+- 81ac973: Fix a delivery-loss defect in the Claude Code channel transport: it no longer marks a delivery
+  claimed before it has surfaced it. The channel now **reserves** the delivery, pushes it, and
+  **commits** the claim only after a successful push — releasing the reservation on a rejected or
+  disconnected push so the event stays unclaimed and re-delivers via the hook transport (or the next
+  poll). Previously a transient MCP disconnect permanently consumed the delivery, because the rows were
+  left claimed and the hook path suppressed them as cross-transport duplicates.
+  - New core `reserveDelivery` / `commitDelivery` / `releaseDelivery` (with an in-memory reservation
+    registry) and matching `hook.reserve` / `hook.commit` / `hook.release` daemon IPC. Reserving leases
+    the rows so a concurrent hook claim can't double-surface them; committing marks them claimed ("was
+    surfaced") — never acknowledged. `claimDelivery` is refactored into a shared decide + apply, leaving
+    the hook transport's behavior unchanged.
+  - If a push succeeds but the commit can't land (the lease lapsed mid-push, or the daemon restarted),
+    the rows re-deliver rather than being lost — at-least-once, never at-most-once — and the transport
+    reports that outcome distinctly instead of claiming success.
+  - Diagnostics and the hook-state projection are lease-aware: while a push is in flight they exclude
+    the reserved rows from "pending claimable work", staying consistent with the claim decision.
+  - No change to notify/debounce timing, urgency bands, or the unread/claimed/acknowledged model.
+
+  See docs/specs/006-agent-integration.md §4.5.1.
+
+- 784e627: Fix cross-monitor delivery coalescing (issue #441): two monitors watching overlapping state (e.g. a
+  high-urgency label monitor and a normal-urgency review-queue monitor both firing off the same
+  underlying change) previously interrupted a session TWICE for one action — a settled high-urgency
+  delivery in one `turn-interruptible` claim, then a separate normal-urgency reminder in a later one.
+
+  When both a settled high-urgency batch and a due normal-urgency reminder are decided in the same
+  `claimDelivery`/`reserveDelivery` call, they now fold into ONE `DeliveryClaim`: the `events` array
+  and top-level `urgency: 'high'` are unchanged from a pure high delivery (never downgraded by the
+  coalesced reminder), the normal reminder's generic prompt is appended to the message (never
+  escalated into per-event detail), and both event sets are claimed together — so there is no leftover
+  second interrupt for the same action. A normal-only reminder (no high-urgency event pending) is
+  unaffected and still reports `urgency: 'normal'`.
+
+  Also: a due normal reminder is now withheld (not fired standalone) while sibling high-urgency work
+  is still pending but unsettled, so it coalesces into that delivery once it settles instead of
+  preempting a separate, later high-urgency interrupt. `DeliveryClaim` gained an optional
+  `coalescedReminder: string` field carrying the coalesced text explicitly — `events`/`message` alone
+  were not enough for the hook-deliver/channel transports to notice it, which meant the coalesced
+  normal rows were claimed but never rendered. Both transports now render it as a footer after the
+  packed event block(s), and a new `previewCoalescedReminder`/`previewCoalescedReminderClient` lets a
+  length-bounded transport reserve room for it before sizing how many event blocks fit.
+  `diagnoseHookDelivery` (`hook deliver --debug`) also now reports this withheld state, and correctly
+  reports the pre-existing coalesced-until-ack hold even when settled high-urgency work is
+  simultaneously being delivered.
+
+- 8084b10: Reject invalid IANA timezones on `schedule` monitors and the `rollup` notify strategy at authoring
+  time (`validate`, `monitor test`, `watch declare`), and defensively isolate a runtime timezone
+  failure to the affected monitor instead of aborting the whole daemon tick.
+
+  Previously, a typo'd `timezone` (e.g. `America/New_Yrok`) on a `schedule` monitor made
+  `Intl.DateTimeFormat` throw deep inside cron scheduling — and because that call happened outside the
+  per-monitor error isolation, it aborted the **entire** tick, silently stopping every other monitor
+  from running. Now:
+  - `validate`, `monitor test`, and `watch declare` reject an invalid `schedule` `scope.timezone` with
+    an actionable error naming the bad value (the `rollup` notify strategy's `timezone` was already
+    validated this way).
+  - If an invalid timezone reaches the runtime anyway (a hand-edited `MONITOR.md` that skipped
+    `validate`), it is isolated to that one monitor — recorded as an `errored` observation, surfaced in
+    `daemon once`/`daemon run` output, and reported by `monitor explain` as an observation-stage
+    failure — instead of crashing the tick or the diagnostic command. Every other monitor keeps
+    running unaffected.
+
+- 518f610: Order snapshots deterministically when second-resolution timestamps tie.
+
+  `monitor_snapshots.created_at` is stored at epoch-second precision, so several snapshots for one
+  `(workspace, monitor, object)` written in the same second all tied on `created_at`.
+  `latestSnapshot()` ordered only by `created_at DESC` and could return the **oldest** tied snapshot
+  as "latest", corrupting the shared diff chain (choosing an older predecessor repeats or omits
+  intermediate changes during bursts). A direct `v1, v2, v3` reproduction returned `v1`.
+
+  Snapshots now carry a monotonic ULID `id` (strictly increasing in insertion order), and
+  `latestSnapshot()` breaks ties with `ORDER BY created_at DESC, id DESC` — the same
+  `(created_at, id)` tie-break the `monitor_events` table already uses. The observation-history audit
+  trail and the newest-first event listings (`events list` / `monitor explain`) apply the same `id`
+  tie-break so their within-second order is stable. No schema migration: `id` was already a ULID
+  column.
+
 ## 0.12.0
 
 ### Minor Changes

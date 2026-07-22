@@ -1,5 +1,23 @@
 # @agentmonitors/source-incoming-changes
 
+## 0.3.2
+
+### Patch Changes
+
+- Updated dependencies [81ac973]
+- Updated dependencies [b474d10]
+- Updated dependencies [784e627]
+- Updated dependencies [dea1510]
+- Updated dependencies [fde6b6a]
+- Updated dependencies [97b0673]
+- Updated dependencies [8084b10]
+- Updated dependencies [9e6cf2f]
+- Updated dependencies [fde6b6a]
+- Updated dependencies [518f610]
+- Updated dependencies [c8d16cd]
+- Updated dependencies [dea1510]
+  - @agentmonitors/core@0.13.0
+
 ## 0.3.1
 
 ### Patch Changes
