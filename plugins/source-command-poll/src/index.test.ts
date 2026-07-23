@@ -8,13 +8,17 @@
  * The tests spawn tiny real subprocesses (`node -e …`) so the no-shell spawn path is
  * genuinely exercised — not a hand-built approximation. Dates are fixed; no network.
  */
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
+  writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1367,6 +1371,388 @@ describe.skipIf(process.platform === 'win32')(
         stdout: 'hi\n',
       });
     });
+  },
+);
+
+/**
+ * Regression tests for the issue #470 review: the self-watchdog must **fail
+ * closed**. The original watchdog script slept and then unconditionally SIGKILLed
+ * the command's process group; if its `sleep` could not run (e.g. a restricted
+ * `PATH`) it fell straight through to the kill and SIGKILLed a perfectly healthy
+ * command almost instantly. And if the watchdog could not be launched at all, the
+ * command was left running with no independent bound — defeating the guarantee
+ * #470 exists to make.
+ *
+ * The fix is twofold: (1) the watchdog never signals unless it genuinely armed
+ * (so a missing `sleep` can never reach the kill), and (2) if no independent bound
+ * was armed, the runtime terminates the command and reports a failure rather than
+ * run it unbounded. Both regressions drive the real `observe()` path with a
+ * `PATH` that starves the watchdog of what it needs, and assert the command is
+ * failed closed — never reported as a healthy result, never left leaked.
+ *
+ * Skipped on Windows, which has no POSIX self-watchdog (a documented platform
+ * limitation); its commands are bounded only by the daemon-resident timers.
+ */
+describe.skipIf(process.platform === 'win32')(
+  'source-command-poll: self-watchdog arming fails closed (issue #470 review)',
+  () => {
+    /** Absolute path of a binary, resolved before any PATH mutation. */
+    function resolveBin(name: string): string {
+      return execFileSync('sh', ['-c', `command -v ${name}`], {
+        encoding: 'utf8',
+      }).trim();
+    }
+
+    /**
+     * Run `body` with `process.env.PATH` set to a fresh bin directory containing
+     * symlinks to exactly `binaries` — so the watchdog sees only those on its
+     * PATH. Restores the prior PATH afterward. The monitored command itself is
+     * always invoked by absolute path (`nodeArgv`), so it never depends on PATH.
+     */
+    /** Poll `childProcessCount()` until it returns to `baseline` or the deadline. */
+    async function awaitChildBaseline(
+      baseline: number,
+      deadlineMs = 6_000,
+    ): Promise<boolean> {
+      const deadline = Date.now() + deadlineMs;
+      while (Date.now() < deadline) {
+        if ((await childProcessCount()) <= baseline) return true;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      return (await childProcessCount()) <= baseline;
+    }
+
+    async function withPathContaining(
+      binaries: string[],
+      body: () => Promise<void>,
+    ): Promise<void> {
+      const resolved = binaries.map((b) => [b, resolveBin(b)] as const);
+      const dir = mkdtempSync(join(tmpdir(), 'am-470-path-'));
+      const previousPath = process.env['PATH'];
+      try {
+        for (const [name, target] of resolved) {
+          symlinkSync(target, join(dir, name));
+        }
+        process.env['PATH'] = dir;
+        await body();
+      } finally {
+        process.env['PATH'] = previousPath;
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+
+    it('fails a long-running command closed when the watchdog cannot find `sleep` (no early kill, no unbounded run)', async () => {
+      const baseline = await childProcessCount().catch(() => 0);
+      // `sh` and `mkfifo` are reachable (the watchdog can launch and the liveness
+      // pipe can be created), but `sleep` is not — so the watchdog can never time
+      // its backstop and must exit WITHOUT signalling. The runtime then fails the
+      // command closed.
+      await withPathContaining(['sh', 'mkfifo'], async () => {
+        const start = Date.now();
+        const result = await source.observe(
+          { command: nodeArgv('setTimeout(() => {}, 60000)'), timeout: '30s' },
+          ctx(),
+        );
+        const elapsed = Date.now() - start;
+
+        // Reported as a failure (not a healthy result), citing the arming failure.
+        expect(result.observations).toHaveLength(1);
+        expect(result.observations[0]?.title).toContain('Command failing');
+        const payload = result.observations[0]?.payload as { error: string };
+        expect(payload.error).toMatch(/self-bounding watchdog/i);
+        expect(result.nextState).toMatchObject({ health: 'failing' });
+
+        // Fail-closed acted near-immediately — the command was neither allowed to
+        // run to its 60s natural end nor left bounded only by the 30s daemon
+        // timer. (A generous ceiling absorbs CI scheduling jitter.)
+        expect(elapsed).toBeLessThan(15_000);
+      });
+
+      if (PGREP_AVAILABLE) {
+        expect(await awaitChildBaseline(baseline)).toBe(true);
+      }
+    }, 30_000);
+
+    it('fails a long-running command closed when the watchdog itself cannot be launched (`sh` missing)', async () => {
+      const baseline = await childProcessCount().catch(() => 0);
+      // Only `mkfifo` is reachable: the liveness pipe is created, but the watchdog
+      // `sh` launch fails (ENOENT), so no independent bound is armed and the
+      // command must be failed closed rather than run unbounded.
+      await withPathContaining(['mkfifo'], async () => {
+        const result = await source.observe(
+          { command: nodeArgv('setTimeout(() => {}, 60000)'), timeout: '30s' },
+          ctx(),
+        );
+        expect(result.observations).toHaveLength(1);
+        const payload = result.observations[0]?.payload as { error: string };
+        expect(payload.error).toMatch(/self-bounding watchdog/i);
+        expect(result.nextState).toMatchObject({ health: 'failing' });
+      });
+
+      if (PGREP_AVAILABLE) {
+        expect(await awaitChildBaseline(baseline)).toBe(true);
+      }
+    }, 30_000);
+  },
+);
+
+/**
+ * Regression test for the issue #472 review: the self-watchdog's liveness pipe
+ * previously handed its write end to the command at fd 3. Read-EOF on that pipe
+ * is meant to mean "the whole command group has exited," but EOF also arrives the
+ * moment the command closes ITS OWN copy of fd 3 — an ordinary shell idiom
+ * (`exec 3>&-`) that has nothing to do with the group actually dying. The bug:
+ * the watchdog disarmed instantly on that spurious EOF, so if the real daemon
+ * died before the backstop deadline, the command orphaned indefinitely — the
+ * exact failure #470 exists to prevent, silently reintroduced.
+ *
+ * This test drives the real production code, not a hand-built approximation: it
+ * spawns a genuine surrogate "daemon" Node process that calls the actual
+ * `source.observe()`, lets the real liveness pipe and self-watchdog arm, then
+ * SIGKILLs that surrogate almost immediately — simulating an abrupt daemon death
+ * before its own SIGTERM/SIGKILL timers could ever fire. With the daemon gone,
+ * the self-watchdog is the ONLY thing standing between the command and an
+ * indefinite orphan. The monitored command itself closes fd 3
+ * (`exec 3>&- 2>/dev/null`) — the exact collision this review demonstrated — and
+ * the assertion is that the command's process group is still killed by the
+ * watchdog's backstop deadline. Pre-fix, this assertion is what fails: the
+ * command survives well past the deadline because the watchdog disarmed on the
+ * spurious EOF and never signals it.
+ *
+ * Skipped on Windows: the self-watchdog is POSIX-only (a documented platform
+ * limitation — 003 §11.2).
+ */
+describe.skipIf(process.platform === 'win32')(
+  'source-command-poll: self-watchdog survives an early fd-3 close (issue #472 review)',
+  () => {
+    it('kills the command group at the backstop deadline even when the command closes fd 3, after the daemon dies', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'am-472-fd3-'));
+      const pidFile = join(dir, 'child.pid');
+      const runnerFile = join(dir, 'surrogate-daemon.mjs');
+      try {
+        const indexUrl = new URL('./index.ts', import.meta.url).href;
+        // Kept short so the whole test stays fast; the surrogate is killed long
+        // before this would ever elapse naturally (003 §11.2's own timers never
+        // get a chance to run here — that's the point).
+        const timeoutSecs = 2;
+        // Backstop deadline = ceil((timeout + grace(5s) + slack(2s)) / 1000) after
+        // the command is spawned (003 §11.2) = 9s here; generous margin for CI
+        // jitter on top.
+        const backstopMarginMs = 20_000;
+
+        const scope = {
+          command: [
+            'sh',
+            '-c',
+            `echo $$ > ${JSON.stringify(pidFile)}; exec 3>&- 2>/dev/null; sleep 30`,
+          ],
+          timeout: `${String(timeoutSecs)}s`,
+        };
+        // A standalone Node process plays the role of "the daemon": it calls the
+        // real `observe()`, then SIGKILLs itself shortly after the watchdog would
+        // have armed — simulating the daemon dying mid-command, before its own
+        // SIGTERM/SIGKILL escalation timers ever get to run.
+        writeFileSync(
+          runnerFile,
+          [
+            `const { default: source } = await import(${JSON.stringify(indexUrl)});`,
+            `const scope = ${JSON.stringify(scope)};`,
+            `source.observe(scope, { now: new Date(${String(NOW.getTime())}) }).catch(() => {});`,
+            `setTimeout(() => { process.kill(process.pid, 'SIGKILL'); }, 500);`,
+          ].join('\n'),
+        );
+
+        const surrogate = spawn(
+          process.execPath,
+          ['--experimental-strip-types', runnerFile],
+          { stdio: 'ignore' },
+        );
+        await new Promise<void>((resolve) => {
+          surrogate.once('exit', () => {
+            resolve();
+          });
+        });
+
+        // The surrogate "daemon" is now dead. The command's own liveness-pipe
+        // write end and the self-watchdog are the only things that can still
+        // bound it.
+        const gotPidFile = await pollUntil(() => existsSync(pidFile), 3_000);
+        expect(gotPidFile).toBe(true);
+        const orphanPid = Number(readFileSync(pidFile, 'utf8').trim());
+        expect(Number.isInteger(orphanPid)).toBe(true);
+
+        const dead = await pollUntil(
+          () => !isProcessAlive(orphanPid),
+          backstopMarginMs,
+        );
+        expect(dead).toBe(true);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }, 30_000);
+  },
+);
+
+/**
+ * Regression test for the issue #472 review: the self-watchdog was proactively
+ * SIGKILLed the instant `observe()` resolved on any NON-timeout path, on the
+ * assumption that the direct child's own exit means the whole process group is
+ * done. That assumption is false for the same idiom issue #303's group-kill
+ * exists for: a leader can background a descendant and exit 0 while that
+ * descendant is still very much alive. Proactively killing the watchdog at that
+ * point destroyed the one thing left capable of noticing and reaping it — and no
+ * daemon-side timer is ever armed for a non-timeout resolution either — so the
+ * descendant leaked silently on every such observation, with nothing bounding it
+ * at all (not even the ordinary daemon death case #470 exists to guard against).
+ *
+ * The fix lets the watchdog run to its own natural conclusion on every outcome:
+ * it disarms itself the instant its own liveness pipe proves the group is
+ * genuinely gone (near-instant for a well-behaved command), and otherwise reaps
+ * the group at its own backstop deadline regardless of how `observe()` resolved.
+ */
+describe.skipIf(process.platform === 'win32')(
+  'source-command-poll: the self-watchdog is never reaped early on a clean leader exit (issue #472 review)',
+  () => {
+    it('reaps a descendant backgrounded by a leader that exits 0, instead of leaking it forever', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'am-472-clean-exit-'));
+      const pidFile = join(dir, 'child.pid');
+      try {
+        const scope = {
+          command: [
+            'sh',
+            '-c',
+            `sleep 30 & echo $! > ${JSON.stringify(pidFile)}; exit 0`,
+          ],
+          timeout: '1s',
+        };
+
+        const result = await source.observe(scope, ctx());
+        // A clean, successful leader exit — never reported as a failure or timeout.
+        expect(result.nextState).toMatchObject({ health: 'ok' });
+
+        const descendantPid = Number(readFileSync(pidFile, 'utf8').trim());
+        expect(Number.isInteger(descendantPid)).toBe(true);
+        // Genuinely still alive right after `observe()` returns — this is the
+        // leaked-descendant scenario, not a race with an already-dead process.
+        expect(isProcessAlive(descendantPid)).toBe(true);
+
+        // Backstop deadline = ceil((timeout(1s) + grace(5s) + slack(2s)) / 1000) =
+        // 8s after the command was spawned; generous margin for CI jitter on top.
+        const dead = await pollUntil(
+          () => !isProcessAlive(descendantPid),
+          15_000,
+        );
+        expect(dead).toBe(true);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }, 20_000);
+  },
+);
+
+/**
+ * Regression test for the issue #472 review: `spawn()` for the monitored command
+ * CAN throw synchronously — not just fail asynchronously via the child's `'error'`
+ * event — for arguments `execve(2)` can never accept at all, e.g. a command
+ * containing an embedded NUL byte. That throw previously skipped every line after
+ * it, including the `closeSync` calls that release the liveness pipe's two fds,
+ * leaking both on every single such call — a monitor that reaches this state on
+ * every tick leaks the daemon's fd table without bound. The fix wraps the `spawn`
+ * call in a try/catch that releases both fds and reports a clean execution
+ * failure instead of propagating the throw.
+ */
+describe.skipIf(process.platform === 'win32')(
+  'source-command-poll: no fd leak when spawn() throws synchronously (issue #472 review)',
+  () => {
+    it('does not accumulate open fds across repeated NUL-byte-command spawn failures', async () => {
+      const nulByteCommand = [`a${String.fromCharCode(0)}b`];
+      const before = readdirSync('/dev/fd').length;
+
+      let state: unknown;
+      for (let i = 0; i < 20; i += 1) {
+        const result = await source.observe(
+          { command: nulByteCommand },
+          ctx(state),
+        );
+        state = result.nextState;
+        if (i === 0) {
+          expect(result.observations).toHaveLength(1);
+          expect(result.observations[0]?.title).toContain('Command failing');
+        }
+      }
+
+      const after = readdirSync('/dev/fd').length;
+      // Pre-fix this grew by ~2 fds per call (40 fds leaked across 20 calls, the
+      // exact ratio the review demonstrated); post-fix it stays flat modulo a
+      // small constant slack unrelated to the loop's iteration count.
+      expect(after - before).toBeLessThan(5);
+    });
+  },
+);
+
+/**
+ * Regression test for the issue #472 review: 003 §11.2 previously claimed that a
+ * watchdog which fails to arm means the monitored command "never runs" — that is
+ * false. The command is spawned (and can begin producing real side effects)
+ * BEFORE the arming handshake is even attempted; if arming later fails, the fix
+ * (issue #470 review) terminates the command PROMPTLY, but does not and cannot
+ * undo whatever the command already did in that window. This test proves the
+ * command genuinely started — by observing a side-effect file it writes as its
+ * very first action — even though the overall execution is still correctly
+ * reported as a self-bounding-watchdog arming failure.
+ */
+describe.skipIf(process.platform === 'win32')(
+  'source-command-poll: an arming-failure command still runs (and can side-effect) before being terminated (issue #472 review)',
+  () => {
+    /** Absolute path of a binary, resolved before any PATH mutation. */
+    function resolveBin(name: string): string {
+      return execFileSync('sh', ['-c', `command -v ${name}`], {
+        encoding: 'utf8',
+      }).trim();
+    }
+
+    it('writes its side-effect marker before the fail-closed kill lands', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'am-472-side-effect-'));
+      const markerFile = join(dir, 'marker');
+      const binDir = mkdtempSync(join(tmpdir(), 'am-472-path-'));
+      const previousPath = process.env['PATH'];
+      try {
+        // `sh` and `mkfifo` are reachable (the watchdog can launch and the
+        // liveness pipe can be created), but `sleep` is not — so arming can never
+        // complete and the runtime must fail the command closed (issue #470
+        // review). The monitored command writes its marker as its very first
+        // action, before any delay of its own.
+        for (const bin of ['sh', 'mkfifo']) {
+          symlinkSync(resolveBin(bin), join(binDir, bin));
+        }
+        process.env['PATH'] = binDir;
+
+        const result = await source.observe(
+          {
+            command: [
+              'sh',
+              '-c',
+              `echo side-effect > ${JSON.stringify(markerFile)}; sleep 60`,
+            ],
+            timeout: '30s',
+          },
+          ctx(),
+        );
+
+        expect(result.observations).toHaveLength(1);
+        const payload = result.observations[0]?.payload as { error: string };
+        expect(payload.error).toMatch(/self-bounding watchdog/i);
+
+        // The command DID run and produce its side effect — the arming failure
+        // terminates it promptly, but does not (and structurally cannot) undo
+        // work already done before that termination lands.
+        expect(existsSync(markerFile)).toBe(true);
+      } finally {
+        process.env['PATH'] = previousPath;
+        rmSync(binDir, { recursive: true, force: true });
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }, 15_000);
   },
 );
 

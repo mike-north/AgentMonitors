@@ -9,6 +9,129 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-07-22 — command-poll self-watchdog: fd leak fix, never-reaped-early fix, doc correction, one open descendant-liveness gap (000, 003 §11.2) — Refs #470, #472
+
+Second review round on the hardened self-watchdog. Four findings; three fixed with regression tests,
+one left open (a design tradeoff, not an oversight) with the analysis recorded here and on the PR
+thread.
+
+- **Fixed — fd leak on synchronous `spawn()` throw.** `spawn()` can throw synchronously for
+  arguments `execve(2)` can never accept (e.g. an embedded NUL byte), skipping the `closeSync` calls
+  that release the liveness pipe's two fds — confirmed leaking ~2 fds per call, unbounded across
+  repeated ticks. The `spawn()` call is now wrapped in a try/catch that always releases both fds and
+  reports a clean execution failure instead of propagating the throw.
+- **Fixed — the watchdog was reaped too early on a clean leader exit.** The runtime proactively
+  SIGKILLed the watchdog immediately on any NON-timeout resolution, assuming the direct child's exit
+  means the whole group is done. False: a leader can background a descendant and exit 0
+  (`sh -c 'sleep 300 & ...; exit 0'`, the same idiom #303's group-kill exists for) while that
+  descendant is still alive — and no daemon-side timer is armed for a non-timeout resolution either,
+  so it leaked silently with nothing bounding it. The runtime now never proactively kills the
+  watchdog on any outcome; it disarms itself (via the same liveness-pipe proof used on the timeout
+  path) the instant the group it can observe is actually gone, and otherwise reaps at its own
+  deadline regardless of how `observe()` resolved.
+- **Fixed — a false doc claim.** 003 §11.2 claimed an arming failure means the monitored command
+  "never runs." False: the command is spawned before arming is even attempted (a real process group
+  has to exist for the watchdog to target), so it can perform real side effects in the window before
+  an arming failure is detected and it is terminated — only the _result_ is suppressed. Corrected the
+  wording and added a regression test proving a side-effect file gets written even though the
+  execution is (correctly) reported as an arming failure.
+- **Left open — a descendant spawned via a close-on-exec-by-default process API never inherits the
+  liveness fd at all.** Confirmed on this head with both an explicit fd-close and, more
+  consequentially, an ordinary `child_process.spawn()`-backgrounded descendant: when the fd-holding
+  leader exits, the pipe EOFs even though that descendant is still alive, and the watchdog disarms —
+  silently reintroducing the #470 orphan failure for that class of command. This is not a hardening
+  edge case; close-on-exec-by-default is the standard behavior of most modern high-level spawn APIs
+  (Node's own `child_process.spawn`, Python's `subprocess`, Go's `os/exec`, Ruby's `Process.spawn`),
+  and fd inheritance into a further descendant is entirely the exec-ing process's own choice — there
+  is no portable OS mechanism to force it from outside that process tree. A fix that does not depend
+  on fd inheritance (periodic `kill -0`-based re-verification instead of a one-shot EOF proof) was
+  considered and rejected: it reintroduces, in a bounded-but-nonzero form, exactly the recycled-pgid
+  hazard the liveness pipe was built to close, trading a zero-risk proof for a probabilistic one.
+  Documented precisely (000 AP8, 003 §11.2, and the `COMMAND_LIVENESS_FD` doc comment) as a known,
+  currently-open gap rather than fixed with a materially different safety property.
+
+Changeset wording amended to match: "the daemon reaps the watchdog promptly" is no longer accurate
+(it never proactively reaps now), and the "whole process group"/"the group" phrasing is qualified to
+"the group members that hold the liveness fd."
+
+## 2026-07-22 — command-poll self-watchdog: liveness-pipe fd moved off fd 3; binary precondition documented (000, 003 §11.2) — Refs #470, #472
+
+Review finding on the hardened self-watchdog: the liveness pipe's write end was handed to the
+monitored command at fd 3. The watchdog's read-EOF-means-"group gone" logic depends on that fd
+staying open for the group's entire lifetime, but fd 3 is the single most collision-prone fd —
+ordinary shell idioms (`exec 3<file`, `read -u`, bash's `exec {var}<>file` auto-assignment starting
+at fd 10) or a command that simply does `exec 3>&-` close their inherited copy of it for reasons
+having nothing to do with the group dying. That closed the watchdog's pipe early, and it disarmed —
+never signalling — while the command kept running: if the real daemon died before the backstop
+deadline, the command orphaned indefinitely, silently reintroducing the exact #470 failure this
+mechanism exists to prevent. The fix moves the write end to a deliberately high fd (`fd 20`, well
+past the fds ordinary shell/script idioms reach for) so this class of collision can't occur; a
+`closefrom(3)`-style hardened program that closes every fd `>= 3` is a residual this can't fully
+close by fd placement alone (documented, not solved, in 003 §11.2) — an alive-check-before-kill
+alternative was considered and rejected because it reintroduces the recycled-pgid hazard the
+liveness pipe was built to close. Added a regression test that spawns a genuine surrogate "daemon"
+process, arms the real watchdog against a command that closes fd 3 itself, SIGKILLs the surrogate to
+simulate an abrupt daemon death, and asserts the orphan is still reaped at the backstop deadline.
+
+Also documented (no behavior change) a binary precondition of the fail-closed design that a second
+review flagged as previously implicit: every POSIX `command-poll` execution now hard-depends on
+`mkfifo`, `sh`, and `sleep` being reachable on `PATH`. On a binary-minimal image (slim/distroless/
+busybox) missing one of these, arming fails on every execution and the monitored command never runs
+— each observation instead reports a self-bounding-watchdog execution failure. Updated 003 §11.2 and
+the AP8 current-guarantee bullet in 000 to state this precondition explicitly.
+
+## 2026-07-22 — command-poll self-watchdog hardened: pgid-reuse safe, fail-closed, AP8 current/target split (000, 003 §11.2) — Refs #470
+
+Review hardening of the self-watchdog introduced below. Three correctness gaps in the initial
+"sleep-then-`kill -KILL -<pgid>`" watchdog are closed, and the AP8 invariant is split into current
+guarantees vs target work per PP7.
+
+- **pgid reuse.** A numeric pgid is recyclable: if the command exits on its own before the deadline,
+  the watchdog's delayed signal could kill an unrelated same-user process group that recycled the
+  pgid (the sleep can be up to ~24.8 days). The watchdog now binds to an **un-recyclable liveness
+  pipe** — the command group inherits the only write ends (an extra inherited fd), the watchdog holds
+  the read end, and a blocking read reaches EOF exactly when the whole group is gone. It signals only
+  while that pipe proves the group is still alive, so it never signals a recycled pgid. (A residual
+  microsecond check-then-signal window is inherent to signalling by pgid; race-free `pidfd` kill is
+  Linux-only — target work.)
+- **Descendant outliving the leader on timeout.** The watchdog is no longer disarmed the instant the
+  direct child exits on the timeout path; the daemon's own SIGKILL escalation is still armed for a
+  SIGTERM-ignoring descendant, so if the daemon dies during the grace, the watchdog (still armed via
+  the pipe) reaps that descendant.
+- **Fail closed.** If no independent bound can be armed (liveness pipe uncreatable, watchdog
+  unlaunchable, or arming unconfirmed), the runtime terminates the command and reports an execution
+  failure instead of running it unbounded; and the watchdog never falls through to a kill when it
+  cannot time its backstop (`sleep` missing), so a healthy command is never SIGKILLed early. `sh` is
+  resolved via `PATH` (portable across layouts without `/bin/sh`).
+
+AP8 in 000 is restated with an explicit current-guarantee (POSIX `command-poll` self-bounding) vs
+target-work (Windows self-bounding, startup stray-sweep, active graceful-shutdown reaping — #426)
+split, and the changeset's unconditional "can never orphan" claim is qualified to POSIX-only,
+best-effort. Updated 003 §11.2. Added regression tests: a `kill -9`-during-grace descendant-reap
+(non-vacuous — fails if the watchdog is disarmed early) and fail-closed arming under a starved
+`PATH`.
+
+## 2026-07-22 — command-poll children are self-bounding; new reap-ability invariant AP8 (000, 003 §11.2/§11.7) — Refs #470
+
+`command-poll` spawns its command `detached` (own process group, for #303's group-kill) but enforced
+the `timeout` with SIGTERM→SIGKILL timers living _in the daemon process_. If the daemon died abruptly
+(`kill -9`, crash, OOM) before a hung command's timeout fired, those timers died with it and the
+detached child reparented to launchd/init and survived **indefinitely** — a reliability-fatal leak
+for a daemon whose whole purpose is running unattended.
+
+The fix makes the child **self-bounding**: on POSIX each execution now also arms an independent,
+`detached` self-watchdog sibling that is handed the command's process-group id, sleeps until a
+backstop deadline (`timeout` + SIGKILL-grace + slack), and then SIGKILLs that whole group
+(`kill -KILL -<pgid>`). Being its own detached process, it survives the daemon's death and reaps the
+orphan on its own timer; on normal completion the daemon reaps the watchdog promptly. The command
+itself is still spawned directly (`shell: false`) — the watchdog is a _sibling_, not a shell wrapper
+— so every §11.1/§11.2/§11.5 semantic (no shell word-splitting, real spawn-failure errors, exact
+exit codes) is unchanged. Windows keeps its daemon-resident `taskkill /T /F` (no process groups); the
+self-bounding backstop is POSIX-only. Updated 003 §11.2 (execution model) and §11.7 (validation
+implications, incl. the new `kill -9`-the-daemon regression test). Added **AP8** to 000: "the daemon
+and any process it spawns must never outlive their purpose and must always be reap-able." The general
+stray-reaping surface (startup sweep across daemons/channels/sockets, `gc`) remains issue #426.
+
 ## 2026-07-22 — Channel `event_count`/`monitor_id`/`event_id` meta corrected for cross-monitor-coalesced claims (006 §4.2) — Refs #441, #456
 
 For a `DeliveryClaim` with `coalescedReminder` set (issue #441 cross-monitor coalescing), the channel
