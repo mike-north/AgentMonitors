@@ -15,6 +15,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1367,6 +1368,128 @@ describe.skipIf(process.platform === 'win32')(
         stdout: 'hi\n',
       });
     });
+  },
+);
+
+/**
+ * Regression tests for the issue #470 review: the self-watchdog must **fail
+ * closed**. The original watchdog script slept and then unconditionally SIGKILLed
+ * the command's process group; if its `sleep` could not run (e.g. a restricted
+ * `PATH`) it fell straight through to the kill and SIGKILLed a perfectly healthy
+ * command almost instantly. And if the watchdog could not be launched at all, the
+ * command was left running with no independent bound — defeating the guarantee
+ * #470 exists to make.
+ *
+ * The fix is twofold: (1) the watchdog never signals unless it genuinely armed
+ * (so a missing `sleep` can never reach the kill), and (2) if no independent bound
+ * was armed, the runtime terminates the command and reports a failure rather than
+ * run it unbounded. Both regressions drive the real `observe()` path with a
+ * `PATH` that starves the watchdog of what it needs, and assert the command is
+ * failed closed — never reported as a healthy result, never left leaked.
+ *
+ * Skipped on Windows, which has no POSIX self-watchdog (a documented platform
+ * limitation); its commands are bounded only by the daemon-resident timers.
+ */
+describe.skipIf(process.platform === 'win32')(
+  'source-command-poll: self-watchdog arming fails closed (issue #470 review)',
+  () => {
+    /** Absolute path of a binary, resolved before any PATH mutation. */
+    function resolveBin(name: string): string {
+      return execFileSync('sh', ['-c', `command -v ${name}`], {
+        encoding: 'utf8',
+      }).trim();
+    }
+
+    /**
+     * Run `body` with `process.env.PATH` set to a fresh bin directory containing
+     * symlinks to exactly `binaries` — so the watchdog sees only those on its
+     * PATH. Restores the prior PATH afterward. The monitored command itself is
+     * always invoked by absolute path (`nodeArgv`), so it never depends on PATH.
+     */
+    /** Poll `childProcessCount()` until it returns to `baseline` or the deadline. */
+    async function awaitChildBaseline(
+      baseline: number,
+      deadlineMs = 6_000,
+    ): Promise<boolean> {
+      const deadline = Date.now() + deadlineMs;
+      while (Date.now() < deadline) {
+        if ((await childProcessCount()) <= baseline) return true;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      return (await childProcessCount()) <= baseline;
+    }
+
+    async function withPathContaining(
+      binaries: string[],
+      body: () => Promise<void>,
+    ): Promise<void> {
+      const resolved = binaries.map((b) => [b, resolveBin(b)] as const);
+      const dir = mkdtempSync(join(tmpdir(), 'am-470-path-'));
+      const previousPath = process.env['PATH'];
+      try {
+        for (const [name, target] of resolved) {
+          symlinkSync(target, join(dir, name));
+        }
+        process.env['PATH'] = dir;
+        await body();
+      } finally {
+        process.env['PATH'] = previousPath;
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+
+    it('fails a long-running command closed when the watchdog cannot find `sleep` (no early kill, no unbounded run)', async () => {
+      const baseline = await childProcessCount().catch(() => 0);
+      // `sh` and `mkfifo` are reachable (the watchdog can launch and the liveness
+      // pipe can be created), but `sleep` is not — so the watchdog can never time
+      // its backstop and must exit WITHOUT signalling. The runtime then fails the
+      // command closed.
+      await withPathContaining(['sh', 'mkfifo'], async () => {
+        const start = Date.now();
+        const result = await source.observe(
+          { command: nodeArgv('setTimeout(() => {}, 60000)'), timeout: '30s' },
+          ctx(),
+        );
+        const elapsed = Date.now() - start;
+
+        // Reported as a failure (not a healthy result), citing the arming failure.
+        expect(result.observations).toHaveLength(1);
+        expect(result.observations[0]?.title).toContain('Command failing');
+        const payload = result.observations[0]?.payload as { error: string };
+        expect(payload.error).toMatch(/self-bounding watchdog/i);
+        expect(result.nextState).toMatchObject({ health: 'failing' });
+
+        // Fail-closed acted near-immediately — the command was neither allowed to
+        // run to its 60s natural end nor left bounded only by the 30s daemon
+        // timer. (A generous ceiling absorbs CI scheduling jitter.)
+        expect(elapsed).toBeLessThan(15_000);
+      });
+
+      if (PGREP_AVAILABLE) {
+        expect(await awaitChildBaseline(baseline)).toBe(true);
+      }
+    }, 30_000);
+
+    it('fails a long-running command closed when the watchdog itself cannot be launched (`sh` missing)', async () => {
+      const baseline = await childProcessCount().catch(() => 0);
+      // Only `mkfifo` is reachable: the liveness pipe is created, but the watchdog
+      // `sh` launch fails (ENOENT), so no independent bound is armed and the
+      // command must be failed closed rather than run unbounded.
+      await withPathContaining(['mkfifo'], async () => {
+        const result = await source.observe(
+          { command: nodeArgv('setTimeout(() => {}, 60000)'), timeout: '30s' },
+          ctx(),
+        );
+        expect(result.observations).toHaveLength(1);
+        const payload = result.observations[0]?.payload as { error: string };
+        expect(payload.error).toMatch(/self-bounding watchdog/i);
+        expect(result.nextState).toMatchObject({ health: 'failing' });
+      });
+
+      if (PGREP_AVAILABLE) {
+        expect(await awaitChildBaseline(baseline)).toBe(true);
+      }
+    }, 30_000);
   },
 );
 

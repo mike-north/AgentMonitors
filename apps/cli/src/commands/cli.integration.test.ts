@@ -3368,12 +3368,14 @@ When the command output changes, review it.
    * reap it. For a long-running background daemon that is the reliability-fatal
    * failure mode #470 exists to close.
    *
-   * The fix makes the child SELF-BOUNDING: it carries its own OS-level watchdog
-   * inside its process group, so its liveness does not depend on the daemon. The
-   * proof that only that self-watchdog (not the daemon) reaps it: `kill -9` the
-   * daemon BEFORE its own per-observe timeout could fire, confirm the descendant
-   * is still alive immediately afterward (genuinely orphaned), then confirm it
-   * terminates ON ITS OWN within the watchdog deadline.
+   * The fix makes the command SELF-BOUNDING via an independent, detached watchdog
+   * SIBLING — its own process in its own process group — that targets the
+   * command's process group and reaps it at a backstop deadline, so the command's
+   * liveness does not depend on the daemon. The proof that only that self-watchdog
+   * (not the daemon) reaps it: `kill -9` the daemon BEFORE its own per-observe
+   * timeout could fire, confirm the descendant is still alive immediately
+   * afterward (genuinely orphaned), then confirm it terminates ON ITS OWN within
+   * the watchdog deadline.
    *
    * @see https://github.com/mike-north/AgentMonitors/issues/470
    */
@@ -3509,6 +3511,154 @@ When the command output changes, review it.
       if (grandchildPid > 0 && isProcessAlive(grandchildPid)) {
         try {
           process.kill(grandchildPid, 'SIGKILL');
+        } catch {
+          // Already gone — the desired state.
+        }
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 45_000);
+
+  /**
+   * Regression test for the issue #470 review (thread 3633653647): the self-watchdog
+   * must stay armed until the whole command group is actually gone, not be reaped
+   * the instant the direct child exits on the timeout path.
+   *
+   * The precise race: a command times out, the daemon SIGTERMs the group, the
+   * direct shell dies on SIGTERM but a descendant IGNORES it and survives, and the
+   * daemon leaves its own SIGKILL grace-timer armed to reap that descendant. If the
+   * daemon is then killed (`kill -9`) DURING that grace window — before its SIGKILL
+   * fires — nothing daemon-side is left to reap the descendant. The self-watchdog
+   * is the only remaining bound, so it must not have been disarmed when the direct
+   * child exited: it stays armed (its liveness pipe is still held open by the
+   * surviving descendant) and reaps the group at its own deadline. Reaping the
+   * watchdog in `finish()` on the timeout path regresses this — the descendant then
+   * survives forever.
+   *
+   * @see https://github.com/mike-north/AgentMonitors/issues/470
+   */
+  it('a SIGTERM-ignoring descendant is reaped by the self-watchdog when the daemon is killed during the SIGKILL grace (issue #470)', async () => {
+    if (process.platform === 'win32') return;
+
+    const dir = path.join(tempDir, 'daemon-470-grace-race');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    const monitorDir = path.join(monitorsRoot, 'ignore-term-desc');
+    mkdirSync(monitorDir, { recursive: true });
+    const pidFile = path.join(dir, 'desc.pid');
+
+    // timeout 1s → the daemon SIGTERMs the group at ~1s and arms its own SIGKILL
+    // for ~6s (5s grace). The direct shell dies on that SIGTERM; the backgrounded
+    // descendant traps/ignores TERM and survives. The self-watchdog deadline is
+    // 1s + 5s grace + 2s slack ≈ 8s.
+    writeFileSync(
+      path.join(monitorDir, 'MONITOR.md'),
+      `---
+name: Backgrounds a TERM-ignoring descendant
+watch:
+  type: command-poll
+  command:
+    - sh
+    - '-c'
+    - "(trap '' TERM; exec sleep 300) & echo $! > ${pidFile}; wait"
+  timeout: 1s
+  interval: 5s
+urgency: normal
+---
+When the command output changes, review it.
+`,
+      'utf-8',
+    );
+
+    const socketPath = path.join(dir, 'agentmon.sock');
+    const child = spawn(
+      'node',
+      [
+        CLI_PATH,
+        'daemon',
+        'run',
+        monitorsRoot,
+        '--workspace',
+        dir,
+        '--poll-ms',
+        '300',
+        '--reap-after-ms',
+        '0',
+        '--socket',
+        socketPath,
+      ],
+      {
+        cwd: dir,
+        env: { ...process.env, AGENTMONITORS_DB: ':memory:' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    );
+
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf-8');
+    child.stderr.setEncoding('utf-8');
+    child.stdout.on('data', (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.on('data', (chunk: string) => {
+      stderr += chunk;
+    });
+
+    let descPid = -1;
+    try {
+      const listenDeadline = Date.now() + 15_000;
+      while (
+        Date.now() < listenDeadline &&
+        !stdout.includes('AgentMon daemon listening')
+      ) {
+        if (child.exitCode !== null) {
+          throw new Error(
+            `Daemon exited early with code ${String(child.exitCode)}.\nSTDOUT:\n${stdout}\nSTDERR:\n${stderr}`,
+          );
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      expect(stdout).toContain('AgentMon daemon listening');
+
+      // The TERM-ignoring descendant has launched under the live daemon.
+      const pidFileDeadline = Date.now() + 10_000;
+      while (Date.now() < pidFileDeadline && !existsSync(pidFile)) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      expect(existsSync(pidFile)).toBe(true);
+      descPid = Number(readFileSync(pidFile, 'utf-8').trim());
+      expect(Number.isInteger(descPid)).toBe(true);
+
+      // Wait past the 1s timeout (SIGTERM sent, direct shell dead, descendant
+      // survives) but well inside the daemon's 5s SIGKILL grace, then kill the
+      // daemon so its own SIGKILL can never fire.
+      await new Promise((resolve) => setTimeout(resolve, 2_500));
+      child.kill('SIGKILL');
+      await new Promise<void>((resolve) => {
+        if (child.exitCode !== null || child.signalCode !== null) {
+          resolve();
+          return;
+        }
+        child.once('exit', () => resolve());
+      });
+
+      // The descendant is a genuine orphan that ignored SIGTERM and never received
+      // the daemon's SIGKILL — it is still alive with nothing daemon-side to reap
+      // it. (If the watchdog had been disarmed on the direct child's exit, it would
+      // survive forever from here.)
+      expect(isProcessAlive(descPid)).toBe(true);
+
+      // Only the still-armed self-watchdog can reap it, at its own deadline
+      // (≈8s from observe start). Generous ceiling for CI scheduling jitter.
+      const dead = await pollUntil(() => !isProcessAlive(descPid), 25_000);
+      expect(dead).toBe(true);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGKILL');
+      }
+      if (descPid > 0 && isProcessAlive(descPid)) {
+        try {
+          process.kill(descPid, 'SIGKILL');
         } catch {
           // Already gone — the desired state.
         }

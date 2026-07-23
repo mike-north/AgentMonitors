@@ -1,4 +1,17 @@
-import { execFile, spawn, type ChildProcess } from 'node:child_process';
+import {
+  execFile,
+  execFileSync,
+  spawn,
+  type ChildProcess,
+} from 'node:child_process';
+import { randomBytes } from 'node:crypto';
+import {
+  closeSync,
+  constants as fsConstants,
+  openSync,
+  unlinkSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type {
   JsonSchema,
@@ -72,49 +85,160 @@ const WATCHDOG_MARKER = 'agentmonitors:command-poll-watchdog';
  * failure mode this closes.
  *
  * The fix is an INDEPENDENT sibling process, spawned `detached` alongside the
- * command and given the command's process-group id: it sleeps until a backstop
- * deadline, then SIGKILLs that whole group (`kill -KILL -<pgid>`). Because it is
- * its own detached process, it survives the daemon's death and reaps the orphan
- * on its own timer. Spawning it as a *sibling* — rather than wrapping the command
- * in a shell — keeps the command spawned directly (`shell: false`), so every
- * §11.1/§11.2/§11.5 semantic (no shell word-splitting, real spawn-failure errors,
- * exact exit codes) is untouched.
+ * command. Being its own detached process, it survives the daemon's death and
+ * reaps the orphan on its own timer. Spawning it as a *sibling* — rather than
+ * wrapping the command in a shell — keeps the command spawned directly
+ * (`shell: false`), so every §11.1/§11.2/§11.5 semantic (no shell word-splitting,
+ * real spawn-failure errors, exact exit codes) is untouched.
  *
- * `$1` is the command's process-group id; `$2` is the whole-second deadline. The
- * `kill` is best-effort (`2>/dev/null`): if the group already exited — the normal
- * case, where the daemon's own escalation or the command's own completion got
- * there first — the signal to an empty group is a harmless no-op.
+ * The group is signalled by its **numeric** process-group id, but a bare
+ * `kill -KILL -<pgid>` after a fixed sleep is unsafe: a numeric pgid is
+ * recyclable. If the command exits on its own before the deadline, its pgid can be
+ * reused by an unrelated same-user process group, which the delayed signal would
+ * then wrongly kill. So the watchdog binds to an **un-recyclable liveness pipe**
+ * rather than trusting the pgid alone. The command group inherits the only write
+ * ends of that pipe (as fd 3); the watchdog holds the read end (arriving as fd 0).
+ * A blocking read on it returns EOF exactly when the WHOLE group — the leader and
+ * every descendant — has gone, and a pipe is a kernel object that cannot be
+ * recycled. The watchdog races the deadline against that EOF: it signals the group
+ * only if the deadline elapses while the pipe is still open (the group provably
+ * still alive), and otherwise disarms without ever signalling.
+ *
+ * `$1` is the command's process-group id; `$2` is the whole-second deadline.
+ * "armed" is printed on stdout only once the watchdog has proven it can time the
+ * backstop and holds a working blocking read end — the daemon treats its absence
+ * as an arming failure and fails the command closed rather than run it unbounded
+ * (issue #470 review).
  */
 const SELF_WATCHDOG_SCRIPT = sh`
 # ${WATCHDOG_MARKER}
 pgid="$1"
 deadline="$2"
-sleep "$deadline"
-kill -KILL -"$pgid" 2>/dev/null
+# A missing 'sleep' means the backstop cannot be timed. Never fall through to the
+# kill in that case — that would SIGKILL a healthy group instantly. Fail closed:
+# exit before printing "armed", so the daemon terminates the command itself.
+command -v sleep >/dev/null 2>&1 || exit 0
+# The liveness read end arrives as fd 0, but it is passed through a child stdio
+# slot, which the runtime forces non-blocking; a bare read would then see a
+# spurious EOF and disarm instantly. Re-open it as a fresh BLOCKING fd (portable
+# via /dev/fd on macOS and Linux). A failure here also fails closed (no "armed").
+exec 3</dev/fd/0 || exit 0
+printf 'armed\n'
+# Deadline timer.
+sleep "$deadline" &
+timer=$!
+# Liveness reader: the command group holds the only write ends of the pipe on
+# fd 3, so a blocking read there returns (EOF) exactly when the WHOLE group — the
+# leader and every descendant, including one that ignored SIGTERM — has gone. On
+# that EOF, cancel the timer so the deadline branch below can never signal a group
+# that has already exited (whose pgid may by then have been recycled).
+{ while IFS= read -r _ <&3; do :; done; kill "$timer" 2>/dev/null; } &
+reader=$!
+# The timer running to completion means the deadline elapsed while the group was
+# still alive (the reader had not cancelled it) — reap the whole group. If the
+# reader cancelled the timer first, the group is already gone, wait returns
+# non-zero, and no signal is ever sent to a possibly-recycled pgid.
+if wait "$timer"; then
+  kill -KILL -"$pgid" 2>/dev/null
+fi
+kill "$reader" 2>/dev/null
 `;
+
+/** An anonymous liveness pipe's two ends (003 §11.2, issue #470). */
+interface LivenessPipe {
+  /** Read end handed to the watchdog as its fd 0. */
+  rfd: number;
+  /** Write end handed to the command as its fd 3; closed in the daemon post-spawn. */
+  wfd: number;
+}
+
+/**
+ * Create an anonymous liveness pipe for the self-watchdog (003 §11.2, issue #470),
+ * or `undefined` if one could not be created.
+ *
+ * Node exposes no `pipe(2)`, so this mints one as a transient, owner-only FIFO,
+ * opens both ends, and unlinks the name immediately — the open fds keep the pipe
+ * alive, and removing the name closes the brief on-disk window (BP4). An `O_RDWR`
+ * scratch open breaks the FIFO open-standoff so the read and write ends can then
+ * be opened **blocking** (no `O_NONBLOCK`) in either order — the watchdog needs a
+ * blocking read end for EOF to mean "group gone", not "no data yet".
+ */
+function createLivenessPipe(): LivenessPipe | undefined {
+  const fifoPath = path.join(
+    tmpdir(),
+    `agentmon-wd-${randomBytes(12).toString('hex')}`,
+  );
+  try {
+    execFileSync('mkfifo', ['-m', '600', fifoPath], { stdio: 'ignore' });
+  } catch {
+    return undefined;
+  }
+  let scratch: number | undefined;
+  let rfd: number | undefined;
+  let wfd: number | undefined;
+  try {
+    scratch = openSync(fifoPath, fsConstants.O_RDWR);
+    wfd = openSync(fifoPath, fsConstants.O_WRONLY);
+    rfd = openSync(fifoPath, fsConstants.O_RDONLY);
+    return { rfd, wfd };
+  } catch {
+    if (rfd !== undefined) closeSync(rfd);
+    if (wfd !== undefined) closeSync(wfd);
+    return undefined;
+  } finally {
+    if (scratch !== undefined) {
+      try {
+        closeSync(scratch);
+      } catch {
+        // Already closed — nothing to do.
+      }
+    }
+    try {
+      unlinkSync(fifoPath);
+    } catch {
+      // Best-effort: the open fds keep the pipe usable regardless.
+    }
+  }
+}
+
+/** A spawned self-watchdog and its arming handshake (003 §11.2, issue #470). */
+interface SelfWatchdog {
+  process: ChildProcess;
+  /**
+   * Resolves `true` once the watchdog confirms (via its "armed" line) that it can
+   * time the backstop and holds a working blocking read end; `false` if it exited
+   * or errored before confirming. `false` means no independent bound was armed, so
+   * the caller must fail the command closed rather than run it unbounded.
+   */
+  readonly armed: Promise<boolean>;
+}
 
 /**
  * Spawn the independent self-watchdog for a just-started command whose
- * process-group id is `commandPgid` (003 §11.2, issue #470). Returns the
- * watchdog child, or `undefined` if it could not be spawned (in which case this
- * tick simply falls back to the daemon-resident timers — no worse than before).
+ * process-group id is `commandPgid`, wired to `rfd` (the liveness read end) as its
+ * fd 0 (003 §11.2, issue #470). Returns the watchdog and its arming handshake, or
+ * `undefined` if it could not be spawned at all.
  *
  * The watchdog is itself `detached` (its own process group) so that (a) it
  * survives the daemon's death to do its job, and (b) it can later be reaped
- * whole — script shell *and* its `sleep` child — via a single group signal,
- * leaving no stray `sleep` behind. It is `unref`'d and its stdio ignored so it
- * never keeps the daemon's event loop alive or holds a pipe open.
+ * whole — script shell *and* its `sleep`/reader children — via a single group
+ * signal. It is `unref`'d so it never keeps the daemon's event loop alive; only
+ * its short-lived stdout handshake is read. `sh` is resolved via `PATH` (portable
+ * across POSIX layouts that do not ship `/bin/sh`), and any launch failure fails
+ * closed through the handshake rather than leaving the command unbounded.
  */
 function spawnSelfWatchdog(
+  rfd: number,
   commandPgid: number,
   deadlineMs: number,
-): ChildProcess | undefined {
+): SelfWatchdog | undefined {
   // Whole seconds — `sleep`'s only POSIX-guaranteed granularity — rounded UP so
   // the self-watchdog can never fire earlier than the daemon's own escalation.
   const deadlineSecs = Math.ceil(deadlineMs / 1000);
+  let watchdog: ChildProcess;
   try {
-    const watchdog = spawn(
-      '/bin/sh',
+    watchdog = spawn(
+      'sh',
       [
         '-c',
         SELF_WATCHDOG_SCRIPT,
@@ -122,30 +246,60 @@ function spawnSelfWatchdog(
         String(commandPgid),
         String(deadlineSecs),
       ],
-      { detached: true, stdio: 'ignore' },
+      { detached: true, stdio: [rfd, 'pipe', 'ignore'] },
     );
-    // A spawn error (e.g. no /bin/sh) must never surface as an unhandled 'error'
-    // event that crashes the daemon; degrade silently to daemon-only timing.
-    watchdog.once('error', () => {
-      /* best-effort backstop only */
-    });
-    watchdog.unref();
-    return watchdog;
   } catch {
     return undefined;
   }
+  const armed = new Promise<boolean>((resolve) => {
+    let settled = false;
+    const settle = (value: boolean): void => {
+      if (!settled) {
+        settled = true;
+        resolve(value);
+      }
+    };
+    const stdout = watchdog.stdout;
+    if (stdout) {
+      let seen = '';
+      stdout.on('data', (chunk: Buffer) => {
+        seen += chunk.toString('utf8');
+        if (seen.includes('armed')) settle(true);
+      });
+      // The handshake pipe must never keep the daemon's event loop alive. `stdout`
+      // is a Socket at runtime (a child stdio pipe), but `unref` is not on the
+      // `Readable` type it is declared as, so reach it through an optional shape.
+      (stdout as { unref?: () => void }).unref?.();
+    }
+    // Exiting or erroring before "armed" means the watchdog could not arm.
+    watchdog.once('exit', () => {
+      settle(false);
+    });
+    // A spawn 'error' must also never surface as an unhandled event that crashes
+    // the daemon; treat it as an arming failure.
+    watchdog.once('error', () => {
+      settle(false);
+    });
+  });
+  watchdog.unref();
+  return { process: watchdog, armed };
 }
 
 /**
- * Reap the self-watchdog once the command has resolved (003 §11.2, issue #470).
- * Signals the watchdog's whole process GROUP (it is a detached group leader), so
- * both the script shell and its backgrounded `sleep` die together — signaling
- * only the shell's pid would orphan the `sleep` to linger out the full deadline.
- * Best-effort: if it already fired and exited, the group is empty and the signal
- * is a harmless no-op.
+ * Reap the self-watchdog once the command has resolved on a non-timeout path
+ * (003 §11.2, issue #470). Signals the watchdog's whole process GROUP (it is a
+ * detached group leader), so the script shell and its `sleep`/reader children die
+ * together — signaling only the shell's pid would orphan them. Best-effort: if it
+ * already disarmed and exited, the group is empty and the signal is a no-op.
+ *
+ * Deliberately NOT called on the timeout path: there the daemon's own SIGKILL
+ * escalation is still armed for a SIGTERM-ignoring descendant, and if the daemon
+ * dies before it fires, the self-watchdog is the only thing left to reap that
+ * descendant — so it must stay armed until the group is actually gone (it then
+ * disarms itself via the liveness pipe's EOF).
  */
-function reapSelfWatchdog(watchdog: ChildProcess | undefined): void {
-  const pid = watchdog?.pid;
+function reapSelfWatchdog(watchdog: SelfWatchdog | undefined): void {
+  const pid = watchdog?.process.pid;
   if (pid === undefined) return;
   try {
     process.kill(-pid, 'SIGKILL');
@@ -396,6 +550,25 @@ async function runCommand(
   return new Promise<ExecOutcome>((resolve) => {
     const [file, ...args] = scope.command;
     const isWindows = process.platform === 'win32';
+
+    // Self-bounding backstop (003 §11.2, issue #470): on POSIX an INDEPENDENT
+    // detached sibling group-kills this command if the daemon dies before its own
+    // timers can. It binds to an un-recyclable liveness pipe whose only write ends
+    // the command group inherits (fd 3), so creating that pipe UP FRONT means a
+    // pipe-creation failure fails closed — the command is never launched unbounded.
+    // Windows has no process groups and no portable in-group watchdog, so there the
+    // daemon-resident timers remain the only bound (a documented platform limit).
+    const livenessPipe = isWindows ? undefined : createLivenessPipe();
+    if (!isWindows && livenessPipe === undefined) {
+      resolve({
+        kind: 'failure',
+        error:
+          'Could not arm self-bounding watchdog: liveness pipe unavailable',
+        stderrTail: '',
+      });
+      return;
+    }
+
     // `file` is guaranteed defined: parseScopeConfig rejects an empty command.
     const child = spawn(
       // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
@@ -413,25 +586,47 @@ async function runCommand(
         // flag; its tree-kill goes through `taskkill /T` instead, which does not
         // depend on process-group membership.
         detached: !isWindows,
-        stdio: ['ignore', 'pipe', 'pipe'],
+        // fd 3 (POSIX only) is the liveness pipe's write end: the command and every
+        // descendant inherit it, so the watchdog's read end reaches EOF exactly when
+        // the whole group has gone. An arbitrary command never touches this fd.
+        stdio: livenessPipe
+          ? ['ignore', 'pipe', 'pipe', livenessPipe.wfd]
+          : ['ignore', 'pipe', 'pipe'],
       },
     );
 
-    // Self-bounding backstop (003 §11.2, issue #470): an INDEPENDENT detached
-    // sibling that group-kills this command if the daemon dies before its own
-    // timers can. On POSIX a detached child's process-group id equals its pid.
-    // Skipped on Windows (no process groups) and if the OS gave us no pid — in
-    // both cases the daemon-resident timers below remain the only bound, as
-    // before. Deadline is set strictly AFTER the daemon's own SIGTERM→SIGKILL
-    // window so the daemon stays authoritative in the normal case; the watchdog
-    // only ever fires when the daemon can't.
-    const selfWatchdog =
-      !isWindows && child.pid !== undefined
-        ? spawnSelfWatchdog(
-            child.pid,
-            scope.timeoutMs + SIGKILL_GRACE_MS + SELF_WATCHDOG_SLACK_MS,
-          )
-        : undefined;
+    // The daemon must not retain the liveness write end, or the pipe would never
+    // reach EOF while the daemon is alive; the command holds its own inherited copy.
+    if (livenessPipe) {
+      try {
+        closeSync(livenessPipe.wfd);
+      } catch {
+        // Already closed — nothing to do.
+      }
+    }
+
+    // Passing fd 3 widens the spawn return type so the requested `pipe` streams are
+    // typed nullable; they are always present here (fds 1/2 are `pipe`).
+    const { stdout, stderr } = child;
+    if (stdout === null || stderr === null) {
+      killProcessTree(child, 'SIGKILL', isWindows);
+      if (livenessPipe) {
+        try {
+          closeSync(livenessPipe.rfd);
+        } catch {
+          // Already closed — nothing to do.
+        }
+      }
+      resolve({
+        kind: 'failure',
+        error: 'Command stdio pipes were unavailable',
+        stderrTail: '',
+      });
+      return;
+    }
+
+    // Armed after `finish()` is defined below, whose fail-closed path it drives.
+    let selfWatchdog: SelfWatchdog | undefined;
 
     let settled = false;
     let timedOut = false;
@@ -452,7 +647,7 @@ async function runCommand(
     // Bound stdout capture at the 1 MiB cap (003 §11.2): once the cap is reached,
     // further bytes are discarded but the stream is never paused, so a chatty child
     // is always drained and can never block on a full pipe buffer (issue #302).
-    child.stdout.on('data', (chunk: Buffer) => {
+    stdout.on('data', (chunk: Buffer) => {
       if (stdoutBytes >= STDOUT_CAP_BYTES) {
         if (chunk.length > 0) truncated = true;
         return;
@@ -473,7 +668,7 @@ async function runCommand(
     // process's own memory unbounded, and — like stdout — never pauses the pipe or
     // kills the child. Only the trailing bytes survive; older chunks are dropped
     // once the retention cap is exceeded.
-    child.stderr.on('data', (chunk: Buffer) => {
+    stderr.on('data', (chunk: Buffer) => {
       // Concat-then-slice keeps the retained buffer truly bounded at
       // STDERR_RETENTION_CAP_BYTES on every chunk — including a single chunk
       // larger than the cap — rather than only evicting whole chunks (which
@@ -524,11 +719,14 @@ async function runCommand(
       if (settled) return;
       settled = true;
       clearTimers();
-      // The command has resolved (success, failure, or timeout) — the daemon is
-      // alive to have gotten here, so its self-bounding backstop is no longer
-      // needed. Reap it promptly so its `sleep` never lingers out the deadline
-      // (issue #470). If it already fired, this is a harmless no-op.
-      reapSelfWatchdog(selfWatchdog);
+      // Reap the self-watchdog only on a NON-timeout resolution (issue #470). On a
+      // normal/failed exit the group is done and the daemon is alive, so reap
+      // promptly. On the TIMEOUT path the daemon's own SIGKILL escalation
+      // (`sigkillTimer`) is still armed for a SIGTERM-ignoring descendant; if the
+      // daemon dies before it fires, the self-watchdog is the only thing left to
+      // reap that descendant — so leave it armed. It disarms itself via the
+      // liveness pipe's EOF once the group is actually gone.
+      if (!timedOut) reapSelfWatchdog(selfWatchdog);
       resolve(outcome);
     }
 
@@ -642,6 +840,57 @@ async function runCommand(
       sigkillTimer.unref();
     }, scope.timeoutMs);
     wallClockTimer.unref();
+
+    // Arm the self-watchdog last, once every timer and `finish()` exist for its
+    // fail-closed path (003 §11.2, issue #470). Still synchronous, so the bound is
+    // in place before the command can make progress. Deadline is set strictly
+    // AFTER the daemon's own SIGTERM→SIGKILL window (plus slack), so the daemon
+    // stays authoritative in the normal case and the watchdog only ever fires when
+    // the daemon can't. Skipped on Windows and if the OS gave us no pid (a pidless
+    // spawn resolves via the 'error' path above).
+    if (livenessPipe && child.pid !== undefined) {
+      selfWatchdog = spawnSelfWatchdog(
+        livenessPipe.rfd,
+        child.pid,
+        scope.timeoutMs + SIGKILL_GRACE_MS + SELF_WATCHDOG_SLACK_MS,
+      );
+    }
+    // The daemon hands the read end to the watchdog and keeps no copy of it; if
+    // arming did not happen, closing it here is what lets the pipe reach EOF.
+    if (livenessPipe) {
+      try {
+        closeSync(livenessPipe.rfd);
+      } catch {
+        // Already closed — nothing to do.
+      }
+    }
+    // Fail closed (issue #470 review): if we intended to arm a bound but couldn't —
+    // the watchdog would not even spawn, or it exited/errored before confirming it
+    // is armed — the command must not keep running unbounded. Terminate its group
+    // and report a failure rather than trust the daemon-resident timers alone,
+    // which is exactly the guarantee #470 exists to make.
+    if (livenessPipe && child.pid !== undefined) {
+      if (selfWatchdog === undefined) {
+        killProcessTree(child, 'SIGKILL', isWindows);
+        finish({
+          kind: 'failure',
+          error: 'Could not arm self-bounding watchdog: launch failed',
+          stderrTail: '',
+        });
+      } else {
+        void selfWatchdog.armed.then((ok) => {
+          if (!ok && !settled) {
+            killProcessTree(child, 'SIGKILL', isWindows);
+            finish({
+              kind: 'failure',
+              error:
+                'Could not arm self-bounding watchdog: arming was not confirmed',
+              stderrTail: stderrTailString(),
+            });
+          }
+        });
+      }
+    }
   });
 }
 
