@@ -1585,21 +1585,44 @@ daemon dies abruptly — `kill -9`, crash, OOM — before a hung command's timeo
 die with it and the detached child reparents to launchd/init and survives **indefinitely**, with
 nothing left to reap it. For a long-running background daemon that is a reliability-fatal leak, not
 a corner case: leaked children accumulate until the user must restart. So on POSIX each execution
-also arms an **independent, `detached` self-watchdog sibling** — given the command's process-group
-id, it sleeps until a backstop deadline and then SIGKILLs that whole group (`kill -KILL -<pgid>`).
-Being its own detached process, it survives the daemon's death and reaps the orphan on its own
-timer; on normal completion (the daemon still alive) it is reaped promptly so its `sleep` never
-lingers. The backstop deadline is set strictly _after_ the daemon's own `timeout` + SIGKILL-grace
-window (plus a small slack), so the daemon-resident timers stay authoritative in the normal case and
-the self-watchdog only ever fires when they cannot. The invariant it guarantees: **`kill -9` the
-daemon mid-command and the command's whole process group still terminates on its own within
-`timeout` + grace + slack.** The watchdog is spawned as a _sibling_ (not a shell wrapper around the
-command) precisely so the command itself is still spawned directly (`shell: false`) and every
-§11.1/§11.2/§11.5 semantic — no shell word-splitting, real spawn-failure errors, exact exit codes —
-is preserved unchanged. Windows has no process groups and no portable in-group watchdog, so there
-the daemon-resident `taskkill /T /F` remains the only bound (a documented platform limitation); the
-self-bounding backstop is POSIX-only, which is the portable answer for the launchd/init reparenting
-that motivates #470.
+also arms an **independent, `detached` self-watchdog sibling** that reaps the command's whole process
+group at a backstop deadline. Being its own detached process, it survives the daemon's death and
+reaps the orphan on its own timer; on normal completion (the daemon still alive) it is reaped
+promptly so it never lingers. The backstop deadline is set strictly _after_ the daemon's own
+`timeout` + SIGKILL-grace window (plus a small slack), so the daemon-resident timers stay
+authoritative in the normal case and the self-watchdog only ever fires when they cannot. The
+invariant it guarantees: **`kill -9` the daemon mid-command and the command's whole process group
+still terminates on its own within `timeout` + grace + slack.** The watchdog is spawned as a
+_sibling_ (not a shell wrapper around the command) precisely so the command itself is still spawned
+directly (`shell: false`) and every §11.1/§11.2/§11.5 semantic — no shell word-splitting, real
+spawn-failure errors, exact exit codes — is preserved unchanged. Windows has no process groups and no
+portable in-group watchdog, so there the daemon-resident `taskkill /T /F` remains the only bound (a
+documented platform limitation, AP8 target work); the self-bounding backstop is POSIX-only, which is
+the portable answer for the launchd/init reparenting that motivates #470.
+
+Three properties make the self-watchdog safe rather than merely present:
+
+- **It kills by identity, not by a recyclable pgid.** A bare `kill -KILL -<pgid>` after a fixed sleep
+  is unsafe: if the command exits on its own before the deadline, its numeric pgid can be recycled by
+  an unrelated same-user process group, which the delayed signal would then wrongly kill (the sleep
+  can be up to ~24.8 days). So the watchdog binds to an **un-recyclable liveness pipe**: the command
+  group inherits the only write ends (an extra inherited fd), and the watchdog holds the read end. A
+  blocking read on it reaches EOF exactly when the **whole** group — leader and every descendant —
+  has gone (a kernel pipe cannot be recycled). The watchdog races the deadline against that EOF and
+  signals **only** if the deadline elapses while the pipe is still open (the group provably still the
+  original, still alive); if the group exited first it disarms without ever signalling. A residual
+  microsecond check-then-signal window is inherent to signalling by pgid on POSIX (a race-free `pidfd`
+  kill is Linux-only, non-portable — AP8 target work).
+- **It stays armed until the group is actually gone.** On the timeout path the daemon's own
+  SIGTERM→SIGKILL escalation is still armed for a SIGTERM-ignoring descendant; the self-watchdog is
+  therefore **not** disarmed when the direct child exits — if the daemon dies during the SIGKILL
+  grace, the watchdog is the only thing left to reap that descendant, and it does so via the same
+  liveness-pipe EOF (issue #470 review).
+- **It fails closed.** If no independent bound can be armed — the liveness pipe cannot be created, the
+  watchdog cannot be launched, or it cannot confirm it is armed — the runtime **terminates the
+  command and reports an execution failure** rather than run it unbounded. The watchdog never
+  fabricates a kill either: if it cannot time its own backstop (`sleep` unavailable) it exits without
+  signalling, so a healthy command is never SIGKILLed early.
 
 The **result** of an execution is `(exitCode, stdout)`. A **nonzero exit code with output is a
 valid result, not a failure** — many CLIs exit nonzero meaningfully (`grep`, linters, a task CLI

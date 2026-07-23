@@ -9,6 +9,37 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-07-22 — command-poll self-watchdog hardened: pgid-reuse safe, fail-closed, AP8 current/target split (000, 003 §11.2) — Refs #470
+
+Review hardening of the self-watchdog introduced below. Three correctness gaps in the initial
+"sleep-then-`kill -KILL -<pgid>`" watchdog are closed, and the AP8 invariant is split into current
+guarantees vs target work per PP7.
+
+- **pgid reuse.** A numeric pgid is recyclable: if the command exits on its own before the deadline,
+  the watchdog's delayed signal could kill an unrelated same-user process group that recycled the
+  pgid (the sleep can be up to ~24.8 days). The watchdog now binds to an **un-recyclable liveness
+  pipe** — the command group inherits the only write ends (an extra inherited fd), the watchdog holds
+  the read end, and a blocking read reaches EOF exactly when the whole group is gone. It signals only
+  while that pipe proves the group is still alive, so it never signals a recycled pgid. (A residual
+  microsecond check-then-signal window is inherent to signalling by pgid; race-free `pidfd` kill is
+  Linux-only — target work.)
+- **Descendant outliving the leader on timeout.** The watchdog is no longer disarmed the instant the
+  direct child exits on the timeout path; the daemon's own SIGKILL escalation is still armed for a
+  SIGTERM-ignoring descendant, so if the daemon dies during the grace, the watchdog (still armed via
+  the pipe) reaps that descendant.
+- **Fail closed.** If no independent bound can be armed (liveness pipe uncreatable, watchdog
+  unlaunchable, or arming unconfirmed), the runtime terminates the command and reports an execution
+  failure instead of running it unbounded; and the watchdog never falls through to a kill when it
+  cannot time its backstop (`sleep` missing), so a healthy command is never SIGKILLed early. `sh` is
+  resolved via `PATH` (portable across layouts without `/bin/sh`).
+
+AP8 in 000 is restated with an explicit current-guarantee (POSIX `command-poll` self-bounding) vs
+target-work (Windows self-bounding, startup stray-sweep, active graceful-shutdown reaping — #426)
+split, and the changeset's unconditional "can never orphan" claim is qualified to POSIX-only,
+best-effort. Updated 003 §11.2. Added regression tests: a `kill -9`-during-grace descendant-reap
+(non-vacuous — fails if the watchdog is disarmed early) and fail-closed arming under a starved
+`PATH`.
+
 ## 2026-07-22 — command-poll children are self-bounding; new reap-ability invariant AP8 (000, 003 §11.2/§11.7) — Refs #470
 
 `command-poll` spawns its command `detached` (own process group, for #303's group-kill) but enforced
