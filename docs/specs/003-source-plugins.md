@@ -1624,6 +1624,15 @@ Three properties make the self-watchdog safe rather than merely present:
   fabricates a kill either: if it cannot time its own backstop (`sleep` unavailable) it exits without
   signalling, so a healthy command is never SIGKILLed early.
 
+  This introduces a hard binary precondition that did not exist before #470: every POSIX
+  `command-poll` execution now needs `mkfifo`, `sh`, and `sleep` reachable on `PATH`, regardless of
+  what the monitored command itself is. On a binary-minimal image (slim/distroless/busybox
+  containers, or any `PATH` that omits one of these), arming fails on every single execution — the
+  fail-closed behavior is deliberate and correct, but its visible consequence is that the monitored
+  command **never runs**: every observation instead reports an execution failure citing the
+  self-bounding watchdog, with no path to recovery short of adding the missing binary(ies) to the
+  daemon's environment.
+
 The **result** of an execution is `(exitCode, stdout)`. A **nonzero exit code with output is a
 valid result, not a failure** — many CLIs exit nonzero meaningfully (`grep`, linters, a task CLI
 whose backing app is closed). The failure category is reserved for executions that produce no

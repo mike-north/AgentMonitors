@@ -8,14 +8,16 @@
  * The tests spawn tiny real subprocesses (`node -e …`) so the no-shell spawn path is
  * genuinely exercised — not a hand-built approximation. Dates are fixed; no network.
  */
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
+  writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1488,6 +1490,103 @@ describe.skipIf(process.platform === 'win32')(
 
       if (PGREP_AVAILABLE) {
         expect(await awaitChildBaseline(baseline)).toBe(true);
+      }
+    }, 30_000);
+  },
+);
+
+/**
+ * Regression test for the issue #472 review: the self-watchdog's liveness pipe
+ * previously handed its write end to the command at fd 3. Read-EOF on that pipe
+ * is meant to mean "the whole command group has exited," but EOF also arrives the
+ * moment the command closes ITS OWN copy of fd 3 — an ordinary shell idiom
+ * (`exec 3>&-`) that has nothing to do with the group actually dying. The bug:
+ * the watchdog disarmed instantly on that spurious EOF, so if the real daemon
+ * died before the backstop deadline, the command orphaned indefinitely — the
+ * exact failure #470 exists to prevent, silently reintroduced.
+ *
+ * This test drives the real production code, not a hand-built approximation: it
+ * spawns a genuine surrogate "daemon" Node process that calls the actual
+ * `source.observe()`, lets the real liveness pipe and self-watchdog arm, then
+ * SIGKILLs that surrogate almost immediately — simulating an abrupt daemon death
+ * before its own SIGTERM/SIGKILL timers could ever fire. With the daemon gone,
+ * the self-watchdog is the ONLY thing standing between the command and an
+ * indefinite orphan. The monitored command itself closes fd 3
+ * (`exec 3>&- 2>/dev/null`) — the exact collision this review demonstrated — and
+ * the assertion is that the command's process group is still killed by the
+ * watchdog's backstop deadline. Pre-fix, this assertion is what fails: the
+ * command survives well past the deadline because the watchdog disarmed on the
+ * spurious EOF and never signals it.
+ *
+ * Skipped on Windows: the self-watchdog is POSIX-only (a documented platform
+ * limitation — 003 §11.2).
+ */
+describe.skipIf(process.platform === 'win32')(
+  'source-command-poll: self-watchdog survives an early fd-3 close (issue #472 review)',
+  () => {
+    it('kills the command group at the backstop deadline even when the command closes fd 3, after the daemon dies', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'am-472-fd3-'));
+      const pidFile = join(dir, 'child.pid');
+      const runnerFile = join(dir, 'surrogate-daemon.mjs');
+      try {
+        const indexUrl = new URL('./index.ts', import.meta.url).href;
+        // Kept short so the whole test stays fast; the surrogate is killed long
+        // before this would ever elapse naturally (003 §11.2's own timers never
+        // get a chance to run here — that's the point).
+        const timeoutSecs = 2;
+        // Backstop deadline = ceil((timeout + grace(5s) + slack(2s)) / 1000) after
+        // the command is spawned (003 §11.2) = 9s here; generous margin for CI
+        // jitter on top.
+        const backstopMarginMs = 20_000;
+
+        const scope = {
+          command: [
+            'sh',
+            '-c',
+            `echo $$ > ${JSON.stringify(pidFile)}; exec 3>&- 2>/dev/null; sleep 30`,
+          ],
+          timeout: `${String(timeoutSecs)}s`,
+        };
+        // A standalone Node process plays the role of "the daemon": it calls the
+        // real `observe()`, then SIGKILLs itself shortly after the watchdog would
+        // have armed — simulating the daemon dying mid-command, before its own
+        // SIGTERM/SIGKILL escalation timers ever get to run.
+        writeFileSync(
+          runnerFile,
+          [
+            `const { default: source } = await import(${JSON.stringify(indexUrl)});`,
+            `const scope = ${JSON.stringify(scope)};`,
+            `source.observe(scope, { now: new Date(${String(NOW.getTime())}) }).catch(() => {});`,
+            `setTimeout(() => { process.kill(process.pid, 'SIGKILL'); }, 500);`,
+          ].join('\n'),
+        );
+
+        const surrogate = spawn(
+          process.execPath,
+          ['--experimental-strip-types', runnerFile],
+          { stdio: 'ignore' },
+        );
+        await new Promise<void>((resolve) => {
+          surrogate.once('exit', () => {
+            resolve();
+          });
+        });
+
+        // The surrogate "daemon" is now dead. The command's own liveness-pipe
+        // write end and the self-watchdog are the only things that can still
+        // bound it.
+        const gotPidFile = await pollUntil(() => existsSync(pidFile), 3_000);
+        expect(gotPidFile).toBe(true);
+        const orphanPid = Number(readFileSync(pidFile, 'utf8').trim());
+        expect(Number.isInteger(orphanPid)).toBe(true);
+
+        const dead = await pollUntil(
+          () => !isProcessAlive(orphanPid),
+          backstopMarginMs,
+        );
+        expect(dead).toBe(true);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
       }
     }, 30_000);
   },

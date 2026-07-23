@@ -9,6 +9,32 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-07-22 — command-poll self-watchdog: liveness-pipe fd moved off fd 3; binary precondition documented (000, 003 §11.2) — Refs #470, #472
+
+Review finding on the hardened self-watchdog: the liveness pipe's write end was handed to the
+monitored command at fd 3. The watchdog's read-EOF-means-"group gone" logic depends on that fd
+staying open for the group's entire lifetime, but fd 3 is the single most collision-prone fd —
+ordinary shell idioms (`exec 3<file`, `read -u`, bash's `exec {var}<>file` auto-assignment starting
+at fd 10) or a command that simply does `exec 3>&-` close their inherited copy of it for reasons
+having nothing to do with the group dying. That closed the watchdog's pipe early, and it disarmed —
+never signalling — while the command kept running: if the real daemon died before the backstop
+deadline, the command orphaned indefinitely, silently reintroducing the exact #470 failure this
+mechanism exists to prevent. The fix moves the write end to a deliberately high fd (`fd 20`, well
+past the fds ordinary shell/script idioms reach for) so this class of collision can't occur; a
+`closefrom(3)`-style hardened program that closes every fd `>= 3` is a residual this can't fully
+close by fd placement alone (documented, not solved, in 003 §11.2) — an alive-check-before-kill
+alternative was considered and rejected because it reintroduces the recycled-pgid hazard the
+liveness pipe was built to close. Added a regression test that spawns a genuine surrogate "daemon"
+process, arms the real watchdog against a command that closes fd 3 itself, SIGKILLs the surrogate to
+simulate an abrupt daemon death, and asserts the orphan is still reaped at the backstop deadline.
+
+Also documented (no behavior change) a binary precondition of the fail-closed design that a second
+review flagged as previously implicit: every POSIX `command-poll` execution now hard-depends on
+`mkfifo`, `sh`, and `sleep` being reachable on `PATH`. On a binary-minimal image (slim/distroless/
+busybox) missing one of these, arming fails on every execution and the monitored command never runs
+— each observation instead reports a self-bounding-watchdog execution failure. Updated 003 §11.2 and
+the AP8 current-guarantee bullet in 000 to state this precondition explicitly.
+
 ## 2026-07-22 — command-poll self-watchdog hardened: pgid-reuse safe, fail-closed, AP8 current/target split (000, 003 §11.2) — Refs #470
 
 Review hardening of the self-watchdog introduced below. Three correctness gaps in the initial

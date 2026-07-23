@@ -3,6 +3,7 @@ import {
   execFileSync,
   spawn,
   type ChildProcess,
+  type StdioOptions,
 } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import {
@@ -104,6 +105,11 @@ const WATCHDOG_MARKER = 'agentmonitors:command-poll-watchdog';
  * only if the deadline elapses while the pipe is still open (the group provably
  * still alive), and otherwise disarms without ever signalling.
  *
+ * The write end is handed to the command at a deliberately HIGH fd
+ * ({@link COMMAND_LIVENESS_FD}), not fd 3, so that ordinary shell fd usage can't
+ * collide with it and produce a false EOF (issue #472 review) — see that
+ * constant's doc comment for the full rationale and its residual limits.
+ *
  * `$1` is the command's process-group id; `$2` is the whole-second deadline.
  * "armed" is printed on stdout only once the watchdog has proven it can time the
  * backstop and holds a working blocking read end — the daemon treats its absence
@@ -148,9 +154,41 @@ kill "$reader" 2>/dev/null
 interface LivenessPipe {
   /** Read end handed to the watchdog as its fd 0. */
   rfd: number;
-  /** Write end handed to the command as its fd 3; closed in the daemon post-spawn. */
+  /**
+   * Write end handed to the command at {@link COMMAND_LIVENESS_FD}; closed in the
+   * daemon post-spawn.
+   */
   wfd: number;
 }
+
+/**
+ * fd index at which the command receives the liveness pipe's write end (003
+ * §11.2, issue #472 review). Deliberately a high fd, not fd 3.
+ *
+ * The watchdog's EOF-means-"group gone" logic (see {@link SELF_WATCHDOG_SCRIPT})
+ * depends on the command and every descendant holding this fd open for their
+ * entire lifetime — closing it early is indistinguishable, from the watchdog's
+ * side, from the whole group having exited. fd 3 is the single most
+ * collision-prone fd for that: POSIX shells routinely use low, ad hoc fds for
+ * scratch redirections (`exec 3<file`, `read -u`), and bash's own
+ * `exec {var}<>file` auto-assignment starts at fd 10 — so a command as ordinary
+ * as `sh -c 'exec 3>&-; ...'`, or one that reopens/closes fd 3 for its own
+ * purposes, would unknowingly close its inherited copy of the write end and trip
+ * a spurious EOF, disarming the watchdog while the command keeps running (the
+ * exact issue #472 defect). Moving the write end to fd 20 — well past the fds
+ * ordinary shell/script idioms reach for — makes that class of collision
+ * effectively impossible without eliminating a narrower residual: a command that
+ * does `closefrom(3)`-style hardening (closing every fd `>= 3`, or `>= N` for
+ * some `N <= 20`) still closes this fd too, because there is no fd number such
+ * hardening would skip. That residual is unavoidable by fd placement alone and
+ * is called out in 003 §11.2 rather than solved here — the alternative (treating
+ * early EOF as a *hint* requiring a `kill -0` liveness check before trusting it)
+ * was considered and rejected: gating the watchdog's kill on `kill -0 -"$pgid"`
+ * being true reintroduces exactly the recycled-pgid hazard this design already
+ * closed (a pgid can be reused by an unrelated group between the check and the
+ * kill), for a residual this rare and this well-documented.
+ */
+const COMMAND_LIVENESS_FD = 20;
 
 /**
  * Create an anonymous liveness pipe for the self-watchdog (003 §11.2, issue #470),
@@ -554,10 +592,11 @@ async function runCommand(
     // Self-bounding backstop (003 §11.2, issue #470): on POSIX an INDEPENDENT
     // detached sibling group-kills this command if the daemon dies before its own
     // timers can. It binds to an un-recyclable liveness pipe whose only write ends
-    // the command group inherits (fd 3), so creating that pipe UP FRONT means a
-    // pipe-creation failure fails closed — the command is never launched unbounded.
-    // Windows has no process groups and no portable in-group watchdog, so there the
-    // daemon-resident timers remain the only bound (a documented platform limit).
+    // the command group inherits (at fd COMMAND_LIVENESS_FD), so creating that pipe
+    // UP FRONT means a pipe-creation failure fails closed — the command is never
+    // launched unbounded. Windows has no process groups and no portable in-group
+    // watchdog, so there the daemon-resident timers remain the only bound (a
+    // documented platform limit).
     const livenessPipe = isWindows ? undefined : createLivenessPipe();
     if (!isWindows && livenessPipe === undefined) {
       resolve({
@@ -586,11 +625,21 @@ async function runCommand(
         // flag; its tree-kill goes through `taskkill /T` instead, which does not
         // depend on process-group membership.
         detached: !isWindows,
-        // fd 3 (POSIX only) is the liveness pipe's write end: the command and every
-        // descendant inherit it, so the watchdog's read end reaches EOF exactly when
-        // the whole group has gone. An arbitrary command never touches this fd.
+        // fd COMMAND_LIVENESS_FD (POSIX only) is the liveness pipe's write end: the
+        // command and every descendant inherit it, so the watchdog's read end
+        // reaches EOF exactly when the whole group has gone. It is deliberately a
+        // high fd rather than the next-available low one — see that constant's
+        // doc comment (issue #472 review) for why. The padding entries between
+        // fd 3 and it are `'ignore'` (mapped to `/dev/null`), matching how Node
+        // already treats stdin/stdout/stderr slots the command doesn't use.
         stdio: livenessPipe
-          ? ['ignore', 'pipe', 'pipe', livenessPipe.wfd]
+          ? ([
+              'ignore',
+              'pipe',
+              'pipe',
+              ...(Array(COMMAND_LIVENESS_FD - 3).fill('ignore') as 'ignore'[]),
+              livenessPipe.wfd,
+            ] satisfies StdioOptions)
           : ['ignore', 'pipe', 'pipe'],
       },
     );
