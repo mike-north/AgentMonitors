@@ -167,26 +167,55 @@ interface LivenessPipe {
  *
  * The watchdog's EOF-means-"group gone" logic (see {@link SELF_WATCHDOG_SCRIPT})
  * depends on the command and every descendant holding this fd open for their
- * entire lifetime — closing it early is indistinguishable, from the watchdog's
- * side, from the whole group having exited. fd 3 is the single most
- * collision-prone fd for that: POSIX shells routinely use low, ad hoc fds for
- * scratch redirections (`exec 3<file`, `read -u`), and bash's own
- * `exec {var}<>file` auto-assignment starts at fd 10 — so a command as ordinary
- * as `sh -c 'exec 3>&-; ...'`, or one that reopens/closes fd 3 for its own
- * purposes, would unknowingly close its inherited copy of the write end and trip
- * a spurious EOF, disarming the watchdog while the command keeps running (the
- * exact issue #472 defect). Moving the write end to fd 20 — well past the fds
- * ordinary shell/script idioms reach for — makes that class of collision
- * effectively impossible without eliminating a narrower residual: a command that
- * does `closefrom(3)`-style hardening (closing every fd `>= 3`, or `>= N` for
- * some `N <= 20`) still closes this fd too, because there is no fd number such
- * hardening would skip. That residual is unavoidable by fd placement alone and
- * is called out in 003 §11.2 rather than solved here — the alternative (treating
- * early EOF as a *hint* requiring a `kill -0` liveness check before trusting it)
- * was considered and rejected: gating the watchdog's kill on `kill -0 -"$pgid"`
- * being true reintroduces exactly the recycled-pgid hazard this design already
- * closed (a pgid can be reused by an unrelated group between the check and the
- * kill), for a residual this rare and this well-documented.
+ * entire lifetime — closing it early, or never inheriting it at all, is
+ * indistinguishable, from the watchdog's side, from the whole group having
+ * exited. fd 3 was the single most collision-prone fd for the deliberate-close
+ * case: POSIX shells routinely use low, ad hoc fds for scratch redirections
+ * (`exec 3<file`, `read -u`), and bash's own `exec {var}<>file` auto-assignment
+ * starts at fd 10 — so a command as ordinary as `sh -c 'exec 3>&-; ...'`, or one
+ * that reopens/closes fd 3 for its own purposes, would unknowingly close its
+ * inherited copy of the write end and trip a spurious EOF, disarming the
+ * watchdog while the command keeps running. Moving the write end to fd 20 — well
+ * past the fds ordinary shell/script idioms reach for — makes that specific
+ * class of collision effectively impossible, but it does NOT close two other,
+ * more consequential residuals in the same "false EOF" family (both confirmed on
+ * this head, issue #472 second review round):
+ *
+ * 1. A `closefrom(3)`-style hardened program (closing every fd `>= 3`, or `>= N`
+ *    for some `N <= 20`) still closes this fd too, because there is no fd number
+ *    such hardening would skip. Narrow and deliberate; unavoidable by fd
+ *    placement alone.
+ * 2. **A descendant the monitored command spawns via any process API that
+ *    defaults to close-on-exec for non-explicit fds — which is the DEFAULT
+ *    behavior of most modern high-level spawn APIs (Node's own
+ *    `child_process.spawn`, Python's `subprocess` with its default
+ *    `close_fds=True`, Go's `os/exec`, Ruby's `Process.spawn`) — never inherits
+ *    this fd at all.** This is not a hardening edge case; it is completely
+ *    ordinary code. When the immediate/intermediate process that DOES hold this
+ *    fd exits (having handed real work off to that descendant), the pipe EOFs
+ *    even though the descendant is still alive, and the watchdog disarms —
+ *    exactly the #470 orphan failure this whole mechanism exists to prevent.
+ *    Fd inheritance into a further descendant is entirely the exec-ing
+ *    process's own choice; from outside that process tree there is no portable
+ *    OS mechanism to force it. Closing this fully would need a liveness proof
+ *    that does not depend on fd inheritance at all — e.g. periodically
+ *    re-verifying group membership via `kill -0 -"$pgid"` — but that
+ *    reintroduces, in a bounded-but-nonzero form, exactly the recycled-pgid
+ *    hazard this liveness-pipe design was built to close (a pgid can be reused
+ *    by an unrelated group between the last successful check and the actual
+ *    kill; shrinking the poll interval shrinks that window but cannot remove
+ *    it, unlike the zero-risk proof a still-open fd gives). Given the standing
+ *    instruction to never reintroduce that hazard, this residual is left
+ *    unresolved here rather than "fixed" with a materially different safety
+ *    property — see the issue #472 second-round review thread for the full
+ *    analysis and the reproduction that confirmed it.
+ *
+ * In practice, the guarantee this mechanism delivers is: the monitored command's
+ * own leader process, and any descendant that continues to hold an inherited
+ * copy of this fd (typically: plain shell/exec-based backgrounding, e.g.
+ * `cmd &`, with no intervening program that clears it), are bounded even if the
+ * daemon dies. A descendant spawned through a close-on-exec-by-default runtime
+ * API is not currently covered by that guarantee.
  */
 const COMMAND_LIVENESS_FD = 20;
 
@@ -321,29 +350,6 @@ function spawnSelfWatchdog(
   });
   watchdog.unref();
   return { process: watchdog, armed };
-}
-
-/**
- * Reap the self-watchdog once the command has resolved on a non-timeout path
- * (003 §11.2, issue #470). Signals the watchdog's whole process GROUP (it is a
- * detached group leader), so the script shell and its `sleep`/reader children die
- * together — signaling only the shell's pid would orphan them. Best-effort: if it
- * already disarmed and exited, the group is empty and the signal is a no-op.
- *
- * Deliberately NOT called on the timeout path: there the daemon's own SIGKILL
- * escalation is still armed for a SIGTERM-ignoring descendant, and if the daemon
- * dies before it fires, the self-watchdog is the only thing left to reap that
- * descendant — so it must stay armed until the group is actually gone (it then
- * disarms itself via the liveness pipe's EOF).
- */
-function reapSelfWatchdog(watchdog: SelfWatchdog | undefined): void {
-  const pid = watchdog?.process.pid;
-  if (pid === undefined) return;
-  try {
-    process.kill(-pid, 'SIGKILL');
-  } catch {
-    // Already gone — the desired state.
-  }
 }
 
 /** Maximum retained stdout, in bytes (003 §11.2). Excess is drained, not kept. */
@@ -608,41 +614,77 @@ async function runCommand(
       return;
     }
 
-    // `file` is guaranteed defined: parseScopeConfig rejects an empty command.
-    const child = spawn(
-      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-      file!,
-      args,
-      {
-        cwd: effectiveCwd,
-        // `env` is merged over the inherited daemon environment (003 §11.1).
-        env: scope.env ? { ...process.env, ...scope.env } : process.env,
-        shell: false,
-        // POSIX: leader of its own process group/session, so the timeout escalation
-        // can signal the whole tree at once (`killProcessTree` above) instead of only
-        // the direct child (003 §11.7, issue #303). This same group is what the
-        // independent self-watchdog (issue #470) targets. Windows has no equivalent
-        // flag; its tree-kill goes through `taskkill /T` instead, which does not
-        // depend on process-group membership.
-        detached: !isWindows,
-        // fd COMMAND_LIVENESS_FD (POSIX only) is the liveness pipe's write end: the
-        // command and every descendant inherit it, so the watchdog's read end
-        // reaches EOF exactly when the whole group has gone. It is deliberately a
-        // high fd rather than the next-available low one — see that constant's
-        // doc comment (issue #472 review) for why. The padding entries between
-        // fd 3 and it are `'ignore'` (mapped to `/dev/null`), matching how Node
-        // already treats stdin/stdout/stderr slots the command doesn't use.
-        stdio: livenessPipe
-          ? ([
-              'ignore',
-              'pipe',
-              'pipe',
-              ...(Array(COMMAND_LIVENESS_FD - 3).fill('ignore') as 'ignore'[]),
-              livenessPipe.wfd,
-            ] satisfies StdioOptions)
-          : ['ignore', 'pipe', 'pipe'],
-      },
-    );
+    /** Close both liveness-pipe fds, best-effort (either or both may already be closed). */
+    function closeLivenessPipe(): void {
+      if (!livenessPipe) return;
+      try {
+        closeSync(livenessPipe.wfd);
+      } catch {
+        // Already closed — nothing to do.
+      }
+      try {
+        closeSync(livenessPipe.rfd);
+      } catch {
+        // Already closed — nothing to do.
+      }
+    }
+
+    // `file` is guaranteed defined: parseScopeConfig rejects an empty command. `spawn`
+    // is synchronous up to and including this call (the actual process launch is
+    // async; failures there surface later via the child's `'error'` event, handled
+    // below) — but it CAN throw synchronously for arguments `execve(2)` can never
+    // accept at all, e.g. a `command`/`arg`/`cwd`/`env` value containing an embedded
+    // NUL byte (issue #472 review). Without a try/catch here, that throw skips every
+    // line below — including the `closeSync` calls that release the liveness pipe's
+    // two fds — leaking both on every single such call; a monitor whose command
+    // reaches this state on every tick leaks the daemon's fd table without bound.
+    let child: ChildProcess;
+    try {
+      child = spawn(
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+        file!,
+        args,
+        {
+          cwd: effectiveCwd,
+          // `env` is merged over the inherited daemon environment (003 §11.1).
+          env: scope.env ? { ...process.env, ...scope.env } : process.env,
+          shell: false,
+          // POSIX: leader of its own process group/session, so the timeout escalation
+          // can signal the whole tree at once (`killProcessTree` above) instead of only
+          // the direct child (003 §11.7, issue #303). This same group is what the
+          // independent self-watchdog (issue #470) targets. Windows has no equivalent
+          // flag; its tree-kill goes through `taskkill /T` instead, which does not
+          // depend on process-group membership.
+          detached: !isWindows,
+          // fd COMMAND_LIVENESS_FD (POSIX only) is the liveness pipe's write end: the
+          // command and every descendant inherit it, so the watchdog's read end
+          // reaches EOF exactly when the whole group has gone. It is deliberately a
+          // high fd rather than the next-available low one — see that constant's
+          // doc comment (issue #472 review) for why. The padding entries between
+          // fd 3 and it are `'ignore'` (mapped to `/dev/null`), matching how Node
+          // already treats stdin/stdout/stderr slots the command doesn't use.
+          stdio: livenessPipe
+            ? ([
+                'ignore',
+                'pipe',
+                'pipe',
+                ...(Array(COMMAND_LIVENESS_FD - 3).fill(
+                  'ignore',
+                ) as 'ignore'[]),
+                livenessPipe.wfd,
+              ] satisfies StdioOptions)
+            : ['ignore', 'pipe', 'pipe'],
+        },
+      );
+    } catch (error) {
+      closeLivenessPipe();
+      resolve({
+        kind: 'failure',
+        error: error instanceof Error ? error.message : String(error),
+        stderrTail: '',
+      });
+      return;
+    }
 
     // The daemon must not retain the liveness write end, or the pipe would never
     // reach EOF while the daemon is alive; the command holds its own inherited copy.
@@ -768,14 +810,22 @@ async function runCommand(
       if (settled) return;
       settled = true;
       clearTimers();
-      // Reap the self-watchdog only on a NON-timeout resolution (issue #470). On a
-      // normal/failed exit the group is done and the daemon is alive, so reap
-      // promptly. On the TIMEOUT path the daemon's own SIGKILL escalation
-      // (`sigkillTimer`) is still armed for a SIGTERM-ignoring descendant; if the
-      // daemon dies before it fires, the self-watchdog is the only thing left to
-      // reap that descendant — so leave it armed. It disarms itself via the
-      // liveness pipe's EOF once the group is actually gone.
-      if (!timedOut) reapSelfWatchdog(selfWatchdog);
+      // The self-watchdog is deliberately NEVER proactively killed here, on ANY
+      // resolution path (issue #472 review). It used to be reaped immediately on a
+      // non-timeout resolution on the assumption that the direct child's own
+      // successful/failed exit means the whole process group is done — but that
+      // is not true: a leader can exit 0 having backgrounded a descendant
+      // (`sh -c 'sleep 300 & ...; exit 0'`, the same idiom #303's group-kill exists
+      // for) that is still very much alive. Proactively killing the watchdog at
+      // that point destroyed the one thing still capable of noticing and reaping
+      // that descendant, leaking it silently on every such observation — with no
+      // daemon-side timer ever armed for it either, since the wall-clock
+      // SIGTERM→SIGKILL escalation only exists on the TIMEOUT path. The watchdog
+      // now runs to its own conclusion unconditionally: it disarms ITSELF, via the
+      // same liveness-pipe EOF used on the timeout path, the moment the whole
+      // group it can observe is actually gone (near-instant for a well-behaved
+      // command with no live descendant), and otherwise reaps the group at its own
+      // backstop deadline — regardless of how `observe()` itself resolved.
       resolve(outcome);
     }
 

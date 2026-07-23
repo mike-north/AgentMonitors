@@ -13,6 +13,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -1589,6 +1590,169 @@ describe.skipIf(process.platform === 'win32')(
         rmSync(dir, { recursive: true, force: true });
       }
     }, 30_000);
+  },
+);
+
+/**
+ * Regression test for the issue #472 review: the self-watchdog was proactively
+ * SIGKILLed the instant `observe()` resolved on any NON-timeout path, on the
+ * assumption that the direct child's own exit means the whole process group is
+ * done. That assumption is false for the same idiom issue #303's group-kill
+ * exists for: a leader can background a descendant and exit 0 while that
+ * descendant is still very much alive. Proactively killing the watchdog at that
+ * point destroyed the one thing left capable of noticing and reaping it — and no
+ * daemon-side timer is ever armed for a non-timeout resolution either — so the
+ * descendant leaked silently on every such observation, with nothing bounding it
+ * at all (not even the ordinary daemon death case #470 exists to guard against).
+ *
+ * The fix lets the watchdog run to its own natural conclusion on every outcome:
+ * it disarms itself the instant its own liveness pipe proves the group is
+ * genuinely gone (near-instant for a well-behaved command), and otherwise reaps
+ * the group at its own backstop deadline regardless of how `observe()` resolved.
+ */
+describe.skipIf(process.platform === 'win32')(
+  'source-command-poll: the self-watchdog is never reaped early on a clean leader exit (issue #472 review)',
+  () => {
+    it('reaps a descendant backgrounded by a leader that exits 0, instead of leaking it forever', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'am-472-clean-exit-'));
+      const pidFile = join(dir, 'child.pid');
+      try {
+        const scope = {
+          command: [
+            'sh',
+            '-c',
+            `sleep 30 & echo $! > ${JSON.stringify(pidFile)}; exit 0`,
+          ],
+          timeout: '1s',
+        };
+
+        const result = await source.observe(scope, ctx());
+        // A clean, successful leader exit — never reported as a failure or timeout.
+        expect(result.nextState).toMatchObject({ health: 'ok' });
+
+        const descendantPid = Number(readFileSync(pidFile, 'utf8').trim());
+        expect(Number.isInteger(descendantPid)).toBe(true);
+        // Genuinely still alive right after `observe()` returns — this is the
+        // leaked-descendant scenario, not a race with an already-dead process.
+        expect(isProcessAlive(descendantPid)).toBe(true);
+
+        // Backstop deadline = ceil((timeout(1s) + grace(5s) + slack(2s)) / 1000) =
+        // 8s after the command was spawned; generous margin for CI jitter on top.
+        const dead = await pollUntil(
+          () => !isProcessAlive(descendantPid),
+          15_000,
+        );
+        expect(dead).toBe(true);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }, 20_000);
+  },
+);
+
+/**
+ * Regression test for the issue #472 review: `spawn()` for the monitored command
+ * CAN throw synchronously — not just fail asynchronously via the child's `'error'`
+ * event — for arguments `execve(2)` can never accept at all, e.g. a command
+ * containing an embedded NUL byte. That throw previously skipped every line after
+ * it, including the `closeSync` calls that release the liveness pipe's two fds,
+ * leaking both on every single such call — a monitor that reaches this state on
+ * every tick leaks the daemon's fd table without bound. The fix wraps the `spawn`
+ * call in a try/catch that releases both fds and reports a clean execution
+ * failure instead of propagating the throw.
+ */
+describe.skipIf(process.platform === 'win32')(
+  'source-command-poll: no fd leak when spawn() throws synchronously (issue #472 review)',
+  () => {
+    it('does not accumulate open fds across repeated NUL-byte-command spawn failures', async () => {
+      const nulByteCommand = [`a${String.fromCharCode(0)}b`];
+      const before = readdirSync('/dev/fd').length;
+
+      let state: unknown;
+      for (let i = 0; i < 20; i += 1) {
+        const result = await source.observe(
+          { command: nulByteCommand },
+          ctx(state),
+        );
+        state = result.nextState;
+        if (i === 0) {
+          expect(result.observations).toHaveLength(1);
+          expect(result.observations[0]?.title).toContain('Command failing');
+        }
+      }
+
+      const after = readdirSync('/dev/fd').length;
+      // Pre-fix this grew by ~2 fds per call (40 fds leaked across 20 calls, the
+      // exact ratio the review demonstrated); post-fix it stays flat modulo a
+      // small constant slack unrelated to the loop's iteration count.
+      expect(after - before).toBeLessThan(5);
+    });
+  },
+);
+
+/**
+ * Regression test for the issue #472 review: 003 §11.2 previously claimed that a
+ * watchdog which fails to arm means the monitored command "never runs" — that is
+ * false. The command is spawned (and can begin producing real side effects)
+ * BEFORE the arming handshake is even attempted; if arming later fails, the fix
+ * (issue #470 review) terminates the command PROMPTLY, but does not and cannot
+ * undo whatever the command already did in that window. This test proves the
+ * command genuinely started — by observing a side-effect file it writes as its
+ * very first action — even though the overall execution is still correctly
+ * reported as a self-bounding-watchdog arming failure.
+ */
+describe.skipIf(process.platform === 'win32')(
+  'source-command-poll: an arming-failure command still runs (and can side-effect) before being terminated (issue #472 review)',
+  () => {
+    /** Absolute path of a binary, resolved before any PATH mutation. */
+    function resolveBin(name: string): string {
+      return execFileSync('sh', ['-c', `command -v ${name}`], {
+        encoding: 'utf8',
+      }).trim();
+    }
+
+    it('writes its side-effect marker before the fail-closed kill lands', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'am-472-side-effect-'));
+      const markerFile = join(dir, 'marker');
+      const binDir = mkdtempSync(join(tmpdir(), 'am-472-path-'));
+      const previousPath = process.env['PATH'];
+      try {
+        // `sh` and `mkfifo` are reachable (the watchdog can launch and the
+        // liveness pipe can be created), but `sleep` is not — so arming can never
+        // complete and the runtime must fail the command closed (issue #470
+        // review). The monitored command writes its marker as its very first
+        // action, before any delay of its own.
+        for (const bin of ['sh', 'mkfifo']) {
+          symlinkSync(resolveBin(bin), join(binDir, bin));
+        }
+        process.env['PATH'] = binDir;
+
+        const result = await source.observe(
+          {
+            command: [
+              'sh',
+              '-c',
+              `echo side-effect > ${JSON.stringify(markerFile)}; sleep 60`,
+            ],
+            timeout: '30s',
+          },
+          ctx(),
+        );
+
+        expect(result.observations).toHaveLength(1);
+        const payload = result.observations[0]?.payload as { error: string };
+        expect(payload.error).toMatch(/self-bounding watchdog/i);
+
+        // The command DID run and produce its side effect — the arming failure
+        // terminates it promptly, but does not (and structurally cannot) undo
+        // work already done before that termination lands.
+        expect(existsSync(markerFile)).toBe(true);
+      } finally {
+        process.env['PATH'] = previousPath;
+        rmSync(binDir, { recursive: true, force: true });
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }, 15_000);
   },
 );
 

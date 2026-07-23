@@ -9,6 +9,51 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-07-22 — command-poll self-watchdog: fd leak fix, never-reaped-early fix, doc correction, one open descendant-liveness gap (000, 003 §11.2) — Refs #470, #472
+
+Second review round on the hardened self-watchdog. Four findings; three fixed with regression tests,
+one left open (a design tradeoff, not an oversight) with the analysis recorded here and on the PR
+thread.
+
+- **Fixed — fd leak on synchronous `spawn()` throw.** `spawn()` can throw synchronously for
+  arguments `execve(2)` can never accept (e.g. an embedded NUL byte), skipping the `closeSync` calls
+  that release the liveness pipe's two fds — confirmed leaking ~2 fds per call, unbounded across
+  repeated ticks. The `spawn()` call is now wrapped in a try/catch that always releases both fds and
+  reports a clean execution failure instead of propagating the throw.
+- **Fixed — the watchdog was reaped too early on a clean leader exit.** The runtime proactively
+  SIGKILLed the watchdog immediately on any NON-timeout resolution, assuming the direct child's exit
+  means the whole group is done. False: a leader can background a descendant and exit 0
+  (`sh -c 'sleep 300 & ...; exit 0'`, the same idiom #303's group-kill exists for) while that
+  descendant is still alive — and no daemon-side timer is armed for a non-timeout resolution either,
+  so it leaked silently with nothing bounding it. The runtime now never proactively kills the
+  watchdog on any outcome; it disarms itself (via the same liveness-pipe proof used on the timeout
+  path) the instant the group it can observe is actually gone, and otherwise reaps at its own
+  deadline regardless of how `observe()` resolved.
+- **Fixed — a false doc claim.** 003 §11.2 claimed an arming failure means the monitored command
+  "never runs." False: the command is spawned before arming is even attempted (a real process group
+  has to exist for the watchdog to target), so it can perform real side effects in the window before
+  an arming failure is detected and it is terminated — only the _result_ is suppressed. Corrected the
+  wording and added a regression test proving a side-effect file gets written even though the
+  execution is (correctly) reported as an arming failure.
+- **Left open — a descendant spawned via a close-on-exec-by-default process API never inherits the
+  liveness fd at all.** Confirmed on this head with both an explicit fd-close and, more
+  consequentially, an ordinary `child_process.spawn()`-backgrounded descendant: when the fd-holding
+  leader exits, the pipe EOFs even though that descendant is still alive, and the watchdog disarms —
+  silently reintroducing the #470 orphan failure for that class of command. This is not a hardening
+  edge case; close-on-exec-by-default is the standard behavior of most modern high-level spawn APIs
+  (Node's own `child_process.spawn`, Python's `subprocess`, Go's `os/exec`, Ruby's `Process.spawn`),
+  and fd inheritance into a further descendant is entirely the exec-ing process's own choice — there
+  is no portable OS mechanism to force it from outside that process tree. A fix that does not depend
+  on fd inheritance (periodic `kill -0`-based re-verification instead of a one-shot EOF proof) was
+  considered and rejected: it reintroduces, in a bounded-but-nonzero form, exactly the recycled-pgid
+  hazard the liveness pipe was built to close, trading a zero-risk proof for a probabilistic one.
+  Documented precisely (000 AP8, 003 §11.2, and the `COMMAND_LIVENESS_FD` doc comment) as a known,
+  currently-open gap rather than fixed with a materially different safety property.
+
+Changeset wording amended to match: "the daemon reaps the watchdog promptly" is no longer accurate
+(it never proactively reaps now), and the "whole process group"/"the group" phrasing is qualified to
+"the group members that hold the liveness fd."
+
 ## 2026-07-22 — command-poll self-watchdog: liveness-pipe fd moved off fd 3; binary precondition documented (000, 003 §11.2) — Refs #470, #472
 
 Review finding on the hardened self-watchdog: the liveness pipe's write end was handed to the

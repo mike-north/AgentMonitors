@@ -10,25 +10,35 @@ and the detached child reparented to launchd/init and survived **indefinitely** 
 reliability-fatal leak for a long-running background daemon, since nothing was left to reap it.
 
 On POSIX each execution now also arms an independent, `detached` self-watchdog sibling that reaps
-the command's whole process group at a backstop deadline (the command's `timeout` + the SIGKILL
-grace + a small slack). Because it is its own detached process, it survives the daemon's death and
-reaps the orphan on its own timer; on normal completion the daemon reaps the watchdog promptly so it
-never lingers. The backstop deadline is set strictly after the daemon's own escalation window, so
-the daemon-resident timers stay authoritative in the normal case and the self-watchdog only ever
-fires when they cannot.
+the command's process group at a backstop deadline (the command's `timeout` + the SIGKILL grace + a
+small slack). Because it is its own detached process, it survives the daemon's death and reaps the
+orphan on its own timer; on normal completion it disarms itself so it never lingers — the daemon
+never proactively kills it. The backstop deadline is set strictly after the daemon's own escalation
+window, so the daemon-resident timers stay authoritative in the normal case and the self-watchdog
+only ever fires when they cannot.
 
 The watchdog is made safe, not merely present:
 
-- **It kills by identity, not a recyclable pgid.** It binds to an un-recyclable liveness pipe whose
-  only write ends the command group inherits; it signals the group **only** while a blocking read on
-  that pipe proves the group is still alive, so a command that exits on its own before the deadline
-  can never have its (possibly-recycled) pgid signalled.
-- **It stays armed until the group is actually gone.** On the timeout path it is not disarmed when
-  the direct child exits, so if the daemon dies during the SIGKILL grace, a SIGTERM-ignoring
-  descendant is still reaped.
+- **It kills by identity, not a recyclable pgid — for the group members that hold that identity.**
+  It binds to an un-recyclable liveness pipe whose only write end the command inherits at spawn; it
+  signals the group **only** while a blocking read on that pipe proves a holder of that fd is still
+  alive, so a command that exits on its own before the deadline can never have its
+  (possibly-recycled) pgid signalled. A descendant the command backgrounds via plain shell/exec-based
+  job control typically inherits the fd too; a descendant spawned through a process API that
+  defaults to close-on-exec for non-explicit fds (the default for most modern high-level spawn
+  APIs — Node's own `child_process.spawn` included) does not, so it is not currently covered by this
+  guarantee if its spawning leader has already exited.
+- **It stays armed regardless of how the execution resolves, until it independently proves the group
+  is gone.** It is never proactively killed by the runtime on any outcome (success, failure, or
+  timeout) — only by its own liveness-pipe proof or its own deadline — so a descendant backgrounded
+  by an otherwise-successful command is bounded too, not just a descendant of a timed-out one.
 - **It fails closed.** If no independent bound can be armed, the command is terminated and reported
   as an execution failure rather than run unbounded; and the watchdog never fabricates a kill (a
   missing `sleep` makes it exit without signalling, so a healthy command is never SIGKILLed early).
+  Every execution now hard-depends on `mkfifo`, `sh`, and `sleep` being on `PATH`; on a
+  binary-minimal image missing one, every execution fails closed instead of running (the monitored
+  command itself still starts and can side-effect before that termination lands — only the reported
+  result is suppressed).
 
 The watchdog is a **sibling**, not a shell wrapper around the command, so the command is still
 spawned directly (`shell: false`): no shell word-splitting, real spawn-failure (`ENOENT`/`EACCES`)

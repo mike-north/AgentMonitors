@@ -1602,22 +1602,45 @@ the portable answer for the launchd/init reparenting that motivates #470.
 
 Three properties make the self-watchdog safe rather than merely present:
 
-- **It kills by identity, not by a recyclable pgid.** A bare `kill -KILL -<pgid>` after a fixed sleep
-  is unsafe: if the command exits on its own before the deadline, its numeric pgid can be recycled by
-  an unrelated same-user process group, which the delayed signal would then wrongly kill (the sleep
-  can be up to ~24.8 days). So the watchdog binds to an **un-recyclable liveness pipe**: the command
-  group inherits the only write ends (an extra inherited fd), and the watchdog holds the read end. A
-  blocking read on it reaches EOF exactly when the **whole** group — leader and every descendant —
-  has gone (a kernel pipe cannot be recycled). The watchdog races the deadline against that EOF and
-  signals **only** if the deadline elapses while the pipe is still open (the group provably still the
-  original, still alive); if the group exited first it disarms without ever signalling. A residual
-  microsecond check-then-signal window is inherent to signalling by pgid on POSIX (a race-free `pidfd`
-  kill is Linux-only, non-portable — AP8 target work).
-- **It stays armed until the group is actually gone.** On the timeout path the daemon's own
-  SIGTERM→SIGKILL escalation is still armed for a SIGTERM-ignoring descendant; the self-watchdog is
-  therefore **not** disarmed when the direct child exits — if the daemon dies during the SIGKILL
-  grace, the watchdog is the only thing left to reap that descendant, and it does so via the same
-  liveness-pipe EOF (issue #470 review).
+- **It kills by identity, not by a recyclable pgid** — for the members of the group that hold the
+  identity. A bare `kill -KILL -<pgid>` after a fixed sleep is unsafe: if the command exits on its own
+  before the deadline, its numeric pgid can be recycled by an unrelated same-user process group, which
+  the delayed signal would then wrongly kill (the sleep can be up to ~24.8 days). So the watchdog binds
+  to an **un-recyclable liveness pipe**: the command inherits the only write end of an extra fd
+  (`COMMAND_LIVENESS_FD` — a deliberately high fd, not fd 3, per the issue #472 review below), and the
+  watchdog holds the read end. A blocking read on it reaches EOF once every process holding a copy of
+  that fd has gone, and a pipe is a kernel object that cannot be recycled. The watchdog races the
+  deadline against that EOF and signals **only** if the deadline elapses while the pipe is still open
+  (a group member provably still holds it, still alive); if every holder exited first it disarms
+  without ever signalling. A residual microsecond check-then-signal window is inherent to signalling by
+  pgid on POSIX (a race-free `pidfd` kill is Linux-only, non-portable — AP8 target work).
+
+  **This proves liveness only for processes that actually hold a copy of the fd — not, as originally
+  documented, unconditionally for "the whole group" (issue #472 second-round review).** The direct
+  command process always holds one (the runtime hands it the fd explicitly at spawn time), and a
+  descendant it backgrounds via plain shell/exec-based job control (`cmd &`, with no intervening
+  program that clears the fd) typically inherits it too. But a descendant spawned through a process API
+  that defaults to close-on-exec for non-explicit fds — the default behavior of most modern high-level
+  spawn APIs (Node's own `child_process.spawn`, Python's `subprocess` with `close_fds=True`, Go's
+  `os/exec`, Ruby's `Process.spawn`) — never receives a copy at all. If the leader then exits having
+  handed real work to that descendant, the pipe EOFs and the watchdog disarms even though the
+  descendant is still alive — silently reintroducing the exact #470 orphan failure for that class of
+  command. This is a genuine, currently open gap, distinct from and more consequential than the
+  `closefrom(3)`-style hardening residual fd placement already accepts (see `COMMAND_LIVENESS_FD`'s
+  doc comment for the full analysis of why a fix was not shipped for it in this round without
+  reintroducing the pgid-recycling hazard the pipe exists to close).
+
+- **It stays armed regardless of how the observation resolves, until it independently proves the group
+  is gone.** The watchdog is never proactively killed by the runtime on any outcome — success, failure,
+  or timeout alike (issue #472 second-round review; it previously WAS killed immediately on any
+  non-timeout resolution, on the false assumption that the direct child's own exit means the whole
+  group is done, which silently leaked a descendant backgrounded by an otherwise-successful command,
+  §11.7-issue-#303-style, with nothing left to reap it). It disarms itself, via the same liveness-pipe
+  EOF, the instant the group it can observe is actually gone — near-instant for a well-behaved command
+  with no live descendant — and otherwise reaps the group at its own backstop deadline. This also covers
+  the timeout path unchanged: the daemon's own SIGTERM→SIGKILL escalation is still armed for a
+  SIGTERM-ignoring descendant there, so if the daemon dies during that grace, the watchdog is the only
+  thing left to reap it.
 - **It fails closed.** If no independent bound can be armed — the liveness pipe cannot be created, the
   watchdog cannot be launched, or it cannot confirm it is armed — the runtime **terminates the
   command and reports an execution failure** rather than run it unbounded. The watchdog never
@@ -1628,10 +1651,16 @@ Three properties make the self-watchdog safe rather than merely present:
   `command-poll` execution now needs `mkfifo`, `sh`, and `sleep` reachable on `PATH`, regardless of
   what the monitored command itself is. On a binary-minimal image (slim/distroless/busybox
   containers, or any `PATH` that omits one of these), arming fails on every single execution — the
-  fail-closed behavior is deliberate and correct, but its visible consequence is that the monitored
-  command **never runs**: every observation instead reports an execution failure citing the
-  self-bounding watchdog, with no path to recovery short of adding the missing binary(ies) to the
-  daemon's environment.
+  fail-closed behavior is deliberate and correct, but its visible consequence is that every
+  observation instead reports an execution failure citing the self-bounding watchdog, with no path
+  to recovery short of adding the missing binary(ies) to the daemon's environment. **The monitored
+  command is not prevented from running** — it is spawned before arming is even attempted (§11.7
+  needs its process group to exist first), so it can start and produce real side effects in the
+  window before an arming failure is detected and it is terminated; only the _result_ is suppressed
+  (reported as an execution failure, per §11.5), never the command's own execution. This is
+  materially different from "never runs": a command whose first action has an observable side
+  effect (writing a file, making a network call) still performs that side effect on every tick, even
+  though the tick is always reported as failing.
 
 The **result** of an execution is `(exitCode, stdout)`. A **nonzero exit code with output is a
 valid result, not a failure** — many CLIs exit nonzero meaningfully (`grep`, linters, a task CLI
