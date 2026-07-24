@@ -1591,8 +1591,10 @@ reaps the orphan on its own timer; on normal completion (the daemon still alive)
 promptly so it never lingers. The backstop deadline is set strictly _after_ the daemon's own
 `timeout` + SIGKILL-grace window (plus a small slack), so the daemon-resident timers stay
 authoritative in the normal case and the self-watchdog only ever fires when they cannot. The
-invariant it guarantees: **`kill -9` the daemon mid-command and the command's whole process group
-still terminates on its own within `timeout` + grace + slack.** The watchdog is spawned as a
+invariant it guarantees: **`kill -9` the daemon mid-command, and the leader — along with any
+descendant that still holds a copy of the liveness fd — terminates on its own within `timeout` +
+grace + slack.** (This is narrower than "the whole process group" — see the bulleted qualification
+below for the class of descendant it does not cover.) The watchdog is spawned as a
 _sibling_ (not a shell wrapper around the command) precisely so the command itself is still spawned
 directly (`shell: false`) and every §11.1/§11.2/§11.5 semantic — no shell word-splitting, real
 spawn-failure errors, exact exit codes — is preserved unchanged. Windows has no process groups and no
@@ -1809,15 +1811,31 @@ issue #86's AC1–AC7):
   (verified: `apps/cli/src/commands/cli.integration.test.ts` — _"a live daemon kills a backgrounded
   sh -c descendant on tick timeout, and shutdown leaves it dead"_), so the no-orphan property holds
   not just per-call but across the daemon's own shutdown.
-- A command-poll child is **self-bounding**: killing the daemon abruptly (`kill -9`) mid-command,
-  before its own timeout could fire, still leaves the command's whole process group terminating on
-  its own within `timeout` + grace + slack — it never orphans indefinitely (issue #470, AP8).
+- A command-poll child is **self-bounding, within the liveness-fd boundary §11.2 documents**:
+  killing the daemon abruptly (`kill -9`) mid-command, before its own timeout could fire, still
+  leaves the command's leader process — and any descendant that continues to hold an inherited copy
+  of `COMMAND_LIVENESS_FD` (plain shell/exec-based backgrounding, e.g. `cmd &`, with no intervening
+  program that clears it) — terminating on its own within `timeout` + grace + slack; it never orphans
+  indefinitely (issue #470, AP8). **This is not an unconditional whole-process-group guarantee.** A
+  descendant spawned through a process API that defaults to close-on-exec for non-explicit fds (the
+  default behavior of most modern high-level spawn APIs — Node's own `child_process.spawn`, Python's
+  `subprocess` with `close_fds=True`, Go's `os/exec`, Ruby's `Process.spawn`) never receives a copy of
+  the fd; once the leader that does hold it exits, the pipe EOFs and the watchdog disarms even though
+  that descendant is still alive. This class of command remains genuinely unbounded once the daemon is
+  gone — issue #470 stays open as the tracker for closing it (a fix needs a liveness proof that does
+  not depend on fd inheritance, e.g. periodically re-verifying group membership by pgid, which
+  reintroduces the recycled-pgid hazard this design exists to avoid; see `COMMAND_LIVENESS_FD`'s doc
+  comment for the full analysis).
   Verified end to end through a live `daemon run` subprocess:
   `apps/cli/src/commands/cli.integration.test.ts` — _"a command-poll descendant self-terminates after
   the daemon is killed with SIGKILL mid-command"_ first confirms the descendant is genuinely orphaned
   (still alive immediately after the daemon is SIGKILLed, so nothing daemon-side is left to reap it),
   then confirms it dies on its own within the self-watchdog deadline. Removing the self-watchdog makes
-  the test fail (the orphan never dies), proving it is not vacuous.
+  the test fail (the orphan never dies), proving it is not vacuous. The boundary itself is pinned by a
+  characterization test (verified: `plugins/source-command-poll/src/index.test.ts` — _"self-watchdog
+  boundary — a close-on-exec-spawned descendant is not reaped"_), which asserts the OPPOSITE outcome
+  for a Node `child_process.spawn({ stdio: 'ignore' })` descendant: it is still alive well past the
+  backstop deadline, making the documented gap loud in the suite rather than silent.
 - Registration + the `init --type command-poll` template + `validate` accepting/rejecting a
   `command-poll` monitor are covered at the CLI layer (AC7: verified:
   `apps/cli/src/commands/cli.integration.test.ts` — _"scaffolds a command-poll monitor that passes

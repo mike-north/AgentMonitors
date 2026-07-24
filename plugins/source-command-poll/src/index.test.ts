@@ -1497,6 +1497,69 @@ describe.skipIf(process.platform === 'win32')(
 );
 
 /**
+ * Regression test for the issue #472 review, round 4: a fast command can exit
+ * (and `finish()` settle from its own outcome) BEFORE the self-watchdog's
+ * "armed" handshake resolves. Pre-fix, `!settled` at that point already read
+ * `true`, so the required fail-closed kill+failure was silently suppressed —
+ * on exact head `40dd622`, with a `PATH` containing `sh`/`mkfifo` but no
+ * `sleep`, 100/100 real `/bin/sh -c 'printf hi'` executions reported
+ * `health: "ok"` even though no watchdog ever armed, contradicting 003 §11.2's
+ * requirement that every unarmable execution fail closed.
+ *
+ * The fix holds the child's own outcome until the arming decision is known,
+ * so a `false` arming result — however late it arrives — always converts the
+ * result to the fail-closed execution failure.
+ */
+describe.skipIf(process.platform === 'win32')(
+  'source-command-poll: fail-closed race with a fast command (issue #472 review, round 4)',
+  () => {
+    /** Absolute path of a binary, resolved before any PATH mutation. */
+    function resolveBin(name: string): string {
+      return execFileSync('sh', ['-c', `command -v ${name}`], {
+        encoding: 'utf8',
+      }).trim();
+    }
+
+    it('fails closed even when the command exits before arming is decided (never reports "ok")', async () => {
+      const binDir = mkdtempSync(join(tmpdir(), 'am-472r4-path-'));
+      const previousPath = process.env['PATH'];
+      try {
+        // `sh` and `mkfifo` are reachable (the watchdog can launch and the
+        // liveness pipe can be created), but `sleep` is not — so arming can
+        // never complete. The monitored command itself is a FAST, immediately
+        // completing one: it must exit well before the watchdog's `exit`
+        // event (which fires the `armed` promise's `false` resolution) has a
+        // chance to run, reproducing the reported race.
+        for (const bin of ['sh', 'mkfifo']) {
+          symlinkSync(resolveBin(bin), join(binDir, bin));
+        }
+        process.env['PATH'] = binDir;
+
+        // Repeated, matching the reported 100/100-repro methodology — a
+        // single run could pass by timing luck even pre-fix.
+        for (let i = 0; i < 25; i++) {
+          const result = await source.observe(
+            { command: ['sh', '-c', 'printf hi'] },
+            ctx(),
+          );
+
+          expect(result.observations).toHaveLength(1);
+          expect(result.observations[0]?.title).toContain('Command failing');
+          expect(result.nextState).toMatchObject({ health: 'failing' });
+          const payload = result.observations[0]?.payload as {
+            error: string;
+          };
+          expect(payload.error).toMatch(/self-bounding watchdog/i);
+        }
+      } finally {
+        process.env['PATH'] = previousPath;
+        rmSync(binDir, { recursive: true, force: true });
+      }
+    }, 30_000);
+  },
+);
+
+/**
  * Regression test for the issue #472 review: the self-watchdog's liveness pipe
  * previously handed its write end to the command at fd 3. Read-EOF on that pipe
  * is meant to mean "the whole command group has exited," but EOF also arrives the
@@ -1647,6 +1710,87 @@ describe.skipIf(process.platform === 'win32')(
         rmSync(dir, { recursive: true, force: true });
       }
     }, 20_000);
+  },
+);
+
+/**
+ * Characterization test pinning the documented guarantee BOUNDARY of the
+ * self-watchdog (003 §11.2, issue #472 second-round review; tracked open at
+ * issue #470). The liveness pipe proves liveness only for processes that
+ * actually hold a copy of {@link COMMAND_LIVENESS_FD} — not, as the acceptance
+ * criterion once claimed unconditionally, "the whole process group". A
+ * descendant spawned through a process API that defaults to close-on-exec for
+ * non-explicit fds — Node's own `child_process.spawn`, exactly as used here —
+ * never receives a copy. Once the direct command process (which does hold the
+ * fd) exits, the pipe EOFs and the watchdog disarms, even though that
+ * descendant is still very much alive.
+ *
+ * This is not a bug this PR fixes — it is the acknowledged residual gap #470
+ * remains open to close (a portable liveness proof that does not depend on fd
+ * inheritance would require re-verifying group membership by pgid on a timer,
+ * which reintroduces the recycled-pgid hazard this design exists to avoid).
+ * The test exists so the gap is loud in the suite — a future change that
+ * silently narrows or widens this boundary should have to touch this
+ * assertion, not discover the gap by an incident report.
+ */
+describe.skipIf(process.platform === 'win32')(
+  'source-command-poll: self-watchdog boundary — a close-on-exec-spawned descendant is not reaped (issue #472 review, tracked open in issue #470)',
+  () => {
+    it('leaves a Node child_process.spawn({ stdio: "ignore" }) descendant alive well past the backstop deadline', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'am-470-close-on-exec-'));
+      const pidFile = join(dir, 'descendant.pid');
+      let descendantPid: number | undefined;
+      try {
+        // The leader IS the direct command process (holds COMMAND_LIVENESS_FD).
+        // It spawns a further descendant via Node's own `child_process.spawn`
+        // with default stdio — which closes every fd it wasn't explicitly
+        // handed, so the descendant never inherits the liveness fd — then exits
+        // immediately, handing all further work to that descendant.
+        const scope = {
+          command: nodeArgv(
+            [
+              "const { spawn } = require('node:child_process');",
+              `const child = spawn('sleep', ['30'], { stdio: 'ignore' });`,
+              `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
+              'child.unref();',
+            ].join('\n'),
+          ),
+          timeout: '1s',
+        };
+
+        const start = Date.now();
+        const result = await source.observe(scope, ctx());
+        const elapsed = Date.now() - start;
+
+        // The leader's own exit is reported healthy — matching the reported
+        // repro (`observe()` returned healthy in 22ms).
+        expect(result.nextState).toMatchObject({ health: 'ok' });
+        expect(elapsed).toBeLessThan(5_000);
+
+        const gotPidFile = await pollUntil(() => existsSync(pidFile), 3_000);
+        expect(gotPidFile).toBe(true);
+        descendantPid = Number(readFileSync(pidFile, 'utf8').trim());
+        expect(Number.isInteger(descendantPid)).toBe(true);
+        expect(isProcessAlive(descendantPid)).toBe(true);
+
+        // Backstop deadline = ceil((timeout(1s) + grace(5s) + slack(2s)) / 1000)
+        // = 8s after the command was spawned. This pins the documented boundary:
+        // unlike the plain-shell-backgrounding case covered elsewhere in this
+        // file, this descendant is NOT reaped by the watchdog's deadline — it
+        // never held a copy of the liveness fd at all.
+        await new Promise((r) => setTimeout(r, 10_000));
+        expect(isProcessAlive(descendantPid)).toBe(true);
+      } finally {
+        if (descendantPid !== undefined && isProcessAlive(descendantPid)) {
+          try {
+            process.kill(descendantPid, 'SIGKILL');
+          } catch {
+            // Already gone — nothing to do.
+          }
+        }
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }, 25_000);
   },
 );
 

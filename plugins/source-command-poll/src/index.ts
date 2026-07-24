@@ -719,6 +719,27 @@ async function runCommand(
     // Armed after `finish()` is defined below, whose fail-closed path it drives.
     let selfWatchdog: SelfWatchdog | undefined;
 
+    /**
+     * Tracks the self-watchdog's arming handshake independently of the child's
+     * own exit (003 §11.2, issue #472 review round 4). `'not-required'` covers
+     * Windows and the pidless-spawn case, where no arming is attempted at all.
+     * `finish()` below joins this against the child's own outcome so a late
+     * arming failure always wins, even when the child already exited.
+     */
+    let armingDecision: 'not-required' | 'pending' | 'ok' | 'failed' =
+      'not-required';
+    /**
+     * The child's own outcome, held here when it arrives while `armingDecision`
+     * is still `'pending'` — a fast command can exit and produce a result
+     * before the watchdog's "armed" handshake resolves. Without this hold,
+     * `finish()` would settle on the child's outcome immediately, and a
+     * subsequently-discovered arming failure would have no effect (the exact
+     * bug reported against exact head `40dd622`: a restricted `PATH` with no
+     * `sleep` combined with a fast command reported `health: "ok"` in 100/100
+     * runs despite no watchdog ever arming).
+     */
+    let deferredOutcome: ExecOutcome | undefined;
+
     let settled = false;
     let timedOut = false;
     let truncated = false;
@@ -806,8 +827,29 @@ async function runCommand(
       // `killProcessTree`, so leaving it armed is always safe.
     }
 
+    /**
+     * The fail-closed conversion applied whenever `armingDecision` is `'failed'`
+     * at settle time — regardless of whether the child's own outcome was ready
+     * before or after arming was decided (003 §11.2, issue #472 review round 4).
+     */
+    function armingFailureOutcome(): ExecOutcome {
+      return {
+        kind: 'failure',
+        error: 'Could not arm self-bounding watchdog: arming was not confirmed',
+        stderrTail: stderrTailString(),
+      };
+    }
+
     function finish(outcome: ExecOutcome): void {
       if (settled) return;
+      if (armingDecision === 'pending') {
+        // Hold the child's own outcome — don't let it settle the promise yet.
+        // The `selfWatchdog.armed.then(...)` handler below re-invokes `finish`
+        // once arming is decided, at which point `armingDecision` is no longer
+        // `'pending'` and this branch is skipped, so it settles exactly once.
+        deferredOutcome ??= outcome;
+        return;
+      }
       settled = true;
       clearTimers();
       // The self-watchdog is deliberately NEVER proactively killed here, on ANY
@@ -826,7 +868,12 @@ async function runCommand(
       // group it can observe is actually gone (near-instant for a well-behaved
       // command with no live descendant), and otherwise reaps the group at its own
       // backstop deadline — regardless of how `observe()` itself resolved.
-      resolve(outcome);
+      //
+      // If arming was ultimately decided as `'failed'`, that always overrides
+      // whatever `outcome` the child itself produced — including a successful
+      // result — per the fail-closed guarantee issue #470 exists to make (003
+      // §11.2, issue #472 review round 4).
+      resolve(armingDecision === 'failed' ? armingFailureOutcome() : outcome);
     }
 
     /**
@@ -977,15 +1024,25 @@ async function runCommand(
           stderrTail: '',
         });
       } else {
+        // Marked 'pending' before the `.then` is even attached — still
+        // synchronous, so a child `exit`/`error` event can never observe
+        // anything other than 'pending' here (003 §11.2, issue #472 review
+        // round 4). `finish()` above defers on exactly this state.
+        armingDecision = 'pending';
         void selfWatchdog.armed.then((ok) => {
-          if (!ok && !settled) {
+          armingDecision = ok ? 'ok' : 'failed';
+          if (deferredOutcome !== undefined) {
+            // The child already produced its own outcome while arming was
+            // still pending. Re-run it through `finish()` now that
+            // `armingDecision` is decided — a failed decision converts even an
+            // already-successful child outcome to the fail-closed failure.
+            const outcome = deferredOutcome;
+            deferredOutcome = undefined;
+            finish(outcome);
+          } else if (!ok && !settled) {
+            // The child is still running: kill it now, same as before.
             killProcessTree(child, 'SIGKILL', isWindows);
-            finish({
-              kind: 'failure',
-              error:
-                'Could not arm self-bounding watchdog: arming was not confirmed',
-              stderrTail: stderrTailString(),
-            });
+            finish(armingFailureOutcome());
           }
         });
       }

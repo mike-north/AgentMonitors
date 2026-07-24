@@ -9,6 +9,33 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-07-24 — command-poll self-watchdog: fail-closed settle race fixed; 11.7 acceptance criterion qualified to match the documented liveness-fd boundary (003 §11.2, §11.7) — Refs #470, #472
+
+Fourth review round. Two findings, both fixed.
+
+- **Fixed — fail-closed race between a fast command's own exit and the arming handshake.** A command
+  could exit and settle `runCommand`'s promise via its own outcome before the self-watchdog's "armed"
+  handshake resolved. Once settled, the `!settled` guard on the arming-failure branch silently
+  suppressed the required fail-closed kill+failure. Confirmed on this head: with `PATH` restricted to
+  `sh`+`mkfifo` (no `sleep`, so arming can never complete), 100/100 real `/bin/sh -c 'printf hi'`
+  executions reported `health: "ok"` — contradicting §11.2's "every unarmable execution fails closed"
+  requirement. Fixed by holding the child's own outcome until the arming decision is known and joining
+  the two before settling: a `'failed'` arming decision now always converts the final result to the
+  fail-closed execution failure, even when the child already produced (and would otherwise have kept)
+  a successful outcome. Regression test added reproducing the exact restricted-`PATH`/fast-command
+  scenario, repeated 25x to rule out timing luck.
+- **Fixed — §11.7's acceptance criterion overclaimed unconditional whole-process-group coverage,
+  contradicting §11.2's own acknowledged close-on-exec gap.** Confirmed on this head: an ordinary Node
+  `child_process.spawn({ stdio: 'ignore' })` descendant did not inherit the liveness fd; `observe()`
+  reported healthy in 22ms, the leader exited, and the descendant was still alive after 10s — past its
+  8s watchdog deadline. Rather than attempt a transitive bound (which would reintroduce the
+  recycled-pgid hazard §11.2 already rejected once), both §11.2's top-level invariant statement and
+  §11.7's acceptance criterion are qualified to state the actual guarantee: the leader, and any
+  descendant that continues to hold an inherited copy of the liveness fd — not descendants spawned via
+  a close-on-exec-by-default API once their leader has exited. A characterization test pins this
+  boundary explicitly by asserting a `child_process.spawn({ stdio: 'ignore' })` descendant is genuinely
+  NOT reaped. Issue #470 remains open as the tracker for closing this class of descendant.
+
 ## 2026-07-22 — command-poll self-watchdog: fd leak fix, never-reaped-early fix, doc correction, one open descendant-liveness gap (000, 003 §11.2) — Refs #470, #472
 
 Second review round on the hardened self-watchdog. Four findings; three fixed with regression tests,
