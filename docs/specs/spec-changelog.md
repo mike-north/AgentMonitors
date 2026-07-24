@@ -9,6 +9,42 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-07-24 — command-poll self-watchdog: Linux CI red fixed — a genuine FIFO-reopen deadlock, plus the close-on-exec boundary confirmed platform-dependent (003 §11.2, §11.7) — Refs #470, #472
+
+CI turned red on the round-4 push (exact head `995d1fe`) on Linux only. Reproduced both failures in a
+`node:24` Linux container (not a flake) and found two distinct, unrelated causes.
+
+- **Fixed — the watchdog's own arming handshake could deadlock forever on Linux for a fast command.**
+  Six pre-existing tests (`sh -c` argv form, all `cwd` resolution tests) started timing out at the
+  vitest default (5000ms) after round 4's fail-closed join started making `observe()` genuinely wait
+  for the arming decision before settling (previously it settled immediately regardless, silently
+  hiding this). Root cause, confirmed via `/proc/<pid>/wchan` showing `wait_for_partner`: the
+  watchdog's `exec 3</dev/fd/0 || exit 0` line re-opens the liveness FIFO through a fresh `open(2)`
+  call (on Linux, via the `/proc/self/fd` magic-symlink mechanism). A fresh open on a FIFO engages the
+  kernel's reader/writer pairing handshake — if every writer has already closed by the time this runs
+  (routine for a command that exits before the watchdog finishes starting up), the open blocks
+  FOREVER waiting for a writer that will never arrive. macOS's `/dev/fd` does not retrigger this
+  handshake, which is why this was never seen before switching CI to test on Linux. Replaced the
+  reopen with the shell's plain fd-duplication form (`exec 3<&0`) — duplicating the already-open fd 0
+  in place needs no fresh open, so no pairing handshake, so it can never block even with zero writers
+  left; empirically verified (both platforms) that it still arms correctly, still disarms only on a
+  genuine writer-count-zero EOF (never spuriously early), and never blocks.
+- **Confirmed (not a bug) — the close-on-exec descendant boundary documented in round 4 is
+  platform-dependent for Node's own `child_process.spawn`, not a cross-platform default.** The new
+  round-4 characterization test (asserting a `child_process.spawn({ stdio: 'ignore' })` descendant
+  survives past the backstop deadline) failed on Linux — NOT from the FIFO fix above (confirmed via
+  direct `/proc/<pid>/fd` inspection: the descendant's fd table shows fd 20 as a live symlink to the
+  liveness FIFO). Node does not itself guarantee closing every non-explicit fd on `spawn()` — that is
+  a property of the underlying OS process-creation call, and it differs by platform: confirmed on
+  macOS the descendant does NOT inherit the fd (the gap reproduces, matching the original report); on
+  the Linux/Node combination CI runs it DOES inherit the fd, so the liveness pipe never reaches EOF
+  while it runs and the ordinary backstop pgid kill reaps it instead — the gap simply does not
+  reproduce there. Split the single characterization test into two platform-scoped tests (one per
+  actual, verified per-platform outcome) rather than skipping Linux silently or force-passing an
+  assertion that isn't true there. 003 §11.2/§11.7 and the `COMMAND_LIVENESS_FD` doc comment corrected
+  to state this is platform-dependent rather than a documented Node default; the PR description's
+  "Known limitation" section updated to match.
+
 ## 2026-07-24 — command-poll self-watchdog: fail-closed settle race fixed; 11.7 acceptance criterion qualified to match the documented liveness-fd boundary (003 §11.2, §11.7) — Refs #470, #472
 
 Fourth review round. Two findings, both fixed.

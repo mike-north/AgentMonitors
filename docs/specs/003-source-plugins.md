@@ -1621,16 +1621,27 @@ Three properties make the self-watchdog safe rather than merely present:
   documented, unconditionally for "the whole group" (issue #472 second-round review).** The direct
   command process always holds one (the runtime hands it the fd explicitly at spawn time), and a
   descendant it backgrounds via plain shell/exec-based job control (`cmd &`, with no intervening
-  program that clears the fd) typically inherits it too. But a descendant spawned through a process API
-  that defaults to close-on-exec for non-explicit fds — the default behavior of most modern high-level
-  spawn APIs (Node's own `child_process.spawn`, Python's `subprocess` with `close_fds=True`, Go's
-  `os/exec`, Ruby's `Process.spawn`) — never receives a copy at all. If the leader then exits having
-  handed real work to that descendant, the pipe EOFs and the watchdog disarms even though the
-  descendant is still alive — silently reintroducing the exact #470 orphan failure for that class of
-  command. This is a genuine, currently open gap, distinct from and more consequential than the
-  `closefrom(3)`-style hardening residual fd placement already accepts (see `COMMAND_LIVENESS_FD`'s
+  program that clears the fd) typically inherits it too. A descendant spawned through a process API
+  documented to default to close-on-exec for non-explicit fds (Python's `subprocess` with
+  `close_fds=True`, Go's `os/exec`, Ruby's `Process.spawn`) never receives a copy at all; if the leader
+  then exits having handed real work to that descendant, the pipe EOFs and the watchdog disarms even
+  though the descendant is still alive — silently reintroducing the exact #470 orphan failure for that
+  class of command. This is a genuine, currently open gap, distinct from and more consequential than
+  the `closefrom(3)`-style hardening residual fd placement already accepts (see `COMMAND_LIVENESS_FD`'s
   doc comment for the full analysis of why a fix was not shipped for it in this round without
   reintroducing the pgid-recycling hazard the pipe exists to close).
+
+  **For Node's own `child_process.spawn`, whether the descendant receives a copy turns out to be
+  platform-dependent, not a documented cross-platform default (issue #472 review round 5).** Node does
+  not, by itself, guarantee closing every non-explicit fd on `spawn()` — that is a property of the
+  underlying OS process-creation call, which differs by platform. Confirmed while reproducing this
+  scenario in CI: on macOS, a `child_process.spawn(cmd, args, { stdio: 'ignore' })` descendant does NOT
+  inherit `COMMAND_LIVENESS_FD` — the gap above reproduces exactly as described. On the Linux/Node
+  combination CI runs, the SAME call DOES pass the fd through (verified via `/proc/<pid>/fd`
+  inspection), so the liveness pipe never reaches EOF while that descendant is alive, and the ordinary
+  backstop deadline reaps it by pgid instead — the gap does not reproduce there. Both outcomes are
+  pinned by platform-scoped characterization tests (see 003 §11.7's validation-implications entry for
+  this item) so neither platform's actual behavior can silently drift without failing a test.
 
 - **It stays armed regardless of how the observation resolves, until it independently proves the group
   is gone.** The watchdog is never proactively killed by the runtime on any outcome — success, failure,
@@ -1817,25 +1828,30 @@ issue #86's AC1–AC7):
   of `COMMAND_LIVENESS_FD` (plain shell/exec-based backgrounding, e.g. `cmd &`, with no intervening
   program that clears it) — terminating on its own within `timeout` + grace + slack; it never orphans
   indefinitely (issue #470, AP8). **This is not an unconditional whole-process-group guarantee.** A
-  descendant spawned through a process API that defaults to close-on-exec for non-explicit fds (the
-  default behavior of most modern high-level spawn APIs — Node's own `child_process.spawn`, Python's
-  `subprocess` with `close_fds=True`, Go's `os/exec`, Ruby's `Process.spawn`) never receives a copy of
-  the fd; once the leader that does hold it exits, the pipe EOFs and the watchdog disarms even though
-  that descendant is still alive. This class of command remains genuinely unbounded once the daemon is
-  gone — issue #470 stays open as the tracker for closing it (a fix needs a liveness proof that does
-  not depend on fd inheritance, e.g. periodically re-verifying group membership by pgid, which
-  reintroduces the recycled-pgid hazard this design exists to avoid; see `COMMAND_LIVENESS_FD`'s doc
-  comment for the full analysis).
+  descendant spawned through a process API documented to default to close-on-exec for non-explicit fds
+  (Python's `subprocess` with `close_fds=True`, Go's `os/exec`, Ruby's `Process.spawn`) never receives a
+  copy of the fd; once the leader that does hold it exits, the pipe EOFs and the watchdog disarms even
+  though that descendant is still alive. This class of command remains genuinely unbounded once the
+  daemon is gone — issue #470 stays open as the tracker for closing it (a fix needs a liveness proof
+  that does not depend on fd inheritance, e.g. periodically re-verifying group membership by pgid,
+  which reintroduces the recycled-pgid hazard this design exists to avoid; see `COMMAND_LIVENESS_FD`'s
+  doc comment for the full analysis). For Node's own `child_process.spawn` specifically, whether a
+  descendant receives a copy is platform-dependent, not a documented cross-platform default (issue
+  #472 review round 5) — confirmed on macOS (the gap above reproduces) but NOT on the Linux/Node
+  combination CI runs (the descendant DOES inherit the fd there, so it stays bounded by the ordinary
+  backstop pgid kill instead; see `COMMAND_LIVENESS_FD`'s doc comment for the `/proc`-verified detail).
   Verified end to end through a live `daemon run` subprocess:
   `apps/cli/src/commands/cli.integration.test.ts` — _"a command-poll descendant self-terminates after
   the daemon is killed with SIGKILL mid-command"_ first confirms the descendant is genuinely orphaned
   (still alive immediately after the daemon is SIGKILLed, so nothing daemon-side is left to reap it),
   then confirms it dies on its own within the self-watchdog deadline. Removing the self-watchdog makes
-  the test fail (the orphan never dies), proving it is not vacuous. The boundary itself is pinned by a
-  characterization test (verified: `plugins/source-command-poll/src/index.test.ts` — _"self-watchdog
-  boundary — a close-on-exec-spawned descendant is not reaped"_), which asserts the OPPOSITE outcome
-  for a Node `child_process.spawn({ stdio: 'ignore' })` descendant: it is still alive well past the
-  backstop deadline, making the documented gap loud in the suite rather than silent.
+  the test fail (the orphan never dies), proving it is not vacuous. The boundary itself is pinned by
+  platform-scoped characterization tests (verified: `plugins/source-command-poll/src/index.test.ts` —
+  _"self-watchdog boundary — a close-on-exec-spawned descendant"_): on a platform where the descendant
+  does not inherit the fd (macOS), it asserts the descendant is still alive well past the backstop
+  deadline; on a platform where it does (this Linux/Node combination), it asserts the descendant is
+  reaped anyway via the ordinary backstop pgid kill — pinning whichever behavior a platform actually
+  has, so neither can silently drift without failing a test.
 - Registration + the `init --type command-poll` template + `validate` accepting/rejecting a
   `command-poll` monitor are covered at the CLI layer (AC7: verified:
   `apps/cli/src/commands/cli.integration.test.ts` — _"scaffolds a command-poll monitor that passes

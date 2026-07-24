@@ -124,11 +124,22 @@ deadline="$2"
 # kill in that case — that would SIGKILL a healthy group instantly. Fail closed:
 # exit before printing "armed", so the daemon terminates the command itself.
 command -v sleep >/dev/null 2>&1 || exit 0
-# The liveness read end arrives as fd 0, but it is passed through a child stdio
-# slot, which the runtime forces non-blocking; a bare read would then see a
-# spurious EOF and disarm instantly. Re-open it as a fresh BLOCKING fd (portable
-# via /dev/fd on macOS and Linux). A failure here also fails closed (no "armed").
-exec 3</dev/fd/0 || exit 0
+# The liveness read end arrives as fd 0. Duplicate it to fd 3 with the shell's
+# fd-duplication form (\`<&\`), NOT a fresh open (\`</dev/fd/0\`) — the two are not
+# equivalent for a FIFO. \`</dev/fd/0\` re-opens the underlying named pipe via a
+# fresh open(2) (on Linux, through the /proc/self/fd magic-symlink mechanism);
+# the kernel's FIFO reader/writer pairing handshake applies to that fresh open
+# exactly as it would to any other open() on the FIFO's path, so if every writer
+# has already closed by the time this runs (routine for a fast command that
+# exits before the watchdog finishes starting up), the open BLOCKS FOREVER
+# waiting for a writer that will never come (confirmed via /proc/<pid>/wchan =
+# \`wait_for_partner\` — issue #472 review round 5). \`<&\` instead duplicates the
+# already-open fd 0 in place — no fresh open, so no pairing handshake, so it can
+# never block even with zero writers left, and it still yields a genuinely
+# blocking fd (dup shares the original open file description's status flags,
+# and Node does not mark a raw-fd stdio slot non-blocking). A failure here also
+# fails closed (no "armed").
+exec 3<&0 || exit 0
 printf 'armed\n'
 # Deadline timer.
 sleep "$deadline" &
@@ -185,30 +196,46 @@ interface LivenessPipe {
  *    for some `N <= 20`) still closes this fd too, because there is no fd number
  *    such hardening would skip. Narrow and deliberate; unavoidable by fd
  *    placement alone.
- * 2. **A descendant the monitored command spawns via any process API that
- *    defaults to close-on-exec for non-explicit fds — which is the DEFAULT
- *    behavior of most modern high-level spawn APIs (Node's own
- *    `child_process.spawn`, Python's `subprocess` with its default
- *    `close_fds=True`, Go's `os/exec`, Ruby's `Process.spawn`) — never inherits
- *    this fd at all.** This is not a hardening edge case; it is completely
- *    ordinary code. When the immediate/intermediate process that DOES hold this
- *    fd exits (having handed real work off to that descendant), the pipe EOFs
- *    even though the descendant is still alive, and the watchdog disarms —
- *    exactly the #470 orphan failure this whole mechanism exists to prevent.
- *    Fd inheritance into a further descendant is entirely the exec-ing
- *    process's own choice; from outside that process tree there is no portable
- *    OS mechanism to force it. Closing this fully would need a liveness proof
- *    that does not depend on fd inheritance at all — e.g. periodically
- *    re-verifying group membership via `kill -0 -"$pgid"` — but that
- *    reintroduces, in a bounded-but-nonzero form, exactly the recycled-pgid
- *    hazard this liveness-pipe design was built to close (a pgid can be reused
- *    by an unrelated group between the last successful check and the actual
- *    kill; shrinking the poll interval shrinks that window but cannot remove
- *    it, unlike the zero-risk proof a still-open fd gives). Given the standing
- *    instruction to never reintroduce that hazard, this residual is left
- *    unresolved here rather than "fixed" with a materially different safety
- *    property — see the issue #472 second-round review thread for the full
- *    analysis and the reproduction that confirmed it.
+ * 2. **A descendant the monitored command spawns via any process API documented
+ *    to default to close-on-exec for non-explicit fds (Python's `subprocess`
+ *    with its default `close_fds=True`, Go's `os/exec`, Ruby's `Process.spawn`)
+ *    never inherits this fd at all.** This is not a hardening edge case; it is
+ *    completely ordinary code. When the immediate/intermediate process that DOES
+ *    hold this fd exits (having handed real work off to that descendant), the
+ *    pipe EOFs even though the descendant is still alive, and the watchdog
+ *    disarms — exactly the #470 orphan failure this whole mechanism exists to
+ *    prevent. Fd inheritance into a further descendant is entirely the
+ *    exec-ing process's own choice; from outside that process tree there is no
+ *    portable OS mechanism to force it. Closing this fully would need a
+ *    liveness proof that does not depend on fd inheritance at all — e.g.
+ *    periodically re-verifying group membership via `kill -0 -"$pgid"` — but
+ *    that reintroduces, in a bounded-but-nonzero form, exactly the
+ *    recycled-pgid hazard this liveness-pipe design was built to close (a pgid
+ *    can be reused by an unrelated group between the last successful check and
+ *    the actual kill; shrinking the poll interval shrinks that window but
+ *    cannot remove it, unlike the zero-risk proof a still-open fd gives).
+ *    Given the standing instruction to never reintroduce that hazard, this
+ *    residual is left unresolved here rather than "fixed" with a materially
+ *    different safety property — see the issue #472 second-round review thread
+ *    for the full analysis and the reproduction that confirmed it.
+ *
+ *    For Node's own `child_process.spawn`, whether a descendant receives a
+ *    copy of this fd turns out to be PLATFORM-DEPENDENT, not a documented
+ *    cross-platform default (issue #472 review round 5) — Node does not
+ *    itself guarantee closing every non-explicit fd on `spawn()`; that is a
+ *    property of the underlying OS process-creation call. Confirmed while
+ *    reproducing this scenario in CI: on macOS, `spawn(cmd, args, { stdio:
+ *    'ignore' })` does NOT pass this fd to the descendant (the gap above
+ *    reproduces exactly). On the Linux/Node combination CI runs, the SAME call
+ *    DOES pass it through — verified directly via `/proc/<pid>/fd/20` showing
+ *    a live symlink to the (deleted) liveness FIFO in the descendant's own fd
+ *    table — so there the pipe never reaches EOF while that descendant runs,
+ *    and the ordinary backstop deadline reaps it by pgid instead; the gap
+ *    does not reproduce on that platform. Both
+ *    outcomes are pinned by platform-scoped tests in
+ *    `plugins/source-command-poll/src/index.test.ts` (the "self-watchdog
+ *    boundary — a close-on-exec-spawned descendant" describe block) so
+ *    neither platform's actual behavior can silently drift unnoticed.
  *
  * In practice, the guarantee this mechanism delivers is: the monitored command's
  * own leader process, and any descendant that continues to hold an inherited

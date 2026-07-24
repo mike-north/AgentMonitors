@@ -1714,83 +1714,155 @@ describe.skipIf(process.platform === 'win32')(
 );
 
 /**
- * Characterization test pinning the documented guarantee BOUNDARY of the
+ * Characterization tests pinning the documented guarantee BOUNDARY of the
  * self-watchdog (003 §11.2, issue #472 second-round review; tracked open at
  * issue #470). The liveness pipe proves liveness only for processes that
  * actually hold a copy of {@link COMMAND_LIVENESS_FD} — not, as the acceptance
- * criterion once claimed unconditionally, "the whole process group". A
- * descendant spawned through a process API that defaults to close-on-exec for
- * non-explicit fds — Node's own `child_process.spawn`, exactly as used here —
- * never receives a copy. Once the direct command process (which does hold the
- * fd) exits, the pipe EOFs and the watchdog disarms, even though that
- * descendant is still very much alive.
+ * criterion once claimed unconditionally, "the whole process group". Whether a
+ * descendant spawned via Node's own `child_process.spawn` receives a copy of
+ * that fd turns out to be PLATFORM-DEPENDENT, discovered while reproducing
+ * this scenario in CI (issue #472 review round 5):
  *
- * This is not a bug this PR fixes — it is the acknowledged residual gap #470
- * remains open to close (a portable liveness proof that does not depend on fd
- * inheritance would require re-verifying group membership by pgid on a timer,
- * which reintroduces the recycled-pgid hazard this design exists to avoid).
- * The test exists so the gap is loud in the suite — a future change that
- * silently narrows or widens this boundary should have to touch this
- * assertion, not discover the gap by an incident report.
+ * - **macOS** (the platform of the original report): the descendant does NOT
+ *   inherit the fd. Once the direct command process (which does hold it)
+ *   exits, the pipe EOFs and the watchdog disarms — even though the
+ *   descendant is still very much alive. This is the acknowledged residual
+ *   gap #470 remains open to close (a portable liveness proof that does not
+ *   depend on fd inheritance would require re-verifying group membership by
+ *   pgid on a timer, which reintroduces the recycled-pgid hazard this design
+ *   exists to avoid).
+ * - **Linux** (confirmed via `/proc/<pid>/fd` inspection in the CI container):
+ *   the descendant DOES inherit the fd, so the liveness pipe never reaches
+ *   EOF while it is alive — the watchdog's ordinary backstop deadline still
+ *   fires and reaps the whole process group (descendant included) by pgid,
+ *   exactly as it would for a plain shell-backgrounded descendant. The gap
+ *   this section documents does not reproduce on this platform.
+ *
+ * Both tests exist so whichever behavior a platform actually has stays loud
+ * in the suite — a future change that silently narrows or widens either
+ * platform's boundary should have to touch its assertion, not be discovered
+ * by an incident report.
  */
 describe.skipIf(process.platform === 'win32')(
-  'source-command-poll: self-watchdog boundary — a close-on-exec-spawned descendant is not reaped (issue #472 review, tracked open in issue #470)',
+  'source-command-poll: self-watchdog boundary — a close-on-exec-spawned descendant (issue #472 review, tracked open in issue #470)',
   () => {
-    it('leaves a Node child_process.spawn({ stdio: "ignore" }) descendant alive well past the backstop deadline', async () => {
-      const dir = mkdtempSync(join(tmpdir(), 'am-470-close-on-exec-'));
-      const pidFile = join(dir, 'descendant.pid');
-      let descendantPid: number | undefined;
-      try {
-        // The leader IS the direct command process (holds COMMAND_LIVENESS_FD).
-        // It spawns a further descendant via Node's own `child_process.spawn`
-        // with default stdio — which closes every fd it wasn't explicitly
-        // handed, so the descendant never inherits the liveness fd — then exits
-        // immediately, handing all further work to that descendant.
-        const scope = {
-          command: nodeArgv(
-            [
-              "const { spawn } = require('node:child_process');",
-              `const child = spawn('sleep', ['30'], { stdio: 'ignore' });`,
-              `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
-              'child.unref();',
-            ].join('\n'),
-          ),
-          timeout: '1s',
-        };
+    /** Absolute pid file path plus the leader script that writes it. */
+    function closeOnExecScope(pidFile: string): Record<string, unknown> {
+      return {
+        command: nodeArgv(
+          [
+            "const { spawn } = require('node:child_process');",
+            `const child = spawn('sleep', ['30'], { stdio: 'ignore' });`,
+            `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
+            'child.unref();',
+          ].join('\n'),
+        ),
+        timeout: '1s',
+      };
+    }
 
-        const start = Date.now();
-        const result = await source.observe(scope, ctx());
-        const elapsed = Date.now() - start;
-
-        // The leader's own exit is reported healthy — matching the reported
-        // repro (`observe()` returned healthy in 22ms).
-        expect(result.nextState).toMatchObject({ health: 'ok' });
-        expect(elapsed).toBeLessThan(5_000);
-
-        const gotPidFile = await pollUntil(() => existsSync(pidFile), 3_000);
-        expect(gotPidFile).toBe(true);
-        descendantPid = Number(readFileSync(pidFile, 'utf8').trim());
-        expect(Number.isInteger(descendantPid)).toBe(true);
-        expect(isProcessAlive(descendantPid)).toBe(true);
-
-        // Backstop deadline = ceil((timeout(1s) + grace(5s) + slack(2s)) / 1000)
-        // = 8s after the command was spawned. This pins the documented boundary:
-        // unlike the plain-shell-backgrounding case covered elsewhere in this
-        // file, this descendant is NOT reaped by the watchdog's deadline — it
-        // never held a copy of the liveness fd at all.
-        await new Promise((r) => setTimeout(r, 10_000));
-        expect(isProcessAlive(descendantPid)).toBe(true);
-      } finally {
-        if (descendantPid !== undefined && isProcessAlive(descendantPid)) {
+    describe.skipIf(process.platform === 'linux')(
+      'on a platform where the descendant does NOT inherit the liveness fd (confirmed on macOS)',
+      () => {
+        it('leaves a Node child_process.spawn({ stdio: "ignore" }) descendant alive well past the backstop deadline', async () => {
+          const dir = mkdtempSync(join(tmpdir(), 'am-470-close-on-exec-'));
+          const pidFile = join(dir, 'descendant.pid');
+          let descendantPid: number | undefined;
           try {
-            process.kill(descendantPid, 'SIGKILL');
-          } catch {
-            // Already gone — nothing to do.
+            // The leader IS the direct command process (holds
+            // COMMAND_LIVENESS_FD). It spawns a further descendant via Node's
+            // own `child_process.spawn` with default stdio, then exits
+            // immediately, handing all further work to that descendant.
+            const scope = closeOnExecScope(pidFile);
+
+            const start = Date.now();
+            const result = await source.observe(scope, ctx());
+            const elapsed = Date.now() - start;
+
+            // The leader's own exit is reported healthy — matching the
+            // reported repro (`observe()` returned healthy in 22ms).
+            expect(result.nextState).toMatchObject({ health: 'ok' });
+            expect(elapsed).toBeLessThan(5_000);
+
+            const gotPidFile = await pollUntil(
+              () => existsSync(pidFile),
+              3_000,
+            );
+            expect(gotPidFile).toBe(true);
+            descendantPid = Number(readFileSync(pidFile, 'utf8').trim());
+            expect(Number.isInteger(descendantPid)).toBe(true);
+            expect(isProcessAlive(descendantPid)).toBe(true);
+
+            // Backstop deadline = ceil((timeout(1s) + grace(5s) + slack(2s)) /
+            // 1000) = 8s after the command was spawned. This pins the
+            // documented boundary: unlike the plain-shell-backgrounding case
+            // covered elsewhere in this file, this descendant is NOT reaped by
+            // the watchdog's deadline — it never held a copy of the liveness
+            // fd at all.
+            await new Promise((r) => setTimeout(r, 10_000));
+            expect(isProcessAlive(descendantPid)).toBe(true);
+          } finally {
+            if (descendantPid !== undefined && isProcessAlive(descendantPid)) {
+              try {
+                process.kill(descendantPid, 'SIGKILL');
+              } catch {
+                // Already gone — nothing to do.
+              }
+            }
+            rmSync(dir, { recursive: true, force: true });
           }
-        }
-        rmSync(dir, { recursive: true, force: true });
-      }
-    }, 25_000);
+        }, 25_000);
+      },
+    );
+
+    describe.skipIf(process.platform !== 'linux')(
+      'on a platform where the descendant DOES inherit the liveness fd (confirmed on this Linux/Node combination)',
+      () => {
+        it('reaps the descendant anyway, via the ordinary backstop pgid kill — the fd-inheritance gap does not reproduce here', async () => {
+          const dir = mkdtempSync(join(tmpdir(), 'am-470-close-on-exec-'));
+          const pidFile = join(dir, 'descendant.pid');
+          let descendantPid: number | undefined;
+          try {
+            const scope = closeOnExecScope(pidFile);
+
+            const result = await source.observe(scope, ctx());
+            expect(result.nextState).toMatchObject({ health: 'ok' });
+
+            const gotPidFile = await pollUntil(
+              () => existsSync(pidFile),
+              3_000,
+            );
+            expect(gotPidFile).toBe(true);
+            descendantPid = Number(readFileSync(pidFile, 'utf8').trim());
+            expect(Number.isInteger(descendantPid)).toBe(true);
+            // Genuinely alive right after `observe()` returns — not a race
+            // with an already-dead process.
+            expect(isProcessAlive(descendantPid)).toBe(true);
+
+            // On this platform the descendant inherits a live copy of the
+            // liveness fd, so the pipe never reaches EOF while it runs — the
+            // watchdog's own backstop deadline (~8s, see the sibling test's
+            // margin comment) still elapses and reaps the whole process group
+            // by pgid, the descendant included, exactly as for a plain
+            // shell-backgrounded one.
+            const dead = await pollUntil(
+              () => !isProcessAlive(descendantPid as number),
+              15_000,
+            );
+            expect(dead).toBe(true);
+          } finally {
+            if (descendantPid !== undefined && isProcessAlive(descendantPid)) {
+              try {
+                process.kill(descendantPid, 'SIGKILL');
+              } catch {
+                // Already gone — nothing to do.
+              }
+            }
+            rmSync(dir, { recursive: true, force: true });
+          }
+        }, 25_000);
+      },
+    );
   },
 );
 
