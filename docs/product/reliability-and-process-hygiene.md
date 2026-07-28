@@ -1,6 +1,8 @@
 # Reliability & Process Hygiene
 
-> **Status:** Draft
+> **Status:** Draft — states the **target contract**, not a description of what today's build
+> already delivers; known gaps are tracked as issues and measured against this bar (see "The
+> promises we make").
 > **Purpose:** the reliability posture we commit to as a product — the kinds of reliability
 > and _process hygiene_ Agent Monitors offers, and the tangible benefit each choice buys the
 > user. This is the _why_ and the _promise_; the technical spec that realizes it is a separate,
@@ -38,14 +40,30 @@ system **accountable for everything it starts.**
 
 ## The promises we make
 
-These are the guarantees a user should be able to assume without reading a line of our code.
-Each is stated as a promise, followed by the concrete thing the user gets.
+These are the guarantees the product is built to deliver — the **target contract**, stated in
+the same current-vs-target discipline the numbered specs use. Where the implementation is known
+to fall short today, the gap is tracked as an issue and this document is the acceptance bar
+those issues are measured against (as of this writing:
+[#470](https://github.com/mike-north/AgentMonitors/issues/470) — descendants spawned via
+close-on-exec APIs can outlive a hard-killed daemon;
+[#426](https://github.com/mike-north/AgentMonitors/issues/426) — the restart sweep is open
+work). A promise below is not an assertion that today's build already delivers it; it is the
+bar a gap must meet before it can close.
+
+**The containment boundary.** Every promise below applies to processes _within our containment
+boundary_: anything Agent Monitors spawns that has not both (a) deliberately detached itself
+into an independent session **and** (b) erased the marks that identify it as ours. A process
+that does both has, by construction, made itself indistinguishable from unrelated work on the
+machine — it has left the boundary, and [the limits section](#the-limits-we-are-upfront-about)
+describes honestly what that means. Defining the boundary once, here, is what lets each promise
+be stated without a hedge.
 
 ### 1. Nothing we start outlives its purpose
 
 Every process Agent Monitors spawns — a poll command, and anything that command itself spawns
-— is **accounted for and bounded**. When its work is done, or its time is up, it is cleaned
-up. There is no path where a monitor tick quietly leaves something running behind it.
+that stays within the containment boundary — is **accounted for and bounded**. When its work is
+done, or its time is up, it is cleaned up. Within the boundary, there is no path where a
+monitor tick quietly leaves something running behind it.
 
 > **What the user gets:** you can run dozens of monitors for weeks and never accumulate a
 > single stray process. The process list stays as clean as the day you started.
@@ -54,8 +72,8 @@ up. There is no path where a monitor tick quietly leaves something running behin
 
 If the daemon crashes or is force-killed, two things still hold: in-flight spawned work is
 **still bounded** (its cleanup does not depend on the daemon being alive to perform it), and
-any stray left by a previous life is **swept on the next start.** Restarting is self-healing,
-not a manual cleanup chore.
+any stray left by a previous life that is still within the containment boundary is **swept on
+the next start.** Restarting is self-healing, not a manual cleanup chore.
 
 > **What the user gets:** a crash or a hard reboot is a non-event. You start the daemon again
 > and it tidies up after its former self — you never have to hunt down leftovers by hand.
@@ -71,21 +89,26 @@ the operating system has recycled an old identifier onto someone else's work.
 > can trust _not_ to cause collateral damage is the difference between "helpful" and
 > "dangerous."
 
-### 4. It is gentle on the machine
+### 4. Our own machinery is gentle on the machine
 
-The system watches **quietly.** No busy-spinning, no runaway load, no surprise battery drain;
-resource use is bounded and proportional to the work actually being done. Idle monitors cost
-close to nothing.
+Agent Monitors' **own machinery** — the daemon, its tick loop, its bookkeeping — watches
+**quietly**: no busy-spinning, no runaway load, no surprise battery drain, and idle monitors
+cost close to nothing. A monitored command is a different matter: it is the _user's own
+program_, and we deliberately do not govern how hard it works (see non-goals). What we promise
+about it is **time-boundedness** — it runs only within its allowed window, and what it leaves
+behind is cleaned up — not that it will be frugal while it runs.
 
-> **What the user gets:** you don't feel it. Fans stay quiet, battery lasts, and "is Agent
-> Monitors why my laptop is hot?" is a question that never comes up.
+> **What the user gets:** the monitoring itself is never why the laptop is hot. If a machine
+> is working hard, it is because a command _you configured_ is working hard, inside a window
+> you set — never because our plumbing is spinning.
 
 ### 5. It is honest about the guarantee it can actually deliver
 
 Different environments allow different levels of enforcement. Rather than over-claim, the
-system **tells you the level of containment it is actually providing** in your environment, and
-where a stronger tier is available it offers it as an explicit choice. We never advertise a
-guarantee we cannot keep on the machine in front of us.
+system **tells you the level of containment it is actually providing** in your environment —
+and because the strongest reachable level is always selected automatically (see below), that
+disclosure is a report, never a configuration surface. We never advertise a guarantee we
+cannot keep on the machine in front of us.
 
 > **What the user gets:** trustworthy signals about the tool's _own_ health, and no nasty
 > surprises where a promised guarantee silently didn't apply. Honesty about limits is itself a
@@ -130,24 +153,36 @@ name what we got than promise one number and quietly degrade.
 ### We would rather leak once than kill the wrong thing
 
 Where a trade-off is unavoidable, we bias toward **never causing collateral damage**, even at
-the cost of a rare, bounded, and _visible_ failure to clean something up. A missed cleanup is
-an annoyance the user can see and recover from; killing an unrelated process is silent damage
-to the user's other work and exactly the kind of betrayal that ends trust permanently.
+the cost of a rare failure to clean something up. That leak comes in two distinct classes, and
+we are precise about which is which:
+
+- **Abstention** — the tool found a process it _suspects_ is ours but cannot positively
+  confirm, so it leaves it alone. An abstention is **visible and reportable**: the tool knows
+  what it declined to reap and says so in its diagnostics, so the user can decide.
+- **Escape** — a descendant that has fully detached and erased its identity (left the
+  containment boundary). By construction we can no longer recognize it, so we can neither
+  bound it nor report it; recovery is the user's ordinary OS tooling. We state this plainly in
+  the limits below rather than pretend a process we cannot see is somehow accounted for.
+
+A missed cleanup — of either class — is recoverable; killing an unrelated process is silent
+damage to the user's other work and exactly the kind of betrayal that ends trust permanently.
 
 > **What the user gets:** the tool's failure modes are always the _safe_ kind. In the rare
-> corner where it cannot be certain, it errs toward leaving things alone, not toward force.
+> corner where it cannot be certain, it errs toward leaving things alone, not toward force —
+> and it tells you about everything it can still see.
 
 ## The limits we are upfront about
 
 Honesty is part of the posture, so we name the boundaries plainly rather than bury them:
 
-- **A process that fully detaches and erases its own identity can escape live cleanup.** A
-  child that deliberately daemonizes itself into an independent session and strips the marks
-  that identify it as ours is, by construction, no longer distinguishable from any other
-  process on the machine. We catch the overwhelming majority of these on the next restart
-  sweep; the vanishing minority that also erase their identity are outside what any
-  local tool can safely reap without risking collateral damage. We will not close this gap by
-  guessing.
+- **A process that fully detaches and erases its own identity leaves the containment
+  boundary — and with it, our sight.** A child that deliberately daemonizes itself into an
+  independent session and strips the marks that identify it as ours is, by construction, no
+  longer distinguishable from any other process on the machine. Detached processes that keep
+  their identity are caught by the restart sweep; the minority that also erase it are outside
+  what any local tool can safely reap without risking collateral damage — and, honestly,
+  outside what our diagnostics can attribute or bound. Recovery there is the user's ordinary
+  OS tooling. We will not close this gap by guessing.
 - **The strongest containment is not achievable on every machine.** What each OS and security
   policy exposes differs, so the guarantee we reach varies — we always run the strongest one
   the machine allows and name it, rather than advertise one guarantee that quietly means
@@ -167,7 +202,8 @@ Honesty is part of the posture, so we name the boundaries plainly rather than bu
 
 ## How we will know we got it right
 
-The posture succeeds when these become true and stay true:
+The posture succeeds when these become true and stay true (each scoped, like the promises, to
+the containment boundary):
 
 - A user can run the daemon continuously for weeks and find **zero** processes attributable to
   Agent Monitors that it did not intend to be running.
