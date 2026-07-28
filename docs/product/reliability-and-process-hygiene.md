@@ -44,8 +44,10 @@ These are the guarantees the product is built to deliver — the **target contra
 the same current-vs-target discipline the numbered specs use. Where the implementation is known
 to fall short today, the gap is tracked as an issue and this document is the acceptance bar
 those issues are measured against (as of this writing:
-[#470](https://github.com/mike-north/AgentMonitors/issues/470) — descendants spawned via
-close-on-exec APIs can outlive a hard-killed daemon;
+[#470](https://github.com/mike-north/AgentMonitors/issues/470) — poll-command lifetime bounds
+today live only in daemon-resident timers, so a hard-killed daemon can orphan the command and
+its descendants; the in-flight self-bounding watchdog (PR #472) narrows this to a residual
+gap for descendants spawned via close-on-exec APIs, but has not landed;
 [#426](https://github.com/mike-north/AgentMonitors/issues/426) — the restart sweep is open
 work). A promise below is not an assertion that today's build already delivers it; it is the
 bar a gap must meet before it can close.
@@ -214,6 +216,7 @@ the containment boundary):
 - When asked what guarantee is in effect, the tool can **answer accurately** for the machine
   it is on.
 
-> The bar is not "leaks are rare." The bar is "the system is accountable for everything it
-> starts, honest about what it can enforce, and safe in every failure mode." That is what earns
+> The bar is not "leaks are rare." The bar is "the system is accountable for everything that
+> remains within the containment boundary — which is precisely where product accountability
+> ends — honest about what it can enforce, and safe in every failure mode." That is what earns
 > the right to be left running.
