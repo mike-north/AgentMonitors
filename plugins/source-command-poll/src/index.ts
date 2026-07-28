@@ -12,6 +12,7 @@ import {
   openSync,
   unlinkSync,
 } from 'node:fs';
+import { Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type {
@@ -97,33 +98,52 @@ const WATCHDOG_MARKER = 'agentmonitors:command-poll-watchdog';
  * recyclable. If the command exits on its own before the deadline, its pgid can be
  * reused by an unrelated same-user process group, which the delayed signal would
  * then wrongly kill. So the watchdog binds to an **un-recyclable liveness pipe**
- * rather than trusting the pgid alone. The command group inherits the only write
- * ends of that pipe (as fd 3); the watchdog holds the read end (arriving as fd 0).
- * A blocking read on it returns EOF exactly when the WHOLE group — the leader and
- * every descendant — has gone, and a pipe is a kernel object that cannot be
- * recycled. The watchdog races the deadline against that EOF: it signals the group
- * only if the deadline elapses while the pipe is still open (the group provably
- * still alive), and otherwise disarms without ever signalling.
+ * rather than trusting the pgid alone. The command receives the only write end of
+ * that pipe at {@link COMMAND_LIVENESS_FD}, and each descendant that inherits that
+ * fd holds a copy of it; the watchdog holds the read end (arriving as fd 0). A
+ * blocking read on it returns EOF exactly when every process still holding a copy
+ * of that write end has gone, and a pipe is a kernel object that cannot be
+ * recycled. EOF therefore proves the fd holders are gone — NOT, in general, that
+ * the process group is empty: a descendant spawned through an API that closes
+ * non-explicit fds on exec never inherits the fd, so it is invisible to the pipe
+ * (the documented boundary — see {@link COMMAND_LIVENESS_FD} and 003 §11.2/§11.7).
+ * The watchdog races the deadline against that EOF: it signals the group only if
+ * the deadline elapses while the pipe is still held open (so a group member is
+ * provably still alive, and the pgid provably still that group's), and otherwise
+ * disarms without ever signalling.
  *
  * The write end is handed to the command at a deliberately HIGH fd
  * ({@link COMMAND_LIVENESS_FD}), not fd 3, so that ordinary shell fd usage can't
  * collide with it and produce a false EOF (issue #472 review) — see that
- * constant's doc comment for the full rationale and its residual limits.
+ * constant's doc comment for the full rationale and its residual limits. (Inside
+ * this script the read end is the one at fd 3; the command's write end is at
+ * {@link COMMAND_LIVENESS_FD} in the command's own fd table, a different process.)
  *
  * `$1` is the command's process-group id; `$2` is the whole-second deadline.
- * "armed" is printed on stdout only once the watchdog has proven it can time the
- * backstop and holds a working blocking read end — the daemon treats its absence
- * as an arming failure and fails the command closed rather than run it unbounded
- * (issue #470 review).
+ * "armed" is printed on stdout only once the watchdog has proven it holds a
+ * working blocking read end AND that its deadline timer is genuinely running —
+ * the daemon treats its absence as an arming failure and fails the command closed
+ * rather than run it unbounded (issue #470 review, issue #472 review round 5).
  */
 const SELF_WATCHDOG_SCRIPT = sh`
 # ${WATCHDOG_MARKER}
 pgid="$1"
 deadline="$2"
-# A missing 'sleep' means the backstop cannot be timed. Never fall through to the
-# kill in that case — that would SIGKILL a healthy group instantly. Fail closed:
-# exit before printing "armed", so the daemon terminates the command itself.
-command -v sleep >/dev/null 2>&1 || exit 0
+# The whole point of this process is to outlive the daemon, and the daemon is
+# the reader of the stdout pipe the arming handshake is printed to. If it dies
+# first (SIGKILL, crash, OOM — the #470 scenario), that write hits a pipe with
+# no reader, and the default SIGPIPE disposition would kill THIS process before
+# it ever arms its backstop — silently reintroducing the orphan. Ignoring SIGPIPE
+# turns that into a failed write we can simply carry on from.
+trap '' PIPE
+# An unusable 'sleep' means the backstop cannot be timed. \`command -v\` only
+# proves the NAME resolves, which a broken stub (e.g. one symlinked to \`false\`)
+# passes just as happily as a working \`sleep\` — so probe the real exit status
+# instead, which catches a 'sleep' that is missing (127), not executable (126),
+# or fails outright. Never fall through to the kill in that case — that would
+# SIGKILL a healthy group instantly. Fail closed: exit before printing "armed",
+# so the daemon terminates the command itself.
+sleep 0 >/dev/null 2>&1 || exit 0
 # The liveness read end arrives as fd 0. Duplicate it to fd 3 with the shell's
 # fd-duplication form (\`<&\`), NOT a fresh open (\`</dev/fd/0\`) — the two are not
 # equivalent for a FIFO. \`</dev/fd/0\` re-opens the underlying named pipe via a
@@ -140,28 +160,64 @@ command -v sleep >/dev/null 2>&1 || exit 0
 # and Node does not mark a raw-fd stdio slot non-blocking). A failure here also
 # fails closed (no "armed").
 exec 3<&0 || exit 0
-printf 'armed\n'
-# Deadline timer.
+# Start the REAL deadline timer BEFORE claiming to be armed, and prove it is
+# genuinely counting (issue #472 review round 5). A 'sleep' that resolves and
+# exits 0 without honoring its operand passes the probe above and yet leaves the
+# timer dead on arrival: "armed" would then be a lie (no independent bound exists
+# at all), and the \`wait\` below would read as "the deadline elapsed" milliseconds
+# in, SIGKILLing a perfectly healthy group. Backgrounding the timer first and
+# confirming it survives a short beat catches exactly that — a functioning
+# 'sleep' is still running, a nonfunctional one has already exited (both shells
+# this script runs under reap an exited background job while waiting on the beat,
+# so \`kill -0\` reports it gone rather than as a lingering zombie). The beat is
+# taken with the same 'sleep' under test, so a nonfunctional one makes it free
+# rather than slow; the \`|| sleep 1\` fallback covers a 'sleep' that rejects a
+# fractional operand, which POSIX does not require it to accept.
+started=$(date +%s 2>/dev/null)
 sleep "$deadline" &
 timer=$!
-# Liveness reader: the command group holds the only write ends of the pipe on
-# fd 3, so a blocking read there returns (EOF) exactly when the WHOLE group — the
-# leader and every descendant, including one that ignored SIGTERM — has gone. On
-# that EOF, cancel the timer so the deadline branch below can never signal a group
+sleep 0.1 2>/dev/null || sleep 1
+kill -0 "$timer" 2>/dev/null || exit 0
+printf 'armed\n'
+# Liveness reader: every fd-holder in the command group holds a write end of the
+# pipe on fd 3, so a blocking read there returns (EOF) exactly when all of them —
+# the leader and each descendant that inherited the fd, including one that
+# ignored SIGTERM — have gone. (EOF proves the fd holders are gone, not that the
+# process group is empty: a descendant spawned through an API that closes
+# non-explicit fds on exec never holds this fd at all, and so is invisible here —
+# see {@link COMMAND_LIVENESS_FD} and 003 §11.2/§11.7 for that boundary.) On that
+# EOF, cancel the timer so the deadline branch below can never signal a group
 # that has already exited (whose pgid may by then have been recycled).
 { while IFS= read -r _ <&3; do :; done; kill "$timer" 2>/dev/null; } &
 reader=$!
-# The timer running to completion means the deadline elapsed while the group was
-# still alive (the reader had not cancelled it) — reap the whole group. If the
-# reader cancelled the timer first, the group is already gone, wait returns
-# non-zero, and no signal is ever sent to a possibly-recycled pgid.
+# The timer running to completion means the deadline elapsed while the pipe was
+# still held open (the reader had not cancelled it) — so the group provably still
+# has a live member, and the whole group is reaped. If the reader cancelled the
+# timer first, every fd holder is already gone, wait returns non-zero, and no
+# signal is ever sent to a possibly-recycled pgid.
 if wait "$timer"; then
-  kill -KILL -"$pgid" 2>/dev/null
+  # Second opinion on "the deadline elapsed", from the shell's own clock rather
+  # than from 'sleep' alone: a 'sleep' that returns early — one that silently
+  # caps or ignores a large operand — would otherwise make the deadline look
+  # reached and take out a healthy group well ahead of time. With no usable clock
+  # reading (no 'date' on PATH, unexpected output) this falls back to trusting
+  # 'sleep', which is then the only bound there is.
+  ended=$(date +%s 2>/dev/null)
+  expired=1
+  if [ -n "$started" ] && [ -n "$ended" ]; then
+    case "$started$ended" in
+      *[!0-9]*) ;;
+      *) [ "$((ended - started))" -ge "$deadline" ] || expired=0 ;;
+    esac
+  fi
+  if [ "$expired" -eq 1 ]; then
+    kill -KILL -"$pgid" 2>/dev/null
+  fi
 fi
 kill "$reader" 2>/dev/null
 `;
 
-/** An anonymous liveness pipe's two ends (003 §11.2, issue #470). */
+/** An anonymous liveness pipe's ends (003 §11.2, issue #470). */
 interface LivenessPipe {
   /** Read end handed to the watchdog as its fd 0. */
   rfd: number;
@@ -170,6 +226,85 @@ interface LivenessPipe {
    * daemon post-spawn.
    */
   wfd: number;
+  /**
+   * A SECOND read end, retained by the daemon for {@link livenessPipeStillHeld}
+   * (003 §11.2, issue #472 review round 5). It is a separate `open()`, not a dup
+   * of {@link rfd}, on purpose: `dup` (which is what handing `rfd` to the
+   * watchdog's stdio performs) shares one open file description, so marking this
+   * fd non-blocking — which reading it from the event loop necessarily does —
+   * would also make the watchdog's own read end non-blocking, turning its
+   * blocking "wait for EOF" read into an instant EAGAIN and silently disarming
+   * the backstop. A distinct `open()` has its own status flags, so the two
+   * cannot interfere.
+   */
+  probeRfd: number;
+}
+
+/**
+ * How long {@link livenessPipeStillHeld} waits for an EOF verdict. The read is
+ * issued immediately and a pipe with no remaining write end reports EOF on that
+ * very first read, so this only has to absorb event-loop scheduling — it is not
+ * a poll interval. Sized well above what that scheduling needs because the error
+ * is asymmetric: reading late looks the same as "still held", and "still held"
+ * is the answer that leads to a signal.
+ */
+const LIVENESS_PROBE_MS = 250;
+
+/**
+ * Whether the liveness pipe still has at least one write end held open — i.e.
+ * whether a member of the command's process group is provably still alive (003
+ * §11.2, issue #472 review round 5).
+ *
+ * This is the daemon-side equivalent of the proof the watchdog itself relies on,
+ * and exists for the same reason: a numeric pgid is recyclable, so it may only be
+ * signalled while something independent of the pgid proves the group is still the
+ * one we spawned. A still-open write end is exactly that proof — it can only be
+ * held by a process that inherited it from this command. `false` (EOF, or any
+ * failure to read at all) means no such proof, so the caller must NOT signal.
+ *
+ * Takes ownership of `probeFd`: it is closed before this resolves, on every path.
+ */
+function livenessPipeStillHeld(probeFd: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let socket: Socket;
+    try {
+      // Reading the fd through `net` (rather than `fs`) keeps the read on the
+      // event loop instead of blocking a threadpool thread for as long as the
+      // group happens to live.
+      socket = new Socket({ fd: probeFd, readable: true, writable: false });
+    } catch {
+      try {
+        closeSync(probeFd);
+      } catch {
+        // Already closed — nothing to do.
+      }
+      resolve(false);
+      return;
+    }
+    let settled = false;
+    // A function declaration (hoisted) so the verdict timer below can be a
+    // `const` while still being cancellable from here.
+    function settle(held: boolean): void {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      // Destroying the socket closes the underlying fd — the ownership this
+      // function documents taking.
+      socket.destroy();
+      resolve(held);
+    }
+    socket.once('end', () => {
+      settle(false);
+    });
+    socket.once('error', () => {
+      settle(false);
+    });
+    socket.resume();
+    const timer = setTimeout(() => {
+      settle(true);
+    }, LIVENESS_PROBE_MS);
+    timer.unref();
+  });
 }
 
 /**
@@ -251,7 +386,7 @@ const COMMAND_LIVENESS_FD = 20;
  * or `undefined` if one could not be created.
  *
  * Node exposes no `pipe(2)`, so this mints one as a transient, owner-only FIFO,
- * opens both ends, and unlinks the name immediately — the open fds keep the pipe
+ * opens its ends, and unlinks the name immediately — the open fds keep the pipe
  * alive, and removing the name closes the brief on-disk window (BP4). An `O_RDWR`
  * scratch open breaks the FIFO open-standoff so the read and write ends can then
  * be opened **blocking** (no `O_NONBLOCK`) in either order — the watchdog needs a
@@ -270,14 +405,17 @@ function createLivenessPipe(): LivenessPipe | undefined {
   let scratch: number | undefined;
   let rfd: number | undefined;
   let wfd: number | undefined;
+  let probeRfd: number | undefined;
   try {
     scratch = openSync(fifoPath, fsConstants.O_RDWR);
     wfd = openSync(fifoPath, fsConstants.O_WRONLY);
     rfd = openSync(fifoPath, fsConstants.O_RDONLY);
-    return { rfd, wfd };
+    probeRfd = openSync(fifoPath, fsConstants.O_RDONLY);
+    return { rfd, wfd, probeRfd };
   } catch {
     if (rfd !== undefined) closeSync(rfd);
     if (wfd !== undefined) closeSync(wfd);
+    if (probeRfd !== undefined) closeSync(probeRfd);
     return undefined;
   } finally {
     if (scratch !== undefined) {
@@ -347,23 +485,35 @@ function spawnSelfWatchdog(
   }
   const armed = new Promise<boolean>((resolve) => {
     let settled = false;
+    const stdout = watchdog.stdout;
     const settle = (value: boolean): void => {
       if (!settled) {
         settled = true;
+        // Release the event loop the moment the handshake is decided — from here
+        // on the watchdog is on its own and must never hold this process open.
+        // `stdout` is a Socket at runtime (a child stdio pipe), but `unref` is
+        // not on the `Readable` type it is declared as, so reach it through an
+        // optional shape.
+        (stdout as { unref?: () => void } | null)?.unref?.();
         resolve(value);
       }
     };
-    const stdout = watchdog.stdout;
     if (stdout) {
       let seen = '';
       stdout.on('data', (chunk: Buffer) => {
         seen += chunk.toString('utf8');
         if (seen.includes('armed')) settle(true);
       });
-      // The handshake pipe must never keep the daemon's event loop alive. `stdout`
-      // is a Socket at runtime (a child stdio pipe), but `unref` is not on the
-      // `Readable` type it is declared as, so reach it through an optional shape.
-      (stdout as { unref?: () => void }).unref?.();
+      // Deliberately left REF'd until the handshake settles (issue #472 review
+      // round 5). A caller's outcome can be held pending this decision (the
+      // deferred-outcome join), and everything else in flight by then is
+      // unref'd — the watchdog process, its timers, and, once a fast command has
+      // exited, its stdio. Unref'ing here too left nothing keeping the event
+      // loop alive, so a short-lived host process (`daemon once`, which ticks
+      // in-process) could simply RUN OUT OF WORK and exit zero mid-tick, before
+      // `observe()` ever settled: no events, no error, no output at all. The
+      // handshake is bounded (the watchdog prints "armed" or exits within about
+      // a second), so holding a ref for that window cannot wedge a host open.
     }
     // Exiting or erroring before "armed" means the watchdog could not arm.
     watchdog.once('exit', () => {
@@ -641,7 +791,34 @@ async function runCommand(
       return;
     }
 
-    /** Close both liveness-pipe fds, best-effort (either or both may already be closed). */
+    /**
+     * The daemon-retained probe read end, while this call still owns it (003
+     * §11.2, issue #472 review round 5). Tracked as "owned or not" rather than
+     * closed blindly, because ownership can transfer to
+     * {@link livenessPipeStillHeld} — closing an fd number twice risks closing a
+     * DIFFERENT, unrelated fd that the runtime has since opened at the same index.
+     */
+    let probeFdOwned: number | undefined = livenessPipe?.probeRfd;
+
+    /** Take ownership of the probe fd, leaving nothing for the closers below. */
+    function takeProbeFd(): number | undefined {
+      const fd = probeFdOwned;
+      probeFdOwned = undefined;
+      return fd;
+    }
+
+    /** Release the probe fd if this call still owns it. */
+    function closeProbeFd(): void {
+      const fd = takeProbeFd();
+      if (fd === undefined) return;
+      try {
+        closeSync(fd);
+      } catch {
+        // Already closed — nothing to do.
+      }
+    }
+
+    /** Close every liveness-pipe fd, best-effort (any may already be closed). */
     function closeLivenessPipe(): void {
       if (!livenessPipe) return;
       try {
@@ -654,6 +831,7 @@ async function runCommand(
       } catch {
         // Already closed — nothing to do.
       }
+      closeProbeFd();
     }
 
     // `file` is guaranteed defined: parseScopeConfig rejects an empty command. `spawn`
@@ -683,11 +861,14 @@ async function runCommand(
           // flag; its tree-kill goes through `taskkill /T` instead, which does not
           // depend on process-group membership.
           detached: !isWindows,
-          // fd COMMAND_LIVENESS_FD (POSIX only) is the liveness pipe's write end: the
-          // command and every descendant inherit it, so the watchdog's read end
-          // reaches EOF exactly when the whole group has gone. It is deliberately a
-          // high fd rather than the next-available low one — see that constant's
-          // doc comment (issue #472 review) for why. The padding entries between
+          // fd COMMAND_LIVENESS_FD (POSIX only) is the liveness pipe's write end:
+          // the command receives it, and every descendant that inherits it holds a
+          // copy, so the watchdog's read end reaches EOF exactly when all of those
+          // fd holders have gone — which is not the same as the whole process group
+          // having exited, since a descendant spawned through an API that closes
+          // non-explicit fds on exec never inherits it (003 §11.2/§11.7). It is
+          // deliberately a high fd rather than the next-available low one — see that
+          // constant's doc comment (issue #472 review) for why. The padding entries between
           // fd 3 and it are `'ignore'` (mapped to `/dev/null`), matching how Node
           // already treats stdin/stdout/stderr slots the command doesn't use.
           stdio: livenessPipe
@@ -734,6 +915,7 @@ async function runCommand(
         } catch {
           // Already closed — nothing to do.
         }
+        closeProbeFd();
       }
       resolve({
         kind: 'failure',
@@ -879,6 +1061,9 @@ async function runCommand(
       }
       settled = true;
       clearTimers();
+      // Nothing left will need the daemon-side liveness proof once this call is
+      // done, so release its fd here rather than holding it past resolution.
+      closeProbeFd();
       // The self-watchdog is deliberately NEVER proactively killed here, on ANY
       // resolution path (issue #472 review). It used to be reaped immediately on a
       // non-timeout resolution on the assumption that the direct child's own
@@ -1065,9 +1250,40 @@ async function runCommand(
             // already-successful child outcome to the fail-closed failure.
             const outcome = deferredOutcome;
             deferredOutcome = undefined;
-            finish(outcome);
+            if (ok) {
+              finish(outcome);
+              return;
+            }
+            // Converting the outcome is not enough: reporting an arming failure
+            // while the command's group is still running would leave it with NO
+            // bound at all (issue #472 review round 5). The watchdog has exited,
+            // and the leader's own exit is what produced `outcome`, so the
+            // daemon's wall-clock escalation was already cleared — nothing else
+            // will ever reap a descendant the leader backgrounded.
+            //
+            // The group cannot simply be signalled by pgid here: unlike the
+            // still-running-child branch below, the leader is known to have
+            // exited, so its pgid is no longer proof that the group is ours to
+            // signal. The daemon's own read end of the liveness pipe supplies
+            // the missing proof — a write end still held means a process that
+            // inherited it from this command is alive, so the pgid is still that
+            // group's. If the pipe has already reached EOF there is nothing left
+            // that this mechanism can see (the group is gone, or holds only the
+            // fd-less descendants of the documented §11.2/§11.7 boundary), and
+            // signalling would risk exactly the recycled-pgid kill this design
+            // exists to rule out.
+            const probeFd = takeProbeFd();
+            if (probeFd === undefined) {
+              finish(outcome);
+              return;
+            }
+            void livenessPipeStillHeld(probeFd).then((stillHeld) => {
+              if (stillHeld) killProcessTree(child, 'SIGKILL', isWindows);
+              finish(outcome);
+            });
           } else if (!ok && !settled) {
-            // The child is still running: kill it now, same as before.
+            // The child has not produced an outcome yet, so it is still running
+            // and its pgid is still its own — safe to signal directly.
             killProcessTree(child, 'SIGKILL', isWindows);
             finish(armingFailureOutcome());
           }

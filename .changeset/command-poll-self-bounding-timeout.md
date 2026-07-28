@@ -32,9 +32,16 @@ The watchdog is made safe, not merely present:
   is gone.** It is never proactively killed by the runtime on any outcome (success, failure, or
   timeout) — only by its own liveness-pipe proof or its own deadline — so a descendant backgrounded
   by an otherwise-successful command is bounded too, not just a descendant of a timed-out one.
-- **It fails closed.** If no independent bound can be armed, the command is terminated and reported
-  as an execution failure rather than run unbounded; and the watchdog never fabricates a kill (a
-  missing `sleep` makes it exit without signalling, so a healthy command is never SIGKILLed early).
+- **It fails closed.** If no independent bound can be armed, the command's process group is
+  terminated and the execution is reported as a failure rather than run unbounded — including when
+  the arming verdict only arrives after the command's own leader has already exited, in which case
+  the group is reaped on the same liveness proof described above rather than on a bare pgid. Arming
+  is a real proof, not a name lookup: the watchdog announces itself armed only once its deadline
+  timer is running, so a `sleep` that resolves but does not work (missing, not executable, or a stub
+  that returns immediately) fails the command closed instead of passing as bounded. The watchdog
+  also never fabricates a kill — it signals only when its own clock agrees the deadline actually
+  elapsed, so neither a missing `sleep` nor one that silently caps its operand can SIGKILL a healthy
+  command early.
   Every execution now hard-depends on `mkfifo`, `sh`, and `sleep` being on `PATH`; on a
   binary-minimal image missing one, every execution fails closed instead of running (the monitored
   command itself still starts and can side-effect before that termination lands — only the reported

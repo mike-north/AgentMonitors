@@ -9,6 +9,50 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-07-28 — command-poll self-watchdog: a late arming failure now reaps the surviving group, and "armed" became a proof (003 §11.2) — Refs #470, #472
+
+Two fail-closed holes found in review of exact head `fb59df5`, both reproduced before being fixed.
+
+- **A late arming failure reported a failure but terminated nothing.** When the arming verdict lands
+  after the command's own leader has exited (the deferred-outcome join), a `false` verdict converted
+  the reported outcome to the fail-closed execution failure and stopped there. Reproduced by stalling
+  the watchdog's startup: `observe()` returned the expected self-bounding-watchdog failure in ~1.1s
+  while a descendant the leader had backgrounded stayed alive indefinitely — the watchdog had already
+  exited, and the leader's clean exit had cleared the daemon's wall-clock escalation, so nothing was
+  left to reap it. That is the unbounded orphan #470 exists to prevent, reported as though prevented.
+  The runtime now reaps the surviving group on that path, gated on the liveness pipe still having a
+  held write end, because a departed leader's pgid is no longer proof the group is the one spawned;
+  an already-EOF'd pipe means there is nothing this mechanism can see, and no signal is sent.
+- **"armed" was announced before the deadline timer existed.** The watchdog printed `armed` after
+  only a `command -v sleep` name lookup, which a `sleep` symlinked to `false` passes as readily as a
+  working one — so the handshake carried no evidence that any bound had been armed. Measured against
+  `fb59df5`, those cases still came out fail-closed (0 of 25 runs healthy, macOS and Linux) purely
+  because the watchdog's `exit` reached the daemon ahead of its own buffered `armed` stdout; the
+  guarantee rested on event ordering, not on the protocol. The watchdog now starts the real timer and
+  confirms it survives a short beat before printing `armed`, and the deadline kill is additionally
+  gated on the shell's own clock agreeing the deadline elapsed (falling back to trusting `sleep` when
+  no clock is available). That closes a second, sharper defect the same review predicted: a `sleep`
+  that silently caps its operand made `wait` return success early and SIGKILL a healthy command group
+  35 seconds ahead of its deadline.
+
+Proving the timer moves the handshake later, which surfaced two further defects — both latent
+before, both now covered by regression tests:
+
+- **The watchdog could be killed by SIGPIPE before arming.** The daemon is the reader of the pipe the
+  handshake is printed to, so a daemon that dies first (the whole scenario the watchdog exists for)
+  leaves that write with no reader; under the default disposition it killed the watchdog outright,
+  reinstating the orphan. Caught by `apps/cli`'s daemon-SIGKILL integration test. The watchdog now
+  ignores SIGPIPE and treats the failed write as just a failed write.
+- **A pending arming decision did not keep its host process alive.** Everything in flight at that
+  point is deliberately unref'd — the watchdog, its timers, and a fast command's stdio — and the
+  handshake pipe was too, so nothing referenced the event loop. A host that ticks in-process and then
+  exits (`daemon once`) could run out of work and exit zero mid-tick: no events, no error, no output
+  at all. The handshake pipe now stays referenced until the decision settles, then unrefs.
+
+Also aligned the §11.2/§11.7 wording carried in the source comments: EOF on the liveness pipe proves
+every holder of the inherited fd is gone, not that the process group is empty, and the command
+receives the write end at fd 20 (fd 3 is the watchdog's own read end, in a different process).
+
 ## 2026-07-24 — command-poll self-watchdog: Linux CI red fixed — a genuine FIFO-reopen deadlock, plus the close-on-exec boundary confirmed platform-dependent (003 §11.2, §11.7) — Refs #470, #472
 
 CI turned red on the round-4 push (exact head `995d1fe`) on Linux only. Reproduced both failures in a

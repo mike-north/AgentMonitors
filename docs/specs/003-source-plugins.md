@@ -1656,9 +1656,20 @@ Three properties make the self-watchdog safe rather than merely present:
   thing left to reap it.
 - **It fails closed.** If no independent bound can be armed — the liveness pipe cannot be created, the
   watchdog cannot be launched, or it cannot confirm it is armed — the runtime **terminates the
-  command and reports an execution failure** rather than run it unbounded. The watchdog never
-  fabricates a kill either: if it cannot time its own backstop (`sleep` unavailable) it exits without
-  signalling, so a healthy command is never SIGKILLed early.
+  command and reports an execution failure** rather than run it unbounded. Termination applies even
+  when the arming verdict arrives only after the command's own leader has already exited and
+  produced an outcome: the surviving process group is reaped on the same liveness proof the watchdog
+  itself uses (a still-held write end), never on a bare pgid, since a departed leader's pgid is no
+  longer evidence that the group is the one that was spawned.
+
+  Confirming "armed" is a proof, not a name lookup. The watchdog announces itself only once it holds
+  a working blocking read end **and** its deadline timer is demonstrably running, so a `sleep` that
+  resolves but does not function — missing, not executable, or a stub that returns immediately —
+  fails the command closed instead of passing as bounded. The watchdog never fabricates a kill
+  either: it signals only when its own clock (via `date`, where available) agrees the deadline
+  genuinely elapsed, so neither an unusable `sleep` nor one that silently caps its operand can
+  SIGKILL a healthy command early. Where no clock reading is available the watchdog falls back to
+  trusting `sleep`'s own timing, which is then the only bound there is.
 
   This introduces a hard binary precondition that did not exist before #470: every POSIX
   `command-poll` execution now needs `mkfifo`, `sh`, and `sleep` reachable on `PATH`, regardless of
