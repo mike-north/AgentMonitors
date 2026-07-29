@@ -1539,12 +1539,16 @@ describe.skipIf(process.platform === 'win32')(
       try {
         const indexUrl = new URL('./index.ts', import.meta.url).href;
         // Backstop = ceil((timeout(1s) + grace(5s) + slack(2s)) / 1000) = 8s.
+        // The command kills THE DAEMON — the #470 scenario — as its very first
+        // action, then execs a long sleep. The daemon's pid is passed through
+        // `env` because the command's parent is the watchdog, not the daemon.
         const scope = {
           command: [
             'sh',
             '-c',
-            `echo $$ > ${JSON.stringify(join(dir, 'cmd.pid'))}; kill -9 $PPID; exec sleep 30`,
+            `echo $$ > ${JSON.stringify(join(dir, 'cmd.pid'))}; kill -9 "$AM_DAEMON_PID"; exec sleep 30`,
           ],
+          env: { AM_DAEMON_PID: '__DAEMON_PID__' },
           timeout: '1s',
         };
         const runnerFile = join(dir, 'surrogate-daemon.mjs');
@@ -1553,6 +1557,7 @@ describe.skipIf(process.platform === 'win32')(
           [
             `const { default: source } = await import(${JSON.stringify(indexUrl)});`,
             `const scope = ${JSON.stringify(scope)};`,
+            `scope.env.AM_DAEMON_PID = String(process.pid);`,
             `source.observe(scope, { now: new Date(${String(NOW.getTime())}) }).catch(() => {});`,
             // Keep the surrogate alive so the ONLY thing that ends it is the
             // command's own `kill -9` — the race under test.
