@@ -11,9 +11,11 @@ reliability-fatal leak for a long-running background daemon, since nothing was l
 
 On POSIX each execution now also arms an independent, `detached` self-watchdog sibling that reaps
 the command's process group at a backstop deadline (the command's `timeout` + the SIGKILL grace + a
-small slack). Because it is its own detached process, it survives the daemon's death and reaps the
-orphan on its own timer; on normal completion it disarms itself so it never lingers — the daemon
-never proactively kills it. The backstop deadline is set strictly after the daemon's own escalation
+small slack). It runs on the daemon's own Node binary — not a shell — so its timer is a `setTimeout`
+that cannot be missing, cannot return early, and cannot hang, and it depends on nothing in `PATH`.
+Because it is its own detached process, it survives the daemon's death and reaps the orphan on its
+own timer; on normal completion it disarms itself so it never lingers — the daemon never proactively
+kills it. The backstop deadline is set strictly after the daemon's own escalation
 window, so the daemon-resident timers stay authoritative in the normal case and the self-watchdog
 only ever fires when they cannot.
 
@@ -32,20 +34,18 @@ The watchdog is made safe, not merely present:
   is gone.** It is never proactively killed by the runtime on any outcome (success, failure, or
   timeout) — only by its own liveness-pipe proof or its own deadline — so a descendant backgrounded
   by an otherwise-successful command is bounded too, not just a descendant of a timed-out one.
-- **It fails closed.** If no independent bound can be armed, the command's process group is
-  terminated and the execution is reported as a failure rather than run unbounded — including when
-  the arming verdict only arrives after the command's own leader has already exited, in which case
-  the group is reaped on the same liveness proof described above rather than on a bare pgid. Arming
-  is a real proof, not a name lookup: the watchdog announces itself armed only once its deadline
-  timer is running, so a `sleep` that resolves but does not work (missing, not executable, or a stub
-  that returns immediately) fails the command closed instead of passing as bounded. The watchdog
-  also never fabricates a kill — it signals only when its own clock agrees the deadline actually
-  elapsed, so neither a missing `sleep` nor one that silently caps its operand can SIGKILL a healthy
-  command early.
-  Every execution now hard-depends on `mkfifo`, `sh`, and `sleep` being on `PATH`; on a
-  binary-minimal image missing one, every execution fails closed instead of running (the monitored
-  command itself still starts and can side-effect before that termination lands — only the reported
-  result is suppressed).
+- **The bound exists before the command does.** The watchdog is spawned and armed BEFORE the command
+  is spawned, and is handed the command's process-group id afterwards with a single synchronous
+  write. Arming after the spawn left the command running unbounded for the whole of the watchdog's
+  launch and handshake — a command whose first actions were to record its pid, kill the daemon, and
+  `exec` a long sleep escaped that way in 2 of 40 measured runs.
+- **It fails closed, and now before anything runs.** If no independent bound can be armed — the
+  liveness pipe cannot be created, the watchdog cannot be launched, or it does not confirm arming
+  within a bounded deadline — the execution is reported as a failure and the command is never
+  spawned at all, rather than spawned and terminated after the fact. The arming handshake is itself
+  bounded, so it can never leave an observation pending forever or strand a detached watchdog
+  subtree. Every execution hard-depends on `mkfifo` being on `PATH` (for the liveness pipe) and
+  nothing else; on an image without it, every execution fails closed instead of running.
 
 The watchdog is a **sibling**, not a shell wrapper around the command, so the command is still
 spawned directly (`shell: false`): no shell word-splitting, real spawn-failure (`ENOENT`/`EACCES`)

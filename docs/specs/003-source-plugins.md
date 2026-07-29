@@ -1587,8 +1587,14 @@ nothing left to reap it. For a long-running background daemon that is a reliabil
 a corner case: leaked children accumulate until the user must restart. So on POSIX each execution
 also arms an **independent, `detached` self-watchdog sibling** that reaps the command's whole process
 group at a backstop deadline. Being its own detached process, it survives the daemon's death and
-reaps the orphan on its own timer; on normal completion (the daemon still alive) it is reaped
-promptly so it never lingers. The backstop deadline is set strictly _after_ the daemon's own
+reaps the orphan on its own timer; on normal completion it disarms itself the moment its liveness
+pipe proves every holder of the inherited fd has gone, so it never lingers. It runs on the daemon's
+own Node binary rather than a shell: a shell watchdog has no timer of its own and can only borrow
+one from `sleep`, which makes every property of the backstop rest on a `PATH` lookup the daemon does
+not control (a `sleep` that is missing, that exits at once, that silently caps its operand, or that
+never returns — each of which was reported in review). `setTimeout` cannot be missing, return early,
+or hang, so that failure class is structurally absent rather than guarded, and `mkfifo` is the only
+remaining `PATH` dependency. The backstop deadline is set strictly _after_ the daemon's own
 `timeout` + SIGKILL-grace window (plus a small slack), so the daemon-resident timers stay
 authoritative in the normal case and the self-watchdog only ever fires when they cannot. The
 invariant it guarantees: **`kill -9` the daemon mid-command, and the leader — along with any
@@ -1597,7 +1603,17 @@ grace + slack.** (This is narrower than "the whole process group" — see the bu
 below for the class of descendant it does not cover.) The watchdog is spawned as a
 _sibling_ (not a shell wrapper around the command) precisely so the command itself is still spawned
 directly (`shell: false`) and every §11.1/§11.2/§11.5 semantic — no shell word-splitting, real
-spawn-failure errors, exact exit codes — is preserved unchanged. Windows has no process groups and no
+spawn-failure errors, exact exit codes — is preserved unchanged.
+
+**Ordering is what makes the bound real.** The watchdog is spawned and armed **before the command
+exists**, and is handed the command's process-group id afterwards over a dedicated pipe, with a
+single synchronous write issued as the very next statement after the spawn returns. Arming after the
+spawn — as this originally did — left the command running for the whole of the watchdog's launch and
+handshake with nothing able to reap it: a command whose first actions were to record its pid, kill
+the daemon, and `exec` a long sleep escaped in 2 of 40 measured runs. Until the handoff lands the
+watchdog deliberately has nothing it can signal: liveness EOF before a pgid means the write end was
+only ever held by the daemon, so the command was never spawned, and the deadline elapsing before a
+pgid means the handoff never completed and no target can be named. Neither case ever guesses. Windows has no process groups and no
 portable in-group watchdog, so there the daemon-resident `taskkill /T /F` remains the only bound (a
 documented platform limitation, AP8 target work); the self-bounding backstop is POSIX-only, which is
 the portable answer for the launchd/init reparenting that motivates #470.
@@ -1654,37 +1670,27 @@ Three properties make the self-watchdog safe rather than merely present:
   the timeout path unchanged: the daemon's own SIGTERM→SIGKILL escalation is still armed for a
   SIGTERM-ignoring descendant there, so if the daemon dies during that grace, the watchdog is the only
   thing left to reap it.
-- **It fails closed.** If no independent bound can be armed — the liveness pipe cannot be created, the
-  watchdog cannot be launched, or it cannot confirm it is armed — the runtime **terminates the
-  command and reports an execution failure** rather than run it unbounded. Termination applies even
-  when the arming verdict arrives only after the command's own leader has already exited and
-  produced an outcome: the surviving process group is reaped on the same liveness proof the watchdog
-  itself uses (a still-held write end), never on a bare pgid, since a departed leader's pgid is no
-  longer evidence that the group is the one that was spawned.
+- **It fails closed, before the command runs.** If no independent bound can be armed — the liveness
+  pipe cannot be created, the watchdog cannot be launched, or it does not confirm it is armed within
+  the daemon's arming deadline — the runtime reports an execution failure and **the command is never
+  spawned at all**. Because arming completes before the command exists, there is no window in which
+  an unbounded command has already started: this replaces the earlier behavior, where the command was
+  spawned first and terminated after the fact (and, for a command whose first action had an
+  observable side effect, terminated too late to prevent it).
 
-  Confirming "armed" is a proof, not a name lookup. The watchdog announces itself only once it holds
-  a working blocking read end **and** its deadline timer is demonstrably running, so a `sleep` that
-  resolves but does not function — missing, not executable, or a stub that returns immediately —
-  fails the command closed instead of passing as bounded. The watchdog never fabricates a kill
-  either: it signals only when its own clock (via `date`, where available) agrees the deadline
-  genuinely elapsed, so neither an unusable `sleep` nor one that silently caps its operand can
-  SIGKILL a healthy command early. Where no clock reading is available the watchdog falls back to
-  trusting `sleep`'s own timing, which is then the only bound there is.
+  Confirming "armed" is a proof, not a name lookup: the watchdog says so only once its deadline timer
+  is running and it is reading the liveness pipe. The arming handshake is itself bounded — a
+  handshake that never resolves would otherwise leave `observe()` pending forever, wedging an
+  in-process host (`daemon once`) and stranding a detached watchdog subtree with it. Exceeding the
+  deadline reaps the watchdog's own process group and fails the command closed, so a slow launch
+  costs an observation, never an unbounded command.
 
-  This introduces a hard binary precondition that did not exist before #470: every POSIX
-  `command-poll` execution now needs `mkfifo`, `sh`, and `sleep` reachable on `PATH`, regardless of
-  what the monitored command itself is. On a binary-minimal image (slim/distroless/busybox
-  containers, or any `PATH` that omits one of these), arming fails on every single execution — the
-  fail-closed behavior is deliberate and correct, but its visible consequence is that every
-  observation instead reports an execution failure citing the self-bounding watchdog, with no path
-  to recovery short of adding the missing binary(ies) to the daemon's environment. **The monitored
-  command is not prevented from running** — it is spawned before arming is even attempted (§11.7
-  needs its process group to exist first), so it can start and produce real side effects in the
-  window before an arming failure is detected and it is terminated; only the _result_ is suppressed
-  (reported as an execution failure, per §11.5), never the command's own execution. This is
-  materially different from "never runs": a command whose first action has an observable side
-  effect (writing a file, making a network call) still performs that side effect on every tick, even
-  though the tick is always reported as failing.
+  The remaining binary precondition is narrow: every POSIX `command-poll` execution needs `mkfifo`
+  reachable on `PATH` for the liveness pipe. Nothing else is required — the watchdog runs on the
+  daemon's own Node binary, so `sh`, `sleep` and `date` are no longer involved. On an image without
+  `mkfifo`, arming fails on every execution and every observation reports an execution failure citing
+  the self-bounding watchdog, with no path to recovery short of adding that binary to the daemon's
+  environment.
 
 The **result** of an execution is `(exitCode, stdout)`. A **nonzero exit code with output is a
 valid result, not a failure** — many CLIs exit nonzero meaningfully (`grep`, linters, a task CLI

@@ -9,6 +9,41 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-07-29 — command-poll self-watchdog: moved onto Node, and armed before the command exists (003 §11.2) — Refs #470, #472
+
+Three defects from the round-6 review, all reproduced against exact head `63b0234` before being
+fixed. The first is a real ordering hole; the other two are the last of a series that all trace to
+the same root cause, which this change removes rather than patches again.
+
+- **The command could run before any bound existed.** Arming happened after the spawn, so for the
+  whole of the watchdog's launch and handshake the command was already running with nothing able to
+  reap it. Reproduced with a command whose first actions are to record its pid, `kill -9` its parent
+  (the daemon), and `exec sleep 30`: 2 of 40 runs were still alive 12s after an 8s backstop,
+  reparented to init. The watchdog is now spawned and armed **before** the command exists and is
+  handed the process-group id afterwards, over a dedicated pipe, with a single synchronous write
+  issued as the very next statement after the spawn returns. An arming failure therefore now means
+  the command is never started, rather than being started and terminated after the fact.
+- **A `sleep` that never returns wedged everything.** The watchdog's own validation probe had no
+  bound of its own, so a `sleep` replaced by a never-returning helper hung it: no "armed", no exit,
+  the arming decision pending forever. `observe()` never settled (the host was still running 25s
+  later), and killing the host stranded the detached watchdog and its helper subtree behind.
+- **A `sleep` that returns EARLY left no bound for the rest of the deadline.** When the clock
+  cross-check caught the early return, the watchdog correctly skipped the kill — and then exited,
+  having already reported itself armed. With the daemon killed at 0.5s and a 10s backstop, the target
+  was still alive at 12s.
+
+Both `sleep` defects are gone by construction rather than by another guard: the watchdog now runs on
+the daemon's own Node binary, where `setTimeout` cannot be missing, cannot return early, and cannot
+hang. That also drops the `sh`, `sleep` and `date` `PATH` dependencies (leaving `mkfifo` as the only
+one), removes the SIGPIPE hazard, and retires the round-4 deferred-outcome join and round-5
+late-arming reap — with arming decided before the command exists, no outcome can race it. A
+daemon-side arming deadline remains as a bound on the handshake itself, reaping the watchdog's group
+and failing closed if it is ever exceeded.
+
+One implementation note worth keeping: the watchdog reads its liveness pipe through `fs`, not `net`.
+A `net.Socket` over a FIFO fd never delivers `end` on macOS, which silently cost the watchdog its
+disarm on every well-behaved command until it was caught.
+
 ## 2026-07-28 — command-poll self-watchdog: a late arming failure now reaps the surviving group, and "armed" became a proof (003 §11.2) — Refs #470, #472
 
 Two fail-closed holes found in review of exact head `fb59df5`, both reproduced before being fixed.

@@ -439,8 +439,9 @@ function spawnSelfWatchdog(
   const armed = new Promise<boolean>((resolve) => {
     let settled = false;
     const stdout = watchdog.stdout;
-    let deadline: ReturnType<typeof setTimeout> | undefined;
-    const settle = (value: boolean): void => {
+    // A function declaration (hoisted) so the arming deadline below can be a
+    // `const` while still being cancellable from here.
+    function settle(value: boolean): void {
       if (settled) return;
       settled = true;
       clearTimeout(deadline);
@@ -451,7 +452,7 @@ function spawnSelfWatchdog(
       // optional shape.
       (stdout as { unref?: () => void } | null)?.unref?.();
       resolve(value);
-    };
+    }
     if (stdout) {
       let seen = '';
       stdout.on('data', (chunk: Buffer) => {
@@ -478,7 +479,7 @@ function spawnSelfWatchdog(
     // A handshake that never resolves must not wedge the caller (issue #472
     // review round 6): give up, reap the watchdog's whole group so nothing is
     // stranded, and report the arming failure.
-    deadline = setTimeout(() => {
+    const deadline = setTimeout(() => {
       reap();
       settle(false);
     }, ARMING_DEADLINE_MS);
