@@ -667,6 +667,41 @@ function spawnSelfWatchdog(
   };
 }
 
+/**
+ * Forward a directly-spawned command's own lifecycle events onto the internal
+ * channel {@link runCommand} consumes (003 §11.2, §11.5).
+ *
+ * `runCommand` learns a command's fate from one event channel regardless of who
+ * spawned it. On POSIX the watchdog spawns the command and reports back over its
+ * own pipe; on Windows — which has no process groups and no portable in-group
+ * watchdog — the daemon spawns the command itself, and this adapter is what
+ * makes that path look identical to the caller.
+ *
+ * Exported (and only for this reason) so the wiring Windows depends on can be
+ * unit-tested on any platform: CI has no Windows runner, so logic reachable only
+ * there is logic nothing can prove, and this exact wiring did ship broken once
+ * because of that (issue #472 review round 6). Kept in this module rather than
+ * its own file because the surrogate-daemon tests load this source through
+ * Node's type stripping, which does not resolve a `.js` specifier to a `.ts`
+ * file.
+ *
+ * The underscore prefix is API Extractor's convention for an export that exists
+ * for internal reasons and is not part of the package's supported surface.
+ *
+ * @internal
+ */
+export function _adaptChildProcessEvents(
+  child: ChildProcess,
+  events: EventEmitter,
+): void {
+  child.once('error', (error: Error) => {
+    events.emit('error', error);
+  });
+  child.once('exit', (code: number | null, signal: NodeJS.Signals | null) => {
+    events.emit('exit', code, signal);
+  });
+}
+
 /** Maximum retained stdout, in bytes (003 §11.2). Excess is drained, not kept. */
 const STDOUT_CAP_BYTES = 1024 * 1024;
 
@@ -1101,15 +1136,9 @@ async function runCommand(
         commandPid = child.pid;
         stdout = child.stdout;
         stderr = child.stderr;
-        child.once('error', (error) => {
-          commandEvents.emit('error', error);
-        });
-        commandEvents.once(
-          'exit',
-          (code: number | null, signal: NodeJS.Signals | null) => {
-            commandEvents.emit('exit', code, signal);
-          },
-        );
+        // Unit-tested on every platform via `child-process-events.test.ts`,
+        // because nothing in CI runs Windows to prove this branch.
+        _adaptChildProcessEvents(child, commandEvents);
       }
 
       // Requested `pipe` stdio is typed nullable; it is always present here.
