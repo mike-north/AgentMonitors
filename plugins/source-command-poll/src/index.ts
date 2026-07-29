@@ -11,6 +11,7 @@ import {
   constants as fsConstants,
   openSync,
   unlinkSync,
+  writeSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -203,31 +204,35 @@ liveness.on('error', () => {
 });
 liveness.resume();
 
-// The pgid handoff, which the daemon performs only after the command exists.
+// The pgid handoff, on its own pipe at fd 4. A dedicated pipe (rather than this
+// process's stdin) is what lets the daemon deliver the target with a single
+// SYNCHRONOUS write, issued as the very next statement after the spawn returns —
+// no event-loop turn in between for the command to run first.
 let handoff = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', (chunk) => {
+const target = createReadStream(null, { fd: 4, autoClose: true });
+target.setEncoding('utf8');
+target.on('data', (chunk) => {
   handoff += chunk;
   const line = handoff.indexOf('\n');
   if (line === -1) return;
   const parsed = Number(handoff.slice(0, line).trim());
   if (Number.isInteger(parsed) && parsed > 0) pgid = parsed;
 });
-process.stdin.on('error', () => {});
-process.stdin.resume();
+target.on('error', () => {});
 
 // Armed: the deadline is running and the liveness pipe is being read. Only now
 // does the daemon spawn the command.
 process.stdout.write('armed\n');
 `;
 
-/** An anonymous liveness pipe's ends (003 §11.2, issue #470). */
-interface LivenessPipe {
-  /** Read end handed to the watchdog as its fd 0. */
+/** An anonymous pipe's two ends (003 §11.2, issue #470). */
+interface FifoPipe {
+  /** Read end handed to the watchdog. */
   rfd: number;
   /**
-   * Write end handed to the command at {@link COMMAND_LIVENESS_FD}; closed in the
-   * daemon post-spawn.
+   * Write end. For the liveness pipe this is handed to the command at
+   * {@link COMMAND_LIVENESS_FD} and closed in the daemon post-spawn; for the
+   * handoff pipe the daemon writes the process-group id to it and closes it.
    */
   wfd: number;
 }
@@ -317,7 +322,7 @@ const COMMAND_LIVENESS_FD = 20;
  * be opened **blocking** (no `O_NONBLOCK`) in either order — the watchdog needs a
  * blocking read end for EOF to mean "group gone", not "no data yet".
  */
-function createLivenessPipe(): LivenessPipe | undefined {
+function createFifoPipe(): FifoPipe | undefined {
   const fifoPath = path.join(
     tmpdir(),
     `agentmon-wd-${randomBytes(12).toString('hex')}`,
@@ -381,11 +386,6 @@ interface SelfWatchdog {
    */
   readonly armed: Promise<boolean>;
   /**
-   * Hand the just-spawned command's process-group id to the watchdog. Until this
-   * lands the watchdog has no target and will never signal anything.
-   */
-  sendPgid(pgid: number): void;
-  /**
    * SIGKILL the watchdog's own process group, best-effort. It is `detached`, so
    * one group signal reaps it and anything it may have spawned — no stray subtree
    * survives an arming failure (003 §11.2, issue #472 review round 6).
@@ -399,8 +399,8 @@ interface SelfWatchdog {
  * watchdog and its arming handshake, or `undefined` if it could not be spawned.
  *
  * Called BEFORE the command exists: the command's process-group id is delivered
- * afterwards via {@link SelfWatchdog.sendPgid}, so the bound is in place before
- * the command can run at all (issue #472 review round 6).
+ * afterwards over the handoff pipe, so the bound is in place before the command
+ * can run at all (issue #472 review round 6).
  *
  * The watchdog is itself `detached` (its own process group) so that (a) it
  * survives the daemon's death to do its job, and (b) it can be reaped whole via a
@@ -410,7 +410,8 @@ interface SelfWatchdog {
  * `PATH`, and any launch failure fails closed through the handshake.
  */
 function spawnSelfWatchdog(
-  rfd: number,
+  livenessRfd: number,
+  handoffRfd: number,
   deadlineMs: number,
 ): SelfWatchdog | undefined {
   let watchdog: ChildProcess;
@@ -418,7 +419,10 @@ function spawnSelfWatchdog(
     watchdog = spawn(
       process.execPath,
       ['-e', SELF_WATCHDOG_SOURCE, '--', String(Math.ceil(deadlineMs))],
-      { detached: true, stdio: ['pipe', 'pipe', 'ignore', rfd] },
+      {
+        detached: true,
+        stdio: ['ignore', 'pipe', 'ignore', livenessRfd, handoffRfd],
+      },
     );
   } catch {
     return undefined;
@@ -484,14 +488,6 @@ function spawnSelfWatchdog(
   return {
     process: watchdog,
     armed,
-    sendPgid(pgid: number): void {
-      try {
-        watchdog.stdin?.end(`${String(pgid)}\n`);
-      } catch {
-        // A dead watchdog cannot be handed a target; its own liveness-pipe EOF
-        // or deadline will retire it.
-      }
-    },
     reap,
   };
 }
@@ -747,8 +743,15 @@ async function runCommand(
     // launched unbounded. Windows has no process groups and no portable in-group
     // watchdog, so there the daemon-resident timers remain the only bound (a
     // documented platform limit).
-    const livenessPipe = isWindows ? undefined : createLivenessPipe();
-    if (!isWindows && livenessPipe === undefined) {
+    const livenessPipe = isWindows ? undefined : createFifoPipe();
+    // A dedicated pipe for the process-group handoff, so it can be delivered
+    // with one synchronous write immediately after the spawn (see below).
+    const handoffPipe =
+      isWindows || livenessPipe === undefined ? undefined : createFifoPipe();
+    if (
+      !isWindows &&
+      (livenessPipe === undefined || handoffPipe === undefined)
+    ) {
       resolve({
         kind: 'failure',
         error:
@@ -758,18 +761,20 @@ async function runCommand(
       return;
     }
 
-    /** Close every liveness-pipe fd, best-effort (any may already be closed). */
+    /** Close every watchdog-related fd, best-effort (any may already be closed). */
     function closeLivenessPipe(): void {
-      if (!livenessPipe) return;
-      try {
-        closeSync(livenessPipe.wfd);
-      } catch {
-        // Already closed — nothing to do.
-      }
-      try {
-        closeSync(livenessPipe.rfd);
-      } catch {
-        // Already closed — nothing to do.
+      for (const fd of [
+        livenessPipe?.wfd,
+        livenessPipe?.rfd,
+        handoffPipe?.wfd,
+        handoffPipe?.rfd,
+      ]) {
+        if (fd === undefined) continue;
+        try {
+          closeSync(fd);
+        } catch {
+          // Already closed — nothing to do.
+        }
       }
     }
 
@@ -781,19 +786,22 @@ async function runCommand(
     // head, and far more on a loaded machine). The watchdog is therefore launched
     // and armed first and learns its target afterwards, so there is no instant at
     // which the command is running without an independently surviving bound.
-    if (livenessPipe) {
+    if (livenessPipe && handoffPipe) {
       const watchdog = spawnSelfWatchdog(
         livenessPipe.rfd,
+        handoffPipe.rfd,
         scope.timeoutMs + SIGKILL_GRACE_MS + SELF_WATCHDOG_SLACK_MS,
       );
-      // The daemon hands the read end to the watchdog and keeps no copy of it.
-      // (The WRITE end stays open here until the command has inherited it —
-      // closing it early would EOF the pipe and disarm the watchdog before the
-      // command it is meant to bound even exists.)
-      try {
-        closeSync(livenessPipe.rfd);
-      } catch {
-        // Already closed — nothing to do.
+      // The daemon hands both read ends to the watchdog and keeps no copy.
+      // (The liveness WRITE end stays open here until the command has inherited
+      // it — closing it early would EOF the pipe and disarm the watchdog before
+      // the command it is meant to bound even exists.)
+      for (const fd of [livenessPipe.rfd, handoffPipe.rfd]) {
+        try {
+          closeSync(fd);
+        } catch {
+          // Already closed — nothing to do.
+        }
       }
       if (watchdog === undefined) {
         closeLivenessPipe();
@@ -821,19 +829,19 @@ async function runCommand(
           });
           return;
         }
-        startCommand(watchdog);
+        startCommand();
       });
       return;
     }
-    startCommand(undefined);
+    startCommand();
 
     /**
-     * Spawn and supervise the command itself, once `watchdog` (POSIX) is armed
+     * Spawn and supervise the command itself, once the watchdog (POSIX) is armed
      * and waiting for its target — or immediately on Windows, which has no
      * process groups and no portable in-group watchdog, so its daemon-resident
      * timers remain the only bound (a documented platform limit).
      */
-    function startCommand(watchdog: SelfWatchdog | undefined): void {
+    function startCommand(): void {
       // `file` is guaranteed defined: parseScopeConfig rejects an empty command. `spawn`
       // is synchronous up to and including this call (the actual process launch is
       // async; failures there surface later via the child's `'error'` event, handled
@@ -894,10 +902,28 @@ async function runCommand(
         return;
       }
 
-      // Hand the watchdog its target now that the group exists. Until this lands the
-      // watchdog is armed but has nothing it can signal, which is exactly the
-      // behavior wanted if the daemon dies mid-handoff: no pgid is ever guessed.
-      if (child.pid !== undefined) watchdog?.sendPgid(child.pid);
+      // Hand the watchdog its target now that the group exists. This is the very
+      // next statement after `spawn()` returns and is a SYNCHRONOUS write, so no
+      // event-loop turn separates the command's creation from its bound becoming
+      // targetable — an async write could be scheduled behind other daemon work
+      // and let a hostile command act first. Until it lands the watchdog is armed
+      // but has nothing it can signal, which is the behavior wanted if the daemon
+      // dies mid-handoff: no pgid is ever guessed.
+      if (handoffPipe) {
+        if (child.pid !== undefined) {
+          try {
+            writeSync(handoffPipe.wfd, `${String(child.pid)}\n`);
+          } catch {
+            // A dead watchdog cannot be handed a target; its own liveness-pipe
+            // EOF or deadline will retire it.
+          }
+        }
+        try {
+          closeSync(handoffPipe.wfd);
+        } catch {
+          // Already closed — nothing to do.
+        }
+      }
 
       // The daemon must not retain the liveness write end, or the pipe would never
       // reach EOF while the daemon is alive; the command holds its own inherited copy.
