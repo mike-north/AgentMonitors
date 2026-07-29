@@ -19,10 +19,17 @@ the same root cause, which this change removes rather than patches again.
   whole of the watchdog's launch and handshake the command was already running with nothing able to
   reap it. Reproduced with a command whose first actions are to record its pid, `kill -9` its parent
   (the daemon), and `exec sleep 30`: 2 of 40 runs were still alive 12s after an 8s backstop,
-  reparented to init. The watchdog is now spawned and armed **before** the command exists and is
-  handed the process-group id afterwards, over a dedicated pipe, with a single synchronous write
-  issued as the very next statement after the spawn returns. An arming failure therefore now means
-  the command is never started, rather than being started and terminated after the fact.
+  reparented to init. Arming was first moved ahead of the spawn, with the process-group id handed
+  over afterwards — which turned out to be unsound rather than merely imperfect: measured on Linux
+  with forty concurrent executions, the pre-fix head escaped **40 of 40** times, and the
+  arm-first-then-hand-off version still escaped **34 of 40**, because under CPU contention the daemon
+  is descheduled between creating the command and delivering the target. The watchdog therefore now
+  **spawns the command itself**, which removes the handoff altogether: whoever creates the command
+  owns its deadline, so the daemon dying at any instant is survivable (0 of 40 escapes, macOS and
+  Linux). An arming failure now means the command is never started at all, rather than being started
+  and terminated after the fact. Node still performs the spawn, so no-shell semantics, real spawn
+  errors, and exact exit codes are unchanged; the command's stdout/stderr are created alongside the
+  watchdog and passed through, so the daemon still reads them directly.
 - **A `sleep` that never returns wedged everything.** The watchdog's own validation probe had no
   bound of its own, so a `sleep` replaced by a never-returning helper hung it: no "armed", no exit,
   the arming decision pending forever. `observe()` never settled (the host was still running 25s
@@ -40,9 +47,13 @@ late-arming reap — with arming decided before the command exists, no outcome c
 daemon-side arming deadline remains as a bound on the handshake itself, reaping the watchdog's group
 and failing closed if it is ever exceeded.
 
-One implementation note worth keeping: the watchdog reads its liveness pipe through `fs`, not `net`.
-A `net.Socket` over a FIFO fd never delivers `end` on macOS, which silently cost the watchdog its
-disarm on every well-behaved command until it was caught.
+Three implementation notes worth keeping. The watchdog reads its liveness pipe through `fs`, not
+`net`: a `net.Socket` over a FIFO fd never delivers `end` on macOS, which silently cost the watchdog
+its disarm on every well-behaved command until it was caught. The watchdog must not exit on liveness
+EOF until it has reported the command's exit — EOF routinely wins that race, and exiting first left
+the daemon never learning the exit code. And the report channel must stay referenced until the
+observation settles: by the time the exit report arrives the command's own streams have ended, so an
+unref'd channel let `daemon once` exit mid-tick with nothing resolved.
 
 ## 2026-07-28 — command-poll self-watchdog: a late arming failure now reaps the surviving group, and "armed" became a proof (003 §11.2) — Refs #470, #472
 

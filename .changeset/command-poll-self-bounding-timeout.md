@@ -34,11 +34,13 @@ The watchdog is made safe, not merely present:
   is gone.** It is never proactively killed by the runtime on any outcome (success, failure, or
   timeout) — only by its own liveness-pipe proof or its own deadline — so a descendant backgrounded
   by an otherwise-successful command is bounded too, not just a descendant of a timed-out one.
-- **The bound exists before the command does.** The watchdog is spawned and armed BEFORE the command
-  is spawned, and is handed the command's process-group id afterwards with a single synchronous
-  write. Arming after the spawn left the command running unbounded for the whole of the watchdog's
-  launch and handshake — a command whose first actions were to record its pid, kill the daemon, and
-  `exec` a long sleep escaped that way in 2 of 40 measured runs.
+- **The watchdog spawns the command, so the bound exists before the command does.** Arming after the
+  spawn left the command running unbounded for the whole of the watchdog's launch — a command whose
+  first action was to kill the daemon escaped that way in 40 of 40 concurrent Linux runs. Arming
+  first but still spawning from the daemon only narrowed it (34 of 40). Having whoever creates the
+  command own its deadline closes it outright (0 of 40). Node still performs the spawn, so the
+  no-shell guarantee, real `ENOENT`/`EACCES` spawn errors, and exact exit codes are unchanged, and
+  the command's output still streams straight to the daemon.
 - **It fails closed, and now before anything runs.** If no independent bound can be armed — the
   liveness pipe cannot be created, the watchdog cannot be launched, or it does not confirm arming
   within a bounded deadline — the execution is reported as a failure and the command is never

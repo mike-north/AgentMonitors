@@ -3,7 +3,6 @@ import {
   execFileSync,
   spawn,
   type ChildProcess,
-  type StdioOptions,
 } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';

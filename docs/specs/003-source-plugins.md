@@ -1605,18 +1605,29 @@ _sibling_ (not a shell wrapper around the command) precisely so the command itse
 directly (`shell: false`) and every §11.1/§11.2/§11.5 semantic — no shell word-splitting, real
 spawn-failure errors, exact exit codes — is preserved unchanged.
 
-**Ordering is what makes the bound real.** The watchdog is spawned and armed **before the command
-exists**, and is handed the command's process-group id afterwards over a dedicated pipe, with a
-single synchronous write issued as the very next statement after the spawn returns. Arming after the
-spawn — as this originally did — left the command running for the whole of the watchdog's launch and
-handshake with nothing able to reap it: a command whose first actions were to record its pid, kill
-the daemon, and `exec` a long sleep escaped in 2 of 40 measured runs. Until the handoff lands the
-watchdog deliberately has nothing it can signal: liveness EOF before a pgid means the write end was
-only ever held by the daemon, so the command was never spawned, and the deadline elapsing before a
-pgid means the handoff never completed and no target can be named. Neither case ever guesses. Windows has no process groups and no
-portable in-group watchdog, so there the daemon-resident `taskkill /T /F` remains the only bound (a
-documented platform limitation, AP8 target work); the self-bounding backstop is POSIX-only, which is
-the portable answer for the launchd/init reparenting that motivates #470.
+**The watchdog spawns the command.** This is what makes the bound real rather than merely early.
+Two weaker orderings were tried and both leaked: arming after the spawn left the command running
+unbounded for the whole of the watchdog's launch and handshake, and arming first while the daemon
+still spawned the command left a window between the command's creation and the handoff of its
+process-group id. That second window is not narrow under load — on Linux, with forty concurrent
+executions, a command whose first action was to kill the daemon escaped through it 34 times out of
+40 (and 40 out of 40 against the arm-after-spawn ordering). Gating an arbitrary command's progress at
+exec time is not possible portably (there is no spawn-suspended, and a shell stub that stops itself
+would swallow exec failures and break §11.5), so the only sound arrangement is for whoever creates
+the command to own its deadline. The daemon therefore sends a command spec to the already-armed
+watchdog, which spawns the command, reports back its pid — or a spawn error, or its exit — and holds
+the deadline for it. The command's stdout and stderr are created alongside the watchdog and passed
+straight through, so the daemon still reads them directly, with no extra hop. Node still performs the
+spawn, so §11.1/§11.5 semantics are unchanged: no shell, real `ENOENT`/`EACCES` spawn errors, exact
+exit codes.
+
+Two consequences worth stating. The command's parent is now the watchdog, not the daemon: a command
+that kills its own parent therefore kills the watchdog and is left bounded by the daemon's timers,
+the mirror image of the previous arrangement (a command that kills both supervisors escapes either
+way — nothing short of privilege separation prevents that). And because the daemon no longer holds
+the child handle, the command's exit arrives as a report over the watchdog's channel; that channel is
+kept referenced until the observation settles, or a host that ticks in-process (`daemon once`) can
+run out of work and exit mid-tick with the observation unresolved.
 
 Three properties make the self-watchdog safe rather than merely present:
 
