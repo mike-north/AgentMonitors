@@ -54,6 +54,11 @@ lands;
 orphaned poll-command process trees is open work, with
 [#426](https://github.com/mike-north/AgentMonitors/issues/426) tracking the adjacent
 daemon/channel-server process hygiene;
+[#479](https://github.com/mike-north/AgentMonitors/issues/479) — live cleanup paths do not yet
+positively verify a target's identity at signal time, so promise #3 is a target;
+[#480](https://github.com/mike-north/AgentMonitors/issues/480) — the capability probe,
+automatic strongest-mechanism selection, and achieved-guarantee reporting behind promise #5 do
+not exist yet;
 [#469](https://github.com/mike-north/AgentMonitors/issues/469) — the always-on daemon has no
 coherent power posture yet (wake coalescing, event-driven sources, conditional requests,
 battery-aware intervals, sleep reconciliation), so promise #4's gentleness is likewise a
