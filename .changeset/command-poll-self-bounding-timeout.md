@@ -25,9 +25,9 @@ The watchdog is made safe, not merely present:
   alive, so a command that exits on its own before the deadline can never have its
   (possibly-recycled) pgid signalled. A descendant the command backgrounds via plain shell/exec-based
   job control typically inherits the fd too; a descendant spawned through a process API that
-  defaults to close-on-exec for non-explicit fds (the default for most modern high-level spawn
-  APIs — Node's own `child_process.spawn` included) does not, so it is not currently covered by this
-  guarantee if its spawning leader has already exited.
+  defaults to close-on-exec for non-explicit fds does not, so it is not currently covered by this
+  guarantee if its spawning leader has already exited. Node's own `child_process.spawn` is
+  platform-dependent: the macOS characterization closes the fd, while Linux CI retains it.
 - **It stays armed regardless of how the execution resolves, until it independently proves the group
   is gone.** It is never proactively killed by the runtime on any outcome (success, failure, or
   timeout) — only by its own liveness-pipe proof or its own deadline — so a descendant backgrounded
