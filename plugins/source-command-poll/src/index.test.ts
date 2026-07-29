@@ -1529,74 +1529,108 @@ describe.skipIf(process.platform === 'win32')(
 describe.skipIf(process.platform === 'win32')(
   'source-command-poll: the bound exists before the command runs (issue #472 review, round 6)',
   () => {
-    // NOTE ON STRENGTH: a single trial of this races a window that was only
-    // ~2/40 wide on the previous head, so it passes there more often than not.
-    // The regression evidence is the 40-trial measurement recorded in the review
-    // thread (2/40 escapes before, 0/40 after); this trial is the end-to-end
-    // guard that the backstop still reaps a daemon-killing command at all.
-    it('reaps a command that SIGKILLs the daemon as its very first action', async () => {
+    /**
+     * Eight concurrent trials, deliberately. A single trial cannot prove
+     * anything about a race: on macOS the pre-fix window was hit 2 times in 40,
+     * so one trial passes there more often than not. CPU contention is what
+     * makes the window wide — the daemon gets descheduled between creating the
+     * command and doing anything about it — and running the trials together is
+     * what produces that contention. Measured with this shape: the head before
+     * this fix escaped 40/40 on Linux and 2/40 on macOS; an intermediate design
+     * that armed first but still spawned the command from the daemon escaped
+     * 34/40 on Linux while looking clean (0/40) on macOS. So this test is sized
+     * to fail against BOTH of those, not just the original.
+     */
+    const CONCURRENT_TRIALS = 8;
+
+    it('reaps commands that SIGKILL the daemon as their very first action, under contention', async () => {
       const dir = mkdtempSync(join(tmpdir(), 'am-472r6-firstaction-'));
+      const commandPids: number[] = [];
       try {
         const indexUrl = new URL('./index.ts', import.meta.url).href;
-        // Backstop = ceil((timeout(1s) + grace(5s) + slack(2s)) / 1000) = 8s.
-        // The command kills THE DAEMON — the #470 scenario — as its very first
-        // action, then execs a long sleep. The daemon's pid is passed through
-        // `env` because the command's parent is the watchdog, not the daemon.
-        const scope = {
-          command: [
-            'sh',
-            '-c',
-            `echo $$ > ${JSON.stringify(join(dir, 'cmd.pid'))}; kill -9 "$AM_DAEMON_PID"; exec sleep 30`,
-          ],
-          env: { AM_DAEMON_PID: '__DAEMON_PID__' },
-          timeout: '1s',
-        };
-        const runnerFile = join(dir, 'surrogate-daemon.mjs');
-        writeFileSync(
-          runnerFile,
-          [
-            `const { default: source } = await import(${JSON.stringify(indexUrl)});`,
-            `const scope = ${JSON.stringify(scope)};`,
-            `scope.env.AM_DAEMON_PID = String(process.pid);`,
-            `source.observe(scope, { now: new Date(${String(NOW.getTime())}) }).catch(() => {});`,
-            // Keep the surrogate alive so the ONLY thing that ends it is the
-            // command's own `kill -9` — the race under test.
-            `setTimeout(() => {}, 60_000);`,
-          ].join('\n'),
-        );
 
-        const surrogate = spawn(
-          process.execPath,
-          ['--experimental-strip-types', runnerFile],
-          { stdio: 'ignore' },
-        );
-        await new Promise<void>((resolve) => {
-          surrogate.once('exit', () => {
-            resolve();
+        /** Start one surrogate daemon whose command kills it immediately. */
+        async function trial(index: number): Promise<string> {
+          const pidFile = join(dir, `cmd-${String(index)}.pid`);
+          const runnerFile = join(dir, `surrogate-${String(index)}.mjs`);
+          // Backstop = ceil((timeout(1s) + grace(5s) + slack(2s)) / 1000) = 8s.
+          // The command kills THE DAEMON — the #470 scenario — as its very first
+          // action, then execs a long sleep. The daemon's pid arrives through
+          // `env` because the command's parent is the watchdog, not the daemon.
+          const scope = {
+            command: [
+              'sh',
+              '-c',
+              `echo $$ > ${JSON.stringify(pidFile)}; kill -9 "$AM_DAEMON_PID"; exec sleep 300`,
+            ],
+            env: { AM_DAEMON_PID: '__DAEMON_PID__' },
+            timeout: '1s',
+          };
+          writeFileSync(
+            runnerFile,
+            [
+              `const { default: source } = await import(${JSON.stringify(indexUrl)});`,
+              `const scope = ${JSON.stringify(scope)};`,
+              `scope.env.AM_DAEMON_PID = String(process.pid);`,
+              `source.observe(scope, { now: new Date(${String(NOW.getTime())}) }).catch(() => {});`,
+              // Keep the surrogate alive so the ONLY thing that ends it is the
+              // command's own `kill -9` — the race under test.
+              `setTimeout(() => {}, 60_000);`,
+            ].join('\n'),
+          );
+
+          const surrogate = spawn(
+            process.execPath,
+            ['--experimental-strip-types', runnerFile],
+            { stdio: 'ignore' },
+          );
+          await new Promise<void>((resolve) => {
+            surrogate.once('exit', () => {
+              resolve();
+            });
           });
+          return pidFile;
+        }
+
+        const pidFiles = await Promise.all(
+          Array.from({ length: CONCURRENT_TRIALS }, (_unused, i) => trial(i)),
+        );
+
+        for (const pidFile of pidFiles) {
+          expect(await pollUntil(() => existsSync(pidFile), 10_000)).toBe(true);
+          const pid = Number(readFileSync(pidFile, 'utf8').trim());
+          expect(Number.isInteger(pid)).toBe(true);
+          commandPids.push(pid);
+        }
+
+        // Every daemon is dead and can do nothing more; only a bound that
+        // existed before its command started can reap these. The ceiling is a
+        // margin over the 8s backstop, not an open-ended wait, and the command
+        // sleeps 300s so its own expiry can never be mistaken for a reap — an
+        // earlier version of this test slept 30s and polled for 30s, which made
+        // every escape look like a success.
+        const allDead = await pollUntil(
+          () => commandPids.every((pid) => !isProcessAlive(pid)),
+          20_000,
+        );
+        const survivors = commandPids.filter((pid) => isProcessAlive(pid));
+        expect({ survivors: survivors.length, allDead }).toEqual({
+          survivors: 0,
+          allDead: true,
         });
-
-        const pidFile = join(dir, 'cmd.pid');
-        expect(await pollUntil(() => existsSync(pidFile), 5_000)).toBe(true);
-        const commandPid = Number(readFileSync(pidFile, 'utf8').trim());
-        expect(Number.isInteger(commandPid)).toBe(true);
-
-        // The daemon it killed can no longer do anything about it; only a bound
-        // armed before the command started can. Generous margin over the 8s
-        // backstop for CI jitter.
-        const dead = await pollUntil(() => !isProcessAlive(commandPid), 20_000);
-        if (!dead) {
-          try {
-            process.kill(commandPid, 'SIGKILL');
-          } catch {
-            // Already gone — nothing to do.
+      } finally {
+        for (const pid of commandPids) {
+          if (isProcessAlive(pid)) {
+            try {
+              process.kill(pid, 'SIGKILL');
+            } catch {
+              // Already gone — nothing to do.
+            }
           }
         }
-        expect(dead).toBe(true);
-      } finally {
         rmSync(dir, { recursive: true, force: true });
       }
-    }, 40_000);
+    }, 90_000);
   },
 );
 
