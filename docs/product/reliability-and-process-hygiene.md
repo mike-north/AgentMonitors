@@ -36,7 +36,8 @@ trust slowly. The failure is rarely dramatic; it is _erosion_:
 Once that happens, the verdict is set: **"it leaks, I have to keep an eye on it."** For a tool
 whose only job is to run unattended, that verdict is fatal. The reliability posture below
 exists to make that verdict impossible to reach — not to make leaks _rare_, but to make the
-system **accountable for everything it starts.**
+system **accountable for everything it starts that remains within the containment boundary**
+(defined below).
 
 ## The promises we make
 
@@ -46,10 +47,17 @@ to fall short today, the gap is tracked as an issue and this document is the acc
 those issues are measured against (as of this writing:
 [#470](https://github.com/mike-north/AgentMonitors/issues/470) — poll-command lifetime bounds
 today live only in daemon-resident timers, so a hard-killed daemon can orphan the command and
-its descendants; the in-flight self-bounding watchdog (PR #472) narrows this to a residual
-gap for descendants spawned via close-on-exec APIs, but has not landed;
-[#426](https://github.com/mike-north/AgentMonitors/issues/426) — the restart sweep is open
-work). A promise below is not an assertion that today's build already delivers it; it is the
+its descendants; PR #472 proposes a self-bounding watchdog intended to narrow this to a
+residual gap for close-on-exec descendants once its correctness blockers are fixed and it
+lands;
+[#478](https://github.com/mike-north/AgentMonitors/issues/478) — the restart sweep for
+orphaned poll-command process trees is open work, with
+[#426](https://github.com/mike-north/AgentMonitors/issues/426) tracking the adjacent
+daemon/channel-server process hygiene;
+[#469](https://github.com/mike-north/AgentMonitors/issues/469) — the always-on daemon has no
+coherent power posture yet (wake coalescing, event-driven sources, conditional requests,
+battery-aware intervals, sleep reconciliation), so promise #4's gentleness is likewise a
+target). A promise below is not an assertion that today's build already delivers it; it is the
 bar a gap must meet before it can close.
 
 **The containment boundary.** Every promise below applies to processes _within our containment
