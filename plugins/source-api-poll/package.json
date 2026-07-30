@@ -1,7 +1,7 @@
 {
   "name": "@agentmonitors/source-api-poll",
   "description": "HTTP endpoint polling and change detection for Agent Monitors",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "engines": {
     "node": ">=24"
   },
