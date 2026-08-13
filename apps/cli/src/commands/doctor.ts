@@ -111,6 +111,17 @@ function leadSessionRemediation(workspacePath: string): string {
 const NEVER_OBSERVED_REMEDIATION =
   'The daemon has not observed this monitor yet. Start it with `agentmonitors daemon run` (or wait for the next tick), then check `agentmonitors monitor history <id>`; `agentmonitors monitor test <path>` dry-runs it now.';
 
+function retryOutboxFor(monitor: DoctorMonitorRollup) {
+  return (
+    monitor.materializationRetries ?? {
+      pending: 0,
+      terminal: 0,
+      bytes: 0,
+      records: [],
+    }
+  );
+}
+
 const STATUS_GLYPH: Record<DoctorCheckStatus, string> = {
   pass: '✓',
   fail: '✗',
@@ -130,6 +141,7 @@ function rollupLine(
   monitor: DoctorMonitorRollup,
   hasLeadSession: boolean,
 ): string {
+  const retryOutbox = retryOutboxFor(monitor);
   return [
     `source=${monitor.sourceName}`,
     `urgency=${monitor.urgency}`,
@@ -137,6 +149,7 @@ function rollupLine(
     `last-observed=${monitor.lastObservedAt ? monitor.lastObservedAt.toISOString() : 'never'}`,
     `next-due=${monitor.nextDueAt ? monitor.nextDueAt.toISOString() : 'unknown'}`,
     `last-event=${monitor.lastEventAt ? monitor.lastEventAt.toISOString() : 'none'}`,
+    `retry-outbox=${String(retryOutbox.pending)}/${String(retryOutbox.terminal)}`,
     hasLeadSession
       ? `unread/claimed/acked=${String(monitor.delivery.unread)}/${String(monitor.delivery.claimed)}/${String(monitor.delivery.acknowledged)}`
       : 'lead-session=none',
@@ -298,11 +311,26 @@ function buildChecks(
   for (const monitor of report.monitors) {
     const name = `monitor:${monitor.id}`;
     const rollup = rollupLine(monitor, hasActiveLeadSession);
+    const retryOutbox = retryOutboxFor(monitor);
     if (!monitor.valid) {
       checks.push({
         name,
         status: 'skip',
         detail: `invalid definition (see monitors-valid)  ${rollup}`,
+      });
+    } else if (retryOutbox.terminal > 0) {
+      checks.push({
+        name,
+        status: 'fail',
+        detail: `terminal materialization retry  ${rollup}`,
+        remediation: `Inspect safe retry details with \`agentmonitors monitor explain ${monitor.id}\`, repair the reported failure, then explicitly re-arm the listed retry record.`,
+      });
+    } else if (retryOutbox.pending > 0) {
+      checks.push({
+        name,
+        status: 'fail',
+        detail: `materialization retry pending  ${rollup}`,
+        remediation: `Inspect this monitor with \`agentmonitors monitor explain ${monitor.id}\` and allow the daemon to retry before observing newer state.`,
       });
     } else if (monitor.neverObserved) {
       checks.push({
@@ -625,6 +653,7 @@ function toJson(
         ? monitor.lastEventAt.toISOString()
         : null,
       delivery: monitor.delivery,
+      materializationRetries: retryOutboxFor(monitor),
     })),
     summary: { passed, failed, skipped, idle },
   };

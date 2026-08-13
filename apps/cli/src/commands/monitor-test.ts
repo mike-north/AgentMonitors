@@ -98,6 +98,12 @@ function printExplainText(report: MonitorExplainReport): void {
   for (const stage of report.stages) {
     console.log(`${statusGlyph(stage.status)} ${stage.label}: ${stage.reason}`);
   }
+  for (const retry of report.materializationRetries?.records ?? []) {
+    console.log(
+      `  Retry ${retry.id}: status=${retry.status}  attempts=${String(retry.attemptCount)}  next-at=${retry.nextAttemptAt?.toISOString() ?? 'none'}  updated-at=${retry.updatedAt.toISOString()}`,
+    );
+    if (retry.lastError) console.log(`    Last error: ${retry.lastError}`);
+  }
   console.log(
     `Verdict: ${report.verdict.status} at ${EXPLAIN_STAGE_LABELS[report.verdict.stage]} - ${report.verdict.reason}`,
   );
@@ -629,7 +635,9 @@ monitorTestCommand
         );
         const definitionOk = definitionStage?.status === 'ok';
         const hasPersistedState =
-          report.observations.length > 0 || report.events.length > 0;
+          report.observations.length > 0 ||
+          report.events.length > 0 ||
+          (report.materializationRetries?.records.length ?? 0) > 0;
         const isUnschedulable = !report.stages.some(
           (stage) => stage.id === 'scheduling',
         );
