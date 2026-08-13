@@ -361,6 +361,81 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
   `);
 
   db.run(sql`
+    CREATE TABLE IF NOT EXISTS database_compatibility_markers (
+      id TEXT PRIMARY KEY,
+      workspace_identity TEXT,
+      capability TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    )
+  `);
+
+  db.run(sql`DROP INDEX IF EXISTS idx_database_compatibility_marker_key`);
+
+  db.run(sql`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_database_compatibility_marker_workspace_key
+      ON database_compatibility_markers (workspace_identity, capability)
+      WHERE workspace_identity IS NOT NULL
+  `);
+
+  db.run(sql`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_database_compatibility_marker_global_key
+      ON database_compatibility_markers (capability)
+      WHERE workspace_identity IS NULL
+  `);
+
+  db.run(sql`
+    CREATE TABLE IF NOT EXISTS external_event_receipts (
+      id TEXT PRIMARY KEY,
+      workspace_identity TEXT NOT NULL,
+      monitor_id TEXT NOT NULL,
+      source TEXT NOT NULL,
+      upstream_event_id TEXT NOT NULL,
+      semantic_hash TEXT NOT NULL,
+      object_id TEXT NOT NULL,
+      object_sequence INTEGER NOT NULL,
+      event_kind TEXT NOT NULL,
+      change_kind TEXT NOT NULL,
+      occurred_at TEXT NOT NULL,
+      outcome TEXT NOT NULL,
+      event_ids TEXT NOT NULL DEFAULT '[]',
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      next_attempt_at INTEGER,
+      accepted_at INTEGER NOT NULL,
+      materialized_at INTEGER,
+      updated_at INTEGER NOT NULL
+    )
+  `);
+
+  db.run(sql`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_external_event_receipt_key
+      ON external_event_receipts (
+        workspace_identity, monitor_id, source, upstream_event_id
+      )
+  `);
+
+  db.run(sql`
+    CREATE TABLE IF NOT EXISTS external_object_sequences (
+      id TEXT PRIMARY KEY,
+      workspace_identity TEXT NOT NULL,
+      monitor_id TEXT NOT NULL,
+      source TEXT NOT NULL,
+      object_id TEXT NOT NULL,
+      highest_sequence INTEGER NOT NULL,
+      receipt_id TEXT NOT NULL,
+      upstream_event_id TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    )
+  `);
+
+  db.run(sql`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_external_object_sequence_key
+      ON external_object_sequences (
+        workspace_identity, monitor_id, source, object_id
+      )
+  `);
+
+  db.run(sql`
     CREATE TABLE IF NOT EXISTS session_event_state (
       id TEXT PRIMARY KEY,
       session_id TEXT NOT NULL,
