@@ -331,6 +331,15 @@ export interface DuplicateMonitorId {
     id: string;
 }
 
+// @public
+export interface EnqueueMaterializationRetryInput {
+    envelope: StoredObservationEnvelope;
+    error: string;
+    monitorId: string;
+    sourceName: string;
+    workspacePath: string | null;
+}
+
 // @public (undocumented)
 export interface EnqueuePayload {
     // (undocumented)
@@ -599,6 +608,56 @@ export interface KeyedCollectionResult {
 
 // @public
 export type KeyedSnapshot = Record<string, unknown>;
+
+// @public
+export const MATERIALIZATION_RETRY_DELAYS_MS: readonly [1000, 5000, 30000, 120000, 300000];
+
+// @public
+export const MATERIALIZATION_RETRY_MAX_BYTES: number;
+
+// @public
+export const MATERIALIZATION_RETRY_MAX_RECORDS = 256;
+
+// @public
+export class MaterializationRetryCapacityError extends Error {
+    constructor(monitorId: string);
+    readonly code = "materialization_retry_capacity_exceeded";
+    readonly monitorId: string;
+}
+
+// @public
+export interface MaterializationRetryQuery {
+    limit?: number;
+    monitorId?: string;
+    status?: MaterializationRetryStatus;
+    workspacePath?: string | null;
+}
+
+// @public
+export interface MaterializationRetryRecord {
+    attemptCount: number;
+    createdAt: Date;
+    envelope: StoredObservationEnvelope;
+    envelopeBytes: number;
+    id: string;
+    lastError: string | null;
+    monitorId: string;
+    nextAttemptAt: Date | null;
+    sourceName: string;
+    status: MaterializationRetryStatus;
+    updatedAt: Date;
+    workspacePath: string | null;
+}
+
+// @public
+export class MaterializationRetrySerializationError extends Error {
+    constructor(path: string, reason: string);
+    readonly code = "materialization_retry_serialization_failed";
+    readonly path: string;
+}
+
+// @public
+export type MaterializationRetryStatus = 'pending' | 'terminal';
 
 // @public
 export const MAX_OPERATION_TIMEOUT_MS = 2147483647;
@@ -1371,12 +1430,14 @@ export class RuntimeStore {
     // (undocumented)
     closeSession(sessionId: string): AgentSessionRecord;
     collapseNetForClaim(sessionId: string, candidates: MonitorEventRecord[]): MonitorEventRecord[];
+    enqueueMaterializationRetries(inputs: EnqueueMaterializationRetryInput[], now?: Date): MaterializationRetryRecord[];
     findEphemeralMonitorById(id: string): EphemeralMonitorRecord | null;
     findSessionById(id: string): AgentSessionRecord | null;
     // (undocumented)
     getEphemeralMonitorById(id: string): EphemeralMonitorRecord;
     // (undocumented)
     getEventById(id: string): MonitorEventRecord;
+    getMaterializationRetry(id: string): MaterializationRetryRecord;
     getMonitorState(monitorId: string, workspacePath: string | null): MonitorRuntimeState;
     // (undocumented)
     getSessionById(id: string): AgentSessionRecord;
@@ -1408,6 +1469,7 @@ export class RuntimeStore {
     listEphemeralMonitorsForSession(sessionId: string): EphemeralMonitorRecord[];
     // (undocumented)
     listEvents(query?: EventQuery): MonitorEventRecord[];
+    listMaterializationRetries(query?: MaterializationRetryQuery): MaterializationRetryRecord[];
     listObservationHistory(query?: ObservationHistoryQuery): ObservationHistoryRecord[];
     // (undocumented)
     listSessions(): AgentSessionRecord[];

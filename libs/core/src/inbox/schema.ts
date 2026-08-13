@@ -87,6 +87,33 @@ export const monitorSnapshots = sqliteTable('monitor_snapshots', {
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
 });
 
+export const materializationRetryStatus = ['pending', 'terminal'] as const;
+
+/**
+ * Durable observations that a source tick accepted but could not materialize.
+ * Designed for drain-before-observe adoption so the runtime can preserve the
+ * source cursor without losing failed siblings.
+ */
+export const materializationRetryOutbox = sqliteTable(
+  'materialization_retry_outbox',
+  {
+    id: text('id').primaryKey(),
+    workspacePath: text('workspace_path'),
+    monitorId: text('monitor_id').notNull(),
+    sourceName: text('source_name').notNull(),
+    envelope: text('envelope').notNull(),
+    envelopeBytes: integer('envelope_bytes').notNull(),
+    attemptCount: integer('attempt_count').notNull().default(0),
+    status: text('status', { enum: materializationRetryStatus })
+      .notNull()
+      .default('pending'),
+    nextAttemptAt: integer('next_attempt_at', { mode: 'timestamp' }),
+    lastError: text('last_error'),
+    createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+    updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
+  },
+);
+
 /**
  * The per-recipient Interpret decision (G14, 002 §1.1.8). Recorded on
  * `session_event_state` because Interpret runs **right of the per-recipient
