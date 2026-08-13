@@ -193,6 +193,7 @@ The `RuntimeStore.saveSnapshot()` and `RuntimeStore.latestSnapshot()` methods (i
 | Retry explain/doctor output is actionable and version-compatible | Covered (`apps/cli/src/commands/cli.integration.test.ts` — pending/terminal text and JSON, envelope non-disclosure, and an older daemon report with no retry field).                                                         |
 | First/later failures produce truthful committed results          | Covered (`libs/core/src/runtime/atomic-ingest-retry.test.ts` — exact ids, errors, history, outbox order, and Interpret calls for event, projection, cursor, and snapshot faults).                                            |
 | State/outbox failure rolls back the ingest batch                 | Covered (`libs/core/src/runtime/atomic-ingest-retry.test.ts` — post-write state and outbox faults leave no events/retries, preserve the source baseline, and replay after restart).                                          |
+| Rollup notify state rolls back with materialization              | Covered (`libs/core/src/runtime/atomic-ingest-retry.test.ts` — pending batches and window markers survive state/outbox failure and flush once after restart).                                                                |
 
 ### 3.5 CLI behavior
 

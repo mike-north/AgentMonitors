@@ -9,12 +9,18 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-08-13 — Rollup-window notify state commits with materialization (002 §4.4; 004 §3.4) — Refs #295, #481
+
+A not-due rollup flush now commits its pending-batch removal and window marker in the same
+transaction as events and retry admission. State or outbox failure leaves the pending batch intact
+for a restart-safe retry, and Interpret still runs only after commit.
+
 ## 2026-08-13 — Poll and watch ingest atomically admit failed observations (002 §2, §15; 004 §3.4) — Refs #295, #481
 
 One immediate transaction now commits successful event materializations, ordered retry envelopes,
 and source/notify state. A state or outbox failure rolls the whole batch back to the prior source
 baseline. Tick ids, errors, and history reflect only committed work, and Interpret runs only after
-commit. Retry draining and rollup-window adoption follow in the next stack layers.
+commit. Retry draining follows in the next stack layer.
 
 ## 2026-08-13 — Failed materialization has a bounded durable retry outbox (002 schema, 004 §3.4, 005 §15) — Refs #295, #481
 
