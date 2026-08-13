@@ -1396,9 +1396,6 @@ export class RuntimeStore {
         previousContent: string | null;
     }, options?: {
         restrictToSessionId?: string;
-        snapshot?: {
-            content: string;
-        };
     }): MonitorEventRecord;
     interpretDigestsForSession(sessionId: string, eventIds: string[]): Map<string, string>;
     // (undocumented)

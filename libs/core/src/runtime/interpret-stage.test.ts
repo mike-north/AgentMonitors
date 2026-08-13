@@ -151,6 +151,7 @@ function setup(
   payloadForm: string | null,
   source: ObservationSource,
   interpret?: InterpretAdapter,
+  Store: new (db: ReturnType<typeof createDb>) => RuntimeStore = RuntimeStore,
 ): {
   runtime: AgentMonitorRuntime;
   store: RuntimeStore;
@@ -160,7 +161,7 @@ function setup(
   const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-interpret-'));
   tempDirs.push(rootDir);
   const db = createDb(path.join(rootDir, 'agentmon.db'));
-  const store = new RuntimeStore(db);
+  const store = new Store(db);
   const registry = new SourceRegistry();
   registry.register(source);
   const runtime = new AgentMonitorRuntime(
@@ -174,6 +175,82 @@ function setup(
 }
 
 describe('Interpret stage (G14, 002 §1.1.8)', () => {
+  it('invokes the adapter only after the event, projection, and snapshot commit', async () => {
+    const committed: {
+      store?: RuntimeStore;
+      sessionId?: string;
+      rootDir?: string;
+    } = {};
+    const fake = fakeAdapter(() => {
+      if (!committed.store || !committed.sessionId || !committed.rootDir) {
+        throw new Error(
+          'Interpret ran before the test installed its commit probe.',
+        );
+      }
+      const events = committed.store.listEvents();
+      expect(events).toHaveLength(1);
+      expect(
+        committed.store.listEvents({ sessionId: committed.sessionId }),
+      ).toHaveLength(1);
+      expect(
+        committed.store.latestSnapshot('interp', 'obj-1', committed.rootDir),
+      ).toMatchObject({ eventId: events[0]?.id, content: 'v1' });
+      return { decision: 'deliver', digest: 'committed' };
+    });
+    const { runtime, store, monitorsDir, rootDir } = setup(
+      'prose',
+      scriptedSource(['v1']),
+      fake,
+    );
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'commit-probe',
+        workspacePath: rootDir,
+      }),
+    );
+    committed.store = store;
+    committed.sessionId = session.id;
+    committed.rootDir = rootDir;
+
+    await runtime.tick(monitorsDir, rootDir);
+
+    expect(fake.calls).toHaveLength(1);
+  });
+
+  it('does not invoke Interpret when deterministic materialization rolls back', async () => {
+    class SnapshotFailingStore extends RuntimeStore {
+      override saveSnapshot(
+        _input: Parameters<RuntimeStore['saveSnapshot']>[0],
+      ): void {
+        throw new Error('simulated snapshot failure');
+      }
+    }
+
+    const fake = fakeAdapter(() => ({
+      decision: 'deliver',
+      digest: 'unexpected',
+    }));
+    const { runtime, store, monitorsDir, rootDir } = setup(
+      'prose',
+      scriptedSource(['v1']),
+      fake,
+      SnapshotFailingStore,
+    );
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'rollback-probe',
+        workspacePath: rootDir,
+      }),
+    );
+
+    await runtime.tick(monitorsDir, rootDir);
+
+    expect(fake.calls).toHaveLength(0);
+    expect(store.listEvents()).toEqual([]);
+    expect(store.listEvents({ sessionId: session.id })).toEqual([]);
+    expect(store.latestSnapshot('interp', 'obj-1', rootDir)).toBeNull();
+  });
+
   it('(a) a prose monitor invokes the adapter; the delta is the per-recipient diff', async () => {
     const fake = fakeAdapter(() => ({ decision: 'deliver', digest: 'ok' }));
     const { runtime, monitorsDir, rootDir } = setup(

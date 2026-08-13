@@ -753,10 +753,7 @@ export class RuntimeStore {
   insertEvent(
     input: Omit<MonitorEventRecord, 'id'>,
     baseline?: { previousContent: string | null },
-    options?: {
-      restrictToSessionId?: string;
-      snapshot?: { content: string };
-    },
+    options?: { restrictToSessionId?: string },
   ): MonitorEventRecord {
     const db = asInternalDb(this.db);
     const materialized = db.$client
@@ -890,7 +887,7 @@ export class RuntimeStore {
           projectedSessionIds.push(session.id);
         }
 
-        if (options?.snapshot) {
+        if (artifact !== null) {
           if (objectKey === null) {
             throw new Error('A snapshot-bearing event requires an object key.');
           }
@@ -899,7 +896,7 @@ export class RuntimeStore {
             monitorId: event.monitorId,
             objectKey,
             eventId: event.id,
-            content: options.snapshot.content,
+            content: artifact,
           });
         }
 

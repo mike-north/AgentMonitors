@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import type { Database as BetterSQLiteClient } from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import { createDb } from '../inbox/db.js';
@@ -37,10 +38,14 @@ function eventInput(workspacePath: string): Omit<MonitorEventRecord, 'id'> {
   };
 }
 
-function openLead(store: RuntimeStore, workspacePath: string) {
+function openLead(
+  store: RuntimeStore,
+  workspacePath: string,
+  hostSessionId = 'transaction-lead',
+) {
   return store.openSession(
     claudeCodeAdapter.createSessionInput({
-      hostSessionId: 'transaction-lead',
+      hostSessionId,
       workspacePath,
     }),
   );
@@ -48,16 +53,32 @@ function openLead(store: RuntimeStore, workspacePath: string) {
 
 function createStore<T extends RuntimeStore>(
   Store: new (db: ReturnType<typeof createDb>) => T,
-): { store: T; workspacePath: string } {
+): { store: T; workspacePath: string; client: BetterSQLiteClient } {
   const workspacePath = mkdtempSync(
     path.join(tmpdir(), 'agentmon-materialization-'),
   );
   tempDirs.push(workspacePath);
-  const store = new Store(createDb(path.join(workspacePath, 'agentmon.db')));
-  return { store, workspacePath };
+  const db = createDb(path.join(workspacePath, 'agentmon.db'));
+  const store = new Store(db);
+  const client = (db as unknown as { $client: BetterSQLiteClient }).$client;
+  return { store, workspacePath, client };
 }
 
 describe('transactional event materialization', () => {
+  it('persists the event snapshot text as the single snapshot source of truth', () => {
+    const { store, workspacePath } = createStore(RuntimeStore);
+
+    const event = store.insertEvent(eventInput(workspacePath));
+
+    const snapshot = store.latestSnapshot(
+      'transaction-monitor',
+      'object-1',
+      workspacePath,
+    );
+    expect(snapshot).toEqual({ content: '{"status":"passed"}' });
+    expect(snapshot?.content).toBe(event.snapshotText);
+  });
+
   it('rolls back the event and cursor when cursor seeding fails', () => {
     class CursorFailingStore extends RuntimeStore {
       override seedSessionObjectCursor(
@@ -71,11 +92,9 @@ describe('transactional event materialization', () => {
     const { store, workspacePath } = createStore(CursorFailingStore);
     const session = openLead(store, workspacePath);
 
-    expect(() =>
-      store.insertEvent(eventInput(workspacePath), undefined, {
-        snapshot: { content: '{"status":"passed"}' },
-      }),
-    ).toThrow('simulated cursor failure');
+    expect(() => store.insertEvent(eventInput(workspacePath))).toThrow(
+      'simulated cursor failure',
+    );
 
     expect(store.listEvents()).toEqual([]);
     expect(store.listEvents({ sessionId: session.id })).toEqual([]);
@@ -104,11 +123,9 @@ describe('transactional event materialization', () => {
     const { store, workspacePath } = createStore(SnapshotFailingStore);
     const session = openLead(store, workspacePath);
 
-    expect(() =>
-      store.insertEvent(eventInput(workspacePath), undefined, {
-        snapshot: { content: '{"status":"passed"}' },
-      }),
-    ).toThrow('simulated snapshot failure');
+    expect(() => store.insertEvent(eventInput(workspacePath))).toThrow(
+      'simulated snapshot failure',
+    );
 
     expect(store.listEvents()).toEqual([]);
     expect(store.listEvents({ sessionId: session.id })).toEqual([]);
@@ -120,6 +137,41 @@ describe('transactional event materialization', () => {
         workspacePath,
       ),
     ).toBeNull();
+    expect(
+      store.latestSnapshot('transaction-monitor', 'object-1', workspacePath),
+    ).toBeNull();
+  });
+
+  it('rolls back an earlier recipient when a later projection insert fails', () => {
+    const { store, workspacePath, client } = createStore(RuntimeStore);
+    const first = openLead(store, workspacePath, 'transaction-lead-1');
+    const second = openLead(store, workspacePath, 'transaction-lead-2');
+    client.exec(`
+      CREATE TRIGGER fail_second_projection
+      BEFORE INSERT ON session_event_state
+      WHEN NEW.session_id = '${second.id}'
+      BEGIN
+        SELECT RAISE(ABORT, 'simulated projection failure');
+      END;
+    `);
+
+    expect(() => store.insertEvent(eventInput(workspacePath))).toThrow(
+      'simulated projection failure',
+    );
+
+    expect(store.listEvents()).toEqual([]);
+    expect(store.listEvents({ sessionId: first.id })).toEqual([]);
+    expect(store.listEvents({ sessionId: second.id })).toEqual([]);
+    for (const session of [first, second]) {
+      expect(
+        store.getSessionObjectCursor(
+          session.id,
+          'transaction-monitor',
+          'object-1',
+          workspacePath,
+        ),
+      ).toBeNull();
+    }
     expect(
       store.latestSnapshot('transaction-monitor', 'object-1', workspacePath),
     ).toBeNull();
