@@ -1,9 +1,19 @@
 import path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { AgentMonitorRuntime } from '@agentmonitors/core';
+import {
+  AgentMonitorRuntime,
+  EXTERNAL_EVENT_SCHEMA,
+} from '@agentmonitors/core';
 import {
   describeDetachIdentityIssue,
   describeSpawnedCleanupOutcome,
@@ -15,6 +25,7 @@ import {
 import { callDaemon, daemonAvailable } from '../daemon-ipc.js';
 import { transportRegistryDir } from '../transport-heartbeat.js';
 import type { SpawnedDaemon } from '../detached-spawn.js';
+import { createRuntime } from '../runtime.js';
 
 // Spies (not fully mocks — real fs behavior passes through) on `node:fs` so a
 // single test below can assert `readdirSync` is never called with the
@@ -31,11 +42,169 @@ function tempDir(): string {
   return root;
 }
 
+function externalMonitor(root: string): string {
+  const monitorDir = path.join(root, '.claude', 'monitors', 'build-health');
+  mkdirSync(monitorDir, { recursive: true });
+  writeFileSync(
+    path.join(monitorDir, 'MONITOR.md'),
+    [
+      '---',
+      'watch:',
+      '  type: file-fingerprint',
+      '  globs:',
+      "    - 'watched.txt'",
+      `  cwd: ${JSON.stringify(root)}`,
+      'urgency: normal',
+      'notify:',
+      '  strategy: debounce',
+      "  settle-for: '1s'",
+      '---',
+      'Handle the captured build state.',
+      '',
+    ].join('\n'),
+    'utf8',
+  );
+  writeFileSync(path.join(root, 'watched.txt'), 'baseline', 'utf8');
+  return path.dirname(monitorDir);
+}
+
+function externalEnvelope() {
+  return {
+    schema: EXTERNAL_EVENT_SCHEMA,
+    monitorId: 'build-health',
+    source: 'example-build-system',
+    upstreamEventId: 'delivery-1',
+    objectId: 'build-1',
+    objectSequence: 1,
+    eventKind: 'build.updated',
+    changeKind: 'modified' as const,
+    occurredAt: new Date().toISOString(),
+    resumeToken: 'relay-cursor',
+    scope: {},
+    state: { status: 'passed' },
+  };
+}
+
+async function waitUntil(
+  predicate: () => boolean | Promise<boolean>,
+  timeoutMs = 4_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await predicate())) {
+    if (Date.now() >= deadline) throw new Error('Timed out waiting for state.');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   for (const root of tempRoots.splice(0)) {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+describe('runLoop — external notification deadlines', () => {
+  it('keeps the daemon alive through a deadline, flushes source-free, then permits reap', async () => {
+    const workspace = tempDir();
+    const monitorsDir = externalMonitor(workspace);
+    const socketPath = path.join(workspace, 'agentmon.sock');
+    const dbPath = path.join(workspace, 'agentmon.db');
+    const loop = runLoop(monitorsDir, workspace, 20, socketPath, 50, dbPath);
+    let receiptId: string;
+    try {
+      await waitUntil(() => daemonAvailable(socketPath));
+      const status = await callDaemon<{
+        workspaceIdentity: string;
+        monitorsDirIdentity: string;
+      }>('status', {}, { socketPath });
+      const session = await callDaemon<{ id: string }>(
+        'session.open',
+        {
+          adapter: 'claude-code',
+          hostSessionId: 'deadline-session',
+          workspacePath: status.workspaceIdentity,
+          agentIdentity: 'claude',
+          hookStatePath: path.join(workspace, 'hook-state.json'),
+        },
+        { socketPath },
+      );
+      const accepted = await callDaemon<{ receiptId: string }>(
+        'events.ingest',
+        {
+          workspaceIdentity: status.workspaceIdentity,
+          monitorsDirIdentity: status.monitorsDirIdentity,
+          envelope: externalEnvelope(),
+        },
+        { socketPath },
+      );
+      receiptId = accepted.receiptId;
+      await callDaemon(
+        'session.close',
+        { sessionId: session.id },
+        { socketPath },
+      );
+      rmSync(path.join(monitorsDir, 'build-health'), {
+        recursive: true,
+        force: true,
+      });
+      await waitUntil(async () => !(await daemonAvailable(socketPath)));
+      await loop;
+    } finally {
+      await callDaemon('stop', {}, { socketPath }).catch(() => undefined);
+    }
+
+    const runtime = createRuntime(dbPath);
+    expect(
+      runtime.externalEventReceiptStatus(realpathSync(workspace), receiptId),
+    ).toMatchObject({
+      outcome: 'materialized',
+      eventIds: [expect.any(String)],
+    });
+  });
+
+  it('flushes overdue accepted work on the next startup', async () => {
+    const workspace = tempDir();
+    const monitorsDir = externalMonitor(workspace);
+    const dbPath = path.join(workspace, 'agentmon.db');
+    const workspaceIdentity = realpathSync(workspace);
+    const runtime = createRuntime(dbPath);
+    const accepted = await runtime.ingestExternalEvent(
+      { workspaceIdentity, envelope: externalEnvelope() },
+      realpathSync(monitorsDir),
+    );
+    rmSync(path.join(monitorsDir, 'build-health'), {
+      recursive: true,
+      force: true,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+
+    const socketPath = path.join(workspace, 'restart.sock');
+    const loop = runLoop(monitorsDir, workspace, 50, socketPath, 0, dbPath);
+    try {
+      await waitUntil(() => daemonAvailable(socketPath));
+      const status = await callDaemon<{
+        workspaceIdentity: string;
+        monitorsDirIdentity: string;
+      }>('status', {}, { socketPath });
+      await expect(
+        callDaemon(
+          'events.ingestStatus',
+          {
+            workspaceIdentity: status.workspaceIdentity,
+            monitorsDirIdentity: status.monitorsDirIdentity,
+            receiptId: accepted.receiptId,
+          },
+          { socketPath },
+        ),
+      ).resolves.toMatchObject({
+        outcome: 'materialized',
+        eventIds: [expect.any(String)],
+      });
+    } finally {
+      await callDaemon('stop', {}, { socketPath }).catch(() => undefined);
+      await loop;
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

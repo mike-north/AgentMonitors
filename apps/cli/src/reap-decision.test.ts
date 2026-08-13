@@ -147,6 +147,24 @@ describe('shouldReap', () => {
     expect(result.nextHasSeenSession).toBe(true);
   });
 
+  it('does not reap while accepted work has a retry-eligible deadline', () => {
+    const result = shouldReap({
+      openCount: 0,
+      channelAttached: false,
+      pendingWork: true,
+      hasSeenSession: true,
+      idleSince: BASE_NOW - 50_000,
+      now: BASE_NOW,
+      reapAfterMs: 1_000,
+      bootGraceMs: BOOT_GRACE_MS,
+    });
+    expect(result).toEqual({
+      reap: false,
+      nextIdleSince: null,
+      nextHasSeenSession: true,
+    });
+  });
+
   // -------------------------------------------------------------------------
   // Exact-boundary: idle === reapAfterMs → reap (>= semantics)
   // -------------------------------------------------------------------------

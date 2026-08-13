@@ -1,5 +1,6 @@
 import os from 'node:os';
 import path from 'node:path';
+import { realpathSync } from 'node:fs';
 import { Command, Option } from 'commander';
 import type {
   AgentSessionRecord,
@@ -819,7 +820,47 @@ export const doctorCommand = new Command('doctor')
             { monitorsDir, workspacePath: workspace },
             dbPath,
           );
+          let canonicalWorkspace = workspace;
+          let canonicalMonitorsDir = monitorsDir;
+          try {
+            canonicalWorkspace = realpathSync(workspace);
+            canonicalMonitorsDir = realpathSync(monitorsDir);
+          } catch {
+            // Missing monitor directories retain the existing resolved identity.
+          }
+          if (canonicalWorkspace !== workspace) {
+            const resolvedReport = report;
+            const canonicalReport = await doctorReportInProcess(
+              {
+                monitorsDir: canonicalMonitorsDir,
+                workspacePath: canonicalWorkspace,
+              },
+              dbPath,
+            );
+            const activity = (candidate: MonitorDoctorReport) =>
+              candidate.monitors.reduce(
+                (count, monitor) =>
+                  count +
+                  (monitor.neverObserved ? 0 : 1) +
+                  (monitor.lastEventAt ? 1 : 0),
+                0,
+              );
+            if (activity(canonicalReport) > activity(resolvedReport)) {
+              report = canonicalReport;
+            }
+            const sessions = new Map(
+              [
+                ...resolvedReport.leadSessions,
+                ...canonicalReport.leadSessions,
+              ].map((session) => [session.id, session] as const),
+            );
+            report = { ...report, leadSessions: [...sessions.values()] };
+          }
         }
+
+        // Keep the author-facing spelling while all durable lookups use the
+        // daemon's canonical identity (notably /var -> /private/var on macOS).
+        report = { ...report, workspacePath: workspace, monitorsDir };
 
         // ACTIVE leads only (issue #425 review, round 3, tightened round 5):
         // `report.leadSessions` is every lead session ever registered for this

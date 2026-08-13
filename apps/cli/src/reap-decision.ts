@@ -32,6 +32,8 @@ export interface ShouldReapInput {
    * (reading and staleness-checking the registry); this function stays pure.
    */
   channelAttached: boolean;
+  /** Retry-eligible accepted work whose deadline still requires this daemon. */
+  pendingWork?: boolean;
   /** Whether at least one session has ever been open during this daemon's lifetime. */
   hasSeenSession: boolean;
   /** Timestamp (ms) when the daemon first became idle in the current idle run, or null if active. */
@@ -79,6 +81,14 @@ export function shouldReap(s: ShouldReapInput): ShouldReapOutput {
       reap: false,
       nextIdleSince: null,
       nextHasSeenSession: true,
+    };
+  }
+
+  if (s.pendingWork) {
+    return {
+      reap: false,
+      nextIdleSince: null,
+      nextHasSeenSession: s.hasSeenSession,
     };
   }
 
