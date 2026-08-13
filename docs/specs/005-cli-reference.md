@@ -1951,9 +1951,14 @@ this section's own diagnoses-only contract.
 For each monitor, `doctor` reports: **id**, **source type**, **urgency**, **cadence** (the cron
 expression for `schedule` sources, else the observe interval), **last-observed** time (or `never`),
 **next-due** time, **last-event** time (or `none`), and the **unread / claimed / acknowledged**
-delivery-state counts for the workspace's lead session — or an explicit `never observed` marker (the
-monitor has no observation history) / `lead-session=none` marker (the workspace has no lead session).
-The three delivery states are distinct (000 AP): claiming a delivery never acknowledges it.
+delivery-state counts for the workspace's lead session. It also reports materialization retry rows
+as `retry-outbox=<pending>/<terminal>`; either count makes that monitor's check fail so a paused or
+exhausted durable signal is not presented as healthy. Its remediation names the exact `monitor
+explain <id>` command. Explain lists bounded safe retry metadata (record id, status, attempts,
+next/update times, and the control-stripped error) but never the captured envelope or payload.
+Otherwise the line carries an explicit `never observed` marker (the monitor has no observation
+history) / `lead-session=none` marker (the workspace has no lead session). The three delivery states
+are distinct (000 AP): claiming a delivery never acknowledges it.
 
 ### Output
 
@@ -2028,7 +2033,13 @@ remediation on failures), and a closing `Summary: <n> passed, <n> failed, <n> sk
       "nextDueAt": "<iso8601 | null>",
       "cadence": "<string>",
       "lastEventAt": "<iso8601 | null>",
-      "delivery": { "unread": 0, "claimed": 0, "acknowledged": 0 }
+      "delivery": { "unread": 0, "claimed": 0, "acknowledged": 0 },
+      "materializationRetries": {
+        "pending": 0,
+        "terminal": 0,
+        "bytes": 0,
+        "records": []
+      }
     }
   ],
   "summary": { "passed": 0, "failed": 0, "skipped": 0, "idle": 0 }

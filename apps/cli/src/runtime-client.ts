@@ -10,6 +10,7 @@ import type {
   EphemeralMonitorRecord,
   EventQuery,
   HookDeliveryDiagnosis,
+  MaterializationRetrySummary,
   MonitorDoctorReport,
   MonitorExplainInput,
   MonitorExplainReport,
@@ -286,11 +287,21 @@ export async function explainMonitorClient(
   input: MonitorExplainInput,
   socketPath?: string,
 ): Promise<MonitorExplainReport> {
-  return await callDaemon<MonitorExplainReport>(
+  const report = await callDaemon<MonitorExplainReport>(
     'monitor.explain',
     input as unknown as Record<string, unknown>,
     socketPath ? { socketPath } : {},
   );
+  return {
+    ...report,
+    ...(report.materializationRetries
+      ? {
+          materializationRetries: reviveMaterializationRetryDates(
+            report.materializationRetries,
+          ),
+        }
+      : {}),
+  };
 }
 
 /**
@@ -441,6 +452,22 @@ const MONITOR_ROLLUP_DATE_FIELDS = [
   'lastEventAt',
 ] as const satisfies readonly (keyof DoctorMonitorRollup)[];
 
+function reviveMaterializationRetryDates(
+  summary: MaterializationRetrySummary,
+): MaterializationRetrySummary {
+  return {
+    ...summary,
+    records: summary.records.map((record) => ({
+      ...record,
+      nextAttemptAt: record.nextAttemptAt
+        ? new Date(record.nextAttemptAt)
+        : null,
+      createdAt: new Date(record.createdAt),
+      updatedAt: new Date(record.updatedAt),
+    })),
+  };
+}
+
 /**
  * Reconstruct the `Date` fields {@link MonitorDoctorReport} promises, lost to
  * plain ISO strings by the JSON round trip over the daemon socket (issue
@@ -460,6 +487,11 @@ function reviveDoctorReportDates(
       for (const field of MONITOR_ROLLUP_DATE_FIELDS) {
         const value = revived[field];
         if (value !== undefined) revived[field] = new Date(value);
+      }
+      if (revived.materializationRetries) {
+        revived.materializationRetries = reviveMaterializationRetryDates(
+          revived.materializationRetries,
+        );
       }
       return revived;
     }),

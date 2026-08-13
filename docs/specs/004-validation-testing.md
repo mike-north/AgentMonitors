@@ -190,6 +190,7 @@ The `RuntimeStore.saveSnapshot()` and `RuntimeStore.latestSnapshot()` methods (i
 | Retry errors are safe and bounded                                | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — C0/DEL controls are stripped and persisted errors are capped at 1,024 characters).                                                                                   |
 | Retry backoff terminalizes and requires explicit re-arm          | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — due filtering, fixed delays, five-attempt terminal state, invalid transitions, re-arm, and transaction-coupled completion).                                          |
 | Retry summaries never expose captured envelopes or payloads      | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — safe terminal metadata is present while envelope title/content is absent).                                                                                           |
+| Retry explain/doctor output is actionable and version-compatible | Covered (`apps/cli/src/commands/cli.integration.test.ts` — pending/terminal text and JSON, envelope non-disclosure, and an older daemon report with no retry field).                                                         |
 
 ### 3.5 CLI behavior
 
