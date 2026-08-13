@@ -216,19 +216,20 @@ The `RuntimeStore.saveSnapshot()` and `RuntimeStore.latestSnapshot()` methods (i
 
 #### 3.4.1 External-ingress contract
 
-| Scenario                                                         | Coverage                                                                                                                                                         |
-| ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Synthetic non-PR current-state envelope validates                | Covered (`libs/core/src/external-ingress/contract.test.ts` — accepts a build-system event and returns canonical JSON).                                           |
-| Missing, extra, or unsupported schema fields fail safely         | Covered (`contract.test.ts` — exact top-level field and schema cases; error text does not echo the rejected payload).                                            |
-| Identifier, scope, state-depth, and envelope bounds are exact    | Covered (`contract-boundaries.test.ts` — exact/+1 multibyte UTF-8 values, cardinality, 32-level object/array paths, 32 KiB scope, and 256 KiB envelope).         |
-| Non-JSON values and invalid RFC3339/sequence values are rejected | Covered (`json.test.ts`, `contract.test.ts`, and `contract-boundaries.test.ts` — descriptors, runtime types, timestamps, and safe-integer bounds).               |
-| Canonical JSON and semantic hashing are deterministic            | Covered (`json.test.ts` and `contract-boundaries.test.ts` — object permutations, array order, and a mutation table for every semantic field).                    |
-| External source/object keys cannot collide                       | Covered (`contract-boundaries.test.ts` — delimiter and JSON-looking source/object tuples produce distinct keys).                                                 |
-| Receipt replay/conflict and stale ordering are durable           | Covered (`persistence.test.ts` — cursor-only replay, conflict, stale sequence, and exact receipt/high-water rows).                                               |
-| Receipt acceptance and durable callback work roll back together  | Covered (`persistence.test.ts` — injected callback failure leaves no receipt, sequence, marker, or monitor state).                                               |
-| Receipt and high-water reads preserve workspace isolation        | Covered (`persistence-queries.test.ts` — another workspace cannot read a receipt or object sequence).                                                            |
-| Forward-only durable state marks only its exact route            | Covered (`persistence-queries.test.ts` and `retry-outbox.test.ts` — nonempty debounce/rollup and named/global retries mark; empty state/admission does not).     |
-| Compatibility migration preserves existing data                  | Covered (`schema.test.ts` — additive table/index recreation preserves existing sessions/events and distinguishes global, empty, and concrete marker identities). |
+| Scenario                                                         | Coverage                                                                                                                                                      |
+| ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Synthetic non-PR current-state envelope validates                | Covered (`libs/core/src/external-ingress/contract.test.ts` — accepts a build-system event and returns canonical JSON).                                        |
+| Missing, extra, or unsupported schema fields fail safely         | Covered (`contract.test.ts` — exact top-level field and schema cases; error text does not echo the rejected payload).                                         |
+| Identifier, scope, state-depth, and envelope bounds are exact    | Covered (`contract-boundaries.test.ts` — exact/+1 multibyte UTF-8 values, cardinality, 32-level object/array paths, 32 KiB scope, and 256 KiB envelope).      |
+| Non-JSON values and invalid RFC3339/sequence values are rejected | Covered (`json.test.ts`, `contract.test.ts`, and `contract-boundaries.test.ts` — descriptors, runtime types, timestamps, and safe-integer bounds).            |
+| Canonical JSON and semantic hashing are deterministic            | Covered (`json.test.ts` and `contract-boundaries.test.ts` — object permutations, array order, and a mutation table for every semantic field).                 |
+| External source/object keys cannot collide                       | Covered (`contract-boundaries.test.ts` — delimiter and JSON-looking source/object tuples produce distinct keys).                                              |
+| Receipt replay/conflict and stale ordering are durable           | Covered (`persistence.test.ts` and `persistence-hardening.test.ts` — reopen plus exact no-op receipt/high-water/marker snapshots).                            |
+| Receipt acceptance and durable callback work roll back together  | Covered (`persistence-hardening.test.ts` — invalid inputs/completions and injected receipt/sequence/marker faults roll back callback work).                   |
+| Concurrent duplicate acceptance is serialized                    | Covered (`persistence-hardening.test.ts` — synchronized child processes overlap calls and produce one callback, accepted decision, receipt, and sequence).    |
+| Receipt and high-water keys preserve every isolation dimension   | Covered (`persistence-queries.test.ts` and `persistence-hardening.test.ts` — workspace, monitor, source, event, and object dimensions vary independently).    |
+| Forward-only durable state marks only its exact route            | Covered (`persistence-queries.test.ts` and `retry-outbox.test.ts` — nonempty debounce/rollup and named/global retries mark; empty state/admission does not).  |
+| Compatibility migration preserves data and replay invariants     | Covered (`schema.test.ts` and `persistence-hardening.test.ts` — tables/indexes rebuild, legacy rows survive, and duplicate/conflict/high-water replay works). |
 
 ### 3.5 CLI behavior
 
