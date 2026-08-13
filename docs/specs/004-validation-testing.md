@@ -212,6 +212,8 @@ session id and exact unread event, and delivery leaves that event unread until e
 The test is registered in the serial configuration; child exits are awaited before fixture removal.
 This proves recovery of already-persisted recipient work, not automatic process supervision,
 uncommitted observation recovery, power-loss durability, or the pending materialization-retry stack.
+| First/later failures produce truthful committed results          | Covered (`libs/core/src/runtime/atomic-ingest-retry.test.ts` — exact ids, errors, history, outbox order, and Interpret calls for event, projection, cursor, and snapshot faults).                                            |
+| State/outbox failure rolls back the ingest batch                 | Covered (`libs/core/src/runtime/atomic-ingest-retry.test.ts` — post-write state and outbox faults leave no events/retries, preserve the source baseline, and replay after restart).                                          |
 
 ### 3.5 CLI behavior
 

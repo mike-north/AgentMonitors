@@ -600,11 +600,18 @@ For each runtime tick, the implementation **MUST**:
 5. determine whether the monitor is due to run
 6. call the source's `observe()` method with: the monitor's `scope`, the monitor's previously persisted source state if any, the runtime-supplied `now` timestamp
 7. route returned observations through notify dispatch
-8. persist updated source state and notify state
-9. materialize emitted observations as durable events
+8. materialize emitted observations as durable events, queue failed envelopes, and persist updated source/notify state in one immediate transaction
+9. report emitted ids and errors from the committed result
 10. refresh hook state for sessions in the affected workspace
 
-Verified: `libs/core/src/runtime/service.ts` — `AgentMonitorRuntime.tick()` (lines 358–420).
+A materialization failure rolls back that envelope's event/projection/cursor/snapshot transaction.
+Earlier successful siblings remain events; the failed envelope and every later sibling enter the
+bounded outbox before source/notify state advances. If outbox admission or the state write fails,
+the outer transaction rolls back the batch and retains the prior source baseline. Interpret and
+audit writes run best-effort only after that durable boundary.
+
+Verified: `libs/core/src/runtime/service.ts` — `AgentMonitorRuntime.tick()`, `ingest()`, and
+`materializeSpan()`.
 
 ### 2.1 Due scheduling
 
@@ -1928,6 +1935,8 @@ and orphan groups. The CLI projects only the documented retry metadata fields an
 error controls and length at its wire boundary as well as at text display. Omitted older-daemon
 fields remain supported; doctor JSON uses empty summaries/groups while explain preserves omission.
 Real owned-socket tests verify dates rather than inferring correctness from core Date objects.
+
+Poll ingestion atomically admits the complete emitted span and source/notify state before Interpret. Runtime retry draining and watch checkpoint recovery remain separate work.
 
 ### `session_event_state`
 
