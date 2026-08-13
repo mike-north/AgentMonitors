@@ -1770,6 +1770,41 @@ Stores the full text content of each snapshot for diff computation. Keyed by `(w
 
 The draft omitted this table. It is required for snapshot diff computation (§5.2) and is populated by `RuntimeStore.saveSnapshot()`. `id` is a monotonic ULID so same-second snapshots retain a total materialization order and `latestSnapshot()` resolves to the newest via `ORDER BY created_at DESC, id DESC` (§5.2, issue #293). Verified: `libs/core/src/runtime/store.ts` — `saveSnapshot()` / `latestSnapshot()`.
 
+### `materialization_retry_outbox`
+
+Durable observations that could not complete deterministic materialization. Each row retains the
+stored observation envelope and trusted local route so a later attempt can re-enter materialization
+without invoking the source or moving a source cursor again.
+
+| Column            | Type             | Notes                                             |
+| ----------------- | ---------------- | ------------------------------------------------- |
+| `id`              | TEXT PK          | Monotonic ULID                                    |
+| `workspace_path`  | TEXT nullable    | Part of the per-monitor capacity scope            |
+| `monitor_id`      | TEXT NOT NULL    | Must match the stored envelope                    |
+| `source_name`     | TEXT NOT NULL    | Must match the envelope's monitor source          |
+| `envelope`        | TEXT NOT NULL    | JSON `StoredObservationEnvelope`                  |
+| `envelope_bytes`  | INTEGER NOT NULL | Exact persisted UTF-8 byte count                  |
+| `attempt_count`   | INTEGER NOT NULL | Automatic retry failures; starts at `0`           |
+| `status`          | TEXT NOT NULL    | `pending \| terminal`                             |
+| `next_attempt_at` | INTEGER nullable | `NULL` after terminalization                      |
+| `last_error`      | TEXT nullable    | Control-stripped, bounded safe diagnostic message |
+| `created_at`      | INTEGER NOT NULL | Preserves oldest-first drain order                |
+| `updated_at`      | INTEGER NOT NULL | Last attempt or operator re-arm                   |
+
+Capacity is 256 rows or 8 MiB of stored envelopes per `(workspace_path, monitor_id)`, including
+terminal rows. Envelope size is the exact serialized UTF-8 byte count. Enqueue rejects values that
+cannot round-trip through JSON (including BigInt, Date values outside the typed `observed_at`
+field, accessors, and cyclic references) with a domain error before database mutation. A batch
+enqueue uses one immediate transaction: if every failed sibling cannot fit, none is stored. Another
+workspace or monitor has independent capacity.
+
+New records first become due after 1 second. `last_error` has terminal controls removed and is capped
+at 1,024 characters.
+
+_Current in this change:_ schema, lossless serialization, route checks, bounded atomic admission,
+and oldest-first reads. Retry state transitions and transaction-coupled completion are added in the
+next stack layer. Runtime drain-before-observe adoption follows after that for #295.
+
 ### `session_event_state`
 
 Per-session delivery tracking for each projected event. Drives the unread/claimed/acknowledged state machine (§7).

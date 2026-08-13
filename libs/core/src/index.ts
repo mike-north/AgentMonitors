@@ -121,7 +121,11 @@ export {
   AgentMonitorRuntime,
   isVerifyScratchObjectKey,
 } from './runtime/service.js';
-export { RuntimeStore } from './runtime/store.js';
+export {
+  MaterializationRetryCapacityError,
+  RuntimeStore,
+} from './runtime/store.js';
+export { MaterializationRetrySerializationError } from './runtime/retry-envelope.js';
 // Canonical runtime scheduling/notify default timings — the single source of
 // truth the daemon schedules against, exported so timing-aware consumers (the
 // CLI `verify` budget) reason from the real values instead of hand-mirrored copies.
@@ -189,6 +193,10 @@ export type {
   InterpretDecision,
   MonitorDeliveryProjection,
   MonitorDeliveryState,
+  MaterializationRetryQuery,
+  MaterializationRetryRecord,
+  MaterializationRetryStatus,
+  EnqueueMaterializationRetryInput,
   MonitorDoctorReport,
   MonitorEventRecord,
   MonitorExplainInput,
@@ -215,7 +223,12 @@ export type {
   WatchHandle,
   UrgencyCounts,
 } from './runtime/types.js';
-export { defaultNotifyConfigForUrgency } from './runtime/types.js';
+export {
+  defaultNotifyConfigForUrgency,
+  MATERIALIZATION_RETRY_DELAYS_MS,
+  MATERIALIZATION_RETRY_MAX_BYTES,
+  MATERIALIZATION_RETRY_MAX_RECORDS,
+} from './runtime/types.js';
 
 // Adapters
 export { claudeCodeAdapter } from './adapter/claude.js';

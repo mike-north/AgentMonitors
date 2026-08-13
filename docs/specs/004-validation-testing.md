@@ -184,6 +184,10 @@ The `RuntimeStore.saveSnapshot()` and `RuntimeStore.latestSnapshot()` methods (i
 | A prior snapshot produces diff text on later change              | Covered (`libs/core/src/runtime/service.test.ts` — "computes a diff against the prior snapshot when an object changes"; "renders a structural json-diff diffText for a real observation routed through processObservation"). |
 | Snapshots are isolated by workspace, monitor, and object key     | Covered (`libs/core/src/runtime/service.test.ts` — "stores and retrieves snapshots isolated by workspace, monitor, and object key").                                                                                         |
 | Event, projection/cursor, and snapshot writes roll back together | Covered (`libs/core/src/runtime/transactional-materialization.test.ts` — injected cursor and snapshot failures leave no event, projection, cursor, or snapshot).                                                             |
+| Retry outbox survives reopen with route and envelope intact      | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — ordered envelopes and timestamps round-trip through an on-disk database reopen).                                                                                     |
+| Retry outbox capacity is batch-atomic and workspace-scoped       | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — exact 256-row and 8 MiB UTF-8 boundaries, competing connections, no partial batch, and independent monitor/workspace scopes).                                        |
+| Retry envelopes round-trip without silent data conversion        | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — BigInt, nested Date, and accessor values fail with a domain error before any sibling is written).                                                                    |
+| Retry errors are safe and bounded                                | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — C0/DEL controls are stripped and persisted errors are capped at 1,024 characters).                                                                                   |
 
 ### 3.5 CLI behavior
 
