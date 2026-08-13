@@ -600,11 +600,18 @@ For each runtime tick, the implementation **MUST**:
 5. determine whether the monitor is due to run
 6. call the source's `observe()` method with: the monitor's `scope`, the monitor's previously persisted source state if any, the runtime-supplied `now` timestamp
 7. route returned observations through notify dispatch
-8. persist updated source state and notify state
-9. materialize emitted observations as durable events
+8. materialize emitted observations as durable events, queue failed envelopes, and persist updated source/notify state in one immediate transaction
+9. report emitted ids and errors from the committed result
 10. refresh hook state for sessions in the affected workspace
 
-Verified: `libs/core/src/runtime/service.ts` — `AgentMonitorRuntime.tick()` (lines 358–420).
+A materialization failure rolls back that envelope's event/projection/cursor/snapshot transaction.
+Earlier successful siblings remain events; the failed envelope and every later sibling enter the
+bounded outbox before source/notify state advances. If outbox admission or the state write fails,
+the outer transaction rolls back the batch and retains the prior source baseline. Interpret and
+audit writes run best-effort only after that durable boundary.
+
+Verified: `libs/core/src/runtime/service.ts` — `AgentMonitorRuntime.tick()`, `ingest()`, and
+`materializeSpan()`.
 
 ### 2.1 Due scheduling
 
@@ -1810,9 +1817,9 @@ transaction; a thrown operation preserves the row, and silent discard is not sup
 Runtime diagnostics expose each row's id, status, attempt count, safe error, and attempt timestamps
 through `monitor explain` and `doctor`. They never expose the stored envelope or its payload.
 
-_Current in this change:_ storage, retry lifecycle, safe core reports, and CLI rendering with an
-empty fallback for older daemon reports. Runtime drain-before-observe adoption follows in the next
-stack layer for #295.
+_Current in this change:_ poll and watch ingestion atomically admit failed envelopes before
+source/notify state advances. Runtime drain-before-observe adoption follows in the next stack layer
+for #295.
 
 ### `session_event_state`
 

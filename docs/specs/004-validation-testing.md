@@ -191,6 +191,8 @@ The `RuntimeStore.saveSnapshot()` and `RuntimeStore.latestSnapshot()` methods (i
 | Retry backoff terminalizes and requires explicit re-arm          | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — due filtering, fixed delays, five-attempt terminal state, invalid transitions, re-arm, and transaction-coupled completion).                                          |
 | Retry summaries never expose captured envelopes or payloads      | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — safe terminal metadata is present while envelope title/content is absent).                                                                                           |
 | Retry explain/doctor output is actionable and version-compatible | Covered (`apps/cli/src/commands/cli.integration.test.ts` — pending/terminal text and JSON, envelope non-disclosure, and an older daemon report with no retry field).                                                         |
+| First/later failures produce truthful committed results          | Covered (`libs/core/src/runtime/atomic-ingest-retry.test.ts` — exact ids, errors, history, outbox order, and Interpret calls for event, projection, cursor, and snapshot faults).                                            |
+| State/outbox failure rolls back the ingest batch                 | Covered (`libs/core/src/runtime/atomic-ingest-retry.test.ts` — post-write state and outbox faults leave no events/retries, preserve the source baseline, and replay after restart).                                          |
 
 ### 3.5 CLI behavior
 

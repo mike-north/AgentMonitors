@@ -551,6 +551,37 @@ interface TickAccumulator {
   skippedMonitors: { monitorId: string; nextDueAt: Date }[];
 }
 
+interface MaterializedObservation {
+  monitor: MonitorDefinition;
+  event: MonitorEventRecord;
+  diffText: string | null;
+  projectedSessionIds: string[];
+}
+
+interface MaterializationFailure {
+  envelope: StoredObservationEnvelope;
+  message: string;
+  auditError: boolean;
+}
+
+interface MaterializationSpanResult {
+  emittedEventIds: string[];
+  failures: MaterializationFailure[];
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function summarizeMaterializationFailures(
+  failures: MaterializationFailure[],
+): string {
+  const first = failures[0]?.message ?? 'Unknown materialization failure.';
+  return failures.length === 1
+    ? first
+    : `${String(failures.length)} observations were queued for materialization retry. First error: ${first}`;
+}
+
 /**
  * The pure decision a delivery makes (issue #300): the rendered {@link
  * DeliveryClaim} plus the candidate rows a commit must mark claimed. Produced by
@@ -2764,17 +2795,30 @@ export class AgentMonitorRuntime {
         // dispatches no NEW observations — only the already-accumulated batch.
         if (rollupDispatch.emitted.length > 0) {
           try {
-            acc.emittedEventIds.push(
-              ...(await this.materializeSpan(monitor, rollupDispatch.emitted, {
+            const materialized = await this.materializeSpan(
+              monitor,
+              rollupDispatch.emitted,
+              {
                 observed: 0,
                 workspacePath,
+                retryQueuedAt: now,
                 ...(ephemeralSessionId !== undefined
                   ? { ephemeralSessionId }
                   : {}),
-              })),
+              },
             );
+            acc.emittedEventIds.push(...materialized.emittedEventIds);
+            if (materialized.failures.length > 0) {
+              acc.erroredObservations.push({
+                monitorId: monitor.id,
+                message: summarizeMaterializationFailures(
+                  materialized.failures,
+                ),
+              });
+            }
           } catch {
-            // best-effort: materialization failure must not abort the tick
+            // Best-effort legacy rollup boundary. The next stack layer couples
+            // this state transition to materialization transactionally.
           }
         }
       }
@@ -2833,14 +2877,16 @@ export class AgentMonitorRuntime {
       return;
     }
 
-    // Block 2 — ingest(): ingest() now isolates per-observation materialization
-    // failures internally (see ingest()), so it should not normally throw.
-    // This outer catch is a defence-in-depth safety net: if ingest() itself
-    // throws (e.g. setMonitorState fails), record errored best-effort and
-    // continue so the tick is not aborted.
+    // Block 2 — ingest(): a materialization failure is returned after its
+    // envelope is durably queued. A transaction, state, or outbox-admission
+    // failure still throws because no source advance can safely commit; this
+    // catch reports it while leaving the prior source baseline available.
     try {
-      acc.emittedEventIds.push(
-        ...(await this.ingest(monitor, observationResult.observations, now, {
+      const ingested = await this.ingest(
+        monitor,
+        observationResult.observations,
+        now,
+        {
           workspacePath,
           ...(observationResult.nextState !== undefined
             ? { nextSourceState: { value: observationResult.nextState } }
@@ -2849,13 +2895,17 @@ export class AgentMonitorRuntime {
             ? { sourceOutcome: observationResult.outcome }
             : {}),
           ...(ephemeralSessionId !== undefined ? { ephemeralSessionId } : {}),
-        })),
+        },
       );
+      acc.emittedEventIds.push(...ingested.emittedEventIds);
+      if (ingested.failures.length > 0) {
+        acc.erroredObservations.push({
+          monitorId: monitor.id,
+          message: summarizeMaterializationFailures(ingested.failures),
+        });
+      }
     } catch (ingestError) {
-      const message =
-        ingestError instanceof Error
-          ? ingestError.message
-          : String(ingestError);
+      const message = errorMessage(ingestError);
       acc.erroredObservations.push({ monitorId: monitor.id, message });
       try {
         this.store.recordObservationHistory({
@@ -2911,7 +2961,7 @@ export class AgentMonitorRuntime {
        */
       ephemeralSessionId?: string;
     },
-  ): Promise<string[]> {
+  ): Promise<MaterializationSpanResult> {
     // Pre-filter: a `payload.form: structured` CEL gate that evaluates `false`
     // suppresses delivery entirely (002 §1.1.6). This check MUST run BEFORE
     // dispatchNotify so that suppressed observations never advance notify state
@@ -2937,13 +2987,13 @@ export class AgentMonitorRuntime {
       monitorState.notifyState,
     );
 
-    this.store.setMonitorState(monitor.id, options.workspacePath, {
+    const nextMonitorState = {
       sourceState: options.nextSourceState
         ? options.nextSourceState.value
         : monitorState.sourceState,
       notifyState: dispatch.nextState,
       lastObservationAt: now,
-    });
+    };
 
     // Audit-history recording and per-observation materialization are shared
     // with the not-due rollup flush in tick() via materializeSpan() (issue
@@ -2955,6 +3005,8 @@ export class AgentMonitorRuntime {
     return await this.materializeSpan(monitor, dispatch.emitted, {
       observed: observations.length,
       workspacePath: options.workspacePath,
+      nextMonitorState,
+      retryQueuedAt: now,
       ...(options.sourceOutcome
         ? { sourceOutcome: options.sourceOutcome }
         : {}),
@@ -2974,21 +3026,10 @@ export class AgentMonitorRuntime {
    *    is the *normal* operating mode for a rollup monitor whose `watch.interval`
    *    is relaxed to match the delivery window.
    *
-   * The helper performs, in order:
-   *
-   *  1. **Audit trail (G6, 002 §10.7 / §1.1.6).** Records the monitor's outcome
-   *     row, classified by what was *emitted*, not by new observations — a batch
-   *     can emit a previously-held observation with zero new observations (e.g. a
-   *     debounce flush, or a rollup window firing on a not-due tick), which is
-   *     still a `triggered` outcome. Only `suppressed` (observations seen but
-   *     held/throttled) and `no-change` (nothing seen) depend on the observation
-   *     count.
-   *  2. **Per-observation materialization with isolation (issue #46).** A single
-   *     failing observation must not drop the already-durably-written ids of its
-   *     batch-mates; on failure a best-effort `errored` history row is written
-   *     for the individual observation and the loop continues. The batch-level
-   *     row from step 1 is unaffected — it reflects what was *dispatched*, not
-   *     what materialized.
+   * Deterministic events, failed-envelope outbox rows, and the source/notify
+   * state advance commit together. A failed sibling is therefore either
+   * durably queued before the source cursor moves or the whole batch rolls back.
+   * Audit rows and Interpret are best-effort after that durable boundary.
    *
    * `observed` is the raw count of observations the source reported this tick
    * (i.e. `observations.length` from the `observe()` result, **before** notify
@@ -3006,81 +3047,155 @@ export class AgentMonitorRuntime {
     options: {
       observed: number;
       workspacePath: string;
+      retryQueuedAt: Date;
+      nextMonitorState?: {
+        sourceState?: unknown;
+        notifyState: NotifyRuntimeState;
+        lastObservationAt?: Date | null;
+      };
       sourceOutcome?: 'rebaselined' | 'no-files-matched';
       /** Ephemeral-monitor declaring session (007 §4.6) — see {@link ingest}. */
       ephemeralSessionId?: string;
     },
-  ): Promise<string[]> {
+  ): Promise<MaterializationSpanResult> {
     const observed = options.observed;
-    const emittedCount = emitted.length;
-    this.store.recordObservationHistory({
-      monitorId: monitor.id,
-      workspacePath: options.workspacePath,
-      sourceName: monitor.frontmatter.watch.type,
-      result:
-        emittedCount > 0
-          ? 'triggered'
-          : // `rebaselined` is, by contract (002 §observation_history), a tick
-            // that returned ZERO observations and advanced its baseline. Guard
-            // on observed === 0 so a source that mistakenly sets the diagnostic
-            // while also returning (suppressed) observations can't mask a
-            // genuine `suppressed` tick — the invariant is enforced here at the
-            // runtime boundary, not left to source authors.
-            observed === 0 && options.sourceOutcome !== undefined
-            ? options.sourceOutcome
-            : observed > 0
-              ? 'suppressed'
-              : 'no-change',
-      observationData: { observed, emitted: emittedCount },
-    });
+    const durable = this.store.runInImmediateTransaction(() => {
+      const materialized: MaterializedObservation[] = [];
+      const failures: MaterializationFailure[] = [];
+      let deferRemaining = false;
 
-    // G10 PR-B (002 §1.1.7, Decision Q3): the shared `monitor_events` chain
-    // records EVERY emitted observation in order, regardless of
-    // `baseline-strategy`. The `net` collapse is no longer applied here — it is
-    // a PER-RECIPIENT decision deferred to claim time (`collapseNetForClaim`),
-    // because an away recipient's net delta must be diffed against ITS OWN
-    // cursor, not the shared snapshot baseline. Keeping every intermediate on
-    // the shared chain is the incremental substrate every recipient diffs over
-    // (precise over cheap). A single tick that emits multiple observations to
-    // one object therefore now materializes one shared event each; the
-    // claim-time per-recipient collapse delivers only the newest of them to a
-    // `net` recipient (the same-tick span `collapseToNetSpan` used to fold,
-    // semantics preserved on the per-recipient side).
-    const emittedEventIds: string[] = [];
-    for (const envelope of emitted) {
-      try {
-        const event = await this.processObservation({
-          monitor: envelope.monitor,
-          sourceName: envelope.monitor.frontmatter.watch.type,
-          observation: envelope.observation,
-          observedAt: envelope.observedAt,
-          workspacePath: options.workspacePath,
-          effectiveUrgency: envelope.effectiveUrgency,
-          ...(options.ephemeralSessionId !== undefined
-            ? { restrictToSessionId: options.ephemeralSessionId }
-            : {}),
-        });
-        if (event) emittedEventIds.push(event.id);
-      } catch (materializeError) {
-        try {
-          this.store.recordObservationHistory({
-            monitorId: monitor.id,
-            workspacePath: options.workspacePath,
-            sourceName: monitor.frontmatter.watch.type,
-            result: 'errored',
-            observationData: {
-              error:
-                materializeError instanceof Error
-                  ? materializeError.message
-                  : String(materializeError),
-            },
+      for (const envelope of emitted) {
+        if (deferRemaining) {
+          failures.push({
+            envelope,
+            message:
+              'Deferred behind an earlier observation that failed materialization.',
+            auditError: false,
           });
-        } catch {
-          // best-effort audit — ignore write failures
+          continue;
+        }
+        try {
+          const result = this.materializeObservation({
+            monitor: envelope.monitor,
+            sourceName: envelope.monitor.frontmatter.watch.type,
+            observation: envelope.observation,
+            observedAt: envelope.observedAt,
+            workspacePath: options.workspacePath,
+            effectiveUrgency: envelope.effectiveUrgency,
+            ...(options.ephemeralSessionId !== undefined
+              ? { restrictToSessionId: options.ephemeralSessionId }
+              : {}),
+          });
+          if (result) {
+            materialized.push({
+              monitor: envelope.monitor,
+              ...result,
+              projectedSessionIds: this.store.projectedSessionIdsForLastEvent(),
+            });
+          }
+        } catch (materializeError) {
+          deferRemaining = true;
+          failures.push({
+            envelope,
+            message: errorMessage(materializeError),
+            auditError: true,
+          });
         }
       }
+
+      if (failures.length > 0) {
+        this.store.enqueueMaterializationRetries(
+          failures.map((failure) => ({
+            workspacePath: options.workspacePath,
+            monitorId: monitor.id,
+            sourceName: monitor.frontmatter.watch.type,
+            envelope: failure.envelope,
+            error: failure.message,
+          })),
+          options.retryQueuedAt,
+        );
+      }
+
+      if (options.nextMonitorState) {
+        // This write deliberately follows outbox admission. If either the
+        // outbox or state write fails, the outer transaction also rolls back
+        // successful siblings, leaving the prior source baseline for replay.
+        this.store.setMonitorState(
+          monitor.id,
+          options.workspacePath,
+          options.nextMonitorState,
+        );
+      }
+      return { materialized, failures };
+    });
+
+    const emittedCount = durable.materialized.length;
+    // Do not write a false batch-level `triggered` row when every dispatched
+    // envelope failed. Individual failure rows below are the truthful outcome.
+    if (emittedCount > 0 || durable.failures.length === 0) {
+      try {
+        this.store.recordObservationHistory({
+          monitorId: monitor.id,
+          workspacePath: options.workspacePath,
+          sourceName: monitor.frontmatter.watch.type,
+          result:
+            emittedCount > 0
+              ? 'triggered'
+              : observed === 0 && options.sourceOutcome !== undefined
+                ? options.sourceOutcome
+                : observed > 0
+                  ? 'suppressed'
+                  : 'no-change',
+          observationData: { observed, emitted: emittedCount },
+        });
+      } catch {
+        // Audit is best-effort and cannot roll back committed runtime state.
+      }
     }
-    return emittedEventIds;
+    for (const failure of durable.failures.filter(
+      ({ auditError }) => auditError,
+    )) {
+      try {
+        this.store.recordObservationHistory({
+          monitorId: monitor.id,
+          workspacePath: options.workspacePath,
+          sourceName: monitor.frontmatter.watch.type,
+          result: 'errored',
+          observationData: { error: failure.message },
+        });
+      } catch {
+        // Audit is best-effort and cannot roll back committed runtime state.
+      }
+    }
+
+    for (const materialized of durable.materialized) {
+      await this.interpretMaterializedObservation(materialized);
+    }
+    return {
+      emittedEventIds: durable.materialized.map(({ event }) => event.id),
+      failures: durable.failures,
+    };
+  }
+
+  private async interpretMaterializedObservation(
+    materialized: MaterializedObservation,
+  ): Promise<void> {
+    if (
+      materialized.monitor.frontmatter.payload?.form !== 'prose' ||
+      !this.interpretAdapter
+    ) {
+      return;
+    }
+    try {
+      await this.runInterpret(
+        materialized.monitor,
+        materialized.event,
+        materialized.diffText,
+        materialized.projectedSessionIds,
+      );
+    } catch {
+      // Interpret is best-effort after the deterministic durable boundary.
+    }
   }
 
   private refreshWorkspaceSessions(workspacePath: string): void {
@@ -3265,35 +3380,31 @@ export class AgentMonitorRuntime {
       });
       for await (const observation of iterable) {
         if (signal.aborted) break;
-        // Per-observation isolation (issue #46): an ingest() failure on one
-        // yielded observation must not kill the entire watcher. Record an
-        // 'errored' history row and continue consuming subsequent observations.
-        // The outer try/catch (below) still handles errors from the async
-        // iterator itself (the watch() generator rejecting).
-        // The audit write is best-effort — if recordObservationHistory itself
-        // throws we swallow it so a failed audit row never kills the watcher.
-        // Ingest runs through the same serialization chain as checkpoint so the
-        // G14 ordering (002 §2.4) holds against out-of-band checkpoint calls.
+        // This layer adopts the atomic ingest result for watch producers. The
+        // following stack layer adds retry draining before the next iterator
+        // pull; until then this preserves the existing continue-on-error loop.
         try {
-          await enqueue(() =>
+          const ingested = await enqueue(() =>
             this.ingest(monitor, [observation], new Date(), {
               workspacePath,
             }),
           );
+          if (ingested.failures.length > 0) {
+            onError?.(
+              monitor.id,
+              new Error(summarizeMaterializationFailures(ingested.failures)),
+            );
+          }
           this.refreshWorkspaceSessions(workspacePath);
         } catch (ingestError) {
+          const message = errorMessage(ingestError);
           try {
             this.store.recordObservationHistory({
               monitorId: monitor.id,
               workspacePath,
               sourceName: monitor.frontmatter.watch.type,
               result: 'errored',
-              observationData: {
-                error:
-                  ingestError instanceof Error
-                    ? ingestError.message
-                    : String(ingestError),
-              },
+              observationData: { error: message },
             });
           } catch {
             // best-effort audit — ignore write failures
@@ -3812,10 +3923,10 @@ export class AgentMonitorRuntime {
     monitor: MonitorDefinition,
     event: { id: string; diffText: string | null; snapshotText: string | null },
     diffText: string | null,
+    sessionIds = this.store.projectedSessionIdsForLastEvent(),
   ): Promise<void> {
     const adapter = this.interpretAdapter;
     if (!adapter) return;
-    const sessionIds = this.store.projectedSessionIdsForLastEvent();
     if (sessionIds.length === 0) return;
 
     // The per-recipient delta (G10, 002 §1.1.2): each recipient is judged on the

@@ -1546,6 +1546,8 @@ export class RuntimeStore {
         removedEventIds: string[];
         affectedSessionIds: string[];
     };
+    // @internal
+    runInImmediateTransaction<T>(operation: () => T): T;
     // (undocumented)
     saveSnapshot(input: {
         workspacePath?: string | null;

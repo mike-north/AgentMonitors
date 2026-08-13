@@ -869,10 +869,11 @@ export interface RuntimeStatus {
  *       case `ingest()` was never called, so the monitor's persisted
  *       `sourceState` is left exactly as it was — no subsequent delta is
  *       dropped.
- *   (2) A single dispatched observation failed to materialize inside `ingest()`
- *       (tick or watch path), e.g. a DB insert error. The batch's other
- *       observations are unaffected; `emittedEventIds` reflects only the
- *       observations that were durably written.
+ *   (2) A dispatched observation failed deterministic materialization inside
+ *       `ingest()` (tick or watch path). Earlier committed siblings remain
+ *       events; the failed envelope and every later sibling are durably queued
+ *       before source/notify state advances. `emittedEventIds` therefore names
+ *       only committed events.
  *   In both cases the audit write itself is best-effort: a `recordObservationHistory`
  *   failure is swallowed so a failing audit row can never re-abort the tick.
  * - `rebaselined`: the source advanced its baseline without computing a delta
