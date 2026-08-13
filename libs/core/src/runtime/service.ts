@@ -1,5 +1,6 @@
 import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { ulid } from 'ulid';
 import { writePrivateFileAtomic } from '../security/local-permissions.js';
 import { scanMonitors } from '../parser/scan-monitors.js';
@@ -567,6 +568,14 @@ interface MaterializationFailure {
 interface MaterializationSpanResult {
   emittedEventIds: string[];
   failures: MaterializationFailure[];
+}
+
+interface MaterializationRetryDrainResult {
+  emittedEventIds: string[];
+  errors: string[];
+  attempted: boolean;
+  blocked: boolean;
+  nextAttemptAt: Date | null;
 }
 
 function errorMessage(error: unknown): string {
@@ -2601,6 +2610,24 @@ export class AgentMonitorRuntime {
     );
     this.reapDormantSessions(now, workspacePath, monitorsById);
 
+    // Retry durable materialization failures before any source observes newer
+    // state. The outbox carries its captured monitor definition, so this also
+    // drains work for a definition that was removed after acceptance.
+    const retryDrain = await this.drainWorkspaceMaterializationRetries(
+      workspacePath,
+      now,
+    );
+    for (const monitorId of retryDrain.evaluatedMonitorIds) {
+      if (!acc.evaluated.includes(monitorId)) acc.evaluated.push(monitorId);
+    }
+    acc.emittedEventIds.push(...retryDrain.emittedEventIds);
+    for (const failure of retryDrain.failures) {
+      acc.erroredObservations.push({
+        monitorId: failure.monitorId,
+        message: failure.message,
+      });
+    }
+
     // Persistent monitors (directory-authored). An unknown source is a hard tick
     // failure — the author can fix the file.
     for (const parsed of result.monitors) {
@@ -2694,6 +2721,16 @@ export class AgentMonitorRuntime {
     ephemeralSessionId?: string,
   ): Promise<void> {
     const sourceName = monitor.frontmatter.watch.type;
+
+    // A monitor remains paused while any retry row exists, including a pending
+    // row whose backoff has not elapsed and a terminal row awaiting operator
+    // repair. The workspace-level drain above always gets the first chance to
+    // clear due work before this guard runs.
+    const retrySummary = this.store.materializationRetrySummary(
+      monitor.id,
+      workspacePath,
+    );
+    if (retrySummary.pending > 0 || retrySummary.terminal > 0) return;
 
     // A monitor with an active continuous watcher is driven by that watcher;
     // skip its one-shot observe() so it is not processed twice (G5).
@@ -2860,7 +2897,7 @@ export class AgentMonitorRuntime {
       return;
     }
 
-    acc.evaluated.push(monitor.id);
+    if (!acc.evaluated.includes(monitor.id)) acc.evaluated.push(monitor.id);
 
     // Two separate try/catch blocks so observe() failures and ingest()
     // failures are handled independently (issue #46):
@@ -3209,6 +3246,160 @@ export class AgentMonitorRuntime {
     };
   }
 
+  private async drainWorkspaceMaterializationRetries(
+    workspacePath: string,
+    now: Date,
+  ) {
+    const monitorIds = new Set(
+      this.store
+        .listMaterializationRetries({
+          workspacePath,
+          limit: Number.MAX_SAFE_INTEGER,
+        })
+        .map(({ monitorId }) => monitorId),
+    );
+    const result = {
+      evaluatedMonitorIds: [] as string[],
+      emittedEventIds: [] as string[],
+      failures: [] as ErroredObservation[],
+    };
+    for (const monitorId of monitorIds) {
+      const drained = await this.drainMaterializationRetries(
+        monitorId,
+        workspacePath,
+        now,
+      );
+      if (drained.attempted) result.evaluatedMonitorIds.push(monitorId);
+      result.emittedEventIds.push(...drained.emittedEventIds);
+      if (drained.errors.length > 0) {
+        result.failures.push({
+          monitorId,
+          message: drained.errors[0] ?? 'Materialization retry failed.',
+        });
+      }
+    }
+    return result;
+  }
+
+  private async drainMaterializationRetries(
+    monitorId: string,
+    workspacePath: string,
+    now: Date,
+  ): Promise<MaterializationRetryDrainResult> {
+    const result: MaterializationRetryDrainResult = {
+      emittedEventIds: [],
+      errors: [],
+      attempted: false,
+      blocked: false,
+      nextAttemptAt: null,
+    };
+
+    for (;;) {
+      const record = this.store.listMaterializationRetries({
+        monitorId,
+        workspacePath,
+        limit: 1,
+      })[0];
+      if (!record) return result;
+      if (record.status === 'terminal') {
+        return { ...result, blocked: true, nextAttemptAt: null };
+      }
+      if (record.nextAttemptAt && record.nextAttemptAt > now) {
+        return {
+          ...result,
+          blocked: true,
+          nextAttemptAt: record.nextAttemptAt,
+        };
+      }
+
+      result.attempted = true;
+      let materialized: MaterializedObservation;
+      const restrictToSessionId = this.ephemeralSessionIdFromMonitorId(
+        record.monitorId,
+      );
+      try {
+        materialized = this.store.completeMaterializationRetry(
+          record.id,
+          () => {
+            const deterministic = this.materializeObservation(
+              {
+                monitor: record.envelope.monitor,
+                sourceName: record.sourceName,
+                observation: record.envelope.observation,
+                observedAt: record.envelope.observedAt,
+                workspacePath,
+                effectiveUrgency: record.envelope.effectiveUrgency,
+                ...(restrictToSessionId !== undefined
+                  ? { restrictToSessionId }
+                  : {}),
+              },
+              { maxSessionBaselineAt: record.envelope.observedAt },
+            );
+            if (!deterministic) {
+              throw new Error(
+                'Stored retry envelope was suppressed during materialization.',
+              );
+            }
+            return {
+              monitor: record.envelope.monitor,
+              ...deterministic,
+              projectedSessionIds: this.store.projectedSessionIdsForLastEvent(),
+            };
+          },
+        );
+      } catch (retryError) {
+        let message = errorMessage(retryError);
+        let nextAttemptAt = record.nextAttemptAt;
+        try {
+          const failed = this.store.markMaterializationRetryFailed(
+            record.id,
+            message,
+            now,
+          );
+          nextAttemptAt = failed.nextAttemptAt;
+        } catch (stateError) {
+          message = `${message} Retry state update failed: ${errorMessage(stateError)}`;
+        }
+        try {
+          this.store.recordObservationHistory({
+            monitorId: record.monitorId,
+            workspacePath,
+            sourceName: record.sourceName,
+            result: 'errored',
+            observationData: { error: message },
+          });
+        } catch {
+          // Audit is best-effort and cannot alter the durable retry row.
+        }
+        result.errors.push(message);
+        return { ...result, blocked: true, nextAttemptAt };
+      }
+
+      result.emittedEventIds.push(materialized.event.id);
+      try {
+        this.store.recordObservationHistory({
+          monitorId: record.monitorId,
+          workspacePath,
+          sourceName: record.sourceName,
+          result: 'triggered',
+          observationData: { observed: 0, emitted: 1 },
+        });
+      } catch {
+        // Audit is best-effort and cannot roll back the committed retry drain.
+      }
+      await this.interpretMaterializedObservation(materialized);
+    }
+  }
+
+  private ephemeralSessionIdFromMonitorId(
+    monitorId: string,
+  ): string | undefined {
+    if (!monitorId.startsWith(EPHEMERAL_MONITOR_ID_PREFIX)) return undefined;
+    const suffix = monitorId.slice(EPHEMERAL_MONITOR_ID_PREFIX.length);
+    const slash = suffix.indexOf('/');
+    return slash > 0 ? suffix.slice(0, slash) : undefined;
+  }
+
   private async interpretMaterializedObservation(
     materialized: MaterializedObservation,
   ): Promise<void> {
@@ -3390,7 +3581,16 @@ export class AgentMonitorRuntime {
       );
     };
 
+    let iterator: AsyncIterator<Observation> | undefined;
     try {
+      await this.waitForMaterializationRetries(
+        monitor.id,
+        workspacePath,
+        signal,
+        onError,
+      );
+      if (signal.aborted) return;
+
       // Hoisted INSIDE the try (not above it): `getMonitorState` can throw
       // (e.g. SQLITE_BUSY) and `watch()` is a plain function that may validate
       // its config and throw synchronously before ever returning an iterable —
@@ -3410,11 +3610,23 @@ export class AgentMonitorRuntime {
         signal,
         checkpoint,
       });
-      for await (const observation of iterable) {
-        if (signal.aborted) break;
-        // This layer adopts the atomic ingest result for watch producers. The
-        // following stack layer adds retry draining before the next iterator
-        // pull; until then this preserves the existing continue-on-error loop.
+      iterator = iterable[Symbol.asyncIterator]();
+      for (;;) {
+        await this.waitForMaterializationRetries(
+          monitor.id,
+          workspacePath,
+          signal,
+          onError,
+        );
+        signal.throwIfAborted();
+        const next = await iterator.next();
+        if (next.done) break;
+        const observation = next.value;
+
+        // A safely queued materialization failure keeps the watcher alive, but
+        // the next loop blocks before pulling another source value. A failure
+        // outside that durable boundary ends this watcher and lets polling
+        // reconciliation resume from the prior state.
         try {
           const ingested = await enqueue(() =>
             this.ingest(monitor, [observation], new Date(), {
@@ -3441,6 +3653,7 @@ export class AgentMonitorRuntime {
           } catch {
             // best-effort audit — ignore write failures
           }
+          throw ingestError;
         }
       }
     } catch (error) {
@@ -3459,6 +3672,13 @@ export class AgentMonitorRuntime {
       // already superseded by a newer one leaves that newer entry untouched.
       if (this.activeWatchers.get(monitor.id) === watcherToken) {
         this.activeWatchers.delete(monitor.id);
+      }
+      if (iterator?.return) {
+        try {
+          await iterator.return();
+        } catch {
+          // The watcher error was already reported above; cleanup is best-effort.
+        }
       }
       // Flush every still-pending checkpoint/ingest before the watcher task
       // resolves, so `stop()` (which awaits every watcher task) truly waits for
@@ -3482,6 +3702,43 @@ export class AgentMonitorRuntime {
       while (settled !== chain) {
         settled = chain;
         await settled;
+      }
+    }
+  }
+
+  private async waitForMaterializationRetries(
+    monitorId: string,
+    workspacePath: string,
+    signal: AbortSignal,
+    onError?: (monitorId: string, error: Error) => void,
+  ): Promise<void> {
+    while (!signal.aborted) {
+      const now = new Date();
+      const drained = await this.drainMaterializationRetries(
+        monitorId,
+        workspacePath,
+        now,
+      );
+      if (drained.emittedEventIds.length > 0) {
+        this.refreshWorkspaceSessions(workspacePath);
+      }
+      for (const message of drained.errors) {
+        onError?.(monitorId, new Error(message));
+      }
+      if (!drained.blocked) return;
+
+      // Pending rows sleep exactly to their persisted deadline. Terminal rows
+      // have no deadline, so re-check at a low fixed cadence for explicit
+      // operator re-arm without spinning the watcher loop.
+      const delayMs = drained.nextAttemptAt
+        ? Math.max(1, drained.nextAttemptAt.getTime() - now.getTime())
+        : 1_000;
+      try {
+        await sleep(delayMs, undefined, { signal });
+      } catch (error) {
+        if (!(error instanceof Error) || error.name !== 'AbortError') {
+          throw error;
+        }
       }
     }
   }
@@ -3840,7 +4097,10 @@ export class AgentMonitorRuntime {
   }
 
   /** Commit the deterministic materialization boundary before optional Interpret. */
-  private materializeObservation(input: ProcessObservationInput) {
+  private materializeObservation(
+    input: ProcessObservationInput,
+    options: { maxSessionBaselineAt?: Date } = {},
+  ) {
     const objectKey = input.observation.objectKey ?? input.monitor.id;
 
     // ── Shape stage (G15, 002 §1.1.4–§1.1.6) ──────────────────────────────
@@ -3931,8 +4191,16 @@ export class AgentMonitorRuntime {
       { previousContent: previousSnapshot?.content ?? null },
       // Ephemeral-monitor projection isolation (007 §4.6): restrict projection to
       // the declaring session so its events never reach a sibling lead session.
-      input.restrictToSessionId !== undefined
-        ? { restrictToSessionId: input.restrictToSessionId }
+      input.restrictToSessionId !== undefined ||
+        options.maxSessionBaselineAt !== undefined
+        ? {
+            ...(input.restrictToSessionId !== undefined
+              ? { restrictToSessionId: input.restrictToSessionId }
+              : {}),
+            ...(options.maxSessionBaselineAt !== undefined
+              ? { maxSessionBaselineAt: options.maxSessionBaselineAt }
+              : {}),
+          }
         : undefined,
     );
 

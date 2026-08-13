@@ -595,14 +595,15 @@ For each runtime tick, the implementation **MUST**:
 
 1. scan the supplied monitors directory for `**/MONITOR.md`
 2. parse valid monitor definitions and collect parse errors separately
-3. resolve each parsed monitor's `source` name against the source registry
-4. fail the tick if a parsed monitor references an unknown source
-5. determine whether the monitor is due to run
-6. call the source's `observe()` method with: the monitor's `scope`, the monitor's previously persisted source state if any, the runtime-supplied `now` timestamp
-7. route returned observations through notify dispatch
-8. materialize emitted observations as durable events, queue failed envelopes, and persist updated source/notify state in one immediate transaction
-9. report emitted ids and errors from the committed result
-10. refresh hook state for sessions in the affected workspace
+3. drain each workspace monitor's materialization retry outbox oldest-first; do not call its source while any pending or terminal row remains
+4. resolve each parsed monitor's `source` name against the source registry
+5. fail the tick if a parsed monitor references an unknown source
+6. determine whether the monitor is due to run
+7. call the source's `observe()` method with: the monitor's `scope`, the monitor's previously persisted source state if any, the runtime-supplied `now` timestamp
+8. route returned observations through notify dispatch
+9. materialize emitted observations as durable events, queue failed envelopes, and persist updated source/notify state in one immediate transaction
+10. report emitted ids and errors from the committed result
+11. refresh hook state for sessions in the affected workspace
 
 A materialization failure rolls back that envelope's event/projection/cursor/snapshot transaction.
 Earlier successful siblings remain events; the failed envelope and every later sibling enter the
@@ -801,7 +802,7 @@ begins is still awaited — is guaranteed to terminate.
 
 `tick()` returns a `RuntimeTickResult` summarizing the tick:
 
-- `evaluatedMonitors` — the ids of every monitor whose `observe()` was attempted this tick (including monitors whose outcome was `errored`).
+- `evaluatedMonitors` — the unique ids of every monitor whose `observe()` or due retry-outbox work was attempted this tick, including errored or removed captured monitors. A monitor that drains and then observes appears once.
 - `emittedEventIds` — the ids of the durable events materialized this tick.
 - `erroredObservations` — one `{ monitorId, message }` entry per monitor whose observation failed this tick (its `observe()` threw/rejected, or its `ingest()` failed). Each entry is pushed from the **same** code path that writes the `errored` row to `observation_history` (§15 `observation_history`), so the result is the single source of truth for tick-time failures — it is never recomputed by re-scanning history. A monitor that genuinely observed no change does **not** appear here.
 - `skippedMonitors` — one `{ monitorId, nextDueAt }` entry per monitor found in the directory but skipped because it was not yet due (interval not elapsed for interval-based monitors; cron window not open for schedule monitors). Populated from the **same** scheduling decision that gates evaluation, so it is never recomputed. A monitor with an active continuous watcher does **not** appear here (it is driven by the watcher, not by the tick).
@@ -1819,13 +1820,17 @@ transaction; a thrown operation preserves the row, and silent discard is not sup
 Runtime diagnostics expose each row's id, status, attempt count, safe error, and attempt timestamps
 through `monitor explain` and `doctor`. They never expose the stored envelope or its payload.
 
-_Current in this change:_ poll and watch ingestion atomically admit failed envelopes before
-source/notify state advances. Runtime drain-before-observe adoption follows in the next stack layer
-for #295.
+_Current:_ tick and watch paths drain oldest-first before requesting newer source input. Pending or
+terminal work pauses the whole workspace/monitor route; success atomically materializes and deletes
+the row, while failure advances persisted backoff and blocks newer rows.
 
 ### `session_event_state`
 
 Per-session delivery tracking for each projected event. Drives the unread/claimed/acknowledged state machine (§7).
+
+Retry materialization restricts projection targets to sessions whose `baseline_at` is no later than
+the stored envelope's original observation time. A session opened during retry backoff therefore
+never receives a pre-registration change.
 
 | Column                 | Type             | Notes                                                                       |
 | ---------------------- | ---------------- | --------------------------------------------------------------------------- |

@@ -1484,6 +1484,7 @@ export class RuntimeStore {
         previousContent: string | null;
     }, options?: {
         restrictToSessionId?: string;
+        maxSessionBaselineAt?: Date;
     }): MonitorEventRecord;
     interpretDigestsForSession(sessionId: string, eventIds: string[]): Map<string, string>;
     // (undocumented)

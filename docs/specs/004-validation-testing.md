@@ -194,6 +194,9 @@ The `RuntimeStore.saveSnapshot()` and `RuntimeStore.latestSnapshot()` methods (i
 | First/later failures produce truthful committed results          | Covered (`libs/core/src/runtime/atomic-ingest-retry.test.ts` — exact ids, errors, history, outbox order, and Interpret calls for event, projection, cursor, and snapshot faults).                                            |
 | State/outbox failure rolls back the ingest batch                 | Covered (`libs/core/src/runtime/atomic-ingest-retry.test.ts` — post-write state and outbox faults leave no events/retries, preserve the source baseline, and replay after restart).                                          |
 | Rollup notify state rolls back with materialization              | Covered (`libs/core/src/runtime/atomic-ingest-retry.test.ts` — pending batches and window markers survive state/outbox failure and flush once after restart).                                                                |
+| Retry drain preserves order and source backpressure              | Covered (`libs/core/src/runtime/atomic-ingest-retry.test.ts` — every injected write fault drains oldest-first after restart and a failed drain pauses source observation).                                                   |
+| Removed and late-session retry routing is coherent               | Covered (`libs/core/src/runtime/atomic-ingest-retry.test.ts` — removed monitors report exact drain results; later sessions receive no projection or cursor).                                                                 |
+| Watch iterator waits behind retry work                           | Covered (`libs/core/src/runtime/service.test.ts` — iterator pull order proves `boom` drains before `ok` is requested and both events persist in source order).                                                               |
 
 ### 3.5 CLI behavior
 

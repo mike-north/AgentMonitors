@@ -128,6 +128,7 @@ Handle it.
   return {
     rootDir,
     dbPath: path.join(rootDir, 'agentmon.db'),
+    monitorDir,
     monitorsDir: path.join(rootDir, '.claude/monitors'),
   };
 }
@@ -403,6 +404,55 @@ describe('atomic poll ingest', () => {
       ]);
     });
   }
+
+  for (const fault of faults) {
+    it(`drains a queued ${fault.name} fault in source order after restart`, async () => {
+      const f = setup();
+      fault.configure(f);
+      const initial = await f.runtime.tick(f.monitorsDir, f.rootDir);
+      fault.cleanup?.(f);
+
+      vi.setSystemTime(NOW.getTime() + 1_000);
+      const reopenedStore = new RuntimeStore(createDb(f.dbPath));
+      const restarted = createRuntime(reopenedStore, f.source, f.interpret);
+      const drained = await restarted.tick(f.monitorsDir, f.rootDir);
+      expectTick(drained, reopenedStore, { emitted: fault.queued });
+      expect([
+        ...summaries(f.store, initial.emittedEventIds),
+        ...summaries(reopenedStore, drained.emittedEventIds),
+      ]).toEqual(['first', 'second']);
+      expect(
+        restarted
+          .listEvents({ monitorId: 'test-monitor' })
+          .map(({ summary }) => summary),
+      ).toEqual(['second', 'first']);
+      expect(reopenedStore.listMaterializationRetries()).toEqual([]);
+      expect(f.observedStates).toEqual([undefined, { cursor: 1 }]);
+      expect(interpretDeltas(f.interpret)).toEqual([
+        'first-state',
+        'second-state',
+      ]);
+      expect(history(restarted)).toEqual([
+        {
+          result: 'no-change',
+          observationData: { observed: 0, emitted: 0 },
+        },
+        ...fault.queued.map(() => ({
+          result: 'triggered' as const,
+          observationData: { observed: 0, emitted: 1 },
+        })),
+        { result: 'errored', observationData: { error: fault.message } },
+        ...(fault.emitted.length === 1
+          ? [
+              {
+                result: 'triggered' as const,
+                observationData: { observed: 2, emitted: 1 },
+              },
+            ]
+          : []),
+      ]);
+    });
+  }
 });
 
 describe('atomic rollup-window flush', () => {
@@ -500,4 +550,125 @@ describe('atomic rollup-window flush', () => {
       ]);
     });
   }
+});
+
+describe('runtime retry scheduling', () => {
+  it('reports failed and successful drains for a removed monitor as evaluations', async () => {
+    const f = setup();
+    f.store.failedSummary = 'first';
+    f.store.eventFailures = 1;
+    await f.runtime.tick(f.monitorsDir, f.rootDir);
+    rmSync(f.monitorDir, { recursive: true, force: true });
+
+    vi.setSystemTime(NOW.getTime() + 1_000);
+    const reopenedStore = new FaultStore(createDb(f.dbPath));
+    reopenedStore.failedSummary = 'first';
+    reopenedStore.eventFailures = 1;
+    const restarted = createRuntime(reopenedStore, f.source, f.interpret);
+    expectTick(await restarted.tick(f.monitorsDir, f.rootDir), reopenedStore, {
+      errors: ['insert failure for first'],
+    });
+    expect(reopenedStore.listMaterializationRetries()[0]).toMatchObject({
+      attemptCount: 1,
+      status: 'pending',
+    });
+    expect(f.observedStates).toEqual([undefined]);
+
+    vi.setSystemTime(NOW.getTime() + 6_000);
+    expectTick(await restarted.tick(f.monitorsDir, f.rootDir), reopenedStore, {
+      emitted: ['first', 'second'],
+    });
+    expect(reopenedStore.listMaterializationRetries()).toEqual([]);
+    expect(f.observedStates).toEqual([undefined]);
+    expect(interpretDeltas(f.interpret)).toEqual([
+      'first-state',
+      'second-state',
+    ]);
+    expect(history(restarted)).toEqual([
+      {
+        result: 'triggered',
+        observationData: { observed: 0, emitted: 1 },
+      },
+      {
+        result: 'triggered',
+        observationData: { observed: 0, emitted: 1 },
+      },
+      {
+        result: 'errored',
+        observationData: { error: 'insert failure for first' },
+      },
+      {
+        result: 'errored',
+        observationData: { error: 'insert failure for first' },
+      },
+    ]);
+  });
+
+  it('does not project delayed retries into a later-opened session', async () => {
+    const f = setup();
+    f.store.failedSummary = 'first';
+    f.store.eventFailures = 1;
+    await f.runtime.tick(f.monitorsDir, f.rootDir);
+
+    vi.setSystemTime(NOW.getTime() + 2_000);
+    const lateSession = f.runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'late-session',
+        workspacePath: f.rootDir,
+      }),
+    );
+    const reopenedStore = new RuntimeStore(createDb(f.dbPath));
+    const restarted = createRuntime(reopenedStore, f.source, f.interpret);
+    expectTick(await restarted.tick(f.monitorsDir, f.rootDir), reopenedStore, {
+      emitted: ['first', 'second'],
+    });
+    expect(
+      restarted
+        .listEvents({ sessionId: f.session.id })
+        .map(({ summary }) => summary),
+    ).toEqual(['second', 'first']);
+    expect(restarted.listEvents({ sessionId: lateSession.id })).toEqual([]);
+    expect(
+      reopenedStore
+        .listDeliveryProjectionsForMonitor('test-monitor', f.rootDir)
+        .map(({ sessionId }) => sessionId),
+    ).toEqual([f.session.id, f.session.id]);
+    expect(
+      reopenedStore.getSessionObjectCursor(
+        lateSession.id,
+        'test-monitor',
+        'first',
+        f.rootDir,
+      ),
+    ).toBeNull();
+  });
+
+  it('pauses source observation until an older retry succeeds', async () => {
+    const f = setup();
+    f.store.failedSummary = 'second';
+    f.store.eventFailures = 2;
+    await f.runtime.tick(f.monitorsDir, f.rootDir);
+
+    vi.setSystemTime(NOW.getTime() + 1_000);
+    expectTick(await f.runtime.tick(f.monitorsDir, f.rootDir), f.store, {
+      errors: ['insert failure for second'],
+    });
+    expect(f.observedStates).toEqual([undefined]);
+    expect(f.store.listMaterializationRetries()[0]).toMatchObject({
+      attemptCount: 1,
+      status: 'pending',
+    });
+
+    f.store.eventFailures = 0;
+    vi.setSystemTime(NOW.getTime() + 6_000);
+    expectTick(await f.runtime.tick(f.monitorsDir, f.rootDir), f.store, {
+      emitted: ['second'],
+    });
+    expect(f.observedStates).toEqual([undefined, { cursor: 1 }]);
+    expect(f.store.listMaterializationRetries()).toEqual([]);
+    expect(interpretDeltas(f.interpret)).toEqual([
+      'first-state',
+      'second-state',
+    ]);
+  });
 });
