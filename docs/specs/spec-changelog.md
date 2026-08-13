@@ -9,6 +9,14 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-08-13 — Event materialization is one atomic durable unit (002 §5, 004 §3.4) — Refs #295, #481
+
+The shared event row, matching lead-session projections, first-recipient cursor seeds, and snapshot
+now commit in one immediate SQLite transaction. A failure at any write rolls the whole observation
+back, so the runtime cannot retain a partial event without its cursor, projection, or snapshot.
+Optional Interpret work remains outside this deterministic transaction and begins only after it
+commits. Focused failure-injection tests now enforce the rollback boundary.
+
 ## 2026-07-22 — Channel `event_count`/`monitor_id`/`event_id` meta corrected for cross-monitor-coalesced claims (006 §4.2) — Refs #441, #456
 
 For a `DeliveryClaim` with `coalescedReminder` set (issue #441 cross-monitor coalescing), the channel
