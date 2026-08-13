@@ -3652,6 +3652,24 @@ export class AgentMonitorRuntime {
   }
 
   private async processObservation(input: ProcessObservationInput) {
+    const materialized = this.materializeObservation(input);
+    if (!materialized) return null;
+
+    const { event, diffText } = materialized;
+    // Interpret runs only after the deterministic event, every recipient
+    // projection/cursor seed, and the snapshot have committed atomically.
+    if (
+      input.monitor.frontmatter.payload?.form === 'prose' &&
+      this.interpretAdapter
+    ) {
+      await this.runInterpret(input.monitor, event, diffText);
+    }
+
+    return event;
+  }
+
+  /** Commit the deterministic materialization boundary before optional Interpret. */
+  private materializeObservation(input: ProcessObservationInput) {
     const objectKey = input.observation.objectKey ?? input.monitor.id;
 
     // ── Shape stage (G15, 002 §1.1.4–§1.1.6) ──────────────────────────────
@@ -3742,39 +3760,17 @@ export class AgentMonitorRuntime {
       { previousContent: previousSnapshot?.content ?? null },
       // Ephemeral-monitor projection isolation (007 §4.6): restrict projection to
       // the declaring session so its events never reach a sibling lead session.
-      input.restrictToSessionId !== undefined
-        ? { restrictToSessionId: input.restrictToSessionId }
-        : undefined,
+      {
+        ...(input.restrictToSessionId !== undefined
+          ? { restrictToSessionId: input.restrictToSessionId }
+          : {}),
+        ...(effectiveSnapshotText
+          ? { snapshot: { content: effectiveSnapshotText } }
+          : {}),
+      },
     );
 
-    // TODO(#46 follow-up): make insertEvent+saveSnapshot atomic via a
-    // transaction. Currently a saveSnapshot failure after a successful insertEvent
-    // leaves an event row without its snapshot — best-effort: the ingest() caller
-    // catches this and records an errored history row for the observation.
-    if (effectiveSnapshotText) {
-      this.store.saveSnapshot({
-        workspacePath: input.workspacePath ?? null,
-        monitorId: input.monitor.id,
-        objectKey,
-        eventId: event.id,
-        content: effectiveSnapshotText,
-      });
-    }
-
-    // ── Interpret stage (G14, 002 §1.1.8) ─────────────────────────────────
-    // Runs AFTER the per-recipient Diff/projection, on the per-recipient delta,
-    // and ONLY for `payload.form: prose`. Best-effort and off the critical path:
-    // a tool failure falls back to the deterministic `rendered` artifact
-    // (already projected above) and is recorded as explainable. The host-specific
-    // tool invocation lives behind `this.interpretAdapter` — never here.
-    if (
-      input.monitor.frontmatter.payload?.form === 'prose' &&
-      this.interpretAdapter
-    ) {
-      await this.runInterpret(input.monitor, event, diffText);
-    }
-
-    return event;
+    return { event, diffText };
   }
 
   /**
