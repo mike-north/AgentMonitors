@@ -6,23 +6,31 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  realpathSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
   existsSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  EXTERNAL_EVENT_SCHEMA,
+  type ExternalEventReceiptRecord,
+} from '@agentmonitors/core';
+import {
   acquireStartupLock,
   callDaemon,
   createDaemonServer,
   daemonAvailable,
+  DaemonApplicationError,
   DaemonConnectionError,
   DaemonUnsupportedRequestError,
   lockPath,
   releaseStartupLock,
   resolveSocketPath,
+  MAX_DAEMON_FRAME_BYTES,
 } from './daemon-ipc.js';
 import { createRuntime } from './runtime.js';
 
@@ -36,6 +44,56 @@ function tempDir(): string {
 
 function tempSocketPath(name: string): string {
   return path.join(tempDir(), `${name}.sock`);
+}
+
+function externalFixture(settleFor = '2s') {
+  const workspace = tempDir();
+  const monitorDir = path.join(
+    workspace,
+    '.claude',
+    'monitors',
+    'build-health',
+  );
+  mkdirSync(monitorDir, { recursive: true });
+  writeFileSync(
+    path.join(monitorDir, 'MONITOR.md'),
+    [
+      '---',
+      'name: Build health',
+      'watch:',
+      '  type: file-fingerprint',
+      '  globs:',
+      "    - 'watched.txt'",
+      `  cwd: ${JSON.stringify(workspace)}`,
+      'urgency: normal',
+      'notify:',
+      '  strategy: debounce',
+      `  settle-for: '${settleFor}'`,
+      '---',
+      'Handle the build state.',
+      '',
+    ].join('\n'),
+    'utf8',
+  );
+  writeFileSync(path.join(workspace, 'watched.txt'), 'baseline', 'utf8');
+  return {
+    workspace,
+    monitorsDir: path.dirname(monitorDir),
+    envelope: {
+      schema: EXTERNAL_EVENT_SCHEMA,
+      monitorId: 'build-health',
+      source: 'example-build-system',
+      upstreamEventId: 'delivery-1',
+      objectId: 'build-1',
+      objectSequence: 1,
+      eventKind: 'build.updated',
+      changeKind: 'modified' as const,
+      occurredAt: new Date().toISOString(),
+      resumeToken: 'relay-cursor',
+      scope: { project: 'example/widgets' },
+      state: { status: 'passed' },
+    },
+  };
 }
 
 afterEach(() => {
@@ -373,6 +431,115 @@ describe('createDaemonServer — request-handling resilience', () => {
       expect(response.id).toBe('invalid');
       expect(response.error).toBe('Invalid JSON request.');
       expect(response.code).toBe('unsupported_request');
+    } finally {
+      await server.close().catch(() => undefined);
+    }
+  });
+
+  it('binds canonical identities and deduplicates concurrent external ingestion', async () => {
+    const fixture = externalFixture();
+    const alias = path.join(tempDir(), 'workspace-link');
+    symlinkSync(fixture.workspace, alias);
+    const workspaceIdentity = realpathSync(alias);
+    const monitorsDirIdentity = realpathSync(
+      path.join(alias, '.claude', 'monitors'),
+    );
+    const socketPath = path.join(fixture.workspace, 'daemon.sock');
+    const stateChanged = vi.fn();
+    const server = createDaemonServer({
+      runtime: createRuntime(path.join(fixture.workspace, 'agentmon.db')),
+      socketPath,
+      workspaceIdentity,
+      monitorsDirIdentity,
+      onExternalStateChanged: stateChanged,
+    });
+    try {
+      await server.listen();
+      await expect(
+        callDaemon('status', {}, { socketPath }),
+      ).resolves.toMatchObject({ workspaceIdentity, monitorsDirIdentity });
+
+      const params = {
+        workspaceIdentity: realpathSync(alias),
+        monitorsDirIdentity: realpathSync(
+          path.join(alias, '.claude', 'monitors'),
+        ),
+        envelope: fixture.envelope,
+      };
+      const results = await Promise.all([
+        callDaemon<{
+          disposition: string;
+          receiptId: string;
+          outcome: string;
+        }>('events.ingest', params, { socketPath }),
+        callDaemon<{
+          disposition: string;
+          receiptId: string;
+          outcome: string;
+        }>('events.ingest', params, { socketPath }),
+      ]);
+      expect(results.map(({ disposition }) => disposition).sort()).toEqual([
+        'accepted',
+        'duplicate',
+      ]);
+      expect(new Set(results.map(({ receiptId }) => receiptId)).size).toBe(1);
+      expect(results[0]?.outcome).toBe('held');
+      expect(stateChanged).toHaveBeenCalledTimes(1);
+
+      await expect(
+        callDaemon<ExternalEventReceiptRecord | null>(
+          'events.ingestStatus',
+          {
+            workspaceIdentity,
+            monitorsDirIdentity,
+            receiptId: results[0]?.receiptId,
+          },
+          { socketPath },
+        ),
+      ).resolves.toMatchObject({ outcome: 'held', eventIds: [] });
+
+      const mismatch = await callDaemon(
+        'events.ingest',
+        { ...params, workspaceIdentity: tempDir() },
+        { socketPath },
+      ).catch((error: unknown) => error);
+      expect(mismatch).toBeInstanceOf(DaemonApplicationError);
+      expect(mismatch).toMatchObject({
+        code: 'workspace_mismatch',
+        retryable: false,
+      });
+    } finally {
+      await server.close().catch(() => undefined);
+    }
+  });
+
+  it('rejects an oversized frame before JSON parsing and keeps serving', async () => {
+    const socketPath = tempSocketPath('oversized-frame');
+    const server = createDaemonServer({
+      runtime: createRuntime(':memory:'),
+      socketPath,
+    });
+    try {
+      await server.listen();
+      const raw = await new Promise<string>((resolve, reject) => {
+        const socket = net.connect(socketPath);
+        let response = '';
+        socket.setEncoding('utf8');
+        socket.on('connect', () => {
+          socket.write('x'.repeat(MAX_DAEMON_FRAME_BYTES + 1));
+        });
+        socket.on('data', (chunk) => {
+          response += chunk;
+        });
+        socket.on('end', () => resolve(response));
+        socket.on('error', reject);
+      });
+      expect(JSON.parse(raw) as Record<string, unknown>).toMatchObject({
+        id: 'invalid',
+        code: 'payload_too_large',
+        retryable: false,
+      });
+      await expect(daemonAvailable(socketPath)).resolves.toBe(true);
     } finally {
       await server.close().catch(() => undefined);
     }

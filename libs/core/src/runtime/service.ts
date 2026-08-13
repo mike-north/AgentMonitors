@@ -69,6 +69,7 @@ import type {
   ErroredObservation,
   MonitorExplainStageId,
   MonitorExplainStageStatus,
+  MaterializationRetryRecord,
   ObservationHistoryQuery,
   ObservationHistoryRecord,
   OpenSessionInput,
@@ -1546,6 +1547,31 @@ export class AgentMonitorRuntime {
       receiptId,
       now,
     );
+  }
+
+  /** Return safe receipt status for one exact workspace identity. */
+  externalEventReceiptStatus(
+    workspaceIdentity: string,
+    receiptId: string,
+  ): ExternalEventReceiptRecord | null {
+    return this.store.externalEventReceiptStatus(workspaceIdentity, receiptId);
+  }
+
+  /** Re-arm one terminal materialization retry without crossing workspaces. */
+  rearmMaterializationRetry(
+    workspaceIdentity: string,
+    retryId: string,
+    now = new Date(),
+  ): MaterializationRetryRecord {
+    const retry = this.store.getMaterializationRetry(retryId);
+    if (retry.workspacePath !== workspaceIdentity) {
+      throw new ExternalEventIngestError(
+        'workspace_mismatch',
+        'Materialization retry does not belong to this workspace.',
+        false,
+      );
+    }
+    return this.store.rearmMaterializationRetry(retryId, now);
   }
 
   async explainMonitor(

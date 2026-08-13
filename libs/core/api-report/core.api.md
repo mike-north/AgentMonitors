@@ -30,6 +30,7 @@ export class AgentMonitorRuntime {
     doctorReport(input: DoctorReportInput): Promise<MonitorDoctorReport>;
     // (undocumented)
     explainMonitor(input: MonitorExplainInput): Promise<MonitorExplainReport>;
+    externalEventReceiptStatus(workspaceIdentity: string, receiptId: string): ExternalEventReceiptRecord | null;
     flushDueNotifications(workspaceIdentity: string, now?: Date): ExternalNotificationFlushResult;
     ingestExternalEvent(input: ExternalEventIngestInput, monitorsDir: string, now?: Date): Promise<ExternalEventIngestResult>;
     listEphemeralMonitors(sessionId: string): EphemeralMonitorRecord[];
@@ -45,6 +46,7 @@ export class AgentMonitorRuntime {
     previewCoalescedReminder(sessionId: string): string | undefined;
     previewSettledHighDelivery(sessionId: string): DeliveryEventSummary[];
     rearmExternalEventReceipt(workspaceIdentity: string, receiptId: string, now?: Date): ExternalEventReceiptRecord;
+    rearmMaterializationRetry(workspaceIdentity: string, retryId: string, now?: Date): MaterializationRetryRecord;
     // (undocumented)
     refreshHookState(sessionId: string): SessionHookState;
     releaseDelivery(reservationId: string): void;

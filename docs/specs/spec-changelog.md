@@ -15,6 +15,13 @@ Core now exposes exact-workspace safe receipt reads and exact four-dimension obj
 Nonempty durable debounce/rollup state and materialization retry admission write the matching
 global or workspace `durable-ingress-v1` marker in the same transaction; empty batches do not mark
 an otherwise compatible database.
+## 2026-08-13 — External ingress crosses the owner-only daemon boundary (002 §2.6, 004 §3.4.1) — Refs #481
+
+The daemon now exposes identity-bound ingest, receipt status/re-arm, and materialization-outbox
+re-arm methods. Its handshake reports canonical local identities, frames are capped before parsing,
+and safe application errors carry stable code/retryability. Deadline timer/startup/reap lifecycle
+remains the next stack entry; user-facing CLI commands are still target behavior.
+
 ## 2026-08-13 — External debounce deadlines flush without polling (002 §2.6, 004 §3.4.1) — Refs #481
 
 Core now exposes workspace-scoped deadline discovery, source-free due-batch flushing, and explicit

@@ -815,9 +815,9 @@ Verified: `libs/core/src/runtime/types.ts` — `RuntimeTickResult`, `ErroredObse
 
 ### 2.6 Source-neutral external event contract
 
-> **Status: contract, persistence, and core ingestion current; IPC ingestion target.**
+> **Status: contract, core ingestion, and daemon IPC current; deadline lifecycle/CLI target.**
 > Core accepts immediate and bounded-debounce events and can flush captured debounce work without
-> polling a source. Daemon scheduling, IPC, and CLI submission remain later stacked changes.
+> polling a source. Daemon timer/reap lifecycle and CLI submission remain later stacked changes.
 
 `agentmonitors.external-event.v1` represents one producer-reconstructed current-state snapshot. Its
 required top-level fields are `schema`, `monitorId`, `source`, `upstreamEventId`, `objectId`,
@@ -891,7 +891,16 @@ batch containing one failed receipt, resets its receipt attempt metadata, and ma
 due. Shared reconciliation dispatch honors this backoff and cannot bypass a pending or terminal
 external flush. A new external event is rejected retryably while a terminal batch blocks the
 monitor. Daemon timer/reap lifecycle and public status/retry commands remain target behavior; no
-daemon/CLI ingestion surface is exposed yet.
+CLI ingestion surface is exposed yet.
+
+The owner-only daemon socket exposes `events.ingest`, `events.ingestStatus`,
+`events.ingestRetry`, and `monitor.retryOutbox`. Its status handshake reports the canonical
+workspace and monitor-directory identities captured at startup; every external method requires the
+caller's expected identities to match before mutation. Requests are capped at 320 KiB before JSON
+parsing. Ingest validates the envelope at the socket boundary and again in core, responds only after
+the durable core operation returns, and never waits for Interpret. Application responses include a
+safe string code and retryability; old-daemon `unsupported_request` responses map to retryable
+`daemon_incompatible`. Deadline timers, overdue startup flush, and reap pinning remain target.
 
 Verified: `libs/core/src/external-ingress/json.test.ts`, `contract.test.ts`,
 `contract-boundaries.test.ts`, `persistence.test.ts`, `persistence-queries.test.ts`,
