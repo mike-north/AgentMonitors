@@ -85,6 +85,8 @@ import type {
   ExternalEventReceiptDecision,
   ExternalEventReceiptOperation,
   ExternalEventReceiptRecord,
+  ExternalNotificationDeadline,
+  ExternalNotificationFlushFailure,
   ExternalObjectSequenceRecord,
   EventQuery,
   MonitorEventRecord,
@@ -104,6 +106,8 @@ import type {
 } from './types.js';
 import {
   DURABLE_INGRESS_COMPATIBILITY_MARKER,
+  EXTERNAL_NOTIFICATION_FLUSH_MAX_ATTEMPTS,
+  EXTERNAL_NOTIFICATION_FLUSH_RETRY_DELAYS_MS,
   MATERIALIZATION_RETRY_DELAYS_MS,
   MATERIALIZATION_RETRY_MAX_ATTEMPTS,
   MATERIALIZATION_RETRY_MAX_BYTES,
@@ -241,6 +245,57 @@ function isUniqueNonemptyStringArray(value: unknown): value is string[] {
       (entry): entry is string => typeof entry === 'string' && entry.length > 0,
     ) && new Set(entries).size === entries.length
   );
+}
+
+const SAFE_EXTERNAL_FLUSH_ERROR =
+  'External notification batch could not be materialized.';
+
+function externalPendingReceiptIds(value: unknown): string[] {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+  const observations = (value as Record<string, unknown>)['observations'];
+  if (!Array.isArray(observations)) return [];
+  return [
+    ...new Set(
+      observations.flatMap((observation) => {
+        if (
+          !observation ||
+          typeof observation !== 'object' ||
+          Array.isArray(observation)
+        ) {
+          return [];
+        }
+        const receiptId = (observation as Record<string, unknown>)[
+          'ingressReceiptId'
+        ];
+        return typeof receiptId === 'string' && receiptId.length > 0
+          ? [receiptId]
+          : [];
+      }),
+    ),
+  ];
+}
+
+function externalPendingDeadline(value: unknown): Date | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  if (externalPendingReceiptIds(value).length === 0) return null;
+  const record = value as Record<string, unknown>;
+  const flush = record['externalFlush'];
+  if (flush && typeof flush === 'object' && !Array.isArray(flush)) {
+    if ((flush as Record<string, unknown>)['status'] === 'terminal')
+      return null;
+  }
+  const dueAtValue = record['dueAt'];
+  if (typeof dueAtValue !== 'string') return null;
+  const dueAt = new Date(dueAtValue);
+  if (Number.isNaN(dueAt.getTime())) return null;
+  const retryValue =
+    flush && typeof flush === 'object' && !Array.isArray(flush)
+      ? (flush as Record<string, unknown>)['nextAttemptAt']
+      : undefined;
+  if (typeof retryValue !== 'string') return dueAt;
+  const retryAt = new Date(retryValue);
+  if (Number.isNaN(retryAt.getTime())) return dueAt;
+  return retryAt > dueAt ? retryAt : dueAt;
 }
 
 function externalReceiptEventIds(value: string, receiptId: string): string[] {
@@ -771,6 +826,198 @@ export class RuntimeStore {
     return row ? rowToExternalEventReceipt(row) : null;
   }
 
+  /** List retry-eligible external debounce deadlines for one workspace. */
+  externalNotificationDeadlines(
+    workspaceIdentity: string,
+  ): ExternalNotificationDeadline[] {
+    return asInternalDb(this.db)
+      .select({
+        monitorId: monitorState.monitorId,
+        notifyState: monitorState.notifyState,
+      })
+      .from(monitorState)
+      .where(eq(monitorState.workspacePath, workspaceIdentity))
+      .all()
+      .flatMap((row) => {
+        const notifyState = parseJson<Record<string, unknown>>(
+          row.notifyState,
+          {},
+        );
+        const dueAt = externalPendingDeadline(notifyState['pendingDebounce']);
+        return dueAt ? [{ monitorId: row.monitorId, dueAt }] : [];
+      })
+      .sort((left, right) => {
+        const byTime = left.dueAt.getTime() - right.dueAt.getTime();
+        return byTime !== 0
+          ? byTime
+          : left.monitorId.localeCompare(right.monitorId);
+      });
+  }
+
+  /** Persist a whole captured batch's retry or terminal transition atomically. */
+  markExternalNotificationFlushFailed(
+    workspaceIdentity: string,
+    monitorId: string,
+    now = new Date(),
+  ): ExternalNotificationFlushFailure {
+    const db = asInternalDb(this.db);
+    return db.$client
+      .transaction(() => {
+        const state = this.getMonitorState(monitorId, workspaceIdentity);
+        const pending = state.notifyState.pendingDebounce;
+        const receiptIds = externalPendingReceiptIds(pending);
+        if (!pending || receiptIds.length === 0) {
+          throw new Error(
+            `External notification batch not found: ${monitorId}.`,
+          );
+        }
+        if (pending.externalFlush?.status === 'terminal') {
+          throw new Error(
+            `External notification batch is terminal: ${monitorId}.`,
+          );
+        }
+        const attemptCount = (pending.externalFlush?.attemptCount ?? 0) + 1;
+        const terminal =
+          attemptCount >= EXTERNAL_NOTIFICATION_FLUSH_MAX_ATTEMPTS;
+        const nextAttemptAt = terminal
+          ? null
+          : new Date(
+              now.getTime() +
+                (EXTERNAL_NOTIFICATION_FLUSH_RETRY_DELAYS_MS[
+                  attemptCount - 1
+                ] ?? 0),
+            );
+        const nextNotifyState = {
+          ...state.notifyState,
+          pendingDebounce: {
+            ...pending,
+            externalFlush: {
+              attemptCount,
+              status: terminal ? ('terminal' as const) : ('pending' as const),
+              ...(nextAttemptAt
+                ? { nextAttemptAt: nextAttemptAt.toISOString() }
+                : {}),
+              lastError: SAFE_EXTERNAL_FLUSH_ERROR,
+            },
+          },
+        };
+        this.setMonitorState(monitorId, workspaceIdentity, {
+          sourceState: state.sourceState,
+          notifyState: nextNotifyState,
+          lastObservationAt: state.lastObservationAt ?? null,
+        });
+        const changed = db
+          .update(externalEventReceipts)
+          .set({
+            outcome: terminal ? 'failed' : 'held',
+            attemptCount,
+            lastError: SAFE_EXTERNAL_FLUSH_ERROR,
+            nextAttemptAt,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(externalEventReceipts.workspaceIdentity, workspaceIdentity),
+              inArray(externalEventReceipts.id, receiptIds),
+            ),
+          )
+          .run().changes;
+        if (changed !== receiptIds.length) {
+          throw new Error(
+            `External notification receipt correlation is incomplete for ${monitorId}.`,
+          );
+        }
+        return {
+          monitorId,
+          attemptCount,
+          terminal,
+          nextAttemptAt,
+          message: SAFE_EXTERNAL_FLUSH_ERROR,
+        };
+      })
+      .immediate();
+  }
+
+  /** Re-arm the terminal batch containing a receipt and return that receipt. */
+  rearmExternalNotificationBatch(
+    workspaceIdentity: string,
+    receiptId: string,
+    now = new Date(),
+  ): ExternalEventReceiptRecord {
+    const db = asInternalDb(this.db);
+    return db.$client
+      .transaction(() => {
+        const receipt = this.externalEventReceiptStatus(
+          workspaceIdentity,
+          receiptId,
+        );
+        if (!receipt) {
+          throw new Error(`External event receipt not found: ${receiptId}`);
+        }
+        const state = this.getMonitorState(
+          receipt.monitorId,
+          workspaceIdentity,
+        );
+        const pending = state.notifyState.pendingDebounce;
+        const receiptIds = externalPendingReceiptIds(pending);
+        if (
+          !pending ||
+          pending.externalFlush?.status !== 'terminal' ||
+          !receiptIds.includes(receiptId)
+        ) {
+          throw new Error(
+            `External event receipt is not in a terminal batch: ${receiptId}`,
+          );
+        }
+        this.setMonitorState(receipt.monitorId, workspaceIdentity, {
+          sourceState: state.sourceState,
+          notifyState: {
+            ...state.notifyState,
+            pendingDebounce: {
+              ...pending,
+              dueAt: now.toISOString(),
+              externalFlush: {
+                attemptCount: 0,
+                status: 'pending',
+                nextAttemptAt: now.toISOString(),
+              },
+            },
+          },
+          lastObservationAt: state.lastObservationAt ?? null,
+        });
+        const changed = db
+          .update(externalEventReceipts)
+          .set({
+            outcome: 'held',
+            attemptCount: 0,
+            lastError: null,
+            nextAttemptAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(externalEventReceipts.workspaceIdentity, workspaceIdentity),
+              inArray(externalEventReceipts.id, receiptIds),
+            ),
+          )
+          .run().changes;
+        if (changed !== receiptIds.length) {
+          throw new Error(
+            `External notification receipt correlation is incomplete for ${receipt.monitorId}.`,
+          );
+        }
+        const rearmed = this.externalEventReceiptStatus(
+          workspaceIdentity,
+          receiptId,
+        );
+        if (!rearmed) {
+          throw new Error(`External event receipt not found: ${receiptId}`);
+        }
+        return rearmed;
+      })
+      .immediate();
+  }
+
   markExternalEventReceiptMaterialized(
     workspaceIdentity: string,
     receiptId: string,
@@ -804,6 +1051,9 @@ export class RuntimeStore {
       .set({
         outcome: 'materialized',
         eventIds: JSON.stringify([eventId]),
+        attemptCount: 0,
+        lastError: null,
+        nextAttemptAt: null,
         materializedAt,
         updatedAt: materializedAt,
       })

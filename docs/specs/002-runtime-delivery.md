@@ -815,9 +815,9 @@ Verified: `libs/core/src/runtime/types.ts` — `RuntimeTickResult`, `ErroredObse
 
 ### 2.6 Source-neutral external event contract
 
-> **Status: contract, persistence, and core ingestion current; source-free/IPC ingestion target.**
-> Core accepts immediate and bounded-debounce events through the runtime. Independent deadline
-> flushing, daemon IPC, and CLI submission remain later stacked changes.
+> **Status: contract, persistence, and core ingestion current; IPC ingestion target.**
+> Core accepts immediate and bounded-debounce events and can flush captured debounce work without
+> polling a source. Daemon scheduling, IPC, and CLI submission remain later stacked changes.
 
 `agentmonitors.external-event.v1` represents one producer-reconstructed current-state snapshot. Its
 required top-level fields are `schema`, `monitorId`, `source`, `upstreamEventId`, `objectId`,
@@ -875,8 +875,23 @@ External and reconciliation observations share notify state. Every shared materi
 retry-outbox path uses the captured source/monitor and changes a held receipt to `materialized` with
 its event ID in the same transaction. Thus an ordinary reconciliation tick can flush or retry a
 batch without losing correlation, and monitor edits affect only future input. Duplicate replay does
-not append or extend a deadline. A source-free deadline operation remains target behavior in the
-next stack entry; no daemon/CLI ingestion surface is exposed yet.
+not append or extend a deadline.
+
+`nextExternalNotificationDeadline()` returns the earliest retry-eligible deadline for one
+workspace. `flushDueNotifications()` reads only the durable captured envelopes: it does not scan
+monitor files or invoke a source. The whole due batch, its events/projections/snapshots, cleared
+notify state, and every receipt-to-event transition commit atomically. Interpret and audit begin
+only after that boundary.
+
+A failed source-free flush rolls back the entire batch, records only a fixed safe error, and applies
+1s, 5s, 30s, and 2m delays after its first four failed attempts. The fifth consecutive failure
+marks the captured batch terminal and every correlated receipt `failed`; terminal work remains
+durable but is excluded from automatic deadlines. `rearmExternalEventReceipt()` re-arms the whole
+batch containing one failed receipt, resets its receipt attempt metadata, and makes it immediately
+due. Shared reconciliation dispatch honors this backoff and cannot bypass a pending or terminal
+external flush. A new external event is rejected retryably while a terminal batch blocks the
+monitor. Daemon timer/reap lifecycle and public status/retry commands remain target behavior; no
+daemon/CLI ingestion surface is exposed yet.
 
 Verified: `libs/core/src/external-ingress/json.test.ts`, `contract.test.ts`,
 `contract-boundaries.test.ts`, `persistence.test.ts`, `persistence-queries.test.ts`,

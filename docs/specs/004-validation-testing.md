@@ -127,8 +127,8 @@ from [002 §2.6](./002-runtime-delivery.md#26-source-neutral-external-event-cont
 unknown fields, custom/accessor objects, cycles, sparse arrays, invalid timestamps, and unsafe or
 non-finite numbers. Validation errors contain only stable safe text and never echo external state.
 
-Receipt persistence plus immediate and bounded-debounce core runtime ingestion are current.
-Source-free deadline flushing and daemon/CLI boundaries remain later changes.
+Receipt persistence, immediate and bounded-debounce core runtime ingestion, and source-free
+deadline flushing are current. Daemon/CLI boundaries remain later changes.
 
 **Verified in:** `libs/core/src/external-ingress/json.test.ts`, `contract.test.ts`, and
 `contract-boundaries.test.ts`.
@@ -233,6 +233,8 @@ The `RuntimeStore.saveSnapshot()` and `RuntimeStore.latestSnapshot()` methods (i
 | Runtime decisions and policy failures are safe                   | Covered (`runtime.test.ts` — duplicate/conflict/stale/suppressed outcomes and pre-receipt throttle/rollup/overlong-debounce rejection).                              |
 | Debounce capture, extension, and shared flush preserve receipts  | Covered (`runtime.test.ts` — default/explicit settle, same/different objects, duplicate no-op, captured policy, ordinary tick, and retry-outbox correlation).        |
 | Pending external count and exact stored bytes are bounded        | Covered (`runtime.test.ts` — exact self-inclusive byte accounting plus 64-record/2 MiB rejection without receipt creation).                                          |
+| Due work flushes without monitor scan or source observation      | Covered (`runtime.test.ts` — captured burst survives monitor removal, uses original instructions, atomically correlates every receipt, and clears pending state).    |
+| Flush failure backs off, terminalizes, and explicitly recovers   | Covered (`runtime.test.ts` — injected rollback, all-receipt retry state, database reopen, fixed deadlines, terminal exclusion, explicit re-arm, and repair).         |
 
 ### 3.5 CLI behavior
 

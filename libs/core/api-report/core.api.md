@@ -30,6 +30,7 @@ export class AgentMonitorRuntime {
     doctorReport(input: DoctorReportInput): Promise<MonitorDoctorReport>;
     // (undocumented)
     explainMonitor(input: MonitorExplainInput): Promise<MonitorExplainReport>;
+    flushDueNotifications(workspaceIdentity: string, now?: Date): ExternalNotificationFlushResult;
     ingestExternalEvent(input: ExternalEventIngestInput, monitorsDir: string, now?: Date): Promise<ExternalEventIngestResult>;
     listEphemeralMonitors(sessionId: string): EphemeralMonitorRecord[];
     // (undocumented)
@@ -38,10 +39,12 @@ export class AgentMonitorRuntime {
     listObservationHistory(query?: ObservationHistoryQuery): ObservationHistoryRecord[];
     // (undocumented)
     listSessions(): AgentSessionRecord[];
+    nextExternalNotificationDeadline(workspaceIdentity: string): Date | null;
     // (undocumented)
     openSession(input: OpenSessionInput): AgentSessionRecord;
     previewCoalescedReminder(sessionId: string): string | undefined;
     previewSettledHighDelivery(sessionId: string): DeliveryEventSummary[];
+    rearmExternalEventReceipt(workspaceIdentity: string, receiptId: string, now?: Date): ExternalEventReceiptRecord;
     // (undocumented)
     refreshHookState(sessionId: string): SessionHookState;
     releaseDelivery(reservationId: string): void;
@@ -438,6 +441,12 @@ export const EXTERNAL_INGRESS_PENDING_MAX_BYTES: number;
 export const EXTERNAL_INGRESS_PENDING_MAX_RECORDS = 64;
 
 // @public (undocumented)
+export const EXTERNAL_NOTIFICATION_FLUSH_MAX_ATTEMPTS = 5;
+
+// @public (undocumented)
+export const EXTERNAL_NOTIFICATION_FLUSH_RETRY_DELAYS_MS: readonly [1000, 5000, 30000, 120000, 300000];
+
+// @public (undocumented)
 
 // @public
 export interface ExternalEventEnvelope {
@@ -592,6 +601,55 @@ export type ExternalJsonObject = Record<string, ExternalJsonValue>;
 export type ExternalJsonValue = null | boolean | number | string | ExternalJsonValue[] | {
     [key: string]: ExternalJsonValue;
 };
+
+// @public
+export interface ExternalNotificationDeadline {
+    // (undocumented)
+    dueAt: Date;
+    // (undocumented)
+    monitorId: string;
+}
+
+// @public
+export interface ExternalNotificationFlushFailure {
+    // (undocumented)
+    attemptCount: number;
+    // (undocumented)
+    message: string;
+    // (undocumented)
+    monitorId: string;
+    // (undocumented)
+    nextAttemptAt: Date | null;
+    // (undocumented)
+    terminal: boolean;
+}
+
+// @public
+export interface ExternalNotificationFlushResult {
+    // (undocumented)
+    emittedEventIds: string[];
+    // (undocumented)
+    failures: ExternalNotificationFlushFailure[];
+    // (undocumented)
+    flushedMonitorIds: string[];
+    // (undocumented)
+    nextDueAt: Date | null;
+}
+
+// @public
+export interface ExternalNotificationFlushState {
+    // (undocumented)
+    attemptCount: number;
+    // (undocumented)
+    lastError?: string;
+    // (undocumented)
+    nextAttemptAt?: string;
+    // (undocumented)
+    status: ExternalNotificationFlushStatus;
+}
+
+// @public (undocumented)
+export type ExternalNotificationFlushStatus = 'pending' | 'terminal';
 
 // @public
 export interface ExternalObjectSequenceRecord {
@@ -1571,6 +1629,7 @@ export interface PayloadTransform {
 export interface PendingDebounceState {
     // (undocumented)
     dueAt: string;
+    externalFlush?: ExternalNotificationFlushState;
     // (undocumented)
     observations: StoredObservationEnvelope[];
 }
@@ -1642,6 +1701,8 @@ export class RuntimeStore {
     completeMaterializationRetry<T>(id: string, operation: () => T): T;
     enqueueMaterializationRetries(inputs: EnqueueMaterializationRetryInput[], now?: Date): MaterializationRetryRecord[];
     externalEventReceiptStatus(workspaceIdentity: string, receiptId: string): ExternalEventReceiptRecord | null;
+    externalNotificationDeadlines(workspaceIdentity: string): ExternalNotificationDeadline[];
+    // (undocumented)
     externalObjectSequence(workspaceIdentity: string, monitorId: string, source: string, objectId: string): ExternalObjectSequenceRecord | null;
     findEphemeralMonitorById(id: string): EphemeralMonitorRecord | null;
     findSessionById(id: string): AgentSessionRecord | null;
@@ -1692,6 +1753,7 @@ export class RuntimeStore {
     // (undocumented)
     markExternalEventReceiptMaterialized(workspaceIdentity: string, receiptId: string, eventId: string, materializedAt?: Date): ExternalEventReceiptRecord;
     // (undocumented)
+    markExternalNotificationFlushFailed(workspaceIdentity: string, monitorId: string, now?: Date): ExternalNotificationFlushFailure;
     markMaterializationRetryFailed(id: string, error: string, now?: Date): MaterializationRetryRecord;
     materializationRetrySummary(monitorId: string, workspacePath: string | null): MaterializationRetrySummary;
     // (undocumented)
@@ -1705,6 +1767,8 @@ export class RuntimeStore {
     purgeExpiredObjectSuppressions(now: Date): void;
     reapEphemeralMonitor(id: string): void;
     reapEphemeralMonitorsForSession(sessionId: string): string[];
+    rearmExternalNotificationBatch(workspaceIdentity: string, receiptId: string, now?: Date): ExternalEventReceiptRecord;
+    // (undocumented)
     rearmMaterializationRetry(id: string, now?: Date): MaterializationRetryRecord;
     recordInterpretDecision(sessionId: string, eventId: string, decision: {
         decision: 'deliver' | 'suppress' | 'failed';
