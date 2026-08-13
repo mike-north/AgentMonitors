@@ -771,6 +771,54 @@ export class RuntimeStore {
     return row ? rowToExternalEventReceipt(row) : null;
   }
 
+  markExternalEventReceiptMaterialized(
+    workspaceIdentity: string,
+    receiptId: string,
+    eventId: string,
+    materializedAt = new Date(),
+  ): ExternalEventReceiptRecord {
+    const db = asInternalDb(this.db);
+    const row = db
+      .select()
+      .from(externalEventReceipts)
+      .where(
+        and(
+          eq(externalEventReceipts.workspaceIdentity, workspaceIdentity),
+          eq(externalEventReceipts.id, receiptId),
+        ),
+      )
+      .get();
+    if (!row) throw new Error(`External event receipt not found: ${receiptId}`);
+    if (row.outcome === 'materialized') {
+      const status = rowToExternalEventReceipt(row);
+      if (status.eventIds.length === 1 && status.eventIds[0] === eventId) {
+        return status;
+      }
+    }
+    if (row.outcome !== 'held') {
+      throw new Error(
+        `External event receipt ${receiptId} cannot materialize from ${row.outcome}.`,
+      );
+    }
+    db.update(externalEventReceipts)
+      .set({
+        outcome: 'materialized',
+        eventIds: JSON.stringify([eventId]),
+        materializedAt,
+        updatedAt: materializedAt,
+      })
+      .where(eq(externalEventReceipts.id, receiptId))
+      .run();
+    const updated = db
+      .select()
+      .from(externalEventReceipts)
+      .where(eq(externalEventReceipts.id, receiptId))
+      .get();
+    if (!updated)
+      throw new Error(`External event receipt not found: ${receiptId}`);
+    return rowToExternalEventReceipt(updated);
+  }
+
   /** Read the high-water mark for one exact workspace/monitor/source/object route. */
   externalObjectSequence(
     workspaceIdentity: string,
@@ -1248,7 +1296,10 @@ export class RuntimeStore {
       if (input.envelope.monitor.id !== input.monitorId) {
         throw new Error('Retry envelope monitor id does not match its route.');
       }
-      if (input.envelope.monitor.frontmatter.watch.type !== input.sourceName) {
+      if (
+        (input.envelope.sourceName ??
+          input.envelope.monitor.frontmatter.watch.type) !== input.sourceName
+      ) {
         throw new Error('Retry envelope source does not match its route.');
       }
       const envelope = serializeRetryEnvelope(input.envelope);

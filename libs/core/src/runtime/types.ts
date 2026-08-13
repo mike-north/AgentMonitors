@@ -646,7 +646,16 @@ export interface StoredObservationEnvelope {
    * @see docs/specs/002-runtime-delivery.md §4.1, §5.1
    */
   effectiveUrgency: Urgency;
+  /** External-ingress receipt correlated through every shared flush/retry path. */
+  ingressReceiptId?: string;
+  /** Event/audit source override; omitted for ordinary source observations. */
+  sourceName?: string;
+  /** Exact UTF-8 bytes consumed by this captured stored envelope. */
+  ingressStoredBytes?: number;
 }
+
+export const EXTERNAL_INGRESS_PENDING_MAX_RECORDS = 64;
+export const EXTERNAL_INGRESS_PENDING_MAX_BYTES = 2 * 1024 * 1024;
 
 /** Capability persisted once a workspace contains forward-only durable work. @public */
 export const DURABLE_INGRESS_COMPATIBILITY_MARKER = 'durable-ingress-v1';

@@ -1,4 +1,5 @@
 import { existsSync, statSync } from 'node:fs';
+import { Buffer } from 'node:buffer';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { ulid } from 'ulid';
@@ -79,6 +80,8 @@ import type {
 import {
   defaultNotifyConfigForUrgency,
   EPHEMERAL_MONITOR_ID_PREFIX,
+  EXTERNAL_INGRESS_PENDING_MAX_BYTES,
+  EXTERNAL_INGRESS_PENDING_MAX_RECORDS,
   type NotifyDispatchResult,
   type NotifyRuntimeState,
   type DeliveryLifecycle,
@@ -363,19 +366,36 @@ function serializeObservation(
   monitor: MonitorDefinition,
   observation: Observation,
   observedAt: Date,
+  ingress?: { receiptId: string; sourceName: string },
 ): StoredObservationEnvelope {
-  return {
+  const envelope: StoredObservationEnvelope = {
     monitor,
     observation,
     observedAt,
     effectiveUrgency: effectiveObservationUrgency(monitor, observation),
+    ...(ingress
+      ? {
+          ingressReceiptId: ingress.receiptId,
+          sourceName: ingress.sourceName,
+          ingressStoredBytes: 0,
+        }
+      : {}),
   };
+  if (ingress) {
+    let storedBytes = Buffer.byteLength(JSON.stringify(envelope), 'utf8');
+    while (storedBytes !== envelope.ingressStoredBytes) {
+      envelope.ingressStoredBytes = storedBytes;
+      storedBytes = Buffer.byteLength(JSON.stringify(envelope), 'utf8');
+    }
+  }
+  return envelope;
 }
 
 function hydrateStoredObservationEnvelope(
   envelope: StoredObservationEnvelope,
 ): StoredObservationEnvelope {
   return {
+    ...envelope,
     monitor: envelope.monitor,
     observation: envelope.observation,
     observedAt:
@@ -395,6 +415,27 @@ function hydrateStoredObservationEnvelope(
       (envelope.effectiveUrgency as Urgency | undefined) ??
       effectiveObservationUrgency(envelope.monitor, envelope.observation),
   };
+}
+
+function storedEnvelopeSourceName(envelope: StoredObservationEnvelope): string {
+  return envelope.sourceName ?? envelope.monitor.frontmatter.watch.type;
+}
+
+function externalPendingUsage(state: NotifyRuntimeState): {
+  records: number;
+  bytes: number;
+} {
+  return (state.pendingDebounce?.observations ?? []).reduce(
+    (usage, envelope) => {
+      if (!envelope.ingressReceiptId) return usage;
+      usage.records += 1;
+      usage.bytes +=
+        envelope.ingressStoredBytes ??
+        Buffer.byteLength(JSON.stringify(envelope), 'utf8');
+      return usage;
+    },
+    { records: 0, bytes: 0 },
+  );
 }
 
 function externalObservation(envelope: ExternalEventEnvelope): Observation {
@@ -1157,10 +1198,14 @@ export class AgentMonitorRuntime {
       monitor.frontmatter.urgency,
       monitor.frontmatter.notify,
     );
-    if (notify) {
+    if (
+      notify &&
+      (notify.strategy !== 'debounce' ||
+        parseDuration(notify['settle-for']) > 5 * 60_000)
+    ) {
       throw new ExternalEventIngestError(
         'unsupported_notify_strategy',
-        'This runtime supports immediate external ingress only.',
+        'External ingress supports only immediate or debounce up to 5 minutes.',
         false,
       );
     }
@@ -1186,7 +1231,7 @@ export class AgentMonitorRuntime {
     try {
       decision = this.store.withExternalEventReceipt(
         normalizedInput,
-        ({ acceptedAt }) => {
+        ({ receiptId, acceptedAt }) => {
           const monitorState = this.store.getMonitorState(
             monitor.id,
             normalizedInput.workspaceIdentity,
@@ -1196,19 +1241,28 @@ export class AgentMonitorRuntime {
             suppressed ? [] : [observation],
             acceptedAt,
             monitorState.notifyState,
+            { receiptId, sourceName: validation.envelope.source },
           );
+          const usage = externalPendingUsage(dispatch.nextState);
+          if (
+            usage.records > EXTERNAL_INGRESS_PENDING_MAX_RECORDS ||
+            usage.bytes > EXTERNAL_INGRESS_PENDING_MAX_BYTES
+          ) {
+            throw new ExternalEventIngestError(
+              'capacity_exceeded',
+              'External event pending capacity has been reached.',
+              true,
+            );
+          }
 
           const materialized: {
             envelope: StoredObservationEnvelope;
             result: MaterializedObservation;
           }[] = [];
           for (const envelope of dispatch.emitted) {
-            const isCurrent = envelope.observation === observation;
             const deterministic = this.materializeObservation({
               monitor: envelope.monitor,
-              sourceName: isCurrent
-                ? validation.envelope.source
-                : envelope.monitor.frontmatter.watch.type,
+              sourceName: storedEnvelopeSourceName(envelope),
               observation: envelope.observation,
               observedAt: envelope.observedAt,
               workspacePath: normalizedInput.workspaceIdentity,
@@ -1217,6 +1271,17 @@ export class AgentMonitorRuntime {
             if (!deterministic) {
               throw new Error(
                 'Captured external observation was suppressed during materialization.',
+              );
+            }
+            if (
+              envelope.ingressReceiptId &&
+              envelope.ingressReceiptId !== receiptId
+            ) {
+              this.store.markExternalEventReceiptMaterialized(
+                normalizedInput.workspaceIdentity,
+                envelope.ingressReceiptId,
+                deterministic.event.id,
+                acceptedAt,
               );
             }
             materialized.push({
@@ -1244,7 +1309,7 @@ export class AgentMonitorRuntime {
           );
 
           const current = materialized.find(
-            ({ envelope }) => envelope.observation === observation,
+            ({ envelope }) => envelope.ingressReceiptId === receiptId,
           );
           if (current) {
             return {
@@ -1254,6 +1319,10 @@ export class AgentMonitorRuntime {
             };
           }
           if (suppressed) return { outcome: 'suppressed' };
+          const held = dispatch.nextState.pendingDebounce?.observations.some(
+            (envelope) => envelope.ingressReceiptId === receiptId,
+          );
+          if (held) return { outcome: 'held' };
           throw new Error(
             'External event produced no durable runtime consequence.',
           );
@@ -3427,16 +3496,27 @@ export class AgentMonitorRuntime {
           continue;
         }
         try {
-          const result = this.materializeObservation({
-            monitor: envelope.monitor,
-            sourceName: envelope.monitor.frontmatter.watch.type,
-            observation: envelope.observation,
-            observedAt: envelope.observedAt,
-            workspacePath: options.workspacePath,
-            effectiveUrgency: envelope.effectiveUrgency,
-            ...(options.ephemeralSessionId !== undefined
-              ? { restrictToSessionId: options.ephemeralSessionId }
-              : {}),
+          const result = this.store.runInImmediateTransaction(() => {
+            const deterministic = this.materializeObservation({
+              monitor: envelope.monitor,
+              sourceName: storedEnvelopeSourceName(envelope),
+              observation: envelope.observation,
+              observedAt: envelope.observedAt,
+              workspacePath: options.workspacePath,
+              effectiveUrgency: envelope.effectiveUrgency,
+              ...(options.ephemeralSessionId !== undefined
+                ? { restrictToSessionId: options.ephemeralSessionId }
+                : {}),
+            });
+            if (deterministic && envelope.ingressReceiptId) {
+              this.store.markExternalEventReceiptMaterialized(
+                options.workspacePath,
+                envelope.ingressReceiptId,
+                deterministic.event.id,
+                options.retryQueuedAt,
+              );
+            }
+            return deterministic;
           });
           if (result) {
             materialized.push({
@@ -3460,7 +3540,7 @@ export class AgentMonitorRuntime {
           failures.map((failure) => ({
             workspacePath: options.workspacePath,
             monitorId: monitor.id,
-            sourceName: monitor.frontmatter.watch.type,
+            sourceName: storedEnvelopeSourceName(failure.envelope),
             envelope: failure.envelope,
             error: failure.message,
           })),
@@ -3487,7 +3567,10 @@ export class AgentMonitorRuntime {
         this.store.recordObservationHistory({
           monitorId: monitor.id,
           workspacePath: options.workspacePath,
-          sourceName: monitor.frontmatter.watch.type,
+          sourceName:
+            emitted[0] === undefined
+              ? monitor.frontmatter.watch.type
+              : storedEnvelopeSourceName(emitted[0]),
           result:
             emittedCount > 0
               ? 'triggered'
@@ -3509,7 +3592,7 @@ export class AgentMonitorRuntime {
         this.store.recordObservationHistory({
           monitorId: monitor.id,
           workspacePath: options.workspacePath,
-          sourceName: monitor.frontmatter.watch.type,
+          sourceName: storedEnvelopeSourceName(failure.envelope),
           result: 'errored',
           observationData: { error: failure.message },
         });
@@ -3619,6 +3702,14 @@ export class AgentMonitorRuntime {
             if (!deterministic) {
               throw new Error(
                 'Stored retry envelope was suppressed during materialization.',
+              );
+            }
+            if (record.envelope.ingressReceiptId) {
+              this.store.markExternalEventReceiptMaterialized(
+                workspacePath,
+                record.envelope.ingressReceiptId,
+                deterministic.event.id,
+                now,
               );
             }
             return {
@@ -4158,6 +4249,7 @@ export class AgentMonitorRuntime {
     observations: Observation[],
     observedAt: Date,
     state: NotifyRuntimeState,
+    ingress?: { receiptId: string; sourceName: string },
   ): NotifyDispatchResult {
     const emitted: StoredObservationEnvelope[] = [];
     const nextState: NotifyRuntimeState = { ...state };
@@ -4190,7 +4282,12 @@ export class AgentMonitorRuntime {
     }
 
     for (const observation of observations) {
-      const envelope = serializeObservation(monitor, observation, observedAt);
+      const envelope = serializeObservation(
+        monitor,
+        observation,
+        observedAt,
+        ingress,
+      );
       // Notify timing is evaluated against the observation's *effective*
       // urgency (salience clamped into the monitor's band), not the monitor's
       // base urgency — so a source can escalate a single observation onto the

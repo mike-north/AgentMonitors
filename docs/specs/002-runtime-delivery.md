@@ -815,9 +815,9 @@ Verified: `libs/core/src/runtime/types.ts` — `RuntimeTickResult`, `ErroredObse
 
 ### 2.6 Source-neutral external event contract
 
-> **Status: contract, persistence, and immediate core ingestion current; delayed/IPC ingestion
-> target.** Core accepts effective-immediate events through the runtime. Bounded debounce, daemon
-> IPC, and CLI submission remain later stacked changes.
+> **Status: contract, persistence, and core ingestion current; source-free/IPC ingestion target.**
+> Core accepts immediate and bounded-debounce events through the runtime. Independent deadline
+> flushing, daemon IPC, and CLI submission remain later stacked changes.
 
 `agentmonitors.external-event.v1` represents one producer-reconstructed current-state snapshot. Its
 required top-level fields are `schema`, `monitorId`, `source`, `upstreamEventId`, `objectId`,
@@ -865,11 +865,18 @@ monitor, and maps current state into the normal Shape, Diff, materialization, pr
 and best-effort Interpret pipeline. It records the external source on the event and in reserved
 query metadata while preserving the reconciliation source's `sourceState` and `lastObservationAt`.
 
-This stack entry accepts only an effective-immediate notify policy. Debounce, throttle, and rollup
-return permanent `unsupported_notify_strategy` before receipt creation; bounded debounce follows in
-the next entry. Deterministic output and the receipt commit atomically. Shape suppression records
-`suppressed`; stale and duplicate inputs create no event; conflicts fail permanently. Interpret
-starts after commit and safe structured failures never echo external state.
+Core supports effective immediate policy and debounce with `settle-for` no greater than five
+minutes. Throttle, rollup, and overlong debounce return permanent `unsupported_notify_strategy`
+before receipt creation. A held envelope captures the validated monitor definition, external
+source, receipt ID, and exact stored byte count. Each monitor may hold at most 64 external envelopes
+or 2 MiB; overflow is retryable and creates no receipt.
+
+External and reconciliation observations share notify state. Every shared materialization and
+retry-outbox path uses the captured source/monitor and changes a held receipt to `materialized` with
+its event ID in the same transaction. Thus an ordinary reconciliation tick can flush or retry a
+batch without losing correlation, and monitor edits affect only future input. Duplicate replay does
+not append or extend a deadline. A source-free deadline operation remains target behavior in the
+next stack entry; no daemon/CLI ingestion surface is exposed yet.
 
 Verified: `libs/core/src/external-ingress/json.test.ts`, `contract.test.ts`,
 `contract-boundaries.test.ts`, `persistence.test.ts`, `persistence-queries.test.ts`,

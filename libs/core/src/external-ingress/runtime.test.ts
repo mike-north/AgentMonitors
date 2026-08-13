@@ -1,4 +1,5 @@
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { Buffer } from 'node:buffer';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -9,6 +10,10 @@ import { SourceRegistry } from '../observation/registry.js';
 import type { ObservationSource } from '../observation/types.js';
 import { AgentMonitorRuntime } from '../runtime/service.js';
 import { RuntimeStore } from '../runtime/store.js';
+import {
+  EXTERNAL_INGRESS_PENDING_MAX_BYTES,
+  EXTERNAL_INGRESS_PENDING_MAX_RECORDS,
+} from '../runtime/types.js';
 import type { ExternalEventIngestInput } from './contract.js';
 import {
   EXTERNAL_EVENT_SCHEMA,
@@ -268,10 +273,113 @@ describe('AgentMonitorRuntime.ingestExternalEvent', () => {
   });
 
   it.each([
-    ['high-urgency default', 'urgency: high\n'],
+    ['high-urgency default', 'urgency: high\n', 15_000],
+    [
+      'explicit debounce',
+      'notify:\n  strategy: debounce\n  settle-for: 1m\n',
+      60_000,
+    ],
+  ])('durably holds the %s notify policy', async (_name, policy, settleMs) => {
+    const f = fixture(policy);
+    const result = await f.runtime.ingestExternalEvent(
+      eventInput(f.rootDir),
+      f.monitorsDir,
+      NOW,
+    );
+    const pending = f.store.getMonitorState('build-health', f.rootDir)
+      .notifyState.pendingDebounce;
+
+    expect(result).toMatchObject({ outcome: 'held', eventIds: [] });
+    expect(pending?.dueAt).toBe(
+      new Date(NOW.getTime() + settleMs).toISOString(),
+    );
+    expect(pending?.observations).toMatchObject([
+      {
+        ingressReceiptId: result.receiptId,
+        sourceName: 'example-build-system',
+        ingressStoredBytes: expect.any(Number),
+      },
+    ]);
+    const captured = pending?.observations[0];
+    expect(captured?.ingressStoredBytes).toBe(
+      Buffer.byteLength(JSON.stringify(captured), 'utf8'),
+    );
+  });
+
+  it('extends a burst only for new input and flushes its captured monitor on a normal tick', async () => {
+    const policy = 'notify:\n  strategy: debounce\n  settle-for: 1m\n';
+    const f = fixture(policy);
+    const first = await f.runtime.ingestExternalEvent(
+      eventInput(f.rootDir),
+      f.monitorsDir,
+      NOW,
+    );
+    const firstDue = f.store.getMonitorState('build-health', f.rootDir)
+      .notifyState.pendingDebounce?.dueAt;
+    const duplicate = await f.runtime.ingestExternalEvent(
+      eventInput(f.rootDir, { resumeToken: 'replay' }),
+      f.monitorsDir,
+      new Date(NOW.getTime() + 30_000),
+    );
+    expect(duplicate.disposition).toBe('duplicate');
+    expect(
+      f.store.getMonitorState('build-health', f.rootDir).notifyState
+        .pendingDebounce?.dueAt,
+    ).toBe(firstDue);
+
+    const second = await f.runtime.ingestExternalEvent(
+      eventInput(f.rootDir, {
+        upstreamEventId: 'delivery-2',
+        objectSequence: 2,
+      }),
+      f.monitorsDir,
+      new Date(NOW.getTime() + 30_000),
+    );
+    const third = await f.runtime.ingestExternalEvent(
+      eventInput(f.rootDir, {
+        upstreamEventId: 'delivery-3',
+        objectId: 'build-group-2',
+        objectSequence: 1,
+      }),
+      f.monitorsDir,
+      new Date(NOW.getTime() + 60_000),
+    );
+    const pending = f.store.getMonitorState('build-health', f.rootDir)
+      .notifyState.pendingDebounce;
+    expect(pending?.observations).toHaveLength(3);
+    expect(pending?.dueAt).toBe(
+      new Date(NOW.getTime() + 120_000).toISOString(),
+    );
+
+    writeMonitor(f.rootDir, policy, 'Edited instructions for future input.');
+    vi.setSystemTime(NOW.getTime() + 121_000);
+    expect(
+      (await f.runtime.tick(f.monitorsDir, f.rootDir)).emittedEventIds,
+    ).toHaveLength(3);
+    expect(
+      f.runtime
+        .listEvents({ workspacePath: f.rootDir })
+        .map(({ body }) => body),
+    ).toEqual(Array(3).fill('Handle the original instructions.'));
+    for (const receipt of [first, second, third]) {
+      expect(
+        f.store.externalEventReceiptStatus(f.rootDir, receipt.receiptId),
+      ).toMatchObject({
+        outcome: 'materialized',
+        eventIds: [expect.any(String)],
+        materializedAt: new Date(NOW.getTime() + 121_000),
+      });
+    }
+    expect(
+      f.store.getMonitorState('build-health', f.rootDir).notifyState
+        .pendingDebounce,
+    ).toBeUndefined();
+  });
+
+  it.each([
     ['throttle', 'notify:\n  strategy: throttle\n  suppress-for: 1m\n'],
     ['rollup', 'notify:\n  strategy: rollup\n  window: "0 9 * * *"\n'],
-    ['debounce', 'notify:\n  strategy: debounce\n  settle-for: 1m\n'],
+    ['overlong debounce', 'notify:\n  strategy: debounce\n  settle-for: 6m\n'],
   ])(
     'rejects unsupported %s before receipt creation',
     async (_name, policy) => {
@@ -292,6 +400,67 @@ describe('AgentMonitorRuntime.ingestExternalEvent', () => {
           'build-group-1',
         ),
       ).toBeNull();
+
+      writeMonitor(
+        f.rootDir,
+        'notify:\n  strategy: debounce\n  settle-for: 1m\n',
+      );
+      await expect(
+        f.runtime.ingestExternalEvent(input, f.monitorsDir, NOW),
+      ).resolves.toMatchObject({ disposition: 'accepted', outcome: 'held' });
+    },
+  );
+
+  it.each([
+    ['record count', EXTERNAL_INGRESS_PENDING_MAX_RECORDS, 1],
+    ['stored bytes', 8, EXTERNAL_INGRESS_PENDING_MAX_BYTES / 8],
+  ])(
+    'rejects %s overflow without retaining a receipt',
+    async (_name, count, bytes) => {
+      const f = fixture('notify:\n  strategy: debounce\n  settle-for: 1m\n');
+      await f.runtime.ingestExternalEvent(
+        eventInput(f.rootDir),
+        f.monitorsDir,
+        NOW,
+      );
+      const held = f.store.getMonitorState('build-health', f.rootDir)
+        .notifyState.pendingDebounce?.observations[0];
+      if (!held) throw new Error('expected held envelope');
+      f.store.setMonitorState('build-health', f.rootDir, {
+        notifyState: {
+          pendingDebounce: {
+            observations: Array.from({ length: count }, () => ({
+              ...held,
+              ingressStoredBytes: bytes,
+            })),
+            dueAt: new Date(NOW.getTime() + 60_000).toISOString(),
+          },
+        },
+      });
+      const overflow = eventInput(f.rootDir, {
+        upstreamEventId: 'delivery-overflow',
+        objectSequence: 2,
+      });
+      const error = await ingestError(
+        f.runtime.ingestExternalEvent(
+          overflow,
+          f.monitorsDir,
+          new Date(NOW.getTime() + 1_000),
+        ),
+      );
+      expect(error.toExternalEventError()).toMatchObject({
+        code: 'capacity_exceeded',
+        retryable: true,
+      });
+
+      f.store.setMonitorState('build-health', f.rootDir, { notifyState: {} });
+      await expect(
+        f.runtime.ingestExternalEvent(
+          overflow,
+          f.monitorsDir,
+          new Date(NOW.getTime() + 2_000),
+        ),
+      ).resolves.toMatchObject({ disposition: 'accepted' });
     },
   );
 
@@ -333,6 +502,41 @@ describe('AgentMonitorRuntime.ingestExternalEvent', () => {
     await expect(
       f.runtime.ingestExternalEvent(input, f.monitorsDir, NOW),
     ).resolves.toMatchObject({ disposition: 'accepted' });
+  });
+
+  it('correlates a failed ordinary flush through the retry outbox', async () => {
+    const f = fixture('notify:\n  strategy: debounce\n  settle-for: 1s\n', {
+      faultStore: true,
+    });
+    const store = f.store as FaultStore;
+    const held = await f.runtime.ingestExternalEvent(
+      eventInput(f.rootDir),
+      f.monitorsDir,
+      NOW,
+    );
+    store.snapshotFailures = 1;
+    vi.setSystemTime(NOW.getTime() + 1_000);
+    await f.runtime.tick(f.monitorsDir, f.rootDir);
+    expect(
+      store.externalEventReceiptStatus(f.rootDir, held.receiptId),
+    ).toMatchObject({ outcome: 'held', eventIds: [] });
+    expect(store.listMaterializationRetries()).toMatchObject([
+      {
+        sourceName: 'example-build-system',
+        envelope: { ingressReceiptId: held.receiptId },
+      },
+    ]);
+
+    vi.setSystemTime(NOW.getTime() + 2_000);
+    await f.runtime.tick(f.monitorsDir, f.rootDir);
+    expect(store.listMaterializationRetries()).toEqual([]);
+    expect(
+      store.externalEventReceiptStatus(f.rootDir, held.receiptId),
+    ).toMatchObject({
+      outcome: 'materialized',
+      eventIds: [expect.any(String)],
+      materializedAt: new Date(NOW.getTime() + 2_000),
+    });
   });
 
   it('classifies invalid routing without exposing envelope state', async () => {

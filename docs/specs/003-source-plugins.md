@@ -355,6 +355,10 @@ monitor's `watch.type`. It maps producer-reconstructed current state directly in
 authored source remains responsible for low-frequency reconciliation, and external ingestion MUST
 preserve that source's `sourceState` and `lastObservationAt`.
 
+Both producers share runtime-owned notify state. A held external observation captures its monitor
+definition and source metadata, so a later reconciliation tick or durable materialization retry
+uses the accepted policy without rewriting the source-owned cursor.
+
 Verified: `libs/core/src/external-ingress/runtime.test.ts`.
 
 ## 3. Bundled Source: `file-fingerprint`
