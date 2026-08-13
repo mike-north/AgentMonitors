@@ -9,6 +9,13 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-08-13 — External persistence reads and downgrade markers are current (002 §2.6, §15; 004 §3.4.1) — Refs #481
+
+Core now exposes exact-workspace safe receipt reads and exact four-dimension object-sequence reads.
+Nonempty durable debounce/rollup state and materialization retry admission write the matching
+global or workspace `durable-ingress-v1` marker in the same transaction; empty batches do not mark
+an otherwise compatible database. Runtime ingestion remains target behavior in the next layers.
+
 ## 2026-08-13 — External receipts and object ordering are durable (002 §2.6, §15; 004 §3.4.1) — Refs #481
 
 Core now persists compact workspace-aware external-event receipts and per-object sequence

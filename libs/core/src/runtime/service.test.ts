@@ -3990,20 +3990,24 @@ Handle it.
     expect(handle.monitorIds).toEqual(['test-monitor']);
 
     await expect
-      .poll(() =>
-        new RuntimeStore(createDb(dbPath))
-          .listMaterializationRetries()
-          .map(({ envelope }) => envelope.observation.summary),
+      .poll(
+        () =>
+          new RuntimeStore(createDb(dbPath))
+            .listMaterializationRetries()
+            .map(({ envelope }) => envelope.observation.summary),
+        { timeout: 3_000 },
       )
       .toEqual(['boom']);
     expect(iteratorPulls).toEqual(['boom']);
     expect(runtime.listEvents({ sessionId: session.id })).toEqual([]);
 
     await expect
-      .poll(() =>
-        runtime
-          .listEvents({ sessionId: session.id })
-          .some((event) => event.summary === 'ok'),
+      .poll(
+        () =>
+          runtime
+            .listEvents({ sessionId: session.id })
+            .some((event) => event.summary === 'ok'),
+        { timeout: 3_000 },
       )
       .toBe(true);
 

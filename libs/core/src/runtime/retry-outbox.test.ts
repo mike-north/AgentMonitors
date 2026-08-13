@@ -64,7 +64,7 @@ function envelope(
 function input(
   monitorId: string,
   objectKey: string,
-  workspacePath = '/workspace',
+  workspacePath: string | null = '/workspace',
   snapshotText?: string,
 ): EnqueueMaterializationRetryInput {
   return {
@@ -105,6 +105,7 @@ describe('materialization retry outbox', () => {
     );
 
     expect(inserted).toHaveLength(2);
+    expect(firstStore.hasDatabaseCompatibilityMarker('/workspace')).toBe(true);
     expect(inserted[0]?.nextAttemptAt?.getTime()).toBe(
       NOW.getTime() + MATERIALIZATION_RETRY_DELAYS_MS[0],
     );
@@ -125,6 +126,24 @@ describe('materialization retry outbox', () => {
         workspacePath: '/other-workspace',
       }),
     ).toEqual([]);
+  });
+
+  it('marks named and global retry routes but not an empty admission', () => {
+    const store = new RuntimeStore(createDb(':memory:'));
+
+    expect(store.enqueueMaterializationRetries([], NOW)).toEqual([]);
+    expect(store.hasDatabaseCompatibilityMarker('/workspace')).toBe(false);
+    expect(store.hasDatabaseCompatibilityMarker(null)).toBe(false);
+
+    store.enqueueMaterializationRetries(
+      [
+        input('named-monitor', 'named-object'),
+        input('global-monitor', 'global-object', null),
+      ],
+      NOW,
+    );
+    expect(store.hasDatabaseCompatibilityMarker('/workspace')).toBe(true);
+    expect(store.hasDatabaseCompatibilityMarker(null)).toBe(true);
   });
 
   it('serializes competing connections at the exact 256-row boundary', () => {

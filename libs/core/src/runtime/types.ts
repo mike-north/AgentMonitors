@@ -693,6 +693,26 @@ export interface ExternalEventReceiptRecord {
   updatedAt: Date;
 }
 
+/** Highest accepted sequence for one exact external object route. @public */
+export interface ExternalObjectSequenceRecord {
+  /** Canonical local workspace identity. */
+  workspaceIdentity: string;
+  /** Local monitor identity from the accepted envelope. */
+  monitorId: string;
+  /** Stable external producer name. */
+  source: string;
+  /** Producer object whose sequence is tracked. */
+  objectId: string;
+  /** Highest sequence accepted for the exact route. */
+  highestSequence: number;
+  /** Receipt that most recently advanced the sequence. */
+  receiptId: string;
+  /** Producer idempotency identifier that advanced the sequence. */
+  upstreamEventId: string;
+  /** Time the sequence was last advanced. */
+  updatedAt: Date;
+}
+
 /** Context passed to new-event durable work inside the receipt transaction. @public */
 export interface ExternalEventReceiptContext {
   /** Receipt identifier reserved for the accepted event. */

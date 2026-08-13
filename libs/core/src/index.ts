@@ -216,6 +216,7 @@ export type {
   ExternalEventReceiptDecision,
   ExternalEventReceiptOperation,
   ExternalEventReceiptRecord,
+  ExternalObjectSequenceRecord,
   DoctorMonitorRollup,
   DoctorParseError,
   DoctorReportInput,
