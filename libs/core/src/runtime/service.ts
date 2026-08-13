@@ -2820,11 +2820,11 @@ export class AgentMonitorRuntime {
           }
           return;
         }
-        this.store.setMonitorState(monitor.id, workspacePath, {
+        const nextMonitorState = {
           sourceState: monitorStateForSkip.sourceState,
           notifyState: rollupDispatch.nextState,
           lastObservationAt: monitorStateForSkip.lastObservationAt ?? null,
-        });
+        };
         // Route the flushed batch through the SAME span materialization as
         // `ingest()` (issue #180) so the not-due path records the `triggered`
         // observation_history row (002 §10.7) and writes every emitted
@@ -2842,6 +2842,7 @@ export class AgentMonitorRuntime {
               {
                 observed: 0,
                 workspacePath,
+                nextMonitorState,
                 retryQueuedAt: now,
                 ...(ephemeralSessionId !== undefined
                   ? { ephemeralSessionId }
@@ -2857,9 +2858,42 @@ export class AgentMonitorRuntime {
                 ),
               });
             }
-          } catch {
-            // Best-effort legacy rollup boundary. The next stack layer couples
-            // this state transition to materialization transactionally.
+          } catch (materializeError) {
+            const message = errorMessage(materializeError);
+            acc.erroredObservations.push({ monitorId: monitor.id, message });
+            try {
+              this.store.recordObservationHistory({
+                monitorId: monitor.id,
+                workspacePath,
+                sourceName,
+                result: 'errored',
+                observationData: { error: message },
+              });
+            } catch {
+              // best-effort audit — ignore write failures
+            }
+          }
+        } else {
+          try {
+            this.store.setMonitorState(
+              monitor.id,
+              workspacePath,
+              nextMonitorState,
+            );
+          } catch (stateError) {
+            const message = errorMessage(stateError);
+            acc.erroredObservations.push({ monitorId: monitor.id, message });
+            try {
+              this.store.recordObservationHistory({
+                monitorId: monitor.id,
+                workspacePath,
+                sourceName,
+                result: 'errored',
+                observationData: { error: message },
+              });
+            } catch {
+              // best-effort audit — ignore write failures
+            }
           }
         }
       }

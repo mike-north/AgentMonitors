@@ -199,7 +199,7 @@ Two contradiction resolutions recorded per 004 §5, both surfaced by PR #512 rev
 One immediate transaction now commits successful event materializations, ordered retry envelopes,
 and source/notify state. A state or outbox failure rolls the whole batch back to the prior source
 baseline. Tick ids, errors, and history reflect only committed work, and Interpret runs only after
-commit. Retry draining and rollup-window adoption follow in the next stack layers.
+commit. Retry draining follows in the next stack layer.
 
 ## 2026-08-13 — Failed materialization has a bounded durable retry outbox (002 schema, 004 §3.4, 005 §15) — Refs #295, #481
 
