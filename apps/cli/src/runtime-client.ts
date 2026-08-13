@@ -9,8 +9,12 @@ import type {
   DoctorReportInput,
   EphemeralMonitorRecord,
   EventQuery,
+  ExternalEventEnvelope,
+  ExternalEventIngestResult,
+  ExternalEventReceiptRecord,
   HookDeliveryDiagnosis,
   MaterializationRetrySummary,
+  MaterializationRetryRecord,
   MonitorDoctorReport,
   MonitorExplainInput,
   MonitorExplainReport,
@@ -22,6 +26,23 @@ import type {
 } from '@agentmonitors/core';
 import { createRuntime } from './runtime.js';
 import { callDaemon, type DaemonStatusResult } from './daemon-ipc.js';
+
+export interface ExternalDaemonRouting {
+  workspaceIdentity: string;
+  monitorsDirIdentity: string;
+}
+
+export type SafeMaterializationRetry = Pick<
+  MaterializationRetryRecord,
+  | 'id'
+  | 'monitorId'
+  | 'sourceName'
+  | 'attemptCount'
+  | 'status'
+  | 'nextAttemptAt'
+  | 'lastError'
+  | 'updatedAt'
+>;
 
 export async function openSessionClient(
   input: OpenSessionInput,
@@ -79,6 +100,77 @@ export async function acknowledgeEventsClient(
     },
     socketPath ? { socketPath } : {},
   );
+}
+
+export async function ingestExternalEventClient(
+  routing: ExternalDaemonRouting,
+  envelope: ExternalEventEnvelope,
+  socketPath?: string,
+): Promise<ExternalEventIngestResult> {
+  return await callDaemon<ExternalEventIngestResult>(
+    'events.ingest',
+    { ...routing, envelope },
+    socketPath ? { socketPath } : {},
+  );
+}
+
+function reviveExternalReceipt(
+  receipt: ExternalEventReceiptRecord,
+): ExternalEventReceiptRecord {
+  return {
+    ...receipt,
+    nextAttemptAt: receipt.nextAttemptAt
+      ? new Date(receipt.nextAttemptAt)
+      : null,
+    acceptedAt: new Date(receipt.acceptedAt),
+    materializedAt: receipt.materializedAt
+      ? new Date(receipt.materializedAt)
+      : null,
+    updatedAt: new Date(receipt.updatedAt),
+  };
+}
+
+export async function externalEventReceiptStatusClient(
+  routing: ExternalDaemonRouting,
+  receiptId: string,
+  socketPath?: string,
+): Promise<ExternalEventReceiptRecord | null> {
+  const receipt = await callDaemon<ExternalEventReceiptRecord | null>(
+    'events.ingestStatus',
+    { ...routing, receiptId },
+    socketPath ? { socketPath } : {},
+  );
+  return receipt ? reviveExternalReceipt(receipt) : null;
+}
+
+export async function rearmExternalEventReceiptClient(
+  routing: ExternalDaemonRouting,
+  receiptId: string,
+  socketPath?: string,
+): Promise<ExternalEventReceiptRecord> {
+  const receipt = await callDaemon<ExternalEventReceiptRecord>(
+    'events.ingestRetry',
+    { ...routing, receiptId },
+    socketPath ? { socketPath } : {},
+  );
+  return reviveExternalReceipt(receipt);
+}
+
+export async function rearmMaterializationRetryClient(
+  routing: ExternalDaemonRouting,
+  retryId: string,
+  socketPath?: string,
+): Promise<SafeMaterializationRetry> {
+  const retry = await callDaemon<SafeMaterializationRetry>(
+    'monitor.retryOutbox',
+    { ...routing, retryId },
+    socketPath ? { socketPath } : {},
+  );
+  return {
+    ...retry,
+    nextAttemptAt: retry.nextAttemptAt ? new Date(retry.nextAttemptAt) : null,
+    updatedAt: new Date(retry.updatedAt),
+  };
 }
 
 /**

@@ -15,6 +15,7 @@ import { eventsCommand } from './commands/events.js';
 import { hookCommand } from './commands/hook.js';
 import { channelCommand } from './commands/channel.js';
 import { watchCommand } from './commands/watch.js';
+import { registerExternalIngressCommands } from './commands/external-ingress.js';
 
 const program = new Command();
 
@@ -22,6 +23,8 @@ program
   .name('agentmonitors')
   .description('Durable observation and inbox delivery for AI agents')
   .version(getCliVersion());
+
+registerExternalIngressCommands(eventsCommand, monitorTestCommand);
 
 program.addCommand(initCommand);
 program.addCommand(validateCommand);

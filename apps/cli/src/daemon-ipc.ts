@@ -1205,7 +1205,7 @@ export function createDaemonServer({
         id,
         error: error instanceof Error ? error.message : String(error),
         code: 'internal_error',
-        retryable: false,
+        retryable: true,
       });
     };
 
