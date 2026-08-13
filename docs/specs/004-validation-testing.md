@@ -189,6 +189,7 @@ The `RuntimeStore.saveSnapshot()` and `RuntimeStore.latestSnapshot()` methods (i
 | Retry envelopes round-trip without silent data conversion        | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — BigInt, nested Date, and accessor values fail with a domain error before any sibling is written).                                                                    |
 | Retry errors are safe and bounded                                | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — C0/DEL controls are stripped and persisted errors are capped at 1,024 characters).                                                                                   |
 | Retry backoff terminalizes and requires explicit re-arm          | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — due filtering, fixed delays, five-attempt terminal state, invalid transitions, re-arm, and transaction-coupled completion).                                          |
+| Retry summaries never expose captured envelopes or payloads      | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — safe terminal metadata is present while envelope title/content is absent).                                                                                           |
 
 ### 3.5 CLI behavior
 

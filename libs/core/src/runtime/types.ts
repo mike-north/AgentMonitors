@@ -450,6 +450,11 @@ export interface MonitorExplainReport {
   events: MonitorEventRecord[];
   projections: MonitorDeliveryProjection[];
   leadSessions: AgentSessionRecord[];
+  /**
+   * Durable materialization work still pending or terminal for this monitor.
+   * Optional for compatibility with reports returned by older daemons.
+   */
+  materializationRetries?: MaterializationRetrySummary;
 }
 
 /**
@@ -507,6 +512,11 @@ export interface DoctorMonitorRollup {
   lastEventAt?: Date;
   /** Delivery-state tallies across this workspace's lead-session projections. */
   delivery: DoctorDeliveryCounts;
+  /**
+   * Durable failed observations awaiting retry or operator repair. Optional
+   * for compatibility with reports returned by older daemons.
+   */
+  materializationRetries?: MaterializationRetrySummary;
 }
 
 /** A parse-level failure attributed to a monitor id (or file path fallback). */
@@ -707,7 +717,25 @@ export interface MaterializationRetryQuery {
   limit?: number;
 }
 
-/** Aggregate capacity and lifecycle counts for one retry outbox. @public */
+/** Operator-safe retry metadata that never contains an envelope or payload. @public */
+export interface MaterializationRetryDiagnostic {
+  /** Stable retry id used by the operator re-arm flow. */
+  id: string;
+  /** Whether automatic work remains eligible or requires operator re-arm. */
+  status: MaterializationRetryStatus;
+  /** Number of failed automatic attempts since enqueue or re-arm. */
+  attemptCount: number;
+  /** Next eligible attempt; null while terminal. */
+  nextAttemptAt: Date | null;
+  /** Control-stripped, 1,024-character failure summary. */
+  lastError: string | null;
+  /** Time the failed observation first entered the outbox. */
+  createdAt: Date;
+  /** Time of the most recent failed attempt or operator re-arm. */
+  updatedAt: Date;
+}
+
+/** Aggregate and bounded record-level diagnostics for one retry outbox. @public */
 export interface MaterializationRetrySummary {
   /** Records still eligible for automatic retry. */
   pending: number;
@@ -715,6 +743,8 @@ export interface MaterializationRetrySummary {
   terminal: number;
   /** Total UTF-8 bytes occupied by stored envelopes in both states. */
   bytes: number;
+  /** Oldest-first safe metadata, without stored envelopes or payloads. */
+  records: MaterializationRetryDiagnostic[];
 }
 
 export interface ProcessObservationInput {
