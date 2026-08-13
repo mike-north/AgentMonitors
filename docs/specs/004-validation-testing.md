@@ -202,6 +202,7 @@ session id and exact unread event, and delivery leaves that event unread until e
 The test is registered in the serial configuration; child exits are awaited before fixture removal.
 This proves recovery of already-persisted recipient work, not automatic process supervision,
 uncommitted observation recovery, power-loss durability, or the pending materialization-retry stack.
+| Retry summaries never expose captured envelopes or payloads      | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — safe terminal metadata is present while envelope title/content is absent).                                                                                           |
 
 ### 3.5 CLI behavior
 

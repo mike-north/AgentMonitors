@@ -1899,6 +1899,13 @@ Verified by `retry-outbox.test.ts` and `retry-lifecycle.test.ts`: due boundaries
 callback non-execution, actual snapshot/deletion fault rollback, failure-text sanitization and
 failed/terminal/rearmed/completed states across on-disk reopen.
 
+Runtime diagnostics expose each row's id, status, attempt count, safe error, and attempt timestamps
+through `monitor explain` and `doctor`. They never expose the stored envelope or its payload.
+
+_Current in this change:_ storage, retry lifecycle, and safe core diagnostic reports. CLI rendering
+and older-daemon compatibility are added in the next stack layer. Runtime drain-before-observe
+adoption follows after that for #295.
+
 ### `session_event_state`
 
 Per-session delivery tracking for each projected event. Drives the unread/claimed/acknowledged state machine (§7).
