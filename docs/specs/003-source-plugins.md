@@ -347,6 +347,16 @@ The motivating failure: a delivered event whose headline was ~400 characters of 
 delivery ([002 §5.4](./002-runtime-delivery.md#54-event-title)); an unbounded implementation detail
 in that position conveys nothing and crowds out what does.
 
+### 2.9 External ingress is an alternate producer
+
+The source-neutral external-ingress runtime method does not register a source plugin or invoke the
+monitor's `watch.type`. It maps producer-reconstructed current state directly into an
+`Observation`, then hands it to the runtime-owned Shape/notify/materialization pipeline. The
+authored source remains responsible for low-frequency reconciliation, and external ingestion MUST
+preserve that source's `sourceState` and `lastObservationAt`.
+
+Verified: `libs/core/src/external-ingress/runtime.test.ts`.
+
 ## 3. Bundled Source: `file-fingerprint`
 
 Source name: `"file-fingerprint"` (verified: `plugins/source-file-fingerprint/src/index.ts` line 278).
