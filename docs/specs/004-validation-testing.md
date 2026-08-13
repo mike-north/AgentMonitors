@@ -188,6 +188,7 @@ The `RuntimeStore.saveSnapshot()` and `RuntimeStore.latestSnapshot()` methods (i
 | Retry outbox capacity is batch-atomic and workspace-scoped       | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — exact 256-row and 8 MiB UTF-8 boundaries, competing connections, no partial batch, and independent monitor/workspace scopes).                                        |
 | Retry envelopes round-trip without silent data conversion        | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — BigInt, nested Date, and accessor values fail with a domain error before any sibling is written).                                                                    |
 | Retry errors are safe and bounded                                | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — C0/DEL controls are stripped and persisted errors are capped at 1,024 characters).                                                                                   |
+| Retry backoff terminalizes and requires explicit re-arm          | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — due filtering, fixed delays, five-attempt terminal state, invalid transitions, re-arm, and transaction-coupled completion).                                          |
 
 ### 3.5 CLI behavior
 

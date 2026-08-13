@@ -77,6 +77,7 @@ import type {
   MonitorRuntimeState,
   MaterializationRetryQuery,
   MaterializationRetryRecord,
+  MaterializationRetrySummary,
   ObservationHistoryQuery,
   ObservationHistoryRecord,
   ObservationOutcome,
@@ -87,6 +88,7 @@ import type {
 } from './types.js';
 import {
   MATERIALIZATION_RETRY_DELAYS_MS,
+  MATERIALIZATION_RETRY_MAX_ATTEMPTS,
   MATERIALIZATION_RETRY_MAX_BYTES,
   MATERIALIZATION_RETRY_MAX_RECORDS,
 } from './types.js';
@@ -918,7 +920,10 @@ export class RuntimeStore {
     return rowToMaterializationRetry(row);
   }
 
-  /** List retry records oldest-first with optional route and status filters. */
+  /**
+   * List retry records oldest-first. A `dueAt` query returns pending records
+   * only, even if a caller also supplies an incompatible terminal status.
+   */
   listMaterializationRetries(
     query: MaterializationRetryQuery = {},
   ): MaterializationRetryRecord[] {
@@ -934,6 +939,12 @@ export class RuntimeStore {
       query.status
         ? eq(materializationRetryOutbox.status, query.status)
         : undefined,
+      query.dueAt
+        ? eq(materializationRetryOutbox.status, 'pending')
+        : undefined,
+      query.dueAt
+        ? lte(materializationRetryOutbox.nextAttemptAt, query.dueAt)
+        : undefined,
     ].filter((condition) => condition !== undefined);
     return asInternalDb(this.db)
       .select()
@@ -946,6 +957,121 @@ export class RuntimeStore {
       .limit(query.limit ?? MATERIALIZATION_RETRY_MAX_RECORDS)
       .all()
       .map(rowToMaterializationRetry);
+  }
+
+  /** Return capacity and lifecycle counts for one workspace/monitor outbox. */
+  materializationRetrySummary(
+    monitorId: string,
+    workspacePath: string | null,
+  ): MaterializationRetrySummary {
+    const rows = asInternalDb(this.db)
+      .select({
+        status: materializationRetryOutbox.status,
+        bytes: materializationRetryOutbox.envelopeBytes,
+      })
+      .from(materializationRetryOutbox)
+      .where(materializationRetryKey(monitorId, workspacePath))
+      .all();
+    return rows.reduce<MaterializationRetrySummary>(
+      (summary, row) => {
+        summary[row.status] += 1;
+        summary.bytes += row.bytes;
+        return summary;
+      },
+      { pending: 0, terminal: 0, bytes: 0 },
+    );
+  }
+
+  /** Record a failed automatic attempt and advance bounded backoff state. */
+  markMaterializationRetryFailed(
+    id: string,
+    error: string,
+    now = new Date(),
+  ): MaterializationRetryRecord {
+    const db = asInternalDb(this.db);
+    return db.$client
+      .transaction(() => {
+        const current = this.getMaterializationRetry(id);
+        if (current.status === 'terminal') {
+          throw new Error(`Materialization retry record is terminal: ${id}`);
+        }
+        const attemptCount = current.attemptCount + 1;
+        const terminal = attemptCount >= MATERIALIZATION_RETRY_MAX_ATTEMPTS;
+        db.update(materializationRetryOutbox)
+          .set({
+            attemptCount,
+            status: terminal ? 'terminal' : 'pending',
+            nextAttemptAt: terminal
+              ? null
+              : new Date(
+                  now.getTime() +
+                    (MATERIALIZATION_RETRY_DELAYS_MS[attemptCount] ?? 0),
+                ),
+            lastError: safeRetryError(error),
+            updatedAt: now,
+          })
+          .where(eq(materializationRetryOutbox.id, id))
+          .run();
+        return this.getMaterializationRetry(id);
+      })
+      .immediate();
+  }
+
+  /** Explicitly re-arm a terminal record from the beginning of its backoff. */
+  rearmMaterializationRetry(
+    id: string,
+    now = new Date(),
+  ): MaterializationRetryRecord {
+    const db = asInternalDb(this.db);
+    return db.$client
+      .transaction(() => {
+        const current = this.getMaterializationRetry(id);
+        if (current.status !== 'terminal') {
+          throw new Error(
+            `Materialization retry record is not terminal: ${id}`,
+          );
+        }
+        db.update(materializationRetryOutbox)
+          .set({
+            attemptCount: 0,
+            status: 'pending',
+            nextAttemptAt: new Date(
+              now.getTime() + MATERIALIZATION_RETRY_DELAYS_MS[0],
+            ),
+            lastError: null,
+            updatedAt: now,
+          })
+          .where(eq(materializationRetryOutbox.id, id))
+          .run();
+        return this.getMaterializationRetry(id);
+      })
+      .immediate();
+  }
+
+  /**
+   * Complete synchronous materialization and delete its retry record in the
+   * same immediate transaction. A thrown operation leaves the record intact.
+   *
+   * @internal
+   */
+  completeMaterializationRetry<T>(id: string, operation: () => T): T {
+    const db = asInternalDb(this.db);
+    return db.$client
+      .transaction(() => {
+        this.getMaterializationRetry(id);
+        const result = operation();
+        const deleted = db
+          .delete(materializationRetryOutbox)
+          .where(eq(materializationRetryOutbox.id, id))
+          .run().changes;
+        if (deleted !== 1) {
+          throw new Error(
+            `Materialization retry record disappeared before commit: ${id}`,
+          );
+        }
+        return result;
+      })
+      .immediate();
   }
 
   /**
