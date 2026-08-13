@@ -3760,14 +3760,9 @@ export class AgentMonitorRuntime {
       { previousContent: previousSnapshot?.content ?? null },
       // Ephemeral-monitor projection isolation (007 §4.6): restrict projection to
       // the declaring session so its events never reach a sibling lead session.
-      {
-        ...(input.restrictToSessionId !== undefined
-          ? { restrictToSessionId: input.restrictToSessionId }
-          : {}),
-        ...(effectiveSnapshotText
-          ? { snapshot: { content: effectiveSnapshotText } }
-          : {}),
-      },
+      input.restrictToSessionId !== undefined
+        ? { restrictToSessionId: input.restrictToSessionId }
+        : undefined,
     );
 
     return { event, diffText };
