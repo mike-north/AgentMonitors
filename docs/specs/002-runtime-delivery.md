@@ -813,6 +813,48 @@ The runtime **MUST** surface `skippedMonitors` so a caller can distinguish "moni
 
 Verified: `libs/core/src/runtime/types.ts` — `RuntimeTickResult`, `ErroredObservation`, `SkippedMonitor`; `libs/core/src/runtime/service.ts` — `tick()` populates `erroredObservations` in both the `observe()` and `ingest()` error branches alongside the `recordObservationHistory({ result: 'errored' })` write; populates `skippedMonitors` in the `!schedule.due` branch from the same scheduling decision.
 
+### 2.6 Source-neutral external event contract
+
+> **Status: contract current; ingestion target.** Core exports the versioned envelope, strict
+> validator, canonical JSON encoder, semantic hash, result/error types, and collision-free object
+> key. No runtime, CLI, or daemon method accepts the envelope yet.
+
+`agentmonitors.external-event.v1` represents one producer-reconstructed current-state snapshot. Its
+required top-level fields are `schema`, `monitorId`, `source`, `upstreamEventId`, `objectId`,
+`objectSequence`, `eventKind`, `changeKind`, `occurredAt`, `resumeToken`, `scope`, and `state`;
+unknown top-level fields are rejected. `changeKind` uses `created | modified | deleted | descoped`.
+`objectSequence` is a non-negative safe integer. `occurredAt` accepts RFC3339's case-insensitive
+`T`/`Z`, arbitrary non-empty fractional seconds, numeric offsets, and valid leap-second forms. `scope` contains
+only local query metadata; `state` is a JSON object containing current state, never instructions or
+an incremental patch. The envelope cannot set monitor policy, instructions, urgency, shaping,
+notify strategy, tags, workspace paths, or recipients.
+
+Validation applies these UTF-8/canonical-JSON limits before any future mutation:
+
+| Value                                                                          |                                                Limit |
+| ------------------------------------------------------------------------------ | ---------------------------------------------------: |
+| Canonical serialized envelope                                                  |                                              256 KiB |
+| Identifier (`monitorId`, `source`, `upstreamEventId`, `objectId`, `eventKind`) |                                            512 bytes |
+| `resumeToken`                                                                  |                                          2,048 bytes |
+| Scope keys / canonical scope                                                   |                                          32 / 32 KiB |
+| Scope key                                                                      |                                             64 bytes |
+| Scope value                                                                    | String or at most 16 strings, each at most 512 bytes |
+| State object/array nesting                                                     |                                            32 levels |
+
+Scope keys `ingressSource`, `eventKind`, `changeKind`, `upstreamEventId`, `objectSequence`, and
+`occurredAt` are reserved for runtime-owned query metadata. Empty identifiers/cursors, invalid or
+non-finite JSON values, accessors/custom objects, cycles, sparse arrays, extra array properties, and
+unsafe integers are rejected without invoking accessors or echoing state in the structured error.
+
+Canonical JSON recursively sorts object keys and preserves array order. The semantic SHA-256 hash
+excludes only `resumeToken`, allowing one upstream event to replay from another relay cursor. The
+snapshot object key is `external:` plus canonical JSON for `[source, objectId]`, avoiding delimiter
+collisions. Receipt persistence, ordering decisions, observation mapping, and ingestion remain
+target behavior in the next stacked changes.
+
+Verified: `libs/core/src/external-ingress/json.test.ts`, `contract.test.ts`, and
+`contract-boundaries.test.ts`.
+
 ## 3. Persisted Monitor State
 
 Each monitor has persisted runtime state containing: `lastObservationAt`, `sourceState`, `notifyState`. `sourceState` is owned by the source plugin and returned via `nextState`. `notifyState` is owned by the runtime and records delivery timing state such as active suppression windows for throttle, pending observation batches for debounce, and the accumulated rollup batch (`pendingRollup`, [§4.4](#44-scheduled-rollup-pace-mode-current)) held between delivery windows.

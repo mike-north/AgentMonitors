@@ -71,6 +71,32 @@ export type {
   EnqueuePayload,
 } from './inbox/types.js';
 
+// Source-neutral local external-ingress contract
+export {
+  EXTERNAL_EVENT_SCHEMA,
+  canonicalJsonStringify,
+  externalEventLimits,
+  externalEventReservedScopeKeys,
+  validateExternalEventEnvelope,
+} from './external-ingress/contract.js';
+export {
+  externalEventObjectKey,
+  externalEventSemanticHash,
+} from './external-ingress/identity.js';
+export type {
+  ExternalEventDisposition,
+  ExternalEventEnvelope,
+  ExternalEventEnvelopeValidationResult,
+  ExternalEventError,
+  ExternalEventErrorCode,
+  ExternalEventIngestInput,
+  ExternalEventIngestResult,
+  ExternalEventOutcome,
+  ExternalEventScope,
+  ExternalJsonObject,
+  ExternalJsonValue,
+} from './external-ingress/contract.js';
+
 // Observation sources
 export { SourceRegistry } from './observation/registry.js';
 export { generateMonitorSchema } from './observation/schema-generator.js';
