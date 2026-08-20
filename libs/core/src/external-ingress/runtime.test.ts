@@ -13,8 +13,8 @@ import type { ExternalEventIngestInput } from './contract.js';
 import {
   EXTERNAL_EVENT_SCHEMA,
   ExternalEventIngestError,
-  externalEventObjectKey,
 } from './contract.js';
+import { externalEventObjectKey } from './identity.js';
 
 const NOW = new Date('2026-08-13T18:00:00.000Z');
 const tempDirs: string[] = [];

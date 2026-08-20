@@ -20,12 +20,12 @@ import type { InterpretAdapter } from '../adapter/interpret.js';
 import {
   canonicalJsonStringify,
   ExternalEventIngestError,
-  externalEventObjectKey,
   validateExternalEventEnvelope,
   type ExternalEventEnvelope,
   type ExternalEventIngestInput,
   type ExternalEventIngestResult,
 } from '../external-ingress/contract.js';
+import { externalEventObjectKey } from '../external-ingress/identity.js';
 import { buildDiff, changeDetectionStrategyOf } from './diff.js';
 import {
   diagnoseReminderSuppression,
