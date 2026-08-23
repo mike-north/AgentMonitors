@@ -10,8 +10,10 @@
 > them together.
 
 The roadmap is a sequence of **numbered milestones (M1, M2, …)**, each an outcome that
-unlocks a concrete capability. Milestones are **ordered, not dated**: sequencing is the
-commitment, timing follows throughput. Confidence in scope decreases with the number —
+unlocks a concrete capability. **Sequencing is the commitment; dates are estimates.**
+The project board carries penciled start/target spans per milestone so its roadmap
+(timeline) view works — treat those as indicative and freely revised, while the M-number
+ordering only changes deliberately. Confidence in scope decreases with the number —
 M1 is being built now; the later milestones are directional and may be reshaped before
 they start. A milestone closes when its issues close, and ordering changes only when new
 information arrives (recorded in the changelog below when it does).
@@ -130,4 +132,5 @@ become the next most valuable thing — not before.
 ## Changes
 
 - **2026-08-23** — initial version: six numbered milestones (M1–M6),
-  reliability-first sequencing after external ingress lands.
+  reliability-first sequencing after external ingress lands. Penciled indicative
+  start/target spans onto the project board to enable its roadmap (timeline) view.
