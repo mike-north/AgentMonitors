@@ -46,7 +46,7 @@ at all. M2 and M3 execute the commitments of the
 numbered spec will make normative
 ([#504](https://github.com/mike-north/AgentMonitors/issues/504)).
 
-The daemon and everything it spawns is contained, identity-verified, and reaped. No
+The daemon and everything it spawns are contained, identity-verified, and reaped. No
 orphaned process trees survive a daemon death
 ([#470](https://github.com/mike-north/AgentMonitors/issues/470),
 [#478](https://github.com/mike-north/AgentMonitors/issues/478)); every cleanup signal
