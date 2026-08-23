@@ -38,18 +38,23 @@ milestone. **Status: actively being built.**
 
 ## M2 — Runtime containment & cleanup
 
-**Unlocks:** a daemon you can leave running unattended — nothing it spawns can outlive
-it unaccounted for, and it never damages unrelated work.
+**Unlocks:** a daemon you can leave running unattended — everything it spawns is
+accounted for up to the posture's documented containment boundary, and it never
+damages unrelated work.
 
 Reliability is the spine of the product thesis — a monitoring system that loses
 signals, leaks processes, or lies about what it delivered is worse than no monitoring
 at all. M2 and M3 execute the commitments of the
-[reliability & process-hygiene posture](./reliability-and-process-hygiene.md), which a
+[reliability & process-hygiene posture](https://github.com/mike-north/AgentMonitors/pull/476)
+(landing as `docs/product/reliability-and-process-hygiene.md`), which a
 numbered spec will make normative
 ([#504](https://github.com/mike-north/AgentMonitors/issues/504)).
 
-The daemon and everything it spawns are contained, identity-verified, and reaped. No
-orphaned process trees survive a daemon death
+The daemon and everything it spawns are contained, identity-verified, and reaped —
+within the containment boundary the posture documents (a fully detached descendant
+that erases its own identity escapes attribution by construction, and the posture
+says so plainly rather than pretending otherwise). Orphaned process trees from a
+previous daemon life are swept
 ([#470](https://github.com/mike-north/AgentMonitors/issues/470),
 [#478](https://github.com/mike-north/AgentMonitors/issues/478)); every cleanup signal
 verifies the target's identity first
@@ -88,8 +93,9 @@ The read-only `snapshot` / `diff` / `summary` verbs
 ([#313](https://github.com/mike-north/AgentMonitors/issues/313)) and the `inspect`
 surface that distinguishes armed → pending → received
 ([#314](https://github.com/mike-north/AgentMonitors/issues/314)). This completes the
-signal-to-action loop for the existing host and closes epic
-[#259](https://github.com/mike-north/AgentMonitors/issues/259).
+signal-to-action loop for the existing host and advances epic
+[#259](https://github.com/mike-north/AgentMonitors/issues/259), whose remaining
+host-adapter workstream lands in M5.
 
 ## M5 — Multi-host adapters
 
