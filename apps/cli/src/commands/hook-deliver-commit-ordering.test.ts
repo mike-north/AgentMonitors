@@ -402,14 +402,17 @@ describe('writeStreamChunk against a REAL Writable that pairs a callback error w
     }
   });
 
-  it('a spawned child process with its stdin closed: writing produces the paired EPIPE callback-then-event without crashing the process', async () => {
+  it('a spawned child process with its stdin closed: writing produces the paired EPIPE/EBADF callback-then-event without crashing the process', async () => {
     // The child closes its OWN stdin (`exec 0<&-`) immediately, then sleeps —
     // so our end of the pipe genuinely has no reader. A short delay lets
     // that close land before we write; a multi-megabyte chunk exceeds the
     // OS pipe buffer so the write actually reaches the (closed) kernel pipe
     // rather than merely being buffered in-process, reproducing a REAL
-    // `EPIPE` — both the write callback AND the paired `'error'` event fire
-    // for it, unlike the single-signal fakes in the describe blocks above.
+    // failed write — both the write callback AND the paired `'error'` event
+    // fire for it, unlike the single-signal fakes in the describe blocks
+    // above. Which errno surfaces is a kernel/libuv timing race, not
+    // something this test controls — see the comment on the assertion
+    // below (issue #506).
     const child = spawn('sh', ['-c', 'exec 0<&-; sleep 2']);
     try {
       await new Promise((resolve) => setTimeout(resolve, 50));
@@ -429,7 +432,11 @@ describe('writeStreamChunk against a REAL Writable that pairs a callback error w
           },
         );
 
-        await expect(pending).rejects.toThrow(/EPIPE/);
+        // Whether the OS reports EPIPE or EBADF for this write depends on
+        // whether fd teardown completes before the kernel write starts
+        // (EBADF) or races with it mid-write (EPIPE) — both mean "the
+        // destination is gone and the write correctly failed" (issue #506).
+        await expect(pending).rejects.toThrow(/EPIPE|EBADF/);
 
         // Give the paired 'error' event (queued on a later tick) a chance
         // to fire before asserting nothing leaked as uncaught.
