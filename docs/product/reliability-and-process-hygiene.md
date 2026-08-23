@@ -62,7 +62,11 @@ not exist yet;
 [#469](https://github.com/mike-north/AgentMonitors/issues/469) — the always-on daemon has no
 coherent power posture yet (wake coalescing, event-driven sources, conditional requests,
 battery-aware intervals, sleep reconciliation), so promise #4's gentleness is likewise a
-target). A promise below is not an assertion that today's build already delivers it; it is the
+target;
+[#507](https://github.com/mike-north/AgentMonitors/issues/507) — the active abstention
+warning below — a durable, user-visible warning rather than a diagnostics record, including
+when no session is open at abstention time — does not exist yet).
+A promise below is not an assertion that today's build already delivers it; it is the
 bar a gap must meet before it can close.
 
 **The containment boundary.** Every promise below applies to processes _within our containment
