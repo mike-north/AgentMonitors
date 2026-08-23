@@ -172,8 +172,11 @@ the cost of a rare failure to clean something up. That leak comes in two distinc
 we are precise about which is which:
 
 - **Abstention** — the tool found a process it _suspects_ is ours but cannot positively
-  confirm, so it leaves it alone. An abstention is **visible and reportable**: the tool knows
-  what it declined to reap and says so in its diagnostics, so the user can decide.
+  confirm, so it leaves it alone. An abstention is **visible and warned about**: the tool
+  actively warns the user — naming what it declined to reap and stating its confidence
+  honestly ("this looks like ours, but we could not confirm it"), never overstating a
+  suspicion as a certainty — so the user can decide, rather than leaving the record to sit
+  silently in diagnostics.
 - **Escape** — a descendant that has fully detached and erased its identity (left the
   containment boundary). By construction we can no longer recognize it, so we can neither
   bound it nor report it; recovery is the user's ordinary OS tooling. We state this plainly in
