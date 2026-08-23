@@ -149,7 +149,7 @@ describe('transactional event materialization', () => {
     client.exec(`
       CREATE TRIGGER fail_second_projection
       BEFORE INSERT ON session_event_state
-      WHEN NEW.session_id = '${second.id}'
+      WHEN (SELECT COUNT(*) FROM session_event_state) = 1
       BEGIN
         SELECT RAISE(ABORT, 'simulated projection failure');
       END;
