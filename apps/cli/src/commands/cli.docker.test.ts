@@ -26,12 +26,17 @@ interface ContainerResult {
 /**
  * Kill and remove the container by name. Best-effort by design: after a
  * normal exit `--rm` has already removed it and this errors harmlessly.
+ * Bounded with its own timeout so a wedged docker daemon cannot turn
+ * cleanup itself into the hang it exists to prevent.
  */
 function forceRemoveContainer(name: string): void {
   try {
-    execFileSync('docker', ['rm', '-f', name], { stdio: 'ignore' });
+    execFileSync('docker', ['rm', '-f', name], {
+      stdio: 'ignore',
+      timeout: 10_000,
+    });
   } catch {
-    // already gone — nothing to clean up
+    // already gone (or the daemon is unresponsive) — nothing more we can do
   }
 }
 
@@ -43,10 +48,13 @@ function forceRemoveContainer(name: string): void {
  * timeout, the container stayed `Up` until an explicit `docker rm -f`. That
  * could still hang the serial CI job to its 30-minute limit and leak a
  * container. So the container gets a unique `--name`, runs via async `spawn`
- * (leaving the vitest worker free), and on deadline we force-remove the
- * container itself — which kills PID 1 regardless of what it is blocked on —
- * before awaiting the client's exit and dumping the captured output
- * (including whatever failure diagnostics `cli-docker-smoke.sh` flushed).
+ * (leaving the vitest worker free), and on deadline we BOTH force-remove the
+ * container (kills PID 1 regardless of what it is blocked on) AND SIGKILL
+ * the docker client (so `close` fires even when the deadline lands before
+ * the container exists — mid image-pull — where removal alone no-ops), then
+ * retry removal in case the container appears after the first attempt,
+ * before dumping the captured output (including whatever failure
+ * diagnostics `cli-docker-smoke.sh` flushed).
  */
 function runSmokeContainer(script: string): Promise<ContainerResult> {
   const name = `am-docker-smoke-${String(process.pid)}-${randomUUID().slice(0, 8)}`;
@@ -75,16 +83,29 @@ function runSmokeContainer(script: string): Promise<ContainerResult> {
     let timedOut = false;
     let capturedBytes = 0;
 
+    // Deadline path (also used for runaway output). `docker rm -f` alone is
+    // NOT sufficient (review round 3): if the deadline fires while the client
+    // is still pulling the image or waiting on the daemon — before the
+    // container exists — removal no-ops with "No such container", the client
+    // stays blocked, and the container can even be created afterwards. So we
+    // also SIGKILL the client itself (guaranteeing `close` fires), and the
+    // close handler retries removal to catch a container that appears after
+    // this first attempt.
+    const enforceDeadline = (): void => {
+      timedOut = true;
+      forceRemoveContainer(name);
+      child.kill('SIGKILL');
+    };
+
     const capture =
       (append: (text: string) => void) =>
       (chunk: Buffer): void => {
         capturedBytes += chunk.length;
         append(chunk.toString('utf-8'));
         if (capturedBytes > MAX_CAPTURED_OUTPUT_BYTES) {
-          // Runaway output: treat like a deadline — kill the container and
-          // let the close handler report with what we captured.
-          timedOut = true;
-          forceRemoveContainer(name);
+          // Runaway output: treat like a deadline — bound it and let the
+          // close handler report with what we captured.
+          enforceDeadline();
         }
       };
     child.stdout.on(
@@ -96,22 +117,38 @@ function runSmokeContainer(script: string): Promise<ContainerResult> {
       capture((text) => (stderr += text)),
     );
 
-    const timer = setTimeout(() => {
-      timedOut = true;
+    const timer = setTimeout(enforceDeadline, CONTAINER_DEADLINE_MS);
+
+    /**
+     * Final cleanup before resolving. On the deadline path the client was
+     * SIGKILLed and may have died mid-creation — dockerd can still finish
+     * creating and starting the container *after* the first removal attempt,
+     * so retry removal a few times (bounded) before handing back the result.
+     * The normal path stays fast: one best-effort removal (usually a no-op
+     * thanks to `--rm`).
+     */
+    const cleanupThenResolve = (result: ContainerResult): void => {
       forceRemoveContainer(name);
-    }, CONTAINER_DEADLINE_MS);
+      if (!result.timedOut) {
+        resolve(result);
+        return;
+      }
+      void (async (): Promise<void> => {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          await new Promise((r) => setTimeout(r, 1_500));
+          forceRemoveContainer(name);
+        }
+        resolve(result);
+      })();
+    };
 
     child.on('close', (code, signal) => {
       clearTimeout(timer);
-      // Belt-and-braces: never leak the container even on unexpected client
-      // exits (e.g. the docker client crashed while the container survived).
-      forceRemoveContainer(name);
-      resolve({ code, signal, stdout, stderr, timedOut });
+      cleanupThenResolve({ code, signal, stdout, stderr, timedOut });
     });
     child.on('error', (error) => {
       clearTimeout(timer);
-      forceRemoveContainer(name);
-      resolve({
+      cleanupThenResolve({
         code: null,
         signal: null,
         stdout,
