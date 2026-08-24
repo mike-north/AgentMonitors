@@ -13,10 +13,11 @@ Agent Monitors spec set in `docs/specs/`.
 
 Added [008-reliability-process-hygiene.md](./008-reliability-process-hygiene.md), promoting the
 product posture of `docs/product/reliability-and-process-hygiene.md` (landed in PR #476) into
-normative, testable spec text: the containment-boundary definition and its four-state
-exhaustiveness, spawned-process lifecycle bounds (whole-tree timeout escalation is **current**,
-proven by the `source-command-poll` no-orphan guards; daemon-death-independent bounds are
-**target**, #470), the restart sweep (#478) and the adjacent daemon/channel-server/socket
+normative, testable spec text: the containment-boundary definition and its five-state
+exhaustiveness (incl. the reported deferred-reconciliation state), spawned-process lifecycle
+bounds (original-process-group/`taskkill`-tree timeout escalation is **current**, proven by
+the `source-command-poll` no-orphan guards; full-boundary and daemon-death-independent bounds
+are **target**, #480/#470), the restart sweep (#478) and the adjacent daemon/channel-server/socket
 hygiene (#426), identity-verified cleanup with the
 prefer-a-leak-to-a-wrong-kill bias (#479), the abstention/escape taxonomy with the active
 abstention-warning surface (#507), the capability probe + achieved-guarantee reporting with an

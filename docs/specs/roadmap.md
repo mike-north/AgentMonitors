@@ -306,15 +306,17 @@ Interpret → Deliver → [React]`:
 
 ### G21 — Reliability & process hygiene target set (P1)
 
-- **Current:** whole-tree timeout escalation is enforced
-  ([008 §3.1](./008-reliability-process-hygiene.md)); the rest of the reliability contract is
+- **Current:** timeout escalation of the original process group (POSIX) / `taskkill` tree
+  (Windows) is enforced ([008 §3.1](./008-reliability-process-hygiene.md)) — descendants that
+  leave the original group are not yet covered; the rest of the reliability contract is
   target — lifetime bounds die with the daemon, there is no restart sweep, cleanup signals are
   not identity-verified, abstention warnings and the capability probe/report do not exist, and
   the daemon has no coherent power posture.
-- **Target:** the full contract of [008](./008-reliability-process-hygiene.md):
-  daemon-death-independent bounds (§3.2), the restart sweep and process hygiene (§4),
-  identity-verified cleanup (§5), the abstention warning surface (§6.1), capability probe +
-  achieved-guarantee reporting (§7), power posture (§8).
+- **Target:** the full contract of [008](./008-reliability-process-hygiene.md): full-boundary
+  bounds with the reported deferred-reconciliation state (§3.2), daemon-death-independent
+  bounds (§3.3), the restart sweep and process hygiene (§4), identity-verified cleanup (§5),
+  the abstention warning surface (§6.1), capability probe + achieved-guarantee reporting
+  (§7), power posture (§8).
 - **Governs:** [008](./008-reliability-process-hygiene.md); PP7, BP1, BP4, NP4 ([000](./000-principles.md)).
 - **Files (anticipated):** `plugins/source-command-poll/src/*`, `libs/core/src/runtime/*`, `apps/cli/src/commands/doctor.ts`, daemon startup path.
 - **Proof:** the per-rule test implications in 008, which are the acceptance bars for #470,

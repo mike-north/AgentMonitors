@@ -10,7 +10,8 @@
 
 ---
 
-> **Whole-document status: mostly _target_.** This document makes the commitments of the
+> **Every normative section below carries its own explicit current/target marking** (this
+> banner is orientation, not classification). This document makes the commitments of the
 > [reliability & process-hygiene posture](../product/reliability-and-process-hygiene.md)
 > normative. The posture doc is the non-normative _why_; this document is the testable _what_.
 > Most rules here are **target**, each citing the tracking issue that closes its gap
@@ -44,7 +45,7 @@ are reliability guarantees, not a security boundary (§11; the security trust bo
 
 ## 2. The Containment Boundary
 
-### 2.1 Definition (normative)
+### 2.1 Definition (normative; the vocabulary is in force now — the states it references land with their cited trackers)
 
 A process is **within the containment boundary** iff Agent Monitors spawned it (directly, or
 transitively through a monitored command) and it has **not** done both of the following:
@@ -63,32 +64,39 @@ restart sweep (§4.2). A process that does both has **escaped** (§6.2).
 is unfalsifiable as an absolute; "no orphans within the boundary, and boundary exits are
 either swept (identity kept) or plainly documented as escapes (identity erased)" is testable.
 
-### 2.2 Exhaustiveness (normative)
+### 2.2 Exhaustiveness (target — the deferred-reconciliation and abstention states land with #480/#478 and #507)
 
 For any process Agent Monitors spawned, exactly one of the following MUST hold at all times —
-there is no fourth state:
+there is no sixth state:
 
 1. **Live and bounded** — running inside its allowed window (§3).
 2. **Cleaned up** — reaped by normal completion, timeout escalation (§3.1), or a sweep (§4.2).
-3. **Abstained** — suspected ours but unconfirmed; left alone and warned about (§6.1).
-4. **Escaped** — identity erased, outside the boundary; documented limit, not a silent state
+3. **Deferred-reconciliation** — in-boundary but beyond the selected containment rung's
+   deadline reach (a re-sessioned, identity-kept descendant on a lower §7.1 rung, §3.2);
+   attributable, reported, and reaped at the next daemon start — explicitly **not** bounded
+   in the interim, and never silently unaccounted.
+4. **Abstained** — suspected ours but unconfirmed; left alone and warned about (§6.1).
+5. **Escaped** — identity erased, outside the boundary; documented limit, not a silent state
    (§6.2).
 
-(States 3 and 4 are the two leak classes; state 4 is the only one invisible to the system,
-and it is the only one the system does not claim to account for.)
+(States 3–4 are visible, reported non-bounded states; state 5 is the only one invisible to
+the system, and the only one the system does not claim to account for.)
 
 ## 3. Lifecycle Bounds — "nothing we start outlives its purpose"
 
 ### 3.1 Time-bounded execution with platform tree termination (current)
 
-A monitored command MUST run only within its configured window. On timeout the runtime
-terminates the direct child and the descendants reachable through the current platform
-mechanism. On POSIX it sends SIGTERM and then SIGKILL to the command's **original process
+A monitored command MUST run only within its configured window: **escalation begins at the
+configured timeout, and the hard upper bound on the command's lifetime is the configured
+timeout plus the fixed 5-second forceful-kill grace period** (a SIGTERM-ignoring child runs
+until the grace expires — empirically, a `timeout: 1s` command resolves in ~6s). On POSIX
+the runtime sends SIGTERM and, after the grace, SIGKILL to the command's **original process
 group**; on Windows it invokes `taskkill /PID <pid> /T /F` and repeats that forceful tree
 kill after the grace period as a defensive retry. A descendant that remains in the original
-process group — e.g. one holding stdio open or surviving its parent — MUST NOT extend the
-window or outlive the escalation. Descendants that leave the original process group/session
-are **not** covered by this current guarantee; their bounded cleanup is target (§3.2).
+process group — e.g. one holding stdio open or surviving its parent — MUST NOT outlive that
+hard upper bound. Descendants that leave the original process group/session are **not**
+covered by this current guarantee; they enter the deferred-reconciliation state (§2.2,
+§3.2).
 
 **Current** — implemented by `@agentmonitors/source-command-poll` per
 [003 §11](./003-source-plugins.md) (escalation targeting fixed in #303). Verified: the
@@ -100,12 +108,18 @@ the live daemon-run/daemon-stop no-orphan check in
 ### 3.2 Full-boundary bounds (target — #480, with #478 as reconciliation)
 
 An in-boundary descendant that leaves the original process group/session while keeping its
-identity (§2.1) MUST still be bounded. Target: on a §7.1 ladder rung whose containment
-mechanism tracks descendants across re-grouping/re-sessioning, timeout termination reaches
-it directly at the deadline; on lower rungs it is reconciled by the restart sweep (§4.2) and
-remains attributable in diagnostics in the interim. Until [#480](https://github.com/mike-north/AgentMonitors/issues/480)
-lands this is a **known current gap**: such a descendant survives the §3.1 escalation and is
-reconciled only at the next daemon start.
+identity (§2.1) MUST be either **bounded at the deadline** or placed in the **reported
+deferred-reconciliation state** (§2.2 state 3) — never silently unaccounted. Which of the
+two applies is a property of the selected §7.1 rung: on a rung whose containment mechanism
+tracks descendants across re-grouping/re-sessioning, timeout termination reaches it directly
+at the deadline (a true lifetime bound); on lower rungs it enters deferred-reconciliation —
+attributable and reported in diagnostics, reaped by the restart sweep (§4.2), and **not
+bounded in the interim** (a daemon start that never happens leaves it running; the report is
+what keeps that honest). Only rungs that enforce the deadline may describe themselves as
+providing a lifetime bound for this class (§7.2's report MUST reflect the distinction).
+Until [#480](https://github.com/mike-north/AgentMonitors/issues/480) lands this is a **known
+current gap**: such a descendant survives the §3.1 escalation without even the
+deferred-reconciliation reporting.
 
 **Test implication:** a command that re-sessions a child (keeping its identity marks) MUST —
 on a kernel-containment rung — see that child terminated at the deadline; on the fallback
@@ -154,11 +168,14 @@ A sweep target that cannot be positively identity-verified is an **abstention** 
 a kill.
 
 **Test implication:** orphan a process tree from a killed daemon life (identity kept),
-restart; the tree is reaped. Orphan a process whose identity cannot be confirmed; it is left
-alone and a warning is produced (§6.1) — three separately-asserted outcomes: reaped /
-abstained-with-warning / never a wrong kill.
+restart; the tree is reaped **and the sweep's diagnostics record what it reaped** (pid,
+identity evidence, daemon life it belonged to — #478's successful-reap assertion, so a sweep
+that silently did nothing is distinguishable from one with nothing to do). Orphan a process
+whose identity cannot be confirmed; it is left alone and a warning is produced (§6.1) —
+three separately-asserted outcomes: reaped-with-diagnostic / abstained-with-warning / never
+a wrong kill.
 
-### 4.3 Hardware failure is reconciled, not defeated (normative boundary)
+### 4.3 Hardware failure is reconciled, not defeated (target — reconciliation is #478's sweep)
 
 A power loss leaves the OS to reap; the commitment is that the **next start** reconciles
 (§4.2), not that orphaning through hardware failure never occurs (see §11).
@@ -219,7 +236,7 @@ session delivery; no-session sweep abstention → persists across a daemon resta
 surfaces on next session open; warning text asserts uncertainty (a certainty phrasing for an
 abstention is a test failure); N observations → one warning.
 
-### 6.2 Escape — outside the boundary, documented, never guessed at (normative limit)
+### 6.2 Escape — outside the boundary, documented, never guessed at (current — a standing prohibition: nothing reaps heuristically today, and nothing ever may)
 
 A process that both detached and erased its identity (§2.1) has left the boundary. The system
 MUST NOT claim visibility of it (it cannot), MUST NOT attempt to reap it by guessing (that
@@ -249,10 +266,12 @@ highest rung whose probe succeeds on this machine:
    primitive, which the kernel prevents for ordinary processes.
 2. **Group/session escalation + self-bounding watchdog** — the two-step original-group
    termination of §3.1 plus the daemon-death-independent watchdog of §3.3. Guarantee:
-   deadline bound for group-resident descendants; re-sessioned descendants fall to the sweep
+   deadline bound for group-resident descendants; re-sessioned descendants enter the
+   reported deferred-reconciliation state (§2.2 state 3, §3.2) until the next start's sweep
    (§4.2).
 3. **Bookkeeping fallback** — direct-child termination plus the identity-marked sweep at
-   next start. Guarantee: bounded direct child; everything else reconciles at restart.
+   next start. Guarantee: bounded direct child; every other in-boundary process sits in the
+   reported deferred-reconciliation state until restart.
 
 The concrete per-platform inventory — which OS facilities implement each rung on each
 supported platform, and each rung's probe — is design work owned by
@@ -294,9 +313,14 @@ A **monitored command** is the user's own program: the contract governs its
 **time-boundedness** (§3), not its frugality — the system MUST NOT throttle or govern how
 hard a user's command works (§11).
 
-**Test implication:** an idle daemon (monitors present, nothing due) exhibits a bounded wake
-rate; a due tick does not busy-wait between observations. (Precise budgets are set by #469's
-design work; the normative floor is "no busy-spinning, coalesced wakes".)
+**Test implication (measurement protocol):** an integration harness counts daemon wakeups —
+poll-loop iterations and timer fires, logged at debug level — over a window of N tick
+intervals with monitors present but nothing due, and asserts the count is O(N) with a small
+constant (no busy-spinning: the count must not scale with wall-clock resolution), and that a
+due tick performs no intermediate wakeups between its observation and the next scheduled
+one. The exact numeric budget per interval is set by #469's design work; the protocol above
+is normative now so #469's budget lands as a number in an existing assertion, not a new test
+design.
 
 ## 9. Durable-State Truthfulness (target — milestone M3)
 
@@ -318,15 +342,20 @@ cross-cutting commitment level required by #504:
   across out-of-order urgency claims
   ([#298](https://github.com/mike-north/AgentMonitors/issues/298)).
 - **Truthful delivery decisions.** A reminder whose unread set emptied before delivery is
-  suppressed, not delivered ([#473](https://github.com/mike-north/AgentMonitors/issues/473));
-  channel claims commit only after a successful push
-  ([#300](https://github.com/mike-north/AgentMonitors/issues/300)); a failed or completed
-  watcher is released so polling resumes
-  ([#296](https://github.com/mike-north/AgentMonitors/issues/296)); editing a monitor never
-  retroactively rewrites already-materialized events
-  ([#451](https://github.com/mike-north/AgentMonitors/issues/451)); transport-health
-  surfaces report the truth
-  ([#462](https://github.com/mike-north/AgentMonitors/issues/462)–[#465](https://github.com/mike-north/AgentMonitors/issues/465)).
+  suppressed, not delivered (target,
+  [#473](https://github.com/mike-north/AgentMonitors/issues/473)); channel claims follow
+  reserve → push → commit/release, committing only after a successful push (**current** —
+  verified: [006 §4.5.1](./006-agent-integration.md), status implemented, Refs #300); a
+  failed or completed watcher is released so polling fallback resumes (**current** —
+  verified: [002 §2.3–§2.4](./002-runtime-delivery.md), Refs #296); editing a monitor never
+  retroactively rewrites already-materialized events (target,
+  [#451](https://github.com/mike-north/AgentMonitors/issues/451)); transport-health
+  surfaces report the truth (target,
+  [#462](https://github.com/mike-north/AgentMonitors/issues/462)–[#465](https://github.com/mike-north/AgentMonitors/issues/465)).
+
+(The section heading's "target" applies per-clause: the two clauses marked **current** above
+are implemented and regression-tested; their still-open trackers #296/#300 are flagged for
+reconciliation.)
 
 **Test implications:** each cited issue's regression test is its acceptance bar; the shared
 scenario is crash-into-restart — kill the daemon at any point in
@@ -354,9 +383,14 @@ carries commitments (#504's verification-gate expectations):
   (spawned daemon/subprocess logs) to be root-caused without re-running (#509's acceptance
   criterion).
 
-**Test implications:** a gate-parity check asserting the CI workflow's test commands are
-derivable from the workspace scripts (#458's acceptance bar); each flake issue cites the
-run/artifact evidence that made it diagnosable.
+**Test implications (executable, not historical):** a gate-parity check asserting the CI
+workflow's test commands are derivable from the workspace scripts (#458's acceptance bar); a
+retry-budget assertion that the guarded suite passes with retries disabled (`--retry=0`) so a
+budget-exhausting test fails loudly instead of masking (#452); a suite-teardown guard
+asserting `PATH` (and equivalent mutated global state) is restored even when a test times out
+(#477); and a forced-failure test per instrumented subprocess harness asserting its
+diagnostic dump actually renders (the docker-smoke forced-failure cases shipped with #509's
+fix are the pattern).
 
 ## 11. Non-Goals
 
@@ -383,7 +417,9 @@ The posture holds when, scoped to the containment boundary:
 | Durable state is atomic, truthful, and restart-safe                         | §9          | #294–#298, #300, #301, #305, #306, #451, #462–#465, #473 |
 | The verification gate is trustworthy (parity, no masked flakes)             | §10         | #452, #458, #509                                         |
 
-Each target rule above carries its own test implication; those implications are the
-acceptance bar for the cited issues, per the posture doc's "how we will know we got it
-right." Scenario-level coverage requirements join [004 §3](./004-validation-testing.md) as
-each rule moves to _current_.
+The per-rule test implications are the acceptance bars for the cited issues, per the posture
+doc's "how we will know we got it right" — with two implications explicitly deferred to their
+owners' design work rather than claimed complete here: §8's wake-rate budget carries a
+measurement protocol (below) but its numeric budget is set by #469, and §7's per-rung
+fixtures depend on #480's platform inventory. Scenario-level coverage requirements join
+[004 §3](./004-validation-testing.md) as each rule moves to _current_.
