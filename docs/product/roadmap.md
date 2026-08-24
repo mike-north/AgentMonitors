@@ -45,16 +45,17 @@ damages unrelated work.
 Reliability is the spine of the product thesis — a monitoring system that loses
 signals, leaks processes, or lies about what it delivered is worse than no monitoring
 at all. M2 and M3 execute the commitments of the
-[reliability & process-hygiene posture](https://github.com/mike-north/AgentMonitors/pull/476)
-(landing as `docs/product/reliability-and-process-hygiene.md`), which a
-numbered spec will make normative
+[reliability & process-hygiene posture](./reliability-and-process-hygiene.md),
+which a numbered spec will make normative
 ([#504](https://github.com/mike-north/AgentMonitors/issues/504)).
 
-The daemon and everything it spawns are contained, identity-verified, and reaped —
-within the containment boundary the posture documents (a fully detached descendant
-that erases its own identity escapes attribution by construction, and the posture
-says so plainly rather than pretending otherwise). Orphaned process trees from a
-previous daemon life are swept
+The daemon and everything it spawns are accounted for within the documented
+containment boundary. Identity-verified targets are reaped; when ownership cannot be
+positively confirmed, the tool abstains, leaves the process alone, and emits a durable
+user-visible warning ([#507](https://github.com/mike-north/AgentMonitors/issues/507)).
+A fully detached descendant that erases its own identity escapes attribution by
+construction, and the posture says so plainly rather than pretending otherwise.
+Orphaned process trees from a previous daemon life are swept
 ([#470](https://github.com/mike-north/AgentMonitors/issues/470),
 [#478](https://github.com/mike-north/AgentMonitors/issues/478)); every cleanup signal
 verifies the target's identity first
