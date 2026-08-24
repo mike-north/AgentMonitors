@@ -80,9 +80,12 @@ and it is the only one the system does not claim to account for.)
 ### 3.1 Time-bounded execution with whole-tree escalation (current)
 
 A monitored command MUST run only within its configured window. On timeout the runtime
-escalates SIGTERM → SIGKILL against the command's **entire process tree**, not just the direct
-child — a descendant holding stdio open or surviving its parent MUST NOT extend the window or
-outlive the escalation.
+performs a graceful-then-forceful termination of the command's **entire process tree**, not
+just the direct child — a descendant holding stdio open or surviving its parent MUST NOT
+extend the window or outlive the escalation. On POSIX platforms this is SIGTERM → SIGKILL;
+on Windows both steps go through `taskkill /PID <pid> /T /F` (forceful and tree-wide, since
+a graceful `taskkill` without `/F` frequently cannot terminate a non-console-attached
+process).
 
 **Current** — implemented by `@agentmonitors/source-command-poll` per
 [003 §11](./003-source-plugins.md) (process-tree escalation fixed in #303 after the
