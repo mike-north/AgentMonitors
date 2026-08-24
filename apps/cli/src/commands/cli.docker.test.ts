@@ -1,66 +1,153 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 /**
- * The shape Node attaches to the `Error` thrown by a failing
- * `execFileSync`/`spawnSync` call (see `child_process.SpawnSyncReturns`).
- * There is no exported class for this — Node merges these fields onto a
- * plain `Error` — so this is a structural type, not a class to `instanceof`.
+ * How long the container may run before we force-remove it. Comfortably
+ * under the test's own 300s budget so a genuine timeout reports as this
+ * test failing with a clear message, not as the whole CI job silently
+ * running out its 30-minute budget.
  */
-interface ExecFileSyncFailure {
-  status: number | null;
+const CONTAINER_DEADLINE_MS = 240_000;
+
+/** Cap on captured container output, mirroring the old `maxBuffer`. */
+const MAX_CAPTURED_OUTPUT_BYTES = 20 * 1024 * 1024;
+
+interface ContainerResult {
+  code: number | null;
   signal: NodeJS.Signals | null;
-  stdout?: string | Buffer;
-  stderr?: string | Buffer;
-}
-
-function isExecFileSyncFailure(
-  error: unknown,
-): error is Error & ExecFileSyncFailure {
-  return (
-    error instanceof Error &&
-    'status' in error &&
-    'signal' in error &&
-    ('stdout' in error || 'stderr' in error)
-  );
-}
-
-function toDisplayString(value: string | Buffer | undefined): string {
-  if (value === undefined) return '(none captured)';
-  return typeof value === 'string' ? value : value.toString('utf-8');
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
 }
 
 /**
- * Issue #509: a bare rethrow here surfaced in CI as nothing more than
- * "Command failed: docker run ...", with no way to root-cause a failure
- * without re-running. The container's own stdout/stderr — including
- * whatever `cli-docker-smoke.sh`'s own failure diagnostics (phase name,
- * captured install/build log tail, daemon log tail) it managed to flush
- * before dying — is still captured on Node's `error.stdout`/`error.stderr`
- * even when the child is killed by the `timeout` option (verified: Node
- * populates both from whatever was buffered before the kill). Printing them
- * here, then rethrowing, makes every failure diagnosable from the CI log
+ * Kill and remove the container by name. Best-effort by design: after a
+ * normal exit `--rm` has already removed it and this errors harmlessly.
+ */
+function forceRemoveContainer(name: string): void {
+  try {
+    execFileSync('docker', ['rm', '-f', name], { stdio: 'ignore' });
+  } catch {
+    // already gone — nothing to clean up
+  }
+}
+
+/**
+ * Issue #509 (review round 2): the previous `execFileSync(..., { timeout })`
+ * did NOT provide a hard bound. Node's timeout only SIGTERMs the `docker run`
+ * *client*; the container keeps running, and if its PID 1 bash is blocked in
+ * apt/npm/pnpm its TERM trap is deferred too — reproduced: after the client
+ * timeout, the container stayed `Up` until an explicit `docker rm -f`. That
+ * could still hang the serial CI job to its 30-minute limit and leak a
+ * container. So the container gets a unique `--name`, runs via async `spawn`
+ * (leaving the vitest worker free), and on deadline we force-remove the
+ * container itself — which kills PID 1 regardless of what it is blocked on —
+ * before awaiting the client's exit and dumping the captured output
+ * (including whatever failure diagnostics `cli-docker-smoke.sh` flushed).
+ */
+function runSmokeContainer(script: string): Promise<ContainerResult> {
+  const name = `am-docker-smoke-${String(process.pid)}-${randomUUID().slice(0, 8)}`;
+  return new Promise((resolve) => {
+    const child = spawn(
+      'docker',
+      [
+        'run',
+        '--rm',
+        '--name',
+        name,
+        '-v',
+        `${repoRoot}:/workspace:ro`,
+        '-w',
+        '/workspace',
+        'node:24-bookworm',
+        'bash',
+        '-lc',
+        script,
+      ],
+      { stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    let capturedBytes = 0;
+
+    const capture =
+      (append: (text: string) => void) =>
+      (chunk: Buffer): void => {
+        capturedBytes += chunk.length;
+        append(chunk.toString('utf-8'));
+        if (capturedBytes > MAX_CAPTURED_OUTPUT_BYTES) {
+          // Runaway output: treat like a deadline — kill the container and
+          // let the close handler report with what we captured.
+          timedOut = true;
+          forceRemoveContainer(name);
+        }
+      };
+    child.stdout.on(
+      'data',
+      capture((text) => (stdout += text)),
+    );
+    child.stderr.on(
+      'data',
+      capture((text) => (stderr += text)),
+    );
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      forceRemoveContainer(name);
+    }, CONTAINER_DEADLINE_MS);
+
+    child.on('close', (code, signal) => {
+      clearTimeout(timer);
+      // Belt-and-braces: never leak the container even on unexpected client
+      // exits (e.g. the docker client crashed while the container survived).
+      forceRemoveContainer(name);
+      resolve({ code, signal, stdout, stderr, timedOut });
+    });
+    child.on('error', (error) => {
+      clearTimeout(timer);
+      forceRemoveContainer(name);
+      resolve({
+        code: null,
+        signal: null,
+        stdout,
+        stderr: `${stderr}\nfailed to spawn docker: ${String(error)}`,
+        timedOut,
+      });
+    });
+  });
+}
+
+/**
+ * Issue #509: a bare failure here used to surface in CI as nothing more
+ * than "Command failed: docker run ...". Dumping the captured container
+ * output — which now includes `cli-docker-smoke.sh`'s own phase-labeled
+ * failure diagnostics — makes every failure diagnosable from the CI log
  * alone.
  */
-function reportDockerFailure(error: unknown): never {
-  if (isExecFileSyncFailure(error)) {
-    console.error(
-      [
-        '',
-        '=== Docker runtime smoke test failed ===',
-        `exit status: ${String(error.status)}, signal: ${String(error.signal)}`,
-        '--- captured container stdout ---',
-        toDisplayString(error.stdout),
-        '--- captured container stderr ---',
-        toDisplayString(error.stderr),
-        '=== end captured output ===',
-        '',
-      ].join('\n'),
-    );
-  }
-  throw error;
+function reportContainerFailure(result: ContainerResult): never {
+  console.error(
+    [
+      '',
+      '=== Docker runtime smoke test failed ===',
+      `exit code: ${String(result.code)}, signal: ${String(result.signal)}, deadline hit: ${String(result.timedOut)}`,
+      '--- captured container stdout ---',
+      result.stdout || '(none captured)',
+      '--- captured container stderr ---',
+      result.stderr || '(none captured)',
+      '=== end captured output ===',
+      '',
+    ].join('\n'),
+  );
+  throw new Error(
+    result.timedOut
+      ? `docker smoke container exceeded its ${String(CONTAINER_DEADLINE_MS / 1000)}s deadline and was force-removed; see captured output above`
+      : `docker smoke container failed (exit code ${String(result.code)}, signal ${String(result.signal)}); see captured output above`,
+  );
 }
 
 function hasDocker(): boolean {
@@ -84,45 +171,17 @@ const dockerScriptPath = path.join(
 );
 
 describe.skipIf(!dockerAvailable)('Docker runtime smoke', () => {
-  it('installs real Claude Code in a clean home directory and exercises AgentMon end-to-end', () => {
+  it('installs real Claude Code in a clean home directory and exercises AgentMon end-to-end', async () => {
     const script = readFileSync(dockerScriptPath, 'utf-8');
 
-    // `timeout` is load-bearing, not decorative (PR #453 CI hang, issue #425
-    // review): `execFileSync` blocks its vitest worker thread synchronously,
-    // so vitest's own `testTimeout`/per-test timeout below can never interrupt
-    // it — only Node killing the child itself can bound a stalled container.
-    // Set comfortably under the test's own 300s budget so a genuine timeout
-    // here reports as this test failing with a clear message, not as the
-    // whole CI job silently running out its 30-minute budget.
-    let output: string;
-    try {
-      output = execFileSync(
-        'docker',
-        [
-          'run',
-          '--rm',
-          '-v',
-          `${repoRoot}:/workspace:ro`,
-          '-w',
-          '/workspace',
-          'node:24-bookworm',
-          'bash',
-          '-lc',
-          script,
-        ],
-        {
-          encoding: 'utf-8',
-          maxBuffer: 1024 * 1024 * 20,
-          timeout: 240_000,
-        },
-      ) as string;
-    } catch (error) {
-      reportDockerFailure(error);
+    const result = await runSmokeContainer(script);
+    if (result.timedOut || result.code !== 0) {
+      reportContainerFailure(result);
     }
 
-    expect(output).toContain('CLAUDE_VERSION=');
-    expect(output).toContain('STATUS_RUNNING=true');
-    expect(output).toContain('EVENT_COUNT=1');
-    expect(output).toContain('CLAIM_URGENCY=normal');
+    expect(result.stdout).toContain('CLAUDE_VERSION=');
+    expect(result.stdout).toContain('STATUS_RUNNING=true');
+    expect(result.stdout).toContain('EVENT_COUNT=1');
+    expect(result.stdout).toContain('CLAIM_URGENCY=normal');
   }, 300_000);
 });
