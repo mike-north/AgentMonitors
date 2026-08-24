@@ -5,7 +5,8 @@
 > **Covers:** the containment boundary, spawned-process lifecycle bounds, crash-survival and
 > the restart sweep, identity-verified cleanup, the abstention/escape taxonomy and the
 > abstention warning surface, the containment capability probe and achieved-guarantee
-> reporting, and the daemon's power posture
+> reporting, the daemon's power posture, and the cross-cutting durable-state-truthfulness
+> and verification-gate commitments
 
 ---
 
@@ -19,7 +20,8 @@
 > [#479](https://github.com/mike-north/AgentMonitors/issues/479),
 > [#480](https://github.com/mike-north/AgentMonitors/issues/480),
 > [#507](https://github.com/mike-north/AgentMonitors/issues/507),
-> [#426](https://github.com/mike-north/AgentMonitors/issues/426)). Rules marked **current**
+> [#426](https://github.com/mike-north/AgentMonitors/issues/426), and the milestone-M3
+> durable-state/verification set cited in §9–§10). Rules marked **current**
 > are already enforced and cite their proving tests. When a target rule ships, move it to
 > _current_ with `verified:` references, and add a
 > [spec-changelog.md](./spec-changelog.md) entry
@@ -36,8 +38,8 @@ cleanup (§5), honest failure modes (§6), honest capability reporting (§7), an
 posture (§8).
 
 Scope: the hygiene of **Agent Monitors' own process tree** — the daemon, channel servers, and
-everything monitors cause it to spawn. The user's own workloads are out of scope (§9). These
-are reliability guarantees, not a security boundary (§9; the security trust boundary is
+everything monitors cause it to spawn. The user's own workloads are out of scope (§11). These
+are reliability guarantees, not a security boundary (§11; the security trust boundary is
 [BP4](./000-principles.md)).
 
 ## 2. The Containment Boundary
@@ -77,41 +79,61 @@ and it is the only one the system does not claim to account for.)
 
 ## 3. Lifecycle Bounds — "nothing we start outlives its purpose"
 
-### 3.1 Time-bounded execution with whole-tree escalation (current)
+### 3.1 Time-bounded execution with platform tree termination (current)
 
 A monitored command MUST run only within its configured window. On timeout the runtime
-performs a graceful-then-forceful termination of the command's **entire process tree**, not
-just the direct child — a descendant holding stdio open or surviving its parent MUST NOT
-extend the window or outlive the escalation. On POSIX platforms this is SIGTERM → SIGKILL;
-on Windows both steps go through `taskkill /PID <pid> /T /F` (forceful and tree-wide, since
-a graceful `taskkill` without `/F` frequently cannot terminate a non-console-attached
-process).
+terminates the direct child and the descendants reachable through the current platform
+mechanism. On POSIX it sends SIGTERM and then SIGKILL to the command's **original process
+group**; on Windows it invokes `taskkill /PID <pid> /T /F` and repeats that forceful tree
+kill after the grace period as a defensive retry. A descendant that remains in the original
+process group — e.g. one holding stdio open or surviving its parent — MUST NOT extend the
+window or outlive the escalation. Descendants that leave the original process group/session
+are **not** covered by this current guarantee; their bounded cleanup is target (§3.2).
 
 **Current** — implemented by `@agentmonitors/source-command-poll` per
-[003 §11](./003-source-plugins.md) (process-tree escalation fixed in #303 after the
-process-group approach missed descendants). Verified: the no-orphan-on-timeout guards in
-`plugins/source-command-poll/src/index.test.ts` (direct child **and** a backgrounded `sh -c`
-descendant) and the live daemon-run/daemon-stop no-orphan check in
+[003 §11](./003-source-plugins.md) (escalation targeting fixed in #303). Verified: the
+no-orphan-on-timeout guards in `plugins/source-command-poll/src/index.test.ts` (direct child
+**and** a backgrounded `sh -c` descendant that remains in the original process group) and
+the live daemon-run/daemon-stop no-orphan check in
 `apps/cli/src/commands/cli.integration.test.ts`.
 
-### 3.2 Bounds must not require a live daemon (target — #470, narrowed by PR #472)
+### 3.2 Full-boundary bounds (target — #480, with #478 as reconciliation)
+
+An in-boundary descendant that leaves the original process group/session while keeping its
+identity (§2.1) MUST still be bounded. Target: on a §7.1 ladder rung whose containment
+mechanism tracks descendants across re-grouping/re-sessioning, timeout termination reaches
+it directly at the deadline; on lower rungs it is reconciled by the restart sweep (§4.2) and
+remains attributable in diagnostics in the interim. Until [#480](https://github.com/mike-north/AgentMonitors/issues/480)
+lands this is a **known current gap**: such a descendant survives the §3.1 escalation and is
+reconciled only at the next daemon start.
+
+**Test implication:** a command that re-sessions a child (keeping its identity marks) MUST —
+on a kernel-containment rung — see that child terminated at the deadline; on the fallback
+rung, the child MUST be reaped by the next daemon start (regression for the
+detached-descendant survival reproduced during this spec's review).
+
+### 3.3 Bounds must not require a live daemon (target — #470, narrowed by PR #472)
 
 The lifetime bound of §3.1 MUST hold even if the daemon dies before the timeout fires.
 **Current behavior falls short:** bounds live only in daemon-resident timers, so a hard-killed
 daemon can orphan the command and its descendants (a detached child reparents to the OS
 supervisor and keeps running). **Target:** spawned work is self-bounding — the mechanism
 enforcing the window survives daemon death (PR #472's self-bounding watchdog is the intended
-narrowing; its residual gap for close-on-exec descendants is then covered by the sweep of
-§4.2).
+narrowing). Its residual close-on-exec-descendant gap **remains open under #470**: such a
+survivor is genuinely unbounded once the daemon is gone, until a future daemon start
+reconciles it. §4.2's sweep is complementary reconciliation, never a substitute for this
+lifetime bound.
 
 **Test implication:** kill the daemon (SIGKILL) mid-command with a timeout pending; the
-command tree MUST still terminate at its deadline with no daemon present.
+command's covered tree (§3.1's mechanism class) MUST still terminate at its deadline with no
+daemon present. The close-on-exec residual is exercised as a sweep-reconciliation case
+(§4.2), not a deadline case, until #470 closes it.
 
 ## 4. Crash Survival — "it survives its own death without leaving a mess"
 
 ### 4.1 In-flight work stays bounded across daemon death (target — #470)
 
-Same mechanism as §3.2, stated as the crash-survival guarantee: cleanup of in-flight spawned
+Same mechanism as §3.3, stated as the crash-survival guarantee: cleanup of in-flight spawned
 work MUST NOT depend on the daemon being alive to perform it.
 
 ### 4.2 The restart sweep (target — #478, adjacent hygiene #426)
@@ -119,7 +141,11 @@ work MUST NOT depend on the daemon being alive to perform it.
 On startup, the daemon MUST sweep strays left by a previous daemon life: any process still
 within the containment boundary (identity kept, §2.1) that belongs to a dead daemon life MUST
 be identity-verified (§5) and reaped. This covers orphaned poll-command process trees
-([#478](https://github.com/mike-north/AgentMonitors/issues/478)) and the adjacent
+([#478](https://github.com/mike-north/AgentMonitors/issues/478) — whose scope, written
+before this boundary definition, is extended to include detached-but-identifiable
+descendants; the contradiction resolution is recorded in
+[spec-changelog.md](./spec-changelog.md) per [004 §5](./004-validation-testing.md) and on
+the issue) and the adjacent
 daemon/channel-server/socket hygiene — stray daemons, channel servers, and stale sockets MUST
 be detectable and collectable
 ([#426](https://github.com/mike-north/AgentMonitors/issues/426)).
@@ -135,7 +161,7 @@ abstained-with-warning / never a wrong kill.
 ### 4.3 Hardware failure is reconciled, not defeated (normative boundary)
 
 A power loss leaves the OS to reap; the commitment is that the **next start** reconciles
-(§4.2), not that orphaning through hardware failure never occurs (see §9).
+(§4.2), not that orphaning through hardware failure never occurs (see §11).
 
 ## 5. Identity-Verified Cleanup — "we only ever kill what is ours" (target — #479)
 
@@ -212,6 +238,28 @@ MUST NOT trigger user-facing permission prompts. Where the strongest platform pr
 requires an optional component, its absence MUST NOT gate a working install: the strongest
 available fallback runs, and the component is detected and used automatically if present.
 
+**The capability ladder (normative ordering).** "Strongest" is adjudicated against this
+ordering — a rung is defined by the guarantee it enforces, and selection MUST pick the
+highest rung whose probe succeeds on this machine:
+
+1. **Kernel-enforced group containment** — an OS primitive that tracks, and can terminate,
+   every descendant regardless of re-grouping or re-sessioning (a kernel-managed process
+   group / job / container construct with tree-kill). Guarantee: §3.2's deadline bound holds
+   for every in-boundary descendant; escape requires identity erasure _plus_ leaving the
+   primitive, which the kernel prevents for ordinary processes.
+2. **Group/session escalation + self-bounding watchdog** — the two-step original-group
+   termination of §3.1 plus the daemon-death-independent watchdog of §3.3. Guarantee:
+   deadline bound for group-resident descendants; re-sessioned descendants fall to the sweep
+   (§4.2).
+3. **Bookkeeping fallback** — direct-child termination plus the identity-marked sweep at
+   next start. Guarantee: bounded direct child; everything else reconciles at restart.
+
+The concrete per-platform inventory — which OS facilities implement each rung on each
+supported platform, and each rung's probe — is design work owned by
+[#480](https://github.com/mike-north/AgentMonitors/issues/480); per its acceptance criteria
+that inventory MUST be recorded in this section when it lands, moving §7 to _current_ with
+the platform table filled in.
+
 ### 7.2 Honest reporting of the achieved level
 
 The daemon MUST be able to answer, accurately and per-machine, what containment guarantee is
@@ -225,10 +273,12 @@ level achieved, and never advertises a level the current environment cannot enfo
 > platform without optional kernel containment; escapes limited to identity-erasing
 > detachment — see docs).
 
-**Test implications (per #480's acceptance criteria):** capability-probe fixtures for
-platforms with/without the stronger mechanism MUST select correctly with no prompt; the
-reported guarantee MUST match the selected mechanism; an environment downgrade (mechanism
-unavailable) MUST change the report, not silently keep the old claim.
+**Test implications (per #480's acceptance criteria):** capability-probe fixtures MUST
+select the highest succeeding rung with no prompt; each rung's guarantee is asserted
+behaviorally (rung 1: deadline-kill of a re-sessioned descendant; rung 2: group deadline-kill
+plus sweep of the re-sessioned case; rung 3: direct-child kill plus sweep); the reported
+guarantee MUST match the selected rung; an environment downgrade (mechanism unavailable)
+MUST change the report, not silently keep the old claim.
 
 ## 8. Power Posture — "our machinery is gentle" (target — #469)
 
@@ -242,13 +292,73 @@ to nothing.
 
 A **monitored command** is the user's own program: the contract governs its
 **time-boundedness** (§3), not its frugality — the system MUST NOT throttle or govern how
-hard a user's command works (§9).
+hard a user's command works (§11).
 
 **Test implication:** an idle daemon (monitors present, nothing due) exhibits a bounded wake
 rate; a due tick does not busy-wait between observations. (Precise budgets are set by #469's
 design work; the normative floor is "no busy-spinning, coalesced wakes".)
 
-## 9. Non-Goals
+## 9. Durable-State Truthfulness (target — milestone M3)
+
+Process hygiene is one half of "a process you can leave running"; the other half is that the
+daemon never lies about durable state. The mechanisms are owned by
+[002](./002-runtime-delivery.md) (persistence, projection, delivery); this section owns the
+cross-cutting commitment level required by #504:
+
+- **Atomic, truthful ingest.** An observation is either fully persisted or truthfully
+  reported as failed — never silently partial. Materialization failures are reported
+  truthfully ([#295](https://github.com/mike-north/AgentMonitors/issues/295)); an emitted
+  span is persisted before any optional Interpret adapter is awaited
+  ([#294](https://github.com/mike-north/AgentMonitors/issues/294)); validation runs before
+  side effects ([#301](https://github.com/mike-north/AgentMonitors/issues/301),
+  [#306](https://github.com/mike-north/AgentMonitors/issues/306)); an unavailable upstream
+  is distinguished from a successful empty baseline
+  ([#305](https://github.com/mike-north/AgentMonitors/issues/305)).
+- **Monotonic per-recipient state.** Per-recipient cursors never move backwards, including
+  across out-of-order urgency claims
+  ([#298](https://github.com/mike-north/AgentMonitors/issues/298)).
+- **Truthful delivery decisions.** A reminder whose unread set emptied before delivery is
+  suppressed, not delivered ([#473](https://github.com/mike-north/AgentMonitors/issues/473));
+  channel claims commit only after a successful push
+  ([#300](https://github.com/mike-north/AgentMonitors/issues/300)); a failed or completed
+  watcher is released so polling resumes
+  ([#296](https://github.com/mike-north/AgentMonitors/issues/296)); editing a monitor never
+  retroactively rewrites already-materialized events
+  ([#451](https://github.com/mike-north/AgentMonitors/issues/451)); transport-health
+  surfaces report the truth
+  ([#462](https://github.com/mike-north/AgentMonitors/issues/462)–[#465](https://github.com/mike-north/AgentMonitors/issues/465)).
+
+**Test implications:** each cited issue's regression test is its acceptance bar; the shared
+scenario is crash-into-restart — kill the daemon at any point in
+ingest → materialize → project → deliver and assert on restart that durable state is either
+complete or truthfully marked failed, never silently partial
+([002](./002-runtime-delivery.md)'s restart-safety discipline).
+
+## 10. Verification-Gate Trust (target — milestone M3)
+
+The claims above are only as credible as the gate that verifies them, so the gate itself
+carries commitments (#504's verification-gate expectations):
+
+- **Local gate ≡ CI gate.** What the workspace verification scripts run locally MUST match
+  what CI enforces; a suite that runs only in CI (or only locally) is drift
+  ([#458](https://github.com/mike-north/AgentMonitors/issues/458)).
+- **No masked flakes.** Retry budgets absorb the environment, never hide defects: a test
+  that consumes its full retry budget on every run is a defect
+  ([#452](https://github.com/mike-north/AgentMonitors/issues/452)), and a nondeterministic
+  failure on an unrelated diff is a tracked defect with an owner, never re-rolled as routine
+  ([#509](https://github.com/mike-north/AgentMonitors/issues/509),
+  [#475](https://github.com/mike-north/AgentMonitors/issues/475),
+  [#477](https://github.com/mike-north/AgentMonitors/issues/477); #506 is the fixed
+  exemplar).
+- **Failures are diagnosable from artifacts.** A CI-only failure MUST capture enough state
+  (spawned daemon/subprocess logs) to be root-caused without re-running (#509's acceptance
+  criterion).
+
+**Test implications:** a gate-parity check asserting the CI workflow's test commands are
+derivable from the workspace scripts (#458's acceptance bar); each flake issue cites the
+run/artifact evidence that made it diagnosable.
+
+## 11. Non-Goals
 
 - **Not a process manager/supervisor** for the user's own workloads (no `pm2`/systemd role).
 - **Not a resource governor** — no CPU/memory quotas or scheduling policy surface; §8 governs
@@ -258,18 +368,20 @@ design work; the normative floor is "no busy-spinning, coalesced wakes".)
   boundary).
 - **Not zero-orphans-through-hardware-failure** — §4.3: the next start reconciles.
 
-## 10. Success Criteria & Validation Summary
+## 12. Success Criteria & Validation Summary
 
 The posture holds when, scoped to the containment boundary:
 
-| Criterion                                                                   | Governing § | Tracked          |
-| --------------------------------------------------------------------------- | ----------- | ---------------- |
-| Weeks of continuous running accumulate zero unintended processes            | §3          | #470             |
-| Hard kill + restart leaves a clean process list with no manual intervention | §3.2, §4    | #470, #478, #426 |
-| No report, ever, of signalling a process that was not ours                  | §5          | #479             |
-| Every abstention produces a durable, honest, user-visible warning           | §6.1        | #507             |
-| The tool answers accurately what guarantee is in effect on this machine     | §7          | #480             |
-| The monitoring machinery is never why the machine is warm, slow, or loud    | §8          | #469             |
+| Criterion                                                                   | Governing § | Tracked                                                  |
+| --------------------------------------------------------------------------- | ----------- | -------------------------------------------------------- |
+| Weeks of continuous running accumulate zero unintended processes            | §3          | #470                                                     |
+| Hard kill + restart leaves a clean process list with no manual intervention | §3.3, §4    | #470, #478, #426                                         |
+| No report, ever, of signalling a process that was not ours                  | §5          | #479                                                     |
+| Every abstention produces a durable, honest, user-visible warning           | §6.1        | #507                                                     |
+| The tool answers accurately what guarantee is in effect on this machine     | §7          | #480                                                     |
+| The monitoring machinery is never why the machine is warm, slow, or loud    | §8          | #469                                                     |
+| Durable state is atomic, truthful, and restart-safe                         | §9          | #294–#298, #300, #301, #305, #306, #451, #462–#465, #473 |
+| The verification gate is trustworthy (parity, no masked flakes)             | §10         | #452, #458, #509                                         |
 
 Each target rule above carries its own test implication; those implications are the
 acceptance bar for the cited issues, per the posture doc's "how we will know we got it

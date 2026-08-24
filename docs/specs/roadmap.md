@@ -317,7 +317,10 @@ Interpret → Deliver → [React]`:
   achieved-guarantee reporting (§7), power posture (§8).
 - **Governs:** [008](./008-reliability-process-hygiene.md); PP7, BP1, BP4, NP4 ([000](./000-principles.md)).
 - **Files (anticipated):** `plugins/source-command-poll/src/*`, `libs/core/src/runtime/*`, `apps/cli/src/commands/doctor.ts`, daemon startup path.
-- **Proof:** the per-rule test implications in 008, which are the acceptance bars for #470, #478, #479, #480, #507, #426, #469 (GitHub milestone "M2 — Runtime containment & cleanup").
+- **Proof:** the per-rule test implications in 008, which are the acceptance bars for #470,
+  #478, #479, #480, #507, #426, #469 (GitHub milestone "M2 — Runtime containment & cleanup")
+  and for the durable-state/verification-gate set cited in 008 §9–§10 (milestone "M3 —
+  Delivery correctness & durability").
 
 ## Test gaps
 
