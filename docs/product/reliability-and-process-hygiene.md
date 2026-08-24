@@ -5,8 +5,9 @@
 > promises we make").
 > **Purpose:** the reliability posture we commit to as a product — the kinds of reliability
 > and _process hygiene_ Agent Monitors offers, and the tangible benefit each choice buys the
-> user. This is the _why_ and the _promise_; the technical spec that realizes it is a separate,
-> downstream document. Companion to [vision & positioning](./vision-and-positioning.md), which
+> user. This is the _why_ and the _promise_; the technical spec that realizes it is
+> [spec 008 — Reliability & Process Hygiene](../specs/008-reliability-process-hygiene.md).
+> Companion to [vision & positioning](./vision-and-positioning.md), which
 > names durability and reliability as the spine.
 
 ## The one-line thesis

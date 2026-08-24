@@ -19,7 +19,9 @@ daemon/IPC, adapters · [`003`](docs/specs/003-source-plugins.md) source-plugin 
 sources · [`004`](docs/specs/004-validation-testing.md) validation & required test scenarios ·
 [`005`](docs/specs/005-cli-reference.md) `agentmonitors` CLI ·
 [`006`](docs/specs/006-agent-integration.md) delivery transports (hooks, channels) & agent
-integration · [`000`](docs/specs/000-principles.md)
+integration · [`007`](docs/specs/007-agent-facing-interaction.md) act-on-signal verbs, ephemeral
+monitors & observability · [`008`](docs/specs/008-reliability-process-hygiene.md) containment,
+process lifecycle/cleanup & power posture · [`000`](docs/specs/000-principles.md)
 the invariants the rest cite · [`roadmap`](docs/specs/roadmap.md) current→target gaps ·
 [`glossary`](docs/specs/glossary.md) terminology. When you change behavior, update the matching doc
 and add a [`spec-changelog.md`](docs/specs/spec-changelog.md) entry

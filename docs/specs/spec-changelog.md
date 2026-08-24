@@ -9,6 +9,20 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-08-24 — New numbered doc: 008 — Reliability & Process Hygiene — Refs #504, PR #476
+
+Added [008-reliability-process-hygiene.md](./008-reliability-process-hygiene.md), promoting the
+product posture of `docs/product/reliability-and-process-hygiene.md` (landed in PR #476) into
+normative, testable spec text: the containment-boundary definition and its four-state
+exhaustiveness, spawned-process lifecycle bounds (whole-tree timeout escalation is **current**,
+proven by the `source-command-poll` no-orphan guards; daemon-death-independent bounds are
+**target**, #470), the restart sweep (#478, #426), identity-verified cleanup with the
+prefer-a-leak-to-a-wrong-kill bias (#479), the abstention/escape taxonomy with the active
+abstention-warning surface (#507), the capability probe + achieved-guarantee reporting with an
+explicit no-user-tier rule (#480), and the power posture (#469). Cross-references added to the
+spec README and 000 §7; the posture doc now links here as its realizing spec. Each target rule
+carries a test implication that serves as the acceptance bar for its tracking issue.
+
 ## 2026-07-22 — Channel `event_count`/`monitor_id`/`event_id` meta corrected for cross-monitor-coalesced claims (006 §4.2) — Refs #441, #456
 
 For a `DeliveryClaim` with `coalescedReminder` set (issue #441 cross-monitor coalescing), the channel
