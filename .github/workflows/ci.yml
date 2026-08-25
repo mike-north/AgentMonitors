@@ -149,6 +149,56 @@ jobs:
       - name: Publish dry-run collateral tests
         run: pnpm test:scripts
 
+  # Review finding on PR #517 (Refs #516/#509): bumping better-sqlite3 to
+  # ^13.0.3 can make the published CLI fail to install for a Windows user
+  # with no C/C++ build toolchain — better-sqlite3 has a current upstream
+  # reproduction of exactly that on clean Windows 11 + Node 24 + npm 11
+  # (https://github.com/WiseLibs/better-sqlite3/issues/1516). Proves the
+  # packed @agentmonitors/cli tarball installs and its native module loads
+  # on Windows/Node 24 (scripts/test-windows-install.mjs). Path-filtered by
+  # the same release-collateral gate as publish-dry-run above, since a
+  # better-sqlite3 version/specifier bump is exactly the kind of change that
+  # gate already exists to catch — this PR's own apps/cli & libs/core
+  # package.json edits match it, so the job actually runs here.
+  #
+  # CAVEAT: GitHub's windows-latest runner image ships Python and Visual
+  # Studio Build Tools pre-installed, unlike a genuinely clean Windows
+  # machine. This job deliberately does not install or configure a
+  # toolchain itself (doing so would mask the failure class it exists to
+  # catch), but it cannot remove the runner image's own pre-existing
+  # toolchain — so a pass here is good evidence, not an absolute guarantee,
+  # that a truly toolchain-free Windows machine installs cleanly.
+  windows-install-check:
+    name: Windows Install Check
+    needs: release-collateral-changed
+    if: |
+      always() &&
+      (github.event_name != 'pull_request' || needs.release-collateral-changed.outputs.changed == 'true')
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build publishable packages
+        run: pnpm build
+
+      - name: Windows install check (packed CLI tarball, native module load)
+        run: pnpm test:windows-install
+
   # Website is excluded from the workspace-root `pnpm build`/`check` targets (it has its
   # own build cycle — see apps/website/README.md), so it otherwise gets zero CI coverage
   # on a PR. Path-filtered the same way as release-collateral-changed above, so PRs that

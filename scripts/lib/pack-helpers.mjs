@@ -53,3 +53,29 @@ export function packPackage(packageDir, packDestDir) {
 
   return path.join(packDestDir, created);
 }
+
+/**
+ * Resolve a file inside a globally-`npm install`ed package, given the
+ * `--prefix` directory the install used. npm's global layout nests installed
+ * packages differently by platform: `<prefix>/lib/node_modules/<pkg>/...` on
+ * POSIX, but `<prefix>/node_modules/<pkg>/...` on Windows (no `lib/`
+ * component). Shared by `scripts/test-e2e-fresh-install-hooks.mjs` and
+ * `scripts/test-windows-install.mjs` so both resolve an installed package's
+ * files identically instead of re-deriving this platform difference.
+ *
+ * @param {string} prefixDir
+ * @param {string} packageName
+ * @param {...string} relativeParts
+ * @returns {string}
+ */
+export function resolveInstalledPackageFile(
+  prefixDir,
+  packageName,
+  ...relativeParts
+) {
+  const nodeModulesDir =
+    process.platform === 'win32'
+      ? path.join(prefixDir, 'node_modules')
+      : path.join(prefixDir, 'lib', 'node_modules');
+  return path.join(nodeModulesDir, packageName, ...relativeParts);
+}
