@@ -89,11 +89,24 @@ export async function main() {
   // No `npm_config_devdir`/build-toolchain env overrides here — unlike
   // test-e2e-fresh-install-hooks.mjs, this run must reflect exactly what a
   // clean machine's default npm config does with better-sqlite3.
+  // CI runners ship Python + build tools, so a silent node-gyp source
+  // rebuild could succeed and mask the exact failure class this check
+  // exists to catch (upstream WiseLibs/better-sqlite3#1516: implicit gyp
+  // rebuild on a clean Windows machine). Pointing NODE_GYP_FORCE_PYTHON
+  // (and npm_config_python) at a guaranteed-missing executable makes any
+  // node-gyp invocation fail loudly instead — so a green install PROVES
+  // the bundled prebuild was used, on any runner image.
+  const missingPython = path.join(
+    tmpRoot,
+    'deliberately-missing-python-so-node-gyp-fails.exe',
+  );
   const installEnv = {
     ...process.env,
     HOME: fakeHome,
     USERPROFILE: fakeHome,
     npm_config_cache: npmCacheDir,
+    NODE_GYP_FORCE_PYTHON: missingPython,
+    npm_config_python: missingPython,
   };
 
   console.log('Packing every publishable package (pnpm pack)...');
@@ -153,8 +166,44 @@ export async function main() {
   }
 
   console.log(
-    `OK: agentmonitors --version reported ${installedVersion} — the native ` +
-      'better-sqlite3 addon loaded without a build toolchain.',
+    `OK: agentmonitors --version reported ${installedVersion} — the ` +
+      'installed entry point executes.',
+  );
+
+  // `--version` alone does NOT prove the native addon loads: better-sqlite3
+  // only calls getBinding() inside the Database constructor, so requiring
+  // its JS entrypoint is native-load-free (verified in review by breaking
+  // Node's `.node` loader: --version still passed while `new Database()`
+  // threw). Explicitly instantiate a Database resolved from the INSTALLED
+  // tree so success requires loading the packed prebuilt binary.
+  const nativeProbe = [
+    "const { createRequire } = require('node:module');",
+    `const req = createRequire(${JSON.stringify(cliEntryPoint)});`,
+    "const Database = req('better-sqlite3');",
+    "const db = new Database(':memory:');",
+    "const row = db.prepare('select 1 as one').get();",
+    'db.close();',
+    "if (row.one !== 1) throw new Error('unexpected query result: ' + JSON.stringify(row));",
+    "console.log('native-addon-ok');",
+  ].join(' ');
+  console.log(
+    'Instantiating better-sqlite3 Database from the installed tree ' +
+      '(forces the native addon to load)...',
+  );
+  const probeResult = run(process.execPath, ['-e', nativeProbe], {
+    env: installEnv,
+  });
+  if (!probeResult.stdout.includes('native-addon-ok')) {
+    throw new Error(
+      'native better-sqlite3 probe did not report success; stdout: ' +
+        probeResult.stdout,
+    );
+  }
+
+  console.log(
+    'OK: the packed native better-sqlite3 addon loaded and executed a query ' +
+      'without a build toolchain (node-gyp was poisoned; a source rebuild ' +
+      'would have failed loudly).',
   );
 }
 

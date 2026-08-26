@@ -193,8 +193,13 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # The workspace `build` script uses a POSIX-only inline env assignment
+      # (`NX_TUI=false nx ...`), which cmd.exe treats as an executable name —
+      # so invoke Nx directly and supply NX_TUI through step env instead.
       - name: Build publishable packages
-        run: pnpm build
+        env:
+          NX_TUI: 'false'
+        run: pnpm exec nx run-many --target=build --exclude=agentmonitors-workspace,@agentmonitors/website
 
       - name: Windows install check (packed CLI tarball, native module load)
         run: pnpm test:windows-install
