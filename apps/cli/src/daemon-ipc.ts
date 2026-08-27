@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { Buffer } from 'node:buffer';
 import { spawnSync } from 'node:child_process';
 import {
   existsSync,
@@ -10,22 +11,27 @@ import {
   unlinkSync,
   writeFileSync,
   readFileSync,
+  realpathSync,
 } from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
 import {
   isErrnoException,
   isVerifyScratchObjectKey,
+  ExternalEventIngestError,
   PRIVATE_DIR_MODE,
   PRIVATE_FILE_MODE,
   restrictExistingPathMode,
   restrictSocketMode,
   withRestrictedUmask,
+  validateExternalEventEnvelope,
 } from '@agentmonitors/core';
 import type {
   AgentMonitorRuntime,
   AgentSessionRole,
   DeliveryLifecycle,
+  ExternalEventReceiptRecord,
+  MaterializationRetryRecord,
   RuntimeStatus,
   Urgency,
 } from '@agentmonitors/core';
@@ -35,6 +41,7 @@ import { resolveDataRoot } from './workspace-paths.js';
 
 type JsonRecord = Record<string, unknown>;
 const MAX_UNIX_SOCKET_PATH_LENGTH = 100;
+export const MAX_DAEMON_FRAME_BYTES = 320 * 1024;
 const sessionRoleValues = ['lead', 'subagent'] as const;
 const urgencyValues = ['low', 'normal', 'high'] as const;
 const deliveryLifecycleValues = [
@@ -53,6 +60,9 @@ const daemonMethodSchema = z.enum([
   'events.ack',
   'events.retractObject',
   'events.suppressObject',
+  'events.ingest',
+  'events.ingestStatus',
+  'events.ingestRetry',
   'hook.claim',
   'hook.reserve',
   'hook.commit',
@@ -62,6 +72,7 @@ const daemonMethodSchema = z.enum([
   'hook.diagnose',
   'history.list',
   'monitor.explain',
+  'monitor.retryOutbox',
   'doctor.report',
   'daemon.tick',
   'watch.declare',
@@ -77,6 +88,7 @@ const daemonResponseSchema = z.object({
   // daemon emitting this never breaks an OLD client. See
   // `UNSUPPORTED_REQUEST_ERROR_CODE` and `DaemonUnsupportedRequestError`.
   code: z.string().optional(),
+  retryable: z.boolean().optional(),
 });
 const sessionRoleSchema = z.enum(
   sessionRoleValues satisfies readonly AgentSessionRole[],
@@ -111,6 +123,22 @@ const eventsAckParamsSchema = z.object({
   sessionId: z.string(),
   eventIds: z.array(z.string()).optional(),
 });
+const externalIdentitySchema = z.string().min(1).max(4_096);
+const externalRoutingParamsSchema = z
+  .object({
+    workspaceIdentity: externalIdentitySchema,
+    monitorsDirIdentity: externalIdentitySchema,
+  })
+  .strict();
+const eventsIngestParamsSchema = externalRoutingParamsSchema
+  .extend({ envelope: z.unknown() })
+  .strict();
+const externalReceiptParamsSchema = externalRoutingParamsSchema
+  .extend({ receiptId: z.string().min(1) })
+  .strict();
+const monitorRetryOutboxParamsSchema = externalRoutingParamsSchema
+  .extend({ retryId: z.string().min(1) })
+  .strict();
 const eventsRetractObjectParamsSchema = z.object({
   monitorId: z.string(),
   objectKey: z.string(),
@@ -228,6 +256,8 @@ export interface DaemonResponse<T = unknown> {
   error?: string;
   /** See {@link DaemonUnsupportedRequestError} for what this signals. */
   code?: string;
+  /** Whether retrying after an external state change may succeed. */
+  retryable?: boolean;
 }
 
 export interface DaemonServerOptions {
@@ -244,6 +274,11 @@ export interface DaemonServerOptions {
    * concept of a reap window.
    */
   reapAfterMs?: number;
+  /** Canonical identities bound when this daemon process starts. */
+  workspaceIdentity?: string;
+  monitorsDirIdentity?: string;
+  /** Re-arm the daemon deadline timer after external durable state changes. */
+  onExternalStateChanged?: () => void;
 }
 
 /**
@@ -263,6 +298,9 @@ export interface DaemonStatusResult extends RuntimeStatus {
   pid: number;
   /** The `--reap-after-ms` value this daemon is running with (0 = disabled). */
   reapAfterMs: number;
+  /** Canonical local identities, or null for an unbound embedded test server. */
+  workspaceIdentity: string | null;
+  monitorsDirIdentity: string | null;
 }
 
 /**
@@ -278,6 +316,8 @@ export interface DaemonStatusResult extends RuntimeStatus {
  */
 export class DaemonConnectionError extends Error {
   override readonly name = 'DaemonConnectionError';
+  readonly code = 'daemon_unavailable';
+  readonly retryable = true;
   constructor(
     message: string,
     readonly cause?: unknown,
@@ -336,6 +376,20 @@ const UNSUPPORTED_REQUEST_ERROR_CODE = 'unsupported_request';
  */
 export class DaemonUnsupportedRequestError extends Error {
   override readonly name = 'DaemonUnsupportedRequestError';
+  readonly code = 'daemon_incompatible';
+  readonly retryable = true;
+}
+
+/** A structured application failure returned by a reachable daemon. */
+export class DaemonApplicationError extends Error {
+  override readonly name = 'DaemonApplicationError';
+  constructor(
+    message: string,
+    readonly code: string,
+    readonly retryable: boolean,
+  ) {
+    super(message);
+  }
 }
 
 /**
@@ -665,17 +719,74 @@ export function releaseStartupLock(socketPath: string): void {
   }
 }
 
-function handleRequest(
+interface DaemonRequestContext {
+  stop: () => void;
+  reapAfterMs?: number;
+  workspaceIdentity?: string;
+  monitorsDirIdentity?: string;
+  onExternalStateChanged?: () => void;
+}
+
+function assertExternalRouting(
+  params: z.infer<typeof externalRoutingParamsSchema>,
+  context: DaemonRequestContext,
+): { workspaceIdentity: string; monitorsDirIdentity: string } {
+  if (
+    !context.workspaceIdentity ||
+    !context.monitorsDirIdentity ||
+    params.workspaceIdentity !== context.workspaceIdentity ||
+    params.monitorsDirIdentity !== context.monitorsDirIdentity
+  ) {
+    throw new ExternalEventIngestError(
+      'workspace_mismatch',
+      'External event routing does not match the serving daemon.',
+      false,
+    );
+  }
+  return {
+    workspaceIdentity: context.workspaceIdentity,
+    monitorsDirIdentity: context.monitorsDirIdentity,
+  };
+}
+
+function boundSessionWorkspace(
+  workspacePath: string | undefined,
+  context: DaemonRequestContext,
+): string | undefined {
+  if (!workspacePath || !context.workspaceIdentity) return workspacePath;
+  let canonical: string;
+  try {
+    canonical = realpathSync(path.resolve(workspacePath));
+  } catch {
+    canonical = path.resolve(workspacePath);
+  }
+  if (canonical !== context.workspaceIdentity) {
+    throw new ExternalEventIngestError(
+      'workspace_mismatch',
+      'Session workspace does not match the serving daemon.',
+      false,
+    );
+  }
+  return context.workspaceIdentity;
+}
+
+function safeMaterializationRetry(record: MaterializationRetryRecord) {
+  return {
+    id: record.id,
+    monitorId: record.monitorId,
+    sourceName: record.sourceName,
+    attemptCount: record.attemptCount,
+    status: record.status,
+    nextAttemptAt: record.nextAttemptAt,
+    lastError: record.lastError,
+    updatedAt: record.updatedAt,
+  };
+}
+
+async function handleRequest(
   runtime: AgentMonitorRuntime,
   request: DaemonRequest,
-  stop: () => void,
-  /**
-   * The daemon's configured reap window, echoed on `status` (see {@link
-   * DaemonStatusResult}). Omitted by call sites that build a server directly
-   * without going through `daemon run` (most unit tests) — those report `0`
-   * (disabled) rather than guessing a nonzero value nothing configured.
-   */
-  reapAfterMs?: number,
+  context: DaemonRequestContext,
 ): Promise<unknown> {
   switch (request.method) {
     case 'ping':
@@ -684,24 +795,28 @@ function handleRequest(
       const result: DaemonStatusResult = {
         ...runtime.status(),
         pid: process.pid,
-        reapAfterMs: reapAfterMs ?? 0,
+        reapAfterMs: context.reapAfterMs ?? 0,
+        workspaceIdentity: context.workspaceIdentity ?? null,
+        monitorsDirIdentity: context.monitorsDirIdentity ?? null,
       };
       return Promise.resolve(result);
     }
     case 'stop':
-      stop();
+      context.stop();
       return Promise.resolve({ stopping: true });
     case 'session.open': {
       const params = openSessionParamsSchema.parse(request.params);
+      const workspacePath = boundSessionWorkspace(
+        params.workspacePath,
+        context,
+      );
       return Promise.resolve(
         runtime.openSession({
           adapter: params.adapter,
           hostSessionId: params.hostSessionId,
           agentIdentity: params.agentIdentity,
           hookStatePath: params.hookStatePath,
-          ...(params.workspacePath
-            ? { workspacePath: params.workspacePath }
-            : {}),
+          ...(workspacePath ? { workspacePath } : {}),
           ...(params.role ? { role: params.role } : {}),
         }),
       );
@@ -763,6 +878,47 @@ function handleRequest(
             : {}),
         }),
       });
+    }
+    case 'events.ingest': {
+      const params = eventsIngestParamsSchema.parse(request.params);
+      const routing = assertExternalRouting(params, context);
+      const validation = validateExternalEventEnvelope(params.envelope);
+      if (!validation.success) {
+        throw new ExternalEventIngestError(
+          validation.error.code,
+          validation.error.message,
+          validation.error.retryable,
+        );
+      }
+      const result = await runtime.ingestExternalEvent(
+        {
+          workspaceIdentity: routing.workspaceIdentity,
+          envelope: validation.envelope,
+        },
+        routing.monitorsDirIdentity,
+      );
+      if (result.disposition === 'accepted') {
+        context.onExternalStateChanged?.();
+      }
+      return result;
+    }
+    case 'events.ingestStatus': {
+      const params = externalReceiptParamsSchema.parse(request.params);
+      const routing = assertExternalRouting(params, context);
+      return runtime.externalEventReceiptStatus(
+        routing.workspaceIdentity,
+        params.receiptId,
+      );
+    }
+    case 'events.ingestRetry': {
+      const params = externalReceiptParamsSchema.parse(request.params);
+      const routing = assertExternalRouting(params, context);
+      const result = runtime.rearmExternalEventReceipt(
+        routing.workspaceIdentity,
+        params.receiptId,
+      );
+      context.onExternalStateChanged?.();
+      return result;
     }
     case 'hook.claim': {
       const params = hookClaimParamsSchema.parse(request.params);
@@ -834,6 +990,16 @@ function handleRequest(
         ...(params.historyLimit ? { historyLimit: params.historyLimit } : {}),
         ...(params.eventLimit ? { eventLimit: params.eventLimit } : {}),
       });
+    }
+    case 'monitor.retryOutbox': {
+      const params = monitorRetryOutboxParamsSchema.parse(request.params);
+      const routing = assertExternalRouting(params, context);
+      const result = runtime.rearmMaterializationRetry(
+        routing.workspaceIdentity,
+        params.retryId,
+      );
+      context.onExternalStateChanged?.();
+      return safeMaterializationRetry(result);
     }
     case 'daemon.tick': {
       const params = daemonTickParamsSchema.parse(request.params);
@@ -962,6 +1128,9 @@ export function createDaemonServer({
   socketPath,
   onStop,
   reapAfterMs,
+  workspaceIdentity,
+  monitorsDirIdentity,
+  onExternalStateChanged,
 }: DaemonServerOptions): {
   listen(): Promise<void>;
   close(): Promise<void>;
@@ -971,19 +1140,69 @@ export function createDaemonServer({
   let serverClosed = false;
   const server = net.createServer((socket) => {
     let buffer = '';
+    let responded = false;
     socket.setEncoding('utf-8');
 
     const respond = (payload: DaemonResponse) => {
+      if (responded) return;
+      responded = true;
       socket.end(`${JSON.stringify(payload)}\n`);
     };
 
+    const respondWithError = (id: string, error: unknown) => {
+      if (error instanceof ExternalEventIngestError) {
+        respond({
+          id,
+          error: error.message,
+          code: error.code,
+          retryable: error.retryable,
+        });
+        return;
+      }
+      if (error instanceof z.ZodError) {
+        respond({
+          id,
+          error: 'Invalid daemon request parameters.',
+          code: 'invalid_envelope',
+          retryable: false,
+        });
+        return;
+      }
+      respond({
+        id,
+        error: error instanceof Error ? error.message : String(error),
+        code: 'internal_error',
+        retryable: false,
+      });
+    };
+
     socket.on('data', (chunk) => {
+      if (responded) return;
       buffer += typeof chunk === 'string' ? chunk : chunk.toString('utf-8');
       const newline = buffer.indexOf('\n');
-      if (newline === -1) return;
+      if (newline === -1) {
+        if (Buffer.byteLength(buffer, 'utf8') > MAX_DAEMON_FRAME_BYTES) {
+          respond({
+            id: UNPARSEABLE_REQUEST_ID,
+            error: 'Daemon request frame exceeds 320 KiB.',
+            code: 'payload_too_large',
+            retryable: false,
+          });
+        }
+        return;
+      }
 
       const raw = buffer.slice(0, newline);
       buffer = buffer.slice(newline + 1);
+      if (Buffer.byteLength(raw, 'utf8') > MAX_DAEMON_FRAME_BYTES) {
+        respond({
+          id: UNPARSEABLE_REQUEST_ID,
+          error: 'Daemon request frame exceeds 320 KiB.',
+          code: 'payload_too_large',
+          retryable: false,
+        });
+        return;
+      }
 
       let request: DaemonRequest;
       try {
@@ -1021,14 +1240,20 @@ export function createDaemonServer({
       // daemon process (issue #292 review). One bad request must never take the
       // daemon down.
       void Promise.resolve()
-        .then(() => handleRequest(runtime, request, stop, reapAfterMs))
+        .then(() =>
+          handleRequest(runtime, request, {
+            stop,
+            ...(reapAfterMs !== undefined ? { reapAfterMs } : {}),
+            ...(workspaceIdentity ? { workspaceIdentity } : {}),
+            ...(monitorsDirIdentity ? { monitorsDirIdentity } : {}),
+            ...(onExternalStateChanged ? { onExternalStateChanged } : {}),
+          }),
+        )
         .then((result) => {
           respond({ id: request.id, result });
         })
         .catch((error: unknown) => {
-          const message =
-            error instanceof Error ? error.message : String(error);
-          respond({ id: request.id, error: message });
+          respondWithError(request.id, error);
         });
     });
   });
@@ -1205,7 +1430,15 @@ export async function callDaemon<T = unknown>(
             );
             return;
           }
-          fail(new Error(response.error));
+          fail(
+            response.code
+              ? new DaemonApplicationError(
+                  response.error,
+                  response.code,
+                  response.retryable ?? false,
+                )
+              : new Error(response.error),
+          );
           return;
         }
         settle(() => {
