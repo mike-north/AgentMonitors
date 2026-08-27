@@ -1578,6 +1578,131 @@ mode #303 fixes. A short bounded fallback (2s) applies the same principle to ord
 completions, so a well-formed command can never hang this call either; a normal command's streams
 close within milliseconds of exit, so this never adds latency in the common case.
 
+**The timeout must not depend on the daemon staying alive — the child is self-bounding** (issue
+#470, and AP8 in [000](./000-principles.md)). The SIGTERM→SIGKILL escalation above lives as timers
+_in the daemon process_. Because the command is spawned `detached` (its own process group), if the
+daemon dies abruptly — `kill -9`, crash, OOM — before a hung command's timeout fires, those timers
+die with it and the detached child reparents to launchd/init and survives **indefinitely**, with
+nothing left to reap it. For a long-running background daemon that is a reliability-fatal leak, not
+a corner case: leaked children accumulate until the user must restart. So on POSIX each execution
+also arms an **independent, `detached` self-watchdog sibling** that reaps the command's whole process
+group at a backstop deadline. Being its own detached process, it survives the daemon's death and
+reaps the orphan on its own timer; on normal completion it disarms itself the moment its liveness
+pipe proves every holder of the inherited fd has gone, so it never lingers. It runs on the daemon's
+own Node binary rather than a shell: a shell watchdog has no timer of its own and can only borrow
+one from `sleep`, which makes every property of the backstop rest on a `PATH` lookup the daemon does
+not control (a `sleep` that is missing, that exits at once, that silently caps its operand, or that
+never returns — each of which was reported in review). `setTimeout` cannot be missing, return early,
+or hang, so that failure class is structurally absent rather than guarded, and `mkfifo` is the only
+remaining `PATH` dependency. The backstop deadline is set strictly _after_ the daemon's own
+`timeout` + SIGKILL-grace window (plus a small slack), so the daemon-resident timers stay
+authoritative in the normal case and the self-watchdog only ever fires when they cannot. The
+invariant it guarantees: **`kill -9` the daemon mid-command, and the leader — along with any
+descendant that still holds a copy of the liveness fd — terminates on its own within `timeout` +
+grace + slack.** (This is narrower than "the whole process group" — see the bulleted qualification
+below for the class of descendant it does not cover.) The watchdog is spawned as a
+_sibling_ (not a shell wrapper around the command) precisely so the command itself is still spawned
+directly (`shell: false`) and every §11.1/§11.2/§11.5 semantic — no shell word-splitting, real
+spawn-failure errors, exact exit codes — is preserved unchanged.
+
+**The watchdog spawns the command.** This is what makes the bound real rather than merely early.
+Two weaker orderings were tried and both leaked: arming after the spawn left the command running
+unbounded for the whole of the watchdog's launch and handshake, and arming first while the daemon
+still spawned the command left a window between the command's creation and the handoff of its
+process-group id. That second window is not narrow under load — on Linux, with forty concurrent
+executions, a command whose first action was to kill the daemon escaped through it 34 times out of
+40 (and 40 out of 40 against the arm-after-spawn ordering). Gating an arbitrary command's progress at
+exec time is not possible portably (there is no spawn-suspended, and a shell stub that stops itself
+would swallow exec failures and break §11.5), so the only sound arrangement is for whoever creates
+the command to own its deadline. The daemon therefore sends a command spec to the already-armed
+watchdog, which spawns the command, reports back its pid — or a spawn error, or its exit — and holds
+the deadline for it. The command's stdout and stderr are created alongside the watchdog and passed
+straight through, so the daemon still reads them directly, with no extra hop. Node still performs the
+spawn, so §11.1/§11.5 semantics are unchanged: no shell, real `ENOENT`/`EACCES` spawn errors, exact
+exit codes.
+
+Two consequences worth stating. The command's parent is now the watchdog, not the daemon: a command
+that kills its own parent therefore kills the watchdog and is left bounded by the daemon's timers,
+the mirror image of the previous arrangement (a command that kills both supervisors escapes either
+way — nothing short of privilege separation prevents that). And because the daemon no longer holds
+the child handle, the command's exit arrives as a report over the watchdog's channel; that channel is
+kept referenced until the observation settles, or a host that ticks in-process (`daemon once`) can
+run out of work and exit mid-tick with the observation unresolved.
+
+Three properties make the self-watchdog safe rather than merely present:
+
+- **It kills by identity, not by a recyclable pgid** — for the members of the group that hold the
+  identity. A bare `kill -KILL -<pgid>` after a fixed sleep is unsafe: if the command exits on its own
+  before the deadline, its numeric pgid can be recycled by an unrelated same-user process group, which
+  the delayed signal would then wrongly kill (the sleep can be up to ~24.8 days). So the watchdog binds
+  to an **un-recyclable liveness pipe**: the command inherits the only write end of an extra fd
+  (`COMMAND_LIVENESS_FD` — a deliberately high fd, not fd 3, per the issue #472 review below), and the
+  watchdog holds the read end. A blocking read on it reaches EOF once every process holding a copy of
+  that fd has gone, and a pipe is a kernel object that cannot be recycled. The watchdog races the
+  deadline against that EOF and signals **only** if the deadline elapses while the pipe is still open
+  (a group member provably still holds it, still alive); if every holder exited first it disarms
+  without ever signalling. A residual microsecond check-then-signal window is inherent to signalling by
+  pgid on POSIX (a race-free `pidfd` kill is Linux-only, non-portable — AP8 target work).
+
+  **This proves liveness only for processes that actually hold a copy of the fd — not, as originally
+  documented, unconditionally for "the whole group" (issue #472 second-round review).** The direct
+  command process always holds one (the runtime hands it the fd explicitly at spawn time), and a
+  descendant it backgrounds via plain shell/exec-based job control (`cmd &`, with no intervening
+  program that clears the fd) typically inherits it too. A descendant spawned through a process API
+  documented to default to close-on-exec for non-explicit fds (Python's `subprocess` with
+  `close_fds=True`, Go's `os/exec`, Ruby's `Process.spawn`) never receives a copy at all; if the leader
+  then exits having handed real work to that descendant, the pipe EOFs and the watchdog disarms even
+  though the descendant is still alive — silently reintroducing the exact #470 orphan failure for that
+  class of command. This is a genuine, currently open gap, distinct from and more consequential than
+  the `closefrom(3)`-style hardening residual fd placement already accepts (see `COMMAND_LIVENESS_FD`'s
+  doc comment for the full analysis of why a fix was not shipped for it in this round without
+  reintroducing the pgid-recycling hazard the pipe exists to close).
+
+  **For Node's own `child_process.spawn`, whether the descendant receives a copy turns out to be
+  platform-dependent, not a documented cross-platform default (issue #472 review round 5).** Node does
+  not, by itself, guarantee closing every non-explicit fd on `spawn()` — that is a property of the
+  underlying OS process-creation call, which differs by platform. Confirmed while reproducing this
+  scenario in CI: on macOS, a `child_process.spawn(cmd, args, { stdio: 'ignore' })` descendant does NOT
+  inherit `COMMAND_LIVENESS_FD` — the gap above reproduces exactly as described. On the Linux/Node
+  combination CI runs, the SAME call DOES pass the fd through (verified via `/proc/<pid>/fd`
+  inspection), so the liveness pipe never reaches EOF while that descendant is alive, and the ordinary
+  backstop deadline reaps it by pgid instead — the gap does not reproduce there. Both outcomes are
+  pinned by platform-scoped characterization tests (see 003 §11.7's validation-implications entry for
+  this item) so neither platform's actual behavior can silently drift without failing a test.
+
+- **It stays armed regardless of how the observation resolves, until it independently proves the group
+  is gone.** The watchdog is never proactively killed by the runtime on any outcome — success, failure,
+  or timeout alike (issue #472 second-round review; it previously WAS killed immediately on any
+  non-timeout resolution, on the false assumption that the direct child's own exit means the whole
+  group is done, which silently leaked a descendant backgrounded by an otherwise-successful command,
+  §11.7-issue-#303-style, with nothing left to reap it). It disarms itself, via the same liveness-pipe
+  EOF, the instant the group it can observe is actually gone — near-instant for a well-behaved command
+  with no live descendant — and otherwise reaps the group at its own backstop deadline. This also covers
+  the timeout path unchanged: the daemon's own SIGTERM→SIGKILL escalation is still armed for a
+  SIGTERM-ignoring descendant there, so if the daemon dies during that grace, the watchdog is the only
+  thing left to reap it.
+- **It fails closed, before the command runs.** If no independent bound can be armed — the liveness
+  pipe cannot be created, the watchdog cannot be launched, or it does not confirm it is armed within
+  the daemon's arming deadline — the runtime reports an execution failure and **the command is never
+  spawned at all**. Because arming completes before the command exists, there is no window in which
+  an unbounded command has already started: this replaces the earlier behavior, where the command was
+  spawned first and terminated after the fact (and, for a command whose first action had an
+  observable side effect, terminated too late to prevent it).
+
+  Confirming "armed" is a proof, not a name lookup: the watchdog says so only once its deadline timer
+  is running and it is reading the liveness pipe. The arming handshake is itself bounded — a
+  handshake that never resolves would otherwise leave `observe()` pending forever, wedging an
+  in-process host (`daemon once`) and stranding a detached watchdog subtree with it. Exceeding the
+  deadline reaps the watchdog's own process group and fails the command closed, so a slow launch
+  costs an observation, never an unbounded command.
+
+  The remaining binary precondition is narrow: every POSIX `command-poll` execution needs `mkfifo`
+  reachable on `PATH` for the liveness pipe. Nothing else is required — the watchdog runs on the
+  daemon's own Node binary, so `sh`, `sleep` and `date` are no longer involved. On an image without
+  `mkfifo`, arming fails on every execution and every observation reports an execution failure citing
+  the self-bounding watchdog, with no path to recovery short of adding that binary to the daemon's
+  environment.
+
 The **result** of an execution is `(exitCode, stdout)`. A **nonzero exit code with output is a
 valid result, not a failure** — many CLIs exit nonzero meaningfully (`grep`, linters, a task CLI
 whose backing app is closed). The failure category is reserved for executions that produce no
@@ -1725,6 +1850,36 @@ issue #86's AC1–AC7):
   (verified: `apps/cli/src/commands/cli.integration.test.ts` — _"a live daemon kills a backgrounded
   sh -c descendant on tick timeout, and shutdown leaves it dead"_), so the no-orphan property holds
   not just per-call but across the daemon's own shutdown.
+- A command-poll child is **self-bounding, within the liveness-fd boundary §11.2 documents**:
+  killing the daemon abruptly (`kill -9`) mid-command, before its own timeout could fire, still
+  leaves the command's leader process — and any descendant that continues to hold an inherited copy
+  of `COMMAND_LIVENESS_FD` (plain shell/exec-based backgrounding, e.g. `cmd &`, with no intervening
+  program that clears it) — terminating on its own within `timeout` + grace + slack; it never orphans
+  indefinitely (issue #470, AP8). **This is not an unconditional whole-process-group guarantee.** A
+  descendant spawned through a process API documented to default to close-on-exec for non-explicit fds
+  (Python's `subprocess` with `close_fds=True`, Go's `os/exec`, Ruby's `Process.spawn`) never receives a
+  copy of the fd; once the leader that does hold it exits, the pipe EOFs and the watchdog disarms even
+  though that descendant is still alive. This class of command remains genuinely unbounded once the
+  daemon is gone — issue #470 stays open as the tracker for closing it (a fix needs a liveness proof
+  that does not depend on fd inheritance, e.g. periodically re-verifying group membership by pgid,
+  which reintroduces the recycled-pgid hazard this design exists to avoid; see `COMMAND_LIVENESS_FD`'s
+  doc comment for the full analysis). For Node's own `child_process.spawn` specifically, whether a
+  descendant receives a copy is platform-dependent, not a documented cross-platform default (issue
+  #472 review round 5) — confirmed on macOS (the gap above reproduces) but NOT on the Linux/Node
+  combination CI runs (the descendant DOES inherit the fd there, so it stays bounded by the ordinary
+  backstop pgid kill instead; see `COMMAND_LIVENESS_FD`'s doc comment for the `/proc`-verified detail).
+  Verified end to end through a live `daemon run` subprocess:
+  `apps/cli/src/commands/cli.integration.test.ts` — _"a command-poll descendant self-terminates after
+  the daemon is killed with SIGKILL mid-command"_ first confirms the descendant is genuinely orphaned
+  (still alive immediately after the daemon is SIGKILLed, so nothing daemon-side is left to reap it),
+  then confirms it dies on its own within the self-watchdog deadline. Removing the self-watchdog makes
+  the test fail (the orphan never dies), proving it is not vacuous. The boundary itself is pinned by
+  platform-scoped characterization tests (verified: `plugins/source-command-poll/src/index.test.ts` —
+  _"self-watchdog boundary — a close-on-exec-spawned descendant"_): on a platform where the descendant
+  does not inherit the fd (macOS), it asserts the descendant is still alive well past the backstop
+  deadline; on a platform where it does (this Linux/Node combination), it asserts the descendant is
+  reaped anyway via the ordinary backstop pgid kill — pinning whichever behavior a platform actually
+  has, so neither can silently drift without failing a test.
 - Registration + the `init --type command-poll` template + `validate` accepting/rejecting a
   `command-poll` monitor are covered at the CLI layer (AC7: verified:
   `apps/cli/src/commands/cli.integration.test.ts` — _"scaffolds a command-poll monitor that passes

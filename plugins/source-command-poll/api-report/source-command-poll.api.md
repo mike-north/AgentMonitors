@@ -4,6 +4,12 @@
 
 ```ts
 
+import { ChildProcess } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+
+// @internal
+export function _adaptChildProcessEvents(child: ChildProcess, events: EventEmitter): void;
+
 // @public
 export type ChangeKind = 'created' | 'modified' | 'deleted' | 'descoped';
 
