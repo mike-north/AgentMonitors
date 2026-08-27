@@ -15,6 +15,7 @@ import {
 } from 'drizzle-orm';
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import type { Database as BetterSQLiteClient } from 'better-sqlite3';
+import { Buffer } from 'node:buffer';
 import { monotonicFactory, ulid } from 'ulid';
 
 /**
@@ -50,10 +51,12 @@ const snapshotUlid = monotonicFactory();
  * this user-visible listing.
  */
 const observationUlid = monotonicFactory();
+const materializationRetryUlid = monotonicFactory();
 import type { InboxDb } from '../inbox/db.js';
 import {
   agentSessions,
   ephemeralMonitors,
+  materializationRetryOutbox,
   monitorEvents,
   monitorSnapshots,
   monitorState,
@@ -65,12 +68,15 @@ import {
 import { EPHEMERAL_MONITOR_ID_PREFIX } from './types.js';
 import type {
   AgentSessionRecord,
+  EnqueueMaterializationRetryInput,
   EphemeralMonitorRecord,
   EventQuery,
   MonitorEventRecord,
   MonitorDeliveryProjection,
   MonitorDeliveryState,
   MonitorRuntimeState,
+  MaterializationRetryQuery,
+  MaterializationRetryRecord,
   ObservationHistoryQuery,
   ObservationHistoryRecord,
   ObservationOutcome,
@@ -79,8 +85,17 @@ import type {
   SessionHookState,
   SessionObjectCursorRecord,
 } from './types.js';
+import {
+  MATERIALIZATION_RETRY_DELAYS_MS,
+  MATERIALIZATION_RETRY_MAX_BYTES,
+  MATERIALIZATION_RETRY_MAX_RECORDS,
+} from './types.js';
 import type { Urgency } from '../schema/types.js';
 import { buildDiff, changeDetectionStrategyOf } from './diff.js';
+import {
+  deserializeRetryEnvelope,
+  serializeRetryEnvelope,
+} from './retry-envelope.js';
 
 type InternalInboxDb = BetterSQLite3Database<
   typeof import('../inbox/schema.js')
@@ -161,6 +176,57 @@ function rowToEphemeralMonitor(
     updatedAt: row.updatedAt,
     ...(row.reapedAt ? { reapedAt: row.reapedAt } : {}),
   };
+}
+
+function rowToMaterializationRetry(
+  row: typeof materializationRetryOutbox.$inferSelect,
+): MaterializationRetryRecord {
+  return {
+    id: row.id,
+    workspacePath: row.workspacePath ?? null,
+    monitorId: row.monitorId,
+    sourceName: row.sourceName,
+    envelope: deserializeRetryEnvelope(row.envelope, row.id),
+    envelopeBytes: row.envelopeBytes,
+    attemptCount: row.attemptCount,
+    status: row.status,
+    nextAttemptAt: row.nextAttemptAt ?? null,
+    lastError: row.lastError ?? null,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function materializationRetryKey(
+  monitorId: string,
+  workspacePath: string | null,
+) {
+  return and(
+    eq(materializationRetryOutbox.monitorId, monitorId),
+    workspacePath === null
+      ? isNull(materializationRetryOutbox.workspacePath)
+      : eq(materializationRetryOutbox.workspacePath, workspacePath),
+  );
+}
+
+function safeRetryError(message: string): string {
+  // eslint-disable-next-line no-control-regex -- persisted diagnostics must remove terminal controls
+  return message.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').slice(0, 1_024);
+}
+
+/** Raised when a workspace/monitor retry outbox has reached its bound. @public */
+export class MaterializationRetryCapacityError extends Error {
+  /** Stable machine-readable error code. */
+  readonly code = 'materialization_retry_capacity_exceeded';
+
+  /** Monitor whose workspace-scoped retry outbox is full. */
+  readonly monitorId: string;
+
+  constructor(monitorId: string) {
+    super(`Materialization retry capacity is exhausted for ${monitorId}.`);
+    this.name = 'MaterializationRetryCapacityError';
+    this.monitorId = monitorId;
+  }
 }
 
 function deliveryStateForRow(row: {
@@ -728,6 +794,158 @@ export class RuntimeStore {
         updatedAt: now,
       })
       .run();
+  }
+
+  /**
+   * Durably enqueue one batch of failed materializations.
+   *
+   * Admission is atomic per call and serialized with an immediate transaction.
+   * Every envelope must match its trusted monitor/source route and contain only
+   * losslessly JSON-safe values (apart from the typed `observedAt` Date).
+   *
+   * @throws {@link MaterializationRetryCapacityError} when any affected
+   * workspace/monitor would exceed its count or byte bound.
+   * @throws {@link MaterializationRetrySerializationError} before mutation when
+   * an envelope cannot be losslessly persisted.
+   */
+  enqueueMaterializationRetries(
+    inputs: EnqueueMaterializationRetryInput[],
+    now = new Date(),
+  ): MaterializationRetryRecord[] {
+    if (inputs.length === 0) return [];
+    const db = asInternalDb(this.db);
+    const prepared = inputs.map((input) => {
+      if (input.envelope.monitor.id !== input.monitorId) {
+        throw new Error('Retry envelope monitor id does not match its route.');
+      }
+      if (input.envelope.monitor.frontmatter.watch.type !== input.sourceName) {
+        throw new Error('Retry envelope source does not match its route.');
+      }
+      const envelope = serializeRetryEnvelope(input.envelope);
+      return {
+        input,
+        id: materializationRetryUlid(now.getTime()),
+        envelope,
+        envelopeBytes: Buffer.byteLength(envelope, 'utf8'),
+      };
+    });
+
+    return db.$client
+      .transaction(() => {
+        const additions = new Map<
+          string,
+          {
+            monitorId: string;
+            workspacePath: string | null;
+            count: number;
+            bytes: number;
+          }
+        >();
+        for (const item of prepared) {
+          const key = JSON.stringify([
+            item.input.workspacePath,
+            item.input.monitorId,
+          ]);
+          const addition = additions.get(key) ?? {
+            monitorId: item.input.monitorId,
+            workspacePath: item.input.workspacePath,
+            count: 0,
+            bytes: 0,
+          };
+          addition.count += 1;
+          addition.bytes += item.envelopeBytes;
+          additions.set(key, addition);
+        }
+
+        for (const addition of additions.values()) {
+          const usage = db
+            .select({
+              count: sql<number>`count(*)`,
+              bytes: sql<number>`coalesce(sum(${materializationRetryOutbox.envelopeBytes}), 0)`,
+            })
+            .from(materializationRetryOutbox)
+            .where(
+              materializationRetryKey(
+                addition.monitorId,
+                addition.workspacePath,
+              ),
+            )
+            .get();
+          if (
+            (usage?.count ?? 0) + addition.count >
+              MATERIALIZATION_RETRY_MAX_RECORDS ||
+            (usage?.bytes ?? 0) + addition.bytes >
+              MATERIALIZATION_RETRY_MAX_BYTES
+          ) {
+            throw new MaterializationRetryCapacityError(addition.monitorId);
+          }
+        }
+
+        const nextAttemptAt = new Date(
+          now.getTime() + MATERIALIZATION_RETRY_DELAYS_MS[0],
+        );
+        for (const item of prepared) {
+          db.insert(materializationRetryOutbox)
+            .values({
+              id: item.id,
+              workspacePath: item.input.workspacePath,
+              monitorId: item.input.monitorId,
+              sourceName: item.input.sourceName,
+              envelope: item.envelope,
+              envelopeBytes: item.envelopeBytes,
+              attemptCount: 0,
+              status: 'pending',
+              nextAttemptAt,
+              lastError: safeRetryError(item.input.error),
+              createdAt: now,
+              updatedAt: now,
+            })
+            .run();
+        }
+        return prepared.map((item) => this.getMaterializationRetry(item.id));
+      })
+      .immediate();
+  }
+
+  /** Return one retry record, or throw when its id does not exist. */
+  getMaterializationRetry(id: string): MaterializationRetryRecord {
+    const row = asInternalDb(this.db)
+      .select()
+      .from(materializationRetryOutbox)
+      .where(eq(materializationRetryOutbox.id, id))
+      .get();
+    if (!row) throw new Error(`Materialization retry record not found: ${id}`);
+    return rowToMaterializationRetry(row);
+  }
+
+  /** List retry records oldest-first with optional route and status filters. */
+  listMaterializationRetries(
+    query: MaterializationRetryQuery = {},
+  ): MaterializationRetryRecord[] {
+    const conditions = [
+      query.monitorId
+        ? eq(materializationRetryOutbox.monitorId, query.monitorId)
+        : undefined,
+      query.workspacePath === undefined
+        ? undefined
+        : query.workspacePath === null
+          ? isNull(materializationRetryOutbox.workspacePath)
+          : eq(materializationRetryOutbox.workspacePath, query.workspacePath),
+      query.status
+        ? eq(materializationRetryOutbox.status, query.status)
+        : undefined,
+    ].filter((condition) => condition !== undefined);
+    return asInternalDb(this.db)
+      .select()
+      .from(materializationRetryOutbox)
+      .where(conditions.length > 0 ? and(...conditions) : undefined)
+      .orderBy(
+        asc(materializationRetryOutbox.createdAt),
+        asc(materializationRetryOutbox.id),
+      )
+      .limit(query.limit ?? MATERIALIZATION_RETRY_MAX_RECORDS)
+      .all()
+      .map(rowToMaterializationRetry);
   }
 
   /**

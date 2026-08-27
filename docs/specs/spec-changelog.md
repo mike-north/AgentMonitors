@@ -9,6 +9,14 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-08-13 — Failed materialization has a bounded durable retry outbox (002 schema, 004 §3.4, 005 §15) — Refs #295, #481
+
+Core now persists failed stored-observation envelopes in a workspace-scoped, per-monitor outbox
+before a later runtime change adopts it for source ticks. Batch enqueue is capacity-atomic at 256
+records or 8 MiB. Envelopes must round-trip through JSON without conversion, trusted routes are
+checked before mutation, and safe errors are control-stripped and bounded. Retry lifecycle and
+operator diagnostics are delivered in the next two stack layers.
+
 ## 2026-08-13 — Event materialization is one atomic durable unit (002 §5, 004 §3.4) — Refs #295, #481
 
 The shared event row, matching lead-session projections, first-recipient cursor seeds, and snapshot
