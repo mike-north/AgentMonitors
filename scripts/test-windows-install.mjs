@@ -60,6 +60,11 @@ function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
+    // Node's CVE-2024-27980 hardening makes spawning a win32 `.cmd` shim
+    // without a shell throw EINVAL. None of our arguments contain spaces or
+    // shell metacharacters (CI temp/repo paths), so shelling the shim is
+    // safe here.
+    shell: command.endsWith('.cmd'),
     ...options,
   });
   if (result.error) {

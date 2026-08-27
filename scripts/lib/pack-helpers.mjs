@@ -25,6 +25,10 @@ export function packPackage(packageDir, packDestDir) {
       cwd: packageDir,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
+      // Node's CVE-2024-27980 hardening makes spawning `pnpm.cmd` without a
+      // shell throw EINVAL on win32. Arguments here are workspace/temp paths
+      // with no spaces or shell metacharacters, so shelling the shim is safe.
+      shell: PNPM_BIN.endsWith('.cmd'),
     },
   );
   if (result.status !== 0) {
