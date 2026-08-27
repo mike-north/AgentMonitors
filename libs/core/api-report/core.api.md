@@ -506,6 +506,59 @@ export function externalEventObjectKey(source: string, objectId: string): string
 export type ExternalEventOutcome = /** One or more normal Agent Monitors events were committed. */ 'materialized' | /** A supported notify delay captured the event durably. */ 'held' | /** Local shaping policy deliberately produced no event. */ 'suppressed' | /** A newer object sequence had already been accepted. */ 'stale' | /** Deferred materialization exhausted automatic retries. */ 'failed';
 
 // @public
+export type ExternalEventReceiptCompletion = {
+    outcome: 'materialized';
+    eventIds: [string, ...string[]];
+    materializedAt?: Date;
+} | {
+    outcome: 'held' | 'suppressed' | 'failed';
+    eventIds?: never;
+    materializedAt?: never;
+};
+
+// @public
+export interface ExternalEventReceiptContext {
+    acceptedAt: Date;
+    receiptId: string;
+}
+
+// @public
+export type ExternalEventReceiptDecision = {
+    decision: 'accepted';
+    receipt: ExternalEventReceiptRecord;
+} | {
+    decision: 'duplicate';
+    receipt: ExternalEventReceiptRecord;
+} | {
+    decision: 'conflict';
+    existingReceiptId: string;
+};
+
+// @public
+export type ExternalEventReceiptOperation = (context: ExternalEventReceiptContext) => ExternalEventReceiptCompletion;
+
+// @public
+export interface ExternalEventReceiptRecord {
+    acceptedAt: Date;
+    attemptCount: number;
+    changeKind: ExternalEventIngestInput['envelope']['changeKind'];
+    eventIds: string[];
+    eventKind: string;
+    lastError: string | null;
+    materializedAt: Date | null;
+    monitorId: string;
+    nextAttemptAt: Date | null;
+    objectId: string;
+    objectSequence: number;
+    occurredAt: string;
+    outcome: ExternalEventOutcome;
+    receiptId: string;
+    source: string;
+    updatedAt: Date;
+    upstreamEventId: string;
+}
+
+// @public
 export const externalEventReservedScopeKeys: readonly ["ingressSource", "eventKind", "changeKind", "upstreamEventId", "objectSequence", "occurredAt"];
 
 // @public
@@ -1697,6 +1750,7 @@ export class RuntimeStore {
         createdAt: Date;
         expiresAt: Date;
     }): void;
+    withExternalEventReceipt(input: ExternalEventIngestInput, operation: ExternalEventReceiptOperation, acceptedAt?: Date): ExternalEventReceiptDecision;
 }
 
 // @public

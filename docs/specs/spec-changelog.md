@@ -9,6 +9,15 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-08-13 — External receipts and object ordering are durable (002 §2.6, §15; 004 §3.4.1) — Refs #481
+
+Core now persists compact workspace-aware external-event receipts and per-object sequence
+high-water marks. One immediate transaction decides duplicate/conflict/stale status, runs accepted
+synchronous durable work, and commits its receipt/order consequence; callback failure rolls all of
+it back. The accepted decision exposes safe receipt metadata without state, payload, cursor, hash,
+scope, or workspace identity. A per-workspace `durable-ingress-v1` marker commits atomically with
+each first receipt; read APIs and marker propagation to held/retry work follow in the next layer.
+
 ## 2026-08-13 — Versioned source-neutral external-event contract is public (002 §2.6, 004 §2.9) — Refs #481
 
 Core now exports the strict `agentmonitors.external-event.v1` envelope validator, recursively

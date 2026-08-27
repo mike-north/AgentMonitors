@@ -52,10 +52,16 @@ const snapshotUlid = monotonicFactory();
  */
 const observationUlid = monotonicFactory();
 const materializationRetryUlid = monotonicFactory();
+const externalReceiptUlid = monotonicFactory();
+const externalSequenceUlid = monotonicFactory();
+const compatibilityMarkerUlid = monotonicFactory();
 import type { InboxDb } from '../inbox/db.js';
 import {
   agentSessions,
+  databaseCompatibilityMarkers,
   ephemeralMonitors,
+  externalEventReceipts,
+  externalObjectSequences,
   materializationRetryOutbox,
   monitorEvents,
   monitorSnapshots,
@@ -65,11 +71,20 @@ import {
   sessionEventState,
   sessionObjectCursor,
 } from '../inbox/schema.js';
+import {
+  type ExternalEventIngestInput,
+  type ExternalEventOutcome,
+  validateExternalEventEnvelope,
+} from '../external-ingress/contract.js';
+import { externalEventSemanticHash } from '../external-ingress/identity.js';
 import { EPHEMERAL_MONITOR_ID_PREFIX } from './types.js';
 import type {
   AgentSessionRecord,
   EnqueueMaterializationRetryInput,
   EphemeralMonitorRecord,
+  ExternalEventReceiptDecision,
+  ExternalEventReceiptOperation,
+  ExternalEventReceiptRecord,
   EventQuery,
   MonitorEventRecord,
   MonitorDeliveryProjection,
@@ -87,6 +102,7 @@ import type {
   SessionObjectCursorRecord,
 } from './types.js';
 import {
+  DURABLE_INGRESS_COMPATIBILITY_MARKER,
   MATERIALIZATION_RETRY_DELAYS_MS,
   MATERIALIZATION_RETRY_MAX_ATTEMPTS,
   MATERIALIZATION_RETRY_MAX_BYTES,
@@ -214,6 +230,158 @@ function materializationRetryKey(
 function safeRetryError(message: string): string {
   // eslint-disable-next-line no-control-regex -- persisted diagnostics must remove terminal controls
   return message.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').slice(0, 1_024);
+}
+
+function isUniqueNonemptyStringArray(value: unknown): value is string[] {
+  if (!Array.isArray(value)) return false;
+  const entries: unknown[] = value;
+  return (
+    entries.every(
+      (entry): entry is string => typeof entry === 'string' && entry.length > 0,
+    ) && new Set(entries).size === entries.length
+  );
+}
+
+function externalReceiptEventIds(value: string, receiptId: string): string[] {
+  const parsed = parseJson<unknown>(value, null);
+  if (!isUniqueNonemptyStringArray(parsed)) {
+    throw new Error(
+      `External event receipt ${receiptId} has invalid event ids.`,
+    );
+  }
+  return parsed;
+}
+
+function rowToExternalEventReceipt(
+  row: typeof externalEventReceipts.$inferSelect,
+): ExternalEventReceiptRecord {
+  return {
+    receiptId: row.id,
+    monitorId: row.monitorId,
+    source: row.source,
+    upstreamEventId: row.upstreamEventId,
+    objectId: row.objectId,
+    objectSequence: row.objectSequence,
+    eventKind: row.eventKind,
+    changeKind: row.changeKind,
+    occurredAt: row.occurredAt,
+    outcome: row.outcome,
+    eventIds: externalReceiptEventIds(row.eventIds, row.id),
+    attemptCount: row.attemptCount,
+    lastError: row.lastError ?? null,
+    nextAttemptAt: row.nextAttemptAt ?? null,
+    acceptedAt: row.acceptedAt,
+    materializedAt: row.materializedAt ?? null,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function externalReceiptKey(input: ExternalEventIngestInput) {
+  return and(
+    eq(externalEventReceipts.workspaceIdentity, input.workspaceIdentity),
+    eq(externalEventReceipts.monitorId, input.envelope.monitorId),
+    eq(externalEventReceipts.source, input.envelope.source),
+    eq(externalEventReceipts.upstreamEventId, input.envelope.upstreamEventId),
+  );
+}
+
+function externalObjectSequenceKey(input: ExternalEventIngestInput) {
+  return and(
+    eq(externalObjectSequences.workspaceIdentity, input.workspaceIdentity),
+    eq(externalObjectSequences.monitorId, input.envelope.monitorId),
+    eq(externalObjectSequences.source, input.envelope.source),
+    eq(externalObjectSequences.objectId, input.envelope.objectId),
+  );
+}
+
+function compatibilityMarkerKey(workspaceIdentity: string | null) {
+  return and(
+    workspaceIdentity === null
+      ? isNull(databaseCompatibilityMarkers.workspaceIdentity)
+      : eq(databaseCompatibilityMarkers.workspaceIdentity, workspaceIdentity),
+    eq(
+      databaseCompatibilityMarkers.capability,
+      DURABLE_INGRESS_COMPATIBILITY_MARKER,
+    ),
+  );
+}
+
+function writeCompatibilityMarker(
+  db: InternalInboxDb,
+  workspaceIdentity: string | null,
+  now: Date,
+): void {
+  const existing = db
+    .select({ id: databaseCompatibilityMarkers.id })
+    .from(databaseCompatibilityMarkers)
+    .where(compatibilityMarkerKey(workspaceIdentity))
+    .get();
+  if (existing) return;
+  db.insert(databaseCompatibilityMarkers)
+    .values({
+      id: compatibilityMarkerUlid(now.getTime()),
+      workspaceIdentity,
+      capability: DURABLE_INGRESS_COMPATIBILITY_MARKER,
+      createdAt: now,
+    })
+    .run();
+}
+
+function normalizeExternalReceiptCompletion(
+  completion: unknown,
+  acceptedAt: Date,
+): {
+  outcome: Exclude<ExternalEventOutcome, 'stale'>;
+  eventIds: string[];
+  materializedAt: Date | null;
+} {
+  if (completion === null || typeof completion !== 'object') {
+    throw new Error('External event completion outcome is invalid.');
+  }
+  const value = completion as Record<string, unknown>;
+  const outcome = value['outcome'];
+  if (
+    !['materialized', 'held', 'suppressed', 'failed'].includes(String(outcome))
+  ) {
+    throw new Error('External event completion outcome is invalid.');
+  }
+
+  if (outcome === 'materialized') {
+    const eventIds = value['eventIds'];
+    if (!isUniqueNonemptyStringArray(eventIds) || eventIds.length === 0) {
+      throw new Error(
+        'A materialized external event must name unique event ids.',
+      );
+    }
+    const materializedAt = Object.hasOwn(value, 'materializedAt')
+      ? value['materializedAt']
+      : acceptedAt;
+    if (
+      !(materializedAt instanceof Date) ||
+      !Number.isFinite(materializedAt.getTime())
+    ) {
+      throw new Error('External event materialization timestamp is invalid.');
+    }
+    return {
+      outcome,
+      eventIds: [...eventIds],
+      materializedAt: new Date(materializedAt.getTime()),
+    };
+  }
+
+  if (
+    Object.hasOwn(value, 'eventIds') ||
+    Object.hasOwn(value, 'materializedAt')
+  ) {
+    throw new Error(
+      'Only a materialized external event may carry event ids or a materialized timestamp.',
+    );
+  }
+  return {
+    outcome: outcome as 'held' | 'suppressed' | 'failed',
+    eventIds: [],
+    materializedAt: null,
+  };
 }
 
 /** Raised when a workspace/monitor retry outbox has reached its bound. @public */
@@ -403,6 +571,165 @@ export class RuntimeStore {
    */
   runInImmediateTransaction<T>(operation: () => T): T {
     return asInternalDb(this.db).$client.transaction(operation).immediate();
+  }
+
+  /**
+   * Persist one external-event idempotency and object-ordering decision.
+   *
+   * The synchronous `operation` runs only for a genuinely new event above the
+   * current object sequence. It runs inside the same immediate transaction as
+   * receipt, high-water, and compatibility-marker writes. Duplicate, conflict,
+   * and stale decisions never invoke it. Any thrown error rolls the complete
+   * transaction back.
+   *
+   * @param input - Canonical workspace identity and unknown-boundary-validated envelope.
+   * @param operation - Synchronous durable work for a new, non-stale event.
+   * @param acceptedAt - Injectable local receipt clock; producer occurrence time is in the envelope.
+   */
+  withExternalEventReceipt(
+    input: ExternalEventIngestInput,
+    operation: ExternalEventReceiptOperation,
+    acceptedAt = new Date(),
+  ): ExternalEventReceiptDecision {
+    const runtimeInput: unknown = input;
+    if (
+      runtimeInput === null ||
+      typeof runtimeInput !== 'object' ||
+      !('workspaceIdentity' in runtimeInput) ||
+      typeof runtimeInput.workspaceIdentity !== 'string' ||
+      runtimeInput.workspaceIdentity.length === 0
+    ) {
+      throw new Error('External event workspace identity must not be empty.');
+    }
+    if (
+      !(acceptedAt instanceof Date) ||
+      !Number.isFinite(acceptedAt.getTime())
+    ) {
+      throw new Error('External event receipt timestamp is invalid.');
+    }
+    const validation = validateExternalEventEnvelope(input.envelope);
+    if (!validation.success) {
+      throw new Error(validation.error.message);
+    }
+    const normalizedInput: ExternalEventIngestInput = {
+      workspaceIdentity: input.workspaceIdentity,
+      envelope: validation.envelope,
+    };
+    const semanticHash = externalEventSemanticHash(validation.envelope);
+    const receiptAcceptedAt = new Date(acceptedAt.getTime());
+    const db = asInternalDb(this.db);
+
+    return db.$client
+      .transaction(() => {
+        const existing = db
+          .select()
+          .from(externalEventReceipts)
+          .where(externalReceiptKey(normalizedInput))
+          .get();
+        if (existing) {
+          if (existing.semanticHash !== semanticHash) {
+            return {
+              decision: 'conflict' as const,
+              existingReceiptId: existing.id,
+            };
+          }
+          return {
+            decision: 'duplicate' as const,
+            receipt: rowToExternalEventReceipt(existing),
+          };
+        }
+
+        const receiptId = externalReceiptUlid(receiptAcceptedAt.getTime());
+        const sequence = db
+          .select()
+          .from(externalObjectSequences)
+          .where(externalObjectSequenceKey(normalizedInput))
+          .get();
+        const stale =
+          sequence !== undefined &&
+          validation.envelope.objectSequence <= sequence.highestSequence;
+        let outcome: ExternalEventOutcome = 'stale';
+        let eventIds: string[] = [];
+        let materializedAt: Date | null = null;
+        if (!stale) {
+          const completion = normalizeExternalReceiptCompletion(
+            operation({
+              receiptId,
+              acceptedAt: new Date(receiptAcceptedAt.getTime()),
+            }),
+            receiptAcceptedAt,
+          );
+          outcome = completion.outcome;
+          eventIds = completion.eventIds;
+          materializedAt = completion.materializedAt;
+        }
+
+        db.insert(externalEventReceipts)
+          .values({
+            id: receiptId,
+            workspaceIdentity: normalizedInput.workspaceIdentity,
+            monitorId: validation.envelope.monitorId,
+            source: validation.envelope.source,
+            upstreamEventId: validation.envelope.upstreamEventId,
+            semanticHash,
+            objectId: validation.envelope.objectId,
+            objectSequence: validation.envelope.objectSequence,
+            eventKind: validation.envelope.eventKind,
+            changeKind: validation.envelope.changeKind,
+            occurredAt: validation.envelope.occurredAt,
+            outcome,
+            eventIds: JSON.stringify(eventIds),
+            acceptedAt: receiptAcceptedAt,
+            materializedAt,
+            updatedAt: receiptAcceptedAt,
+          })
+          .run();
+
+        if (!stale) {
+          const sequenceValues = {
+            highestSequence: validation.envelope.objectSequence,
+            receiptId,
+            upstreamEventId: validation.envelope.upstreamEventId,
+            updatedAt: receiptAcceptedAt,
+          };
+          if (sequence) {
+            db.update(externalObjectSequences)
+              .set(sequenceValues)
+              .where(eq(externalObjectSequences.id, sequence.id))
+              .run();
+          } else {
+            db.insert(externalObjectSequences)
+              .values({
+                id: externalSequenceUlid(receiptAcceptedAt.getTime()),
+                workspaceIdentity: normalizedInput.workspaceIdentity,
+                monitorId: validation.envelope.monitorId,
+                source: validation.envelope.source,
+                objectId: validation.envelope.objectId,
+                ...sequenceValues,
+              })
+              .run();
+          }
+        }
+
+        writeCompatibilityMarker(
+          db,
+          normalizedInput.workspaceIdentity,
+          receiptAcceptedAt,
+        );
+        const inserted = db
+          .select()
+          .from(externalEventReceipts)
+          .where(eq(externalEventReceipts.id, receiptId))
+          .get();
+        if (!inserted) {
+          throw new Error('External event receipt was not persisted.');
+        }
+        return {
+          decision: 'accepted' as const,
+          receipt: rowToExternalEventReceipt(inserted),
+        };
+      })
+      .immediate();
   }
 
   openSession(input: OpenSessionInput): AgentSessionRecord {

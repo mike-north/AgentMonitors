@@ -6,6 +6,10 @@ import type {
 import type { ephemeralMonitorStatus } from '../inbox/schema.js';
 import type { Observation } from '../observation/types.js';
 import type { DuplicateMonitorId } from '../parser/scan-monitors.js';
+import type {
+  ExternalEventIngestInput,
+  ExternalEventOutcome,
+} from '../external-ingress/contract.js';
 import { schedulingDefaults } from './scheduling-defaults.js';
 
 export type AgentLifecycleEvent =
@@ -643,6 +647,116 @@ export interface StoredObservationEnvelope {
    */
   effectiveUrgency: Urgency;
 }
+
+/** Capability persisted once a workspace contains forward-only durable work. @public */
+export const DURABLE_INGRESS_COMPATIBILITY_MARKER = 'durable-ingress-v1';
+
+/**
+ * Safe receipt metadata; deliberately excludes workspace identity, semantic
+ * hash, scope, state, payload, and resume cursor.
+ * @public
+ */
+export interface ExternalEventReceiptRecord {
+  /** Stable Agent Monitors receipt identifier. */
+  receiptId: string;
+  /** Local monitor identity from the validated envelope. */
+  monitorId: string;
+  /** Stable external producer name. */
+  source: string;
+  /** Producer-assigned idempotency identifier. */
+  upstreamEventId: string;
+  /** Producer object whose current state was observed. */
+  objectId: string;
+  /** Producer sequence accepted for the object. */
+  objectSequence: number;
+  /** Source-defined semantic event label. */
+  eventKind: string;
+  /** Agent Monitors change classification. */
+  changeKind: ExternalEventIngestInput['envelope']['changeKind'];
+  /** Original RFC 3339 producer timestamp. */
+  occurredAt: string;
+  /** Current durable receipt outcome. */
+  outcome: ExternalEventOutcome;
+  /** Correlated Agent Monitors event IDs, empty before materialization. */
+  eventIds: string[];
+  /** Deferred materialization failures recorded so far. */
+  attemptCount: number;
+  /** Safe bounded failure detail, or `null`. */
+  lastError: string | null;
+  /** Next deferred attempt, or `null` when none is scheduled. */
+  nextAttemptAt: Date | null;
+  /** Local durable acceptance time. */
+  acceptedAt: Date;
+  /** Local materialization time, or `null` before materialization. */
+  materializedAt: Date | null;
+  /** Time of the latest durable receipt transition. */
+  updatedAt: Date;
+}
+
+/** Context passed to new-event durable work inside the receipt transaction. @public */
+export interface ExternalEventReceiptContext {
+  /** Receipt identifier reserved for the accepted event. */
+  receiptId: string;
+  /** Stable local acceptance time for every write in the transaction. */
+  acceptedAt: Date;
+}
+
+/**
+ * Durable consequence produced inside a new receipt's acceptance transaction.
+ * Materialized work requires at least one event ID; other outcomes cannot carry
+ * event correlation or a materialization timestamp.
+ * @public
+ */
+export type ExternalEventReceiptCompletion =
+  | {
+      /** The callback durably materialized normal Agent Monitors events. */
+      outcome: 'materialized';
+      /** One or more event IDs committed by the callback. */
+      eventIds: [string, ...string[]];
+      /** Materialization time; defaults to the receipt acceptance time. */
+      materializedAt?: Date;
+    }
+  | {
+      /** A supported delay held work, policy suppressed it, or retries failed. */
+      outcome: 'held' | 'suppressed' | 'failed';
+      /** Non-materialized outcomes cannot claim event correlation. */
+      eventIds?: never;
+      /** Non-materialized outcomes cannot claim a materialization time. */
+      materializedAt?: never;
+    };
+
+/**
+ * Synchronous durable work for a genuinely new, non-stale receipt.
+ *
+ * The operation runs inside the same immediate transaction as receipt and
+ * sequence persistence. It is not invoked for duplicate, conflict, or stale
+ * decisions. Throwing rolls back both callback writes and receipt state.
+ * @public
+ */
+export type ExternalEventReceiptOperation = (
+  context: ExternalEventReceiptContext,
+) => ExternalEventReceiptCompletion;
+
+/** Idempotency and ordering decision returned by receipt persistence. @public */
+export type ExternalEventReceiptDecision =
+  | {
+      /** A new receipt and its durable consequence committed. */
+      decision: 'accepted';
+      /** Newly committed safe receipt status. */
+      receipt: ExternalEventReceiptRecord;
+    }
+  | {
+      /** The same key and semantic hash were already committed. */
+      decision: 'duplicate';
+      /** Existing safe receipt status; the operation was not invoked. */
+      receipt: ExternalEventReceiptRecord;
+    }
+  | {
+      /** The same idempotency key was reused with different semantic content. */
+      decision: 'conflict';
+      /** Existing receipt that owns the conflicting key. */
+      existingReceiptId: string;
+    };
 
 /** Maximum durable retry rows per workspace and monitor. @public */
 export const MATERIALIZATION_RETRY_MAX_RECORDS = 256;

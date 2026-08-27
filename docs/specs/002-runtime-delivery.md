@@ -815,9 +815,10 @@ Verified: `libs/core/src/runtime/types.ts` — `RuntimeTickResult`, `ErroredObse
 
 ### 2.6 Source-neutral external event contract
 
-> **Status: contract current; ingestion target.** Core exports the versioned envelope, strict
-> validator, canonical JSON encoder, semantic hash, result/error types, and collision-free object
-> key. No runtime, CLI, or daemon method accepts the envelope yet.
+> **Status: contract and persistence current; ingestion target.** Core exports the versioned
+> envelope, strict validator, canonical JSON encoder, semantic hash, result/error types, and
+> collision-free object key. Durable receipt/order primitives exist, but no runtime, CLI, or daemon
+> method accepts the envelope yet.
 
 `agentmonitors.external-event.v1` represents one producer-reconstructed current-state snapshot. Its
 required top-level fields are `schema`, `monitorId`, `source`, `upstreamEventId`, `objectId`,
@@ -849,11 +850,20 @@ unsafe integers are rejected without invoking accessors or echoing state in the 
 Canonical JSON recursively sorts object keys and preserves array order. The semantic SHA-256 hash
 excludes only `resumeToken`, allowing one upstream event to replay from another relay cursor. The
 snapshot object key is `external:` plus canonical JSON for `[source, objectId]`, avoiding delimiter
-collisions. Receipt persistence, ordering decisions, observation mapping, and ingestion remain
-target behavior in the next stacked changes.
+collisions.
 
-Verified: `libs/core/src/external-ingress/json.test.ts`, `contract.test.ts`, and
-`contract-boundaries.test.ts`.
+`RuntimeStore.withExternalEventReceipt()` serializes the idempotency and sequence decision in one
+immediate transaction. A same-key/same-hash replay returns the retained receipt; conflicting reuse
+mutates nothing. A new lower or equal sequence records a compact `stale` receipt without invoking
+durable work or moving the high-water row. For a newer event, the caller's synchronous durable work,
+receipt, high-water mark, and compatibility marker commit or roll back together. Receipts retain
+only safe correlation metadata, outcome, event IDs, and timestamps; state, payload, scope, resume
+token, workspace identity, and semantic hash are absent from the returned decision. Workspace-safe
+status/high-water queries, observation mapping, and runtime/IPC ingestion remain target behavior in
+the next stacked changes.
+
+Verified: `libs/core/src/external-ingress/json.test.ts`, `contract.test.ts`,
+`contract-boundaries.test.ts`, and `persistence.test.ts`; `libs/core/src/runtime/store.ts`.
 
 ## 3. Persisted Monitor State
 
@@ -1865,6 +1875,26 @@ through `monitor explain` and `doctor`. They never expose the stored envelope or
 _Current:_ tick and watch paths drain oldest-first before requesting newer source input. Pending or
 terminal work pauses the whole workspace/monitor route; success atomically materializes and deletes
 the row, while failure advances persisted backoff and blocks newer rows.
+
+### External-ingress persistence
+
+`external_event_receipts` is the compact, indefinitely retained idempotency tombstone. Its unique
+key is `(workspace_identity, monitor_id, source, upstream_event_id)`; it stores the semantic hash,
+object identity/sequence, safe event metadata, outcome, correlated event IDs, attempt/error state,
+and accepted/materialized/update timestamps. It never stores external state, payload, scope, or the
+resume token. The accepted/duplicate decision omits both `workspace_identity` and `semantic_hash`;
+workspace-scoped status reads remain target in the next review layer.
+
+`external_object_sequences` holds the highest accepted sequence and its receipt/upstream event ID.
+Its unique key is exactly `(workspace_identity, monitor_id, source, object_id)`, so another monitor
+or workspace advances independently. Stale receipts do not mutate this table.
+
+`database_compatibility_markers` records `durable-ingress-v1` once per workspace using separate
+partial unique indexes for global and concrete identities. A receipt and its marker share a
+transaction. Marker propagation to held notify batches and materialization retries is target in the
+next review layer. Direct use of an old binary after a marker exists is unsupported; a
+version-aware installer can refuse that downgrade. Merely opening/migrating an older database
+creates the additive tables but does not mark it forward-only.
 
 ### `session_event_state`
 
