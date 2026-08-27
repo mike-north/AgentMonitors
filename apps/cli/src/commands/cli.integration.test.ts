@@ -37,6 +37,11 @@ import {
   renderChannelEvent,
 } from '../channel-render.js';
 import { escapeShellPath } from '../delivery-event-render.js';
+import {
+  createDb,
+  RuntimeStore,
+  type StoredObservationEnvelope,
+} from '@agentmonitors/core';
 
 const CLI_PATH = path.resolve(__dirname, '../../dist/index.cjs');
 const CLI_PACKAGE_DIR = path.resolve(__dirname, '../..');
@@ -396,6 +401,58 @@ function startLegacyUnsupportedDaemon(socketPath: string): {
           resolve();
         });
       }),
+  };
+}
+
+async function startStaticResultDaemon(
+  socketPath: string,
+  result: Record<string, unknown>,
+): Promise<{ close: () => Promise<void> }> {
+  const serverScript = `
+    const net = require('node:net');
+    const socketPath = process.argv[1];
+    const result = JSON.parse(process.argv[2]);
+    const server = net.createServer((socket) => {
+      let buffer = '';
+      socket.setEncoding('utf8');
+      socket.on('data', (chunk) => {
+        buffer += chunk;
+        const newline = buffer.indexOf('\\n');
+        if (newline < 0) return;
+        const request = JSON.parse(buffer.slice(0, newline));
+        socket.end(JSON.stringify({ id: request.id, result }) + '\\n');
+      });
+    });
+    server.listen(socketPath);
+    process.on('SIGTERM', () => server.close(() => process.exit(0)));
+  `;
+  const child = spawn(
+    process.execPath,
+    ['-e', serverScript, socketPath, JSON.stringify(result)],
+    { stdio: ['ignore', 'ignore', 'pipe'] },
+  );
+  let stderr = '';
+  child.stderr.setEncoding('utf-8');
+  child.stderr.on('data', (chunk) => {
+    stderr += chunk;
+  });
+  const deadline = Date.now() + 5_000;
+  while (!existsSync(socketPath) && child.exitCode === null) {
+    if (Date.now() >= deadline) break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  if (!existsSync(socketPath) || child.exitCode !== null) {
+    child.kill('SIGTERM');
+    throw new Error(`Static daemon failed to start: ${stderr}`);
+  }
+  return {
+    close: () => {
+      child.kill('SIGTERM');
+      return new Promise<void>((resolve) => {
+        if (child.exitCode !== null) resolve();
+        else child.once('exit', () => resolve());
+      });
+    },
   };
 }
 
@@ -5152,6 +5209,67 @@ Handle it.
     writeFileSync(path.join(monitorDir, 'MONITOR.md'), body, 'utf-8');
   }
 
+  function seedMaterializationRetry(
+    dbPath: string,
+    workspacePath: string,
+    monitorId: string,
+    terminal: boolean,
+  ) {
+    const store = new RuntimeStore(createDb(dbPath));
+    const observedAt = new Date('2026-08-13T18:00:00.000Z');
+    const envelope: StoredObservationEnvelope = {
+      monitor: {
+        id: monitorId,
+        displayName: monitorId,
+        filePath: path.join(
+          workspacePath,
+          '.claude',
+          'monitors',
+          monitorId,
+          'MONITOR.md',
+        ),
+        instructions: 'Inspect this signal.',
+        frontmatter: {
+          watch: { type: 'schedule', cron: '* * * * *', timezone: 'UTC' },
+          urgency: 'normal',
+          urgencyMax: 'normal',
+          baselineStrategy: 'incremental',
+        },
+      },
+      observation: {
+        title: `${monitorId} changed`,
+        objectKey: `${monitorId}-object`,
+        snapshotText: 'captured-envelope-must-stay-private',
+        payload: { secret: 'captured-payload-must-stay-private' },
+      },
+      observedAt,
+      effectiveUrgency: 'normal',
+    };
+    let record = store.enqueueMaterializationRetries(
+      [
+        {
+          workspacePath,
+          monitorId,
+          sourceName: 'schedule',
+          envelope,
+          error: `${monitorId}\u001b failure`,
+        },
+      ],
+      observedAt,
+    )[0];
+    if (!record) throw new Error('retry seed was not inserted');
+    if (terminal) {
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        record = store.markMaterializationRetryFailed(
+          record.id,
+          `${monitorId}\u001b terminal failure`,
+          new Date(observedAt.getTime() + (attempt + 1) * 60_000),
+        );
+      }
+    }
+    return record;
+  }
+
   // --- Negative: project not enabled ----------------------------------------
   it('fails project-enabled with the enable-step remediation when the project is not enabled', () => {
     const dir = path.join(tempDir, 'doctor-not-enabled');
@@ -5250,6 +5368,213 @@ Handle it.
     expect(result.stdout).toMatch(
       /Summary: \d+ passed, 0 failed, 2 skipped, 3 idle\./,
     );
+  });
+
+  it('renders safe pending and terminal retry details in explain and doctor text/JSON', () => {
+    const dir = path.join(tempDir, 'doctor-retry-outbox');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    writeDoctorMonitor(monitorsRoot, 'pending-retry', FIRING_SCHEDULE);
+    writeDoctorMonitor(monitorsRoot, 'terminal-retry', FIRING_SCHEDULE);
+    writeLocalState(dir, { enabled: true });
+
+    const dbPath = path.join(dir, 'agentmon.db');
+    const socketPath = doctorSocket('retry-outbox');
+    const env = { AGENTMONITORS_DB: dbPath, AGENTMONITORS_SOCKET: socketPath };
+    const pending = seedMaterializationRetry(
+      dbPath,
+      dir,
+      'pending-retry',
+      false,
+    );
+    const terminal = seedMaterializationRetry(
+      dbPath,
+      dir,
+      'terminal-retry',
+      true,
+    );
+
+    const pendingText = runWithEnv(
+      [
+        'monitor',
+        'explain',
+        'pending-retry',
+        '--dir',
+        monitorsRoot,
+        '--workspace',
+        dir,
+        '--socket',
+        socketPath,
+        '--format',
+        'text',
+      ],
+      env,
+      dir,
+    );
+    expect(pendingText.exitCode).toBe(0);
+    expect(pendingText.stdout).toContain(`Retry ${pending.id}: status=pending`);
+    expect(pendingText.stdout).toContain('pending-retry  failure');
+    expect(pendingText.stdout).not.toContain('captured-envelope');
+    expect(pendingText.stdout).not.toContain('captured-payload');
+
+    const terminalJson = runWithEnv(
+      [
+        'monitor',
+        'explain',
+        'terminal-retry',
+        '--dir',
+        monitorsRoot,
+        '--workspace',
+        dir,
+        '--socket',
+        socketPath,
+        '--format',
+        'json',
+      ],
+      env,
+      dir,
+    );
+    expect(terminalJson.exitCode).toBe(0);
+    const explain = JSON.parse(terminalJson.stdout) as {
+      materializationRetries: {
+        terminal: number;
+        records: Record<string, unknown>[];
+      };
+    };
+    expect(explain.materializationRetries.terminal).toBe(1);
+    expect(explain.materializationRetries.records).toEqual([
+      expect.objectContaining({
+        id: terminal.id,
+        status: 'terminal',
+        attemptCount: 5,
+        nextAttemptAt: null,
+      }),
+    ]);
+    expect(explain.materializationRetries.records[0]).not.toHaveProperty(
+      'envelope',
+    );
+    expect(terminalJson.stdout).not.toContain('captured-envelope');
+    expect(terminalJson.stdout).not.toContain('captured-payload');
+
+    const doctorText = runWithEnv(
+      ['doctor', '--workspace', dir, '--format', 'text'],
+      env,
+      dir,
+    );
+    expect(doctorText.exitCode).toBe(1);
+    expect(doctorText.stdout).toMatch(
+      /monitor:pending-retry.*materialization retry pending.*retry-outbox=1\/0/u,
+    );
+    expect(doctorText.stdout).toMatch(
+      /monitor:terminal-retry.*terminal materialization retry.*retry-outbox=0\/1/u,
+    );
+    expect(doctorText.stdout).toContain(
+      'agentmonitors monitor explain terminal-retry',
+    );
+
+    const doctorJson = runWithEnv(
+      ['doctor', '--workspace', dir, '--format', 'json'],
+      env,
+      dir,
+    );
+    expect(doctorJson.exitCode).toBe(1);
+    const doctor = JSON.parse(doctorJson.stdout) as {
+      monitors: {
+        id: string;
+        materializationRetries: {
+          pending: number;
+          terminal: number;
+          records: Record<string, unknown>[];
+        };
+      }[];
+    };
+    const pendingMonitor = doctor.monitors.find(
+      (monitor) => monitor.id === 'pending-retry',
+    );
+    const terminalMonitor = doctor.monitors.find(
+      (monitor) => monitor.id === 'terminal-retry',
+    );
+    expect(pendingMonitor?.materializationRetries).toMatchObject({
+      pending: 1,
+      terminal: 0,
+    });
+    expect(terminalMonitor?.materializationRetries).toMatchObject({
+      pending: 0,
+      terminal: 1,
+    });
+    expect(
+      terminalMonitor?.materializationRetries.records[0],
+    ).not.toHaveProperty('envelope');
+    expect(doctorJson.stdout).not.toContain('captured-envelope');
+    expect(doctorJson.stdout).not.toContain('captured-payload');
+  });
+
+  it('treats retry diagnostics omitted by an older daemon as an empty outbox in text and JSON', async () => {
+    const dir = path.join(tempDir, 'doctor-old-retry-report');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    writeDoctorMonitor(monitorsRoot, 'heartbeat', FIRING_SCHEDULE);
+    writeLocalState(dir, { enabled: true });
+    const socketPath = doctorSocket('old-retry-report');
+    const now = '2026-08-13T18:00:00.000Z';
+    const oldReport = {
+      generatedAt: now,
+      monitorsDir: monitorsRoot,
+      workspacePath: dir,
+      monitorsDirExists: true,
+      monitors: [
+        {
+          id: 'heartbeat',
+          displayName: 'Heartbeat',
+          sourceName: 'schedule',
+          urgency: 'normal',
+          valid: true,
+          lastObservedAt: now,
+          neverObserved: false,
+          due: false,
+          nextDueAt: now,
+          cadence: "cron '* * * * *'",
+          lastEventAt: now,
+          delivery: { unread: 0, claimed: 0, acknowledged: 0 },
+        },
+      ],
+      invalidCount: 0,
+      duplicateIds: [],
+      parseErrors: [],
+      leadSessions: [],
+      hasLeadSession: false,
+    };
+    const daemon = await startStaticResultDaemon(socketPath, oldReport);
+    const env = {
+      AGENTMONITORS_DB: path.join(dir, 'agentmon.db'),
+      AGENTMONITORS_SOCKET: socketPath,
+    };
+
+    try {
+      const text = runWithEnv(
+        ['doctor', '--workspace', dir, '--format', 'text'],
+        env,
+        dir,
+      );
+      expect(text.exitCode).toBe(0);
+      expect(text.stdout).toMatch(/monitor:heartbeat.*retry-outbox=0\/0/u);
+
+      const json = runWithEnv(
+        ['doctor', '--workspace', dir, '--format', 'json'],
+        env,
+        dir,
+      );
+      expect(json.exitCode).toBe(0);
+      const report = JSON.parse(json.stdout) as {
+        monitors: { materializationRetries: unknown }[];
+      };
+      expect(report.monitors[0]?.materializationRetries).toEqual({
+        pending: 0,
+        terminal: 0,
+        bytes: 0,
+        records: [],
+      });
+    } finally {
+      await daemon.close();
+    }
   });
 
   // --- Negative: version-skew daemon (issue #382) ---------------------------
