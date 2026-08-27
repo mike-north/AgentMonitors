@@ -25,6 +25,7 @@
 import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { versionAtLeast } from './check-dependency-audit.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = join(__dirname, '..');
@@ -127,7 +128,20 @@ export function main() {
   const resolutions = betterSqlite3Resolutions();
   console.log('better-sqlite3 workspace resolution:');
   console.log(formatResolutions(resolutions));
-  process.exitCode = resolutions.length === 1 ? 0 : 1;
+  // Standalone runs must enforce the same floor the vitest suite asserts:
+  // a single-but-unsafe resolution is exactly the regression this module
+  // exists to catch, and exiting 0 on it would be a lie.
+  const belowMinimum = resolutions.filter(
+    ({ version }) => !versionAtLeast(version, SAFE_MINIMUM_VERSION),
+  );
+  if (belowMinimum.length > 0) {
+    console.error(
+      `FAIL: resolution(s) below the safe minimum ${SAFE_MINIMUM_VERSION} ` +
+        '(the release that fixed the Node 24 native abort — issues #516/#509).',
+    );
+  }
+  process.exitCode =
+    resolutions.length === 1 && belowMinimum.length === 0 ? 0 : 1;
 }
 
 // `file://${process.argv[1]}` string construction isn't portable (notably on
