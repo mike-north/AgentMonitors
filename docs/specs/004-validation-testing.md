@@ -127,8 +127,8 @@ from [002 §2.6](./002-runtime-delivery.md#26-source-neutral-external-event-cont
 unknown fields, custom/accessor objects, cycles, sparse arrays, invalid timestamps, and unsafe or
 non-finite numbers. Validation errors contain only stable safe text and never echo external state.
 
-Receipt persistence and effective-immediate core runtime ingestion are current. Daemon/CLI
-boundaries and bounded delayed notification remain later changes.
+Receipt persistence plus immediate and bounded-debounce core runtime ingestion are current.
+Source-free deadline flushing and daemon/CLI boundaries remain later changes.
 
 **Verified in:** `libs/core/src/external-ingress/json.test.ts`, `contract.test.ts`, and
 `contract-boundaries.test.ts`.
@@ -230,7 +230,9 @@ The `RuntimeStore.saveSnapshot()` and `RuntimeStore.latestSnapshot()` methods (i
 | Forward-only durable state marks only its exact route            | Covered (`persistence-queries.test.ts` and `retry-outbox.test.ts` — nonempty debounce/rollup and named/global retries mark; empty state/admission does not).  |
 | Compatibility migration preserves data and replay invariants     | Covered (`schema.test.ts` and `persistence-hardening.test.ts` — tables/indexes rebuild, legacy rows survive, and duplicate/conflict/high-water replay works). |
 | Immediate runtime ingestion uses the normal durable pipeline     | Covered (`runtime.test.ts` — canonical mapping, receipt/event correlation, source-state preservation, rollback, and post-commit Interpret).                          |
-| Runtime decisions and policy failures are safe                   | Covered (`runtime.test.ts` — duplicate/conflict/stale/suppressed outcomes and pre-receipt deferred-policy rejection).                                                |
+| Runtime decisions and policy failures are safe                   | Covered (`runtime.test.ts` — duplicate/conflict/stale/suppressed outcomes and pre-receipt throttle/rollup/overlong-debounce rejection).                              |
+| Debounce capture, extension, and shared flush preserve receipts  | Covered (`runtime.test.ts` — default/explicit settle, same/different objects, duplicate no-op, captured policy, ordinary tick, and retry-outbox correlation).        |
+| Pending external count and exact stored bytes are bounded        | Covered (`runtime.test.ts` — exact self-inclusive byte accounting plus 64-record/2 MiB rejection without receipt creation).                                          |
 
 ### 3.5 CLI behavior
 

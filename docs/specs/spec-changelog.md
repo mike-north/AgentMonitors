@@ -16,6 +16,13 @@ Nonempty durable debounce/rollup state and materialization retry admission write
 global or workspace `durable-ingress-v1` marker in the same transaction; empty batches do not mark
 an otherwise compatible database.
 
+## 2026-08-13 — External debounce is bounded and receipt-correlated (002 §2.6, 003 §2.9, 004 §3.4.1) — Refs #481
+
+Core now accepts effective debounce up to five minutes, captures the accepted monitor/source in
+durable notify state, and enforces 64-record/2 MiB per-monitor limits before receipt creation.
+Ordinary tick materialization and retry-outbox drain update each held receipt atomically with its
+event. A dedicated source-free deadline operation remains the next stack entry.
+
 ## 2026-08-13 — Immediate external events enter the core runtime atomically (002 §2.6, 003 §2.9, 004 §2.9/§3.4.1) — Refs #481
 
 Core now exposes `AgentMonitorRuntime.ingestExternalEvent()` for effective-immediate monitors. It

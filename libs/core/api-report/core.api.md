@@ -431,6 +431,13 @@ export const EXTERNAL_EVENT_SCHEMA: "agentmonitors.external-event.v1";
 
 // @public
 export type ExternalEventDisposition = /** A new event was durably accepted. */ 'accepted' | /** The same semantic event was already accepted. */ 'duplicate';
+// @public (undocumented)
+export const EXTERNAL_INGRESS_PENDING_MAX_BYTES: number;
+
+// @public (undocumented)
+export const EXTERNAL_INGRESS_PENDING_MAX_RECORDS = 64;
+
+// @public (undocumented)
 
 // @public
 export interface ExternalEventEnvelope {
@@ -1682,6 +1689,9 @@ export class RuntimeStore {
     listSessions(): AgentSessionRecord[];
     // (undocumented)
     markClaimed(sessionId: string, eventIds: string[], lifecycle: string): void;
+    // (undocumented)
+    markExternalEventReceiptMaterialized(workspaceIdentity: string, receiptId: string, eventId: string, materializedAt?: Date): ExternalEventReceiptRecord;
+    // (undocumented)
     markMaterializationRetryFailed(id: string, error: string, now?: Date): MaterializationRetryRecord;
     materializationRetrySummary(monitorId: string, workspacePath: string | null): MaterializationRetrySummary;
     // (undocumented)
@@ -1959,12 +1969,15 @@ export class SourceRegistry {
 // @public (undocumented)
 export interface StoredObservationEnvelope {
     effectiveUrgency: Urgency;
+    ingressReceiptId?: string;
+    ingressStoredBytes?: number;
     // (undocumented)
     monitor: MonitorDefinition;
     // (undocumented)
     observation: Observation;
     // (undocumented)
     observedAt: Date;
+    sourceName?: string;
 }
 
 // @public
