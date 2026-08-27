@@ -27,6 +27,7 @@ import {
   evaluateAuditReport,
   loadAllowlist,
   resolvedVersions,
+  resolvedVersionsUnderAncestor,
   versionAtLeast,
 } from './check-dependency-audit.mjs';
 
@@ -544,12 +545,20 @@ const PATCHED_MINIMUMS = [
   { package: 'drizzle-orm', minVersion: '0.45.2' },
   // lodash-es via cel-js>chevrotain (libs/core) — GHSA-r5fr-rjxr-66jc, patched >=4.17.24
   { package: 'lodash-es', minVersion: '4.17.24' },
-  // fast-uri via @modelcontextprotocol/sdk>ajv (apps/cli) — GHSA-v39h-62p7-jpjc, patched >=3.1.2
-  { package: 'fast-uri', minVersion: '3.1.2' },
+  // fast-uri via @modelcontextprotocol/sdk>ajv (apps/cli) — GHSA-v39h-62p7-jpjc,
+  // GHSA-v2hh-gcrm-f6hx, GHSA-7p8r-x3mc-p8w7, patched >=3.1.5
+  { package: 'fast-uri', minVersion: '3.1.5' },
   // hono via @modelcontextprotocol/sdk (apps/cli) — GHSA-88fw-hqm2-52qc, patched >=4.12.25
   { package: 'hono', minVersion: '4.12.25' },
-  // next (apps/website) — multiple GHSAs, most recent patched >=16.2.6
-  { package: 'next', minVersion: '16.2.6' },
+  // next (apps/website) — multiple GHSAs, most recent (GHSA-6gpp-xcg3-4w24,
+  // GHSA-m99w-x7hq-7vfj, GHSA-89xv-2m56-2m9x, GHSA-p9j2-gv94-2wf4) patched >=16.2.11
+  { package: 'next', minVersion: '16.2.11' },
+  // ip-address via @modelcontextprotocol/sdk>express-rate-limit (apps/cli) —
+  // GHSA-mwp4-54f8-5fhr, patched >=10.3.1
+  { package: 'ip-address', minVersion: '10.3.1' },
+  // sharp, an optional dependency of next (apps/website) — GHSA-f88m-g3jw-g9cj,
+  // patched >=0.35.0
+  { package: 'sharp', minVersion: '0.35.0' },
 ];
 
 describe('resolved dependency versions clear known high-severity advisories (lockfile regression)', () => {
@@ -562,6 +571,67 @@ describe('resolved dependency versions clear known high-severity advisories (loc
         expect(
           versionAtLeast(version, minVersion),
           `expected ${pkg}@${version} to be >= ${minVersion}`,
+        ).toBe(true);
+      }
+    });
+  }
+});
+
+// Some packages this issue fixed legitimately resolve to more than one line
+// in the workspace lockfile — a devDependency-only build tool pinned to an
+// old, unpatched line (out of `pnpm audit --prod`'s scope) alongside the
+// production path the override/upgrade actually targets. A blanket "every
+// resolved version is >= N" check (as above) would fail on the untouched
+// line, so these assert only against the specific path named in the
+// advisory's `paths` (via `resolvedVersionsUnderAncestor`'s ancestor-scoped
+// search of the `pnpm why --json` tree).
+const PATCHED_MINIMUMS_UNDER_ANCESTOR = [
+  // gray-matter (libs/core, a direct dependency) pins the js-yaml 3.x line —
+  // GHSA-52cp-r559-cp3m, GHSA-5p4m-2wfm-xmqj, patched >=3.15.1. The other
+  // resolved js-yaml@3.x instances (nx>@yarnpkg/parsers, nx>front-matter,
+  // @changesets/cli's transitive read-yaml-file@1) are devDependency-only
+  // tooling, out of `--prod` audit scope, and intentionally left alone.
+  { package: 'js-yaml', ancestor: 'gray-matter', minVersion: '3.15.1' },
+  // @markdoc/next.js (apps/website, a direct dependency) pins the js-yaml
+  // 4.x line — same two advisories, patched >=4.3.1.
+  { package: 'js-yaml', ancestor: '@markdoc/next.js', minVersion: '4.3.1' },
+  // Our own `glob` dependency (libs/core, apps/cli,
+  // plugins/source-file-fingerprint) resolves minimatch@10.x, which pulls
+  // brace-expansion — GHSA-3jxr-9vmj-r5cp, GHSA-mh99-v99m-4gvg,
+  // GHSA-rgw5-rvv9-x895, patched >=5.0.9. Scoped to the `@agentmonitors/core`
+  // ancestor (rather than `glob` or `minimatch`, whose names are also used,
+  // at different unrelated majors, by devDependency-only tooling such as
+  // fixturify-project and nx) to isolate this exact path.
+  {
+    package: 'brace-expansion',
+    ancestor: '@agentmonitors/core',
+    minVersion: '5.0.9',
+  },
+  // postcss, a dependency of next (apps/website) — GHSA-r28c-9q8g-f849,
+  // patched >=8.5.18. The `vite` (via vitest) devDependency chain resolves
+  // its own, older postcss line and is intentionally left alone.
+  { package: 'postcss', ancestor: 'next', minVersion: '8.5.18' },
+  // nanoid, a dependency of postcss which is itself a dependency of next
+  // (apps/website) — GHSA-28wg-ghj8-5hjv, GHSA-2v37-7h3g-55p8, patched
+  // >=3.3.18. The `vite` devDependency chain's older postcss/nanoid line is
+  // intentionally left alone.
+  { package: 'nanoid', ancestor: 'next', minVersion: '3.3.18' },
+];
+
+describe('resolved dependency versions clear known high-severity advisories on their specific flagged path (lockfile regression)', () => {
+  for (const {
+    package: pkg,
+    ancestor,
+    minVersion,
+  } of PATCHED_MINIMUMS_UNDER_ANCESTOR) {
+    it(`${pkg} resolves to >= ${minVersion} under ${ancestor} in the workspace lockfile`, () => {
+      const versions = resolvedVersionsUnderAncestor(pkg, ancestor);
+
+      expect(versions.length).toBeGreaterThan(0);
+      for (const version of versions) {
+        expect(
+          versionAtLeast(version, minVersion),
+          `expected ${pkg}@${version} (under ${ancestor}) to be >= ${minVersion}`,
         ).toBe(true);
       }
     });

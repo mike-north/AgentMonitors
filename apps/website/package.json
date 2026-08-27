@@ -15,7 +15,7 @@
   "dependencies": {
     "@markdoc/markdoc": "^0.5.5",
     "@markdoc/next.js": "^0.5.0",
-    "next": "^16.2.10",
+    "next": "^16.3.3",
     "react": "^19.2.4",
     "react-dom": "^19.2.4"
   },
@@ -24,7 +24,7 @@
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "linkinator": "^7.6.1",
-    "postcss": "^8.5.8",
+    "postcss": "^8.5.18",
     "start-server-and-test": "^3.0.11",
     "typescript": "^5.9.0"
   }
