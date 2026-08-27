@@ -815,9 +815,9 @@ Verified: `libs/core/src/runtime/types.ts` — `RuntimeTickResult`, `ErroredObse
 
 ### 2.6 Source-neutral external event contract
 
-> **Status: contract, core ingestion, and daemon IPC current; deadline lifecycle/CLI target.**
+> **Status: contract, core ingestion, and daemon delivery lifecycle current; CLI target.**
 > Core accepts immediate and bounded-debounce events and can flush captured debounce work without
-> polling a source. Daemon timer/reap lifecycle and CLI submission remain later stacked changes.
+> polling a source. User-facing CLI submission remains a later stacked change.
 
 `agentmonitors.external-event.v1` represents one producer-reconstructed current-state snapshot. Its
 required top-level fields are `schema`, `monitorId`, `source`, `upstreamEventId`, `objectId`,
@@ -900,7 +900,14 @@ caller's expected identities to match before mutation. Requests are capped at 32
 parsing. Ingest validates the envelope at the socket boundary and again in core, responds only after
 the durable core operation returns, and never waits for Interpret. Application responses include a
 safe string code and retryability; old-daemon `unsupported_request` responses map to retryable
-`daemon_incompatible`. Deadline timers, overdue startup flush, and reap pinning remain target.
+`daemon_incompatible`.
+
+`daemon run` flushes overdue accepted work on startup and maintains one timer for the earliest
+retry-eligible external deadline. Each accepted ingest, explicit re-arm, and ordinary runtime tick
+re-arms that timer from durable state. Pending work suppresses idle reap through its deadline and
+retry attempts; successful or terminal completion removes that exemption. Timer failures are
+contained and retried without changing an already-committed ingest response. The timer uses only
+captured envelopes, so monitor removal does not force a source observation or lose accepted work.
 
 Verified: `libs/core/src/external-ingress/json.test.ts`, `contract.test.ts`,
 `contract-boundaries.test.ts`, `persistence.test.ts`, `persistence-queries.test.ts`,

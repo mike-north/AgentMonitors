@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { realpathSync } from 'node:fs';
 import { Command, Option } from 'commander';
 import type {
   RuntimeStatus,
@@ -355,12 +356,74 @@ export async function runLoop(
   dbPath: string,
 ): Promise<void> {
   const runtime = createRuntime(dbPath);
+  const workspaceIdentity = realpathSync(path.resolve(workspacePath));
+  let monitorsDirIdentity: string;
+  try {
+    monitorsDirIdentity = realpathSync(path.resolve(monitorsDir));
+  } catch {
+    monitorsDirIdentity = path.resolve(monitorsDir);
+  }
   let stopping = false;
   let wakeLoop: (() => void) | undefined;
+  let externalTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const flushExternalNotifications = (): boolean => {
+    try {
+      const result = runtime.flushDueNotifications(workspaceIdentity);
+      if (result.emittedEventIds.length > 0) {
+        console.log(
+          `Flushed ${String(result.emittedEventIds.length)} external event(s) from ${String(result.flushedMonitorIds.length)} monitor(s).`,
+        );
+      }
+      for (const failure of result.failures) {
+        console.error(
+          `External notification flush failed for "${failure.monitorId}" (attempt ${String(failure.attemptCount)}${failure.terminal ? ', terminal' : ''}).`,
+        );
+      }
+      return true;
+    } catch {
+      console.error(
+        'External notification deadline failed before retry state could be updated.',
+      );
+      return false;
+    }
+  };
+
+  function onExternalDeadline(): void {
+    externalTimer = undefined;
+    const flushed = flushExternalNotifications();
+    scheduleExternalFlush(flushed ? undefined : 1_000);
+    wakeLoop?.();
+  }
+  function scheduleExternalFlush(fallbackDelayMs?: number): void {
+    if (externalTimer) clearTimeout(externalTimer);
+    externalTimer = undefined;
+    if (stopping) return;
+    let deadline: Date | null;
+    try {
+      deadline = runtime.nextExternalNotificationDeadline(workspaceIdentity);
+    } catch {
+      console.error(
+        'External notification timer could not be armed; retrying.',
+      );
+      externalTimer = setTimeout(onExternalDeadline, fallbackDelayMs ?? 1_000);
+      return;
+    }
+    if (!deadline) return;
+    const delay =
+      fallbackDelayMs ?? Math.max(0, deadline.getTime() - Date.now());
+    externalTimer = setTimeout(onExternalDeadline, delay);
+  }
+
   const server = createDaemonServer({
     runtime,
     socketPath,
     reapAfterMs,
+    workspaceIdentity,
+    monitorsDirIdentity,
+    onExternalStateChanged: () => {
+      scheduleExternalFlush();
+    },
     onStop: () => {
       stopping = true;
       wakeLoop?.();
@@ -379,19 +442,25 @@ export async function runLoop(
   process.on('SIGTERM', stop);
   await server.listen();
   console.log(`AgentMon daemon listening on ${socketPath}`);
+  const startupFlushSucceeded = flushExternalNotifications();
+  scheduleExternalFlush(startupFlushSucceeded ? undefined : 1_000);
 
   // Start continuous watchers for any watch-capable sources (G5). Watched
   // monitors are driven by their watcher; the tick loop below skips them. New
   // monitors added after startup are picked up on the next daemon restart.
   let watchHandle: WatchHandle | undefined;
   try {
-    watchHandle = await runtime.watchMonitors(monitorsDir, workspacePath, {
-      onError: (monitorId, error) => {
-        console.error(
-          `AgentMon watcher for "${monitorId}" failed: ${error.message}`,
-        );
+    watchHandle = await runtime.watchMonitors(
+      monitorsDirIdentity,
+      workspaceIdentity,
+      {
+        onError: (monitorId, error) => {
+          console.error(
+            `AgentMon watcher for "${monitorId}" failed: ${error.message}`,
+          );
+        },
       },
-    });
+    );
     if (watchHandle.monitorIds.length > 0) {
       console.log(
         `Watching ${String(watchHandle.monitorIds.length)} monitor(s) continuously: ${watchHandle.monitorIds.join(', ')}.`,
@@ -405,7 +474,11 @@ export async function runLoop(
   try {
     while (!isStoppingRequested()) {
       try {
-        const result = await runtime.tick(monitorsDir, workspacePath);
+        const result = await runtime.tick(
+          monitorsDirIdentity,
+          workspaceIdentity,
+        );
+        scheduleExternalFlush();
         // Log when the tick emitted events OR when one or more monitors
         // errored — a silent `emitted 0` must not hide a broken source
         // (issue #117). A clean no-change tick still logs nothing.
@@ -447,7 +520,7 @@ export async function runLoop(
         const nowDate = new Date(now);
         const workspaceSessions = runtime
           .listSessions()
-          .filter((s) => s.workspacePath === workspacePath);
+          .filter((s) => s.workspacePath === workspaceIdentity);
         const openCount = workspaceSessions.filter(
           (s) => s.status === 'active',
         ).length;
@@ -474,8 +547,10 @@ export async function runLoop(
         // (that registry can hold many transports across many workspaces on a
         // busy machine). The lease only matters when the daemon is otherwise
         // about to reap: reaping enabled AND no open session.
+        const pendingWork =
+          runtime.nextExternalNotificationDeadline(workspaceIdentity) !== null;
         const heartbeatScan =
-          reapAfterMs > 0 && openCount === 0
+          reapAfterMs > 0 && openCount === 0 && !pendingWork
             ? readTransportHeartbeatsResult()
             : undefined;
         // A registry-directory read failure (transient EMFILE/EACCES, etc.)
@@ -519,6 +594,7 @@ export async function runLoop(
         const decision = shouldReap({
           openCount,
           channelAttached,
+          pendingWork,
           hasSeenSession: hasSeenSession || anySession,
           idleSince,
           now,
@@ -550,6 +626,7 @@ export async function runLoop(
   } finally {
     process.off('SIGINT', stop);
     process.off('SIGTERM', stop);
+    if (externalTimer) clearTimeout(externalTimer);
     if (watchHandle) await watchHandle.stop();
     await server.close();
   }

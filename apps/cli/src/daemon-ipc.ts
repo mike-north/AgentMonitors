@@ -30,7 +30,6 @@ import type {
   AgentMonitorRuntime,
   AgentSessionRole,
   DeliveryLifecycle,
-  ExternalEventReceiptRecord,
   MaterializationRetryRecord,
   RuntimeStatus,
   Urgency,
@@ -770,6 +769,27 @@ function boundSessionWorkspace(
   return context.workspaceIdentity;
 }
 
+function boundMonitorsDirectory(
+  monitorsDir: string,
+  context: DaemonRequestContext,
+): string {
+  if (!context.monitorsDirIdentity) return monitorsDir;
+  let canonical: string;
+  try {
+    canonical = realpathSync(path.resolve(monitorsDir));
+  } catch {
+    canonical = path.resolve(monitorsDir);
+  }
+  if (canonical !== context.monitorsDirIdentity) {
+    throw new ExternalEventIngestError(
+      'workspace_mismatch',
+      'Monitor directory does not match the serving daemon.',
+      false,
+    );
+  }
+  return context.monitorsDirIdentity;
+}
+
 function safeMaterializationRetry(record: MaterializationRetryRecord) {
   return {
     id: record.id,
@@ -855,27 +875,31 @@ async function handleRequest(
       return Promise.resolve({ ok: true });
     case 'events.retractObject': {
       const params = eventsRetractObjectParamsSchema.parse(request.params);
+      const workspacePath = boundSessionWorkspace(
+        params.workspacePath,
+        context,
+      );
       return Promise.resolve({
         removed: runtime.retractObjectEvents({
           monitorId: params.monitorId,
           objectKey: params.objectKey,
           eventIds: params.eventIds,
-          ...(params.workspacePath
-            ? { workspacePath: params.workspacePath }
-            : {}),
+          ...(workspacePath ? { workspacePath } : {}),
         }),
       });
     }
     case 'events.suppressObject': {
       const params = eventsSuppressObjectParamsSchema.parse(request.params);
+      const workspacePath = boundSessionWorkspace(
+        params.workspacePath,
+        context,
+      );
       return Promise.resolve({
         removed: runtime.suppressObjectEvents({
           monitorId: params.monitorId,
           objectKey: params.objectKey,
           ttlMs: params.ttlMs,
-          ...(params.workspacePath
-            ? { workspacePath: params.workspacePath }
-            : {}),
+          ...(workspacePath ? { workspacePath } : {}),
         }),
       });
     }
@@ -969,24 +993,28 @@ async function handleRequest(
     }
     case 'history.list': {
       const params = historyListParamsSchema.parse(request.params);
+      const workspacePath = boundSessionWorkspace(
+        params.workspacePath,
+        context,
+      );
       return Promise.resolve(
         runtime.listObservationHistory({
           ...(params.monitorId ? { monitorId: params.monitorId } : {}),
-          ...(params.workspacePath
-            ? { workspacePath: params.workspacePath }
-            : {}),
+          ...(workspacePath ? { workspacePath } : {}),
           ...(params.limit ? { limit: params.limit } : {}),
         }),
       );
     }
     case 'monitor.explain': {
       const params = monitorExplainParamsSchema.parse(request.params);
+      const workspacePath = boundSessionWorkspace(
+        params.workspacePath,
+        context,
+      );
       return runtime.explainMonitor({
         monitorId: params.monitorId,
-        monitorsDir: params.monitorsDir,
-        ...(params.workspacePath
-          ? { workspacePath: params.workspacePath }
-          : {}),
+        monitorsDir: boundMonitorsDirectory(params.monitorsDir, context),
+        ...(workspacePath ? { workspacePath } : {}),
         ...(params.historyLimit ? { historyLimit: params.historyLimit } : {}),
         ...(params.eventLimit ? { eventLimit: params.eventLimit } : {}),
       });
@@ -1003,7 +1031,10 @@ async function handleRequest(
     }
     case 'daemon.tick': {
       const params = daemonTickParamsSchema.parse(request.params);
-      return runtime.tick(params.monitorsDir, params.workspacePath);
+      return runtime.tick(
+        boundMonitorsDirectory(params.monitorsDir, context),
+        boundSessionWorkspace(params.workspacePath, context),
+      );
     }
     case 'watch.declare': {
       const params = watchDeclareParamsSchema.parse(request.params);
@@ -1031,8 +1062,10 @@ async function handleRequest(
     case 'doctor.report': {
       const params = doctorReportParamsSchema.parse(request.params);
       return runtime.doctorReport({
-        monitorsDir: params.monitorsDir,
-        workspacePath: params.workspacePath,
+        monitorsDir: boundMonitorsDirectory(params.monitorsDir, context),
+        workspacePath:
+          boundSessionWorkspace(params.workspacePath, context) ??
+          params.workspacePath,
         ...(params.historyLimit ? { historyLimit: params.historyLimit } : {}),
       });
     }
