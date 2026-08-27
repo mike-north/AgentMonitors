@@ -8,6 +8,7 @@ import { MaterializationRetryCapacityError, RuntimeStore } from './store.js';
 import { MaterializationRetrySerializationError } from './retry-envelope.js';
 import {
   MATERIALIZATION_RETRY_DELAYS_MS,
+  MATERIALIZATION_RETRY_MAX_ATTEMPTS,
   MATERIALIZATION_RETRY_MAX_BYTES,
   MATERIALIZATION_RETRY_MAX_RECORDS,
 } from './types.js';
@@ -87,6 +88,11 @@ function inputWithEnvelopeBytes(
   candidate.envelope.observation.snapshotText =
     'é'.repeat(Math.floor(remaining / 2)) + (remaining % 2 === 0 ? '' : 'x');
   return candidate;
+}
+
+function nextAttempt(record: { nextAttemptAt: Date | null }): Date {
+  if (!record.nextAttemptAt) throw new Error('expected a pending retry');
+  return record.nextAttemptAt;
 }
 
 describe('materialization retry outbox', () => {
@@ -260,5 +266,94 @@ describe('materialization retry outbox', () => {
       }),
     ).toBe(false);
     expect(record?.lastError?.startsWith(`start${' '.repeat(5)}x`)).toBe(true);
+  });
+
+  it('backs off, terminalizes, re-arms, and completes transactionally', () => {
+    const store = new RuntimeStore(createDb(':memory:'));
+    let record = store.enqueueMaterializationRetries(
+      [input('monitor-a', 'object-1')],
+      NOW,
+    )[0];
+    if (!record) throw new Error('expected retry record');
+
+    expect(
+      store.listMaterializationRetries({
+        dueAt: new Date(nextAttempt(record).getTime() - 1),
+      }),
+    ).toEqual([]);
+    expect(
+      store.listMaterializationRetries({ dueAt: nextAttempt(record) }),
+    ).toHaveLength(1);
+
+    for (const [index, delay] of MATERIALIZATION_RETRY_DELAYS_MS.slice(
+      1,
+    ).entries()) {
+      const failedAt = nextAttempt(record);
+      record = store.markMaterializationRetryFailed(
+        record.id,
+        `attempt ${String(index + 1)} failed`,
+        failedAt,
+      );
+      expect(record).toMatchObject({
+        attemptCount: index + 1,
+        status: 'pending',
+      });
+      expect(record.nextAttemptAt?.getTime()).toBe(failedAt.getTime() + delay);
+    }
+
+    record = store.markMaterializationRetryFailed(
+      record.id,
+      'fifth retry failed',
+      nextAttempt(record),
+    );
+    expect(record).toMatchObject({
+      attemptCount: MATERIALIZATION_RETRY_MAX_ATTEMPTS,
+      status: 'terminal',
+      nextAttemptAt: null,
+    });
+    expect(
+      store.materializationRetrySummary('monitor-a', '/workspace'),
+    ).toEqual({ pending: 0, terminal: 1, bytes: record.envelopeBytes });
+    expect(
+      store.listMaterializationRetries({
+        monitorId: 'monitor-a',
+        dueAt: new Date('2126-08-14T18:00:00.000Z'),
+      }),
+    ).toEqual([]);
+    expect(() =>
+      store.markMaterializationRetryFailed(record.id, 'must stay terminal'),
+    ).toThrow(`Materialization retry record is terminal: ${record.id}`);
+
+    const pending = store.enqueueMaterializationRetries(
+      [input('monitor-b', 'pending')],
+      NOW,
+    )[0];
+    expect(() =>
+      store.rearmMaterializationRetry(pending?.id ?? 'missing'),
+    ).toThrow('Materialization retry record is not terminal');
+
+    const rearmedAt = new Date('2026-08-14T18:00:00.000Z');
+    record = store.rearmMaterializationRetry(record.id, rearmedAt);
+    expect(record).toMatchObject({
+      attemptCount: 0,
+      status: 'pending',
+      lastError: null,
+    });
+    expect(record.nextAttemptAt?.getTime()).toBe(
+      rearmedAt.getTime() + MATERIALIZATION_RETRY_DELAYS_MS[0],
+    );
+
+    expect(() =>
+      store.completeMaterializationRetry(record.id, () => {
+        throw new Error('materialization still failed');
+      }),
+    ).toThrow('materialization still failed');
+    expect(store.getMaterializationRetry(record.id).id).toBe(record.id);
+    expect(
+      store.completeMaterializationRetry(record.id, () => 'materialized'),
+    ).toBe('materialized');
+    expect(() => store.getMaterializationRetry(record.id)).toThrow(
+      `Materialization retry record not found: ${record.id}`,
+    );
   });
 });

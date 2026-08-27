@@ -1801,9 +1801,14 @@ workspace or monitor has independent capacity.
 New records first become due after 1 second. `last_error` has terminal controls removed and is capped
 at 1,024 characters.
 
-_Current in this change:_ schema, lossless serialization, route checks, bounded atomic admission,
-and oldest-first reads. Retry state transitions and transaction-coupled completion are added in the
-next stack layer. Runtime drain-before-observe adoption follows after that for #295.
+Failed automatic attempts wait 5 seconds, 30 seconds, 2 minutes, and 5 minutes; the fifth failed
+automatic attempt marks the row `terminal` and clears `next_attempt_at`. Due queries never return a
+terminal row. Terminal rows remain durable and consume capacity until an operator explicitly
+re-arms them. Successful synchronous materialization and row deletion share one immediate
+transaction; a thrown operation preserves the row, and silent discard is not supported.
+
+_Current in this change:_ storage plus retry state transitions and transaction-coupled completion.
+Runtime drain-before-observe adoption follows in the next stack layer for #295.
 
 ### `session_event_state`
 

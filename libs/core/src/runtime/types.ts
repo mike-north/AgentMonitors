@@ -642,6 +642,9 @@ export const MATERIALIZATION_RETRY_MAX_BYTES = 8 * 1024 * 1024;
 export const MATERIALIZATION_RETRY_DELAYS_MS = [
   1_000, 5_000, 30_000, 120_000, 300_000,
 ] as const;
+/** Attempts after which a retry becomes terminal and requires re-arm. @public */
+export const MATERIALIZATION_RETRY_MAX_ATTEMPTS = 5;
+
 /** Durable lifecycle state for one failed materialization. @public */
 export type MaterializationRetryStatus = 'pending' | 'terminal';
 
@@ -690,7 +693,7 @@ export interface EnqueueMaterializationRetryInput {
   error: string;
 }
 
-/** Oldest-first retry query. @public */
+/** Oldest-first retry query. `dueAt` always excludes terminal records. @public */
 export interface MaterializationRetryQuery {
   /** Exact workspace route; omit to query every workspace. */
   workspacePath?: string | null;
@@ -698,8 +701,20 @@ export interface MaterializationRetryQuery {
   monitorId?: string;
   /** Exact lifecycle state; omit to include both states. */
   status?: MaterializationRetryStatus;
+  /** Include only pending records due at or before this time. */
+  dueAt?: Date;
   /** Maximum oldest-first rows; defaults to the per-monitor capacity. */
   limit?: number;
+}
+
+/** Aggregate capacity and lifecycle counts for one retry outbox. @public */
+export interface MaterializationRetrySummary {
+  /** Records still eligible for automatic retry. */
+  pending: number;
+  /** Records paused until explicit operator re-arm. */
+  terminal: number;
+  /** Total UTF-8 bytes occupied by stored envelopes in both states. */
+  bytes: number;
 }
 
 export interface ProcessObservationInput {

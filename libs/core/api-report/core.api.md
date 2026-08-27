@@ -613,6 +613,9 @@ export type KeyedSnapshot = Record<string, unknown>;
 export const MATERIALIZATION_RETRY_DELAYS_MS: readonly [1000, 5000, 30000, 120000, 300000];
 
 // @public
+export const MATERIALIZATION_RETRY_MAX_ATTEMPTS = 5;
+
+// @public
 export const MATERIALIZATION_RETRY_MAX_BYTES: number;
 
 // @public
@@ -627,6 +630,7 @@ export class MaterializationRetryCapacityError extends Error {
 
 // @public
 export interface MaterializationRetryQuery {
+    dueAt?: Date;
     limit?: number;
     monitorId?: string;
     status?: MaterializationRetryStatus;
@@ -658,6 +662,13 @@ export class MaterializationRetrySerializationError extends Error {
 
 // @public
 export type MaterializationRetryStatus = 'pending' | 'terminal';
+
+// @public
+export interface MaterializationRetrySummary {
+    bytes: number;
+    pending: number;
+    terminal: number;
+}
 
 // @public
 export const MAX_OPERATION_TIMEOUT_MS = 2147483647;
@@ -1430,6 +1441,8 @@ export class RuntimeStore {
     // (undocumented)
     closeSession(sessionId: string): AgentSessionRecord;
     collapseNetForClaim(sessionId: string, candidates: MonitorEventRecord[]): MonitorEventRecord[];
+    // @internal
+    completeMaterializationRetry<T>(id: string, operation: () => T): T;
     enqueueMaterializationRetries(inputs: EnqueueMaterializationRetryInput[], now?: Date): MaterializationRetryRecord[];
     findEphemeralMonitorById(id: string): EphemeralMonitorRecord | null;
     findSessionById(id: string): AgentSessionRecord | null;
@@ -1475,6 +1488,8 @@ export class RuntimeStore {
     listSessions(): AgentSessionRecord[];
     // (undocumented)
     markClaimed(sessionId: string, eventIds: string[], lifecycle: string): void;
+    markMaterializationRetryFailed(id: string, error: string, now?: Date): MaterializationRetryRecord;
+    materializationRetrySummary(monitorId: string, workspacePath: string | null): MaterializationRetrySummary;
     // (undocumented)
     openSession(input: OpenSessionInput): AgentSessionRecord;
     // (undocumented)
@@ -1486,6 +1501,7 @@ export class RuntimeStore {
     purgeExpiredObjectSuppressions(now: Date): void;
     reapEphemeralMonitor(id: string): void;
     reapEphemeralMonitorsForSession(sessionId: string): string[];
+    rearmMaterializationRetry(id: string, now?: Date): MaterializationRetryRecord;
     recordInterpretDecision(sessionId: string, eventId: string, decision: {
         decision: 'deliver' | 'suppress' | 'failed';
         reason?: string | undefined;

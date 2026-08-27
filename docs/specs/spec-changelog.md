@@ -14,8 +14,10 @@ Agent Monitors spec set in `docs/specs/`.
 Core now persists failed stored-observation envelopes in a workspace-scoped, per-monitor outbox
 before a later runtime change adopts it for source ticks. Batch enqueue is capacity-atomic at 256
 records or 8 MiB. Envelopes must round-trip through JSON without conversion, trusted routes are
-checked before mutation, and safe errors are control-stripped and bounded. Retry lifecycle and
-operator diagnostics are delivered in the next two stack layers.
+checked before mutation, and safe errors are control-stripped and bounded. The lifecycle layer adds
+fixed retry delays, terminal state after five failures, explicit re-arm, and transaction-coupled
+completion so a thrown materialization cannot delete its durable retry. Operator diagnostics follow
+in the next stack layer.
 
 ## 2026-08-13 — Event materialization is one atomic durable unit (002 §5, 004 §3.4) — Refs #295, #481
 
