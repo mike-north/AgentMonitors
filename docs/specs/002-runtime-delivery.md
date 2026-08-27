@@ -1086,7 +1086,15 @@ this stage.
 
 Each emitted observation becomes one row in the `monitor_events` table. The runtime **MUST** persist at least: `id`, `workspacePath`, `monitorId`, `sourceName`, `urgency`, `title`, `body`, `summary`, `payload`, `snapshotMetadata`, `snapshotText`, `diffText`, `objectKey`, `queryScope`, `tags`, `createdAt`.
 
-Verified: `libs/core/src/runtime/service.ts` — `processObservation()` (lines 566–617); `libs/core/src/runtime/store.ts` — `insertEvent()` (lines 260–299).
+The event row, every matching lead-session projection, any first-recipient cursor seed, and the
+event's snapshot form one synchronous durable materialization unit. They **MUST** commit in one
+immediate SQLite transaction or all roll back. Optional Interpret work begins only after that
+transaction commits and remains best-effort; an Interpret failure cannot undo the deterministic
+artifact.
+
+Verified: `libs/core/src/runtime/service.ts` — `materializeObservation()` / `processObservation()`;
+`libs/core/src/runtime/store.ts` — `insertEvent()`; and
+`libs/core/src/runtime/transactional-materialization.test.ts`.
 
 ### 5.1 Derived defaults
 
@@ -1112,7 +1120,7 @@ If an emitted observation includes `snapshotText`, the runtime **MUST**:
 
 1. look up the latest stored snapshot for the same `(workspacePath, monitorId, objectKey)` triple
 2. compute a textual diff if a previous snapshot exists
-3. store the new snapshot after persisting the event
+3. store the new snapshot in the same transaction as the event, projections, and cursor seeds
 
 **Snapshot ordering (total materialization order).** `created_at` is stored at epoch-**second** precision, so several snapshots for one `(workspacePath, monitorId, objectKey)` written in the same second (an ordinary same-tick burst) tie on `created_at`. The runtime **MUST** give snapshots a total materialization order and resolve "the latest stored snapshot" to the **most recently materialized** one under identical timestamps — never an older tied row, which would corrupt the shared diff chain (repeating or omitting intermediate changes). This is satisfied by a strictly-increasing (monotonic ULID) snapshot `id` and ordering by `(created_at, id)` — the same tie-break the `monitor_events` table already uses. User-visible newest-first listings that order by second-precision `created_at` (`events list` / `monitor explain` event and observation-history audit rows) apply the same `id` tie-break so their order is stable within a second.
 
@@ -1131,7 +1139,7 @@ The renderer is chosen by the object's `change-detection.strategy` (003 §4.2/§
 > Fixing this (carrying `ignore-paths` through the persisted snapshot metadata and stripping the
 > same fields before rendering) is a follow-up, not implemented as part of issue #437.
 
-Verified: `libs/core/src/runtime/service.ts` — `processObservation()`; `libs/core/src/runtime/store.ts` — `insertEvent()`, `collapseNetForClaim()`, `saveSnapshot()`/`latestSnapshot()` (monotonic `snapshotUlid`, `(created_at, id)` tie-break); `libs/core/src/runtime/diff.ts` — `buildDiff()`, `buildTextDiff()` (cap at 20 lines), `buildJsonDiff()` (cap at 20 entries).
+Verified: `libs/core/src/runtime/service.ts` — `materializeObservation()`; `libs/core/src/runtime/store.ts` — `insertEvent()`, `collapseNetForClaim()`, `saveSnapshot()`/`latestSnapshot()` (monotonic `snapshotUlid`, `(created_at, id)` tie-break); `libs/core/src/runtime/diff.ts` — `buildDiff()`, `buildTextDiff()` (cap at 20 lines), `buildJsonDiff()` (cap at 20 entries); `libs/core/src/runtime/transactional-materialization.test.ts` (rollback after cursor and snapshot failures).
 
 This makes snapshot history an object-level concern rather than a monitor-level or session-level concern (SP5).
 
@@ -1879,7 +1887,10 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
 - `no-files-matched` — the source returned zero observations and signalled that its file-system scope matched zero files. This is distinct from `no-change` because no watched target was actually observed. `observationData` is `{ observed: 0, emitted: 0 }`.
 - `errored` — a failure occurred and was **isolated** so the tick (or watcher) continued. Two sub-cases:
   - `observe()` threw or rejected in the tick loop: `ingest()` was never called, so the monitor's persisted `sourceState` is left exactly as it was and no subsequent delta is dropped.
-  - A single dispatched observation failed to materialize inside `ingest()` (tick or watch path, e.g. a DB insert error): the batch's other observations are unaffected and `emittedEventIds` reflects only what was durably written. Note: `insertEvent` and `saveSnapshot` are two separate writes; a `saveSnapshot` failure after a successful `insertEvent` is best-effort — the event row exists but has no snapshot (see TODO in `service.ts processObservation`).
+  - A single dispatched observation failed to materialize inside `ingest()` (tick or watch path,
+    e.g. an event, projection/cursor, or snapshot write error): that observation's entire
+    materialization transaction rolls back, the batch's other observations are unaffected, and
+    `emittedEventIds` reflects only durably committed events.
 
   In both cases `observationData` is `{ error: "<message>" }`. The audit write itself is best-effort: a `recordObservationHistory` failure is swallowed so a failing audit row can never re-abort the tick.
 

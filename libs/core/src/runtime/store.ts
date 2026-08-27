@@ -14,6 +14,7 @@ import {
   sql,
 } from 'drizzle-orm';
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
+import type { Database as BetterSQLiteClient } from 'better-sqlite3';
 import { monotonicFactory, ulid } from 'ulid';
 
 /**
@@ -83,7 +84,7 @@ import { buildDiff, changeDetectionStrategyOf } from './diff.js';
 
 type InternalInboxDb = BetterSQLite3Database<
   typeof import('../inbox/schema.js')
->;
+> & { $client: BetterSQLiteClient };
 
 function asInternalDb(db: InboxDb): InternalInboxDb {
   return db as unknown as InternalInboxDb;
@@ -755,134 +756,156 @@ export class RuntimeStore {
     options?: { restrictToSessionId?: string },
   ): MonitorEventRecord {
     const db = asInternalDb(this.db);
-    const id = eventUlid();
-    db.insert(monitorEvents)
-      .values({
-        id,
-        workspacePath: input.workspacePath,
-        monitorId: input.monitorId,
-        sourceName: input.sourceName,
-        urgency: input.urgency,
-        title: input.title,
-        body: input.body,
-        summary: input.summary,
-        payload: JSON.stringify(input.payload ?? {}),
-        snapshotMetadata: JSON.stringify(input.snapshotMetadata ?? {}),
-        snapshotText: input.snapshotText,
-        diffText: input.diffText,
-        objectKey: input.objectKey,
-        baselineStrategy: input.baselineStrategy,
-        queryScope: JSON.stringify(input.queryScope),
-        tags: JSON.stringify(input.tags),
-        createdAt: input.createdAt,
-      })
-      .run();
+    const materialized = db.$client
+      .transaction(() => {
+        const id = eventUlid();
+        db.insert(monitorEvents)
+          .values({
+            id,
+            workspacePath: input.workspacePath,
+            monitorId: input.monitorId,
+            sourceName: input.sourceName,
+            urgency: input.urgency,
+            title: input.title,
+            body: input.body,
+            summary: input.summary,
+            payload: JSON.stringify(input.payload ?? {}),
+            snapshotMetadata: JSON.stringify(input.snapshotMetadata ?? {}),
+            snapshotText: input.snapshotText,
+            diffText: input.diffText,
+            objectKey: input.objectKey,
+            baselineStrategy: input.baselineStrategy,
+            queryScope: JSON.stringify(input.queryScope),
+            tags: JSON.stringify(input.tags),
+            createdAt: input.createdAt,
+          })
+          .run();
 
-    const event = this.getEventById(id);
-    const artifact = event.snapshotText;
-    const objectKey = event.objectKey;
-    const projectedSessionIds: string[] = [];
-    // Reap race (007 §4.4): a tick pre-fetches the active ephemeral monitors, then
-    // `await source.observe()` yields; a concurrent `watch cancel` on another
-    // socket can reap THIS monitor while the session stays active (session-close
-    // dormancy is caught by the `status === 'active'` session filter below, but a
-    // bare cancel is not). Re-check the ephemeral monitor's status at insert time
-    // so an in-flight observation from a just-reaped watch projects to nobody —
-    // "reaping stops further observation / delivery." Only the ephemeral path
-    // (restrictToSessionId set) is re-checked; a persistent event is unaffected.
-    const ephemeralStillActive =
-      options?.restrictToSessionId === undefined ||
-      this.findEphemeralMonitorById(event.monitorId)?.status === 'active';
-    // Projection target (002 §6). For a persistent monitor, every matching LEAD
-    // session (workspace match or global). For an EPHEMERAL monitor (007 §4.6),
-    // projection is restricted to the DECLARING session ONLY — its events must
-    // never reach a sibling lead session in the same workspace (the ephemeral
-    // isolation invariant). `restrictToSessionId` names that session; it is still
-    // filtered to a lead role (the declaring session is a lead by construction,
-    // 007 §4.6), so a stray non-lead binding projects to nobody rather than
-    // leaking. The declaring session must also still be `active`: a session reaped
-    // mid-tick (its close raced this observation) must not receive a projection
-    // (007 §4.4). The event row itself is still retained for durability.
-    const projectionTargets = ephemeralStillActive
-      ? this.sessionsForWorkspace(event.workspacePath).filter(
-          (candidate) =>
-            candidate.role === 'lead' &&
-            (options?.restrictToSessionId === undefined ||
-              (candidate.id === options.restrictToSessionId &&
-                candidate.status === 'active')),
-        )
-      : [];
-    for (const session of projectionTargets) {
-      // ── Per-recipient Diff (G10, 002 §1.1.2) ──────────────────────────────
-      // Compute this session's delta against ITS OWN baseline cursor, and seed
-      // the cursor on first projection. Only meaningful for snapshot-bearing
-      // events keyed by an objectKey; snapshot-less events leave diff_text NULL.
-      let perRecipientDiff: string | null = null;
-      if (artifact !== null && objectKey !== null) {
-        const cursor = this.getSessionObjectCursor(
-          session.id,
-          event.monitorId,
-          objectKey,
-          event.workspacePath,
-        );
-        // The object's declared change-detection strategy (issue #437): renders
-        // a structural diffText for `strategy: json-diff` instead of a
-        // compact-JSON line diff. Read from the persisted `snapshotMetadata`
-        // (the source's `snapshot` metadata round-tripped through the DB).
-        const strategy = changeDetectionStrategyOf(event.snapshotMetadata);
-        if (cursor) {
-          // Existing recipient: span from its own cursor. Never advanced here —
-          // materialization SEEDS only; the cursor advances at claim
-          // (markClaimed), so a recipient that stayed away keeps spanning from
-          // its last-seen point across multiple shared observations.
-          perRecipientDiff = buildDiff(
-            cursor.baselineContent,
-            artifact,
-            strategy,
-          );
-        } else {
-          // First projection of this object to this session = "caught up to the
-          // pre-event state": its delta is the shared diff (prior → artifact),
-          // identical to today's single-baseline behavior (backward-compat).
-          const previous = baseline?.previousContent ?? null;
-          perRecipientDiff =
-            previous !== null ? buildDiff(previous, artifact, strategy) : null;
-          // Seed the cursor to the state the recipient is now caught up to: the
-          // prior snapshot for a non-baseline event (so the NEXT event spans
-          // prior → next), or this event's own artifact at a baseline event
-          // (nothing precedes it). Advanced only at claim thereafter.
-          //
-          // Provenance: `baselineSnapshotId` must reference the snapshot that
-          // supplied `baselineContent`.  When seeding from `previous` (the
-          // pre-event snapshot content), there is no cursor-accessible snapshot
-          // id in scope, so we use NULL — the id is only set when seeding from
-          // the current event's own artifact (the baseline case). (Copilot
-          // review: comment 2.)
-          this.seedSessionObjectCursor({
-            sessionId: session.id,
+        const event = this.getEventById(id);
+        const artifact = event.snapshotText;
+        const objectKey = event.objectKey;
+        const projectedSessionIds: string[] = [];
+        // Reap race (007 §4.4): a tick pre-fetches the active ephemeral monitors, then
+        // `await source.observe()` yields; a concurrent `watch cancel` on another
+        // socket can reap THIS monitor while the session stays active (session-close
+        // dormancy is caught by the `status === 'active'` session filter below, but a
+        // bare cancel is not). Re-check the ephemeral monitor's status at insert time
+        // so an in-flight observation from a just-reaped watch projects to nobody —
+        // "reaping stops further observation / delivery." Only the ephemeral path
+        // (restrictToSessionId set) is re-checked; a persistent event is unaffected.
+        const ephemeralStillActive =
+          options?.restrictToSessionId === undefined ||
+          this.findEphemeralMonitorById(event.monitorId)?.status === 'active';
+        // Projection target (002 §6). For a persistent monitor, every matching LEAD
+        // session (workspace match or global). For an EPHEMERAL monitor (007 §4.6),
+        // projection is restricted to the DECLARING session ONLY — its events must
+        // never reach a sibling lead session in the same workspace (the ephemeral
+        // isolation invariant). `restrictToSessionId` names that session; it is still
+        // filtered to a lead role (the declaring session is a lead by construction,
+        // 007 §4.6), so a stray non-lead binding projects to nobody rather than
+        // leaking. The declaring session must also still be `active`: a session reaped
+        // mid-tick (its close raced this observation) must not receive a projection
+        // (007 §4.4). The event row itself is still retained for durability.
+        const projectionTargets = ephemeralStillActive
+          ? this.sessionsForWorkspace(event.workspacePath).filter(
+              (candidate) =>
+                candidate.role === 'lead' &&
+                (options?.restrictToSessionId === undefined ||
+                  (candidate.id === options.restrictToSessionId &&
+                    candidate.status === 'active')),
+            )
+          : [];
+        for (const session of projectionTargets) {
+          // ── Per-recipient Diff (G10, 002 §1.1.2) ──────────────────────────────
+          // Compute this session's delta against ITS OWN baseline cursor, and seed
+          // the cursor on first projection. Only meaningful for snapshot-bearing
+          // events keyed by an objectKey; snapshot-less events leave diff_text NULL.
+          let perRecipientDiff: string | null = null;
+          if (artifact !== null && objectKey !== null) {
+            const cursor = this.getSessionObjectCursor(
+              session.id,
+              event.monitorId,
+              objectKey,
+              event.workspacePath,
+            );
+            // The object's declared change-detection strategy (issue #437): renders
+            // a structural diffText for `strategy: json-diff` instead of a
+            // compact-JSON line diff. Read from the persisted `snapshotMetadata`
+            // (the source's `snapshot` metadata round-tripped through the DB).
+            const strategy = changeDetectionStrategyOf(event.snapshotMetadata);
+            if (cursor) {
+              // Existing recipient: span from its own cursor. Never advanced here —
+              // materialization SEEDS only; the cursor advances at claim
+              // (markClaimed), so a recipient that stayed away keeps spanning from
+              // its last-seen point across multiple shared observations.
+              perRecipientDiff = buildDiff(
+                cursor.baselineContent,
+                artifact,
+                strategy,
+              );
+            } else {
+              // First projection of this object to this session = "caught up to the
+              // pre-event state": its delta is the shared diff (prior → artifact),
+              // identical to today's single-baseline behavior (backward-compat).
+              const previous = baseline?.previousContent ?? null;
+              perRecipientDiff =
+                previous !== null
+                  ? buildDiff(previous, artifact, strategy)
+                  : null;
+              // Seed the cursor to the state the recipient is now caught up to: the
+              // prior snapshot for a non-baseline event (so the NEXT event spans
+              // prior → next), or this event's own artifact at a baseline event
+              // (nothing precedes it). Advanced only at claim thereafter.
+              //
+              // Provenance: `baselineSnapshotId` must reference the snapshot that
+              // supplied `baselineContent`.  When seeding from `previous` (the
+              // pre-event snapshot content), there is no cursor-accessible snapshot
+              // id in scope, so we use NULL — the id is only set when seeding from
+              // the current event's own artifact (the baseline case). (Copilot
+              // review: comment 2.)
+              this.seedSessionObjectCursor({
+                sessionId: session.id,
+                monitorId: event.monitorId,
+                objectKey,
+                workspacePath: event.workspacePath,
+                baselineSnapshotId: previous !== null ? null : event.id,
+                baselineContent: previous ?? artifact,
+              });
+            }
+          }
+
+          db.insert(sessionEventState)
+            .values({
+              id: ulid(),
+              sessionId: session.id,
+              eventId: event.id,
+              diffText: perRecipientDiff,
+              createdAt: event.createdAt,
+              updatedAt: event.createdAt,
+            })
+            .run();
+          projectedSessionIds.push(session.id);
+        }
+
+        if (artifact !== null) {
+          if (objectKey === null) {
+            throw new Error('A snapshot-bearing event requires an object key.');
+          }
+          this.saveSnapshot({
+            workspacePath: event.workspacePath,
             monitorId: event.monitorId,
             objectKey,
-            workspacePath: event.workspacePath,
-            baselineSnapshotId: previous !== null ? null : event.id,
-            baselineContent: previous ?? artifact,
+            eventId: event.id,
+            content: artifact,
           });
         }
-      }
 
-      db.insert(sessionEventState)
-        .values({
-          id: ulid(),
-          sessionId: session.id,
-          eventId: event.id,
-          diffText: perRecipientDiff,
-          createdAt: event.createdAt,
-          updatedAt: event.createdAt,
-        })
-        .run();
-      projectedSessionIds.push(session.id);
-    }
-    this.lastProjectedSessionIds = projectedSessionIds;
-    return event;
+        return { event, projectedSessionIds };
+      })
+      .immediate();
+
+    this.lastProjectedSessionIds = materialized.projectedSessionIds;
+    return materialized.event;
   }
 
   /**
