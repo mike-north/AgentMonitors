@@ -104,7 +104,7 @@ function recordingInterpretAdapter(): RecordingInterpretAdapter {
   };
 }
 
-function createFixture() {
+function createFixture(options: { interval?: string; notify?: string } = {}) {
   const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-atomic-ingest-'));
   tempDirs.push(rootDir);
   const monitorDir = path.join(rootDir, '.claude/monitors/test-monitor');
@@ -115,11 +115,11 @@ function createFixture() {
 name: Test monitor
 watch:
   type: retry-source
-  interval: 1s
+  interval: ${options.interval ?? '1s'}
 urgency: normal
 payload:
   form: prose
-baseline-strategy: incremental
+${options.notify ?? ''}baseline-strategy: incremental
 ---
 Handle it.
 `,
@@ -173,8 +173,8 @@ function createRuntime(
   );
 }
 
-function setup() {
-  const fixture = createFixture();
+function setup(options: Parameters<typeof createFixture>[0] = {}) {
+  const fixture = createFixture(options);
   const observedStates: unknown[] = [];
   const source = createSource(observedStates);
   const db = createDb(fixture.dbPath);
@@ -206,19 +206,24 @@ function summaries(store: RuntimeStore, ids: string[]): string[] {
 function expectTick(
   result: RuntimeTickResult,
   store: RuntimeStore,
-  expected: { emitted?: string[]; errors?: string[] },
+  expected: {
+    emitted?: string[];
+    errors?: string[];
+    evaluated?: string[];
+    skipped?: RuntimeTickResult['skippedMonitors'];
+  },
 ) {
   expect({
     ...result,
     emittedEventIds: summaries(store, result.emittedEventIds),
   }).toEqual({
-    evaluatedMonitors: ['test-monitor'],
+    evaluatedMonitors: expected.evaluated ?? ['test-monitor'],
     emittedEventIds: expected.emitted ?? [],
     erroredObservations: (expected.errors ?? []).map((message) => ({
       monitorId: 'test-monitor',
       message,
     })),
-    skippedMonitors: [],
+    skippedMonitors: expected.skipped ?? [],
   });
 }
 
@@ -395,6 +400,103 @@ describe('atomic poll ingest', () => {
           observationData: { observed: 2, emitted: 2 },
         },
         { result: 'errored', observationData: { error: message } },
+      ]);
+    });
+  }
+});
+
+describe('atomic rollup-window flush', () => {
+  for (const [fault, message] of [
+    ['state', 'monitor state write failed'],
+    ['outbox', 'retry outbox write failed'],
+  ] as const) {
+    it(`preserves pending notify state across ${fault} failure and restart`, async () => {
+      const outsideWindow = new Date('2026-08-13T08:00:00.000Z');
+      const atWindow = new Date('2026-08-13T09:00:00.000Z');
+      vi.setSystemTime(outsideWindow);
+      const f = setup({
+        interval: '2h',
+        notify: "notify:\n  strategy: rollup\n  window: '0 9 * * *'\n",
+      });
+
+      expectTick(await f.runtime.tick(f.monitorsDir, f.rootDir), f.store, {});
+      const pendingSummaries = (store: RuntimeStore) =>
+        store
+          .getMonitorState('test-monitor', f.rootDir)
+          .notifyState.pendingRollup?.observations.map(
+            ({ observation }) => observation.summary,
+          );
+      expect(pendingSummaries(f.store)).toEqual(['first', 'second']);
+
+      if (fault === 'state') {
+        f.store.stateFailures = 1;
+      } else {
+        f.store.failedSummary = 'first';
+        f.store.eventFailures = 1;
+        f.store.outboxFailures = 1;
+      }
+      vi.setSystemTime(atWindow);
+      const skipped = [
+        {
+          monitorId: 'test-monitor',
+          nextDueAt: new Date('2026-08-13T10:00:00.000Z'),
+        },
+      ];
+      expectTick(await f.runtime.tick(f.monitorsDir, f.rootDir), f.store, {
+        errors: [message],
+        evaluated: [],
+        skipped,
+      });
+      const rolledBack = f.store.getMonitorState('test-monitor', f.rootDir);
+      expect(pendingSummaries(f.store)).toEqual(['first', 'second']);
+      expect(rolledBack.notifyState.rollupLastFiredMinute).toBeUndefined();
+      expect(f.runtime.listEvents({ monitorId: 'test-monitor' })).toEqual([]);
+      expect(f.store.listMaterializationRetries()).toEqual([]);
+      expect(interpretDeltas(f.interpret)).toEqual([]);
+      expect(history(f.runtime)).toEqual([
+        { result: 'errored', observationData: { error: message } },
+        {
+          result: 'suppressed',
+          observationData: { observed: 2, emitted: 0 },
+        },
+      ]);
+
+      vi.setSystemTime(atWindow.getTime() + 1_000);
+      const reopenedStore = new RuntimeStore(createDb(f.dbPath));
+      const restarted = createRuntime(reopenedStore, f.source, f.interpret);
+      expectTick(
+        await restarted.tick(f.monitorsDir, f.rootDir),
+        reopenedStore,
+        {
+          emitted: ['first', 'second'],
+          evaluated: [],
+          skipped,
+        },
+      );
+      const flushed = reopenedStore.getMonitorState('test-monitor', f.rootDir);
+      expect(flushed.notifyState.pendingRollup).toBeUndefined();
+      expect(flushed.notifyState.rollupLastFiredMinute).toBe(
+        Math.floor(atWindow.getTime() / 60_000),
+      );
+      expect(
+        restarted
+          .listEvents({ monitorId: 'test-monitor' })
+          .map(({ summary }) => summary),
+      ).toEqual(['second', 'first']);
+      expect(interpretDeltas(f.interpret)).toEqual([
+        'first-state',
+        'second-state',
+      ]);
+      expect(history(restarted)).toEqual([
+        {
+          result: 'triggered',
+          observationData: { observed: 0, emitted: 2 },
+        },
+        { result: 'errored', observationData: { error: message } },
+        {
+          result: 'suppressed',
+          observationData: { observed: 2, emitted: 0 },
+        },
       ]);
     });
   }

@@ -1040,7 +1040,9 @@ three clocks especially visible:
    expression against the current time using the configured `timezone` (defaulting to `UTC`). The
    window fires at most once per minute (same guard as the schedule source, §2.2). If the window
    matches and the accumulated batch is non-empty, the batch is flushed as a single composite
-   emission and the accumulation state is cleared.
+   emission and the accumulation state is cleared. The window marker, pending-batch removal,
+   materialized events, and retry-outbox admission commit in one immediate transaction. A state or
+   outbox failure leaves the prior pending batch and marker available for restart recovery.
 
 3. **Empty window.** If the window opens but no observations have accumulated since the last flush,
    the runtime produces no delivery (no empty pings — preserving C14).
