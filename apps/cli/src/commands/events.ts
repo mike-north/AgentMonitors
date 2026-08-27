@@ -76,7 +76,7 @@ export function singleLineSafe(value: string): string {
 }
 
 export const eventsCommand = new Command('events').description(
-  'Query or acknowledge runtime events',
+  'Query, acknowledge, or ingest runtime events',
 );
 
 const eventsListCommand = eventsCommand

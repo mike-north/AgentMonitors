@@ -436,6 +436,28 @@ describe('createDaemonServer — request-handling resilience', () => {
     }
   });
 
+  it('classifies an unexpected daemon application failure as retryable', async () => {
+    const socketPath = tempSocketPath('internal-error-policy');
+    const runtime = createRuntime(':memory:');
+    vi.spyOn(runtime, 'status').mockImplementation(() => {
+      throw new Error('unexpected failure');
+    });
+    const server = createDaemonServer({ runtime, socketPath });
+    try {
+      await server.listen();
+      const error = await callDaemon('status', {}, { socketPath }).catch(
+        (caught: unknown) => caught,
+      );
+      expect(error).toBeInstanceOf(DaemonApplicationError);
+      expect(error).toMatchObject({
+        code: 'internal_error',
+        retryable: true,
+      });
+    } finally {
+      await server.close().catch(() => undefined);
+    }
+  });
+
   it('binds canonical identities and deduplicates concurrent external ingestion', async () => {
     const fixture = externalFixture();
     const alias = path.join(tempDir(), 'workspace-link');

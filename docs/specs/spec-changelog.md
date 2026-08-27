@@ -15,6 +15,13 @@ Core now exposes exact-workspace safe receipt reads and exact four-dimension obj
 Nonempty durable debounce/rollup state and materialization retry admission write the matching
 global or workspace `durable-ingress-v1` marker in the same transaction; empty batches do not mark
 an otherwise compatible database.
+## 2026-08-13 — External ingress has an automation-safe CLI (005 §11.3–11.6) — Refs #481
+
+The CLI now accepts one validated envelope from stdin or a file, verifies the serving daemon's
+canonical local identities, and exposes safe receipt status plus explicit receipt/outbox recovery.
+Structured failures preserve stable code/retryability without echoing event state, and no command
+falls back to direct database mutation when the daemon is unavailable.
+
 ## 2026-08-13 — The daemon owns external deadline lifecycle (002 §2.6, 004 §3.4.1) — Refs #481
 
 The daemon now flushes overdue accepted work at startup, arms the earliest durable external
