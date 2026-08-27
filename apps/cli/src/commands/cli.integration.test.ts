@@ -11,6 +11,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -22,6 +23,11 @@ import { spawn, spawnSync } from 'node:child_process';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import {
+  createDb,
+  RuntimeStore,
+  type StoredObservationEnvelope,
+} from '@agentmonitors/core';
 import { writeLocalState } from '../local-state.js';
 import {
   daemonAvailable,
@@ -13197,4 +13203,508 @@ describe('events help names the required --session option (issue #389 P3)', () =
       "required option '--session <id>'",
     );
   });
+});
+
+describe('external ingress CLI UAT', () => {
+  function ingressSocket(label: string): string {
+    return path.join(
+      '/tmp',
+      `agentmon-${label}-${String(process.pid)}-${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+  }
+
+  function writeIngressMonitor(workspace: string, settleFor?: string): string {
+    const monitorsDir = path.join(workspace, '.claude', 'monitors');
+    const monitorDir = path.join(monitorsDir, 'build-health');
+    mkdirSync(monitorDir, { recursive: true });
+    writeFileSync(path.join(workspace, 'watched.txt'), 'baseline', 'utf8');
+    writeFileSync(
+      path.join(monitorDir, 'MONITOR.md'),
+      [
+        '---',
+        'name: Build health',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs:',
+        "    - 'watched.txt'",
+        `  cwd: ${JSON.stringify(workspace)}`,
+        'urgency: normal',
+        ...(settleFor
+          ? ['notify:', '  strategy: debounce', `  settle-for: ${settleFor}`]
+          : []),
+        '---',
+        'Handle the captured build state.',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
+    return monitorsDir;
+  }
+
+  function ingressEnvelope(
+    upstreamEventId: string,
+    objectSequence: number,
+    state: Record<string, unknown> = { status: 'passed' },
+  ): Record<string, unknown> {
+    return {
+      schema: 'agentmonitors.external-event.v1',
+      monitorId: 'build-health',
+      source: 'synthetic-build-system',
+      upstreamEventId,
+      objectId: 'build-123',
+      objectSequence,
+      eventKind: 'build.updated',
+      changeKind: 'modified',
+      occurredAt: new Date().toISOString(),
+      resumeToken: `cursor-${String(objectSequence)}`,
+      scope: { project: 'example/widgets' },
+      state,
+    };
+  }
+
+  function externalArgs(
+    command: string,
+    workspace: string,
+    monitorsDir: string,
+    socket: string,
+    tail: string[] = [],
+  ): string[] {
+    return [
+      'events',
+      command,
+      '--workspace',
+      workspace,
+      '--dir',
+      monitorsDir,
+      '--socket',
+      socket,
+      '--format',
+      'json',
+      ...tail,
+    ];
+  }
+
+  it('rejects malformed stdin before connecting and classifies an absent daemon', () => {
+    const workspace = path.join(tempDir, 'external-ingress-io');
+    const monitorsDir = writeIngressMonitor(workspace);
+    const socket = ingressSocket('missing');
+    const env = { AGENTMONITORS_DB: path.join(workspace, 'events.db') };
+
+    const malformed = runWithStdin(
+      externalArgs('ingest', workspace, monitorsDir, socket),
+      env,
+      '{}\n{}',
+      workspace,
+    );
+    expect(malformed.exitCode).toBe(1);
+    expect(JSON.parse(malformed.stdout)).toMatchObject({
+      error: { code: 'invalid_envelope', retryable: false },
+    });
+
+    const unavailable = runWithStdin(
+      externalArgs('ingest', workspace, monitorsDir, socket),
+      env,
+      JSON.stringify(ingressEnvelope('unavailable-1', 1)),
+      workspace,
+    );
+    expect(unavailable.exitCode).toBe(1);
+    expect(JSON.parse(unavailable.stdout)).toMatchObject({
+      error: { code: 'daemon_unavailable', retryable: true },
+    });
+  });
+
+  it('survives restart, deduplicates file replay, isolates sessions, delivers once, and acknowledges', async () => {
+    const workspace = path.join(tempDir, 'external-ingress-uat');
+    const otherWorkspace = path.join(tempDir, 'external-ingress-other');
+    const monitorsDir = writeIngressMonitor(workspace);
+    const otherMonitorsDir = writeIngressMonitor(otherWorkspace);
+    const socket = ingressSocket('primary');
+    const otherSocket = ingressSocket('other');
+    const db = path.join(workspace, 'agentmon.db');
+    const otherDb = path.join(otherWorkspace, 'agentmon.db');
+    const env = { AGENTMONITORS_DB: db };
+    const otherEnv = { AGENTMONITORS_DB: otherDb };
+    let daemon = await startDaemon(monitorsDir, workspace, env, socket);
+    const otherDaemon = await startDaemon(
+      otherMonitorsDir,
+      otherWorkspace,
+      otherEnv,
+      otherSocket,
+    );
+
+    try {
+      const openSession = (
+        host: string,
+        role: 'lead' | 'subagent',
+        target = workspace,
+        targetSocket = socket,
+        targetEnv = env,
+      ) =>
+        JSON.parse(
+          runWithEnv(
+            [
+              'session',
+              'open',
+              '--host-session-id',
+              host,
+              '--role',
+              role,
+              '--workspace',
+              target,
+              '--socket',
+              targetSocket,
+              '--format',
+              'json',
+            ],
+            targetEnv,
+            target,
+          ).stdout,
+        ) as { id: string };
+      const lead = openSession('ingress-lead', 'lead');
+      const subagent = openSession('ingress-subagent', 'subagent');
+      const otherLead = openSession(
+        'other-lead',
+        'lead',
+        otherWorkspace,
+        otherSocket,
+        otherEnv,
+      );
+      expect(
+        runWithEnv(
+          ['session', 'close', lead.id, '--socket', socket],
+          env,
+          workspace,
+        ).exitCode,
+      ).toBe(0);
+
+      const wrongSocket = runWithStdin(
+        externalArgs('ingest', workspace, monitorsDir, otherSocket),
+        env,
+        JSON.stringify(ingressEnvelope('wrong-workspace', 0)),
+        workspace,
+      );
+      expect(wrongSocket.exitCode).toBe(1);
+      expect(JSON.parse(wrongSocket.stdout)).toMatchObject({
+        error: { code: 'workspace_mismatch', retryable: false },
+      });
+
+      const envelope = ingressEnvelope('delivery-immediate-1', 1, {
+        status: 'passed',
+        privateMarker: 'DO-NOT-RETURN-STATE',
+      });
+      const accepted = runWithStdin(
+        externalArgs('ingest', workspace, monitorsDir, socket),
+        env,
+        JSON.stringify(envelope),
+        workspace,
+      );
+      expect(accepted.exitCode).toBe(0);
+      const acceptedJson = JSON.parse(accepted.stdout) as {
+        disposition: string;
+        outcome: string;
+        receiptId: string;
+        eventIds: string[];
+      };
+      expect(acceptedJson).toMatchObject({
+        disposition: 'accepted',
+        outcome: 'materialized',
+        eventIds: [expect.any(String)],
+      });
+      expect(accepted.stdout).not.toContain('DO-NOT-RETURN-STATE');
+
+      daemon.stop();
+      await daemon.waitForExit();
+      daemon = await startDaemon(monitorsDir, workspace, env, socket);
+      const envelopePath = path.join(workspace, 'event.json');
+      writeFileSync(envelopePath, JSON.stringify(envelope), 'utf8');
+      const duplicate = runWithEnv(
+        externalArgs('ingest', workspace, monitorsDir, socket, [
+          '--file',
+          envelopePath,
+        ]),
+        env,
+        workspace,
+      );
+      expect(JSON.parse(duplicate.stdout)).toMatchObject({
+        disposition: 'duplicate',
+        receiptId: acceptedJson.receiptId,
+        eventIds: acceptedJson.eventIds,
+      });
+      const status = runWithEnv(
+        externalArgs('ingest-status', workspace, monitorsDir, socket, [
+          '--receipt',
+          acceptedJson.receiptId,
+        ]),
+        env,
+        workspace,
+      );
+      expect(JSON.parse(status.stdout)).toMatchObject({
+        outcome: 'materialized',
+        eventIds: acceptedJson.eventIds,
+      });
+      expect(status.stdout).not.toContain('DO-NOT-RETURN-STATE');
+
+      const listEvents = (
+        sessionId: string,
+        targetSocket = socket,
+        targetEnv = env,
+        target = workspace,
+      ) =>
+        JSON.parse(
+          runWithEnv(
+            [
+              'events',
+              'list',
+              '--session',
+              sessionId,
+              '--socket',
+              targetSocket,
+              '--format',
+              'json',
+            ],
+            targetEnv,
+            target,
+          ).stdout,
+        ) as { id: string }[];
+      expect(listEvents(subagent.id)).toEqual([]);
+      expect(
+        listEvents(otherLead.id, otherSocket, otherEnv, otherWorkspace),
+      ).toEqual([]);
+
+      expect(openSession('ingress-lead', 'lead').id).toBe(lead.id);
+      const claim = runWithEnv(
+        [
+          'hook',
+          'claim',
+          '--session',
+          lead.id,
+          '--lifecycle',
+          'post-compact',
+          '--socket',
+          socket,
+          '--format',
+          'json',
+        ],
+        env,
+        workspace,
+      );
+      expect(JSON.parse(claim.stdout)).toMatchObject({
+        events: [{ eventId: acceptedJson.eventIds[0] }],
+      });
+      expect(
+        runWithEnv(
+          ['events', 'ack', '--session', lead.id, '--socket', socket],
+          env,
+          workspace,
+        ).exitCode,
+      ).toBe(0);
+      expect(listEvents(lead.id)).toEqual([
+        expect.objectContaining({ id: acceptedJson.eventIds[0] }),
+      ]);
+      expect(
+        JSON.parse(
+          runWithEnv(
+            [
+              'events',
+              'list',
+              '--session',
+              lead.id,
+              '--unread',
+              '--socket',
+              socket,
+              '--format',
+              'json',
+            ],
+            env,
+            workspace,
+          ).stdout,
+        ),
+      ).toEqual([]);
+    } finally {
+      daemon.stop();
+      otherDaemon.stop();
+      await Promise.all([daemon.waitForExit(), otherDaemon.waitForExit()]);
+    }
+  }, 45_000);
+
+  it('extends debounce deadlines and exposes safe status plus explicit receipt/outbox recovery', async () => {
+    const workspace = path.join(tempDir, 'external-ingress-retry');
+    const monitorsDir = writeIngressMonitor(workspace, '2s');
+    const socket = ingressSocket('retry');
+    const db = path.join(workspace, 'agentmon.db');
+    const env = { AGENTMONITORS_DB: db };
+    let daemon = await startDaemon(monitorsDir, workspace, env, socket);
+
+    try {
+      const ingest = (envelope: Record<string, unknown>) =>
+        JSON.parse(
+          runWithStdin(
+            externalArgs('ingest', workspace, monitorsDir, socket),
+            env,
+            JSON.stringify(envelope),
+            workspace,
+          ).stdout,
+        ) as { receiptId: string; outcome: string };
+      const first = ingest(ingressEnvelope('debounce-1', 1));
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      const second = ingest(ingressEnvelope('debounce-2', 2));
+      expect(first.outcome).toBe('held');
+      expect(second.outcome).toBe('held');
+      await new Promise((resolve) => setTimeout(resolve, 1_300));
+
+      const status = (receiptId: string) =>
+        JSON.parse(
+          runWithEnv(
+            externalArgs('ingest-status', workspace, monitorsDir, socket, [
+              '--receipt',
+              receiptId,
+            ]),
+            env,
+            workspace,
+          ).stdout,
+        ) as { outcome: string; eventIds: string[] };
+      expect(status(first.receiptId).outcome).toBe('held');
+      const deadline = Date.now() + 5_000;
+      while (
+        Date.now() < deadline &&
+        status(second.receiptId).outcome !== 'materialized'
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      expect(status(first.receiptId)).toMatchObject({
+        outcome: 'materialized',
+        eventIds: [expect.any(String)],
+      });
+      expect(status(second.receiptId)).toMatchObject({
+        outcome: 'materialized',
+        eventIds: [expect.any(String)],
+      });
+
+      writeIngressMonitor(workspace, '30s');
+      const recoverable = ingest(
+        ingressEnvelope('debounce-terminal', 3, {
+          privateMarker: 'NEVER-IN-STATUS',
+        }),
+      );
+      daemon.stop();
+      await daemon.waitForExit();
+      const workspaceIdentity = realpathSync(workspace);
+      const store = new RuntimeStore(createDb(db));
+      let failedAt = new Date();
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const failure = store.markExternalNotificationFlushFailed(
+          workspaceIdentity,
+          'build-health',
+          failedAt,
+        );
+        failedAt = failure.nextAttemptAt ?? failedAt;
+      }
+
+      const retryEnvelope: StoredObservationEnvelope = {
+        monitor: {
+          id: 'build-health',
+          displayName: 'Build health',
+          filePath: path.join(monitorsDir, 'build-health', 'MONITOR.md'),
+          instructions: 'Handle the captured build state.',
+          frontmatter: {
+            watch: { type: 'file-fingerprint' },
+            urgency: 'normal',
+            urgencyMax: 'normal',
+            baselineStrategy: 'incremental',
+          },
+        },
+        observation: {
+          title: 'Stored retry',
+          objectKey: 'retry-object',
+          snapshotText: '{"private":"OUTBOX-PRIVATE"}',
+        },
+        observedAt: new Date(),
+        effectiveUrgency: 'normal',
+      };
+      let outbox = store.enqueueMaterializationRetries([
+        {
+          workspacePath: workspaceIdentity,
+          monitorId: 'build-health',
+          sourceName: 'file-fingerprint',
+          envelope: retryEnvelope,
+          error: 'forced test failure',
+        },
+      ])[0];
+      if (!outbox) throw new Error('Expected a retry record.');
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        outbox = store.markMaterializationRetryFailed(
+          outbox.id,
+          'forced test failure',
+          outbox.nextAttemptAt ?? new Date(),
+        );
+      }
+
+      daemon = await startDaemon(monitorsDir, workspace, env, socket);
+      const failedStatus = runWithEnv(
+        externalArgs('ingest-status', workspace, monitorsDir, socket, [
+          '--receipt',
+          recoverable.receiptId,
+        ]),
+        env,
+        workspace,
+      );
+      expect(JSON.parse(failedStatus.stdout)).toMatchObject({
+        outcome: 'failed',
+        attemptCount: 5,
+      });
+      expect(failedStatus.stdout).not.toContain('NEVER-IN-STATUS');
+
+      const rearmed = runWithEnv(
+        externalArgs('ingest-retry', workspace, monitorsDir, socket, [
+          '--receipt',
+          recoverable.receiptId,
+        ]),
+        env,
+        workspace,
+      );
+      expect(JSON.parse(rearmed.stdout)).toMatchObject({
+        outcome: 'held',
+        attemptCount: 0,
+      });
+      const outboxRearmed = runWithEnv(
+        [
+          'monitor',
+          'retry-outbox',
+          '--retry',
+          outbox.id,
+          '--workspace',
+          workspace,
+          '--dir',
+          monitorsDir,
+          '--socket',
+          socket,
+          '--format',
+          'json',
+        ],
+        env,
+        workspace,
+      );
+      expect(JSON.parse(outboxRearmed.stdout)).toMatchObject({
+        id: outbox.id,
+        status: 'pending',
+        attemptCount: 0,
+      });
+      expect(outboxRearmed.stdout).not.toContain('OUTBOX-PRIVATE');
+
+      const recoveryDeadline = Date.now() + 5_000;
+      while (
+        Date.now() < recoveryDeadline &&
+        status(recoverable.receiptId).outcome !== 'materialized'
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      expect(status(recoverable.receiptId)).toMatchObject({
+        outcome: 'materialized',
+        eventIds: [expect.any(String)],
+      });
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+    }
+  }, 45_000);
 });

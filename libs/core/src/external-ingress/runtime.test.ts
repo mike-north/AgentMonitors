@@ -15,10 +15,7 @@ import {
   EXTERNAL_INGRESS_PENDING_MAX_RECORDS,
 } from '../runtime/types.js';
 import type { ExternalEventIngestInput } from './contract.js';
-import {
-  EXTERNAL_EVENT_SCHEMA,
-  ExternalEventIngestError,
-} from './contract.js';
+import { EXTERNAL_EVENT_SCHEMA, ExternalEventIngestError } from './contract.js';
 import { externalEventObjectKey } from './identity.js';
 
 const NOW = new Date('2026-08-13T18:00:00.000Z');

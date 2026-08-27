@@ -15,6 +15,14 @@ Core now exposes exact-workspace safe receipt reads and exact four-dimension obj
 Nonempty durable debounce/rollup state and materialization retry admission write the matching
 global or workspace `durable-ingress-v1` marker in the same transaction; empty batches do not mark
 an otherwise compatible database.
+
+## 2026-08-13 — Fresh-process UAT proves external delivery and recovery (004 §3.5) — Refs #481
+
+A fresh-process CLI/daemon UAT now covers malformed/permanent and unavailable/retryable failures,
+socket identity rejection, restart deduplication, lead/subagent/workspace isolation, hook delivery
+and acknowledgement, extended debounce deadlines, safe receipt correlation, and explicit recovery
+from deterministic terminal receipt and outbox failures. The README uses only synthetic data.
+
 ## 2026-08-13 — External ingress has an automation-safe CLI (005 §11.3–11.6) — Refs #481
 
 The CLI now accepts one validated envelope from stdin or a file, verifies the serving daemon's

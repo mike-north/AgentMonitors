@@ -134,6 +134,39 @@ reboots, or context compaction.
 MONITOR.md ──▶ daemon tick ──▶ source observes change ──▶ durable event ──▶ your agent session
 ```
 
+### Push external state without polling
+
+An authenticated local bridge can submit a source-neutral current-state event directly to a
+running workspace daemon. The monitor still owns instructions, urgency, shaping, and notification
+policy; the external payload cannot override them. Accepted events are durably deduplicated before
+the command succeeds, so a producer can safely retry after a lost response.
+
+```json
+{
+  "schema": "agentmonitors.external-event.v1",
+  "monitorId": "build-health",
+  "source": "example-build-system",
+  "upstreamEventId": "delivery-01HX",
+  "objectId": "build-123",
+  "objectSequence": 42,
+  "eventKind": "build.updated",
+  "changeKind": "modified",
+  "occurredAt": "2026-08-13T18:00:00.000Z",
+  "resumeToken": "cursor-42",
+  "scope": { "project": "example/widgets" },
+  "state": { "status": "passed", "completed": 12, "total": 12 }
+}
+```
+
+```bash
+agentmonitors events ingest --workspace "$PWD" --file event.json --format json
+agentmonitors events ingest-status --workspace "$PWD" --receipt <receipt-id> --format json
+```
+
+The daemon must already be running. Debounced accepted work is captured locally and flushed by its
+deadline without another source observation; overdue work resumes on the next daemon start. Use
+`events ingest-retry` only to re-arm a terminal external batch after repairing its cause.
+
 ## Standalone CLI (without an agent)
 
 You don't need an agent to use the watcher. The daemon and query commands work on their own — handy
