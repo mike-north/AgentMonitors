@@ -114,6 +114,60 @@ export const materializationRetryOutbox = sqliteTable(
   },
 );
 
+/** Compact idempotency tombstones for source-neutral external events. */
+export const externalEventReceipts = sqliteTable('external_event_receipts', {
+  id: text('id').primaryKey(),
+  workspaceIdentity: text('workspace_identity').notNull(),
+  monitorId: text('monitor_id').notNull(),
+  source: text('source').notNull(),
+  upstreamEventId: text('upstream_event_id').notNull(),
+  semanticHash: text('semantic_hash').notNull(),
+  objectId: text('object_id').notNull(),
+  objectSequence: integer('object_sequence').notNull(),
+  eventKind: text('event_kind').notNull(),
+  changeKind: text('change_kind', {
+    enum: ['created', 'modified', 'deleted', 'descoped'],
+  }).notNull(),
+  occurredAt: text('occurred_at').notNull(),
+  outcome: text('outcome', {
+    enum: ['materialized', 'held', 'suppressed', 'stale', 'failed'],
+  }).notNull(),
+  eventIds: text('event_ids').notNull().default('[]'),
+  attemptCount: integer('attempt_count').notNull().default(0),
+  lastError: text('last_error'),
+  nextAttemptAt: integer('next_attempt_at', { mode: 'timestamp' }),
+  acceptedAt: integer('accepted_at', { mode: 'timestamp' }).notNull(),
+  materializedAt: integer('materialized_at', { mode: 'timestamp' }),
+  updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
+});
+
+/** Highest accepted producer sequence for one external source object. */
+export const externalObjectSequences = sqliteTable(
+  'external_object_sequences',
+  {
+    id: text('id').primaryKey(),
+    workspaceIdentity: text('workspace_identity').notNull(),
+    monitorId: text('monitor_id').notNull(),
+    source: text('source').notNull(),
+    objectId: text('object_id').notNull(),
+    highestSequence: integer('highest_sequence').notNull(),
+    receiptId: text('receipt_id').notNull(),
+    upstreamEventId: text('upstream_event_id').notNull(),
+    updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
+  },
+);
+
+/** Forward-only durable features present in a workspace database. */
+export const databaseCompatibilityMarkers = sqliteTable(
+  'database_compatibility_markers',
+  {
+    id: text('id').primaryKey(),
+    workspaceIdentity: text('workspace_identity'),
+    capability: text('capability').notNull(),
+    createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+  },
+);
+
 /**
  * The per-recipient Interpret decision (G14, 002 §1.1.8). Recorded on
  * `session_event_state` because Interpret runs **right of the per-recipient
