@@ -394,6 +394,17 @@ function scopeMatches(
 export class RuntimeStore {
   constructor(private readonly db: InboxDb) {}
 
+  /**
+   * Run a synchronous runtime persistence unit in one immediate transaction.
+   * Nested store transactions use SQLite savepoints, so callers can compose
+   * existing atomic operations without exposing the database handle.
+   *
+   * @internal
+   */
+  runInImmediateTransaction<T>(operation: () => T): T {
+    return asInternalDb(this.db).$client.transaction(operation).immediate();
+  }
+
   openSession(input: OpenSessionInput): AgentSessionRecord {
     const db = asInternalDb(this.db);
     const existing = db
