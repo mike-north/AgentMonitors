@@ -815,10 +815,9 @@ Verified: `libs/core/src/runtime/types.ts` — `RuntimeTickResult`, `ErroredObse
 
 ### 2.6 Source-neutral external event contract
 
-> **Status: contract and persistence current; ingestion target.** Core exports the versioned
-> envelope, strict validator, canonical JSON encoder, semantic hash, result/error types, and
-> collision-free object key. Durable receipt/order primitives exist, but no runtime, CLI, or daemon
-> method accepts the envelope yet.
+> **Status: contract, persistence, and immediate core ingestion current; delayed/IPC ingestion
+> target.** Core accepts effective-immediate events through the runtime. Bounded debounce, daemon
+> IPC, and CLI submission remain later stacked changes.
 
 `agentmonitors.external-event.v1` represents one producer-reconstructed current-state snapshot. Its
 required top-level fields are `schema`, `monitorId`, `source`, `upstreamEventId`, `objectId`,
@@ -860,11 +859,22 @@ receipt, high-water mark, and compatibility marker commit or roll back together.
 only safe correlation metadata, outcome, event IDs, and timestamps; state, payload, scope, resume
 token, workspace identity, and semantic hash are absent from the returned decision. Workspace-safe
 receipt and exact workspace/monitor/source/object high-water queries expose only compact metadata.
-Observation mapping and runtime/IPC ingestion remain target behavior in the next stacked changes.
+
+`AgentMonitorRuntime.ingestExternalEvent()` validates the envelope, resolves one unambiguous local
+monitor, and maps current state into the normal Shape, Diff, materialization, projection, snapshot,
+and best-effort Interpret pipeline. It records the external source on the event and in reserved
+query metadata while preserving the reconciliation source's `sourceState` and `lastObservationAt`.
+
+This stack entry accepts only an effective-immediate notify policy. Debounce, throttle, and rollup
+return permanent `unsupported_notify_strategy` before receipt creation; bounded debounce follows in
+the next entry. Deterministic output and the receipt commit atomically. Shape suppression records
+`suppressed`; stale and duplicate inputs create no event; conflicts fail permanently. Interpret
+starts after commit and safe structured failures never echo external state.
 
 Verified: `libs/core/src/external-ingress/json.test.ts`, `contract.test.ts`,
-`contract-boundaries.test.ts`, `persistence.test.ts`, and `persistence-queries.test.ts`;
-`libs/core/src/runtime/store.ts`.
+`contract-boundaries.test.ts`, `persistence.test.ts`, `persistence-queries.test.ts`,
+`persistence-hardening.test.ts`, and `runtime.test.ts`;
+`libs/core/src/runtime/service.ts`; `libs/core/src/runtime/store.ts`.
 
 ## 3. Persisted Monitor State
 

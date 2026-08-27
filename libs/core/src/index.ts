@@ -78,6 +78,7 @@ export {
   externalEventLimits,
   externalEventReservedScopeKeys,
   validateExternalEventEnvelope,
+  ExternalEventIngestError,
 } from './external-ingress/contract.js';
 export {
   externalEventObjectKey,

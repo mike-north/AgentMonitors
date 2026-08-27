@@ -30,6 +30,7 @@ export class AgentMonitorRuntime {
     doctorReport(input: DoctorReportInput): Promise<MonitorDoctorReport>;
     // (undocumented)
     explainMonitor(input: MonitorExplainInput): Promise<MonitorExplainReport>;
+    ingestExternalEvent(input: ExternalEventIngestInput, monitorsDir: string, now?: Date): Promise<ExternalEventIngestResult>;
     listEphemeralMonitors(sessionId: string): EphemeralMonitorRecord[];
     // (undocumented)
     listEvents(query?: EventQuery): MonitorEventRecord[];
@@ -469,6 +470,16 @@ export interface ExternalEventError {
 export type ExternalEventErrorCode = /** No daemon could be reached. Retryable. */ 'daemon_unavailable' | /** The daemon does not implement this protocol. Retryable after upgrade. */ 'daemon_incompatible' | /** The daemon could not service the request yet. Retryable. */ 'daemon_busy' | /** Durable local storage failed. Retryable. */ 'storage_failure' | /** Bounded pending capacity is currently full. Retryable. */ 'capacity_exceeded' | /** An unclassified local failure occurred. Retryable. */ 'internal_error' | /** The envelope schema version is unsupported. Permanent. */ 'unsupported_schema' | /** The envelope violates the versioned schema. Permanent. */ 'invalid_envelope' | /** A byte or cardinality limit was exceeded. Permanent. */ 'payload_too_large' | /** The selected local monitor is absent or ambiguous. Permanent. */ 'invalid_monitor' | /** The selected monitor has invalid local policy. Permanent. */ 'monitor_policy_error' | /** The monitor uses a notify policy unsupported by this schema. Permanent. */ 'unsupported_notify_strategy' | /** Client and daemon workspace identities differ. Permanent. */ 'workspace_mismatch' | /** An idempotency key was reused for different semantic content. Permanent. */ 'idempotency_conflict';
 
 // @public
+export class ExternalEventIngestError extends Error {
+    constructor(code: ExternalEventErrorCode, message: string, retryable: boolean, options?: ErrorOptions);
+    // (undocumented)
+    readonly code: ExternalEventErrorCode;
+    // (undocumented)
+    readonly retryable: boolean;
+    // (undocumented)
+    toExternalEventError(): ExternalEventError;
+}
+
 export interface ExternalEventIngestInput {
     envelope: ExternalEventEnvelope;
     workspaceIdentity: string;

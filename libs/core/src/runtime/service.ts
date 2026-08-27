@@ -17,6 +17,15 @@ import type { SourceRegistry } from '../observation/registry.js';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import type { AgentRuntimeAdapter } from '../adapter/types.js';
 import type { InterpretAdapter } from '../adapter/interpret.js';
+import {
+  canonicalJsonStringify,
+  ExternalEventIngestError,
+  validateExternalEventEnvelope,
+  type ExternalEventEnvelope,
+  type ExternalEventIngestInput,
+  type ExternalEventIngestResult,
+} from '../external-ingress/contract.js';
+import { externalEventObjectKey } from '../external-ingress/identity.js';
 import { buildDiff, changeDetectionStrategyOf } from './diff.js';
 import {
   diagnoseReminderSuppression,
@@ -49,6 +58,7 @@ import type {
   DoctorParseError,
   DoctorReportInput,
   EventQuery,
+  ExternalEventReceiptRecord,
   MonitorDoctorReport,
   MonitorEventRecord,
   MonitorExplainInput,
@@ -384,6 +394,44 @@ function hydrateStoredObservationEnvelope(
     effectiveUrgency:
       (envelope.effectiveUrgency as Urgency | undefined) ??
       effectiveObservationUrgency(envelope.monitor, envelope.observation),
+  };
+}
+
+function externalObservation(envelope: ExternalEventEnvelope): Observation {
+  const summary = `${envelope.eventKind}: ${envelope.objectId}`;
+  return {
+    title: envelope.eventKind,
+    summary: summary.slice(0, 1_024),
+    payload: envelope,
+    snapshot: envelope.state,
+    snapshotText: canonicalJsonStringify(envelope.state),
+    objectKey: externalEventObjectKey(envelope.source, envelope.objectId),
+    queryScope: {
+      ...envelope.scope,
+      ingressSource: envelope.source,
+      eventKind: envelope.eventKind,
+      changeKind: envelope.changeKind,
+      upstreamEventId: envelope.upstreamEventId,
+      objectSequence: String(envelope.objectSequence),
+      occurredAt: envelope.occurredAt,
+    },
+    changeKind: envelope.changeKind,
+  };
+}
+
+function externalIngestResult(
+  receipt: ExternalEventReceiptRecord,
+  disposition: 'accepted' | 'duplicate',
+): ExternalEventIngestResult {
+  return {
+    disposition,
+    outcome: receipt.outcome,
+    receiptId: receipt.receiptId,
+    monitorId: receipt.monitorId,
+    upstreamEventId: receipt.upstreamEventId,
+    eventIds: receipt.eventIds,
+    acceptedAt: receipt.acceptedAt.toISOString(),
+    materializedAt: receipt.materializedAt?.toISOString() ?? null,
   };
 }
 
@@ -1028,6 +1076,239 @@ export class AgentMonitorRuntime {
     query: ObservationHistoryQuery = {},
   ): ObservationHistoryRecord[] {
     return this.store.listObservationHistory(query);
+  }
+
+  /**
+   * Accept one source-neutral current-state event through the normal runtime
+   * pipeline. The receipt, ordering decision, notify state, deterministic event,
+   * projections, and snapshot commit in one SQLite transaction. Interpret starts
+   * only after that boundary and never delays the acknowledgement.
+   */
+  async ingestExternalEvent(
+    input: ExternalEventIngestInput,
+    monitorsDir: string,
+    now = new Date(),
+  ): Promise<ExternalEventIngestResult> {
+    if (
+      typeof input.workspaceIdentity !== 'string' ||
+      input.workspaceIdentity.length === 0
+    ) {
+      throw new ExternalEventIngestError(
+        'workspace_mismatch',
+        'External event workspace identity is invalid.',
+        false,
+      );
+    }
+    if (Number.isNaN(now.getTime())) {
+      throw new ExternalEventIngestError(
+        'invalid_envelope',
+        'External event receipt timestamp is invalid.',
+        false,
+      );
+    }
+    const validation = validateExternalEventEnvelope(input.envelope);
+    if (!validation.success) {
+      throw new ExternalEventIngestError(
+        validation.error.code,
+        validation.error.message,
+        validation.error.retryable,
+      );
+    }
+    const normalizedInput: ExternalEventIngestInput = {
+      workspaceIdentity: input.workspaceIdentity,
+      envelope: validation.envelope,
+    };
+
+    let scan: Awaited<ReturnType<typeof scanMonitors>>;
+    try {
+      scan = await scanMonitors(monitorsDir);
+    } catch (cause) {
+      throw new ExternalEventIngestError(
+        'invalid_monitor',
+        'External event target monitor could not be loaded.',
+        false,
+        { cause },
+      );
+    }
+    const matching = scan.monitors.filter(
+      ({ monitor }) => monitor.id === validation.envelope.monitorId,
+    );
+    if (
+      scan.errors.length > 0 ||
+      scan.duplicateIds.length > 0 ||
+      matching.length !== 1
+    ) {
+      throw new ExternalEventIngestError(
+        'invalid_monitor',
+        'External event target monitor is missing, invalid, or ambiguous.',
+        false,
+      );
+    }
+    const monitor = matching[0]?.monitor;
+    if (!monitor) {
+      throw new ExternalEventIngestError(
+        'invalid_monitor',
+        'External event target monitor is missing, invalid, or ambiguous.',
+        false,
+      );
+    }
+
+    const notify = defaultNotifyConfigForUrgency(
+      monitor.frontmatter.urgency,
+      monitor.frontmatter.notify,
+    );
+    if (notify) {
+      throw new ExternalEventIngestError(
+        'unsupported_notify_strategy',
+        'This runtime supports immediate external ingress only.',
+        false,
+      );
+    }
+
+    const observation = externalObservation(validation.envelope);
+    let suppressed: boolean;
+    try {
+      suppressed = shapeObservation(observation, now, {
+        shape: monitor.frontmatter.shape,
+        payload: monitor.frontmatter.payload,
+      }).suppressed;
+    } catch (cause) {
+      throw new ExternalEventIngestError(
+        'monitor_policy_error',
+        'External event monitor policy could not be evaluated.',
+        false,
+        { cause },
+      );
+    }
+
+    const interpretAfterCommit: MaterializedObservation[] = [];
+    let decision: ReturnType<RuntimeStore['withExternalEventReceipt']>;
+    try {
+      decision = this.store.withExternalEventReceipt(
+        normalizedInput,
+        ({ acceptedAt }) => {
+          const monitorState = this.store.getMonitorState(
+            monitor.id,
+            normalizedInput.workspaceIdentity,
+          );
+          const dispatch = this.dispatchNotify(
+            monitor,
+            suppressed ? [] : [observation],
+            acceptedAt,
+            monitorState.notifyState,
+          );
+
+          const materialized: {
+            envelope: StoredObservationEnvelope;
+            result: MaterializedObservation;
+          }[] = [];
+          for (const envelope of dispatch.emitted) {
+            const isCurrent = envelope.observation === observation;
+            const deterministic = this.materializeObservation({
+              monitor: envelope.monitor,
+              sourceName: isCurrent
+                ? validation.envelope.source
+                : envelope.monitor.frontmatter.watch.type,
+              observation: envelope.observation,
+              observedAt: envelope.observedAt,
+              workspacePath: normalizedInput.workspaceIdentity,
+              effectiveUrgency: envelope.effectiveUrgency,
+            });
+            if (!deterministic) {
+              throw new Error(
+                'Captured external observation was suppressed during materialization.',
+              );
+            }
+            materialized.push({
+              envelope,
+              result: {
+                monitor: envelope.monitor,
+                ...deterministic,
+                projectedSessionIds:
+                  this.store.projectedSessionIdsForLastEvent(),
+              },
+            });
+          }
+
+          this.store.setMonitorState(
+            monitor.id,
+            normalizedInput.workspaceIdentity,
+            {
+              sourceState: monitorState.sourceState,
+              notifyState: dispatch.nextState,
+              lastObservationAt: monitorState.lastObservationAt ?? null,
+            },
+          );
+          interpretAfterCommit.push(
+            ...materialized.map(({ result }) => result),
+          );
+
+          const current = materialized.find(
+            ({ envelope }) => envelope.observation === observation,
+          );
+          if (current) {
+            return {
+              outcome: 'materialized',
+              eventIds: [current.result.event.id],
+              materializedAt: acceptedAt,
+            };
+          }
+          if (suppressed) return { outcome: 'suppressed' };
+          throw new Error(
+            'External event produced no durable runtime consequence.',
+          );
+        },
+        now,
+      );
+    } catch (cause) {
+      interpretAfterCommit.length = 0;
+      if (cause instanceof ExternalEventIngestError) throw cause;
+      throw new ExternalEventIngestError(
+        'storage_failure',
+        'External event could not be committed durably.',
+        true,
+        { cause },
+      );
+    }
+
+    if (decision.decision === 'conflict') {
+      throw new ExternalEventIngestError(
+        'idempotency_conflict',
+        'External event idempotency key conflicts with prior input.',
+        false,
+      );
+    }
+    for (const materialized of interpretAfterCommit) {
+      void this.interpretMaterializedObservation(materialized).catch(
+        () => undefined,
+      );
+    }
+    if (
+      decision.decision === 'accepted' &&
+      decision.receipt.outcome !== 'stale'
+    ) {
+      try {
+        this.store.recordObservationHistory({
+          monitorId: monitor.id,
+          workspacePath: normalizedInput.workspaceIdentity,
+          sourceName: validation.envelope.source,
+          result:
+            decision.receipt.outcome === 'materialized'
+              ? 'triggered'
+              : 'suppressed',
+          observationData: {
+            observed: 1,
+            emitted: decision.receipt.eventIds.length,
+          },
+        });
+      } catch {
+        // Audit is best-effort after the durable receipt boundary.
+      }
+    }
+    return externalIngestResult(
+      decision.receipt,
+      decision.decision === 'duplicate' ? 'duplicate' : 'accepted',
+    );
   }
 
   async explainMonitor(

@@ -144,6 +144,26 @@ export interface ExternalEventError {
  * };
  * ```
  */
+/** Structured runtime/transport error for one external-ingress attempt. */
+export class ExternalEventIngestError extends Error {
+  constructor(
+    readonly code: ExternalEventErrorCode,
+    message: string,
+    readonly retryable: boolean,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = 'ExternalEventIngestError';
+  }
+
+  toExternalEventError(): ExternalEventError {
+    return {
+      code: this.code,
+      message: this.message,
+      retryable: this.retryable,
+    };
+  }
+}
 export interface ExternalEventIngestResult {
   /** Whether this call accepted new work or found a duplicate. */
   disposition: ExternalEventDisposition;
