@@ -3921,7 +3921,7 @@ Handle it.
   // A FlakyStore subclass that throws on a sentinel observation title provides
   // a clean public seam to trigger ingest() failure without private mocking.
   // https://github.com/mike-north/AgentMonitors/issues/46
-  it('isolates an ingest() failure in consumeWatch() so the watcher survives and subsequent observations still flow', async () => {
+  it('drains a transient ingest failure before the watcher consumes a newer observation', async () => {
     const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
     tempDirs.push(rootDir);
     const dbPath = path.join(rootDir, 'agentmon.db');
@@ -3935,17 +3935,19 @@ Handle it.
 
     // Subclass RuntimeStore to throw on the sentinel observation so ingest()
     // fails for that specific observation without patching private methods.
+    let remainingFailures = 1;
     class FlakyStore extends RuntimeStore {
       override insertEvent(
-        input: Omit<MonitorEventRecord, 'id'>,
+        ...args: Parameters<RuntimeStore['insertEvent']>
       ): MonitorEventRecord {
+        const [input] = args;
         // Keyed on `summary`: the materialized `title` is the monitor's
         // authored name since issue #449, so the source's sentinel text — which
         // this fault injection targets — now arrives as `summary`.
-        if (input.summary === 'boom') {
+        if (input.summary === 'boom' && remainingFailures-- > 0) {
           throw new Error('simulated insert failure');
         }
-        return super.insertEvent(input);
+        return super.insertEvent(...args);
       }
     }
 
@@ -3954,14 +3956,18 @@ Handle it.
 
     // Watch source: yields 'boom' (ingest will fail), then 'ok' (ingest succeeds),
     // then idles until aborted.
+    const iteratorPulls: string[] = [];
     registry.register({
       name: 'watch-ingest-source',
       scopeSchema: { type: 'object' },
       observe: () => Promise.resolve({ observations: [] }),
       async *watch(_config, context: ObservationContext) {
+        iteratorPulls.push('boom');
         yield { title: 'boom', summary: 'boom', objectKey: 'obj-boom' };
+        iteratorPulls.push('ok');
         yield { title: 'ok', summary: 'ok', objectKey: 'obj-ok' };
         // idle until aborted
+        iteratorPulls.push('idle');
         await new Promise<void>((resolve) => {
           context.signal?.addEventListener('abort', () => resolve(), {
             once: true,
@@ -3983,19 +3989,42 @@ Handle it.
     const handle = await runtime.watchMonitors(monitorsDir, rootDir);
     expect(handle.monitorIds).toEqual(['test-monitor']);
 
-    // give the watcher enough time to consume both observations
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await expect
+      .poll(() =>
+        new RuntimeStore(createDb(dbPath))
+          .listMaterializationRetries()
+          .map(({ envelope }) => envelope.observation.summary),
+      )
+      .toEqual(['boom']);
+    expect(iteratorPulls).toEqual(['boom']);
+    expect(runtime.listEvents({ sessionId: session.id })).toEqual([]);
 
-    // (a) watcher survived 'boom' — handle still active and 'ok' produced an event
+    await expect
+      .poll(() =>
+        runtime
+          .listEvents({ sessionId: session.id })
+          .some((event) => event.summary === 'ok'),
+      )
+      .toBe(true);
+
+    // The watcher did not pull 'ok' until 'boom' drained, then stayed active.
+    expect(iteratorPulls).toEqual(['boom', 'ok', 'idle']);
     const events = runtime.listEvents({ sessionId: session.id });
-    expect(events.some((e) => e.summary === 'ok')).toBe(true);
+    expect([...events].reverse().map((event) => event.summary)).toEqual([
+      'boom',
+      'ok',
+    ]);
 
     // (b) 'ok' produced a triggered history row
     const history = runtime.listObservationHistory({
       monitorId: 'test-monitor',
     });
     const triggered = history.filter((h) => h.result === 'triggered');
-    expect(triggered.length).toBeGreaterThan(0);
+    expect(triggered).toHaveLength(2);
+    expect(triggered.map(({ observationData }) => observationData)).toEqual([
+      { observed: 1, emitted: 1 },
+      { observed: 0, emitted: 1 },
+    ]);
 
     // (c) 'boom' produced an errored history row
     const errored = history.filter((h) => h.result === 'errored');

@@ -812,12 +812,15 @@ export interface SkippedMonitor {
 /**
  * Summary returned by a single `AgentMonitorRuntime.tick()` call.
  *
- * Note: errored monitors (whose `observe()` threw, or whose `ingest()` failed)
- * are still included in `evaluatedMonitors` — they were attempted even though
- * their outcome is `errored` rather than `triggered`/`suppressed`/`no-change`.
- * They are additionally listed in `erroredObservations`, populated from the
- * same path that writes an `errored` row to `observation_history`, so the tick
- * itself can report the failure rather than silently print `emitted 0`.
+ * Note: errored monitors (whose `observe()` threw, whose `ingest()` failed, or
+ * whose due retry-outbox work failed) are still included in
+ * `evaluatedMonitors` — they were attempted even though their outcome is
+ * `errored` rather than `triggered`/`suppressed`/`no-change`. A successful due
+ * retry drain is also an evaluation, including when its captured monitor has
+ * since been removed. Errors are additionally listed in
+ * `erroredObservations`, populated from the same path that writes an `errored`
+ * row to `observation_history`, so the tick itself can report the failure
+ * rather than silently print `emitted 0`.
  *
  * Monitors found in the directory but skipped because their interval has not
  * elapsed are listed in `skippedMonitors` so callers can distinguish
@@ -873,7 +876,8 @@ export interface RuntimeStatus {
  *       `ingest()` (tick or watch path). Earlier committed siblings remain
  *       events; the failed envelope and every later sibling are durably queued
  *       before source/notify state advances. `emittedEventIds` therefore names
- *       only committed events.
+ *       only committed events, and the monitor pauses until oldest-first drain
+ *       succeeds or terminalizes.
  *   In both cases the audit write itself is best-effort: a `recordObservationHistory`
  *   failure is swallowed so a failing audit row can never re-abort the tick.
  * - `rebaselined`: the source advanced its baseline without computing a delta

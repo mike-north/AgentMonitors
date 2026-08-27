@@ -1127,7 +1127,10 @@ export class RuntimeStore {
   insertEvent(
     input: Omit<MonitorEventRecord, 'id'>,
     baseline?: { previousContent: string | null },
-    options?: { restrictToSessionId?: string },
+    options?: {
+      restrictToSessionId?: string;
+      maxSessionBaselineAt?: Date;
+    },
   ): MonitorEventRecord {
     const db = asInternalDb(this.db);
     const materialized = db.$client
@@ -1184,6 +1187,8 @@ export class RuntimeStore {
           ? this.sessionsForWorkspace(event.workspacePath).filter(
               (candidate) =>
                 candidate.role === 'lead' &&
+                (options?.maxSessionBaselineAt === undefined ||
+                  candidate.baselineAt <= options.maxSessionBaselineAt) &&
                 (options?.restrictToSessionId === undefined ||
                   (candidate.id === options.restrictToSessionId &&
                     candidate.status === 'active')),
