@@ -226,6 +226,8 @@ The `RuntimeStore.saveSnapshot()` and `RuntimeStore.latestSnapshot()` methods (i
 | External source/object keys cannot collide                       | Covered (`contract-boundaries.test.ts` — delimiter and JSON-looking source/object tuples produce distinct keys).                                                 |
 | Receipt replay/conflict and stale ordering are durable           | Covered (`persistence.test.ts` — cursor-only replay, conflict, stale sequence, and exact receipt/high-water rows).                                               |
 | Receipt acceptance and durable callback work roll back together  | Covered (`persistence.test.ts` — injected callback failure leaves no receipt, sequence, marker, or monitor state).                                               |
+| Receipt and high-water reads preserve workspace isolation        | Covered (`persistence-queries.test.ts` — another workspace cannot read a receipt or object sequence).                                                            |
+| Forward-only durable state marks only its exact route            | Covered (`persistence-queries.test.ts` and `retry-outbox.test.ts` — nonempty debounce/rollup and named/global retries mark; empty state/admission does not).     |
 | Compatibility migration preserves existing data                  | Covered (`schema.test.ts` — additive table/index recreation preserves existing sessions/events and distinguishes global, empty, and concrete marker identities). |
 
 ### 3.5 CLI behavior

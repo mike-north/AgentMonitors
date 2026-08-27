@@ -85,6 +85,7 @@ import type {
   ExternalEventReceiptDecision,
   ExternalEventReceiptOperation,
   ExternalEventReceiptRecord,
+  ExternalObjectSequenceRecord,
   EventQuery,
   MonitorEventRecord,
   MonitorDeliveryProjection,
@@ -325,6 +326,20 @@ function writeCompatibilityMarker(
       createdAt: now,
     })
     .run();
+}
+
+function containsNonemptyHeldNotificationState(value: unknown): boolean {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const state = value as Record<string, unknown>;
+  return ['pendingDebounce', 'pendingRollup'].some((key) => {
+    if (!Object.hasOwn(state, key)) return false;
+    const pending = state[key];
+    if (pending === null || typeof pending !== 'object') return false;
+    const observations = (pending as Record<string, unknown>)['observations'];
+    return Array.isArray(observations) && observations.length > 0;
+  });
 }
 
 function normalizeExternalReceiptCompletion(
@@ -732,6 +747,74 @@ export class RuntimeStore {
       .immediate();
   }
 
+  /**
+   * Read compact receipt status within one exact workspace.
+   *
+   * The returned record excludes workspace identity, semantic hash, state,
+   * scope, payload, and resume cursor. A receipt owned by another workspace is
+   * indistinguishable from a missing receipt.
+   */
+  externalEventReceiptStatus(
+    workspaceIdentity: string,
+    receiptId: string,
+  ): ExternalEventReceiptRecord | null {
+    const row = asInternalDb(this.db)
+      .select()
+      .from(externalEventReceipts)
+      .where(
+        and(
+          eq(externalEventReceipts.workspaceIdentity, workspaceIdentity),
+          eq(externalEventReceipts.id, receiptId),
+        ),
+      )
+      .get();
+    return row ? rowToExternalEventReceipt(row) : null;
+  }
+
+  /** Read the high-water mark for one exact workspace/monitor/source/object route. */
+  externalObjectSequence(
+    workspaceIdentity: string,
+    monitorId: string,
+    source: string,
+    objectId: string,
+  ): ExternalObjectSequenceRecord | null {
+    const row = asInternalDb(this.db)
+      .select()
+      .from(externalObjectSequences)
+      .where(
+        and(
+          eq(externalObjectSequences.workspaceIdentity, workspaceIdentity),
+          eq(externalObjectSequences.monitorId, monitorId),
+          eq(externalObjectSequences.source, source),
+          eq(externalObjectSequences.objectId, objectId),
+        ),
+      )
+      .get();
+    return row
+      ? {
+          workspaceIdentity: row.workspaceIdentity,
+          monitorId: row.monitorId,
+          source: row.source,
+          objectId: row.objectId,
+          highestSequence: row.highestSequence,
+          receiptId: row.receiptId,
+          upstreamEventId: row.upstreamEventId,
+          updatedAt: row.updatedAt,
+        }
+      : null;
+  }
+
+  /** Test whether an exact global or workspace route contains forward-only durable work. */
+  hasDatabaseCompatibilityMarker(workspaceIdentity: string | null): boolean {
+    return (
+      asInternalDb(this.db)
+        .select({ id: databaseCompatibilityMarkers.id })
+        .from(databaseCompatibilityMarkers)
+        .where(compatibilityMarkerKey(workspaceIdentity))
+        .get() !== undefined
+    );
+  }
+
   openSession(input: OpenSessionInput): AgentSessionRecord {
     const db = asInternalDb(this.db);
     const existing = db
@@ -1102,38 +1185,45 @@ export class RuntimeStore {
   ): void {
     const now = new Date();
     const db = asInternalDb(this.db);
-    const existing = db
-      .select()
-      .from(monitorState)
-      .where(monitorStateKey(monitorId, workspacePath))
-      .get();
+    db.$client
+      .transaction(() => {
+        const existing = db
+          .select()
+          .from(monitorState)
+          .where(monitorStateKey(monitorId, workspacePath))
+          .get();
 
-    if (existing) {
-      db.update(monitorState)
-        .set({
-          lastObservationAt: state.lastObservationAt ?? null,
-          lastFingerprint: null,
-          sourceState: JSON.stringify(state.sourceState ?? {}),
-          notifyState: JSON.stringify(state.notifyState ?? {}),
-          updatedAt: now,
-        })
-        .where(eq(monitorState.id, existing.id))
-        .run();
-      return;
-    }
+        if (existing) {
+          db.update(monitorState)
+            .set({
+              lastObservationAt: state.lastObservationAt ?? null,
+              lastFingerprint: null,
+              sourceState: JSON.stringify(state.sourceState ?? {}),
+              notifyState: JSON.stringify(state.notifyState ?? {}),
+              updatedAt: now,
+            })
+            .where(eq(monitorState.id, existing.id))
+            .run();
+        } else {
+          db.insert(monitorState)
+            .values({
+              id: ulid(),
+              monitorId,
+              workspacePath,
+              lastObservationAt: state.lastObservationAt ?? null,
+              lastFingerprint: null,
+              sourceState: JSON.stringify(state.sourceState ?? {}),
+              notifyState: JSON.stringify(state.notifyState ?? {}),
+              updatedAt: now,
+            })
+            .run();
+        }
 
-    db.insert(monitorState)
-      .values({
-        id: ulid(),
-        monitorId,
-        workspacePath,
-        lastObservationAt: state.lastObservationAt ?? null,
-        lastFingerprint: null,
-        sourceState: JSON.stringify(state.sourceState ?? {}),
-        notifyState: JSON.stringify(state.notifyState ?? {}),
-        updatedAt: now,
+        if (containsNonemptyHeldNotificationState(state.notifyState)) {
+          writeCompatibilityMarker(db, workspacePath, now);
+        }
       })
-      .run();
+      .immediate();
   }
 
   /**
@@ -1241,6 +1331,9 @@ export class RuntimeStore {
               updatedAt: now,
             })
             .run();
+        }
+        for (const addition of additions.values()) {
+          writeCompatibilityMarker(db, addition.workspacePath, now);
         }
         return prepared.map((item) => this.getMaterializationRetry(item.id));
       })

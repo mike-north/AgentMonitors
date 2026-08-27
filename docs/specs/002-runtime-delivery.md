@@ -859,11 +859,12 @@ durable work or moving the high-water row. For a newer event, the caller's synch
 receipt, high-water mark, and compatibility marker commit or roll back together. Receipts retain
 only safe correlation metadata, outcome, event IDs, and timestamps; state, payload, scope, resume
 token, workspace identity, and semantic hash are absent from the returned decision. Workspace-safe
-status/high-water queries, observation mapping, and runtime/IPC ingestion remain target behavior in
-the next stacked changes.
+receipt and exact workspace/monitor/source/object high-water queries expose only compact metadata.
+Observation mapping and runtime/IPC ingestion remain target behavior in the next stacked changes.
 
 Verified: `libs/core/src/external-ingress/json.test.ts`, `contract.test.ts`,
-`contract-boundaries.test.ts`, and `persistence.test.ts`; `libs/core/src/runtime/store.ts`.
+`contract-boundaries.test.ts`, `persistence.test.ts`, and `persistence-queries.test.ts`;
+`libs/core/src/runtime/store.ts`.
 
 ## 3. Persisted Monitor State
 
@@ -1883,18 +1884,22 @@ key is `(workspace_identity, monitor_id, source, upstream_event_id)`; it stores 
 object identity/sequence, safe event metadata, outcome, correlated event IDs, attempt/error state,
 and accepted/materialized/update timestamps. It never stores external state, payload, scope, or the
 resume token. The accepted/duplicate decision omits both `workspace_identity` and `semantic_hash`;
-workspace-scoped status reads remain target in the next review layer.
+`externalEventReceiptStatus()` requires the exact workspace identity and makes another workspace's
+receipt indistinguishable from a missing receipt.
 
 `external_object_sequences` holds the highest accepted sequence and its receipt/upstream event ID.
 Its unique key is exactly `(workspace_identity, monitor_id, source, object_id)`, so another monitor
-or workspace advances independently. Stale receipts do not mutate this table.
+or workspace advances independently. `externalObjectSequence()` requires all four key dimensions.
+Stale receipts do not mutate this table.
 
 `database_compatibility_markers` records `durable-ingress-v1` once per workspace using separate
 partial unique indexes for global and concrete identities. A receipt and its marker share a
-transaction. Marker propagation to held notify batches and materialization retries is target in the
-next review layer. Direct use of an old binary after a marker exists is unsupported; a
-version-aware installer can refuse that downgrade. Merely opening/migrating an older database
-creates the additive tables but does not mark it forward-only.
+transaction. Persisting a nonempty debounce/rollup batch marks the same route in the monitor-state
+transaction; admitting materialization retries marks each global or workspace route in the outbox
+transaction. Empty notify batches and empty retry admissions do not mark a database. Direct use of
+an old binary after a marker exists is unsupported; a version-aware installer can refuse that
+downgrade. Merely opening/migrating an older database creates the additive tables but does not mark
+it forward-only.
 
 ### `session_event_state`
 
