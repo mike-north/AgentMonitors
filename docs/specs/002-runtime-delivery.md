@@ -1807,8 +1807,12 @@ terminal row. Terminal rows remain durable and consume capacity until an operato
 re-arms them. Successful synchronous materialization and row deletion share one immediate
 transaction; a thrown operation preserves the row, and silent discard is not supported.
 
-_Current in this change:_ storage plus retry state transitions and transaction-coupled completion.
-Runtime drain-before-observe adoption follows in the next stack layer for #295.
+Runtime diagnostics expose each row's id, status, attempt count, safe error, and attempt timestamps
+through `monitor explain` and `doctor`. They never expose the stored envelope or its payload.
+
+_Current in this change:_ storage, retry lifecycle, and safe core diagnostic reports. CLI rendering
+and older-daemon compatibility are added in the next stack layer. Runtime drain-before-observe
+adoption follows after that for #295.
 
 ### `session_event_state`
 

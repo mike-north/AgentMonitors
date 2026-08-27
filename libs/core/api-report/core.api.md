@@ -300,6 +300,7 @@ export interface DoctorMonitorRollup {
     id: string;
     lastEventAt?: Date;
     lastObservedAt?: Date;
+    materializationRetries?: MaterializationRetrySummary;
     neverObserved: boolean;
     nextDueAt?: Date;
     // (undocumented)
@@ -629,6 +630,17 @@ export class MaterializationRetryCapacityError extends Error {
 }
 
 // @public
+export interface MaterializationRetryDiagnostic {
+    attemptCount: number;
+    createdAt: Date;
+    id: string;
+    lastError: string | null;
+    nextAttemptAt: Date | null;
+    status: MaterializationRetryStatus;
+    updatedAt: Date;
+}
+
+// @public
 export interface MaterializationRetryQuery {
     dueAt?: Date;
     limit?: number;
@@ -667,6 +679,7 @@ export type MaterializationRetryStatus = 'pending' | 'terminal';
 export interface MaterializationRetrySummary {
     bytes: number;
     pending: number;
+    records: MaterializationRetryDiagnostic[];
     terminal: number;
 }
 
@@ -794,6 +807,7 @@ export interface MonitorExplainReport {
     generatedAt: Date;
     // (undocumented)
     leadSessions: AgentSessionRecord[];
+    materializationRetries?: MaterializationRetrySummary;
     // (undocumented)
     monitor?: {
         id: string;

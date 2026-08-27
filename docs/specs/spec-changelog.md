@@ -17,7 +17,8 @@ records or 8 MiB. Envelopes must round-trip through JSON without conversion, tru
 checked before mutation, and safe errors are control-stripped and bounded. The lifecycle layer adds
 fixed retry delays, terminal state after five failures, explicit re-arm, and transaction-coupled
 completion so a thrown materialization cannot delete its durable retry. Operator diagnostics follow
-in the next stack layer.
+with bounded id/status/attempt/error/timestamp metadata in core reports; stored envelopes and
+payloads never cross that reporting boundary. CLI rendering follows in the next stack layer.
 
 ## 2026-08-13 — Event materialization is one atomic durable unit (002 §5, 004 §3.4) — Refs #295, #481
 

@@ -1129,6 +1129,10 @@ export class AgentMonitorRuntime {
     // now") while the observation/event/history stages read unscoped across ALL
     // workspaces — a self-contradictory report and a cross-workspace history leak.
     const workspacePath = input.workspacePath ?? input.monitorsDir;
+    const materializationRetries = this.store.materializationRetrySummary(
+      input.monitorId,
+      workspacePath,
+    );
 
     const runtimeState = this.store.getMonitorState(
       input.monitorId,
@@ -1386,7 +1390,25 @@ export class AgentMonitorRuntime {
         workspacePath,
       })
       .slice(0, eventLimit);
-    if (events.length === 0) {
+    if (materializationRetries.terminal > 0) {
+      stages.push(
+        explainStage(
+          'materialization',
+          'failure',
+          `${String(materializationRetries.terminal)} observation(s) exhausted automatic materialization retries and require operator repair.`,
+          { ...materializationRetries },
+        ),
+      );
+    } else if (materializationRetries.pending > 0) {
+      stages.push(
+        explainStage(
+          'materialization',
+          'pending',
+          `${String(materializationRetries.pending)} observation(s) are durably queued for materialization retry.`,
+          { ...materializationRetries },
+        ),
+      );
+    } else if (events.length === 0) {
       // When no event has materialized yet because the notify layer has a queued
       // batch (actively settling or overdue-but-unflushed), materialization is
       // pending — not a failure. The observation was observed but the runtime
@@ -1569,6 +1591,7 @@ export class AgentMonitorRuntime {
       events,
       projections,
       leadSessions,
+      materializationRetries,
     };
   }
 
@@ -1691,6 +1714,10 @@ export class AgentMonitorRuntime {
         // 'acknowledged' (an explicit === check trips no-unnecessary-condition).
         else delivery.acknowledged += 1;
       }
+      const materializationRetries = this.store.materializationRetrySummary(
+        monitor.id,
+        workspacePath,
+      );
 
       monitors.push({
         id: monitor.id,
@@ -1709,6 +1736,7 @@ export class AgentMonitorRuntime {
         ),
         ...(lastEventAt ? { lastEventAt } : {}),
         delivery,
+        materializationRetries,
       });
     }
 

@@ -959,26 +959,45 @@ export class RuntimeStore {
       .map(rowToMaterializationRetry);
   }
 
-  /** Return capacity and lifecycle counts for one workspace/monitor outbox. */
+  /** Return bounded operator-safe retry diagnostics without stored envelopes. */
   materializationRetrySummary(
     monitorId: string,
     workspacePath: string | null,
   ): MaterializationRetrySummary {
     const rows = asInternalDb(this.db)
       .select({
+        id: materializationRetryOutbox.id,
         status: materializationRetryOutbox.status,
         bytes: materializationRetryOutbox.envelopeBytes,
+        attemptCount: materializationRetryOutbox.attemptCount,
+        nextAttemptAt: materializationRetryOutbox.nextAttemptAt,
+        lastError: materializationRetryOutbox.lastError,
+        createdAt: materializationRetryOutbox.createdAt,
+        updatedAt: materializationRetryOutbox.updatedAt,
       })
       .from(materializationRetryOutbox)
       .where(materializationRetryKey(monitorId, workspacePath))
+      .orderBy(
+        asc(materializationRetryOutbox.createdAt),
+        asc(materializationRetryOutbox.id),
+      )
       .all();
     return rows.reduce<MaterializationRetrySummary>(
       (summary, row) => {
         summary[row.status] += 1;
         summary.bytes += row.bytes;
+        summary.records.push({
+          id: row.id,
+          status: row.status,
+          attemptCount: row.attemptCount,
+          nextAttemptAt: row.nextAttemptAt ?? null,
+          lastError: row.lastError ?? null,
+          createdAt: row.createdAt,
+          updatedAt: row.updatedAt,
+        });
         return summary;
       },
-      { pending: 0, terminal: 0, bytes: 0 },
+      { pending: 0, terminal: 0, bytes: 0, records: [] },
     );
   }
 

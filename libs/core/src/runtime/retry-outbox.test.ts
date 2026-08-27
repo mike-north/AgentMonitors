@@ -311,9 +311,26 @@ describe('materialization retry outbox', () => {
       status: 'terminal',
       nextAttemptAt: null,
     });
-    expect(
-      store.materializationRetrySummary('monitor-a', '/workspace'),
-    ).toEqual({ pending: 0, terminal: 1, bytes: record.envelopeBytes });
+    const summary = store.materializationRetrySummary(
+      'monitor-a',
+      '/workspace',
+    );
+    expect(summary).toMatchObject({
+      pending: 0,
+      terminal: 1,
+      bytes: record.envelopeBytes,
+      records: [
+        {
+          id: record.id,
+          status: 'terminal',
+          attemptCount: MATERIALIZATION_RETRY_MAX_ATTEMPTS,
+          lastError: 'fifth retry failed',
+          nextAttemptAt: null,
+        },
+      ],
+    });
+    expect(summary.records[0]).not.toHaveProperty('envelope');
+    expect(JSON.stringify(summary)).not.toContain('object-1 changed');
     expect(
       store.listMaterializationRetries({
         monitorId: 'monitor-a',
