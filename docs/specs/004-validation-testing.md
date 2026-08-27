@@ -118,6 +118,22 @@ automatically) and `scripts/cli-suite-partition.test.ts` (runs the real `vitest 
 against both `apps/cli` configs and asserts the result partitions the package's git-tracked test
 files with no overlap or gaps). Both run under `pnpm test:scripts`, wired into CI per-PR.
 
+### 2.9 External-ingress envelope validation
+
+The exported `validateExternalEventEnvelope()` helper is the validation boundary for the
+source-neutral `agentmonitors.external-event.v1` contract. It validates the complete JSON value
+before returning a normalized envelope, applies the exact UTF-8 byte, cardinality, and depth limits
+from [002 §2.6](./002-runtime-delivery.md#26-source-neutral-external-event-contract), and rejects
+unknown fields, custom/accessor objects, cycles, sparse arrays, invalid timestamps, and unsafe or
+non-finite numbers. Validation errors contain only stable safe text and never echo external state.
+
+This surface currently proves the public contract only. A later change adds receipt persistence and
+the runtime mutation boundary; callers cannot ingest an envelope through the runtime, daemon, or CLI
+yet.
+
+**Verified in:** `libs/core/src/external-ingress/json.test.ts`, `contract.test.ts`, and
+`contract-boundaries.test.ts`.
+
 ## 3. Required Test Scenarios
 
 The spec set is incomplete unless each major rule has at least one concrete testable scenario. The table below maps each scenario to the test file that covers it, or flags it as a gap.
@@ -197,6 +213,17 @@ The `RuntimeStore.saveSnapshot()` and `RuntimeStore.latestSnapshot()` methods (i
 | Retry drain preserves order and source backpressure              | Covered (`libs/core/src/runtime/atomic-ingest-retry.test.ts` — every injected write fault drains oldest-first after restart and a failed drain pauses source observation).                                                   |
 | Removed and late-session retry routing is coherent               | Covered (`libs/core/src/runtime/atomic-ingest-retry.test.ts` — removed monitors report exact drain results; later sessions receive no projection or cursor).                                                                 |
 | Watch iterator waits behind retry work                           | Covered (`libs/core/src/runtime/service.test.ts` — iterator pull order proves `boom` drains before `ok` is requested and both events persist in source order).                                                               |
+
+#### 3.4.1 External-ingress contract
+
+| Scenario                                                         | Coverage                                                                                                                                                 |
+| ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Synthetic non-PR current-state envelope validates                | Covered (`libs/core/src/external-ingress/contract.test.ts` — accepts a build-system event and returns canonical JSON).                                   |
+| Missing, extra, or unsupported schema fields fail safely         | Covered (`contract.test.ts` — exact top-level field and schema cases; error text does not echo the rejected payload).                                    |
+| Identifier, scope, state-depth, and envelope bounds are exact    | Covered (`contract-boundaries.test.ts` — exact/+1 multibyte UTF-8 values, cardinality, 32-level object/array paths, 32 KiB scope, and 256 KiB envelope). |
+| Non-JSON values and invalid RFC3339/sequence values are rejected | Covered (`json.test.ts`, `contract.test.ts`, and `contract-boundaries.test.ts` — descriptors, runtime types, timestamps, and safe-integer bounds).       |
+| Canonical JSON and semantic hashing are deterministic            | Covered (`json.test.ts` and `contract-boundaries.test.ts` — object permutations, array order, and a mutation table for every semantic field).            |
+| External source/object keys cannot collide                       | Covered (`contract-boundaries.test.ts` — delimiter and JSON-looking source/object tuples produce distinct keys).                                         |
 
 ### 3.5 CLI behavior
 

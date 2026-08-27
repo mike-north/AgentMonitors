@@ -144,6 +144,9 @@ export function buildDiff(previous: string, current: string, strategy?: ChangeDe
 export function buildTextDiff(previous: string, current: string): string;
 
 // @public
+export function canonicalJsonStringify(value: unknown): string;
+
+// @public
 export function changeDetectionCollectionError(watchConfig: Record<string, unknown>): string | undefined;
 
 // @public
@@ -421,6 +424,103 @@ export interface EventQuery {
     urgency?: Urgency;
     workspacePath?: string;
 }
+
+// @public
+export const EXTERNAL_EVENT_SCHEMA: "agentmonitors.external-event.v1";
+
+// @public
+export type ExternalEventDisposition = /** A new event was durably accepted. */ 'accepted' | /** The same semantic event was already accepted. */ 'duplicate';
+
+// @public
+export interface ExternalEventEnvelope {
+    changeKind: ChangeKind;
+    eventKind: string;
+    monitorId: string;
+    objectId: string;
+    objectSequence: number;
+    occurredAt: string;
+    resumeToken: string;
+    schema: typeof EXTERNAL_EVENT_SCHEMA;
+    scope: ExternalEventScope;
+    source: string;
+    state: ExternalJsonObject;
+    upstreamEventId: string;
+}
+
+// @public
+export type ExternalEventEnvelopeValidationResult = {
+    success: true;
+    envelope: ExternalEventEnvelope;
+    canonicalJson: string;
+    envelopeBytes: number;
+} | {
+    success: false;
+    error: ExternalEventError;
+};
+
+// @public
+export interface ExternalEventError {
+    code: ExternalEventErrorCode;
+    message: string;
+    retryable: boolean;
+}
+
+// @public
+export type ExternalEventErrorCode = /** No daemon could be reached. Retryable. */ 'daemon_unavailable' | /** The daemon does not implement this protocol. Retryable after upgrade. */ 'daemon_incompatible' | /** The daemon could not service the request yet. Retryable. */ 'daemon_busy' | /** Durable local storage failed. Retryable. */ 'storage_failure' | /** Bounded pending capacity is currently full. Retryable. */ 'capacity_exceeded' | /** An unclassified local failure occurred. Retryable. */ 'internal_error' | /** The envelope schema version is unsupported. Permanent. */ 'unsupported_schema' | /** The envelope violates the versioned schema. Permanent. */ 'invalid_envelope' | /** A byte or cardinality limit was exceeded. Permanent. */ 'payload_too_large' | /** The selected local monitor is absent or ambiguous. Permanent. */ 'invalid_monitor' | /** The selected monitor has invalid local policy. Permanent. */ 'monitor_policy_error' | /** The monitor uses a notify policy unsupported by this schema. Permanent. */ 'unsupported_notify_strategy' | /** Client and daemon workspace identities differ. Permanent. */ 'workspace_mismatch' | /** An idempotency key was reused for different semantic content. Permanent. */ 'idempotency_conflict';
+
+// @public
+export interface ExternalEventIngestInput {
+    envelope: ExternalEventEnvelope;
+    workspaceIdentity: string;
+}
+
+// @public
+export interface ExternalEventIngestResult {
+    acceptedAt: string;
+    disposition: ExternalEventDisposition;
+    eventIds: string[];
+    materializedAt: string | null;
+    monitorId: string;
+    outcome: ExternalEventOutcome;
+    receiptId: string;
+    upstreamEventId: string;
+}
+
+// @public
+export const externalEventLimits: Readonly<{
+    readonly envelopeBytes: number;
+    readonly identifierBytes: 512;
+    readonly resumeTokenBytes: 2048;
+    readonly scopeKeys: 32;
+    readonly scopeBytes: number;
+    readonly scopeKeyBytes: 64;
+    readonly scopeValuesPerKey: 16;
+    readonly scopeValueBytes: 512;
+    readonly stateDepth: 32;
+}>;
+
+// @public
+export function externalEventObjectKey(source: string, objectId: string): string;
+
+// @public
+export type ExternalEventOutcome = /** One or more normal Agent Monitors events were committed. */ 'materialized' | /** A supported notify delay captured the event durably. */ 'held' | /** Local shaping policy deliberately produced no event. */ 'suppressed' | /** A newer object sequence had already been accepted. */ 'stale' | /** Deferred materialization exhausted automatic retries. */ 'failed';
+
+// @public
+export const externalEventReservedScopeKeys: readonly ["ingressSource", "eventKind", "changeKind", "upstreamEventId", "objectSequence", "occurredAt"];
+
+// @public
+export type ExternalEventScope = Record<string, string | string[]>;
+
+// @public
+export function externalEventSemanticHash(envelope: ExternalEventEnvelope): string;
+
+// @public
+export type ExternalJsonObject = Record<string, ExternalJsonValue>;
+
+// @public
+export type ExternalJsonValue = null | boolean | number | string | ExternalJsonValue[] | {
+    [key: string]: ExternalJsonValue;
+};
 
 // @public (undocumented)
 export function fingerprintText(content: string): string;
@@ -1819,6 +1919,9 @@ export interface UrgentItem {
 
 // @public
 export function validateCelPredicate(expression: string): string | undefined;
+
+// @public
+export function validateExternalEventEnvelope(input: unknown): ExternalEventEnvelopeValidationResult;
 
 // @public
 export function validatePayloadTransform(transform: PayloadTransform): string | undefined;

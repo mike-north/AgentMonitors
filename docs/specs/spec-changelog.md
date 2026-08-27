@@ -9,6 +9,15 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-08-13 — Versioned source-neutral external-event contract is public (002 §2.6, 004 §2.9) — Refs #481
+
+Core now exports the strict `agentmonitors.external-event.v1` envelope validator, recursively
+canonical JSON encoder, semantic SHA-256 helper that excludes only the relay cursor, collision-free
+source/object key, and public ingress result/error types. Exact UTF-8 size, scope, JSON-depth,
+timestamp, and sequence bounds are enforced without echoing state in failures. This change exposes
+the contract only: durable receipts, runtime ingestion, daemon IPC, and CLI submission remain target
+behavior in later stacked changes.
+
 ## 2026-08-13 — Retry drain precedes newer poll and watch input (002 §2, §15; 004 §3.4) — Refs #295, #481
 
 Ticks and continuous watchers now drain captured observations oldest-first before requesting newer
