@@ -38,25 +38,48 @@ afterEach(() => {
 
 class FaultStore extends RuntimeStore {
   snapshotFailures = 0;
+  snapshotsBeforeFailure = 0;
 
   override saveSnapshot(
     input: Parameters<RuntimeStore['saveSnapshot']>[0],
   ): void {
     super.saveSnapshot(input);
+    if (this.snapshotsBeforeFailure > 0) {
+      this.snapshotsBeforeFailure -= 1;
+      return;
+    }
     if (this.snapshotFailures-- > 0) {
       throw new Error('injected snapshot failure with PRIVATE-STATE');
     }
   }
 }
 
-const reconcileSource: ObservationSource = {
-  name: 'reconcile-source',
-  scopeSchema: { type: 'object', additionalProperties: true },
-  stateful: true,
-  observe() {
-    return Promise.resolve({ observations: [], nextState: { cursor: 8 } });
-  },
-};
+function reconcileSource(observationCalls: Date[]): ObservationSource {
+  return {
+    name: 'reconcile-source',
+    scopeSchema: { type: 'object', additionalProperties: true },
+    stateful: true,
+    observe(_config, context) {
+      observationCalls.push(context.now);
+      return Promise.resolve({ observations: [], nextState: { cursor: 8 } });
+    },
+  };
+}
+
+function runtimeFor(
+  store: RuntimeStore,
+  observationCalls: Date[],
+  interpretAdapter?: InterpretAdapter,
+): AgentMonitorRuntime {
+  const registry = new SourceRegistry();
+  registry.register(reconcileSource(observationCalls));
+  return new AgentMonitorRuntime(
+    store,
+    registry,
+    [claudeCodeAdapter],
+    interpretAdapter,
+  );
+}
 
 function eventInput(
   workspaceIdentity: string,
@@ -116,17 +139,12 @@ function fixture(
   );
   tempDirs.push(rootDir);
   const monitorsDir = writeMonitor(rootDir, policy);
-  const db = createDb(path.join(rootDir, 'agentmon.db'));
+  const dbPath = path.join(rootDir, 'agentmon.db');
+  const db = createDb(dbPath);
   const store = options.faultStore ? new FaultStore(db) : new RuntimeStore(db);
-  const registry = new SourceRegistry();
-  registry.register(reconcileSource);
-  const runtime = new AgentMonitorRuntime(
-    store,
-    registry,
-    [claudeCodeAdapter],
-    options.interpretAdapter,
-  );
-  return { rootDir, monitorsDir, store, runtime };
+  const observationCalls: Date[] = [];
+  const runtime = runtimeFor(store, observationCalls, options.interpretAdapter);
+  return { rootDir, monitorsDir, dbPath, observationCalls, store, runtime };
 }
 
 async function ingestError(
@@ -593,5 +611,204 @@ describe('AgentMonitorRuntime.ingestExternalEvent', () => {
 
     expect(second.outcome).toBe('materialized');
     expect(interpretCalls).toBeGreaterThan(0);
+  });
+
+  it('flushes a captured burst without scanning a monitor or invoking its source', async () => {
+    const policy = 'notify:\n  strategy: debounce\n  settle-for: 2s\n';
+    const f = fixture(policy);
+    const first = await f.runtime.ingestExternalEvent(
+      eventInput(f.rootDir),
+      f.monitorsDir,
+      NOW,
+    );
+    const secondAt = new Date(NOW.getTime() + 1_000);
+    const second = await f.runtime.ingestExternalEvent(
+      eventInput(f.rootDir, {
+        upstreamEventId: 'delivery-2',
+        objectSequence: 2,
+      }),
+      f.monitorsDir,
+      secondAt,
+    );
+    const dueAt = new Date(secondAt.getTime() + 2_000);
+    expect(f.runtime.nextExternalNotificationDeadline(f.rootDir)).toEqual(
+      dueAt,
+    );
+
+    rmSync(path.join(f.monitorsDir, 'build-health'), {
+      recursive: true,
+      force: true,
+    });
+    const result = await f.runtime.flushDueNotifications(f.rootDir, dueAt);
+
+    expect(result).toMatchObject({
+      flushedMonitorIds: ['build-health'],
+      emittedEventIds: [expect.any(String), expect.any(String)],
+      failures: [],
+      nextDueAt: null,
+    });
+    expect(f.observationCalls).toEqual([]);
+    expect(
+      f.runtime
+        .listEvents({ workspacePath: f.rootDir })
+        .map(({ body }) => body),
+    ).toEqual(Array(2).fill('Handle the original instructions.'));
+    for (const receipt of [first, second]) {
+      expect(
+        f.store.externalEventReceiptStatus(f.rootDir, receipt.receiptId),
+      ).toMatchObject({
+        outcome: 'materialized',
+        eventIds: [expect.any(String)],
+        materializedAt: dueAt,
+      });
+    }
+    expect(
+      f.store.getMonitorState('build-health', f.rootDir).notifyState
+        .pendingDebounce,
+    ).toBeUndefined();
+  });
+
+  it('persists flush backoff across restart, terminalizes, and explicitly re-arms the batch', async () => {
+    const f = fixture('notify:\n  strategy: debounce\n  settle-for: 1s\n', {
+      faultStore: true,
+    });
+    const held = await f.runtime.ingestExternalEvent(
+      eventInput(f.rootDir),
+      f.monitorsDir,
+      NOW,
+    );
+    let store = f.store as FaultStore;
+    let runtime = f.runtime;
+    const attempts = [1_000, 2_000, 7_000, 37_000, 157_000];
+    const nextAttempts = [2_000, 7_000, 37_000, 157_000, null];
+
+    for (let index = 0; index < attempts.length; index += 1) {
+      if (index === 1) {
+        store = new FaultStore(createDb(f.dbPath));
+        runtime = runtimeFor(store, f.observationCalls);
+      }
+      store.snapshotFailures = 1;
+      const attemptedAt = new Date(NOW.getTime() + (attempts[index] ?? 0));
+      const result = await runtime.flushDueNotifications(
+        f.rootDir,
+        attemptedAt,
+      );
+      const nextOffset = nextAttempts[index];
+      expect(result.failures).toMatchObject([
+        {
+          monitorId: 'build-health',
+          attemptCount: index + 1,
+          terminal: nextOffset === null,
+          nextAttemptAt:
+            nextOffset === null ? null : new Date(NOW.getTime() + nextOffset),
+        },
+      ]);
+      expect(
+        store.externalEventReceiptStatus(f.rootDir, held.receiptId),
+      ).toMatchObject({
+        outcome: nextOffset === null ? 'failed' : 'held',
+        attemptCount: index + 1,
+        nextAttemptAt:
+          nextOffset === null ? null : new Date(NOW.getTime() + nextOffset),
+      });
+    }
+
+    expect(runtime.nextExternalNotificationDeadline(f.rootDir)).toBeNull();
+    expect(f.observationCalls).toEqual([]);
+    expect(runtime.listEvents({ workspacePath: f.rootDir })).toEqual([]);
+    const terminal = store.getMonitorState('build-health', f.rootDir)
+      .notifyState.pendingDebounce;
+    expect(terminal).toMatchObject({
+      observations: [expect.any(Object)],
+      externalFlush: { attemptCount: 5, status: 'terminal' },
+    });
+    expect(JSON.stringify(terminal)).not.toContain('PRIVATE-STATE');
+    const blocked = await ingestError(
+      runtime.ingestExternalEvent(
+        eventInput(f.rootDir, {
+          upstreamEventId: 'delivery-2',
+          objectSequence: 2,
+        }),
+        f.monitorsDir,
+        new Date(NOW.getTime() + 158_000),
+      ),
+    );
+    expect(blocked.toExternalEventError()).toMatchObject({
+      code: 'capacity_exceeded',
+      retryable: true,
+    });
+    expect(
+      store.getMonitorState('build-health', f.rootDir).notifyState
+        .pendingDebounce?.observations,
+    ).toHaveLength(1);
+
+    const repairedAt = new Date(NOW.getTime() + 158_000);
+    expect(
+      runtime.rearmExternalEventReceipt(f.rootDir, held.receiptId, repairedAt),
+    ).toMatchObject({ outcome: 'held', attemptCount: 0 });
+    expect(runtime.nextExternalNotificationDeadline(f.rootDir)).toEqual(
+      repairedAt,
+    );
+    const repaired = await runtime.flushDueNotifications(f.rootDir, repairedAt);
+    expect(repaired).toMatchObject({
+      failures: [],
+      emittedEventIds: [expect.any(String)],
+      nextDueAt: null,
+    });
+    expect(
+      store.externalEventReceiptStatus(f.rootDir, held.receiptId),
+    ).toMatchObject({
+      outcome: 'materialized',
+      attemptCount: 0,
+      eventIds: [expect.any(String)],
+    });
+  });
+
+  it('rolls back a failed burst and advances every correlated receipt together', async () => {
+    const policy = 'notify:\n  strategy: debounce\n  settle-for: 2s\n';
+    const f = fixture(policy, { faultStore: true });
+    const first = await f.runtime.ingestExternalEvent(
+      eventInput(f.rootDir),
+      f.monitorsDir,
+      NOW,
+    );
+    const second = await f.runtime.ingestExternalEvent(
+      eventInput(f.rootDir, {
+        upstreamEventId: 'delivery-2',
+        objectSequence: 2,
+      }),
+      f.monitorsDir,
+      new Date(NOW.getTime() + 1_000),
+    );
+    (f.store as FaultStore).snapshotsBeforeFailure = 1;
+    (f.store as FaultStore).snapshotFailures = 1;
+    const attemptedAt = new Date(NOW.getTime() + 3_000);
+    const result = await f.runtime.flushDueNotifications(
+      f.rootDir,
+      attemptedAt,
+    );
+
+    expect(result).toMatchObject({
+      emittedEventIds: [],
+      failures: [
+        {
+          monitorId: 'build-health',
+          attemptCount: 1,
+          terminal: false,
+          nextAttemptAt: new Date(NOW.getTime() + 4_000),
+        },
+      ],
+    });
+    expect(f.runtime.listEvents({ workspacePath: f.rootDir })).toEqual([]);
+    for (const receipt of [first, second]) {
+      expect(
+        f.store.externalEventReceiptStatus(f.rootDir, receipt.receiptId),
+      ).toMatchObject({
+        outcome: 'held',
+        eventIds: [],
+        attemptCount: 1,
+        nextAttemptAt: new Date(NOW.getTime() + 4_000),
+      });
+    }
   });
 });

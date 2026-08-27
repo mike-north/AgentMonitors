@@ -60,6 +60,7 @@ import type {
   DoctorReportInput,
   EventQuery,
   ExternalEventReceiptRecord,
+  ExternalNotificationFlushResult,
   MonitorDoctorReport,
   MonitorEventRecord,
   MonitorExplainInput,
@@ -71,6 +72,7 @@ import type {
   ObservationHistoryQuery,
   ObservationHistoryRecord,
   OpenSessionInput,
+  PendingDebounceState,
   PollingDecision,
   ProcessObservationInput,
   RuntimeTickResult,
@@ -435,6 +437,25 @@ function externalPendingUsage(state: NotifyRuntimeState): {
       return usage;
     },
     { records: 0, bytes: 0 },
+  );
+}
+
+function pendingDebounceIsDue(
+  pending: PendingDebounceState,
+  now: Date,
+): boolean {
+  if (pending.externalFlush?.status === 'terminal') return false;
+  const dueAt = new Date(pending.dueAt);
+  const retryAt = pending.externalFlush?.nextAttemptAt
+    ? new Date(pending.externalFlush.nextAttemptAt)
+    : null;
+  const effectiveDueAt =
+    retryAt && !Number.isNaN(retryAt.getTime()) && retryAt > dueAt
+      ? retryAt
+      : dueAt;
+  return (
+    !Number.isNaN(effectiveDueAt.getTime()) &&
+    effectiveDueAt.getTime() <= now.getTime()
   );
 }
 
@@ -1209,6 +1230,16 @@ export class AgentMonitorRuntime {
         false,
       );
     }
+    if (
+      this.store.getMonitorState(monitor.id, normalizedInput.workspaceIdentity)
+        .notifyState.pendingDebounce?.externalFlush?.status === 'terminal'
+    ) {
+      throw new ExternalEventIngestError(
+        'capacity_exceeded',
+        'External event pending capacity is blocked by a terminal batch.',
+        true,
+      );
+    }
 
     const observation = externalObservation(validation.envelope);
     let suppressed: boolean;
@@ -1377,6 +1408,143 @@ export class AgentMonitorRuntime {
     return externalIngestResult(
       decision.receipt,
       decision.decision === 'duplicate' ? 'duplicate' : 'accepted',
+    );
+  }
+
+  /** Return the earliest retry-eligible external debounce deadline. */
+  nextExternalNotificationDeadline(workspaceIdentity: string): Date | null {
+    return (
+      this.store.externalNotificationDeadlines(workspaceIdentity)[0]?.dueAt ??
+      null
+    );
+  }
+
+  /**
+   * Materialize due external debounce batches from their captured envelopes.
+   * This path deliberately does not scan monitor files or invoke a source.
+   */
+  flushDueNotifications(
+    workspaceIdentity: string,
+    now = new Date(),
+  ): ExternalNotificationFlushResult {
+    if (Number.isNaN(now.getTime())) {
+      throw new Error('External notification flush timestamp is invalid.');
+    }
+    const flushedMonitorIds: string[] = [];
+    const emittedEventIds: string[] = [];
+    const failures: ExternalNotificationFlushResult['failures'] = [];
+    const due = this.store
+      .externalNotificationDeadlines(workspaceIdentity)
+      .filter(({ dueAt }) => dueAt <= now);
+
+    for (const { monitorId } of due) {
+      const interpretAfterCommit: MaterializedObservation[] = [];
+      try {
+        const eventIds = this.store.runInImmediateTransaction(() => {
+          const state = this.store.getMonitorState(
+            monitorId,
+            workspaceIdentity,
+          );
+          const pending = state.notifyState.pendingDebounce;
+          if (!pending) return [];
+          const deadline = this.store
+            .externalNotificationDeadlines(workspaceIdentity)
+            .find((candidate) => candidate.monitorId === monitorId)?.dueAt;
+          if (!deadline || deadline > now) return [];
+
+          const materialized: MaterializedObservation[] = [];
+          for (const stored of pending.observations) {
+            const envelope = hydrateStoredObservationEnvelope(stored);
+            const deterministic = this.materializeObservation({
+              monitor: envelope.monitor,
+              sourceName: storedEnvelopeSourceName(envelope),
+              observation: envelope.observation,
+              observedAt: envelope.observedAt,
+              workspacePath: workspaceIdentity,
+              effectiveUrgency: envelope.effectiveUrgency,
+            });
+            if (!deterministic) {
+              throw new Error(
+                'Captured external observation was suppressed during materialization.',
+              );
+            }
+            if (envelope.ingressReceiptId) {
+              this.store.markExternalEventReceiptMaterialized(
+                workspaceIdentity,
+                envelope.ingressReceiptId,
+                deterministic.event.id,
+                now,
+              );
+            }
+            materialized.push({
+              monitor: envelope.monitor,
+              ...deterministic,
+              projectedSessionIds: this.store.projectedSessionIdsForLastEvent(),
+            });
+          }
+          const nextNotifyState = { ...state.notifyState };
+          delete nextNotifyState.pendingDebounce;
+          this.store.setMonitorState(monitorId, workspaceIdentity, {
+            sourceState: state.sourceState,
+            notifyState: nextNotifyState,
+            lastObservationAt: state.lastObservationAt ?? null,
+          });
+          interpretAfterCommit.push(...materialized);
+          return materialized.map(({ event }) => event.id);
+        });
+        if (eventIds.length === 0) continue;
+        flushedMonitorIds.push(monitorId);
+        emittedEventIds.push(...eventIds);
+        for (const materialized of interpretAfterCommit) {
+          void this.interpretMaterializedObservation(materialized).catch(
+            () => undefined,
+          );
+        }
+        try {
+          this.store.recordObservationHistory({
+            monitorId,
+            workspacePath: workspaceIdentity,
+            sourceName:
+              interpretAfterCommit[0]?.event.sourceName ?? 'external-ingress',
+            result: 'triggered',
+            observationData: {
+              observed: interpretAfterCommit.length,
+              emitted: eventIds.length,
+            },
+          });
+        } catch {
+          // Audit remains best-effort after the durable materialization boundary.
+        }
+      } catch {
+        interpretAfterCommit.length = 0;
+        failures.push(
+          this.store.markExternalNotificationFlushFailed(
+            workspaceIdentity,
+            monitorId,
+            now,
+          ),
+        );
+      }
+    }
+
+    return {
+      flushedMonitorIds,
+      emittedEventIds,
+      failures,
+      nextDueAt: this.nextExternalNotificationDeadline(workspaceIdentity),
+    };
+  }
+
+  /** Explicitly re-arm the terminal debounce batch containing a receipt. */
+  rearmExternalEventReceipt(
+    workspaceIdentity: string,
+    receiptId: string,
+    now = new Date(),
+  ): ExternalEventReceiptRecord {
+    return this.store.rearmExternalNotificationBatch(
+      workspaceIdentity,
+      receiptId,
+      now,
     );
   }
 
@@ -4270,8 +4438,7 @@ export class AgentMonitorRuntime {
     }
 
     if (nextState.pendingDebounce) {
-      const dueAt = new Date(nextState.pendingDebounce.dueAt);
-      if (dueAt.getTime() <= observedAt.getTime()) {
+      if (pendingDebounceIsDue(nextState.pendingDebounce, observedAt)) {
         emitted.push(
           ...nextState.pendingDebounce.observations.map(
             hydrateStoredObservationEnvelope,
@@ -4309,7 +4476,11 @@ export class AgentMonitorRuntime {
       // observations plus this one — immediately, rather than splitting the
       // batch (splitting risks ordering confusion). This is the only path that
       // can short-circuit a settling debounce window before its `dueAt`.
-      if (isEscalated && nextState.pendingDebounce) {
+      if (
+        isEscalated &&
+        nextState.pendingDebounce &&
+        !nextState.pendingDebounce.externalFlush
+      ) {
         emitted.push(
           ...nextState.pendingDebounce.observations.map(
             hydrateStoredObservationEnvelope,
@@ -4351,6 +4522,7 @@ export class AgentMonitorRuntime {
 
       if (nextState.pendingDebounce) {
         nextState.pendingDebounce = {
+          ...nextState.pendingDebounce,
           observations: [
             ...nextState.pendingDebounce.observations.map(
               hydrateStoredObservationEnvelope,

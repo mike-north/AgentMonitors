@@ -15,6 +15,13 @@ Core now exposes exact-workspace safe receipt reads and exact four-dimension obj
 Nonempty durable debounce/rollup state and materialization retry admission write the matching
 global or workspace `durable-ingress-v1` marker in the same transaction; empty batches do not mark
 an otherwise compatible database.
+## 2026-08-13 — External debounce deadlines flush without polling (002 §2.6, 004 §3.4.1) — Refs #481
+
+Core now exposes workspace-scoped deadline discovery, source-free due-batch flushing, and explicit
+receipt-based re-arm. Captured events, projections, snapshots, cleared notify state, and all receipt
+correlations commit together. Failures roll back the batch, persist fixed safe retry metadata across
+restart, back off, and become terminal after five attempts; terminal work is durable but excluded
+from automatic scheduling until re-armed. Daemon timer/IPC lifecycle remains the next stack entry.
 
 ## 2026-08-13 — External debounce is bounded and receipt-correlated (002 §2.6, 003 §2.9, 004 §3.4.1) — Refs #481
 

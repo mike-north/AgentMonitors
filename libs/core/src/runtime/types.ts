@@ -600,6 +600,41 @@ export interface MonitorRuntimeState {
 export interface PendingDebounceState {
   observations: StoredObservationEnvelope[];
   dueAt: string;
+  /** Durable retry state for a source-free external-ingress deadline flush. */
+  externalFlush?: ExternalNotificationFlushState;
+}
+
+export type ExternalNotificationFlushStatus = 'pending' | 'terminal';
+
+/** Retry metadata retained with the captured debounce batch across restarts. */
+export interface ExternalNotificationFlushState {
+  attemptCount: number;
+  status: ExternalNotificationFlushStatus;
+  nextAttemptAt?: string;
+  lastError?: string;
+}
+
+/** One durable external-ingress debounce deadline. */
+export interface ExternalNotificationDeadline {
+  monitorId: string;
+  dueAt: Date;
+}
+
+/** A due batch whose source-free materialization failed durably. */
+export interface ExternalNotificationFlushFailure {
+  monitorId: string;
+  attemptCount: number;
+  terminal: boolean;
+  nextAttemptAt: Date | null;
+  message: string;
+}
+
+/** Result of flushing every eligible external-ingress batch in one workspace. */
+export interface ExternalNotificationFlushResult {
+  flushedMonitorIds: string[];
+  emittedEventIds: string[];
+  failures: ExternalNotificationFlushFailure[];
+  nextDueAt: Date | null;
 }
 
 /**
@@ -656,6 +691,10 @@ export interface StoredObservationEnvelope {
 
 export const EXTERNAL_INGRESS_PENDING_MAX_RECORDS = 64;
 export const EXTERNAL_INGRESS_PENDING_MAX_BYTES = 2 * 1024 * 1024;
+export const EXTERNAL_NOTIFICATION_FLUSH_RETRY_DELAYS_MS = [
+  1_000, 5_000, 30_000, 120_000, 300_000,
+] as const;
+export const EXTERNAL_NOTIFICATION_FLUSH_MAX_ATTEMPTS = 5;
 
 /** Capability persisted once a workspace contains forward-only durable work. @public */
 export const DURABLE_INGRESS_COMPATIBILITY_MARKER = 'durable-ingress-v1';
