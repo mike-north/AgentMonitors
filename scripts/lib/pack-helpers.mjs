@@ -25,6 +25,10 @@ export function packPackage(packageDir, packDestDir) {
       cwd: packageDir,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
+      // Node's CVE-2024-27980 hardening makes spawning `pnpm.cmd` without a
+      // shell throw EINVAL on win32. Arguments here are workspace/temp paths
+      // with no spaces or shell metacharacters, so shelling the shim is safe.
+      shell: PNPM_BIN.endsWith('.cmd'),
     },
   );
   if (result.status !== 0) {
@@ -52,4 +56,30 @@ export function packPackage(packageDir, packDestDir) {
   }
 
   return path.join(packDestDir, created);
+}
+
+/**
+ * Resolve a file inside a globally-`npm install`ed package, given the
+ * `--prefix` directory the install used. npm's global layout nests installed
+ * packages differently by platform: `<prefix>/lib/node_modules/<pkg>/...` on
+ * POSIX, but `<prefix>/node_modules/<pkg>/...` on Windows (no `lib/`
+ * component). Shared by `scripts/test-e2e-fresh-install-hooks.mjs` and
+ * `scripts/test-windows-install.mjs` so both resolve an installed package's
+ * files identically instead of re-deriving this platform difference.
+ *
+ * @param {string} prefixDir
+ * @param {string} packageName
+ * @param {...string} relativeParts
+ * @returns {string}
+ */
+export function resolveInstalledPackageFile(
+  prefixDir,
+  packageName,
+  ...relativeParts
+) {
+  const nodeModulesDir =
+    process.platform === 'win32'
+      ? path.join(prefixDir, 'node_modules')
+      : path.join(prefixDir, 'lib', 'node_modules');
+  return path.join(nodeModulesDir, packageName, ...relativeParts);
 }
