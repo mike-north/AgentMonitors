@@ -468,31 +468,73 @@ describe('buildJsonDiff — performance (issue #437 review)', () => {
   // 601ms at 100k, 2.3s at 200k duplicate elements — clearly superlinear. A
   // single distinguishable "moved" element plus a large duplicate bucket
   // reproduces this without relying on identity-key matching.
-  it('diffs a large duplicate-value bucket plus one moved element well under a bounded time', () => {
-    const DUPLICATE_COUNT = 200_000;
-    const duplicate = { a: 'same', b: 'same' };
-    const moved = { a: 'unique', b: 'unique' };
+  //
+  // (issue #515) This used to assert a hard `elapsedMs < 1000` wall-clock
+  // bound at a single input size. On a loaded/shared CI runner that bound has
+  // essentially zero headroom — the real (linear) runtime at 200k duplicates
+  // already sits close to 1000ms, so single-digit-percent scheduler noise
+  // alone fails the assertion (observed: 1006.27ms in run 32782066364,
+  // 1022.08ms in run 33277217804, both on unrelated docs-only PRs). The test
+  // exists to catch a COMPLEXITY regression (quadratic bucket handling), not
+  // to enforce a latency SLA, so it now measures the SAME operation at two
+  // input sizes (N and 4N) and asserts the *ratio* of elapsed times instead
+  // of an absolute duration. Load noise (a slower/busier runner) scales both
+  // measurements together and mostly cancels out of the ratio, whereas a
+  // quadratic regression makes 4x the input take ~16x as long regardless of
+  // how fast or slow the runner is — so the ratio bound stays sensitive to
+  // the thing it guards while becoming insensitive to ambient load.
+  it('diffs a large duplicate-value bucket plus one moved element in time that scales linearly (not quadratically) with bucket size', () => {
+    function fixtureTexts(duplicateCount: number): {
+      prevText: string;
+      currText: string;
+    } {
+      const duplicate = { a: 'same', b: 'same' };
+      const moved = { a: 'unique', b: 'unique' };
 
-    const prev = [
-      ...Array.from({ length: DUPLICATE_COUNT }, () => duplicate),
-      moved,
-    ];
-    // `moved` relocates to the front; every duplicate stays a duplicate.
-    const curr = [
-      moved,
-      ...Array.from({ length: DUPLICATE_COUNT }, () => duplicate),
-    ];
+      const prev = [
+        ...Array.from({ length: duplicateCount }, () => duplicate),
+        moved,
+      ];
+      // `moved` relocates to the front; every duplicate stays a duplicate.
+      const curr = [
+        moved,
+        ...Array.from({ length: duplicateCount }, () => duplicate),
+      ];
+      return {
+        prevText: JSON.stringify(prev),
+        currText: JSON.stringify(curr),
+      };
+    }
 
-    const start = performance.now();
-    const diff = buildJsonDiff(JSON.stringify(prev), JSON.stringify(curr));
-    const elapsedMs = performance.now() - start;
+    function timeDiff(duplicateCount: number): number {
+      const { prevText, currText } = fixtureTexts(duplicateCount);
+      const start = performance.now();
+      const diff = buildJsonDiff(prevText, currText);
+      const elapsedMs = performance.now() - start;
+      expect(diff).toBeDefined();
+      expect(diff).toContain('reordered');
+      return elapsedMs;
+    }
 
-    expect(diff).toBeDefined();
-    expect(diff).toContain('reordered');
-    // Generous enough for a slow CI runner under linear (O(N+M)) behavior,
-    // but well under the ~2.3s the quadratic `shift()`-based implementation
-    // took at this same duplicate-bucket size.
-    expect(elapsedMs).toBeLessThan(1000);
+    // 50k duplicates already takes double-digit milliseconds (measured
+    // locally: ~20-30ms), well above sub-millisecond noise territory, so the
+    // ratio itself doesn't get swamped by timer-resolution jitter.
+    const SMALL_COUNT = 50_000;
+    const LARGE_COUNT = SMALL_COUNT * 4;
+
+    const smallElapsedMs = timeDiff(SMALL_COUNT);
+    const largeElapsedMs = timeDiff(LARGE_COUNT);
+    const ratio = largeElapsedMs / smallElapsedMs;
+
+    // Linear (O(N+M)) behavior puts the ratio near 4x (measured locally:
+    // ~4.0-4.5x, including fixed per-call overhead that skews slightly
+    // above 4x at the smaller size). Quadratic (O(M^2)) behavior on a 4x
+    // input puts the ratio near 16x. 8x sits with wide margin above the
+    // linear expectation and wide margin below the quadratic one, so it
+    // stays load-insensitive (both measurements move together under
+    // ambient noise) while still failing hard on a genuine complexity
+    // regression (issues #437, #515).
+    expect(ratio).toBeLessThan(8);
   });
 });
 
