@@ -314,6 +314,65 @@ export function resolvedVersions(packageName, { cwd = REPO_ROOT } = {}) {
 }
 
 /**
+ * @typedef {{ name?: string, dependents?: WhyDependent[] }} WhyDependent
+ */
+
+/**
+ * Depth-first search of a `pnpm why --json` `dependents` tree for a node
+ * named `ancestorName`, at any depth.
+ *
+ * @param {WhyDependent[]} dependents
+ * @param {string} ancestorName
+ * @returns {boolean}
+ */
+function hasAncestorNamed(dependents, ancestorName) {
+  const stack = [...dependents];
+  while (stack.length > 0) {
+    const node = /** @type {WhyDependent} */ (stack.pop());
+    if (node.name === ancestorName) return true;
+    if (Array.isArray(node.dependents)) stack.push(...node.dependents);
+  }
+  return false;
+}
+
+/**
+ * Like {@link resolvedVersions}, but scoped to only the resolutions of
+ * `packageName` reachable through a specific `ancestorName` package
+ * somewhere in their `dependents` chain (at any depth). Several of the
+ * packages this gate tracks legitimately resolve to more than one
+ * coexisting line in this workspace — e.g. a devDependency-only build tool
+ * pinned to an old, unpatched line alongside the production path an
+ * override actually targets (`postcss`/`nanoid` via `vite`, or
+ * `brace-expansion` via an unrelated, ancient `minimatch@3`/`5` chain) — so
+ * a blanket "every resolved version of X is >= N" check would incorrectly
+ * fail on a line the fix was never meant to touch. Scoping by an ancestor
+ * that's unique to the flagged path (typically one of our own
+ * `@agentmonitors/*` packages, or the specific direct dependency an
+ * advisory's `paths` named) isolates just that path.
+ *
+ * @param {string} packageName
+ * @param {string} ancestorName
+ * @param {{ cwd?: string }} [options]
+ * @returns {string[]}
+ */
+export function resolvedVersionsUnderAncestor(
+  packageName,
+  ancestorName,
+  { cwd = REPO_ROOT } = {},
+) {
+  const stdout = execFileSync('pnpm', ['why', packageName, '--json'], {
+    encoding: 'utf8',
+    cwd,
+  });
+  /** @type {Array<{ version: string, dependents?: WhyDependent[] }>} */
+  const entries = JSON.parse(stdout);
+  const matches = entries.filter((entry) =>
+    hasAncestorNamed(entry.dependents ?? [], ancestorName),
+  );
+  return [...new Set(matches.map((entry) => entry.version))];
+}
+
+/**
  * Minimal dotted-numeric version comparator (no pre-release/build-metadata
  * support — none of the packages this gate tracks need it). Sufficient for
  * asserting "the resolved version is at least the patched one".

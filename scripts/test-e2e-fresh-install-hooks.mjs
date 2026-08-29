@@ -70,7 +70,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { clearTimeout, setTimeout } from 'node:timers';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { packPackage } from './lib/pack-helpers.mjs';
+import {
+  packPackage,
+  resolveInstalledPackageFile,
+} from './lib/pack-helpers.mjs';
 import { PACKAGE_DIRS } from './publish-release-packages.mjs';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -206,23 +209,6 @@ function speedUpMonitorForTesting(monitorPath) {
     );
   }
   writeFileSync(monitorPath, withNotify, 'utf-8');
-}
-
-/**
- * Resolve a file inside a globally-`npm install`ed package, given the
- * `--prefix` directory the install used. npm's global layout nests installed
- * packages under `<prefix>/lib/node_modules/<name>` on POSIX and
- * `<prefix>/node_modules/<name>` on win32 (no `lib/` there) — this is the
- * real installed package directory, distinct from the `<prefix>/bin/*` bin
- * shims/symlinks npm also generates (which, for a bin-name collision like
- * this test's, may not point at the package you actually want).
- */
-function resolveInstalledPackageFile(prefixDir, packageName, ...relativeParts) {
-  const nodeModulesDir =
-    process.platform === 'win32'
-      ? path.join(prefixDir, 'node_modules')
-      : path.join(prefixDir, 'lib', 'node_modules');
-  return path.join(nodeModulesDir, packageName, ...relativeParts);
 }
 
 /**
