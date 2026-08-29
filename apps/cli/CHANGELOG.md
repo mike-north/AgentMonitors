@@ -1,5 +1,18 @@
 # @agentmonitors/cli
 
+## 0.11.1
+
+### Patch Changes
+
+- 7c30c92: Upgrade better-sqlite3 to 13.x, fixing a native crash (env != nullptr abort in Statement teardown) that could kill the daemon on Node 24.
+- Updated dependencies [7c30c92]
+  - @agentmonitors/core@0.13.1
+  - @agentmonitors/source-api-poll@0.5.1
+  - @agentmonitors/source-command-poll@0.4.1
+  - @agentmonitors/source-file-fingerprint@0.4.3
+  - @agentmonitors/source-incoming-changes@0.3.3
+  - @agentmonitors/source-schedule@0.2.3
+
 ## 0.11.0
 
 ### Minor Changes
