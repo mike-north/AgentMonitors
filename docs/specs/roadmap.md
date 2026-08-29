@@ -304,6 +304,26 @@ Interpret → Deliver → [React]`:
 > source-side poll-cursor sketch, G20 is the Cursor editor host; see the **Poll cursor / source
 > cursor protocol** disambiguation in [glossary.md](./glossary.md).)
 
+### G21 — Reliability & process hygiene target set (P1)
+
+- **Current:** timeout escalation of the original process group (POSIX) / `taskkill` tree
+  (Windows) is enforced ([008 §3.1](./008-reliability-process-hygiene.md)) — descendants that
+  leave the original group are not yet covered; the rest of the reliability contract is
+  target — lifetime bounds die with the daemon, there is no restart sweep, cleanup signals are
+  not identity-verified, abstention warnings and the capability probe/report do not exist, and
+  the daemon has no coherent power posture.
+- **Target:** the full contract of [008](./008-reliability-process-hygiene.md): full-boundary
+  bounds with the reported deferred-reconciliation state (§3.2), daemon-death-independent
+  bounds (§3.3), the restart sweep and process hygiene (§4), identity-verified cleanup (§5),
+  the abstention warning surface (§6.1), capability probe + achieved-guarantee reporting
+  (§7), power posture (§8).
+- **Governs:** [008](./008-reliability-process-hygiene.md); PP7, BP1, BP4, NP4 ([000](./000-principles.md)).
+- **Files (anticipated):** `plugins/source-command-poll/src/*`, `libs/core/src/runtime/*`, `apps/cli/src/commands/doctor.ts`, daemon startup path.
+- **Proof:** the per-rule test implications in 008, which are the acceptance bars for #470,
+  #478, #479, #480, #507, #426, #469 (GitHub milestone "M2 — Runtime containment & cleanup")
+  and for the durable-state/verification-gate set cited in 008 §9–§10 (milestone "M3 —
+  Delivery correctness & durability").
+
 ## Test gaps
 
 All test gaps tracked from [004 §3](./004-validation-testing.md) are now closed:
