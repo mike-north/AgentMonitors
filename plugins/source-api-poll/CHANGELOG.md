@@ -1,5 +1,12 @@
 # @agentmonitors/source-api-poll
 
+## 0.5.1
+
+### Patch Changes
+
+- Updated dependencies [7c30c92]
+  - @agentmonitors/core@0.13.1
+
 ## 0.5.0
 
 ### Minor Changes
