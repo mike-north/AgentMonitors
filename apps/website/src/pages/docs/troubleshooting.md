@@ -75,7 +75,7 @@ Read the verdict stage, not just its glyph:
 6. **Delivery pending/failure** — an event exists but nothing was projected to a session in this
    workspace yet. Continue to the next section.
 
-**Traces to:** [002 §10.7](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/002-runtime-delivery.md#107-monitor-pipeline-diagnosis)
+**Traces to:** [spec: daemon/ipc](https://github.com/mike-north/AgentMonitors/blob/main/openspec/specs/daemon/ipc/spec.md)
 (monitor pipeline diagnosis, stage statuses) and
 [005 `monitor explain`](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/005-cli-reference.md#monitor-explain--pipeline-diagnosis).
 
@@ -139,10 +139,10 @@ printf '{"session_id":"<host-session-id>","cwd":"%s","hook_event_name":"UserProm
   | agentmonitors hook deliver --debug
 ```
 
-**Traces to:** [002 §6](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/002-runtime-delivery.md#6-session-projection)
-(session projection, exact-match workspace filtering), [002 §7](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/002-runtime-delivery.md#7-unread-claimed-and-acknowledged)
-(unread/claimed/acknowledged), [002 §9](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/002-runtime-delivery.md#9-delivery-lifecycles)
-(delivery lifecycles), and [002 §10.7](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/002-runtime-delivery.md#107-monitor-pipeline-diagnosis)
+**Traces to:** [spec: delivery/session-projection](https://github.com/mike-north/AgentMonitors/blob/main/openspec/specs/delivery/session-projection/spec.md)
+(session projection, exact-match workspace filtering), [spec: delivery/session-projection](https://github.com/mike-north/AgentMonitors/blob/main/openspec/specs/delivery/session-projection/spec.md)
+(unread/claimed/acknowledged), [spec: delivery/lifecycles](https://github.com/mike-north/AgentMonitors/blob/main/openspec/specs/delivery/lifecycles/spec.md)
+(delivery lifecycles), and [spec: daemon/ipc](https://github.com/mike-north/AgentMonitors/blob/main/openspec/specs/daemon/ipc/spec.md)
 (`explain` vs. `events list` disagreement).
 
 ## It worked once then stopped
@@ -173,8 +173,8 @@ baseline is required to detect a change. If the daemon (re)started recently and 
 change before its first tick ran, that tick baselines instead of firing; the following tick
 detects it.
 
-**Traces to:** [002 §10.2](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/002-runtime-delivery.md#102-daemon-run--continuous-loop--unix-socket-server)
-(idle reaping, lazy boot) and [002 §4.1](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/002-runtime-delivery.md#41-default-notify-behavior)
+**Traces to:** [spec: daemon/ipc](https://github.com/mike-north/AgentMonitors/blob/main/openspec/specs/daemon/ipc/spec.md)
+(idle reaping, lazy boot) and [spec: runtime/notify-dispatch](https://github.com/mike-north/AgentMonitors/blob/main/openspec/specs/runtime/notify-dispatch/spec.md)
 (default notify/settle behavior); the `command-poll` baseline-then-detect recipe in the
 [`setup-monitors` skill's Verify It Fires section](https://github.com/mike-north/AgentMonitors/blob/main/agent-plugins/agentmonitors/skills/setup-monitors/SKILL.md#verify-it-fires).
 
@@ -218,8 +218,8 @@ printf '{"session_id":"verify-1","cwd":"%s","hook_event_name":"SessionStart"}' "
 A project with **zero** monitor definitions stays fully silent either way — the advisory fires only
 when something is sitting unwatched.
 
-**Traces to:** [002 §10.2](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/002-runtime-delivery.md#102-daemon-run--continuous-loop--unix-socket-server)
-("Quick-exit when not enabled") and [006 §5.6](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/006-agent-integration.md#56-activation-packaging-the-agentmonitors-plugin)
+**Traces to:** [spec: daemon/ipc](https://github.com/mike-north/AgentMonitors/blob/main/openspec/specs/daemon/ipc/spec.md)
+("Quick-exit when not enabled") and [spec: delivery/channel-transport](https://github.com/mike-north/AgentMonitors/blob/main/openspec/specs/delivery/channel-transport/spec.md), [spec: delivery/hook-transport](https://github.com/mike-north/AgentMonitors/blob/main/openspec/specs/delivery/hook-transport/spec.md)
 ("Monitors-found-but-disabled advisory").
 
 ## Which session ID do I use
@@ -241,8 +241,8 @@ Use the **AgentMon id** (first column) for `--session` on `events list`/`events 
 `hook deliver` — there is no `CLAUDE_CODE_SESSION_ID` environment variable to fall back on; it
 must come from stdin.
 
-**Traces to:** [005 §10](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/005-cli-reference.md#10-session--manage-agent-sessions)
-(`session` command reference) and [006 §5.0](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/006-agent-integration.md#50-input-contract-stdin-json)
+**Traces to:** [spec: cli/session-commands](https://github.com/mike-north/AgentMonitors/blob/main/openspec/specs/cli/session-commands/spec.md)
+(`session` command reference) and [spec: delivery/hook-transport](https://github.com/mike-north/AgentMonitors/blob/main/openspec/specs/delivery/hook-transport/spec.md)
 (hook input contract).
 
 ## Next steps

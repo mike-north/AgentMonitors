@@ -21,7 +21,7 @@ const graphemes = new Intl.Segmenter(undefined, {
 
 /**
  * Render a source `objectKey` for inclusion in an observation's `title` or
- * `summary`, bounded to a headline-sized string (003 §2.8, issue #449).
+ * `summary`, bounded to a headline-sized string (spec: sources/contract, issue #449).
  *
  * An `objectKey` is an **identity**, not a display string: it is free to be as
  * long as identity requires. `command-poll` defaults its key to the joined argv,

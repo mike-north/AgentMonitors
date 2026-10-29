@@ -49,8 +49,8 @@
  * but every row in the reservation remains unread and eligible to appear
  * again on a future recap.
  *
- * @see docs/specs/005-cli-reference.md §10.4
- * @see docs/specs/006-agent-integration.md §5.6
+ * @see openspec/specs/cli/session-commands/spec.md, openspec/specs/delivery/hook-transport/spec.md
+ * @see openspec/specs/delivery/channel-transport/spec.md, openspec/specs/delivery/hook-transport/spec.md
  */
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import type { DeliveryClaim, DeliveryEventSummary } from '@agentmonitors/core';

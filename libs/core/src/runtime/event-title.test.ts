@@ -1,7 +1,7 @@
 /**
  * Issue #449 — the runtime, not the source, decides a materialized event's
  * `title`: the monitor's AUTHORED `name` when it has one, otherwise the
- * source-provided title unchanged (002 §5.4).
+ * source-provided title unchanged (spec: runtime/event-materialization).
  *
  * The `apps/cli` companion suite (`event-title-transports.test.ts`) proves the
  * same rule end-to-end through the real `command-poll` source and both delivery
@@ -10,7 +10,7 @@
  * source's own per-object text is NOT lost, because it remains the `summary`.
  *
  * @see https://github.com/mike-north/AgentMonitors/issues/449
- * @see ../../../../docs/specs/002-runtime-delivery.md §5.4
+ * @see ../../../../openspec/specs/runtime/event-materialization/spec.md
  */
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -44,7 +44,7 @@ afterEach(() => {
 /**
  * Emits one changing observation per tick. `fields` overrides the observation's
  * text so a test can drive the distinct-`title`/`summary` case a third-party
- * source may legitimately produce (002 §5.4's compatibility table).
+ * source may legitimately produce (spec: runtime/event-materialization's compatibility table).
  */
 function scriptedSource(
   fields: { title: string; summary?: string; body?: string } = {
@@ -140,8 +140,8 @@ describe('issue #449: event title selection', () => {
 
   // Raised in review of #449: `Observation.summary` is optional and MAY differ
   // from the required `title`, so "the source title is never lost" was false.
-  // These lock the actual compatibility contract now written in 002 §5.4.
-  describe('a source whose summary DIFFERS from its title (002 §5.4 table)', () => {
+  // These lock the actual compatibility contract now written in spec: runtime/event-materialization.
+  describe('a source whose summary DIFFERS from its title (spec: runtime/event-materialization table)', () => {
     const DISTINCT = {
       title: 'Upstream feed reported a change',
       summary: 'PR #443 moved to MERGED',
@@ -165,7 +165,7 @@ describe('issue #449: event title selection', () => {
     });
   });
 
-  // 002 §5.1 derives an absent summary from `body`; the delivered block must not
+  // spec: runtime/event-materialization derives an absent summary from `body`; the delivered block must not
   // then render that body twice (issue #449 review).
   it('derives summary from body when the source omits summary', async () => {
     const event = await materializeOneEvent('Spec watcher', {

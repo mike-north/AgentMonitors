@@ -18,10 +18,10 @@
  * `cli.integration.test.ts` a genuine substitute for the MCP tool's
  * capability — not just a superficially similar command: both transports
  * drive the identical daemon IPC methods (`events.ack`, `hook.claim`),
- * exactly as 006 §2's "realization" note describes ("the transport boundary
+ * exactly as spec: delivery/transport-seam's "realization" note describes ("the transport boundary
  * is the daemon IPC surface, not a new core type").
  *
- * @see docs/specs/006-agent-integration.md §2 and §4.3 (the agentmon_ack tool)
+ * @see openspec/specs/delivery/transport-seam/spec.md, openspec/specs/delivery/channel-transport/spec.md (the agentmon_ack tool)
  */
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -67,7 +67,7 @@ describe('agentmon_ack MCP tool vs. hooks-only CLI: shared daemon-IPC plumbing (
     // bug, issue #300): it RESERVES, pushes, then COMMITS on success (or
     // RELEASES on a failed push). reserve/commit are the deferred form of the
     // hook's `hook.claim` — both reduce to the one core decide/apply — so
-    // capability parity (006 §6.1) still holds: same daemon, same delivery
+    // capability parity (spec: delivery/transport-seam — "MCP is never required", "Channel and hook paths share the same daemon IPC") still holds: same daemon, same delivery
     // decision, different surface.
     expect(
       importsFromRuntimeClient(CHANNEL_SOURCE, 'reserveDeliveryClient'),
@@ -123,7 +123,7 @@ describe('agentmon_ack MCP tool vs. hooks-only CLI: shared daemon-IPC plumbing (
 /**
  * Rendering parity (issue #436): the two injecting transports must surface the
  * SAME event content — the channel is a rendering surface over the same
- * semantics, "only the surface" differs (006 §6). This exercises the REAL
+ * semantics, "only the surface" differs (spec: delivery/transport-seam). This exercises the REAL
  * renderers (`renderHookDelivery` and `renderChannelEvent`) against one shared
  * `DeliveryClaim`, not a hand-built approximation, and asserts both emit the
  * transport-shared per-event block (`buildEventBlock`): title + monitor body +

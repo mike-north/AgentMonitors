@@ -51,7 +51,7 @@ import { mapWithConcurrency } from './map-with-concurrency.js';
 const MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
 
 /**
- * Maximum number of composite parts (§2.6) fetched concurrently within one
+ * Maximum number of composite parts (spec: sources/api-poll, sources/contract) fetched concurrently within one
  * `observe()` call (issue #304). Without a cap, a composite with many parts
  * starts every request at once, multiplying the stalled-connection and
  * memory-pressure risk this issue exists to bound.
@@ -117,14 +117,14 @@ interface ScopeConfig {
   /**
    * The change-detection strategy as written by the author, or `undefined` when
    * the author omitted `change-detection.strategy`. The omitted case is resolved
-   * after the fetch by inferring from the response `Content-Type` (003 §4.2,
+   * after the fetch by inferring from the response `Content-Type` (spec: sources/api-poll,
    * issue #230); an explicit value always wins (no inference, no override).
    */
   explicitStrategy: ChangeStrategy | undefined;
-  /** Keyed-collection config (003 §12), present only under `strategy: json-diff`. */
+  /** Keyed-collection config (spec: sources/contract), present only under `strategy: json-diff`. */
   collection: KeyedCollectionConfig | undefined;
   /**
-   * Composite-observation config (003 §2.6), present only when the monitor uses
+   * Composite-observation config (spec: sources/api-poll, sources/contract), present only when the monitor uses
    * `change-detection.composite`. Reduces N sub-resource calls into one stable
    * snapshot under one `objectKey`.
    */
@@ -135,7 +135,7 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
   const composite = parseCompositeConfig(config['change-detection']);
 
   const url = config['url'];
-  // `url` is optional only in composite mode (§2.6), which supplies per-part
+  // `url` is optional only in composite mode (spec: sources/api-poll, sources/contract), which supplies per-part
   // URLs instead. But if it IS present it must be a string on ALL paths — a
   // non-string `url` alongside `composite` is a misconfiguration that would
   // otherwise be silently dropped.
@@ -148,7 +148,7 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
 
   // The strategy is honored *verbatim* when the author specifies one; when it is
   // OMITTED we leave `explicitStrategy` undefined and infer it from the response
-  // Content-Type after the fetch (003 §4.2, issue #230). Explicit always wins.
+  // Content-Type after the fetch (spec: sources/api-poll, issue #230). Explicit always wins.
   //
   // An unrecognized strategy value is an authoring error — not a signal to fall
   // through to inference. If the author wrote e.g. `strategy: jsondiff` (a
@@ -177,7 +177,7 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
       ? strategy
       : undefined;
 
-  // Keyed-collection mode (003 §12) is only valid under `json-diff`. The generated
+  // Keyed-collection mode (spec: sources/contract) is only valid under `json-diff`. The generated
   // schema rejects `collection` under other strategies at authoring time (BP3); this
   // is the defence-in-depth guard for the observe path. `collection` forces an
   // explicit `json-diff` (the schema's if/then requires it), so inference never
@@ -187,7 +187,7 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
     throw new Error('change-detection.collection requires strategy: json-diff');
   }
 
-  // Composite (§2.6) assembles one whole from many calls; keyed-collection (§12)
+  // Composite (spec: sources/api-poll, sources/contract) assembles one whole from many calls; keyed-collection (spec: sources/contract)
   // tracks many independent objects. They are different shapes of fan-in and
   // cannot be combined on one monitor.
   if (composite && collection) {
@@ -234,7 +234,7 @@ interface CachedResponse {
   body: string;
   status: number;
   /**
-   * The keyed-collection snapshot from the previous cycle (003 §12), present only
+   * The keyed-collection snapshot from the previous cycle (spec: sources/contract), present only
    * when the monitor uses `change-detection.collection`. Held alongside the raw body
    * so the per-object diff has a baseline to compare against.
    */
@@ -315,7 +315,7 @@ const scopeSchema: JsonSchema = {
           type: 'string',
           enum: ['json-diff', 'text-diff', 'status-code'],
         },
-        // Keyed-collection mode (003 §12). The `collection` block is only valid
+        // Keyed-collection mode (spec: sources/contract). The `collection` block is only valid
         // under `strategy: json-diff`; the `if/then` below enforces that at
         // authoring time (BP3).
         collection: {
@@ -340,7 +340,7 @@ const scopeSchema: JsonSchema = {
           },
           required: ['path', 'key'],
         },
-        // Composite-observation mode (003 §2.6): reduce N sub-resource calls into
+        // Composite-observation mode (spec: sources/api-poll, sources/contract): reduce N sub-resource calls into
         // ONE stable snapshot under ONE object-key. The composite *is* the
         // observed object, so there is one key for the whole, not one per call.
         composite: {
@@ -360,7 +360,7 @@ const scopeSchema: JsonSchema = {
               minItems: 1,
               // Issue #304 review, third round: bounds request count,
               // rendered-artifact size, and worst-case tick duration
-              // (003 §4.9) — see MAX_COMPOSITE_PARTS in composite.ts.
+              // (spec: sources/api-poll) — see MAX_COMPOSITE_PARTS in composite.ts.
               maxItems: MAX_COMPOSITE_PARTS,
               items: {
                 type: 'object',
@@ -399,7 +399,7 @@ const scopeSchema: JsonSchema = {
     },
   },
   // A monitor MUST configure either a top-level `url` (single-resource modes) or
-  // `change-detection.composite` (composite mode §2.6, which supplies per-part
+  // `change-detection.composite` (composite mode spec: sources/api-poll, sources/contract, which supplies per-part
   // URLs instead). `url` is therefore not globally required: this `anyOf`
   // enforces "one or the other" so a config with neither is still rejected.
   anyOf: [
@@ -666,7 +666,7 @@ async function fetchBody(
  * test doubles that omit `headers`. The DOM/undici `Response` type declares
  * `headers` as always present, but a hand-built mock may not have it; reading
  * through `unknown` keeps this safe at runtime without lying to the type system.
- * A missing/empty header maps to `undefined` → text-diff inference (003 §4.2).
+ * A missing/empty header maps to `undefined` → text-diff inference (spec: sources/api-poll).
  */
 function readContentType(response: Response): string | undefined {
   const headers = (response as { headers?: unknown }).headers;
@@ -712,7 +712,7 @@ function isSuccessStatus(status: number): boolean {
  * media type or any structured-syntax `+json` suffix (e.g. `application/ld+json`,
  * `application/vnd.api+json`), per RFC 6838. Parameters (`; charset=utf-8`) and
  * case are ignored. Used to infer the change-detection strategy when the author
- * omits `change-detection.strategy` (003 §4.2, issue #230).
+ * omits `change-detection.strategy` (spec: sources/api-poll, issue #230).
  *
  * @see https://www.rfc-editor.org/rfc/rfc6838#section-4.2.8 (+json suffix)
  */
@@ -727,7 +727,7 @@ function isJsonContentType(contentType: string | undefined): boolean {
  * Resolve the effective change-detection strategy. An explicit author value is
  * used verbatim (explicit always wins). When omitted, infer from the response
  * `Content-Type`: JSON media types → `json-diff`; everything else (text/html,
- * text/plain, missing/unknown) → `text-diff` (003 §4.2, issue #230).
+ * text/plain, missing/unknown) → `text-diff` (spec: sources/api-poll, issue #230).
  */
 function resolveStrategy(
   explicit: ChangeStrategy | undefined,
@@ -740,7 +740,7 @@ function resolveStrategy(
 /**
  * Whether `body` parses as JSON. Used to warn when `strategy: json-diff` is
  * configured against a body that is not JSON (e.g. an HTML status page), which
- * would silently degrade to text comparison (003 §4.2, issue #219).
+ * would silently degrade to text comparison (spec: sources/api-poll, issue #219).
  */
 function isParseableJson(body: string): boolean {
   try {
@@ -755,7 +755,7 @@ function isParseableJson(body: string): boolean {
  * Remove URL components that commonly carry credentials or request-scoped
  * tokens before embedding a URL in **any** human-facing text: a non-fatal
  * warning, and the observation `title`/`summary`, which are durably persisted on
- * every event and rendered into agent deliveries (002 §5.4). The source should
+ * every event and rendered into agent deliveries (spec: runtime/event-materialization). The source should
  * still fetch the author's exact URL, and the untouched URL remains on
  * `payload.url` / `objectKey` for debugging; only text a human or agent reads
  * gets the redacted form.
@@ -787,7 +787,7 @@ function jsonDiffNonJsonWarning(url: string): string {
   return `api-poll: change-detection.strategy is json-diff but the response from ${redactUrlForWarning(url)} does not parse as JSON; falling back to text comparison. Use strategy: text-diff for HTML/plain-text pages.`;
 }
 
-/** Source-owned change-detection state for composite mode (§2.6). */
+/** Source-owned change-detection state for composite mode (spec: sources/api-poll, sources/contract). */
 interface CompositeState {
   /** The prior rendered composite snapshot, used to decide whether to emit. */
   composite: string;
@@ -802,11 +802,11 @@ function isCompositeState(value: unknown): value is CompositeState {
 }
 
 /**
- * Composite observe path (003 §2.6): issue **N** calls within one `observe()`,
+ * Composite observe path (spec: sources/api-poll, sources/contract): issue **N** calls within one `observe()`,
  * reduce them into **one** deterministic snapshot under **one** `objectKey`, and
  * emit a single composite observation. The source's `nextState` holds only the
  * prior rendered composite (its own change-detection cursor); the runtime owns
- * the consumer-baseline diff (§2.5).
+ * the consumer-baseline diff (spec: sources/contract).
  */
 async function observeComposite(
   composite: CompositeConfig,
@@ -838,7 +838,7 @@ async function observeComposite(
   // each part (wired into `fetchBody` below as `externalSignal`) cancels
   // every other in-flight part the instant the batch is doomed, instead of
   // letting them run to their own full per-part deadline. Either way,
-  // `nextState` never advances and the prior baseline is preserved (002 §3) —
+  // `nextState` never advances and the prior baseline is preserved (spec: runtime/monitor-state) —
   // we never silently emit a composite missing a part. Each part still gets
   // the same request/body deadline and byte cap as a single-URL monitor.
   const results = await mapWithConcurrency(
@@ -857,7 +857,7 @@ async function observeComposite(
       // a non-2xx part body (a 401/500 error page) must NOT be baselined into the
       // snapshot — that would make a misconfigured monitor look healthy and diff
       // error pages. Throwing here fails the surrounding mapWithConcurrency call,
-      // so `nextState` never advances and the prior baseline is preserved (002 §3),
+      // so `nextState` never advances and the prior baseline is preserved (spec: runtime/monitor-state),
       // exactly as the single-URL path does. There is no `status-code` exemption
       // in composite mode: composite is always a body-diffing assembly, never a
       // status-transition watcher, so every part must be a 2xx success.
@@ -906,7 +906,7 @@ async function observeComposite(
   // regardless of part count or fetch order, rather than trying to predict
   // the separator count mid-loop (which depends on the final sort order, not
   // fetch-completion order). `nextState` never advances on this throw, so the
-  // prior baseline is preserved (002 §3), exactly like the running check.
+  // prior baseline is preserved (spec: runtime/monitor-state), exactly like the running check.
   const renderedBytes = Buffer.byteLength(rendered, 'utf8');
   if (renderedBytes > MAX_COMPOSITE_BYTES) {
     throw new Error(
@@ -951,7 +951,7 @@ const source: ObservationSource = {
     const authHeaders = resolveAuth(auth);
     const combinedHeaders = { ...authHeaders, ...headers };
 
-    // ---- Composite mode (003 §2.6) ----------------------------------------------
+    // ---- Composite mode (spec: sources/api-poll, sources/contract) ----------------------------------------------
     // Reduce N sub-resource calls into one stable snapshot under one objectKey.
     if (composite) {
       return observeComposite(
@@ -969,7 +969,7 @@ const source: ObservationSource = {
     }
 
     // `status-code` never inspects the body — the status transition IS the
-    // watched signal (003 §4.9's exemption also applies here: reading and
+    // watched signal (spec: sources/api-poll's exemption also applies here: reading and
     // buffering a body the strategy will never look at is exactly the
     // wedge/memory risk this issue exists to bound). Skip reading it
     // entirely for that strategy (issue #304 review, finding 2) — cheaper,
@@ -987,7 +987,7 @@ const source: ObservationSource = {
     );
 
     // Resolve the effective strategy: explicit wins verbatim; otherwise infer
-    // from the response Content-Type (003 §4.2, issue #230). Inference can only
+    // from the response Content-Type (spec: sources/api-poll, issue #230). Inference can only
     // produce a body-diffing strategy (json-diff / text-diff), never status-code.
     const changeDetection = resolveStrategy(explicitStrategy, contentType);
 
@@ -1019,7 +1019,7 @@ const source: ObservationSource = {
 
     // ---- json-diff on a non-JSON body → warning (issue #219, #230) --------------
     // `json-diff` silently degrades to text comparison when a body does not parse
-    // as JSON (003 §4.2). That is the wrong strategy for HTML/plain-text pages and
+    // as JSON (spec: sources/api-poll). That is the wrong strategy for HTML/plain-text pages and
     // is invisible by default. Surface a warning (non-fatal) so `monitor test`
     // tells the author to switch to text-diff, rather than diffing HTML as JSON.
     //
@@ -1031,7 +1031,7 @@ const source: ObservationSource = {
         ? [jsonDiffNonJsonWarning(url)]
         : [];
 
-    // ---- Keyed-collection mode (003 §12) ----------------------------------------
+    // ---- Keyed-collection mode (spec: sources/contract) ----------------------------------------
     // Parse the body as JSON and diff per keyed object, instead of treating the
     // whole body as one blob. Per-object observations carry `<url>#<key>` ids.
     if (collection) {

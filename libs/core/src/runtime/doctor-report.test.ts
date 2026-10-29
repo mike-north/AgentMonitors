@@ -2,7 +2,7 @@
  * Tests for `AgentMonitorRuntime.doctorReport()` — the workspace-wide,
  * durable-state health report behind `agentmonitors doctor` (issue #267).
  *
- * Assertions trace to docs/specs/005-cli-reference.md §14 ("doctor") and the
+ * Assertions trace to openspec/specs/agent/ephemeral-monitors/spec.md ("doctor") and the
  * per-monitor rollup contract there; they are written from the spec, not from
  * whatever the implementation currently emits.
  *
@@ -75,7 +75,7 @@ function scratch(): string {
 }
 
 describe('AgentMonitorRuntime.doctorReport', () => {
-  it('rolls up an observed monitor with its lead-session delivery counts (spec 005 §14)', async () => {
+  it('rolls up an observed monitor with its lead-session delivery counts (spec: agent/ephemeral-monitors)', async () => {
     const root = scratch();
     const monitorsDir = path.join(root, '.claude', 'monitors');
     writeMonitor(monitorsDir, 'watch-src', [
@@ -102,8 +102,8 @@ describe('AgentMonitorRuntime.doctorReport', () => {
       now: NOW,
     });
 
-    expect(report.monitorsDirExists).toBe(true); // §14: directory found
-    expect(report.hasLeadSession).toBe(true); // §14: lead session present
+    expect(report.monitorsDirExists).toBe(true); // spec: cli/doctor: directory found
+    expect(report.hasLeadSession).toBe(true); // spec: cli/doctor: lead session present
     expect(report.leadSessions).toHaveLength(1);
     expect(report.invalidCount).toBe(0);
     expect(report.monitors).toHaveLength(1);
@@ -124,7 +124,7 @@ describe('AgentMonitorRuntime.doctorReport', () => {
     });
   });
 
-  it('marks a never-ticked monitor as never observed with next-due = now when due (spec 005 §14)', async () => {
+  it('marks a never-ticked monitor as never observed with next-due = now when due (spec: agent/ephemeral-monitors)', async () => {
     const root = scratch();
     const monitorsDir = path.join(root, '.claude', 'monitors');
     writeMonitor(monitorsDir, 'idle', [
@@ -156,7 +156,7 @@ describe('AgentMonitorRuntime.doctorReport', () => {
     });
   });
 
-  it('reports an unknown-source monitor as invalid with a validation error (spec 005 §14)', async () => {
+  it('reports an unknown-source monitor as invalid with a validation error (spec: agent/ephemeral-monitors)', async () => {
     const root = scratch();
     const monitorsDir = path.join(root, '.claude', 'monitors');
     writeMonitor(monitorsDir, 'mystery', [
@@ -266,7 +266,7 @@ describe('AgentMonitorRuntime.doctorReport', () => {
     expect(byId.get('schedule-mon')?.cadence).toBe("cron '0 9 * * 1-5'");
   });
 
-  it('reports monitorsDirExists=false and no monitors when the directory is missing (spec 005 §14)', async () => {
+  it('reports monitorsDirExists=false and no monitors when the directory is missing (spec: agent/ephemeral-monitors)', async () => {
     const root = scratch();
     const monitorsDir = path.join(root, '.claude', 'monitors'); // never created
 

@@ -3,7 +3,7 @@
  *
  * The defect: a `turn-interruptible` claim marked the FULL settled high-urgency
  * candidate set CLAIMED before a length-bounded transport (the hook-deliver
- * 4000-char `additionalContext`, 006 §5.1/§5.5) rendered and truncated it — so
+ * 4000-char `additionalContext`, spec: delivery/hook-transport, delivery/channel-transport) rendered and truncated it — so
  * events truncated out of the visible context were claimed
  * (`first_notified_at` set) and NEVER re-delivered at the next context event,
  * even though they stayed unread. This silently loses signal for exactly the
@@ -15,8 +15,8 @@
  * pending to re-deliver next context event. These tests drive the core methods
  * directly with deterministic, already-settled events (no real-clock waits).
  *
- * @see ../../../../docs/specs/006-agent-integration.md §5.5 (unread-recoverability, redelivery)
- * @see ../../../../docs/specs/002-runtime-delivery.md §9 (claimed vs unread vs acknowledged)
+ * @see ../../../../openspec/specs/delivery/channel-transport/spec.md, ../../../../openspec/specs/delivery/hook-transport/spec.md (unread-recoverability, redelivery)
+ * @see ../../../../openspec/specs/delivery/lifecycles/spec.md (claimed vs unread vs acknowledged)
  */
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -257,7 +257,7 @@ describe('capped high-urgency claim + preview (issue #299)', () => {
   // intermediates were marked net-suppressed while their group was never
   // claimed — orphaning them: excluded from pending/unread (both filter
   // `net_suppressed_at IS NULL`) yet lacking a `first_notified_at`. That
-  // contradicts the claimed-but-suppressed-AT-CLAIM-TIME contract (002 §1.1.7).
+  // contradicts the claimed-but-suppressed-AT-CLAIM-TIME contract (spec: pipeline/post-processing).
   it('defers a whole net object group untouched: its intermediates stay unsuppressed & pending until the group is surfaced (#299 review)', () => {
     const h = setup();
     const session = openLead(h, 'sess-net');
@@ -288,7 +288,7 @@ describe('capped high-urgency claim + preview (issue #299)', () => {
     expect(first?.events.map((e) => e.eventId)).toEqual([o2]);
     // O's delivered delta spans this recipient's cursor (o0) → endpoint (o2) —
     // the re-anchored catch-up, not the last incremental step o1 → o2
-    // (002 §5.2 line format).
+    // (spec: runtime/event-materialization line format).
     expect(recipientDelta(o2)).toBe('- 1: o0\n+ 1: o2');
 
     // Only O's intermediate (o1) is net-suppressed; the DEFERRED object P is

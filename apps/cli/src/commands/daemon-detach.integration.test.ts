@@ -15,7 +15,7 @@
  * run only via vitest.serial.config.ts, like the other daemon-spawning suites
  * — the spawned daemon must not be CPU-starved by concurrent test workers.
  *
- * @see ../../../../docs/specs/005-cli-reference.md §9.2 (`daemon run`, Background mode)
+ * @see ../../../../openspec/specs/cli/daemon-commands/spec.md (`daemon run`, Background mode)
  */
 
 import { afterEach, describe, expect, it } from 'vitest';
@@ -80,7 +80,7 @@ interface RunResult {
  *
  * `AGENTMONITORS_DB` is always pinned to the case's own temp db. These temp
  * workspaces are not `enabled`, so `resolveWorkspaceDbPath()` would otherwise
- * fall back to the machine-wide default db (005 §2) — and this file shares a
+ * fall back to the machine-wide default db (spec: cli/authoring-commands) — and this file shares a
  * single non-isolated fork with the other serial daemon suites
  * (`vitest.serial.config.ts`), so a daemon holding that shared db would leak
  * into their runs.
@@ -529,7 +529,7 @@ describe('daemon run --detach (issue #389 P1)', () => {
   // The log captures daemon stdout/stderr — workspace paths, socket paths, and
   // monitor failure messages. Under a common `umask 022` a plain
   // `openSync(path, 'a')` creates it 0644, readable by every other local user;
-  // it must follow Agent Monitors' owner-only runtime-data policy (002 §3.1)
+  // it must follow Agent Monitors' owner-only runtime-data policy (spec: runtime/local-data-permissions)
   // instead. Regression coverage for both a custom `--log` and the default.
   it('creates the log owner-only (0600) and its parent 0700, whatever the umask', async () => {
     const ws = makeWorkspace('logmode');

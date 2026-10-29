@@ -60,14 +60,14 @@ const COMMAND_POLL_DEFAULT_COMMAND_BLOCK =
  * that never fires again.
  *
  * The mechanism is deliberate. `command-poll` classifies a nonzero exit *with*
- * output as a normal result (003 §11.2/§11.5), so a plain `exit 1` here would
+ * output as a normal result (spec: sources/command-poll), so a plain `exit 1` here would
  * be diffed like any other output: the very first tick would silently record
  * the error text as the baseline and stay quiet forever. Terminating by a
  * signal instead (`kill -TERM $$`) is classified as an execution **failure**,
  * which emits the `Command failing: <key>` health observation on the very
  * first tick, preserves any prior baseline rather than re-baselining onto
  * garbage, and emits `Command recovered: <key>` once `gh` works again
- * (003 §11.5). The human-readable remedy is written to stderr, which the
+ * (spec: sources/command-poll). The human-readable remedy is written to stderr, which the
  * failure observation carries as `stderrTail`.
  *
  * `$$` is the `sh` process's own PID — not `-$$`, which would signal the whole
@@ -94,7 +94,7 @@ const COMMAND_POLL_DEFAULT_COMMAND_BLOCK =
  * removed by an `EXIT` trap for ordinary exits, plus an explicit `rm -f` before each `kill -TERM $$`
  * self-signal: death by an untrapped signal does NOT run the `EXIT` trap in most `sh`
  * implementations, so the self-signal branches must clean up first. An external `SIGTERM` from
- * `command-poll`'s timeout escalation (003 §11.2/§11.7) can still strand the file, as can
+ * `command-poll`'s timeout escalation (spec: sources/command-poll) can still strand the file, as can
  * `SIGKILL` — the same limit every
  * one remaining escalation step is the only path a stale file can survive under — the same limit every
  * `mktemp`-based script has.
@@ -102,7 +102,7 @@ const COMMAND_POLL_DEFAULT_COMMAND_BLOCK =
  * Note the absence of `--repo`: `gh` resolves the repository from its process
  * working directory. Neither preset's frontmatter carries an explicit `cwd:`
  * — `command-poll` resolves an omitted `cwd` against the **runtime**
- * workspace/config root for a project monitor (003 §11.1), which is where
+ * workspace/config root for a project monitor (spec: sources/command-poll), which is where
  * this repository's `MONITOR.md` lives, so `gh` lands in the right directory
  * without a path baked into the file at scaffold time. Omitting `--repo` is
  * what then lets that resolved working directory scope `gh` to the right
@@ -179,9 +179,9 @@ const PR_REVIEW_URGENCY_COMMENT =
   '# that actually need reviewing right now: a PR that has been decided leaves the\n' +
   '# set instead of churning a field inside it, so there is no benign per-push or\n' +
   '# per-comment traffic to interrupt on. `normal` was tried and rejected — normal\n' +
-  '# reminders are coalesced-until-ack (002 §9.2), so one claimed-but-unacked\n' +
+  '# reminders are coalesced-until-ack (spec: delivery/lifecycles), so one claimed-but-unacked\n' +
   '# normal event from ANY monitor suppresses the reminder for all of them, and\n' +
-  '# normal carries no event BODY mid-session (002 §9.2/§9.3), so the reviewer\n' +
+  '# normal carries no event BODY mid-session (spec: delivery/lifecycles), so the reviewer\n' +
   '# would not learn WHICH PR needs review until session recap.\n';
 
 /**
@@ -190,15 +190,15 @@ const PR_REVIEW_URGENCY_COMMENT =
  * the payload filter: only PRs that need the author to act are in the list
  * at all, so an ordinary CI run (queued -> running -> passing) produces no
  * event, and `normal`'s coalesce-until-ack + no-mid-session-body behavior
- * (002 §9.2/§9.3) was tried in the field and does not work for this preset
- * (003 §11.9).
+ * (spec: delivery/lifecycles) was tried in the field and does not work for this preset
+ * (spec: cli/authoring-commands).
  */
 const MY_PRS_URGENCY_COMMENT =
   '# high, earned by the payload filter above: PRs are in the list only when they\n' +
   '# need YOU to do something (one benign exception below), so an ordinary CI run\n' +
   '# (queued -> running -> passing) produces no event. `normal` was tried in the\n' +
   '# field and does not work\n' +
-  '# here, for two compounding reasons (002 §9.2/§9.3):\n' +
+  '# here, for two compounding reasons (spec: delivery/lifecycles):\n' +
   '#   1. Normal reminders are coalesced-until-ack. One claimed-but-unacked normal\n' +
   '#      event from ANY monitor suppresses the coalesced reminder for ALL of them,\n' +
   '#      which in an active session is nearly always true — so a normal author\n' +
@@ -222,7 +222,7 @@ const MY_PRS_URGENCY_COMMENT =
  * seeded value, so only the general contract pointer applies.
  */
 const GENERALIZED_URGENCY_COMMENT =
-  '# urgency overridden via --urgency; see 002 §9 for how each level is delivered.\n';
+  '# urgency overridden via --urgency; see spec: delivery/lifecycles for how each level is delivered.\n';
 
 /** Maps a preset `--type` to its urgency-rationale comment, for
  * {@link seedUrgency}'s comment-swap. Types with no such comment (every
@@ -546,7 +546,7 @@ const PR_REVIEW_REDUCE =
  * PR they have. This is deliberately **not** claimed as a mathematical guarantee: an author with more
  * than 1000 simultaneously open PRs (not a realistic operating point for this preset) would still see
  * the oldest evicted, same failure shape as before at a vastly higher threshold (PR #446 review,
- * 21:43 round: this residual gap is real and intentionally not re-solved here — see 003 §11.9 for the
+ * 21:43 round: this residual gap is real and intentionally not re-solved here — see spec: cli/authoring-commands for the
  * documented boundary).
  *
  * **The merged/closed calls filter by a `merged:`/`closed:` search date range, not by relying on
@@ -856,7 +856,7 @@ const VALID_URGENCIES = ['low', 'normal', 'high'];
 
 /**
  * `--type` values that are ready-made presets rather than observation source
- * types (005 §2: "pr-review and my-prs are not source types"). Used to keep
+ * types (spec: cli/authoring-commands: "pr-review and my-prs are not source types"). Used to keep
  * {@link VALID_TYPES} — which Commander's `.choices()` still needs as one flat
  * list — split apart wherever the CLI presents types to a human, so the
  * interactive prompt and its error don't imply a preset is a kind of source.
@@ -869,7 +869,7 @@ const SOURCE_TYPES = VALID_TYPES.filter((type) => !PRESET_TYPES.has(type));
 
 /**
  * Types whose template has a seedable path-pattern list: `globs:` for
- * `file-fingerprint`, `paths:` for `incoming-changes` (spec 001 §2 field
+ * `file-fingerprint`, `paths:` for `incoming-changes` (spec: monitor/definition field
  * names differ per source even though `--glob` addresses both). Types not
  * in this map have no such block, so `--glob` is rejected for them.
  */
@@ -1128,7 +1128,7 @@ const GITIGNORE_LINE = '.claude/*.local.*';
  * `.agentmonitors/` is the project-root runtime directory the core writes
  * per-session hook state into (`<workspace>/.agentmonitors/sessions/<id>/hook-state.json`,
  * see `libs/core/src/adapter/claude.ts#defaultHookStatePath` and
- * docs/specs/002-runtime-delivery.md §11.3). It is created the moment a
+ * openspec/specs/delivery/host-adapters/spec.md). It is created the moment a
  * session opens — before any user opts into it — so it must be ignored
  * alongside {@link GITIGNORE_LINE} rather than left for the user to discover
  * in `git status` (issue #336). Every file under it is a materialized,
@@ -1167,7 +1167,7 @@ interface ScaffoldResult {
  * Neither preset seeds an explicit `cwd:` (issue #444 review, finding 826): a
  * PR-alerting preset omits `cwd` entirely, and `command-poll` now defaults an
  * omitted `cwd` to the **runtime** workspace/config root for a project
- * monitor (003 §11.1) — the same root the daemon resolves fresh on every
+ * monitor (spec: sources/command-poll) — the same root the daemon resolves fresh on every
  * tick, from wherever `MONITOR.md` actually lives, never a value baked into
  * the file at scaffold time. Baking in `process.cwd()` here, as an earlier
  * revision did, broke the very first tick after the project was relocated or
@@ -1283,7 +1283,7 @@ async function promptForMonitor(): Promise<{
     let type = DEFAULT_TYPE;
     for (;;) {
       // Presets (pr-review, my-prs) are listed separately from source types
-      // — 005 §2 is explicit that a preset is not a kind of source, and
+      // — spec: cli/authoring-commands is explicit that a preset is not a kind of source, and
       // conflating them here would make a future source-type-wide behavior
       // wrongly sweep presets in.
       const answer = (

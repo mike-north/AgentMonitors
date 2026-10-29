@@ -104,9 +104,9 @@ export const validateCommand = new Command('validate')
 
       // Extract per-source config (watch block minus `type`) for schema
       // validation. `validateWatchScope` is the shared core helper — schema
-      // check plus the BP3 `change-detection.collection` friendly wrapper (003
-      // §12) — so `validate` and the ephemeral `watch declare` path (007 §4.2)
-      // reject an invalid scope with the identical diagnosis (005 §14.4).
+      // check plus the BP3 `change-detection.collection` friendly wrapper (
+      // spec: sources/contract) — so `validate` and the ephemeral `watch declare` path (spec: agent/ephemeral-monitors)
+      // reject an invalid scope with the identical diagnosis (spec: agent/ephemeral-monitors).
       const { type: _type, ...watchConfig } = m.monitor.frontmatter.watch;
       const allScopeErrors = validateWatchScope(
         watchConfig,

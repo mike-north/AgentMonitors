@@ -3,7 +3,7 @@
  * used for the manual/no-docs CLI-path papercuts (issue #420 P2/P5).
  *
  * @see ./command-hints.ts
- * @see ../../../docs/specs/005-cli-reference.md §11 (events), §10 (monitor history)
+ * @see ../../../openspec/specs/cli/session-commands/spec.md (events), spec: cli/session-commands (monitor history)
  */
 import { Command } from 'commander';
 import { describe, expect, it, vi } from 'vitest';

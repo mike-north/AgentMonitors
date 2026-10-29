@@ -11,7 +11,7 @@
  * the watched file, and confirm the resulting signal is both queryable
  * (`events list --unread`) and deliverable through the real hook contract
  * (`hook deliver` fed a real Claude Code `UserPromptSubmit` stdin payload —
- * docs/specs/006-agent-integration.md §5). No MCP/channel path is exercised
+ * openspec/specs/delivery/hook-transport/spec.md). No MCP/channel path is exercised
  * (issue #276 non-goal); only `init`, `daemon`, `session`, `events`, and
  * `hook` subcommands are invoked.
  *
@@ -50,10 +50,10 @@
  * `--poll-ms`, isolated `AGENTMONITORS_DB`, settle-window waits with
  * margin).
  *
- * @see ../docs/specs/006-agent-integration.md §5 (hook stdin/stdout contract)
- * @see ../docs/specs/002-runtime-delivery.md §9.1 (15s high-urgency claim-time settle window)
- * @see ../docs/specs/002-runtime-delivery.md §10.4 (daemon IPC wire protocol)
- * @see ../docs/specs/002-runtime-delivery.md §10.5 (the `daemon.tick` method used to force a deterministic baseline)
+ * @see ../openspec/specs/delivery/hook-transport/spec.md (hook stdin/stdout contract)
+ * @see ../openspec/specs/delivery/lifecycles/spec.md (15s high-urgency claim-time settle window)
+ * @see ../openspec/specs/daemon/ipc/spec.md — "Newline-delimited JSON wire protocol", "Unparseable requests get a stable sentinel" (daemon IPC wire protocol)
+ * @see ../openspec/specs/daemon/ipc/spec.md (the `daemon.tick` method used to force a deterministic baseline)
  */
 import { Buffer } from 'node:buffer';
 import { spawn, spawnSync } from 'node:child_process';
@@ -92,7 +92,7 @@ if (process.platform === 'win32') {
 const PNPM_BIN = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
 const NPM_BIN = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
-// docs/specs/002-runtime-delivery.md §9.1: `claimDelivery`'s turn-interruptible
+// openspec/specs/delivery/lifecycles/spec.md: `claimDelivery`'s turn-interruptible
 // high-urgency branch only surfaces events that have aged past this hardcoded
 // claim-time settle window — independent of the monitor's own `notify`
 // settle-for. No CLI flag shortens it, so the polling timeout below must
@@ -214,8 +214,8 @@ function speedUpMonitorForTesting(monitorPath) {
 /**
  * Send a single request over the daemon's Unix-socket IPC and resolve with
  * its `result` — the newline-delimited JSON protocol documented in
- * docs/specs/002-runtime-delivery.md §10.4: "Each request/response is a
- * single newline-delimited JSON object." `daemon.tick` (§10.5) is the only
+ * openspec/specs/daemon/ipc/spec.md — "Newline-delimited JSON wire protocol", "Unparseable requests get a stable sentinel": "Each request/response is a
+ * single newline-delimited JSON object." `daemon.tick` (spec: daemon/ipc) is the only
  * method this script ever calls this way; every other daemon interaction
  * goes through the installed launcher binary, the real user-facing surface
  * this test exists to prove. `daemon.tick` has no CLI-exposed passthrough —
@@ -662,7 +662,7 @@ async function main() {
       async () => {
         // Force a real tick on the already-running daemon through the
         // `daemon.tick` IPC method (docs/specs/002-runtime-delivery.md
-        // §10.5) instead of sleeping and hoping the daemon's own --poll-ms
+        // spec: daemon/ipc) instead of sleeping and hoping the daemon's own --poll-ms
         // interval baselines the file first. Awaiting this call is a hard
         // guarantee the baseline fingerprint has been recorded before the
         // file is mutated below — a fixed sleep instead races the daemon's
@@ -752,7 +752,7 @@ async function main() {
     );
 
     await step(
-      'assert the hook wire JSON shape and a non-empty additionalContext (docs/specs/006 §5.1)',
+      'assert the hook wire JSON shape and a non-empty additionalContext (openspec/specs/delivery/hook-transport/spec.md)',
       () => {
         const parsed = JSON.parse(deliverOutput);
         if (parsed.continue !== true) {
@@ -784,7 +784,7 @@ async function main() {
     );
 
     await step(
-      'cross-check: claiming never acknowledges — the event is still unread, now "claimed" (docs/specs/002 §7)',
+      'cross-check: claiming never acknowledges — the event is still unread, now "claimed" (openspec/specs/delivery/session-projection/spec.md — "Unread, claimed, and acknowledged are distinct session states")',
       () => {
         const result = runCli([
           'events',

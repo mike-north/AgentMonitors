@@ -3,8 +3,8 @@
  * (issues #329, #420 P1, #389 P2).
  *
  * @see ./commands/hook.ts (writes these lines to stderr, unconditionally)
- * @see ../../../docs/specs/005-cli-reference.md §12.2.1 (always-on diagnostics)
- * @see ../../../docs/specs/006-agent-integration.md §5 (hook-deliver transport)
+ * @see ../../../openspec/specs/cli/session-commands/spec.md (always-on diagnostics)
+ * @see ../../../openspec/specs/delivery/hook-transport/spec.md (hook-deliver transport)
  */
 import { describe, expect, it } from 'vitest';
 import {
@@ -47,7 +47,7 @@ describe('describeUnknownHostSessionWarning', () => {
   // Regression: JSON.stringify only escapes C0 controls (< U+0020) — DEL,
   // the C1 controls (U+0080–U+009F, e.g. U+009B CSI), and the U+2028/U+2029
   // line/paragraph separators passed through raw, undermining the
-  // "control-safe one line" contract (005 §12.2.1 / 006 §5.2.1).
+  // "control-safe one line" contract (spec: cli/session-commands, delivery/hook-transport).
   it('escapes DEL, C1 controls, and U+2028/U+2029 that JSON.stringify leaves raw', () => {
     const hostile = 'a\u007fb\u009bc\u0085d\u2028e\u2029f';
     const msg = describeUnknownHostSessionWarning(hostile);

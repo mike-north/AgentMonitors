@@ -1,6 +1,6 @@
 /**
  * The deterministic **payload-transform** evaluator for `payload.form: structured`
- * (roadmap G15, [002 §1.1.6](../../../../docs/specs/002-runtime-delivery.md#116-author-declared-payload-form)).
+ * (spec: pipeline/post-processing, [spec: pipeline/post-processing](../../../../openspec/specs/pipeline/post-processing/spec.md)).
  *
  * When a monitor declares `payload.form: structured`, the author supplies a
  * turnkey declarative transform over the **canonical JSON** form of the shaped
@@ -11,7 +11,7 @@
  * - **`cel` gates** — it evaluates to a boolean: `true` delivers the canonical
  *   (un-reshaped) shaped snapshot; `false` **suppresses delivery entirely** (a
  *   suppressed delivery is recorded, not silently dropped — that recording is
- *   the runtime's job, §1.1.6).
+ *   the runtime's job, spec: pipeline/post-processing).
  *
  * **CSP / Workers safety.** Both evaluators are pure parser/interpreter
  * implementations that do **not** use the `Function` constructor or `eval`:
@@ -20,8 +20,8 @@
  * `@cfworker/json-schema` over `ajv`. The transform is a constrained declarative
  * expression — **not** arbitrary user code.
  *
- * @see ../../../../docs/specs/001-monitor-definition.md §5.2 (payload form)
- * @see ../../../../docs/specs/002-runtime-delivery.md §1.1.6
+ * @see ../../../../openspec/specs/monitor/definition/spec.md (payload form)
+ * @see ../../../../openspec/specs/pipeline/post-processing/spec.md
  */
 import { evaluate as celEvaluate, parse as celParse } from 'cel-js';
 import jqInTheBrowser from 'jq-in-the-browser';
@@ -30,7 +30,7 @@ import jqInTheBrowser from 'jq-in-the-browser';
 export type TransformLanguage = 'jq' | 'cel';
 
 /**
- * An author-declared `payload.transform` block ([001 §5.2](../../../../docs/specs/001-monitor-definition.md#52-payload-form-target)).
+ * An author-declared `payload.transform` block ([spec: monitor/definition](../../../../openspec/specs/monitor/definition/spec.md)).
  */
 export interface PayloadTransform {
   /** `jq` (extraction/reshaping) or `cel` (boolean significance gate). */
@@ -62,7 +62,7 @@ export type TransformOutcome =
  * @throws if the expression is malformed (callers that need a soft failure
  *   should validate first with {@link validatePayloadTransform}).
  *
- * @see ../../../../docs/specs/002-runtime-delivery.md §1.1.6
+ * @see ../../../../openspec/specs/pipeline/post-processing/spec.md
  */
 export function applyPayloadTransform(
   canonical: unknown,
@@ -74,7 +74,7 @@ export function applyPayloadTransform(
     return { delivered: true, value: run(canonical) };
   }
   // cel gates: a boolean. `true` delivers the canonical snapshot un-reshaped;
-  // `false` suppresses the delivery entirely (§1.1.6).
+  // `false` suppresses the delivery entirely (spec: pipeline/post-processing).
   const context =
     canonical !== null &&
     typeof canonical === 'object' &&
@@ -92,9 +92,9 @@ export function applyPayloadTransform(
  * it against data. Returns `undefined` when the expression compiles, or a
  * human-readable error message when it is malformed. Used by `validate` so a
  * malformed `jq`/`cel` transform is rejected before runtime
- * ([001 §5.2](../../../../docs/specs/001-monitor-definition.md#52-payload-form-target)).
+ * ([spec: monitor/definition](../../../../openspec/specs/monitor/definition/spec.md)).
  *
- * @see ../../../../docs/specs/004-validation-testing.md §2.2
+ * @see ../../../../openspec/specs/monitor/validation/spec.md
  */
 export function validatePayloadTransform(
   transform: PayloadTransform,

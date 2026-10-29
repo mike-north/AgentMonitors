@@ -79,7 +79,7 @@ const SQLITE_ARTIFACT_SUFFIXES = ['', '-wal', '-shm', '-journal'] as const;
 
 /**
  * Database paths whose artifact modes have already been tightened this process.
- * Spec 002 §3.1 requires tightening once per *startup* (one process); caching
+ * Spec spec: runtime/local-data-permissions requires tightening once per *startup* (one process); caching
  * lets a re-`createDb` on the same path in a long-lived process skip the
  * per-suffix `lstat`/`open`/`fchmod` cycles. Tests simulating a second startup
  * in one process clear it via {@link resetSqliteArtifactModeCacheForTest}.
@@ -237,10 +237,10 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
   // `source_state`) is reset.
   migrateMonitorStateToWorkspaceScope(db, sqlite);
 
-  // Ephemeral (agent-declared, session-scoped) monitors (007 §4). Additive —
+  // Ephemeral (agent-declared, session-scoped) monitors (spec: agent/ephemeral-monitors). Additive —
   // a brand-new table, so a durable DB from an earlier version simply gains it
   // on the next open. Keyed to the declaring session; survives a daemon restart
-  // while that session lives (007 §4.4, BP1).
+  // while that session lives (spec: agent/ephemeral-monitors, BP1).
   db.run(sql`
     CREATE TABLE IF NOT EXISTS ephemeral_monitors (
       id TEXT PRIMARY KEY,
@@ -317,7 +317,7 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
     )
   `);
 
-  // Additive migration (G10 PR-B, 002 §1.1.7): a `monitor_events` table created
+  // Additive migration (spec: pipeline/post-processing): a `monitor_events` table created
   // before PR-B lacks the persisted `baseline_strategy` column. Add it if
   // missing so the per-recipient `net` collapse can read each event's strategy
   // at claim time; legacy rows keep NULL and are treated as `incremental`.
@@ -353,7 +353,7 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
     )
   `);
 
-  // Additive migration (G14, 002 §1.1.8): a `session_event_state` table created
+  // Additive migration (spec: pipeline/post-processing): a `session_event_state` table created
   // by an earlier version lacks the per-recipient Interpret columns. `CREATE
   // TABLE IF NOT EXISTS` will not add them, so add each missing column to keep
   // pre-existing durable DBs forward-compatible (restart-safety, BP1).
@@ -366,7 +366,7 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
   addColumnIfMissing(sqlite, 'session_event_state', 'interpret_reason', 'TEXT');
   addColumnIfMissing(sqlite, 'session_event_state', 'interpret_digest', 'TEXT');
 
-  // Per-recipient baseline cursor + per-recipient delta (G10, 002 §1.1.2).
+  // Per-recipient baseline cursor + per-recipient delta (spec: pipeline/post-processing).
   db.run(sql`
     CREATE TABLE IF NOT EXISTS session_object_cursor (
       id TEXT PRIMARY KEY,
@@ -391,13 +391,13 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
       )
   `);
 
-  // Additive migration (G10, 002 §1.1.2): a `session_event_state` table created
+  // Additive migration (spec: pipeline/post-processing): a `session_event_state` table created
   // before G10 lacks the per-recipient `diff_text` column. Add it if missing so
   // pre-existing durable DBs stay forward-compatible; legacy rows keep a NULL
   // here and delivery/explain fall back to the shared `monitor_events.diff_text`.
   addColumnIfMissing(sqlite, 'session_event_state', 'diff_text', 'TEXT');
 
-  // Additive migration (G10 PR-B, 002 §1.1.7): a `session_event_state` table
+  // Additive migration (spec: pipeline/post-processing): a `session_event_state` table
   // created before PR-B lacks the per-recipient `net`-collapse suppression
   // marker. Add it if missing; legacy rows keep NULL (never net-suppressed).
   addColumnIfMissing(
@@ -491,7 +491,7 @@ function migrateMonitorStateToWorkspaceScope(
  *
  * The durable `notify_state` batch is NOT diagnostic and is NOT dropped:
  * `pendingDebounce`/`pendingRollup` hold ALREADY-DETECTED observations the
- * runtime MUST redeliver after a restart (002 §4.4, issue #109); dropping them
+ * runtime MUST redeliver after a restart (spec: runtime/notify-dispatch, pipeline/post-processing, issue #109); dropping them
  * is silent, permanent event loss (the next tick re-baselines and never
  * re-detects those changes). Each batched observation carries its monitor's
  * `filePath`, from which its workspace is derived, so a batch is split across

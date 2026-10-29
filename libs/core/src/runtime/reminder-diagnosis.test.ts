@@ -4,9 +4,9 @@
  * The expected verdicts are derived BY HAND from the delivery-guard spec, not
  * captured from program output:
  *
- *   §9.2 — at `turn-interruptible`, normal-urgency events surface a generic
+ *   spec: delivery/lifecycles — at `turn-interruptible`, normal-urgency events surface a generic
  *          inbox reminder ONLY IF all unread normal events are still unclaimed.
- *   §9.3 — at `turn-idle`, low-urgency events surface a generic reminder ONLY IF
+ *   spec: delivery/lifecycles — at `turn-idle`, low-urgency events surface a generic reminder ONLY IF
  *          all unread low events are still unclaimed.
  *
  * So the reminder is suppressed exactly when there is unread work AND at least
@@ -15,9 +15,9 @@
  * `hook claim --lifecycle turn-interruptible` returned `null` after the first
  * had claimed the only normal event.
  *
- * @see ../../../../docs/specs/002-runtime-delivery.md §9.2 (normal reminder)
- * @see ../../../../docs/specs/002-runtime-delivery.md §9.3 (low reminder)
- * @see ../../../../docs/specs/002-runtime-delivery.md §10.7 (monitor explain)
+ * @see ../../../../openspec/specs/delivery/lifecycles/spec.md (normal reminder)
+ * @see ../../../../openspec/specs/delivery/lifecycles/spec.md (low reminder)
+ * @see ../../../../openspec/specs/daemon/ipc/spec.md (monitor explain)
  */
 import { describe, expect, it } from 'vitest';
 import {
@@ -26,7 +26,7 @@ import {
 } from './reminder-diagnosis.js';
 
 describe('diagnoseReminderSuppression', () => {
-  it('reports no finding when every unread normal event is still unclaimed (reminder would fire, §9.2)', () => {
+  it('reports no finding when every unread normal event is still unclaimed (reminder would fire, spec: delivery/lifecycles)', () => {
     // unread === pending → guard `pending === unread && pending > 0` holds → fires.
     const counts: ReminderSessionCounts[] = [
       { sessionId: 's1', urgency: 'normal', unreadCount: 2, pendingCount: 2 },
@@ -34,7 +34,7 @@ describe('diagnoseReminderSuppression', () => {
     expect(diagnoseReminderSuppression(counts)).toEqual([]);
   });
 
-  it('reports `already-claimed` when the only unread normal event is claimed (the S3 trap, §9.2)', () => {
+  it('reports `already-claimed` when the only unread normal event is claimed (the S3 trap, spec: delivery/lifecycles)', () => {
     // The S3 sequence: reminder fired once (claiming the event), so a second
     // claim finds unread=1 (still unacked), pending=0 (claimed) → suppressed.
     const counts: ReminderSessionCounts[] = [
@@ -46,7 +46,7 @@ describe('diagnoseReminderSuppression', () => {
     expect(finding).toMatchObject({
       sessionId: 's1',
       urgency: 'normal',
-      lifecycle: 'turn-interruptible', // §9.2 delivers at turn-interruptible
+      lifecycle: 'turn-interruptible', // spec: delivery/lifecycles delivers at turn-interruptible
       unreadCount: 1,
       claimedCount: 1,
       reason: 'already-claimed',
@@ -120,7 +120,7 @@ describe('diagnoseReminderSuppression', () => {
     );
   });
 
-  it('reports `coalesced-until-ack` when unread normal events mix claimed and unclaimed (§9.2)', () => {
+  it('reports `coalesced-until-ack` when unread normal events mix claimed and unclaimed (spec: delivery/lifecycles)', () => {
     // unread=3, pending=1 → 2 claimed, 1 unclaimed. `pending !== unread` → the
     // coalesced reminder is held back by the claimed rows even though a fresh
     // unclaimed event exists.
@@ -138,7 +138,7 @@ describe('diagnoseReminderSuppression', () => {
     expect(findings[0]?.message).toContain('2 of 3');
   });
 
-  it('diagnoses the low-urgency reminder at turn-idle (§9.3)', () => {
+  it('diagnoses the low-urgency reminder at turn-idle (spec: delivery/lifecycles)', () => {
     const counts: ReminderSessionCounts[] = [
       { sessionId: 's1', urgency: 'low', unreadCount: 1, pendingCount: 0 },
     ];
@@ -146,7 +146,7 @@ describe('diagnoseReminderSuppression', () => {
     expect(findings).toHaveLength(1);
     expect(findings[0]).toMatchObject({
       urgency: 'low',
-      lifecycle: 'turn-idle', // §9.3 delivers at turn-idle
+      lifecycle: 'turn-idle', // spec: delivery/lifecycles delivers at turn-idle
       reason: 'already-claimed',
     });
     expect(findings[0]?.message).toContain('Low-urgency reminder at turn-idle');

@@ -20,7 +20,7 @@
  * hook-state path into a shared, group-writable directory), the `chmod` fails
  * with `EPERM`/`EACCES`. That is not fatal — the pre-hardening code needed only
  * write permission — so the helpers emit one structured stderr warning per path
- * per process and continue rather than throwing (spec 002 §3.1).
+ * per process and continue rather than throwing (spec: runtime/local-data-permissions).
  */
 import {
   chmodSync,
@@ -173,7 +173,7 @@ export function restrictExistingPathMode(
 
 /**
  * Paths for which {@link ensurePrivateDir} has already created-and-tightened the
- * directory this process. Spec 002 §3.1 requires tightening once per *startup*
+ * directory this process. Spec spec: runtime/local-data-permissions requires tightening once per *startup*
  * (a startup is one process); the daemon then writes hook state per lead session
  * per tick, so re-running `lstat`/`open`/`fchmod` on the same session directory
  * every write is wasted work. The cache collapses that to one verification per

@@ -38,7 +38,7 @@ Acknowledgement (`agentmonitors events ack --session <id>`, or the MCP `agentmon
 always a separate, explicit step, so a claimed-but-unhandled event stays discoverable.
 
 _Governing spec: [`docs/specs/002-runtime-delivery.md`](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/002-runtime-delivery.md)
-§6 (session projection), §7 (unread/claimed/acknowledged), §9 (delivery lifecycles)._
+spec: delivery/session-projection (session projection), spec: delivery/session-projection — "Unread, claimed, and acknowledged are distinct session states" (unread/claimed/acknowledged), spec: delivery/lifecycles (delivery lifecycles)._
 
 ## Urgency: what's surfaced, and when
 
@@ -81,7 +81,7 @@ showed you (e.g. `agentmonitors events ack --session <id> --event-ids <id1>,<id2
 handled what it showed. Acking is what turns the coalesced reminder back on for the affected band's next
 `normal`/`low` event.
 
-_Governing spec: 002 §9.1 (high), §9.2 (normal), §9.3 (low), §9.4 (recap)._
+_Governing spec: spec: delivery/lifecycles (high), spec: delivery/lifecycles (normal), spec: delivery/lifecycles (low), spec: delivery/lifecycles — "Post-compact recap", "Claiming marks rows claimed without acknowledging" (recap)._
 
 ## What the Claude Code plugin automates (hooks)
 
@@ -100,7 +100,7 @@ a silent no-op (with a one-time onboarding hint on `SessionStart`) rather than a
 every prompt.
 
 _Governing spec: [`docs/specs/006-agent-integration.md`](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/006-agent-integration.md)
-§3 (hook-state transport), §5 (the `hook deliver` wire contract), §5.6 (plugin activation packaging)._
+spec: delivery/hook-transport — "Hook-state transport is the per-session portable baseline" (hook-state transport), spec: delivery/hook-transport (the `hook deliver` wire contract), spec: delivery/channel-transport, delivery/hook-transport (plugin activation packaging)._
 
 ## What the optional MCP channel adds
 
@@ -118,12 +118,12 @@ The channel is also **research-preview and gated**: it requires Claude Code v2.1
 Team/Enterprise plans an admin must enable channels and allowlist the server. This is exactly why
 it's built as an addition, never a dependency — see the next section.
 
-_Governing spec: 006 §4 (channel mechanism, notification schema, the `agentmon_ack` tool), §6
+_Governing spec: spec: delivery/channel-transport (channel mechanism, notification schema, the `agentmon_ack` tool), spec: delivery/transport-seam
 (availability & the additive-only invariant)._
 
 ## Restricted environments: operating without MCP
 
-**MCP is never required.** This is a spec invariant (006 §6, "NP-CH"), not an incidental gap:
+**MCP is never required.** This is a spec invariant (spec: delivery/transport-seam, "NP-CH"), not an incidental gap:
 every capability — delivery, acknowledgement, and status — is reachable through hooks and the CLI
 over the same daemon connection the channel itself uses. A hooks-only deployment is a fully
 supported, first-class configuration, not a degraded fallback.
@@ -174,8 +174,8 @@ agentmonitors events ack --session <session-id>
 agentmonitors events list --session <session-id> --unread
 ```
 
-_Governing spec: 006 §2 (the transport seam — every transport drives the same daemon IPC, never
-re-deriving delivery decisions), §6 (availability & fallback, NP-CH)._
+_Governing spec: spec: delivery/transport-seam (the transport seam — every transport drives the same daemon IPC, never
+re-deriving delivery decisions), spec: delivery/transport-seam (availability & fallback, NP-CH)._
 
 ## Host support today
 
@@ -193,7 +193,7 @@ the Claude Code channel). That adapter ships today only for Claude Code; Codex a
 are named, scoped **target** work with a defined contract each future adapter must satisfy — not
 yet implemented, and not overstated as available.
 
-_Governing spec: 006 §11 (the multi-host adapter matrix, target status; see §11.1 for the contract
+_Governing spec: change: add-multi-host-adapters (the multi-host adapter matrix, target status; see change: add-multi-host-adapters for the contract
 every future host adapter must satisfy)._
 
 ## Learn more

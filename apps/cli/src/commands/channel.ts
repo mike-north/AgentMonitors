@@ -175,7 +175,7 @@ function reminderFooterLength(reminder: string | undefined): number {
 
 /**
  * Reserve a `turn-interruptible` delivery sized to fit under the channel's
- * content ceiling, tolerating the preview↔reserve race (006 §5.5, issue #442).
+ * content ceiling, tolerating the preview↔reserve race (spec: delivery/channel-transport, delivery/hook-transport, issue #442).
  *
  * Sizing (`previewSettledHighDeliveryClient` + `packChannelEventsUnderCap`) and
  * reservation (`reserveDeliveryClient`) are two SEPARATE IPC round-trips, so the
@@ -236,7 +236,7 @@ function reminderFooterLength(reminder: string | undefined): number {
  * only asks "does the CLAIMED set fit", never "is there MORE settled work
  * than what got claimed". Left unchecked, the push would render with no
  * {@link CHANNEL_DEFERRED_MARKER} even though the second, now-settled event
- * stays pending — contrary to 006 §5.5 ("the render omits any pending event
+ * stays pending — contrary to spec: delivery/channel-transport, delivery/hook-transport ("the render omits any pending event
  * ... signposting that more updates are pending").
  *
  * Re-runs the SAME read-only preview {@link reserveSizedChannelDelivery}
@@ -422,22 +422,22 @@ export async function reserveSizedChannelDelivery(
 }
 
 /**
- * One reserve → push → commit/release delivery cycle for a bound session (006
- * §4, issue #300).
+ * One reserve → push → commit/release delivery cycle for a bound session (
+ * spec: delivery/channel-transport, issue #300).
  *
  * Reserves the pending `turn-interruptible` delivery — which leases the rows so
- * the hook transport will not double-surface them (006 §4.5) — pushes the claim
+ * the hook transport will not double-surface them (spec: delivery/channel-transport) — pushes the claim
  * via `push`, and COMMITS the claim only after the push resolves. If `push`
  * rejects (an MCP disconnect/rejection), the reservation is RELEASED so the rows
  * stay unclaimed and re-deliver via the hook transport or the next poll — a
  * transient failure never consumes the delivery. The rows are never
  * acknowledged by this path (BP2); a committed claim only means "was surfaced".
  *
- * **Bounded reservation (006 §5.5, issue #442).** {@link
+ * **Bounded reservation (spec: delivery/channel-transport, delivery/hook-transport, issue #442).** {@link
  * reserveSizedChannelDelivery} sizes (and, if the preview↔reserve race leaves
  * an oversized or mismatched claim, re-sizes) the reservation so the
  * reserved/claimed set is sized to what `push` will actually render — the
- * claimed set still equals the rendered set (006 §5.5) — and any settled-high
+ * claimed set still equals the rendered set (spec: delivery/channel-transport, delivery/hook-transport) — and any settled-high
  * events that do not fit stay pending, re-delivering on a later poll. `push`
  * receives a second `moreDeferred` flag so the renderer can signpost that more
  * is pending.
@@ -446,7 +446,7 @@ export async function reserveSizedChannelDelivery(
  * them to "daemon unreachable → drop the cached session"); a `push` rejection is
  * handled here (release + `'push-failed'`), not thrown. The `push` seam is what
  * the integration test injects to exercise the success and disconnect paths
- * without a live Claude Code MCP host (channels are research-preview, §4/§6).
+ * without a live Claude Code MCP host (channels are research-preview, spec: delivery/channel-transport, delivery/transport-seam).
  */
 export async function runChannelDeliveryCycle(
   boundSession: string,
@@ -460,8 +460,8 @@ export async function runChannelDeliveryCycle(
     await push(reservation.claim, moreDeferred);
   } catch {
     // Push rejected/disconnected: release the reservation so the leased rows
-    // return to pending and re-deliver via the hook path or the next poll (006
-    // §4, issue #300). NEVER commit here — committing an unsurfaced claim is the
+    // return to pending and re-deliver via the hook path or the next poll (
+    // spec: delivery/channel-transport, issue #300). NEVER commit here — committing an unsurfaced claim is the
     // delivery-loss bug this cycle exists to prevent. Release is best-effort: if
     // it also fails (daemon unreachable), the reservation self-expires.
     await releaseDeliveryClient(reservation.reservationId, socketPath).catch(
@@ -470,7 +470,7 @@ export async function runChannelDeliveryCycle(
     return 'push-failed';
   }
   // Surfaced successfully: commit the claim now (the rows become claimed / "was
-  // surfaced", deduped from the hook transport — 006 §4.5). Claim is not ack (BP2).
+  // surfaced", deduped from the hook transport — spec: delivery/channel-transport). Claim is not ack (BP2).
   // commit returns null when the reservation was already gone (lease expired
   // during a slow/hung push, or the daemon restarted): the push already
   // happened, but the rows were never claimed, so they stay eligible for
@@ -502,10 +502,10 @@ export const CHANNEL_SERVER_INSTRUCTIONS =
  * event. Each poll RESERVES the delivery, pushes it, and COMMITS the claim only
  * after the push succeeds — so a rejected or disconnected push never permanently
  * consumes the delivery; the leased rows are released back to the hook transport
- * (006 §4, issue #300). Reserving leases the rows, so cross-transport dedup (006
- * §4.5) still holds during the push. Inbound: expose an `agentmon_ack` tool that
+ * (spec: delivery/channel-transport, issue #300). Reserving leases the rows, so cross-transport dedup (
+ * spec: delivery/channel-transport) still holds during the push. Inbound: expose an `agentmon_ack` tool that
  * routes through `events.ack` so the agent can acknowledge what it has handled
- * (006 §4.3).
+ * (spec: delivery/channel-transport — "Channel acknowledgement tool", "Acknowledgement is re-authorized to the bound session").
  */
 async function runChannelServe(options: ChannelServeOptions): Promise<void> {
   const hostSessionId =
@@ -567,7 +567,7 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
     try {
       const boundSession = await resolveSession();
       // events.ack only touches rows projected to this session, so passing the
-      // bound session id is the "outbound gate" that re-authorizes the ids (006 §4.3).
+      // bound session id is the "outbound gate" that re-authorizes the ids (spec: delivery/channel-transport — "Channel acknowledgement tool", "Acknowledgement is re-authorized to the bound session").
       await acknowledgeEventsClient(
         boundSession,
         parsed.args.eventIds,
@@ -687,7 +687,7 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
       }
     } catch {
       // Reserve/commit/release IPC failed → daemon unreachable / socket missing:
-      // the hook-state transport still delivers durably (006 §7), and any
+      // the hook-state transport still delivers durably (spec: delivery/transport-seam — "Permission relay is out of scope", "Inbound channel messages are not a source"), and any
       // reservation we couldn't release self-expires. Drop the cached session id
       // and retry.
       sessionId = undefined;

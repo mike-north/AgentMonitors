@@ -112,13 +112,13 @@ describe('renderChannelEvent', () => {
     expect(rendered.length).toBeLessThanOrEqual(MAX_EVENT_DIFF);
   });
 
-  // 006 §4.6 / §4.2.1 / §5.5 (issue #436 human-review finding #3): the
+  // spec: delivery/channel-transport, delivery/transport-seam, delivery/hook-transport (issue #436 human-review finding #3): the
   // per-event diff bound is an INDEPENDENT truncation layer from the
   // channel's own content ceiling (`MAX_CHANNEL_CONTENT`, 20,000 chars,
   // exercised further down this file) — the channel packs WHOLE blocks under
   // that ceiling (never dropping a partial block to fit), with the single
   // exception of a lone oversized event, which `renderChannelEvent`
-  // mid-truncates as a last resort (§4.2.1). The per-event diff bound applies
+  // mid-truncates as a last resort (spec: delivery/channel-transport, delivery/transport-seam). The per-event diff bound applies
   // regardless of overall size, so no single untrusted diff is dumped
   // wholesale even when the whole claim comfortably fits under the ceiling.
   // Its elision marker is applied INSIDE buildEventBlock and then sanitized,
@@ -194,7 +194,7 @@ describe('renderChannelEvent', () => {
       expect(typeof value).toBe('string');
       // keys must be identifiers (no hyphens — the host drops them silently)
       expect(key).toMatch(/^[a-z0-9_]+$/);
-      // every value must be free of tag-breakout characters (006 §4.6)
+      // every value must be free of tag-breakout characters (spec: delivery/channel-transport, delivery/transport-seam — "Channel meta and content are sanitized", "Injecting transports keep identity out of untrusted content")
       expect(value).not.toMatch(/[<>[\]\r\n;]/);
     }
   });
@@ -233,7 +233,7 @@ describe('renderChannelEvent', () => {
   // `renderHookDelivery`'s identical footer — `claim.coalescedReminder` must
   // be surfaced explicitly whenever set, since `claim.events`/`claim.message`
   // carry no representation of it on their own, and `claimDelivery` claims
-  // the coalesced normal rows alongside the surfaced high events (006 §5.5).
+  // the coalesced normal rows alongside the surfaced high events (spec: delivery/channel-transport, delivery/hook-transport).
   it('appends the coalesced reminder footer, with this transport’s own agentmon_ack action step, after the packed event block(s)', () => {
     const { content } = renderChannelEvent(
       makeClaim({
@@ -244,8 +244,8 @@ describe('renderChannelEvent', () => {
     expect(content).toContain('Monitored changes are pending.');
     // The runtime's coalesced reminder is transport-neutral; the channel
     // transport appends its OWN acknowledge step (the `agentmon_ack` tool, not
-    // the hook's CLI verb — issue #445 wording contract, 002 §9.2 / 006
-    // §5.1.1) so the coalesced reminder is self-sufficient on the channel too.
+    // the hook's CLI verb — issue #445 wording contract, spec: delivery/lifecycles /
+    // spec: delivery/channel-transport, delivery/hook-transport, delivery/transport-seam) so the coalesced reminder is self-sufficient on the channel too.
     expect(content).toContain('agentmon_ack');
     expect(content).toContain(
       'agentmonitors events list --session s1 --unread',
@@ -361,7 +361,7 @@ describe('renderChannelEvent', () => {
     expect(meta.monitor_id).not.toMatch(/[<>[\]]/);
   });
 
-  // 006 §5.5: when the coalesced claim's blocks all fit under
+  // spec: delivery/channel-transport, delivery/hook-transport: when the coalesced claim's blocks all fit under
   // MAX_CHANNEL_CONTENT, the channel renders every event it claims uncut — the
   // claimed set equals the rendered set. A large coalesced delivery whose
   // joined blocks exceed the old 4000-char hook cap, but stay under
@@ -451,7 +451,7 @@ describe('renderChannelEvent', () => {
   // the separately-deferred remainder are two different, non-overlapping
   // facts, so BOTH markers must be signposted — rendering only the
   // truncation marker would silently drop the "more work is pending" signal,
-  // contradicting 006 §5.5's candidate-growth guarantee (and diverging from
+  // contradicting spec: delivery/channel-transport, delivery/hook-transport's candidate-growth guarantee (and diverging from
   // the hook transport's `renderHookDelivery`, which renders both of its
   // analogous markers in the identical mixed case).
   it('mid-truncates the oversized first event AND signposts the genuinely deferred remainder (mixed case)', () => {
@@ -493,14 +493,14 @@ describe('renderChannelEvent', () => {
 
   // Issue #436: a normal-band reminder carries no concrete events, but its
   // event_count must reflect the pending events it refers to — NOT read "0"
-  // (which looks like a bug). 002 §9.2: reminders carry no event bodies.
+  // (which looks like a bug). spec: delivery/lifecycles: reminders carry no event bodies.
   //
   // Issue #438: attribution is transport-owned. The runtime emits a SEMANTIC
   // message; this transport adds NO prefix, because the enclosing
   // `<channel source="agentmonitors">` tag already names the source — an
   // "AgentMon" prefix here would double-attribute.
   it('renders a reminder claim with the runtime message plus the channel-owned agentmon_ack action step, unattributed, counting the pending events it refers to', () => {
-    // 002 §9.2 (PR #445 review, finding 2): the runtime's own message is now
+    // spec: delivery/lifecycles (PR #445 review, finding 2): the runtime's own message is now
     // transport-neutral — no CLI verb baked in — so this transport supplies
     // its OWN action step (`agentmon_ack`, not the hook's CLI ack command).
     const semanticReminder = 'Monitored changes are pending.';
@@ -616,7 +616,7 @@ describe('buildChannelTruncatedMarker', () => {
     // The raw, unsanitized id must not survive verbatim into the marker.
     expect(marker).not.toContain('a<b>c[d];e\r\nf');
     // No tag-breakout or attribute-breakout characters survive from the
-    // EMBEDDED session id (§4.6) — the marker's own template intentionally
+    // EMBEDDED session id (spec: delivery/channel-transport, delivery/transport-seam — "Channel meta and content are sanitized", "Injecting transports keep identity out of untrusted content") — the marker's own template intentionally
     // starts with `\n\n`, so only the id-derived characters are checked here.
     const [, embeddedId] = /--session (\S+) --unread/.exec(marker) ?? [
       undefined,

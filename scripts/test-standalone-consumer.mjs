@@ -160,9 +160,9 @@ try {
   const port = address.port;
 
   // Both fixtures below declare \`baseline-strategy: incremental\` explicitly:
-  // the default, \`net\` (001 §3.7), collapses each object's multiple
-  // observations down to one delivered "newest" event at claim time (002
-  // §1.1.7), which would undercount the per-observation event/unread
+  // the default, \`net\` (spec: monitor/definition), collapses each object's multiple
+  // observations down to one delivered "newest" event at claim time (
+  // spec: pipeline/post-processing), which would undercount the per-observation event/unread
   // assertions below (each of the 2 ticks touches the same object twice).
   // \`incremental\` restores the original play-by-play semantics this smoke
   // test was written against.
@@ -255,7 +255,7 @@ Tell the agent the local API changed.
   const claim = runtime.claimDelivery(session.id, 'turn-interruptible');
   assert.ok(claim);
   assert.equal(claim.urgency, 'normal');
-  // 002 §9.2 (issues #438/#434, revised by PR #445 review finding 2): a
+  // spec: delivery/lifecycles (issues #438/#434, revised by PR #445 review finding 2): a
   // prior revision of this assertion (matching a prior revision of
   // \`reminderMessage\`) required the runtime's reminder body to embed BOTH
   // runnable commands directly. That embedding was itself the defect finding
@@ -303,11 +303,11 @@ Tell the agent the local API changed.
   // ---- command-poll source: direct-call smoke ----
   // Exercised directly (like schedule above) rather than via a full runtime
   // tick: command-poll's behavior is fully deterministic from \`observe()\`
-  // inputs alone (003 §11), so a tick-based fixture would add scaffolding
+  // inputs alone (spec: sources/command-poll), so a tick-based fixture would add scaffolding
   // without adding coverage. The first call establishes the baseline (no
   // observations); the second call, with the same argv but a different
   // \`env\` value threaded into stdout, must emit exactly one
-  // output-changed event (003 §11.3/§11.4, text-diff strategy).
+  // output-changed event (spec: sources/command-poll, text-diff strategy).
   const commandScope = {
     command: ['node', '-e', 'console.log(process.env.SMOKE_VALUE || "")'],
   };
@@ -335,7 +335,7 @@ Tell the agent the local API changed.
   // The incoming-changes source shells out to git, so exercise it against a
   // real temp repo: create a branch with an initial commit, baseline it, then
   // advance it with a second commit touching the tracked path and assert the
-  // next tick emits exactly one event for the changed file (spec 003 §6.2).
+  // next tick emits exactly one event for the changed file (spec: sources/incoming-changes).
   const gitRepoDir = path.join(projectDir, 'incoming-repo');
   const trackedDir = path.join(gitRepoDir, 'tracked');
   const trackedFile = path.join(trackedDir, 'file.txt');
@@ -394,7 +394,7 @@ Tell the agent an incoming change landed.
   const incomingWorkspaceDir = path.join(projectDir, 'incoming-workspace');
   mkdirSync(incomingWorkspaceDir, { recursive: true });
 
-  // Baseline run: records the current SHA and emits nothing (spec 003 §6.2).
+  // Baseline run: records the current SHA and emits nothing (spec: sources/incoming-changes).
   const incomingBaselineTick = await runtime.tick(
     incomingMonitorsDir,
     incomingWorkspaceDir,
@@ -416,21 +416,21 @@ Tell the agent an incoming change landed.
   assert.equal(incomingEvents.length, 1);
   const incomingEvent = incomingEvents[0];
   assert.ok(incomingEvent);
-  // spec 002 §5.4: the event title is the monitor's authored name
+  // spec: runtime/event-materialization: the event title is the monitor's authored name
   assert.equal(incomingEvent.title, 'Watch incoming');
-  // spec 003 §6.2: the source's own text — "Incoming change: <path>
+  // spec: sources/incoming-changes: the source's own text — "Incoming change: <path>
   // (<changeKind>)" — is carried by summary
   assert.equal(
     incomingEvent.summary,
     'Incoming change: tracked/file.txt (modified)',
   );
-  // spec 003 §2.3 + §6.2: runtime copies changeKind into queryScope.changeKind
+  // spec: sources/contract + spec: sources/incoming-changes: runtime copies changeKind into queryScope.changeKind
   assert.equal(incomingEvent.queryScope.changeKind, 'modified');
-  // spec 003 §6.2: objectKey is the file path as reported by git
+  // spec: sources/incoming-changes: objectKey is the file path as reported by git
   assert.equal(incomingEvent.objectKey, 'tracked/file.txt');
-  // spec 003 §6.2: snapshotText is the new file content for modified files
+  // spec: sources/incoming-changes: snapshotText is the new file content for modified files
   assert.equal(incomingEvent.snapshotText, 'two\\n');
-  // spec 003 §6.2: payload is { path, status, fromRef, toRef }
+  // spec: sources/incoming-changes: payload is { path, status, fromRef, toRef }
   assert.equal(incomingEvent.payload.path, 'tracked/file.txt');
   assert.equal(incomingEvent.payload.status, 'M');
 

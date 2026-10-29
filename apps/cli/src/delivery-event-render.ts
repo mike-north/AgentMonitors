@@ -2,10 +2,10 @@ import type { DeliveryEventSummary } from '@agentmonitors/core';
 
 /**
  * Shared per-event block renderer for the two injecting transports — the
- * hook-deliver `additionalContext` path (`hook-deliver-render.ts`, 006 §5.1) and
- * the channel `<channel>` tag body (`channel-render.ts`, 006 §4.2). Keeping the
+ * hook-deliver `additionalContext` path (`hook-deliver-render.ts`, spec: delivery/hook-transport) and
+ * the channel `<channel>` tag body (`channel-render.ts`, spec: delivery/channel-transport). Keeping the
  * block shape in ONE place is what makes the two surfaces render the *same
- * event* equivalently (006 §6: "same events, same urgency ... only the surface")
+ * event* equivalently (spec: delivery/transport-seam: "same events, same urgency ... only the surface")
  * — the only per-transport difference is the {@link sanitize} function each
  * passes (the hook preserves `<>[]`, the channel strips them for tag safety) and
  * the overall cap/truncation each applies afterward. Before this was shared, the
@@ -19,7 +19,7 @@ import type { DeliveryEventSummary } from '@agentmonitors/core';
  * Per-event bound for the change summary (`diffText`). A raw diff can be
  * arbitrarily large and the rendered block lands in the agent's context window,
  * so each event's diff is truncated to this many UTF-16 code units before the
- * transport's own overall cap is applied (006 §4.6: surfaced content SHOULD be
+ * transport's own overall cap is applied (spec: delivery/channel-transport, delivery/transport-seam — "Channel meta and content are sanitized", "Injecting transports keep identity out of untrusted content": surfaced content SHOULD be
  * bounded rather than dumping full untrusted bodies). Chosen so a single event's
  * change summary stays a *summary* — enough to see what moved — while leaving
  * room under the 4000-char transport caps for the title, body, and coalesced
@@ -64,7 +64,7 @@ const PATH_SAFE_CHAR = /^[A-Za-z0-9/._-]$/;
  * literally (that is the whole point of single-quoting), so the raw
  * `<`/`>`/`[`/`]` (and a raw CR or backtick, which can corrupt a code span or
  * the surrounding payload) would reappear in the pushed content unescaped —
- * violating 006 §4.6's tag-safety contract even though the shell-safety
+ * violating spec: delivery/channel-transport, delivery/transport-seam — "Channel meta and content are sanitized", "Injecting transports keep identity out of untrusted content"'s tag-safety contract even though the shell-safety
  * contract was satisfied.
  *
  * The fix: render the path in bash/zsh **ANSI-C quoting** (`$'...'`), with
@@ -186,14 +186,14 @@ export function appendMarkerWithinCap(
  * <bounded diffText>
  * ```
  *
- * `<title>` is the monitor's authored name (002 §5.4); `<objectDetail>` is the
+ * `<title>` is the monitor's authored name (spec: runtime/event-materialization); `<objectDetail>` is the
  * source's deterministic per-object text (`DeliveryEventSummary.objectDetail`,
- * never an Interpret digest, 002 §1.1.8) and is emitted only when it differs
+ * never an Interpret digest, spec: pipeline/post-processing) and is emitted only when it differs
  * from both the title and the body (they are identical for a monitor with no
  * authored `name`, which falls back to the source title; and derived from
- * `body` when a source supplies only `title` + `body`, 002 §5.1). `<digest>` is
+ * `body` when a source supplies only `title` + `body`, spec: runtime/event-materialization). `<digest>` is
  * the recipient-visible `DeliveryEventSummary.summary` — an Interpret digest
- * when one was produced for this recipient (002 §1.1.6/§1.1.8) — and is emitted
+ * when one was produced for this recipient (spec: pipeline/post-processing) — and is emitted
  * on its own additional line whenever it says something `<objectDetail>`
  * doesn't already (i.e. it differs from the title, body, AND the object detail
  * line): dropping it would silently discard a successful prose summarization,
@@ -208,7 +208,7 @@ export function appendMarkerWithinCap(
  * inside the injected content would be fragile.
  *
  * Every field is passed through `sanitize` so each transport enforces its own
- * content-safety rules (006 §4.6) on the same logical block: the hook path
+ * content-safety rules (spec: delivery/channel-transport, delivery/transport-seam — "Channel meta and content are sanitized", "Injecting transports keep identity out of untrusted content") on the same logical block: the hook path
  * preserves `<>[]` (its `additionalContext` is a JSON string, not tag-delimited),
  * while the channel path strips them so nothing can break out of the `<channel>`
  * tag. The block is otherwise identical across transports — that shared shape is
@@ -222,7 +222,7 @@ export function buildEventBlock(
   const urgency = sanitize(event.urgency);
   const title = sanitize(event.title);
   const body = sanitize(event.body);
-  // The title is the monitor's authored name (002 §5.4, issue #449) — it says
+  // The title is the monitor's authored name (spec: runtime/event-materialization, issue #449) — it says
   // what the monitor is FOR, but not which object moved. `objectDetail` carries
   // the source's deterministic per-object text ("Incoming change:
   // docs/specs/001.md (modified)"), so it is rendered on its own line whenever
@@ -231,7 +231,7 @@ export function buildEventBlock(
   // self-sufficiency #434/#438 requires.
   //
   // Deliberately `objectDetail`, NOT `summary`: `summary` prefers the Interpret
-  // digest (G14, 002 §1.1.8) when one was produced, and a digest is a prose
+  // digest (spec: pipeline/post-processing) when one was produced, and a digest is a prose
   // reading of the change that carries no guaranteed object identity — using it
   // here could silently drop which object a multi-object `prose` monitor's event
   // is about (issue #449 review). `objectDetail` is never digest-replaced.
@@ -241,7 +241,7 @@ export function buildEventBlock(
   const digest = sanitize(event.summary);
   const detailLines: string[] = [];
   // Also skip when the detail IS the body: materialization derives an absent
-  // `Observation.summary` from `body` (002 §5.1), so a source that supplies only
+  // `Observation.summary` from `body` (spec: runtime/event-materialization), so a source that supplies only
   // `title` + `body` would otherwise render its body twice — once here and once
   // in the template below (issue #449 review).
   if (objectDetail && objectDetail !== title && objectDetail !== body) {
@@ -326,7 +326,7 @@ export interface PackEventsUnderCapOptions extends PackWholeBlocksOptions {
  * once rendered via {@link buildEventBlock} with `sanitize` and assembled with
  * `options` (header/joiner). The caller uses this to decide how many events to
  * CLAIM/reserve, so the claimed set equals the rendered set and the remainder
- * stays pending for the next poll/context event (006 §5.5).
+ * stays pending for the next poll/context event (spec: delivery/channel-transport, delivery/hook-transport).
  *
  * When not everything fits, room is reserved for `options.markerLength` so no
  * INCLUDED block is cut. At least 1 is returned when there is any event —

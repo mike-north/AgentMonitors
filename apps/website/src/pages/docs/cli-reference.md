@@ -120,7 +120,7 @@ argument errors (missing directory, path is a file) exit non-zero.
 The legacy inbox state machine (`queued → acked → in-progress → completed|failed → archived`).
 All subcommands are in-process. See
 [002-runtime-delivery.md](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/002-runtime-delivery.md)
-§12 for how this relates to the primary monitor-events pipeline.
+spec: inbox/legacy-inbox — "Inbox item state machine", "Inbox is not the authoritative delivery path" for how this relates to the primary monitor-events pipeline.
 
 ### `inbox list`
 
@@ -592,13 +592,13 @@ plugin, not run by hand. See
 
 ## Planned: agent-facing verbs (not yet shipped)
 
-Spec 005 §14 defines five read-only/declaration-only verbs — `snapshot`, `diff`, `summary`,
+Spec spec: agent/ephemeral-monitors defines five read-only/declaration-only verbs — `snapshot`, `diff`, `summary`,
 `watch`, `inspect` — that let an agent pull a stored snapshot, diff two points in time, get a
 cheap orientation summary, declare an ephemeral session-scoped monitor, or inspect
 received/pending/armed signal state, all without an extra source observation. **None of these
 exist in the CLI today** — the commands above are the complete, currently-installed surface. See
 [005-cli-reference.md](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/005-cli-reference.md)
-§14 and [spec 007](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/007-agent-facing-interaction.md)
+spec: agent/ephemeral-monitors and [spec 007](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/007-agent-facing-interaction.md)
 for the full target contract.
 
 ---

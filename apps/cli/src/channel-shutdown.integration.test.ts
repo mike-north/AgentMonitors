@@ -29,7 +29,7 @@ import { writeLocalState } from './local-state.js';
  * They spawn a real CLI subprocess, so they live in the SERIAL config
  * (`vitest.serial.config.ts`) alongside the other process-spawning suites.
  *
- * @see ../../../docs/specs/006-agent-integration.md §12 (transport health)
+ * @see ../../../openspec/specs/delivery/transport-health/spec.md (transport health)
  */
 
 const CLI_PATH = path.resolve(import.meta.dirname, '..', 'dist', 'index.cjs');
@@ -211,7 +211,7 @@ describe('channel serve shutdown (issue #425)', () => {
 
   it('removes its heartbeat on clean shutdown so it is not read as still listening', async () => {
     // "No channel" and "stale channel" are different findings with different
-    // fixes (006 §12). A server that shut down cleanly must leave the former,
+    // fixes (spec: delivery/transport-health). A server that shut down cleanly must leave the former,
     // not linger as the latter for the whole TTL.
     await runChannelServeToCompletion('shutdown-removes');
 

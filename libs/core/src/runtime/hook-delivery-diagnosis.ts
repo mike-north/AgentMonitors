@@ -4,7 +4,7 @@ import type { DeliveryLifecycle, SessionUnreadCounts } from './types.js';
 /**
  * Diagnosis for "why did `hook deliver` surface nothing this turn?" (issue
  * #334). `hook deliver`'s stdout contract is deliberately silent-on-idle
- * (006 §5.1) — a real host hook must never inject noise — but that silence is
+ * (spec: delivery/hook-transport) — a real host hook must never inject noise — but that silence is
  * indistinguishable, from the outside, between "correctly idle" and
  * "misconfigured" (unknown session, disabled workspace, unreachable daemon) or
  * "genuinely held" (settle window, coalesced reminder). This module computes
@@ -17,22 +17,22 @@ import type { DeliveryLifecycle, SessionUnreadCounts } from './types.js';
  * finding (issue #333, `libs/core/src/runtime/reminder-diagnosis.ts`) — both
  * surfaces are explaining the identical underlying guard (a coalesced
  * normal/low reminder fires only while every unread event of the band is still
- * unclaimed, 002 §9.2/§9.3) and must agree on what to call it.
+ * unclaimed, spec: delivery/lifecycles) and must agree on what to call it.
  *
- * @see ../../../../docs/specs/006-agent-integration.md §5 (hook-deliver transport)
- * @see ../../../../docs/specs/002-runtime-delivery.md §9 (delivery lifecycles)
+ * @see ../../../../openspec/specs/delivery/hook-transport/spec.md (hook-deliver transport)
+ * @see ../../../../openspec/specs/delivery/lifecycles/spec.md (delivery lifecycles)
  */
 
 /**
  * Why a band of unread events is not deliverable right now:
  * - `settle-window` — high-urgency: pending (unclaimed) events exist but
- *   none has aged past the claim-time settle threshold yet (002 §9.1). Also
+ *   none has aged past the claim-time settle threshold yet (spec: delivery/lifecycles). Also
  *   emitted for a normal-urgency reminder (issue #441 cross-monitor
  *   coalescing; {@link classifyCoalescingWithheldHold}) that is due but held
  *   back by concurrent, still-unsettled high-urgency work it will be
  *   coalesced into once that work settles.
  * - `already-claimed` — normal/low only: every unread event of the band is
- *   already durably claimed, so the coalesced reminder (002 §9.2/§9.3) will not
+ *   already durably claimed, so the coalesced reminder (spec: delivery/lifecycles) will not
  *   re-fire until acknowledgment. A fresh unclaimed event of the same band
  *   arriving in the meantime does NOT restore it.
  * - `coalesced-until-ack` — normal/low only: a mix of claimed and unclaimed
@@ -116,7 +116,7 @@ function reminderLabel(urgency: 'normal' | 'low'): string {
 }
 
 /**
- * Classify why a coalesced normal/low reminder (002 §9.2/§9.3) is currently
+ * Classify why a coalesced normal/low reminder (spec: delivery/lifecycles) is currently
  * withheld for one band. Returns `null` when the reminder would actually fire
  * (every unread event is unclaimed) or there is no unread work for the band —
  * neither case is a "hold" worth reporting.
@@ -176,7 +176,7 @@ export function classifyReminderHold(
 
 /**
  * Classify the high-urgency band at `turn-interruptible`: held by the
- * claim-time settle window (002 §9.1, 006 §5.5) when pending (unclaimed)
+ * claim-time settle window (spec: delivery/lifecycles, delivery/channel-transport, delivery/hook-transport) when pending (unclaimed)
  * high-urgency work exists but NONE of it has aged past `settleMs` yet —
  * `claimDelivery` surfaces only settled events, so an all-unsettled pending set
  * delivers nothing this turn. Returns `null` when at least one pending event is

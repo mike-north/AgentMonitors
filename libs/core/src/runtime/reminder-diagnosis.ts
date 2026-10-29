@@ -1,10 +1,10 @@
 import type { DeliveryLifecycle } from './types.js';
 
 /**
- * Reminder diagnosis (issue #333, 002 §9.2–§9.3).
+ * Reminder diagnosis (issue #333, spec: delivery/lifecycles).
  *
  * The coalesced generic inbox reminder for `normal` (at `turn-interruptible`,
- * §9.2) and `low` (at `turn-idle`, §9.3) urgency is delivered **only if all
+ * spec: delivery/lifecycles) and `low` (at `turn-idle`, spec: delivery/lifecycles) urgency is delivered **only if all
  * unread events of that urgency are still unclaimed**. Once any unread event of
  * that urgency has been claimed (its `firstNotifiedAt` is set) but not yet
  * acknowledged, the reminder is suppressed — it does not re-fire until the
@@ -17,10 +17,10 @@ import type { DeliveryLifecycle } from './types.js';
  * `hook claim --lifecycle turn-interruptible` surfaced the reminder AND claimed
  * the underlying normal event; a second identical claim then returned `null`
  * (nothing surfaced) with no explanation. Per the silent-failure-honesty
- * invariant (capability C12, and §1.1.8's "why nothing fired" principle), that
+ * invariant (capability C12, and spec: pipeline/post-processing's "why nothing fired" principle), that
  * silence must be inspectable rather than presented as a dead end. This module
  * turns the guard's decision into a named, human-readable verdict surfaced by
- * `monitor explain` (§10.7 projection-and-delivery stage).
+ * `monitor explain` (spec: daemon/ipc projection-and-delivery stage).
  *
  * The reminder guard is a **session-level, cross-monitor** decision (it counts
  * every unread event of the urgency band for the session, regardless of which
@@ -91,7 +91,7 @@ export interface ReminderSuppressionFinding {
   message: string;
 }
 
-/** The lifecycle each reminder band is delivered at (§9.2/§9.3). */
+/** The lifecycle each reminder band is delivered at (spec: delivery/lifecycles). */
 const REMINDER_LIFECYCLE: Record<ReminderUrgency, DeliveryLifecycle> = {
   normal: 'turn-interruptible',
   low: 'turn-idle',
@@ -144,7 +144,7 @@ function buildMessage(
  * Diagnose, per session-and-band, whether the coalesced reminder is currently
  * suppressed and why.
  *
- * The delivery guard (§9.2/§9.3) fires the reminder iff `pendingCount > 0 &&
+ * The delivery guard (spec: delivery/lifecycles) fires the reminder iff `pendingCount > 0 &&
  * pendingCount === unreadCount`, where `pendingCount` already excludes rows
  * LEASED by an in-flight channel-push reservation (issue #300) — i.e. at least
  * one unread event exists and **every** unread event is unclaimed AND

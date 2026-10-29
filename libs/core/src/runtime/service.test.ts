@@ -37,7 +37,7 @@ function createRuntime(
 /**
  * Like {@link createRuntime} but also returns the underlying {@link RuntimeStore}
  * so a test can read back persisted monitor state (e.g. the durably-written
- * `sourceState` after a watch-mode checkpoint, 002 §2.4).
+ * `sourceState` after a watch-mode checkpoint, spec: runtime/tick-scheduling).
  */
 function createRuntimeWithStore(
   dbPath: string,
@@ -333,7 +333,7 @@ Handle it.
     // The batch's top-level urgency is never downgraded by the coalesced
     // normal event — it stays 'high', the most urgent band present.
     expect(claim?.urgency).toBe('high');
-    // Per 002 §9.2, a normal reminder still carries no per-event detail —
+    // Per spec: delivery/lifecycles, a normal reminder still carries no per-event detail —
     // coalescing folds its TEXT into the message, it does not escalate the
     // normal event into a full DeliveryEventSummary.
     expect(claim?.events).toHaveLength(1);
@@ -343,7 +343,7 @@ Handle it.
     expect(claim?.events[0]?.urgency).toBe('high');
     expect(claim?.message).toContain('PR #123 ready to merge');
     // The runtime's coalesced reminder is the transport-neutral reminderMessage()
-    // body (002 §9.2, PR #445 wording contract) — no product prefix, no CLI/tool
+    // body (spec: delivery/lifecycles, PR #445 wording contract) — no product prefix, no CLI/tool
     // verb; each transport appends its own acknowledge step at render time.
     expect(claim?.message).toContain('Monitored changes are pending.');
     // PR #456 review finding 2: `events`/`message` alone are not enough for a
@@ -503,7 +503,7 @@ Handle it.
     expect(claim?.message).toBe('Monitored changes are pending.');
   });
 
-  // 006 §5.1.1 (PR #445 review): the coalesced-until-ack guard is BAND-scoped —
+  // spec: delivery/channel-transport, delivery/hook-transport, delivery/transport-seam (PR #445 review): the coalesced-until-ack guard is BAND-scoped —
   // it compares a band's own claimed-but-unacknowledged events against that SAME
   // band's unread total (`normalPending.length === unreadNormal.length`), never
   // across bands. A prior revision of 006 wrongly claimed that leaving a
@@ -554,7 +554,7 @@ Handle it.
       createdAt: new Date(Date.now() - 20_000),
     });
 
-    // First claim: the settled high-urgency event takes priority (§9.1) and is
+    // First claim: the settled high-urgency event takes priority (spec: delivery/lifecycles) and is
     // claimed — but NOT acknowledged. No normal event exists yet, so nothing
     // coalesces into it.
     const highClaim = runtime.claimDelivery(session.id, 'turn-interruptible');
@@ -594,7 +594,7 @@ Handle it.
     expect(normalClaim?.events).toEqual([]);
   });
 
-  // 006 §5.1.1 (PR #445 review, round 6 — discussion_r3615219860): the
+  // spec: delivery/channel-transport, delivery/hook-transport, delivery/transport-seam (PR #445 review, round 6 — discussion_r3615219860): the
   // cross-band-independence guard above is TRUE ONLY for a `high`-only claim.
   // A `post-compact` recap claims the FULL unread set across every band
   // (`applyDelivery`'s `candidates: unread`), so a mixed-band recap that
@@ -1120,7 +1120,7 @@ Handle it.
   });
 
   // Issue #338 (item 1): `events list --unread` filters on `acknowledgedAt IS
-  // NULL` (002 §7), so it INCLUDES claimed-but-unacknowledged events — a
+  // NULL` (spec: delivery/session-projection — "Unread, claimed, and acknowledged are distinct session states"), so it INCLUDES claimed-but-unacknowledged events — a
   // surprise for a debugger reading "unread" as "never seen". `listEvents()`
   // must report each session-scoped event's `deliveryState` so a caller can
   // tell the two apart, and that state must track claim/ack transitions.
@@ -1371,7 +1371,7 @@ Handle it.
     const claim = runtime.claimDelivery(session.id, 'turn-idle');
     expect(claim?.mode).toBe('delivery');
     expect(claim?.urgency).toBe('low');
-    // 002 §9.3 (issues #438/#434, PR #445 review finding 2): a semantic,
+    // spec: delivery/lifecycles (issues #438/#434, PR #445 review finding 2): a semantic,
     // transport- and verb-neutral body — no product-name prefix, no CLI verb,
     // no reference to the legacy `inbox` model. Each transport supplies its
     // own concrete, session-scoped action step (`apps/cli`'s
@@ -1554,13 +1554,13 @@ Handle it.
 
   // --- RANGE urgency + per-observation salience (issue #109) ---------------
   //
-  // Contract (002 §4.1, §5.1; 003 §2.3): a monitor's authored `urgency` is a
+  // Contract (spec: runtime/notify-dispatch, runtime/event-materialization, sources/contract): a monitor's authored `urgency` is a
   // band `lo..hi`; a source observation MAY carry a `salience`; the runtime
   // resolves the effective urgency as `clamp(salience ?? lo, lo, hi)`. The
   // materialized event row carries that effective urgency. See also the schema-
   // and parser-level tests for band parse/validation.
 
-  it('salience within the authored band escalates the materialized event urgency (002 §5.1)', async () => {
+  it('salience within the authored band escalates the materialized event urgency (spec: runtime/event-materialization)', async () => {
     const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
     tempDirs.push(rootDir);
     // Band normal..high authorizes a source to escalate up to `high`. An
@@ -1612,7 +1612,7 @@ Handle it.
     expect(unread[0]?.urgency).toBe('high');
   });
 
-  it('clamps a salience above the band to the high bound (002 §4.1)', async () => {
+  it('clamps a salience above the band to the high bound (spec: runtime/notify-dispatch)', async () => {
     const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
     tempDirs.push(rootDir);
     // Band low..normal: a `high` salience must clamp down to `normal`.
@@ -1658,7 +1658,7 @@ Handle it.
     expect(unread[0]?.urgency).toBe('normal');
   });
 
-  it('clamps a salience below the band to the low bound (002 §4.1)', async () => {
+  it('clamps a salience below the band to the low bound (spec: runtime/notify-dispatch)', async () => {
     const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
     tempDirs.push(rootDir);
     // Band normal..high: a `low` salience must clamp up to `normal`.
@@ -1704,7 +1704,7 @@ Handle it.
     expect(unread[0]?.urgency).toBe('normal');
   });
 
-  it('a degenerate band (bare scalar urgency) never escalates — backward compat (003 §2.3)', async () => {
+  it('a degenerate band (bare scalar urgency) never escalates — backward compat (spec: sources/contract)', async () => {
     const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
     tempDirs.push(rootDir);
     // Bare scalar `normal` is the degenerate band normal..normal: a `high`
@@ -1748,7 +1748,7 @@ Handle it.
     expect(unread[0]?.urgency).toBe('normal');
   });
 
-  it('an escalated observation flushes the whole held debounce batch early without splitting it (002 §4.1)', async () => {
+  it('an escalated observation flushes the whole held debounce batch early without splitting it (spec: runtime/notify-dispatch)', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-01-15T10:00:00.000Z'));
     try {
@@ -2408,7 +2408,7 @@ Handle unchanged.
       (stage) => stage.id === 'observation',
     );
     expect(unchangedObservation?.status).toBe('healthy');
-    // Affirmative, not-a-bug wording (002 §10.7 / issue #94).
+    // Affirmative, not-a-bug wording (spec: daemon/ipc / issue #94).
     expect(unchangedObservation?.reason).toContain('0 changes');
     expect(unchangedObservation?.reason).toContain('not a bug');
     // A healthy/idle monitor must carry no ✗ failure anywhere downstream: the
@@ -2426,7 +2426,7 @@ Handle unchanged.
 
   // Issue #297: scheduleForMonitor() never throws — an invalid IANA timezone on
   // a `schedule` monitor surfaces as `PollingDecision.error` instead. explain
-  // MUST NOT crash (it is a read-only diagnostic surface, 002 §10.7) and must
+  // MUST NOT crash (it is a read-only diagnostic surface, spec: daemon/ipc) and must
   // report the failure as an OBSERVATION-stage diagnostic — the same shape a
   // real observe() error would produce — rather than a raw thrown RangeError.
   it('explains an invalid schedule timezone as an observation-stage failure, not a crash (issue #297)', async () => {
@@ -2488,7 +2488,7 @@ This monitor has a typo'd timezone.
     expect(report.stages.some((stage) => stage.id === 'scheduling')).toBe(
       false,
     );
-    // explainMonitor MUST NOT mutate runtime state (002 §10.7): asking again
+    // explainMonitor MUST NOT mutate runtime state (spec: daemon/ipc): asking again
     // must not have written an observation_history row as a side effect.
     expect(
       runtime.listObservationHistory({ monitorId: 'bad-timezone-monitor' }),
@@ -4350,7 +4350,7 @@ Handle it.
 
   // --- G13: author-declared baseline strategy (net default vs incremental) --
   //
-  // Contract (001 §3.7, 002 §1.1.7; default changed 2026-06-19, Refs #110):
+  // Contract (spec: monitor/definition, pipeline/post-processing; default changed 2026-06-19, Refs #110):
   // the per-recipient Diff stage spans a *catch-up span* — the set of shaped
   // observations that accumulated for a recipient since its baseline.
   // `baseline-strategy` declares how that span is delivered:
@@ -4364,8 +4364,8 @@ Handle it.
   //
   // Each test establishes a baseline snapshot on tick 1, then delivers a
   // catch-up span of N=3 successive states (one shared objectKey) in a single
-  // tick 2. Expected delta counts are written by hand from 002 §1.1.7.
-  describe('baseline strategy (G13, 002 §1.1.7)', () => {
+  // tick 2. Expected delta counts are written by hand from spec: pipeline/post-processing.
+  describe('baseline strategy (spec: pipeline/post-processing)', () => {
     const SPAN_OBJECT_KEY = 'doc-1';
     // Baseline established on tick 1, then a 3-observation catch-up span on
     // tick 2. Distinct text per state so each transition is a real diff.
@@ -4492,7 +4492,7 @@ Handle it.
       return { runtime, monitorsDir, rootDir, sessionId: session.id, events };
     }
 
-    // Criterion (b) + G10 PR-B (002 §1.1.7, Decision Q3): under `net`, the
+    // Criterion (b) + G10 PR-B (spec: pipeline/post-processing, Decision Q3): under `net`, the
     // SHARED `monitor_events` chain now records EVERY intermediate (N=3 span
     // events + baseline = 4), but the per-recipient DELIVERY collapses to ONE
     // net delta at claim — the newest event per object — with the older
@@ -4546,7 +4546,7 @@ Handle it.
       // The surviving net delta is the NEWEST event (edit 3, where things stand
       // now), and its per-recipient diff spans the recipient's baseline →
       // endpoint, so all three line edits appear in one delta (collapsed, not
-      // replayed). 002 §1.1.7.
+      // replayed). spec: pipeline/post-processing.
       const survivor = events.find((e) => e.id === delivered[0]?.eventId);
       expect(survivor?.summary).toBe('edit 3');
       expect(survivor?.snapshotText).toBe(SPAN_STATES[2]);
@@ -4564,7 +4564,7 @@ Handle it.
     });
 
     /**
-     * Assert an `incremental`-style delivery (002 §1.1.7): the recipient
+     * Assert an `incremental`-style delivery (spec: pipeline/post-processing): the recipient
      * receives one event per span observation (N=3), every intermediate
      * observation materialized — NOT collapsed. The proof is the count (3, vs.
      * `net`'s 1) and that all three distinct endpoint states are present as
@@ -4579,7 +4579,7 @@ Handle it.
      */
     function expectIncrementalChain(events: MonitorEventRecord[]): void {
       const spanEvents = events.filter((event) => event.summary !== 'baseline');
-      // 002 §1.1.7: N=3 deltas, play-by-play (one event per step, nothing
+      // spec: pipeline/post-processing: N=3 deltas, play-by-play (one event per step, nothing
       // collapsed).
       expect(spanEvents).toHaveLength(3);
       const bySummary = new Map(
@@ -4604,7 +4604,7 @@ Handle it.
     }
 
     // Criterion (c): an `incremental` recipient in the same scenario receives N
-    // ordered deltas (002 §1.1.7).
+    // ordered deltas (spec: pipeline/post-processing).
     it('incremental: a recipient that missed N observations receives N ordered deltas', async () => {
       const { events } = await deliverSpan(
         'baseline-strategy: incremental\n',
@@ -4616,7 +4616,7 @@ Handle it.
     });
 
     // Criterion (d): omitting `baseline-strategy` defaults to `net` (2026-06-19
-    // decision, Refs #110 / 001 §3.7 / 002 §1.1.7). The omitted-field case
+    // decision, Refs #110 / spec: monitor/definition, pipeline/post-processing). The omitted-field case
     // must behave identically to an explicit `baseline-strategy: net` — the
     // recipient is delivered ONE net delta for a catch-up span of N observations.
     it('omitting baseline-strategy defaults to net (one net delta per object)', async () => {
@@ -4651,9 +4651,9 @@ Handle it.
     });
   });
 
-  // --- Scheduled-rollup Pace mode (G12) ------------------------------------
+  // --- Scheduled-rollup Pace mode (spec: runtime/notify-dispatch) ------------------------------------
   //
-  // Contract (001 §3.6, 002 §4.4): a `notify.strategy: rollup` monitor
+  // Contract (spec: monitor/definition, runtime/notify-dispatch, pipeline/post-processing): a `notify.strategy: rollup` monitor
   // accumulates every observation in durable `notifyState.pendingRollup` and
   // delivers nothing until the author's `window` cron fires. On the window
   // opening the whole accumulated batch is flushed as one composite delivery
@@ -4663,7 +4663,7 @@ Handle it.
   // The window cron is evaluated against the injected `now` (fake timers), so
   // these tests are fully deterministic. A short `interval` makes the monitor
   // due every tick; time is advanced past the interval between ticks.
-  describe('rollup Pace mode (G12, 002 §4.4)', () => {
+  describe('rollup Pace mode (spec: runtime/notify-dispatch, pipeline/post-processing)', () => {
     // A source that hands out one queued observation per tick (or none when the
     // queue is exhausted), so a test can drive accumulation tick by tick.
     function queuedSource(
@@ -4702,7 +4702,7 @@ Handle it.
     }
 
     // (b) Observations accumulate durably across ticks WITHOUT delivering
-    //     between windows (002 §4.4 step 1 + step 6).
+    //     between windows (spec: runtime/notify-dispatch, pipeline/post-processing step 1 + step 6).
     it('accumulates observations across ticks without delivering between windows', async () => {
       vi.useFakeTimers();
       vi.setSystemTime(OUTSIDE_WINDOW);
@@ -4762,7 +4762,7 @@ Handle it.
     });
 
     // (c) The window opening flushes the whole accumulated batch and clears the
-    //     accumulation state (002 §4.4 step 2).
+    //     accumulation state (spec: runtime/notify-dispatch, pipeline/post-processing step 2).
     it('flushes the accumulated batch and clears state when the window fires', async () => {
       vi.useFakeTimers();
       vi.setSystemTime(OUTSIDE_WINDOW);
@@ -4796,7 +4796,7 @@ Handle it.
 
         // Tick 2 (09:00, window fires): Change B arrives this tick and the whole
         // batch (A + B) flushes as one composite delivery — two event rows
-        // (002 §4.4 step 4: one row per accumulated observation).
+        // (spec: runtime/notify-dispatch, pipeline/post-processing step 4: one row per accumulated observation).
         vi.setSystemTime(AT_WINDOW);
         const tick2 = await runtime.tick(monitorsDir, rootDir);
         expect(tick2.emittedEventIds).toHaveLength(2);
@@ -4823,7 +4823,7 @@ Handle it.
       }
     });
 
-    // (d) An empty window produces no delivery (002 §4.4 step 3 — no empty
+    // (d) An empty window produces no delivery (spec: runtime/notify-dispatch, pipeline/post-processing step 3 — no empty
     //     pings). The window opens but nothing accumulated since the last flush.
     it('produces no delivery when the window opens with an empty batch', async () => {
       vi.useFakeTimers();
@@ -4864,7 +4864,7 @@ Handle it.
       }
     });
 
-    // (e) Restart-safety (BP1, 002 §4.4 step 1): an accumulated batch persisted
+    // (e) Restart-safety (BP1, spec: runtime/notify-dispatch, pipeline/post-processing step 1): an accumulated batch persisted
     //     before a daemon restart survives the restart and flushes on the next
     //     window opening. Modeled with a file-backed DB and TWO independent
     //     runtime instances (the first is dropped entirely, simulating a daemon
@@ -4922,7 +4922,7 @@ Handle it.
         expect(delivered).toHaveLength(1);
         expect(delivered[0]?.summary).toBe('Pre-restart change');
         // A valid urgency was materialized for the restart-recovered envelope
-        // (hydration backfill, 002 §3 / §4.4 step 1), never `undefined`.
+        // (hydration backfill, spec: runtime/monitor-state, runtime/notify-dispatch, pipeline/post-processing step 1), never `undefined`.
         expect(delivered[0]?.urgency).toBe('normal');
 
         // The accumulation state is cleared after the post-restart flush.
@@ -4937,7 +4937,7 @@ Handle it.
       }
     });
 
-    // (f) Once-per-minute guard (002 §4.4 step 2): two ticks within the same
+    // (f) Once-per-minute guard (spec: runtime/notify-dispatch, pipeline/post-processing step 2): two ticks within the same
     //     calendar minute must produce exactly ONE flush, not two.
     //     `cronMatchesDate` returns true for any timestamp within the matching
     //     minute, so without the `rollupLastFiredMinute` guard a sub-minute tick
@@ -5000,7 +5000,7 @@ Handle it.
       }
     });
 
-    // (g) Explain path treats pendingRollup as a pending hold (002 §4.4 step 6):
+    // (g) Explain path treats pendingRollup as a pending hold (spec: runtime/notify-dispatch, pipeline/post-processing step 6):
     //     when observations are accumulated between windows, `monitor explain`
     //     must surface the notify stage as 'pending' and describe the hold —
     //     consistent with how the debounce strategy reports its held batch.
@@ -5063,16 +5063,16 @@ Handle it.
   // --- Rollup not-due flush composition (issue #180, G12 × G13) -------------
   //
   // Bug: tick() flushes a rollup batch via two paths. The DUE path goes through
-  // ingest() (which applies `net` collapse — 002 §1.1.7 — AND records a
-  // `triggered` observation_history row — 002 §10.7). The NOT-DUE path (the
+  // ingest() (which applies `net` collapse — spec: pipeline/post-processing — AND records a
+  // `triggered` observation_history row — spec: daemon/ipc). The NOT-DUE path (the
   // source poll interval has NOT elapsed but the delivery window opens) is the
   // *normal* operating mode for a rollup monitor whose `watch.interval` is
-  // relaxed to match the window (002 §4.4), and it had drifted: it applied
+  // relaxed to match the window (spec: runtime/notify-dispatch, pipeline/post-processing), and it had drifted: it applied
   // neither behavior. Both paths now route through the shared materializeSpan().
   //
   // Expected delta/history counts below are written BY HAND from the spec, not
   // captured from program output.
-  describe('rollup not-due flush composition (issue #180, 002 §1.1.7 / §10.7)', () => {
+  describe('rollup not-due flush composition (issue #180, spec: pipeline/post-processing, daemon/ipc)', () => {
     const NET_OBJECT_KEY = 'doc-1';
     // Three successive states of one object accumulated across three ticks.
     // Distinct text per state so each transition is a real diff and the net
@@ -5247,7 +5247,7 @@ Daily digest.
 
     /**
      * Claim the not-due/due flush as the recipient and assert the per-recipient
-     * `net` collapse (G10 PR-B, 002 §1.1.7): the shared chain materialized all
+     * `net` collapse (spec: pipeline/post-processing): the shared chain materialized all
      * three rollup edits, but the recipient is delivered exactly ONE net delta
      * (the newest, edit 3, against its baseline) with the two intermediates
      * recorded claimed-but-suppressed and explainable.
@@ -5280,7 +5280,7 @@ Daily digest.
       expect(survivor?.snapshotText).toBe(STATES[2]);
     }
 
-    // Criterion 1 (P1, 002 §1.1.7) + G10 PR-B: rollup + net, window fires on a
+    // Criterion 1 (P1, spec: pipeline/post-processing) + G10 PR-B: rollup + net, window fires on a
     // NOT-DUE tick after 3 accumulated edits to one objectKey. The SHARED chain
     // now records all three (the incremental substrate, Decision Q3); the
     // per-recipient DELIVERY collapses to ONE net delta at claim. (Pre-PR-B the
@@ -5307,7 +5307,7 @@ Daily digest.
       }
     });
 
-    // Criterion 1 control (002 §1.1.7): the DUE path (via ingest()) records the
+    // Criterion 1 control (spec: pipeline/post-processing): the DUE path (via ingest()) records the
     // same three shared events and the same single per-recipient net delivery.
     // Asserting both paths agree proves the shared helper kept the not-due path
     // matching the due path — no drift (issue #180 invariant, PR-B form).
@@ -5342,7 +5342,7 @@ Daily digest.
       }
     });
 
-    // Criterion 2 (P2, 002 §10.7 / §1.1.6): the not-due flush records a
+    // Criterion 2 (P2, spec: daemon/ipc, pipeline/post-processing): the not-due flush records a
     // `triggered` observation_history row retrievable via listObservationHistory
     // and surfaced by monitor explain. Before the fix the not-due branch wrote
     // NO history row, so a real daily-digest delivery was invisible to the audit
@@ -5369,12 +5369,12 @@ Daily digest.
         // The audit row counts what was *dispatched* into the flush (the whole
         // accumulated span of 3), not what survived the net collapse — matching
         // ingest()'s due-path behavior, where the row reflects dispatch, not
-        // materialization (002 §10.7). The `triggered` result is the contract;
+        // materialization (spec: daemon/ipc). The `triggered` result is the contract;
         // this count assertion just pins the row to the due-path semantics.
         expect(history[0]?.observationData['emitted']).toBe(STATES.length);
         expect(history[0]?.observationData['observed']).toBe(0);
 
-        // The audit row is surfaced by `monitor explain` (002 §10.7): the
+        // The audit row is surfaced by `monitor explain` (spec: daemon/ipc): the
         // report's observation history carries the `triggered` row.
         const report = await ctx.runtime.explainMonitor({
           monitorId: 'test-monitor',
@@ -5388,7 +5388,7 @@ Daily digest.
       }
     });
 
-    // Criterion 3 (no regression, 002 §1.1.7): rollup + explicit `incremental`
+    // Criterion 3 (no regression, spec: pipeline/post-processing): rollup + explicit `incremental`
     // on the not-due path still delivers N ordered deltas — the play-by-play is
     // preserved, not collapsed. The shared helper must leave the incremental
     // span untouched.
@@ -5412,7 +5412,7 @@ Daily digest.
           .slice()
           .reverse();
         expect(delivered).toHaveLength(STATES.length);
-        // 002 §1.1.7: N=3 ordered deltas — edit 1 before edit 2 before edit 3.
+        // spec: pipeline/post-processing: N=3 ordered deltas — edit 1 before edit 2 before edit 3.
         expect(delivered.map((e) => e.summary)).toEqual([
           'edit 1',
           'edit 2',
@@ -5472,7 +5472,7 @@ Daily digest.
 // Issue #333: a blind study subject saw a durable, unread `urgency: normal`
 // event produce NO surfacing at any lifecycle — `hook claim --lifecycle
 // turn-interruptible` returned null, `turn-idle` returned "No pending
-// delivery." Per 002 §9.2 the normal reminder should surface at
+// delivery." Per spec: delivery/lifecycles the normal reminder should surface at
 // turn-interruptible while all unread normal events are unclaimed. The verdict:
 // NOT a first-claim bug. The subject had ALREADY run a turn-interruptible claim
 // earlier (S3 phase 11), which surfaced the reminder AND CLAIMED the normal
@@ -5482,12 +5482,12 @@ Daily digest.
 // refutation (first claim DOES surface the reminder) and proves the suppression
 // is now explainable via `monitor explain` (criterion 1 + 2).
 //
-// @see ../../../../docs/specs/002-runtime-delivery.md §9.2 (normal reminder,
+// @see ../../../../openspec/specs/delivery/lifecycles/spec.md (normal reminder,
 //   coalesced-until-unclaimed)
-// @see ../../../../docs/specs/002-runtime-delivery.md §10.7 (monitor explain
+// @see ../../../../openspec/specs/daemon/ipc/spec.md (monitor explain
 //   projection-and-delivery diagnosis)
 describe('normal-urgency reminder suppression is explainable (issue #333)', () => {
-  // 002 §9.2 (issues #438/#434, PR #445 review finding 2): the coalesced
+  // spec: delivery/lifecycles (issues #438/#434, PR #445 review finding 2): the coalesced
   // reminder body for the normal band — semantic and transport/verb-neutral
   // (no product-name attribution, no CLI verb; both are transport-owned),
   // free of the legacy `inbox` model.
@@ -5576,7 +5576,7 @@ describe('normal-urgency reminder suppression is explainable (issue #333)', () =
 
       // Criterion 1 (refute the first-claim bug): with the normal event unread
       // and UNCLAIMED, the FIRST turn-interruptible claim surfaces the coalesced
-      // generic reminder — exactly what 002 §9.2 requires.
+      // generic reminder — exactly what spec: delivery/lifecycles requires.
       const first = runtime.claimDelivery(session.id, 'turn-interruptible');
       expect(first?.mode).toBe('delivery');
       expect(first?.urgency).toBe('normal');
@@ -5585,7 +5585,7 @@ describe('normal-urgency reminder suppression is explainable (issue #333)', () =
       // never carries the product name.
       expect(first?.message).not.toContain('AgentMon');
       expect(first?.message).not.toContain('inbox');
-      expect(first?.events).toEqual([]); // §9.2: no per-event payloads
+      expect(first?.events).toEqual([]); // spec: delivery/lifecycles: no per-event payloads
 
       // The divergent precondition from the study: that first claim marked the
       // event CLAIMED (firstNotifiedAt) but NOT acknowledged. A second identical
@@ -5636,12 +5636,12 @@ describe('normal-urgency reminder suppression is explainable (issue #333)', () =
   });
 });
 
-// Watch-mode source-state checkpointing (002 §2.4). A long-lived watch() source
+// Watch-mode source-state checkpointing (spec: runtime/tick-scheduling). A long-lived watch() source
 // durably advances its persisted `sourceState` out of band via
 // `context.checkpoint`, serialized with observation ingestion per-watcher (the
 // G14 durable-write-before-ingest ordering) so a mid-watch crash reconciles from
 // the checkpointed baseline instead of re-emitting already-delivered changes.
-describe('watch-mode source-state checkpointing (002 §2.4)', () => {
+describe('watch-mode source-state checkpointing (spec: runtime/tick-scheduling)', () => {
   const checkpointTmpDirs: string[] = [];
 
   afterEach(() => {
@@ -6034,7 +6034,7 @@ describe('watch-mode source-state checkpointing (002 §2.4)', () => {
   });
 
   // A checkpoint must land in the watcher's OWN (monitorId, workspacePath) state
-  // row (002 §3, #345/#307): the persistence DB is global and the same monitor id
+  // row (spec: runtime/monitor-state, #345/#307): the persistence DB is global and the same monitor id
   // can exist in unrelated workspaces, so a checkpoint written to the wrong scope
   // would either miss the watcher's own row or clobber another workspace's
   // change-detection baseline. This asserts both directions at once.
@@ -6086,7 +6086,7 @@ describe('watch-mode source-state checkpointing (002 §2.4)', () => {
   // A checkpoint delivered AFTER the watcher is stopped (its AbortSignal aborted
   // by stop(), and the watcher no longer the current active watcher for its id)
   // must be REJECTED: it writes nothing and logs one warning, so a straggling
-  // `checkpoint(staleState)` can never clobber a newer baseline (002 §2.4).
+  // `checkpoint(staleState)` can never clobber a newer baseline (spec: runtime/tick-scheduling).
   it('rejects a checkpoint delivered after the watcher is stopped (no write, one warning)', async () => {
     const { rootDir, dbPath, monitorsDir } = scratch();
 

@@ -2,7 +2,7 @@
  * Tests for the `command-poll` observation source.
  *
  * Correctness is asserted against the normative design in
- * `docs/specs/003-source-plugins.md` §11 (§11.1–§11.7). Each test cites the
+ * `docs/specs/003-source-plugins.md` spec: sources/command-poll (spec: sources/command-poll). Each test cites the
  * acceptance criterion (AC1–AC6 from issue #86) and/or the spec section it proves.
  *
  * The tests spawn tiny real subprocesses (`node -e …`) so the no-shell spawn path is
@@ -59,14 +59,14 @@ function nodeArgv(program: string): string[] {
 }
 
 describe('source-command-poll', () => {
-  it('has the correct name, is stateful, and exposes a scopeSchema (003 §11)', () => {
+  it('has the correct name, is stateful, and exposes a scopeSchema (spec: sources/command-poll)', () => {
     expect(source.name).toBe('command-poll');
     expect(source.stateful).toBe(true);
     expect(source.scopeSchema).toHaveProperty('properties');
     expect(source.scopeSchema['required']).toEqual(['command']);
   });
 
-  describe('config validation (003 §11.1)', () => {
+  describe('config validation (spec: sources/command-poll)', () => {
     it('rejects a missing command', async () => {
       await expect(source.observe({}, ctx())).rejects.toThrow('command');
     });
@@ -83,7 +83,7 @@ describe('source-command-poll', () => {
       ).rejects.toThrow('command');
     });
 
-    it('guides a bare-string command toward the sh -c argv form (003 §11.1)', async () => {
+    it('guides a bare-string command toward the sh -c argv form (spec: sources/command-poll)', async () => {
       // A pipeline written as a bare string is the most common mistake; the error
       // must teach the supported inline form rather than just rejecting it.
       await expect(
@@ -124,7 +124,7 @@ describe('source-command-poll', () => {
   });
 
   // AC1 — no shell: a shell-metacharacter argv element is passed through verbatim.
-  describe('AC1: no shell involvement (003 §11.1/§11.7)', () => {
+  describe('AC1: no shell involvement (spec: sources/command-poll)', () => {
     it('passes shell metacharacters through as a literal argument', async () => {
       const metachars = '$(whoami); rm -rf /tmp/x && echo pwned `id` | cat';
       // `node -e` prints argv[1] verbatim; if a shell were involved, the command
@@ -155,7 +155,7 @@ describe('source-command-poll', () => {
   });
 
   /**
-   * `cwd` resolution (003 §11.1, issue #444 review finding 826): a scaffolded
+   * `cwd` resolution (spec: sources/command-poll, issue #444 review finding 826): a scaffolded
    * `MONITOR.md` that omits `cwd` must resolve the child process's working
    * directory from the **runtime** `workspacePath`, not a value baked into
    * the file at scaffold time — otherwise relocating or sharing the project
@@ -163,8 +163,8 @@ describe('source-command-poll', () => {
    * short of re-scaffolding. `pwd` (no shell involved — `argv[0]` directly)
    * proves the actual spawned cwd, not just that the child ran.
    */
-  describe('cwd resolution (003 §11.1)', () => {
-    /** The first-ever run always baselines silently (003 §11.4): read the
+  describe('cwd resolution (spec: sources/command-poll)', () => {
+    /** The first-ever run always baselines silently (spec: sources/command-poll — "command-poll observation identity", "command-poll stateful baseline"): read the
      * spawned cwd back from `nextState.stdout` rather than a diffed
      * observation, which needs a second tick to appear. */
     function stdoutOf(result: ObservationResult): string {
@@ -251,7 +251,7 @@ describe('source-command-poll', () => {
   });
 
   // AC2 — baseline emits nothing; each strategy detects its change class.
-  describe('AC2: baseline and change-detection strategies (003 §11.3/§11.4)', () => {
+  describe('AC2: baseline and change-detection strategies (spec: sources/command-poll)', () => {
     it('baseline run emits nothing and stores state', async () => {
       const result = await source.observe(
         { command: nodeArgv('process.stdout.write("v1")') },
@@ -390,9 +390,9 @@ describe('source-command-poll', () => {
     });
   });
 
-  // Keyed-collection change detection (003 §12) wired through command-poll. The
+  // Keyed-collection change detection (spec: sources/contract) wired through command-poll. The
   // shared diff lives in @agentmonitors/core; these verify command-poll consumes it.
-  describe('keyed-collection (003 §12)', () => {
+  describe('keyed-collection (spec: sources/contract)', () => {
     /** argv that prints a fixed JSON document. */
     function jsonArgv(doc: unknown): string[] {
       return nodeArgv(
@@ -611,7 +611,7 @@ describe('source-command-poll', () => {
   });
 
   // AC3 — nonzero exit WITH changed output is a result, diffed and reported.
-  describe('AC3: nonzero-exit result is diffed, not swallowed (003 §11.2/§11.7)', () => {
+  describe('AC3: nonzero-exit result is diffed, not swallowed (spec: sources/command-poll)', () => {
     it('reports a changed nonzero-exit output as an observation', async () => {
       const baseline = await source.observe(
         { command: nodeArgv('process.stdout.write("first");process.exit(2)') },
@@ -639,7 +639,7 @@ describe('source-command-poll', () => {
   });
 
   // AC4 — failure (spawn + timeout) transition-edge semantics.
-  describe('AC4: transition-edge failure semantics (003 §11.5)', () => {
+  describe('AC4: transition-edge failure semantics (spec: sources/command-poll)', () => {
     it('spawn failure: one ok→failing, silent while failing, failing→ok on recovery', async () => {
       const badBinary = {
         command: ['this-binary-does-not-exist-agentmonitors-xyz'],
@@ -747,7 +747,7 @@ describe('source-command-poll', () => {
   });
 
   // AC5 — env reaches the child but is never persisted.
-  describe('AC5: env reaches the child, never persisted (003 §11.1)', () => {
+  describe('AC5: env reaches the child, never persisted (spec: sources/command-poll)', () => {
     it('passes env to the child but excludes the env config from all persisted artifacts', async () => {
       const SECRET = 'super-secret-token-value-9f3a';
       // The child observes its env value but emits only a NON-secret derived marker
@@ -806,7 +806,7 @@ describe('source-command-poll', () => {
   });
 
   // AC6 (part 1) — truncation: >1 MiB captures diff stably.
-  describe('AC6: 1 MiB truncation diffs stably (003 §11.2/§11.7)', () => {
+  describe('AC6: 1 MiB truncation diffs stably (spec: sources/command-poll)', () => {
     it('marks truncated and produces stable diffs across identical leading content', async () => {
       // Emit 2 MiB of a single repeated byte — well over the 1 MiB cap.
       const bigOutput = nodeArgv(
@@ -833,7 +833,7 @@ describe('source-command-poll', () => {
 
   // Drain, don't kill: a command producing more than the cap on either stream must
   // still run to completion and report its real exit status (issue #302).
-  describe('drains excess output without killing the process (003 §11.2, issue #302)', () => {
+  describe('drains excess output without killing the process (spec: sources/command-poll, issue #302)', () => {
     it('>1 MiB stdout: a marker side effect after the overflow still lands, and the real exit code (7) is reported', async () => {
       const dir = mkdtempSync(join(tmpdir(), 'am-302-stdout-'));
       const markerFile = join(dir, 'marker');
@@ -1062,7 +1062,7 @@ describe('source-command-poll', () => {
     });
   });
 
-  describe('observation identity (003 §11.4)', () => {
+  describe('observation identity (spec: sources/command-poll — "command-poll observation identity", "command-poll stateful baseline")', () => {
     it('defaults objectKey to the joined argv and honors a key override', async () => {
       const baseline = await source.observe(
         { command: nodeArgv('process.stdout.write("x")') },
@@ -1095,8 +1095,8 @@ describe('source-command-poll', () => {
     });
 
     // Issue #449: a long argv is an identity, not a headline. `objectKey` keeps
-    // the full joined argv, but the human-facing title/summary bound it (003
-    // §2.8) so a jq-heavy poller cannot make its own implementation the alert.
+    // the full joined argv, but the human-facing title/summary bound it (
+    // spec: sources/contract) so a jq-heavy poller cannot make its own implementation the alert.
     it('bounds the argv in title/summary while objectKey and payload keep it whole (issue #449)', async () => {
       // A long trailing argument stands in for the reported jq program: the
       // program ignores it, but it lands in the joined-argv objectKey.
@@ -1120,8 +1120,8 @@ describe('source-command-poll', () => {
       expect(obs?.payload).toMatchObject({ command: changedArgv });
     });
 
-    // 003 §11.4: snapshot.command is the argv array, not the objectKey string.
-    it('snapshot.command is the argv array, not objectKey (003 §11.4)', async () => {
+    // spec: sources/command-poll — "command-poll observation identity", "command-poll stateful baseline": snapshot.command is the argv array, not the objectKey string.
+    it('snapshot.command is the argv array, not objectKey (spec: sources/command-poll — "command-poll observation identity", "command-poll stateful baseline")', async () => {
       const argv = nodeArgv('process.stdout.write("snap-test")');
       const baseline = await source.observe({ command: argv }, ctx());
       const changed = await source.observe(
@@ -1146,7 +1146,7 @@ describe('source-command-poll', () => {
     });
   });
 
-  describe('isCommandState guard (003 §11.4)', () => {
+  describe('isCommandState guard (spec: sources/command-poll — "command-poll observation identity", "command-poll stateful baseline")', () => {
     // Regression test: a malformed previousState with non-boolean `truncated`
     // must be rejected by the guard and re-baselined, not re-persisted.
     it('re-baselines when previousState has non-boolean truncated', async () => {
@@ -1179,10 +1179,10 @@ describe('source-command-poll', () => {
 /**
  * Process-leak guard: assert the spawned-children count returns to baseline.
  * Skipped on platforms where `pgrep` is unavailable — without it the helper
- * always returns 0 and the test would pass vacuously (003 §11.7).
+ * always returns 0 and the test would pass vacuously (spec: sources/command-poll).
  */
 describe.skipIf(!PGREP_AVAILABLE)(
-  'source-command-poll: no orphan processes (003 §11.7)',
+  'source-command-poll: no orphan processes (spec: sources/command-poll)',
   () => {
     let baselineChildCount = 0;
 
@@ -1230,7 +1230,7 @@ describe.skipIf(!PGREP_AVAILABLE)(
  * specifically needs `sh`.
  */
 describe.skipIf(process.platform === 'win32')(
-  'source-command-poll: timed-out sh -c descendant is fully terminated (003 §11.7, issue #303)',
+  'source-command-poll: timed-out sh -c descendant is fully terminated (spec: sources/command-poll, issue #303)',
   () => {
     it('kills the backgrounded grandchild, not just the shell', async () => {
       const dir = mkdtempSync(join(tmpdir(), 'am-303-'));
@@ -1245,7 +1245,7 @@ describe.skipIf(process.platform === 'win32')(
         const result = await source.observe(hung, ctx());
         const elapsed = Date.now() - start;
 
-        // Same transition-edge failure semantics as any other timeout (003 §11.5)
+        // Same transition-edge failure semantics as any other timeout (spec: sources/command-poll)
         // — this fix must not change that.
         expect(result.observations).toHaveLength(1);
         expect(result.observations[0]?.title).toContain('Command failing');
@@ -1254,7 +1254,7 @@ describe.skipIf(process.platform === 'win32')(
         expect(result.nextState).toMatchObject({ health: 'failing' });
 
         // Resolves within timeout + grace + slack — never hangs waiting on the
-        // grandchild's inherited stdout/stderr streams to close (003 §11.7).
+        // grandchild's inherited stdout/stderr streams to close (spec: sources/command-poll).
         expect(elapsed).toBeLessThan(1_000 + 5_000 + 3_000);
 
         const grandchildPid = Number(readFileSync(pidFile, 'utf8').trim());

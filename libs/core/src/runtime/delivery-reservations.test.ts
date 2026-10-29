@@ -1,5 +1,5 @@
 /**
- * Reserve → commit/release delivery semantics (006 §4, issue #300).
+ * Reserve → commit/release delivery semantics (spec: delivery/channel-transport, issue #300).
  *
  * These are the core state-machine tests for the fix that stops the channel
  * transport consuming a delivery before it has actually surfaced it. They assert
@@ -9,8 +9,8 @@
  * them to the hook path; and a leased row is hidden from a concurrent claim so
  * the two transports do not double-surface it.
  *
- * @see docs/specs/006-agent-integration.md §4 (channel transport), §4.5 (cross-transport dedup)
- * @see docs/specs/002-runtime-delivery.md §7 (unread / claimed / acknowledged states)
+ * @see openspec/specs/delivery/channel-transport/spec.md (channel transport), spec: delivery/channel-transport (cross-transport dedup)
+ * @see openspec/specs/delivery/session-projection/spec.md — "Unread, claimed, and acknowledged are distinct session states" (unread / claimed / acknowledged states)
  */
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -41,7 +41,7 @@ interface Harness {
 /**
  * A runtime with one lead session and one pending event projected into it — the
  * minimal state a `turn-interruptible` delivery surfaces. A `high` event is aged
- * 20s so it is past the 15s settle window (002 §9.1); a `normal` event surfaces
+ * 20s so it is past the 15s settle window (spec: delivery/lifecycles); a `normal` event surfaces
  * as the coalesced reminder. `reservationTtlMs` overrides the uncommitted-
  * reservation lifetime so expiry can be exercised deterministically.
  */
@@ -86,8 +86,8 @@ function makeHarness({
     objectKey: 'ci/default',
     queryScope: { pipeline: 'default' },
     tags: ['ci'],
-    // A high event must be past the 15s settle window to be deliverable (002
-    // §9.1); a normal event surfaces immediately as a reminder.
+    // A high event must be past the 15s settle window to be deliverable (
+    // spec: delivery/lifecycles); a normal event surfaces immediately as a reminder.
     createdAt: new Date(Date.now() - (urgency === 'high' ? 20_000 : 1_000)),
   });
   return {
@@ -143,7 +143,7 @@ describe('reserve → commit/release delivery semantics (issue #300)', () => {
 
     // While the reservation is outstanding, the hook transport's claim finds
     // nothing to surface — the channel is mid-surfacing this row, so it must not
-    // be double-surfaced (006 §4.5).
+    // be double-surfaced (spec: delivery/channel-transport).
     expect(
       h.runtime.claimDelivery(h.sessionId, 'turn-interruptible'),
     ).toBeNull();

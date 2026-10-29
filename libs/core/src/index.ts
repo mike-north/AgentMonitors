@@ -133,7 +133,7 @@ export {
   renderShapeArtifact,
 } from './runtime/diff.js';
 export type { ChangeDetectionStrategy } from './runtime/diff.js';
-// Shape stage (G15): deterministic derived facts + render-then-diff
+// Shape stage (spec: pipeline/post-processing): deterministic derived facts + render-then-diff
 export {
   computeDerivedFacts,
   renderArtifact,

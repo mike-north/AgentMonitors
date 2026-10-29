@@ -380,7 +380,7 @@ export async function runLoop(
   await server.listen();
   console.log(`AgentMon daemon listening on ${socketPath}`);
 
-  // Start continuous watchers for any watch-capable sources (G5). Watched
+  // Start continuous watchers for any watch-capable sources (spec: runtime/tick-scheduling). Watched
   // monitors are driven by their watcher; the tick loop below skips them. New
   // monitors added after startup are picked up on the next daemon restart.
   let watchHandle: WatchHandle | undefined;
@@ -509,7 +509,7 @@ export async function runLoop(
                 !isHeartbeatStale(heartbeat, nowDate),
             ));
         // The daemon READS the registry to decide, but never reaps it: GC is a
-        // write-path responsibility (006 §12.2) — a lapsed record is removed
+        // write-path responsibility (spec: delivery/transport-health) — a lapsed record is removed
         // only when a transport re-registers, so `doctor` keeps reporting the
         // failure until something recovers. A stale record is already inert to
         // the decision above (`!isHeartbeatStale` excludes it), so leaving it in

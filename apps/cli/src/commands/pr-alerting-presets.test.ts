@@ -5,8 +5,8 @@
  * `watch:` block — the shell wrapper and the `gh` argv are exercised verbatim,
  * with only the `gh` binary itself replaced by a stub on `PATH`. Expected
  * behavior is asserted against the contract in the issue and specs
- * [003 §11](../../../../docs/specs/003-source-plugins.md) /
- * [005 §2](../../../../docs/specs/005-cli-reference.md), not against captured
+ * [spec: sources/command-poll](../../../../openspec/specs/sources/command-poll/spec.md) /
+ * [spec: cli/authoring-commands](../../../../openspec/specs/cli/authoring-commands/spec.md), not against captured
  * output.
  *
  * @see https://cli.github.com/manual/gh_pr_list — `gh pr list` fields
@@ -239,7 +239,7 @@ async function observe(
 /**
  * Baseline on `before`, then tick again on `after`. Returns the second tick's
  * observation titles — the runtime's first successful run always baselines
- * silently (003 §11.4), so a transition is only observable on the second.
+ * silently (spec: sources/command-poll — "command-poll observation identity", "command-poll stateful baseline"), so a transition is only observable on the second.
  */
 async function transition(
   scope: Scope,
@@ -573,7 +573,7 @@ describe('the presets’ jq reduction over raw gh output', () => {
      * entering-membership) transitions on the same `isDraft` field, and
      * `command-poll`'s stateless `json-diff` polling carries no history
      * that would let a preset tell them apart. This is a documented,
-     * accepted limitation (003 §11.9's `my-prs` body already tells the
+     * accepted limitation (spec: cli/authoring-commands's `my-prs` body already tells the
      * author how to disambiguate: "if you did not just put it there,
      * someone pulled it back"), not a defect — pinning it here as a
      * characterization test (rather than leaving it unasserted) is what
@@ -841,7 +841,7 @@ describe('the presets’ jq reduction over raw gh output', () => {
     });
 
     /**
-     * PR #446 review, 21:43 round (main review body): 003 §11.9 had drifted
+     * PR #446 review, 21:43 round (main review body): spec: cli/authoring-commands had drifted
      * to describe the OLD `--limit 30` bound while the implementation and
      * 004 already say `1000`, and the test above (99 merged rows, but only
      * ONE open row) passed unchanged under either bound — it never actually
@@ -1563,7 +1563,7 @@ describe('graceful degradation when gh is unusable (issue #444)', () => {
     async (type) => {
       const scope = presetScope(type);
       const { observations } = await observeRaw(scope, pathWithoutGh());
-      // 003 §11.5: a first-ever failing run emits the health observation
+      // spec: sources/command-poll: a first-ever failing run emits the health observation
       // rather than establishing an empty baseline that never diffs again.
       expect(observations).toHaveLength(1);
       expect(observations[0]?.title).toBe(`Command failing: ${type}`);
@@ -1624,7 +1624,7 @@ describe('graceful degradation when gh is unusable (issue #444)', () => {
     expect(first.observations.map((o) => o.title)).toEqual([
       'Command failing: my-prs',
     ]);
-    // 003 §11.5: the failing state is edge-triggered, so a persistently broken
+    // spec: sources/command-poll: the failing state is edge-triggered, so a persistently broken
     // gh must not interrupt on every tick.
     const second = await observeRaw(scope, broken, first.state);
     expect(second.observations).toEqual([]);
@@ -2052,7 +2052,7 @@ describe('preset portability guarantees (issue #444)', () => {
   // is a MEMBERSHIP set filtered to PRs that actually need action right now:
   // a PR that has been decided leaves the set instead of churning a field
   // inside it, so there is no benign per-push or per-comment traffic to
-  // interrupt on. See 002 §9 and 003 §11.9.
+  // interrupt on. See spec: delivery/lifecycles, cli/authoring-commands.
   it('both presets are high urgency', () => {
     expect(TEMPLATES['my-prs'] ?? '').toMatch(/^urgency: high$/m);
     expect(TEMPLATES['pr-review'] ?? '').toMatch(/^urgency: high$/m);

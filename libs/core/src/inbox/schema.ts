@@ -65,7 +65,7 @@ export const monitorEvents = sqliteTable('monitor_events', {
   snapshotText: text('snapshot_text'),
   diffText: text('diff_text'),
   objectKey: text('object_key'),
-  // The monitor's author-declared baseline strategy (G13/G10 PR-B, 002 §1.1.7),
+  // The monitor's author-declared baseline strategy (spec: pipeline/post-processing),
   // persisted on the shared event so the per-recipient `net` collapse can run at
   // claim time without re-scanning monitor definitions. NULL on legacy rows
   // materialized before PR-B; treated as `incremental` (the default).
@@ -88,13 +88,13 @@ export const monitorSnapshots = sqliteTable('monitor_snapshots', {
 });
 
 /**
- * The per-recipient Interpret decision (G14, 002 §1.1.8). Recorded on
+ * The per-recipient Interpret decision (spec: pipeline/post-processing). Recorded on
  * `session_event_state` because Interpret runs **right of the per-recipient
  * seam** — its verdict is per recipient, not the shared tick-level
  * `observation_history`. `deliver` = the agentic gate passed (or no gate);
  * `suppress` = the agentic gate judged the delta not substantive (no delivery);
  * `failed` = the AI tool errored and the runtime fell back to the deterministic
- * `rendered` artifact (best-effort, 002 §1.1.8).
+ * `rendered` artifact (best-effort, spec: pipeline/post-processing).
  */
 export const interpretDecisionValues = [
   'deliver',
@@ -111,14 +111,14 @@ export const sessionEventState = sqliteTable('session_event_state', {
   acknowledgedAt: integer('acknowledged_at', { mode: 'timestamp' }),
   lastClaimAt: integer('last_claim_at', { mode: 'timestamp' }),
   lastClaimLifecycle: text('last_claim_lifecycle'),
-  // The PER-RECIPIENT delta (G10, 002 §1.1.2): the diff of this event's shaped
+  // The PER-RECIPIENT delta (spec: pipeline/post-processing): the diff of this event's shaped
   // artifact against THIS session's own baseline cursor at projection time.
   // Right of the Pace→Diff seam, so two sessions at divergent baselines record
   // different spans from the SAME shared `monitor_events` row. `NULL` for a
   // baseline event (no prior to diff) and for legacy rows materialized before
   // G10 — delivery/explain fall back to the shared `monitor_events.diff_text`.
   diffText: text('diff_text'),
-  // Per-recipient Interpret verdict (G14, 002 §1.1.8); absent for the deterministic
+  // Per-recipient Interpret verdict (spec: pipeline/post-processing); absent for the deterministic
   // forms that never invoke Interpret. `interpret_reason` is the agentic-gate
   // suppression reason or the fallback-failure detail; `interpret_digest` is the
   // delivered cheap digest when the decision is `deliver`.
@@ -127,11 +127,11 @@ export const sessionEventState = sqliteTable('session_event_state', {
   }),
   interpretReason: text('interpret_reason'),
   interpretDigest: text('interpret_digest'),
-  // The per-recipient `net` collapse marker (G10 PR-B, 002 §1.1.7). When a `net`
+  // The per-recipient `net` collapse marker (spec: pipeline/post-processing). When a `net`
   // monitor's recipient claims a multi-event catch-up span for one object, the
   // newest event is delivered and the older intermediates are recorded
   // CLAIMED-BUT-SUPPRESSED here: the row is retained (so the collapse stays
-  // explainable via `monitor explain`, 002 §10.7) but excluded from delivery
+  // explainable via `monitor explain`, spec: daemon/ipc) but excluded from delivery
   // (unread/pending/recap). Set at claim time alongside `first_notified_at`.
   netSuppressedAt: integer('net_suppressed_at', { mode: 'timestamp' }),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
@@ -162,11 +162,11 @@ export const monitorState = sqliteTable('monitor_state', {
 });
 
 /**
- * The PER-RECIPIENT baseline cursor (G10, 002 §1.1.2). One row per
+ * The PER-RECIPIENT baseline cursor (spec: pipeline/post-processing). One row per
  * `(session_id, monitor_id, object_key, workspace_path)`: the last shaped
  * artifact this recipient was caught up to, the anchor its per-recipient Diff
  * spans FROM. Lives in the same durable SQLite DB so cursors survive a daemon
- * restart/reboot (002 §3, BP1); session-keyed so isolation is structural (one
+ * restart/reboot (spec: runtime/monitor-state, BP1); session-keyed so isolation is structural (one
  * session advancing its cursor never moves another's).
  *
  * `baseline_content` is DENORMALIZED (the full artifact text, not just a
@@ -194,21 +194,21 @@ export const sessionObjectCursor = sqliteTable('session_object_cursor', {
 
 /**
  * The lifecycle status of an ephemeral (agent-declared, session-scoped) monitor
- * (007 §4.4). `active` — declared and evaluated on the normal runtime tick;
+ * (spec: agent/ephemeral-monitors). `active` — declared and evaluated on the normal runtime tick;
  * `reaped` — its declaring session ended/went dormant or it was cancelled, so it
  * is no longer observed. A reaped record is retained (never resurrected) so a
- * later restart cannot re-arm it (007 §4.4: "a restart after the session has
+ * later restart cannot re-arm it (spec: agent/ephemeral-monitors: "a restart after the session has
  * ended does not resurrect it").
  */
 export const ephemeralMonitorStatus = ['active', 'reaped'] as const;
 
 /**
- * An **ephemeral monitor** (007 §4): an agent-declared, session-scoped monitor
+ * An **ephemeral monitor** (spec: agent/ephemeral-monitors): an agent-declared, session-scoped monitor
  * handled by the SAME daemon and pipeline as a persistent `MONITOR.md` monitor
  * (AP7). Unlike a persistent monitor it has no directory — its definition lives
  * here, durably, keyed to the declaring session, so it survives a daemon restart
- * while that session lives (007 §4.4, PP1). Its `id` is the namespaced runtime
- * identity `ephemeral:<sessionId>/<ulid>` (007 §4.3): a directory-derived
+ * while that session lives (spec: agent/ephemeral-monitors, PP1). Its `id` is the namespaced runtime
+ * identity `ephemeral:<sessionId>/<ulid>` (spec: agent/ephemeral-monitors — "Namespaced ephemeral identity", "Ephemeral identity is stable for the monitor lifetime"): a directory-derived
  * persistent id is a single path segment and cannot contain `/`, so an ephemeral
  * id (which always does) can never collide with one.
  */
@@ -219,17 +219,17 @@ export const ephemeralMonitors = sqliteTable('ephemeral_monitors', {
   sourceName: text('source_name').notNull(),
   // The source-`scopeSchema`-valid scope config (JSON), validated by the same
   // `validateScope` path as `agentmonitors validate` at declaration time
-  // (007 §4.2) so an ephemeral monitor cannot express a config a persistent one
+  // (spec: agent/ephemeral-monitors) so an ephemeral monitor cannot express a config a persistent one
   // could not.
   scope: text('scope').notNull().default('{}'),
   // The authored urgency band: `urgency` is the low bound (base) and
   // `urgencyMax` the high bound — the same flattened representation
-  // `MonitorFrontmatter` carries (002 §4.1). Equal for a scalar urgency.
+  // `MonitorFrontmatter` carries (spec: runtime/notify-dispatch). Equal for a scalar urgency.
   urgency: text('urgency', { enum: urgencyValues }).notNull(),
   urgencyMax: text('urgency_max', { enum: urgencyValues }).notNull(),
   // Free-text handling guidance that becomes the monitor's body, surfaced
   // verbatim on delivery so the reminder arrives with the agent's own
-  // instruction attached (007 §4.2).
+  // instruction attached (spec: agent/ephemeral-monitors).
   instruction: text('instruction').notNull().default(''),
   displayName: text('display_name'),
   status: text('status', { enum: ephemeralMonitorStatus })

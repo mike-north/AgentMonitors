@@ -4,17 +4,17 @@
  * The expected verdicts are derived BY HAND from the delivery-guard spec, not
  * captured from program output:
  *
- *   002 §9.1 — at `turn-interruptible`, a high-urgency event is deliverable
+ *   spec: delivery/lifecycles — at `turn-interruptible`, a high-urgency event is deliverable
  *              only once it has aged past the 15s claim-time settle window.
- *   002 §9.2 — the normal-urgency reminder fires at `turn-interruptible` ONLY
+ *   spec: delivery/lifecycles — the normal-urgency reminder fires at `turn-interruptible` ONLY
  *              IF every unread normal event is still unclaimed.
- *   002 §9.3 — the low-urgency reminder fires at `turn-idle` ONLY IF every
+ *   spec: delivery/lifecycles — the low-urgency reminder fires at `turn-idle` ONLY IF every
  *              unread low event is still unclaimed.
  *
- * @see ../../../../docs/specs/002-runtime-delivery.md §9.1 (high-urgency settle window)
- * @see ../../../../docs/specs/002-runtime-delivery.md §9.2 (normal reminder)
- * @see ../../../../docs/specs/002-runtime-delivery.md §9.3 (low reminder)
- * @see ../../../../docs/specs/006-agent-integration.md §5 (hook-deliver transport)
+ * @see ../../../../openspec/specs/delivery/lifecycles/spec.md (high-urgency settle window)
+ * @see ../../../../openspec/specs/delivery/lifecycles/spec.md (normal reminder)
+ * @see ../../../../openspec/specs/delivery/lifecycles/spec.md (low reminder)
+ * @see ../../../../openspec/specs/delivery/hook-transport/spec.md (hook-deliver transport)
  */
 import { describe, expect, it } from 'vitest';
 import {
@@ -27,8 +27,8 @@ const SETTLE_MS = 15_000;
 const NOW = new Date('2026-07-14T12:00:00.000Z');
 
 describe('classifyReminderHold', () => {
-  it('reports no hold when every unread normal event is still unclaimed (the reminder would fire, §9.2)', () => {
-    // unread === pending → the §9.2 guard holds → fires → nothing to explain.
+  it('reports no hold when every unread normal event is still unclaimed (the reminder would fire, spec: delivery/lifecycles)', () => {
+    // unread === pending → the spec: delivery/lifecycles guard holds → fires → nothing to explain.
     expect(classifyReminderHold('normal', 2, 2)).toBeNull();
   });
 
@@ -37,7 +37,7 @@ describe('classifyReminderHold', () => {
     expect(classifyReminderHold('low', 0, 0)).toBeNull();
   });
 
-  it('reports `already-claimed` when the only unread normal event is claimed (§9.2)', () => {
+  it('reports `already-claimed` when the only unread normal event is claimed (spec: delivery/lifecycles)', () => {
     const hold = classifyReminderHold('normal', 1, 0);
     expect(hold).toMatchObject({
       urgency: 'normal',
@@ -66,7 +66,7 @@ describe('classifyReminderHold', () => {
     expect(hold?.claimedEventIds).toEqual(['evt-1']);
   });
 
-  it('reports `coalesced-until-ack` when unread normal events mix claimed and unclaimed (§9.2)', () => {
+  it('reports `coalesced-until-ack` when unread normal events mix claimed and unclaimed (spec: delivery/lifecycles)', () => {
     // unread=3, pending=1 → 2 claimed, 1 unclaimed — the claimed rows hold the
     // coalesced reminder back even though a fresh unclaimed event exists.
     const hold = classifyReminderHold('normal', 3, 1);
@@ -79,7 +79,7 @@ describe('classifyReminderHold', () => {
     expect(hold?.message).toContain('2 of 3');
   });
 
-  it('diagnoses the low band at turn-idle (§9.3)', () => {
+  it('diagnoses the low band at turn-idle (spec: delivery/lifecycles)', () => {
     const hold = classifyReminderHold('low', 1, 0);
     expect(hold).toMatchObject({
       urgency: 'low',

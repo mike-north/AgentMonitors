@@ -15,29 +15,29 @@ import {
 const META_STRIP = /[<>[\]\r\n;]/g;
 // Channel `content` is the tag body — newlines are fine, but still remove the
 // angle/bracket characters that could be read as nested tags. Source-derived
-// text reaches here, so treat it as untrusted (006 §4.6).
+// text reaches here, so treat it as untrusted (spec: delivery/channel-transport, delivery/transport-seam — "Channel meta and content are sanitized", "Injecting transports keep identity out of untrusted content").
 const CONTENT_STRIP = /[<>[\]\r]/g;
 
 function metaValue(value: string): string {
   return value.replace(META_STRIP, ' ').trim();
 }
 
-/** Sanitize `content` text for the `<channel>` tag body (006 §4.6). */
+/** Sanitize `content` text for the `<channel>` tag body (spec: delivery/channel-transport, delivery/transport-seam — "Channel meta and content are sanitized", "Injecting transports keep identity out of untrusted content"). */
 function contentValue(value: string): string {
   return value.replace(CONTENT_STRIP, ' ');
 }
 
 /**
  * Ceiling on how much rendered content one `notifications/claude/channel`
- * push may carry (006 §5.5). Restoring rendering-parity with the hook path
+ * push may carry (spec: delivery/channel-transport, delivery/hook-transport). Restoring rendering-parity with the hook path
  * (issue #436) — full event bodies plus a bounded change summary per event —
  * made a coalesced push's SIZE unbounded again (bodies and the number of
- * coalesced events have no cap; only the per-event `diffText`, §4.6, does).
+ * coalesced events have no cap; only the per-event `diffText`, spec: delivery/channel-transport, delivery/transport-seam — "Channel meta and content are sanitized", "Injecting transports keep identity out of untrusted content", does).
  * Unlike the hook-deliver transport's 4000-char single-turn injection budget,
  * the channel surfaces a push outside a specific turn's context budget, so
  * this ceiling is deliberately much larger — several multiples of the hook
  * cap — while still bounding worst-case payload size for one JSON-RPC
- * notification. The invariant that makes this safe (006 §5.5, "claimed set
+ * notification. The invariant that makes this safe (spec: delivery/channel-transport, delivery/hook-transport, "claimed set
  * equals rendered set") is preserved: the ceiling sizes how many WHOLE event
  * blocks are RESERVED/CLAIMED (`packChannelEventsUnderCap`, used by
  * `channel.ts` before calling `reserveDelivery`), never by dropping a block
@@ -53,7 +53,7 @@ export const MAX_CHANNEL_CONTENT = 20_000;
  * Appended to `content` when the channel deferred some settled high-urgency
  * events beyond this push's ceiling (`options.moreDeferred` on
  * {@link renderChannelEvent}) — the deferred events stay pending and
- * re-deliver on a later poll (006 §5.5). Deliberately bracket-free (no
+ * re-deliver on a later poll (spec: delivery/channel-transport, delivery/hook-transport). Deliberately bracket-free (no
  * `<`/`>`/`[`/`]`) so it never needs `contentValue` sanitization itself: a
  * marker that had to be stripped of its own punctuation would render
  * confusingly (e.g. missing brackets around a command name).
@@ -83,7 +83,7 @@ export const CHANNEL_DEFERRED_MARKER =
  *
  * - **Resolves non-null** — committed: the row is claimed, and
  *   `pendingEventsForSession()` (which excludes rows with `first_notified_at`
- *   set, 002 §7) will never surface it again on an ordinary poll.
+ *   set, spec: delivery/session-projection — "Unread, claimed, and acknowledged are distinct session states") will never surface it again on an ordinary poll.
  * - **Resolves null** — the reservation's lease already lapsed
  *   (`'surfaced-uncommitted'`, `channel.ts`): the row was definitely never
  *   claimed, so it stays eligible for at-least-once redelivery.
@@ -105,7 +105,7 @@ export const CHANNEL_DEFERRED_MARKER =
  * review). The marker instead renders the exact, directly executable
  * command for the session that received THIS delivery, taking `sessionId`
  * from the claim itself and sanitizing it the same way every other
- * claim-derived field reaching this tag body is sanitized (§4.6) — an id
+ * claim-derived field reaching this tag body is sanitized (spec: delivery/channel-transport, delivery/transport-seam — "Channel meta and content are sanitized", "Injecting transports keep identity out of untrusted content") — an id
  * that happened to carry a tag-breakout or attribute-breakout character
  * would otherwise corrupt the rendered command or the surrounding tag.
  *
@@ -131,8 +131,8 @@ export const CHANNEL_DEFERRED_MARKER =
  * no `--socket` could silently query the wrong (or a dead) daemon. The path is
  * escaped with {@link escapeShellPath} — NOT `metaValue`/`contentValue`, since
  * both of those strip the very tag-breakout characters a raw path could
- * contain rather than round-tripping them — so it stays both tag-safe (006
- * §4.6) and shell-safe, and reconstructs to the exact original path when the
+ * contain rather than round-tripping them — so it stays both tag-safe (
+ * spec: delivery/channel-transport, delivery/transport-seam — "Channel meta and content are sanitized", "Injecting transports keep identity out of untrusted content") and shell-safe, and reconstructs to the exact original path when the
  * advertised command is run (issue #442, PR #442 round-8 review). Omitted (no
  * `--socket` clause) only when the caller genuinely has no socket to
  * advertise.
@@ -192,7 +192,7 @@ function buildChannelReminderActionStep(
 
 /**
  * How many WHOLE high-urgency event blocks (from `events`, oldest-first) a
- * channel push can render under {@link MAX_CHANNEL_CONTENT} (006 §5.5). Mirrors
+ * channel push can render under {@link MAX_CHANNEL_CONTENT} (spec: delivery/channel-transport, delivery/hook-transport). Mirrors
  * the hook-deliver transport's `packEventsUnderCap` (`hook-deliver-render.ts`,
  * issue #299): `channel.ts` calls this on the settled-high preview BEFORE
  * reserving, so it can pass the result as `reserveDelivery`'s `maxEvents` — the
@@ -307,10 +307,10 @@ export interface RenderChannelEventOptions {
 
 /**
  * Render a runtime {@link DeliveryClaim} into the `{ content, meta }` shape of a
- * `notifications/claude/channel` event (006 §4.2). Pure and side-effect free.
+ * `notifications/claude/channel` event (spec: delivery/channel-transport). Pure and side-effect free.
  *
  * The tag body carries the **same event content** the hook-deliver transport
- * injects (issue #436, 006 §6): a body-injection claim (a settled high-urgency
+ * injects (issue #436, spec: delivery/transport-seam): a body-injection claim (a settled high-urgency
  * delivery, whose `events` are populated) renders one block per event —
  * `### monitor (urgency)` / title / the monitor's body-instructions / a bounded
  * `Changes:` summary of the diff — via the transport-shared {@link
@@ -327,14 +327,14 @@ export interface RenderChannelEventOptions {
  * transport, whose `additionalContext` arrives unlabeled, prepends its own
  * label instead — see `hook-deliver-render.ts`'s `HOOK_ATTRIBUTION_PREFIX`.)
  *
- * **The channel surface IS bounded (006 §5.5), primarily by packing WHOLE
+ * **The channel surface IS bounded (spec: delivery/channel-transport, delivery/hook-transport), primarily by packing WHOLE
  * event blocks under {@link MAX_CHANNEL_CONTENT} BEFORE reserving, not by
  * cutting an already-claimed render.** The boundedness mostly lives in
  * `channel.ts`: it previews the settled-high delivery, sizes how many whole
  * blocks fit via {@link packChannelEventsUnderCap}, and reserves/claims
  * exactly that many (`reserveDelivery`'s `maxEvents`), so the deferred
  * remainder stays pending and re-delivers on a later poll. This is what makes
- * claimed-set-equals-rendered-set (006 §5.5) compatible with boundedness in
+ * claimed-set-equals-rendered-set (spec: delivery/channel-transport, delivery/hook-transport) compatible with boundedness in
  * the common case: capping `content` here, after the claim was already
  * reserved, would otherwise drop later blocks from the rendered tag while the
  * whole claim was still eligible to be committed — silently omitting
@@ -370,7 +370,7 @@ export interface RenderChannelEventOptions {
  * silently drop the other (mirroring `renderHookDelivery`'s identical mixed
  * case). Per-event change summaries are ALSO individually
  * bounded inside
- * {@link buildEventBlock} (006 §4.6, currently 800 chars each), so no single
+ * {@link buildEventBlock} (spec: delivery/channel-transport, delivery/transport-seam — "Channel meta and content are sanitized", "Injecting transports keep identity out of untrusted content", currently 800 chars each), so no single
  * untrusted diff is dumped wholesale regardless of packing.
  *
  * When `claim.coalescedReminder` is set (issue #441 cross-monitor coalescing:
@@ -390,7 +390,7 @@ export function renderChannelEvent(
   // body + bounded change summary), matching the hook path. Reminder claim (no
   // events) → the coalesced advisory message, kept generic. Boundedness is
   // enforced upstream (packing WHOLE blocks under the ceiling before
-  // reserving, 006 §5.5) — but this pack-and-truncate is repeated here as a
+  // reserving, spec: delivery/channel-transport, delivery/hook-transport) — but this pack-and-truncate is repeated here as a
   // defense-in-depth ceiling enforcement (issue #442): sizing upstream cannot
   // rule out every over-cap case (see the doc comment above).
   let content: string;
@@ -406,7 +406,7 @@ export function renderChannelEvent(
     // this is required at all (`claim.events`/`claim.message` carry no
     // representation of the coalesced reminder on their own, yet
     // `claimDelivery` claims the coalesced normal rows alongside the surfaced
-    // high events). Per #445's wording contract (002 §9.2 / 006 §5.1.1) the
+    // high events). Per #445's wording contract (spec: delivery/lifecycles, delivery/channel-transport, delivery/hook-transport, delivery/transport-seam) the
     // runtime emits ONLY the transport-neutral reminder body; this transport
     // appends its OWN acknowledge step ({@link buildChannelReminderActionStep},
     // pointing at the `agentmon_ack` MCP tool — never the hook's CLI ack verb),
@@ -445,7 +445,7 @@ export function renderChannelEvent(
       // session (issue #442, PR #442 round-6 review — a bare `--unread`
       // without `--session` exits 1) rather than promising a specific
       // claimed/redelivery outcome for this event's own tail (claiming ≠
-      // acking, 006 §5.5).
+      // acking, spec: delivery/channel-transport, delivery/hook-transport).
       //
       // Mixed case (issue #442, PR #442 round-12 review): `moreDeferred` can
       // ALSO be true here — this claim's single (oversized) event is the
@@ -453,7 +453,7 @@ export function renderChannelEvent(
       // exists beyond it and stays pending (the reservation/claim was sized
       // to just this one event). Rendering the truncated-event marker alone
       // would silently suppress that second, distinct signal, contradicting
-      // §5.5's candidate-growth guarantee (and diverging from the hook
+      // spec: delivery/channel-transport, delivery/hook-transport's candidate-growth guarantee (and diverging from the hook
       // transport's `renderHookDelivery`, which renders both of its
       // analogous markers in the same mixed case). Render BOTH markers
       // whenever both apply — they describe two different, non-overlapping,
@@ -544,7 +544,7 @@ export function renderChannelEvent(
     }
   }
 
-  // 006 §4.6: ALL meta values must be tag-breakout-sanitized — defense in depth,
+  // spec: delivery/channel-transport, delivery/transport-seam — "Channel meta and content are sanitized", "Injecting transports keep identity out of untrusted content": ALL meta values must be tag-breakout-sanitized — defense in depth,
   // even for fields that are currently constrained enums/counts.
   for (const key of Object.keys(meta)) {
     const value = meta[key];

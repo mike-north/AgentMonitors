@@ -7,7 +7,7 @@
  * (a single stale row, a second distinct row, a genuine `triggered` row
  * arriving mid-window) can be exercised without spinning up a real daemon.
  *
- * @see docs/specs/005-cli-reference.md §16
+ * @see openspec/specs/cli/verify/spec.md
  */
 import { describe, it, expect } from 'vitest';
 import type {
@@ -96,7 +96,7 @@ describe('resolveObserveVerdict', () => {
     );
   });
 
-  it('suppresses the no-change verdict while a suppressed row is present (debounce settling — 002 §9.2/§9.3)', () => {
+  it('suppresses the no-change verdict while a suppressed row is present (debounce settling — spec: delivery/lifecycles)', () => {
     const seen = new Set<string>();
     const rows = [
       row('01ROW2', 'no-change', OBSERVE_FROM + 1_200),

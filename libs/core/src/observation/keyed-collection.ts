@@ -2,17 +2,17 @@ import { displayObjectKey } from './display.js';
 import type { ChangeKind, Observation } from './types.js';
 
 /**
- * Keyed-collection change detection (003 §12).
+ * Keyed-collection change detection (spec: sources/contract).
  *
  * A `change-detection.collection` block turns a source's parsed JSON output into a
  * **collection of keyed objects** rather than one opaque blob, so consumers get
  * precise per-object `created` / `modified` / `descoped` observations with stable
  * per-object `objectKey`s. The mode is source-agnostic: `api-poll` and
- * `command-poll` share this one implementation (003 §12 frames it as a generic
- * companion to §11), keeping create/modified/descoped semantics identical across
+ * `command-poll` share this one implementation (spec: sources/contract frames it as a generic
+ * companion to spec: sources/command-poll), keeping create/modified/descoped semantics identical across
  * sources rather than duplicating — and risking divergence — in each plugin.
  *
- * `path` syntax (resolving §12's open design point): a **minimal dotted path**.
+ * `path` syntax (resolving spec: sources/contract's open design point): a **minimal dotted path**.
  * Both explicit-root (`$.tasks`, `$.data.items`) and bare root-relative (`tasks`,
  * `data.items`) forms are accepted. No wildcards, filters, or recursive descent.
  * `path` MUST select exactly one array; `ignore-paths` entries use the same dotted
@@ -20,7 +20,7 @@ import type { ChangeKind, Observation } from './types.js';
  * e.g. `$.fetchedAt` or `fetchedAt`).
  */
 
-/** A parsed `change-detection.collection` config (003 §12). */
+/** A parsed `change-detection.collection` config (spec: sources/contract). */
 export interface KeyedCollectionConfig {
   /** Dotted path to the array within the parsed output (e.g. `$.tasks` or `tasks`). */
   path: string;
@@ -116,7 +116,7 @@ export function parseKeyedCollectionConfig(
  *
  * Rejected characters: `[`, `]`, `*`, `?`, and whitespace — the characters that
  * JSONPath uses for index access, wildcards, filters, and recursive-descent
- * operators. All of these are outside the declared grammar (§12).
+ * operators. All of these are outside the declared grammar (spec: sources/contract).
  */
 function assertValidSegment(path: string, segment: string): void {
   if (/[[\]*?\s]/.test(segment)) {
@@ -285,7 +285,7 @@ function keyValueOf(element: unknown, keyField: string): string {
 }
 
 /**
- * Diff a parsed JSON output against the prior keyed snapshot per 003 §12, emitting
+ * Diff a parsed JSON output against the prior keyed snapshot per spec: sources/contract, emitting
  * per-object observations and returning the new snapshot to persist.
  *
  * @param parsedOutput - The source's output parsed as JSON.
@@ -343,7 +343,7 @@ export function diffKeyedCollection(
     current[keyValue] = normalizeElement(element, config.ignorePaths);
   }
 
-  // Baseline run: record the snapshot, emit nothing (003 §12).
+  // Baseline run: record the snapshot, emit nothing (spec: sources/contract).
   if (previousSnapshot === undefined) {
     return { observations: [], snapshot: current };
   }
@@ -381,7 +381,7 @@ export function diffKeyedCollection(
     }
   }
 
-  // `descoped` for keys that disappeared (003 §12 — not `deleted`).
+  // `descoped` for keys that disappeared (spec: sources/contract — not `deleted`).
   for (const keyValue of Object.keys(previousSnapshot)) {
     if (!Object.prototype.hasOwnProperty.call(current, keyValue)) {
       emit(keyValue, 'descoped');

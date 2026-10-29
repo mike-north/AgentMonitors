@@ -13,9 +13,9 @@
  * rather than re-deriving the diff by hand, so a regression in the actual
  * strategy-selection wiring — not just the renderer itself — is caught.
  *
- * @see ../../../../docs/specs/002-runtime-delivery.md §5.2 (diff renderer selection)
- * @see ../../../../docs/specs/002-runtime-delivery.md §1.1.7 (net-collapse recomputation)
- * @see ../../../../docs/specs/003-source-plugins.md §4.2, §11.3 (json-diff strategy)
+ * @see ../../../../openspec/specs/runtime/event-materialization/spec.md (diff renderer selection)
+ * @see ../../../../openspec/specs/pipeline/post-processing/spec.md (net-collapse recomputation)
+ * @see ../../../../openspec/specs/sources/api-poll/spec.md, ../../../../openspec/specs/sources/command-poll/spec.md (json-diff strategy)
  */
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -235,7 +235,7 @@ describe('json-diff production wiring — net-collapse recomputation after a per
     );
 
     // Exactly one net-collapsed delivery for the object (the two intermediates
-    // are claimed-but-suppressed, per 002 §1.1.7).
+    // are claimed-but-suppressed, per spec: pipeline/post-processing).
     expect(delivered).toHaveLength(1);
     const deliveredDelta = restarted
       .perRecipientDiffsForSession(away, [delivered[0]?.id ?? ''])

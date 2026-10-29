@@ -98,7 +98,7 @@ describe('renderToon', () => {
   });
 
   // Round-trip tests for the exact JSON shapes emitted by each structured-output
-  // command. These are spec-derived from the JSON output contract in 005 §4–§7.
+  // command. These are spec-derived from the JSON output contract in spec: cli/authoring-commands.
 
   it('round-trips the scan output shape', () => {
     // duplicateIds is DuplicateMonitorId[] — objects with { id, filePaths },

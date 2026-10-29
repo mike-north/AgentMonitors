@@ -299,7 +299,7 @@ registers a throwaway session, triggers a real change, waits for the event to ma
 claims it through the same delivery path a live hook uses — then tears everything down. Check the
 exit code: `0` means PASS, non-zero means FAIL with the failing stage named directly. Prefer
 `--format json` if you want to branch on the result programmatically instead of parsing text (spec
-005 §16 documents the stable JSON shape: `ok`, `monitorId`, `stages`, `failure`, `additionalContext`,
+spec: cli/verify documents the stable JSON shape: `ok`, `monitorId`, `stages`, `failure`, `additionalContext`,
 `daemonStderr`, `elapsedMs`).
 
 **Auto-trigger only covers `file-fingerprint`.** For a literal single-file glob (e.g.
@@ -645,8 +645,8 @@ before it will surface the event's body — independent of your monitor's `notif
 the 20 × 2s retry window above comfortably covers that. **Do not** change any files or re-open the
 session while you wait for step 5 once the event already exists — that resets the condition you're
 trying to observe. A `normal`-urgency monitor doesn't have this extra wait: `hook deliver` surfaces
-a reminder (not the full body) as soon as the event is unread (002 §9.2). `low` urgency is delivered
-only at the `turn-idle` lifecycle (002 §9.3, §13.2) — this recipe's step 5 sends
+a reminder (not the full body) as soon as the event is unread (spec: delivery/lifecycles). `low` urgency is delivered
+only at the `turn-idle` lifecycle (spec: delivery/lifecycles) — this recipe's step 5 sends
 `UserPromptSubmit`, which maps to `turn-interruptible` only, so it never exercises low-urgency
 delivery; expect step 5 to keep returning empty for a `low`-urgency monitor regardless of how long
 you wait.

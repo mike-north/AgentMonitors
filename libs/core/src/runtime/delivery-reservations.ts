@@ -3,7 +3,7 @@ import type { DeliveryClaim, MonitorEventRecord } from './types.js';
 
 /**
  * Default lifetime of an uncommitted delivery reservation, in milliseconds
- * (006 §4, issue #300).
+ * (spec: delivery/channel-transport, issue #300).
  *
  * A reservation is held only for the span of a single channel push
  * (`mcp.notification()` — a local stdio round-trip that normally settles in
@@ -41,7 +41,7 @@ export interface DeliveryReservationPlan {
 }
 
 /**
- * In-memory registry of uncommitted delivery reservations (006 §4, issue #300).
+ * In-memory registry of uncommitted delivery reservations (spec: delivery/channel-transport, issue #300).
  *
  * This is the "reserve → commit/release" half of the atomic surfacing protocol.
  * A transport (the channel, `apps/cli/src/commands/channel.ts`) reserves the
@@ -49,12 +49,12 @@ export interface DeliveryReservationPlan {
  * disconnected push never leaves rows permanently claimed. While a reservation
  * is outstanding its event ids are **leased**: the runtime hides them from the
  * claim decision so the hook transport does not double-surface them (the
- * cross-transport dedup boundary of 006 §4.5, moved to reserve time). A lease is
+ * cross-transport dedup boundary of spec: delivery/channel-transport, moved to reserve time). A lease is
  * NOT acknowledgement and NOT a durable claim — it only defers the claim across
  * the push.
  *
  * The registry is intentionally **in-memory and daemon-local**: both transports
- * drive the one daemon runtime (006 §6.1), so an in-process map is sufficient to
+ * drive the one daemon runtime (spec: delivery/transport-seam — "MCP is never required", "Channel and hook paths share the same daemon IPC"), so an in-process map is sufficient to
  * mediate them, and losing it on a daemon restart is the SAFE direction — a
  * dropped lease simply returns its rows to `pending`, where the hook path
  * recovers them (never a lost delivery, PP1). Persisting a lease would instead

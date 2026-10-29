@@ -10,17 +10,17 @@
  * the WRONG change summary — a recipient last seen at `a1` should receive the
  * full `a1→a3` span, but the shared row only carries `a2→a3` (the latest
  * snapshot delta). That is incomplete/incorrect evidence and violates the
- * per-recipient Diff + session-isolation contract (002 §1.1.2). Both the claim
+ * per-recipient Diff + session-isolation contract (spec: pipeline/post-processing). Both the claim
  * path (`claimDelivery`) and the preview path (`previewSettledHighDelivery`) go
  * through the same mapper, so both are covered.
  *
  * Expected diff text is written BY HAND from the `buildTextDiff` format spec
- * (002 §5.2: line-level `- <n>: <before>` / `+ <n>: <after>`), never captured
+ * (spec: runtime/event-materialization: line-level `- <n>: <before>` / `+ <n>: <after>`), never captured
  * from program output. No snapshot/gold-master assertions (repo policy).
  *
- * @see ../../../../docs/specs/002-runtime-delivery.md §1.1.2 (the shared/per-recipient seam)
- * @see ../../../../docs/specs/002-runtime-delivery.md §5.2 (diff format)
- * @see ../../../../docs/specs/006-agent-integration.md §4.2.1 (change summary on the delivery surface)
+ * @see ../../../../openspec/specs/pipeline/post-processing/spec.md (the shared/per-recipient seam)
+ * @see ../../../../openspec/specs/runtime/event-materialization/spec.md (diff format)
+ * @see ../../../../openspec/specs/delivery/channel-transport/spec.md, ../../../../openspec/specs/delivery/transport-seam/spec.md (change summary on the delivery surface)
  * @see ../../../../docs/specs/roadmap.md §G10
  */
 import { mkdtempSync, rmSync } from 'node:fs';

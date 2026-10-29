@@ -4,10 +4,10 @@
  * The budget math is spec-derived (interval + settle + margin), NOT captured
  * from output: each assertion traces to the runtime's canonical
  * `schedulingDefaults` (exported from `@agentmonitors/core`, consumed by both
- * the daemon in `service.ts` and verify-budget) and 002 §4.4 / §9.1.
+ * the daemon in `service.ts` and verify-budget) and spec: runtime/notify-dispatch, pipeline/post-processing, delivery/lifecycles.
  *
  * @see docs/specs/002-runtime-delivery.md
- * @see docs/specs/005-cli-reference.md §16
+ * @see openspec/specs/cli/verify/spec.md
  */
 import path from 'node:path';
 import { describe, it, expect } from 'vitest';
@@ -82,7 +82,7 @@ describe('resolvePollIntervalMs', () => {
 
 describe('resolveSettleMs', () => {
   it('is 0 for normal urgency when no notify strategy is declared', () => {
-    // An omitted `urgency` defaults to the `normal` band (001 §3.2) — no
+    // An omitted `urgency` defaults to the `normal` band (spec: monitor/definition) — no
     // default debounce settle applies, unlike `high` below.
     const monitor = monitorFrom(
       'watch:\n  type: file-fingerprint\n  globs:\n    - "*.md"',
@@ -185,7 +185,7 @@ describe('computeVerifyBudget', () => {
       "watch:\n  type: file-fingerprint\n  globs:\n    - '*.md'\n  interval: '4s'\nurgency: high",
     );
     const budget = computeVerifyBudget(monitor);
-    // 002 §9.1: high urgency with no explicit notify still gets a default
+    // spec: delivery/lifecycles: high urgency with no explicit notify still gets a default
     // debounce settle before materialization (issue #406) PLUS the
     // claim-settle window before hook-surfacing — both apply only to detect
     // (claim), not baseline.

@@ -190,9 +190,9 @@ describe('source-api-poll', () => {
     });
   });
 
-  // Keyed-collection change detection (003 §12) wired through api-poll. The shared
+  // Keyed-collection change detection (spec: sources/contract) wired through api-poll. The shared
   // diff lives in @agentmonitors/core; these verify api-poll consumes it correctly.
-  describe('keyed-collection (003 §12)', () => {
+  describe('keyed-collection (spec: sources/contract)', () => {
     function mockBody(body: string): void {
       (
         globalThis.fetch as unknown as ReturnType<typeof vi.fn>
@@ -643,7 +643,7 @@ describe('source-api-poll', () => {
   // verbatim (no inference, no override). The inferred path never warns, because
   // inference picks the correct strategy for the body.
   //
-  // @see docs/specs/003-source-plugins.md §4.3
+  // @see openspec/specs/sources/api-poll/spec.md — "api-poll bearer authentication", "api-poll basic authentication"
   // @see https://www.rfc-editor.org/rfc/rfc6838#section-4.2.8 (+json suffix)
   // ---------------------------------------------------------------------------
   describe('strategy inference from Content-Type (issue #230)', () => {
@@ -813,15 +813,15 @@ describe('source-api-poll', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Composite observation (003 §2.6): a source assembles ONE observation from
+  // Composite observation (spec: sources/api-poll, sources/contract): a source assembles ONE observation from
   // MANY calls — N requests reduced into one stable composite snapshot under a
   // single objectKey. The runtime then diffs that one snapshot against the
-  // consumer's baseline exactly as it would a single-call snapshot (§2.5).
+  // consumer's baseline exactly as it would a single-call snapshot (spec: sources/contract).
   //
-  // @see docs/specs/003-source-plugins.md §2.6
-  // @see docs/specs/003-source-plugins.md §2.5
+  // @see openspec/specs/sources/api-poll/spec.md, openspec/specs/sources/contract/spec.md
+  // @see openspec/specs/sources/contract/spec.md
   // ---------------------------------------------------------------------------
-  describe('composite observation (003 §2.6)', () => {
+  describe('composite observation (spec: sources/api-poll, sources/contract)', () => {
     /**
      * Mock `fetch` so each part URL returns a body from a lookup table. The mock
      * resolves by URL, so the order the source issues calls in is irrelevant —
@@ -887,21 +887,21 @@ describe('source-api-poll', () => {
       // Exactly ONE observation — the composite whole, not one per call.
       expect(next.observations).toHaveLength(1);
       const obs = next.observations[0];
-      // ONE objectKey for the whole (§2.6), not one per underlying call.
+      // ONE objectKey for the whole (spec: sources/api-poll, sources/contract), not one per underlying call.
       expect(obs?.objectKey).toBe('order-42');
       // The snapshot is the assembled WHOLE — every part is present, including
       // the unchanged ones — proving it is a composite snapshot, not a delta.
       expect(obs?.snapshotText).toContain('{"status":"open"}');
       expect(obs?.snapshotText).toContain('{"qty":1}');
       expect(obs?.snapshotText).toContain('{"qty":99}');
-      // The source returns a snapshot, never a diff (§2.5).
+      // The source returns a snapshot, never a diff (spec: sources/contract).
       expect(obs).not.toHaveProperty('diffText');
     });
 
     it('renders a deterministic snapshot regardless of part-fetch ordering', async () => {
       // Same underlying state, parts declared in a different order: the rendered
       // composite MUST be byte-identical so the runtime diff is not churned by
-      // ordering (§2.6 stability requirement).
+      // ordering (spec: sources/api-poll, sources/contract stability requirement).
       const orderA = {
         'change-detection': {
           composite: {
@@ -990,8 +990,8 @@ describe('source-api-poll', () => {
           },
         },
       };
-      // §2.6 partial-failure policy: a failed part throws — nextState never
-      // advances, so the prior baseline is preserved (002 §3). We never silently
+      // spec: sources/api-poll, sources/contract partial-failure policy: a failed part throws — nextState never
+      // advances, so the prior baseline is preserved (spec: runtime/monitor-state). We never silently
       // emit a composite missing a part.
       await expect(source.observe(cfg, { now: new Date() })).rejects.toThrow(
         /boom/,
@@ -1189,7 +1189,7 @@ describe('source-api-poll', () => {
   // Integration: drive the composite source through the REAL runtime and prove
   // the runtime — not the source — computes the delivery diff over the one
   // composite snapshot, materializing a single event under the one objectKey.
-  describe('composite × runtime integration (003 §2.6 + §2.5)', () => {
+  describe('composite × runtime integration (spec: sources/api-poll, sources/contract + spec: sources/contract)', () => {
     const tempDirs: string[] = [];
 
     afterEach(() => {
@@ -1294,7 +1294,7 @@ When the document changes, act on it.
       // Second change: another section edit. The composite is assembled from 3
       // calls again; the RUNTIME diffs the one composite snapshot against the
       // snapshot it stored on the first change — exactly as a single-call
-      // snapshot would be diffed (§2.6). The source never computes this diff.
+      // snapshot would be diffed (spec: sources/api-poll, sources/contract). The source never computes this diff.
       vi.advanceTimersByTime(2_000);
       mockByUrl({
         'https://api.example.com/doc/7': 'TITLE: Draft',
@@ -1315,7 +1315,7 @@ When the document changes, act on it.
       const latest = events.find((e) =>
         e.snapshotText?.includes('two v3 CHANGED'),
       );
-      // The runtime produced the diff (the source never does, §2.5) …
+      // The runtime produced the diff (the source never does, spec: sources/contract) …
       expect(latest?.diffText).not.toBeNull();
       expect(latest?.diffText).toContain('CHANGED');
       // … over the composite whole-state snapshot (all sections present).
@@ -1833,7 +1833,7 @@ When the document changes, act on it.
       });
     });
 
-    describe('composite concurrency (003 §2.6)', () => {
+    describe('composite concurrency (spec: sources/api-poll, sources/contract)', () => {
       it('bounds simultaneous in-flight part requests', async () => {
         const partCount = 12;
         let active = 0;
@@ -2115,12 +2115,12 @@ When the document changes, act on it.
 
     // Issue #304 review, third round: the cumulative BYTE budget bounds
     // aggregate size, but bounds neither the number of parts (and therefore
-    // requests/worst-case tick duration, 003 §4.9) nor a single part's id
+    // requests/worst-case tick duration, spec: sources/api-poll) nor a single part's id
     // length (which inflates the rendered artifact through framing alone,
     // independent of any response body). `MAX_COMPOSITE_PARTS` and
     // `MAX_PART_ID_LENGTH` close both gaps, enforced identically in the
     // JSON Schema (authoring-time `agentmonitors validate`) and the parser
-    // (defense in depth for a hand-edited MONITOR.md, 002 §2.2).
+    // (defense in depth for a hand-edited MONITOR.md, spec: runtime/tick-scheduling).
     describe('composite part-count and part-id bounds (issue #304 review, third round)', () => {
       it('parseCompositeConfig rejects more than MAX_COMPOSITE_PARTS entries', () => {
         const parts = Array.from(
@@ -2223,7 +2223,7 @@ When the document changes, act on it.
       it('scopeSchema accepts a 200-code-point emoji id via validateWatchScope (schema/parser parity)', () => {
         // Confirms `validateWatchScope` (the JSON Schema path, used by
         // authoring-time `agentmonitors validate`) and `parseCompositeConfig`
-        // (the runtime parser, used by `tick()`, 002 §2.2) agree on this
+        // (the runtime parser, used by `tick()`, spec: runtime/tick-scheduling) agree on this
         // astral-character id: both must accept it, or a config that passes
         // authoring-time validation would still fail at runtime.
         const emojiId = '\u{1F600}'.repeat(200);

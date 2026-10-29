@@ -1,13 +1,13 @@
 /**
  * Proof tests for the deterministic Shape stage's derived-facts and render
- * primitives (roadmap G15).
+ * primitives (spec: pipeline/post-processing).
  *
  * Expected values are written BY HAND from the spec — no snapshot / gold-master
  * assertions (explicit repo policy). Every assertion traces to a spec rule.
  *
- * @see ../../../../docs/specs/001-monitor-definition.md §5.1 (Shape declaration)
- * @see ../../../../docs/specs/002-runtime-delivery.md §1.1.4 (derived facts)
- * @see ../../../../docs/specs/002-runtime-delivery.md §1.1.5 (render-then-diff)
+ * @see ../../../../openspec/specs/monitor/definition/spec.md (Shape declaration)
+ * @see ../../../../openspec/specs/pipeline/post-processing/spec.md (derived facts)
+ * @see ../../../../openspec/specs/pipeline/post-processing/spec.md (render-then-diff)
  */
 import { describe, expect, it } from 'vitest';
 import {
@@ -27,17 +27,17 @@ const NOW_MINUS_1MIN = NOW - ONE_MINUTE;
 
 // A single deferred task whose defer-until threshold is exactly `NOW`: at `NOW`
 // it is `revealed` (`defer-until <= now`); one minute earlier it is not.
-// 002 §1.1.4: `revealed` when a previously-deferred item has `defer-until <= now`.
+// spec: pipeline/post-processing: `revealed` when a previously-deferred item has `defer-until <= now`.
 const deferUntilNow = { task: 'Ship deck', deferUntil: NOW };
 
-// 001 §5.1: `derive` is an ordered list of { name, when } where `when` is a CEL
+// spec: monitor/definition: `derive` is an ordered list of { name, when } where `when` is a CEL
 // boolean predicate over (snapshot, now).
 const revealedRule: DerivedFactRule = {
   name: 'revealed',
   when: 'deferUntil <= now',
 };
 
-describe('Shape — derived facts (002 §1.1.4)', () => {
+describe('Shape — derived facts (spec: pipeline/post-processing)', () => {
   describe('fixed-`now` purity (threshold crossing)', () => {
     it('yields exactly `revealed` when the defer threshold is crossed', () => {
       // At NOW, deferUntil (== NOW) <= now → the rule holds, and ONLY that fact.
@@ -60,7 +60,7 @@ describe('Shape — derived facts (002 §1.1.4)', () => {
     });
   });
 
-  describe('the four E8 rule shapes (002 §1.1.4 table)', () => {
+  describe('the four E8 rule shapes (spec: pipeline/post-processing table)', () => {
     // priority high, due 12h out, defer crossed → urgent + due-soon + revealed.
     const HOUR = 3_600_000;
     const task = {
@@ -96,7 +96,7 @@ describe('Shape — derived facts (002 §1.1.4)', () => {
   });
 });
 
-describe('Shape — render-then-diff (002 §1.1.5)', () => {
+describe('Shape — render-then-diff (spec: pipeline/post-processing)', () => {
   const rules: DerivedFactRule[] = [
     { name: 'revealed', when: 'deferUntil <= now' },
   ];
@@ -110,7 +110,7 @@ describe('Shape — render-then-diff (002 §1.1.5)', () => {
   });
 
   it('is byte-stable regardless of source key ordering', () => {
-    // 002 §1.1.5: stable field ordering, no incidental churn. Reordering the
+    // spec: pipeline/post-processing: stable field ordering, no incidental churn. Reordering the
     // snapshot's keys must not change the rendered artifact.
     const reordered = { deferUntil: NOW, task: 'Ship deck' };
     expect(renderShapeArtifact(reordered, NOW, rules)).toBe(
@@ -141,7 +141,7 @@ describe('Shape — render-then-diff (002 §1.1.5)', () => {
   });
 });
 
-describe('Shape — CEL predicate validation (004 §2.2)', () => {
+describe('Shape — CEL predicate validation (spec: monitor/validation)', () => {
   it('accepts a well-formed predicate', () => {
     expect(validateCelPredicate('deferUntil <= now')).toBeUndefined();
   });

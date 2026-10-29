@@ -2,13 +2,13 @@
  * Tests for the transport-shared event-block renderer and packing helpers
  * (`buildEventBlock`, `truncateWithMarker`, `packWholeBlocks`,
  * `packEventsUnderCap`) — the primitives both the hook-deliver transport
- * (`hook-deliver-render.ts`, 006 §5.1) and the channel transport
- * (`channel-render.ts`, 006 §4.2) build on. Before {@link truncateWithMarker}
+ * (`hook-deliver-render.ts`, spec: delivery/hook-transport) and the channel transport
+ * (`channel-render.ts`, spec: delivery/channel-transport) build on. Before {@link truncateWithMarker}
  * and the generic packing helpers were extracted here, `hook-deliver-render.ts`
  * and `delivery-event-render.ts` each carried a character-identical copy of
  * the same code-point-safe truncation loop (issue #442, review finding #5b).
  *
- * @see docs/specs/006-agent-integration.md §4.2.1, §5.1, §5.5
+ * @see openspec/specs/delivery/channel-transport/spec.md, openspec/specs/delivery/transport-seam/spec.md, openspec/specs/delivery/hook-transport/spec.md
  */
 import { spawnSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
@@ -23,7 +23,7 @@ import {
   truncateWithMarker,
 } from './delivery-event-render.js';
 
-/** 006 §4.6: every tag-breakout / attribute-breakout character. */
+/** spec: delivery/channel-transport, delivery/transport-seam — "Channel meta and content are sanitized", "Injecting transports keep identity out of untrusted content": every tag-breakout / attribute-breakout character. */
 const FORBIDDEN_CHARS = /[<>[\]\r\n;]/;
 
 const identity = (value: string): string => value;
@@ -149,14 +149,14 @@ describe('buildEventBlock', () => {
   it('renders the header, title, summary, and body with no Changes section when diffText is absent', () => {
     const block = buildEventBlock(makeEvent(), identity);
     // The summary line carries the source's per-object text, which the title no
-    // longer does (002 §5.4, issue #449) — so it is rendered under the title.
+    // longer does (spec: runtime/event-materialization, issue #449) — so it is rendered under the title.
     expect(block).toBe('### m1 (high)\nt1\ns1\n\na body');
     expect(block).not.toContain('Changes:');
   });
 
   it('omits the summary line when it merely repeats the body (source set only title + body)', () => {
     // Materialization derives an absent `Observation.summary` from `body`
-    // (002 §5.1), so this is a valid third-party observation shape — the body
+    // (spec: runtime/event-materialization), so this is a valid third-party observation shape — the body
     // must not be rendered twice (issue #449 review).
     const block = buildEventBlock(
       makeEvent({
@@ -206,7 +206,7 @@ describe('buildEventBlock', () => {
   });
 
   // Regression (issue #449 review): `summary` prefers the Interpret digest
-  // (G14, 002 §1.1.8) when one was produced for the recipient's delta, and a
+  // (spec: pipeline/post-processing) when one was produced for the recipient's delta, and a
   // digest is a prose reading of the change that carries no guaranteed object
   // identity. `objectDetail` is the deterministic per-object text and must be
   // what names the object here, even when `summary` has been replaced by a

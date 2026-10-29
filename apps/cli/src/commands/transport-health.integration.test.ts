@@ -33,8 +33,8 @@ import { writeLocalState } from '../local-state.js';
  * extra load, and the Docker test that dominates CI's pool does not even run
  * here.
  *
- * @see docs/specs/006-agent-integration.md §12 (transport health)
- * @see docs/specs/005-cli-reference.md §15 (doctor)
+ * @see openspec/specs/delivery/transport-health/spec.md (transport health)
+ * @see openspec/specs/cli/doctor/spec.md (doctor)
  */
 
 const CLI_PATH = path.resolve(
@@ -209,8 +209,8 @@ afterAll(() => {
 // id — without it there is no link between the two, and the surface correctly
 // has nothing to say.
 //
-// @see docs/specs/006-agent-integration.md §12 (transport health)
-// @see docs/specs/005-cli-reference.md §15 (doctor)
+// @see openspec/specs/delivery/transport-health/spec.md (transport health)
+// @see openspec/specs/cli/doctor/spec.md (doctor)
 describe('doctor delivery-transport health (issue #425)', () => {
   const SCHEDULE_MONITOR = `---
 name: Heartbeat
@@ -498,7 +498,7 @@ This monitor fires on a schedule.
     // lead, same daemon, nothing recovered — found no record, took the "no
     // transport has ever reported in" branch and exited 0. A dead channel
     // server looked fixed purely because somebody had looked at it. It also
-    // made `doctor` mutate state, which 005 §15 says it never does.
+    // made `doctor` mutate state, which spec: cli/doctor says it never does.
     const fixture = transportFixture('stale-persists');
     const daemon = await startDaemon(
       fixture.monitorsRoot,
@@ -683,7 +683,7 @@ This monitor fires on a schedule.
       expect(claim.exitCode).toBe(0);
       const claimed = JSON.parse(claim.stdout) as { mode: string } | null;
       // The first turn-interruptible claim over an unclaimed normal event
-      // always surfaces the coalesced reminder (002 §9.2) and durably claims
+      // always surfaces the coalesced reminder (spec: delivery/lifecycles) and durably claims
       // the event (never acknowledges it) — confirming the exact
       // claimed-but-unread state the suppression guard holds on, rather than
       // assuming the claim did what it was expected to.
@@ -801,7 +801,7 @@ This monitor fires on a schedule.
   //
   // A closed session is NOT a live degradation, though — it is the SAME
   // "nothing is open right now" state as the ordinary no-lead-session idle
-  // case (005 §15: "no lead session at all" → `idle`/exit 0, even for a
+  // case (spec: cli/doctor: "no lead session at all" → `idle`/exit 0, even for a
   // transport that DID report in during some past session). Round 4's
   // review had this exiting 1/`fail`, reasoning a running heartbeat with no
   // recipient was a "real degradation" — but that contradicted the spec text
@@ -866,7 +866,7 @@ This monitor fires on a schedule.
       );
       expect(result.stdout).toContain('no live session');
       // A closed session is the ordinary "nothing is open right now" idle
-      // state, not a live degradation — 005 §15's exit-code contract, and the
+      // state, not a live degradation — spec: cli/doctor's exit-code contract, and the
       // same treatment `lead-session`/`daemon-reachable` already give it.
       expect(result.stdout).toContain('◇ delivery-verdict');
       expect(result.stdout).not.toContain('✗ delivery-verdict');

@@ -14,7 +14,7 @@
  * therefore rejects a non-synthetic key at the trust boundary, and a literal watched
  * file verify created is cleaned up by the id-scoped `retractObjectEvents` instead.
  *
- * @see docs/specs/005-cli-reference.md §16 (step 9, "Clean up")
+ * @see openspec/specs/cli/verify/spec.md (step 9, "Clean up")
  * @see docs/specs/spec-changelog.md 2026-07-16 (Refs #414, #418)
  */
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';

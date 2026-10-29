@@ -1,16 +1,16 @@
-// Tests for the generalized host-probe harness (spec 006 §11.6).
+// Tests for the generalized host-probe harness (change: add-multi-host-adapters — "Host adapters ship with conformance evidence").
 //
 // Two layers, per the repo's testing-strategy rule:
 //   - Unit tests against lib.mjs's pure reduction logic, with synthetic payloads whose
-//     shape is taken directly from the documented hook stdin contract (006 §5.0) and the
-//     MCP-server env contract (006 §4.4) — not from captured program output.
+//     shape is taken directly from the documented hook stdin contract (spec: delivery/hook-transport) and the
+//     MCP-server env contract (spec: delivery/channel-transport) — not from captured program output.
 //   - An integration test that spawns `node probe.mjs record-hook` as a real subprocess and
 //     pipes real stdin JSON into it, the same way a Claude Code hook actually invokes a
-//     command (006 §5.0/§5.1), so a drift in the wire contract (missing `continue`, wrong
+//     command (spec: delivery/hook-transport), so a drift in the wire contract (missing `continue`, wrong
 //     `hookSpecificOutput.hookEventName`, emitting context on a non-context event) fails
 //     this test rather than only a hand-built approximation.
 //
-// @see docs/specs/006-agent-integration.md §4.4, §5.0, §5.1, §5.4, §11
+// @see openspec/specs/delivery/channel-transport/spec.md, openspec/specs/delivery/hook-transport/spec.md
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -61,7 +61,7 @@ describe('candidateSignalKeys', () => {
 });
 
 describe('buildHookSighting', () => {
-  // Spec 006 §5.0: the hook stdin payload carries session_id / hook_event_name / cwd.
+  // Spec spec: delivery/hook-transport: the hook stdin payload carries session_id / hook_event_name / cwd.
   it('records the documented session-identity and workspace-binding fields when present', () => {
     const payload = {
       session_id: '62e1887b-17a0-4b11-890c-3f08843ef898',
@@ -82,7 +82,7 @@ describe('buildHookSighting', () => {
     });
   });
 
-  // Spec 006 §5.2 step 2: a TTY/empty/unparseable stdin stream is treated as `{}` — the
+  // Spec spec: delivery/hook-transport step 2: a TTY/empty/unparseable stdin stream is treated as `{}` — the
   // harness MUST record that absence honestly, not synthesize a value.
   it('records absent session-identity/workspace-binding fields honestly (empty payload)', () => {
     const sighting = buildHookSighting({
@@ -117,7 +117,7 @@ describe('buildHookSighting', () => {
 });
 
 describe('buildMcpSighting', () => {
-  // Spec 006 §4.4: a spawned MCP server can read CLAUDE_PROJECT_DIR / CLAUDE_CODE_SESSION_ID
+  // Spec spec: delivery/channel-transport: a spawned MCP server can read CLAUDE_PROJECT_DIR / CLAUDE_CODE_SESSION_ID
   // from its environment and answer roots/list.
   it('records env signals and roots/list result', () => {
     const sighting = buildMcpSighting({
@@ -138,14 +138,14 @@ describe('buildMcpSighting', () => {
 });
 
 describe('summarize', () => {
-  // This is criterion 2: running the probe in Claude Code must reproduce the 006 §11.3
+  // This is criterion 2: running the probe in Claude Code must reproduce the change: add-multi-host-adapters — "Matrix cells are pinned by a per-host probe"
   // Claude column. Expected values below are taken directly from that spec section, not
   // from a captured probe run:
-  //   - session identity: stdin session_id (hooks) + CLAUDE_CODE_SESSION_ID (MCP) — §4.4/§5.0
-  //   - workspace binding: stdin cwd (hooks) + CLAUDE_PROJECT_DIR / roots/list (MCP) — §4.4/§5.0
+  //   - session identity: stdin session_id (hooks) + CLAUDE_CODE_SESSION_ID (MCP) — spec: delivery/channel-transport, delivery/hook-transport
+  //   - workspace binding: stdin cwd (hooks) + CLAUDE_PROJECT_DIR / roots/list (MCP) — spec: delivery/channel-transport, delivery/hook-transport
   //   - lifecycle hook points: SessionStart / UserPromptSubmit / PreToolUse / PostToolUse /
-  //     Stop are the hooks the activation plugin wires or that fire during a turn (§5.6, §11.3)
-  it('reproduces the 006 §11.3 Claude Code column from a full set of sightings', () => {
+  //     Stop are the hooks the activation plugin wires or that fire during a turn (spec: delivery/channel-transport, delivery/hook-transport)
+  it('reproduces the change: add-multi-host-adapters — "Matrix cells are pinned by a per-host probe" Claude Code column from a full set of sightings', () => {
     const commonPayloadFields = {
       session_id: 'sess-1',
       cwd: '/workspace',
@@ -250,7 +250,7 @@ describe('probe.mjs record-hook (real subprocess, real stdin contract)', () => {
     };
   }
 
-  // 006 §5.1/§5.4: UserPromptSubmit is a context event and MUST get hookSpecificOutput
+  // spec: delivery/hook-transport: UserPromptSubmit is a context event and MUST get hookSpecificOutput
   // with a matching hookEventName.
   it('emits hookSpecificOutput.additionalContext for a context event (UserPromptSubmit)', () => {
     const { parsed } = runHook({
@@ -264,7 +264,7 @@ describe('probe.mjs record-hook (real subprocess, real stdin contract)', () => {
     });
   });
 
-  // 006 §5.4: PreToolUse does NOT honor additionalContext (it uses permissionDecision) —
+  // spec: delivery/hook-transport: PreToolUse does NOT honor additionalContext (it uses permissionDecision) —
   // the harness MUST NOT emit hookSpecificOutput for it, matching hook deliver's rule.
   it('omits hookSpecificOutput for a non-context event (PreToolUse)', () => {
     const { parsed } = runHook({
@@ -293,7 +293,7 @@ describe('probe.mjs record-hook (real subprocess, real stdin contract)', () => {
     });
   });
 
-  // 006 §5.2 step 2: a TTY/empty/unparseable stream is treated as `{}` — never crashes,
+  // spec: delivery/hook-transport step 2: a TTY/empty/unparseable stream is treated as `{}` — never crashes,
   // never hangs, and prints nothing when there is nothing to say.
   it('never crashes on an empty stdin stream and records absence honestly', () => {
     const stdout = execFileSync(

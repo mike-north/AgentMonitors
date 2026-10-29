@@ -1,7 +1,7 @@
 # Channel UAT (automated end-to-end)
 
 Proves the **channel transport** ([`006-agent-integration.md`](../../docs/specs/006-agent-integration.md)
-§4) end to end: does `agentmonitors channel serve` actually resolve its bound session, poll the
+spec: delivery/channel-transport) end to end: does `agentmonitors channel serve` actually resolve its bound session, poll the
 daemon, claim a settled delivery, render it, and **push** a `<channel>` notification to the host?
 
 Channels are a Claude Code research-preview feature, so a real Claude session can't run in CI — and
@@ -47,7 +47,7 @@ received notification is printed to stdout.
 ```
 
 (`event_count` on a reminder claim reports the session's pending unread total the reminder refers to —
-it is never `0`, since a reminder is only ever pushed when at least one event is pending; 006 §4.2.)
+it is never `0`, since a reminder is only ever pushed when at least one event is pending; spec: delivery/channel-transport.)
 
 `high` — the concrete event, after the 15s high-urgency settle:
 

@@ -107,7 +107,7 @@ The core is host-agnostic by construction; prove it. A Codex adapter
 ([#316](https://github.com/mike-north/AgentMonitors/issues/316)) first, then Cursor
 ([#317](https://github.com/mike-north/AgentMonitors/issues/317)), each with delivery
 semantics invariant against the Claude Code adapter per
-[spec 006 §11](../specs/006-agent-integration.md).
+[change: add-multi-host-adapters](../../openspec/changes/add-multi-host-adapters/proposal.md).
 
 ## M6 — User-level monitors & authoring
 
