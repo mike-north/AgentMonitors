@@ -1,59 +1,59 @@
-# Agent Monitors — Specification Set
+# Agent Monitors — Specification
 
-This directory is the **canonical implementation contract** for Agent Monitors: a
-system that turns external changes into durable, queryable work signals for AI agents.
+The **canonical implementation contract** for Agent Monitors is the OpenSpec specification in
+[`openspec/`](../../openspec/):
 
-Public website docs (`apps/website`) are explanatory and may simplify or lag. When the
-website and these specs disagree, **these specs win** (PP8). When these specs and the
-current code disagree, each spec says explicitly which behavior is _current_ and which is
-_target_ (PP7).
+- [`openspec/specs/<capability>/spec.md`](../../openspec/specs/) — **current** (implemented)
+  behavior, as requirements (`SHALL` / `MUST`) with testable scenarios.
+- [`openspec/changes/<change>/`](../../openspec/changes/) — **target** (not-yet-implemented)
+  behavior: a `proposal.md`, delta specs, `tasks.md`, and optionally a `design.md`. The set of open
+  changes is the roadmap.
+- [`openspec/config.yaml`](../../openspec/config.yaml) — project context and the rules each
+  artifact must follow.
 
-## Reading order
+Public website docs (`apps/website`) are explanatory and may simplify or lag. When they disagree
+with OpenSpec, **OpenSpec wins** (PP8).
 
-Read top to bottom the first time; after that, jump to the doc that owns your concern.
+## Finding the right capability
 
-| Doc                                                                                                     | Owns                                                                                                                                                                                 | Read when                                                                    |
-| ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------- |
-| [000 — Principles & Properties](./000-principles.md)                                                    | The invariants (PP/SP/AP/BP/NP) every other doc cites                                                                                                                                | Always first — the rest reference these by ID                                |
-| [001 — Monitor Definition & Authoring](./001-monitor-definition.md)                                     | `MONITOR.md` layout, frontmatter schema, identity, notify shapes                                                                                                                     | Authoring monitors; changing the frontmatter schema                          |
-| [002 — Runtime, Delivery & Persistence](./002-runtime-delivery.md)                                      | Tick loop, scheduling, notify dispatch, event materialization, session projection, hook state, delivery lifecycles, daemon/IPC, adapters, DB schema                                  | Anything about _when_ a signal becomes durable and _how_ it reaches an agent |
-| [003 — Source Plugins](./003-source-plugins.md)                                                         | The source contract and the bundled `file-fingerprint` / `api-poll` / `schedule` / `incoming-changes` sources                                                                        | Writing a source; changing observation behavior                              |
-| [004 — Validation & Testing](./004-validation-testing.md)                                               | Validation surfaces, required test scenarios, ambiguity/drift handling                                                                                                               | Adding tests; resolving a contradiction                                      |
-| [005 — CLI Reference](./005-cli-reference.md)                                                           | The `agentmonitors` command surface                                                                                                                                                  | Using or changing a CLI command                                              |
-| [006 — Agent Integration & Delivery Transports](./006-agent-integration.md)                             | The adapter/transport seam, the hook-state transport, the Claude Code channel transport (target), availability/fallback, the multi-host adapter matrix (target)                      | Adding/changing how deliveries reach an agent (hooks, channels, new hosts)   |
-| [007 — Agent-Facing Interaction, Ephemeral Monitors & Observability](./007-agent-facing-interaction.md) | The agent → daemon direction (target): act-on-signal verbs (snapshot/diff/summary), agent-declared ephemeral monitors, the observability surface                                     | Adding/changing how an agent _acts on_ a pushed signal or _declares_ a watch |
-| [008 — Reliability & Process Hygiene](./008-reliability-process-hygiene.md)                             | The containment boundary, spawned-process lifecycle bounds, restart sweep, identity-verified cleanup, abstention warnings, capability probe/reporting, power posture (mostly target) | Anything touching daemon/spawned-process lifecycle, cleanup, or containment  |
+```bash
+openspec list --specs                       # every capability and its requirement count
+openspec show delivery/lifecycles --type spec   # read one capability
+openspec list                               # open (target) changes
+```
 
-## Normative vs supporting docs
+| Domain                    | Capabilities                                                                                                                                                                                    |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Invariants                | `principles` (PP/SP/AP/BP/NP — cited by ID everywhere else)                                                                                                                                     |
+| Authoring                 | `monitor/definition`, `monitor/validation`                                                                                                                                                      |
+| Runtime                   | `pipeline/post-processing`, `runtime/tick-scheduling`, `runtime/monitor-state`, `runtime/local-data-permissions`, `runtime/notify-dispatch`, `runtime/event-materialization`                    |
+| Delivery                  | `delivery/session-projection`, `delivery/lifecycles`, `delivery/host-adapters`, `delivery/transport-seam`, `delivery/hook-transport`, `delivery/channel-transport`, `delivery/transport-health` |
+| Daemon & storage          | `daemon/ipc`, `persistence/schema`, `inbox/legacy-inbox`                                                                                                                                        |
+| Sources                   | `sources/contract`, `sources/file-fingerprint`, `sources/api-poll`, `sources/schedule`, `sources/incoming-changes`, `sources/command-poll`                                                      |
+| CLI                       | `cli/conventions`, `cli/authoring-commands`, `cli/monitor-commands`, `cli/daemon-commands`, `cli/session-commands`, `cli/doctor`, `cli/verify`                                                  |
+| Agent-facing              | `agent/ephemeral-monitors`                                                                                                                                                                      |
+| Reliability & engineering | `reliability/process-hygiene`, `engineering/test-integrity`                                                                                                                                     |
 
-- **Normative** (`000`–`008`): use MUST / MUST NOT / MAY. These define the contract.
-- **Supporting** (non-normative), this directory:
-  - [glossary.md](./glossary.md) — one canonical definition per core term.
-  - [roadmap.md](./roadmap.md) — the current→target gaps, as prioritizable work items.
-  - [spec-changelog.md](./spec-changelog.md) — clarifications and contradiction resolutions.
-  - [maintainer-migration-notes.md](./maintainer-migration-notes.md) — how the old single-page
-    draft maps to this set.
+## How to change behavior
 
-## How to propose a change
+1. Propose an OpenSpec change (`/opsx:propose` in Claude Code; `openspec-propose` skill elsewhere):
+   proposal, delta specs (`ADDED` / `MODIFIED` / `REMOVED` requirements), tasks.
+2. Implement it with its tests (`/opsx:apply`), in the same PR as the change, or a later one.
+3. When it ships, archive it (`/opsx:archive`): its deltas are merged into `openspec/specs/` and the
+   change moves to `openspec/changes/archive/`. Main specs describe current behavior only.
+4. `openspec validate --all --strict` must pass.
 
-Follow the drift-handling process in [004 §5](./004-validation-testing.md) and the acceptance
-checklist in [004 §6](./004-validation-testing.md). In short:
+Clarifications that do not change behavior may edit `openspec/specs/` directly.
 
-1. Update the relevant numbered doc first. Keep _current_ vs _target_ explicit.
-2. If the change resolves a contradiction or alters an earlier statement, add a
-   [spec-changelog.md](./spec-changelog.md) entry.
-3. Add or update tests so the decision is enforced ([004 §3](./004-validation-testing.md)).
-4. Only then adjust public website summaries if needed.
+## What remains in this directory (non-normative)
 
-Every substantive normative change must be able to answer all five acceptance-checklist
-questions in [004 §6](./004-validation-testing.md). If any answer is "no", it is underspecified.
-
-## Source layout (orientation)
-
-The contract is implemented across a pnpm + Nx monorepo:
-
-- `libs/core` (`@agentmonitors/core`) — parser, schema, source registry, runtime, hook bridge,
-  adapters, persistence. The published library and the home of most normative behavior.
-- `apps/cli` (`agentmonitors`) — the command surface and the daemon/IPC layer.
-- `plugins/source-*` — the four bundled observation sources (`file-fingerprint`, `api-poll`, `schedule`, `incoming-changes`).
-- `apps/website` — public docs (out of scope for this spec set).
+- [glossary.md](./glossary.md) — one canonical definition per core term.
+- `000`–`008` (e.g. [002](./002-runtime-delivery.md)) — **crosswalk stubs**. The former numbered
+  docs are still cited throughout code comments as `NNN §X.Y`; each stub maps every former section
+  to the capability (and requirement names) or change that now owns it. Their full former text is in
+  git history (`git show e1bafcfa:docs/specs/<file>`).
+- [roadmap.md](./roadmap.md) — maps the former gap IDs (`G1`…`G21`) to changes or capabilities.
+- [spec-changelog.md](./spec-changelog.md) — the frozen pre-OpenSpec history of clarifications and
+  contradiction resolutions. New history is the archived changes in `openspec/changes/archive/`.
+- [maintainer-migration-notes.md](./maintainer-migration-notes.md), [design/](./design/),
+  [plans/](./plans/) — historical design records.

@@ -3,9 +3,10 @@
 > **Status:** Supporting (non-normative)
 > **Covers:** one canonical definition per core Agent Monitors term
 
-This glossary fixes the vocabulary used across the spec set. Each term links to the
-numbered doc that governs it. Where a term has a precise normative meaning, the linked doc
-is authoritative; this page is a quick index, not the contract.
+This glossary fixes the vocabulary used across the OpenSpec specification
+([`openspec/`](../../openspec/)). Each term links to the former numbered doc section that governed
+it; those docs are now crosswalk stubs pointing at the owning OpenSpec capability, which is
+authoritative. This page is a quick index, not the contract.
 
 ## Authoring
 

@@ -147,15 +147,16 @@ agentmonitors events list --session <session-id> --unread   # inspect a session'
 
 Run `agentmonitors --help` for the full command surface, or see the
 [CLI reference](https://agentmonitors.io/docs) /
-[`docs/specs/005-cli-reference.md`](docs/specs/005-cli-reference.md).
+[`openspec/specs/cli/`](openspec/specs/cli/).
 
 ## Documentation
 
 - **[agentmonitors.io](https://agentmonitors.io)** — the user docs site (start here): getting
   started, authoring monitors, end-to-end delivery, use cases.
-- **[`docs/specs/`](docs/specs/)** — the canonical specification (source of truth for intended
-  behavior, marked _current_ vs _target_). Start with the [spec README](docs/specs/README.md). For
-  building monitors you rarely need these; they're for deep dives and contributors.
+- **[`openspec/`](openspec/)** — the canonical specification (source of truth for intended
+  behavior): current behavior in `openspec/specs/`, planned behavior in `openspec/changes/`. Start
+  with the [spec README](docs/specs/README.md). For building monitors you rarely need these; they're
+  for deep dives and contributors.
 
 ## Contributing
 

@@ -1,13 +1,23 @@
 # Spec Changelog
 
+> **Status:** Frozen (non-normative history). The specification moved to OpenSpec
+> ([`openspec/`](../../openspec/)); new history is the archived changes in
+> `openspec/changes/archive/`. Do not add entries here.
+
 This file records clarifications, contradiction resolutions, and structural changes to the
-Agent Monitors spec set in `docs/specs/`.
+Agent Monitors spec set as it existed in `docs/specs/` before the OpenSpec migration.
 
-## Usage
+## 2026-10-28 — Specification migrated to OpenSpec
 
-- Add entries when ambiguity is resolved or the intended contract changes.
-- Prefer short entries tied to the numbered doc affected.
-- If implementation behavior and desired behavior differ, say so explicitly.
+The normative docs `000`–`008` were migrated into OpenSpec: current behavior into 35 capability
+specs under `openspec/specs/`, target behavior (including every open `roadmap.md` gap) into change
+proposals under `openspec/changes/`. Each numbered doc is now a crosswalk stub mapping its former
+sections to their new home, so `NNN §X.Y` citations in code still resolve. Where the docs and the
+code disagreed, the migration specified the code's current behavior and recorded the discrepancy in
+the owning change or capability; notable resolutions: 002 §1.1 and 006 §4 "(target)" headings were
+stale (shipped), 004 §5.1's "duplicate IDs not rejected" and "JSON Schema not enforced" limits were
+stale (both enforced), and 001 §8 vs 003 §3.5.3 on absolute + home-relative glob mixing was resolved
+in favor of 003 (change `add-user-level-monitor-glob-scopes`). This file is frozen from here on.
 
 ## 2026-08-24 — New numbered doc: 008 — Reliability & Process Hygiene — Refs #504, PR #476
 

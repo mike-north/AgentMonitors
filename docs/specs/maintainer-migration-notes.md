@@ -1,6 +1,7 @@
 # Maintainer Migration Notes
 
-> **Status:** Supporting (non-normative)
+> **Status:** Historical (non-normative). The numbered docs described here have since been
+> migrated to OpenSpec ([`openspec/`](../../openspec/)); see the [spec README](./README.md).
 
 This document explains how the previous single-page draft and the repository layout map to
 the numbered internal spec set in `docs/specs/`. Nothing here is a requirement to preserve
