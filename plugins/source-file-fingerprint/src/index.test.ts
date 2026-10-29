@@ -488,7 +488,7 @@ describe('source-file-fingerprint', () => {
     });
   });
 
-  // G3: beyond modify, the source distinguishes created / deleted / descoped.
+  // changeKind (spec: sources/file-fingerprint): beyond modify, the source distinguishes created / deleted / descoped.
   describe('create, delete, and descope (spec: sources/contract, sources/file-fingerprint)', () => {
     // changeKind is a first-class typed field on the Observation; the runtime is
     // what copies it into the materialized event's queryScope (tested in core).

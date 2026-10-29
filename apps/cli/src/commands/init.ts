@@ -1010,7 +1010,7 @@ function seedGlobs(template: string, type: string, globs: string[]): string {
  * not plain scalars — a leading `-`/`--` like `--porcelain`, embedded spaces,
  * `#`, `:` — round-trip verbatim. Quoting also means seeding never invents shell
  * semantics: each `--command` token is one argv element, matching the
- * "argv array, run directly (no shell)" contract (spec 003 §"command-poll").
+ * "argv array, run directly (no shell)" contract (spec: sources/command-poll).
  *
  * If the template's `command:` block ever drifts out of the shape
  * `blockPattern` expects, `String.replace` would otherwise return the

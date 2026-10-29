@@ -6,7 +6,7 @@
  * per-monitor rollup contract there; they are written from the spec, not from
  * whatever the implementation currently emits.
  *
- * @see docs/specs/005-cli-reference.md
+ * @see openspec/specs/cli/doctor/spec.md
  */
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -109,7 +109,7 @@ describe('AgentMonitorRuntime.doctorReport', () => {
     expect(report.monitors).toHaveLength(1);
 
     const monitor = report.monitors[0];
-    expect(monitor?.id).toBe('watch-src'); // id = folder name (001 §)
+    expect(monitor?.id).toBe('watch-src'); // id = folder name (spec: monitor/definition)
     expect(monitor?.sourceName).toBe('test-firing'); // source type
     expect(monitor?.urgency).toBe('normal');
     expect(monitor?.valid).toBe(true);

@@ -150,7 +150,7 @@ export interface ObservationContext {
    *
    * The runtime serializes checkpoint writes with observation ingestion
    * per-watcher: a checkpoint in flight when an observation arrives completes
-   * **before** that observation is ingested (the G14 durable-write-before-ingest
+   * **before** that observation is ingested (the durable-write-before-ingest
    * ordering). A checkpoint is a state write only — it never materializes or
    * delivers an observation. A checkpoint whose durable write fails does **not**
    * abort the watcher (a transient durability gap, not a protocol violation): the

@@ -46,7 +46,7 @@ describe('diagnoseReminderSuppression', () => {
     expect(finding).toMatchObject({
       sessionId: 's1',
       urgency: 'normal',
-      lifecycle: 'turn-interruptible', // spec: delivery/lifecycles delivers at turn-interruptible
+      lifecycle: 'turn-interruptible', // normal reminders deliver at turn-interruptible (spec: delivery/lifecycles)
       unreadCount: 1,
       claimedCount: 1,
       reason: 'already-claimed',
@@ -146,7 +146,7 @@ describe('diagnoseReminderSuppression', () => {
     expect(findings).toHaveLength(1);
     expect(findings[0]).toMatchObject({
       urgency: 'low',
-      lifecycle: 'turn-idle', // spec: delivery/lifecycles delivers at turn-idle
+      lifecycle: 'turn-idle', // low reminders deliver at turn-idle (spec: delivery/lifecycles)
       reason: 'already-claimed',
     });
     expect(findings[0]?.message).toContain('Low-urgency reminder at turn-idle');

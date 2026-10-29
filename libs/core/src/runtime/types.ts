@@ -219,7 +219,7 @@ export interface DeliveryEventSummary {
    * last seen two observations ago receives the full multi-observation span,
    * while a caught-up session receives only the latest delta (session
    * isolation, issue #436). The shared `MonitorEventRecord.diffText` is used
-   * only as a **legacy fallback** for a pre-G10 row whose per-recipient column
+   * only as a **legacy fallback** for a pre-per-recipient-delta row whose per-recipient column
    * is `null` (mirrors `perRecipientDiffsForSession`'s own contract).
    *
    * Optional: absent when the event carried no diff at all (neither the
@@ -401,7 +401,7 @@ export interface MonitorDeliveryProjection {
    * The PER-RECIPIENT delta for this projection (spec: pipeline/post-processing): the diff of
    * the shared event's artifact against THIS session's own baseline cursor.
    * Absent for a baseline event (nothing to diff) and for legacy rows
-   * materialized before G10 — consumers fall back to the shared
+   * materialized before per-recipient deltas — consumers fall back to the shared
    * `MonitorEventRecord.diffText` in that case.
    */
   diffText?: string;
@@ -534,7 +534,7 @@ export interface DoctorReportInput {
 
 /**
  * The workspace-wide, durable-state health report behind the
- * `agentmonitors doctor` command (005 §"doctor", issue #267). It is a
+ * `agentmonitors doctor` command (spec: cli/doctor, issue #267). It is a
  * read-only diagnosis of the core/daemon side; the CLI layers the
  * project-enabled and daemon-reachable checks (both CLI-only concerns) on
  * top of it.

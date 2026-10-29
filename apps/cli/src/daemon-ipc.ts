@@ -888,7 +888,7 @@ function handleRequest(
  * exists with a looser mode. On-disk databases already tighten this directory at
  * `createDb` → `ensurePrivateDir`, but a `:memory:` database has no such call
  * site — so without this, a pre-existing world-readable default socket directory
- * would never be tightened (issue #292 review), a hole in spec: runtime/local-data-permissions's "each
+ * would never be tightened (issue #292 review), a hole in the runtime/local-data-permissions spec's "each
  * startup re-applies" rule that also underwrites the socket TOCTOU mitigation
  * (the owner-only parent directory is the load-bearing guard). Tightening is
  * best-effort — {@link restrictExistingPathMode} warns and continues if the

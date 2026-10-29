@@ -392,7 +392,7 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
   `);
 
   // Additive migration (spec: pipeline/post-processing): a `session_event_state` table created
-  // before G10 lacks the per-recipient `diff_text` column. Add it if missing so
+  // before per-recipient deltas lacks the per-recipient `diff_text` column. Add it if missing so
   // pre-existing durable DBs stay forward-compatible; legacy rows keep a NULL
   // here and delivery/explain fall back to the shared `monitor_events.diff_text`.
   addColumnIfMissing(sqlite, 'session_event_state', 'diff_text', 'TEXT');

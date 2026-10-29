@@ -1,5 +1,5 @@
 /**
- * Tests for spec: pipeline/post-processing: the `net` baseline collapse and the G14 Interpret
+ * Tests for spec: pipeline/post-processing: the `net` baseline collapse and the Interpret
  * stage rewired onto the PER-RECIPIENT seam (spec: pipeline/post-processing).
  *
  * PR-A moved the Diff right of the Pace→Diff seam (each recipient diffs the
@@ -25,7 +25,7 @@
  * @see ../../../../openspec/specs/pipeline/post-processing/spec.md (baseline strategy, per-recipient net)
  * @see ../../../../openspec/specs/pipeline/post-processing/spec.md (Interpret per distinct delta)
  * @see ../../../../openspec/specs/runtime/event-materialization/spec.md (diff format)
- * @see ../../../../docs/specs/roadmap.md §G10
+ * @see ../../../../openspec/specs/pipeline/post-processing/spec.md
  */
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -572,7 +572,7 @@ describe('regression #186: collapseNetForClaim workspace-isolation (spec: pipeli
 });
 
 // ───────────────────────────────────────────────────────────────────────────
-// Criterion 3: G14 Interpret per DISTINCT per-recipient delta (spec: pipeline/post-processing).
+// Criterion 3: Interpret per DISTINCT per-recipient delta (spec: pipeline/post-processing).
 // Driven through the real runtime tick so the per-recipient deltas are produced
 // by the genuine projection path (PR-A seam), with a deterministic fake adapter.
 // ───────────────────────────────────────────────────────────────────────────

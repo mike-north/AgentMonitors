@@ -2,7 +2,7 @@
  * Tests for the `command-poll` observation source.
  *
  * Correctness is asserted against the normative design in
- * `docs/specs/003-source-plugins.md` spec: sources/command-poll (spec: sources/command-poll). Each test cites the
+ * `openspec/specs/sources/command-poll/spec.md`. Each test cites the
  * acceptance criterion (AC1–AC6 from issue #86) and/or the spec section it proves.
  *
  * The tests spawn tiny real subprocesses (`node -e …`) so the no-shell spawn path is

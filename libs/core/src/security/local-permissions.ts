@@ -7,8 +7,8 @@
  * unauthenticated. On a multi-user host with permissive home/XDG directory
  * modes, another local user could otherwise read the database or connect to the
  * socket. This module centralizes the owner-only permission invariant so every
- * creation site enforces it identically — see `docs/specs/002-runtime-delivery.md`
- * §3.1 and `docs/specs/000-principles.md` (BP4).
+ * creation site enforces it identically — see the
+ * `runtime/local-data-permissions` and `principles` (BP4) specs under `openspec/specs/`.
  *
  * The trust boundary is the current OS user: directories are `0700`, files are
  * `0600`. Modes are meaningless on Windows, so the helpers degrade to no-ops

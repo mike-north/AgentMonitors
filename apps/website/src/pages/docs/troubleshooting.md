@@ -77,7 +77,7 @@ Read the verdict stage, not just its glyph:
 
 **Traces to:** [spec: daemon/ipc](https://github.com/mike-north/AgentMonitors/blob/main/openspec/specs/daemon/ipc/spec.md)
 (monitor pipeline diagnosis, stage statuses) and
-[005 `monitor explain`](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/005-cli-reference.md#monitor-explain--pipeline-diagnosis).
+[`cli/monitor-commands`](https://github.com/mike-north/AgentMonitors/blob/main/openspec/specs/cli/monitor-commands/spec.md) (`monitor explain`).
 
 ## It fired but my agent wasn't told
 

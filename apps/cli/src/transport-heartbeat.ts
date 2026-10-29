@@ -330,7 +330,7 @@ export function writeTransportHeartbeat(
   // meant `doctor` itself deleted the only evidence of the failure it had
   // just reported: `[heartbeat-stale]` on run 1, then a clean "not
   // configured" idle verdict on run 2, purely because the diagnostic had
-  // been invoked once already (spec: cli/doctor's "diagnoses only, never mutates"
+  // been invoked once already (the cli/doctor spec's "diagnoses only, never mutates"
   // contract). A live process WRITING again is the genuine reconciliation
   // event a lapsed record should wait for; a bystander's read is not. A busy
   // channel poll writes its own record every ~3s regardless of whether
@@ -453,7 +453,7 @@ export interface ReadTransportHeartbeatsResult {
  * **Pure — never mutates, never reaps** (issue #425 review, round 6). This
  * function takes no `now` and has no GC side effect; a stale-past-TTL record
  * is returned exactly as read, every time, until something else reconciles
- * it. That is deliberate: `doctor` is spec: cli/doctor's "diagnoses only" surface, and
+ * it. That is deliberate: `doctor` is the cli/doctor spec's "diagnoses only" surface, and
  * reaping on THIS read path previously let one `doctor` invocation destroy
  * the only evidence of the failure it had just reported — the record proving
  * `[heartbeat-stale]` on run 1 was gone by run 2, which then saw no

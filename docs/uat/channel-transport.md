@@ -53,7 +53,7 @@ so it does not exercise the new precedence one way or the other).
 
 | Recipe step(s)          | Proves                                                                                                                                                                                            | Governing spec                                                                                                             |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| 1–6 (setup)             | A monitor fires and materializes a durable event in a real, plugin-installed session                                                                                                              | [002 §§1–9](../specs/002-runtime-delivery.md)                                                                              |
+| 1–6 (setup)             | A monitor fires and materializes a durable event in a real, plugin-installed session                                                                                                              | [spec: runtime/\*, delivery/session-projection, delivery/lifecycles](../../openspec/specs/)                                |
 | 7–9 (channel push)      | The channel server pushes a `<channel source="agentmonitors" ...>` event carrying the field schema in [spec: delivery/channel-transport](../../openspec/specs/delivery/channel-transport/spec.md) | spec: delivery/channel-transport                                                                                           |
 | 10 (dedup)              | The same event is **not** re-delivered via the hook path after the channel already claimed it                                                                                                     | spec: delivery/channel-transport                                                                                           |
 | 11–12 (ack)             | `agentmon_ack` acknowledges the event in-session and `events list` reflects the acknowledged state                                                                                                | spec: delivery/channel-transport — "Channel acknowledgement tool", "Acknowledgement is re-authorized to the bound session" |
@@ -266,7 +266,7 @@ printf '{"session_id":"<host-session-id>","cwd":"%s","hook_event_name":"UserProm
 
 **Expected observation:** **completely empty stdout.** The event the channel already claimed is
 excluded from a fresh `turn-interruptible` claim (the runtime's `pendingEventsForSession` only
-considers rows with no `first_notified_at` yet — spec: delivery/channel-transport's "the existing claimed state is the
+considers rows with no `first_notified_at` yet — the delivery/channel-transport spec's "the existing claimed state is the
 dedup boundary"), and with no other unread `normal`/`low` events in this minimal test project there
 is nothing else to report. Any non-empty output here (in particular, the file's title/body
 reappearing) is a dedup regression — capture the full JSON output and `agentmonitors monitor

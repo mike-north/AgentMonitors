@@ -514,7 +514,7 @@ describe('ephemeral monitors — lifecycle (spec: agent/ephemeral-monitors, crit
   // naming affordance (it has no frontmatter file), so it must reach the same
   // authored-name signal a persistent monitor's `name:` does — otherwise a named
   // ephemeral watch still headlines with the source's implementation detail,
-  // violating spec: agent/ephemeral-monitors's "same pipeline semantics".
+  // violating the agent/ephemeral-monitors spec's "same pipeline semantics".
   it('titles a named ephemeral watch with its display name, across a daemon restart (spec: runtime/event-materialization, agent/ephemeral-monitors)', async () => {
     const root = mkdtempSync(path.join(tmpdir(), 'am-eph-title-'));
     tempDirs.push(root);
@@ -575,7 +575,7 @@ describe('ephemeral monitors — lifecycle (spec: agent/ephemeral-monitors, crit
 
   // Regression (issue #449 review): a present-but-whitespace-only display name
   // is an ephemeral monitor's ONLY naming affordance, so if it were accepted it
-  // would win spec: runtime/event-materialization's title precedence and durably headline every delivered
+  // would win the runtime/event-materialization spec's title precedence and durably headline every delivered
   // event with blank text. Reject it at declaration time, matching the
   // whitespace-only rejection `monitorFrontmatterSchema.name` applies to a
   // persistent monitor's frontmatter.

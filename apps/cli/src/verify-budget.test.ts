@@ -6,7 +6,8 @@
  * `schedulingDefaults` (exported from `@agentmonitors/core`, consumed by both
  * the daemon in `service.ts` and verify-budget) and spec: runtime/notify-dispatch, pipeline/post-processing, delivery/lifecycles.
  *
- * @see docs/specs/002-runtime-delivery.md
+ * @see openspec/specs/runtime/notify-dispatch/spec.md
+ * @see openspec/specs/delivery/lifecycles/spec.md
  * @see openspec/specs/cli/verify/spec.md
  */
 import path from 'node:path';

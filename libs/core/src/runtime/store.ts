@@ -731,8 +731,8 @@ export class RuntimeStore {
 
   /**
    * Materialize ONE shared `monitor_events` row and project it into matching
-   * lead sessions (spec: delivery/session-projection), computing a PER-RECIPIENT delta for each (G10,
-   * spec: pipeline/post-processing) — the shared artifact diffed against THAT session's own baseline
+   * lead sessions (spec: delivery/session-projection), computing a PER-RECIPIENT delta for each
+   * (spec: pipeline/post-processing) — the shared artifact diffed against THAT session's own baseline
    * cursor, recorded on `session_event_state.diff_text`.
    *
    * The per-recipient diff lives here (not after an Interpret await) so all
@@ -932,8 +932,8 @@ export class RuntimeStore {
   }
 
   /**
-   * Return the per-session interpret verdicts for a set of events (G14,
-   * spec: pipeline/post-processing). Used by the delivery path to prefer the agentic digest over
+   * Return the per-session interpret verdicts for a set of events
+   * (spec: pipeline/post-processing). Used by the delivery path to prefer the agentic digest over
    * the raw `summary`/`body` for `prose` monitors. Only rows that have an
    * `interpret_digest` recorded are included; callers fall back to
    * `event.summary || event.body || event.title` when absent.
@@ -964,11 +964,11 @@ export class RuntimeStore {
   }
 
   /**
-   * Return the PER-RECIPIENT delta for a set of events for one session (G10,
-   * spec: pipeline/post-processing): the diff this session computed against its OWN baseline cursor,
+   * Return the PER-RECIPIENT delta for a set of events for one session
+   * (spec: pipeline/post-processing): the diff this session computed against its OWN baseline cursor,
    * recorded on `session_event_state.diff_text`. Only events with a
    * non-NULL per-recipient `diff_text` are included; callers fall back to the
-   * shared `MonitorEventRecord.diffText` for legacy (pre-G10, NULL) rows.
+   * shared `MonitorEventRecord.diffText` for legacy (pre-per-recipient-delta, NULL) rows.
    */
   perRecipientDiffsForSession(
     sessionId: string,
@@ -1001,8 +1001,8 @@ export class RuntimeStore {
    * then groups the results by session id in memory.
    *
    * Use this instead of calling {@link perRecipientDiffsForSession} in a per-
-   * session loop (which would be O(N) queries for N recipients).  (G10,
-   * spec: pipeline/post-processing; Copilot review: comment 3.)
+   * session loop (which would be O(N) queries for N recipients).
+   * (spec: pipeline/post-processing; Copilot review: comment 3.)
    *
    * @returns Map from sessionId → diff text for the event.  Sessions with a NULL
    *   or missing row are omitted; callers should fall back to the shared event
@@ -1462,7 +1462,7 @@ export class RuntimeStore {
       ...(state.netSuppressedAt ? { netSuppressed: true } : {}),
       // Per-recipient delta (spec: pipeline/post-processing): the diff this recipient computed
       // against its own cursor. Fall back to the shared event-level diff for
-      // legacy (pre-G10) rows where the per-recipient column is NULL.
+      // legacy (pre-per-recipient-delta) rows where the per-recipient column is NULL.
       ...(() => {
         const diff = state.diffText ?? event.diffText;
         return diff !== null ? { diffText: diff } : {};
@@ -1882,8 +1882,8 @@ export class RuntimeStore {
   }
 
   /**
-   * Record the per-recipient `net`-collapse suppression marker (G10 PR-B,
-   * spec: pipeline/post-processing) on the given projections: claimed-but-suppressed intermediates,
+   * Record the per-recipient `net`-collapse suppression marker
+   * (spec: pipeline/post-processing) on the given projections: claimed-but-suppressed intermediates,
    * retained for `monitor explain` but excluded from delivery.
    */
   private markNetSuppressed(sessionId: string, eventIds: string[]): void {

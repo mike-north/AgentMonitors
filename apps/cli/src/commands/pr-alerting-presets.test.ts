@@ -573,7 +573,7 @@ describe('the presets’ jq reduction over raw gh output', () => {
      * entering-membership) transitions on the same `isDraft` field, and
      * `command-poll`'s stateless `json-diff` polling carries no history
      * that would let a preset tell them apart. This is a documented,
-     * accepted limitation (spec: cli/authoring-commands's `my-prs` body already tells the
+     * accepted limitation (the cli/authoring-commands spec's `my-prs` body already tells the
      * author how to disambiguate: "if you did not just put it there,
      * someone pulled it back"), not a defect — pinning it here as a
      * characterization test (rather than leaving it unasserted) is what

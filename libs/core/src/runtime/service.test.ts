@@ -181,7 +181,7 @@ describe('AgentMonitorRuntime', () => {
     expect(unread[0]?.summary).toContain('Watched file changed');
   });
 
-  // Regression for G1 / SP2: monitor state is keyed by monitorId, so a tick over a
+  // Regression for duplicate monitor ids (SP2; spec: monitor/validation): monitor state is keyed by monitorId, so a tick over a
   // tree with two folders deriving the same id must be refused, not processed.
   it('refuses to tick when two monitors derive the same id', async () => {
     const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
@@ -2237,7 +2237,7 @@ Handle it.
     expect(withDiff[0]?.diffText).not.toMatch(/^\+ 1:/m);
   });
 
-  // G6: each due monitor's outcome is recorded to observation_history per tick.
+  // observation_history (spec: persistence/schema): each due monitor's outcome is recorded to observation_history per tick.
   it('records observation history (triggered, then no-change) per tick', async () => {
     const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
     tempDirs.push(rootDir);
@@ -3189,7 +3189,7 @@ Handle it.
     expect(history[1]?.observationData).toEqual({ observed: 1, emitted: 0 });
   });
 
-  // G5: a source that implements watch() is driven continuously by the runtime;
+  // Watch mode (spec: runtime/tick-scheduling): a source that implements watch() is driven continuously by the runtime;
   // each yielded observation flows through the same notify/materialize/project
   // pipeline as observe(), and stop() aborts the watcher cleanly.
   it('drives a watch()-based source end-to-end and stops cleanly', async () => {
@@ -3311,7 +3311,7 @@ Handle it.
     expect(state.sourceState).toEqual({ v: 1 });
   });
 
-  // G5: while a monitor is watched, the tick loop must not also observe() it
+  // Watch mode: while a monitor is watched, the tick loop must not also observe() it
   // (no double-processing); once the watcher stops, the tick loop resumes it.
   it('skips a watched monitor in the tick loop and resumes it after stop', async () => {
     const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
@@ -3464,7 +3464,7 @@ Handle it.
     });
     expect(throwingHistory).toHaveLength(1);
     expect(throwingHistory[0]?.result).toBe('errored');
-    // H2: assert observationData shape (spec 002 §observation_history)
+    // H2: assert observationData shape (spec: persistence/schema)
     expect(throwingHistory[0]?.observationData).toEqual({
       error: 'simulated source failure',
     });
@@ -4206,7 +4206,7 @@ Handle it.
     expect(history[0]?.observationData).toEqual({ observed: 1, emitted: 1 });
   });
 
-  // Issue #56 (PR review): `rebaselined` is, by contract (002 §observation_history),
+  // Issue #56 (PR review): `rebaselined` is, by contract (spec: persistence/schema),
   // a tick that returned ZERO observations. If a source returns observations that
   // get suppressed (emitted=0, observed>0) AND mistakenly sets outcome:'rebaselined',
   // the runtime must record `suppressed`, not `rebaselined` — the observed===0 guard
@@ -4348,7 +4348,7 @@ Handle it.
     expect(triggered).toHaveLength(1);
   });
 
-  // --- G13: author-declared baseline strategy (net default vs incremental) --
+  // --- Author-declared baseline strategy (net default vs incremental) -------
   //
   // Contract (spec: monitor/definition, pipeline/post-processing; default changed 2026-06-19, Refs #110):
   // the per-recipient Diff stage spans a *catch-up span* — the set of shaped
@@ -4492,7 +4492,7 @@ Handle it.
       return { runtime, monitorsDir, rootDir, sessionId: session.id, events };
     }
 
-    // Criterion (b) + G10 PR-B (spec: pipeline/post-processing, Decision Q3): under `net`, the
+    // Criterion (b) + per-recipient `net` collapse (spec: pipeline/post-processing, Decision Q3): under `net`, the
     // SHARED `monitor_events` chain now records EVERY intermediate (N=3 span
     // events + baseline = 4), but the per-recipient DELIVERY collapses to ONE
     // net delta at claim — the newest event per object — with the older
@@ -4501,7 +4501,7 @@ Handle it.
       const { runtime, monitorsDir, rootDir, sessionId, events } =
         await deliverSpan('baseline-strategy: net\n', 'claude-g13-net');
 
-      // G10 PR-B / criterion 4 (no shared-collapse regression): the shared chain
+      // Per-recipient `net` collapse / criterion 4 (no shared-collapse regression): the shared chain
       // is the incremental substrate — all three span observations materialized,
       // none collapsed. Baseline (1) + N=3 = 4 total shared events.
       expect(events).toHaveLength(4);
@@ -4942,7 +4942,7 @@ Handle it.
     //     `cronMatchesDate` returns true for any timestamp within the matching
     //     minute, so without the `rollupLastFiredMinute` guard a sub-minute tick
     //     interval would emit the batch twice. This is a regression test for
-    //     the guard introduced alongside G12.
+    //     the guard introduced alongside the scheduled-rollup Pace mode.
     it('fires the window at most once per minute even when ticked twice in the same window minute', async () => {
       vi.useFakeTimers();
       vi.setSystemTime(OUTSIDE_WINDOW);
@@ -5060,7 +5060,7 @@ Handle it.
     });
   });
 
-  // --- Rollup not-due flush composition (issue #180, G12 × G13) -------------
+  // --- Rollup not-due flush composition (issue #180, rollup × baseline strategy) -------------
   //
   // Bug: tick() flushes a rollup batch via two paths. The DUE path goes through
   // ingest() (which applies `net` collapse — spec: pipeline/post-processing — AND records a
@@ -5280,7 +5280,7 @@ Daily digest.
       expect(survivor?.snapshotText).toBe(STATES[2]);
     }
 
-    // Criterion 1 (P1, spec: pipeline/post-processing) + G10 PR-B: rollup + net, window fires on a
+    // Criterion 1 (P1, spec: pipeline/post-processing) + per-recipient `net` collapse: rollup + net, window fires on a
     // NOT-DUE tick after 3 accumulated edits to one objectKey. The SHARED chain
     // now records all three (the incremental substrate, Decision Q3); the
     // per-recipient DELIVERY collapses to ONE net delta at claim. (Pre-PR-B the
@@ -5355,7 +5355,7 @@ Daily digest.
           'baseline-strategy: net\n',
         );
         const flush = await driveNotDueFlush(ctx);
-        // G10 PR-B: the shared chain records all three (per-recipient collapse
+        // Per-recipient `net` collapse: the shared chain records all three (per-recipient collapse
         // happens at claim, not on the shared chain).
         expect(flush.emittedEventIds).toHaveLength(STATES.length);
 
@@ -5639,7 +5639,7 @@ describe('normal-urgency reminder suppression is explainable (issue #333)', () =
 // Watch-mode source-state checkpointing (spec: runtime/tick-scheduling). A long-lived watch() source
 // durably advances its persisted `sourceState` out of band via
 // `context.checkpoint`, serialized with observation ingestion per-watcher (the
-// G14 durable-write-before-ingest ordering) so a mid-watch crash reconciles from
+// durable-write-before-ingest ordering) so a mid-watch crash reconciles from
 // the checkpointed baseline instead of re-emitting already-delivered changes.
 describe('watch-mode source-state checkpointing (spec: runtime/tick-scheduling)', () => {
   const checkpointTmpDirs: string[] = [];
@@ -5797,7 +5797,7 @@ describe('watch-mode source-state checkpointing (spec: runtime/tick-scheduling)'
   // land after the delayed checkpoint if it is on the SAME per-watcher chain —
   // an independent chain would let the (undelayed) ingest write run first and
   // fail the assertion.
-  it('orders an in-flight, genuinely-delayed checkpoint before a following ingest (G14 serialization)', async () => {
+  it('orders an in-flight, genuinely-delayed checkpoint before a following ingest (durable-write-before-ingest serialization)', async () => {
     const { rootDir, dbPath, monitorsDir } = scratch();
 
     const source: ObservationSource = {

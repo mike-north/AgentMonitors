@@ -44,7 +44,7 @@ afterEach(() => {
 /**
  * Emits one changing observation per tick. `fields` overrides the observation's
  * text so a test can drive the distinct-`title`/`summary` case a third-party
- * source may legitimately produce (spec: runtime/event-materialization's compatibility table).
+ * source may legitimately produce (the runtime/event-materialization spec's compatibility table).
  */
 function scriptedSource(
   fields: { title: string; summary?: string; body?: string } = {

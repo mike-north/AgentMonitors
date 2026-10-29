@@ -969,7 +969,7 @@ const source: ObservationSource = {
     }
 
     // `status-code` never inspects the body — the status transition IS the
-    // watched signal (spec: sources/api-poll's exemption also applies here: reading and
+    // watched signal (the sources/api-poll spec's exemption also applies here: reading and
     // buffering a body the strategy will never look at is exactly the
     // wedge/memory risk this issue exists to bound). Skip reading it
     // entirely for that strategy (issue #304 review, finding 2) — cheaper,

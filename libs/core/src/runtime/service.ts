@@ -508,7 +508,7 @@ function recipientSummary(
  * at `a1` receives the full `a1→a3` span, while a session already caught up to
  * `a2` receives only `a2→a3` from the same shared observation (session isolation,
  * issue #436). The shared `MonitorEventRecord.diffText` is used only as the
- * legacy fallback for pre-G10 rows whose per-recipient column is NULL (mirroring
+ * legacy fallback for pre-per-recipient-delta rows whose per-recipient column is NULL (mirroring
  * `perRecipientDiffsForSession`'s own contract and the explain projection).
  */
 function toDeliveryEventSummary(
@@ -744,7 +744,7 @@ export class AgentMonitorRuntime {
     //     ephemeral monitor's ONLY naming affordance (no frontmatter file), and it
     //     flows into `frontmatter.name` on every tick reconstruction
     //     (`ephemeralRecordToMonitor` below). A present-but-blank name would
-    //     silently win over the source title there (spec: runtime/event-materialization's precedence) and
+    //     silently win over the source title there (the runtime/event-materialization spec's precedence) and
     //     durably headline every delivered event with whitespace. Mirrors the
     //     same rejection `monitorFrontmatterSchema`'s `name` field applies to a
     //     persistent monitor's frontmatter.
@@ -1574,7 +1574,7 @@ export class AgentMonitorRuntime {
 
   /**
    * Produce a workspace-wide, durable-state health report — the read-only
-   * diagnosis behind `agentmonitors doctor` (005 §"doctor", issue #267). Unlike
+   * diagnosis behind `agentmonitors doctor` (spec: cli/doctor, issue #267). Unlike
    * {@link explainMonitor} (single-monitor, staged) this rolls up every monitor
    * in the tree plus the workspace's lead-session state, so an author can answer
    * "is my monitoring working, and if not, where is it broken?" from one call.
@@ -2729,7 +2729,7 @@ export class AgentMonitorRuntime {
         // `ingest()` (issue #180) so the not-due path records the `triggered`
         // observation_history row (spec: daemon/ipc) and writes every emitted
         // observation onto the shared chain — the due path already does both.
-        // (The `net` collapse is per-recipient at claim time; G10 PR-B.)
+        // (The `net` collapse is per-recipient at claim time; spec: pipeline/post-processing.)
         // Only invoke it when the window actually flushed something: an empty
         // window check runs every not-due tick and must NOT flood the audit
         // trail with `no-change` rows. `observed: 0` because this path
@@ -2992,7 +2992,7 @@ export class AgentMonitorRuntime {
       result:
         emittedCount > 0
           ? 'triggered'
-          : // `rebaselined` is, by contract (002 §observation_history), a tick
+          : // `rebaselined` is, by contract (spec: persistence/schema), a tick
             // that returned ZERO observations and advanced its baseline. Guard
             // on observed === 0 so a source that mistakenly sets the diagnostic
             // while also returning (suppressed) observations can't mask a
@@ -3006,7 +3006,7 @@ export class AgentMonitorRuntime {
       observationData: { observed, emitted: emittedCount },
     });
 
-    // G10 PR-B (spec: pipeline/post-processing, Decision Q3): the shared `monitor_events` chain
+    // Per-recipient `net` collapse (spec: pipeline/post-processing, Decision Q3): the shared `monitor_events` chain
     // records EVERY emitted observation in order, regardless of
     // `baseline-strategy`. The `net` collapse is no longer applied here — it is
     // a PER-RECIPIENT decision deferred to claim time (`collapseNetForClaim`),
@@ -3170,10 +3170,10 @@ export class AgentMonitorRuntime {
     watcherToken: symbol,
     onError?: (monitorId: string, error: Error) => void,
   ): Promise<void> {
-    // Per-watcher serialization chain (spec: pipeline/post-processing, runtime/tick-scheduling). Both watch-checkpoint
+    // Per-watcher serialization chain (spec: runtime/tick-scheduling). Both watch-checkpoint
     // writes and observation ingests append to this single chain, so:
     //  - a checkpoint whose durable write is in flight when an observation
-    //    arrives ALWAYS completes before that observation is ingested (the G14
+    //    arrives ALWAYS completes before that observation is ingested (the
     //    durable-write-before-ingest ordering), and
     //  - an ingest's read-modify-write of `monitorState.sourceState` is never
     //    interleaved with a checkpoint write of the same row (which would let a
@@ -3245,7 +3245,7 @@ export class AgentMonitorRuntime {
         // The audit write is best-effort — if recordObservationHistory itself
         // throws we swallow it so a failed audit row never kills the watcher.
         // Ingest runs through the same serialization chain as checkpoint so the
-        // G14 ordering (spec: runtime/tick-scheduling) holds against out-of-band checkpoint calls.
+        // durable-write-before-ingest ordering (spec: runtime/tick-scheduling) holds against out-of-band checkpoint calls.
         try {
           await enqueue(() =>
             this.ingest(monitor, [observation], new Date(), {
@@ -3328,7 +3328,7 @@ export class AgentMonitorRuntime {
    * durability gap, not a protocol violation (spec: runtime/tick-scheduling). We log a warning and
    * resolve so even a source that does not guard `checkpoint()` keeps watching.
    * The caller enqueues this on the per-watcher serialization chain, which is
-   * what gives it the G14 durable-write-before-ingest ordering.
+   * what gives it the durable-write-before-ingest ordering.
    */
   private writeCheckpoint(
     monitorId: string,
@@ -3806,7 +3806,7 @@ export class AgentMonitorRuntime {
     // adapter call (same input → same verdict, no redundant tool round-trips).
     // When recipients are co-registered at the same baseline their deltas are
     // identical, so this collapses to exactly today's single shared call (the
-    // G14 behavior PR-A must not change).
+    // shared-delta behavior that must not change).
     const sharedFallback = diffText ?? event.snapshotText ?? '';
     // Fetch all per-recipient diffs for every projected session in ONE query
     // (avoids the N+1 pattern of calling perRecipientDiffsForSession once per

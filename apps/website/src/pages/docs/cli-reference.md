@@ -8,7 +8,7 @@ description: Every agentmonitors command — synopsis, key flags, an example, an
 The binary is `agentmonitors` ("Durable observation and inbox delivery for AI agents"). This page
 is a quick-scan reference card — synopsis, key flags, and a runnable example per command. It is
 not the contract: for full behavior, exit codes, and JSON shapes see
-[spec 005 — CLI Reference](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/005-cli-reference.md)
+the [`cli/*` OpenSpec capabilities](https://github.com/mike-north/AgentMonitors/tree/main/openspec/specs/cli)
 (this page was built from that spec's current revision). New to the CLI? Start with
 [Getting Started](/docs/getting-started).
 
@@ -119,8 +119,7 @@ argument errors (missing directory, path is a file) exit non-zero.
 
 The legacy inbox state machine (`queued → acked → in-progress → completed|failed → archived`).
 All subcommands are in-process. See
-[002-runtime-delivery.md](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/002-runtime-delivery.md)
-spec: inbox/legacy-inbox — "Inbox item state machine", "Inbox is not the authoritative delivery path" for how this relates to the primary monitor-events pipeline.
+[`inbox/legacy-inbox`](https://github.com/mike-north/AgentMonitors/blob/main/openspec/specs/inbox/legacy-inbox/spec.md) for how this relates to the primary monitor-events pipeline.
 
 ### `inbox list`
 
@@ -597,9 +596,9 @@ Spec spec: agent/ephemeral-monitors defines five read-only/declaration-only verb
 cheap orientation summary, declare an ephemeral session-scoped monitor, or inspect
 received/pending/armed signal state, all without an extra source observation. **None of these
 exist in the CLI today** — the commands above are the complete, currently-installed surface. See
-[005-cli-reference.md](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/005-cli-reference.md)
-spec: agent/ephemeral-monitors and [spec 007](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/007-agent-facing-interaction.md)
-for the full target contract.
+[`agent/ephemeral-monitors`](https://github.com/mike-north/AgentMonitors/blob/main/openspec/specs/agent/ephemeral-monitors/spec.md) and the
+[`add-agent-signal-verbs`](https://github.com/mike-north/AgentMonitors/blob/main/openspec/changes/add-agent-signal-verbs/proposal.md) change for the full target
+contract.
 
 ---
 

@@ -2,7 +2,7 @@
 
 Drop-in monitoring for agentic coding. Install this plugin once into Claude Code; thereafter you
 turn monitoring on per project by dropping markdown monitor files into `.claude/monitors/` and
-enabling activation locally. See [`docs/specs/006-agent-integration.md` spec: delivery/channel-transport, delivery/hook-transport](../../docs/specs/006-agent-integration.md)
+enabling activation locally. See [`delivery/hook-transport`](../../openspec/specs/delivery/hook-transport/spec.md)
 for the full contract.
 
 ## What it wires
@@ -42,7 +42,7 @@ The channel MCP server (`.mcp.json`, `agentmonitors channel serve`) is **entirel
 your environment disallows unblessed MCP servers (common on Team/Enterprise or in restricted
 corporate setups), you can strip or disable `.mcp.json` and keep everything else — delivery
 semantics are unchanged; see
-[`docs/specs/006-agent-integration.md` spec: delivery/transport-seam — "MCP is never required", "Channel and hook paths share the same daemon IPC"](../../docs/specs/006-agent-integration.md) for the
+[`delivery/transport-seam`](../../openspec/specs/delivery/transport-seam/spec.md) ("MCP is never required") for the
 proof and the full guarantee.
 
 **To run hooks-only:** install/keep [`hooks/hooks.json`](./hooks/hooks.json) (the three commands in

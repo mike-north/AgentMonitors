@@ -12,7 +12,7 @@ import type { ChangeKind, Observation } from './types.js';
  * companion to spec: sources/command-poll), keeping create/modified/descoped semantics identical across
  * sources rather than duplicating — and risking divergence — in each plugin.
  *
- * `path` syntax (resolving spec: sources/contract's open design point): a **minimal dotted path**.
+ * `path` syntax (resolving the sources/contract spec's open design point): a **minimal dotted path**.
  * Both explicit-root (`$.tasks`, `$.data.items`) and bare root-relative (`tasks`,
  * `data.items`) forms are accepted. No wildcards, filters, or recursive descent.
  * `path` MUST select exactly one array; `ignore-paths` entries use the same dotted

@@ -17,7 +17,7 @@
  *
  * @see ../../../../openspec/specs/pipeline/post-processing/spec.md (the shared/per-recipient seam)
  * @see ../../../../openspec/specs/runtime/event-materialization/spec.md (diff format)
- * @see ../../../../docs/specs/roadmap.md §G10
+ * @see ../../../../openspec/specs/pipeline/post-processing/spec.md
  */
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -196,14 +196,14 @@ describe('per-recipient baseline seam (spec: pipeline/post-processing)', () => {
     expect(recipientDelta(store, a.id, e3)).toBe('- 1: a2\n+ 1: a3');
   });
 
-  it('4a. backward-compat: a single co-registered session reproduces the pre-G10 shared diff byte-for-byte', () => {
+  it('4a. backward-compat: a single co-registered session reproduces the pre-per-recipient-delta shared diff byte-for-byte', () => {
     const { store } = freshStore();
     const only = openLead(store, 'sess-only');
 
     materialize(store, 'a1'); // baseline
     const e2 = materialize(store, 'a2');
 
-    // The pre-G10 behavior: one diff per object against the latest stored
+    // The pre-per-recipient-delta behavior: one diff per object against the latest stored
     // snapshot. With a single session at the shared baseline, the per-recipient
     // delta MUST equal that shared object-level diff exactly.
     const shared = store.getEventById(e2).diffText;
@@ -218,7 +218,7 @@ describe('per-recipient baseline seam (spec: pipeline/post-processing)', () => {
     materialize(store, 'a1'); // baseline
     const e2 = materialize(store, 'a2');
 
-    // Simulate a row materialized before G10: NULL out the per-recipient column.
+    // Simulate a row materialized before per-recipient deltas: NULL out the per-recipient column.
     nullOutPerRecipientDiff(dbPath, legacy.id, e2);
     expect(recipientDelta(store, legacy.id, e2)).toBeUndefined();
 
@@ -380,7 +380,7 @@ describe('cursor key collision regression (Copilot review comment 1)', () => {
 });
 
 /**
- * Force a `session_event_state` row back to the pre-G10 shape (NULL per-recipient
+ * Force a `session_event_state` row back to the pre-per-recipient-delta shape (NULL per-recipient
  * `diff_text`) to exercise the legacy fallback path. The store only ever WRITES
  * this column at projection time, so a regression test for the legacy migration
  * case must produce the NULL directly — done over a second raw better-sqlite3

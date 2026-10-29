@@ -116,7 +116,7 @@ export const sessionEventState = sqliteTable('session_event_state', {
   // Right of the Pace→Diff seam, so two sessions at divergent baselines record
   // different spans from the SAME shared `monitor_events` row. `NULL` for a
   // baseline event (no prior to diff) and for legacy rows materialized before
-  // G10 — delivery/explain fall back to the shared `monitor_events.diff_text`.
+  // per-recipient deltas — delivery/explain fall back to the shared `monitor_events.diff_text`.
   diffText: text('diff_text'),
   // Per-recipient Interpret verdict (spec: pipeline/post-processing); absent for the deterministic
   // forms that never invoke Interpret. `interpret_reason` is the agentic-gate

@@ -37,8 +37,9 @@ Claiming a delivery marks the underlying events **claimed** — it does not **ac
 Acknowledgement (`agentmonitors events ack --session <id>`, or the MCP `agentmon_ack` tool) is
 always a separate, explicit step, so a claimed-but-unhandled event stays discoverable.
 
-_Governing spec: [`docs/specs/002-runtime-delivery.md`](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/002-runtime-delivery.md)
-spec: delivery/session-projection (session projection), spec: delivery/session-projection — "Unread, claimed, and acknowledged are distinct session states" (unread/claimed/acknowledged), spec: delivery/lifecycles (delivery lifecycles)._
+_Governing spec: [`delivery/session-projection`](https://github.com/mike-north/AgentMonitors/blob/main/openspec/specs/delivery/session-projection/spec.md)
+(session projection; unread/claimed/acknowledged) and [`delivery/lifecycles`](https://github.com/mike-north/AgentMonitors/blob/main/openspec/specs/delivery/lifecycles/spec.md)
+(delivery lifecycles)._
 
 ## Urgency: what's surfaced, and when
 
@@ -81,7 +82,7 @@ showed you (e.g. `agentmonitors events ack --session <id> --event-ids <id1>,<id2
 handled what it showed. Acking is what turns the coalesced reminder back on for the affected band's next
 `normal`/`low` event.
 
-_Governing spec: spec: delivery/lifecycles (high), spec: delivery/lifecycles (normal), spec: delivery/lifecycles (low), spec: delivery/lifecycles — "Post-compact recap", "Claiming marks rows claimed without acknowledging" (recap)._
+_Governing spec: [`delivery/lifecycles`](https://github.com/mike-north/AgentMonitors/blob/main/openspec/specs/delivery/lifecycles/spec.md) (high, normal, low, recap)._
 
 ## What the Claude Code plugin automates (hooks)
 
@@ -99,8 +100,8 @@ Each command is guarded so an environment without the `agentmonitors` binary on 
 a silent no-op (with a one-time onboarding hint on `SessionStart`) rather than a visible error on
 every prompt.
 
-_Governing spec: [`docs/specs/006-agent-integration.md`](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/006-agent-integration.md)
-spec: delivery/hook-transport — "Hook-state transport is the per-session portable baseline" (hook-state transport), spec: delivery/hook-transport (the `hook deliver` wire contract), spec: delivery/channel-transport, delivery/hook-transport (plugin activation packaging)._
+_Governing spec: [`delivery/hook-transport`](https://github.com/mike-north/AgentMonitors/blob/main/openspec/specs/delivery/hook-transport/spec.md) (hook-state
+transport, the `hook deliver` wire contract, plugin activation packaging)._
 
 ## What the optional MCP channel adds
 
@@ -118,8 +119,10 @@ The channel is also **research-preview and gated**: it requires Claude Code v2.1
 Team/Enterprise plans an admin must enable channels and allowlist the server. This is exactly why
 it's built as an addition, never a dependency — see the next section.
 
-_Governing spec: spec: delivery/channel-transport (channel mechanism, notification schema, the `agentmon_ack` tool), spec: delivery/transport-seam
-(availability & the additive-only invariant)._
+_Governing spec: [`delivery/channel-transport`](https://github.com/mike-north/AgentMonitors/blob/main/openspec/specs/delivery/channel-transport/spec.md) (channel
+mechanism, notification schema, the `agentmon_ack` tool) and
+[`delivery/transport-seam`](https://github.com/mike-north/AgentMonitors/blob/main/openspec/specs/delivery/transport-seam/spec.md) (availability & the additive-only
+invariant)._
 
 ## Restricted environments: operating without MCP
 
@@ -174,8 +177,9 @@ agentmonitors events ack --session <session-id>
 agentmonitors events list --session <session-id> --unread
 ```
 
-_Governing spec: spec: delivery/transport-seam (the transport seam — every transport drives the same daemon IPC, never
-re-deriving delivery decisions), spec: delivery/transport-seam (availability & fallback, NP-CH)._
+_Governing spec: [`delivery/transport-seam`](https://github.com/mike-north/AgentMonitors/blob/main/openspec/specs/delivery/transport-seam/spec.md) (the transport
+seam — every transport drives the same daemon IPC, never re-deriving delivery decisions; availability &
+fallback, NP-CH)._
 
 ## Host support today
 
@@ -193,8 +197,8 @@ the Claude Code channel). That adapter ships today only for Claude Code; Codex a
 are named, scoped **target** work with a defined contract each future adapter must satisfy — not
 yet implemented, and not overstated as available.
 
-_Governing spec: change: add-multi-host-adapters (the multi-host adapter matrix, target status; see change: add-multi-host-adapters for the contract
-every future host adapter must satisfy)._
+_Governing spec: the [`add-multi-host-adapters`](https://github.com/mike-north/AgentMonitors/blob/main/openspec/changes/add-multi-host-adapters/proposal.md) change
+(the multi-host adapter matrix, target status, and the contract every future host adapter must satisfy)._
 
 ## Learn more
 

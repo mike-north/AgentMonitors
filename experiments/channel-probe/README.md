@@ -1,7 +1,7 @@
 # Channel probe (throwaway experiment)
 
-Answers the open question in [`docs/specs/006-agent-integration.md`](../../docs/specs/006-agent-integration.md)
-spec: delivery/channel-transport, delivery/transport-seam: **when Claude Code spawns a stdio channel MCP server, what does it provide?**
+Answers the open question in [`delivery/channel-transport`](../../openspec/specs/delivery/channel-transport/spec.md)
+(workspace/session binding): **when Claude Code spawns a stdio channel MCP server, what does it provide?**
 Specifically — is `CLAUDE_PROJECT_DIR` set, what is the server's `cwd`, and does `roots/list`
 work? The answer decides whether the real channel transport can bind to a workspace.
 

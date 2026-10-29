@@ -1,6 +1,6 @@
 /**
- * The host-agnostic **Interpret adapter** boundary (G14,
- * [spec: pipeline/post-processing](../../../../openspec/specs/pipeline/post-processing/spec.md),
+ * The host-agnostic **Interpret adapter** boundary
+ * ([spec: pipeline/post-processing](../../../../openspec/specs/pipeline/post-processing/spec.md),
  * [spec: delivery/transport-seam](../../../../openspec/specs/delivery/transport-seam/spec.md)).
  *
  * The optional Interpret stage produces a cheap, natural-language digest of a

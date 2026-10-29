@@ -383,7 +383,7 @@ describe('issue #110: per-object before/after consolidation (net) end-to-end', (
     // writeMonitor, which writes the field explicitly; to test the true omitted
     // case we build a minimal monitor without the field via the same harness
     // (the schema default applies at parse time regardless of how we author it,
-    // but the test for the omitted-field case lives in service.test.ts §G13
+    // but the test for the omitted-field case lives in service.test.ts's author-declared baseline strategy block
     // criterion (d); here we exercise the same net consolidation behavior to
     // pin that the default is what is shipped).
     //

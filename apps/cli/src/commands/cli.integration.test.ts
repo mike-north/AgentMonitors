@@ -778,12 +778,12 @@ describe('init', () => {
 
   // AC4 (issue #268): the named `init <name> --type ...` scaffold output must be
   // unchanged by the bare-init bootstrap work. The expected string below is
-  // written by hand from spec: cli/authoring-commands's documented output (spec-owned-expected-string
+  // written by hand from the cli/authoring-commands spec's documented output (spec-owned-expected-string
   // matching, not a captured snapshot of program output), so any drift (an
   // added line, a reworded hint) fails here.
   //
   // Updated for issue #331 criterion 1: the closing output now also names
-  // `agentmonitors doctor` as the health-check next step (spec: cli/authoring-commands's documented
+  // `agentmonitors doctor` as the health-check next step (the cli/authoring-commands spec's documented
   // output was updated in lockstep — see the added line below).
   //
   // Renamed from "...is byte-for-byte unchanged..." (PR #341 review, issue
@@ -1962,7 +1962,7 @@ This monitor has a typo'd timezone.
     expect(parsed.error).toContain('agentmonitors monitor test');
   });
 
-  // Regression for G1 / SP2: two folders with the same basename derive the same
+  // Regression for duplicate monitor ids (SP2; spec: monitor/validation): two folders with the same basename derive the same
   // monitor id; validate must fail (exit 1) and name the collision.
   it('rejects duplicate monitor ids', () => {
     const dir = path.join(tempDir, 'validate-dup-test');
@@ -5064,7 +5064,7 @@ This monitor has a typo'd timezone.
 // and the exit code (acceptance criterion 3). Tests use the existing CLI harness
 // with the no-orphan-daemon discipline (every started daemon is stopped in a
 // finally). doctor reads persisted state in-process, so most cases need no daemon.
-// @see docs/specs/005-cli-reference.md §"doctor"
+// @see openspec/specs/cli/doctor/spec.md
 describe('doctor (issue #267)', () => {
   const VALID_FILE_MONITOR = `---
 name: Watch source
@@ -10989,8 +10989,8 @@ describe('hook deliver: always-on malformed-payload / unmapped-lifecycle stderr 
 });
 
 // Issue #270: prove hooks-only (no-MCP) operation is a complete, first-class
-// mode — not an implementation accident. Governing spec: docs/specs/006-
-// agent-integration.md, new subsection "Operating without MCP" (NP-CH). This
+// mode — not an implementation accident. Governing spec: delivery/transport-seam
+// (operating without MCP, NP-CH). This
 // is the `verified:` reference that subsection points at.
 describe('hooks-only delivery parity (issue #270)', () => {
   it('daemon up, monitor fires, hook deliver claims a real stdin payload, events ack acknowledges, events list reflects it — zero MCP/channel involvement', async () => {

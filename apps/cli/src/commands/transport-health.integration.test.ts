@@ -866,7 +866,7 @@ This monitor fires on a schedule.
       );
       expect(result.stdout).toContain('no live session');
       // A closed session is the ordinary "nothing is open right now" idle
-      // state, not a live degradation — spec: cli/doctor's exit-code contract, and the
+      // state, not a live degradation — the cli/doctor spec's exit-code contract, and the
       // same treatment `lead-session`/`daemon-reachable` already give it.
       expect(result.stdout).toContain('◇ delivery-verdict');
       expect(result.stdout).not.toContain('✗ delivery-verdict');

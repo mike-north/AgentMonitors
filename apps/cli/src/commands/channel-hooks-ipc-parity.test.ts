@@ -18,7 +18,7 @@
  * `cli.integration.test.ts` a genuine substitute for the MCP tool's
  * capability — not just a superficially similar command: both transports
  * drive the identical daemon IPC methods (`events.ack`, `hook.claim`),
- * exactly as spec: delivery/transport-seam's "realization" note describes ("the transport boundary
+ * exactly as the delivery/transport-seam spec's "realization" note describes ("the transport boundary
  * is the daemon IPC surface, not a new core type").
  *
  * @see openspec/specs/delivery/transport-seam/spec.md, openspec/specs/delivery/channel-transport/spec.md (the agentmon_ack tool)

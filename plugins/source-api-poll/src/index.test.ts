@@ -1189,7 +1189,7 @@ describe('source-api-poll', () => {
   // Integration: drive the composite source through the REAL runtime and prove
   // the runtime — not the source — computes the delivery diff over the one
   // composite snapshot, materializing a single event under the one objectKey.
-  describe('composite × runtime integration (spec: sources/api-poll, sources/contract + spec: sources/contract)', () => {
+  describe('composite × runtime integration (spec: sources/api-poll, sources/contract)', () => {
     const tempDirs: string[] = [];
 
     afterEach(() => {

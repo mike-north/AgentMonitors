@@ -6,7 +6,7 @@
 > in what order, and why. Execution detail lives in the
 > [GitHub milestones](https://github.com/mike-north/AgentMonitors/milestones); the
 > spec-vs-implementation gap ledger lives in
-> [docs/specs/roadmap.md](../specs/roadmap.md). This doc is the narrative that ties
+> [`openspec/changes/`](../../openspec/changes/) (`openspec list`). This doc is the narrative that ties
 > them together.
 
 The roadmap is a sequence of **numbered milestones (M1, M2, …)**, each an outcome that
@@ -132,7 +132,7 @@ Tracked, real, and not on the sequenced path yet: new observation sources (event
 file watching [#279](https://github.com/mike-north/AgentMonitors/issues/279), the
 macOS notification-observer source
 [#128](https://github.com/mike-north/AgentMonitors/issues/128)), third-party source
-discovery/installation (G4 in [docs/specs/roadmap.md](../specs/roadmap.md)), and
+discovery/installation (the [`add-source-plugin-manager`](../../openspec/changes/add-source-plugin-manager/proposal.md) change), and
 engineering-debt items labeled `backlog`. These graduate onto a milestone when they
 become the next most valuable thing — not before.
 

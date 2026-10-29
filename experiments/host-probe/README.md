@@ -1,8 +1,8 @@
 # Host probe (generalized binding-probe harness)
 
 Generalizes [`experiments/channel-probe`](../channel-probe/README.md) into a reusable, per-host
-diagnostic required by [`docs/specs/006-agent-integration.md`](../../docs/specs/006-agent-integration.md)
-change: add-multi-host-adapters — "Host adapters ship with conformance evidence": before a host's cells in the change: add-multi-host-adapters — "Matrix cells are pinned by a per-host probe" adapter matrix move from _(probe)_ to _current_, a probe run
+diagnostic required by the [`add-multi-host-adapters`](../../openspec/changes/add-multi-host-adapters/proposal.md)
+change ("Host adapters ship with conformance evidence"): before a host's cells in the adapter matrix move from _(probe)_ to _current_, a probe run
 must pin the **session-identity signal**, the **workspace-binding signal**, and **which lifecycle hook
 points fired** — and commit the artifact as evidence.
 

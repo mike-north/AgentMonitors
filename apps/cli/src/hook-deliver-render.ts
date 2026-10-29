@@ -329,7 +329,7 @@ function appendMarkerWithinCap(
  * instruction can never claim more than what the recipient was shown.
  *
  * Emitted ONCE per delivery batch (it lives in the shared header, not per
- * event) and kept terse — this lands in an LLM context window (spec: delivery/hook-transport's
+ * event) and kept terse — this lands in an LLM context window (the delivery/hook-transport spec's
  * injection-size concern). The session id and each event id are sanitized
  * like every other claim-derived field reaching this payload (see
  * {@link sanitize}).
@@ -905,7 +905,7 @@ export function renderHookDelivery(
  * breadcrumb, forever (the worst kind of onboarding dead-end).
  *
  * This uses the SAME `additionalContext` wire mechanism as
- * {@link renderHookDelivery} (spec: delivery/hook-transport of the agent-integration spec), but is a
+ * {@link renderHookDelivery} (spec: delivery/hook-transport), but is a
  * fixed advisory template rather than a rendering of a `DeliveryClaim` — there
  * is no daemon, no session, and no claimed delivery in this path (by design;
  * see the non-goals in issue #269: never auto-enable, never boot a daemon).

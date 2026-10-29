@@ -549,7 +549,7 @@ function renderText(
 }
 
 /**
- * Stable, documented machine shape (criterion 4; spec 005 §"doctor"). Dates are
+ * Stable, documented machine shape (criterion 4; spec: cli/doctor). Dates are
  * ISO strings or `null`; `ok` is `true` iff no check failed.
  */
 function toJson(
@@ -835,7 +835,7 @@ export const doctorCommand = new Command('doctor')
           // A PURE read (issue #425 review): `doctor` never reaps. Reaping
           // here let the diagnostic erase its own evidence — a second run
           // found no record and exited 0 with nothing actually recovered —
-          // and contradicted spec: cli/doctor's "diagnoses only, never mutates".
+          // and contradicted the cli/doctor spec's "diagnoses only, never mutates".
           heartbeats: readTransportHeartbeats(),
           diagnoses,
           diagnosisUnavailableSessionIds: unavailableSessionIds,

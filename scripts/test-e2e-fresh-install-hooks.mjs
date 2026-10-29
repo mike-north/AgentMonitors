@@ -661,8 +661,8 @@ async function main() {
       'force a deterministic baseline tick via daemon.tick, then touch the watched file',
       async () => {
         // Force a real tick on the already-running daemon through the
-        // `daemon.tick` IPC method (docs/specs/002-runtime-delivery.md
-        // spec: daemon/ipc) instead of sleeping and hoping the daemon's own --poll-ms
+        // `daemon.tick` IPC method
+        // (spec: daemon/ipc) instead of sleeping and hoping the daemon's own --poll-ms
         // interval baselines the file first. Awaiting this call is a hard
         // guarantee the baseline fingerprint has been recorded before the
         // file is mutated below — a fixed sleep instead races the daemon's

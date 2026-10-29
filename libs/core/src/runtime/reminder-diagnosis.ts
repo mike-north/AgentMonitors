@@ -17,7 +17,7 @@ import type { DeliveryLifecycle } from './types.js';
  * `hook claim --lifecycle turn-interruptible` surfaced the reminder AND claimed
  * the underlying normal event; a second identical claim then returned `null`
  * (nothing surfaced) with no explanation. Per the silent-failure-honesty
- * invariant (capability C12, and spec: pipeline/post-processing's "why nothing fired" principle), that
+ * invariant (capability C12, and the pipeline/post-processing spec's "why nothing fired" principle), that
  * silence must be inspectable rather than presented as a dead end. This module
  * turns the guard's decision into a named, human-readable verdict surfaced by
  * `monitor explain` (spec: daemon/ipc projection-and-delivery stage).

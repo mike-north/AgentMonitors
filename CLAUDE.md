@@ -89,7 +89,7 @@ its own checked-in API report. If you change a package's **public** API surface,
   public API (api-extractor rollup).
 - `apps/cli` (`@agentmonitors/cli`, bin `agentmonitors`) — command surface + the daemon and its
   Unix-socket IPC layer. Thin wrapper over core (per AP6: CLI must not invent behavior the core
-  doesn't define). See [`docs/specs/005-cli-reference.md`](docs/specs/005-cli-reference.md).
+  doesn't define). See the `cli/*` capabilities in [`openspec/specs/cli/`](openspec/specs/cli/).
 - `plugins/source-*` — the three bundled observation sources (`file-fingerprint`, `api-poll`,
   `schedule`), each a separately published package implementing the source contract.
 - `apps/website` — public docs site (excluded from `build`/`check`; lags the specs).
@@ -127,14 +127,14 @@ The repo persists **two** separate models in SQLite (better-sqlite3 + drizzle-or
    monitor-delivery path).
 2. **Legacy inbox** — `inbox_items` state machine (`queued → acked → in-progress →
 completed|failed → archived`), exposed via `agentmonitors inbox …`. Still implemented and public,
-   but **not** the authoritative path. See [`docs/specs/002-runtime-delivery.md`](docs/specs/002-runtime-delivery.md) §12.
+   but **not** the authoritative path. See [`inbox/legacy-inbox`](openspec/specs/inbox/legacy-inbox/spec.md).
 
 ### Daemon vs in-process (a common gotcha)
 
 `daemon run` is the long-running process that ticks on an interval and serves a Unix socket;
 `session` / `events` / `hook` commands round-trip through that socket. But `daemon once` (single
 tick) and a couple of fallbacks run **in-process without the socket** — see
-[`docs/specs/002-runtime-delivery.md`](docs/specs/002-runtime-delivery.md) §10.
+[`daemon/ipc`](openspec/specs/daemon/ipc/spec.md).
 
 ## Conventions
 
