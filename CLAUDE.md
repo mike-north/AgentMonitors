@@ -30,7 +30,7 @@ sources · `cli/*` the `agentmonitors` command surface · `agent/*` ephemeral mo
 artifact are in [`openspec/config.yaml`](openspec/config.yaml); `pnpm check:openspec`
 (`openspec validate --all --strict`, part of `pnpm check`) must pass. `docs/specs/` is
 non-normative: glossary, design history, the frozen pre-OpenSpec `spec-changelog.md`, and the
-`000`–`008` crosswalk stubs that map the `NNN §X.Y` citations still found in code comments to the
+`000`–`008` crosswalk stubs that map the legacy `NNN §X.Y` citations (changelogs, commits, issues, older code comments) to the
 capability or change that now owns each section.
 
 ## Commands

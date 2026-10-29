@@ -4,7 +4,7 @@
 >
 > The normative content of this document now lives in [OpenSpec](../../openspec/): current
 > behavior in `openspec/specs/`, not-yet-implemented (target) behavior in `openspec/changes/`.
-> Code and docs still cite sections of this document as `004 §X.Y`; the table below maps each
+> Changelogs, commits, issues, and older code comments cite sections of this document as `004 §X.Y`; the table below maps each
 > former section to the capability (and requirement names) or change that now owns it. The
 > full former text is in git history: `git show e1bafcfa:docs/specs/004-validation-testing.md`.
 

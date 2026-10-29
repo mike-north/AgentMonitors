@@ -43,8 +43,8 @@ When you change behavior, do it through an OpenSpec change (the `openspec-propos
 `openspec-apply-change`, and `openspec-archive-change` skills in `.agents/skills/`); archiving
 promotes the delta specs into `openspec/specs/`. Per-artifact rules are in
 [`openspec/config.yaml`](openspec/config.yaml), and `openspec validate --all --strict` must pass.
-`docs/specs/` is non-normative: the `000`–`008` files are crosswalk stubs mapping the `NNN §X.Y`
-citations still found in code comments to the capability or change that now owns each section.
+`docs/specs/` is non-normative: the `000`–`008` files are crosswalk stubs mapping the legacy `NNN §X.Y`
+citations (changelogs, commits, issues, older code comments) to the capability or change that now owns each section.
 
 ## Commands
 

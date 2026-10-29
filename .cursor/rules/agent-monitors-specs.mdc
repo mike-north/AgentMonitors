@@ -26,4 +26,5 @@ behavior is in `openspec/specs/<capability>/spec.md`; target (not-yet-implemente
 When you change behavior, do it through an OpenSpec change (`/opsx-propose`, `/opsx-apply`,
 `/opsx-archive`); rules per artifact are in `openspec/config.yaml` and
 `openspec validate --all --strict` must pass. The `docs/specs/000`–`008` files are non-normative
-crosswalk stubs mapping the `NNN §X.Y` citations still found in code comments to their new home.
+crosswalk stubs mapping the legacy `NNN §X.Y` citations
+(changelogs, commits, issues, older code comments) to their new home.

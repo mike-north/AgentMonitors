@@ -4,8 +4,8 @@
 >
 > Current→target gaps are now OpenSpec changes: run `openspec list` (or browse
 > [`openspec/changes/`](../../openspec/changes/)) for every planned behavior, each with a
-> proposal, delta specs, and tasks. This page keeps the gap IDs (`G1`…`G21`, `T1`…`T4`) still cited
-> in code comments resolvable. The former text is in git history:
+> proposal, delta specs, and tasks. This page keeps the gap IDs (`G1`…`G21`, `T1`…`T4`) cited in
+> changelogs, issues, and older code comments resolvable. The former text is in git history:
 > `git show e1bafcfa:docs/specs/roadmap.md`.
 
 ## Open gaps → OpenSpec changes

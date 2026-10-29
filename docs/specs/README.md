@@ -49,7 +49,7 @@ Clarifications that do not change behavior may edit `openspec/specs/` directly.
 
 - [glossary.md](./glossary.md) — one canonical definition per core term.
 - `000`–`008` (e.g. [002](./002-runtime-delivery.md)) — **crosswalk stubs**. The former numbered
-  docs are still cited throughout code comments as `NNN §X.Y`; each stub maps every former section
+  docs are cited as `NNN §X.Y` in changelogs, commits, issues, and older code comments; each stub maps every former section
   to the capability (and requirement names) or change that now owns it. Their full former text is in
   git history (`git show e1bafcfa:docs/specs/<file>`).
 - [roadmap.md](./roadmap.md) — maps the former gap IDs (`G1`…`G21`) to changes or capabilities.
