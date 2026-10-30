@@ -60,9 +60,10 @@ The schema-generation path proves that the source registry can produce a combine
 
 ### 2.5 Runtime tests
 
-Runtime tests are the primary proof surface for: state persistence across runtime restarts; due scheduling; delivery lifecycle semantics; session projection; hook state correctness.
+Runtime tests are the primary proof surface for: state persistence across runtime restarts; due scheduling; delivery lifecycle semantics; session projection; hook state correctness; and atomic rollback of deterministic materialization writes.
 
-**Verified in:** `libs/core/src/runtime/service.test.ts`
+**Verified in:** `libs/core/src/runtime/service.test.ts` and
+`libs/core/src/runtime/transactional-materialization.test.ts`.
 
 ### 2.6 CLI integration tests
 
@@ -175,13 +176,14 @@ The spec set is incomplete unless each major rule has at least one concrete test
 
 ### 3.4 Persistence and snapshotting
 
-The `RuntimeStore.saveSnapshot()` and `RuntimeStore.latestSnapshot()` methods (in `libs/core/src/runtime/store.ts`) implement snapshot storage keyed by `(workspacePath, monitorId, objectKey)`. The `processObservation` method in `libs/core/src/runtime/service.ts` uses these to retrieve the prior snapshot and compute a `diffText` before saving the event.
+The `RuntimeStore.saveSnapshot()` and `RuntimeStore.latestSnapshot()` methods (in `libs/core/src/runtime/store.ts`) implement snapshot storage keyed by `(workspacePath, monitorId, objectKey)`. The `materializeObservation` method in `libs/core/src/runtime/service.ts` uses these to retrieve the prior snapshot and compute a `diffText` before atomically saving the event, projections/cursor seeds, and snapshot.
 
-| Scenario                                                     | Coverage                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `snapshotText` stores a later-retrievable snapshot           | **TEST GAP** — The `RuntimeStore` methods `saveSnapshot` and `latestSnapshot` have no dedicated unit tests. The integration path through `processObservation` is exercised in `service.test.ts` only for the case where `snapshotText` is `null` (all manual `insertEvent` calls pass `snapshotText: null`). No test asserts that a `snapshotText` provided by a source observation is stored, retrieved, and used to produce `diffText` on a subsequent observation. |
-| A prior snapshot produces diff text on later change          | **TEST GAP** — No test verifies that `diffText` is populated when the same `(monitorId, objectKey)` pair has a prior snapshot.                                                                                                                                                                                                                                                                                                                                        |
-| Snapshots are isolated by workspace, monitor, and object key | **TEST GAP** — No test verifies that `latestSnapshot` with different workspace paths, monitor IDs, or object keys returns independent values.                                                                                                                                                                                                                                                                                                                         |
+| Scenario                                                         | Coverage                                                                                                                                                                                                                     |
+| ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `snapshotText` stores a later-retrievable snapshot               | Covered (`libs/core/src/runtime/service.test.ts` — "stores and retrieves snapshots isolated by workspace, monitor, and object key"; "computes a diff against the prior snapshot when an object changes").                    |
+| A prior snapshot produces diff text on later change              | Covered (`libs/core/src/runtime/service.test.ts` — "computes a diff against the prior snapshot when an object changes"; "renders a structural json-diff diffText for a real observation routed through processObservation"). |
+| Snapshots are isolated by workspace, monitor, and object key     | Covered (`libs/core/src/runtime/service.test.ts` — "stores and retrieves snapshots isolated by workspace, monitor, and object key").                                                                                         |
+| Event, projection/cursor, and snapshot writes roll back together | Covered (`libs/core/src/runtime/transactional-materialization.test.ts` — injected cursor and snapshot failures leave no event, projection, cursor, or snapshot).                                                             |
 
 ### 3.5 CLI behavior
 

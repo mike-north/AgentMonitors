@@ -9,6 +9,13 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-10-30 — Preserve empty snapshots and make commit-order proof observable (002 §5.2) — Refs #482
+
+Empty snapshots now participate in shared and newly projected recipient diffs: removing all
+content produces a deletion delta and the empty value remains the next baseline. The Interpret
+commit-order regression test now observes through a separate SQLite connection and asserts outside
+the adapter callback, where fallback handling cannot swallow a failed test assertion.
+
 ## 2026-08-24 — New numbered doc: 008 — Reliability & Process Hygiene — Refs #504, PR #476
 
 Added [008-reliability-process-hygiene.md](./008-reliability-process-hygiene.md), promoting the
@@ -41,6 +48,14 @@ Two contradiction resolutions recorded per 004 §5, both surfaced by PR #512 rev
   boundary. Resolution: #478's scope is extended (recorded on the issue) to cover
   detached-but-identifiable descendants; identity-erasing detachment remains the documented
   escape.
+
+## 2026-08-13 — Event materialization is one atomic durable unit (002 §5, 004 §3.4) — Refs #295, #481
+
+The shared event row, matching lead-session projections, first-recipient cursor seeds, and snapshot
+now commit in one immediate SQLite transaction. A failure at any write rolls the whole observation
+back, so the runtime cannot retain a partial event without its cursor, projection, or snapshot.
+Optional Interpret work remains outside this deterministic transaction and begins only after it
+commits. Focused failure-injection tests now enforce the rollback boundary.
 
 ## 2026-07-22 — Channel `event_count`/`monitor_id`/`event_id` meta corrected for cross-monitor-coalesced claims (006 §4.2) — Refs #441, #456
 
