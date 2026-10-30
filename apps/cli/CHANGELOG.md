@@ -1,5 +1,28 @@
 # @agentmonitors/cli
 
+## 0.11.1
+
+### Patch Changes
+
+- f194a12: Allow fresh normal and low reminder batches while older events remain claimed and unacknowledged.
+  Preserve same-band in-flight reservation holds and high-urgency settle coalescing, and update
+  suppression diagnostics to distinguish no new work from a temporary reservation.
+
+  Use the explicit `no-new-work` diagnostic for healthy claimed-only backlogs. Retain conservative
+  health warnings for legacy daemon reasons whose policy can still block future batches.
+
+- 7c30c92: Upgrade better-sqlite3 to 13.x, fixing a native crash (env != nullptr abort in Statement teardown) that could kill the daemon on Node 24.
+- Updated dependencies [ab9b6ad]
+- Updated dependencies [57e2878]
+- Updated dependencies [f194a12]
+- Updated dependencies [7c30c92]
+  - @agentmonitors/core@0.14.0
+  - @agentmonitors/source-api-poll@0.5.1
+  - @agentmonitors/source-command-poll@0.4.1
+  - @agentmonitors/source-file-fingerprint@0.4.3
+  - @agentmonitors/source-incoming-changes@0.3.3
+  - @agentmonitors/source-schedule@0.2.3
+
 ## 0.11.0
 
 ### Minor Changes

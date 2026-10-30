@@ -1,5 +1,15 @@
 # @agentmonitors/source-command-poll
 
+## 0.4.1
+
+### Patch Changes
+
+- Updated dependencies [ab9b6ad]
+- Updated dependencies [57e2878]
+- Updated dependencies [f194a12]
+- Updated dependencies [7c30c92]
+  - @agentmonitors/core@0.14.0
+
 ## 0.4.0
 
 ### Minor Changes
