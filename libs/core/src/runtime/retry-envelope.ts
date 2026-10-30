@@ -1,14 +1,15 @@
 /**
- * Defines the retry outbox's persistable value domain. Validation excludes
- * caller-defined reads and serialization hooks so a stored observation retains
- * its data; only the observation timestamp has typed hydration semantics.
+ * Defines the retry outbox's supported plain-data domain. Validation rejects
+ * detectable unsupported values without caller-defined reads or serialization
+ * hooks. Callers must supply records, not objects with private intrinsic state;
+ * only the observation timestamp has typed hydration semantics.
  */
 import { types } from 'node:util';
 import type { StoredObservationEnvelope } from './types.js';
 
 /**
- * Raised when a retry envelope cannot be persisted and restored without
- * changing its data.
+ * Raised for a detected violation of the retry envelope's supported plain-data
+ * domain, before any member of its batch is persisted.
  *
  * @public
  */
@@ -35,6 +36,33 @@ function childPath(parent: string, key: string): string {
   return /^[A-Za-z_$][A-Za-z0-9_$]*$/u.test(key)
     ? `${parent}.${key}`
     : `${parent}[${JSON.stringify(key)}]`;
+}
+
+/**
+ * Prototype identity does not establish that a value is an ordinary data record:
+ * built-ins retain internal state when their prototypes are replaced. These
+ * intrinsic checks reject the brands Node exposes without coercion or hooks.
+ * Callers still own the plain-data precondition for undetectable private state.
+ */
+function hasUnsupportedIntrinsicState(value: object): boolean {
+  return (
+    types.isBoxedPrimitive(value) ||
+    types.isMap(value) ||
+    types.isSet(value) ||
+    types.isWeakMap(value) ||
+    types.isWeakSet(value) ||
+    types.isAnyArrayBuffer(value) ||
+    types.isArrayBufferView(value) ||
+    types.isRegExp(value) ||
+    types.isNativeError(value) ||
+    types.isPromise(value) ||
+    types.isMapIterator(value) ||
+    types.isSetIterator(value) ||
+    types.isGeneratorObject(value) ||
+    types.isArgumentsObject(value) ||
+    types.isModuleNamespaceObject(value) ||
+    types.isExternal(value)
+  );
 }
 
 function assertJsonSafe(
@@ -77,6 +105,9 @@ function assertJsonSafe(
     }
     if (Number.isNaN(timestamp)) fail(path, 'an invalid Date is unsupported.');
     return;
+  }
+  if (hasUnsupportedIntrinsicState(value)) {
+    fail(path, 'intrinsic object state is not plain JSON data.');
   }
   if (ancestors.has(value)) fail(path, 'cyclic references are unsupported.');
 

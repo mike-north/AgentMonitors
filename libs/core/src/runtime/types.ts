@@ -656,8 +656,8 @@ export interface MaterializationRetryRecord {
   /** Trusted observation-source route captured at enqueue time. */
   sourceName: string;
   /**
-   * Restored observation. Enqueue rejects non-JSON-safe nested data instead of
-   * silently changing it; `observedAt` is restored as a Date.
+   * Restored supported plain-data observation. Detectable unsupported nested
+   * data is rejected at enqueue; `observedAt` is restored as a Date.
    */
   envelope: StoredObservationEnvelope;
   /** UTF-8 bytes occupied by the serialized envelope. */
@@ -685,10 +685,15 @@ export interface EnqueueMaterializationRetryInput {
   /** Trusted source route; must match the envelope's watch type. */
   sourceName: string;
   /**
-   * Failed observation to persist losslessly for a later attempt. Nested values
-   * must be JSON-safe (no negative zero, proxies, accessors, cycles or custom classes).
-   * `observedAt` is the sole Date leaf and must be valid, have Date.prototype,
-   * and have no own properties. Invalid data raises a serialization domain error.
+   * Failed observation to persist losslessly for a later attempt. Callers must
+   * supply ordinary data records and dense arrays of JSON primitives (excluding
+   * negative zero). Built-in/class instances, even with replaced prototypes, are
+   * outside this domain. `observedAt` is the sole Date leaf and must be valid,
+   * have Date.prototype, and have no own properties.
+   * Detectable violations (including proxies, accessors, cycles and intrinsic
+   * brands exposed by Node) raise a serialization domain error. Validation is
+   * not authentication of object provenance or unobservable private state;
+   * callers remain responsible for the plain-data precondition.
    */
   envelope: StoredObservationEnvelope;
   /** Failure text to sanitize and persist as bounded operator diagnostics. */

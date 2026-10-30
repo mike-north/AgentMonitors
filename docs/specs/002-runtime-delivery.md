@@ -1798,13 +1798,29 @@ without invoking the source or moving a source cursor again.
 | `updated_at`      | INTEGER NOT NULL | Last attempt or operator re-arm                   |
 
 Capacity is 256 rows or 8 MiB of stored envelopes per `(workspace_path, monitor_id)`, including
-terminal rows. Envelope size is the exact serialized UTF-8 byte count. Enqueue rejects values that
-cannot round-trip through JSON (including BigInt, negative zero, Date values outside the typed
-`observedAt` field, proxies, accessors, and cyclic references) with a domain error before database mutation.
+terminal rows. Envelope size is the exact serialized UTF-8 byte count. Callers must supply ordinary
+plain-data records and dense arrays of JSON primitives (excluding negative zero), apart from the
+single typed `observedAt` Date. Class/built-in instances remain outside this supported domain even
+if their prototypes have been replaced. Enqueue rejects detectable domain violations (including
+BigInt, negative zero, nested Dates, proxies, accessors, cycles, and intrinsic object brands exposed
+by Node) with a domain error before database mutation.
 The full envelope is validated before route fields are read. Proxies, including revoked proxies,
 are rejected before their traps can run; route accessors are rejected without invoking their getters.
 Date detection uses an intrinsic brand check rather than traversing prototype chains, so an
 ordinary object or array with a proxy prototype is rejected without executing inherited traps.
+Known intrinsic brands are checked independently of prototype identity: Maps, Sets, boxed
+primitives, buffers/views and other detectable built-ins cannot disguise their internal data as
+plain records merely by replacing their prototypes.
+
+The plain-data rule is a caller precondition, not authentication of arbitrary same-process object
+provenance. JavaScript cannot generally distinguish an ordinary empty record from an object whose
+prototype was replaced and whose private/native state has no exposed intrinsic brand (for example,
+a private-field class, or some platform objects). Such values are unsupported even when early
+validation cannot identify them. Sources must normalize their meaningful data into ordinary
+records before constructing retry envelopes; successful validation is not proof that an arbitrary
+object's hidden state was preserved. This boundary does not change the round-trip guarantee for
+supported plain-data inputs.
+
 `observedAt` must be a valid, unmodified Date instance: subclasses or own properties are rejected
 without invoking their hooks. The validated instant is serialized explicitly as ISO text and
 restored as a Date; a string timestamp is not an accepted substitute. A batch

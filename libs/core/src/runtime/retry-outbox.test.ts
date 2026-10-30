@@ -447,6 +447,52 @@ describe('materialization retry outbox', () => {
     }
   });
 
+  it.each([
+    ['Map', () => new Map([['retain', 'value']])],
+    ['Set', () => new Set(['retain'])],
+    ['WeakMap', () => new WeakMap([[{}, 'retain']])],
+    ['WeakSet', () => new WeakSet([{}])],
+    ['boxed Number', () => Object(42)],
+    ['boxed Boolean', () => Object(true)],
+    ['boxed String', () => Object('retain')],
+    ['boxed BigInt', () => Object(42n)],
+    ['boxed Symbol', () => Object(Symbol('retain'))],
+    ['RegExp', () => /retain/u],
+    ['ArrayBuffer', () => new ArrayBuffer(4)],
+    ['SharedArrayBuffer', () => new SharedArrayBuffer(4)],
+    ['DataView', () => new DataView(new ArrayBuffer(4))],
+    ['typed array', () => new Uint8Array([42])],
+    ['Promise', () => Promise.resolve('retain')],
+    ['native Error', () => new Error('retain')],
+    ['Map iterator', () => new Map([['retain', 'value']]).entries()],
+    ['Set iterator', () => new Set(['retain']).values()],
+    [
+      'generator',
+      () =>
+        (function* () {
+          yield 'retain';
+        })(),
+    ],
+  ] satisfies readonly (readonly [string, () => object])[])(
+    'rejects intrinsic %s data even with an ordinary-looking prototype',
+    (_name, makeValue) => {
+      const store = new RuntimeStore(createDb(':memory:'));
+      for (const prototype of [Object.prototype, null]) {
+        const value = makeValue();
+        Reflect.setPrototypeOf(value, prototype);
+        const invalid = input('monitor-a', 'intrinsic-data');
+        invalid.envelope.observation.payload = value;
+        expect(() =>
+          store.enqueueMaterializationRetries(
+            [input('monitor-a', 'valid-sibling'), invalid],
+            NOW,
+          ),
+        ).toThrow(MaterializationRetrySerializationError);
+        expect(store.listMaterializationRetries()).toEqual([]);
+      }
+    },
+  );
+
   it('rejects route accessors before reading them or writing siblings', () => {
     const store = new RuntimeStore(createDb(':memory:'));
     let getterCalls = 0;

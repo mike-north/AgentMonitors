@@ -800,13 +800,15 @@ export class RuntimeStore {
    * Durably enqueue one batch of failed materializations.
    *
    * Admission is atomic per call and serialized with an immediate transaction.
-   * Every envelope must match its trusted monitor/source route and contain only
-   * losslessly JSON-safe values (apart from the typed `observedAt` Date).
+   * Every envelope must match its trusted monitor/source route and satisfy the
+   * caller-owned plain-data precondition documented on its input type (apart
+   * from the typed `observedAt` Date). Detectable domain violations are rejected;
+   * arbitrary instances with hidden private state are not supported records.
    *
    * @throws {@link MaterializationRetryCapacityError} when any affected
    * workspace/monitor would exceed its count or byte bound.
    * @throws {@link MaterializationRetrySerializationError} before mutation when
-   * an envelope cannot be losslessly persisted.
+   * an envelope has a detectable violation of the supported plain-data domain.
    */
   enqueueMaterializationRetries(
     inputs: EnqueueMaterializationRetryInput[],

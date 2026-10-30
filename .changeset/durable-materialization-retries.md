@@ -7,3 +7,5 @@ Add a bounded durable outbox for retrying failed observation materialization.
 Reject values that JSON would silently normalize, including negative zero and customized observation timestamps, before persisting any retry batch member.
 
 Reject proxy envelopes and proxy prototypes before traps run, using intrinsic Date detection; validate route data before invoking property reads.
+
+Reject detectable intrinsic built-ins even after their prototypes are replaced. Document the caller-owned plain-data domain and the limits of detecting unobservable private state.

@@ -78,3 +78,39 @@ Validation: 14 focused retry tests and all 626 core tests across 43 files pass o
 Core strict TypeScript, build/API-report check (unchanged), changed-source ESLint (zero errors),
 formatting, and whitespace checks pass. A new independent reviewer is required because this
 reviewer authored the repair. No push or merge was performed.
+
+## Intrinsic-state admission repair and supported-domain boundary
+
+An independent reviewer rejected `3926706c275ba031c18f838a7145593dc108a528`: replacing only the
+prototype of a Map, Set, or boxed Number let its internal data bypass the plain-prototype check
+and be lost or changed in JSON. Nineteen parameterized tests were added first, each exercising
+Object.prototype and null replacements. The pre-repair run had 16 failures and 17 passes: existing
+hidden-property checks already rejected three brands, while sixteen additional brands were
+accepted or failed with the wrong error.
+
+Validation now excludes detectable internal-slot brands via Node's non-coercing intrinsic checks:
+boxed primitives, maps/sets and weak variants, buffers/views, RegExp, native errors, promises,
+map/set iterators, generators, arguments, module namespaces, and native externals. The existing
+proxy/accessor/prototype-chain tests remain green. Node's isKeyObject/isCryptoKey wrappers were
+not retained: unlike these intrinsic checks, they read symbol properties; an intermediate attempt
+was caught by the existing revoked-proxy-prototype regression. Symbol-bearing objects remain
+unsupported via descriptor inspection.
+
+The coordinator explicitly accepted a bounded repair rather than an arbitrary-object serializer
+redesign. The public input contract and 002 now distinguish the semantic supported domain from
+early detection: callers must supply ordinary plain-data records/arrays; built-in/class instances
+with replaced prototypes are still unsupported. JavaScript has no general intrinsic for erased
+object provenance or unobservable private state. A prototype-stripped private-field class or some
+platform objects (e.g. URL/URLSearchParams/AbortController) can look like empty records. They must
+be normalized by their source, not treated as supported because validation passed. This does not
+weaken the round-trip guarantee for supported ordinary records, but it corrects the previous
+implication that runtime validation could authenticate every arbitrary same-process object.
+Independent review must assess this boundary explicitly before integration.
+
+Validation: all 33 retry tests and 645 core tests (43 files) pass; strict TypeScript, build/API-report
+check (unchanged), changed-source ESLint (zero errors; existing release-tag warnings), formatting,
+and whitespace checks pass. Re-running the independent reviewer's public harness preserves all
+five positive rollback/reopen/round-trip/scope/refusal checks and now rejects Map/Set/Number with
+the serialization domain error. No remote push or merge was performed. Rebase onto merged #482
+is performed only after confirming the previous base and merged main have identical trees;
+final replacement SHA and tree-equivalence evidence are in the handoff.
