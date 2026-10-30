@@ -189,6 +189,18 @@ The `RuntimeStore.saveSnapshot()` and `RuntimeStore.latestSnapshot()` methods (i
 | Retry envelopes round-trip without silent data conversion        | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — BigInt, negative zero, nested/customized Date, non-Date observedAt, and accessor/proxy values fail with a domain error before any sibling is written; altered-prototype built-in brands are rejected; route getters and direct or inherited proxy traps never run). |
 | Retry errors are safe and bounded                                | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — C0/DEL controls are stripped and persisted errors are capped at 1,024 characters).                                                                                                                                                                                  |
 
+### 3.4.1 Real daemon crash recovery
+
+`apps/cli/src/commands/daemon-crash-recovery.integration.test.ts` exercises a built CLI daemon
+with its own temporary workspace, user-data directory, database, and socket. It observes a real
+file change into a lead session, waits for the unread event, kills the owned daemon with SIGKILL,
+and explicitly starts a replacement on the same database. It verifies that doctor reports the
+dead daemon with a registered session, reopening the same host-session identity retains its
+session id and exact unread event, and delivery leaves that event unread until explicit acknowledgment.
+The test is registered in the serial configuration; child exits are awaited before fixture removal.
+This proves recovery of already-persisted recipient work, not automatic process supervision,
+uncommitted observation recovery, power-loss durability, or the pending materialization-retry stack.
+
 ### 3.5 CLI behavior
 
 | Scenario                                                                                                                                                                           | Coverage                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
