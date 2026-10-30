@@ -19,7 +19,7 @@ Each major normative rule SHALL have at least one concrete, testable scenario ba
 
 ### Requirement: Runtime tests prove durable runtime semantics
 
-Runtime tests in `libs/core` SHALL be the primary proof surface for state persistence across runtime restarts, due scheduling, delivery lifecycle semantics, session projection, and hook state correctness.
+Runtime tests in `libs/core` SHALL be the primary proof surface for state persistence across runtime restarts, due scheduling, delivery lifecycle semantics, session projection, hook state correctness, and atomic rollback of materialization writes.
 
 #### Scenario: Restart persistence is proven at the runtime layer
 

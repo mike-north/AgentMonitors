@@ -151,6 +151,7 @@ function setup(
   payloadForm: string | null,
   source: ObservationSource,
   interpret?: InterpretAdapter,
+  Store: new (db: ReturnType<typeof createDb>) => RuntimeStore = RuntimeStore,
 ): {
   runtime: AgentMonitorRuntime;
   store: RuntimeStore;
@@ -160,7 +161,7 @@ function setup(
   const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-interpret-'));
   tempDirs.push(rootDir);
   const db = createDb(path.join(rootDir, 'agentmon.db'));
-  const store = new RuntimeStore(db);
+  const store = new Store(db);
   const registry = new SourceRegistry();
   registry.register(source);
   const runtime = new AgentMonitorRuntime(
@@ -174,6 +175,109 @@ function setup(
 }
 
 describe('Interpret stage (spec: pipeline/post-processing)', () => {
+  it('invokes the adapter only after the event, projection, and snapshot commit', async () => {
+    let probeError: unknown;
+    let observed:
+      | {
+          eventCount: number;
+          projectionCount: number;
+          snapshot: { content: string } | null;
+          cursorContent: string | undefined;
+        }
+      | undefined;
+    const fake = fakeAdapter(() => {
+      try {
+        probe();
+      } catch (error) {
+        probeError = error;
+      }
+      return { decision: 'deliver', digest: 'committed' };
+    });
+    const { runtime, store, monitorsDir, rootDir } = setup(
+      'prose',
+      scriptedSource(['v1']),
+      fake,
+    );
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'commit-probe',
+        workspacePath: rootDir,
+      }),
+    );
+    // A separate connection observes only committed rows, never uncommitted
+    // writes visible to the materializing connection inside its transaction.
+    const reader = new RuntimeStore(
+      createDb(path.join(rootDir, 'agentmon.db')),
+    );
+    const probe = () => {
+      observed = {
+        eventCount: reader.listEvents().length,
+        projectionCount: reader.listEvents({ sessionId: session.id }).length,
+        snapshot: reader.latestSnapshot('interp', 'obj-1', rootDir),
+        cursorContent: reader.getSessionObjectCursor(
+          session.id,
+          'interp',
+          'obj-1',
+          rootDir,
+        )?.baselineContent,
+      };
+    };
+    await runtime.tick(monitorsDir, rootDir);
+
+    // Assertions must be outside the adapter: Interpret intentionally catches
+    // adapter exceptions, including assertion errors, to preserve its fallback.
+    expect(probeError).toBeUndefined();
+    expect(fake.calls).toHaveLength(1);
+    expect(observed).toEqual({
+      eventCount: 1,
+      projectionCount: 1,
+      snapshot: { content: 'v1' },
+      cursorContent: 'v1',
+    });
+    expect([
+      ...store
+        .interpretDigestsForSession(
+          session.id,
+          store.listEvents().map((event) => event.id),
+        )
+        .values(),
+    ]).toEqual(['committed']);
+  });
+
+  it('does not invoke Interpret when deterministic materialization rolls back', async () => {
+    class SnapshotFailingStore extends RuntimeStore {
+      override saveSnapshot(
+        _input: Parameters<RuntimeStore['saveSnapshot']>[0],
+      ): void {
+        throw new Error('simulated snapshot failure');
+      }
+    }
+
+    const fake = fakeAdapter(() => ({
+      decision: 'deliver',
+      digest: 'unexpected',
+    }));
+    const { runtime, store, monitorsDir, rootDir } = setup(
+      'prose',
+      scriptedSource(['v1']),
+      fake,
+      SnapshotFailingStore,
+    );
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'rollback-probe',
+        workspacePath: rootDir,
+      }),
+    );
+
+    await runtime.tick(monitorsDir, rootDir);
+
+    expect(fake.calls).toHaveLength(0);
+    expect(store.listEvents()).toEqual([]);
+    expect(store.listEvents({ sessionId: session.id })).toEqual([]);
+    expect(store.latestSnapshot('interp', 'obj-1', rootDir)).toBeNull();
+  });
+
   it('(a) a prose monitor invokes the adapter; the delta is the per-recipient diff', async () => {
     const fake = fakeAdapter(() => ({ decision: 'deliver', digest: 'ok' }));
     const { runtime, monitorsDir, rootDir } = setup(
