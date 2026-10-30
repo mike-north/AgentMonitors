@@ -1,21 +1,4 @@
-/**
- * Tests for the pure hook-delivery hold-reason classifiers (issue #334).
- *
- * The expected verdicts are derived BY HAND from the delivery-guard spec, not
- * captured from program output:
- *
- *   002 §9.1 — at `turn-interruptible`, a high-urgency event is deliverable
- *              only once it has aged past the 15s claim-time settle window.
- *   002 §9.2 — the normal-urgency reminder fires at `turn-interruptible` ONLY
- *              IF every unread normal event is still unclaimed.
- *   002 §9.3 — the low-urgency reminder fires at `turn-idle` ONLY IF every
- *              unread low event is still unclaimed.
- *
- * @see ../../../../docs/specs/002-runtime-delivery.md §9.1 (high-urgency settle window)
- * @see ../../../../docs/specs/002-runtime-delivery.md §9.2 (normal reminder)
- * @see ../../../../docs/specs/002-runtime-delivery.md §9.3 (low reminder)
- * @see ../../../../docs/specs/006-agent-integration.md §5 (hook-deliver transport)
- */
+/** Hand-authored examples for fresh reminder batches, leases and high settle windows. */
 import { describe, expect, it } from 'vitest';
 import {
   classifyCoalescingWithheldHold,
@@ -47,12 +30,10 @@ describe('classifyReminderHold', () => {
     });
     expect(hold?.message).toContain('turn-interruptible');
     expect(hold?.message).toContain('already claimed');
-    expect(hold?.message).toContain('coalesced-until-ack');
+    expect(hold?.message).toContain(
+      'fresh unclaimed normal event will trigger',
+    );
     expect(hold?.message).toContain('agentmonitors events ack');
-    // Regression (PR #445 review round 8): the guard is ack-only — the
-    // message must not promise a fresh/new unclaimed event restores it.
-    expect(hold?.message).not.toMatch(/acknowledged.*or a (fresh|new)/);
-    expect(hold?.message).toContain('does not restore it');
   });
 
   it('defaults `claimedEventIds` to an empty array when the caller omits it', () => {
@@ -66,17 +47,8 @@ describe('classifyReminderHold', () => {
     expect(hold?.claimedEventIds).toEqual(['evt-1']);
   });
 
-  it('reports `coalesced-until-ack` when unread normal events mix claimed and unclaimed (§9.2)', () => {
-    // unread=3, pending=1 → 2 claimed, 1 unclaimed — the claimed rows hold the
-    // coalesced reminder back even though a fresh unclaimed event exists.
-    const hold = classifyReminderHold('normal', 3, 1);
-    expect(hold).toMatchObject({
-      urgency: 'normal',
-      reason: 'coalesced-until-ack',
-      unreadCount: 3,
-      pendingCount: 1,
-    });
-    expect(hold?.message).toContain('2 of 3');
+  it('does not hold fresh pending normal work behind older claims', () => {
+    expect(classifyReminderHold('normal', 3, 1, ['a', 'b'])).toBeNull();
   });
 
   it('diagnoses the low band at turn-idle (§9.3)', () => {
@@ -114,21 +86,20 @@ describe('classifyReminderHold', () => {
     expect(hold?.message).not.toMatch(/\back\b/i);
   });
 
-  it('reports `coalesced-until-ack` (not `already-claimed`) when a normal band mixes a durable claim with a live lease (issue #300, round 10)', () => {
+  it('reports the live reservation when claimed work also exists', () => {
     // unreadCount=2, pendingCount=0, one claimed id, leasedCount=1 →
     // claimedCount=1: a real claim is present, but the ack remedy must not
     // claim to cover the leased row too.
     const hold = classifyReminderHold('normal', 2, 0, ['evt-claimed'], 1);
     expect(hold).toMatchObject({
       urgency: 'normal',
-      reason: 'coalesced-until-ack',
+      reason: 'reserved-in-flight',
       unreadCount: 2,
       pendingCount: 0,
-      claimedEventIds: ['evt-claimed'],
       leasedCount: 1,
     });
     expect(hold?.message).toContain('1 of 2');
-    expect(hold?.message).toContain('agentmonitors events ack');
+    expect(hold?.message).not.toContain('agentmonitors events ack');
     expect(hold?.message).toContain('in-flight channel-push reservation');
   });
 
@@ -199,10 +170,14 @@ describe('classifyCoalescingWithheldHold', () => {
     expect(classifyCoalescingWithheldHold(1, 1, 1, 1)).toBeNull();
   });
 
-  it('reports no hold when the reminder is not otherwise fully due (a claimed row already blocks it — classifyReminderHold explains that case)', () => {
-    // unread=2, pending=1: some claimed. classifyCoalescingWithheldHold defers
-    // to classifyReminderHold's coalesced-until-ack for this shape.
-    expect(classifyCoalescingWithheldHold(2, 1, 1, 0)).toBeNull();
+  it('reports the high settle hold even when older normal claims coexist', () => {
+    expect(classifyCoalescingWithheldHold(2, 1, 1, 0)?.reason).toBe(
+      'settle-window',
+    );
+  });
+
+  it('defers to reservation diagnosis when pending work and a lease coexist', () => {
+    expect(classifyCoalescingWithheldHold(3, 1, 1, 0, 1)).toBeNull();
   });
 
   it('reports no hold when the reminder’s only unread row is leased (pending < unread) — defers to classifyReminderHold’s reserved-in-flight (issue #441 × #300)', () => {

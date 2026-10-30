@@ -9985,7 +9985,9 @@ describe('hook claim normal-urgency reminder + suppression diagnosis (issue #333
       // Suppression is EXPECTED behavior, not a fault.
       expect(delivery?.status).toBe('ok');
       expect(delivery?.reason).toContain('already claimed');
-      expect(delivery?.reason).toContain('coalesced-until-ack');
+      expect(delivery?.reason).toContain(
+        'fresh unclaimed normal event will trigger',
+      );
       const findings = delivery?.details?.reminderSuppression;
       expect(findings).toHaveLength(1);
       expect(findings?.[0]).toMatchObject({

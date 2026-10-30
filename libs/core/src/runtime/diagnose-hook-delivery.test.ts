@@ -188,59 +188,35 @@ describe('diagnoseHookDelivery', () => {
     expect(h.runtime.claimDelivery(session, 'turn-interruptible')).toBeNull(); // matches the diagnosis
   });
 
-  it('reports `coalesced-until-ack` when unread normal events mix claimed and unclaimed', () => {
+  it('reports no hold for fresh normal work despite an earlier unacknowledged claim', () => {
     const h = setup();
     const session = openLead(h, 'sess-mixed');
-    const claimedId = materialize(h, 'normal', 'mon', 'obj-a', new Date());
-    h.runtime.claimDelivery(session, 'turn-interruptible'); // claims obj-a
-    const unclaimedId = materialize(h, 'normal', 'mon', 'obj-b', new Date()); // fresh, unclaimed
-
+    materialize(h, 'normal', 'mon', 'obj-a', new Date());
+    h.runtime.claimDelivery(session, 'turn-interruptible');
+    const fresh = materialize(h, 'normal', 'mon', 'obj-b', new Date());
     const diagnosis = h.runtime.diagnoseHookDelivery(
       session,
       'turn-interruptible',
     );
-    expect(diagnosis.unreadCounts).toMatchObject({ normal: 2, total: 2 });
-    expect(diagnosis.holds).toHaveLength(1);
-    expect(diagnosis.holds[0]).toMatchObject({
-      urgency: 'normal',
-      reason: 'coalesced-until-ack',
-      unreadCount: 2,
-      pendingCount: 1,
-      // Only the CLAIMED event is named — the fresh unclaimed one must not
-      // be swept into a remediation scoped to "the events holding this
-      // reminder back".
-      claimedEventIds: [claimedId],
-    });
-    expect(diagnosis.holds[0]?.claimedEventIds).not.toContain(unclaimedId);
+    expect(diagnosis.unreadCounts.normal).toBe(2);
+    expect(diagnosis.holds).toEqual([]);
+    expect(
+      h.store.pendingEventsForSession(session).map((event) => event.id),
+    ).toEqual([fresh]);
+    expect(
+      h.runtime.claimDelivery(session, 'turn-interruptible')?.urgency,
+    ).toBe('normal');
+    expect(h.store.unreadEventsForSession(session)).toHaveLength(2);
   });
 
-  // PR #456 review finding 3: a prior version of this diagnosis SUPPRESSED
-  // the normal-reminder hold check entirely whenever settled high-urgency
-  // work existed, on the theory that settled-high work always preempts the
-  // normal reminder — true only when the reminder is otherwise fully due (it
-  // then coalesces INTO the settled-high delivery, issue #441). It is false
-  // whenever the coalesced-until-ack guard (#333) is already blocking the
-  // reminder on its OWN — that hold is independent of any concurrent
-  // high-urgency work, and the settled-high delivery does not claim (or even
-  // touch) the blocked normal rows. This reproduces exactly that case:
-  // settled high-urgency work is pending AND a normal event is
-  // claimed-but-unacknowledged alongside a fresh unclaimed one — the
-  // `coalesced-until-ack` hold on the normal band must still be reported.
-  it('reports a `coalesced-until-ack` normal hold even while settled high-urgency work is ALSO pending (issue #441 review finding 3)', () => {
+  it('does not report an old-claim hold when fresh normal work coalesces with settled high work', () => {
     vi.useFakeTimers();
     vi.setSystemTime(NOW);
     const h = setup();
     const session = openLead(h, 'sess-mixed-with-high');
-
-    // A normal event, claimed while no high-urgency work exists yet (fires
-    // standalone).
     materialize(h, 'normal', 'mon-n', 'obj-n', NOW);
     h.runtime.claimDelivery(session, 'turn-interruptible');
-    // A second, fresh normal event — unclaimed. Guard (#333) now blocks the
-    // reminder: not every unread normal event is unclaimed.
     materialize(h, 'normal', 'mon-n2', 'obj-n2', NOW);
-    // A settled high event arrives too — `claimDelivery` would deliver it
-    // ALONE (the guard above blocks coalescing the normal rows into it).
     materialize(
       h,
       'high',
@@ -248,20 +224,14 @@ describe('diagnoseHookDelivery', () => {
       'obj-h',
       new Date(NOW.getTime() - SETTLE_MS),
     );
-
-    const diagnosis = h.runtime.diagnoseHookDelivery(
-      session,
-      'turn-interruptible',
-    );
-    const normalHold = diagnosis.holds.find(
-      (hold) => hold.urgency === 'normal',
-    );
-    expect(normalHold).toMatchObject({
-      urgency: 'normal',
-      reason: 'coalesced-until-ack',
-      unreadCount: 2,
-      pendingCount: 1,
-    });
+    expect(
+      h.runtime.diagnoseHookDelivery(session, 'turn-interruptible').holds,
+    ).toEqual([]);
+    expect(h.runtime.previewCoalescedReminder(session)).toBeTruthy();
+    expect(
+      h.runtime.claimDelivery(session, 'turn-interruptible')
+        ?.coalescedNormalCount,
+    ).toBe(1);
   });
 
   // PR #456 review finding 1: a normal reminder that WOULD otherwise fire

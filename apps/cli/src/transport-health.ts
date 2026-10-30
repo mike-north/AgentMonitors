@@ -385,7 +385,7 @@ function bindingProblems(
  * Whether a suppressing hold's `claimedEventIds` is a real, trustworthy,
  * NON-EMPTY array of ids rather than absent, empty, or malformed.
  *
- * Only ever called on `already-claimed` / `coalesced-until-ack` holds (see
+ * Only ever called on legacy `coalesced-until-ack` holds (see
  * {@link suppressionProblems}'s filter) — `settle-window` holds are one
  * legitimate source of an empty `claimedEventIds`; never reaching this
  * function. A hold entirely held back by an in-flight channel LEASE is no
@@ -442,11 +442,10 @@ function hasValidClaimedEventIds(
 function suppressionProblems(input: TransportHealthInput): TransportProblem[] {
   const suppressed = input.diagnoses.flatMap((diagnosis) =>
     diagnosis.holds
-      .filter(
-        (hold) =>
-          hold.reason === 'coalesced-until-ack' ||
-          hold.reason === 'already-claimed',
-      )
+      // No fresh pending work is not a broken transport. Current runtimes
+      // report already-claimed for that harmless backlog; only older daemons
+      // can report the starvation policy that actually blocks fresh work.
+      .filter((hold) => hold.reason === 'coalesced-until-ack')
       .map((hold) => ({ sessionId: diagnosis.sessionId, hold })),
   );
   if (suppressed.length === 0) return [];

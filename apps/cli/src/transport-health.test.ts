@@ -1254,3 +1254,28 @@ describe('computeTransportHealth', () => {
     });
   });
 });
+
+it('treats an already-claimed-only backlog as no new work, not blocked future delivery', () => {
+  const diagnosis: HookDeliveryDiagnosis = {
+    sessionId: 'session-progress',
+    lifecycle: 'turn-interruptible',
+    unreadCounts: { low: 0, normal: 1, high: 0, total: 1 },
+    holds: [
+      {
+        urgency: 'normal',
+        reason: 'already-claimed',
+        unreadCount: 1,
+        pendingCount: 0,
+        claimedEventIds: ['older'],
+        message: 'Older work remains unread; fresh work can surface.',
+      },
+    ],
+  };
+  const health = computeTransportHealth(input({ diagnoses: [diagnosis] }));
+  expect(health.deliverable).toBe(true);
+  expect(health.pipelineProblems.map((problem) => problem.code)).not.toContain(
+    'reminders-suppressed',
+  );
+  expect(health.verdict).not.toContain('acknowledged');
+  expect(health.remediation.join(' ')).not.toContain('events ack');
+});
