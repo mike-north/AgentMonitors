@@ -18,8 +18,9 @@ the owning change or capability; notable resolutions: 002 §1.1 and 006 §4 "(ta
 stale (shipped), 004 §5.1's "duplicate IDs not rejected" and "JSON Schema not enforced" limits were
 stale (both enforced), and 001 §8 vs 003 §3.5.3 on absolute + home-relative glob mixing was resolved
 in favor of 003 (change `add-user-level-monitor-glob-scopes`). This file is frozen from here on;
-an entry dated after this one was written against the old docs before the migration merged, and
-its rules were ported into OpenSpec (`runtime/event-materialization`).
+entries dated after this one were written against the old docs before the migration merged, and
+their content was ported into OpenSpec (`runtime/event-materialization`; the
+`add-multi-host-adapters` change's design).
 
 ## 2026-10-30 — Preserve empty snapshots and make commit-order proof observable (002 §5.2) — Refs #482
 
@@ -27,6 +28,18 @@ Empty snapshots now participate in shared and newly projected recipient diffs: r
 content produces a deletion delta and the empty value remains the next baseline. The Interpret
 commit-order regression test now observes through a separate SQLite connection and asserts outside
 the adapter callback, where fallback handling cannot swallow a failed test assertion.
+
+## 2026-10-30 — Partial read-only Codex ownership diagnostic (006 §11.7) — Refs #316
+
+Document the explicit-socket ownership diagnostic and its bounded refusal behavior. The tool
+checks version, loaded identity, and workspace without session or turn mutations. It supplies
+partial diagnostic evidence only: no existing desktop endpoint, delivery capability, lifecycle
+mapping, or adapter support is established, and all Codex matrix cells remain target. Synthetic
+socket tests are explicitly separate from the live probe evidence required by §11.6.
+
+Adversarial repair: the success boundary also rejects failures observed after resolution of the
+final read response, including additional complete frames in the same parsing turn. This is a
+bounded snapshot guarantee, not a promise about later unobserved peer activity.
 
 ## 2026-08-24 — New numbered doc: 008 — Reliability & Process Hygiene — Refs #504, PR #476
 

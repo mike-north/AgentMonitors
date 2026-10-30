@@ -25,6 +25,24 @@ Cells marked "probe" are not pinned; illustrative details are unverified.
   cell is unambiguous.
 - **Local hosts only.** Cloud-hosted agents stay deferred (NP5; closed #126).
 
+## Probe Evidence So Far
+
+- **Codex ownership diagnostic (partial; Refs #316).** `experiments/host-probe/codex-owner.mjs` is a
+  read-only diagnostic for an explicitly supplied, existing App Server control socket and thread id.
+  It initializes the connection, records the server's self-reported version
+  (`initialize.userAgent`), verifies the id in paginated `thread/loaded/list`, reads
+  `thread/read.id` and `thread/read.cwd` without turn history, and rechecks that the thread is still
+  loaded. Missing ownership, a malformed response, a connection failure, bounded-response overflow,
+  or a timeout produce refusal, as does any such failure observed before the final response's parse
+  completes; a valid final response cannot override it. It never discovers endpoints, starts
+  servers, loads/resumes/forks sessions, sends observations, or starts/steers/interrupts turns, and
+  it closes after one bounded snapshot.
+- What it establishes: momentary thread ownership and workspace metadata as reported by that
+  supplied server. What it does not: delivery capability, lifecycle mapping, the CLI/desktop
+  surface, or a supported control endpoint for an existing desktop chat. Its synthetic socket tests
+  (`experiments/host-probe/codex-owner.test.ts`) prove only its refusal and read-only behavior; they
+  are not a live binding-probe artifact, and no Codex matrix cell moves to current on their basis.
+
 ## Open Questions
 
 - The concrete lifecycle-hook names, session-identity signals, and workspace-binding mechanisms for
