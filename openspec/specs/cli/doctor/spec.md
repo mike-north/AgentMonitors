@@ -234,17 +234,23 @@ Every `idle` transport check, configured or not, SHALL carry a non-null `remedia
 
 ### Requirement: delivery-verdict check
 
-`delivery-verdict` SHALL pass when some transport is listening and delivery is not currently blocked; SHALL fail naming the specific blocker (a down daemon, a misbound transport, or reminders suppressed by `coalesced-until-ack`); and SHALL be `idle` when no lead session or no transport has reported in.
+`delivery-verdict` SHALL pass when some transport is listening and delivery is not currently blocked; SHALL fail naming the specific blocker (a down daemon, a misbound transport, or a legacy `already-claimed` / `coalesced-until-ack` suppression reported by an older daemon); and SHALL be `idle` when no lead session or no transport has reported in.
 
-#### Scenario: Muted reminders
+#### Scenario: Legacy muted reminders from an older daemon
 
-- **GIVEN** a healthy hook transport and reminders suppressed by claimed unacknowledged events
+- **GIVEN** a healthy hook transport and an older daemon reporting a `coalesced-until-ack` hold
 - **WHEN** `doctor` runs
 - **THEN** `delivery-verdict` is `fail` and names the `coalesced-until-ack` suppression
 
+#### Scenario: Claimed backlog is not a delivery failure
+
+- **GIVEN** a healthy hook transport and a lead whose unread normal events are all claimed, reported as `no-new-work`
+- **WHEN** `doctor` runs
+- **THEN** `delivery-verdict` does not fail on that account and no `reminders-suppressed` problem is reported
+
 ### Requirement: Suppression remediation is a scoped acknowledgement
 
-The `reminders-suppressed` remediation SHALL be `agentmonitors events ack --session <id> --event-ids <id1,id2,...> --socket <path>`, naming the exact claimed event ids holding the reminder back and the socket this run resolved; it SHALL NEVER be a bare `--session <id>` acknowledgement without `--event-ids`.
+The `reminders-suppressed` remediation SHALL be `agentmonitors events ack --session <id> --event-ids <id1,id2,...> --socket <path>`, naming the exact claimed event ids a legacy suppressing hold reports and the socket this run resolved; it SHALL NEVER be a bare `--session <id>` acknowledgement without `--event-ids`.
 
 #### Scenario: Two claimed events hold the reminder
 
@@ -312,7 +318,7 @@ The `reminders-suppressed` remediation SHALL be `agentmonitors events ack --sess
 
 #### Scenario: Both transports configured
 
-- **GIVEN** both transports reported in and reminders are suppressed
+- **GIVEN** both transports reported in and an older daemon reports a legacy suppressing hold
 - **WHEN** `doctor --format json` runs
 - **THEN** `reminders-suppressed` appears once in `pipelineProblems` and once in each transport's `problems`
 - **AND** text output prints it once
@@ -340,7 +346,7 @@ The Delivery transports section SHALL close with one verdict line `delivery to a
 
 #### Scenario: Listening but muted
 
-- **GIVEN** a healthy hook transport whose reminders are suppressed
+- **GIVEN** a healthy hook transport whose reminders an older daemon reports as suppressed (`coalesced-until-ack`)
 - **WHEN** `doctor --format json` runs
 - **THEN** `deliveryWillReachThisSession` is `hook` and `deliverable` is `false`
 

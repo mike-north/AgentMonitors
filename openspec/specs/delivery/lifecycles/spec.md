@@ -132,7 +132,7 @@ A normal reminder that is otherwise due MUST NOT fire standalone while any high-
 
 ### Requirement: Coalescing is limited to turn-interruptible
 
-Cross-band coalescing SHALL apply only at `turn-interruptible` (high plus normal). Low-urgency reminders fire at `turn-idle` and SHALL NOT be folded into high deliveries. The existing coalesced-until-ack guard still decides whether a normal reminder is due at all.
+Cross-band coalescing SHALL apply only at `turn-interruptible` (high plus normal). Low-urgency reminders fire at `turn-idle` and SHALL NOT be folded into high deliveries. The fresh-pending-batch policy (Normal-urgency coalesced reminder) still decides whether a normal reminder is due at all.
 
 #### Scenario: Low reminder is not folded into a high delivery
 
@@ -153,7 +153,7 @@ An events-rendering, length-bounded transport MUST render a present `coalescedRe
 
 ### Requirement: Hook-delivery diagnosis mirrors coalescing precedence
 
-The hook-delivery diagnosis (`hook deliver --debug`, issue #334) SHALL report a `settle-window` hold on the `normal` band when a due reminder is withheld by an unsettled high event, and SHALL independently report an `already-claimed` or `coalesced-until-ack` hold whenever a claimed row blocks the reminder, including on a turn that also delivers settled high work.
+The hook-delivery diagnosis (`hook deliver --debug`, issue #334) SHALL report a `settle-window` hold on the `normal` band when a due reminder is withheld by an unsettled high event, SHALL report `no-new-work` only when no fresh pending work remains and `reserved-in-flight` while a same-band reservation is active, and SHALL NOT report an older claim as withholding a fresh reminder.
 
 #### Scenario: Withheld reminder is diagnosed as a settle-window hold
 
@@ -163,7 +163,7 @@ The hook-delivery diagnosis (`hook deliver --debug`, issue #334) SHALL report a 
 
 ### Requirement: Normal-urgency coalesced reminder
 
-At `turn-interruptible`, normal-urgency events SHALL be delivered as one coalesced reminder (`mode: 'delivery'`, empty `events`) only if every unread normal-urgency event for the session is still unclaimed (pending count equals unread count).
+At `turn-interruptible`, fresh pending normal-urgency events SHALL be delivered as one coalesced reminder per batch (`mode: 'delivery'`, empty `events`) when pending normal work exists and no same-band reservation is active. Claimed-but-unacknowledged normal events MUST NOT block a fresh batch.
 
 #### Scenario: Normal reminder fires on the first claim
 
@@ -190,27 +190,44 @@ Each delivering transport SHALL append its own concrete, runnable next step to t
 - **WHEN** the channel transport renders a reminder claim
 - **THEN** the rendered text references `agentmon_ack` and not the `events ack` CLI verb
 
-### Requirement: Reminder is coalesced until acknowledgment
+### Requirement: Fresh reminder batches do not wait for older acknowledgments
 
-Delivering a reminder SHALL claim the underlying events. While any unread event of the band is claimed but unacknowledged, the reminder SHALL be suppressed; a fresh unclaimed event of the band arriving meanwhile SHALL NOT restore it. Suppressed events stay unread and durable, and the suppression MUST be inspectable via `monitor explain` (per `daemon/ipc`), never bare silence (issue #333).
+Delivering a reminder SHALL claim only its pending batch, never acknowledge it. With no newly pending work, a repeated claim SHALL return `null` while the older work stays unread and queryable. A fresh pending event SHALL produce a new reminder at the next eligible lifecycle without acknowledgment of older claims, across monitors and after a mixed-band recap. The runtime MUST NOT auto-acknowledge, reset, or re-claim older rows to make progress (#524).
 
-#### Scenario: Normal reminder coalesces until acknowledged
+#### Scenario: Repeat claim without new work is quiet and explained
 
 - **GIVEN** a normal event E1 was delivered as a reminder and claimed but not acknowledged
 - **WHEN** a second `turn-interruptible` claim runs
 - **THEN** it returns `null`
-- **AND** `monitor explain` reports the delivery stage `ok` with a `reminderSuppression` reason `already-claimed`
+- **AND** `monitor explain` reports the delivery stage `ok` with a `reminderSuppression` reason `no-new-work`
 
-#### Scenario: Fresh event does not restore a suppressed reminder
+#### Scenario: Fresh event surfaces despite an older claim
 
-- **GIVEN** normal event E1 is claimed but unacknowledged and a new unclaimed normal event E2 arrives
+- **GIVEN** normal event E1 is claimed but unacknowledged and a new unclaimed normal event E2 arrives, from the same or another monitor
 - **WHEN** S claims at `turn-interruptible`
-- **THEN** it returns `null`
-- **AND** after E1 is acknowledged, the next claim returns a reminder covering E2
+- **THEN** a reminder claim covering E2 is returned and E2 is claimed
+- **AND** E1 stays claimed and unread, neither acknowledged nor re-claimed
 
-### Requirement: Reminder acknowledgment is not id-scoped
+#### Scenario: Mixed-band recap does not mute later reminders
 
-Because a reminder fires only when every unread event of its band is unclaimed, there is no narrower id list within the band to scope its ack to. The hook transport's step SHALL name the un-scoped ack verb; the channel transport's step SHALL instruct listing the session's unread events first and then calling `agentmon_ack` with only the ids actually handled, never the bare no-argument form.
+- **GIVEN** a `post-compact` recap claimed an old normal event alongside high events, and none were acknowledged
+- **WHEN** a fresh normal event arrives and S claims at `turn-interruptible`
+- **THEN** a reminder claim covering the fresh event is returned
+
+### Requirement: A same-band reservation holds the next reminder
+
+A live same-band delivery reservation SHALL withhold the band's next reminder, so competing transports never surface simultaneous generic reminders. The hold SHALL end on commit, release, or lease expiry; a committed batch then stays unread but SHALL NOT block the next pending batch.
+
+#### Scenario: Reminder resumes after the lease resolves
+
+- **GIVEN** the channel transport holds a reservation on S's normal batch and a fresh normal event arrives
+- **WHEN** the hook transport claims at `turn-interruptible` before the reservation resolves
+- **THEN** it returns `null` with hold reason `reserved-in-flight`
+- **AND** once the reservation commits, releases, or expires, the next claim returns a reminder for the fresh event
+
+### Requirement: Reminder acknowledgment is explicit and handled-item scoped
+
+A reminder tells the recipient to inspect unread events and acknowledge what it handled; it does not identify every handled item, and a new reminder neither erases older unread claims nor certifies their completion. The hook transport's step SHALL name the ack verb; the channel transport's step SHALL instruct listing the session's unread events first and then calling `agentmon_ack` with only the ids actually handled, never the bare no-argument form.
 
 #### Scenario: Channel reminder never suggests a blanket ack
 
@@ -219,7 +236,7 @@ Because a reminder fires only when every unread event of its band is unclaimed, 
 
 ### Requirement: Low-urgency reminder only at turn-idle
 
-Low-urgency events SHALL be delivered only at `turn-idle`, as one coalesced reminder with empty `events` and the shared reminder body, and only if every unread low-urgency event is still unclaimed. A `turn-interruptible` claim SHALL NOT deliver low-urgency events. The low reminder is coalesced until acknowledgment exactly as the normal reminder is.
+Low-urgency events SHALL be delivered only at `turn-idle`, as one coalesced reminder per fresh pending batch with empty `events` and the shared reminder body; the normal band's pending, claimed, and reservation rules apply identically, so older claimed low events MUST NOT block a fresh low batch. A `turn-interruptible` claim SHALL NOT deliver low-urgency events, and no low event is promoted to the normal lifecycle.
 
 #### Scenario: Low urgency delivers only at idle lifecycle points
 

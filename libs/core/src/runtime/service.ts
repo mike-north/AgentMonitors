@@ -1475,16 +1475,10 @@ export class AgentMonitorRuntime {
         suppressedCount > 0
           ? ` Interpret suppressed ${String(suppressedCount)} as not substantive (recorded per-recipient).`
           : '';
-      // Coalesced-reminder suppression (issue #333, 002 §9.2–§9.3): when a
-      // session's unread normal/low events are already CLAIMED (but not yet
-      // acknowledged), the generic inbox reminder is suppressed — the exact trap
-      // where a second `hook claim --lifecycle turn-interruptible` returns null
-      // with no explanation. Name that reason here so the silence is inspectable
-      // (capability C12) rather than a dead end. The guard is SESSION-level and
-      // cross-monitor (it counts every unread event of the band for the session),
-      // so we read session-scoped store counts, restricted to the sessions this
-      // monitor actually projects a still-unread (unacknowledged, unsuppressed)
-      // event to.
+      // Explain absent reminders without changing state. Old claims explain
+      // silence only when no fresh work remains; a reservation explains a
+      // temporary same-band hold. Counts are session-scoped across monitors,
+      // restricted to sessions this monitor still projects unread work into.
       const reminderSessionIds = new Set(
         projections
           .filter(
@@ -2043,10 +2037,6 @@ export class AgentMonitorRuntime {
     };
 
     if (lifecycle === 'turn-interruptible') {
-      const unreadNormal = this.store.unreadEventsForSession(
-        sessionId,
-        'normal',
-      );
       const highUnread = this.pendingForClaim(sessionId, 'high');
       const settledHigh = highUnread.filter(
         (event) =>
@@ -2061,12 +2051,12 @@ export class AgentMonitorRuntime {
       // state (e.g. a high-urgency label monitor and a normal-urgency
       // review-queue monitor both firing off the same underlying change)
       // previously interrupted the session twice for one action; this makes
-      // it one batch when both land in the same settle window. The guard
-      // itself (coalesced-until-ack, issue #333) is unchanged.
+      // it one batch when both land in the same settle window. Previously
+      // surfaced rows remain unread but never block fresh pending work.
       const normalPending = this.pendingForClaim(sessionId, 'normal');
       const normalReminderDue =
         normalPending.length > 0 &&
-        normalPending.length === unreadNormal.length;
+        this.leasedPendingCount(sessionId, 'normal') === 0;
 
       if (settledHigh.length > 0) {
         // Per-recipient `net` collapse (G10 PR-B, 002 §1.1.7): deliver only the
@@ -2189,10 +2179,9 @@ export class AgentMonitorRuntime {
       return null;
     }
 
-    const unreadLow = this.store.unreadEventsForSession(sessionId, 'low');
     const lowUnread = this.pendingForClaim(sessionId, 'low');
     const shouldSendLow =
-      lowUnread.length > 0 && lowUnread.length === unreadLow.length;
+      lowUnread.length > 0 && this.leasedPendingCount(sessionId, 'low') === 0;
 
     if (lifecycle === 'turn-idle' && shouldSendLow) {
       return {
@@ -2359,10 +2348,10 @@ export class AgentMonitorRuntime {
     );
     if (settledHigh.length === 0) return undefined;
 
-    const unreadNormal = this.store.unreadEventsForSession(sessionId, 'normal');
     const normalPending = this.pendingForClaim(sessionId, 'normal');
     const normalReminderDue =
-      normalPending.length > 0 && normalPending.length === unreadNormal.length;
+      normalPending.length > 0 &&
+      this.leasedPendingCount(sessionId, 'normal') === 0;
     return normalReminderDue ? reminderMessage() : undefined;
   }
 
@@ -2372,25 +2361,11 @@ export class AgentMonitorRuntime {
    * it never claims, suppresses, re-anchors a delta, or refreshes hook state
    * (contrast {@link claimDelivery}) — so diagnosing never consumes a delivery.
    *
-   * Mirrors {@link claimDelivery}'s (post-#441) precedence exactly so the
-   * reported holds match what a real claim would decide: at
-   * `turn-interruptible`, the high-urgency settle-window hold is reported
-   * whenever pending high work is entirely unsettled; the normal-reminder
-   * hold is now evaluated UNCONDITIONALLY (issue #441 cross-monitor
-   * coalescing; PR #456 review finding 3 — a prior version suppressed this
-   * check whenever settled high work existed, which wrongly hid a genuine
-   * `coalesced-until-ack` hold on a turn where settled high work ALSO
-   * delivers, since coalescing is only ever transparent to the reminder when
-   * it is fully due). Two independent reasons can withhold the normal
-   * reminder: {@link classifyCoalescingWithheldHold} (a due reminder held
-   * back by a CONCURRENT, still-unsettled high-urgency batch it will be
-   * coalesced into once that batch settles) and {@link classifyReminderHold}
-   * (`already-claimed`/`coalesced-until-ack` — a claimed-but-unacknowledged
-   * row blocking it, independent of any high-urgency work). At `turn-idle`,
-   * only the low-reminder hold is evaluated. `post-compact` (the recap
-   * lifecycle) has no coalescing/settle guard to explain — recap fires
-   * whenever `unreadCounts.total > 0` — so no band-specific holds are
-   * computed for it.
+   * Mirrors the delivery policy: high work can hold a fresh normal reminder
+   * until its settle window ends; a live reservation temporarily holds the
+   * same urgency band. Claimed rows are reported only when no fresh work is
+   * pending. They remain unread, but do not hold newer observations hostage to
+   * acknowledgment. The post-compact recap still re-shows unread work.
    */
   diagnoseHookDelivery(
     sessionId: string,
@@ -2458,29 +2433,16 @@ export class AgentMonitorRuntime {
         sessionId,
         'normal',
       );
-      // Two independent, mutually-exclusive reasons can withhold the normal
-      // reminder — evaluated unconditionally (not gated on settledHighCount),
-      // since each classifier returns null outside the state it owns:
-      //   • classifyCoalescingWithheldHold (#441) fires ONLY when the reminder
-      //     is otherwise fully due — `pendingNormal.length === unreadCounts.normal`,
-      //     the exact lease-aware gate `decideDelivery` uses — but concurrent
-      //     high-urgency work is still unsettled, so the reminder is held to be
-      //     coalesced into that batch once it settles. `pendingNormal` is
-      //     lease-filtered, so this equality can hold only when NO normal row is
-      //     claimed AND none is leased; in that state classifyReminderHold
-      //     necessarily returns null (nothing to hold).
-      //   • Otherwise a claimed row (coalesced-until-ack/already-claimed) or a
-      //     leased row (reserved-in-flight) makes the reminder not-due, the
-      //     coalescing hold returns null, and classifyReminderHold names the
-      //     real reason. A leased normal row thus defers to reserved-in-flight,
-      //     matching `decideDelivery`, which likewise neither fires nor
-      //     coalesces the reminder while a normal row is leased.
+      // A due normal reminder waits only for a concurrent high settle window.
+      // A reservation instead explains its own temporary hold; claimed rows
+      // cannot block fresh pending work, regardless of other urgency bands.
       const normalHold =
         classifyCoalescingWithheldHold(
           unreadCounts.normal,
           pendingNormal.length,
           pendingHigh.length,
           settledHighCount,
+          leasedNormal,
         ) ??
         classifyReminderHold(
           'normal',

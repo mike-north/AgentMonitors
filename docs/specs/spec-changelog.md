@@ -20,7 +20,8 @@ stale (both enforced), and 001 §8 vs 003 §3.5.3 on absolute + home-relative gl
 in favor of 003 (change `add-user-level-monitor-glob-scopes`). This file is frozen from here on;
 entries dated after this one were written against the old docs before the migration merged, and
 their content was ported into OpenSpec (`runtime/event-materialization`; the
-`add-multi-host-adapters` change's design).
+`add-multi-host-adapters` change's design; the fresh-batch reminder policy in `delivery/lifecycles`,
+`daemon/ipc`, `cli/session-commands`, `cli/doctor`, and `delivery/transport-health`).
 
 ## 2026-10-30 — Preserve empty snapshots and make commit-order proof observable (002 §5.2) — Refs #482
 
@@ -40,6 +41,20 @@ socket tests are explicitly separate from the live probe evidence required by §
 Adversarial repair: the success boundary also rejects failures observed after resolution of the
 final read response, including additional complete frames in the same parsing turn. This is a
 bounded snapshot guarantee, not a promise about later unobserved peer activity.
+
+## 2026-10-30 — Fresh reminder batches do not wait for old acknowledgments (002 §9, 006) — Refs #524
+
+Deliberately replaces the normal/low `pending === unread` guard: a claimed-but-unacknowledged event
+no longer blocks fresh pending events of the same band. Each eligible batch is claimed once; no
+automatic acknowledgment or replay of old claims is introduced. Same-band reservations still hold
+new reminders temporarily until commit/release/expiry, and high settle coalescing is unchanged.
+Diagnostics now distinguish no-new-work (`no-new-work`) from a live lease (`reserved-in-flight`);
+legacy `already-claimed` / `coalesced-until-ack` values remain accepted but are no longer emitted. This policy change
+closes reminder starvation identified in the Chief of Staff reliability review; it is separate from
+the earlier acknowledgment-instruction fix (#434) and from any claim-TTL design (#468).
+
+Validation: tests first reproduced seven failures across hook/channel, normal/low and high-coalescing
+cases; the forward-progress suite and both transport renderers now cover the revised contract.
 
 ## 2026-08-24 — New numbered doc: 008 — Reliability & Process Hygiene — Refs #504, PR #476
 
