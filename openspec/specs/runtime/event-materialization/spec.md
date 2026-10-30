@@ -21,6 +21,39 @@ least `id`, `workspacePath`, `monitorId`, `sourceName`, `urgency`, `title`, `bod
 - **WHEN** notify dispatch emits two observations on a tick
 - **THEN** two `monitor_events` rows exist, each with every required field populated or explicitly null
 
+### Requirement: Materialization is one atomic durable unit
+
+The system SHALL commit an observation's event row, every matching lead-session projection, any
+first-recipient cursor seed, and its snapshot in one immediate SQLite transaction, or roll all of
+them back. Optional Interpret work SHALL begin only after that transaction commits and stays
+best-effort (per `pipeline/post-processing`), so an Interpret failure cannot undo the committed
+event.
+
+#### Scenario: Cursor-seed failure rolls back the whole observation
+
+- **GIVEN** a lead session matching the monitor and a cursor-seed write that fails
+- **WHEN** the observation is materialized
+- **THEN** no event row, projection, cursor seed, or snapshot for it remains
+- **AND** the tick records it as `errored` and omits it from `emittedEventIds`
+
+#### Scenario: Snapshot failure rolls back the event
+
+- **WHEN** the snapshot write fails after the event row and projections were written in the same transaction
+- **THEN** no event row, projection, cursor seed, or snapshot for the observation remains
+
+#### Scenario: A later projection failure rolls back earlier recipients
+
+- **GIVEN** two lead sessions match the monitor and the second projection insert fails
+- **WHEN** the observation is materialized
+- **THEN** neither session has a projection or cursor seed for it and no event row remains
+
+#### Scenario: Interpret runs only after the commit
+
+- **GIVEN** a monitor with an Interpret stage
+- **WHEN** an observation is materialized
+- **THEN** the adapter is invoked only once the event, projections, and snapshot are committed and visible to another connection
+- **AND** when the deterministic transaction rolls back, the adapter is not invoked
+
 ### Requirement: Missing body and summary are derived
 
 When an emitted observation omits them, the system SHALL derive `body` from the observation body,
@@ -63,7 +96,8 @@ the observation sets `changeKind`, the system SHALL add `changeKind` to the stor
 
 When an emitted observation includes `snapshotText`, the system SHALL look up the latest stored
 snapshot for the same `(workspacePath, monitorId, objectKey)`, compute a diff if one exists, and
-store the new snapshot after persisting the event (per SP5).
+store the new snapshot in the same transaction as the event, projections, and cursor seeds (per
+SP5).
 
 #### Scenario: snapshotText stores a later-retrievable snapshot
 
@@ -86,6 +120,31 @@ store the new snapshot after persisting the event (per SP5).
 
 - **WHEN** an object's first `snapshotText` is materialized
 - **THEN** its `diffText` is null
+
+### Requirement: Empty snapshot text is a present snapshot
+
+The system SHALL treat `snapshotText: ""` as a present snapshot: it MUST be persisted, MUST produce
+the prior-to-empty deletion delta in both the shared history and a newly projected recipient's
+delta, and MUST serve as the baseline for the next observation. Only a `null` or absent
+`snapshotText` SHALL mean no snapshot.
+
+#### Scenario: Removing all content yields a deletion delta
+
+- **GIVEN** a stored snapshot `a\nb\n` for an object
+- **WHEN** an observation with `snapshotText: ""` for the same object is materialized
+- **THEN** its `diffText` shows lines `a` and `b` removed, and the empty snapshot is stored
+
+#### Scenario: Content returning diffs from the empty baseline
+
+- **GIVEN** the latest stored snapshot for an object is `""`
+- **WHEN** an observation with `snapshotText: "c\n"` is materialized
+- **THEN** its `diffText` shows line `c` added, not a first-snapshot null diff
+
+#### Scenario: Late-joining lead session sees the deletion
+
+- **GIVEN** a lead session that opens after the object's `a\n` snapshot was stored
+- **WHEN** an observation with `snapshotText: ""` is materialized and projected to it
+- **THEN** the delta that session receives shows line `a` removed
 
 ### Requirement: Snapshots have a total materialization order
 

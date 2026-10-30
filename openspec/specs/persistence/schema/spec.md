@@ -185,7 +185,7 @@ On the first open of a database whose `monitor_state` predates workspace scoping
 
 ### Requirement: Errored observations are isolated and recorded
 
-`result` SHALL be `errored`, with `observation_data` `{ error: "<message>" }`, when `observe()` throws (persisted `source_state` left unchanged), when one observation fails to materialize (siblings unaffected; only durably written event ids reported), or when schedule evaluation fails, e.g. an invalid timezone (per `runtime/tick-scheduling`). The tick or watcher SHALL continue, and a failing history write SHALL be swallowed (issue #46).
+`result` SHALL be `errored`, with `observation_data` `{ error: "<message>" }`, when `observe()` throws (persisted `source_state` left unchanged), when one observation fails to materialize (rolled back whole per `runtime/event-materialization`; siblings unaffected; only committed event ids reported), or when schedule evaluation fails, e.g. an invalid timezone (per `runtime/tick-scheduling`). The tick or watcher SHALL continue, and a failing history write SHALL be swallowed (issue #46).
 
 #### Scenario: Throwing source does not abort the tick
 

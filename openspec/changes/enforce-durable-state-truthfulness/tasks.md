@@ -1,6 +1,6 @@
 ## 1. Atomic, truthful ingest
 
-- [ ] 1.1 Make ingest persistence atomic and report materialization failures truthfully (#295)
+- [x] 1.1 Make ingest persistence atomic and report materialization failures truthfully (#295; shipped in #482 — see `runtime/event-materialization`)
 - [ ] 1.2 Persist an entire emitted span before awaiting the optional Interpret adapter (#294)
 - [ ] 1.3 Apply source `scopeSchema` validation before `monitor test` performs side effects (#301)
 - [ ] 1.4 Strictly validate `channel --poll-ms` before starting the MCP loop (#306)
