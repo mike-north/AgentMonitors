@@ -1339,7 +1339,11 @@ describe('init', () => {
       // words — the latter would silently stop testing anything if the
       // rationale were ever reworded.
       expect(monitor).toContain('# urgency overridden via --urgency');
-      expect(monitor).not.toContain('coalesced-until-ack');
+      expect(monitor).not.toContain(
+        type === 'pr-review'
+          ? 'MEMBERSHIP set of PRs'
+          : 'earned by the payload filter',
+      );
 
       const validated = run(['validate', monitorsDir, '--format', 'json'], dir);
       expect(validated.exitCode).toBe(0);
@@ -9780,10 +9784,10 @@ describe('hook deliver', () => {
 // surface the coalesced normal reminder (spec: delivery/lifecycles). The study subject had run an
 // EARLIER turn-interruptible claim (S3 phase 11) that surfaced the reminder AND
 // claimed the event; the second identical claim was then correctly suppressed
-// because the reminder coalesces until acknowledgment. The real defect was the
+// because no fresh work remained. The real defect was the
 // SILENCE — no way to discover why. This test pins both: (1) the reminder
 // surfaces on the first claim; (2) after a claim, the reminder is suppressed and
-// `monitor explain` NAMES the reason (already-claimed / coalesced-until-ack).
+// `monitor explain` NAMES the reason (no-new-work).
 describe('hook claim normal-urgency reminder + suppression diagnosis (issue #333)', () => {
   /**
    * The coalesced reminder body the runtime emits (spec: delivery/lifecycles, issues
@@ -9985,14 +9989,16 @@ describe('hook claim normal-urgency reminder + suppression diagnosis (issue #333
       // Suppression is EXPECTED behavior, not a fault.
       expect(delivery?.status).toBe('ok');
       expect(delivery?.reason).toContain('already claimed');
-      expect(delivery?.reason).toContain('coalesced-until-ack');
+      expect(delivery?.reason).toContain(
+        'fresh unclaimed normal event will trigger',
+      );
       const findings = delivery?.details?.reminderSuppression;
       expect(findings).toHaveLength(1);
       expect(findings?.[0]).toMatchObject({
         sessionId: session.id,
         urgency: 'normal',
         lifecycle: 'turn-interruptible',
-        reason: 'already-claimed',
+        reason: 'no-new-work',
       });
     } finally {
       daemon.stop();

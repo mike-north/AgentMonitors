@@ -286,7 +286,7 @@ Each `--type` SHALL scaffold a distinct starter `watch:` block: `file-fingerprin
 
 ### Requirement: Presets alert at high urgency only
 
-Both presets SHALL scaffold `urgency: high`, which is safe because each payload is a membership set of actionable items rather than full PR state. `normal` MUST NOT be the preset urgency: normal reminders are coalesced-until-acknowledgment and carry no mid-session event body (per the `delivery/lifecycles` capability).
+Both presets SHALL scaffold `urgency: high`, which is safe because each payload is a membership set of actionable items rather than full PR state. `normal` MUST NOT be the preset urgency: normal reminders carry no mid-session event body, so the recipient would not learn which PR needs action until recap (per the `delivery/lifecycles` capability).
 
 #### Scenario: High-urgency silence on non-events
 

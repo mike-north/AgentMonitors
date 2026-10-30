@@ -236,7 +236,8 @@ Success (exit 0) reports `owner-observed`, identity/workspace signals, version, 
 methods. This is a point-in-time claim by the supplied server, **not an ownership lease**, an
 independent authentication of that server, or proof that another client can safely deliver to it.
 `surface` and `deliveryCapability` remain `unverified`; no lifecycle hook was exercised. This
-partial diagnostic does not satisfy all of §11.6 or unblock the #316 adapter on its own.
+partial diagnostic does not satisfy all of change: add-multi-host-adapters —
+"Host adapters ship with conformance evidence" or unblock the #316 adapter on its own.
 
 Output contains the requested thread id and workspace path for local diagnosis. Apply the
 artifact-hygiene substitutions above before committing real output; do not include conversation

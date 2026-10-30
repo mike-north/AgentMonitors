@@ -20,7 +20,47 @@ stale (both enforced), and 001 §8 vs 003 §3.5.3 on absolute + home-relative gl
 in favor of 003 (change `add-user-level-monitor-glob-scopes`). This file is frozen from here on;
 entries dated after this one were written against the old docs before the migration merged, and
 their content was ported into OpenSpec (`runtime/event-materialization`; the
-`add-multi-host-adapters` change's design).
+`add-multi-host-adapters` change's design; the `materialization_retry_outbox` requirements in
+`persistence/schema`; the fresh-batch reminder policy in `delivery/lifecycles`,
+`daemon/ipc`, `cli/session-commands`, `cli/doctor`, and `delivery/transport-health`).
+
+## 2026-10-30 — Retry admission rejects detectable hidden intrinsic state (002 outbox, 004 §3.4) — Refs #483
+
+Prototype identity alone does not establish a plain record. Intrinsic checks now reject boxed
+primitives, Map/Set and weak variants, buffers/views, promises, native errors, and other brands
+Node exposes even after their prototypes are replaced. Nineteen built-in regression cases cover
+both Object.prototype and null prototypes, requiring a domain error and no sibling writes.
+Clarify the public caller precondition: only ordinary data records/arrays and the typed timestamp
+are supported. Early validation rejects detectable violations; it cannot authenticate erased
+object provenance or private state without an exposed intrinsic brand. Unsupported hidden-state
+objects must be normalized by their source, not inferred to be supported from validation success.
+
+## 2026-10-30 — Retry Date checks do not traverse caller prototype chains (002 outbox, 004 §3.4) — Refs #483
+
+Replace `instanceof Date` with intrinsic Date detection during passive-data validation. A non-proxy
+object may inherit a proxy whose prototype trap changes its data and repairs its prototype during
+`instanceof`, causing altered data to be accepted. Intrinsic brand checks and direct prototype
+identity checks reject this unsupported domain without executing traps. Regression coverage
+includes payloads, root envelopes, routes, arrays, timestamps, indirect proxy ancestors, and
+revoked proxy prototypes, with no sibling writes.
+
+## 2026-10-30 — Reject proxy serialization and validate before route reads (002 outbox, 004 §3.4) — Refs #483
+
+Retry envelopes exclude proxies, including revoked proxies, before reflection or property reads.
+This closes an accepted-value conversion where a proxy could expose an unvalidated toJSON hook
+only when JSON.stringify read it. Full envelope validation now precedes route traversal so monitor
+and watch-type accessors are rejected without running their getters. Regression tests prove no
+proxy traps/getters run and no valid sibling is persisted for each unsupported case.
+
+## 2026-10-30 — Retry serialization rejects lossy values before admission (002 outbox, 004 §3.4) — Refs #483
+
+The supported retry-envelope domain now explicitly excludes negative zero and customized Date
+instances, which JSON otherwise silently normalizes. The only Date leaf, `observedAt`, must be a
+valid Date with Date.prototype and no own properties; ISO strings are rejected rather than
+hydrated into a different input type. The timestamp is serialized explicitly without invoking
+caller hooks. All failures are serialization-domain errors before any batch member is persisted.
+New tests also prove two-item count and aggregate-byte overflow leave every sibling unwritten,
+including a sibling in another route. Capacity admission logic is unchanged.
 
 ## 2026-10-30 — Preserve empty snapshots and make commit-order proof observable (002 §5.2) — Refs #482
 
@@ -40,6 +80,20 @@ socket tests are explicitly separate from the live probe evidence required by §
 Adversarial repair: the success boundary also rejects failures observed after resolution of the
 final read response, including additional complete frames in the same parsing turn. This is a
 bounded snapshot guarantee, not a promise about later unobserved peer activity.
+
+## 2026-10-30 — Fresh reminder batches do not wait for old acknowledgments (002 §9, 006) — Refs #524
+
+Deliberately replaces the normal/low `pending === unread` guard: a claimed-but-unacknowledged event
+no longer blocks fresh pending events of the same band. Each eligible batch is claimed once; no
+automatic acknowledgment or replay of old claims is introduced. Same-band reservations still hold
+new reminders temporarily until commit/release/expiry, and high settle coalescing is unchanged.
+Diagnostics now distinguish no-new-work (`no-new-work`) from a live lease (`reserved-in-flight`);
+legacy `already-claimed` / `coalesced-until-ack` values remain accepted but are no longer emitted. This policy change
+closes reminder starvation identified in the Chief of Staff reliability review; it is separate from
+the earlier acknowledgment-instruction fix (#434) and from any claim-TTL design (#468).
+
+Validation: tests first reproduced seven failures across hook/channel, normal/low and high-coalescing
+cases; the forward-progress suite and both transport renderers now cover the revised contract.
 
 ## 2026-08-24 — New numbered doc: 008 — Reliability & Process Hygiene — Refs #504, PR #476
 
@@ -73,6 +127,14 @@ Two contradiction resolutions recorded per 004 §5, both surfaced by PR #512 rev
   boundary. Resolution: #478's scope is extended (recorded on the issue) to cover
   detached-but-identifiable descendants; identity-erasing detachment remains the documented
   escape.
+
+## 2026-08-13 — Failed materialization has a bounded durable retry outbox (002 schema, 004 §3.4, 005 §15) — Refs #295, #481
+
+Core now persists failed stored-observation envelopes in a workspace-scoped, per-monitor outbox
+before a later runtime change adopts it for source ticks. Batch enqueue is capacity-atomic at 256
+records or 8 MiB. Envelopes must round-trip through JSON without conversion, trusted routes are
+checked before mutation, and safe errors are control-stripped and bounded. Retry lifecycle and
+operator diagnostics are delivered in the next two stack layers.
 
 ## 2026-08-13 — Event materialization is one atomic durable unit (002 §5, 004 §3.4) — Refs #295, #481
 

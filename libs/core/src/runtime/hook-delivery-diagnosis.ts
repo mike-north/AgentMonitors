@@ -12,12 +12,10 @@ import type { DeliveryLifecycle, SessionUnreadCounts } from './types.js';
  * unread but are not yet deliverable at the requested lifecycle — so the
  * `--debug` flag can name it on stderr without touching stdout.
  *
- * The two reminder-suppression reasons (`already-claimed` / `coalesced-until-ack`)
- * intentionally use the SAME vocabulary as `monitor explain`'s reminder-suppression
- * finding (issue #333, `libs/core/src/runtime/reminder-diagnosis.ts`) — both
- * surfaces are explaining the identical underlying guard (a coalesced
- * normal/low reminder fires only while every unread event of the band is still
- * unclaimed, spec: delivery/lifecycles) and must agree on what to call it.
+ * Reminder vocabulary agrees with monitor explain: a prior claim suppresses
+ * repetition of that work only; fresh work remains eligible. An in-flight
+ * reservation temporarily serializes generic reminders for the urgency band.
+ * Historical `coalesced-until-ack` values remain accepted for older daemons.
  *
  * @see ../../../../openspec/specs/delivery/hook-transport/spec.md (hook-deliver transport)
  * @see ../../../../openspec/specs/delivery/lifecycles/spec.md (delivery lifecycles)
@@ -31,25 +29,16 @@ import type { DeliveryLifecycle, SessionUnreadCounts } from './types.js';
  *   coalescing; {@link classifyCoalescingWithheldHold}) that is due but held
  *   back by concurrent, still-unsettled high-urgency work it will be
  *   coalesced into once that work settles.
- * - `already-claimed` — normal/low only: every unread event of the band is
- *   already durably claimed, so the coalesced reminder (spec: delivery/lifecycles) will not
- *   re-fire until acknowledgment. A fresh unclaimed event of the same band
- *   arriving in the meantime does NOT restore it.
- * - `coalesced-until-ack` — normal/low only: a mix of claimed and unclaimed
- *   unread events exists (a leased-but-not-yet-claimed row may also be present
- *   and is reported separately via `leasedCount`); the claimed ones hold the
- *   coalesced reminder back even though a newer unclaimed event is also
- *   pending.
- * - `reserved-in-flight` — normal/low only: NO unread event of the band is
- *   durably claimed, but at least one is currently LEASED by an in-flight
- *   channel-push reservation (issue #300). A lease is not a claim — it
- *   resolves itself (commit → claimed, or release/expiry → pending again) —
- *   so, unlike the other two reasons, this one must never recommend
- *   `events ack`: acknowledging a leased-but-unseen row before the push
- *   resolves can permanently lose it if the push then fails (round 10 review).
+ * - `no-new-work` — current policy: no fresh unclaimed work remains; future batches can surface.
+ * - `already-claimed` — legacy policy: old claims block future batches until acknowledgment.
+ * - `coalesced-until-ack` — legacy value retained for older daemon responses;
+ *   the current policy never emits it because old claims cannot block new work.
+ * - `reserved-in-flight` — a live same-band reservation temporarily holds a
+ *   reminder. Commit, release or expiry resolves it; acknowledgment cannot.
  */
 export type HookDeliveryHoldReason =
   | 'settle-window'
+  | 'no-new-work'
   | 'already-claimed'
   | 'coalesced-until-ack'
   | 'reserved-in-flight';
@@ -74,9 +63,9 @@ export interface HookDeliveryHold {
    */
   settleRemainingMs?: number;
   /**
-   * `already-claimed` / `coalesced-until-ack` only: the exact ids of this
-   * band's unread-but-already-claimed events — the ones actually holding the
-   * coalesced reminder back. Threaded through so a consumer (e.g. `doctor`'s
+   * `no-new-work` / legacy `already-claimed` / `coalesced-until-ack`: the exact ids of this
+   * band's unread-but-already-claimed events. These describe old unread work,
+   * not a blocker for a fresh batch under the current policy. Threaded through so a consumer (e.g. `doctor`'s
    * remediation) can acknowledge PRECISELY these rows rather than every
    * unread event on the session, which would also clear unrelated,
    * never-surfaced work (issue #425 review, round 6). Empty for
@@ -118,7 +107,7 @@ function reminderLabel(urgency: 'normal' | 'low'): string {
 /**
  * Classify why a coalesced normal/low reminder (spec: delivery/lifecycles) is currently
  * withheld for one band. Returns `null` when the reminder would actually fire
- * (every unread event is unclaimed) or there is no unread work for the band —
+ * (fresh work exists and no same-band reservation is active) or there is no unread work for the band —
  * neither case is a "hold" worth reporting.
  */
 export function classifyReminderHold(
@@ -128,18 +117,15 @@ export function classifyReminderHold(
   claimedEventIds: string[] = [],
   leasedCount = 0,
 ): HookDeliveryHold | null {
-  const claimedCount = unreadCount - pendingCount - leasedCount;
-  // Fires (not held) when there is unread work and none of it is claimed or
-  // leased yet.
-  if (unreadCount <= 0 || (claimedCount <= 0 && leasedCount <= 0)) return null;
+  if (unreadCount <= 0 || (pendingCount > 0 && leasedCount <= 0)) return null;
 
   const lifecycle = REMINDER_LIFECYCLE[urgency];
   const label = reminderLabel(urgency);
   const ackHint = 'agentmonitors events ack';
 
-  if (claimedCount <= 0) {
-    // Pure lease: nothing is durably claimed, so there is nothing an ack can
-    // clear yet — a lease resolves itself. Never recommend ack here (round 10).
+  if (leasedCount > 0) {
+    // The live lease is the blocker even if older claimed rows coexist.
+    // Acknowledging those rows cannot resolve a transport operation.
     return {
       urgency,
       reason: 'reserved-in-flight',
@@ -150,18 +136,8 @@ export function classifyReminderHold(
     };
   }
 
-  const reason: HookDeliveryHoldReason =
-    pendingCount <= 0 && leasedCount <= 0
-      ? 'already-claimed'
-      : 'coalesced-until-ack';
-  const leasedNote =
-    leasedCount > 0
-      ? ` (${String(leasedCount)} more of this band are being surfaced by an in-flight channel-push reservation and need no action)`
-      : '';
-  const message =
-    reason === 'already-claimed'
-      ? `${label}-urgency reminder at ${lifecycle} is suppressed: all ${String(unreadCount)} unread ${urgency} event(s) are already claimed (coalesced-until-ack). It re-fires once they are acknowledged (\`${ackHint}\`) — a fresh unclaimed ${urgency} event arriving in the meantime does not restore it.`
-      : `${label}-urgency reminder at ${lifecycle} is suppressed: ${String(claimedCount)} of ${String(unreadCount)} unread ${urgency} event(s) are already claimed (coalesced-until-ack)${leasedNote}. It re-fires only once every unread ${urgency} event is unclaimed — acknowledge the claimed ones (\`${ackHint}\`).`;
+  const reason: HookDeliveryHoldReason = 'no-new-work';
+  const message = `${label}-urgency reminder at ${lifecycle} is suppressed: all ${String(unreadCount)} unread ${urgency} event(s) are already claimed. They remain unread until explicitly acknowledged (\`${ackHint}\`). A fresh unclaimed ${urgency} event will trigger a new reminder; previously claimed events are not repeated.`;
 
   return {
     urgency,
@@ -230,36 +206,19 @@ export function classifySettleWindowHold(
  * and preempting a later, separate high-urgency interrupt (the exact
  * two-interrupt failure #441 fixes).
  *
- * This is a DIFFERENT hold from {@link classifyReminderHold}'s
- * `already-claimed`/`coalesced-until-ack`/`reserved-in-flight` reasons, which
- * apply regardless of any concurrent high-urgency work (a claimed or leased
- * unread row blocks the reminder on its own). Both are evaluated independently
- * by `diagnoseHookDelivery` and are mutually exclusive by construction: this
- * function fires only when `reminderDue` (`pendingCount === unreadCount`), and
- * because the caller passes the LEASE-FILTERED pending count for `pendingCount`,
- * that equality can hold only when NO unread normal row is claimed AND none is
- * leased (`claimedCount = unreadCount - pendingCount - leasedCount = 0` forces
- * both to zero). In exactly that state {@link classifyReminderHold} returns
- * `null` (nothing claimed or leased to hold). Conversely, a single leased
- * normal row makes `pendingCount < unreadCount`, so `reminderDue` is false here
- * and the diagnosis defers to {@link classifyReminderHold}'s `reserved-in-flight`
- * verdict — matching `decideDelivery`, whose `normalReminderDue` gate uses the
- * same lease-filtered equality and likewise neither fires nor coalesces the
- * reminder while a normal row is leased.
- *
- * Returns `null` when the reminder is not otherwise due (nothing unread, or
- * some of it already claimed or leased), or when there is no unsettled pending
- * high-urgency work to withhold it (settled high-urgency work coalesces the
- * reminder into itself instead — see `decideDelivery` — and no pending
- * high-urgency work at all means the reminder fires standalone).
+ * This hold applies only to an otherwise-ready fresh normal batch. Older
+ * claims do not affect readiness. A live normal reservation takes precedence
+ * and is explained by classifyReminderHold instead. No pending high work, or
+ * any settled high work, means no hold: delivery is standalone or coalesced.
  */
 export function classifyCoalescingWithheldHold(
   unreadCount: number,
   pendingCount: number,
   pendingHighCount: number,
   settledHighCount: number,
+  leasedCount = 0,
 ): HookDeliveryHold | null {
-  const reminderDue = pendingCount > 0 && pendingCount === unreadCount;
+  const reminderDue = pendingCount > 0 && leasedCount === 0;
   if (!reminderDue) return null;
   if (pendingHighCount === 0 || settledHighCount > 0) return null;
 

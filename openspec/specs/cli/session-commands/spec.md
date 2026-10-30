@@ -502,19 +502,35 @@ The `--debug` diagnosis SHALL report, in order: the payload's `session_id`/`hook
 
 ### Requirement: hook deliver --debug hold-reason vocabulary
 
-Per-band hold reasons SHALL use these names: `settle-window` (pending high events not yet past the 15s claim settle), `already-claimed` / `coalesced-until-ack` (the coalesced normal/low reminder suppressed by claimed unread events — the same vocabulary as `monitor explain`, #333), `reserved-in-flight` (suppressed only by leased rows), and `deferred-by-cap` (settled high events deferred by the 4000-char `additionalContext` cap; they redeliver at the next context event).
+Per-band hold reasons SHALL use these names: `settle-window` (pending high events not yet past the 15s claim settle), `no-new-work` (no fresh pending normal/low work remains; same vocabulary as `monitor explain`, #333), `reserved-in-flight` (a same-band reservation holds the reminder, even beside older claimed rows), and `deferred-by-cap` (settled high events deferred by the 4000-char `additionalContext` cap; they redeliver at the next context event).
 
-#### Scenario: Reminder suppressed until ack
+#### Scenario: Older claim does not hold a fresh reminder
 
-- **GIVEN** a claimed but unacknowledged normal-urgency event and a newer unread normal event
+- **GIVEN** a claimed but unacknowledged normal-urgency event and a newer unclaimed normal event, with no lease
 - **WHEN** `hook deliver --debug` runs at `turn-interruptible`
-- **THEN** the normal band's hold reason is `already-claimed` / `coalesced-until-ack`, with the acknowledge remedy
+- **THEN** no hold is reported for the normal band and the reminder is delivered
+
+#### Scenario: Nothing new to remind about
+
+- **GIVEN** every unread normal-urgency event of the session is already claimed
+- **WHEN** `hook deliver --debug` runs at `turn-interruptible`
+- **THEN** the normal band's hold reason is `no-new-work`
 
 #### Scenario: Leased row is not an acknowledge prompt
 
-- **GIVEN** a band whose only suppressing row is leased by an in-flight channel push and no row is durably claimed
+- **GIVEN** a band with a row leased by an in-flight channel push, with or without older claimed rows
 - **WHEN** `hook deliver --debug` runs
 - **THEN** the band's hold reason is `reserved-in-flight` and no acknowledge instruction is printed
+
+### Requirement: Legacy hold reasons are accepted but never emitted
+
+`already-claimed` and `coalesced-until-ack` SHALL remain accepted hold-reason values for compatibility with older daemon responses, but current delivery decisions SHALL NOT emit them (#524).
+
+#### Scenario: Current daemon never reports coalesced-until-ack
+
+- **GIVEN** a band with both claimed-unacknowledged and fresh unclaimed events
+- **WHEN** `hook deliver --debug` runs against a current daemon
+- **THEN** no hold reason is `already-claimed` or `coalesced-until-ack`
 
 ### Requirement: hook deliver lifecycle surfacing
 

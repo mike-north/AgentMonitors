@@ -272,23 +272,23 @@ The projection-and-delivery stage SHALL report `session_event_state` joined to `
 
 ### Requirement: Reminder suppression is explained
 
-When a session's unread normal or low events are claimed or leased so the coalesced reminder is suppressed, the delivery stage SHALL add a `reminderSuppression` finding per session and band: `already-claimed` or `coalesced-until-ack` when a band event is durably claimed, else `reserved-in-flight` when one is leased by an in-flight channel push (issue #300). The stage stays `ok`.
+When a session's band has unread normal or low events but no reminder can surface, the delivery stage SHALL add a `reminderSuppression` finding per session and band: `reserved-in-flight` when a same-band row is leased by an in-flight reservation (issue #300), else `no-new-work` when every unread event is already claimed. Fresh pending work with no lease SHALL produce no finding. The stage stays `ok`. `already-claimed` / `coalesced-until-ack` are legacy values that current decisions never emit.
 
 #### Scenario: Fully claimed band
 
 - **GIVEN** every unread normal event of session S is claimed
 - **WHEN** `monitor.explain` runs
-- **THEN** the delivery stage is `ok` with a `reminderSuppression` of `already-claimed` for S's `normal` band
+- **THEN** the delivery stage is `ok` with a `reminderSuppression` of `no-new-work` for S's `normal` band
 
 #### Scenario: Mixed claimed and unclaimed band
 
-- **GIVEN** S has one claimed and one unclaimed unread normal event
+- **GIVEN** S has one claimed and one unclaimed unread normal event and no lease
 - **WHEN** `monitor.explain` runs
-- **THEN** the finding reason is `coalesced-until-ack`
+- **THEN** no `reminderSuppression` finding is reported for S's `normal` band, because the fresh event is deliverable
 
 ### Requirement: Leased-only suppression never recommends acknowledging
 
-A `reserved-in-flight` finding SHALL NOT recommend `events ack`: a lease is not a claim and resolves itself, and acknowledging a leased-but-unseen row before the push resolves could lose it permanently if the push fails.
+A `reserved-in-flight` finding SHALL NOT recommend `events ack`, even when older claimed rows coexist: a lease is not a claim and resolves itself, and acknowledging a leased-but-unseen row before the push resolves could lose it permanently if the push fails.
 
 #### Scenario: Leased band guidance
 

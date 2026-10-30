@@ -336,6 +336,31 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
   `);
 
   db.run(sql`
+    CREATE TABLE IF NOT EXISTS materialization_retry_outbox (
+      id TEXT PRIMARY KEY,
+      workspace_path TEXT,
+      monitor_id TEXT NOT NULL,
+      source_name TEXT NOT NULL,
+      envelope TEXT NOT NULL,
+      envelope_bytes INTEGER NOT NULL,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'pending',
+      next_attempt_at INTEGER,
+      last_error TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    )
+  `);
+
+  db.run(sql`
+    CREATE INDEX IF NOT EXISTS idx_materialization_retry_due
+      ON materialization_retry_outbox (
+        monitor_id, COALESCE(workspace_path, ''), status,
+        next_attempt_at, created_at, id
+      )
+  `);
+
+  db.run(sql`
     CREATE TABLE IF NOT EXISTS session_event_state (
       id TEXT PRIMARY KEY,
       session_id TEXT NOT NULL,

@@ -186,14 +186,19 @@ listening method as `hook`, `channel`, `both`, or `none`.
 ### Requirement: Health causes are reported distinctly with remediation
 
 The verdict SHALL report each cause distinctly — absent daemon, workspace/socket/environment misbinding,
-muted reminders, lapsed heartbeat — never collapsed into a generic unhealthy, and SHALL attach a concrete
+muted reminders reported by an older daemon, lapsed heartbeat — never collapsed into a generic unhealthy, and SHALL attach a concrete
 command or action to every problem. Problem-code names, the blocking/advisory split, and their rendering
 are owned by the `cli/doctor` capability.
 
-#### Scenario: Muted reminders
+#### Scenario: Legacy muted reminders
 
-- **WHEN** a lead's `normal` reminders are withheld by `coalesced-until-ack` while both transports are connected
+- **WHEN** an older daemon reports a lead's `normal` reminders withheld by `coalesced-until-ack` while both transports are connected
 - **THEN** the verdict reports `reminders-suppressed` with a scoped acknowledge command, separate from any binding problem
+
+#### Scenario: Claimed backlog is ordinary
+
+- **WHEN** a lead's diagnosis reports `no-new-work` and no fresh work is pending
+- **THEN** the verdict treats it as an ordinary backlog, not a broken delivery path, and reports no `reminders-suppressed` problem
 
 ### Requirement: Listening is separated from will-arrive
 
@@ -202,7 +207,7 @@ for this session now, asking the daemon per active lead whether a reminder is su
 
 #### Scenario: Connected but suppressed
 
-- **WHEN** the channel is fresh and correctly bound but every lead's reminders are suppressed
+- **WHEN** the channel is fresh and correctly bound but an older daemon reports every lead's reminders as suppressed (`coalesced-until-ack`)
 - **THEN** the listening method is `channel` and the verdict states delivery will not arrive until acknowledged
 
 ### Requirement: Unknown is never reported as healthy
@@ -273,7 +278,7 @@ remediation; its non-blocking treatment is per the `cli/doctor` capability.
 
 ### Requirement: Suppressing holds require trustworthy claimed ids
 
-`HookDeliveryHold.claimedEventIds` is optional; for an `already-claimed` / `coalesced-until-ack` hold whose
+`HookDeliveryHold.claimedEventIds` is optional; for a legacy `already-claimed` / `coalesced-until-ack` hold whose
 `claimedEventIds` is missing or not a non-empty array of non-empty strings, the verdict SHALL report
 `delivery-diagnosis-unavailable` for that session — never a blank `--event-ids` command and never an
 unscoped ack-all fallback.
