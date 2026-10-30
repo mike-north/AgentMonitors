@@ -1803,6 +1803,8 @@ cannot round-trip through JSON (including BigInt, negative zero, Date values out
 `observedAt` field, proxies, accessors, and cyclic references) with a domain error before database mutation.
 The full envelope is validated before route fields are read. Proxies, including revoked proxies,
 are rejected before their traps can run; route accessors are rejected without invoking their getters.
+Date detection uses an intrinsic brand check rather than traversing prototype chains, so an
+ordinary object or array with a proxy prototype is rejected without executing inherited traps.
 `observedAt` must be a valid, unmodified Date instance: subclasses or own properties are rejected
 without invoking their hooks. The validated instant is serialized explicitly as ISO text and
 restored as a Date; a string timestamp is not an accepted substitute. A batch

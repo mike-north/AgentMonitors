@@ -55,7 +55,10 @@ function assertJsonSafe(
   // Proxies can present plain descriptors while changing reads or supplying
   // hidden toJSON hooks. Detect even revoked proxies before any reflection.
   if (types.isProxy(value)) fail(path, 'proxy values are unsupported.');
-  if (value instanceof Date) {
+  // Brand checks must not walk the prototype chain: a non-proxy object can
+  // inherit a proxy whose traps mutate its data during instanceof. Inspect
+  // intrinsic brands and direct prototype identity only throughout validation.
+  if (types.isDate(value)) {
     // Only the observation timestamp has a defined Date hydration contract.
     // Own properties and subclasses can customize serialization or carry data
     // JSON would discard; reject them without calling any caller-supplied hook.
@@ -129,7 +132,7 @@ export function serializeRetryEnvelope(
     envelope,
     'observedAt',
   )?.value;
-  if (!(observedAt instanceof Date)) {
+  if (!types.isDate(observedAt)) {
     fail('$.observedAt', 'a valid Date is required.');
   }
   // Do not let JSON.stringify select a Date serialization hook: persist the

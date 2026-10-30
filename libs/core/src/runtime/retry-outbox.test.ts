@@ -375,6 +375,78 @@ describe('materialization retry outbox', () => {
     }
   });
 
+  it('rejects proxy prototypes without traversing them or admitting changed data', () => {
+    const store = new RuntimeStore(createDb(':memory:'));
+    let trapCalls = 0;
+    // The object itself is not a proxy. A prototype-chain walk would execute
+    // caller code that changes its data and disguises the unsupported prototype.
+    function withProxyPrototype<T extends object>(value: T): T {
+      const originalPrototype: object | null = Reflect.getPrototypeOf(value);
+      const prototype = new Proxy(
+        {},
+        {
+          getPrototypeOf() {
+            trapCalls += 1;
+            Reflect.setPrototypeOf(value, originalPrototype);
+            if (Reflect.has(value, 'value'))
+              Reflect.set(value, 'value', 'changed');
+            return null;
+          },
+        },
+      );
+      Reflect.setPrototypeOf(value, prototype);
+      return value;
+    }
+    const payload = input('monitor-a', 'proxy-prototype-payload');
+    payload.envelope.observation.payload = withProxyPrototype({
+      value: 'original',
+    });
+    const root = input('monitor-a', 'proxy-prototype-root');
+    withProxyPrototype(root.envelope);
+    const route = input('monitor-a', 'proxy-prototype-route');
+    withProxyPrototype(route.envelope.monitor);
+    const array = input('monitor-a', 'proxy-prototype-array');
+    array.envelope.observation.payload = withProxyPrototype(['original']);
+    const timestamp = input('monitor-a', 'proxy-prototype-date');
+    timestamp.envelope.observedAt = withProxyPrototype(new Date(NOW));
+    const revoked = input('monitor-a', 'revoked-prototype');
+    const revocable = Proxy.revocable({}, {});
+    revocable.revoke();
+    revoked.envelope.observation.payload = Object.create(revocable.proxy);
+    const indirect = input('monitor-a', 'indirect-proxy-prototype');
+    indirect.envelope.observation.payload = Object.create(
+      Object.create(
+        new Proxy(
+          {},
+          {
+            getPrototypeOf() {
+              trapCalls += 1;
+              return null;
+            },
+          },
+        ),
+      ),
+    );
+    for (const invalid of [
+      payload,
+      root,
+      route,
+      array,
+      timestamp,
+      revoked,
+      indirect,
+    ]) {
+      expect(() =>
+        store.enqueueMaterializationRetries(
+          [input('monitor-a', 'valid-sibling'), invalid],
+          NOW,
+        ),
+      ).toThrow(MaterializationRetrySerializationError);
+      expect(trapCalls).toBe(0);
+      expect(store.listMaterializationRetries()).toEqual([]);
+    }
+  });
+
   it('rejects route accessors before reading them or writing siblings', () => {
     const store = new RuntimeStore(createDb(':memory:'));
     let getterCalls = 0;

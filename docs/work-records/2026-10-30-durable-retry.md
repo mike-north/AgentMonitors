@@ -54,3 +54,27 @@ the new candidate. No push or merge was performed.
 Follow-up validation: 13 focused retry tests and all 625 core tests (43 files) pass on Node 24.14.0.
 Core strict TypeScript, build/API report (unchanged), changed-file ESLint (0 errors; existing
 release-tag warnings), formatting, and diff whitespace checks pass.
+
+## Prototype-chain validation repair
+
+A different independent reviewer rejected `7ab1bed8f26af2d49d5b9d855bb22d3b115a8877` after
+reproducing a remaining accepted-value conversion. A non-proxy object inherited a Proxy whose
+`getPrototypeOf` trap ran during `instanceof Date`, changed the object's data, and replaced its
+prototype with Object.prototype. Validation then accepted and stored the altered value. The
+exact-SHA rejection and reproduction are recorded in the coordinator's
+`2026-10-30-review-483-final.md` work record.
+
+That reviewer was then assigned this repair. The regression was written first and failed
+(13 existing tests passed); it now rejects root/payload/route objects, arrays, Date instances,
+indirect proxy ancestors, and revoked proxy prototypes without trap calls or sibling writes.
+Both Date checks now use Node's intrinsic brand predicate. Direct prototype identity checks,
+intrinsic brands, and own-property descriptors cover classification without walking arbitrary
+prototype chains. No clone is required within this supported domain: unsupported prototypes,
+proxies, and accessors are rejected before any caller-defined reads. This remains a passive-data
+contract rather than a security boundary against global intrinsic replacement or trusted
+route-wrapper callbacks.
+
+Validation: 14 focused retry tests and all 626 core tests across 43 files pass on Node 24.14.0.
+Core strict TypeScript, build/API-report check (unchanged), changed-source ESLint (zero errors),
+formatting, and whitespace checks pass. A new independent reviewer is required because this
+reviewer authored the repair. No push or merge was performed.
