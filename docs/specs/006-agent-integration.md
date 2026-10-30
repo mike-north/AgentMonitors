@@ -1627,6 +1627,27 @@ Per [004 §6](./004-validation-testing.md), each host adapter, when it ships, **
 - proof that **delivery semantics are unchanged** vs the Claude adapter (§11.5): same claimed-not-ack
   behavior (BP2), same lead-only projection, same urgency/lifecycle handling.
 
+### 11.7 Bounded Codex ownership diagnostic (partial evidence only)
+
+`experiments/host-probe/codex-owner.mjs` is a read-only diagnostic for an explicitly supplied,
+existing App Server control socket and thread id. It initializes the connection, records the
+server's self-reported version from `initialize.userAgent`, verifies the id in paginated
+`thread/loaded/list`, reads `thread/read.id` and `thread/read.cwd` without turn history, and
+rechecks that the thread remains loaded. Missing ownership, malformed responses, connection
+failure, bounded-response overflow, or timeout produce refusal. It does not discover endpoints,
+start servers, load/resume/fork sessions, send observations, or start/steer/interrupt turns.
+Before returning evidence, it checks all failures observed through the final response's parsing
+turn and subsequent read continuations. A valid final response cannot override a malformed frame,
+peer request, duplicate response, or connection failure already observed in that interval. It
+closes after this bounded snapshot; success makes no claim about later unobserved peer activity.
+
+The artifact establishes only momentary ownership and metadata as reported by that supplied
+server. Delivery capability, lifecycle mapping, and CLI/desktop surface remain unverified. A
+supported control endpoint for an existing desktop chat has not been established. Synthetic
+socket tests in `experiments/host-probe/codex-owner.test.ts` verify the diagnostic's refusal and
+read-only behavior; they do not constitute a live binding-probe artifact or promote any §11.3
+Codex matrix cell to _current_. The remaining §11.6 gates and #316 remain open.
+
 ## 12. Transport Health & Heartbeats (_current_ — issue #425)
 
 A transport that is **up** is not a transport that is **delivering**. Both transports can silently
