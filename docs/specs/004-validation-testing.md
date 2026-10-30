@@ -185,6 +185,18 @@ The `RuntimeStore.saveSnapshot()` and `RuntimeStore.latestSnapshot()` methods (i
 | Snapshots are isolated by workspace, monitor, and object key     | Covered (`libs/core/src/runtime/service.test.ts` — "stores and retrieves snapshots isolated by workspace, monitor, and object key").                                                                                         |
 | Event, projection/cursor, and snapshot writes roll back together | Covered (`libs/core/src/runtime/transactional-materialization.test.ts` — injected cursor and snapshot failures leave no event, projection, cursor, or snapshot).                                                             |
 
+### 3.4.1 Real daemon crash recovery
+
+`apps/cli/src/commands/daemon-crash-recovery.integration.test.ts` exercises a built CLI daemon
+with its own temporary workspace, user-data directory, database, and socket. It observes a real
+file change into a lead session, waits for the unread event, kills the owned daemon with SIGKILL,
+and explicitly starts a replacement on the same database. It verifies that doctor reports the
+dead daemon with a registered session, reopening the same host-session identity retains its
+session id and exact unread event, and delivery leaves that event unread until explicit acknowledgment.
+The test is registered in the serial configuration; child exits are awaited before fixture removal.
+This proves recovery of already-persisted recipient work, not automatic process supervision,
+uncommitted observation recovery, power-loss durability, or the pending materialization-retry stack.
+
 ### 3.5 CLI behavior
 
 | Scenario                                                                                                                                                                           | Coverage                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |

@@ -42,6 +42,12 @@ the earlier acknowledgment-instruction fix (#434) and from any claim-TTL design 
 Validation: tests first reproduced seven failures across hook/channel, normal/low and high-coalescing
 cases; the forward-progress suite and both transport renderers now cover the revised contract.
 
+## 2026-10-30 — Real-daemon crash recovery acceptance coverage (004 §3.4.1) — Refs #527
+
+Adds an isolated built-CLI SIGKILL/restart test for persisted unread work and same-session identity.
+It also verifies dead-daemon diagnostics and the distinction between delivery and acknowledgment.
+No runtime behavior changes or automatic restart/supervisor guarantees are introduced.
+
 ## 2026-08-24 — New numbered doc: 008 — Reliability & Process Hygiene — Refs #504, PR #476
 
 Added [008-reliability-process-hygiene.md](./008-reliability-process-hygiene.md), promoting the
