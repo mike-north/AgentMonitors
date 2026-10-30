@@ -815,13 +815,15 @@ export class RuntimeStore {
     if (inputs.length === 0) return [];
     const db = asInternalDb(this.db);
     const prepared = inputs.map((input) => {
+      // Validate the entire value domain before route reads can invoke an
+      // accessor or proxy supplied inside the envelope.
+      const envelope = serializeRetryEnvelope(input.envelope);
       if (input.envelope.monitor.id !== input.monitorId) {
         throw new Error('Retry envelope monitor id does not match its route.');
       }
       if (input.envelope.monitor.frontmatter.watch.type !== input.sourceName) {
         throw new Error('Retry envelope source does not match its route.');
       }
-      const envelope = serializeRetryEnvelope(input.envelope);
       return {
         input,
         id: materializationRetryUlid(now.getTime()),

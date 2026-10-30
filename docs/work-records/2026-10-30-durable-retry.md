@@ -36,3 +36,21 @@ Full core suite: 43 files, 623 tests passed on Node 24.14.0. Formatting and diff
 passed. Rebased onto #482's independently reviewed candidate
 `35393aea6b2a5b9999e4fb1568d48073153af1cb`; the parent change after the initial rebase was documentation
 only. The reviewed #483 remote head has not been overwritten.
+
+## Adversarial serialization repair
+
+Independent review of `0f3b3c0f5cdfabb8f34b4960b8abc12db091f3cb` found a remaining
+accepted-value change: nested proxies could synthesize an unvalidated toJSON hook after descriptor
+validation. Route getters also ran before serialization rejected their accessor descriptors.
+Two tests were added first and failed as expected (11 prior tests passed): proxy admission did not
+throw, and a route getter ran once. The repaired domain explicitly excludes proxies via Node's
+intrinsic check before reflection, including revoked proxies. Full envelope validation precedes
+route reads. Cases cover root, payload, monitor route, timestamp, revoked proxies, and both trusted
+route leaf accessors; they require zero hook calls and zero persisted siblings.
+
+The prior reviewer authored this follow-up repair, so a different independent reviewer must review
+the new candidate. No push or merge was performed.
+
+Follow-up validation: 13 focused retry tests and all 625 core tests (43 files) pass on Node 24.14.0.
+Core strict TypeScript, build/API report (unchanged), changed-file ESLint (0 errors; existing
+release-tag warnings), formatting, and diff whitespace checks pass.

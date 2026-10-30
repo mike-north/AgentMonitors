@@ -686,7 +686,7 @@ export interface EnqueueMaterializationRetryInput {
   sourceName: string;
   /**
    * Failed observation to persist losslessly for a later attempt. Nested values
-   * must be JSON-safe (no negative zero, accessors, cycles or custom classes).
+   * must be JSON-safe (no negative zero, proxies, accessors, cycles or custom classes).
    * `observedAt` is the sole Date leaf and must be valid, have Date.prototype,
    * and have no own properties. Invalid data raises a serialization domain error.
    */

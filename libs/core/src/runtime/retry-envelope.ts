@@ -1,3 +1,9 @@
+/**
+ * Defines the retry outbox's persistable value domain. Validation excludes
+ * caller-defined reads and serialization hooks so a stored observation retains
+ * its data; only the observation timestamp has typed hydration semantics.
+ */
+import { types } from 'node:util';
 import type { StoredObservationEnvelope } from './types.js';
 
 /**
@@ -46,6 +52,9 @@ function assertJsonSafe(
   }
   if (typeof value !== 'object')
     fail(path, `${typeof value} values are unsupported.`);
+  // Proxies can present plain descriptors while changing reads or supplying
+  // hidden toJSON hooks. Detect even revoked proxies before any reflection.
+  if (types.isProxy(value)) fail(path, 'proxy values are unsupported.');
   if (value instanceof Date) {
     // Only the observation timestamp has a defined Date hydration contract.
     // Own properties and subclasses can customize serialization or carry data

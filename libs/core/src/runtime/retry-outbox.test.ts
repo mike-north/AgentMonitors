@@ -329,6 +329,87 @@ describe('materialization retry outbox', () => {
     expect(store.listMaterializationRetries()).toEqual([]);
   });
 
+  it('rejects proxies at every envelope boundary without running traps or writing siblings', () => {
+    const store = new RuntimeStore(createDb(':memory:'));
+    let trapCalls = 0;
+    const trapHandler: ProxyHandler<object> = {
+      get(target, key, receiver) {
+        trapCalls += 1;
+        if (key === 'toJSON') return () => ({ value: 'changed' });
+        return Reflect.get(target, key, receiver);
+      },
+      getPrototypeOf(target) {
+        trapCalls += 1;
+        return Reflect.getPrototypeOf(target);
+      },
+      ownKeys(target) {
+        trapCalls += 1;
+        return Reflect.ownKeys(target);
+      },
+    };
+    const nested = input('monitor-a', 'proxy-payload');
+    nested.envelope.observation.payload = new Proxy(
+      { value: 'original' },
+      trapHandler,
+    );
+    const root = input('monitor-a', 'proxy-root');
+    root.envelope = new Proxy(root.envelope, trapHandler);
+    const route = input('monitor-a', 'proxy-route');
+    route.envelope.monitor = new Proxy(route.envelope.monitor, trapHandler);
+    const timestamp = input('monitor-a', 'proxy-date');
+    timestamp.envelope.observedAt = new Proxy(new Date(NOW), trapHandler);
+    const revoked = input('monitor-a', 'revoked-proxy');
+    const revocable = Proxy.revocable({}, trapHandler);
+    revocable.revoke();
+    revoked.envelope.observation.payload = revocable.proxy;
+
+    for (const invalid of [nested, root, route, timestamp, revoked]) {
+      expect(() =>
+        store.enqueueMaterializationRetries(
+          [input('monitor-a', 'valid-sibling'), invalid],
+          NOW,
+        ),
+      ).toThrow(MaterializationRetrySerializationError);
+      expect(trapCalls).toBe(0);
+      expect(store.listMaterializationRetries()).toEqual([]);
+    }
+  });
+
+  it('rejects route accessors before reading them or writing siblings', () => {
+    const store = new RuntimeStore(createDb(':memory:'));
+    let getterCalls = 0;
+    const monitorAccessor = input('monitor-a', 'monitor-accessor');
+    Object.defineProperty(monitorAccessor.envelope.monitor, 'id', {
+      enumerable: true,
+      get: () => {
+        getterCalls += 1;
+        return 'monitor-a';
+      },
+    });
+    const sourceAccessor = input('monitor-a', 'source-accessor');
+    Object.defineProperty(
+      sourceAccessor.envelope.monitor.frontmatter.watch,
+      'type',
+      {
+        enumerable: true,
+        get: () => {
+          getterCalls += 1;
+          return 'test-source';
+        },
+      },
+    );
+    for (const invalid of [monitorAccessor, sourceAccessor]) {
+      expect(() =>
+        store.enqueueMaterializationRetries(
+          [input('monitor-a', 'valid-sibling'), invalid],
+          NOW,
+        ),
+      ).toThrow(MaterializationRetrySerializationError);
+      expect(getterCalls).toBe(0);
+      expect(store.listMaterializationRetries()).toEqual([]);
+    }
+  });
+
   it('rejects trusted-route mismatches before writing any sibling', () => {
     const store = new RuntimeStore(createDb(':memory:'));
     const wrongMonitor = input('monitor-a', 'wrong-monitor');
