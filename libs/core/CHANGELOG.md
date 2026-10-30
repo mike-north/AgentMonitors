@@ -1,5 +1,30 @@
 # @agentmonitors/core
 
+## 0.14.0
+
+### Minor Changes
+
+- 57e2878: Add a bounded durable outbox for retrying failed observation materialization.
+
+  Reject values that JSON would silently normalize, including negative zero and customized observation timestamps, before persisting any retry batch member.
+
+  Reject proxy envelopes and proxy prototypes before traps run, using intrinsic Date detection; validate route data before invoking property reads.
+
+  Reject detectable intrinsic built-ins even after their prototypes are replaced. Document the caller-owned plain-data domain and the limits of detecting unobservable private state.
+
+### Patch Changes
+
+- ab9b6ad: Commit event rows, lead-session projections, recipient cursor seeds, and snapshots atomically.
+  Preserve empty snapshots as valid diff baselines, including deletion deltas for late recipients.
+- f194a12: Allow fresh normal and low reminder batches while older events remain claimed and unacknowledged.
+  Preserve same-band in-flight reservation holds and high-urgency settle coalescing, and update
+  suppression diagnostics to distinguish no new work from a temporary reservation.
+
+  Use the explicit `no-new-work` diagnostic for healthy claimed-only backlogs. Retain conservative
+  health warnings for legacy daemon reasons whose policy can still block future batches.
+
+- 7c30c92: Upgrade better-sqlite3 to 13.x, fixing a native crash (env != nullptr abort in Statement teardown) that could kill the daemon on Node 24.
+
 ## 0.13.0
 
 ### Minor Changes
