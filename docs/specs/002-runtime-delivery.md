@@ -1794,6 +1794,64 @@ Stores the full text content of each snapshot for diff computation. Keyed by `(w
 
 The draft omitted this table. It is required for snapshot diff computation (§5.2) and is populated by `RuntimeStore.saveSnapshot()`. `id` is a monotonic ULID so same-second snapshots retain a total materialization order and `latestSnapshot()` resolves to the newest via `ORDER BY created_at DESC, id DESC` (§5.2, issue #293). Verified: `libs/core/src/runtime/store.ts` — `saveSnapshot()` / `latestSnapshot()`.
 
+### `materialization_retry_outbox`
+
+Durable observations that could not complete deterministic materialization. Each row retains the
+stored observation envelope and trusted local route so a later attempt can re-enter materialization
+without invoking the source or moving a source cursor again.
+
+| Column            | Type             | Notes                                             |
+| ----------------- | ---------------- | ------------------------------------------------- |
+| `id`              | TEXT PK          | Monotonic ULID                                    |
+| `workspace_path`  | TEXT nullable    | Part of the per-monitor capacity scope            |
+| `monitor_id`      | TEXT NOT NULL    | Must match the stored envelope                    |
+| `source_name`     | TEXT NOT NULL    | Must match the envelope's monitor source          |
+| `envelope`        | TEXT NOT NULL    | JSON `StoredObservationEnvelope`                  |
+| `envelope_bytes`  | INTEGER NOT NULL | Exact persisted UTF-8 byte count                  |
+| `attempt_count`   | INTEGER NOT NULL | Automatic retry failures; starts at `0`           |
+| `status`          | TEXT NOT NULL    | `pending \| terminal`                             |
+| `next_attempt_at` | INTEGER nullable | `NULL` after terminalization                      |
+| `last_error`      | TEXT nullable    | Control-stripped, bounded safe diagnostic message |
+| `created_at`      | INTEGER NOT NULL | Preserves oldest-first drain order                |
+| `updated_at`      | INTEGER NOT NULL | Last attempt or operator re-arm                   |
+
+Capacity is 256 rows or 8 MiB of stored envelopes per `(workspace_path, monitor_id)`, including
+terminal rows. Envelope size is the exact serialized UTF-8 byte count. Callers must supply ordinary
+plain-data records and dense arrays of JSON primitives (excluding negative zero), apart from the
+single typed `observedAt` Date. Class/built-in instances remain outside this supported domain even
+if their prototypes have been replaced. Enqueue rejects detectable domain violations (including
+BigInt, negative zero, nested Dates, proxies, accessors, cycles, and intrinsic object brands exposed
+by Node) with a domain error before database mutation.
+The full envelope is validated before route fields are read. Proxies, including revoked proxies,
+are rejected before their traps can run; route accessors are rejected without invoking their getters.
+Date detection uses an intrinsic brand check rather than traversing prototype chains, so an
+ordinary object or array with a proxy prototype is rejected without executing inherited traps.
+Known intrinsic brands are checked independently of prototype identity: Maps, Sets, boxed
+primitives, buffers/views and other detectable built-ins cannot disguise their internal data as
+plain records merely by replacing their prototypes.
+
+The plain-data rule is a caller precondition, not authentication of arbitrary same-process object
+provenance. JavaScript cannot generally distinguish an ordinary empty record from an object whose
+prototype was replaced and whose private/native state has no exposed intrinsic brand (for example,
+a private-field class, or some platform objects). Such values are unsupported even when early
+validation cannot identify them. Sources must normalize their meaningful data into ordinary
+records before constructing retry envelopes; successful validation is not proof that an arbitrary
+object's hidden state was preserved. This boundary does not change the round-trip guarantee for
+supported plain-data inputs.
+
+`observedAt` must be a valid, unmodified Date instance: subclasses or own properties are rejected
+without invoking their hooks. The validated instant is serialized explicitly as ISO text and
+restored as a Date; a string timestamp is not an accepted substitute. A batch
+enqueue uses one immediate transaction: if every failed sibling cannot fit, none is stored. Another
+workspace or monitor has independent capacity.
+
+New records first become due after 1 second. `last_error` has terminal controls removed and is capped
+at 1,024 characters.
+
+_Current in this change:_ schema, lossless serialization, route checks, bounded atomic admission,
+and oldest-first reads. Retry state transitions and transaction-coupled completion are added in the
+next stack layer. Runtime drain-before-observe adoption follows after that for #295.
+
 ### `session_event_state`
 
 Per-session delivery tracking for each projected event. Drives the unread/claimed/acknowledged state machine (§7).
