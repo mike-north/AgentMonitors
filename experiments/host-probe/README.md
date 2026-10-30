@@ -205,3 +205,37 @@ Before committing a probe artifact, redact identifying values: replace the home 
 absolute path with `/Users/<user>` (or `<HOME>`) and each session UUID with a stable placeholder
 (`<session-1>`, `<session-2>`, …; keep the mapping consistent within one probe run). The matrix
 evidence needs key presence, mechanisms, and hook shapes — never real ids or personal paths.
+
+## Read-only Codex owner diagnostic
+
+`codex-owner.mjs` checks an **existing, explicitly supplied App Server control socket**. Use only
+an endpoint documented/exposed by the host owner. It does not search the filesystem, inspect
+private desktop IPC, launch an App Server, or load a persisted thread. A supported endpoint for
+an existing desktop chat has not been established; do not infer one from a successful synthetic
+socket test or a separate CLI App Server.
+
+```bash
+node codex-owner.mjs --socket /absolute/path/to/control.sock --thread EXISTING_THREAD_ID
+# Optional total deadline, including connection and pagination (default 5000, maximum 60000ms):
+node codex-owner.mjs --socket /absolute/path/to/control.sock --thread EXISTING_THREAD_ID --timeout-ms 10000
+```
+
+The command initializes the JSON-line connection, reads `initialize.userAgent` for the server's
+self-reported version, checks `thread/loaded/list` (including pagination), reads identity and
+workspace with `thread/read` and `includeTurns: false`, then rechecks loaded ownership. Its only
+client messages are `initialize`, `initialized`, `thread/loaded/list`, and `thread/read`. It never
+starts/resumes/forks a thread, starts/steers/interrupts a turn, sends observations, or grants
+approvals. Peer requests, missing/unloaded identities, malformed metadata, connection errors,
+timeouts, repeated cursors, over 100 pages, or over 1 MiB total response bytes cause refusal
+(exit 1). Server error bodies and conversation previews are not printed or retained.
+
+Success (exit 0) reports `owner-observed`, identity/workspace signals, version, and observed read
+methods. This is a point-in-time claim by the supplied server, **not an ownership lease**, an
+independent authentication of that server, or proof that another client can safely deliver to it.
+`surface` and `deliveryCapability` remain `unverified`; no lifecycle hook was exercised. This
+partial diagnostic does not satisfy all of §11.6 or unblock the #316 adapter on its own.
+
+Output contains the requested thread id and workspace path for local diagnosis. Apply the
+artifact-hygiene substitutions above before committing real output; do not include conversation
+history, source-message bodies, or private socket paths. Automated fixtures are synthetic and
+must never be relabeled as live Codex evidence.
