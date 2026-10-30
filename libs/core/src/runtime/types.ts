@@ -634,6 +634,84 @@ export interface StoredObservationEnvelope {
   effectiveUrgency: Urgency;
 }
 
+/** Maximum durable retry rows per workspace and monitor. @public */
+export const MATERIALIZATION_RETRY_MAX_RECORDS = 256;
+/** Maximum serialized envelope bytes per workspace and monitor. @public */
+export const MATERIALIZATION_RETRY_MAX_BYTES = 8 * 1024 * 1024;
+/** Delay before each automatic materialization retry. @public */
+export const MATERIALIZATION_RETRY_DELAYS_MS = [
+  1_000, 5_000, 30_000, 120_000, 300_000,
+] as const;
+/** Durable lifecycle state for one failed materialization. @public */
+export type MaterializationRetryStatus = 'pending' | 'terminal';
+
+/** A durable failed observation retained until materialization succeeds. @public */
+export interface MaterializationRetryRecord {
+  /** Stable retry id used by the operator re-arm flow. */
+  id: string;
+  /** Canonical workspace route, or null for a global monitor. */
+  workspacePath: string | null;
+  /** Trusted monitor route captured at enqueue time. */
+  monitorId: string;
+  /** Trusted observation-source route captured at enqueue time. */
+  sourceName: string;
+  /**
+   * Restored supported plain-data observation. Detectable unsupported nested
+   * data is rejected at enqueue; `observedAt` is restored as a Date.
+   */
+  envelope: StoredObservationEnvelope;
+  /** UTF-8 bytes occupied by the serialized envelope. */
+  envelopeBytes: number;
+  /** Number of failed automatic attempts since enqueue or re-arm. */
+  attemptCount: number;
+  /** Whether automatic work remains eligible or requires operator re-arm. */
+  status: MaterializationRetryStatus;
+  /** Next eligible attempt; null while terminal. */
+  nextAttemptAt: Date | null;
+  /** Control-stripped, 1,024-character failure summary. */
+  lastError: string | null;
+  /** Time the failed observation first entered the outbox. */
+  createdAt: Date;
+  /** Time of the most recent failed attempt or operator re-arm. */
+  updatedAt: Date;
+}
+
+/** Input to atomically enqueue one failed materialization. @public */
+export interface EnqueueMaterializationRetryInput {
+  /** Canonical workspace route, or null for a global monitor. */
+  workspacePath: string | null;
+  /** Trusted monitor route; must match `envelope.monitor.id`. */
+  monitorId: string;
+  /** Trusted source route; must match the envelope's watch type. */
+  sourceName: string;
+  /**
+   * Failed observation to persist losslessly for a later attempt. Callers must
+   * supply ordinary data records and dense arrays of JSON primitives (excluding
+   * negative zero). Built-in/class instances, even with replaced prototypes, are
+   * outside this domain. `observedAt` is the sole Date leaf and must be valid,
+   * have Date.prototype, and have no own properties.
+   * Detectable violations (including proxies, accessors, cycles and intrinsic
+   * brands exposed by Node) raise a serialization domain error. Validation is
+   * not authentication of object provenance or unobservable private state;
+   * callers remain responsible for the plain-data precondition.
+   */
+  envelope: StoredObservationEnvelope;
+  /** Failure text to sanitize and persist as bounded operator diagnostics. */
+  error: string;
+}
+
+/** Oldest-first retry query. @public */
+export interface MaterializationRetryQuery {
+  /** Exact workspace route; omit to query every workspace. */
+  workspacePath?: string | null;
+  /** Exact monitor id; omit to query every monitor. */
+  monitorId?: string;
+  /** Exact lifecycle state; omit to include both states. */
+  status?: MaterializationRetryStatus;
+  /** Maximum oldest-first rows; defaults to the per-monitor capacity. */
+  limit?: number;
+}
+
 export interface ProcessObservationInput {
   monitor: MonitorDefinition;
   sourceName: string;

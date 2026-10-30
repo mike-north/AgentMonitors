@@ -69,6 +69,50 @@ Persisted tables SHALL use SQLite snake_case column names. Every row `id` SHALL 
 - **WHEN** the latest snapshot is read
 - **THEN** the second-inserted snapshot is returned
 
+### Requirement: materialization_retry_outbox columns
+
+`materialization_retry_outbox` SHALL durably hold observations that failed materialization, with: `id` TEXT PK (monotonic ULID); `workspace_path` TEXT nullable; `monitor_id`, `source_name` TEXT NOT NULL; `envelope` TEXT NOT NULL (JSON); `envelope_bytes`, `attempt_count` INTEGER NOT NULL; `status` TEXT NOT NULL (`pending | terminal`); `next_attempt_at` INTEGER nullable; `last_error` TEXT nullable; `created_at`, `updated_at` INTEGER NOT NULL.
+
+#### Scenario: Outbox survives reopen
+
+- **GIVEN** two envelopes enqueued for monitor `m`
+- **WHEN** the database is closed and reopened
+- **THEN** both are read back oldest-first with their route and envelope intact
+
+### Requirement: Retry outbox admission is bounded and batch-atomic
+
+The outbox SHALL admit at most 256 rows or 8 MiB of stored envelopes (exact serialized UTF-8 bytes) per `(workspace_path, monitor_id)`, counting terminal rows. A batch enqueue SHALL run in one immediate transaction: when any failed sibling cannot fit, none is stored. Each workspace and monitor SHALL have independent capacity.
+
+#### Scenario: Overflowing batch stores nothing
+
+- **GIVEN** monitor `m` has room for one more envelope and a batch of two arrives
+- **WHEN** the batch is enqueued
+- **THEN** neither envelope is stored, and another monitor's capacity is unaffected
+
+### Requirement: Retry envelopes are validated plain data
+
+Enqueue SHALL accept only ordinary plain-data records and dense arrays of JSON primitives, plus one `observedAt` that is a valid, unmodified `Date` (serialized as ISO text, restored as a `Date`). It SHALL reject detectable violations (BigInt, negative zero, nested Dates, proxies, accessors, cycles, built-in brands) with a domain error before any database mutation, validating the whole envelope before route fields and never running proxy traps or getters.
+
+#### Scenario: Lossy value rejects the whole batch
+
+- **GIVEN** a batch whose second envelope's payload contains negative zero
+- **WHEN** the batch is enqueued
+- **THEN** a domain error is raised and no envelope from the batch is stored
+
+#### Scenario: Proxy is rejected without running traps
+
+- **WHEN** an envelope whose payload is a proxy is enqueued
+- **THEN** it is rejected with a domain error and none of the proxy's traps run
+
+### Requirement: Retry records are scheduled and carry safe errors
+
+A new outbox record SHALL first become due 1 second after enqueue, and records SHALL be read oldest-first. `last_error` SHALL have terminal control characters (C0 and DEL) removed and SHALL be capped at 1,024 characters.
+
+#### Scenario: Unsafe error text is sanitized
+
+- **WHEN** a record is stored with a 2,000-character error containing an ANSI escape
+- **THEN** `last_error` has no control characters and is at most 1,024 characters
+
 ### Requirement: session_event_state delivery-state columns
 
 `session_event_state` SHALL hold one row per (session, projected event) with: `id` TEXT PK; `session_id` TEXT NOT NULL (refers to `agent_sessions.id`); `event_id` TEXT NOT NULL (refers to `monitor_events.id`); `first_notified_at` INTEGER nullable (`NULL` = pending); `acknowledged_at` INTEGER nullable (`NULL` = unread); `last_claim_at` INTEGER nullable; `last_claim_lifecycle` TEXT nullable; `created_at`, `updated_at` INTEGER NOT NULL.
