@@ -3689,20 +3689,23 @@ export class AgentMonitorRuntime {
 
     const effectiveSnapshotText = shaped.snapshotText;
 
-    const previousSnapshot = effectiveSnapshotText
-      ? this.store.latestSnapshot(
-          input.monitor.id,
-          objectKey,
-          input.workspacePath ?? null,
-        )
-      : null;
+    // An empty snapshot is an observed empty object. Only null/undefined mean
+    // no snapshot; deletion deltas must still use the prior durable baseline.
+    const previousSnapshot =
+      effectiveSnapshotText != null
+        ? this.store.latestSnapshot(
+            input.monitor.id,
+            objectKey,
+            input.workspacePath ?? null,
+          )
+        : null;
 
     // The object's declared change-detection strategy (issue #437), read from
     // the raw observation's `snapshot` metadata so `strategy: json-diff`
     // renders a structural diffText instead of a compact-JSON line diff.
     const strategy = changeDetectionStrategyOf(input.observation.snapshot);
     const diffText =
-      effectiveSnapshotText && previousSnapshot
+      effectiveSnapshotText != null && previousSnapshot
         ? buildDiff(previousSnapshot.content, effectiveSnapshotText, strategy)
         : null;
 

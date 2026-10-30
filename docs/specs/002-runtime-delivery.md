@@ -1116,6 +1116,12 @@ Verified: `libs/core/src/runtime/service.ts` — `processObservation()`.
 
 ### 5.2 Snapshots and diffs
 
+An explicitly empty `snapshotText: ""` is a present snapshot, not a missing value. The runtime
+**MUST** persist it and compute the prior-to-empty deletion delta for both shared history and a
+newly projected recipient. A later nonempty observation diffs from that empty baseline. Only
+`null`/`undefined` mean no snapshot. Verified: `runtime/empty-snapshot.test.ts` exercises
+nonempty → empty → nonempty through the runtime and a late-joining lead session.
+
 If an emitted observation includes `snapshotText`, the runtime **MUST**:
 
 1. look up the latest stored snapshot for the same `(workspacePath, monitorId, objectKey)` triple

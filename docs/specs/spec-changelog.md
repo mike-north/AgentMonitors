@@ -9,6 +9,13 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-10-30 — Preserve empty snapshots and make commit-order proof observable (002 §5.2) — Refs #482
+
+Empty snapshots now participate in shared and newly projected recipient diffs: removing all
+content produces a deletion delta and the empty value remains the next baseline. The Interpret
+commit-order regression test now observes through a separate SQLite connection and asserts outside
+the adapter callback, where fallback handling cannot swallow a failed test assertion.
+
 ## 2026-08-24 — New numbered doc: 008 — Reliability & Process Hygiene — Refs #504, PR #476
 
 Added [008-reliability-process-hygiene.md](./008-reliability-process-hygiene.md), promoting the
