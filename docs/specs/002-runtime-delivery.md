@@ -1377,7 +1377,7 @@ reminder to a later call:
 - `hook deliver --debug`'s diagnosis (§10.7-adjacent `diagnoseHookDelivery`, issue #334) mirrors this
   precedence: it reports a `settle-window`-reasoned hold on the `normal` band when a fully-due
   reminder is being withheld by a concurrent unsettled high-urgency event, and independently still
-  reports `already-claimed` only when no fresh work remains, and `reserved-in-flight`
+  reports `no-new-work` only when no fresh work remains, and `reserved-in-flight`
   while a same-band reservation is active. Older claims do not withhold a fresh reminder.
 
 Verified: `libs/core/src/runtime/service.ts` — `decideDelivery()`'s `turn-interruptible` branch computes `normalReminderDue` before the settled-high branch; when both are due it folds `normalPending` into the high branch's `candidates`, appends `COALESCED_NORMAL_SUFFIX` to the claim's `message`, and sets `coalescedReminder`; when a fully-due reminder exists but `highUnread.length > 0` with nothing settled, it returns no delivery (withheld) rather than firing the reminder standalone. `previewCoalescedReminder` (core) / `previewCoalescedReminderClient` (CLI) mirror the same due-check read-only for transport sizing. `diagnoseHookDelivery`'s `classifyCoalescingWithheldHold` (`hook-delivery-diagnosis.ts`) reports the withheld-by-settle-window case; `classifyReminderHold` is now evaluated unconditionally (not gated on `settledHighCount === 0`). `renderHookDelivery` (`apps/cli/src/hook-deliver-render.ts`) and `renderChannelEvent` (`apps/cli/src/channel-render.ts`) render `claim.coalescedReminder` as a cap-reserved footer after the packed event block(s). Proven by the "coalesces a due normal-urgency reminder..." / "holds a due normal-urgency reminder while a sibling high-urgency event is still inside its settle window, then coalesces both once it settles (issue #441 review finding 1)" / urgency-mixing-guard cases in `libs/core/src/runtime/service.test.ts`; the `previewCoalescedReminder` cases in `libs/core/src/runtime/hook-cap-redelivery.test.ts`; the withheld/fresh-batch-alongside-settled-high cases in `libs/core/src/runtime/diagnose-hook-delivery.test.ts` and `hook-delivery-diagnosis.test.ts`; and the reminder-footer rendering/sizing cases in `apps/cli/src/hook-deliver-render.test.ts` and `apps/cli/src/channel-render.test.ts`.
@@ -1413,7 +1413,7 @@ from competing transports. That hold ends on commit, release or expiry; the comm
 then remains unread but cannot block the next pending batch. The runtime MUST NOT auto-acknowledge,
 reset prior claims, or re-claim old rows to obtain forward progress.
 
-**Diagnostics.** `already-claimed` means no fresh pending work remains. `reserved-in-flight` means
+**Diagnostics.** `no-new-work` means no fresh pending work remains. `reserved-in-flight` means
 a same-band lease is the temporary blocker, even when older claimed rows coexist; it MUST NOT
 recommend acknowledgment as a remedy. Fresh pending work with no lease produces neither finding.
 `coalesced-until-ack` remains a legacy wire value for compatibility with older daemon responses,
@@ -1589,7 +1589,7 @@ monitor through the persisted pipeline state and returns stages for:
 6. Projection and delivery: `session_event_state` joined to `agent_sessions`, reported as
    `unread`, `claimed`, or `acknowledged`. When a session's unread normal/low events are already
    claimed with no fresh work remaining, or a same-band lease exists, this stage additionally
-   reports a `reminderSuppression` finding: `already-claimed` means no new pending work;
+   reports a `reminderSuppression` finding: `no-new-work` means no new pending work;
    `reserved-in-flight` means a temporary reservation is holding the next batch. A live lease is
    never remediated by acknowledgment. Older claims cannot suppress fresh pending observations.
 
@@ -1730,7 +1730,7 @@ Note: the `inbox_items` table does not share rows with `monitor_events`. They ar
 1. a `urgency: normal` monitor emits a change; the event is persisted and projected into a lead session (unread, unclaimed)
 2. `turn-interruptible` evaluates the §9.2 guard — fresh pending normal work exists and no same-band reservation is active → returns a `DeliveryClaim` with `message: reminderMessage()` and an empty `events` array; the delivering transport appends its own action step naming the ack command, so the recipient can explicitly complete handled work, **and claims the event** (`markClaimed` sets `firstNotifiedAt`; not acknowledged)
 3. a **second** `turn-interruptible` claim finds the event unread-but-claimed → the guard no longer holds → returns `null` (no new pending work exists; a fresh unclaimed normal event restores the reminder independently of the older claim, §9.2)
-4. `monitor explain <id>` reports the `delivery` stage as `ok` with a `reminderSuppression` finding naming the reason (`already-claimed`), so the `null` is explainable rather than silent
+4. `monitor explain <id>` reports the `delivery` stage as `ok` with a `reminderSuppression` finding naming the reason (`no-new-work`), so the `null` is explainable rather than silent
 
 **What this example proves:** the normal reminder fires on the first claim (it is _not_ silently swallowed); batch-level coalescing means a repeat claim without fresh work is intentionally quiet; claiming is not acknowledgment (the event stays unread and durable); and the "why nothing surfaced" answer is inspectable via `monitor explain`, never presented as bare silence. This is the resolution of the blind-study S3 F2 report: a first-run subject who claimed once, then claimed again, saw `null` the second time and mistook intended coalescing for a broken delivery path.
 

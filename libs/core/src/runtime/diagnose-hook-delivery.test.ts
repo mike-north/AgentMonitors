@@ -151,7 +151,7 @@ describe('diagnoseHookDelivery', () => {
     expect(diagnosis.holds).toEqual([]);
   });
 
-  it('reports `already-claimed` for the normal reminder once its only unread event is claimed, and diagnosing never claims it itself (002 §9.2)', () => {
+  it('reports `no-new-work` for the normal reminder once its only unread event is claimed, and diagnosing never claims it itself (002 §9.2)', () => {
     const h = setup();
     const session = openLead(h, 'sess-normal');
     const eventId = materialize(h, 'normal', 'mon', 'obj-a', new Date());
@@ -177,7 +177,7 @@ describe('diagnoseHookDelivery', () => {
     expect(diagnosis.holds).toHaveLength(1);
     expect(diagnosis.holds[0]).toMatchObject({
       urgency: 'normal',
-      reason: 'already-claimed',
+      reason: 'no-new-work',
       unreadCount: 1,
       pendingCount: 0,
       // Regression (issue #425 review, round 6): the exact claimed event id
@@ -347,7 +347,7 @@ describe('diagnoseHookDelivery', () => {
     expect(idle.holds).toHaveLength(1);
     expect(idle.holds[0]).toMatchObject({
       urgency: 'low',
-      reason: 'already-claimed',
+      reason: 'no-new-work',
       claimedEventIds: [eventId],
     });
 

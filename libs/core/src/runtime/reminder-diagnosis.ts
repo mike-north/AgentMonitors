@@ -15,10 +15,11 @@ export type ReminderUrgency = 'normal' | 'low';
 /**
  * Why no fresh reminder can surface. `coalesced-until-ack` is retained only for
  * compatibility with historical diagnostics; new decisions never emit it.
- * `already-claimed` means no fresh pending work remains. `reserved-in-flight`
+ * `no-new-work` means no fresh pending work remains; `already-claimed` is legacy. `reserved-in-flight`
  * is a temporary lease and must never suggest acknowledgment as a remedy.
  */
 export type ReminderSuppressionReason =
+  | 'no-new-work'
   | 'already-claimed'
   | 'coalesced-until-ack'
   | 'reserved-in-flight';
@@ -112,7 +113,7 @@ export function diagnoseReminderSuppression(
     if (c.unreadCount <= 0 || (c.pendingCount > 0 && leasedCount <= 0))
       continue;
     const reason: ReminderSuppressionReason =
-      leasedCount > 0 ? 'reserved-in-flight' : 'already-claimed';
+      leasedCount > 0 ? 'reserved-in-flight' : 'no-new-work';
     findings.push({
       sessionId: c.sessionId,
       urgency: c.urgency,

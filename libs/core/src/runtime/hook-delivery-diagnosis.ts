@@ -29,7 +29,8 @@ import type { DeliveryLifecycle, SessionUnreadCounts } from './types.js';
  *   coalescing; {@link classifyCoalescingWithheldHold}) that is due but held
  *   back by concurrent, still-unsettled high-urgency work it will be
  *   coalesced into once that work settles.
- * - `already-claimed` — no fresh unclaimed work remains in the band.
+ * - `no-new-work` — current policy: no fresh unclaimed work remains; future batches can surface.
+ * - `already-claimed` — legacy policy: old claims block future batches until acknowledgment.
  * - `coalesced-until-ack` — legacy value retained for older daemon responses;
  *   the current policy never emits it because old claims cannot block new work.
  * - `reserved-in-flight` — a live same-band reservation temporarily holds a
@@ -37,6 +38,7 @@ import type { DeliveryLifecycle, SessionUnreadCounts } from './types.js';
  */
 export type HookDeliveryHoldReason =
   | 'settle-window'
+  | 'no-new-work'
   | 'already-claimed'
   | 'coalesced-until-ack'
   | 'reserved-in-flight';
@@ -61,7 +63,7 @@ export interface HookDeliveryHold {
    */
   settleRemainingMs?: number;
   /**
-   * `already-claimed` / `coalesced-until-ack` only: the exact ids of this
+   * `no-new-work` / legacy `already-claimed` / `coalesced-until-ack`: the exact ids of this
    * band's unread-but-already-claimed events. These describe old unread work,
    * not a blocker for a fresh batch under the current policy. Threaded through so a consumer (e.g. `doctor`'s
    * remediation) can acknowledge PRECISELY these rows rather than every
@@ -134,7 +136,7 @@ export function classifyReminderHold(
     };
   }
 
-  const reason: HookDeliveryHoldReason = 'already-claimed';
+  const reason: HookDeliveryHoldReason = 'no-new-work';
   const message = `${label}-urgency reminder at ${lifecycle} is suppressed: all ${String(unreadCount)} unread ${urgency} event(s) are already claimed. They remain unread until explicitly acknowledged (\`${ackHint}\`). A fresh unclaimed ${urgency} event will trigger a new reminder; previously claimed events are not repeated.`;
 
   return {

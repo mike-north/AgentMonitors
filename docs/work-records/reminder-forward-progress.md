@@ -35,3 +35,20 @@ A busy source can generate more reminders than the previous once-until-ack polic
 still batch all currently pending events and retain existing upstream timing/coalescing rules. This
 change does not introduce periodic reminders for old work or a new rate limit. User-visible cadence
 should be assessed in real use separately from correctness of fresh-work progress.
+
+## Adversarial review correction
+
+The reviewer rejected 23cf0de because ignoring `already-claimed` also blessed older daemons whose
+old policy blocks future batches. Two version-skew health tests failed before repair. Current runtime
+now emits distinct `no-new-work`; both legacy reasons remain conservative health failures, independent
+of prose and version strings. Public API report and actual IPC assertions are updated. This revision
+requires a fresh independent review; no merge approval is inferred from earlier tests.
+
+Repair validation: full core suite 617 passed; transport-health 64 passed; live-daemon/urgency
+selection 15 passed; preset override selection 6 passed (including both preset urgency overrides).
+Workspace build and check passed; core API report check passed with the new additive reason.
+Historical changelog entries remain unchanged. Preset rationale and body-delivery comments now
+explain the current forward-progress policy; no preset urgency was changed.
+
+Checkpoint for continuation: repair is ready for exact-SHA independent re-review. Do not push or
+merge from this worker; parent owns those steps. Worktree: reminder-starvation/agentmonitors.

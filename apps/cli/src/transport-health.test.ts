@@ -1255,7 +1255,7 @@ describe('computeTransportHealth', () => {
   });
 });
 
-it('treats an already-claimed-only backlog as no new work, not blocked future delivery', () => {
+it('treats a no-new-work backlog as no new work, not blocked future delivery', () => {
   const diagnosis: HookDeliveryDiagnosis = {
     sessionId: 'session-progress',
     lifecycle: 'turn-interruptible',
@@ -1263,7 +1263,7 @@ it('treats an already-claimed-only backlog as no new work, not blocked future de
     holds: [
       {
         urgency: 'normal',
-        reason: 'already-claimed',
+        reason: 'no-new-work',
         unreadCount: 1,
         pendingCount: 0,
         claimedEventIds: ['older'],
@@ -1279,3 +1279,41 @@ it('treats an already-claimed-only backlog as no new work, not blocked future de
   expect(health.verdict).not.toContain('acknowledged');
   expect(health.remediation.join(' ')).not.toContain('events ack');
 });
+
+it.each(['normal', 'low'] as const)(
+  'does not bless a legacy all-claimed %s backlog as fresh-work capable',
+  (urgency) => {
+    const health = computeTransportHealth(
+      input({
+        diagnoses: [
+          {
+            sessionId: 'legacy',
+            lifecycle:
+              urgency === 'normal' ? 'turn-interruptible' : 'turn-idle',
+            unreadCounts: {
+              low: urgency === 'low' ? 1 : 0,
+              normal: urgency === 'normal' ? 1 : 0,
+              high: 0,
+              total: 1,
+            },
+            holds: [
+              {
+                urgency,
+                reason: 'already-claimed',
+                unreadCount: 1,
+                pendingCount: 0,
+                claimedEventIds: ['A'],
+                message:
+                  'Unrelated prose must not determine the protocol version.',
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    expect(health.deliverable).toBe(false);
+    expect(health.pipelineProblems.map((problem) => problem.code)).toContain(
+      'reminders-suppressed',
+    );
+  },
+);

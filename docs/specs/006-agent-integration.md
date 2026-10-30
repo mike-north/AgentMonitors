@@ -878,15 +878,15 @@ hold reason for anything not yet deliverable:
 
 - `settle-window` — pending high-urgency work exists but is not yet past the 15s claim-time settle
   window (§9.1 of [002](./002-runtime-delivery.md)).
-- `already-claimed` — no fresh pending normal/low work remains. Previously surfaced work stays
+- `no-new-work` — no fresh pending normal/low work remains. Previously surfaced work stays
   unread until explicitly acknowledged; a fresh observation can produce a new reminder independently.
 - `reserved-in-flight` — a same-band reservation temporarily holds the reminder, whether or not
   older claimed rows coexist. Commit, release or expiry resolves it. Acknowledge is never its remedy.
-- `coalesced-until-ack` — retained for older daemon responses only; current runtime decisions no
+- `already-claimed` / `coalesced-until-ack` — retained for older daemon responses only; current runtime decisions no
   longer emit this band-wide starvation hold.
 
-Transport health treats `already-claimed` with no fresh work as an ordinary backlog, not a
-broken delivery path. It still diagnoses legacy `coalesced-until-ack` responses from older daemons
+Transport health treats `no-new-work` with no fresh work as an ordinary backlog, not a
+broken delivery path. It still diagnoses legacy `already-claimed` / `coalesced-until-ack` responses from older daemons
 as blocked fresh work.
 
 **Criterion: stdout MUST be byte-identical between a `--debug` run and a non-`--debug` run of the
@@ -1872,8 +1872,8 @@ that session** (`delivery-diagnosis-unavailable`, §12.4 item 5), never as:
 
 An empty array (`[]`) IS still a valid, deliberate signal for `settle-window` holds — nothing is
 claimed while pending work merely waits out the settle window — but `settle-window` never reaches
-this check at all: only legacy `coalesced-until-ack` holds are suppressing transport-health holds.
-`already-claimed` with no fresh work is an ordinary backlog, not a transport problem. Only a real, non-empty array of non-empty
+this check at all: only legacy `already-claimed` / `coalesced-until-ack` holds are suppressing transport-health holds.
+`no-new-work` with no fresh work is an ordinary backlog, not a transport problem. Only a real, non-empty array of non-empty
 strings is trustworthy.
 
 ### 12.8 The lease keeps the daemon alive for an idle channel-attached session (issue #435 Option A)

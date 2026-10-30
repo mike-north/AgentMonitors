@@ -5622,7 +5622,7 @@ describe('normal-urgency reminder suppression is explainable (issue #333)', () =
         lifecycle: 'turn-interruptible',
         unreadCount: 1,
         claimedCount: 1,
-        reason: 'already-claimed',
+        reason: 'no-new-work',
       });
     } finally {
       vi.useRealTimers();

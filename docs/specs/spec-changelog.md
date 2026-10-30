@@ -34,8 +34,8 @@ Deliberately replaces the normal/low `pending === unread` guard: a claimed-but-u
 no longer blocks fresh pending events of the same band. Each eligible batch is claimed once; no
 automatic acknowledgment or replay of old claims is introduced. Same-band reservations still hold
 new reminders temporarily until commit/release/expiry, and high settle coalescing is unchanged.
-Diagnostics now distinguish no-new-work (`already-claimed`) from a live lease (`reserved-in-flight`);
-legacy `coalesced-until-ack` values remain accepted but are no longer emitted. This policy change
+Diagnostics now distinguish no-new-work (`no-new-work`) from a live lease (`reserved-in-flight`);
+legacy `already-claimed` / `coalesced-until-ack` values remain accepted but are no longer emitted. This policy change
 closes reminder starvation identified in the Chief of Staff reliability review; it is separate from
 the earlier acknowledgment-instruction fix (#434) and from any claim-TTL design (#468).
 

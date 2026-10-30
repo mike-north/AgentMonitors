@@ -14,7 +14,7 @@ describe('diagnoseReminderSuppression', () => {
     expect(diagnoseReminderSuppression(counts)).toEqual([]);
   });
 
-  it('reports `already-claimed` when the only unread normal event is claimed (the S3 trap, §9.2)', () => {
+  it('reports `no-new-work` when the only unread normal event is claimed (the S3 trap, §9.2)', () => {
     // The S3 sequence: reminder fired once (claiming the event), so a second
     // claim finds unread=1 (still unacked), pending=0 (claimed) → suppressed.
     const counts: ReminderSessionCounts[] = [
@@ -29,7 +29,7 @@ describe('diagnoseReminderSuppression', () => {
       lifecycle: 'turn-interruptible', // §9.2 delivers at turn-interruptible
       unreadCount: 1,
       claimedCount: 1,
-      reason: 'already-claimed',
+      reason: 'no-new-work',
     });
     // The message must name BOTH the mechanism and the policy, and the remedy.
     expect(finding?.message).toContain('already claimed');
@@ -113,7 +113,7 @@ describe('diagnoseReminderSuppression', () => {
     expect(findings[0]).toMatchObject({
       urgency: 'low',
       lifecycle: 'turn-idle', // §9.3 delivers at turn-idle
-      reason: 'already-claimed',
+      reason: 'no-new-work',
     });
     expect(findings[0]?.message).toContain('Low-urgency reminder at turn-idle');
   });

@@ -20,11 +20,11 @@ describe('classifyReminderHold', () => {
     expect(classifyReminderHold('low', 0, 0)).toBeNull();
   });
 
-  it('reports `already-claimed` when the only unread normal event is claimed (§9.2)', () => {
+  it('reports `no-new-work` when the only unread normal event is claimed (§9.2)', () => {
     const hold = classifyReminderHold('normal', 1, 0);
     expect(hold).toMatchObject({
       urgency: 'normal',
-      reason: 'already-claimed',
+      reason: 'no-new-work',
       unreadCount: 1,
       pendingCount: 0,
     });
@@ -55,7 +55,7 @@ describe('classifyReminderHold', () => {
     const hold = classifyReminderHold('low', 1, 0);
     expect(hold).toMatchObject({
       urgency: 'low',
-      reason: 'already-claimed',
+      reason: 'no-new-work',
     });
     expect(hold?.message).toContain('turn-idle');
     expect(hold?.message).toContain('Low-urgency reminder');
