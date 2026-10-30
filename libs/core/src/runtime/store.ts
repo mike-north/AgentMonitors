@@ -736,6 +736,10 @@ export class RuntimeStore {
    * 002 §1.1.2) — the shared artifact diffed against THAT session's own baseline
    * cursor, recorded on `session_event_state.diff_text`.
    *
+   * The event, its projections, initial recipient cursors, and supplied snapshot
+   * commit together in one immediate transaction. Any failure rolls back that
+   * entire materialization; callers must not save its snapshot separately.
+   * An empty snapshot is present data and is persisted just like nonempty text.
    * The per-recipient diff lives here (not after an Interpret await) so all
    * durable writes complete synchronously BEFORE the critical-path boundary,
    * preserving the `ingest()` ordering invariant (002 §1.1.8).
@@ -747,8 +751,11 @@ export class RuntimeStore {
    *   (`previousContent`, or `null`/absent at a baseline event). Used to SEED a
    *   first-time recipient's cursor so a session registered after an earlier
    *   change hears only changes AFTER it registered, not a full-current-state
-   *   first delta (decided semantics Q1). When omitted, no per-recipient diff is
-   *   computed (snapshot-less event).
+   *   first delta (decided semantics Q1). When omitted, a first-time recipient
+   *   starts from the current artifact; an existing recipient keeps its cursor.
+   * @throws If `input.snapshotText` is non-null but `input.objectKey` is null:
+   *   persisted snapshots require an object identity. Snapshot-less events may
+   *   omit that identity.
    */
   insertEvent(
     input: Omit<MonitorEventRecord, 'id'>,
