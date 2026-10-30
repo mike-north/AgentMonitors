@@ -181,9 +181,9 @@ multi-values flattened):
   always claims additional normal-urgency rows alongside its high event(s) (`claimDelivery` claims
   `surfacedCandidates` **and** `normalPending` together), so routing per-event meta to that one
   event's own IDs would invite a scoped ack (via `agentmon_ack`) that leaves the coalesced normal rows
-  claimed-but-unacknowledged — still requiring explicit handling and acknowledgment
-  (002 §9.2's `normalPending.length === unreadNormal.length` gate never re-fires while they sit
-  claimed). Such a claim is always summarized at the claim level, identically to a claim with
+  claimed-but-unacknowledged and outside that scoped acknowledgment. Those rows still require
+  explicit handling and acknowledgment, even though fresh pending work remains eligible under
+  002 §9.2. Such a claim is always summarized at the claim level, identically to a claim with
   multiple events.
 
 The `source` attribute on the rendered `<channel>` tag is set by the host from the MCP server name
@@ -884,6 +884,8 @@ hold reason for anything not yet deliverable:
   older claimed rows coexist. Commit, release or expiry resolves it. Acknowledge is never its remedy.
 - `already-claimed` / `coalesced-until-ack` — retained for older daemon responses only; current runtime decisions no
   longer emit this band-wide starvation hold.
+- `deferred-by-cap` — settled high-urgency events existed but some were deferred by the transport's
+  own 4000-char cap (§5.5); a hold reason owned by this transport, not the runtime.
 
 Transport health treats `no-new-work` with no fresh work as an ordinary backlog, not a
 broken delivery path. It still diagnoses legacy `already-claimed` / `coalesced-until-ack` responses from older daemons
@@ -1852,7 +1854,7 @@ in the store within a bound — would upgrade this from advisory to detection.
 crosses the daemon IPC boundary, so it can arrive from a build that predates the field entirely — the
 type describes what THIS build produces, not what a remote peer actually sent on the wire.
 
-`doctor` must treat a legacy suppressing (`coalesced-until-ack`) hold whose
+`doctor` must treat a legacy suppressing (`already-claimed` or `coalesced-until-ack`) hold whose
 `claimedEventIds` is not a real, NON-EMPTY array of non-empty strings as **diagnosis-unavailable for
 that session** (`delivery-diagnosis-unavailable`, §12.4 item 5), never as:
 
