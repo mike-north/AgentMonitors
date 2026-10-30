@@ -83,13 +83,13 @@ const DEFAULT_HIGH_URGENCY_SETTLE_MS =
 const MAX_RECAP_EVENTS = 10;
 
 /**
- * Per-session dormancy threshold (002 §6.2 / 007 §4.4). A session that has not
+ * Per-session dormancy threshold (spec: delivery/session-projection, agent/ephemeral-monitors). A session that has not
  * advanced its `lastActiveAt` for at least this long is treated as **dormant by
  * inactivity** — a backstop for a session that vanished without an explicit
- * close ([002 §6.1](../../../docs/specs/002-runtime-delivery.md)) — so its
+ * close ([spec: delivery/session-projection](../../../../openspec/specs/delivery/session-projection/spec.md)) — so its
  * ephemeral monitors are reaped even though it never called `session close`.
  * This is a per-session transition, distinct from the daemon-wide idle
- * self-termination (002 §10.2). Overridable via the runtime constructor for
+ * self-termination (spec: daemon/ipc). Overridable via the runtime constructor for
  * deterministic tests.
  */
 const DEFAULT_SESSION_DORMANCY_MS = 30 * 60 * 1_000;
@@ -175,7 +175,7 @@ function describeCadence(
 }
 /**
  * Semantic, transport-neutral body for a coalesced normal/low-urgency reminder
- * (002 §9.2/§9.3). This is the message a `DeliveryClaim` with no event bodies
+ * (spec: delivery/lifecycles). This is the message a `DeliveryClaim` with no event bodies
  * carries.
  *
  * Two properties, each fixing a defect of the former `NORMAL_INBOX_PROMPT`
@@ -188,7 +188,7 @@ function describeCadence(
  *    Emitting "AgentMon" here double-attributed the channel. So the runtime,
  *    per the host-agnostic-core rule, emits only the semantic message.
  * 2. **No reference to the legacy `inbox` model.** `inbox_items` is
- *    non-authoritative (002 §12); the authoritative path is
+ *    non-authoritative (spec: inbox/legacy-inbox — "Inbox item state machine", "Inbox is not the authoritative delivery path"); the authoritative path is
  *    events/session-projection. "Read the inbox" pointed at a deprecated
  *    concept with no runnable referent.
  *
@@ -219,8 +219,8 @@ function reminderMessage(): string {
  * cross-monitor coalescing). Reuses the exact transport-neutral
  * {@link reminderMessage} body so the coalesced reminder reads identically to a
  * standalone normal reminder — just one more line of the same message rather
- * than a separate delivery. Per #445's wording contract (002 §9.2 / 006
- * §5.1.1) this shared suffix carries ONLY the semantic body — no product
+ * than a separate delivery. Per #445's wording contract (spec: delivery/lifecycles /
+ * spec: delivery/channel-transport, delivery/hook-transport, delivery/transport-seam) this shared suffix carries ONLY the semantic body — no product
  * prefix, no CLI/tool verb. Each transport appends its own acknowledge action
  * step (hook: `agentmonitors events ack`; channel: `agentmon_ack`) from the
  * claim's `coalescedReminder` field when it renders the footer.
@@ -323,7 +323,7 @@ const URGENCY_RANK: Record<Urgency, number> = {
  * escalated — every salience clamps back to the single authored level,
  * preserving PP5 and full backward compatibility.
  *
- * @see docs/specs/002-runtime-delivery.md §4.1
+ * @see openspec/specs/runtime/notify-dispatch/spec.md
  */
 function effectiveObservationUrgency(
   monitor: MonitorDefinition,
@@ -334,7 +334,7 @@ function effectiveObservationUrgency(
   // persisted state (before the range-urgency change was deployed). Treat a
   // missing value as a degenerate band (`hi === lo`) — the observation can never
   // escalate, and we return the base urgency. This is the same semantics as a
-  // bare scalar urgency (full backward compat). See 002 §3 restart-safety note.
+  // bare scalar urgency (full backward compat). See spec: runtime/monitor-state restart-safety note.
   // The cast to `Urgency | undefined` is intentional: at compile time
   // `MonitorFrontmatter.urgencyMax` is always `Urgency`, but pre-upgrade
   // deserialized JSON may lack the field entirely.
@@ -371,7 +371,7 @@ function hydrateStoredObservationEnvelope(
       envelope.observedAt instanceof Date
         ? envelope.observedAt
         : new Date(envelope.observedAt),
-    // Restart-safety / upgrade backfill (002 §3, issue #109): a debounce batch
+    // Restart-safety / upgrade backfill (spec: runtime/monitor-state, issue #109): a debounce batch
     // persisted BEFORE the range-urgency upgrade will have no `effectiveUrgency`
     // field on its envelopes. Recompute it from the envelope's `monitor` +
     // `observation` so the materialized event row is never written with
@@ -482,7 +482,7 @@ function summarizeEvents(events: { title: string; summary: string }[]): string {
 }
 
 /**
- * Build the recipient-visible summary for one event (G14, 002 §1.1.8): prefer
+ * Build the recipient-visible summary for one event (spec: pipeline/post-processing): prefer
  * the per-session Interpret digest when present (the agentic gate produced a
  * cheap digest for this recipient), otherwise fall back to the deterministic
  * `summary` → `body` → `title` chain. Shared by the claim and preview paths so
@@ -502,13 +502,13 @@ function recipientSummary(
  *
  * `perRecipientDiffs` maps each surfaced event id → the delta THIS recipient
  * computed against its OWN baseline cursor (`session_event_state.diff_text`,
- * G10 / 002 §1.1.2). Surfacing the per-recipient delta — not the shared
+ * spec: pipeline/post-processing). Surfacing the per-recipient delta — not the shared
  * latest-snapshot delta on `MonitorEventRecord.diffText` — is what keeps the
  * change summary correct under divergent recipient cursors: a session last seen
  * at `a1` receives the full `a1→a3` span, while a session already caught up to
  * `a2` receives only `a2→a3` from the same shared observation (session isolation,
  * issue #436). The shared `MonitorEventRecord.diffText` is used only as the
- * legacy fallback for pre-G10 rows whose per-recipient column is NULL (mirroring
+ * legacy fallback for pre-per-recipient-delta rows whose per-recipient column is NULL (mirroring
  * `perRecipientDiffsForSession`'s own contract and the explain projection).
  */
 function toDeliveryEventSummary(
@@ -583,14 +583,14 @@ export class AgentMonitorRuntime {
   private readonly activeWatchers = new Map<string, symbol>();
 
   /**
-   * The per-session dormancy threshold in ms (002 §6.2 / 007 §4.4). Defaults to
+   * The per-session dormancy threshold in ms (spec: delivery/session-projection, agent/ephemeral-monitors). Defaults to
    * {@link DEFAULT_SESSION_DORMANCY_MS}; overridable for deterministic tests.
    */
   private readonly sessionDormancyMs: number;
 
   /**
    * In-memory reservations for the reserve → commit/release surfacing protocol
-   * (006 §4, issue #300). Daemon-local by design — both transports drive the one
+   * (spec: delivery/channel-transport, issue #300). Daemon-local by design — both transports drive the one
    * runtime, and a lost lease safely returns its rows to the hook path.
    */
   private readonly reservations: DeliveryReservationRegistry;
@@ -600,21 +600,21 @@ export class AgentMonitorRuntime {
     private readonly registry: SourceRegistry,
     private readonly adapters: AgentRuntimeAdapter[] = [claudeCodeAdapter],
     /**
-     * The optional **Interpret adapter** (G14, 002 §1.1.8). When present, a
+     * The optional **Interpret adapter** (spec: pipeline/post-processing). When present, a
      * `payload.form: prose` monitor's per-recipient delta is read by the user's
      * own AI tool to produce a cheap digest + agentic significance gate. When
      * absent, Interpret never runs (fully backward compatible) and `prose`
      * deliveries carry the deterministic `rendered` artifact. The runtime core
      * never embeds the tool's command string — the host-specific invocation lives
-     * behind this adapter (002 §11.1, 006 §2.1, AP3).
+     * behind this adapter (spec: delivery/host-adapters, delivery/transport-seam, AP3).
      */
     private readonly interpretAdapter?: InterpretAdapter,
     /**
      * Optional runtime tuning. `sessionDormancyMs` overrides the per-session
-     * dormancy threshold (002 §6.2 / 007 §4.4) — used by tests to exercise
+     * dormancy threshold (spec: delivery/session-projection, agent/ephemeral-monitors) — used by tests to exercise
      * inactivity-triggered ephemeral-monitor reaping deterministically.
      * `deliveryReservationTtlMs` overrides the uncommitted-reservation lifetime
-     * (006 §4, issue #300) — used by tests to exercise lease expiry
+     * (spec: delivery/channel-transport, issue #300) — used by tests to exercise lease expiry
      * deterministically.
      */
     options: {
@@ -645,67 +645,67 @@ export class AgentMonitorRuntime {
 
   closeSession(sessionId: string): AgentSessionRecord {
     const session = this.store.closeSession(sessionId);
-    // Reap the session's ephemeral monitors (007 §4.4): a session that ends or
+    // Reap the session's ephemeral monitors (spec: agent/ephemeral-monitors): a session that ends or
     // goes dormant MUST release its session-scoped watches immediately — they
     // must not outlive the session, leak into another session, or resurrect
     // after a daemon restart. Reaping retains their already-materialized events
     // (the session record goes dormant, not deleted) so a late delivery is never
-    // silently dropped (007 §4.4 default retention, PP1).
+    // silently dropped (spec: agent/ephemeral-monitors default retention, PP1).
     this.store.reapEphemeralMonitorsForSession(sessionId);
     this.refreshHookState(session.id);
     return session;
   }
 
   /**
-   * Declare an ephemeral (agent-declared, session-scoped) monitor (007 §4.2):
+   * Declare an ephemeral (agent-declared, session-scoped) monitor (spec: agent/ephemeral-monitors):
    * "tell me when _X_, and remind me of _this instruction_ when it does." The
    * declaration binds to the resolved AgentMon session, is validated by the
    * **same** {@link validateScope} path as `agentmonitors validate` (so an
    * ephemeral monitor cannot express a config a persistent one could not), is
-   * assigned a namespaced runtime identity (007 §4.3), and is persisted durably
-   * so it survives a daemon restart while the session lives (007 §4.4). The
+   * assigned a namespaced runtime identity (spec: agent/ephemeral-monitors — "Namespaced ephemeral identity", "Ephemeral identity is stable for the monitor lifetime"), and is persisted durably
+   * so it survives a daemon restart while the session lives (spec: agent/ephemeral-monitors). The
    * declaration performs **no** watching: it registers intent and returns; the
-   * daemon does all subsequent observation on the normal tick (PP9, 007 §4.5).
+   * daemon does all subsequent observation on the normal tick (PP9, spec: agent/ephemeral-monitors).
    *
    * @throws if the bound session is unknown or not active (an unbindable
-   *   declaration is rejected, never silently made global — 007 §4.2), the source
+   *   declaration is rejected, never silently made global — spec: agent/ephemeral-monitors), the source
    *   is unknown, or the scope/urgency is invalid.
    */
   declareEphemeralMonitor(
     input: DeclareEphemeralMonitorInput,
   ): EphemeralMonitorRecord {
-    // 1. Resolve + validate the binding session (007 §4.2).
+    // 1. Resolve + validate the binding session (spec: agent/ephemeral-monitors).
     const session = this.store.findSessionById(input.sessionId);
     if (!session) {
       throw new Error(
         `Cannot declare an ephemeral monitor: session "${input.sessionId}" was not found. ` +
-          'A declaration must bind to a live AgentMon session (007 §4.2).',
+          'A declaration must bind to a live AgentMon session (spec: agent/ephemeral-monitors).',
       );
     }
     if (session.status !== 'active') {
       throw new Error(
         `Cannot declare an ephemeral monitor: session "${input.sessionId}" is ${session.status}. ` +
-          'A declaration must bind to an active session (007 §4.2).',
+          'A declaration must bind to an active session (spec: agent/ephemeral-monitors).',
       );
     }
     // An ephemeral monitor's events project into the declaring session ONLY, and
-    // projection is filtered to LEAD sessions (007 §4.6 / 002 §6). A monitor bound
+    // projection is filtered to LEAD sessions (spec: agent/ephemeral-monitors, delivery/session-projection). A monitor bound
     // to a subagent session would therefore observe forever but never deliver a
     // single event — a silently-dead watch. Reject it at declaration time rather
     // than register something that can never fire.
     if (session.role !== 'lead') {
       throw new Error(
         `Cannot declare an ephemeral monitor: session "${input.sessionId}" is a ${session.role} session. ` +
-          'Ephemeral-monitor events project into lead sessions only (007 §4.6), so a ' +
+          'Ephemeral-monitor events project into lead sessions only (spec: agent/ephemeral-monitors), so a ' +
           'non-lead binding would never deliver — declare from the lead session.',
       );
     }
 
     // 2. Validate the source name + scope via the SAME `validateScope` path as
-    //    `agentmonitors validate` (007 §4.2, AP4/BP3). `validateWatchScope`
+    //    `agentmonitors validate` (spec: agent/ephemeral-monitors, AP4/BP3). `validateWatchScope`
     //    (schema check + the shared BP3 change-detection.collection friendly
     //    error) is the exact path `agentmonitors validate` uses, so an invalid
-    //    scope is rejected with the IDENTICAL diagnosis (005 §14.4).
+    //    scope is rejected with the IDENTICAL diagnosis (spec: agent/ephemeral-monitors).
     const source = this.registry.get(input.source);
     if (!source) {
       throw new Error(
@@ -744,7 +744,7 @@ export class AgentMonitorRuntime {
     //     ephemeral monitor's ONLY naming affordance (no frontmatter file), and it
     //     flows into `frontmatter.name` on every tick reconstruction
     //     (`ephemeralRecordToMonitor` below). A present-but-blank name would
-    //     silently win over the source title there (002 §5.4's precedence) and
+    //     silently win over the source title there (the runtime/event-materialization spec's precedence) and
     //     durably headline every delivered event with whitespace. Mirrors the
     //     same rejection `monitorFrontmatterSchema`'s `name` field applies to a
     //     persistent monitor's frontmatter.
@@ -755,7 +755,7 @@ export class AgentMonitorRuntime {
       );
     }
 
-    // 4. Assign the namespaced runtime identity (007 §4.3) and persist.
+    // 4. Assign the namespaced runtime identity (spec: agent/ephemeral-monitors — "Namespaced ephemeral identity", "Ephemeral identity is stable for the monitor lifetime") and persist.
     const id = `${EPHEMERAL_MONITOR_ID_PREFIX}${session.id}/${ulid()}`;
     const record = this.store.insertEphemeralMonitor({
       id,
@@ -769,8 +769,8 @@ export class AgentMonitorRuntime {
       ...(input.displayName ? { displayName: input.displayName } : {}),
     });
     // Declaring a watch IS session activity: bump the session's `lastActiveAt`
-    // so a declaration on its own resets the per-session dormancy clock (002
-    // §6.2 / 007 §4.4). Without this, only `claimDelivery`/recap advance it, so a
+    // so a declaration on its own resets the per-session dormancy clock (
+    // spec: delivery/session-projection, agent/ephemeral-monitors). Without this, only `claimDelivery`/recap advance it, so a
     // session that declares a watch and then blocks on one long tool call (no
     // hooks) would be reaped mid-wait and lose its watches — exactly the case a
     // watch exists for. See also the declaredAt guard in `staleActiveSessions`.
@@ -778,13 +778,13 @@ export class AgentMonitorRuntime {
     return record;
   }
 
-  /** List the active ephemeral monitors declared by a session (007 §4, `watch list`). */
+  /** List the active ephemeral monitors declared by a session (spec: agent/ephemeral-monitors, `watch list`). */
   listEphemeralMonitors(sessionId: string): EphemeralMonitorRecord[] {
     return this.store.listEphemeralMonitorsForSession(sessionId);
   }
 
   /**
-   * Cancel an ephemeral monitor (007 §4.4, `watch cancel`), reaping it
+   * Cancel an ephemeral monitor (spec: agent/ephemeral-monitors, `watch cancel`), reaping it
    * immediately. The `sessionId` MUST own the monitor — a session can only
    * cancel its own watches (session isolation) — so a cancel targeting another
    * session's id, or an unknown id, is rejected.
@@ -807,7 +807,7 @@ export class AgentMonitorRuntime {
 
   /**
    * Rebuild the pipeline-facing {@link MonitorDefinition} from a durable
-   * ephemeral declaration (007 §4.6). Reconstructed on every tick (and after a
+   * ephemeral declaration (spec: agent/ephemeral-monitors). Reconstructed on every tick (and after a
    * daemon restart) so an ephemeral monitor flows the identical pipeline as a
    * persistent one (AP7). The urgency band is restored to its `lo..hi` string
    * form so the frontmatter schema reproduces the same flattened
@@ -831,8 +831,8 @@ export class AgentMonitorRuntime {
       // An explicit `--display-name` IS the authored name for an ephemeral
       // monitor — its only naming affordance, since it has no frontmatter file.
       // It must reach `frontmatter.name` (not just `displayName`) so the event
-      // title rule (002 §5.4) treats ephemeral and persistent monitors
-      // identically (007 §4.6). Absent, `name` stays unset and the source title
+      // title rule (spec: runtime/event-materialization) treats ephemeral and persistent monitors
+      // identically (spec: agent/ephemeral-monitors). Absent, `name` stays unset and the source title
       // remains the fallback, exactly as for a nameless persistent monitor.
       ...(record.displayName ? { name: record.displayName } : {}),
     });
@@ -846,12 +846,12 @@ export class AgentMonitorRuntime {
   }
 
   /**
-   * Per-session dormancy transition (002 §6.2 / 007 §4.4). Before evaluating
+   * Per-session dormancy transition (spec: delivery/session-projection, agent/ephemeral-monitors). Before evaluating
    * monitors on a tick, move any `active` session in `workspacePath` that has
    * been inactive for at least {@link sessionDormancyMs} to `dormant` and reap
    * its ephemeral monitors — a backstop for a session that vanished without an
    * explicit `session close`. Distinct from the daemon-wide idle self-termination
-   * (002 §10.2), which stops the whole daemon once ALL a workspace's sessions are
+   * (spec: daemon/ipc), which stops the whole daemon once ALL a workspace's sessions are
    * inactive.
    */
   private reapDormantSessions(
@@ -1138,10 +1138,10 @@ export class AgentMonitorRuntime {
     if (schedule.error) {
       // Defensive isolation (issue #297): scheduleForMonitor() never throws —
       // an invalid IANA timezone surfaces here as `schedule.error` instead.
-      // explainMonitor() MUST NOT mutate runtime state (002 §10.7), so — unlike
+      // explainMonitor() MUST NOT mutate runtime state (spec: daemon/ipc), so — unlike
       // the tick path — this does NOT write an observation_history row.
       //
-      // Stage placement: the failure is in cron/timezone evaluation (002 §10.7
+      // Stage placement: the failure is in cron/timezone evaluation (spec: daemon/ipc
       // stage 2, "Scheduling"), not observe() (stage 3, "Observation") — the
       // source was never even called. It is nonetheless rendered as an
       // 'observation'-stage failure, DELIBERATELY, for consistency with the
@@ -1340,7 +1340,7 @@ export class AgentMonitorRuntime {
       notifyState.pendingRollup.observations.length > 0
     ) {
       // Rollup is accumulating: the notify layer is intentionally holding
-      // observations until the next delivery window fires (002 §4.4). This is
+      // observations until the next delivery window fires (spec: runtime/notify-dispatch, pipeline/post-processing). This is
       // expected `pending` — not a bug — consistent with the debounce branch.
       notifyPending = true;
       const count = notifyState.pendingRollup.observations.length;
@@ -1452,7 +1452,7 @@ export class AgentMonitorRuntime {
         },
         {},
       );
-      // Per-recipient Interpret verdicts (G14, 002 §1.1.8): surface why a `prose`
+      // Per-recipient Interpret verdicts (spec: pipeline/post-processing): surface why a `prose`
       // delta was suppressed-as-not-substantive or fell back after a tool failure,
       // so "why nothing fired" is inspectable (capability C12). The verdict is
       // recorded right of the seam, on each projection.
@@ -1568,7 +1568,7 @@ export class AgentMonitorRuntime {
 
   /**
    * Produce a workspace-wide, durable-state health report — the read-only
-   * diagnosis behind `agentmonitors doctor` (005 §"doctor", issue #267). Unlike
+   * diagnosis behind `agentmonitors doctor` (spec: cli/doctor, issue #267). Unlike
    * {@link explainMonitor} (single-monitor, staged) this rolls up every monitor
    * in the tree plus the workspace's lead-session state, so an author can answer
    * "is my monitoring working, and if not, where is it broken?" from one call.
@@ -1873,26 +1873,26 @@ export class AgentMonitorRuntime {
   }
 
   /**
-   * Claim the pending delivery for a session at a lifecycle point (002 §9) —
+   * Claim the pending delivery for a session at a lifecycle point (spec: delivery/lifecycles) —
    * decide the delivery and apply it (mark claimed) in one atomic step. This is
    * the immediate, single-call path the hook transport uses.
    *
    * The reserve → commit path ({@link reserveDelivery}/{@link commitDelivery})
    * splits the same decision from its persistence, so a transport that must
    * surface the claim over a fallible channel can defer the claim until the push
-   * succeeds (006 §4, issue #300); this method is exactly `decide → apply`.
+   * succeeds (spec: delivery/channel-transport, issue #300); this method is exactly `decide → apply`.
    *
    * `maxEvents` bounds how many delivered events a **`turn-interruptible`
    * high-urgency** claim actually surfaces AND claims (issue #299). A transport
    * whose surface is length-bounded — the hook-deliver transport renders into a
-   * 4000-char `additionalContext` (006 §5.1) — first sizes how many whole event
+   * 4000-char `additionalContext` (spec: delivery/hook-transport) — first sizes how many whole event
    * blocks fit (via {@link previewSettledHighDelivery}) and passes that count, so
    * we claim ONLY the events it renders and leave the truncated-away remainder
    * pending (`first_notified_at` NULL) to re-deliver at the next context event.
    * `undefined` (the default, and every non-capped caller such as the channel
    * transport) claims the full delivered set exactly as before. It has no effect
    * on the reminder / low / recap branches, which inject no per-event bodies
-   * (reminders) or already self-heal by re-showing all unread (recap, 006 §5.5).
+   * (reminders) or already self-heal by re-showing all unread (recap, spec: delivery/channel-transport, delivery/hook-transport).
    */
   claimDelivery(
     sessionId: string,
@@ -1908,10 +1908,10 @@ export class AgentMonitorRuntime {
 
   /**
    * Reserve — but do NOT yet claim — the pending delivery for a session at a
-   * lifecycle point (006 §4, issue #300). Returns the SAME {@link DeliveryClaim}
+   * lifecycle point (spec: delivery/channel-transport, issue #300). Returns the SAME {@link DeliveryClaim}
    * a {@link claimDelivery} would (rendered from the identical decision) plus an
    * opaque `reservationId`, and LEASES the underlying rows so the hook transport
-   * will not double-surface them (the cross-transport dedup boundary of 006 §4.5,
+   * will not double-surface them (the cross-transport dedup boundary of spec: delivery/channel-transport,
    * now enforced from reserve time). Crucially it performs **no** store mutation:
    * `first_notified_at` ("was surfaced") is stamped only when the caller
    * {@link commitDelivery} after a successful surface. On a failed/disconnected
@@ -1945,7 +1945,7 @@ export class AgentMonitorRuntime {
 
   /**
    * Commit a reservation from {@link reserveDelivery} after its claim was
-   * surfaced (006 §4, issue #300): apply the deferred claim (mark the reserved
+   * surfaced (spec: delivery/channel-transport, issue #300): apply the deferred claim (mark the reserved
    * rows claimed, "was surfaced" — BP2, not acknowledged), returning the claim.
    * Returns `null` if the reservation is unknown or already expired — the rows
    * were never permanently consumed, so a stale commit is a safe no-op (they may
@@ -1959,7 +1959,7 @@ export class AgentMonitorRuntime {
   }
 
   /**
-   * Release a reservation from {@link reserveDelivery} WITHOUT claiming (006 §4,
+   * Release a reservation from {@link reserveDelivery} WITHOUT claiming (spec: delivery/channel-transport,
    * issue #300): the push failed or disconnected, so drop the lease and return
    * the rows to `pending`, where the hook transport (or the next channel poll)
    * re-delivers them. A no-op for an unknown/expired reservation.
@@ -1974,10 +1974,10 @@ export class AgentMonitorRuntime {
 
   /**
    * Pending (not-yet-claimed) events for a session's claim decision, MINUS any
-   * currently leased by an outstanding reservation (006 §4, issue #300). Leased
+   * currently leased by an outstanding reservation (spec: delivery/channel-transport, issue #300). Leased
    * rows are hidden from the claim decision so a concurrent hook claim does not
-   * surface an event the channel is mid-surfacing (cross-transport dedup, 006
-   * §4.5). A released/expired lease restores them on the next call.
+   * surface an event the channel is mid-surfacing (cross-transport dedup,
+   * spec: delivery/channel-transport). A released/expired lease restores them on the next call.
    */
   private pendingForClaim(
     sessionId: string,
@@ -1992,7 +1992,7 @@ export class AgentMonitorRuntime {
   /**
    * The count of a band's pending (unclaimed) events that are currently held
    * out of {@link pendingForClaim} because they are LEASED by an outstanding
-   * reservation (006 §4, issue #300; PR #445 review round 10) — i.e. an
+   * reservation (spec: delivery/channel-transport, issue #300; PR #445 review round 10) — i.e. an
    * in-flight channel push is mid-surfacing them, not a durable claim. Callers
    * that explain WHY a coalesced reminder is held (`monitor explain`,
    * {@link diagnoseHookDelivery}) need this split out from truly-claimed rows:
@@ -2059,7 +2059,7 @@ export class AgentMonitorRuntime {
         this.leasedPendingCount(sessionId, 'normal') === 0;
 
       if (settledHigh.length > 0) {
-        // Per-recipient `net` collapse (G10 PR-B, 002 §1.1.7): deliver only the
+        // Per-recipient `net` collapse (spec: pipeline/post-processing): deliver only the
         // newest event per object for a `net` monitor; the older intermediates
         // are folded away and (at apply time) recorded claimed-but-suppressed.
         // The decision is the pure {@link computeNetCollapseView}; the mutating
@@ -2202,12 +2202,12 @@ export class AgentMonitorRuntime {
 
     const unread = this.store.unreadEventsForSession(sessionId);
     if (lifecycle === 'post-compact' && unread.length > 0) {
-      // Per-recipient `net` collapse (G10 PR-B, 002 §1.1.7) over the FULL unread
+      // Per-recipient `net` collapse (spec: pipeline/post-processing) over the FULL unread
       // set, then recap only the delivered (post-collapse) tail. The full set is
       // claimed at apply time so the cursor advances and suppressed intermediates
       // are consumed. Recap reads all UNREAD (not pending), so a leased row is
       // still recapped — a lease is not acknowledgement, and recap re-shows unread
-      // until acked (006 §5.5).
+      // until acked (spec: delivery/channel-transport, delivery/hook-transport).
       const deliveredUnread = computeNetCollapseView(unread).delivered;
       const recapSlice = deliveredUnread.slice(-MAX_RECAP_EVENTS);
       const recapIds = recapSlice.map((event) => event.id);
@@ -2281,7 +2281,7 @@ export class AgentMonitorRuntime {
    * Non-mutating preview of the settled high-urgency events a
    * `turn-interruptible` {@link claimDelivery} WOULD surface right now, in
    * delivery order (issue #299). A length-bounded transport (the hook-deliver
-   * transport, 006 §5.1) calls this FIRST to size how many whole event blocks
+   * transport, spec: delivery/hook-transport) calls this FIRST to size how many whole event blocks
    * fit under its context cap, then passes that count back as `claimDelivery`'s
    * `maxEvents` so it claims exactly the events it renders. Returns `[]` when no
    * settled high delivery is pending (the caller then falls through to an
@@ -2332,7 +2332,7 @@ export class AgentMonitorRuntime {
    * packed blocks (see `renderHookDelivery`/`renderChannelEvent`), so sizing
    * against the event blocks alone — without reserving room for this text —
    * risks a claim that fits its events but overflows once the coalesced
-   * reminder is appended, or truncates the reminder away (both a 006 §5.5
+   * reminder is appended, or truncates the reminder away (both a spec: delivery/channel-transport, delivery/hook-transport
    * claimed-but-unrendered violation). Returns `undefined` when no reminder
    * would be coalesced right now (nothing pending/due, or no settled
    * high-urgency work to coalesce it into). Reads only — never claims,
@@ -2493,7 +2493,7 @@ export class AgentMonitorRuntime {
       skippedMonitors: [],
     };
 
-    // Per-session dormancy (002 §6.2 / 007 §4.4): before evaluating anything,
+    // Per-session dormancy (spec: delivery/session-projection, agent/ephemeral-monitors): before evaluating anything,
     // transition stale active sessions to dormant and reap their ephemeral
     // monitors, so a session that vanished without an explicit close still
     // releases its session-scoped watches this tick (and they never fire below).
@@ -2525,9 +2525,9 @@ export class AgentMonitorRuntime {
     }
 
     // Ephemeral monitors (agent-declared, session-scoped) flow the IDENTICAL
-    // pipeline (007 §4.6, AP7): each is rebuilt into a MonitorDefinition and run
+    // pipeline (spec: agent/ephemeral-monitors, AP7): each is rebuilt into a MonitorDefinition and run
     // through the SAME `evaluateMonitorOnTick`, threading its declaring session
-    // id so materialized events project ONLY to that session (007 §4.6 isolation).
+    // id so materialized events project ONLY to that session (spec: agent/ephemeral-monitors isolation).
     // Only monitors whose declaring session is still active are returned.
     for (const record of this.store.listActiveEphemeralMonitors(
       workspacePath,
@@ -2582,10 +2582,10 @@ export class AgentMonitorRuntime {
 
   /**
    * Evaluate ONE monitor on a tick — shared by the persistent (directory) and
-   * ephemeral (007 §4) paths so both flow the IDENTICAL scheduling → observe →
+   * ephemeral (spec: agent/ephemeral-monitors) paths so both flow the IDENTICAL scheduling → observe →
    * notify → materialize logic (AP7). Mutates the passed {@link TickAccumulator}
    * exactly as the old inlined loop did. `ephemeralSessionId`, when present,
-   * restricts materialized events to that declaring session (007 §4.6 isolation);
+   * restricts materialized events to that declaring session (spec: agent/ephemeral-monitors isolation);
    * it is `undefined` for persistent monitors (project into all lead sessions).
    */
   private async evaluateMonitorOnTick(
@@ -2599,7 +2599,7 @@ export class AgentMonitorRuntime {
     const sourceName = monitor.frontmatter.watch.type;
 
     // A monitor with an active continuous watcher is driven by that watcher;
-    // skip its one-shot observe() so it is not processed twice (G5).
+    // skip its one-shot observe() so it is not processed twice (spec: runtime/tick-scheduling).
     if (this.activeWatchers.has(monitor.id)) return;
 
     const schedule = this.scheduleForMonitor(monitor, now, workspacePath);
@@ -2641,7 +2641,7 @@ export class AgentMonitorRuntime {
       const nextDueAt = new Date(lastObservationAt + schedule.nextPollMs);
       acc.skippedMonitors.push({ monitorId: monitor.id, nextDueAt });
 
-      // Special case for scheduled-rollup (002 §4.4): the rollup window must
+      // Special case for scheduled-rollup (spec: runtime/notify-dispatch, pipeline/post-processing): the rollup window must
       // be evaluated on every tick regardless of the source polling interval.
       // A monitor whose interval has not yet elapsed must still flush its
       // accumulated batch when the delivery window opens, so we dispatch
@@ -2689,9 +2689,9 @@ export class AgentMonitorRuntime {
         });
         // Route the flushed batch through the SAME span materialization as
         // `ingest()` (issue #180) so the not-due path records the `triggered`
-        // observation_history row (002 §10.7) and writes every emitted
+        // observation_history row (spec: daemon/ipc) and writes every emitted
         // observation onto the shared chain — the due path already does both.
-        // (The `net` collapse is per-recipient at claim time; G10 PR-B.)
+        // (The `net` collapse is per-recipient at claim time; spec: pipeline/post-processing.)
         // Only invoke it when the window actually flushed something: an empty
         // window check runs every not-due tick and must NOT flood the audit
         // trail with `no-change` rows. `observed: 0` because this path
@@ -2817,11 +2817,11 @@ export class AgentMonitorRuntime {
    * `nextSourceState` is provided only by `observe()` (which returns the next
    * source state); the watcher omits it, since a long-lived `watch()` owns its
    * own in-memory state. The watcher advances the persisted `sourceState` out of
-   * band via the `context.checkpoint` callback (002 §2.4, `writeCheckpoint`),
+   * band via the `context.checkpoint` callback (spec: runtime/tick-scheduling, `writeCheckpoint`),
    * serialized with this `ingest()` on the per-watcher chain — not through this
    * path.
    *
-   * **Ordering guarantee (G14, 002 §1.1.8):** all durable monitor-state mutation
+   * **Ordering guarantee (spec: pipeline/post-processing):** all durable monitor-state mutation
    * (notify state via `setMonitorState`, per-recipient event rows via
    * `insertEvent`, and snapshot rows via `saveSnapshot`) completes synchronously
    * before the first `await` — the Interpret shell-out. If the process dies mid-
@@ -2839,15 +2839,15 @@ export class AgentMonitorRuntime {
       nextSourceState?: { value: unknown };
       sourceOutcome?: 'rebaselined' | 'no-files-matched';
       /**
-       * Present only for an ephemeral monitor (007 §4): materialized events
+       * Present only for an ephemeral monitor (spec: agent/ephemeral-monitors): materialized events
        * project into ONLY this declaring session, never a sibling lead session
-       * in the same workspace (007 §4.6 isolation).
+       * in the same workspace (spec: agent/ephemeral-monitors isolation).
        */
       ephemeralSessionId?: string;
     },
   ): Promise<string[]> {
     // Pre-filter: a `payload.form: structured` CEL gate that evaluates `false`
-    // suppresses delivery entirely (002 §1.1.6). This check MUST run BEFORE
+    // suppresses delivery entirely (spec: pipeline/post-processing). This check MUST run BEFORE
     // dispatchNotify so that suppressed observations never advance notify state
     // and are never counted as emitted in the audit history row.  Running it
     // inside processObservation (after dispatch) was incorrect: the history row
@@ -2883,9 +2883,9 @@ export class AgentMonitorRuntime {
     // with the not-due rollup flush in tick() via materializeSpan() (issue
     // #180): both the source-interval-elapsed (`ingest`) path and the
     // window-fires-on-a-not-due-tick path write the `triggered` history row
-    // (002 §10.7) and record every emitted observation on the shared chain.
-    // The `net` collapse (002 §1.1.7) is NO LONGER applied here — it is a
-    // per-recipient claim-time decision (G10 PR-B); see materializeSpan().
+    // (spec: daemon/ipc) and record every emitted observation on the shared chain.
+    // The `net` collapse (spec: pipeline/post-processing) is NO LONGER applied here — it is a
+    // per-recipient claim-time decision (spec: pipeline/post-processing); see materializeSpan().
     return await this.materializeSpan(monitor, dispatch.emitted, {
       observed: observations.length,
       workspacePath: options.workspacePath,
@@ -2904,13 +2904,13 @@ export class AgentMonitorRuntime {
    *
    *  - `ingest()` — the source-interval-elapsed ("due") path, and
    *  - the not-due rollup branch in `tick()` — where the source poll interval
-   *    has NOT elapsed but the rollup delivery window opens. Per 002 §4.4 this
+   *    has NOT elapsed but the rollup delivery window opens. Per spec: runtime/notify-dispatch, pipeline/post-processing this
    *    is the *normal* operating mode for a rollup monitor whose `watch.interval`
    *    is relaxed to match the delivery window.
    *
    * The helper performs, in order:
    *
-   *  1. **Audit trail (G6, 002 §10.7 / §1.1.6).** Records the monitor's outcome
+   *  1. **Audit trail (spec: persistence/schema, daemon/ipc, pipeline/post-processing).** Records the monitor's outcome
    *     row, classified by what was *emitted*, not by new observations — a batch
    *     can emit a previously-held observation with zero new observations (e.g. a
    *     debounce flush, or a rollup window firing on a not-due tick), which is
@@ -2941,7 +2941,7 @@ export class AgentMonitorRuntime {
       observed: number;
       workspacePath: string;
       sourceOutcome?: 'rebaselined' | 'no-files-matched';
-      /** Ephemeral-monitor declaring session (007 §4.6) — see {@link ingest}. */
+      /** Ephemeral-monitor declaring session (spec: agent/ephemeral-monitors) — see {@link ingest}. */
       ephemeralSessionId?: string;
     },
   ): Promise<string[]> {
@@ -2954,7 +2954,7 @@ export class AgentMonitorRuntime {
       result:
         emittedCount > 0
           ? 'triggered'
-          : // `rebaselined` is, by contract (002 §observation_history), a tick
+          : // `rebaselined` is, by contract (spec: persistence/schema), a tick
             // that returned ZERO observations and advanced its baseline. Guard
             // on observed === 0 so a source that mistakenly sets the diagnostic
             // while also returning (suppressed) observations can't mask a
@@ -2968,7 +2968,7 @@ export class AgentMonitorRuntime {
       observationData: { observed, emitted: emittedCount },
     });
 
-    // G10 PR-B (002 §1.1.7, Decision Q3): the shared `monitor_events` chain
+    // Per-recipient `net` collapse (spec: pipeline/post-processing, Decision Q3): the shared `monitor_events` chain
     // records EVERY emitted observation in order, regardless of
     // `baseline-strategy`. The `net` collapse is no longer applied here — it is
     // a PER-RECIPIENT decision deferred to claim time (`collapseNetForClaim`),
@@ -3043,7 +3043,7 @@ export class AgentMonitorRuntime {
 
   /**
    * Start continuous watchers for every scanned monitor whose source implements
-   * `watch()` (G5). Each yielded observation is funnelled through the same
+   * `watch()` (spec: runtime/tick-scheduling). Each yielded observation is funnelled through the same
    * pipeline as a ticked `observe()` (notify dispatch → materialization →
    * projection). Returns a handle whose `stop()` aborts and awaits every watcher.
    * While a watcher is active, the tick loop skips that monitor's `observe()`, so
@@ -3080,7 +3080,7 @@ export class AgentMonitorRuntime {
       controllers.set(monitor.id, controller);
       // Identity token for THIS watcher: `consumeWatch` releases the slot only
       // while its own token is still current, and a superseded watcher's
-      // straggling checkpoint is rejected on token mismatch (002 §2.4).
+      // straggling checkpoint is rejected on token mismatch (spec: runtime/tick-scheduling).
       const watcherToken = Symbol(monitor.id);
       this.activeWatchers.set(monitor.id, watcherToken);
 
@@ -3132,10 +3132,10 @@ export class AgentMonitorRuntime {
     watcherToken: symbol,
     onError?: (monitorId: string, error: Error) => void,
   ): Promise<void> {
-    // Per-watcher serialization chain (G14, 002 §2.4). Both watch-checkpoint
+    // Per-watcher serialization chain (spec: runtime/tick-scheduling). Both watch-checkpoint
     // writes and observation ingests append to this single chain, so:
     //  - a checkpoint whose durable write is in flight when an observation
-    //    arrives ALWAYS completes before that observation is ingested (the G14
+    //    arrives ALWAYS completes before that observation is ingested (the
     //    durable-write-before-ingest ordering), and
     //  - an ingest's read-modify-write of `monitorState.sourceState` is never
     //    interleaved with a checkpoint write of the same row (which would let a
@@ -3155,12 +3155,12 @@ export class AgentMonitorRuntime {
     // A checkpoint delivered after this watcher is torn down — its AbortSignal
     // aborted (stop()), or it is no longer the current active watcher for this
     // monitor id (it exited and was superseded) — is REJECTED rather than
-    // enqueued (002 §2.4): a straggling `checkpoint(staleState)` must never
+    // enqueued (spec: runtime/tick-scheduling): a straggling `checkpoint(staleState)` must never
     // clobber a newer baseline written by observe() or a re-established watcher.
     // Rejecting at call time (not enqueuing) is also what keeps the shutdown
     // flush below terminating — no new chain links appear once the watcher is
     // torn down. The checkpoint is scoped to this watcher's own
-    // `(monitorId, workspacePath)` state row (002 §3, #345/#307).
+    // `(monitorId, workspacePath)` state row (spec: runtime/monitor-state, #345/#307).
     const checkpoint = (nextState: unknown): Promise<void> => {
       if (
         signal.aborted ||
@@ -3207,7 +3207,7 @@ export class AgentMonitorRuntime {
         // The audit write is best-effort — if recordObservationHistory itself
         // throws we swallow it so a failed audit row never kills the watcher.
         // Ingest runs through the same serialization chain as checkpoint so the
-        // G14 ordering (002 §2.4) holds against out-of-band checkpoint calls.
+        // durable-write-before-ingest ordering (spec: runtime/tick-scheduling) holds against out-of-band checkpoint calls.
         try {
           await enqueue(() =>
             this.ingest(monitor, [observation], new Date(), {
@@ -3278,19 +3278,19 @@ export class AgentMonitorRuntime {
   }
 
   /**
-   * Durably persist a watch-mode checkpoint (002 §2.4): write the watcher's
+   * Durably persist a watch-mode checkpoint (spec: runtime/tick-scheduling): write the watcher's
    * updated source state into its own `(monitorId, workspacePath)` state row's
-   * `sourceState` (002 §3, #345/#307), leaving notify state and
+   * `sourceState` (spec: runtime/monitor-state, #345/#307), leaving notify state and
    * `lastObservationAt` untouched. A checkpoint is a **state write only** — it
    * never materializes or delivers an observation, and it must land in the
    * watcher's OWN workspace scope so a same-id monitor in another workspace is
    * never clobbered.
    *
    * A checkpoint write failure MUST NOT abort the watcher: it is a transient
-   * durability gap, not a protocol violation (002 §2.4). We log a warning and
+   * durability gap, not a protocol violation (spec: runtime/tick-scheduling). We log a warning and
    * resolve so even a source that does not guard `checkpoint()` keeps watching.
    * The caller enqueues this on the per-watcher serialization chain, which is
-   * what gives it the G14 durable-write-before-ingest ordering.
+   * what gives it the durable-write-before-ingest ordering.
    */
   private writeCheckpoint(
     monitorId: string,
@@ -3415,10 +3415,10 @@ export class AgentMonitorRuntime {
     const emitted: StoredObservationEnvelope[] = [];
     const nextState: NotifyRuntimeState = { ...state };
 
-    // Scheduled-rollup Pace mode (002 §4.4). A `rollup` monitor accumulates
+    // Scheduled-rollup Pace mode (spec: runtime/notify-dispatch, pipeline/post-processing). A `rollup` monitor accumulates
     // every observation in durable `notifyState.pendingRollup` and delivers
     // nothing until the author's `window` cron fires (no per-change interrupts,
-    // §4.4 step 6). It never uses the debounce/throttle/immediate paths below,
+    // spec: runtime/notify-dispatch, pipeline/post-processing step 6). It never uses the debounce/throttle/immediate paths below,
     // so it short-circuits the rest of dispatchNotify.
     //
     // Clear any stale `pendingDebounce` state first: if the monitor's strategy
@@ -3460,7 +3460,7 @@ export class AgentMonitorRuntime {
         URGENCY_RANK[envelope.effectiveUrgency] >
         URGENCY_RANK[monitor.frontmatter.urgency];
 
-      // Whole-batch early flush (002 §4.1): an escalated observation landing in
+      // Whole-batch early flush (spec: runtime/notify-dispatch): an escalated observation landing in
       // a held debounce batch flushes the ENTIRE batch — the already-held
       // observations plus this one — immediately, rather than splitting the
       // batch (splitting risks ordering confusion). This is the only path that
@@ -3532,26 +3532,26 @@ export class AgentMonitorRuntime {
   }
 
   /**
-   * Scheduled-rollup Pace mode dispatch (002 §4.4). On each tick:
+   * Scheduled-rollup Pace mode dispatch (spec: runtime/notify-dispatch, pipeline/post-processing). On each tick:
    *
    * 1. **Accumulate** every new observation into the durable
    *    `notifyState.pendingRollup` batch (no `dueAt` reset — the flush time is
-   *    schedule-driven, not settle-driven). Persisted across restarts (§4.4
+   *    schedule-driven, not settle-driven). Persisted across restarts (spec: runtime/notify-dispatch, pipeline/post-processing
    *    step 1, BP1) because `notifyState` is serialized into
    *    `monitor_state.notify_state`.
    * 2. **Evaluate** the author's `window` cron against `observedAt` in the
    *    configured `timezone` (default UTC). The window fires at most once per
-   *    minute (002 §4.4 step 2), guarded by `rollupLastFiredMinute` — an
+   *    minute (spec: runtime/notify-dispatch, pipeline/post-processing step 2), guarded by `rollupLastFiredMinute` — an
    *    epoch-minute integer persisted independently of `pendingRollup` so the
    *    guard survives a flush.
    * 3. **Flush** the whole batch as the emitted set and clear accumulation iff
    *    the window matches AND the batch is non-empty. An empty window produces
-   *    no delivery (§4.4 step 3 — no empty pings).
+   *    no delivery (spec: runtime/notify-dispatch, pipeline/post-processing step 3 — no empty pings).
    *
    * Observations that arrive on the same tick the window fires are included in
    * that window's delivery (they were produced at-or-before this opening).
    * Each accumulated observation becomes its own `monitor_events` row downstream
-   * (§4.4 step 4), so the full event history is queryable.
+   * (spec: runtime/notify-dispatch, pipeline/post-processing step 4), so the full event history is queryable.
    */
   private dispatchRollup(
     monitor: MonitorDefinition,
@@ -3567,7 +3567,7 @@ export class AgentMonitorRuntime {
     }
 
     // 1. Accumulate. Hydrate any restart-persisted envelopes (backfilling
-    // `effectiveUrgency` per 002 §3 / issue #109) so a batch that survived a
+    // `effectiveUrgency` per spec: runtime/monitor-state / issue #109) so a batch that survived a
     // daemon restart materializes with a valid urgency, then append this tick's
     // new observations.
     const accumulated: StoredObservationEnvelope[] = [
@@ -3580,7 +3580,7 @@ export class AgentMonitorRuntime {
     ];
 
     // 2. Evaluate the delivery window with a once-per-minute deduplication
-    // guard (002 §4.4 step 2): `cronMatchesDate` returns true for every
+    // guard (spec: runtime/notify-dispatch, pipeline/post-processing step 2): `cronMatchesDate` returns true for every
     // timestamp within the matching minute, so we compare the current
     // epoch-minute to `rollupLastFiredMinute` to prevent a second flush
     // within the same minute when ticks are sub-minute.
@@ -3595,14 +3595,14 @@ export class AgentMonitorRuntime {
     }
 
     // 3. Flush iff the window fires AND the batch is non-empty; an empty window
-    // produces no delivery (§4.4 step 3).
+    // produces no delivery (spec: runtime/notify-dispatch, pipeline/post-processing step 3).
     if (windowFires && accumulated.length > 0) {
       delete nextState.pendingRollup;
       return { emitted: accumulated, nextState };
     }
 
-    // Otherwise keep accumulating silently — no per-change interrupts (§4.4
-    // step 6). Persist the batch (durable accumulation, §4.4 step 1) only when
+    // Otherwise keep accumulating silently — no per-change interrupts (spec: runtime/notify-dispatch, pipeline/post-processing
+    // step 6). Persist the batch (durable accumulation, spec: runtime/notify-dispatch, pipeline/post-processing step 1) only when
     // there is something to hold; an empty window with nothing accumulated
     // leaves `pendingRollup` absent.
     if (accumulated.length > 0) {
@@ -3634,7 +3634,7 @@ export class AgentMonitorRuntime {
   private materializeObservation(input: ProcessObservationInput) {
     const objectKey = input.observation.objectKey ?? input.monitor.id;
 
-    // ── Shape stage (G15, 002 §1.1.4–§1.1.6) ──────────────────────────────
+    // ── Shape stage (spec: pipeline/post-processing) ──────────────────────────────
     // Runs on the shared side of the seam, BEFORE Diff. When the monitor
     // declares `shape`, render the shaped snapshot (the source's raw facts +
     // the derived facts computed at the injected `now`) into a stable, diffable
@@ -3678,7 +3678,7 @@ export class AgentMonitorRuntime {
         sourceName: input.sourceName,
         urgency: input.effectiveUrgency,
         // The delivered headline is the monitor's AUTHORED name when it has one
-        // (002 §5.4, issue #449). A source title is written from the source's
+        // (spec: runtime/event-materialization, issue #449). A source title is written from the source's
         // point of view and often embeds a configuration detail — `command-poll`
         // interpolates its `objectKey`, which defaults to the joined argv, so an
         // unnamed jq-heavy poller announced itself with ~400 characters of its
@@ -3697,14 +3697,14 @@ export class AgentMonitorRuntime {
         snapshotMetadata: input.observation.snapshot ?? {},
         snapshotText: effectiveSnapshotText ?? null,
         // The SHARED object-level diff (against the latest stored snapshot) for
-        // `events list`/history display (002 §5.2). The PER-RECIPIENT delta is
+        // `events list`/history display (spec: runtime/event-materialization). The PER-RECIPIENT delta is
         // computed inside insertEvent's projection loop and recorded on each
-        // session's session_event_state.diff_text (G10, 002 §1.1.2).
+        // session's session_event_state.diff_text (spec: pipeline/post-processing).
         diffText,
         objectKey,
         // Persist the author-declared baseline strategy on the shared event so
         // the per-recipient `net` collapse can run at claim time without
-        // re-scanning monitor definitions (G10 PR-B, 002 §1.1.7). Defaults to
+        // re-scanning monitor definitions (spec: pipeline/post-processing). Defaults to
         // `incremental` when the monitor omits the field.
         baselineStrategy: input.monitor.frontmatter.baselineStrategy,
         // Make the source-agnostic changeKind queryable without each source having
@@ -3723,7 +3723,7 @@ export class AgentMonitorRuntime {
       // registered (decided semantics Q1; backward-compat with the single-baseline
       // diff above when there is one recipient at the shared baseline).
       { previousContent: previousSnapshot?.content ?? null },
-      // Ephemeral-monitor projection isolation (007 §4.6): restrict projection to
+      // Ephemeral-monitor projection isolation (spec: agent/ephemeral-monitors): restrict projection to
       // the declaring session so its events never reach a sibling lead session.
       input.restrictToSessionId !== undefined
         ? { restrictToSessionId: input.restrictToSessionId }
@@ -3734,12 +3734,12 @@ export class AgentMonitorRuntime {
   }
 
   /**
-   * Drive the per-recipient Interpret stage (G14, 002 §1.1.8) over every lead
+   * Drive the per-recipient Interpret stage (spec: pipeline/post-processing) over every lead
    * session the just-materialized `event` projected into. For each recipient the
    * adapter reads the per-recipient delta and either delivers a cheap digest or
    * suppresses the projection as not-substantive; every verdict is recorded on
    * `session_event_state` so "why nothing fired" is inspectable via
-   * `monitor explain` (002 §10.7, capability C12).
+   * `monitor explain` (spec: daemon/ipc, capability C12).
    *
    * Best-effort: an adapter rejection (tool missing / errors / times out) MUST
    * NOT drop the underlying delta — the projection stays deliverable as the
@@ -3755,18 +3755,18 @@ export class AgentMonitorRuntime {
     const sessionIds = this.store.projectedSessionIdsForLastEvent();
     if (sessionIds.length === 0) return;
 
-    // The per-recipient delta (G10, 002 §1.1.2): each recipient is judged on the
+    // The per-recipient delta (spec: pipeline/post-processing): each recipient is judged on the
     // diff it actually computed against ITS OWN baseline cursor (recorded on
     // session_event_state.diff_text), falling back to the shared event diff, then
     // the full artifact at a baseline. Recipients sharing the same delta get ONE
     // adapter call (same input → same verdict, no redundant tool round-trips).
     // When recipients are co-registered at the same baseline their deltas are
     // identical, so this collapses to exactly today's single shared call (the
-    // G14 behavior PR-A must not change).
+    // shared-delta behavior that must not change).
     const sharedFallback = diffText ?? event.snapshotText ?? '';
     // Fetch all per-recipient diffs for every projected session in ONE query
     // (avoids the N+1 pattern of calling perRecipientDiffsForSession once per
-    // recipient in the loop below). (G10, 002 §1.1.2; Copilot review: comment 3.)
+    // recipient in the loop below). (spec: pipeline/post-processing; Copilot review: comment 3.)
     const allRecipientDiffs = this.store.perRecipientDiffsForAllSessions(
       sessionIds,
       event.id,

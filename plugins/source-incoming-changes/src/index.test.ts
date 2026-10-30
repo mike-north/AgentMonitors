@@ -12,8 +12,8 @@
  *
  * Rule: no `new Date()` / `Date.now()` in test data (fixed-dates-in-tests rule).
  *
- * @see ../../../docs/specs/003-source-plugins.md — source contract & scope schema
- * @see ../../../docs/specs/002-runtime-delivery.md — `observation_history` outcomes (incl. `rebaselined`, issue #56)
+ * @see ../../../openspec/specs/sources/contract/spec.md — source contract & scope schema
+ * @see ../../../openspec/specs/persistence/schema/spec.md — `observation_history` outcomes (incl. `rebaselined`, issue #56)
  */
 
 import { execFileSync } from 'node:child_process';

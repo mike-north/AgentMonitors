@@ -11,7 +11,7 @@
  * the produced string's parseability and the constant's invariant so that
  * regression is caught here instead of in a running daemon.
  *
- * @see docs/specs/002-runtime-delivery.md §9.1 (high-urgency debounce settle)
+ * @see openspec/specs/delivery/lifecycles/spec.md (high-urgency debounce settle)
  */
 import { describe, expect, it } from 'vitest';
 import { defaultNotifyConfigForUrgency } from './types.js';

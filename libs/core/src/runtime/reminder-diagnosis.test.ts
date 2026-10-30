@@ -6,7 +6,7 @@ import {
 } from './reminder-diagnosis.js';
 
 describe('diagnoseReminderSuppression', () => {
-  it('reports no finding when every unread normal event is still unclaimed (reminder would fire, §9.2)', () => {
+  it('reports no finding when every unread normal event is still unclaimed (reminder would fire, spec: delivery/lifecycles)', () => {
     // unread === pending → guard `pending === unread && pending > 0` holds → fires.
     const counts: ReminderSessionCounts[] = [
       { sessionId: 's1', urgency: 'normal', unreadCount: 2, pendingCount: 2 },
@@ -14,7 +14,7 @@ describe('diagnoseReminderSuppression', () => {
     expect(diagnoseReminderSuppression(counts)).toEqual([]);
   });
 
-  it('reports `no-new-work` when the only unread normal event is claimed (the S3 trap, §9.2)', () => {
+  it('reports `no-new-work` when the only unread normal event is claimed (the S3 trap, spec: delivery/lifecycles)', () => {
     // The S3 sequence: reminder fired once (claiming the event), so a second
     // claim finds unread=1 (still unacked), pending=0 (claimed) → suppressed.
     const counts: ReminderSessionCounts[] = [
@@ -26,7 +26,7 @@ describe('diagnoseReminderSuppression', () => {
     expect(finding).toMatchObject({
       sessionId: 's1',
       urgency: 'normal',
-      lifecycle: 'turn-interruptible', // §9.2 delivers at turn-interruptible
+      lifecycle: 'turn-interruptible', // normal reminders deliver at turn-interruptible (spec: delivery/lifecycles)
       unreadCount: 1,
       claimedCount: 1,
       reason: 'no-new-work',
@@ -104,7 +104,7 @@ describe('diagnoseReminderSuppression', () => {
     ).toEqual([]);
   });
 
-  it('diagnoses the low-urgency reminder at turn-idle (§9.3)', () => {
+  it('diagnoses the low-urgency reminder at turn-idle (spec: delivery/lifecycles)', () => {
     const counts: ReminderSessionCounts[] = [
       { sessionId: 's1', urgency: 'low', unreadCount: 1, pendingCount: 0 },
     ];
@@ -112,7 +112,7 @@ describe('diagnoseReminderSuppression', () => {
     expect(findings).toHaveLength(1);
     expect(findings[0]).toMatchObject({
       urgency: 'low',
-      lifecycle: 'turn-idle', // §9.3 delivers at turn-idle
+      lifecycle: 'turn-idle', // low reminders deliver at turn-idle (spec: delivery/lifecycles)
       reason: 'no-new-work',
     });
     expect(findings[0]?.message).toContain('Low-urgency reminder at turn-idle');

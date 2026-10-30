@@ -1,5 +1,5 @@
 /**
- * Tests for the PER-RECIPIENT baseline seam + per-recipient Diff (roadmap G10,
+ * Tests for the PER-RECIPIENT baseline seam + per-recipient Diff (spec: pipeline/post-processing,
  * PR-A): the Diff is moved to the RIGHT of the Pace→Diff seam so each recipient
  * (lead session) diffs the shared shaped artifact against ITS OWN baseline
  * cursor. Two sessions at divergent last-seen points each receive the correct
@@ -12,12 +12,12 @@
  * records each recipient's per-recipient `diff_text`), then `saveSnapshot`.
  *
  * Expected diff text is written BY HAND from the `buildTextDiff` format spec
- * (002 §5.2: line-level `- <n>: <before>` / `+ <n>: <after>`), not captured from
+ * (spec: runtime/event-materialization: line-level `- <n>: <before>` / `+ <n>: <after>`), not captured from
  * program output. No snapshot/gold-master assertions (repo policy).
  *
- * @see ../../../../docs/specs/002-runtime-delivery.md §1.1.2 (the shared/per-recipient seam)
- * @see ../../../../docs/specs/002-runtime-delivery.md §5.2 (diff format)
- * @see ../../../../docs/specs/roadmap.md §G10
+ * @see ../../../../openspec/specs/pipeline/post-processing/spec.md (the shared/per-recipient seam)
+ * @see ../../../../openspec/specs/runtime/event-materialization/spec.md (diff format)
+ * @see ../../../../openspec/specs/pipeline/post-processing/spec.md
  */
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -122,7 +122,7 @@ function freshStore(): { store: RuntimeStore; dbPath: string } {
   return { store: new RuntimeStore(createDb(dbPath)), dbPath };
 }
 
-describe('per-recipient baseline seam (G10 PR-A, 002 §1.1.2)', () => {
+describe('per-recipient baseline seam (spec: pipeline/post-processing)', () => {
   it('1. divergent-baseline fan-out: A spans artifact2→artifact3, B spans artifact1→artifact3 from one shared obs3', () => {
     const { store } = freshStore();
     const a = openLead(store, 'sess-A');
@@ -141,8 +141,8 @@ describe('per-recipient baseline seam (G10 PR-A, 002 §1.1.2)', () => {
     // obs3 (artifact "a3"): ONE shared event, projected into both.
     const e3 = materialize(store, 'a3');
 
-    // THE proof (002 §1.1.2 / roadmap G10): different spans from one shared obs.
-    // buildTextDiff format (002 §5.2): single changed line 1.
+    // THE proof (spec: pipeline/post-processing): different spans from one shared obs.
+    // buildTextDiff format (spec: runtime/event-materialization): single changed line 1.
     expect(recipientDelta(store, a.id, e3)).toBe('- 1: a2\n+ 1: a3');
     expect(recipientDelta(store, b.id, e3)).toBe('- 1: a1\n+ 1: a3');
   });
@@ -162,7 +162,7 @@ describe('per-recipient baseline seam (G10 PR-A, 002 §1.1.2)', () => {
     const restarted = new RuntimeStore(createDb(dbPath));
 
     // A new event after restart must span each recipient from its PERSISTED
-    // cursor — proving the cursors survived (002 §3, BP1), not reset to a shared
+    // cursor — proving the cursors survived (spec: runtime/monitor-state, BP1), not reset to a shared
     // baseline.
     const e3 = materialize(restarted, 'a3');
     expect(recipientDelta(restarted, a.id, e3)).toBe('- 1: a2\n+ 1: a3');
@@ -196,14 +196,14 @@ describe('per-recipient baseline seam (G10 PR-A, 002 §1.1.2)', () => {
     expect(recipientDelta(store, a.id, e3)).toBe('- 1: a2\n+ 1: a3');
   });
 
-  it('4a. backward-compat: a single co-registered session reproduces the pre-G10 shared diff byte-for-byte', () => {
+  it('4a. backward-compat: a single co-registered session reproduces the pre-per-recipient-delta shared diff byte-for-byte', () => {
     const { store } = freshStore();
     const only = openLead(store, 'sess-only');
 
     materialize(store, 'a1'); // baseline
     const e2 = materialize(store, 'a2');
 
-    // The pre-G10 behavior: one diff per object against the latest stored
+    // The pre-per-recipient-delta behavior: one diff per object against the latest stored
     // snapshot. With a single session at the shared baseline, the per-recipient
     // delta MUST equal that shared object-level diff exactly.
     const shared = store.getEventById(e2).diffText;
@@ -218,7 +218,7 @@ describe('per-recipient baseline seam (G10 PR-A, 002 §1.1.2)', () => {
     materialize(store, 'a1'); // baseline
     const e2 = materialize(store, 'a2');
 
-    // Simulate a row materialized before G10: NULL out the per-recipient column.
+    // Simulate a row materialized before per-recipient deltas: NULL out the per-recipient column.
     nullOutPerRecipientDiff(dbPath, legacy.id, e2);
     expect(recipientDelta(store, legacy.id, e2)).toBeUndefined();
 
@@ -380,7 +380,7 @@ describe('cursor key collision regression (Copilot review comment 1)', () => {
 });
 
 /**
- * Force a `session_event_state` row back to the pre-G10 shape (NULL per-recipient
+ * Force a `session_event_state` row back to the pre-per-recipient-delta shape (NULL per-recipient
  * `diff_text`) to exercise the legacy fallback path. The store only ever WRITES
  * this column at projection time, so a regression test for the legacy migration
  * case must produce the NULL directly — done over a second raw better-sqlite3

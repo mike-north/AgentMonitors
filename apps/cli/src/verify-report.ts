@@ -98,7 +98,7 @@ export function renderVerifyText(result: VerifyResult): string {
   return lines.join('\n');
 }
 
-/** Render the stable machine-readable shape (spec 005 §16). */
+/** Render the stable machine-readable shape (spec: cli/verify). */
 export function renderVerifyJson(result: VerifyResult): string {
   return JSON.stringify(
     {

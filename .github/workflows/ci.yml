@@ -66,7 +66,7 @@ jobs:
       # Issue #276: proves the product works from a truly fresh environment —
       # global npm install of the packed launcher, project setup, a monitor
       # firing, delivered through the real Claude Code hook stdin/stdout
-      # contract (docs/specs/006-agent-integration.md §5). Runs per-PR: the
+      # contract (openspec/specs/delivery/hook-transport/spec.md). Runs per-PR: the
       # measured runtime (~50-70s) is comparable to the standalone-consumer
       # step above, and to the Docker-backed daemon tests (`*.docker.test.ts`)
       # that already run inside the generic "Test" step — there is no

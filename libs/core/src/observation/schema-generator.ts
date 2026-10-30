@@ -38,7 +38,7 @@ export function generateMonitorSchema(
     title: 'Agent Monitor Definition',
     type: 'object',
     // Only `watch` is required. `urgency` is optional and defaults to `normal`
-    // in the parser (001 §3.2), so the generated JSON Schema must not mark it
+    // in the parser (spec: monitor/definition), so the generated JSON Schema must not mark it
     // required — otherwise editor tooling would flag a valid minimal monitor.
     required: ['watch'],
     properties: {
@@ -58,7 +58,7 @@ export function generateMonitorSchema(
       // A bare level (`normal`) or an authored band `lo..hi` (`normal..high`).
       // This editor-hint schema enforces only the *shape* of each bound; the
       // authoritative parser (`monitorFrontmatterSchema`) additionally rejects
-      // an inverted range (`lo > hi`). See 001 §3.2.
+      // an inverted range (`lo > hi`). See spec: monitor/definition.
       //
       // Leading/trailing whitespace is allowed (`\s*` anchors at both ends)
       // to mirror the Zod parser, which calls `.trim()` on the raw value
@@ -93,7 +93,7 @@ export function generateMonitorSchema(
             required: ['strategy', 'suppress-for'],
           },
           {
-            // Scheduled-rollup Pace mode (001 §3.6). `window` is a five-field
+            // Scheduled-rollup Pace mode (spec: monitor/definition). `window` is a five-field
             // cron expression defining the recurring delivery time; `timezone`
             // is an optional IANA zone (defaults to UTC at runtime).
             properties: {

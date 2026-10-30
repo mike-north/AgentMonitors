@@ -9,16 +9,16 @@
  * monitor's own implementation, burning context on every delivery.
  *
  * The rule under test is transport-independent because core owns it: the title
- * is chosen once when the event is materialized (`processObservation`, 002 §5.4),
+ * is chosen once when the event is materialized (`processObservation`, spec: runtime/event-materialization),
  * so the hook and channel renderers cannot diverge. These tests therefore drive
  * a REAL runtime tick against the REAL bundled `command-poll` source, claim a
  * REAL {@link DeliveryClaim}, and render that one claim through BOTH
  * `renderHookDelivery` and `renderChannelEvent`.
  *
  * @see https://github.com/mike-north/AgentMonitors/issues/449
- * @see ../../../../docs/specs/002-runtime-delivery.md §5.4 (event title)
- * @see ../../../../docs/specs/003-source-plugins.md §11.4 (command-poll observation identity)
- * @see ../../../../docs/specs/006-agent-integration.md §4 (channel transport), §5 (hook transport)
+ * @see ../../../../openspec/specs/runtime/event-materialization/spec.md (event title)
+ * @see ../../../../openspec/specs/sources/command-poll/spec.md — "command-poll observation identity", "command-poll stateful baseline" (command-poll observation identity)
+ * @see ../../../../openspec/specs/delivery/channel-transport/spec.md (channel transport), spec: delivery/hook-transport (hook transport)
  */
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -88,7 +88,7 @@ interface Harness {
 
 interface ScaffoldOptions {
   /**
-   * `payload.form: prose` (G14, 002 §1.1.8): the only form that drives the
+   * `payload.form: prose` (spec: pipeline/post-processing): the only form that drives the
    * Interpret stage. Omitted for the plain title-fallback tests, which have
    * no need of a digest.
    */
@@ -103,7 +103,7 @@ interface ScaffoldOptions {
 /**
  * Scaffold a workspace with one real `command-poll` monitor reading `data.json`.
  * `urgency: high` is what makes a claim carry event BODIES (normal/low deliver a
- * generic mid-session reminder, 002 §9.2), which is where the title is visible.
+ * generic mid-session reminder, spec: delivery/lifecycles), which is where the title is visible.
  * `name` is omitted entirely when `monitorName` is undefined — the fallback case.
  */
 function scaffold(
@@ -182,7 +182,7 @@ async function deliverOneChange(harness: Harness): Promise<DeliveryClaim> {
     }),
   );
 
-  // Tick 1: first successful execution baselines silently (003 §11.4).
+  // Tick 1: first successful execution baselines silently (spec: sources/command-poll — "command-poll observation identity", "command-poll stateful baseline").
   await harness.runtime.tick(harness.monitorsDir, harness.workspace);
 
   // The change under observation: PR 443 merged, PR 447 appeared.
@@ -249,9 +249,9 @@ describe('issue #449: delivered event title is the monitor name, not the raw com
     const claim = await deliverOneChange(harness);
     const title = claim.events[0]?.title ?? '';
 
-    // Documented fallback (002 §5.4): the source-provided title, unchanged.
+    // Documented fallback (spec: runtime/event-materialization): the source-provided title, unchanged.
     expect(title).toMatch(/^Command output changed: /);
-    // …but the interpolated objectKey is bounded (003 §2.8), so a 200-character
+    // …but the interpolated objectKey is bounded (spec: sources/contract), so a 200-character
     // argv can no longer become the headline.
     expect(title.length).toBeLessThan(90);
     expect(title).not.toContain(JQ_TAIL);
@@ -283,7 +283,7 @@ describe('issue #449: delivered event title is the monitor name, not the raw com
   // Regression (issue #449 review, 2026-07-21): the prior review round required
   // a real runtime claim with a distinct Interpret digest — driven through BOTH
   // real transports, not just the shared `buildEventBlock` unit. A `prose`
-  // monitor's `summary` is the Interpret digest (G14, 002 §1.1.8), which shares
+  // monitor's `summary` is the Interpret digest (spec: pipeline/post-processing), which shares
   // no text with the deterministic per-object `objectDetail`; a transport that
   // dropped either would either lose object identity or silently discard a
   // successful agentic digest.
@@ -302,7 +302,7 @@ describe('issue #449: delivered event title is the monitor name, not the raw com
     const claim = await deliverOneChange(harness);
 
     // Core-owned: objectDetail is the deterministic per-object text (never
-    // digest-replaced, 002 §5.4); summary is the recipient-visible digest —
+    // digest-replaced, spec: runtime/event-materialization); summary is the recipient-visible digest —
     // and the two are distinct here, on purpose.
     const objectDetail = claim.events[0]?.objectDetail ?? '';
     const summary = claim.events[0]?.summary ?? '';
@@ -319,7 +319,7 @@ describe('issue #449: delivered event title is the monitor name, not the raw com
       expect(headerIndex).toBeGreaterThanOrEqual(0);
       // Name first (the title), then the deterministic object identity, then
       // the distinct Interpret digest — neither dropped, in this exact order
-      // (`buildEventBlock`, 002 §5.4 / issue #449 review).
+      // (`buildEventBlock`, spec: runtime/event-materialization / issue #449 review).
       expect(lines[headerIndex + 1]).toBe(MONITOR_NAME);
       expect(lines[headerIndex + 2]).toBe(objectDetail);
       expect(lines[headerIndex + 3]).toBe(digest);

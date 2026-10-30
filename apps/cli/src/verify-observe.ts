@@ -17,7 +17,7 @@ function toMs(value: Date | string | number): number {
  * `verify`'s post-trigger observe-stage verdict: the decisive outcome once a
  * post-trigger tick has run, or `null` to keep polling.
  *
- * @see docs/specs/005-cli-reference.md §16
+ * @see openspec/specs/cli/verify/spec.md
  */
 export type ObserveVerdict = 'triggered' | 'no-change' | 'no-files-matched';
 
@@ -49,7 +49,7 @@ export type ObserveVerdict = 'triggered' | 'no-change' | 'no-files-matched';
  *
  * `no-change` is suppressed entirely while a `suppressed` row is present in
  * the same window — that means the change WAS observed and is settling in a
- * debounce/throttle window (002 §9.2/§9.3); the eventual `triggered` row at
+ * debounce/throttle window (spec: delivery/lifecycles); the eventual `triggered` row at
  * flush still wins via the check above.
  */
 export function resolveObserveVerdict(

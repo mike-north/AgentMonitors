@@ -12,7 +12,7 @@ import {
 /**
  * Pure line-formatting for `hook deliver --debug` (issue #334).
  *
- * `hook deliver`'s stdout contract is silent-on-idle by design (006 §5.1) — a
+ * `hook deliver`'s stdout contract is silent-on-idle by design (spec: delivery/hook-transport) — a
  * hook that ever printed diagnostic noise to stdout would corrupt the Claude
  * Code wire format. `--debug` writes a parallel diagnosis to **stderr**, one
  * line per resolution/diagnosis step, so "correctly idle" and "misconfigured"
@@ -29,7 +29,7 @@ import {
  * {@link sanitizeUntrustedField} (issue #365, hardening the same vector
  * closed for the always-on path by #362/#363).
  *
- * @see ../../../docs/specs/006-agent-integration.md §5 (hook-deliver transport)
+ * @see ../../../openspec/specs/delivery/hook-transport/spec.md (hook-deliver transport)
  */
 
 const DEBUG_PREFIX = 'agentmonitors hook deliver --debug:';
@@ -39,7 +39,7 @@ function line(message: string): string {
 }
 
 /**
- * Echoes the parsed stdin payload's relevant fields (§5.0 input contract).
+ * Echoes the parsed stdin payload's relevant fields (spec: delivery/hook-transport input contract).
  * All three fields are untrusted stdin JSON, so each is rendered via
  * {@link sanitizeUntrustedFieldOrNone} (issue #365) — the same escaping the
  * always-on warnings apply to the identical fields.
@@ -61,7 +61,7 @@ export function describeNoSessionId(): string {
 }
 
 /**
- * `hook_event_name` did not map to a delivery lifecycle (§5.4).
+ * `hook_event_name` did not map to a delivery lifecycle (spec: delivery/hook-transport).
  * `hookEventName` is untrusted stdin JSON — sanitized (issue #365).
  */
 export function describeUnmappedLifecycle(
@@ -188,7 +188,7 @@ export function describeDiagnosisFailure(error: unknown): string {
 
 /**
  * Settled high-urgency events existed but some were deferred by the
- * transport's 4000-char `additionalContext` cap (issue #299, 006 §5.5) — a
+ * transport's 4000-char `additionalContext` cap (issue #299, spec: delivery/channel-transport, delivery/hook-transport) — a
  * hold reason owned by the hook-deliver transport itself, not the runtime.
  */
 export function describeCapDeferral(

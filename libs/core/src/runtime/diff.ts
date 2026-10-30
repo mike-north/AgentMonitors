@@ -33,8 +33,8 @@ export function buildTextDiff(previous: string, current: string): string {
 
 /**
  * The `change-detection.strategy` values a bundled source (`source-api-poll`,
- * `source-command-poll`) may set on `snapshot.strategy` (003 §4.2/§11.3). This
- * is an **open** vocabulary — the source contract ([003 §2](../../../../docs/specs/003-source-plugins.md#2-source-contract))
+ * `source-command-poll`) may set on `snapshot.strategy` (spec: sources/api-poll, sources/command-poll). This
+ * is an **open** vocabulary — the source contract ([spec: sources/contract](../../../../openspec/specs/sources/contract/spec.md))
  * does not require every source to set it, and a third-party source MAY declare
  * its own strategy string — so the `(string & {})` member preserves literal
  * autocompletion for the four recognized values while still accepting an
@@ -57,7 +57,7 @@ export type ChangeDetectionStrategy =
  * recognizable metadata object with a string `strategy` field — callers treat
  * that as "use the default line-diff renderer" (issue #437). Setting
  * `snapshot.strategy` is a bundled-source convention, not a source-contract
- * requirement (003 §2) — a third-party source that omits it simply always
+ * requirement (spec: sources/contract) — a third-party source that omits it simply always
  * renders via {@link buildTextDiff}.
  */
 export function changeDetectionStrategyOf(
@@ -75,7 +75,7 @@ export function changeDetectionStrategyOf(
 }
 
 /**
- * Render the delta between two snapshot texts for `diffText` (002 §5.2),
+ * Render the delta between two snapshot texts for `diffText` (spec: runtime/event-materialization),
  * choosing the renderer by the object's `change-detection.strategy` (issue
  * #437). `strategy: json-diff` renders a **structural** diff — added/removed/
  * changed elements or key paths — instead of {@link buildTextDiff}'s
@@ -85,7 +85,7 @@ export function changeDetectionStrategyOf(
  *
  * Falls back to {@link buildTextDiff} whenever `strategy: json-diff` is
  * declared but either side does not parse as JSON — identical to each source's
- * own `hasChanged` fallback (003 §11.3/§4.2), so the diff renderer never
+ * own `hasChanged` fallback (spec: sources/command-poll, sources/api-poll), so the diff renderer never
  * disagrees with the strategy that decided a change occurred.
  */
 export function buildDiff(
@@ -103,7 +103,7 @@ export function buildDiff(
 /**
  * Maximum number of structural diff entries (added/removed/changed) rendered
  * before an explicit elision marker line is appended — the `json-diff` analog
- * of {@link buildTextDiff}'s 20-changed-line cap (002 §5.2), since this text
+ * of {@link buildTextDiff}'s 20-changed-line cap (spec: runtime/event-materialization), since this text
  * reaches LLM context windows (issue #437 AC3).
  */
 const MAX_JSON_DIFF_ENTRIES = 20;
@@ -196,7 +196,7 @@ class DiffEntrySink {
  * an elision marker (issue #437 AC1/AC3). Returns `undefined` — signaling the
  * caller to fall back to {@link buildTextDiff} — when either text fails to
  * parse as JSON, mirroring the `json-diff` `hasChanged` fallback used to decide
- * whether a change occurred in the first place (003 §11.3). Also returns
+ * whether a change occurred in the first place (spec: sources/command-poll). Also returns
  * `undefined` when the structural traversal itself overflows the call stack
  * on a pathologically deep JSON value (`RangeError`, issue #437 review:
  * `JSON.parse` tolerates roughly 4.2M nesting levels but the recursive
@@ -287,7 +287,7 @@ function diffJsonObject(
  * Both identity-based matchers ({@link diffJsonArrayByKey},
  * {@link diffJsonArrayByDeepEquality}) are themselves order-INsensitive by
  * construction (they match by key/content, not position) — but `hasChanged`
- * (003 §4.2/§11.3, each `json-diff` source) is array-order-SENSITIVE (it
+ * (spec: sources/api-poll, sources/command-poll, each `json-diff` source) is array-order-SENSITIVE (it
  * sorts object keys, never array elements), so a pure element reorder is a
  * real detected change. Both matchers therefore fall back to an explicit
  * `reordered` entry when they find no other diff, preserving the invariant
@@ -393,8 +393,8 @@ function diffJsonArrayByKey(
     }
   }
 
-  // Same key set, same content per key — but json-diff's `hasChanged` (003
-  // §4.2/§11.3) is array-ORDER-sensitive (it sorts object keys, never array
+  // Same key set, same content per key — but json-diff's `hasChanged` (
+  // spec: sources/api-poll, sources/command-poll) is array-ORDER-sensitive (it sorts object keys, never array
   // elements), so a pure reorder is a real detected change. The invariant
   // "change detected ⟺ non-empty diffText" must hold even though identity-key
   // matching is itself order-insensitive, so surface the reorder explicitly
@@ -693,10 +693,10 @@ function renderJsonValue(value: unknown): string {
 }
 
 /**
- * Render a shaped snapshot to the stable Shape artifact (§1.1.5), the input the
+ * Render a shaped snapshot to the stable Shape artifact (spec: pipeline/post-processing), the input the
  * runtime diffs **instead of** the raw source. Deterministic and pure over
  * `(snapshot, now, rules)`: the only time input is the injected `now`. Computes
- * the derived facts (§1.1.4), then renders the shaped state to a byte-stable
+ * the derived facts (spec: pipeline/post-processing), then renders the shaped state to a byte-stable
  * artifact. The same shaped state at the same `now` MUST render to byte-identical
  * text (no phantom diff).
  *
@@ -705,7 +705,7 @@ function renderJsonValue(value: unknown): string {
  * @param rules - The author-declared `shape.derive` rules, in order.
  * @returns The byte-stable rendered artifact.
  *
- * @see ../../../../docs/specs/002-runtime-delivery.md §1.1.4–§1.1.5
+ * @see ../../../../openspec/specs/pipeline/post-processing/spec.md
  */
 export function renderShapeArtifact(
   snapshot: unknown,

@@ -31,8 +31,8 @@ import { writeLocalState } from '../local-state.js';
  * (`vitest.serial.config.ts`) alongside the other daemon-spawning suites, where
  * the child is not CPU-starved by concurrent workers.
  *
- * @see ../../../docs/specs/002-runtime-delivery.md §10.2 (idle self-termination)
- * @see ../../../docs/specs/006-agent-integration.md §12.8 (channel keeps the daemon alive)
+ * @see ../../../../openspec/specs/daemon/ipc/spec.md (idle self-termination)
+ * @see ../../../../openspec/specs/daemon/ipc/spec.md (channel keeps the daemon alive)
  */
 
 const CLI_PATH = path.resolve(

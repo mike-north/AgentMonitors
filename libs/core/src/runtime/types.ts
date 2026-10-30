@@ -54,45 +54,45 @@ export interface AgentSessionRecord {
 }
 
 /**
- * The lifecycle status of an ephemeral monitor (007 §4.4), derived from the
+ * The lifecycle status of an ephemeral monitor (spec: agent/ephemeral-monitors), derived from the
  * single source of truth — the drizzle column enum {@link ephemeralMonitorStatus}
  * — so the persisted values and this public type cannot drift.
  */
 export type EphemeralMonitorStatus = (typeof ephemeralMonitorStatus)[number];
 
 /**
- * Reserved id prefix for ephemeral (agent-declared) monitors (007 §4.3). Every
+ * Reserved id prefix for ephemeral (agent-declared) monitors (spec: agent/ephemeral-monitors — "Namespaced ephemeral identity", "Ephemeral identity is stable for the monitor lifetime"). Every
  * ephemeral id is `ephemeral:<sessionId>/<ulid>` — it always contains a `/`,
  * which a directory-derived persistent monitor id (a single path segment) never
  * can, so an ephemeral id is structurally incapable of colliding with a
  * persistent one (SP2). The prefix keeps `monitor_events.monitor_id`,
  * `monitor explain`, and `queryScope` filtering unambiguously namespaced, and
  * lets a store-level query recognise an ephemeral event by its `monitor_id`
- * alone (e.g. to keep an ephemeral event out of an unscoped read, 007 §4.6).
+ * alone (e.g. to keep an ephemeral event out of an unscoped read, spec: agent/ephemeral-monitors).
  */
 export const EPHEMERAL_MONITOR_ID_PREFIX = 'ephemeral:';
 
 /**
- * A durable ephemeral-monitor record (007 §4): an agent-declared, session-scoped
+ * A durable ephemeral-monitor record (spec: agent/ephemeral-monitors): an agent-declared, session-scoped
  * monitor stored in the daemon's durable store so it survives a restart while the
- * declaring session lives (007 §4.4). `id` is the namespaced runtime identity
- * `ephemeral:<sessionId>/<ulid>` (007 §4.3).
+ * declaring session lives (spec: agent/ephemeral-monitors). `id` is the namespaced runtime identity
+ * `ephemeral:<sessionId>/<ulid>` (spec: agent/ephemeral-monitors — "Namespaced ephemeral identity", "Ephemeral identity is stable for the monitor lifetime").
  */
 export interface EphemeralMonitorRecord {
   id: string;
   sessionId: string;
   workspacePath: string | null;
   sourceName: string;
-  /** The source-`scopeSchema`-valid scope config (007 §4.2). */
+  /** The source-`scopeSchema`-valid scope config (spec: agent/ephemeral-monitors). */
   scope: Record<string, unknown>;
   /** The authored urgency band's low bound (base effective urgency). */
   urgency: Urgency;
   /** The authored urgency band's high bound (equals `urgency` for a scalar). */
   urgencyMax: Urgency;
   /**
-   * Free-text handling guidance — the monitor's body-instructions (007 §4.2),
+   * Free-text handling guidance — the monitor's body-instructions (spec: agent/ephemeral-monitors),
    * mirroring a persistent monitor's markdown body. It is used as the delivered
-   * event body (`DeliveryEventSummary.body`, 002 §9.1) only as a **fallback**:
+   * event body (`DeliveryEventSummary.body`, spec: delivery/lifecycles) only as a **fallback**:
    * an observation that carries its own `body` overrides it
    * (`observation.body ?? monitor.instructions`), so it is not always what is
    * surfaced on delivery.
@@ -106,12 +106,12 @@ export interface EphemeralMonitorRecord {
 }
 
 /**
- * Input to {@link AgentMonitorRuntime.declareEphemeralMonitor} (007 §4.2). The
+ * Input to {@link AgentMonitorRuntime.declareEphemeralMonitor} (spec: agent/ephemeral-monitors). The
  * declaration binds to the resolved AgentMon session `sessionId`; its scope is
  * validated by the same `validateScope` path as `agentmonitors validate`.
  */
 export interface DeclareEphemeralMonitorInput {
-  /** The declaring (bound) AgentMon session id (007 §4.2). */
+  /** The declaring (bound) AgentMon session id (spec: agent/ephemeral-monitors). */
   sessionId: string;
   /** A registered source name (003). */
   source: string;
@@ -119,10 +119,10 @@ export interface DeclareEphemeralMonitorInput {
   scope: Record<string, unknown>;
   /**
    * Authored urgency — a scalar (`normal`) or a band (`normal..high`). Defaults
-   * to `normal`, matching persistent monitors (007 §4.2).
+   * to `normal`, matching persistent monitors (spec: agent/ephemeral-monitors).
    */
   urgency?: string;
-  /** Free-text handling guidance that becomes the monitor's body (007 §4.2). */
+  /** Free-text handling guidance that becomes the monitor's body (spec: agent/ephemeral-monitors). */
   instruction?: string;
   /** Optional human-readable display name. */
   displayName?: string;
@@ -144,7 +144,7 @@ export interface MonitorEventRecord {
   objectKey: string | null;
   /**
    * The monitor's author-declared baseline strategy at materialization time
-   * (G13/G10 PR-B, 002 §1.1.7), persisted on the shared event so the
+   * (spec: pipeline/post-processing), persisted on the shared event so the
    * per-recipient `net` collapse runs at claim without re-scanning monitors.
    * `null` on legacy rows materialized before PR-B — treated as `incremental`.
    */
@@ -153,14 +153,14 @@ export interface MonitorEventRecord {
   tags: string[];
   createdAt: Date;
   /**
-   * The requesting session's delivery state for this event (002 §7):
+   * The requesting session's delivery state for this event (spec: delivery/session-projection — "Unread, claimed, and acknowledged are distinct session states"):
    * `unread` (not acknowledged), `claimed` (surfaced at least once at a
    * delivery lifecycle, but not acknowledged), or `acknowledged`. Only present
    * when the query was session-scoped (`EventQuery.sessionId` set) — a
    * global/unscoped `listEvents()` call has no single session's state to
    * report, so this is `undefined` in that case. The CLI's unread filter
    * matches an unacknowledged event and therefore includes
-   * claimed-but-unacknowledged events (002 §7); this field lets a caller tell
+   * claimed-but-unacknowledged events (spec: delivery/session-projection — "Unread, claimed, and acknowledged are distinct session states"); this field lets a caller tell
    * an unread-and-unclaimed event apart from one that was already surfaced
    * once (issue #338).
    */
@@ -172,7 +172,7 @@ export interface DeliveryEventSummary {
   monitorId: string;
   title: string;
   /**
-   * The recipient-visible summary (G14, 002 §1.1.8): the Interpret digest when
+   * The recipient-visible summary (spec: pipeline/post-processing): the Interpret digest when
    * one was produced for this recipient's delta, otherwise the deterministic
    * `MonitorEventRecord.summary` → `body` → `title` fallback chain
    * (`recipientSummary` in `service.ts`). A digest is a **prose reading of the
@@ -180,7 +180,7 @@ export interface DeliveryEventSummary {
    * monitor watching many objects, two distinct objects can legitimately
    * produce indistinguishable or identity-free digest text. Transports that
    * need to name WHICH object an event is about (e.g. a multi-object source
-   * delivering under one shared authored title, 002 §5.4) MUST use {@link
+   * delivering under one shared authored title, spec: runtime/event-materialization) MUST use {@link
    * objectDetail}, not this field.
    */
   summary: string;
@@ -212,14 +212,14 @@ export interface DeliveryEventSummary {
    * *what changed*, not just the title and the author's instructions.
    *
    * This is the **recipient-specific** delta (`session_event_state.diff_text`,
-   * G10 / 002 §1.1.2): the diff THIS recipient's own baseline cursor produces
+   * spec: pipeline/post-processing): the diff THIS recipient's own baseline cursor produces
    * against the shared observation, not necessarily the shared latest-snapshot
    * delta on `MonitorEventRecord.diffText`. Two sessions at divergent cursors
    * receive different (correct) spans from the same shared event — a session
    * last seen two observations ago receives the full multi-observation span,
    * while a caught-up session receives only the latest delta (session
    * isolation, issue #436). The shared `MonitorEventRecord.diffText` is used
-   * only as a **legacy fallback** for a pre-G10 row whose per-recipient column
+   * only as a **legacy fallback** for a pre-per-recipient-delta row whose per-recipient column
    * is `null` (mirrors `perRecipientDiffsForSession`'s own contract).
    *
    * Optional: absent when the event carried no diff at all (neither the
@@ -254,7 +254,7 @@ export interface DeliveryClaim {
    * reads `message` when `events.length > 0`. A bounded transport MUST render
    * this field explicitly whenever it is present, or the coalesced normal
    * rows are claimed but never actually surfaced anywhere — a
-   * claimed-set-equals-rendered-set violation (006 §5.5).
+   * claimed-set-equals-rendered-set violation (spec: delivery/channel-transport, delivery/hook-transport).
    */
   coalescedReminder?: string;
   /**
@@ -276,11 +276,11 @@ export interface DeliveryClaim {
 }
 
 /**
- * An uncommitted delivery reservation (006 §4, issue #300): the {@link
+ * An uncommitted delivery reservation (spec: delivery/channel-transport, issue #300): the {@link
  * DeliveryClaim} a transport should surface, plus an opaque `reservationId` it
  * commits (after a successful surface) or releases (on a failed/disconnected
  * push). Reserving leases the underlying rows — hiding them from the hook
- * transport's claim so the two do not double-surface (006 §4.5) — WITHOUT
+ * transport's claim so the two do not double-surface (spec: delivery/channel-transport) — WITHOUT
  * marking them claimed. The claim (`firstNotifiedAt`, "was surfaced") is written
  * only at commit; a release returns the rows to the hook path. The rows stay
  * unacknowledged throughout (BP2).
@@ -360,7 +360,7 @@ export interface MonitorExplainStage {
 export type MonitorDeliveryState = 'unread' | 'claimed' | 'acknowledged';
 
 /**
- * The per-recipient Interpret verdict recorded on a projection (G14, 002 §1.1.8):
+ * The per-recipient Interpret verdict recorded on a projection (spec: pipeline/post-processing):
  * `deliver` — the agentic gate passed (or no gate) and a digest was produced;
  * `suppress` — the agentic gate judged the delta not substantive, so no delivery;
  * `failed` — the AI tool errored and the runtime fell back to the deterministic
@@ -369,7 +369,7 @@ export type MonitorDeliveryState = 'unread' | 'claimed' | 'acknowledged';
 export type InterpretDecision = 'deliver' | 'suppress' | 'failed';
 
 /**
- * A per-recipient baseline cursor (G10, 002 §1.1.2): the last shaped artifact a
+ * A per-recipient baseline cursor (spec: pipeline/post-processing): the last shaped artifact a
  * given session was caught up to for one `(monitorId, objectKey, workspacePath)`
  * object. The recipient's Diff stage spans FROM `baselineContent`.
  * `baselineContent` is denormalized (prune-immune); `baselineSnapshotId` records
@@ -398,14 +398,14 @@ export interface MonitorDeliveryProjection {
   lastClaimLifecycle?: string;
   acknowledgedAt?: Date;
   /**
-   * The PER-RECIPIENT delta for this projection (G10, 002 §1.1.2): the diff of
+   * The PER-RECIPIENT delta for this projection (spec: pipeline/post-processing): the diff of
    * the shared event's artifact against THIS session's own baseline cursor.
    * Absent for a baseline event (nothing to diff) and for legacy rows
-   * materialized before G10 — consumers fall back to the shared
+   * materialized before per-recipient deltas — consumers fall back to the shared
    * `MonitorEventRecord.diffText` in that case.
    */
   diffText?: string;
-  /** The per-recipient Interpret verdict (G14), absent for non-`prose` deliveries. */
+  /** The per-recipient Interpret verdict (spec: pipeline/post-processing), absent for non-`prose` deliveries. */
   interpretDecision?: InterpretDecision;
   /** The agentic-gate suppression reason or the fallback-failure detail. */
   interpretReason?: string;
@@ -413,7 +413,7 @@ export interface MonitorDeliveryProjection {
   interpretDigest?: string;
   /**
    * Set when this projection was CLAIMED-BUT-SUPPRESSED by the per-recipient
-   * `net` collapse (G10 PR-B, 002 §1.1.7): an older intermediate of a `net`
+   * `net` collapse (spec: pipeline/post-processing): an older intermediate of a `net`
    * monitor's catch-up span whose newest sibling was delivered instead. The row
    * is retained so the collapse stays explainable, but it was never surfaced to
    * a transport.
@@ -534,7 +534,7 @@ export interface DoctorReportInput {
 
 /**
  * The workspace-wide, durable-state health report behind the
- * `agentmonitors doctor` command (005 §"doctor", issue #267). It is a
+ * `agentmonitors doctor` command (spec: cli/doctor, issue #267). It is a
  * read-only diagnosis of the core/daemon side; the CLI layers the
  * project-enabled and daemon-reachable checks (both CLI-only concerns) on
  * top of it.
@@ -555,7 +555,7 @@ export interface MonitorDoctorReport {
   monitors: DoctorMonitorRollup[];
   /** Count of discovered monitors that failed validation. */
   invalidCount: number;
-  /** Monitor-id collisions across the tree (001 §4). */
+  /** Monitor-id collisions across the tree (spec: monitor/definition — "Duplicate monitor IDs are reported by scan", "Duplicate monitor IDs are a hard error"). */
   duplicateIds: DuplicateMonitorId[];
   /** Parse-level failures (a `MONITOR.md` that could not be parsed at all). */
   parseErrors: DoctorParseError[];
@@ -590,15 +590,15 @@ export interface PendingDebounceState {
 
 /**
  * Durable accumulation state for the scheduled-rollup Pace mode
- * (`notify.strategy: rollup`, 001 §3.6 / 002 §4.4). Every observation produced
+ * (`notify.strategy: rollup`, spec: monitor/definition, runtime/notify-dispatch, pipeline/post-processing). Every observation produced
  * since the last window flush is appended to `observations`; unlike
  * `PendingDebounceState` there is **no** `dueAt` reset on each new observation —
  * the flush time is schedule-driven (the author's `window` cron), not
  * settle-driven. The batch is persisted in `monitor_state.notify_state` and
- * **MUST** survive a daemon restart (002 §4.4 step 1, BP1); it is hydrated and
+ * **MUST** survive a daemon restart (spec: runtime/notify-dispatch, pipeline/post-processing step 1, BP1); it is hydrated and
  * flushed on the first tick where the window cron fires with a non-empty batch.
  *
- * @see docs/specs/002-runtime-delivery.md §4.4
+ * @see openspec/specs/runtime/notify-dispatch/spec.md, openspec/specs/pipeline/post-processing/spec.md
  */
 export interface PendingRollupState {
   observations: StoredObservationEnvelope[];
@@ -611,7 +611,7 @@ export interface NotifyRuntimeState {
   /**
    * The epoch-minute (Math.floor(ms / 60_000)) of the most recent rollup window
    * flush. Guards against duplicate flushes within the same calendar minute when
-   * the tick interval is shorter than 60 s (002 §4.4 step 2 "at most once per
+   * the tick interval is shorter than 60 s (spec: runtime/notify-dispatch, pipeline/post-processing step 2 "at most once per
    * minute"). Persisted independently of `pendingRollup` so the guard survives
    * the flush that deletes `pendingRollup`.
    */
@@ -629,7 +629,7 @@ export interface StoredObservationEnvelope {
    * high-urgency debounce default) and the materialized `monitor_events.urgency`
    * row, so a held batch and its event rows agree on the effective urgency.
    *
-   * @see docs/specs/002-runtime-delivery.md §4.1, §5.1
+   * @see openspec/specs/runtime/notify-dispatch/spec.md, openspec/specs/runtime/event-materialization/spec.md
    */
   effectiveUrgency: Urgency;
 }
@@ -722,13 +722,13 @@ export interface ProcessObservationInput {
    * The effective urgency resolved at notify time
    * (`clamp(salience ?? band.lo, band.lo, band.hi)`). The materialized
    * `monitor_events.urgency` row MUST use this value so the persisted event and
-   * the notify-timing decision agree (002 §5.1).
+   * the notify-timing decision agree (spec: runtime/event-materialization).
    */
   effectiveUrgency: Urgency;
   /**
-   * Present only for an ephemeral monitor (007 §4): the declaring session id.
+   * Present only for an ephemeral monitor (spec: agent/ephemeral-monitors): the declaring session id.
    * When set, the materialized event projects into ONLY this session, never a
-   * sibling lead session in the same workspace (007 §4.6 isolation).
+   * sibling lead session in the same workspace (spec: agent/ephemeral-monitors isolation).
    */
   restrictToSessionId?: string;
 }
@@ -766,7 +766,7 @@ export interface ErroredObservation {
  * yet elapsed since the last observation. Surfaced so callers (e.g. daemon
  * once) can distinguish "skipped, not yet due" from "no monitors found".
  *
- * @see docs/specs/002-runtime-delivery.md §2.4
+ * @see openspec/specs/runtime/tick-scheduling/spec.md
  */
 export interface SkippedMonitor {
   monitorId: string;

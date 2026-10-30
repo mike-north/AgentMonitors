@@ -154,11 +154,11 @@ export async function claimDeliveryClient(
 
 /**
  * Reserve — but do not yet claim — the pending `turn-interruptible` delivery for
- * a session (006 §4, issue #300). Returns the {@link DeliveryReservation}
+ * a session (spec: delivery/channel-transport, issue #300). Returns the {@link DeliveryReservation}
  * (claim + opaque `reservationId`) a transport surfaces then {@link
  * commitDeliveryClient commits} (on success) or {@link releaseDeliveryClient
  * releases} (on a failed push), or `null` when nothing is pending. Reserving
- * leases the rows so the hook transport will not double-surface them (006 §4.5),
+ * leases the rows so the hook transport will not double-surface them (spec: delivery/channel-transport),
  * WITHOUT marking them claimed — the claim is deferred to commit so a transient
  * push failure never consumes the delivery.
  */
@@ -181,7 +181,7 @@ export async function reserveDeliveryClient(
 
 /**
  * Commit a reservation from {@link reserveDeliveryClient} after its claim was
- * surfaced (006 §4, issue #300): the reserved rows become claimed ("was
+ * surfaced (spec: delivery/channel-transport, issue #300): the reserved rows become claimed ("was
  * surfaced", BP2 — not acknowledged). Returns the committed {@link
  * DeliveryClaim}, or `null` if the reservation was unknown/expired (a safe
  * no-op — the rows were never permanently consumed).
@@ -198,8 +198,8 @@ export async function commitDeliveryClient(
 }
 
 /**
- * Release a reservation from {@link reserveDeliveryClient} WITHOUT claiming (006
- * §4, issue #300): the push failed/disconnected, so the leased rows return to
+ * Release a reservation from {@link reserveDeliveryClient} WITHOUT claiming (
+ * spec: delivery/channel-transport, issue #300): the push failed/disconnected, so the leased rows return to
  * `pending` for the hook transport (or the next poll) to re-deliver.
  */
 export async function releaseDeliveryClient(
@@ -239,7 +239,7 @@ export async function previewSettledHighDeliveryClient(
  * text (when non-`undefined`) BEFORE sizing how many whole high-urgency event
  * blocks fit — the reminder is appended AFTER the packed blocks, so sizing
  * against the blocks alone risks a claim that overflows the cap once the
- * reminder is appended, or truncates it away (006 §5.5).
+ * reminder is appended, or truncates it away (spec: delivery/channel-transport, delivery/hook-transport).
  */
 export async function previewCoalescedReminderClient(
   sessionId: string,
@@ -295,7 +295,7 @@ export async function explainMonitorClient(
 
 /**
  * Declare an ephemeral (agent-declared, session-scoped) monitor through the
- * daemon (007 §4.2 / 005 §14.4). Thin over the socket IPC (AP6); the runtime
+ * daemon (spec: agent/ephemeral-monitors). Thin over the socket IPC (AP6); the runtime
  * validates the scope with the same `validateScope` path as `agentmonitors
  * validate`.
  */
@@ -310,7 +310,7 @@ export async function declareWatchClient(
   );
 }
 
-/** List a session's active ephemeral monitors (007 §4, `watch list`). */
+/** List a session's active ephemeral monitors (spec: agent/ephemeral-monitors, `watch list`). */
 export async function listWatchClient(
   sessionId: string,
   socketPath?: string,
@@ -322,7 +322,7 @@ export async function listWatchClient(
   );
 }
 
-/** Cancel (immediately reap) one of a session's ephemeral monitors (007 §4.4). */
+/** Cancel (immediately reap) one of a session's ephemeral monitors (spec: agent/ephemeral-monitors). */
 export async function cancelWatchClient(
   sessionId: string,
   ephemeralId: string,

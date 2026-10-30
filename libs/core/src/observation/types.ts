@@ -30,28 +30,28 @@ export type ChangeKind = 'created' | 'modified' | 'deleted' | 'descoped';
 /**
  * Data returned by an observation source when it detects a change or event.
  *
- * **Sources return current-state snapshots, not diffs (003 §2.5).** An
+ * **Sources return current-state snapshots, not diffs (spec: sources/contract).** An
  * `Observation` describes *what the watched thing is now* — its `snapshotText`
  * and/or `snapshot` metadata capture the current state — never a pre-computed
  * "what changed for the consumer" delta. The runtime is the **sole producer of
  * the delivery diff**: it diffs each observation's `snapshotText` against the
- * consumer's stored baseline (002 §5.2). A source MUST NOT attempt to compute
+ * consumer's stored baseline (spec: runtime/event-materialization). A source MUST NOT attempt to compute
  * "what is new for recipient X" — it does not hold any recipient's baseline, so
  * that is structurally the runtime's job. This split is what lets one shared
  * observation fan out to recipients with divergent baselines.
  *
  * A source still carries change-detection state via {@link ObservationResult.nextState}
- * (003 §2.4) — but only to decide *whether to emit at all* and to advance its
+ * (spec: sources/contract — "Stateful sources establish a baseline", "Bundled sources declare statefulness") — but only to decide *whether to emit at all* and to advance its
  * own cursor, never to produce the consumer-facing delta.
  *
  * A single `Observation` MAY be a **composite** assembled from many underlying
  * source calls reduced into one stable, deterministic snapshot under one
- * `objectKey` (003 §2.6) — the runtime sees and diffs it exactly as a
+ * `objectKey` (spec: sources/api-poll, sources/contract) — the runtime sees and diffs it exactly as a
  * single-call snapshot.
  *
- * @see docs/specs/003-source-plugins.md §2.5
- * @see docs/specs/003-source-plugins.md §2.6
- * @see docs/specs/002-runtime-delivery.md §5.2
+ * @see openspec/specs/sources/contract/spec.md
+ * @see openspec/specs/sources/api-poll/spec.md, openspec/specs/sources/contract/spec.md
+ * @see openspec/specs/runtime/event-materialization/spec.md
  */
 export interface Observation {
   /**
@@ -59,11 +59,11 @@ export interface Observation {
    *
    * This is **not** necessarily the delivered event title. The runtime chooses
    * that at materialization: the monitor's authored `name` when it has one,
-   * otherwise this string unchanged (002 §5.4). A source therefore writes a
+   * otherwise this string unchanged (spec: runtime/event-materialization). A source therefore writes a
    * title that reads well as the FALLBACK headline for a nameless monitor.
    *
    * A source interpolating a configuration-identity `objectKey` here (a joined
-   * argv, a URL) bounds it with `displayObjectKey` (003 §2.8).
+   * argv, a URL) bounds it with `displayObjectKey` (spec: sources/contract).
    */
   title: string;
   /** Optional body/description */
@@ -72,12 +72,12 @@ export interface Observation {
    * Optional short per-object text for lightweight delivery surfaces.
    *
    * This is what both injecting transports render as the DETAIL LINE beneath the
-   * title (006 §4.2.1), so for a monitor with an authored `name` it — not
+   * title (spec: delivery/channel-transport, delivery/transport-seam), so for a monitor with an authored `name` it — not
    * {@link Observation.title} — is the string that names which object moved. A
    * source that supplies a `summary` distinct from its `title` is choosing that
    * text as the surfaced one; the title then appears only for a nameless
-   * monitor (the compatibility table in 002 §5.4). When omitted, the runtime
-   * derives it from `body`, else `title` (002 §5.1).
+   * monitor (the compatibility table in spec: runtime/event-materialization). When omitted, the runtime
+   * derives it from `body`, else `title` (spec: runtime/event-materialization).
    */
   summary?: string;
   /** Raw source payload, preserved for later querying */
@@ -109,8 +109,8 @@ export interface Observation {
    * degenerate band `x..x`) can never be escalated, preserving PP5 and full
    * backward compatibility.
    *
-   * @see docs/specs/003-source-plugins.md §2.3
-   * @see docs/specs/002-runtime-delivery.md §4.1
+   * @see openspec/specs/sources/contract/spec.md
+   * @see openspec/specs/runtime/notify-dispatch/spec.md
    */
   salience?: Urgency;
   /** Point-in-time snapshot metadata captured at fire time */
@@ -136,7 +136,7 @@ export interface ObservationContext {
    */
   signal?: AbortSignal;
   /**
-   * Watch-mode source-state checkpoint (002 §2.4). Supplied **only** on the
+   * Watch-mode source-state checkpoint (spec: runtime/tick-scheduling). Supplied **only** on the
    * `watch()` path; `observe()` advances source state via
    * {@link ObservationResult.nextState} instead and never receives this callback.
    *
@@ -150,7 +150,7 @@ export interface ObservationContext {
    *
    * The runtime serializes checkpoint writes with observation ingestion
    * per-watcher: a checkpoint in flight when an observation arrives completes
-   * **before** that observation is ingested (the G14 durable-write-before-ingest
+   * **before** that observation is ingested (the durable-write-before-ingest
    * ordering). A checkpoint is a state write only — it never materializes or
    * delivers an observation. A checkpoint whose durable write fails does **not**
    * abort the watcher (a transient durability gap, not a protocol violation): the
@@ -158,7 +158,7 @@ export interface ObservationContext {
    * not guard the call keeps watching. Sources **SHOULD** checkpoint roughly at
    * their configured `interval` and **MAY** coalesce rapid requests.
    *
-   * @see docs/specs/002-runtime-delivery.md §2.4
+   * @see openspec/specs/runtime/tick-scheduling/spec.md
    */
   checkpoint?: (nextState: unknown) => Promise<void>;
 }
@@ -172,7 +172,7 @@ export interface ObservationResult {
    * last API body, a last-seen commit SHA) — used only to decide *whether* to
    * emit and to advance the source's own cursor. It is **not** a per-recipient
    * baseline and is never the delivery diff: the runtime owns the consumer
-   * baseline and is the sole diff producer (003 §2.5, 002 §5.2).
+   * baseline and is the sole diff producer (spec: sources/contract, runtime/event-materialization).
    */
   nextState?: unknown;
   /**
@@ -188,7 +188,7 @@ export interface ObservationResult {
    * `nextState` and `observations` are still valid — but it surfaces a likely
    * misconfiguration the author should fix. Example: `api-poll` configured with
    * `change-detection.strategy: json-diff` against a body that does not parse as
-   * JSON, which silently degrades to text comparison (003 §4.2).
+   * JSON, which silently degrades to text comparison (spec: sources/api-poll).
    *
    * `agentmonitors monitor test` prints these so authors see the problem during
    * a dry-run instead of getting quietly wrong diffing in production.

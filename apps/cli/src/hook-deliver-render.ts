@@ -55,7 +55,7 @@ function socketClause(socketPath: string | undefined): string {
  * delivery's semantic `message` (PR #445 review, finding 2). The runtime's
  * `reminderMessage()` (`libs/core/src/runtime/service.ts`) states only the
  * transport-neutral fact that changes are pending — attribution AND the
- * concrete next step are both transport-owned (002 §9.2, 006 §5.1.1): this
+ * concrete next step are both transport-owned (spec: delivery/lifecycles, delivery/channel-transport, delivery/hook-transport, delivery/transport-seam): this
  * transport names the CLI verbs directly, with an explicit `--socket <path>`
  * (issue #358) so a copy-pasted command can't silently query a stale
  * `$AGENTMONITORS_SOCKET` (PR #445 review, finding 4) — unlike the channel
@@ -86,7 +86,7 @@ function buildHookReminderActionStep(
  * caller deferred more (`options.moreDeferred`) — but genuinely stays
  * **pending** (`first_notified_at` still `NULL`): `claimDeliveryClient` only
  * claimed the events actually rendered, so the omitted remainder re-delivers
- * at the next context event (006 §5.1/§5.5). "more monitor updates are
+ * at the next context event (spec: delivery/hook-transport, delivery/channel-transport). "more monitor updates are
  * pending" is therefore an accurate promise for THIS branch only — see
  * {@link buildHookClaimedUnreadMarker} for the single-event mid-truncation
  * branch, which must NOT reuse this framing
@@ -136,7 +136,7 @@ function buildHookDeferredMarker(
  * A prior version of this marker asserted "it is claimed but NOT
  * acknowledged ... it will not redeliver automatically" — true only if the
  * commit **resolves non-null** (the row is claimed and will never redeliver
- * via the ordinary context-event flow, §5.5); FALSE if the commit
+ * via the ordinary context-event flow, spec: delivery/channel-transport, delivery/hook-transport); FALSE if the commit
  * **resolves null** (the reservation's lease already lapsed — the row was
  * definitely never claimed, so it stays pending and WILL redeliver); and
  * neither assertion holds if the commit **rejects** (an IPC/transport
@@ -177,7 +177,7 @@ function buildHookClaimedUnreadMarker(
  * (`applyDelivery` claims `decision.candidates`, not just the rendered
  * `recapSlice`) — but recap re-SOURCES from `unreadEventsForSession`, not
  * `pendingEventsForSession`, so a row being claimed (`first_notified_at` set)
- * never hides it from a FUTURE recap; only acknowledging does (§5.5). That
+ * never hides it from a FUTURE recap; only acknowledging does (spec: delivery/channel-transport, delivery/hook-transport). That
  * means:
  *
  * - {@link buildHookDeferredMarker}'s own contract — "more monitor updates
@@ -198,14 +198,14 @@ function buildHookClaimedUnreadMarker(
  *   can't back up. The recap marker below is preferred precisely because it
  *   CAN make a guarantee that holds across all three commit outcomes:
  *   future recap resurfacing, which is unaffected by whether THIS commit
- *   claims these rows (§5.5's self-heal re-sources from
+ *   claims these rows (spec: delivery/channel-transport, delivery/hook-transport's self-heal re-sources from
  *   `unreadEventsForSession`, not `pendingEventsForSession`).
  * - {@link buildHookClaimedUnreadMarker} (in its current, post-round-10
  *   wording) no longer asserts a redelivery outcome either way — but a
  *   recap's own framing is still distinct: it can (and should) promise the
  *   POSITIVE "will reappear on future recaps" outcome, which is true
  *   regardless of whether THIS recap's own commit lands, because a FUTURE
- *   recap always re-sources from `unreadEventsForSession` (§5.5's self-heal).
+ *   recap always re-sources from `unreadEventsForSession` (spec: delivery/channel-transport, delivery/hook-transport's self-heal).
  *   The ordinary marker cannot make that promise (a `turn-interruptible`
  *   claim's tail genuinely does NOT redeliver once acknowledged-adjacent
  *   state is uncertain), so it settles for the outcome-agnostic "stays
@@ -324,7 +324,7 @@ function appendMarkerWithinCap(
  * instruction can never claim more than what the recipient was shown.
  *
  * Emitted ONCE per delivery batch (it lives in the shared header, not per
- * event) and kept terse — this lands in an LLM context window (006 §5.1's
+ * event) and kept terse — this lands in an LLM context window (the delivery/hook-transport spec's
  * injection-size concern). The session id and each event id are sanitized
  * like every other claim-derived field reaching this payload (see
  * {@link sanitize}).
@@ -375,7 +375,7 @@ function buildHeader(
 /**
  * Render one event as its `additionalContext` block, using the transport-shared
  * block builder so this path and the channel path render the same event
- * equivalently (issue #436, 006 §6). The hook `sanitize` preserves `<>[]` — the
+ * equivalently (issue #436, spec: delivery/transport-seam). The hook `sanitize` preserves `<>[]` — the
  * `additionalContext` is a JSON string, not tag-delimited (see {@link sanitize}).
  */
 function buildEventBlock(event: DeliveryEventSummary): string {
@@ -456,7 +456,7 @@ function resolveHookHeaderPacking(
 /**
  * How many WHOLE high-urgency event blocks (from `events`, oldest-first) the
  * hook-deliver transport can render under its `additionalContext` cap
- * (006 §5.1, issue #299). The transport uses this to decide how many events to
+ * (spec: delivery/hook-transport, issue #299). The transport uses this to decide how many events to
  * CLAIM, so the claimed set equals the rendered set and the remainder stays
  * pending for the next context event.
  *
@@ -548,7 +548,7 @@ export interface PackedHookBlocks {
  * different, larger pending events). Sizing on count alone would then commit
  * (via `claimDelivery`) a set that no longer fits the rendered cap — and
  * because the row is claimed synchronously, the truncated-away tail can
- * **never redeliver** (§5.5). `hook.ts`'s `reserveSizedHookDelivery` calls
+ * **never redeliver** (spec: delivery/channel-transport, delivery/hook-transport). `hook.ts`'s `reserveSizedHookDelivery` calls
  * this function on the ACTUAL reserved claim, before committing, so a
  * mismatch can still be released and retried while the rows are only leased,
  * not yet claimed — mirroring the channel transport's
@@ -634,7 +634,7 @@ export interface RenderHookDeliveryOptions {
  * and `session.ts`'s `session start` action, which reuses the identical flow
  * for the `post-compact` recap it surfaces from the SAME stdin payload it
  * reads to register the session (a chained `hook deliver` would see an
- * already-consumed stdin and no-op — 006 §5.6). Both callers render off the
+ * already-consumed stdin and no-op — spec: delivery/channel-transport, delivery/hook-transport). Both callers render off the
  * RESERVATION's own (not-yet-committed) claim, never a claim that has already
  * been durably committed.
  *
@@ -672,7 +672,7 @@ export interface RenderHookDeliveryOptions {
  *   footer AFTER the packed event blocks — `claim.events`/`claim.message`
  *   carry no representation of it on their own, and `claimDelivery` claims
  *   the coalesced normal rows alongside the surfaced high events, so omitting
- *   this footer would claim-but-never-render them (006 §5.5, PR #456 review
+ *   this footer would claim-but-never-render them (spec: delivery/channel-transport, delivery/hook-transport, PR #456 review
  *   finding 2).
  * - **Reminder line** — a `normal`/`low` turn-boundary claim carries no event
  *   bodies (`events: []`) but a populated `message` (the same advisory line
@@ -703,7 +703,7 @@ export function renderHookDelivery(
   // A `post-compact` recap is a DIFFERENT lifecycle from a `turn-interruptible`
   // (or `turn-idle`) claim: it intentionally re-shows the full unread set on
   // EVERY recap, regardless of whether a given row already got claimed
-  // (§5.5) — so neither of the two markers below is truthful for it. Marker
+  // (spec: delivery/channel-transport, delivery/hook-transport) — so neither of the two markers below is truthful for it. Marker
   // selection is therefore lifecycle-aware (issue #442, PR #442 round-9
   // review): see {@link buildHookRecapMarker}.
   const isRecap = claim.lifecycle === 'post-compact';
@@ -785,16 +785,16 @@ export function renderHookDelivery(
   // representation of it, and `claim.message` is never consulted in this
   // (body-injection) branch — so without this footer the coalesced reminder
   // was claimed (the caller claims `normalPending` alongside the surfaced high
-  // events) but never actually rendered anywhere, violating 006 §5.5's
+  // events) but never actually rendered anywhere, violating spec: delivery/channel-transport, delivery/hook-transport's
   // claimed-set-equals-rendered-set invariant. Per #445's wording contract
-  // (002 §9.2 / 006 §5.1.1) the runtime emits ONLY the transport-neutral
+  // (spec: delivery/lifecycles, delivery/channel-transport, delivery/hook-transport, delivery/transport-seam) the runtime emits ONLY the transport-neutral
   // reminder body; this transport appends its OWN concrete, session+socket-
   // scoped acknowledge step ({@link buildHookReminderActionStep}) — exactly as
   // the reminder-only branch above does — so the coalesced reminder is
   // self-sufficient and actionable, never a bare "changes are pending" line
   // with no way to act. Reserved as a fixed suffix BEFORE sizing the event
   // blocks (see `effectiveCap`) so its own length never pushes the render over
-  // `MAX_ADDITIONAL_CONTEXT`, nor truncates the reminder away (006 §5.5). When
+  // `MAX_ADDITIONAL_CONTEXT`, nor truncates the reminder away (spec: delivery/channel-transport, delivery/hook-transport). When
   // no reminder is coalesced, `reminderFooter` is empty and `effectiveCap`
   // equals `MAX_ADDITIONAL_CONTEXT`, so a pure high-urgency delivery renders
   // byte-identically to before.
@@ -900,7 +900,7 @@ export function renderHookDelivery(
  * breadcrumb, forever (the worst kind of onboarding dead-end).
  *
  * This uses the SAME `additionalContext` wire mechanism as
- * {@link renderHookDelivery} (§5.1 of the agent-integration spec), but is a
+ * {@link renderHookDelivery} (spec: delivery/hook-transport), but is a
  * fixed advisory template rather than a rendering of a `DeliveryClaim` — there
  * is no daemon, no session, and no claimed delivery in this path (by design;
  * see the non-goals in issue #269: never auto-enable, never boot a daemon).

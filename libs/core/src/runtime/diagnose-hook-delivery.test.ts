@@ -6,8 +6,8 @@
  * `claimDelivery` exactly, and assert the diagnosis never mutates state.
  *
  * @see ./hook-delivery-diagnosis.test.ts (pure classifier unit tests)
- * @see ../../../../docs/specs/002-runtime-delivery.md §9 (delivery lifecycles)
- * @see ../../../../docs/specs/006-agent-integration.md §5 (hook-deliver transport)
+ * @see ../../../../openspec/specs/delivery/lifecycles/spec.md (delivery lifecycles)
+ * @see ../../../../openspec/specs/delivery/hook-transport/spec.md (hook-deliver transport)
  */
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -108,7 +108,7 @@ describe('diagnoseHookDelivery', () => {
     });
   });
 
-  it('reports a `settle-window` hold for high-urgency work that has not aged past the claim-time threshold (002 §9.1)', () => {
+  it('reports a `settle-window` hold for high-urgency work that has not aged past the claim-time threshold (spec: delivery/lifecycles)', () => {
     vi.useFakeTimers();
     vi.setSystemTime(NOW);
     const h = setup();
@@ -151,7 +151,7 @@ describe('diagnoseHookDelivery', () => {
     expect(diagnosis.holds).toEqual([]);
   });
 
-  it('reports `no-new-work` for the normal reminder once its only unread event is claimed, and diagnosing never claims it itself (002 §9.2)', () => {
+  it('reports `no-new-work` for the normal reminder once its only unread event is claimed, and diagnosing never claims it itself (spec: delivery/lifecycles)', () => {
     const h = setup();
     const session = openLead(h, 'sess-normal');
     const eventId = materialize(h, 'normal', 'mon', 'obj-a', new Date());
@@ -163,7 +163,7 @@ describe('diagnoseHookDelivery', () => {
     // Diagnosis is read-only — it must not have claimed the event.
     expect(h.store.pendingEventsForSession(session, 'normal')).toHaveLength(1);
 
-    // A real claim fires the reminder and claims the event (§9.2).
+    // A real claim fires the reminder and claims the event (spec: delivery/lifecycles).
     const claim = h.runtime.claimDelivery(session, 'turn-interruptible');
     expect(claim?.mode).toBe('delivery');
     expect(claim?.urgency).toBe('normal');
@@ -337,7 +337,7 @@ describe('diagnoseHookDelivery', () => {
     expect(claim?.coalescedReminder).toBe('Monitored changes are pending.');
   });
 
-  it('diagnoses the low band at turn-idle only (002 §9.3)', () => {
+  it('diagnoses the low band at turn-idle only (spec: delivery/lifecycles)', () => {
     const h = setup();
     const session = openLead(h, 'sess-low');
     const eventId = materialize(h, 'low', 'mon', 'obj-a', new Date());

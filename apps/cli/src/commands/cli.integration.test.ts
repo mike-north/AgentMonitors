@@ -778,12 +778,12 @@ describe('init', () => {
 
   // AC4 (issue #268): the named `init <name> --type ...` scaffold output must be
   // unchanged by the bare-init bootstrap work. The expected string below is
-  // written by hand from 005 §2's documented output (spec-owned-expected-string
+  // written by hand from the cli/authoring-commands spec's documented output (spec-owned-expected-string
   // matching, not a captured snapshot of program output), so any drift (an
   // added line, a reworded hint) fails here.
   //
   // Updated for issue #331 criterion 1: the closing output now also names
-  // `agentmonitors doctor` as the health-check next step (005 §2's documented
+  // `agentmonitors doctor` as the health-check next step (the cli/authoring-commands spec's documented
   // output was updated in lockstep — see the added line below).
   //
   // Renamed from "...is byte-for-byte unchanged..." (PR #341 review, issue
@@ -907,7 +907,7 @@ describe('init', () => {
 
   // Issue #330 AC2: --glob seeds watch.paths verbatim for incoming-changes
   // (a different underlying frontmatter field than file-fingerprint's
-  // `globs:`, per spec 001 §2 / spec 003 §6), and still passes validate.
+  // `globs:`, per spec: monitor/definition, sources/incoming-changes), and still passes validate.
   it('--glob seeds watch.paths verbatim for incoming-changes (AC2)', () => {
     const dir = path.join(tempDir, 'init-glob-incoming');
     mkdirSync(dir, { recursive: true });
@@ -1289,7 +1289,7 @@ describe('init', () => {
       // No `cwd:` is seeded at scaffold time (issue #444 review, finding
       // 826, superseding the prior finding-1 fix that baked one in):
       // `command-poll` now resolves an omitted `cwd` against the runtime
-      // workspace/config root itself (003 §11.1), so the scaffolded file
+      // workspace/config root itself (spec: sources/command-poll), so the scaffolded file
       // carries no project-root-shaped state that would go stale if the
       // project were relocated after scaffolding.
       expect(monitor).not.toMatch(/^\s*cwd:/m);
@@ -1572,7 +1572,7 @@ describe('init', () => {
 // covered above and must stay unchanged.
 //
 // @see https://github.com/mike-north/AgentMonitors/issues/268
-// @see docs/specs/005-cli-reference.md §2
+// @see openspec/specs/cli/authoring-commands/spec.md
 // @see agent-plugins/agentmonitors/skills/setup-monitors/SKILL.md
 describe('init bootstrap (bare init)', () => {
   const LOCAL_STATE_REL = path.join('.claude', 'agentmonitors.local.md');
@@ -1584,7 +1584,7 @@ describe('init bootstrap (bare init)', () => {
 
   // The exact minimal enable-file shape from the setup-monitors skill's
   // "Enable The Project" section (`agent-plugins/agentmonitors/skills/setup-monitors/SKILL.md`)
-  // and 005 §2. Written by hand from that doc, not derived from program
+  // and spec: cli/authoring-commands. Written by hand from that doc, not derived from program
   // output, so drift in either the skill doc or the implementation fails here.
   const EXPECTED_LOCAL_STATE_CONTENTS =
     '---\n' +
@@ -1966,7 +1966,7 @@ This monitor has a typo'd timezone.
     expect(parsed.error).toContain('agentmonitors monitor test');
   });
 
-  // Regression for G1 / SP2: two folders with the same basename derive the same
+  // Regression for duplicate monitor ids (SP2; spec: monitor/validation): two folders with the same basename derive the same
   // monitor id; validate must fail (exit 1) and name the collision.
   it('rejects duplicate monitor ids', () => {
     const dir = path.join(tempDir, 'validate-dup-test');
@@ -2026,7 +2026,7 @@ This monitor has a typo'd timezone.
     expect(result.stdout.toLowerCase()).toMatch(/scope|array|type/);
   });
 
-  // issue #109 / 001 §3.2: an authored urgency band `lo..hi` is valid.
+  // issue #109 / spec: monitor/definition: an authored urgency band `lo..hi` is valid.
   it('accepts a range urgency band (lo..hi)', () => {
     const dir = path.join(tempDir, 'validate-range-urgency-test');
     const monitorDir = path.join(dir, 'monitors', 'banded');
@@ -2049,7 +2049,7 @@ This monitor has a typo'd timezone.
     expect(result.stdout).toContain('Valid monitors: 1');
   });
 
-  // issue #109 / 001 §3.2: an inverted band (lo > hi) must be rejected.
+  // issue #109 / spec: monitor/definition: an inverted band (lo > hi) must be rejected.
   it('rejects an inverted urgency band (high..normal)', () => {
     const dir = path.join(tempDir, 'validate-inverted-urgency-test');
     const monitorDir = path.join(dir, 'monitors', 'inverted');
@@ -2072,7 +2072,7 @@ This monitor has a typo'd timezone.
     expect(result.stdout.toLowerCase()).toContain('urgency');
   });
 
-  // G13 / 001 §3.7 / 002 §1.1.7: `baseline-strategy` accepts incremental and
+  // spec: pipeline/post-processing, monitor/definition: `baseline-strategy` accepts incremental and
   // net, and rejects any other value.
   for (const strategy of ['incremental', 'net'] as const) {
     it(`accepts baseline-strategy: ${strategy}`, () => {
@@ -2122,7 +2122,7 @@ This monitor has a typo'd timezone.
     expect(result.stdout.toLowerCase()).toContain('baseline-strategy');
   });
 
-  // G12 / 001 §3.6, 002 §4.4: a scheduled-rollup monitor (`strategy: rollup`
+  // spec: runtime/notify-dispatch, monitor/definition, pipeline/post-processing: a scheduled-rollup monitor (`strategy: rollup`
   // with a `window` cron) is accepted by `validate`. Proof criterion (a),
   // exercised end-to-end through the real CLI.
   it('accepts a rollup notify monitor with a window cron', () => {
@@ -2150,7 +2150,7 @@ This monitor has a typo'd timezone.
     expect(result.stdout).toContain('Valid monitors: 1');
   });
 
-  // G12 / 001 §3.6: `strategy: rollup` WITHOUT the required `window` is rejected.
+  // spec: runtime/notify-dispatch, monitor/definition: `strategy: rollup` WITHOUT the required `window` is rejected.
   // Proof criterion (a), rejection half.
   it('rejects a rollup notify monitor missing the required window', () => {
     const dir = path.join(tempDir, 'validate-rollup-reject-test');
@@ -2603,7 +2603,7 @@ This monitor has a typo'd timezone.
     expect(result.stdout).toContain('bogus-nonsense-key');
   });
 
-  // 003 §12 BP3 — a `change-detection.collection` block is only valid under
+  // spec: sources/contract BP3 — a `change-detection.collection` block is only valid under
   // `strategy: json-diff`. Under text-diff/exit-code it must be rejected with a
   // clear message, for both poll sources.
   function collectionMonitorBody(
@@ -2788,7 +2788,7 @@ describe('scan', () => {
   it('exits 1 when two monitors share a duplicate id (duplicateIds non-empty)', () => {
     const root = path.join(tempDir, 'scan-dup', 'monitors');
     // Same leaf folder name in two subtrees → duplicate monitor id (the id is
-    // the parent directory name, 001 §4).
+    // the parent directory name, spec: monitor/definition — "Duplicate monitor IDs are reported by scan", "Duplicate monitor IDs are a hard error").
     for (const grp of ['grp1', 'grp2']) {
       const dir = path.join(root, grp, 'dupe');
       mkdirSync(dir, { recursive: true });
@@ -3137,7 +3137,7 @@ describe('daemon run — explicit --socket over the AF_UNIX limit (issue #337)',
         .replace('AgentMon daemon listening on ', '')
         .trim();
 
-      // Criterion 2: the startup line (spec 002 §10.2) is unchanged — the
+      // Criterion 2: the startup line (spec: daemon/ipc) is unchanged — the
       // daemon still reports whatever it actually bound (the substituted,
       // hash-derived path), never the requested one.
       expect(substitutedSocketPath).not.toBe(requestedSocketPath);
@@ -4021,7 +4021,7 @@ describe('schema generate', () => {
         watch?: {
           properties?: { type?: { enum?: string[] } };
         };
-        // issue #109 / 001 §3.2: urgency is now a bare level OR a `lo..hi` band,
+        // issue #109 / spec: monitor/definition: urgency is now a bare level OR a `lo..hi` band,
         // so the JSON Schema uses `pattern` (shape-only) rather than `enum`.
         urgency?: { type?: string; pattern?: string };
       };
@@ -4029,7 +4029,7 @@ describe('schema generate', () => {
     expect(schema.properties?.watch?.properties?.type?.enum).toEqual(
       expect.arrayContaining(['file-fingerprint', 'api-poll', 'schedule']),
     );
-    // issue #109 / 001 §3.2: editor-hint schema uses pattern, not enum, so that
+    // issue #109 / spec: monitor/definition: editor-hint schema uses pattern, not enum, so that
     // both bare levels (`normal`) and bands (`normal..high`) are accepted.
     // `low` is first-class (PP5). All three bare levels and the `..` band
     // separator must be covered by the pattern.
@@ -5068,7 +5068,7 @@ This monitor has a typo'd timezone.
 // and the exit code (acceptance criterion 3). Tests use the existing CLI harness
 // with the no-orphan-daemon discipline (every started daemon is stopped in a
 // finally). doctor reads persisted state in-process, so most cases need no daemon.
-// @see docs/specs/005-cli-reference.md §"doctor"
+// @see openspec/specs/cli/doctor/spec.md
 describe('doctor (issue #267)', () => {
   const VALID_FILE_MONITOR = `---
 name: Watch source
@@ -6566,7 +6566,7 @@ describe('monitor test', () => {
 
   // Issue #297: an invalid IANA timezone on a schedule monitor's scope must be
   // rejected with an actionable diagnosis (the SAME validateWatchScope error
-  // `validate`/`watch declare` give, 005 §14.4), not silently echoed back or
+  // `validate`/`watch declare` give, spec: agent/ephemeral-monitors), not silently echoed back or
   // left to crash deep inside runtime cron matching.
   it('rejects a schedule monitor with an invalid IANA timezone', () => {
     const dir = path.join(tempDir, 'monitor-test-bad-timezone');
@@ -7129,7 +7129,7 @@ Summarize what changed in the spec/standard docs and whether it affects current 
       // titled `Incoming change: <path> (<changeKind>)`.
       const [event] = unreadEvents;
       expect(event?.monitorId).toBe('spec-changes');
-      // The headline is the monitor's authored name (002 §5.4, issue #449); the
+      // The headline is the monitor's authored name (spec: runtime/event-materialization, issue #449); the
       // per-path detail this acceptance is about rides on `summary`, which the
       // delivered block renders under the title.
       expect(event?.title).toBe('Spec & standard changes from upstream');
@@ -7223,7 +7223,7 @@ Summarize what changed in the spec/standard docs and whether it affects current 
       expect(nestedEvents).toHaveLength(1);
       // The event must name the deeply-nested path, not just a top-level file.
       // incoming-changes summaries: `Incoming change: <path> (<changeKind>)`
-      // (the title is the monitor's authored name, 002 §5.4).
+      // (the title is the monitor's authored name, spec: runtime/event-materialization).
       expect(nestedEvents[0]?.summary).toContain('docs/specs/design/nested.md');
       expect(nestedEvents[0]?.summary).toContain('created');
       expect(nestedEvents[0]?.monitorId).toBe('spec-changes');
@@ -7337,7 +7337,7 @@ When files change, review them.
 
         // Opening a session alone materializes the per-session hook-state
         // file under `.agentmonitors/sessions/<id>/hook-state.json`
-        // (002 §11.3) — this is the exact directory the issue is about.
+        // (spec: delivery/host-adapters) — this is the exact directory the issue is about.
         expect(existsSync(path.join(dir, '.agentmonitors'))).toBe(true);
 
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1100);
@@ -8236,7 +8236,7 @@ describe('channel serve workspace-socket resolution (issue #358)', () => {
       //    it: no `--socket`, no `AGENTMONITORS_SOCKET` -- only the
       //    CLAUDE_PROJECT_DIR / CLAUDE_CODE_SESSION_ID a real Claude Code
       //    MCP-server spawn provides (`experiments/channel-probe`'s
-      //    confirmed contract, 006 §4.4). Inherit the rest of the real
+      //    confirmed contract, spec: delivery/channel-transport). Inherit the rest of the real
       //    baseline env (HOME, XDG_DATA_HOME, locale, ...) rather than a
       //    hand-picked allowlist: `workspacePaths`/`resolveSocketPath` read
       //    HOME/XDG_DATA_HOME to derive the per-workspace socket, and step 1
@@ -8363,7 +8363,7 @@ describe('session start: monitoring-disabled advisory (issue #269)', () => {
       );
       expect(start.exitCode).toBe(0);
 
-      // The real SessionStart hook wire shape (§5.1): continue + hookSpecificOutput.
+      // The real SessionStart hook wire shape (spec: delivery/hook-transport): continue + hookSpecificOutput.
       const output = JSON.parse(start.stdout) as {
         continue: boolean;
         hookSpecificOutput: {
@@ -9781,7 +9781,7 @@ describe('hook deliver', () => {
 // turn-interruptible over the real IPC socket (the subject's exact command).
 //
 // Verdict: NOT a first-claim bug. The FIRST turn-interruptible claim DOES
-// surface the coalesced normal reminder (002 §9.2). The study subject had run an
+// surface the coalesced normal reminder (spec: delivery/lifecycles). The study subject had run an
 // EARLIER turn-interruptible claim (S3 phase 11) that surfaced the reminder AND
 // claimed the event; the second identical claim was then correctly suppressed
 // because no fresh work remained. The real defect was the
@@ -9790,7 +9790,7 @@ describe('hook deliver', () => {
 // `monitor explain` NAMES the reason (no-new-work).
 describe('hook claim normal-urgency reminder + suppression diagnosis (issue #333)', () => {
   /**
-   * The coalesced reminder body the runtime emits (002 §9.2, issues
+   * The coalesced reminder body the runtime emits (spec: delivery/lifecycles, issues
    * #438/#434, PR #445 review finding 2), written out here from the spec
    * rather than read back from the implementation: a SEMANTIC, transport- and
    * verb-neutral message — no product-name attribution and no CLI verb, both
@@ -9913,7 +9913,7 @@ describe('hook claim normal-urgency reminder + suppression diagnosis (issue #333
 
       // CRITERION 1 (refute the first-claim bug): the subject's exact command,
       // with the event unread and UNCLAIMED, surfaces the coalesced generic
-      // reminder — precisely what 002 §9.2 requires. This is NOT null.
+      // reminder — precisely what spec: delivery/lifecycles requires. This is NOT null.
       const first = claimAt('turn-interruptible');
       expect(first.exitCode).toBe(0);
       const firstClaim = JSON.parse(first.stdout) as {
@@ -9930,7 +9930,7 @@ describe('hook claim normal-urgency reminder + suppression diagnosis (issue #333
       // owned by each transport (issue #438).
       expect(firstClaim?.message).not.toContain('AgentMon');
       expect(firstClaim?.message).not.toContain('inbox');
-      expect(firstClaim?.events).toEqual([]); // §9.2: reminder carries no events
+      expect(firstClaim?.events).toEqual([]); // spec: delivery/lifecycles: reminder carries no events
 
       // The divergent precondition from the study transcript: the first claim
       // marked the event CLAIMED (not acknowledged). A SECOND identical claim is
@@ -10243,7 +10243,7 @@ describe('hook deliver --debug diagnosis (issue #334)', () => {
 
   // Criterion 2, branch: events held by the settle window. A high-urgency
   // monitor with a short debounce (settle-for: 1s) materializes its event well
-  // before the SEPARATE 15s claim-time settle window (002 §9.1) elapses — a
+  // before the SEPARATE 15s claim-time settle window (spec: delivery/lifecycles) elapses — a
   // real, observable "held, not lost" state without any real-clock 15s wait.
   it('high-urgency event held by the settle window: stdout stays empty, stderr names the settle-window hold', async () => {
     const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-334-settle-'));
@@ -10267,7 +10267,7 @@ describe('hook deliver --debug diagnosis (issue #334)', () => {
         'urgency: high',
         // A short notify debounce (default high debounce is 15s — the SAME
         // duration as the claim-time settle window, so it would never be
-        // observably "held" without this override; see 002 §9.1/§9.2 and the
+        // observably "held" without this override; see spec: delivery/lifecycles and the
         // CLAUDE.md note on the default high-urgency debounce).
         'notify:',
         '  strategy: debounce',
@@ -10383,7 +10383,7 @@ describe('hook deliver --debug diagnosis (issue #334)', () => {
 
   // Criterion 1's core regression guard: --debug MUST NOT alter stdout in any
   // mode. Two independent sessions in the SAME workspace see the SAME shared
-  // normal-urgency event (session isolation, 002 §6) — one claimed via a
+  // normal-urgency event (session isolation, spec: delivery/session-projection) — one claimed via a
   // plain `hook deliver`, the other via `hook deliver --debug`. Their stdout
   // must be byte-identical; only the debug run also writes to stderr.
   it('stdout is byte-identical between a plain hook deliver and hook deliver --debug for the same delivery', async () => {
@@ -10438,7 +10438,7 @@ describe('hook deliver --debug diagnosis (issue #334)', () => {
 
     try {
       // Two independent LEAD sessions in the same workspace — each gets its
-      // own unread/claimed projection of the same shared event (002 §6).
+      // own unread/claimed projection of the same shared event (spec: delivery/session-projection).
       for (const hostSessionId of [hostA, hostB]) {
         const sessionOpen = runWithEnv(
           [
@@ -10572,7 +10572,7 @@ describe('hook deliver --debug diagnosis (issue #334)', () => {
 
 // Issue #329: an unresolvable host session_id produced empty stdout + exit 0
 // — indistinguishable from the EXPECTED empty output during the ~15s
-// high-urgency claim-settle window (002 §9.1). Since a bad session_id can
+// high-urgency claim-settle window (spec: delivery/lifecycles). Since a bad session_id can
 // never resolve (unlike the settle window, which resolves on its own), this
 // ONE quiet-return branch now ALWAYS writes a one-line stderr diagnostic,
 // regardless of `--debug` — while every other quiet-return branch (including
@@ -10696,7 +10696,7 @@ describe('hook deliver: always-on unknown-session stderr diagnostic (issue #329)
         '  interval: "1s"',
         'urgency: high',
         // Short notify debounce so the event materializes in ~1s, well
-        // short of the SEPARATE 15s claim-time settle window (002 §9.1) —
+        // short of the SEPARATE 15s claim-time settle window (spec: delivery/lifecycles) —
         // an observably "held" state without a real-clock 15s wait.
         'notify:',
         '  strategy: debounce',
@@ -10995,8 +10995,8 @@ describe('hook deliver: always-on malformed-payload / unmapped-lifecycle stderr 
 });
 
 // Issue #270: prove hooks-only (no-MCP) operation is a complete, first-class
-// mode — not an implementation accident. Governing spec: docs/specs/006-
-// agent-integration.md, new subsection "Operating without MCP" (NP-CH). This
+// mode — not an implementation accident. Governing spec: delivery/transport-seam
+// (operating without MCP, NP-CH). This
 // is the `verified:` reference that subsection points at.
 describe('hooks-only delivery parity (issue #270)', () => {
   it('daemon up, monitor fires, hook deliver claims a real stdin payload, events ack acknowledges, events list reflects it — zero MCP/channel involvement', async () => {
@@ -11034,9 +11034,9 @@ describe('hooks-only delivery parity (issue #270)', () => {
     writeLocalState(ws, { enabled: true, socket, db, reapAfterMs: 30_000 });
 
     // Deliberately NO CLAUDE_CODE_SESSION_ID: that env var is the
-    // channel/MCP transport's session-binding signal (006 §4.4). Every
+    // channel/MCP transport's session-binding signal (spec: delivery/channel-transport). Every
     // command below resolves the host session id from the hook STDIN
-    // payload instead (006 §5.0) — this is what makes the flow hooks-only.
+    // payload instead (spec: delivery/hook-transport) — this is what makes the flow hooks-only.
     const env: Record<string, string> = {
       CLAUDE_PROJECT_DIR: ws,
       AGENTMONITORS_DB: db,
@@ -11046,7 +11046,7 @@ describe('hooks-only delivery parity (issue #270)', () => {
     try {
       // 1. Daemon up — the hook-driven lazy-boot command (`session start`),
       //    fed a real SessionStart stdin payload exactly as the plugin's
-      //    hooks.json wires it (006 §5.6). Nothing in this flow spawns an
+      //    hooks.json wires it (spec: delivery/channel-transport, delivery/hook-transport). Nothing in this flow spawns an
       //    MCP server or imports the channel transport (channel.ts).
       const start = runWithStdin(
         ['session', 'start'],
@@ -11113,8 +11113,8 @@ describe('hooks-only delivery parity (issue #270)', () => {
       const eventId = unreadEvent.id;
 
       // 3. Delivery claimed via `hook deliver`, fed a real UserPromptSubmit
-      //    stdin payload — the same wire contract Claude Code uses (006
-      //    §5.0). This is the hooks/CLI equivalent of the channel
+      //    stdin payload — the same wire contract Claude Code uses (
+      //    spec: delivery/hook-transport). This is the hooks/CLI equivalent of the channel
       //    transport's outbound push (channel.ts's poll loop, which also
       //    calls claimDeliveryClient — confirmed statically in
       //    channel-hooks-ipc-parity.test.ts): same daemon IPC call
@@ -11207,7 +11207,7 @@ describe('hooks-only delivery parity (issue #270)', () => {
     }
   }, 30_000);
 
-  // Issue #449 review: `title` is the monitor's AUTHORED name (002 §5.4),
+  // Issue #449 review: `title` is the monitor's AUTHORED name (spec: runtime/event-materialization),
   // shared by every event from a multi-object source. A glob-watching
   // `file-fingerprint` monitor firing on two distinct files therefore
   // produces two rows with an IDENTICAL `title` — without the per-object
@@ -11545,7 +11545,7 @@ describe('hooks-only delivery parity (issue #270)', () => {
 // Drives the REAL channel delivery cycle (`runChannelDeliveryCycle` from
 // channel.ts) against a REAL daemon over its socket, injecting only the one
 // thing that cannot run in CI — the MCP `notifications/claude/channel` push
-// (channels are research-preview, 006 §4/§6). Everything else is the production
+// (channels are research-preview, spec: delivery/channel-transport, delivery/transport-seam). Everything else is the production
 // path: the daemon's `hook.reserve`/`hook.commit`/`hook.release` IPC and the
 // core reserve/commit/release state machine.
 //
@@ -11738,7 +11738,7 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
       expect(outcome).toBe('surfaced');
       expect(pushed).toBeDefined();
       // Claimed ("was surfaced"), and the hook transport now sees nothing to
-      // claim (cross-transport dedup, 006 §4.5).
+      // claim (cross-transport dedup, spec: delivery/channel-transport).
       expect(deliveryStateOf(f)).toBe('claimed');
       expect(
         await claimDeliveryClient(f.sessionId, 'turn-interruptible', f.socket),
@@ -11802,7 +11802,7 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
     try {
       // Run a concurrent hook claim WHILE the reservation is held (inside the
       // push, before commit). It must find nothing — the row is leased, so the
-      // two transports cannot both surface it (006 §4.5).
+      // two transports cannot both surface it (spec: delivery/channel-transport).
       let concurrentClaim: unknown = 'unset';
       const outcome = await runChannelDeliveryCycle(
         f.sessionId,
@@ -11971,7 +11971,7 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
         '  interval: "1s"',
         'urgency: high',
         // Short notify debounce so the event MATERIALIZES quickly; the
-        // SEPARATE 15s claim-time settle window (002 §9.1,
+        // SEPARATE 15s claim-time settle window (spec: delivery/lifecycles,
         // DEFAULT_HIGH_URGENCY_SETTLE_MS) is not configurable and is what
         // this test actually waits out below.
         'notify:',
@@ -11988,7 +11988,7 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
     // round-8 review): a space and brackets are both legal bytes in a Unix
     // domain socket path, but they are ALSO `<channel>`-tag-breakout
     // characters (brackets) and shell metacharacters (space). This proves the
-    // marker's `--socket` clause is BOTH transport-safe (§4.6) and
+    // marker's `--socket` clause is BOTH transport-safe (spec: delivery/channel-transport, delivery/transport-seam — "Channel meta and content are sanitized", "Injecting transports keep identity out of untrusted content") and
     // shell-round-trip-safe end to end against a real daemon, not just at the
     // unit level.
     const socket = path.join(
@@ -12096,7 +12096,7 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
       );
       expect(renderedContent).not.toContain(CHANNEL_DEFERRED_MARKER.trim());
       // The adversarial socket path's own tag-breakout brackets must not
-      // survive raw into the pushed `<channel>` content (006 §4.6) — only
+      // survive raw into the pushed `<channel>` content (spec: delivery/channel-transport, delivery/transport-seam — "Channel meta and content are sanitized", "Injecting transports keep identity out of untrusted content") — only
       // their escaped `\xNN` form should appear.
       expect(renderedContent).not.toMatch(/\[huge\]/);
 
@@ -12214,7 +12214,7 @@ describe('hook deliver: oversized single-event marker socket scoping (issue #358
         '  interval: "1s"',
         'urgency: high',
         // Short notify debounce so the event MATERIALIZES quickly; the
-        // SEPARATE 15s claim-time settle window (002 §9.1,
+        // SEPARATE 15s claim-time settle window (spec: delivery/lifecycles,
         // DEFAULT_HIGH_URGENCY_SETTLE_MS) is not configurable and is what
         // this test actually waits out below.
         'notify:',
@@ -12452,7 +12452,7 @@ describe('inbox commands fail cleanly on an unopenable database (issue #292)', (
 });
 
 // ---------------------------------------------------------------------------
-// Ephemeral monitors — `watch` verbs (007 §4 / 005 §14.4), issue #312.
+// Ephemeral monitors — `watch` verbs (spec: agent/ephemeral-monitors), issue #312.
 //
 // Drives the REAL daemon IPC and the REAL CLI contract (not a hand-built
 // approximation): `session open` → `watch declare` → the daemon ticks the
@@ -12460,7 +12460,7 @@ describe('inbox commands fail cleanly on an unopenable database (issue #292)', (
 // projects into the DECLARING session only → hook-state + `hook claim`
 // delivery surfaces it → `watch cancel` reaps it.
 // ---------------------------------------------------------------------------
-describe('ephemeral monitors: watch declare/list/cancel (007 §4 / 005 §14.4)', () => {
+describe('ephemeral monitors: watch declare/list/cancel (spec: agent/ephemeral-monitors)', () => {
   it('declares, fires into the declaring session ONLY, delivers, and cancels', async () => {
     const dir = path.join(tempDir, 'watch-declare');
     const monitorsDir = path.join(dir, '.claude', 'monitors');
@@ -12529,7 +12529,7 @@ describe('ephemeral monitors: watch declare/list/cancel (007 §4 / 005 §14.4)',
         sessionId: string;
         sourceName: string;
       };
-      // Namespaced runtime identity (007 §4.3).
+      // Namespaced runtime identity (spec: agent/ephemeral-monitors — "Namespaced ephemeral identity", "Ephemeral identity is stable for the monitor lifetime").
       expect(record.id.startsWith('ephemeral:')).toBe(true);
       expect(record.id).toContain(declaring.id);
       expect(record.status).toBe('active');
@@ -12574,14 +12574,14 @@ describe('ephemeral monitors: watch declare/list/cancel (007 §4 / 005 §14.4)',
       }[];
       expect(declaringEvents.length).toBeGreaterThanOrEqual(1);
       // The event belongs to the EPHEMERAL monitor — it flowed the identical
-      // pipeline as a persistent monitor (007 §4.6).
+      // pipeline as a persistent monitor (spec: agent/ephemeral-monitors).
       expect(declaringEvents[0]?.monitorId).toBe(record.id);
 
-      // Projection isolation (007 §4.6, criterion 4): the sibling lead session in
+      // Projection isolation (spec: agent/ephemeral-monitors, criterion 4): the sibling lead session in
       // the SAME workspace receives NOTHING from the ephemeral monitor.
       expect(JSON.parse(unreadFor(sibling.id).stdout)).toHaveLength(0);
 
-      // Same transports (007 §4.6, criterion 5): the hook-state file reflects the
+      // Same transports (spec: agent/ephemeral-monitors, criterion 5): the hook-state file reflects the
       // unread event for the declaring session, and NOT for the sibling.
       const declaringHookState = JSON.parse(
         readFileSync(declaring.hookStatePath, 'utf-8'),
@@ -12635,7 +12635,7 @@ describe('ephemeral monitors: watch declare/list/cancel (007 §4 / 005 §14.4)',
       expect(claimSibling.exitCode).toBe(0);
       expect(JSON.parse(claimSibling.stdout)).toBeNull();
 
-      // `watch cancel` immediately reaps the monitor (007 §4.4).
+      // `watch cancel` immediately reaps the monitor (spec: agent/ephemeral-monitors).
       const cancel = runWithEnv(
         [
           'watch',
@@ -12762,7 +12762,7 @@ Bad schedule scope.
 // empty stdout + exit 0 — indistinguishable from "nothing pending" — with the
 // explanation gated behind `--debug`. It now joins the always-on stderr
 // diagnostics, while `hook deliver`'s STDOUT stays byte-identical (the hook
-// wire contract, 006 §5.1, is a hard non-goal to change).
+// wire contract, spec: delivery/hook-transport, is a hard non-goal to change).
 // ---------------------------------------------------------------------------
 describe('hook deliver: always-on no-socket stderr diagnostic (issue #389 P2)', () => {
   it('help documents the always-on no-socket stderr diagnostic', () => {

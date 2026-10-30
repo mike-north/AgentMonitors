@@ -215,10 +215,10 @@ executor (schema + lifecycle). Not blocking the Tier 1–3 spine.
 
 ### S6. Where this lands in the specs (when we formalize)
 
-Capability-level only — not a design yet. Body grammar & trigger composition → [001](../specs/001-monitor-definition.md);
+Capability-level only — not a design yet. Body grammar & trigger composition → [`monitor/definition`](../../openspec/specs/monitor/definition/spec.md);
 new pipeline stages (compute/render, diff-the-artifact, Pace modes, the per-recipient seam, the
-reaction layer + idempotency) → [002](../specs/002-runtime-delivery.md); source contract (snapshots
-not diffs, composite/stream/CLI/file-watch acquisition) → [003](../specs/003-source-plugins.md); the
+reaction layer + idempotency) → [`pipeline/post-processing`](../../openspec/specs/pipeline/post-processing/spec.md); source contract (snapshots
+not diffs, composite/stream/CLI/file-watch acquisition) → [`sources/contract`](../../openspec/specs/sources/contract/spec.md); the
 reaction layer likely warrants its **own** new spec.
 
 ---

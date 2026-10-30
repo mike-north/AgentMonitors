@@ -1,7 +1,7 @@
 /**
  * Empty snapshots represent an observed empty object, not absence of observation.
  * Their deletion delta and baseline must survive materialization and late joining
- * recipients (002 §5.2), including transitions back to nonempty content.
+ * recipients (spec: runtime/event-materialization — "Empty snapshot text is a present snapshot"), including transitions back to nonempty content.
  */
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';

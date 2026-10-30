@@ -192,8 +192,8 @@ describe('renderHookDelivery', () => {
   // Issue #441 cross-monitor coalescing (PR #456 review finding 2): a claim
   // with `events` populated must ALSO surface `coalescedReminder` when set —
   // `claimDelivery` claims the coalesced normal rows alongside the surfaced
-  // high events, so omitting this would claim-but-never-render them (006
-  // §5.5).
+  // high events, so omitting this would claim-but-never-render them (
+  // spec: delivery/channel-transport, delivery/hook-transport).
   it('appends the coalesced reminder footer, with this transport’s own ack action step, after the packed event block(s)', () => {
     const out = renderHookDelivery(
       makeClaim({
@@ -207,7 +207,7 @@ describe('renderHookDelivery', () => {
     expect(ctx).toContain('Monitored changes are pending.');
     // The runtime's coalesced reminder is transport-neutral; the hook transport
     // appends its OWN concrete, session-scoped acknowledge step (issue #445
-    // wording contract, 002 §9.2 / 006 §5.1.1) so the coalesced reminder is
+    // wording contract, spec: delivery/lifecycles, delivery/channel-transport, delivery/hook-transport, delivery/transport-seam) so the coalesced reminder is
     // self-sufficient and actionable, not a bare "changes are pending" line.
     expect(ctx).toContain('agentmonitors events list --session s1 --unread');
     expect(ctx).toContain('agentmonitors events ack --session s1');
@@ -283,7 +283,7 @@ describe('renderHookDelivery', () => {
 
   // (c.3 — issue #434) a body-injection delivery CLAIMS the events it renders,
   // but claiming is not acknowledgment — until the recipient acknowledges, the
-  // coalesced-until-ack rule (002 §9.2) mutes every later normal reminder. So
+  // coalesced-until-ack rule (spec: delivery/lifecycles) mutes every later normal reminder. So
   // the delivered payload MUST name the ack step, with the real session id, ONCE
   // per batch (not per event).
   it('includes a single ack instruction in a high-urgency delivery (issue #434)', () => {
@@ -858,7 +858,7 @@ describe('renderHookDelivery', () => {
 
 // (issue #442, PR #442 round-9/round-10 review) Marker selection is
 // lifecycle-aware: a `post-compact` recap re-shows the FULL unread set on
-// EVERY recap, regardless of whether a row is already claimed (§5.5 —
+// EVERY recap, regardless of whether a row is already claimed (spec: delivery/channel-transport, delivery/hook-transport —
 // `decideDelivery`'s recap branch reads `unreadEventsForSession`, not
 // `pendingEventsForSession`, and `applyDelivery` claims the FULL candidate
 // set at commit time regardless of what actually renders). Neither of the

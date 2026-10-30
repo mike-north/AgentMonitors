@@ -112,7 +112,7 @@ urgency: normal
     expect(result.error).toContain('watch');
   });
 
-  it('parses a range urgency band from YAML frontmatter (issue #109 / 001 §3.2)', () => {
+  it('parses a range urgency band from YAML frontmatter (issue #109 / spec: monitor/definition)', () => {
     // Proves `normal..high` survives gray-matter/YAML as a plain scalar (no
     // quoting needed) and is expanded into the low/high band bounds.
     const content = yaml`---
@@ -133,7 +133,7 @@ Handle salient changes.
     expect(result.monitor.frontmatter.urgencyMax).toBe('high');
   });
 
-  it('rejects an inverted range urgency band (issue #109 / 001 §3.2)', () => {
+  it('rejects an inverted range urgency band (issue #109 / spec: monitor/definition)', () => {
     const content = yaml`---
 name: Inverted band
 watch:

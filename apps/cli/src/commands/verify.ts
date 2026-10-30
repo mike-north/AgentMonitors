@@ -1132,7 +1132,7 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
     // key; id-scoped retract for a real created file) so they never linger for a
     // later session. The one residual is a daemon death after materialization (the
     // socket call fails); the daemon's own reap backstop then cleans it up on the
-    // next tick — documented in 005 §16.
+    // next tick — documented in spec: cli/verify.
     await teardownWorkspaceArtifacts();
     // Disarm the module-level signal cleanup so a later run (or a stray signal
     // after this run returns) never acts on this run's now-closed session.
@@ -1149,7 +1149,7 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
  * (`reserveSizedHookDelivery`'s `settledWorkRemainsBeyondClaim`) — rather than
  * a bespoke preview → direct `claimDeliveryClient` → render sequence of its
  * own. Before this fix, `verify` could pass even when the production
- * claimed-set-equals-rendered-set contract (§5.5) was violated: a
+ * claimed-set-equals-rendered-set contract (spec: delivery/channel-transport, delivery/hook-transport) was violated: a
  * substitution race between `verify`'s own preview and its direct claim could
  * replace the previewed events with larger blocks under the same count,
  * durably claim all the replacements, and let the renderer silently omit

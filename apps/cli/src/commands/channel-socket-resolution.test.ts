@@ -29,8 +29,8 @@ import { writeLocalState } from '../local-state.js';
  * (`resolveSocketPath(state.socket ?? workspacePaths(workspace).socket)`,
  * `apps/cli/src/commands/session.ts`).
  *
- * @see ../../../../docs/specs/006-agent-integration.md §4.1
- * @see ../../../../docs/specs/005-cli-reference.md §13
+ * @see ../../../../openspec/specs/delivery/channel-transport/spec.md
+ * @see ../../../../openspec/specs/cli/session-commands/spec.md
  */
 describe('resolveChannelSocketPath (issue #358)', () => {
   let savedSocketEnv: string | undefined;

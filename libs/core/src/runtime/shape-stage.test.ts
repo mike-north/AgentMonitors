@@ -1,6 +1,6 @@
 /**
  * Integration proof for the deterministic Shape stage wired through the runtime
- * tick (roadmap G15). Drives a real {@link AgentMonitorRuntime} with a real
+ * tick (spec: pipeline/post-processing). Drives a real {@link AgentMonitorRuntime} with a real
  * source and a real `MONITOR.md` carrying `shape`/`payload` frontmatter, then
  * asserts on the materialized event the runtime persists.
  *
@@ -8,7 +8,7 @@
  * never `Date.now()`/`new Date()`. Expected artifact lines are written BY HAND
  * from the spec (no snapshot/gold-master assertions).
  *
- * @see ../../../../docs/specs/002-runtime-delivery.md §1.1.4–§1.1.6
+ * @see ../../../../openspec/specs/pipeline/post-processing/spec.md
  */
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -60,7 +60,7 @@ function writeMonitor(
   return monitorsDir;
 }
 
-/** A source that surfaces the raw `deferUntil` fact (003 §2.7) — never derives. */
+/** A source that surfaces the raw `deferUntil` fact (spec: sources/contract — "Sources surface raw facts, not derived facts") — never derives. */
 function deferSource(name: string, snapshot: () => unknown): ObservationSource {
   return {
     name,
@@ -89,7 +89,7 @@ function createRuntime(dbPath: string, source: ObservationSource) {
   ]);
 }
 
-describe('Shape stage wired through the runtime tick (G15)', () => {
+describe('Shape stage wired through the runtime tick (spec: pipeline/post-processing)', () => {
   it('diffs the rendered artifact, not the raw source — a crossed threshold adds one `revealed` line', async () => {
     const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-shape-'));
     tempDirs.push(rootDir);
@@ -98,7 +98,7 @@ describe('Shape stage wired through the runtime tick (G15)', () => {
     // The raw `deferUntil` fact is identical across both ticks; only the
     // injected `now` advances past the threshold between them. Diffing the raw
     // source would yield NOTHING (the source bytes never changed); diffing the
-    // RENDERED artifact yields exactly the new `revealed` line (§1.1.5).
+    // RENDERED artifact yields exactly the new `revealed` line (spec: pipeline/post-processing).
     const source = deferSource('shape-defer', () => ({
       task: 'Ship deck',
       deferUntil: DEFER_UNTIL,
@@ -193,7 +193,7 @@ describe('Shape stage wired through the runtime tick (G15)', () => {
     }
   });
 
-  it('a `payload.form: structured` CEL gate of false suppresses delivery entirely (§1.1.6)', async () => {
+  it('a `payload.form: structured` CEL gate of false suppresses delivery entirely (spec: pipeline/post-processing)', async () => {
     const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-shape-'));
     tempDirs.push(rootDir);
     const dbPath = path.join(rootDir, 'agentmon.db');

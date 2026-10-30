@@ -147,13 +147,13 @@ const eventsListCommand = eventsCommand
           return;
         }
         for (const event of events) {
-          // deliveryState (issue #338, 002 §7) is always present here: this
+          // deliveryState (issue #338, spec: delivery/session-projection — "Unread, claimed, and acknowledged are distinct session states") is always present here: this
           // query is always session-scoped (`--session` is required). It's
           // printed as its own column so `--unread` output doesn't read as
           // "never seen" -- --unread matches acknowledgedAt IS NULL, which
           // INCLUDES claimed-but-unacknowledged events.
           //
-          // `event.title` is the monitor's authored name (002 §5.4, issue
+          // `event.title` is the monitor's authored name (spec: runtime/event-materialization, issue
           // #449) -- it says what the monitor is FOR, not which object moved.
           // A multi-object source (e.g. file-fingerprint watching a glob)
           // emits one row per object, all sharing that same title, so without

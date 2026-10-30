@@ -26,8 +26,8 @@ import { resolveDataRoot } from './workspace-paths.js';
  * them into a generic "unhealthy" is the specific defect this surface fixes,
  * since they have nothing in common but the symptom (silence).
  *
- * @see ../../../docs/specs/006-agent-integration.md §12 (transport health)
- * @see ../../../docs/specs/002-runtime-delivery.md §9.2/§9.3 (coalesced reminders)
+ * @see ../../../openspec/specs/delivery/transport-health/spec.md (transport health)
+ * @see ../../../openspec/specs/delivery/lifecycles/spec.md (coalesced reminders)
  */
 
 const NOW = new Date('2026-07-19T12:00:00.000Z');

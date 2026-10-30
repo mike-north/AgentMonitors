@@ -179,7 +179,7 @@ the monitor's `watch.globs`), waits for the event to materialize, and claims it 
 delivery path a live hook would use — then tears everything down. There's no socket to pick, no
 database to scratch-isolate, no `trap` cleanup, and no poll loop to size by hand: `verify` derives
 its own wait budget from the monitor's own `watch.interval` and `notify.settle-for` and prints
-elapsed/ETA progress to stderr, so you're never left staring at silence (spec 005 §16, "Budget").
+elapsed/ETA progress to stderr, so you're never left staring at silence (spec: cli/verify, "Budget").
 
 **Success looks like:**
 
@@ -246,7 +246,7 @@ A few flags worth knowing:
 - **`--timeout-ms`** — overrides the derived post-trigger detection budget, if you need more time
   than what `verify` estimates.
 
-See the `verify` command reference (spec 005 §16) for the full flag table.
+See the `verify` command reference (spec: cli/verify) for the full flag table.
 
 Once you're satisfied a monitor delivers, revert any `interval` / `settle-for` shortcuts you made
 just to speed up testing.

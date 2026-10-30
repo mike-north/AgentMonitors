@@ -1,7 +1,7 @@
 # Channel probe (throwaway experiment)
 
-Answers the open question in [`docs/specs/006-agent-integration.md`](../../docs/specs/006-agent-integration.md)
-§4.4 / §9: **when Claude Code spawns a stdio channel MCP server, what does it provide?**
+Answers the open question in [`delivery/channel-transport`](../../openspec/specs/delivery/channel-transport/spec.md)
+(workspace/session binding): **when Claude Code spawns a stdio channel MCP server, what does it provide?**
 Specifically — is `CLAUDE_PROJECT_DIR` set, what is the server's `cwd`, and does `roots/list`
 work? The answer decides whether the real channel transport can bind to a workspace.
 
@@ -48,13 +48,13 @@ Once the session is up, three independent readouts are available — check which
 
 | Question | Where the answer is | Why it matters |
 | --- | --- | --- |
-| Is `CLAUDE_PROJECT_DIR` set, and to what? | `CLAUDE_PROJECT_DIR` in the findings | the primary workspace-binding signal (006 §4.4) |
+| Is `CLAUDE_PROJECT_DIR` set, and to what? | `CLAUDE_PROJECT_DIR` in the findings | the primary workspace-binding signal (spec: delivery/channel-transport) |
 | What is the server's `cwd`? | `cwd` in the findings | the fallback / sanity check |
 | Does `roots/list` work, and what does it return? | `roots` in the tool result / channel push | the alternative workspace signal |
 | Is there any session id anywhere? | `claudeEnv` keys | confirms (or refutes) the "no session id" finding |
 | Does a `<channel>` event actually render? | readout #3 | validates the transport surface itself |
 
-Report the findings JSON back and we promote 006 §4.4 from *target* to *current* (or revise it).
+Report the findings JSON back and we promote spec: delivery/channel-transport from *target* to *current* (or revise it).
 
 ## Result (Claude Code 2.1.157, 2026-05-31)
 
@@ -65,7 +65,7 @@ which spawned the probe **as an MCP server**. Confirmed:
 - **`CLAUDE_CODE_SESSION_ID` is inherited** by the MCP-server subprocess (the host session id).
 - `roots/list` is answered, returning the workspace as a single `file://` root.
 
-Conclusion: **session-level binding is available** (006 §4.4 preferred path), with workspace binding
+Conclusion: **session-level binding is available** (spec: delivery/channel-transport preferred path), with workspace binding
 as fallback. The diagnostic is worth re-running when targeting a newer Claude Code, since the env
 contract is host-version-dependent.
 

@@ -1,9 +1,9 @@
 /**
- * Tests for keyed-collection change detection (003 §12).
+ * Tests for keyed-collection change detection (spec: sources/contract).
  *
- * @see ../../../../docs/specs/003-source-plugins.md §12
+ * @see ../../../../openspec/specs/sources/contract/spec.md
  *
- * The §12 contract: parsed JSON output is treated as a collection of keyed objects;
+ * The spec: sources/contract contract: parsed JSON output is treated as a collection of keyed objects;
  * each element becomes a tracked object with `objectKey = <monitorObjectKey>#<key>`;
  * per-object observations use the `created` / `modified` / `descoped` vocabulary
  * (never `deleted`); the baseline run records the snapshot and emits nothing;
@@ -144,7 +144,7 @@ describe('resolveDottedPath', () => {
   });
 });
 
-describe('diffKeyedCollection — baseline (003 §12)', () => {
+describe('diffKeyedCollection — baseline (spec: sources/contract)', () => {
   it('emits nothing on the first run and records the snapshot', () => {
     const result = baseline(
       {
@@ -160,7 +160,7 @@ describe('diffKeyedCollection — baseline (003 §12)', () => {
   });
 });
 
-describe('diffKeyedCollection — reordering & whitespace (003 §12)', () => {
+describe('diffKeyedCollection — reordering & whitespace (spec: sources/contract)', () => {
   it('a re-sorted collection produces ZERO observations', () => {
     const first = baseline(
       {
@@ -200,7 +200,7 @@ describe('diffKeyedCollection — reordering & whitespace (003 §12)', () => {
   });
 });
 
-describe('diffKeyedCollection — modified (003 §12)', () => {
+describe('diffKeyedCollection — modified (spec: sources/contract)', () => {
   it('one element changing → exactly one `modified` with keyed objectKey', () => {
     const first = baseline(
       {
@@ -229,7 +229,7 @@ describe('diffKeyedCollection — modified (003 §12)', () => {
   });
 });
 
-describe('diffKeyedCollection — created / descoped (003 §12)', () => {
+describe('diffKeyedCollection — created / descoped (spec: sources/contract)', () => {
   it('element addition → `created`', () => {
     const first = baseline({ tasks: [{ id: 'a', v: 1 }] }, TASKS_CONFIG);
     const next = diffKeyedCollection(
@@ -301,7 +301,7 @@ describe('diffKeyedCollection — created / descoped (003 §12)', () => {
   });
 });
 
-describe('diffKeyedCollection — ignore-paths (003 §12)', () => {
+describe('diffKeyedCollection — ignore-paths (spec: sources/contract)', () => {
   const CONFIG_IGNORE: KeyedCollectionConfig = {
     path: '$.tasks',
     key: 'id',
@@ -357,7 +357,7 @@ describe('diffKeyedCollection — ignore-paths (003 §12)', () => {
   });
 });
 
-describe('diffKeyedCollection — path must select one array (003 §12)', () => {
+describe('diffKeyedCollection — path must select one array (spec: sources/contract)', () => {
   it('throws when path resolves to a non-array', () => {
     expect(() =>
       baseline({ tasks: { not: 'an array' } }, TASKS_CONFIG),
@@ -415,8 +415,8 @@ describe('diffKeyedCollection — key handling', () => {
 // Issue #449 review: the scope-half truncation branch had no direct coverage —
 // the suite only used the short `mon` scope, so reverting the bound would have
 // stayed green. A `command-poll` collection's scope is the joined argv, which is
-// exactly the unbounded case (003 §2.8).
-describe('diffKeyedCollection — long monitor scope in display text (003 §2.8)', () => {
+// exactly the unbounded case (spec: sources/contract).
+describe('diffKeyedCollection — long monitor scope in display text (spec: sources/contract)', () => {
   /** A joined-argv-shaped scope well past the 60-char display bound. */
   const LONG_SCOPE = `sh -c gh pr list --json number,state --jq ${'[.[] | {number}]'.repeat(6)}`;
 

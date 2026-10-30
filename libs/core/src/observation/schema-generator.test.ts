@@ -28,7 +28,7 @@ describe('generateMonitorSchema', () => {
     expect(schema.$schema).toBe('http://json-schema.org/draft-07/schema#');
     expect(schema.type).toBe('object');
     expect(schema.required).toContain('watch');
-    // urgency is optional (defaults to normal, 001 §3.2) — it must NOT be marked
+    // urgency is optional (defaults to normal, spec: monitor/definition) — it must NOT be marked
     // required in the generated schema, or editor tooling would reject a valid
     // minimal monitor (watch + body).
     expect(schema.required).not.toContain('urgency');
@@ -137,7 +137,7 @@ describe('generateMonitorSchema', () => {
     const properties = schema.properties as Record<string, unknown>;
     const notify = properties.notify as Record<string, unknown>;
     expect(notify.type).toBe('object');
-    // Three Pace modes: debounce, throttle, and scheduled-rollup (G12, 001 §3.6).
+    // Three Pace modes: debounce, throttle, and scheduled-rollup (spec: runtime/notify-dispatch, monitor/definition).
     const oneOf = notify.oneOf as {
       properties: { strategy: { const: string } };
     }[];

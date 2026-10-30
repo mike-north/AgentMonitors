@@ -153,7 +153,7 @@ const MAX_HOOK_RESERVE_ATTEMPTS = 3;
  * `renderHookDelivery` appends `\n\n${reminder}` AFTER the packed blocks, so
  * sizing against the blocks alone risks a claim that fits its events but
  * overflows once the reminder is appended (or truncates the reminder away —
- * either a 006 §5.5 claimed-but-unrendered violation). `undefined` reserves
+ * either a spec: delivery/channel-transport, delivery/hook-transport claimed-but-unrendered violation). `undefined` reserves
  * nothing. Computed from the RAW (unsanitized) reminder text — `sanitize`
  * only ever REMOVES characters (control chars), so this is a safe, slightly
  * conservative upper bound on the actual rendered footer's length.
@@ -193,7 +193,7 @@ export interface SizedHookDelivery {
  * check only asks "does the RESERVED set fit", never "is there MORE settled
  * work than what got reserved". Left unchecked, `hook deliver` would render
  * with no deferred marker even though the second, now-settled event stays
- * pending — contrary to §5.5 ("the render omits any pending event ...
+ * pending — contrary to spec: delivery/channel-transport, delivery/hook-transport ("the render omits any pending event ...
  * signposting that more updates are pending").
  *
  * Re-runs the SAME read-only preview {@link reserveSizedHookDelivery} itself
@@ -234,7 +234,7 @@ async function settledWorkRemainsBeyondClaim(
  * substituted, larger set would pass the COUNT check but still fail
  * `renderHookDelivery`'s own repack — and because `claimDelivery` sets
  * `first_notified_at` synchronously, the truncated-away tail of an
- * already-claimed row can **never redeliver** (§5.5's core guarantee, broken).
+ * already-claimed row can **never redeliver** (spec: delivery/channel-transport, delivery/hook-transport's core guarantee, broken).
  *
  * **The fix.** Reserve first (leasing the rows — no durable claim yet), then
  * check the REAL reserved claim's fit via {@link resolveHookClaimFit} — the
@@ -254,7 +254,7 @@ async function settledWorkRemainsBeyondClaim(
  * `message`, not assembled from a variable number of per-event blocks, so
  * there is nothing for a substitution race to drop; `turn-idle`/`post-compact`
  * need no sizing either (the recap self-heals by re-showing all unread each
- * time, §5.5). Both are reserved with no `maxEvents` and accepted directly.
+ * time, spec: delivery/channel-transport, delivery/hook-transport). Both are reserved with no `maxEvents` and accepted directly.
  *
  * Returns `null` when nothing is pending to reserve (mirrors `reserveDelivery`
  * returning `null`).
@@ -473,7 +473,7 @@ export interface HookDeliveryFlowResult {
  * failed afterward, the surrounding try/catch (the hook's always-exit-0
  * contract) swallowed the error and emitted nothing — while the rows were
  * PERMANENTLY excluded from ordinary redelivery (`pendingEventsForSession`
- * never returns an already-claimed row, §5.5). That is an at-most-once loss
+ * never returns an already-claimed row, spec: delivery/channel-transport, delivery/hook-transport). That is an at-most-once loss
  * window: the delivery could vanish with no user-visible signal and no path
  * back except the durable-but-unread copy via `agentmonitors events list`.
  *
@@ -848,7 +848,7 @@ Diagnosis:
         // every other quiet-return branch above, an unresolvable session_id
         // is otherwise indistinguishable from the expected high-urgency
         // claim-settle window (up to ~15s of legitimately empty output,
-        // 002 §9.1) — so this ONE branch always writes a one-line stderr
+        // spec: delivery/lifecycles) — so this ONE branch always writes a one-line stderr
         // diagnostic, regardless of --debug (issue #329). STDOUT is
         // untouched either way.
         const sessions = await listSessionsClient(socketPath);
@@ -899,7 +899,7 @@ Diagnosis:
         // point.
         //
         // For a `turn-interruptible` high-urgency delivery the visible surface
-        // is length-bounded (the 4000-char additionalContext, 006 §5.1), so we
+        // is length-bounded (the 4000-char additionalContext, spec: delivery/hook-transport), so we
         // must claim ONLY the events that actually fit — otherwise events
         // truncated out of the render would be marked claimed and never
         // re-delivered (issue #299). This is a RESERVE → validate-fit →

@@ -297,8 +297,8 @@ describe('source-file-fingerprint', () => {
   });
 
   // Ergonomic shorthand: a single pattern may be written as a bare string
-  // (003 §3 — `globs` accepts a string or an array of strings).
-  describe('globs string shorthand (003 §3)', () => {
+  // (spec: sources/file-fingerprint — `globs` accepts a string or an array of strings).
+  describe('globs string shorthand (spec: sources/file-fingerprint)', () => {
     it('accepts a single glob written as a bare string and detects changes', async () => {
       const dir = makeTempDir();
       writeFileSync(path.join(dir, 'notes.md'), 'hello');
@@ -353,7 +353,7 @@ describe('source-file-fingerprint', () => {
     });
   });
 
-  describe('scopeSchema accepts string or array globs (003 §3)', () => {
+  describe('scopeSchema accepts string or array globs (spec: sources/file-fingerprint)', () => {
     it('documents the runtime observe interval knob', () => {
       const properties = source.scopeSchema['properties'] as Record<
         string,
@@ -420,7 +420,7 @@ describe('source-file-fingerprint', () => {
     });
   });
 
-  describe('ignore exclude globs (003 §3)', () => {
+  describe('ignore exclude globs (spec: sources/file-fingerprint)', () => {
     it.each([
       ['string array', ['**/notified-*.txt']],
       ['bare string', '**/notified-*.txt'],
@@ -480,7 +480,7 @@ describe('source-file-fingerprint', () => {
     });
   });
 
-  describe('parseScopeConfig error messages (003 §3)', () => {
+  describe('parseScopeConfig error messages (spec: sources/file-fingerprint)', () => {
     it('reports a dedicated "is required" error when globs is absent', async () => {
       await expect(source.observe({}, { now: new Date() })).rejects.toThrow(
         'scope.globs is required',
@@ -488,8 +488,8 @@ describe('source-file-fingerprint', () => {
     });
   });
 
-  // G3: beyond modify, the source distinguishes created / deleted / descoped.
-  describe('create, delete, and descope (G3)', () => {
+  // changeKind (spec: sources/file-fingerprint): beyond modify, the source distinguishes created / deleted / descoped.
+  describe('create, delete, and descope (spec: sources/contract, sources/file-fingerprint)', () => {
     // changeKind is a first-class typed field on the Observation; the runtime is
     // what copies it into the materialized event's queryScope (tested in core).
     function changeKindOf(obs: { changeKind?: unknown } | undefined): unknown {
@@ -595,11 +595,11 @@ describe('source-file-fingerprint', () => {
     });
   });
 
-  // Salience policy (003 §3.4): a `deleted` observation carries `salience:
+  // Salience policy (spec: sources/file-fingerprint — "Salience policy"): a `deleted` observation carries `salience:
   // 'high'` so a `normal..high` band monitor can escalate on file deletion.
   // Other change kinds carry no salience, leaving effective urgency at the
   // monitor's band floor (band.lo).
-  describe('salience (003 §3.4)', () => {
+  describe('salience (spec: sources/file-fingerprint — "Salience policy")', () => {
     it('emits salience: high on a deleted observation', async () => {
       const dir = makeTempDir();
       const filePath = path.join(dir, 'a.txt');
@@ -756,8 +756,8 @@ describe('source-file-fingerprint', () => {
 // poll interval (set in the MONITOR.md fixture) is satisfied without real
 // wall-clock waiting.
 //
-// @see docs/specs/003-source-plugins.md §3.4 (file-fingerprint salience policy)
-// @see docs/specs/002-runtime-delivery.md §4.1 (clamp formula)
+// @see openspec/specs/sources/file-fingerprint/spec.md — "Salience policy" (file-fingerprint salience policy)
+// @see openspec/specs/runtime/notify-dispatch/spec.md (clamp formula)
 describe('file-fingerprint end-to-end: salience escalation through the runtime (issue #151)', () => {
   const tempDirs: string[] = [];
 
@@ -919,15 +919,15 @@ When files change, act on it.
   });
 });
 
-// Proof for 003 §2.5 (snapshots-not-diffs): a BUNDLED source returns
+// Proof for spec: sources/contract (snapshots-not-diffs): a BUNDLED source returns
 // current-state snapshots + its own change-detection state (`nextState`); it
 // does NOT pre-diff. The runtime is the sole producer of the delivery diff,
-// computed against the consumer's stored baseline (002 §5.2). This drives a real
+// computed against the consumer's stored baseline (spec: runtime/event-materialization). This drives a real
 // bundled source through the real runtime and asserts each half of the contract.
 //
-// @see docs/specs/003-source-plugins.md §2.5
-// @see docs/specs/002-runtime-delivery.md §5.2
-describe('file-fingerprint × runtime: snapshots-not-diffs (003 §2.5)', () => {
+// @see openspec/specs/sources/contract/spec.md
+// @see openspec/specs/runtime/event-materialization/spec.md
+describe('file-fingerprint × runtime: snapshots-not-diffs (spec: sources/contract)', () => {
   const tempDirs: string[] = [];
 
   afterEach(() => {
@@ -949,7 +949,7 @@ describe('file-fingerprint × runtime: snapshots-not-diffs (003 §2.5)', () => {
       { now: new Date() },
     );
     expect(baseline.observations).toHaveLength(0);
-    // The source carries its OWN change-detection state forward (§2.4/§2.5):
+    // The source carries its OWN change-detection state forward (spec: sources/contract):
     // this is not a per-recipient baseline and not a diff.
     expect(baseline.nextState).toBeDefined();
 
@@ -961,7 +961,7 @@ describe('file-fingerprint × runtime: snapshots-not-diffs (003 §2.5)', () => {
 
     expect(next.observations).toHaveLength(1);
     const obs = next.observations[0];
-    // §2.5: the observation is the CURRENT whole-file state, not a delta. The
+    // spec: sources/contract: the observation is the CURRENT whole-file state, not a delta. The
     // snapshot equals the full current file content — both old and new lines are
     // present, proving it is a snapshot rather than a "what changed" packet.
     expect(obs?.snapshotText).toBe('line one\nline two CHANGED\n');

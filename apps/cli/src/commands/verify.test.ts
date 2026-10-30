@@ -1,7 +1,7 @@
 /**
  * Unit tests for internal `verify` command helpers (issue #399).
  *
- * @see docs/specs/005-cli-reference.md §16
+ * @see openspec/specs/cli/verify/spec.md
  */
 import { describe, it, expect } from 'vitest';
 import type { Stage } from '../verify-report.js';
