@@ -52,3 +52,34 @@ explain the current forward-progress policy; no preset urgency was changed.
 
 Checkpoint for continuation: repair is ready for exact-SHA independent re-review. Do not push or
 merge from this worker; parent owns those steps. Worktree: reminder-starvation/agentmonitors.
+
+## Serial transport-health acceptance repair
+
+CI exposed an unchanged serial integration test still requiring the old
+coalesced-until-ack health failure after a normal claim. On candidate 796cf341,
+a fresh workspace build followed by that test with `--retry=0` reproduced the
+obsolete `[reminders-suppressed]` assertion failure. No runtime regression was
+found: the new policy correctly reported no blocked fresh work.
+
+The real-daemon test now verifies the intended state transitions rather than
+removing health coverage: A is observed and claimed but stays unread; diagnosis
+reports no-new-work and doctor is healthy with a matching registered hook;
+new B is observed and claimed before any acknowledgment of A; neither is
+repeated; explicit scoped acknowledgment of A leaves B unread, then explicit
+acknowledgment of B clears it. Legacy daemon mute/remediation cases remain in
+the transport-health unit suite. A real daemon-once establishes the source
+baseline instead of assuming a fixed sleep is enough.
+
+Each invocation now creates a unique workspace/database. The old fixed directory
+was reused across Vitest retries, explaining the later 2/3-event failures after
+the first failed attempt left its claimed event in the same database.
+
+The prior independent reviewer authored this test-only correction, so an independent
+review by another agent is required for the successor. No production change, push
+or merge is included in this repair.
+
+Repair validation: all 12 real-daemon transport-health serial tests pass with retries
+disabled; 71 CLI health/rendering tests and 11 core forward-progress cases pass.
+Fresh workspace build and full pnpm check pass (existing lint warnings, 0 errors).
+A separate TypeScript check explicitly including the edited integration test passes;
+normal CLI package typechecks exclude test files. Diff whitespace and formatting pass.
