@@ -14,8 +14,8 @@ contract** — the interoperable surface a stranger can implement against. It de
 does **not** mandate how cleverly a runtime decides _when_ or _how_ to deliver; that is
 implementation quality, not conformance (see §7).
 
-> **Relationship to the internal specs.** The numbered docs in
-> [`../specs/`](../specs/README.md) are this repository's _implementation contract_. This
+> **Relationship to the internal specs.** The OpenSpec specification in
+> [`openspec/`](../../openspec/) is this repository's _implementation contract_. This
 > document is the _outward standard_ those internals aim to satisfy. Where they disagree,
 > this standard describes the intended interoperable behavior and the internal specs
 > describe what this codebase currently does.

@@ -1,5 +1,5 @@
 ---
-applyTo: 'docs/specs/**/*.md,agent-plugins/**/*.md,**/SKILL.md,**/README.md'
+applyTo: 'openspec/**/*.md,docs/specs/**/*.md,agent-plugins/**/*.md,**/SKILL.md,**/README.md'
 ---
 
 # Spec And Documentation Accuracy Guidance
@@ -11,7 +11,7 @@ applyTo: 'docs/specs/**/*.md,agent-plugins/**/*.md,**/SKILL.md,**/README.md'
   the output is NOT sanitized, escaped, truncated, or length-capped — only use
   them when the renderer genuinely passes the content through untouched.
 - Be precise about lifecycle and urgency timing (see
-  `docs/specs/002-runtime-delivery.md` §13 and `claimDelivery`): high-urgency
+  the `delivery/lifecycles` capability and `claimDelivery`): high-urgency
   events surface at `turn-interruptible` (after the 15s settle window); normal
   reminders surface at `turn-interruptible`; low-urgency defers to `turn-idle`.
   Do not write a table or sentence that places low urgency at
