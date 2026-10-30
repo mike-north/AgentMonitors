@@ -178,9 +178,7 @@ const PR_REVIEW_URGENCY_COMMENT =
   '# high, and that is only safe because the payload is a MEMBERSHIP set of PRs\n' +
   '# that actually need reviewing right now: a PR that has been decided leaves the\n' +
   '# set instead of churning a field inside it, so there is no benign per-push or\n' +
-  '# per-comment traffic to interrupt on. `normal` was tried and rejected — normal\n' +
-  '# reminders are coalesced-until-ack (002 §9.2), so one claimed-but-unacked\n' +
-  '# normal event from ANY monitor suppresses the reminder for all of them, and\n' +
+  '# per-comment traffic to interrupt on. Fresh normal reminders can surface, but\n' +
   '# normal carries no event BODY mid-session (002 §9.2/§9.3), so the reviewer\n' +
   '# would not learn WHICH PR needs review until session recap.\n';
 
@@ -189,7 +187,7 @@ const PR_REVIEW_URGENCY_COMMENT =
  * template; see {@link PR_REVIEW_URGENCY_COMMENT}. `high` is earned here by
  * the payload filter: only PRs that need the author to act are in the list
  * at all, so an ordinary CI run (queued -> running -> passing) produces no
- * event, and `normal`'s coalesce-until-ack + no-mid-session-body behavior
+ * event, and `normal`'s no-mid-session-body behavior
  * (002 §9.2/§9.3) was tried in the field and does not work for this preset
  * (003 §11.9).
  */
@@ -198,13 +196,8 @@ const MY_PRS_URGENCY_COMMENT =
   '# need YOU to do something (one benign exception below), so an ordinary CI run\n' +
   '# (queued -> running -> passing) produces no event. `normal` was tried in the\n' +
   '# field and does not work\n' +
-  '# here, for two compounding reasons (002 §9.2/§9.3):\n' +
-  '#   1. Normal reminders are coalesced-until-ack. One claimed-but-unacked normal\n' +
-  '#      event from ANY monitor suppresses the coalesced reminder for ALL of them,\n' +
-  '#      which in an active session is nearly always true — so a normal author\n' +
-  '#      monitor goes silent exactly when the agent has been busy.\n' +
-  '#   2. Normal delivers no event BODY mid-session; bodies arrive only at recap.\n' +
-  '#      An author needs to know WHICH PR broke and HOW while still working.\n' +
+  '# here: normal delivers no event BODY mid-session; bodies arrive at recap.\n' +
+  '# An author needs to know WHICH PR broke and HOW while still working.\n' +
   '# Not every fire is actionable, and not every ENTERING one is either:\n' +
   '#   - a PR LEAVING the list (CI fixed, review answered, draft marked ready)\n' +
   '#     diffs as a one-per-cycle confirmation, not a task; and\n' +

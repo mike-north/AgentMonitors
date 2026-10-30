@@ -1360,7 +1360,7 @@ reminder to a later call:
   section exists to fix, just shifted from (high-then-normal) to (normal-then-high). The reminder is
   instead withheld until there is no pending high-urgency work at all; once the pending high event
   settles, it is folded into that SAME delivery per the bullets above.
-- The `normalPending.length === unreadNormal.length` coalesced-until-ack guard (§9.2) is unchanged
+- The fresh-pending-batch reminder policy (§9.2) applies
   and still gates whether a normal reminder is due at all; this section only changes WHERE (and, per
   the bullet above, WHEN) a due normal reminder is delivered.
 - A length-bounded transport sizing how many whole high-urgency event blocks fit under its cap
@@ -1377,15 +1377,14 @@ reminder to a later call:
 - `hook deliver --debug`'s diagnosis (§10.7-adjacent `diagnoseHookDelivery`, issue #334) mirrors this
   precedence: it reports a `settle-window`-reasoned hold on the `normal` band when a fully-due
   reminder is being withheld by a concurrent unsettled high-urgency event, and independently still
-  reports the ordinary `already-claimed`/`coalesced-until-ack` hold (§9.2) whenever a claimed row
-  blocks the reminder on its own — including on a turn where settled high-urgency work is ALSO being
-  delivered (the coalescing guard blocking coalescing does not mean nothing is held).
+  reports `no-new-work` only when no fresh work remains, and `reserved-in-flight`
+  while a same-band reservation is active. Older claims do not withhold a fresh reminder.
 
-Verified: `libs/core/src/runtime/service.ts` — `decideDelivery()`'s `turn-interruptible` branch computes `normalReminderDue` before the settled-high branch; when both are due it folds `normalPending` into the high branch's `candidates`, appends `COALESCED_NORMAL_SUFFIX` to the claim's `message`, and sets `coalescedReminder`; when a fully-due reminder exists but `highUnread.length > 0` with nothing settled, it returns no delivery (withheld) rather than firing the reminder standalone. `previewCoalescedReminder` (core) / `previewCoalescedReminderClient` (CLI) mirror the same due-check read-only for transport sizing. `diagnoseHookDelivery`'s `classifyCoalescingWithheldHold` (`hook-delivery-diagnosis.ts`) reports the withheld-by-settle-window case; `classifyReminderHold` is now evaluated unconditionally (not gated on `settledHighCount === 0`). `renderHookDelivery` (`apps/cli/src/hook-deliver-render.ts`) and `renderChannelEvent` (`apps/cli/src/channel-render.ts`) render `claim.coalescedReminder` as a cap-reserved footer after the packed event block(s). Proven by the "coalesces a due normal-urgency reminder..." / "holds a due normal-urgency reminder while a sibling high-urgency event is still inside its settle window, then coalesces both once it settles (issue #441 review finding 1)" / urgency-mixing-guard cases in `libs/core/src/runtime/service.test.ts`; the `previewCoalescedReminder` cases in `libs/core/src/runtime/hook-cap-redelivery.test.ts`; the withheld/coalesced-until-ack-alongside-settled-high cases in `libs/core/src/runtime/diagnose-hook-delivery.test.ts` and `hook-delivery-diagnosis.test.ts`; and the reminder-footer rendering/sizing cases in `apps/cli/src/hook-deliver-render.test.ts` and `apps/cli/src/channel-render.test.ts`.
+Verified: `libs/core/src/runtime/service.ts` — `decideDelivery()`'s `turn-interruptible` branch computes `normalReminderDue` before the settled-high branch; when both are due it folds `normalPending` into the high branch's `candidates`, appends `COALESCED_NORMAL_SUFFIX` to the claim's `message`, and sets `coalescedReminder`; when a fully-due reminder exists but `highUnread.length > 0` with nothing settled, it returns no delivery (withheld) rather than firing the reminder standalone. `previewCoalescedReminder` (core) / `previewCoalescedReminderClient` (CLI) mirror the same due-check read-only for transport sizing. `diagnoseHookDelivery`'s `classifyCoalescingWithheldHold` (`hook-delivery-diagnosis.ts`) reports the withheld-by-settle-window case; `classifyReminderHold` is now evaluated unconditionally (not gated on `settledHighCount === 0`). `renderHookDelivery` (`apps/cli/src/hook-deliver-render.ts`) and `renderChannelEvent` (`apps/cli/src/channel-render.ts`) render `claim.coalescedReminder` as a cap-reserved footer after the packed event block(s). Proven by the "coalesces a due normal-urgency reminder..." / "holds a due normal-urgency reminder while a sibling high-urgency event is still inside its settle window, then coalesces both once it settles (issue #441 review finding 1)" / urgency-mixing-guard cases in `libs/core/src/runtime/service.test.ts`; the `previewCoalescedReminder` cases in `libs/core/src/runtime/hook-cap-redelivery.test.ts`; the withheld/fresh-batch-alongside-settled-high cases in `libs/core/src/runtime/diagnose-hook-delivery.test.ts` and `hook-delivery-diagnosis.test.ts`; and the reminder-footer rendering/sizing cases in `apps/cli/src/hook-deliver-render.test.ts` and `apps/cli/src/channel-render.test.ts`.
 
 ### 9.2 Normal urgency
 
-At `turn-interruptible`, normal-urgency events are delivered as a coalesced reminder only if all unread normal-urgency events are still unclaimed. This coalesces multiple normal events into one reminder until the session acknowledges them. The `events` array is empty in this case.
+At `turn-interruptible`, fresh pending normal-urgency events are delivered as one coalesced reminder per batch. Previously claimed-but-unacknowledged events MUST NOT block new pending work. A live same-band reservation temporarily withholds the reminder until commit, release or lease expiry; high-urgency settling still coalesces the reminder as specified in §9.1.1. The `events` array is empty in this case.
 
 **Reminder wording contract (issues #438, #434; revised by PR #445 review, finding 2).** The runtime emits a **semantic, transport- and verb-neutral** reminder body, built by `reminderMessage()`:
 
@@ -1398,23 +1397,48 @@ Two properties are **normative**:
 1. **No product-name attribution.** The runtime **MUST NOT** embed a product name (e.g. `AgentMon`) in the reminder body. Attribution is a property of the delivery **surface**, and is owned by each transport ([006 §5](006-agent-integration.md)): the hook transport prepends its own label because its `additionalContext` arrives in the agent's context window unlabeled; the channel transport prepends **nothing**, because its `<channel source="agentmonitors">` tag already names the source. A product name in the body double-attributed the channel. This also keeps the core host-agnostic — per-surface phrasing lives in the adapter/transport, never in the runtime.
 2. **No reference to the legacy `inbox` model.** `inbox_items` is explicitly non-authoritative ([§12](#12-legacy-inbox-model)); the authoritative path is events/session projection. The former wording (`'AgentMon messages are available. Read the inbox.'`) steered recipients toward a deprecated concept with no runnable referent, and **MUST NOT** reappear in any authoritative delivery string. (The legacy `inbox` CLI surface itself is unchanged.)
 
-**Self-sufficiency and the acknowledge step are transport-owned (revised by PR #445 review, finding 2).** An earlier revision of this function also embedded the concrete `agentmonitors events list`/`events ack` CLI commands directly in the shared message — but the channel transport pushes this string verbatim into its `<channel>` tag body, and a channel-connected agent acknowledges through the `agentmon_ack` MCP tool ([006 §4.3](006-agent-integration.md)), not the CLI. Baking one transport's verb into the transport-neutral message put conflicting instructions on the channel surface. Each transport now appends its **own** concrete, runnable next step — including the acknowledge step, with the recipient's real session id interpolated (the transport has it on the `DeliveryClaim`/its own render options) — on top of this shared sentence: the hook transport names `agentmonitors events list`/`events ack` directly, with an explicit `--socket <path>` ([006 §5.1.1](006-agent-integration.md#511-attribution-is-transport-owned-delivered-text-is-self-sufficient-issues-438-434)); the channel transport points at its `agentmon_ack` tool instead. Including the ack step somewhere in the delivered payload is what keeps the coalescing rule below from becoming a silent trap: a recipient that does exactly what the delivery asks also clears the suppression (issue #434) — this is a property of the **overall rendered payload**, not this shared message alone.
+**Self-sufficiency and the acknowledge step are transport-owned (revised by PR #445 review, finding 2).** An earlier revision of this function also embedded the concrete `agentmonitors events list`/`events ack` CLI commands directly in the shared message — but the channel transport pushes this string verbatim into its `<channel>` tag body, and a channel-connected agent acknowledges through the `agentmon_ack` MCP tool ([006 §4.3](006-agent-integration.md)), not the CLI. Baking one transport's verb into the transport-neutral message put conflicting instructions on the channel surface. Each transport now appends its **own** concrete, runnable next step — including the acknowledge step, with the recipient's real session id interpolated (the transport has it on the `DeliveryClaim`/its own render options) — on top of this shared sentence: the hook transport names `agentmonitors events list`/`events ack` directly, with an explicit `--socket <path>` ([006 §5.1.1](006-agent-integration.md#511-attribution-is-transport-owned-delivered-text-is-self-sufficient-issues-438-434)); the channel transport points at its `agentmon_ack` tool instead. Including the ack step somewhere in the delivered payload lets the recipient explicitly complete handling of the observations (issue #434) — this is a property of the **overall rendered payload**, not this shared message alone.
 
 The same body is used for the low-urgency reminder (§9.3); urgency is carried in the claim's `urgency` field and in the transports' metadata, not in the prose.
 
-**The reminder is coalesced-until-acknowledgment (issue #333).** Because this rule makes acknowledgment the ONLY thing that un-mutes the band, the delivered payload itself must name the ack step — see each transport's own action step above and, for body-injection deliveries that carry no reminder prose, the per-batch ack instruction in [006 §5](006-agent-integration.md) (issue #434). Delivering the reminder claims the underlying events (`markClaimed` sets `firstNotifiedAt`; §9.4 — claiming never acknowledges), so once any unread normal event has been claimed-but-not-acknowledged, the `normalPending.length === unreadNormal.length` guard no longer holds and the reminder is **suppressed** — it does not re-fire until the claimed events are acknowledged. A fresh, unrelated unclaimed normal event arriving in the meantime does **not** restore the reminder: it grows both `normalPending` (by one) and `unreadNormal` (by one, since the still-claimed row remains in the unread total), so the two counts stay unequal until the claimed row is specifically acknowledged. A second `hook claim --lifecycle turn-interruptible` after the first therefore correctly returns `null`. This is intended coalescing, **not** a lost signal: the events stay unread (re-discoverable via `events list --unread`) and durable. Because a silent `null` is indistinguishable from "nothing was ever pending," this suppression **MUST** be inspectable rather than presented as silence (the silent-failure-honesty invariant, [§1.1.8](#118-interpret-a-cheap-agentic-digest-via-the-users-own-ai-tool), capability C12): `monitor explain`'s projection-and-delivery stage ([§10.7](#107-monitor-pipeline-diagnosis)) names the suppression reason (`already-claimed` when every unread event of the band is claimed; `coalesced-until-ack` when a mix of claimed and unclaimed events holds the coalesced reminder back).
+**Fresh work is independent of acknowledgment of older work (current).** Delivering a reminder
+claims only its pending batch (`firstNotifiedAt` is set), never acknowledges it. With no newly
+pending work, repeated claims return `null`; old work remains unread and queryable until explicitly
+acknowledged. If event A was claimed and event B arrives, B MUST produce a new reminder at the next
+eligible lifecycle without requiring acknowledgment of A. This applies across monitors and after a
+mixed-band recap. It deliberately replaces the former `pending === unread` band-wide suppression.
 
-**Reminder acknowledgment is not id-scoped (unlike §9.1's per-batch ack instruction below).** This reminder claim only ever fires when every unread event of its own urgency band is unclaimed (the `normalPending.length === unreadNormal.length` / low-band equivalent guard) — so unlike a capped `high`-urgency delivery or a `post-compact` recap (whose rendered `events` can be a strict subset of what a delivery actually claims), there is no narrower id list within the band to scope the ack to. A blanket `events ack --session <id>` (no `--event-ids`), or an `agentmon_ack` call with no `event_ids`, run in response to this reminder would still ack events of OTHER urgency bands the recipient never saw, though. The two transports' reminder action steps handle this differently (revised by PR #445 review, round 2, finding 2 — BLOCKER): the hook transport's step names the un-scoped ack CLI verb directly ([006 §5.1.1](006-agent-integration.md#511-attribution-is-transport-owned-delivered-text-is-self-sufficient-issues-438-434)); the channel transport's step, instead of presenting its `agentmon_ack` tool as an "or" alternative to inspecting, instructs the recipient to list this session's unread events **first** and then call `agentmon_ack` naming only the ids it actually handled — never the bare, no-argument form, which would otherwise silently ack unseen cross-band work. Neither step can supply a narrower id list itself (there is none within the band, per above); the corrected channel wording instead defers correct scoping to the recipient's own post-inspection choice.
+A live same-band reservation still holds the next reminder, preventing simultaneous generic reminders
+from competing transports. That hold ends on commit, release or expiry; the committed older batch
+then remains unread but cannot block the next pending batch. The runtime MUST NOT auto-acknowledge,
+reset prior claims, or re-claim old rows to obtain forward progress.
 
-Verified: `libs/core/src/runtime/service.ts` — the `normalPending.length === unreadNormal.length` guard in `claimDelivery`; the `reminderMessage()` builder. The wording contract is proven end-to-end (one runtime claim, both transports) by `apps/cli/src/delivery-text.integration.test.ts`. The suppression diagnosis is `diagnoseReminderSuppression` (`libs/core/src/runtime/reminder-diagnosis.ts`), surfaced by the `delivery` stage of `explainMonitor`. Proven by `libs/core/src/runtime/reminder-diagnosis.test.ts`, the "normal-urgency reminder suppression is explainable (issue #333)" case in `libs/core/src/runtime/service.test.ts`, and the real-daemon/IPC "hook claim normal-urgency reminder + suppression diagnosis (issue #333)" case in `apps/cli/src/commands/cli.integration.test.ts`.
+**Diagnostics.** `no-new-work` means no fresh pending work remains. `reserved-in-flight` means
+a same-band lease is the temporary blocker, even when older claimed rows coexist; it MUST NOT
+recommend acknowledgment as a remedy. Fresh pending work with no lease produces neither finding.
+`coalesced-until-ack` remains a legacy wire value for compatibility with older daemon responses,
+but current decisions never emit it. Concurrent high settling still reports `settle-window`.
+
+**Acknowledgment remains explicit and handled-item scoped.** A reminder tells the recipient to inspect
+unread events and acknowledge handled work; it does not identify every item that was handled. The
+existing transport-owned action steps remain in force. Older unread claims are included in unread
+queries and counts; a new reminder does not erase them or certify their completion.
+
+Verified: `libs/core/src/runtime/reminder-progress.test.ts` covers new batches through direct hook
+claims and channel reserve/commit, per-session isolation, lease commit/release/expiry, and high settle
+coalescing. `reminder-diagnosis.test.ts`, `hook-delivery-diagnosis.test.ts` and
+`diagnose-hook-delivery.test.ts` cover truthful holds. `apps/cli/src/delivery-text.integration.test.ts`
+checks rendering of fresh normal/low batches through both transport renderers.
 
 ### 9.3 Low urgency
 
-At `turn-idle`, low-urgency events are delivered as a coalesced reminder only if all unread low-urgency events are still unclaimed. The `events` array is empty. The reminder body is the same `reminderMessage()` the normal band uses, and is bound by the identical wording contract (§9.2): semantic, transport/verb-neutral, and `inbox`-free — self-sufficiency and the ack step come from each transport's own action step.
+At `turn-idle`, fresh pending low-urgency events are delivered as one coalesced reminder per batch.
+The normal-band pending/claimed/lease rules of §9.2 apply identically. Old claimed-but-unacknowledged
+low events MUST NOT block a fresh low batch. The `events` array is empty; the reminder body is the
+same transport-neutral `reminderMessage()`. No low event is promoted to the normal lifecycle.
 
-The low-urgency reminder is coalesced-until-acknowledgment exactly as the normal reminder is (§9.2): once an unread low event is claimed-but-not-acknowledged, the reminder is suppressed until that claimed event is acknowledged — a fresh unclaimed low event arriving in the meantime does not restore it, for the same reason given in §9.2 — and the same `monitor explain` diagnosis (§10.7) names the reason (issue #333).
-
-Verified: `libs/core/src/runtime/service.ts` — the `shouldSendLow` guard in `claimDelivery`; the shared `reminderMessage()` builder. Suppression diagnosis: `diagnoseReminderSuppression` (`libs/core/src/runtime/reminder-diagnosis.ts`), proven for the `low`/`turn-idle` band by `libs/core/src/runtime/reminder-diagnosis.test.ts`.
+Verified: `libs/core/src/runtime/reminder-progress.test.ts` runs the same forward-progress, isolation
+and reservation scenarios for `low` at `turn-idle` and `normal` at `turn-interruptible`.
 
 ### 9.4 Recap
 
@@ -1564,16 +1588,10 @@ monitor through the persisted pipeline state and returns stages for:
 5. Materialization: recent `monitor_events`
 6. Projection and delivery: `session_event_state` joined to `agent_sessions`, reported as
    `unread`, `claimed`, or `acknowledged`. When a session's unread normal/low events are already
-   claimed OR leased (so the coalesced turn-interruptible/turn-idle reminder of §9.2/§9.3 is
-   currently suppressed), this stage additionally reports a `reminderSuppression` finding per
-   session-and-band naming the reason — `already-claimed` or `coalesced-until-ack` when at least one
-   unread event of the band is durably claimed, or `reserved-in-flight` (issue #300, PR #445 review
-   round 10) when none is durably claimed but at least one is LEASED by an in-flight channel-push
-   reservation — so a `null` claim is explainable rather than silent (issue #333). A lease is not a
-   claim and resolves itself, so `reserved-in-flight` findings never recommend `events ack`;
-   acknowledging a leased-but-unseen row before the push resolves could otherwise lose it
-   permanently if the push then fails. The stage stays `ok` (the events are projected and
-   claimed/leased correctly; the paused reminder is expected behavior, not a fault).
+   claimed with no fresh work remaining, or a same-band lease exists, this stage additionally
+   reports a `reminderSuppression` finding: `no-new-work` means no new pending work;
+   `reserved-in-flight` means a temporary reservation is holding the next batch. A live lease is
+   never remediated by acknowledgment. Older claims cannot suppress fresh pending observations.
 
 Each stage carries a `status` of `ok`, `pending`, `healthy`, or `failure`:
 
@@ -1702,7 +1720,7 @@ Note: the `inbox_items` table does not share rows with `monitor_events`. They ar
 
 1. a low-urgency event is persisted and projected into a session
 2. `turn-interruptible` returns `null` (low urgency is not delivered here)
-3. `turn-idle` evaluates `shouldSendLow`: `pendingEventsForSession(sessionId, 'low').length > 0` and all low-urgency unread events are still unclaimed → returns a `DeliveryClaim` with `message: reminderMessage()` (§9.2's wording contract); the delivering transport then appends its own session-scoped action step
+3. `turn-idle` evaluates `shouldSendLow`: `pendingEventsForSession(sessionId, 'low').length > 0` and no low-urgency reservation is active → returns a `DeliveryClaim` with `message: reminderMessage()` (§9.2's wording contract); the delivering transport then appends its own session-scoped action step
 4. the event remains unread until explicitly acknowledged
 
 **What this example proves:** `low` urgency is real runtime behavior, not schema-only metadata; idle-time delivery differs intentionally from interruptible delivery.
@@ -1710,11 +1728,11 @@ Note: the `inbox_items` table does not share rows with `monitor_events`. They ar
 ### 13.3 Coalesced normal reminder, then its suppression (issue #333)
 
 1. a `urgency: normal` monitor emits a change; the event is persisted and projected into a lead session (unread, unclaimed)
-2. `turn-interruptible` evaluates the §9.2 guard — all unread normal events are unclaimed → returns a `DeliveryClaim` with `message: reminderMessage()` and an empty `events` array; the delivering transport appends its own action step naming the ack command, so the recipient can avoid step 3's mute, **and claims the event** (`markClaimed` sets `firstNotifiedAt`; not acknowledged)
-3. a **second** `turn-interruptible` claim finds the event unread-but-claimed → the guard no longer holds → returns `null` (the coalesced reminder does not nag again until the claimed event is acknowledged — a fresh unclaimed normal event arriving in the meantime does not restore it, §9.2)
-4. `monitor explain <id>` reports the `delivery` stage as `ok` with a `reminderSuppression` finding naming the reason (`already-claimed`), so the `null` is explainable rather than silent
+2. `turn-interruptible` evaluates the §9.2 guard — fresh pending normal work exists and no same-band reservation is active → returns a `DeliveryClaim` with `message: reminderMessage()` and an empty `events` array; the delivering transport appends its own action step naming the ack command, so the recipient can explicitly complete handled work, **and claims the event** (`markClaimed` sets `firstNotifiedAt`; not acknowledged)
+3. a **second** `turn-interruptible` claim finds the event unread-but-claimed → the guard no longer holds → returns `null` (no new pending work exists; a fresh unclaimed normal event restores the reminder independently of the older claim, §9.2)
+4. `monitor explain <id>` reports the `delivery` stage as `ok` with a `reminderSuppression` finding naming the reason (`no-new-work`), so the `null` is explainable rather than silent
 
-**What this example proves:** the normal reminder fires on the first claim (it is _not_ silently swallowed); coalescing-until-acknowledgment means a repeat claim is intentionally quiet; claiming is not acknowledgment (the event stays unread and durable); and the "why nothing surfaced" answer is inspectable via `monitor explain`, never presented as bare silence. This is the resolution of the blind-study S3 F2 report: a first-run subject who claimed once, then claimed again, saw `null` the second time and mistook intended coalescing for a broken delivery path.
+**What this example proves:** the normal reminder fires on the first claim (it is _not_ silently swallowed); batch-level coalescing means a repeat claim without fresh work is intentionally quiet; claiming is not acknowledgment (the event stays unread and durable); and the "why nothing surfaced" answer is inspectable via `monitor explain`, never presented as bare silence. This is the resolution of the blind-study S3 F2 report: a first-run subject who claimed once, then claimed again, saw `null` the second time and mistook intended coalescing for a broken delivery path.
 
 ## 14. Validation Implications
 
@@ -1723,7 +1741,7 @@ Runtime and persistence tests should be able to prove:
 - stateful source state survives runtime restarts (persisted via `monitor_state.source_state`)
 - schedule matching respects configured timezone via `Intl.DateTimeFormat`
 - high-urgency delivery waits for the 15-second settle window before `claimDelivery` returns a payload
-- normal reminders coalesce until unread events are acknowledged (guard: `normalPending.length === unreadNormal.length`)
+- fresh normal/low batches surface despite older unacknowledged claims, while repeated claims without new work stay quiet
 - low-urgency delivery happens only at `turn-idle` lifecycle points
 - events project only into matching lead sessions (role filter in `insertEvent`)
 - scope filters query `queryScope` rather than source payload internals (post-query filter in `listEvents`)

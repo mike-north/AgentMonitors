@@ -445,7 +445,7 @@ export interface HookDeliveryHold {
 }
 
 // @public
-export type HookDeliveryHoldReason = 'settle-window' | 'already-claimed' | 'coalesced-until-ack' | 'reserved-in-flight';
+export type HookDeliveryHoldReason = 'settle-window' | 'no-new-work' | 'already-claimed' | 'coalesced-until-ack' | 'reserved-in-flight';
 
 // @public (undocumented)
 export interface HookState {

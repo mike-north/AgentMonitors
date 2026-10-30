@@ -594,19 +594,9 @@ Handle it.
     expect(normalClaim?.events).toEqual([]);
   });
 
-  // 006 §5.1.1 (PR #445 review, round 6 — discussion_r3615219860): the
-  // cross-band-independence guard above is TRUE ONLY for a `high`-only claim.
-  // A `post-compact` recap claims the FULL unread set across every band
-  // (`applyDelivery`'s `candidates: unread`), so a mixed-band recap that
-  // claims an OLD normal-urgency event alongside high-urgency events leaves
-  // that normal row claimed-but-unacknowledged. This regression proves the
-  // band-scoped guard (`normalPending.length === unreadNormal.length`) then
-  // correctly SUPPRESSES the next turn-interruptible normal reminder once a
-  // fresh, unrelated normal event arrives — because `unreadNormal` (2, the old
-  // recap-claimed row plus the new one) no longer equals `normalPending` (1,
-  // only the new unclaimed row) — a prior revision of 006 wrongly claimed a
-  // mixed-band recap claim "does not, on its own, block" this reminder.
-  it('a mixed-band post-compact recap claim suppresses the next normal-urgency reminder for a fresh, unrelated normal event (mixed-band recap suppression)', () => {
+  // A recap claims old work without acknowledging it. A later observation
+  // must still produce its own reminder, rather than inheriting that claim.
+  it('a mixed-band recap does not suppress a fresh unrelated normal reminder', () => {
     const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
     tempDirs.push(rootDir);
     const db = createDb(':memory:');
@@ -684,12 +674,10 @@ Handle it.
       createdAt: new Date(),
     });
 
-    // The recap-claimed normal row is still unacknowledged, so `unreadNormal`
-    // is 2 while only the fresh event is unclaimed (`normalPending` is 1) —
-    // the band-scoped guard therefore withholds the reminder (returns null),
-    // NOT fires it, until the recap-claimed normal row is acknowledged.
     const normalClaim = runtime.claimDelivery(session.id, 'turn-interruptible');
-    expect(normalClaim).toBeNull();
+    expect(normalClaim?.urgency).toBe('normal');
+    expect(store.unreadEventsForSession(session.id)).toHaveLength(3);
+    expect(runtime.claimDelivery(session.id, 'turn-interruptible')).toBeNull();
   });
 
   // Issue #407: `verify --use-workspace-daemon` must retract the events its own
@@ -1379,7 +1367,7 @@ Handle it.
     expect(claim?.message).toBe('Monitored changes are pending.');
   });
 
-  it('coalesces normal-urgency reminders until unread events are acknowledged', () => {
+  it('coalesces each fresh normal batch without waiting for older acknowledgments', () => {
     const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
     tempDirs.push(rootDir);
     const db = createDb(':memory:');
@@ -1435,6 +1423,10 @@ Handle it.
       createdAt: new Date(),
     });
 
+    expect(
+      runtime.claimDelivery(session.id, 'turn-interruptible')?.urgency,
+    ).toBe('normal');
+    expect(store.unreadEventsForSession(session.id)).toHaveLength(2);
     expect(runtime.claimDelivery(session.id, 'turn-interruptible')).toBeNull();
 
     runtime.acknowledgeSession(session.id);
@@ -5616,7 +5608,9 @@ describe('normal-urgency reminder suppression is explainable (issue #333)', () =
       // Suppression is EXPECTED behavior, not a fault — the stage stays ok.
       expect(delivery?.status).toBe('ok');
       expect(delivery?.reason).toContain('already claimed');
-      expect(delivery?.reason).toContain('coalesced-until-ack');
+      expect(delivery?.reason).toContain(
+        'fresh unclaimed normal event will trigger',
+      );
 
       const findings = delivery?.details?.['reminderSuppression'] as
         | ReminderSuppressionFinding[]
@@ -5628,7 +5622,7 @@ describe('normal-urgency reminder suppression is explainable (issue #333)', () =
         lifecycle: 'turn-interruptible',
         unreadCount: 1,
         claimedCount: 1,
-        reason: 'already-claimed',
+        reason: 'no-new-work',
       });
     } finally {
       vi.useRealTimers();

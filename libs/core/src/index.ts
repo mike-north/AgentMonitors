@@ -155,9 +155,9 @@ export type {
   ShapedObservation,
 } from './runtime/shape-stage.js';
 // Hook-deliver debug diagnosis (issue #334): why `hook deliver` surfaced
-// nothing at a given lifecycle — held by the settle window, or a coalesced
-// normal/low reminder suppressed by an already-claimed / partially-claimed
-// unread set. Read-only; never claims or mutates.
+// nothing at a given lifecycle — high work is settling, a fresh normal/low
+// batch is reserved by another transport, or no new work remains. Previously
+// claimed work stays unread without blocking fresh batches. Read-only; never mutates.
 export {
   classifyReminderHold,
   classifySettleWindowHold,

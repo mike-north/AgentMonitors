@@ -181,9 +181,9 @@ multi-values flattened):
   always claims additional normal-urgency rows alongside its high event(s) (`claimDelivery` claims
   `surfacedCandidates` **and** `normalPending` together), so routing per-event meta to that one
   event's own IDs would invite a scoped ack (via `agentmon_ack`) that leaves the coalesced normal rows
-  claimed-but-unacknowledged — durably muting the session's normal reminders until they are acked
-  (002 §9.2's `normalPending.length === unreadNormal.length` gate never re-fires while they sit
-  claimed). Such a claim is always summarized at the claim level, identically to a claim with
+  claimed-but-unacknowledged and outside that scoped acknowledgment. Those rows still require
+  explicit handling and acknowledgment, even though fresh pending work remains eligible under
+  002 §9.2. Such a claim is always summarized at the claim level, identically to a claim with
   multiple events.
 
 The `source` attribute on the rendered `<channel>` tag is set by the host from the MCP server name
@@ -652,30 +652,11 @@ adapter. Adding a new surface means choosing its attribution there, not editing 
 
 **The acknowledge instruction.** A body-injection delivery (settled high-urgency events at
 `turn-interruptible`, or the `post-compact` recap surfaced at `SessionStart`) **claims** the events it
-renders — and claiming is never acknowledging (BP2 / SP4). The coalesced-until-ack rule
-([002 §9.2](./002-runtime-delivery.md#92-normal-urgency)) is **band-scoped**: it compares a band's own
-pending count against that SAME band's unread total, where the unread total is the superset that also
-contains any claimed-but-unacknowledged row (`normalPending.length === unreadNormal.length`, where
-`normalPending` holds `normal` rows that are both **not-yet-claimed and currently claimable** — a row
-held by an in-flight channel-push reservation is unclaimed but leased, so `pendingForClaim` (issue
-#300) excludes it from `normalPending` too, and `unreadNormal` holds every unread `normal` row
-regardless of claim OR lease state; the low-urgency guard, §9.3, is the identical pattern against its
-own band). Leaving a claim unacknowledged
-therefore suppresses only the reminder for whichever band(s) the claimed events actually belong to — a
-`high`-**only** claim touches no `normal`/`low` row at all, so it does **not**, on its own, block a NEW
-`normal`-urgency reminder from firing for unrelated, still-unclaimed `normal` events in the same
-session; the two coexist. A **mixed-band** `post-compact` recap is different: if it claims an old
-`normal` (or `low`) event alongside `high` events, that `normal` row stays claimed-but-unacknowledged —
-present in `unreadNormal` but absent from `normalPending` — so once a fresh, unrelated `normal` event
-later arrives, `normalPending` (1, the fresh unclaimed row) no longer equals `unreadNormal` (2, the
-fresh row plus the still-claimed recap row) — the band-scoped equality guard therefore suppresses THAT
-band's next `turn-interruptible` reminder too, until the recap's `normal`/`low` events are
-acknowledged. In short:
-suppression is band-scoped, not high/recap-vs-normal/low-scoped — a claim suppresses exactly the
-band(s) it actually touched. Previously the delivered payload named no way to acknowledge, so an
-agent that fully handled the delivered work still left that claimed band's own future reminder
-silently muted; the remediation existed only in `monitor explain`, which nobody runs while things
-appear fine (issue #434 — the delivery-side twin of the silent-degradation family in issue #425).
+renders — and claiming is never acknowledging (BP2 / SP4). Under the fresh-batch policy
+([002 §9.2–§9.3](./002-runtime-delivery.md#92-normal-urgency)), old claims remain unread but do not
+block later pending events of any band. This applies after mixed-band recaps as well as ordinary
+claims. The completion instruction is still required so recipients can explicitly acknowledge the
+work they handled; it is not a prerequisite for notifying them about unrelated new work.
 
 Therefore the hook transport's body-injection header **MUST** carry a completion instruction naming
 the acknowledge command with the recipient's **real session id** and an explicit **`--socket
@@ -897,22 +878,18 @@ hold reason for anything not yet deliverable:
 
 - `settle-window` — pending high-urgency work exists but is not yet past the 15s claim-time settle
   window (§9.1 of [002](./002-runtime-delivery.md)).
-- `already-claimed` / `coalesced-until-ack` — the coalesced normal/low reminder ([002 §9.2/§9.3](./002-runtime-delivery.md))
-  is currently suppressed by one or more DURABLY claimed (not yet acknowledged) rows of that band.
-  This is the SAME vocabulary `monitor explain`'s reminder-suppression diagnosis uses
-  ([002 §10.7](./002-runtime-delivery.md), issue #333) — both surfaces explain the identical
-  coalescing guard and MUST agree on what to call it. Acknowledging (`agentmonitors events ack`)
-  is the correct remedy for both.
-- `reserved-in-flight` — the coalesced reminder is suppressed, but NO row of the band is durably
-  claimed; at least one is instead currently LEASED by an in-flight channel-push reservation
-  (issue #300, PR #445 review round 10). A lease is not a claim — it resolves itself (the push
-  commits it as claimed, or fails/expires and returns it to pending) — so, unlike the other two
-  reasons, this one MUST NOT be presented alongside an acknowledge instruction: acknowledging a
-  leased-but-unseen row before the push resolves can permanently lose it if the push then fails.
-  `acknowledgeSession`'s implicit "ack everything unread" path excludes leased rows for the same
-  reason.
+- `no-new-work` — no fresh pending normal/low work remains. Previously surfaced work stays
+  unread until explicitly acknowledged; a fresh observation can produce a new reminder independently.
+- `reserved-in-flight` — a same-band reservation temporarily holds the reminder, whether or not
+  older claimed rows coexist. Commit, release or expiry resolves it. Acknowledge is never its remedy.
+- `already-claimed` / `coalesced-until-ack` — retained for older daemon responses only; current runtime decisions no
+  longer emit this band-wide starvation hold.
 - `deferred-by-cap` — settled high-urgency events existed but some were deferred by the transport's
   own 4000-char cap (§5.5); a hold reason owned by this transport, not the runtime.
+
+Transport health treats `no-new-work` with no fresh work as an ordinary backlog, not a
+broken delivery path. It still diagnoses legacy `already-claimed` / `coalesced-until-ack` responses from older daemons
+as blocked fresh work.
 
 **Criterion: stdout MUST be byte-identical between a `--debug` run and a non-`--debug` run of the
 same payload against the same daemon state.** `--debug` adds exactly one extra read-only daemon call
@@ -1468,7 +1445,7 @@ Transport and integration tests should be able to prove:
   used **without** the hook-driven `session open` flow, or require the hook flow as a precondition.
 - **Deferred, not rejected (issue #434): should `hook deliver` auto-acknowledge events claimed by a
   PREVIOUS delivery to the same session when a NEWER delivery is surfaced?** That would make the
-  coalesced-until-ack loop self-healing without any agent cooperation. It is deliberately **not**
+  abandoned-claim lifecycle self-healing without any agent cooperation. It is deliberately **not**
   built here. Auto-acking on delivery would collapse two of the three distinct delivery states
   (unread / claimed / acknowledged, [002 §9.4](./002-runtime-delivery.md)) into one: "acknowledged"
   would come to mean "a later delivery happened," not "a recipient handled this," which is precisely
@@ -1655,7 +1632,7 @@ diverge from the workspace they were meant to serve, and every divergence presen
 nothing arrives — while every surface looks green. Three distinct instances of this were observed in
 a single day of dogfooding: a reaped daemon with no session to revive it; a channel server bound to
 the home-directory workspace because the session was launched from `$HOME`; and correct, materialized
-events whose reminders were withheld on every lead session by the `coalesced-until-ack` guard
+events whose reminders were withheld on every lead session by the former `coalesced-until-ack` guard
 (002 §9.2/§9.3). The third is the important one: both transports were connected and correctly
 configured, and the agent was still never told its PR's CI had broken.
 
@@ -1877,7 +1854,7 @@ in the store within a bound — would upgrade this from advisory to detection.
 crosses the daemon IPC boundary, so it can arrive from a build that predates the field entirely — the
 type describes what THIS build produces, not what a remote peer actually sent on the wire.
 
-`doctor` must treat a suppressing (`already-claimed` / `coalesced-until-ack`) hold whose
+`doctor` must treat a legacy suppressing (`already-claimed` or `coalesced-until-ack`) hold whose
 `claimedEventIds` is not a real, NON-EMPTY array of non-empty strings as **diagnosis-unavailable for
 that session** (`delivery-diagnosis-unavailable`, §12.4 item 5), never as:
 
@@ -1888,8 +1865,8 @@ that session** (`delivery-diagnosis-unavailable`, §12.4 item 5), never as:
   `--event-ids`) would re-introduce exactly the blanket-acknowledgement defect round 6 fixed:
   clearing every unread row for the session, including work the agent never claimed or saw. This
   applies equally to a MISSING field (round 7) and to an EMPTY array (round 8): `classifyReminderHold`
-  only ever returns an `already-claimed`/`coalesced-until-ack` hold when at least one event is
-  claimed, so a real hold from this build always names at least one id — an empty array reaching
+  historically returned a `coalesced-until-ack` hold only when at least one event was
+  claimed, so a well-formed legacy suppression names at least one id — an empty array reaching
   `doctor` can only mean the value came from something other than that classifier (a malformed daemon
   response, or a hand-built `HookDeliveryHold`) and must be treated exactly like a missing one, not
   folded into the scoped-remediation branch where an empty list renders as "omit the flag" and
@@ -1897,8 +1874,8 @@ that session** (`delivery-diagnosis-unavailable`, §12.4 item 5), never as:
 
 An empty array (`[]`) IS still a valid, deliberate signal for `settle-window` holds — nothing is
 claimed while pending work merely waits out the settle window — but `settle-window` never reaches
-this check at all: only `already-claimed`/`coalesced-until-ack` holds are suppressing holds, and for
-those two reasons an empty array is never legitimate. Only a real, non-empty array of non-empty
+this check at all: only legacy `already-claimed` / `coalesced-until-ack` holds are suppressing transport-health holds.
+`no-new-work` with no fresh work is an ordinary backlog, not a transport problem. Only a real, non-empty array of non-empty
 strings is trustworthy.
 
 ### 12.8 The lease keeps the daemon alive for an idle channel-attached session (issue #435 Option A)
