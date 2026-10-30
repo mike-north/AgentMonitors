@@ -1636,6 +1636,10 @@ server's self-reported version from `initialize.userAgent`, verifies the id in p
 rechecks that the thread remains loaded. Missing ownership, malformed responses, connection
 failure, bounded-response overflow, or timeout produce refusal. It does not discover endpoints,
 start servers, load/resume/fork sessions, send observations, or start/steer/interrupt turns.
+Before returning evidence, it checks all failures observed through the final response's parsing
+turn and subsequent read continuations. A valid final response cannot override a malformed frame,
+peer request, duplicate response, or connection failure already observed in that interval. It
+closes after this bounded snapshot; success makes no claim about later unobserved peer activity.
 
 The artifact establishes only momentary ownership and metadata as reported by that supplied
 server. Delivery capability, lifecycle mapping, and CLI/desktop surface remain unverified. A

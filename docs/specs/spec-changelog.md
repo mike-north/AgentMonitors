@@ -24,6 +24,10 @@ partial diagnostic evidence only: no existing desktop endpoint, delivery capabil
 mapping, or adapter support is established, and all Codex matrix cells remain target. Synthetic
 socket tests are explicitly separate from the live probe evidence required by §11.6.
 
+Adversarial repair: the success boundary also rejects failures observed after resolution of the
+final read response, including additional complete frames in the same parsing turn. This is a
+bounded snapshot guarantee, not a promise about later unobserved peer activity.
+
 ## 2026-08-24 — New numbered doc: 008 — Reliability & Process Hygiene — Refs #504, PR #476
 
 Added [008-reliability-process-hygiene.md](./008-reliability-process-hygiene.md), promoting the

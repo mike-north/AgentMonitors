@@ -65,6 +65,10 @@ export async function probeCodexOwner({
     }
     // A persisted thread/read alone is not ownership. Recheck after reading metadata too.
     await requireLoaded(client, threadId);
+    // Promise resolution cannot revoke a response when another frame in the same
+    // parsing turn fails. Inspect the accumulated connection state after that turn
+    // and its read continuations, immediately before committing snapshot evidence.
+    client.assertHealthy();
     return {
       status: 'owner-observed',
       host: 'codex',
@@ -178,6 +182,10 @@ function readClient(socketPath, timeoutMs) {
     }
   });
   return {
+    /** Refuse any failure already observed in this snapshot's connection interval. */
+    assertHealthy() {
+      if (failure) throw failure;
+    },
     rpc(method, params) {
       return new Promise((resolveResult, reject) => {
         if (failure) return reject(failure);

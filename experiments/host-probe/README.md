@@ -228,6 +228,9 @@ starts/resumes/forks a thread, starts/steers/interrupts a turn, sends observatio
 approvals. Peer requests, missing/unloaded identities, malformed metadata, connection errors,
 timeouts, repeated cursors, over 100 pages, or over 1 MiB total response bytes cause refusal
 (exit 1). Server error bodies and conversation previews are not printed or retained.
+The final success check includes errors observed after the last valid response but before evidence
+is returned, including other complete frames in the same parsing turn. The connection then closes;
+this bounded snapshot does not wait for or certify future, unobserved peer activity.
 
 Success (exit 0) reports `owner-observed`, identity/workspace signals, version, and observed read
 methods. This is a point-in-time claim by the supplied server, **not an ownership lease**, an

@@ -1,12 +1,12 @@
 /** Synthetic socket fixtures prove read-only diagnostics, never host delivery support (006 §11.6). */
-import { createServer, type Socket } from 'node:net';
+import { createServer, Socket } from 'node:net';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { probeCodexOwner } from './codex-owner.mjs';
 
 type IRequest = {
@@ -208,6 +208,47 @@ describe('explicit Codex owner diagnostic', () => {
       }),
     ).rejects.toThrow(/cursor/);
   });
+  // The last response is not success if its parsing turn also observes a failure.
+  // Coalescing the frames into one write makes the terminal-response race explicit.
+  it.each(['malformed', 'server-request', 'duplicate'] as const)(
+    'refuses a final valid response followed by %s in the same parsing turn',
+    async (mode) => {
+      let listings = 0;
+      const server = await fixture((request, socket) => {
+        if (request.method !== 'thread/loaded/list' || ++listings !== 2) {
+          reply(request, socket);
+          return;
+        }
+        const response = JSON.stringify({
+          id: request.id,
+          result: { data: ['existing-thread'], nextCursor: null },
+        });
+        const tail =
+          mode === 'malformed'
+            ? 'not JSON'
+            : mode === 'server-request'
+              ? JSON.stringify({
+                  id: 99,
+                  method: 'item/commandExecution/requestApproval',
+                })
+              : response;
+        socket.write(`${response}\n${tail}\n`);
+      });
+      await expect(
+        probeCodexOwner({
+          socketPath: server.socketPath,
+          threadId: 'existing-thread',
+        }),
+      ).rejects.toThrow();
+      expect(server.requests.map((request) => request.method)).toEqual([
+        'initialize',
+        'initialized',
+        'thread/loaded/list',
+        'thread/read',
+        'thread/loaded/list',
+      ]);
+    },
+  );
   it('requires explicit absolute socket and nonempty thread before connecting', async () => {
     for (const options of [
       {},
@@ -217,6 +258,41 @@ describe('explicit Codex owner diagnostic', () => {
       { socketPath: '/tmp/x', threadId: 'x', timeoutMs: 0 },
     ]) {
       await expect(probeCodexOwner(options)).rejects.toThrow(/Invalid/);
+    }
+  });
+  it('refuses a connection failure observed after the final frame but before returning evidence', async () => {
+    const server = await fixture();
+    const emit = Socket.prototype.emit;
+    // Inject a local socket error between promise continuations, after the last
+    // data callback completes. No waiting for future peer activity is required.
+    const intercepted = vi
+      .spyOn(Socket.prototype, 'emit')
+      .mockImplementation(function (
+        this: Socket,
+        event: string | symbol,
+        ...args: unknown[]
+      ): boolean {
+        const result = emit.apply(this, [event, ...args]);
+        if (
+          event === 'data' &&
+          typeof args[0] === 'string' &&
+          args[0].includes('"id":4,"result"')
+        ) {
+          queueMicrotask(() =>
+            this.emit('error', new Error('Synthetic late read failure')),
+          );
+        }
+        return result;
+      });
+    try {
+      await expect(
+        probeCodexOwner({
+          socketPath: server.socketPath,
+          threadId: 'existing-thread',
+        }),
+      ).rejects.toThrow();
+    } finally {
+      intercepted.mockRestore();
     }
   });
   it('refuses absent sockets without creating a server', async () => {
