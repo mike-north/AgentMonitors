@@ -113,6 +113,12 @@ describe('materialization retry outbox', () => {
       records.map((record) => record.envelope.observation.objectKey),
     ).toEqual(['object-1', 'object-2']);
     expect(records[0]?.envelope.observedAt).toEqual(NOW);
+    expect(records[0]?.envelope).toStrictEqual(
+      envelope('monitor-a', 'object-1'),
+    );
+    expect(records[1]?.envelope).toStrictEqual(
+      envelope('monitor-a', 'object-2'),
+    );
     expect(
       reopened.listMaterializationRetries({
         monitorId: 'monitor-a',
@@ -201,6 +207,126 @@ describe('materialization retry outbox', () => {
       ),
     ).toThrow(MaterializationRetryCapacityError);
     expect(overflowStore.listMaterializationRetries()).toEqual([]);
+  });
+
+  it('rejects a two-item row overflow without retaining either sibling or another route', () => {
+    const store = new RuntimeStore(createDb(scratchDb()));
+    const existing = store.enqueueMaterializationRetries(
+      Array.from(
+        { length: MATERIALIZATION_RETRY_MAX_RECORDS - 1 },
+        (_, index) => input('monitor-a', `existing-${String(index)}`),
+      ),
+      NOW,
+    );
+    expect(() =>
+      store.enqueueMaterializationRetries(
+        [
+          input('monitor-b', 'unrelated-route'),
+          input('monitor-a', 'fits-alone'),
+          input('monitor-a', 'overflows-together'),
+        ],
+        NOW,
+      ),
+    ).toThrow(MaterializationRetryCapacityError);
+    expect(
+      store.listMaterializationRetries().map((record) => record.id),
+    ).toEqual(existing.map((record) => record.id));
+  });
+
+  it('rejects aggregate sibling bytes even when either sibling individually fits', () => {
+    const dbPath = scratchDb();
+    const store = new RuntimeStore(createDb(dbPath));
+    const siblingBytes = 1024;
+    const existing = store.enqueueMaterializationRetries(
+      [
+        inputWithEnvelopeBytes(
+          MATERIALIZATION_RETRY_MAX_BYTES - 2 * siblingBytes + 1,
+        ),
+      ],
+      NOW,
+    );
+    expect(() =>
+      store.enqueueMaterializationRetries(
+        [
+          inputWithEnvelopeBytes(siblingBytes),
+          inputWithEnvelopeBytes(siblingBytes),
+        ],
+        NOW,
+      ),
+    ).toThrow(MaterializationRetryCapacityError);
+    const reopened = new RuntimeStore(createDb(dbPath));
+    expect(
+      reopened.listMaterializationRetries().map((record) => record.id),
+    ).toEqual(existing.map((record) => record.id));
+    // Exactly one sibling still fits, proving overflow was aggregate rather
+    // than an individually invalid envelope or a pre-existing full outbox.
+    expect(
+      reopened.enqueueMaterializationRetries(
+        [inputWithEnvelopeBytes(siblingBytes)],
+        NOW,
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('rejects negative zero before any sibling writes, rather than restoring positive zero', () => {
+    const store = new RuntimeStore(createDb(scratchDb()));
+    const invalid = input('monitor-a', 'negative-zero');
+    invalid.envelope.observation.payload = { value: -0 };
+    expect(() =>
+      store.enqueueMaterializationRetries(
+        [input('monitor-a', 'valid-sibling'), invalid],
+        NOW,
+      ),
+    ).toThrow(MaterializationRetrySerializationError);
+    expect(store.listMaterializationRetries()).toEqual([]);
+  });
+
+  it('rejects customized observedAt dates without invoking caller hooks or writing siblings', () => {
+    const store = new RuntimeStore(createDb(scratchDb()));
+    let hookCalls = 0;
+    const hook = () => {
+      hookCalls += 1;
+      return '2020-01-01T00:00:00.000Z';
+    };
+    class CustomDate extends Date {
+      toJSON(): string {
+        return hook();
+      }
+    }
+    const customized = [
+      Object.defineProperty(new Date(NOW), 'toJSON', { value: hook }),
+      Object.defineProperty(new Date(NOW), 'getTime', {
+        value: () => {
+          hookCalls += 1;
+          return 0;
+        },
+      }),
+      new CustomDate(NOW),
+      Object.assign(new Date(NOW), { metadata: 'would be discarded' }),
+    ];
+    for (const observedAt of customized) {
+      const invalid = input('monitor-a', 'custom-date');
+      invalid.envelope.observedAt = observedAt;
+      expect(() =>
+        store.enqueueMaterializationRetries(
+          [input('monitor-a', 'valid-sibling'), invalid],
+          NOW,
+        ),
+      ).toThrow(MaterializationRetrySerializationError);
+      expect(store.listMaterializationRetries()).toEqual([]);
+    }
+    expect(hookCalls).toBe(0);
+  });
+
+  it('rejects a non-Date observedAt instead of changing its type when reopened', () => {
+    const store = new RuntimeStore(createDb(scratchDb()));
+    const invalid = input('monitor-a', 'string-date');
+    // The public persistence boundary also serves JavaScript callers.
+    Reflect.set(invalid.envelope, 'observedAt', NOW.toISOString());
+    expect(() => store.enqueueMaterializationRetries([invalid], NOW)).toThrow(
+      MaterializationRetrySerializationError,
+    );
+    expect(store.listMaterializationRetries()).toEqual([]);
   });
 
   it('rejects trusted-route mismatches before writing any sibling', () => {

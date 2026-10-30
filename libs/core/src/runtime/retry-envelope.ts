@@ -40,13 +40,30 @@ function assertJsonSafe(
   if (typeof value === 'number') {
     if (!Number.isFinite(value))
       fail(path, 'non-finite numbers are unsupported.');
+    if (Object.is(value, -0))
+      fail(path, 'negative zero cannot round-trip through JSON.');
     return;
   }
   if (typeof value !== 'object')
     fail(path, `${typeof value} values are unsupported.`);
   if (value instanceof Date) {
-    if (path !== '$.observedAt' || Number.isNaN(value.getTime()))
-      fail(path, 'Date values are unsupported here.');
+    // Only the observation timestamp has a defined Date hydration contract.
+    // Own properties and subclasses can customize serialization or carry data
+    // JSON would discard; reject them without calling any caller-supplied hook.
+    if (
+      path !== '$.observedAt' ||
+      Reflect.getPrototypeOf(value) !== Date.prototype ||
+      Reflect.ownKeys(value).length !== 0
+    ) {
+      fail(path, 'only an unmodified observedAt Date is supported.');
+    }
+    let timestamp: number;
+    try {
+      timestamp = Date.prototype.getTime.call(value);
+    } catch {
+      fail(path, 'a real Date value is required.');
+    }
+    if (Number.isNaN(timestamp)) fail(path, 'an invalid Date is unsupported.');
     return;
   }
   if (ancestors.has(value)) fail(path, 'cyclic references are unsupported.');
@@ -99,9 +116,19 @@ export function serializeRetryEnvelope(
   envelope: StoredObservationEnvelope,
 ): string {
   assertJsonSafe(envelope, '$', new Set());
-  if (!Object.hasOwn(envelope, 'observedAt'))
+  const observedAt: unknown = Object.getOwnPropertyDescriptor(
+    envelope,
+    'observedAt',
+  )?.value;
+  if (!(observedAt instanceof Date)) {
     fail('$.observedAt', 'a valid Date is required.');
-  return JSON.stringify(envelope);
+  }
+  // Do not let JSON.stringify select a Date serialization hook: persist the
+  // already-validated instant explicitly, then restore that typed leaf on read.
+  return JSON.stringify({
+    ...envelope,
+    observedAt: Date.prototype.toISOString.call(observedAt),
+  });
 }
 
 /** Restore the one typed Date after reading a validated JSON envelope. @internal */

@@ -1799,8 +1799,11 @@ without invoking the source or moving a source cursor again.
 
 Capacity is 256 rows or 8 MiB of stored envelopes per `(workspace_path, monitor_id)`, including
 terminal rows. Envelope size is the exact serialized UTF-8 byte count. Enqueue rejects values that
-cannot round-trip through JSON (including BigInt, Date values outside the typed `observed_at`
-field, accessors, and cyclic references) with a domain error before database mutation. A batch
+cannot round-trip through JSON (including BigInt, negative zero, Date values outside the typed
+`observedAt` field, accessors, and cyclic references) with a domain error before database mutation.
+`observedAt` must be a valid, unmodified Date instance: subclasses or own properties are rejected
+without invoking their hooks. The validated instant is serialized explicitly as ISO text and
+restored as a Date; a string timestamp is not an accepted substitute. A batch
 enqueue uses one immediate transaction: if every failed sibling cannot fit, none is stored. Another
 workspace or monitor has independent capacity.
 

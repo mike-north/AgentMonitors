@@ -684,7 +684,12 @@ export interface EnqueueMaterializationRetryInput {
   monitorId: string;
   /** Trusted source route; must match the envelope's watch type. */
   sourceName: string;
-  /** Failed observation to persist losslessly for a later attempt. */
+  /**
+   * Failed observation to persist losslessly for a later attempt. Nested values
+   * must be JSON-safe (no negative zero, accessors, cycles or custom classes).
+   * `observedAt` is the sole Date leaf and must be valid, have Date.prototype,
+   * and have no own properties. Invalid data raises a serialization domain error.
+   */
   envelope: StoredObservationEnvelope;
   /** Failure text to sanitize and persist as bounded operator diagnostics. */
   error: string;
