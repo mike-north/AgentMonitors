@@ -22,7 +22,8 @@ entries dated after this one were written against the old docs before the migrat
 their content was ported into OpenSpec (`runtime/event-materialization`; the
 `add-multi-host-adapters` change's design; the `materialization_retry_outbox` requirements in
 `persistence/schema`; the fresh-batch reminder policy in `delivery/lifecycles`,
-`daemon/ipc`, `cli/session-commands`, `cli/doctor`, and `delivery/transport-health`).
+`daemon/ipc`, `cli/session-commands`, `cli/doctor`, and `delivery/transport-health`; the
+real-daemon crash-recovery test obligation in `engineering/test-integrity`).
 
 ## 2026-10-30 — Retry admission rejects detectable hidden intrinsic state (002 outbox, 004 §3.4) — Refs #483
 
@@ -94,6 +95,12 @@ the earlier acknowledgment-instruction fix (#434) and from any claim-TTL design 
 
 Validation: tests first reproduced seven failures across hook/channel, normal/low and high-coalescing
 cases; the forward-progress suite and both transport renderers now cover the revised contract.
+
+## 2026-10-30 — Real-daemon crash recovery acceptance coverage (004 §3.4.1) — Refs #527
+
+Adds an isolated built-CLI SIGKILL/restart test for persisted unread work and same-session identity.
+It also verifies dead-daemon diagnostics and the distinction between delivery and acknowledgment.
+No runtime behavior changes or automatic restart/supervisor guarantees are introduced.
 
 ## 2026-08-24 — New numbered doc: 008 — Reliability & Process Hygiene — Refs #504, PR #476
 

@@ -30,6 +30,7 @@ export default defineConfig({
       'src/concurrent-spawn.test.ts',
       'src/detached-spawn.test.ts',
       'src/commands/daemon-detach.integration.test.ts',
+      'src/commands/daemon-crash-recovery.integration.test.ts',
       'src/commands/verify.integration.test.ts',
       'src/commands/cli.docker.test.ts',
       'src/channel-shutdown.integration.test.ts',

@@ -26,6 +26,18 @@ Runtime tests in `libs/core` SHALL be the primary proof surface for state persis
 - **WHEN** a change affects source-state persistence or delivery lifecycle rules
 - **THEN** a runtime test in `libs/core/src/runtime/` constructs the runtime, restarts it over the same database, and asserts the persisted state and resulting deliveries
 
+### Requirement: Daemon crash recovery is proven against a real daemon
+
+Recovery of already-persisted recipient work after a daemon crash SHALL be proven by a serial integration test that drives the built CLI daemon in an isolated workspace, user-data directory, database, and socket, kills it with SIGKILL, and starts a replacement on the same database, awaiting child exits before fixture removal. This proves no automatic supervision, recovery of uncommitted observations, or power-loss durability (#527).
+
+#### Scenario: Unread work survives SIGKILL and restart
+
+- **GIVEN** a real file change observed into a lead session as an unread event
+- **WHEN** the owned daemon is killed with SIGKILL and a replacement is started on the same database
+- **THEN** `doctor` had reported the dead daemon with a registered session
+- **AND** reopening the same host-session identity keeps its session id and the exact unread event
+- **AND** delivery leaves that event unread until it is explicitly acknowledged
+
 ### Requirement: CLI integration tests prove command wiring
 
 CLI integration tests in `apps/cli` SHALL be the primary proof surface for command wiring, output shape, argument validation, and round-trip behavior through the daemon/runtime interface.

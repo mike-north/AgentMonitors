@@ -31,6 +31,7 @@ export default defineConfig({
       '**/concurrent-spawn.test.ts',
       '**/detached-spawn.test.ts',
       '**/daemon-detach.integration.test.ts',
+      '**/daemon-crash-recovery.integration.test.ts',
       '**/verify.integration.test.ts',
       '**/cli.docker.test.ts',
       // Spawns a real `channel serve` subprocess and waits for it to exit on
