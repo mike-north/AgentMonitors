@@ -1,4 +1,4 @@
-/** Synthetic socket fixtures prove read-only diagnostics, never host delivery support (006 §11.6). */
+/** Synthetic socket fixtures prove read-only diagnostics, never host delivery support (change: add-multi-host-adapters — "Host adapters ship with conformance evidence"). */
 import { createServer, Socket } from 'node:net';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
