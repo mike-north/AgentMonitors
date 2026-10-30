@@ -1,7 +1,7 @@
 ## 1. Probe diagnostics
 
 - [ ] 1.1 Generalize the `experiments/channel-probe` diagnostic into a per-host binding probe that records the host version and the session-identity and workspace-binding signals
-- [ ] 1.2 Run the probe for Codex CLI and Codex desktop; record lifecycle hooks, advisory-injection events, identity, workspace, baseline and richer transports
+- [ ] 1.2 Run the probe for Codex CLI and Codex desktop; record lifecycle hooks, advisory-injection events, identity, workspace, baseline and richer transports (partial: a read-only Codex thread-ownership diagnostic exists, see design "Probe Evidence So Far"; no live binding-probe artifact yet)
 - [ ] 1.3 Run the probe for Cursor CLI and Cursor IDE; record the same dimensions
 - [ ] 1.4 Decide per host whether the internal `surface: 'cli' | 'desktop'` branch is needed
 
