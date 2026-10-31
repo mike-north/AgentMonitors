@@ -1607,7 +1607,11 @@ Per [004 §6](./004-validation-testing.md), each host adapter, when it ships, **
 ### 11.7 Bounded Codex ownership diagnostic (partial evidence only)
 
 `experiments/host-probe/codex-owner.mjs` is a read-only diagnostic for an explicitly supplied,
-existing App Server control socket and thread id. It initializes the connection, records the
+existing App Server control socket and thread id. The Unix transport performs HTTP Upgrade and
+exchanges one JSON-RPC message per WebSocket text frame; raw JSONL belongs to stdio, not this
+socket. It uses only the supplied Unix path, with no TCP fallback, redirects, compression, or
+server startup. Binary messages are refused; the deadline covers the handshake and all reads,
+and aggregate response bytes remain bounded. It initializes the connection, records the
 server's self-reported version from `initialize.userAgent`, verifies the id in paginated
 `thread/loaded/list`, reads `thread/read.id` and `thread/read.cwd` without turn history, and
 rechecks that the thread remains loaded. Missing ownership, malformed responses, connection

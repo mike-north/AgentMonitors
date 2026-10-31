@@ -6,6 +6,7 @@
 import { connect } from 'node:net';
 import { isAbsolute, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import WebSocket from 'ws';
 
 /** Bound memory and elapsed time even if a peer streams unrelated notifications indefinitely. */
 const MAX_BYTES = 1024 * 1024;
@@ -116,16 +117,23 @@ async function requireLoaded(client, threadId) {
 }
 
 /**
- * Narrow JSON-line client for the documented local control socket transport. The closed method
+ * Narrow WebSocket client for the documented Unix control socket transport. The closed method
  * allowlist prevents accidental receiver writes; peer requests terminate without granting approval.
  * One deadline and a total byte budget cover connection setup, all pages, and notifications.
  */
 function readClient(socketPath, timeoutMs) {
-  const socket = connect({ path: socketPath });
+  // The HTTP Upgrade is carried only over the caller-selected Unix socket.
+  // No TCP fallback, redirects, compression, or server startup is permitted.
+  const socket = new WebSocket('ws://localhost/', {
+    createConnection: () => connect({ path: socketPath }),
+    followRedirects: false,
+    perMessageDeflate: false,
+    maxPayload: MAX_BYTES,
+    handshakeTimeout: timeoutMs,
+  });
   let pending;
   let failure;
   let nextId = 0;
-  let buffer = '';
   let bytes = 0;
   const timer = setTimeout(
     () => fail(new Error('Owner probe timed out')),
@@ -136,51 +144,54 @@ function readClient(socketPath, timeoutMs) {
     clearTimeout(timer);
     pending?.reject(failure);
     pending = undefined;
-    socket.destroy();
+    socket.terminate();
   }
   socket.on('error', () =>
     fail(new Error('Cannot connect to or read supplied App Server socket')),
   );
   socket.on('close', () => fail(new Error('App Server connection closed')));
-  socket.setEncoding('utf8');
-  socket.on('data', (chunk) => {
-    bytes += Buffer.byteLength(chunk);
+  socket.on('message', (data, isBinary) => {
+    if (failure) return;
+    bytes += data.length;
     if (bytes > MAX_BYTES)
       return fail(new Error('App Server response budget exceeded'));
-    buffer += chunk;
-    while (buffer.includes('\n') && !failure) {
-      const end = buffer.indexOf('\n');
-      const line = buffer.slice(0, end);
-      buffer = buffer.slice(end + 1);
-      let message;
-      try {
-        message = JSON.parse(line);
-      } catch {
-        return fail(new Error('Malformed App Server JSON'));
-      }
-      if (!message || typeof message !== 'object' || Array.isArray(message)) {
-        return fail(new Error('Malformed App Server message'));
-      }
-      if (typeof message.method === 'string') {
-        if (Object.hasOwn(message, 'id'))
-          return fail(
-            new Error('Unexpected App Server request; no approval granted'),
-          );
-        continue; // Notifications are not evidence of ownership or delivery and are never retained.
-      }
-      if (
-        !pending ||
-        message.id !== pending.id ||
-        !Object.hasOwn(message, 'result') ||
-        Object.hasOwn(message, 'error')
-      ) {
-        return fail(new Error('Invalid or failed App Server response'));
-      }
-      const entry = pending;
-      pending = undefined;
-      entry.resolve(message.result);
+    if (isBinary) return fail(new Error('App Server response must be text'));
+    let message;
+    try {
+      message = JSON.parse(data.toString());
+    } catch {
+      return fail(new Error('Malformed App Server JSON'));
     }
+    if (!message || typeof message !== 'object' || Array.isArray(message)) {
+      return fail(new Error('Malformed App Server message'));
+    }
+    if (typeof message.method === 'string') {
+      if (Object.hasOwn(message, 'id'))
+        return fail(
+          new Error('Unexpected App Server request; no approval granted'),
+        );
+      return; // Notifications carry no ownership evidence and are never retained.
+    }
+    if (
+      !pending ||
+      message.id !== pending.id ||
+      !Object.hasOwn(message, 'result') ||
+      Object.hasOwn(message, 'error')
+    ) {
+      return fail(new Error('Invalid or failed App Server response'));
+    }
+    const entry = pending;
+    pending = undefined;
+    entry.resolve(message.result);
   });
+  /** Never transmit application messages before the peer accepts HTTP Upgrade. */
+  function send(message) {
+    const transmit = () => {
+      if (!failure) socket.send(JSON.stringify(message));
+    };
+    if (socket.readyState === WebSocket.OPEN) transmit();
+    else socket.once('open', transmit);
+  }
   return {
     /** Refuse any failure already observed in this snapshot's connection interval. */
     assertHealthy() {
@@ -193,12 +204,12 @@ function readClient(socketPath, timeoutMs) {
           return reject(new Error('Probe permits sequential reads only'));
         const id = ++nextId;
         pending = { id, resolve: resolveResult, reject };
-        socket.write(`${JSON.stringify({ id, method, params })}\n`);
+        send({ id, method, params });
       });
     },
     initialized() {
       if (failure) throw failure;
-      socket.write(`${JSON.stringify({ method: 'initialized' })}\n`);
+      send({ method: 'initialized' });
     },
     close() {
       fail(new Error('Owner probe closed'));
