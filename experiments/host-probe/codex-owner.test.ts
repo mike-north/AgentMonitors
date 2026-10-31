@@ -17,7 +17,11 @@ type IRequest = {
   method: string;
   params?: Record<string, unknown>;
 };
-type IResponder = (request: IRequest, socket: WebSocket) => void;
+type IResponder = (
+  request: IRequest,
+  socket: WebSocket,
+  transport: Duplex,
+) => void;
 const cleanups: (() => Promise<void>)[] = [];
 /** HTTP Upgrade and WebSocket frames model the documented Unix transport, capturing all methods. */
 async function fixture(respond?: IResponder) {
@@ -29,13 +33,13 @@ async function fixture(respond?: IResponder) {
   const upgrades: IncomingHttpHeaders[] = [];
   server.on('upgrade', (request) => upgrades.push(request.headers));
   const websocketServer = new WebSocketServer({ server });
-  websocketServer.on('connection', (socket) => {
+  websocketServer.on('connection', (socket, upgradeRequest) => {
     sockets.add(socket);
     socket.on('close', () => sockets.delete(socket));
     socket.on('message', (data) => {
       const request: IRequest = JSON.parse(data.toString());
       requests.push(request);
-      if (respond) respond(request, socket);
+      if (respond) respond(request, socket, upgradeRequest.socket);
       else reply(request, socket);
     });
   });
@@ -338,6 +342,43 @@ describe('explicit Codex owner diagnostic', () => {
         'thread/read',
         'thread/loaded/list',
       ]);
+    },
+  );
+  it.each([1000, 1011])(
+    'refuses an already-observed close frame (%s) following the final response',
+    async (closeCode) => {
+      let listings = 0;
+      const server = await fixture((request, socket, transport) => {
+        if (request.method !== 'thread/loaded/list' || ++listings !== 2) {
+          reply(request, socket);
+          return;
+        }
+        const response = Buffer.from(
+          JSON.stringify({
+            id: request.id,
+            result: { data: ['existing-thread'], nextCursor: null },
+          }),
+        );
+        // One transport write ensures both frames are available to the parser before
+        // ownership promises settle. Short, unmasked server frames are sufficient here.
+        expect(response.length).toBeLessThan(126);
+        const closePayload = Buffer.alloc(2);
+        closePayload.writeUInt16BE(closeCode);
+        transport.write(
+          Buffer.concat([
+            Buffer.from([0x81, response.length]),
+            response,
+            Buffer.from([0x88, closePayload.length]),
+            closePayload,
+          ]),
+        );
+      });
+      await expect(
+        probeCodexOwner({
+          socketPath: server.socketPath,
+          threadId: 'existing-thread',
+        }),
+      ).rejects.toThrow(/clos/i);
     },
   );
   it('requires explicit absolute socket and nonempty thread before connecting', async () => {

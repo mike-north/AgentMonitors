@@ -1621,6 +1621,8 @@ Before returning evidence, it checks all failures observed through the final res
 turn and subsequent read continuations. A valid final response cannot override a malformed frame,
 peer request, duplicate response, or connection failure already observed in that interval. It
 closes after this bounded snapshot; success makes no claim about later unobserved peer activity.
+A received WebSocket close frame already disqualifies success while the connection is CLOSING,
+even if the library has not yet emitted its terminal close event.
 
 The artifact establishes only momentary ownership and metadata as reported by that supplied
 server. Delivery capability, lifecycle mapping, and CLI/desktop surface remain unverified. A

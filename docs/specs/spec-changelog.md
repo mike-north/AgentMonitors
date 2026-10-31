@@ -14,7 +14,9 @@ Agent Monitors spec set in `docs/specs/`.
 Correct the diagnostic's raw-JSONL assumption: documented Unix App Server listeners require HTTP
 Upgrade and WebSocket text frames. Synthetic tests now use that transport and retain read-only,
 deadline, byte-budget and terminal-failure assertions. The client cannot fall back to TCP or
-follow redirects and does not negotiate compression. An isolated installed-server check verified
+follow redirects and does not negotiate compression. A received close frame disqualifies the
+final snapshot even before the terminal close event fires; same-write normal/error close regressions
+cover that interval. An isolated installed-server check verified
 initialize/list and correctly refused an absent target. This fixes diagnostic compatibility;
 it does not establish a supported endpoint for the existing desktop process or promote #316.
 

@@ -235,7 +235,9 @@ The transport never falls back to TCP, follows redirects, negotiates compression
 server. Binary messages are refused. The whole-probe deadline includes the HTTP handshake.
 The final success check includes errors observed after the last valid response but before evidence
 is returned, including other complete frames in the same parsing turn. The connection then closes;
-this bounded snapshot does not wait for or certify future, unobserved peer activity.
+this bounded snapshot does not wait for or certify future, unobserved peer activity. A received
+close frame disqualifies success immediately, including the CLOSING interval before the library
+emits its terminal close event.
 
 Success (exit 0) reports `owner-observed`, identity/workspace signals, version, and observed read
 methods. This is a point-in-time claim by the supplied server, **not an ownership lease**, an

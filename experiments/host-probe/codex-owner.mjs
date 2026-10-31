@@ -196,6 +196,10 @@ function readClient(socketPath, timeoutMs) {
     /** Refuse any failure already observed in this snapshot's connection interval. */
     assertHealthy() {
       if (failure) throw failure;
+      // A received close frame moves ws to CLOSING before its close event fires.
+      // That already-observed state cannot certify an open ownership snapshot.
+      if (socket.readyState !== WebSocket.OPEN)
+        throw new Error('App Server connection is closing or closed');
     },
     rpc(method, params) {
       return new Promise((resolveResult, reject) => {
