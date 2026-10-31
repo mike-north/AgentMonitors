@@ -1876,7 +1876,9 @@ and schedules the initial delay again. Re-arming a pending row is an invalid tra
 
 Completion accepts a deterministically rendered event from the retained envelope, not a caller
 callback. The store **MUST** reject terminal work before any event write, and **MUST** require the
-event's workspace, monitor, source and object identity to match the retained work. Rendering and
+event's workspace, monitor, source and object identity to match the retained work. An omitted
+observation object key defaults to the monitor ID, matching the normal runtime materialization path;
+explicit keys, including the empty string, retain their own identity. Rendering and
 selection of due work remain runtime responsibilities. The store owns the synchronous event,
 projection, cursor-seed and snapshot writes plus retry-row deletion in one immediate transaction.
 Any write or deletion failure **MUST** preserve the retry row and roll back all materialization

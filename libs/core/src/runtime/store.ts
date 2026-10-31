@@ -1112,7 +1112,9 @@ export class RuntimeStore {
    * to the caller; this boundary enforces lifecycle and atomic persistence.
    *
    * Input must be the deterministic materialization of the stored envelope,
-   * with the same workspace, monitor, source and object identity. Rendering
+   * with the same workspace, monitor, source and object identity. An omitted
+   * observation key uses the monitor id, matching runtime materialization;
+   * explicit keys (including the empty string) keep their identity. Rendering
    * remains the runtime's responsibility. This seam accepts event data, never
    * a callback: arbitrary asynchronous effects cannot be rolled back by SQLite.
    * Interpret and other external work belong after this method returns.
@@ -1150,7 +1152,8 @@ export class RuntimeStore {
             input.workspacePath !== current.workspacePath ||
             input.monitorId !== current.monitorId ||
             input.sourceName !== current.sourceName ||
-            input.objectKey !== (current.envelope.observation.objectKey ?? null)
+            input.objectKey !==
+              (current.envelope.observation.objectKey ?? current.monitorId)
           ) {
             throw new MaterializationRetryTransitionError(
               id,

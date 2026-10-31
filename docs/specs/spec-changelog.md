@@ -3,15 +3,6 @@
 This file records clarifications, contradiction resolutions, and structural changes to the
 Agent Monitors spec set in `docs/specs/`.
 
-## 2026-10-31 — Retry completion owns synchronous materialization (002 persistence, 004 §3.4) — Refs #494
-
-Replace the generic completion callback with concrete event data so asynchronous caller work cannot
-escape the transaction. Require pending state and matching observation route before writes; atomically
-commit event/projections/cursors/snapshot plus retry removal and preserve the projection cache on rollback.
-Document typed missing-identity/invalid-transition errors, single-line failure updates, and upward-rounded
-second-resolution deadlines. Tests reproduce terminal bypass, callback escape, early due admission and
-unsafe Unicode separators, then verify real database faults and on-disk lifecycle recovery.
-
 ## Usage
 
 - Add entries when ambiguity is resolved or the intended contract changes.
@@ -26,6 +17,17 @@ long commands, exclude earlier same-second rows and intermediate command idle ti
 evidence across window rotation, and refuse negative verdicts when history gaps could hide success.
 Keep explicit timeout caps and two-distinct-row no-change confirmation. Unit tests use actual persisted
 equal-second rows; a real daemon regression waits for durable triggered history before command exit.
+
+## 2026-10-31 — Retry completion owns synchronous materialization (002 persistence, 004 §3.4) — Refs #494
+
+Replace the generic completion callback with concrete event data so asynchronous caller work cannot
+escape the transaction. Require pending state and matching observation route before writes; atomically
+commit event/projections/cursors/snapshot plus retry removal and preserve the projection cache on rollback.
+Document typed missing-identity/invalid-transition errors, single-line failure updates, and upward-rounded
+second-resolution deadlines. Tests reproduce terminal bypass, callback escape, early due admission and
+unsafe Unicode separators, then verify real database faults and on-disk lifecycle recovery. A runtime-backed
+regression also requires completion to honor the normal monitor-ID fallback for omitted object keys
+while preserving explicit keys, including the empty string.
 
 ## 2026-10-31 — Preserve SQLite locks during permission migration (002 §3.1) — Refs #529
 

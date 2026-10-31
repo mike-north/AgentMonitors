@@ -2,13 +2,15 @@
  * Outcome tests for the retry lifecycle: retained work survives every failed
  * transition, and only an atomic event commit may consume a pending record.
  */
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { Database as BetterSQLiteClient } from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import { createDb } from '../inbox/db.js';
+import { SourceRegistry } from '../observation/registry.js';
+import { AgentMonitorRuntime } from './service.js';
 import { RuntimeStore } from './store.js';
 import type {
   EnqueueMaterializationRetryInput,
@@ -191,6 +193,75 @@ describe('retry lifecycle safety', () => {
       ).toThrow();
       expect(store.getMaterializationRetry(id).status).toBe('pending');
       expect(store.listEvents()).toEqual([]);
+    },
+  );
+
+  it.each([undefined, '', 'explicit-key'])(
+    'accepts the real runtime materialization for observation object key %s',
+    async (objectKey) => {
+      const monitorsDir = mkdtempSync(
+        path.join(tmpdir(), 'retry-object-identity-'),
+      );
+      directories.push(monitorsDir);
+      const monitorDir = path.join(monitorsDir, 'retry-monitor');
+      mkdirSync(monitorDir);
+      writeFileSync(
+        path.join(monitorDir, 'MONITOR.md'),
+        `---
+name: Retry monitor
+watch:
+  type: test-source
+urgency: normal
+---
+Inspect changes.
+`,
+      );
+      const observation = {
+        title: 'Changed',
+        snapshotText: 'after',
+        ...(objectKey === undefined ? {} : { objectKey }),
+      };
+      const registry = new SourceRegistry();
+      registry.register({
+        name: 'test-source',
+        scopeSchema: { type: 'object' },
+        async observe() {
+          return { observations: [observation] };
+        },
+      });
+      const runtimeStore = open().store;
+      const runtime = new AgentMonitorRuntime(runtimeStore, registry, [
+        claudeCodeAdapter,
+      ]);
+      const tick = await runtime.tick(monitorsDir, '/workspace');
+      expect(tick.emittedEventIds).toHaveLength(1);
+      const rendered = runtimeStore.listEvents()[0];
+      if (!rendered) throw new Error('Expected a real runtime event');
+      expect(rendered.objectKey).toBe(objectKey ?? rendered.monitorId);
+
+      // A separate database receives the already rendered event so the test
+      // cannot invent a key convention independently of runtime materialization.
+      const completionStore = open().store;
+      const retained = retryInput();
+      retained.envelope.observation = observation;
+      const retry = completionStore.enqueueMaterializationRetries(
+        [retained],
+        NOW,
+      )[0];
+      if (!retry) throw new Error('Expected retained observation');
+      const completed = completionStore.completeMaterializationRetry(
+        retry.id,
+        rendered,
+      );
+      expect(completed.objectKey).toBe(rendered.objectKey);
+      expect(
+        completionStore.latestSnapshot(
+          'retry-monitor',
+          rendered.objectKey ?? '',
+          '/workspace',
+        ),
+      ).toEqual({ content: 'after' });
+      expect(completionStore.listMaterializationRetries()).toEqual([]);
     },
   );
 
