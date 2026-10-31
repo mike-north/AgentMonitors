@@ -220,7 +220,10 @@ node codex-owner.mjs --socket /absolute/path/to/control.sock --thread EXISTING_T
 node codex-owner.mjs --socket /absolute/path/to/control.sock --thread EXISTING_THREAD_ID --timeout-ms 10000
 ```
 
-The command initializes the JSON-line connection, reads `initialize.userAgent` for the server's
+Install this standalone experiment with `npm ci` before invoking the command.
+
+The command performs HTTP Upgrade over the supplied Unix socket and exchanges WebSocket text
+frames (one JSON-RPC message per frame), reads `initialize.userAgent` for the server's
 self-reported version, checks `thread/loaded/list` (including pagination), reads identity and
 workspace with `thread/read` and `includeTurns: false`, then rechecks loaded ownership. Its only
 client messages are `initialize`, `initialized`, `thread/loaded/list`, and `thread/read`. It never
@@ -228,9 +231,13 @@ starts/resumes/forks a thread, starts/steers/interrupts a turn, sends observatio
 approvals. Peer requests, missing/unloaded identities, malformed metadata, connection errors,
 timeouts, repeated cursors, over 100 pages, or over 1 MiB total response bytes cause refusal
 (exit 1). Server error bodies and conversation previews are not printed or retained.
+The transport never falls back to TCP, follows redirects, negotiates compression, or starts a
+server. Binary messages are refused. The whole-probe deadline includes the HTTP handshake.
 The final success check includes errors observed after the last valid response but before evidence
 is returned, including other complete frames in the same parsing turn. The connection then closes;
-this bounded snapshot does not wait for or certify future, unobserved peer activity.
+this bounded snapshot does not wait for or certify future, unobserved peer activity. A received
+close frame disqualifies success immediately, including the CLOSING interval before the library
+emits its terminal close event.
 
 Success (exit 0) reports `owner-observed`, identity/workspace signals, version, and observed read
 methods. This is a point-in-time claim by the supplied server, **not an ownership lease**, an
@@ -242,3 +249,8 @@ Output contains the requested thread id and workspace path for local diagnosis. 
 artifact-hygiene substitutions above before committing real output; do not include conversation
 history, source-message bodies, or private socket paths. Automated fixtures are synthetic and
 must never be relabeled as live Codex evidence.
+
+The Unix wire format follows the [official App Server transport contract](https://learn.chatgpt.com/docs/app-server#protocol).
+An isolated installed-server check on 0.165.0-alpha.1.2 confirmed initialize/list compatibility;
+the empty fixture correctly refused the target as not loaded. This checks transport compatibility
+only and does not establish an external endpoint for the running desktop chat.

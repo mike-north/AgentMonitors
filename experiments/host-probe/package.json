@@ -8,9 +8,11 @@
     "test": "vitest run --config vitest.config.ts"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "ws": "^8.22.1"
   },
   "devDependencies": {
+    "@types/ws": "^8.18.2",
     "vitest": "^4.0.18"
   }
 }

@@ -1,5 +1,8 @@
 /** Synthetic socket fixtures prove read-only diagnostics, never host delivery support (006 §11.6). */
-import { createServer, Socket } from 'node:net';
+import { createServer } from 'node:http';
+import type { IncomingHttpHeaders } from 'node:http';
+import type { Duplex } from 'node:stream';
+import WebSocket, { WebSocketServer } from 'ws';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
@@ -14,41 +17,45 @@ type IRequest = {
   method: string;
   params?: Record<string, unknown>;
 };
-type IResponder = (request: IRequest, socket: Socket) => void;
+type IResponder = (
+  request: IRequest,
+  socket: WebSocket,
+  transport: Duplex,
+) => void;
 const cleanups: (() => Promise<void>)[] = [];
-/** A real local socket captures every method, including otherwise hidden writes. */
+/** HTTP Upgrade and WebSocket frames model the documented Unix transport, capturing all methods. */
 async function fixture(respond?: IResponder) {
   const dir = await mkdtemp(join(tmpdir(), 'am-owner-'));
   const socketPath = join(dir, 'rpc.sock');
   const requests: IRequest[] = [];
-  const sockets = new Set<Socket>();
-  const server = createServer((socket) => {
+  const sockets = new Set<WebSocket>();
+  const server = createServer();
+  const upgrades: IncomingHttpHeaders[] = [];
+  server.on('upgrade', (request) => upgrades.push(request.headers));
+  const websocketServer = new WebSocketServer({ server });
+  websocketServer.on('connection', (socket, upgradeRequest) => {
     sockets.add(socket);
     socket.on('close', () => sockets.delete(socket));
-    let pending = '';
-    socket.setEncoding('utf8');
-    socket.on('data', (chunk) => {
-      pending += chunk;
-      while (pending.includes('\n')) {
-        const end = pending.indexOf('\n');
-        const request: IRequest = JSON.parse(pending.slice(0, end));
-        pending = pending.slice(end + 1);
-        requests.push(request);
-        if (respond) respond(request, socket);
-        else reply(request, socket);
-      }
+    socket.on('message', (data) => {
+      const request: IRequest = JSON.parse(data.toString());
+      requests.push(request);
+      if (respond) respond(request, socket, upgradeRequest.socket);
+      else reply(request, socket);
     });
   });
   await new Promise<void>((resolve) => server.listen(socketPath, resolve));
   cleanups.push(async () => {
-    for (const socket of sockets) socket.destroy();
+    for (const socket of sockets) socket.terminate();
+    await new Promise<void>((resolve) =>
+      websocketServer.close(() => resolve()),
+    );
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await rm(dir, { recursive: true, force: true });
   });
-  return { socketPath, requests };
+  return { socketPath, requests, upgrades };
 }
 /** Only read responses are modeled; no fake write success can conceal a mutation. */
-function reply(request: IRequest, socket: Socket, result?: unknown) {
+function reply(request: IRequest, socket: WebSocket, result?: unknown) {
   if (request.id === undefined) return;
   const defaults: Record<string, unknown> = {
     initialize: {
@@ -57,7 +64,7 @@ function reply(request: IRequest, socket: Socket, result?: unknown) {
     'thread/loaded/list': { data: ['existing-thread'], nextCursor: null },
     'thread/read': { thread: { id: 'existing-thread', cwd: '/workspace' } },
   };
-  socket.write(
+  socket.send(
     `${JSON.stringify({ id: request.id, result: result ?? defaults[request.method] })}\n`,
   );
 }
@@ -65,7 +72,7 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0)) await cleanup();
 });
 describe('explicit Codex owner diagnostic', () => {
-  it('pins version, identity and workspace using only initialization and reads', async () => {
+  it('uses HTTP Upgrade and WebSocket frames to pin identity with read-only methods', async () => {
     const server = await fixture();
     await expect(
       probeCodexOwner({
@@ -79,6 +86,9 @@ describe('explicit Codex owner diagnostic', () => {
       workspacePath: '/workspace',
       deliveryCapability: 'unverified',
     });
+    expect(server.upgrades).toHaveLength(1);
+    expect(server.upgrades[0]['upgrade']).toBe('websocket');
+    expect(server.upgrades[0]['sec-websocket-extensions']).toBeUndefined();
     expect(server.requests.map((request) => request.method)).toEqual([
       'initialize',
       'initialized',
@@ -165,20 +175,20 @@ describe('explicit Codex owner diagnostic', () => {
     'oversized',
   ])('fails closed for %s', async (mode) => {
     const server = await fixture((request, socket) => {
-      if (mode === 'malformed') socket.write('not json\n');
-      if (mode === 'close') socket.end();
+      if (mode === 'malformed') socket.send('not json\n');
+      if (mode === 'close') socket.close();
       if (mode === 'server-request')
-        socket.write(
+        socket.send(
           '{"id":80,"method":"item/commandExecution/requestApproval"}\n',
         );
       if (mode === 'rpc-error')
-        socket.write(
+        socket.send(
           JSON.stringify({
             id: request.id,
             error: { code: -32601, message: 'private content' },
           }) + '\n',
         );
-      if (mode === 'oversized') socket.write('x'.repeat(1024 * 1024 + 1));
+      if (mode === 'oversized') socket.send('x'.repeat(1024 * 1024 + 1));
     });
     await expect(
       probeCodexOwner({
@@ -190,6 +200,90 @@ describe('explicit Codex owner diagnostic', () => {
     expect(server.requests.map((request) => request.method)).toEqual([
       'initialize',
     ]);
+  });
+  it('rejects binary messages instead of interpreting them as protocol text', async () => {
+    const server = await fixture((request, socket) => {
+      socket.send(Buffer.from(JSON.stringify({ id: request.id, result: {} })));
+    });
+    await expect(
+      probeCodexOwner({
+        socketPath: server.socketPath,
+        threadId: 'existing-thread',
+      }),
+    ).rejects.toThrow(/text/);
+  });
+  it('bounds aggregate notification bytes even when every frame is small', async () => {
+    const server = await fixture((_request, socket) => {
+      for (let index = 0; index < 20; index++) {
+        socket.send(
+          JSON.stringify({
+            method: 'notice',
+            params: { data: 'x'.repeat(65536) },
+          }),
+        );
+      }
+    });
+    await expect(
+      probeCodexOwner({
+        socketPath: server.socketPath,
+        threadId: 'existing-thread',
+      }),
+    ).rejects.toThrow(/budget/);
+  });
+  it('applies the whole-probe deadline while HTTP Upgrade is stalled', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'am-owner-stall-'));
+    const socketPath = join(directory, 'rpc.sock');
+    const connections = new Set<Duplex>();
+    const server = createServer();
+    server.on('upgrade', (_request, socket) => {
+      connections.add(socket);
+    });
+    await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+    try {
+      await expect(
+        probeCodexOwner({
+          socketPath,
+          threadId: 'existing-thread',
+          timeoutMs: 30,
+        }),
+      ).rejects.toThrow();
+    } finally {
+      for (const socket of connections) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+  it('never follows a Unix server redirect to a TCP listener', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'am-owner-redirect-'));
+    const socketPath = join(directory, 'rpc.sock');
+    let tcpRequests = 0;
+    const tcp = createServer((_request, response) => {
+      tcpRequests++;
+      response.end();
+    });
+    await new Promise<void>((resolve) => tcp.listen(0, '127.0.0.1', resolve));
+    const address = tcp.address();
+    if (!address || typeof address === 'string')
+      throw new Error('Missing test listener');
+    const unix = createServer((_request, response) => {
+      response.writeHead(302, { Location: `ws://127.0.0.1:${address.port}/` });
+      response.end();
+    });
+    await new Promise<void>((resolve) => unix.listen(socketPath, resolve));
+    try {
+      await expect(
+        probeCodexOwner({
+          socketPath,
+          threadId: 'existing-thread',
+          timeoutMs: 100,
+        }),
+      ).rejects.toThrow();
+      expect(tcpRequests).toBe(0);
+    } finally {
+      await new Promise<void>((resolve) => unix.close(() => resolve()));
+      await new Promise<void>((resolve) => tcp.close(() => resolve()));
+      await rm(directory, { recursive: true, force: true });
+    }
   });
   it('bounds repeated cursors', async () => {
     const server = await fixture((request, socket) =>
@@ -209,7 +303,7 @@ describe('explicit Codex owner diagnostic', () => {
     ).rejects.toThrow(/cursor/);
   });
   // The last response is not success if its parsing turn also observes a failure.
-  // Coalescing the frames into one write makes the terminal-response race explicit.
+  // Consecutive sends let the WebSocket parser observe both frames before promise continuations.
   it.each(['malformed', 'server-request', 'duplicate'] as const)(
     'refuses a final valid response followed by %s in the same parsing turn',
     async (mode) => {
@@ -232,7 +326,8 @@ describe('explicit Codex owner diagnostic', () => {
                   method: 'item/commandExecution/requestApproval',
                 })
               : response;
-        socket.write(`${response}\n${tail}\n`);
+        socket.send(response);
+        socket.send(tail);
       });
       await expect(
         probeCodexOwner({
@@ -249,6 +344,43 @@ describe('explicit Codex owner diagnostic', () => {
       ]);
     },
   );
+  it.each([1000, 1011])(
+    'refuses an already-observed close frame (%s) following the final response',
+    async (closeCode) => {
+      let listings = 0;
+      const server = await fixture((request, socket, transport) => {
+        if (request.method !== 'thread/loaded/list' || ++listings !== 2) {
+          reply(request, socket);
+          return;
+        }
+        const response = Buffer.from(
+          JSON.stringify({
+            id: request.id,
+            result: { data: ['existing-thread'], nextCursor: null },
+          }),
+        );
+        // One transport write ensures both frames are available to the parser before
+        // ownership promises settle. Short, unmasked server frames are sufficient here.
+        expect(response.length).toBeLessThan(126);
+        const closePayload = Buffer.alloc(2);
+        closePayload.writeUInt16BE(closeCode);
+        transport.write(
+          Buffer.concat([
+            Buffer.from([0x81, response.length]),
+            response,
+            Buffer.from([0x88, closePayload.length]),
+            closePayload,
+          ]),
+        );
+      });
+      await expect(
+        probeCodexOwner({
+          socketPath: server.socketPath,
+          threadId: 'existing-thread',
+        }),
+      ).rejects.toThrow(/clos/i);
+    },
+  );
   it('requires explicit absolute socket and nonempty thread before connecting', async () => {
     for (const options of [
       {},
@@ -262,21 +394,21 @@ describe('explicit Codex owner diagnostic', () => {
   });
   it('refuses a connection failure observed after the final frame but before returning evidence', async () => {
     const server = await fixture();
-    const emit = Socket.prototype.emit;
+    const emit = WebSocket.prototype.emit;
     // Inject a local socket error between promise continuations, after the last
-    // data callback completes. No waiting for future peer activity is required.
+    // message callback completes. No waiting for future peer activity is required.
     const intercepted = vi
-      .spyOn(Socket.prototype, 'emit')
+      .spyOn(WebSocket.prototype, 'emit')
       .mockImplementation(function (
-        this: Socket,
+        this: WebSocket,
         event: string | symbol,
         ...args: unknown[]
       ): boolean {
         const result = emit.apply(this, [event, ...args]);
         if (
-          event === 'data' &&
-          typeof args[0] === 'string' &&
-          args[0].includes('"id":4,"result"')
+          event === 'message' &&
+          Buffer.isBuffer(args[0]) &&
+          args[0].toString().includes('"id":4,"result"')
         ) {
           queueMicrotask(() =>
             this.emit('error', new Error('Synthetic late read failure')),

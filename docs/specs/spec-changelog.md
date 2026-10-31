@@ -9,6 +9,17 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-10-31 — Codex owner probe uses the real Unix WebSocket transport (006 §11.7)
+
+Correct the diagnostic's raw-JSONL assumption: documented Unix App Server listeners require HTTP
+Upgrade and WebSocket text frames. Synthetic tests now use that transport and retain read-only,
+deadline, byte-budget and terminal-failure assertions. The client cannot fall back to TCP or
+follow redirects and does not negotiate compression. A received close frame disqualifies the
+final snapshot even before the terminal close event fires; same-write normal/error close regressions
+cover that interval. An isolated installed-server check verified
+initialize/list and correctly refused an absent target. This fixes diagnostic compatibility;
+it does not establish a supported endpoint for the existing desktop process or promote #316.
+
 ## 2026-10-30 — Retry admission rejects detectable hidden intrinsic state (002 outbox, 004 §3.4) — Refs #483
 
 Prototype identity alone does not establish a plain record. Intrinsic checks now reject boxed
