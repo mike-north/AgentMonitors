@@ -123,6 +123,8 @@ export {
 } from './runtime/service.js';
 export {
   MaterializationRetryCapacityError,
+  MaterializationRetryNotFoundError,
+  MaterializationRetryTransitionError,
   RuntimeStore,
 } from './runtime/store.js';
 export { MaterializationRetrySerializationError } from './runtime/retry-envelope.js';

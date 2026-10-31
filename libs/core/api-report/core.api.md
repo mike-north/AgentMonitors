@@ -629,6 +629,13 @@ export class MaterializationRetryCapacityError extends Error {
 }
 
 // @public
+export class MaterializationRetryNotFoundError extends Error {
+    constructor(retryId: string);
+    readonly code = "materialization_retry_not_found";
+    readonly retryId: string;
+}
+
+// @public
 export interface MaterializationRetryQuery {
     dueAt?: Date;
     limit?: number;
@@ -668,6 +675,13 @@ export interface MaterializationRetrySummary {
     bytes: number;
     pending: number;
     terminal: number;
+}
+
+// @public
+export class MaterializationRetryTransitionError extends Error {
+    constructor(retryId: string, reason: string);
+    readonly code = "materialization_retry_invalid_transition";
+    readonly retryId: string;
 }
 
 // @public
@@ -1442,7 +1456,11 @@ export class RuntimeStore {
     closeSession(sessionId: string): AgentSessionRecord;
     collapseNetForClaim(sessionId: string, candidates: MonitorEventRecord[]): MonitorEventRecord[];
     // @internal
-    completeMaterializationRetry<T>(id: string, operation: () => T): T;
+    completeMaterializationRetry(id: string, input: Omit<MonitorEventRecord, 'id'>, baseline?: {
+        previousContent: string | null;
+    }, options?: {
+        restrictToSessionId?: string;
+    }): MonitorEventRecord;
     enqueueMaterializationRetries(inputs: EnqueueMaterializationRetryInput[], now?: Date): MaterializationRetryRecord[];
     findEphemeralMonitorById(id: string): EphemeralMonitorRecord | null;
     findSessionById(id: string): AgentSessionRecord | null;

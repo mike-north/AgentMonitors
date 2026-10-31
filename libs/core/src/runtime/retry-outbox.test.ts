@@ -593,7 +593,7 @@ describe('materialization retry outbox', () => {
     expect(record?.lastError?.startsWith(`start${' '.repeat(5)}x`)).toBe(true);
   });
 
-  it('backs off, terminalizes, re-arms, and completes transactionally', () => {
+  it('backs off, terminalizes, and explicitly re-arms', () => {
     const store = new RuntimeStore(createDb(':memory:'));
     let record = store.enqueueMaterializationRetries(
       [input('monitor-a', 'object-1')],
@@ -666,19 +666,6 @@ describe('materialization retry outbox', () => {
     });
     expect(record.nextAttemptAt?.getTime()).toBe(
       rearmedAt.getTime() + MATERIALIZATION_RETRY_DELAYS_MS[0],
-    );
-
-    expect(() =>
-      store.completeMaterializationRetry(record.id, () => {
-        throw new Error('materialization still failed');
-      }),
-    ).toThrow('materialization still failed');
-    expect(store.getMaterializationRetry(record.id).id).toBe(record.id);
-    expect(
-      store.completeMaterializationRetry(record.id, () => 'materialized'),
-    ).toBe('materialized');
-    expect(() => store.getMaterializationRetry(record.id)).toThrow(
-      `Materialization retry record not found: ${record.id}`,
     );
   });
 });

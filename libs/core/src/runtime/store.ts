@@ -1,3 +1,8 @@
+/**
+ * Synchronous durable storage for monitor observations, recipient delivery
+ * state and recovery obligations. Transactions own persistence invariants;
+ * source observation, scheduling and asynchronous interpretation stay outside.
+ */
 import {
   and,
   asc,
@@ -211,9 +216,50 @@ function materializationRetryKey(
   );
 }
 
+/** Persist single-line diagnostics without allowing source text to control terminal layout. */
 function safeRetryError(message: string): string {
-  // eslint-disable-next-line no-control-regex -- persisted diagnostics must remove terminal controls
-  return message.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').slice(0, 1_024);
+  return (
+    message
+      // eslint-disable-next-line no-control-regex -- persisted diagnostics must remove terminal controls
+      .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, ' ')
+      .slice(0, 1_024)
+  );
+}
+
+/**
+ * SQLite stores retry timestamps in whole seconds. Round deadlines upward so
+ * persistence never shortens a backoff; the extra wait is less than one second.
+ */
+function retryDeadline(now: Date, delayMs: number): Date {
+  return new Date(Math.ceil((now.getTime() + delayMs) / 1_000) * 1_000);
+}
+
+/** A retained-work identity no longer exists; callers can distinguish this from I/O failure. @public */
+export class MaterializationRetryNotFoundError extends Error {
+  /** Stable code for callers that cannot rely on class identity across process boundaries. */
+  readonly code = 'materialization_retry_not_found';
+  /** The requested durable work identity, never its observation payload. */
+  readonly retryId: string;
+
+  constructor(retryId: string) {
+    super(`Materialization retry record not found: ${retryId}`);
+    this.name = 'MaterializationRetryNotFoundError';
+    this.retryId = retryId;
+  }
+}
+
+/** An operation would bypass the retained-work lifecycle or consume a different observation. @public */
+export class MaterializationRetryTransitionError extends Error {
+  /** Stable code for lifecycle rejection, distinct from storage failure. */
+  readonly code = 'materialization_retry_invalid_transition';
+  /** Identity of the work whose state remains unchanged after rejection. */
+  readonly retryId: string;
+
+  constructor(retryId: string, reason: string) {
+    super(`Materialization retry record ${reason}: ${retryId}`);
+    this.name = 'MaterializationRetryTransitionError';
+    this.retryId = retryId;
+  }
 }
 
 /** Raised when a workspace/monitor retry outbox has reached its bound. @public */
@@ -887,8 +933,9 @@ export class RuntimeStore {
           }
         }
 
-        const nextAttemptAt = new Date(
-          now.getTime() + MATERIALIZATION_RETRY_DELAYS_MS[0],
+        const nextAttemptAt = retryDeadline(
+          now,
+          MATERIALIZATION_RETRY_DELAYS_MS[0],
         );
         for (const item of prepared) {
           db.insert(materializationRetryOutbox)
@@ -913,14 +960,14 @@ export class RuntimeStore {
       .immediate();
   }
 
-  /** Return one retry record, or throw when its id does not exist. */
+  /** Resolve retained work by identity; absence is a typed error, never a successful discard. */
   getMaterializationRetry(id: string): MaterializationRetryRecord {
     const row = asInternalDb(this.db)
       .select()
       .from(materializationRetryOutbox)
       .where(eq(materializationRetryOutbox.id, id))
       .get();
-    if (!row) throw new Error(`Materialization retry record not found: ${id}`);
+    if (!row) throw new MaterializationRetryNotFoundError(id);
     return rowToMaterializationRetry(row);
   }
 
@@ -986,7 +1033,11 @@ export class RuntimeStore {
     );
   }
 
-  /** Record a failed automatic attempt and advance bounded backoff state. */
+  /**
+   * Retain a failed automatic attempt and advance its bounded backoff. Terminal
+   * rows cannot accrue new attempts until explicitly rearmed; failure text is
+   * persisted only as a bounded single-line diagnostic.
+   */
   markMaterializationRetryFailed(
     id: string,
     error: string,
@@ -997,7 +1048,7 @@ export class RuntimeStore {
       .transaction(() => {
         const current = this.getMaterializationRetry(id);
         if (current.status === 'terminal') {
-          throw new Error(`Materialization retry record is terminal: ${id}`);
+          throw new MaterializationRetryTransitionError(id, 'is terminal');
         }
         const attemptCount = current.attemptCount + 1;
         const terminal = attemptCount >= MATERIALIZATION_RETRY_MAX_ATTEMPTS;
@@ -1007,9 +1058,9 @@ export class RuntimeStore {
             status: terminal ? 'terminal' : 'pending',
             nextAttemptAt: terminal
               ? null
-              : new Date(
-                  now.getTime() +
-                    (MATERIALIZATION_RETRY_DELAYS_MS[attemptCount] ?? 0),
+              : retryDeadline(
+                  now,
+                  MATERIALIZATION_RETRY_DELAYS_MS[attemptCount] ?? 0,
                 ),
             lastError: safeRetryError(error),
             updatedAt: now,
@@ -1021,7 +1072,10 @@ export class RuntimeStore {
       .immediate();
   }
 
-  /** Explicitly re-arm a terminal record from the beginning of its backoff. */
+  /**
+   * Explicitly return terminal work to pending without replacing its envelope
+   * or identity. Pending work cannot be reset to evade its attempt budget.
+   */
   rearmMaterializationRetry(
     id: string,
     now = new Date(),
@@ -1031,16 +1085,15 @@ export class RuntimeStore {
       .transaction(() => {
         const current = this.getMaterializationRetry(id);
         if (current.status !== 'terminal') {
-          throw new Error(
-            `Materialization retry record is not terminal: ${id}`,
-          );
+          throw new MaterializationRetryTransitionError(id, 'is not terminal');
         }
         db.update(materializationRetryOutbox)
           .set({
             attemptCount: 0,
             status: 'pending',
-            nextAttemptAt: new Date(
-              now.getTime() + MATERIALIZATION_RETRY_DELAYS_MS[0],
+            nextAttemptAt: retryDeadline(
+              now,
+              MATERIALIZATION_RETRY_DELAYS_MS[0],
             ),
             lastError: null,
             updatedAt: now,
@@ -1053,29 +1106,77 @@ export class RuntimeStore {
   }
 
   /**
-   * Complete synchronous materialization and delete its retry record in the
-   * same immediate transaction. A thrown operation leaves the record intact.
+   * Consume pending retained work only by committing its event, projections,
+   * cursor seeds and snapshot together with removal of the retry row.
+   * Terminal work requires explicit re-arm. Scheduling/due selection belongs
+   * to the caller; this boundary enforces lifecycle and atomic persistence.
+   *
+   * Input must be the deterministic materialization of the stored envelope,
+   * with the same workspace, monitor, source and object identity. Rendering
+   * remains the runtime's responsibility. This seam accepts event data, never
+   * a callback: arbitrary asynchronous effects cannot be rolled back by SQLite.
+   * Interpret and other external work belong after this method returns.
    *
    * @internal
    */
-  completeMaterializationRetry<T>(id: string, operation: () => T): T {
+  completeMaterializationRetry(
+    id: string,
+    input: Omit<MonitorEventRecord, 'id'>,
+    baseline?: { previousContent: string | null },
+    options?: { restrictToSessionId?: string },
+  ): MonitorEventRecord {
     const db = asInternalDb(this.db);
-    return db.$client
-      .transaction(() => {
-        this.getMaterializationRetry(id);
-        const result = operation();
-        const deleted = db
-          .delete(materializationRetryOutbox)
-          .where(eq(materializationRetryOutbox.id, id))
-          .run().changes;
-        if (deleted !== 1) {
-          throw new Error(
-            `Materialization retry record disappeared before commit: ${id}`,
-          );
-        }
-        return result;
-      })
-      .immediate();
+    const previousProjectedSessionIds = this.lastProjectedSessionIds;
+    try {
+      return db.$client
+        .transaction(() => {
+          const current = this.getMaterializationRetry(id);
+          if (current.status === 'terminal') {
+            throw new MaterializationRetryTransitionError(id, 'is terminal');
+          }
+          // JavaScript callers can bypass the declared event-data type.
+          const suppliedInput: unknown = input;
+          if (
+            typeof suppliedInput !== 'object' ||
+            suppliedInput === null ||
+            Array.isArray(suppliedInput)
+          ) {
+            throw new MaterializationRetryTransitionError(
+              id,
+              'requires event data, not a callback',
+            );
+          }
+          if (
+            input.workspacePath !== current.workspacePath ||
+            input.monitorId !== current.monitorId ||
+            input.sourceName !== current.sourceName ||
+            input.objectKey !== (current.envelope.observation.objectKey ?? null)
+          ) {
+            throw new MaterializationRetryTransitionError(
+              id,
+              'does not match the retained observation route',
+            );
+          }
+          const result = this.insertEvent(input, baseline, options);
+          const deleted = db
+            .delete(materializationRetryOutbox)
+            .where(eq(materializationRetryOutbox.id, id))
+            .run().changes;
+          if (deleted !== 1) {
+            throw new MaterializationRetryTransitionError(
+              id,
+              'disappeared before commit',
+            );
+          }
+          return result;
+        })
+        .immediate();
+    } catch (error) {
+      // insertEvent's projection cache is in memory, outside SQLite rollback.
+      // A failed outer completion must not expose recipients of a rolled-back event.
+      this.lastProjectedSessionIds = previousProjectedSessionIds;
+      throw error;
+    }
   }
 
   /**
