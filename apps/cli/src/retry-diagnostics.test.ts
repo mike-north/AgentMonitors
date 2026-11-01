@@ -260,6 +260,7 @@ async function run(
       if (error.stdout.length === 0) {
         throw new Error(
           `CLI exited without a diagnostic report: ${'stderr' in error ? String(error.stderr) : String(error)}`,
+          { cause: error },
         );
       }
       return { stdout: error.stdout, code: error.code };
