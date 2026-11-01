@@ -421,6 +421,29 @@ different baselines each receive their own collapsed span. A within-tick burst t
 observations for one object collapses the same way (the newest of the burst is the surviving net
 delta for an away recipient).
 
+**Event order and equal-time endpoints.** Event delivery, `net` endpoint selection,
+claimed cursor advancement and event listings order by persisted observation `created_at`
+first, then private SQLite `monitor_events.sequence`. Timestamps remain second-precision;
+this does not recover discarded millisecond observation ordering. The sequence resolves
+only equal persisted timestamps by committed materialization order across writers. A
+later insertion with an earlier observation timestamp does not displace a newer-observed
+endpoint. Public event IDs and `MonitorEventRecord` shapes are unchanged.
+
+The pure collapse decision consumes candidates already in canonical equal-time order.
+Store pending/unread queries establish this order; preview filtering and transport caps
+preserve it. The mutating `collapseNetForClaim` boundary reloads authoritative records
+by candidate ID and orders them from SQLite before choosing endpoints, including mixed
+urgency concatenations and externally supplied arrays. Unknown or duplicate IDs fail
+before mutation; caller-modified artifacts do not override persisted content. Preview,
+actual claim and cursor advancement therefore use the same ordering contract.
+
+Event sequence allocation occurs within existing event/projection/cursor/snapshot
+atomicity. Its transactional migration preserves all row fields, public IDs, logical
+references and explicit indexes/triggers. As for snapshots (§5.2), current hidden rowid
+is the legacy bootstrap policy, not reconstructed lost chronology. Rollback leaves no
+committed position, deletion does not reuse committed positions, and VACUUM/reopen
+preserve them. No observation-history or source-frontier contract changes are implied.
+
 **Interaction with Pace modes.** The baseline strategy is independent of the Pace mode. A `net`
 strategy on a `debounce` monitor still settles first (Pace), then collapses the catch-up span for
 delivery (Diff). A recipient that was live for every settled observation and never missed a window
@@ -1167,8 +1190,8 @@ an explicit bootstrap policy: it cannot recover chronology already lost before m
 (for example through historical `VACUUM`) or repair previously generated diffs. Reopening
 an already migrated database is idempotent; simultaneous openers serialize the migration.
 Older binaries can still insert their named columns, but their timestamp/ULID readers do
-not gain the corrected ordering behavior. Event and observation-history ordering is a
-separate contract; this snapshot change makes no cross-process guarantee for those rows.
+not gain the corrected ordering behavior. Event ordering is defined separately in §1.1.7; observation-history ordering and source
+frontiers are unchanged by these sequences.
 
 The renderer is chosen by the object's `change-detection.strategy` (003 §4.2/§11.3), via `buildDiff(previous, current, strategy)`:
 
@@ -1799,24 +1822,25 @@ Verified: `libs/core/src/inbox/schema.ts` (entire file); `libs/core/src/inbox/db
 
 Corresponds to the `monitorEvents` Drizzle table. One row per materialized observation. Rows are immutable after insertion.
 
-| Column              | Type             | Notes                                           |
-| ------------------- | ---------------- | ----------------------------------------------- |
-| `id`                | TEXT PK          | ULID                                            |
-| `workspace_path`    | TEXT nullable    | Path to the workspace; `NULL` for global events |
-| `monitor_id`        | TEXT NOT NULL    | Stable monitor identifier                       |
-| `source_name`       | TEXT NOT NULL    | Source plugin name                              |
-| `urgency`           | TEXT NOT NULL    | `low \| normal \| high`                         |
-| `title`             | TEXT NOT NULL    |                                                 |
-| `body`              | TEXT NOT NULL    | Defaults to `''`                                |
-| `summary`           | TEXT NOT NULL    | Defaults to `''`                                |
-| `payload`           | TEXT NOT NULL    | JSON; defaults to `{}`                          |
-| `snapshot_metadata` | TEXT NOT NULL    | JSON; defaults to `{}`                          |
-| `snapshot_text`     | TEXT nullable    | Full snapshot content if provided               |
-| `diff_text`         | TEXT nullable    | Line-level diff vs. previous snapshot           |
-| `object_key`        | TEXT nullable    | Snapshot and diff keying                        |
-| `query_scope`       | TEXT NOT NULL    | JSON; defaults to `{}`                          |
-| `tags`              | TEXT NOT NULL    | JSON array; defaults to `[]`                    |
-| `created_at`        | INTEGER NOT NULL | Observation timestamp                           |
+| Column              | Type                     | Notes                                           |
+| ------------------- | ------------------------ | ----------------------------------------------- |
+| `sequence`          | INTEGER PK AUTOINCREMENT | Private equal-time materialization tie-break    |
+| `id`                | TEXT NOT NULL UNIQUE     | Public ULID identity                            |
+| `workspace_path`    | TEXT nullable            | Path to the workspace; `NULL` for global events |
+| `monitor_id`        | TEXT NOT NULL            | Stable monitor identifier                       |
+| `source_name`       | TEXT NOT NULL            | Source plugin name                              |
+| `urgency`           | TEXT NOT NULL            | `low \| normal \| high`                         |
+| `title`             | TEXT NOT NULL            |                                                 |
+| `body`              | TEXT NOT NULL            | Defaults to `''`                                |
+| `summary`           | TEXT NOT NULL            | Defaults to `''`                                |
+| `payload`           | TEXT NOT NULL            | JSON; defaults to `{}`                          |
+| `snapshot_metadata` | TEXT NOT NULL            | JSON; defaults to `{}`                          |
+| `snapshot_text`     | TEXT nullable            | Full snapshot content if provided               |
+| `diff_text`         | TEXT nullable            | Line-level diff vs. previous snapshot           |
+| `object_key`        | TEXT nullable            | Snapshot and diff keying                        |
+| `query_scope`       | TEXT NOT NULL            | JSON; defaults to `{}`                          |
+| `tags`              | TEXT NOT NULL            | JSON array; defaults to `[]`                    |
+| `created_at`        | INTEGER NOT NULL         | Observation timestamp                           |
 
 ### `monitor_snapshots`
 

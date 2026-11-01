@@ -70,3 +70,38 @@ probe `/private/tmp/event-order-independent`.
 
 All five prefix CI heads are green according to coordinator, but merge remains held on
 these confirmed foundation defects. No remote action is authorized for this workstream.
+
+## Event extension checkpoint
+
+Snapshot-only commit `def8c1a` was independently accepted by reviewer after15 focused
+passes. Event scope and design were then accepted by root: private AUTOINCREMENT event
+sequence, persisted created_at primary, sequence tie, no public field leakage.
+
+Caller audit found direct pure-preview inputs come from pending/unread SQL plus
+filter/slice; mutation receives a high+normal concatenation. The public mutating
+boundary now reloads authoritative persisted candidate records and canonicalizes their
+order. Unknown/duplicate IDs fail before mutation. No private ordinal leaks into public
+records. Event schema currently has logical ID references, no declared SQLite FKs.
+
+Tests-first event red:5 failed /2 passed on snapshot-only candidate. Genuine adverse-ID
+query order, missing sequence, unknown/duplicate identity and caller-modified artifact
+cases failed; unequal-time priority already passed. Implemented event migration/order
+repair and initial focused25tests passed. Added full runtime mixed-band claim and
+concurrent migration cases; final validation pending. No remote action taken.
+
+## Event extension validation complete
+
+- Final focused32tests across event8/snapshot6/net11/hook-cap7 passed.
+- Full core678 tests across47 files passed, exit0.
+- Workspace build7, full check, and strict workspace API reports6 passed.
+- An initial full-check failure was one test-only `Array<T>` lint style; corrected
+  to `T[]`, then full check and workspace API reports reran successfully.
+- No public API report diffs. Runtime tests also verify sequence is absent from
+  returned event keys; snapshot results retain exact `{ content }` equality.
+- Logs: `/private/tmp/event-order-core.log`, `/private/tmp/event-order-build.log`,
+  `/private/tmp/event-order-check.log`, `/private/tmp/event-order-api.log`.
+- Event commit is being frozen for independent review. Snapshot commit was accepted;
+  combined final acceptance is pending. No remote action or prefix merge performed.
+
+The existing collapse/markClaimed multi-statement boundary is not redesigned; this work
+establishes deterministic persisted ordering, not atomicity against concurrent pruning.

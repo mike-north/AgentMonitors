@@ -205,6 +205,22 @@ with unchanged public data/indexes/triggers and no replayed trigger effects, mig
 idempotence, and simultaneous first-open migration. The existing transactional
 materialization suite retains event/projection/cursor/snapshot rollback coverage.
 
+### Equal-time event order
+
+`runtime/event-materialization-order.test.ts` uses two genuine independent event ULID
+factories and controlled commit order at the same clock. Pending/unread queries, event
+listings, pure net selection, actual runtime preview, capped claim, suppression and
+claimed cursor must agree on the later commit. Private sequences must not appear in
+public event records. A high/normal coalescing case checks that concatenating bands
+cannot reverse an equal-time endpoint; the mutating boundary reloads canonical stored
+records and rejects unknown/duplicate IDs before side effects. Unequal observed times
+retain their existing primary order.
+
+Additional cases cover transaction rollback, caller-modified artifact rejection, legacy
+migration with unchanged projections/snapshots/cursors/indexes/triggers, no replayed
+trigger effects, deletion/reinsert, VACUUM/reopen and simultaneous migrating writers.
+Existing net and hook-cap suites continue to cover per-recipient delivery semantics.
+
 ### 3.4.1 Real daemon crash recovery
 
 `apps/cli/src/commands/daemon-crash-recovery.integration.test.ts` exercises a built CLI daemon

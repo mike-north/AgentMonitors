@@ -19,13 +19,9 @@ import { Buffer } from 'node:buffer';
 import { monotonicFactory, ulid } from 'ulid';
 
 /**
- * Monotonic ULID factory for `monitor_events` ids (G10 PR-B). Plain `ulid()` is
- * NOT ordered within a single millisecond, but the per-recipient `net` collapse
- * and the claim-time cursor advance both need a deterministic "newest event per
- * object" tiebreak when a tick materializes several events for one object in the
- * same millisecond (their `created_at` ties at the runtime tick clock). A
- * monotonic factory makes `id` strictly increasing in insertion order, so
- * ordering by `(created_at, id)` reflects materialization order exactly.
+ * Public event identities retain their ULID representation. This process-local
+ * factory supplies uniqueness, not cross-process event order; persisted
+ * observation time and SQLite's private event sequence govern delivery order.
  */
 const eventUlid = monotonicFactory();
 
@@ -293,17 +289,19 @@ export interface NetCollapseView {
   netGroupSizeByKey: Map<string, number>;
 }
 
+/**
+ * Select net endpoints without writes. Equal-time candidates must already be
+ * in canonical materialization order, as supplied by the store's event queries.
+ * Stable timestamp sorting preserves that tie order without treating opaque IDs
+ * as chronology. Filter/slice preserve the precondition; concatenated or external
+ * candidate sets must first pass the store's canonicalization boundary.
+ */
 export function computeNetCollapseView(
   candidates: MonitorEventRecord[],
 ): NetCollapseView {
-  // Order by (createdAt, id): events materialized in the same tick share a
-  // createdAt, so the monotonic `id` (see `eventUlid`) breaks the tie in
-  // insertion order — the last is the true endpoint ("where things stand now",
-  // 002 §1.1.7).
-  const ordered = [...candidates].sort((a, b) => {
-    const byTime = a.createdAt.getTime() - b.createdAt.getTime();
-    return byTime !== 0 ? byTime : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-  });
+  const ordered = [...candidates].sort(
+    (a, b) => a.createdAt.getTime() - b.createdAt.getTime(),
+  );
   const newestNetByObject = new Map<string, MonitorEventRecord>();
   const netGroupSizeByKey = new Map<string, number>();
   for (const event of ordered) {
@@ -1332,10 +1330,9 @@ export class RuntimeStore {
               ...conditions,
             ),
           )
-          // Second-precision `created_at` ties within a tick; the monotonic
-          // event `id` (see `eventUlid`) keeps this newest-first listing stably
-          // ordered (issue #293).
-          .orderBy(desc(monitorEvents.createdAt), desc(monitorEvents.id))
+          // Preserve persisted observation time; SQLite's sequence resolves
+          // equal-time history consistently across independent writers.
+          .orderBy(desc(monitorEvents.createdAt), desc(monitorEvents.sequence))
           .all()
           .map((row) => ({
             ...rowToEvent(row.event),
@@ -1367,10 +1364,9 @@ export class RuntimeStore {
               ...conditions,
             ),
           )
-          // Second-precision `created_at` ties within a tick; the monotonic
-          // event `id` (see `eventUlid`) keeps this newest-first listing stably
-          // ordered (issue #293).
-          .orderBy(desc(monitorEvents.createdAt), desc(monitorEvents.id))
+          // Preserve persisted observation time; SQLite's sequence resolves
+          // equal-time history consistently across independent writers.
+          .orderBy(desc(monitorEvents.createdAt), desc(monitorEvents.sequence))
           .all()
           .map(rowToEvent);
 
@@ -1669,10 +1665,9 @@ export class RuntimeStore {
         eq(sessionEventState.sessionId, agentSessions.id),
       )
       .where(and(...conditions))
-      // Second-precision `created_at` ties within a tick; the monotonic event
-      // `id` (see `eventUlid`) keeps this diagnostic listing stably ordered
-      // (issue #293).
-      .orderBy(desc(monitorEvents.createdAt), desc(monitorEvents.id))
+      // Diagnostics use the same persisted time/materialization tie order as
+      // recipient delivery, including rows written by another process.
+      .orderBy(desc(monitorEvents.createdAt), desc(monitorEvents.sequence))
       .all();
 
     return rows.map(({ event, state, session }) => ({
@@ -1753,7 +1748,7 @@ export class RuntimeStore {
           notNetSuppressed(),
         ),
       )
-      .orderBy(asc(monitorEvents.createdAt), asc(monitorEvents.id))
+      .orderBy(asc(monitorEvents.createdAt), asc(monitorEvents.sequence))
       .all();
     return rows.map((row) => rowToEvent(row.event));
   }
@@ -1779,7 +1774,7 @@ export class RuntimeStore {
           notNetSuppressed(),
         ),
       )
-      .orderBy(asc(monitorEvents.createdAt), asc(monitorEvents.id))
+      .orderBy(asc(monitorEvents.createdAt), asc(monitorEvents.sequence))
       .all();
     return rows.map((row) => rowToEvent(row.event));
   }
@@ -2041,6 +2036,35 @@ export class RuntimeStore {
   }
 
   /**
+   * Resolve a candidate identity set back to authoritative persisted records in
+   * delivery order. External callers and mixed-urgency concatenations may not
+   * preserve equal-time order; opaque IDs or supplied artifacts cannot repair
+   * it. Reject missing/duplicate identities before any collapse side effects.
+   */
+  private canonicalEventCandidates(
+    candidates: MonitorEventRecord[],
+  ): MonitorEventRecord[] {
+    if (candidates.length === 0) return [];
+    const ids = candidates.map((event) => event.id);
+    if (new Set(ids).size !== ids.length) {
+      throw new Error('Duplicate event in collapse candidates');
+    }
+    const rows = asInternalDb(this.db)
+      .select()
+      .from(monitorEvents)
+      .where(inArray(monitorEvents.id, ids))
+      .orderBy(asc(monitorEvents.createdAt), asc(monitorEvents.sequence))
+      .all();
+    if (rows.length !== ids.length) {
+      const found = new Set(rows.map((row) => row.id));
+      throw new Error(
+        `Event not found: ${ids.find((id) => !found.has(id)) ?? ''}`,
+      );
+    }
+    return rows.map(rowToEvent);
+  }
+
+  /**
    * Apply the per-recipient `net` collapse to a recipient's candidate delivery
    * set at claim time (G10 PR-B, 002 §1.1.7).
    *
@@ -2064,10 +2088,12 @@ export class RuntimeStore {
    * no-op (`net` ≡ `incremental` in the degenerate single-observation span).
    *
    * @param sessionId - the claiming recipient.
-   * @param candidates - the recipient's candidate events, OLDEST-FIRST.
+   * @param candidates - a unique set of persisted candidate event identities.
+   *   Stored content and canonical delivery order are authoritative. Unknown or
+   *   duplicate IDs fail before mutation.
    * @returns the events to actually deliver (suppressed intermediates removed),
-   *   preserving the input order. The caller still passes the FULL candidate set
-   *   (delivered + suppressed) to {@link markClaimed} so the cursor advances to
+   *   in persisted observation-time/materialization order. The caller still
+   *   passes the FULL candidate set (delivered + suppressed) to {@link markClaimed} so the cursor advances to
    *   the newest claimed artifact and the suppressed rows are consumed
    *   (`first_notified_at`).
    */
@@ -2079,10 +2105,11 @@ export class RuntimeStore {
     // siblings are suppressed) is the pure, side-effect-free
     // {@link computeNetCollapseView} — shared verbatim with the delivery preview
     // (issue #299) so a capped hook context claims exactly the events it renders.
-    const view = computeNetCollapseView(candidates);
+    const canonical = this.canonicalEventCandidates(candidates);
+    const view = computeNetCollapseView(canonical);
 
-    // No `net` group present → nothing to re-anchor or suppress; pass through.
-    if (view.netGroupSizeByKey.size === 0) return candidates;
+    // No `net` group present → nothing to re-anchor or suppress.
+    if (view.netGroupSizeByKey.size === 0) return canonical;
 
     // The MUTATION half. For each surviving delivered event whose group ACTUALLY
     // collapsed (>1 net event), recompute its per-recipient diff_text against
@@ -2197,8 +2224,8 @@ export class RuntimeStore {
 
   /**
    * For a set of just-claimed events, advance the recipient's per-object cursor
-   * to the artifact of the NEWEST (latest `createdAt`, then ULID-ordered) claimed
-   * event of each `(monitorId, objectKey, workspacePath)`. Events without a
+   * to the artifact of the NEWEST claimed event (persisted `createdAt`, then
+   * SQLite sequence) of each `(monitorId, objectKey, workspacePath)`. Events without a
    * snapshot artifact are skipped (nothing to span from). (G10, 002 §1.1.2.)
    */
   private advanceCursorsForClaimedEvents(
@@ -2209,7 +2236,7 @@ export class RuntimeStore {
       .select()
       .from(monitorEvents)
       .where(inArray(monitorEvents.id, eventIds))
-      .orderBy(asc(monitorEvents.createdAt), asc(monitorEvents.id))
+      .orderBy(asc(monitorEvents.createdAt), asc(monitorEvents.sequence))
       .all();
 
     // Iterating in ascending order and overwriting leaves the NEWEST claimed
