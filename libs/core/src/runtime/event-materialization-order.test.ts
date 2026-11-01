@@ -484,4 +484,113 @@ describe('durable equal-time event order', () => {
       await Promise.allSettled(workers.map((worker) => worker.exited));
     }
   }, 30_000);
+  it.each(['incremental', 'net'] as const)(
+    'preserves verified recipient views and raw views for a single %s event',
+    (baselineStrategy) => {
+      const { store } = open(databasePath());
+      const session = lead(store, `view-${baselineStrategy}`);
+      store.seedSessionObjectCursor({
+        sessionId: session,
+        monitorId: 'monitor',
+        objectKey: 'object',
+        workspacePath: '/workspace',
+        baselineSnapshotId: null,
+        baselineContent: 'recipient-old',
+      });
+      const event = store.insertEvent({
+        ...eventInput('new', epoch),
+        baselineStrategy,
+        diffText: '- 1: shared-old\n+ 1: new',
+      });
+      const recipientDiff = '- 1: recipient-old\n+ 1: new';
+      expect(
+        store.perRecipientDiffsForSession(session, [event.id]).get(event.id),
+      ).toBe(recipientDiff);
+      store.markClaimed(session, [event.id], 'turn-interruptible');
+      const sessionRow = store.listEvents({ sessionId: session })[0];
+      if (!sessionRow) throw new Error('Missing recipient event view');
+      const projectedView = { ...sessionRow, diffText: recipientDiff };
+      expect(store.collapseNetForClaim(session, [projectedView])).toEqual([
+        projectedView,
+      ]);
+      expect(
+        store.perRecipientDiffsForSession(session, [event.id]).get(event.id),
+      ).toBe(recipientDiff);
+      // Raw shared records keep their existing representation too; ordering
+      // canonicalization does not silently enrich them with another view.
+      expect(store.collapseNetForClaim(session, [event])).toEqual([event]);
+      const forged = { ...projectedView, diffText: 'forged', title: 'forged' };
+      expect(store.collapseNetForClaim(session, [forged])).toEqual([
+        { ...sessionRow, diffText: recipientDiff },
+      ]);
+    },
+  );
+
+  it('never preserves another recipient projection as the requested session view', () => {
+    const { store } = open(databasePath());
+    const requested = lead(store, 'requested-view');
+    const other = lead(store, 'other-view');
+    for (const [sessionId, baselineContent] of [
+      [requested, 'requested-old'],
+      [other, 'other-old'],
+    ]) {
+      if (!sessionId || !baselineContent)
+        throw new Error('Missing recipient fixture');
+      store.seedSessionObjectCursor({
+        sessionId,
+        monitorId: 'monitor',
+        objectKey: 'object',
+        workspacePath: '/workspace',
+        baselineSnapshotId: null,
+        baselineContent,
+      });
+    }
+    const event = store.insertEvent({
+      ...eventInput('new', epoch),
+      baselineStrategy: 'incremental',
+      diffText: '- 1: shared-old\n+ 1: new',
+    });
+    store.markClaimed(other, [event.id], 'turn-interruptible');
+    const otherView = store.listEvents({ sessionId: other })[0];
+    const requestedView = store.listEvents({ sessionId: requested })[0];
+    if (!otherView || !requestedView)
+      throw new Error('Missing projected views');
+    const foreignView = { ...otherView, diffText: '- 1: other-old\n+ 1: new' };
+    expect(store.collapseNetForClaim(requested, [foreignView])).toEqual([
+      { ...requestedView, diffText: '- 1: requested-old\n+ 1: new' },
+    ]);
+  });
+  it('refreshes a stale recipient delta from that projection rather than reverting to shared history', () => {
+    const { store } = open(databasePath());
+    const session = lead(store, 'stale-projection');
+    store.seedSessionObjectCursor({
+      sessionId: session,
+      monitorId: 'monitor',
+      objectKey: 'object',
+      workspacePath: '/workspace',
+      baselineSnapshotId: null,
+      baselineContent: 'A',
+    });
+    const first = store.insertEvent({
+      ...eventInput('B', epoch),
+      diffText: '- 1: shared-X\n+ 1: B',
+    });
+    const last = store.insertEvent({
+      ...eventInput('C', epoch),
+      diffText: '- 1: shared-Y\n+ 1: C',
+    });
+    const staleView = { ...last, diffText: '- 1: A\n+ 1: C' };
+    expect(
+      store.perRecipientDiffsForSession(session, [last.id]).get(last.id),
+    ).toBe(staleView.diffText);
+    store.markClaimed(session, [first.id], 'turn-interruptible');
+    store.collapseNetForClaim(session, [first, last]);
+    expect(
+      store.perRecipientDiffsForSession(session, [last.id]).get(last.id),
+    ).toBe('- 1: B\n+ 1: C');
+    expect(store.collapseNetForClaim(session, [staleView])).toEqual([
+      { ...last, diffText: '- 1: B\n+ 1: C' },
+    ]);
+    expect(store.collapseNetForClaim(session, [last])).toEqual([last]);
+  });
 });

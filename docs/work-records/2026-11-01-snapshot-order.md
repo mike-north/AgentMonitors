@@ -105,3 +105,32 @@ concurrent migration cases; final validation pending. No remote action taken.
 
 The existing collapse/markClaimed multi-statement boundary is not redesigned; this work
 establishes deterministic persisted ordering, not atomicity against concurrent pruning.
+
+## Recipient-view review repair in progress
+
+Event candidate88426e4 was frozen but NOT accepted: root spotted raw canonical reload
+losing legitimate public recipient views. New tests first failed incremental and
+single-net delta/lifecycle preservation plus foreign-view handling (3red). An initial
+exact-equality overlay rule then failed a stale legitimate delta after another collapse
+re-anchored the stored projection (explicit red captured).
+
+Root-directed final rule: authoritative event reload left-joins only the requested
+session projection. Raw shared candidates stay raw. A lifecycle-bearing or non-shared
+delta requests a recipient view, refreshed from current persisted projection, never
+trusted as text. Thus stale/forged/other-recipient overlays cannot overwrite that view.
+No matching projection retains prior raw behavior; no new authorization model introduced.
+
+Focused35tests passed (event12/net11/perrecipient8/json4). Broad successor validation
+pending;88426e4 remains review-held until this follow-up is frozen and independently
+accepted. No remote actions performed.
+
+## Recipient-view successor validation complete
+
+Final core682 tests across47files passed. Workspace build7, full check and strict
+workspaceAPI6 passed, no API report diffs. Focused35 passed after final representation
+rule. Logs are `/private/tmp/event-view-core.log`, `/private/tmp/event-view-build.log`,
+`/private/tmp/event-view-check.log`, `/private/tmp/event-view-api.log`.
+
+The follow-up is frozen for independent review; no claim of combined acceptance until
+reviewer confirms the exact successor. Source work remains on the managed worktree
+branch with no remote mutations.

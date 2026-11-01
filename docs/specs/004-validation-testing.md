@@ -219,7 +219,12 @@ retain their existing primary order.
 Additional cases cover transaction rollback, caller-modified artifact rejection, legacy
 migration with unchanged projections/snapshots/cursors/indexes/triggers, no replayed
 trigger effects, deletion/reinsert, VACUUM/reopen and simultaneous migrating writers.
-Existing net and hook-cap suites continue to cover per-recipient delivery semantics.
+Direct public-boundary cases also cover incremental/single-net recipient views whose
+delta differs from shared history, raw shared inputs, lifecycle preservation, forged or
+other-recipient overlays, and a legitimate stale delta after re-anchoring. These must
+resolve to the requested recipient's current persisted projection without trusting
+caller-provided delta text. Existing net and hook-cap suites continue to cover
+per-recipient delivery semantics.
 
 ### 3.4.1 Real daemon crash recovery
 

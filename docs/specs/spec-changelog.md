@@ -1,3 +1,12 @@
+## 2026-11-01 — Preserve recipient views while canonicalizing event order (002 §1.1.7, 004)
+
+The event-order boundary retains raw shared input representation and refreshes recipient
+views from the requested session projection. Incremental and single-net results preserve
+recipient deltas/lifecycle state; stale deltas after re-anchoring no longer fall back to
+shared history. Supplied text and another recipient's state never become authoritative.
+Tests first reproduced view loss and stale-delta fallback, then verify both raw and
+recipient representations. Immutable event ordering/artifacts remain database-owned.
+
 ## 2026-11-01 — Durable equal-time event ordering (002 §1.1.7/§15, 004)
 
 Event queries and claimed cursor advancement retain persisted observation time as their

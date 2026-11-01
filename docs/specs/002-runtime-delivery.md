@@ -434,8 +434,15 @@ Store pending/unread queries establish this order; preview filtering and transpo
 preserve it. The mutating `collapseNetForClaim` boundary reloads authoritative records
 by candidate ID and orders them from SQLite before choosing endpoints, including mixed
 urgency concatenations and externally supplied arrays. Unknown or duplicate IDs fail
-before mutation; caller-modified artifacts do not override persisted content. Preview,
-actual claim and cursor advancement therefore use the same ordering contract.
+before mutation; caller-modified artifacts do not override persisted content. Raw shared
+candidate records retain that representation. Candidates carrying a delivery-state view
+or a delta different from the shared event request a recipient view: the return value
+uses the **requested session's current persisted projection**, not supplied delta text.
+This preserves incremental/single-net views and refreshes stale re-anchored deltas without
+falling back to shared history. Optional delivery state is likewise refreshed when
+requested. If the event has no projection for that session, existing raw-event behavior
+remains; this ordering boundary does not add a new authorization model. Preview, actual
+claim and cursor advancement use the same ordering contract.
 
 Event sequence allocation occurs within existing event/projection/cursor/snapshot
 atomicity. Its transactional migration preserves all row fields, public IDs, logical

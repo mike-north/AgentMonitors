@@ -2039,29 +2039,61 @@ export class RuntimeStore {
    * Resolve a candidate identity set back to authoritative persisted records in
    * delivery order. External callers and mixed-urgency concatenations may not
    * preserve equal-time order; opaque IDs or supplied artifacts cannot repair
-   * it. Reject missing/duplicate identities before any collapse side effects.
+   * it. Session-scoped views are retained only when verified against that
+   * recipient's projection. Reject missing/duplicate identities before any
+   * collapse side effects.
    */
   private canonicalEventCandidates(
+    sessionId: string,
     candidates: MonitorEventRecord[],
   ): MonitorEventRecord[] {
     if (candidates.length === 0) return [];
+    const suppliedById = new Map(candidates.map((event) => [event.id, event]));
     const ids = candidates.map((event) => event.id);
-    if (new Set(ids).size !== ids.length) {
+    if (suppliedById.size !== ids.length) {
       throw new Error('Duplicate event in collapse candidates');
     }
     const rows = asInternalDb(this.db)
-      .select()
+      .select({ event: monitorEvents, state: sessionEventState })
       .from(monitorEvents)
+      .leftJoin(
+        sessionEventState,
+        and(
+          eq(sessionEventState.eventId, monitorEvents.id),
+          eq(sessionEventState.sessionId, sessionId),
+        ),
+      )
       .where(inArray(monitorEvents.id, ids))
       .orderBy(asc(monitorEvents.createdAt), asc(monitorEvents.sequence))
       .all();
     if (rows.length !== ids.length) {
-      const found = new Set(rows.map((row) => row.id));
+      const found = new Set(rows.map((row) => row.event.id));
       throw new Error(
         `Event not found: ${ids.find((id) => !found.has(id)) ?? ''}`,
       );
     }
-    return rows.map(rowToEvent);
+    return rows.map((row) => {
+      const supplied = suppliedById.get(row.event.id);
+      const projectionDiff = row.state?.diffText;
+      const requestsRecipientView =
+        supplied !== undefined &&
+        (supplied.deliveryState !== undefined ||
+          supplied.diffText !== row.event.diffText);
+      // A lifecycle-bearing or non-shared delta represents a recipient view,
+      // not authoritative text. Refresh it from THIS session's projection even
+      // when another claim has re-anchored the saved delta since the caller's
+      // read. Raw shared inputs remain raw; stale, forged or foreign overlays
+      // never become the authority for either artifacts or recipient state.
+      return {
+        ...rowToEvent(row.event),
+        ...(projectionDiff != null && requestsRecipientView
+          ? { diffText: projectionDiff }
+          : {}),
+        ...(row.state && supplied?.deliveryState !== undefined
+          ? { deliveryState: deliveryStateForRow(row.state) }
+          : {}),
+      };
+    });
   }
 
   /**
@@ -2105,7 +2137,7 @@ export class RuntimeStore {
     // siblings are suppressed) is the pure, side-effect-free
     // {@link computeNetCollapseView} — shared verbatim with the delivery preview
     // (issue #299) so a capped hook context claims exactly the events it renders.
-    const canonical = this.canonicalEventCandidates(candidates);
+    const canonical = this.canonicalEventCandidates(sessionId, candidates);
     const view = computeNetCollapseView(canonical);
 
     // No `net` group present → nothing to re-anchor or suppress.
