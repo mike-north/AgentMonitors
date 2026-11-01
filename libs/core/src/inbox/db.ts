@@ -1,3 +1,9 @@
+/**
+ * Own SQLite connection setup, private artifact creation, and durable schema
+ * migration. Filesystem permission migration must precede SQLite ownership of
+ * descriptors so external closes cannot invalidate its POSIX lock bookkeeping.
+ */
+import { lstatSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import Database, { type Database as BetterSQLiteClient } from 'better-sqlite3';
 import { BetterSQLite3Database, drizzle } from 'drizzle-orm/better-sqlite3';
@@ -5,6 +11,7 @@ import { sql } from 'drizzle-orm';
 import { ulid } from 'ulid';
 import {
   ensurePrivateDir,
+  isErrnoException,
   PRIVATE_FILE_MODE,
   resetVerifiedPathCachesForTest,
   restrictExistingPathMode,
@@ -88,9 +95,11 @@ const verifiedSqlitePaths = new Set<string>();
 
 /**
  * Tighten the mode of the SQLite database and its sidecar files to owner-only
- * (`0600`). Called after schema setup to (a) migrate a database created by an
- * earlier version under a permissive umask (issue #292) and (b) belt-and-braces
- * cover any sidecar SQLite created outside the restricted-umask window.
+ * (`0600`) before opening SQLite. Closing an independently opened descriptor
+ * releases all POSIX locks held by this process on that inode, including locks
+ * SQLite believes it still owns. In particular, losing database and SHM locks
+ * can let another process reset the WAL while this connection still uses it.
+ * New artifacts are instead protected by the restricted-umask creation window.
  */
 function restrictSqliteArtifactModes(dbPath: string): void {
   if (verifiedSqlitePaths.has(dbPath)) return;
@@ -98,6 +107,31 @@ function restrictSqliteArtifactModes(dbPath: string): void {
     restrictExistingPathMode(`${dbPath}${suffix}`, PRIVATE_FILE_MODE);
   }
   verifiedSqlitePaths.add(dbPath);
+}
+
+/**
+ * Resolve one physical path for SQLite and its permission migration. File and
+ * directory symlinks select the actual database target, including its sidecars;
+ * merely caching the target while chmod-ing an alias would leave it unprotected.
+ * Reusing this path prevents repeat migration under another spelling while a
+ * connection is live. The parent exists before lookup; a new database uses its
+ * real parent plus filename until the file is created. Hard-link aliases are not
+ * supported because SQLite itself requires one filename for a database's WAL.
+ */
+function resolveSqlitePath(dbPath: string): string {
+  try {
+    return realpathSync(dbPath);
+  } catch (error) {
+    if (!isErrnoException(error) || error.code !== 'ENOENT') {
+      throw error;
+    }
+    // A dangling file alias has no stable canonical identity. Refuse it rather
+    // than cache the alias and later re-tighten its newly created live target.
+    if (lstatSync(dbPath, { throwIfNoEntry: false })?.isSymbolicLink()) {
+      throw error;
+    }
+    return path.join(realpathSync(path.dirname(dbPath)), path.basename(dbPath));
+  }
 }
 
 /**
@@ -118,24 +152,21 @@ export function resetSqliteArtifactModeCacheForTest(): void {
  * On-disk databases are created owner-only (issue #292): the containing
  * directory is forced to `0700`, and the database file plus its WAL/SHM sidecars
  * to `0600`. The open + schema build runs under a restricted (`0o077`) umask so
- * files SQLite creates itself are private from birth, then existing artifacts are
- * re-tightened so a database from an earlier, world-readable version is migrated
- * forward on the next open.
+ * files SQLite creates itself are private from birth. Existing artifacts are
+ * tightened before opening the connection, migrating older world-readable
+ * files without releasing any locks owned by the new SQLite connection.
  *
  * @param dbPath - Path to the SQLite database file, or ':memory:' for in-memory
  */
 export function createDb(dbPath: string): InboxDb {
-  const inMemory = dbPath === ':memory:';
-  if (!inMemory) {
-    ensurePrivateDir(path.dirname(dbPath));
+  if (dbPath === ':memory:') {
+    return buildDb(dbPath);
   }
-  const db = inMemory
-    ? buildDb(dbPath)
-    : withRestrictedUmask(() => buildDb(dbPath));
-  if (!inMemory) {
-    restrictSqliteArtifactModes(dbPath);
-  }
-  return db;
+  ensurePrivateDir(path.dirname(dbPath));
+  const canonicalPath = resolveSqlitePath(dbPath);
+  ensurePrivateDir(path.dirname(canonicalPath));
+  restrictSqliteArtifactModes(canonicalPath);
+  return withRestrictedUmask(() => buildDb(canonicalPath));
 }
 
 /**

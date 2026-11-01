@@ -137,6 +137,47 @@ change onto a file the user does not own.
 - **WHEN** startup tightening runs
 - **THEN** neither the symlink nor its target has its mode changed
 
+### Requirement: Database tightening precedes the first connection
+
+The system SHALL tighten existing SQLite artifacts before the process opens its first connection to that database, and permission migration MUST NOT open and close independent descriptors on artifacts owned by a live SQLite connection, because on POSIX closing them releases SQLite's locks. Newly created artifacts stay protected by the restricted umask (#529).
+
+#### Scenario: Opening an alternate spelling keeps the live connection's locks
+
+- **GIVEN** a process holding a live connection to a database
+- **WHEN** the same process opens and closes the database through a relative, directory-symlinked, or file-symlinked spelling
+- **THEN** the first connection still observes each later commit by an independent process
+
+### Requirement: Database paths resolve to one canonical path
+
+Relative, absolute, and symlinked spellings of a database path SHALL resolve to one actual path, used by SQLite, permission migration (including the target directory and sidecars), and the once-per-process permission cache. A dangling database-file symlink SHALL be rejected before SQLite opens or creates its target. Generic filesystem tightening still refuses symlinks; hard-link database aliases are unsupported.
+
+#### Scenario: Symlinked database path tightens the real file
+
+- **GIVEN** a database path that is a symlink to an existing `0644` database file
+- **WHEN** the CLI opens it
+- **THEN** the real database file and its `-wal` and `-shm` sidecars become `0600`
+
+#### Scenario: Dangling database symlink is rejected
+
+- **WHEN** the database path is a symlink whose target does not exist
+- **THEN** the open fails before any database file is created
+
+### Requirement: Concurrent processes keep SQLite visibility and writer exclusion
+
+Outside an explicit transaction, a long-lived reader SHALL observe each write committed later by another process, and a competing process SHALL read only committed data and SHALL receive `SQLITE_BUSY` when it tries to write while an immediate transaction holds the writer lock.
+
+#### Scenario: Long-lived reader sees successive commits
+
+- **GIVEN** a long-lived reader connection that is never reopened
+- **WHEN** an independent process commits two successive values
+- **THEN** the reader observes each committed value in turn
+
+#### Scenario: Writer lock is exclusive across processes
+
+- **GIVEN** one process holds an immediate transaction
+- **WHEN** another process tries to write
+- **THEN** it receives `SQLITE_BUSY` and reads only committed data
+
 ### Requirement: User-chosen and shared directories are not tightened
 
 The system SHALL NOT tighten a socket directory the user explicitly chose (`--socket` or
