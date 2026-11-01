@@ -9,6 +9,15 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-01 — Lock the complete rollup decision and admission (002 §4.4; 004 §3.4) — Refs #498
+
+Require not-due rollup checks to read their authoritative batch, marker, source checkpoint and
+observation time after obtaining the writer lock. Preserve fresh source/time state while committing
+successful event prefix, retained suffix, batch clear and marker together. Empty windows persist a
+marker without delivery/audit spam; non-emitting write failures roll back and remain monitor-local.
+Controlled competing runtimes cover not-due/due/watch entrypoints; independent readers verify suffix
+visibility before Interpret, rollback and restart. No public API changes or retry drain are introduced.
+
 ## 2026-11-01 — Watch batches bind observations to source checkpoints (002 §2.4; 003 §2; 004 §3.4) — Refs #497, #294, #295
 
 Record the user's accepted explicit-batch decision and its rationale: an independent opaque

@@ -624,14 +624,15 @@ If the persisted source token changed before admission, the batch is refused wit
 the winner's checkpoint or held work, including an empty batch that omits `nextState`. Notify-only
 updates committed before admission participate in the fresh dispatch decision. This guards changed
 baselines; it does not provide cross-process leader election or distinguish an ABA return to the
-same serialized source state. The separate not-due rollup decision boundary remains #498 work.
+same serialized source state. Not-due rollup checks also read and decide under their admission
+write lock (§4.4), but acquire no source observations and preserve the fresh source checkpoint/time.
 
 Transaction composition is package-private and accepts only implementation-owned synchronous work.
 The exported RuntimeStore API does not expose an executable transaction callback. This does not
 claim that SQLite cancels asynchronous JavaScript effects. Watch batches use the same admission boundary under §2.4.
 
 Verified: `libs/core/src/runtime/service.ts` — `AgentMonitorRuntime.tick()`, `ingest()`, and
-`materializeSpan()`.
+`admitSpan()`, `flushRollupWindow()` and `finishMaterializationSpan()`.
 
 ### 2.1 Due scheduling
 
@@ -1037,9 +1038,24 @@ three clocks especially visible:
    emission and the accumulation state is cleared. The window marker, pending-batch removal,
    materialized events, and retry-outbox admission commit in one immediate transaction. A state or
    outbox failure leaves the prior pending batch and marker available for restart recovery.
+   The authoritative read of the batch, minute marker, source checkpoint and observation time
+   **MUST** occur after acquiring that immediate writer lock. A preliminary scheduling read cannot
+   supply the persisted decision. A competing poll/watch/rollup admission that committed first
+   participates in this fresh decision; an already-fired minute cannot flush newly held work again.
+   Not-due evaluation preserves the locked current source checkpoint and `lastObservationAt` because
+   it acquires no new observations. The successful event prefix and complete retry suffix share the
+   batch clear/marker commit; retained work is successful admission, not completed materialization.
+   Any state/outbox failure also rolls back projections, cursor seeds, snapshots, and the store's
+   projected-recipient cache. Audit and Interpret run only after outer commit.
 
 3. **Empty window.** If the window opens but no observations have accumulated since the last flush,
-   the runtime produces no delivery (no empty pings — preserving C14).
+   the runtime produces no delivery (no empty pings — preserving C14), but still commits the minute
+   marker. Closed-window checks retain their pending batch. Neither case creates routine no-change
+   history. Even a non-emitting state write belongs to the transaction: failure preserves exact
+   prior state, reports one monitor error/best-effort error history, and allows healthy siblings to run.
+   Verified by `rollup-admission.test.ts`: independently owned competing runtimes before BEGIN,
+   a reader opened before admission, retained-suffix barriers, rollback/reopen, and empty/closed-window
+   error isolation. This does not add source leader election or retry draining; §2 limits still apply.
 
 4. **Batch representation.** The flushed batch becomes one or more `monitor_events` rows (one per
    accumulated observation) rather than a single merged row, so the full event history is
