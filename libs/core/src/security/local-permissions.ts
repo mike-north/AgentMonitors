@@ -173,7 +173,7 @@ export function restrictExistingPathMode(
 
 /**
  * Paths for which {@link ensurePrivateDir} has already created-and-tightened the
- * directory this process. Spec spec: runtime/local-data-permissions requires tightening once per *startup*
+ * directory this process. The runtime/local-data-permissions spec requires tightening once per *startup*
  * (a startup is one process); the daemon then writes hook state per lead session
  * per tick, so re-running `lstat`/`open`/`fchmod` on the same session directory
  * every write is wasted work. The cache collapses that to one verification per

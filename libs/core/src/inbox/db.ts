@@ -86,7 +86,7 @@ const SQLITE_ARTIFACT_SUFFIXES = ['', '-wal', '-shm', '-journal'] as const;
 
 /**
  * Database paths whose artifact modes have already been tightened this process.
- * Spec spec: runtime/local-data-permissions requires tightening once per *startup* (one process); caching
+ * The runtime/local-data-permissions spec requires tightening once per *startup* (one process); caching
  * lets a re-`createDb` on the same path in a long-lived process skip the
  * per-suffix `lstat`/`open`/`fchmod` cycles. Tests simulating a second startup
  * in one process clear it via {@link resetSqliteArtifactModeCacheForTest}.

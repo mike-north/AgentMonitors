@@ -61,7 +61,7 @@ describe('candidateSignalKeys', () => {
 });
 
 describe('buildHookSighting', () => {
-  // Spec spec: delivery/hook-transport: the hook stdin payload carries session_id / hook_event_name / cwd.
+  // The delivery/hook-transport spec: the hook stdin payload carries session_id / hook_event_name / cwd.
   it('records the documented session-identity and workspace-binding fields when present', () => {
     const payload = {
       session_id: '62e1887b-17a0-4b11-890c-3f08843ef898',
@@ -82,7 +82,7 @@ describe('buildHookSighting', () => {
     });
   });
 
-  // Spec spec: delivery/hook-transport step 2: a TTY/empty/unparseable stdin stream is treated as `{}` — the
+  // The delivery/hook-transport spec, step 2: a TTY/empty/unparseable stdin stream is treated as `{}` — the
   // harness MUST record that absence honestly, not synthesize a value.
   it('records absent session-identity/workspace-binding fields honestly (empty payload)', () => {
     const sighting = buildHookSighting({
@@ -117,7 +117,7 @@ describe('buildHookSighting', () => {
 });
 
 describe('buildMcpSighting', () => {
-  // Spec spec: delivery/channel-transport: a spawned MCP server can read CLAUDE_PROJECT_DIR / CLAUDE_CODE_SESSION_ID
+  // The delivery/channel-transport spec: a spawned MCP server can read CLAUDE_PROJECT_DIR / CLAUDE_CODE_SESSION_ID
   // from its environment and answer roots/list.
   it('records env signals and roots/list result', () => {
     const sighting = buildMcpSighting({

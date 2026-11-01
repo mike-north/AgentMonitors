@@ -591,7 +591,7 @@ plugin, not run by hand. See
 
 ## Planned: agent-facing verbs (not yet shipped)
 
-Spec spec: agent/ephemeral-monitors defines five read-only/declaration-only verbs — `snapshot`, `diff`, `summary`,
+The agent/ephemeral-monitors spec defines five read-only/declaration-only verbs — `snapshot`, `diff`, `summary`,
 `watch`, `inspect` — that let an agent pull a stored snapshot, diff two points in time, get a
 cheap orientation summary, declare an ephemeral session-scoped monitor, or inspect
 received/pending/armed signal state, all without an extra source observation. **None of these
