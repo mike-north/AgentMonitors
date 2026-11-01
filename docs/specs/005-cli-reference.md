@@ -1955,6 +1955,13 @@ delivery-state counts for the workspace's lead session — or an explicit `never
 monitor has no observation history) / `lead-session=none` marker (the workspace has no lead session).
 The three delivery states are distinct (000 AP): claiming a delivery never acknowledges it.
 
+**Core retained-work contract (current; CLI adoption target #496):** core doctor/explain reports
+include workspace-scoped materialization retry metadata. Outboxes without an unambiguous parsed
+current definition appear in `orphanedMaterializationRetries`, including removed, parse-failed and
+duplicate definitions. These groups do not invent a current source or cadence. CLI text/JSON and
+socket date reconstruction must adopt both per-monitor and orphan summaries before claiming full
+operator rendering; see [002 retry outbox](./002-runtime-delivery.md#materialization_retry_outbox).
+
 ### Output
 
 **Text format:** a workspace/monitors/daemon header, one line per check (with an indented `↳`

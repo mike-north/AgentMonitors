@@ -1899,12 +1899,32 @@ Verified by `retry-outbox.test.ts` and `retry-lifecycle.test.ts`: due boundaries
 callback non-execution, actual snapshot/deletion fault rollback, failure-text sanitization and
 failed/terminal/rearmed/completed states across on-disk reopen.
 
-Runtime diagnostics expose each row's id, status, attempt count, safe error, and attempt timestamps
-through `monitor explain` and `doctor`. They never expose the stored envelope or its payload.
+Core diagnostics expose each retained row's id, status, attempt count, sanitized error and attempt
+timestamps through `explainMonitor` and `doctorReport`. Queries select metadata only: captured
+envelopes, source configuration, instructions and observation payloads are never reconstructed.
+Errors are control-stripped and length-bounded at the read projection as well as on writes, so
+legacy rows cannot bypass the diagnostic boundary. Reads do not rewrite the stored error. This is
+not arbitrary secret redaction.
 
-_Current in this change:_ storage, retry lifecycle, and safe core diagnostic reports. CLI rendering
-and older-daemon compatibility are added in the next stack layer. Runtime drain-before-observe
-adoption follows after that for #295.
+`explainMonitor` **MUST** include the exact workspace/monitor retry summary even when the definition
+is missing, parse-invalid, duplicated, source/scope-invalid or unschedulable. Its existing definition
+or scheduling failure remains the primary diagnosis. Omitted workspace defaults to `monitorsDir`,
+matching tick; it never means an unscoped or NULL-workspace query.
+
+`doctorReport` attaches retry summaries to unambiguous parsed monitor rollups, including those with
+invalid scope or schedule. Its `orphanedMaterializationRetries` groups summaries by monitor id when
+no unambiguous parsed current definition exists: removed/parse-failed definitions and duplicated
+ids. Each retained outbox appears in exactly one diagnostic location. Orphan groups contain only
+`monitorId` and `summary`; they **MUST NOT** fabricate current source, urgency or cadence from the
+captured envelope. Existing parse and duplicate diagnostics remain intact. Groups are ordered by
+monitor id; each summary orders records by `(createdAt, id)` and includes exact counts and bytes.
+Outbox discovery is not capped by the per-monitor 256-row limit: one full outbox cannot hide another.
+Every summary excludes other workspaces and NULL-scope records unless that exact scope is requested
+at the store boundary. Diagnostic reads never re-arm, discard, observe or materialize retained work.
+
+Report additions remain optional for older-daemon compatibility. _Current:_ core retry metadata
+reports. _Target:_ CLI rendering and socket date revival, including orphan groups, in #496. Core
+Date values are not evidence of correctly reconstructed dates after a JSON IPC roundtrip.
 
 ### `session_event_state`
 

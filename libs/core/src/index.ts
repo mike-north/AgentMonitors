@@ -197,6 +197,7 @@ export type {
   MonitorDeliveryState,
   MaterializationRetryQuery,
   MaterializationRetryDiagnostic,
+  OrphanedMaterializationRetrySummary,
   MaterializationRetryRecord,
   MaterializationRetryStatus,
   MaterializationRetrySummary,

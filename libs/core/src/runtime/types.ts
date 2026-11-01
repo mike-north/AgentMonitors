@@ -513,8 +513,10 @@ export interface DoctorMonitorRollup {
   /** Delivery-state tallies across this workspace's lead-session projections. */
   delivery: DoctorDeliveryCounts;
   /**
-   * Durable failed observations awaiting retry or operator repair. Optional
-   * for compatibility with reports returned by older daemons.
+   * Durable failed observations awaiting retry or operator repair. Duplicated
+   * ids omit this summary: their one outbox belongs to the report's orphaned
+   * groups instead of being attributed to each conflicting definition.
+   * Optional for compatibility with reports returned by older daemons.
    */
   materializationRetries?: MaterializationRetrySummary;
 }
@@ -563,6 +565,14 @@ export interface MonitorDoctorReport {
   monitorsDirExists: boolean;
   /** Every discovered monitor's rollup (both valid and invalid definitions). */
   monitors: DoctorMonitorRollup[];
+  /**
+   * Retained outboxes without one unambiguous parsed current definition:
+   * missing/parse-failed definitions and duplicated ids. These are recovery
+   * obligations, not synthetic monitor definitions. A represented outbox appears
+   * here or on its monitor rollup, never both. Ordered by monitor id.
+   * Optional for compatibility with older daemon reports.
+   */
+  orphanedMaterializationRetries?: OrphanedMaterializationRetrySummary[];
   /** Count of discovered monitors that failed validation. */
   invalidCount: number;
   /** Monitor-id collisions across the tree (001 §4). */
@@ -725,6 +735,19 @@ export interface MaterializationRetryQuery {
   dueAt?: Date;
   /** Maximum oldest-first rows; defaults to the per-monitor capacity. */
   limit?: number;
+}
+
+/**
+ * Safe retained-work summary for a route with no unambiguous parsed current
+ * monitor definition. The containing doctor report supplies its workspace;
+ * captured source/configuration metadata is deliberately not reconstructed.
+ * @public
+ */
+export interface OrphanedMaterializationRetrySummary {
+  /** Durable route identity needed to inspect and repair the retained work. */
+  monitorId: string;
+  /** Exact route's lifecycle totals and bounded metadata, never its envelopes. */
+  summary: MaterializationRetrySummary;
 }
 
 /** Operator-safe retry metadata that never contains an envelope or payload. @public */
