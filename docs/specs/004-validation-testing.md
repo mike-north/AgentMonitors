@@ -212,6 +212,16 @@ session id and exact unread event, and delivery leaves that event unread until e
 The test is registered in the serial configuration; child exits are awaited before fixture removal.
 This proves recovery of already-persisted recipient work, not automatic process supervision,
 uncommitted observation recovery, power-loss durability, or the pending materialization-retry stack.
+| First/later failures produce truthful committed results | Covered (`libs/core/src/runtime/atomic-ingest-retry.test.ts` — exact ids, errors, history, outbox order, and Interpret calls for event, projection, cursor, and snapshot faults). |
+| State/outbox failure rolls back the ingest batch | Covered (`libs/core/src/runtime/atomic-ingest-retry.test.ts` — post-write state and outbox faults leave no events/retries, preserve the source baseline, and replay after restart). |
+
+| Whole poll span precedes first Interpret | Covered (`libs/core/src/runtime/poll-admission.test.ts` — independent connection sees three same-object transitions including empty text, two recipients, and the ordered retry suffix while the first adapter invocation is suspended). |
+| Admission rollback preserves source, notify and committed cache | Covered (`libs/core/src/runtime/poll-admission.test.ts` — state/outbox faults preserve held notify work and prior recipient cache, leave no partial projections/cursors/snapshots, and replay on reopen; held-only admission also rolls back). |
+
+| Watch batches and source state admit together | Covered (`libs/core/src/runtime/watch-batch-admission.test.ts` — two-recipient full-span/suffix visibility while first Interpret is suspended; whole and empty-state failures stop before newer input, preserve old state and replay on reopen). |
+| Watch source migration and lifecycle fencing | Covered (`libs/core/src/runtime/watch-batch-admission.test.ts` — checkpoint callback absent, legacy yields refused, omitted/undefined/null semantics, other-workspace isolation, abort before admission/during Interpret, old-handle replacement safety, normal completion and synchronous setup failure). |
+
+| Concurrent admission decisions preserve newer durable work | Covered (`poll-admission.test.ts` — independent notify writer commits immediately before BEGIN and its held envelope is materialized; mutation of observation context cannot alter the captured source token; `watch-batch-admission.test.ts` refuses a stale later batch without changing the winning source/notify state). |
 
 ### 3.5 CLI behavior
 

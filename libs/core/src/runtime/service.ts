@@ -1,3 +1,8 @@
+/**
+ * Coordinate host-neutral observation, pacing, durable admission and session delivery.
+ * Deterministic persistence completes before optional interpretation; source plugins
+ * own acquisition while adapters own host-specific interaction.
+ */
 import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { ulid } from 'ulid';
@@ -10,6 +15,7 @@ import { parseDuration } from '../notify/notifier.js';
 import type {
   Observation,
   ObservationContext,
+  ObservationResult,
   ObservationSource,
 } from '../observation/types.js';
 import type { SourceRegistry } from '../observation/registry.js';
@@ -36,6 +42,7 @@ import {
   netCollapseGroupKey,
 } from './store.js';
 import { DeliveryReservationRegistry } from './delivery-reservations.js';
+import { runRuntimeTransaction } from './runtime-transaction.js';
 import type {
   AgentSessionRecord,
   DeclareEphemeralMonitorInput,
@@ -551,6 +558,86 @@ interface TickAccumulator {
   skippedMonitors: { monitorId: string; nextDueAt: Date }[];
 }
 
+/** Committed event plus its exact recipient set for post-commit interpretation. */
+interface MaterializedObservation {
+  monitor: MonitorDefinition;
+  event: MonitorEventRecord;
+  diffText: string | null;
+  projectedSessionIds: string[];
+}
+
+/** Retained suffix entry; only the first actual write failure warrants an error audit. */
+interface MaterializationFailure {
+  envelope: StoredObservationEnvelope;
+  message: string;
+  auditError: boolean;
+}
+
+/** Admission outcome distinguishes committed event ids from durable retry obligations. */
+interface MaterializationSpanResult {
+  emittedEventIds: string[];
+  failures: MaterializationFailure[];
+}
+
+/** Inputs shared by durable admission and its best-effort post-commit reporting. */
+interface MaterializationSpanOptions {
+  /** Raw source count before shaping/pacing, used only for audit classification. */
+  observed: number;
+  workspacePath: string;
+  retryQueuedAt: Date;
+  nextMonitorState?: {
+    sourceState?: unknown;
+    notifyState: NotifyRuntimeState;
+    lastObservationAt?: Date | null;
+  };
+  sourceOutcome?: 'rebaselined' | 'no-files-matched';
+  /** Restricts ephemeral monitor projections to their declaring session. */
+  ephemeralSessionId?: string;
+}
+
+/** Deterministic span result; interpretation may use it only after outer commit. */
+interface DurableMaterializationSpan {
+  materialized: MaterializedObservation[];
+  failures: MaterializationFailure[];
+}
+
+/** Match the persisted source baseline representation without retaining source-mutable objects. */
+function sourceStateToken(state: unknown): string {
+  return JSON.stringify(state ?? {});
+}
+
+/** Require an explicit finite source batch at the untyped plugin boundary. */
+function isObservationBatch(value: unknown): value is ObservationResult {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    'observations' in value &&
+    Array.isArray(value.observations) &&
+    value.observations.every(
+      (observation: unknown) =>
+        observation !== null &&
+        typeof observation === 'object' &&
+        'title' in observation &&
+        typeof observation.title === 'string',
+    )
+  );
+}
+
+/** Preserve a useful failure description without assuming the thrown value is an Error. */
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** Report the failed suffix size while preserving the first materialization error. */
+function summarizeMaterializationFailures(
+  failures: MaterializationFailure[],
+): string {
+  const first = failures[0]?.message ?? 'Unknown materialization failure.';
+  return failures.length === 1
+    ? first
+    : `${String(failures.length)} observations were queued for materialization retry. First error: ${first}`;
+}
+
 /**
  * The pure decision a delivery makes (issue #300): the rendered {@link
  * DeliveryClaim} plus the candidate rows a commit must mark claimed. Produced by
@@ -574,7 +661,7 @@ export class AgentMonitorRuntime {
   /**
    * Monitor ids currently driven by a continuous `watch()` (see `watchMonitors`),
    * mapped to a per-watcher identity token. The token distinguishes the *current*
-   * watcher for an id from an earlier, torn-down one: a straggling checkpoint
+   * watcher for an id from an earlier, torn-down one: a straggling batch
    * from a superseded watcher is rejected when its token no longer matches the
    * live entry, and each watcher only releases its own slot on exit. The tick
    * loop still uses membership (`has`) to skip `observe()` for actively-watched
@@ -2749,17 +2836,30 @@ export class AgentMonitorRuntime {
         // dispatches no NEW observations — only the already-accumulated batch.
         if (rollupDispatch.emitted.length > 0) {
           try {
-            acc.emittedEventIds.push(
-              ...(await this.materializeSpan(monitor, rollupDispatch.emitted, {
+            const materialized = await this.materializeSpan(
+              monitor,
+              rollupDispatch.emitted,
+              {
                 observed: 0,
                 workspacePath,
+                retryQueuedAt: now,
                 ...(ephemeralSessionId !== undefined
                   ? { ephemeralSessionId }
                   : {}),
-              })),
+              },
             );
+            acc.emittedEventIds.push(...materialized.emittedEventIds);
+            if (materialized.failures.length > 0) {
+              acc.erroredObservations.push({
+                monitorId: monitor.id,
+                message: summarizeMaterializationFailures(
+                  materialized.failures,
+                ),
+              });
+            }
           } catch {
-            // best-effort: materialization failure must not abort the tick
+            // Best-effort legacy rollup boundary. The next stack layer couples
+            // this state transition to materialization transactionally.
           }
         }
       }
@@ -2777,11 +2877,13 @@ export class AgentMonitorRuntime {
     // what preserves the previously-persisted sourceState so the next tick's
     // diff spans from the last good baseline rather than an empty state.
     let observationResult;
+    let expectedSourceState: string;
     try {
       const monitorState = this.store.getMonitorState(
         monitor.id,
         workspacePath,
       );
+      expectedSourceState = sourceStateToken(monitorState.sourceState);
       observationResult = await source.observe(
         watchConfig(monitor.frontmatter.watch),
         {
@@ -2818,15 +2920,18 @@ export class AgentMonitorRuntime {
       return;
     }
 
-    // Block 2 — ingest(): ingest() now isolates per-observation materialization
-    // failures internally (see ingest()), so it should not normally throw.
-    // This outer catch is a defence-in-depth safety net: if ingest() itself
-    // throws (e.g. setMonitorState fails), record errored best-effort and
-    // continue so the tick is not aborted.
+    // Block 2 — ingest(): a materialization failure is returned after its
+    // envelope is durably queued. A transaction, state, or outbox-admission
+    // failure still throws because no source advance can safely commit; this
+    // catch reports it while leaving the prior source baseline available.
     try {
-      acc.emittedEventIds.push(
-        ...(await this.ingest(monitor, observationResult.observations, now, {
+      const ingested = await this.ingest(
+        monitor,
+        observationResult.observations,
+        now,
+        {
           workspacePath,
+          expectedSourceState,
           ...(observationResult.nextState !== undefined
             ? { nextSourceState: { value: observationResult.nextState } }
             : {}),
@@ -2834,13 +2939,17 @@ export class AgentMonitorRuntime {
             ? { sourceOutcome: observationResult.outcome }
             : {}),
           ...(ephemeralSessionId !== undefined ? { ephemeralSessionId } : {}),
-        })),
+        },
       );
+      acc.emittedEventIds.push(...ingested.emittedEventIds);
+      if (ingested.failures.length > 0) {
+        acc.erroredObservations.push({
+          monitorId: monitor.id,
+          message: summarizeMaterializationFailures(ingested.failures),
+        });
+      }
     } catch (ingestError) {
-      const message =
-        ingestError instanceof Error
-          ? ingestError.message
-          : String(ingestError);
+      const message = errorMessage(ingestError);
       acc.erroredObservations.push({ monitorId: monitor.id, message });
       try {
         this.store.recordObservationHistory({
@@ -2865,12 +2974,10 @@ export class AgentMonitorRuntime {
    * (`watch()`), so both paths apply identical notify/throttle/debounce semantics
    * and event materialization.
    *
-   * `nextSourceState` is provided only by `observe()` (which returns the next
-   * source state); the watcher omits it, since a long-lived `watch()` owns its
-   * own in-memory state. The watcher advances the persisted `sourceState` out of
-   * band via the `context.checkpoint` callback (002 §2.4, `writeCheckpoint`),
-   * serialized with this `ingest()` on the per-watcher chain — not through this
-   * path.
+   * `nextSourceState` is the restart baseline associated with this finite poll
+   * or watch batch. An omitted checkpoint preserves the prior source state.
+   * Source/notify state and every emitted event or retry obligation share the
+   * same synchronous commit; no independent watch checkpoint path exists.
    *
    * **Ordering guarantee (G14, 002 §1.1.8):** all durable monitor-state mutation
    * (notify state via `setMonitorState`, per-recipient event rows via
@@ -2887,6 +2994,8 @@ export class AgentMonitorRuntime {
     now: Date,
     options: {
       workspacePath: string;
+      /** Immutable baseline captured before source code acquires the batch. */
+      expectedSourceState: string;
       nextSourceState?: { value: unknown };
       sourceOutcome?: 'rebaselined' | 'no-files-matched';
       /**
@@ -2896,7 +3005,7 @@ export class AgentMonitorRuntime {
        */
       ephemeralSessionId?: string;
     },
-  ): Promise<string[]> {
+  ): Promise<MaterializationSpanResult> {
     // Pre-filter: a `payload.form: structured` CEL gate that evaluates `false`
     // suppresses delivery entirely (002 §1.1.6). This check MUST run BEFORE
     // dispatchNotify so that suppressed observations never advance notify state
@@ -2911,130 +3020,101 @@ export class AgentMonitorRuntime {
       return !shaped.suppressed;
     });
 
-    const monitorState = this.store.getMonitorState(
-      monitor.id,
-      options.workspacePath,
-    );
-    const dispatch = this.dispatchNotify(
+    const admitted = runRuntimeTransaction(this.store, () => {
+      // Read and decide under the same write lock as admission. Another writer's
+      // held notify work must participate in dispatch rather than be overwritten
+      // by a stale pre-transaction snapshot.
+      const monitorState = this.store.getMonitorState(
+        monitor.id,
+        options.workspacePath,
+      );
+      if (
+        sourceStateToken(monitorState.sourceState) !==
+        options.expectedSourceState
+      ) {
+        throw new Error(
+          'Monitor source baseline changed before admission; discard this stale batch and observe again from persisted state.',
+        );
+      }
+      const dispatch = this.dispatchNotify(
+        monitor,
+        passedObservations,
+        now,
+        monitorState.notifyState,
+      );
+      const spanOptions: MaterializationSpanOptions = {
+        observed: observations.length,
+        workspacePath: options.workspacePath,
+        nextMonitorState: {
+          sourceState: options.nextSourceState
+            ? options.nextSourceState.value
+            : monitorState.sourceState,
+          notifyState: dispatch.nextState,
+          lastObservationAt: now,
+        },
+        retryQueuedAt: now,
+        ...(options.sourceOutcome
+          ? { sourceOutcome: options.sourceOutcome }
+          : {}),
+        ...(options.ephemeralSessionId !== undefined
+          ? { ephemeralSessionId: options.ephemeralSessionId }
+          : {}),
+      };
+      return {
+        durable: this.admitSpan(monitor, dispatch.emitted, spanOptions),
+        spanOptions,
+      };
+    });
+    return await this.finishMaterializationSpan(
       monitor,
-      passedObservations,
-      now,
-      monitorState.notifyState,
+      admitted.durable,
+      admitted.spanOptions,
     );
-
-    this.store.setMonitorState(monitor.id, options.workspacePath, {
-      sourceState: options.nextSourceState
-        ? options.nextSourceState.value
-        : monitorState.sourceState,
-      notifyState: dispatch.nextState,
-      lastObservationAt: now,
-    });
-
-    // Audit-history recording and per-observation materialization are shared
-    // with the not-due rollup flush in tick() via materializeSpan() (issue
-    // #180): both the source-interval-elapsed (`ingest`) path and the
-    // window-fires-on-a-not-due-tick path write the `triggered` history row
-    // (002 §10.7) and record every emitted observation on the shared chain.
-    // The `net` collapse (002 §1.1.7) is NO LONGER applied here — it is a
-    // per-recipient claim-time decision (G10 PR-B); see materializeSpan().
-    return await this.materializeSpan(monitor, dispatch.emitted, {
-      observed: observations.length,
-      workspacePath: options.workspacePath,
-      ...(options.sourceOutcome
-        ? { sourceOutcome: options.sourceOutcome }
-        : {}),
-      ...(options.ephemeralSessionId !== undefined
-        ? { ephemeralSessionId: options.ephemeralSessionId }
-        : {}),
-    });
   }
 
   /**
-   * Materialize a dispatched catch-up span into durable events, shared by BOTH
-   * flush paths so they can never drift (issue #180):
-   *
-   *  - `ingest()` — the source-interval-elapsed ("due") path, and
-   *  - the not-due rollup branch in `tick()` — where the source poll interval
-   *    has NOT elapsed but the rollup delivery window opens. Per 002 §4.4 this
-   *    is the *normal* operating mode for a rollup monitor whose `watch.interval`
-   *    is relaxed to match the delivery window.
-   *
-   * The helper performs, in order:
-   *
-   *  1. **Audit trail (G6, 002 §10.7 / §1.1.6).** Records the monitor's outcome
-   *     row, classified by what was *emitted*, not by new observations — a batch
-   *     can emit a previously-held observation with zero new observations (e.g. a
-   *     debounce flush, or a rollup window firing on a not-due tick), which is
-   *     still a `triggered` outcome. Only `suppressed` (observations seen but
-   *     held/throttled) and `no-change` (nothing seen) depend on the observation
-   *     count.
-   *  2. **Per-observation materialization with isolation (issue #46).** A single
-   *     failing observation must not drop the already-durably-written ids of its
-   *     batch-mates; on failure a best-effort `errored` history row is written
-   *     for the individual observation and the loop continues. The batch-level
-   *     row from step 1 is unaffected — it reflects what was *dispatched*, not
-   *     what materialized.
-   *
-   * `observed` is the raw count of observations the source reported this tick
-   * (i.e. `observations.length` from the `observe()` result, **before** notify
-   * dispatch and the Shape pre-filter). It is used only for the history-row
-   * classification: when `emitted > 0` the row is always `triggered` regardless
-   * of `observed`; `observed` only distinguishes `suppressed` (source returned
-   * something but dispatch held it) from `no-change` (source returned nothing).
-   * The not-due rollup flush passes `observed: 0` because no source `observe()`
-   * call was made on that tick — only the already-accumulated batch is emitted —
-   * so a non-empty flush there correctly classifies as `triggered` (emitted \> 0).
+   * Admit an already-dispatched span, used when a notify window flushes without
+   * a new source acquisition. The caller owns dispatch decision freshness;
+   * this wrapper shares event/retry persistence and post-commit reporting with
+   * ingest, but does not recompute its supplied decision.
    */
   private async materializeSpan(
     monitor: MonitorDefinition,
     emitted: StoredObservationEnvelope[],
-    options: {
-      observed: number;
-      workspacePath: string;
-      sourceOutcome?: 'rebaselined' | 'no-files-matched';
-      /** Ephemeral-monitor declaring session (007 §4.6) — see {@link ingest}. */
-      ephemeralSessionId?: string;
-    },
-  ): Promise<string[]> {
-    const observed = options.observed;
-    const emittedCount = emitted.length;
-    this.store.recordObservationHistory({
-      monitorId: monitor.id,
-      workspacePath: options.workspacePath,
-      sourceName: monitor.frontmatter.watch.type,
-      result:
-        emittedCount > 0
-          ? 'triggered'
-          : // `rebaselined` is, by contract (002 §observation_history), a tick
-            // that returned ZERO observations and advanced its baseline. Guard
-            // on observed === 0 so a source that mistakenly sets the diagnostic
-            // while also returning (suppressed) observations can't mask a
-            // genuine `suppressed` tick — the invariant is enforced here at the
-            // runtime boundary, not left to source authors.
-            observed === 0 && options.sourceOutcome !== undefined
-            ? options.sourceOutcome
-            : observed > 0
-              ? 'suppressed'
-              : 'no-change',
-      observationData: { observed, emitted: emittedCount },
-    });
+    options: MaterializationSpanOptions,
+  ): Promise<MaterializationSpanResult> {
+    const durable = runRuntimeTransaction(this.store, () =>
+      this.admitSpan(monitor, emitted, options),
+    );
+    return await this.finishMaterializationSpan(monitor, durable, options);
+  }
 
-    // G10 PR-B (002 §1.1.7, Decision Q3): the shared `monitor_events` chain
-    // records EVERY emitted observation in order, regardless of
-    // `baseline-strategy`. The `net` collapse is no longer applied here — it is
-    // a PER-RECIPIENT decision deferred to claim time (`collapseNetForClaim`),
-    // because an away recipient's net delta must be diffed against ITS OWN
-    // cursor, not the shared snapshot baseline. Keeping every intermediate on
-    // the shared chain is the incremental substrate every recipient diffs over
-    // (precise over cheap). A single tick that emits multiple observations to
-    // one object therefore now materializes one shared event each; the
-    // claim-time per-recipient collapse delivers only the newest of them to a
-    // `net` recipient (the same-tick span `collapseToNetSpan` used to fold,
-    // semantics preserved on the per-recipient side).
-    const emittedEventIds: string[] = [];
+  /**
+   * Synchronously persist the event prefix, ordered retry suffix and state.
+   * Caller holds the outer immediate transaction; individual events use nested
+   * savepoints. No adapter or producer callback is allowed in this boundary.
+   */
+  private admitSpan(
+    monitor: MonitorDefinition,
+    emitted: StoredObservationEnvelope[],
+    options: MaterializationSpanOptions,
+  ): DurableMaterializationSpan {
+    const materialized: MaterializedObservation[] = [];
+    const failures: MaterializationFailure[] = [];
+    let deferRemaining = false;
+
     for (const envelope of emitted) {
+      if (deferRemaining) {
+        failures.push({
+          envelope,
+          message:
+            'Deferred behind an earlier observation that failed materialization.',
+          auditError: false,
+        });
+        continue;
+      }
       try {
-        const event = await this.processObservation({
+        const result = this.materializeObservation({
           monitor: envelope.monitor,
           sourceName: envelope.monitor.frontmatter.watch.type,
           observation: envelope.observation,
@@ -3045,29 +3125,127 @@ export class AgentMonitorRuntime {
             ? { restrictToSessionId: options.ephemeralSessionId }
             : {}),
         });
-        if (event) emittedEventIds.push(event.id);
-      } catch (materializeError) {
-        try {
-          this.store.recordObservationHistory({
-            monitorId: monitor.id,
-            workspacePath: options.workspacePath,
-            sourceName: monitor.frontmatter.watch.type,
-            result: 'errored',
-            observationData: {
-              error:
-                materializeError instanceof Error
-                  ? materializeError.message
-                  : String(materializeError),
-            },
+        if (result) {
+          materialized.push({
+            monitor: envelope.monitor,
+            ...result,
+            projectedSessionIds: this.store.projectedSessionIdsForLastEvent(),
           });
-        } catch {
-          // best-effort audit — ignore write failures
         }
+      } catch (materializeError) {
+        deferRemaining = true;
+        failures.push({
+          envelope,
+          message: errorMessage(materializeError),
+          auditError: true,
+        });
       }
     }
-    return emittedEventIds;
+
+    if (failures.length > 0) {
+      this.store.enqueueMaterializationRetries(
+        failures.map((failure) => ({
+          workspacePath: options.workspacePath,
+          monitorId: monitor.id,
+          sourceName: monitor.frontmatter.watch.type,
+          envelope: failure.envelope,
+          error: failure.message,
+        })),
+        options.retryQueuedAt,
+      );
+    }
+
+    if (options.nextMonitorState) {
+      // This write deliberately follows outbox admission. If either the
+      // outbox or state write fails, the outer transaction also rolls back
+      // successful siblings, leaving the prior source baseline for replay.
+      this.store.setMonitorState(
+        monitor.id,
+        options.workspacePath,
+        options.nextMonitorState,
+      );
+    }
+    return { materialized, failures };
   }
 
+  /** Audit and interpret only the deterministic result of a successful outer commit. */
+  private async finishMaterializationSpan(
+    monitor: MonitorDefinition,
+    durable: DurableMaterializationSpan,
+    options: MaterializationSpanOptions,
+  ): Promise<MaterializationSpanResult> {
+    const observed = options.observed;
+    const emittedCount = durable.materialized.length;
+    // Do not write a false batch-level `triggered` row when every dispatched
+    // envelope failed. Individual failure rows below are the truthful outcome.
+    if (emittedCount > 0 || durable.failures.length === 0) {
+      try {
+        this.store.recordObservationHistory({
+          monitorId: monitor.id,
+          workspacePath: options.workspacePath,
+          sourceName: monitor.frontmatter.watch.type,
+          result:
+            emittedCount > 0
+              ? 'triggered'
+              : observed === 0 && options.sourceOutcome !== undefined
+                ? options.sourceOutcome
+                : observed > 0
+                  ? 'suppressed'
+                  : 'no-change',
+          observationData: { observed, emitted: emittedCount },
+        });
+      } catch {
+        // Audit is best-effort and cannot roll back committed runtime state.
+      }
+    }
+    for (const failure of durable.failures.filter(
+      ({ auditError }) => auditError,
+    )) {
+      try {
+        this.store.recordObservationHistory({
+          monitorId: monitor.id,
+          workspacePath: options.workspacePath,
+          sourceName: monitor.frontmatter.watch.type,
+          result: 'errored',
+          observationData: { error: failure.message },
+        });
+      } catch {
+        // Audit is best-effort and cannot roll back committed runtime state.
+      }
+    }
+
+    for (const materialized of durable.materialized) {
+      await this.interpretMaterializedObservation(materialized);
+    }
+    return {
+      emittedEventIds: durable.materialized.map(({ event }) => event.id),
+      failures: durable.failures,
+    };
+  }
+
+  /** Interpret only committed work; optional adapter failures cannot undo admission. */
+  private async interpretMaterializedObservation(
+    materialized: MaterializedObservation,
+  ): Promise<void> {
+    if (
+      materialized.monitor.frontmatter.payload?.form !== 'prose' ||
+      !this.interpretAdapter
+    ) {
+      return;
+    }
+    try {
+      await this.runInterpret(
+        materialized.monitor,
+        materialized.event,
+        materialized.diffText,
+        materialized.projectedSessionIds,
+      );
+    } catch {
+      // Interpret is best-effort after the deterministic durable boundary.
+    }
+  }
+
+  /** Refresh projections only after the workspace's deterministic admission has settled. */
   private refreshWorkspaceSessions(workspacePath: string): void {
     for (const session of this.store.sessionsForWorkspace(workspacePath)) {
       this.refreshHookState(session.id);
@@ -3094,15 +3272,15 @@ export class AgentMonitorRuntime {
 
   /**
    * Start continuous watchers for every scanned monitor whose source implements
-   * `watch()` (G5). Each yielded observation is funnelled through the same
+   * `watch()` (G5). Each yielded finite batch is funnelled through the same
    * pipeline as a ticked `observe()` (notify dispatch → materialization →
    * projection). Returns a handle whose `stop()` aborts and awaits every watcher.
    * While a watcher is active, the tick loop skips that monitor's `observe()`, so
    * it is never driven twice. Sources without `watch()` are untouched and keep
    * running on the tick loop.
    *
-   * Restart-safety: watchers are re-established on restart; a `watch()` source's
-   * own change-detection state is in-memory (the runtime does not persist it).
+   * Restart-safety: every accepted batch commits its associated source state.
+   * Re-established watchers receive that baseline as previousState.
    */
   async watchMonitors(
     monitorsDir: string,
@@ -3131,7 +3309,7 @@ export class AgentMonitorRuntime {
       controllers.set(monitor.id, controller);
       // Identity token for THIS watcher: `consumeWatch` releases the slot only
       // while its own token is still current, and a superseded watcher's
-      // straggling checkpoint is rejected on token mismatch (002 §2.4).
+      // straggling batch is rejected on token mismatch (002 §2.4).
       const watcherToken = Symbol(monitor.id);
       this.activeWatchers.set(monitor.id, watcherToken);
 
@@ -3166,204 +3344,103 @@ export class AgentMonitorRuntime {
   }
 
   /**
-   * Drive a single monitor's `watch()` iterable to completion (or abort),
-   * ingesting each yielded observation. Never rejects: an error that is not the
-   * result of our own abort is reported via `onError` and the monitor is released
-   * from the active-watcher set so the tick loop resumes driving it via
-   * `observe()`.
+   * Admit each finite watch batch before interpretation and the next iterator
+   * pull. A whole-admission failure ends this iterator so its source cannot
+   * advance beyond work that is absent from durable storage. Retained retries
+   * count as successful admission; their later drain has its own lifecycle.
    */
   private async consumeWatch(
     monitor: MonitorDefinition,
     watch: (
       config: Record<string, unknown>,
       context: ObservationContext & { signal: AbortSignal },
-    ) => AsyncIterable<Observation>,
+    ) => AsyncIterable<ObservationResult>,
     workspacePath: string,
     signal: AbortSignal,
     watcherToken: symbol,
     onError?: (monitorId: string, error: Error) => void,
   ): Promise<void> {
-    // Per-watcher serialization chain (G14, 002 §2.4). Both watch-checkpoint
-    // writes and observation ingests append to this single chain, so:
-    //  - a checkpoint whose durable write is in flight when an observation
-    //    arrives ALWAYS completes before that observation is ingested (the G14
-    //    durable-write-before-ingest ordering), and
-    //  - an ingest's read-modify-write of `monitorState.sourceState` is never
-    //    interleaved with a checkpoint write of the same row (which would let a
-    //    stale-baseline ingest clobber a newer checkpoint, or vice versa).
-    // A task's rejection is isolated so it never poisons the chain for the next
-    // task (each caller handles its own failure).
-    let chain: Promise<unknown> = Promise.resolve();
-    const enqueue = <T>(task: () => Promise<T>): Promise<T> => {
-      const result = chain.then(task);
-      chain = result.then(
-        () => undefined,
-        () => undefined,
-      );
-      return result;
-    };
-
-    // A checkpoint delivered after this watcher is torn down — its AbortSignal
-    // aborted (stop()), or it is no longer the current active watcher for this
-    // monitor id (it exited and was superseded) — is REJECTED rather than
-    // enqueued (002 §2.4): a straggling `checkpoint(staleState)` must never
-    // clobber a newer baseline written by observe() or a re-established watcher.
-    // Rejecting at call time (not enqueuing) is also what keeps the shutdown
-    // flush below terminating — no new chain links appear once the watcher is
-    // torn down. The checkpoint is scoped to this watcher's own
-    // `(monitorId, workspacePath)` state row (002 §3, #345/#307).
-    const checkpoint = (nextState: unknown): Promise<void> => {
-      if (
-        signal.aborted ||
-        this.activeWatchers.get(monitor.id) !== watcherToken
-      ) {
-        process.stderr.write(
-          `Warning: watch checkpoint for monitor "${monitor.id}" ignored after ` +
-            `the watcher stopped; state not persisted.\n`,
-        );
-        return Promise.resolve();
-      }
-      return enqueue(() =>
-        this.writeCheckpoint(monitor.id, workspacePath, nextState),
-      );
-    };
-
+    // Ownership is local to this runtime. A stopped or superseded iterator can
+    // still settle a pending next(), but its late batch has no admission rights.
+    const ownsWatch = () =>
+      !signal.aborted && this.activeWatchers.get(monitor.id) === watcherToken;
     try {
-      // Hoisted INSIDE the try (not above it): `getMonitorState` can throw
-      // (e.g. SQLITE_BUSY) and `watch()` is a plain function that may validate
-      // its config and throw synchronously before ever returning an iterable —
-      // legal per the `ObservationSource.watch` type, which only constrains the
-      // RETURNED value to `AsyncIterable<Observation>`. Either throw must still
-      // hit the `finally` below so the active-watcher slot is released instead
-      // of leaking forever (the id would otherwise stay pinned, permanently
-      // skipped by the tick loop and unreachable by a future `watchMonitors()`).
       const monitorState = this.store.getMonitorState(
         monitor.id,
         workspacePath,
       );
+      let expectedSourceState = sourceStateToken(monitorState.sourceState);
       const iterable = watch(watchConfig(monitor.frontmatter.watch), {
         previousState: monitorState.sourceState,
         now: new Date(),
         workspacePath,
         signal,
-        checkpoint,
       });
-      for await (const observation of iterable) {
-        if (signal.aborted) break;
-        // Per-observation isolation (issue #46): an ingest() failure on one
-        // yielded observation must not kill the entire watcher. Record an
-        // 'errored' history row and continue consuming subsequent observations.
-        // The outer try/catch (below) still handles errors from the async
-        // iterator itself (the watch() generator rejecting).
-        // The audit write is best-effort — if recordObservationHistory itself
-        // throws we swallow it so a failed audit row never kills the watcher.
-        // Ingest runs through the same serialization chain as checkpoint so the
-        // G14 ordering (002 §2.4) holds against out-of-band checkpoint calls.
-        try {
-          await enqueue(() =>
-            this.ingest(monitor, [observation], new Date(), {
-              workspacePath,
-            }),
+      for await (const batch of iterable) {
+        if (!ownsWatch()) break;
+        // JavaScript plugins may still use the old bare-observation interface.
+        // Refuse it rather than inventing a checkpoint association or silently
+        // persisting the batch object itself as a fabricated observation.
+        if (!isObservationBatch(batch)) {
+          throw new Error(
+            'watch() must yield an observation batch with an observations array; migrate bare observations and checkpoint callbacks to ObservationResult.',
           );
-          this.refreshWorkspaceSessions(workspacePath);
-        } catch (ingestError) {
-          try {
-            this.store.recordObservationHistory({
-              monitorId: monitor.id,
-              workspacePath,
-              sourceName: monitor.frontmatter.watch.type,
-              result: 'errored',
-              observationData: {
-                error:
-                  ingestError instanceof Error
-                    ? ingestError.message
-                    : String(ingestError),
-              },
-            });
-          } catch {
-            // best-effort audit — ignore write failures
-          }
         }
+        const nextExpectedSourceState =
+          batch.nextState === undefined
+            ? expectedSourceState
+            : sourceStateToken(batch.nextState);
+        const ingested = await this.ingest(
+          monitor,
+          batch.observations,
+          new Date(),
+          {
+            workspacePath,
+            expectedSourceState,
+            ...(batch.nextState !== undefined
+              ? { nextSourceState: { value: batch.nextState } }
+              : {}),
+            ...(batch.outcome ? { sourceOutcome: batch.outcome } : {}),
+          },
+        );
+        expectedSourceState = nextExpectedSourceState;
+        if (ingested.failures.length > 0) {
+          onError?.(
+            monitor.id,
+            new Error(summarizeMaterializationFailures(ingested.failures)),
+          );
+        }
+        this.refreshWorkspaceSessions(workspacePath);
+        // Abort may arrive while Interpret is suspended. Do not ask the source
+        // for newer input after it has lost ownership of this watcher.
+        if (!ownsWatch()) break;
       }
     } catch (error) {
-      if (!signal.aborted) {
+      if (ownsWatch()) {
+        const message = errorMessage(error);
+        try {
+          this.store.recordObservationHistory({
+            monitorId: monitor.id,
+            workspacePath,
+            sourceName: monitor.frontmatter.watch.type,
+            result: 'errored',
+            observationData: { error: message },
+          });
+        } catch {
+          // Reporting failure cannot turn rolled-back admission into success.
+        }
         onError?.(
           monitor.id,
-          error instanceof Error ? error : new Error(String(error)),
+          error instanceof Error ? error : new Error(message),
         );
       }
     } finally {
-      // This watcher is done (normal completion, iterator error, or abort):
-      // release its active-watcher slot IF it is still the current watcher for
-      // this monitor id, so the tick loop resumes driving observe() (a watch()
-      // that completes normally must not permanently pin the id and starve
-      // observe()) and a future watchMonitors() can re-establish it. A watcher
-      // already superseded by a newer one leaves that newer entry untouched.
+      // for-await closes the iterator on a failed admission or early break.
+      // Release only this watcher's slot, never a successor's ownership token.
       if (this.activeWatchers.get(monitor.id) === watcherToken) {
         this.activeWatchers.delete(monitor.id);
       }
-      // Flush every still-pending checkpoint/ingest before the watcher task
-      // resolves, so `stop()` (which awaits every watcher task) truly waits for
-      // in-flight durable writes rather than racing shutdown against them.
-      //
-      // Under the CURRENT invariants — the slot delete above always precedes
-      // this flush, `checkpoint()`'s post-teardown guard rejects (rather than
-      // enqueuing) once the slot is deleted/superseded, and `writeCheckpoint`'s
-      // persistence is synchronous better-sqlite3 work — no NEW link can be
-      // appended to `chain` once we start reading it here, so a single
-      // `await chain` would already be sufficient. The re-read loop below is
-      // deliberately kept anyway as a defensive guard against a future change
-      // to any of those three invariants (e.g. an async checkpoint backend, or
-      // a reordering of the delete relative to this flush) reintroducing a
-      // window where a link is enqueued between the read and its settle; it is
-      // not compensating for a race that exists today. Do not reorder the slot
-      // delete relative to this flush — that ordering is what the guarantee
-      // depends on.
-      let settled = chain;
-      await settled;
-      while (settled !== chain) {
-        settled = chain;
-        await settled;
-      }
     }
-  }
-
-  /**
-   * Durably persist a watch-mode checkpoint (002 §2.4): write the watcher's
-   * updated source state into its own `(monitorId, workspacePath)` state row's
-   * `sourceState` (002 §3, #345/#307), leaving notify state and
-   * `lastObservationAt` untouched. A checkpoint is a **state write only** — it
-   * never materializes or delivers an observation, and it must land in the
-   * watcher's OWN workspace scope so a same-id monitor in another workspace is
-   * never clobbered.
-   *
-   * A checkpoint write failure MUST NOT abort the watcher: it is a transient
-   * durability gap, not a protocol violation (002 §2.4). We log a warning and
-   * resolve so even a source that does not guard `checkpoint()` keeps watching.
-   * The caller enqueues this on the per-watcher serialization chain, which is
-   * what gives it the G14 durable-write-before-ingest ordering.
-   */
-  private writeCheckpoint(
-    monitorId: string,
-    workspacePath: string,
-    nextState: unknown,
-  ): Promise<void> {
-    try {
-      const current = this.store.getMonitorState(monitorId, workspacePath);
-      this.store.setMonitorState(monitorId, workspacePath, {
-        sourceState: nextState,
-        notifyState: current.notifyState,
-        ...(current.lastObservationAt
-          ? { lastObservationAt: current.lastObservationAt }
-          : {}),
-      });
-    } catch (error) {
-      process.stderr.write(
-        `Warning: watch checkpoint for monitor "${monitorId}" failed to persist ` +
-          `(${error instanceof Error ? error.message : String(error)}); continuing to watch.\n`,
-      );
-    }
-    return Promise.resolve();
   }
 
   status() {
@@ -3800,10 +3877,10 @@ export class AgentMonitorRuntime {
     monitor: MonitorDefinition,
     event: { id: string; diffText: string | null; snapshotText: string | null },
     diffText: string | null,
+    sessionIds = this.store.projectedSessionIdsForLastEvent(),
   ): Promise<void> {
     const adapter = this.interpretAdapter;
     if (!adapter) return;
-    const sessionIds = this.store.projectedSessionIdsForLastEvent();
     if (sessionIds.length === 0) return;
 
     // The per-recipient delta (G10, 002 §1.1.2): each recipient is judged on the
