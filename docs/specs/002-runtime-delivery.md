@@ -891,6 +891,22 @@ artifacts on startup** (BP4, [000 §5](./000-principles.md)).
   before `fchmod`, so a planted symlink cannot redirect a `chmod` onto a file the user does not own.
   A socket directory the user _explicitly chose_ (`--socket` / `AGENTMONITORS_SOCKET`) or a shared
   system directory is **not** tightened — only Agent-Monitors-owned directories are.
+- **SQLite lock ownership.** Existing SQLite artifacts MUST be tightened before this
+  process opens its first connection to that database. Newly created artifacts remain
+  protected by the restricted umask. Permission migration MUST NOT open and close
+  independent descriptors on artifacts owned by a live SQLite connection: on POSIX,
+  closing those descriptors releases SQLite's locks. Equivalent relative, absolute,
+  and symlinked paths resolve to one actual database path for both SQLite and
+  permission migration, including the target directory and sidecars. The canonical
+  path shares the once-per-process permission cache; generic filesystem tightening
+  still refuses symlinks. A dangling database file symlink is rejected before
+  SQLite opens or creates its target because it has no stable canonical identity.
+  Hard-link database aliases are unsupported. Outside an explicit
+  transaction, a long-lived reader MUST observe each later committed process write;
+  a competing process MUST read only committed data and receive `SQLITE_BUSY` when
+  trying to write while an immediate transaction owns the writer lock. Regression:
+  `db-visibility.test.ts` exercises independent processes without warming or reopening
+  the original reader.
 - **Degrade gracefully where the artifact is not ours.** Tightening never _fails_ an operation that
   only needs write access. When the target exists but is owned by another user (a caller pointed,
   say, `--hook-state-path` into a shared group-writable directory), the `chmod` returns
