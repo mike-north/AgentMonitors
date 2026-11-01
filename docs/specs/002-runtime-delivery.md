@@ -421,6 +421,38 @@ different baselines each receive their own collapsed span. A within-tick burst t
 observations for one object collapses the same way (the newest of the burst is the surviving net
 delta for an away recipient).
 
+**Event order and equal-time endpoints.** Event delivery, `net` endpoint selection,
+claimed cursor advancement and event listings order by persisted observation `created_at`
+first, then private SQLite `monitor_events.sequence`. Timestamps remain second-precision;
+this does not recover discarded millisecond observation ordering. The sequence resolves
+only equal persisted timestamps by committed materialization order across writers. A
+later insertion with an earlier observation timestamp does not displace a newer-observed
+endpoint. Public event IDs and `MonitorEventRecord` shapes are unchanged.
+
+The pure collapse decision consumes candidates already in canonical equal-time order.
+Store pending/unread queries establish this order; preview filtering and transport caps
+preserve it. The mutating `collapseNetForClaim` boundary reloads authoritative records
+by candidate ID and orders them from SQLite before choosing endpoints, including mixed
+urgency concatenations and externally supplied arrays. Unknown or duplicate IDs fail
+before mutation; caller-modified artifacts do not override persisted content. Raw shared
+candidate records retain that representation, including `listEvents(session)` records
+that carry optional delivery state with a shared diff. Only a delta different from the
+shared event requests a recipient delta view: the return value uses the **requested
+session's current persisted projection**, not supplied delta text.
+This preserves incremental/single-net views and refreshes stale re-anchored deltas without
+falling back to shared history. Optional delivery state is refreshed independently when
+requested; its presence never changes the delta representation. If the event has no
+projection for that session, existing raw-event behavior remains; this ordering boundary
+does not add a new authorization model. Preview, actual
+claim and cursor advancement use the same ordering contract.
+
+Event sequence allocation occurs within existing event/projection/cursor/snapshot
+atomicity. Its transactional migration preserves all row fields, public IDs, logical
+references and explicit indexes/triggers. As for snapshots (§5.2), current hidden rowid
+is the legacy bootstrap policy, not reconstructed lost chronology. Rollback leaves no
+committed position, deletion does not reuse committed positions, and VACUUM/reopen
+preserve them. No observation-history or source-frontier contract changes are implied.
+
 **Interaction with Pace modes.** The baseline strategy is independent of the Pace mode. A `net`
 strategy on a `debounce` monitor still settles first (Pace), then collapses the catch-up span for
 delivery (Diff). A recipient that was live for every settled observation and never missed a window
@@ -1144,7 +1176,31 @@ If an emitted observation includes `snapshotText`, the runtime **MUST**:
 2. compute a textual diff if a previous snapshot exists
 3. store the new snapshot in the same transaction as the event, projections, and cursor seeds
 
-**Snapshot ordering (total materialization order).** `created_at` is stored at epoch-**second** precision, so several snapshots for one `(workspacePath, monitorId, objectKey)` written in the same second (an ordinary same-tick burst) tie on `created_at`. The runtime **MUST** give snapshots a total materialization order and resolve "the latest stored snapshot" to the **most recently materialized** one under identical timestamps — never an older tied row, which would corrupt the shared diff chain (repeating or omitting intermediate changes). This is satisfied by a strictly-increasing (monotonic ULID) snapshot `id` and ordering by `(created_at, id)` — the same tie-break the `monitor_events` table already uses. User-visible newest-first listings that order by second-precision `created_at` (`events list` / `monitor explain` event and observation-history audit rows) apply the same `id` tie-break so their order is stable within a second.
+**Snapshot ordering (total materialization order).** The runtime **MUST** resolve
+"the latest stored snapshot" to the most recently materialized retained row for its
+workspace/monitor/object, independently of observation timestamps, ambient clock changes,
+or process-local ULID factories. `monitor_snapshots.sequence` is a private SQLite
+`INTEGER PRIMARY KEY AUTOINCREMENT`, allocated in the snapshot insert and its enclosing
+materialization transaction. `latestSnapshot()` orders by `sequence DESC` only. Public
+snapshot `id` values remain unique ULIDs; they identify rows but do not order them.
+
+SQLite's single writer serializes allocations across connections/processes. A rollback
+leaves no committed predecessor and may reuse its uncommitted allocation. Deleting any
+committed rows, including the newest or all rows, does not reuse their sequence numbers;
+a new snapshot follows the remaining history. Explicit integer keys survive reopen and
+`VACUUM`. The sequence is private ordering metadata, not an external cursor or contiguous
+counter. Existing event/projection/snapshot atomicity is unchanged.
+
+A legacy snapshot table is rebuilt atomically under the schema migration's immediate
+transaction. All public IDs, contents, timestamps, scope and event references survive;
+explicit indexes and triggers are recreated without replaying insertion side effects.
+Retained rows receive sequence numbers in their **current hidden rowid order**. This is
+an explicit bootstrap policy: it cannot recover chronology already lost before migration
+(for example through historical `VACUUM`) or repair previously generated diffs. Reopening
+an already migrated database is idempotent; simultaneous openers serialize the migration.
+Older binaries can still insert their named columns, but their timestamp/ULID readers do
+not gain the corrected ordering behavior. Event ordering is defined separately in §1.1.7; observation-history ordering and source
+frontiers are unchanged by these sequences.
 
 The renderer is chosen by the object's `change-detection.strategy` (003 §4.2/§11.3), via `buildDiff(previous, current, strategy)`:
 
@@ -1161,7 +1217,7 @@ The renderer is chosen by the object's `change-detection.strategy` (003 §4.2/§
 > Fixing this (carrying `ignore-paths` through the persisted snapshot metadata and stripping the
 > same fields before rendering) is a follow-up, not implemented as part of issue #437.
 
-Verified: `libs/core/src/runtime/service.ts` — `materializeObservation()`; `libs/core/src/runtime/store.ts` — `insertEvent()`, `collapseNetForClaim()`, `saveSnapshot()`/`latestSnapshot()` (monotonic `snapshotUlid`, `(created_at, id)` tie-break); `libs/core/src/runtime/diff.ts` — `buildDiff()`, `buildTextDiff()` (cap at 20 lines), `buildJsonDiff()` (cap at 20 entries); `libs/core/src/runtime/transactional-materialization.test.ts` (rollback after cursor and snapshot failures).
+Verified: `libs/core/src/runtime/service.ts` — `materializeObservation()`; `libs/core/src/runtime/store.ts` — `insertEvent()`, `collapseNetForClaim()`, `saveSnapshot()`/`latestSnapshot()` (private SQLite snapshot sequence); `libs/core/src/runtime/diff.ts` — `buildDiff()`, `buildTextDiff()` (cap at 20 lines), `buildJsonDiff()` (cap at 20 entries); `libs/core/src/runtime/transactional-materialization.test.ts` (rollback after cursor and snapshot failures).
 
 This makes snapshot history an object-level concern rather than a monitor-level or session-level concern (SP5).
 
@@ -1775,40 +1831,46 @@ Verified: `libs/core/src/inbox/schema.ts` (entire file); `libs/core/src/inbox/db
 
 Corresponds to the `monitorEvents` Drizzle table. One row per materialized observation. Rows are immutable after insertion.
 
-| Column              | Type             | Notes                                           |
-| ------------------- | ---------------- | ----------------------------------------------- |
-| `id`                | TEXT PK          | ULID                                            |
-| `workspace_path`    | TEXT nullable    | Path to the workspace; `NULL` for global events |
-| `monitor_id`        | TEXT NOT NULL    | Stable monitor identifier                       |
-| `source_name`       | TEXT NOT NULL    | Source plugin name                              |
-| `urgency`           | TEXT NOT NULL    | `low \| normal \| high`                         |
-| `title`             | TEXT NOT NULL    |                                                 |
-| `body`              | TEXT NOT NULL    | Defaults to `''`                                |
-| `summary`           | TEXT NOT NULL    | Defaults to `''`                                |
-| `payload`           | TEXT NOT NULL    | JSON; defaults to `{}`                          |
-| `snapshot_metadata` | TEXT NOT NULL    | JSON; defaults to `{}`                          |
-| `snapshot_text`     | TEXT nullable    | Full snapshot content if provided               |
-| `diff_text`         | TEXT nullable    | Line-level diff vs. previous snapshot           |
-| `object_key`        | TEXT nullable    | Snapshot and diff keying                        |
-| `query_scope`       | TEXT NOT NULL    | JSON; defaults to `{}`                          |
-| `tags`              | TEXT NOT NULL    | JSON array; defaults to `[]`                    |
-| `created_at`        | INTEGER NOT NULL | Observation timestamp                           |
+| Column              | Type                     | Notes                                           |
+| ------------------- | ------------------------ | ----------------------------------------------- |
+| `sequence`          | INTEGER PK AUTOINCREMENT | Private equal-time materialization tie-break    |
+| `id`                | TEXT NOT NULL UNIQUE     | Public ULID identity                            |
+| `workspace_path`    | TEXT nullable            | Path to the workspace; `NULL` for global events |
+| `monitor_id`        | TEXT NOT NULL            | Stable monitor identifier                       |
+| `source_name`       | TEXT NOT NULL            | Source plugin name                              |
+| `urgency`           | TEXT NOT NULL            | `low \| normal \| high`                         |
+| `title`             | TEXT NOT NULL            |                                                 |
+| `body`              | TEXT NOT NULL            | Defaults to `''`                                |
+| `summary`           | TEXT NOT NULL            | Defaults to `''`                                |
+| `payload`           | TEXT NOT NULL            | JSON; defaults to `{}`                          |
+| `snapshot_metadata` | TEXT NOT NULL            | JSON; defaults to `{}`                          |
+| `snapshot_text`     | TEXT nullable            | Full snapshot content if provided               |
+| `diff_text`         | TEXT nullable            | Line-level diff vs. previous snapshot           |
+| `object_key`        | TEXT nullable            | Snapshot and diff keying                        |
+| `query_scope`       | TEXT NOT NULL            | JSON; defaults to `{}`                          |
+| `tags`              | TEXT NOT NULL            | JSON array; defaults to `[]`                    |
+| `created_at`        | INTEGER NOT NULL         | Observation timestamp                           |
 
 ### `monitor_snapshots`
 
 Stores the full text content of each snapshot for diff computation. Keyed by `(workspace_path, monitor_id, object_key)`.
 
-| Column           | Type             | Notes                                                   |
-| ---------------- | ---------------- | ------------------------------------------------------- |
-| `id`             | TEXT PK          | Monotonic ULID — strictly increasing in insertion order |
-| `workspace_path` | TEXT nullable    |                                                         |
-| `monitor_id`     | TEXT NOT NULL    |                                                         |
-| `object_key`     | TEXT NOT NULL    |                                                         |
-| `event_id`       | TEXT NOT NULL    | FK to `monitor_events.id`                               |
-| `content`        | TEXT NOT NULL    | Full snapshot text                                      |
-| `created_at`     | INTEGER NOT NULL | Epoch **seconds**; ties broken by `id` (§5.2)           |
+| Column           | Type                     | Notes                                       |
+| ---------------- | ------------------------ | ------------------------------------------- |
+| `sequence`       | INTEGER PK AUTOINCREMENT | Private durable materialization order       |
+| `id`             | TEXT NOT NULL UNIQUE     | Public ULID identity; not an ordering key   |
+| `workspace_path` | TEXT nullable            |                                             |
+| `monitor_id`     | TEXT NOT NULL            |                                             |
+| `object_key`     | TEXT NOT NULL            |                                             |
+| `event_id`       | TEXT NOT NULL            | Logical reference to `monitor_events.id`    |
+| `content`        | TEXT NOT NULL            | Full snapshot text                          |
+| `created_at`     | INTEGER NOT NULL         | Epoch seconds for diagnostics, not ordering |
 
-The draft omitted this table. It is required for snapshot diff computation (§5.2) and is populated by `RuntimeStore.saveSnapshot()`. `id` is a monotonic ULID so same-second snapshots retain a total materialization order and `latestSnapshot()` resolves to the newest via `ORDER BY created_at DESC, id DESC` (§5.2, issue #293). Verified: `libs/core/src/runtime/store.ts` — `saveSnapshot()` / `latestSnapshot()`.
+`RuntimeStore.saveSnapshot()` allocates the sequence through SQLite;
+`latestSnapshot()` selects the greatest retained sequence for the scoped object. See
+§5.2 for rollback, deletion, reopen and legacy migration semantics. The public result
+remains `{ content }`. Verified: `runtime/store.ts`, `inbox/schema.ts`, `inbox/db.ts`, and
+`runtime/snapshot-materialization-order.test.ts`.
 
 ### `materialization_retry_outbox`
 
