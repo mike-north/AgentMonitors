@@ -2075,18 +2075,17 @@ export class RuntimeStore {
     return rows.map((row) => {
       const supplied = suppliedById.get(row.event.id);
       const projectionDiff = row.state?.diffText;
-      const requestsRecipientView =
-        supplied !== undefined &&
-        (supplied.deliveryState !== undefined ||
-          supplied.diffText !== row.event.diffText);
-      // A lifecycle-bearing or non-shared delta represents a recipient view,
-      // not authoritative text. Refresh it from THIS session's projection even
-      // when another claim has re-anchored the saved delta since the caller's
-      // read. Raw shared inputs remain raw; stale, forged or foreign overlays
-      // never become the authority for either artifacts or recipient state.
+      const requestsRecipientDiff =
+        supplied !== undefined && supplied.diffText !== row.event.diffText;
+      // Delta representation and optional lifecycle state are independent:
+      // listEvents(session) carries deliveryState but still has a shared diff.
+      // Only a non-shared delta requests this recipient's CURRENT projection,
+      // including when a prior claim has re-anchored it since the caller's read.
+      // Supplied text is never authoritative; stale, forged or foreign overlays
+      // cannot replace persisted artifacts or the requested recipient's state.
       return {
         ...rowToEvent(row.event),
-        ...(projectionDiff != null && requestsRecipientView
+        ...(projectionDiff != null && requestsRecipientDiff
           ? { diffText: projectionDiff }
           : {}),
         ...(row.state && supplied?.deliveryState !== undefined

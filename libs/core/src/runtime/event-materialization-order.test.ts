@@ -593,4 +593,32 @@ describe('durable equal-time event order', () => {
     ]);
     expect(store.collapseNetForClaim(session, [last])).toEqual([last]);
   });
+  it.each(['incremental', 'net'] as const)(
+    'keeps the shared diff of a lifecycle-only list view for a single %s event',
+    (baselineStrategy) => {
+      const { store } = open(databasePath());
+      const session = lead(store, `lifecycle-only-${baselineStrategy}`);
+      store.seedSessionObjectCursor({
+        sessionId: session,
+        monitorId: 'monitor',
+        objectKey: 'object',
+        workspacePath: '/workspace',
+        baselineSnapshotId: null,
+        baselineContent: 'recipient-old',
+      });
+      const event = store.insertEvent({
+        ...eventInput('new', epoch),
+        baselineStrategy,
+        diffText: '- 1: shared-old\n+ 1: new',
+      });
+      expect(
+        store.perRecipientDiffsForSession(session, [event.id]).get(event.id),
+      ).toBe('- 1: recipient-old\n+ 1: new');
+      store.markClaimed(session, [event.id], 'turn-interruptible');
+      const listed = store.listEvents({ sessionId: session });
+      expect(listed[0]?.diffText).toBe(event.diffText);
+      expect(listed[0]?.deliveryState).toBe('claimed');
+      expect(store.collapseNetForClaim(session, listed)).toEqual(listed);
+    },
+  );
 });

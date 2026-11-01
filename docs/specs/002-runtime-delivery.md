@@ -435,13 +435,15 @@ preserve it. The mutating `collapseNetForClaim` boundary reloads authoritative r
 by candidate ID and orders them from SQLite before choosing endpoints, including mixed
 urgency concatenations and externally supplied arrays. Unknown or duplicate IDs fail
 before mutation; caller-modified artifacts do not override persisted content. Raw shared
-candidate records retain that representation. Candidates carrying a delivery-state view
-or a delta different from the shared event request a recipient view: the return value
-uses the **requested session's current persisted projection**, not supplied delta text.
+candidate records retain that representation, including `listEvents(session)` records
+that carry optional delivery state with a shared diff. Only a delta different from the
+shared event requests a recipient delta view: the return value uses the **requested
+session's current persisted projection**, not supplied delta text.
 This preserves incremental/single-net views and refreshes stale re-anchored deltas without
-falling back to shared history. Optional delivery state is likewise refreshed when
-requested. If the event has no projection for that session, existing raw-event behavior
-remains; this ordering boundary does not add a new authorization model. Preview, actual
+falling back to shared history. Optional delivery state is refreshed independently when
+requested; its presence never changes the delta representation. If the event has no
+projection for that session, existing raw-event behavior remains; this ordering boundary
+does not add a new authorization model. Preview, actual
 claim and cursor advancement use the same ordering contract.
 
 Event sequence allocation occurs within existing event/projection/cursor/snapshot

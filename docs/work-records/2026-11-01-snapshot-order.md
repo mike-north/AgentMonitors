@@ -134,3 +134,27 @@ rule. Logs are `/private/tmp/event-view-core.log`, `/private/tmp/event-view-buil
 The follow-up is frozen for independent review; no claim of combined acceptance until
 reviewer confirms the exact successor. Source work remains on the managed worktree
 branch with no remote mutations.
+
+## Orthogonal lifecycle/delta contract correction
+
+Successor e71d925 was held after root/reviewer compared baseline16a directly:
+`listEvents(session)` adds deliveryState while its MonitorEventRecord.diffText remains
+SHARED. Treating lifecycle presence as a recipient-delta marker over-expanded behavior.
+Two additional tests first failed on e71 (incremental and single-net lifecycle-only
+views changed shared→recipient delta). Root authorized the narrow correction.
+
+Final rule now keeps fields independent: only supplied diff different from immutable
+shared diff requests the current requested-session projection. Optional deliveryState
+is refreshed independently. Raw and lifecycle-only shared views remain shared; explicit
+projected/stale/forged/foreign non-shared deltas use current requested-session data.
+No ordering, migration, event identity, or other runtime logic changed in this correction.
+Final successor validation/review pending; earlier e71 is not accepted for publication.
+
+## Orthogonal correction validation complete
+
+Focused64tests/7files passed, including both new lifecycle-only regressions. Full core
+684tests/47files, workspace build7, full check, and strict workspaceAPI6 all passed.
+No API report changes. Logs: `/private/tmp/event-view-final-core.log`,
+`/private/tmp/event-view-final-build.log`, `/private/tmp/event-view-final-check.log`,
+`/private/tmp/event-view-final-api.log`. Final successor is being frozen for independent
+exact-head acceptance; no remote actions occurred.

@@ -223,8 +223,10 @@ Direct public-boundary cases also cover incremental/single-net recipient views w
 delta differs from shared history, raw shared inputs, lifecycle preservation, forged or
 other-recipient overlays, and a legitimate stale delta after re-anchoring. These must
 resolve to the requested recipient's current persisted projection without trusting
-caller-provided delta text. Existing net and hook-cap suites continue to cover
-per-recipient delivery semantics.
+caller-provided delta text. Lifecycle-only session list views must retain their shared
+diff for incremental and single-net events; lifecycle presence does not select a
+recipient delta. Existing net and hook-cap suites continue to cover per-recipient
+delivery semantics.
 
 ### 3.4.1 Real daemon crash recovery
 
