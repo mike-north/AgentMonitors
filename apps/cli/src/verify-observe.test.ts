@@ -1,30 +1,27 @@
 /**
- * Unit tests for `verify`'s observe-stage discriminator (issue #442 round 19).
- *
- * These are deterministic, fast, unit-level tests on the pure predicate and
- * deadline math — NOT the slow, daemon-backed integration path in
- * `commands/verify.integration.test.ts` — so the discriminator's edge cases
- * (a single stale row, a second distinct row, a genuine `triggered` row
- * arriving mid-window) can be exercised without spinning up a real daemon.
- *
- * @see docs/specs/005-cli-reference.md §16
+ * Verification uses retained observation identity, not second-rounded timestamps,
+ * to separate historical rows from new recording activity. These tests preserve
+ * conservative negative verdicts for in-flight work and incomplete history.
  */
-import { describe, it, expect } from 'vitest';
-import type {
-  ObservationHistoryRecord,
-  ObservationOutcome,
-} from '@agentmonitors/core';
+import { describe, it, expect, vi } from 'vitest';
 import {
+  createDb,
+  RuntimeStore,
+  type ObservationHistoryRecord,
+  type ObservationOutcome,
+} from '@agentmonitors/core';
+import type { Database as BetterSQLiteClient } from 'better-sqlite3';
+import {
+  createObserveWindow,
   resolveObserveDeadline,
   resolveObserveVerdict,
 } from './verify-observe.js';
 
-const OBSERVE_FROM = 1_000_000;
-
+/** Arbitrary millisecond timestamps intentionally share one persisted second. */
 function row(
   id: string,
   result: ObservationOutcome,
-  createdAtMs: number,
+  createdAtMs = 1000,
 ): ObservationHistoryRecord {
   return {
     id,
@@ -36,114 +33,301 @@ function row(
     createdAt: new Date(createdAtMs),
   };
 }
+const BASELINE = row('01BASE', 'triggered');
+
+/** Every complete first window includes the already-captured baseline frontier. */
+function complete(
+  ...rows: ObservationHistoryRecord[]
+): ObservationHistoryRecord[] {
+  return [...rows, BASELINE];
+}
 
 describe('resolveObserveVerdict', () => {
-  it('is not decisive on a single post-trigger no-change row, however many times it is re-seen', () => {
-    // The SAME stale row, re-read on every poll — simulating a tick that was
-    // already in flight when the trigger fired and finished just after
-    // `observeFrom`. This must never become decisive on its own; it is the
-    // exact bug this predicate exists to fix (issue #442 round 19).
-    const rows = [row('01ROW1', 'no-change', OBSERVE_FROM + 100)];
-    const seen = new Set<string>();
-    expect(resolveObserveVerdict(rows, OBSERVE_FROM, false, seen)).toBeNull();
-    // Re-polling with the exact same row (nothing new happened) — still null.
-    expect(resolveObserveVerdict(rows, OBSERVE_FROM, false, seen)).toBeNull();
-    expect(resolveObserveVerdict(rows, OBSERVE_FROM, false, seen)).toBeNull();
-  });
-
-  it('is decisive once a SECOND, DISTINCT post-trigger no-change row is seen', () => {
-    const seen = new Set<string>();
-    const firstPoll = [row('01ROW1', 'no-change', OBSERVE_FROM + 100)];
+  it('recognizes a new same-second triggered row and excludes historical same-second success', () => {
+    const state = createObserveWindow(BASELINE.id, BASELINE.id);
     expect(
-      resolveObserveVerdict(firstPoll, OBSERVE_FROM, false, seen),
-    ).toBeNull();
-
-    // A genuinely later, distinct tick also observed no-change.
-    const secondPoll = [
-      row('01ROW2', 'no-change', OBSERVE_FROM + 1_200),
-      row('01ROW1', 'no-change', OBSERVE_FROM + 100),
-    ];
-    expect(resolveObserveVerdict(secondPoll, OBSERVE_FROM, false, seen)).toBe(
-      'no-change',
-    );
-  });
-
-  it('a genuine `triggered` row still wins immediately, even amid stale no-change rows', () => {
-    const seen = new Set<string>();
-    const rows = [
-      row('01ROW2', 'triggered', OBSERVE_FROM + 1_200),
-      row('01ROW1', 'no-change', OBSERVE_FROM + 100),
-    ];
-    expect(resolveObserveVerdict(rows, OBSERVE_FROM, false, seen)).toBe(
-      'triggered',
-    );
-  });
-
-  it('ignores pre-trigger rows entirely', () => {
-    const seen = new Set<string>();
-    const rows = [
-      row('01ROW1', 'no-change', OBSERVE_FROM - 500),
-      row('01ROW0', 'triggered', OBSERVE_FROM - 10),
-    ];
-    expect(resolveObserveVerdict(rows, OBSERVE_FROM, false, seen)).toBeNull();
-  });
-
-  it('is decisive immediately for a post-trigger no-files-matched row', () => {
-    const seen = new Set<string>();
-    const rows = [row('01ROW1', 'no-files-matched', OBSERVE_FROM + 100)];
-    expect(resolveObserveVerdict(rows, OBSERVE_FROM, false, seen)).toBe(
-      'no-files-matched',
-    );
-  });
-
-  it('suppresses the no-change verdict while a suppressed row is present (debounce settling — 002 §9.2/§9.3)', () => {
-    const seen = new Set<string>();
-    const rows = [
-      row('01ROW2', 'no-change', OBSERVE_FROM + 1_200),
-      row('01ROW1', 'suppressed', OBSERVE_FROM + 100),
-    ];
-    // Even two no-change-flavored rows must not fire while a `suppressed` row
-    // is in the window — the change WAS observed and is settling; the eventual
-    // `triggered` row at flush wins via the earlier check.
-    expect(resolveObserveVerdict(rows, OBSERVE_FROM, false, seen)).toBeNull();
-  });
-
-  it('never fail-fasts on no-change or no-files-matched in manual mode', () => {
-    const seen = new Set<string>();
-    const noChangeRows = [
-      row('01ROW1', 'no-change', OBSERVE_FROM + 100),
-      row('01ROW2', 'no-change', OBSERVE_FROM + 1_200),
-    ];
-    expect(
-      resolveObserveVerdict(noChangeRows, OBSERVE_FROM, true, seen),
-    ).toBeNull();
-    const noFilesRows = [row('01ROW1', 'no-files-matched', OBSERVE_FROM + 100)];
-    expect(
-      resolveObserveVerdict(noFilesRows, OBSERVE_FROM, true, seen),
-    ).toBeNull();
-    // But a real `triggered` row still resolves even in manual mode.
-    const triggeredRows = [row('01ROW3', 'triggered', OBSERVE_FROM + 2_000)];
-    expect(resolveObserveVerdict(triggeredRows, OBSERVE_FROM, true, seen)).toBe(
-      'triggered',
-    );
-  });
-
-  it('coerces string/number createdAt (wire-deserialized shape) the same as a Date', () => {
-    const seen = new Set<string>();
-    const wireRow = {
-      ...row('01ROW1', 'no-change', 0),
-      createdAt: new Date(OBSERVE_FROM + 100).toISOString(),
-    } as unknown as ObservationHistoryRecord;
-    const wireRow2 = {
-      ...row('01ROW2', 'no-change', 0),
-      createdAt: new Date(OBSERVE_FROM + 1_200).toISOString(),
-    } as unknown as ObservationHistoryRecord;
-    expect(
-      resolveObserveVerdict([wireRow], OBSERVE_FROM, false, seen),
+      resolveObserveVerdict(
+        [BASELINE, row('00OLD', 'triggered')],
+        state,
+        false,
+      ),
     ).toBeNull();
     expect(
-      resolveObserveVerdict([wireRow2, wireRow], OBSERVE_FROM, false, seen),
+      resolveObserveVerdict(
+        complete(
+          row('04', 'no-change', 3000),
+          row('03', 'no-change', 2000),
+          row('02', 'triggered', 1000),
+        ),
+        state,
+        false,
+      ),
+    ).toBe('triggered');
+  });
+
+  it('uses actual persisted identities to distinguish equal-second observation timestamps', () => {
+    const db = createDb(':memory:');
+    // The fixture owns this connection; the public branded DB hides its client.
+    const client = (db as unknown as { $client: BetterSQLiteClient }).$client;
+    const store = new RuntimeStore(db);
+    const input = {
+      monitorId: 'm',
+      workspacePath: '/ws',
+      sourceName: 'test',
+      result: 'triggered' as const,
+      observationData: {},
+    };
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1100);
+      store.recordObservationHistory(input);
+      const baseline = store.listObservationHistory({
+        monitorId: 'm',
+        workspacePath: '/ws',
+      })[0];
+      if (!baseline) throw new Error('Expected baseline');
+      const state = createObserveWindow(baseline.id, baseline.id);
+      expect(resolveObserveVerdict([baseline], state, false)).toBeNull();
+      vi.setSystemTime(1750);
+      store.recordObservationHistory(input);
+      const rows = store.listObservationHistory({
+        monitorId: 'm',
+        workspacePath: '/ws',
+      });
+      expect(rows.map(({ createdAt }) => createdAt.getTime())).toEqual([
+        1000, 1000,
+      ]);
+      expect(rows[0]?.id).not.toBe(baseline.id);
+      expect(resolveObserveVerdict(rows, state, false)).toBe('triggered');
+      // A second write at exactly1750ms must advance raw identity too; record
+      // order is now the boundary even when neither clock precision advances.
+      const firstId = rows[0]?.id;
+      if (!firstId) throw new Error('Expected first new observation');
+      store.recordObservationHistory(input);
+      const sameMillisecond = store.listObservationHistory({
+        monitorId: 'm',
+        workspacePath: '/ws',
+      });
+      expect(sameMillisecond).toHaveLength(3);
+      const secondId = sameMillisecond[0]?.id;
+      if (!secondId) throw new Error('Expected second new observation');
+      expect(secondId > firstId).toBe(true);
+      expect(
+        sameMillisecond.map(({ createdAt }) => createdAt.getTime()),
+      ).toEqual([1000, 1000, 1000]);
+    } finally {
+      vi.useRealTimers();
+      client.close();
+    }
+  });
+
+  it('retains a triggered row recorded while the trigger command is still running', () => {
+    const state = createObserveWindow(BASELINE.id, '03');
+    expect(
+      resolveObserveVerdict(
+        complete(row('03', 'no-change', 3000), row('02', 'triggered', 2000)),
+        state,
+        false,
+      ),
+    ).toBe('triggered');
+  });
+
+  it('ignores negative evidence from during a long trigger command', () => {
+    const state = createObserveWindow(BASELINE.id, '03');
+    expect(
+      resolveObserveVerdict(
+        complete(row('03', 'no-change'), row('02', 'no-change')),
+        state,
+        false,
+      ),
+    ).toBeNull();
+    expect(
+      resolveObserveVerdict(
+        [row('04', 'no-change'), row('03', 'no-change')],
+        state,
+        false,
+      ),
+    ).toBeNull();
+    expect(
+      resolveObserveVerdict(
+        [row('05', 'no-change'), row('04', 'no-change')],
+        state,
+        false,
+      ),
     ).toBe('no-change');
+  });
+
+  it('requires distinct newly recorded no-change rows, not repeated sightings', () => {
+    const state = createObserveWindow(BASELINE.id, BASELINE.id);
+    const first = complete(row('02', 'no-change'));
+    for (let poll = 0; poll < 5; poll += 1)
+      expect(resolveObserveVerdict(first, state, false)).toBeNull();
+    // Adjacent windows retain the frontier even though the baseline aged out.
+    expect(
+      resolveObserveVerdict(
+        [row('03', 'no-change'), row('02', 'no-change')],
+        state,
+        false,
+      ),
+    ).toBe('no-change');
+  });
+
+  it('lets triggered win over two no-change rows', () => {
+    const state = createObserveWindow(BASELINE.id, BASELINE.id);
+    expect(
+      resolveObserveVerdict(
+        complete(
+          row('04', 'triggered'),
+          row('03', 'no-change'),
+          row('02', 'no-change'),
+        ),
+        state,
+        false,
+      ),
+    ).toBe('triggered');
+  });
+
+  it('fails fast on newly recorded no-files-matched only after trigger completion', () => {
+    const state = createObserveWindow(BASELINE.id, '02');
+    expect(
+      resolveObserveVerdict(
+        complete(row('02', 'no-files-matched')),
+        state,
+        false,
+      ),
+    ).toBeNull();
+    expect(
+      resolveObserveVerdict(
+        [row('03', 'no-files-matched'), row('02', 'no-files-matched')],
+        state,
+        false,
+      ),
+    ).toBe('no-files-matched');
+  });
+
+  it('remembers settling evidence after a bounded history window rotates', () => {
+    const state = createObserveWindow(BASELINE.id, '02');
+    expect(
+      resolveObserveVerdict(complete(row('02', 'suppressed')), state, false),
+    ).toBeNull();
+    expect(
+      resolveObserveVerdict(
+        [row('03', 'no-change'), row('02', 'suppressed')],
+        state,
+        false,
+      ),
+    ).toBeNull();
+    expect(
+      resolveObserveVerdict(
+        [row('04', 'no-change'), row('03', 'no-change')],
+        state,
+        false,
+      ),
+    ).toBeNull();
+    expect(
+      resolveObserveVerdict(
+        [row('05', 'triggered'), row('04', 'no-change')],
+        state,
+        false,
+      ),
+    ).toBe('triggered');
+  });
+
+  it('does not let prior no-change sightings overpower later settling evidence', () => {
+    const state = createObserveWindow(BASELINE.id, BASELINE.id);
+    expect(
+      resolveObserveVerdict(complete(row('02', 'no-change')), state, false),
+    ).toBeNull();
+    expect(
+      resolveObserveVerdict(
+        [
+          row('04', 'no-change'),
+          row('03', 'suppressed'),
+          row('02', 'no-change'),
+        ],
+        state,
+        false,
+      ),
+    ).toBeNull();
+  });
+
+  it('refuses negative verdicts when a truncated window could have hidden a change', () => {
+    const state = createObserveWindow(BASELINE.id, '04');
+    // Missing the prior frontier means an intervening success/suppression could
+    // have fallen out of the retained window before the first poll.
+    expect(
+      resolveObserveVerdict(
+        [row('06', 'no-change'), row('05', 'no-change')],
+        state,
+        false,
+      ),
+    ).toBeNull();
+    expect(
+      resolveObserveVerdict(
+        [row('07', 'no-files-matched'), row('06', 'no-change')],
+        state,
+        false,
+      ),
+    ).toBeNull();
+    // A visible positive remains evidence even when earlier history is missing.
+    expect(
+      resolveObserveVerdict(
+        [row('08', 'triggered'), row('07', 'no-files-matched')],
+        state,
+        false,
+      ),
+    ).toBe('triggered');
+  });
+
+  it('never treats an empty/unavailable history window as evidence of no change', () => {
+    const state = createObserveWindow(BASELINE.id, BASELINE.id);
+    expect(resolveObserveVerdict([], state, false)).toBeNull();
+    expect(
+      resolveObserveVerdict(
+        [row('03', 'no-change'), row('02', 'no-change')],
+        state,
+        false,
+      ),
+    ).toBeNull();
+  });
+
+  it('never fail-fasts in manual mode but accepts a newly recorded change', () => {
+    const state = createObserveWindow(BASELINE.id, BASELINE.id);
+    expect(
+      resolveObserveVerdict(
+        complete(row('03', 'no-change'), row('02', 'no-change')),
+        state,
+        true,
+      ),
+    ).toBeNull();
+    expect(
+      resolveObserveVerdict(
+        [row('04', 'no-files-matched'), row('03', 'no-change')],
+        state,
+        true,
+      ),
+    ).toBeNull();
+    expect(
+      resolveObserveVerdict(
+        [row('05', 'triggered'), row('04', 'no-files-matched')],
+        state,
+        true,
+      ),
+    ).toBe('triggered');
+  });
+
+  it('does not depend on wire timestamps being revived into Date instances', () => {
+    const wire = {
+      ...row('02', 'triggered'),
+      createdAt: '1970-01-01T00:00:01.000Z',
+    } as unknown as ObservationHistoryRecord;
+    expect(
+      resolveObserveVerdict(
+        complete(wire),
+        createObserveWindow(BASELINE.id, BASELINE.id),
+        false,
+      ),
+    ).toBe('triggered');
   });
 });
 
