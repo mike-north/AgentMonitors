@@ -617,10 +617,18 @@ that first invocation is suspended. Held notify observations also belong to admi
 no event is emitted. An outer failure preserves prior source and notify state, all prior committed
 rows, and the store's last-committed recipient cache; restart can retry from that prior state.
 
+Admission **MUST** read current source/notify state and decide notify dispatch under the same immediate
+transaction as its writes. A normalized serialized source-baseline token is captured before invoking
+external observation code, so mutating the context object cannot change the expected baseline.
+If the persisted source token changed before admission, the batch is refused without overwriting
+the winner's checkpoint or held work, including an empty batch that omits `nextState`. Notify-only
+updates committed before admission participate in the fresh dispatch decision. This guards changed
+baselines; it does not provide cross-process leader election or distinguish an ABA return to the
+same serialized source state. The separate not-due rollup decision boundary remains #498 work.
+
 Transaction composition is package-private and accepts only implementation-owned synchronous work.
 The exported RuntimeStore API does not expose an executable transaction callback. This does not
-claim that SQLite cancels asynchronous JavaScript effects. The separate watch checkpoint path in
-§2.4 is not part of this finite poll guarantee.
+claim that SQLite cancels asynchronous JavaScript effects. Watch batches use the same admission boundary under §2.4.
 
 Verified: `libs/core/src/runtime/service.ts` — `AgentMonitorRuntime.tick()`, `ingest()`, and
 `materializeSpan()`.
@@ -677,137 +685,95 @@ as an observation-stage failure, not a crash") and `doctor-report.test.ts`.
 
 ### 2.3 Watch-mode execution
 
-In addition to the one-shot `observe()` tick loop, the runtime drives continuous `watch()` for sources that implement it (NP4). `AgentMonitorRuntime.watchMonitors(monitorsDir, workspacePath)` scans the tree and, for each monitor whose source exposes `watch()`, consumes its `AsyncIterable<Observation>`, funnelling each yielded observation through the **same** notify dispatch → event materialization → session projection pipeline as `observe()` (the shared `ingest()` path). It returns a `WatchHandle` whose `stop()` aborts (via `context.signal`) and awaits every watcher. `daemon run` starts watchers at startup and stops them on shutdown.
+In addition to the one-shot `observe()` tick loop, the runtime drives continuous `watch()` for sources that implement it (NP4). `AgentMonitorRuntime.watchMonitors(monitorsDir, workspacePath)` scans the tree and, for each monitor whose source exposes `watch()`, consumes its `AsyncIterable<ObservationResult>`, funnelling each finite batch through the **same** notify dispatch → event materialization → session projection pipeline as `observe()` (the shared `ingest()` path). It returns a `WatchHandle` whose `stop()` aborts (via `context.signal`) and awaits every watcher. `daemon run` starts watchers at startup and stops them on shutdown.
 
-While a monitor has an active watcher, the tick loop **MUST** skip its `observe()`, so it is never driven twice. A watcher **MUST** be released from the active-watcher set whenever it exits for **any** reason — the `watch()` iterable completing normally, an error (other than the runtime's own abort; that case is also reported via the `onError` callback), or `stop()`/abort — after which the tick loop resumes driving that monitor via `observe()` and a later `watchMonitors()` can re-establish it. A watcher that ends normally must therefore not remain pinned in the active-watcher set (which would permanently starve `observe()`). Each active-watcher slot carries a per-watcher identity token so a superseded watcher only ever releases its **own** slot, never a newer watcher's. A `watch()` source owns its change-detection state in memory; the runtime does not persist it automatically, so watchers otherwise re-establish fresh on restart — unless the source durably checkpoints its state via `context.checkpoint` ([§2.4](#24-watch-mode-source-state-checkpointing)), in which case a restart reconciles from the last checkpointed baseline.
+While a monitor has an active watcher, the tick loop **MUST** skip its `observe()`, so it is never driven twice. A watcher **MUST** be released from the active-watcher set whenever it exits for **any** reason — the `watch()` iterable completing normally, an error (other than the runtime's own abort; that case is also reported via the `onError` callback), or `stop()`/abort — after which the tick loop resumes driving that monitor via `observe()` and a later `watchMonitors()` can re-establish it. A watcher that ends normally must therefore not remain pinned in the active-watcher set (which would permanently starve `observe()`). Each active-watcher slot carries a per-watcher identity token so a superseded watcher only ever releases its **own** slot, never a newer watcher's. A `watch()` source yields its associated restart baseline in each batch's `nextState`; the runtime commits it with the batch ([§2.4](#24-watch-mode-source-state-checkpointing)). A restarted watcher receives that persisted baseline in `context.previousState`.
 
-> **Example:** a source that opens an OS file-system watcher yields a `modified` observation the instant a file changes, rather than waiting for the next poll interval; `stop()` closes the OS watcher via the aborted signal.
+> **Example:** a source that opens an OS file-system watcher yields a batch containing a `modified` observation and its next fingerprint state when a file changes, rather than waiting for the next poll interval; `stop()` closes the OS watcher via the aborted signal.
 >
-> **Test implication:** a `watch()`-based source whose iterator yields one observation then idles until aborted produces exactly one materialized, session-projected event, and `stop()` resolves with the source's abort handler having fired (`libs/core/src/runtime/service.test.ts`).
+> **Test implication:** a `watch()`-based source whose iterator yields a one-observation batch then idles until aborted produces exactly one materialized, session-projected event, and `stop()` resolves with the source's abort handler having fired (`libs/core/src/runtime/service.test.ts`).
 
 Verified: `libs/core/src/runtime/service.ts` — `watchMonitors()`, `consumeWatch()`, the `activeWatchers` skip in `tick()`, and the shared `ingest()` helper; `apps/cli/src/commands/daemon.ts` — watcher start/stop in `runLoop()`.
 
 ### 2.4 Watch-mode source-state checkpointing
 
-> **Status: current** (Refs #278). The runtime supports the watch-checkpoint mechanism defined below:
-> an active `watch()` source durably advances its persisted `sourceState` out of band via
-> `context.checkpoint`, serialized with observation ingestion per-watcher so the durable write
-> completes before any subsequent observation is ingested (the G14 ordering). Moved target → current
-> when it shipped (process: [004 §5–6](./004-validation-testing.md)).
->
-> Verified: the exported `ObservationContext.checkpoint` callback
-> (`libs/core/src/observation/types.ts`) is supplied only on the `watch()` path.
-> `AgentMonitorRuntime.consumeWatch` and its `writeCheckpoint` helper
-> (`libs/core/src/runtime/service.ts`) persist the checkpointed state into the watcher's own
-> `(monitorId, workspacePath)` `monitorState.sourceState` row ([§3](#3-persisted-monitor-state),
-> #345/#307; leaving notify state and `lastObservationAt` untouched) and enqueue
-> **both** checkpoint writes and `ingest()` on a single per-watcher promise chain — the G14
-> durable-write-before-ingest serialization; a failed checkpoint write logs a warning
-> (`process.stderr`) and resolves rather than aborting the watcher. A checkpoint delivered after the
-> watcher is torn down (its `AbortSignal` aborted, or it is no longer the current active watcher for
-> its id) is rejected — one warning, no write — and watcher shutdown flushes the serialization chain
-> to a stable reference so an in-flight checkpoint is still awaited. Proven by the
-> `watch-mode source-state checkpointing (002 §2.4)` suite in
-> `libs/core/src/runtime/service.test.ts`, whose cases cover: checkpoint supplied on the `watch()`
-> path and persisting the updated state before it resolves; the callback absent from the `observe()`
-> tick path; an in-flight, genuinely-delayed checkpoint ordered before a following ingest (the G14
-> serialization); a checkpoint materializing no `monitor_events`; a failing checkpoint warning and
-> leaving the watcher alive; a real-SQLite restart round-trip reconciling a re-established watcher
-> from the checkpointed baseline; a per-workspace checkpoint never mutating a same-id monitor's row
-> in another workspace; a post-stop checkpoint rejected with a warning and no write; a normally
-> completing `watch()` releasing its active-watcher slot so `observe()` resumes; a `watch()` that
-> throws synchronously before ever returning an iterable also releasing its active-watcher slot
-> (rather than leaking it forever) while still reporting the error via `onError`; and a superseded
-> (non-aborted) watcher's stale checkpoint being rejected by the per-watcher identity token alone,
-> without touching its successor's persisted baseline.
+> **Status: current.** Explicit finite watch batches replace the independent checkpoint callback.
+> **Accepted decision, 2026-11-01:** the user selected “Explicit batches: change the watch contract
+> so the runtime commits observations and checkpoint together (recommended).” An opaque checkpoint
+> could previously advance before an observation was yielded; serialization alone did not prevent
+> lost work after admission failure or a crash. Deferring it until the next yield is also insufficient
+> when it covers several future yields. Association must therefore be explicit in the yielded value.
 
-A source whose `watch()` implementation maintains in-memory change-detection state (e.g.,
-`file-fingerprint`'s fingerprint map) faces a crash-safety gap: if the daemon is killed between
-OS-event deliveries, the accumulated state is lost, and on restart the reconcile-on-start pass
-([003 §3.5](./003-source-plugins.md)) will re-emit observations for changes that were already
-delivered before the crash — duplicate deliveries.
+#### One finite batch and one commit
 
-To close this gap, the runtime **MUST** support a **watch-checkpoint mechanism** by which an active
-watcher can periodically write back its updated `sourceState` durably, independent of yielding an
-observation.
-
-#### Contract shape
-
-The `ObservationContext` **MUST** be extended with an optional `checkpoint` callback:
+`ObservationSource.watch` returns `AsyncIterable<ObservationResult>`, reusing the poll result:
 
 ```typescript
-context.checkpoint?: (nextState: unknown) => Promise<void>
+yield {
+  observations: [firstObservation, secondObservation],
+  nextState: nextSourceBaseline,
+};
 ```
 
-A watcher implementation calls `context.checkpoint(updatedFingerprintState)` to request a durable
-write of the updated source state. The runtime **MUST**:
+Every yielded batch is one admission unit. The runtime **MUST** persist its source checkpoint,
+notify state, successful event prefix (including all recipient projections/cursor seeds/snapshots),
+and complete ordered retry suffix in one synchronous transaction. The whole unit **MUST** commit
+before the first Interpret invocation or next iterator pull. No source/plugin callback, Interpret,
+or other external asynchronous effect runs inside that transaction. A materialization failure with
+successful durable retry admission is an admitted batch; an outbox/state/transaction failure is not.
 
-1. Persist the provided `nextState` into the monitor's `monitorState.sourceState` row **before**
-   processing any further observations from the same watcher (G14 durable-write-before-Interpret
-   ordering — the same ordering invariant already enforced by `ingest()` for observation materialize;
-   see [§1.1.8](#118-interpret-a-cheap-agentic-digest-via-the-users-own-ai-tool)).
-2. Return the resolved `Promise<void>` when the write is durable.
-3. NOT deliver or materialize any observation as a side effect of a checkpoint call — a checkpoint is
-   a state write only, not an observation yield.
+`nextState` is source-owned change-detection/restart state, not a recipient baseline, delivery
+receipt or agent acknowledgement. Omitted or `undefined` preserves the prior source baseline;
+`null` resets it to the existing empty-state representation `{}`. The source **MUST** associate
+only work covered by the finite batch, retaining replayability of unadmitted input. The runtime
+can enforce the atomic association supplied by the source; it cannot infer omitted upstream events
+or validate source-specific cursor meaning.
 
-The `checkpoint` callback is supplied only to `watch()` (via `ObservationContext`); `observe()` uses
-the existing `nextState` field on `ObservationResult` for the same purpose.
+An empty `observations` array is valid for a state-only source batch. It introduces no source event;
+normal notify evaluation may still flush already-held work. Source checkpoint and any resulting
+notify changes share the same transaction, including when nothing emits. Like polling, the batch
+updates `lastObservationAt` and records its normal no-change/rebaseline audit outcome; it is not
+the former callback's state-only write that left observation timing untouched. An empty-batch state-write
+failure is an admission failure, not a warning-only checkpoint operation.
 
-#### Checkpoint timing
+#### Failed admission and lifecycle
 
-A watcher SHOULD call `checkpoint` at an interval approximately equal to the monitor's `interval`
-field (or the default 30s if omitted). The implementation MAY coalesce rapid checkpoint requests
-and is not required to checkpoint on every OS event.
+Whole-admission failure **MUST** preserve the prior source/notify state and all prior committed rows,
+record/report the error best-effort, close the iterator, and stop before requesting newer input.
+A restart or one-shot fallback receives the prior baseline and can replay the unadmitted batch.
+Durable retry obligations remain distinct from completed materialization; retry draining before
+newer input and the final owned-process crash proof remain separate runtime recovery work.
 
-A checkpoint failure (the write throws or rejects) MUST NOT abort the watcher — the source SHOULD
-log a warning and continue watching. A failed checkpoint is a transient durability gap, not a watcher
-protocol violation.
+Aborted or superseded watchers **MUST NOT** admit late batches. After an abort during Interpret,
+already committed work survives and no newer iterator pull occurs. Iterator completion, setup
+failure, admission failure and abort release only that watcher's own ownership token. `stop()`
+awaits watcher completion; source implementations must release resources on iterator close or abort.
+All state writes use the watcher's exact `(monitorId, workspacePath)` scope.
 
-#### G14 ordering invariant
+Ownership tokens fence watchers inside one runtime instance. Each watch also retains the serialized
+source baseline captured before producer invocation, advances that expected token only after its own
+successful batch admission, and refuses a later batch if the persisted baseline changed. Notify
+state is read and dispatched under the admission lock. These checks prevent stale overwrite but do
+not establish cross-process source leadership, distinguish source-state ABA, or promise exactly-once
+acquisition by competing producers.
 
-The durable checkpoint write MUST complete before any subsequent `ingest()` call processes an
-observation yielded by the same watcher (the G14 ordering). Because `checkpoint` is called
-independently of `yield`, the runtime MUST serialize these two paths per-watcher: if a checkpoint
-write is in flight when an observation arrives, the runtime MUST await the checkpoint before
-ingesting the observation.
+#### Breaking plugin migration
 
-> **Example.** A `file-fingerprint` watcher receives a burst of 10 OS events, updates its
-> in-memory fingerprint map, yields 10 observations, and calls `checkpoint` once after the burst.
-> The runtime ingests all 10 observations (funnelling each through `ingest()`), then persists the
-> updated fingerprint state from the checkpoint. If the daemon is killed after the 10 observations
-> are materialized but before the checkpoint write, a restart will reconcile from the pre-burst
-> baseline — producing the same 10 observations again as reconcile observations. (This is a
-> narrow window, bounded to the interval between burst completion and checkpoint write; it is
-> preferable to the alternative of never persisting mid-watch state at all.)
->
-> **Test implication.** A test that (a) stubs `context.checkpoint`, (b) has the watcher yield an
-> observation, and (c) asserts that `checkpoint` was called with the updated state before
-> `context.checkpoint` resolved MUST pass. A test that forces `context.checkpoint` to throw MUST
-> confirm the watcher continues yielding subsequent observations and does NOT abort.
+`ObservationContext.checkpoint` is removed. There is no independent checkpoint callback and no
+bare-observation compatibility fallback. Migrate `yield observation` plus a separate checkpoint to
+`yield { observations: [observation], nextState }`; collect all observations covered by one checkpoint
+in the same finite array. A baseline-only update uses `{ observations: [], nextState }`. Runtime
+validation rejects a legacy bare observation before changing state and stops that iterator with a
+migration error. Poll `observe()` signatures remain unchanged; no bundled source currently uses
+`watch()`.
 
-#### Workspace scoping
-
-A checkpoint write MUST land in the watcher's **own** `(monitorId, workspacePath)` state row
-([§3](#3-persisted-monitor-state)), never a `monitorId`-only or global scope. The database is global
-and the same monitor id can exist in unrelated workspaces (#345/#307), so a checkpoint written to the
-wrong scope would either miss the watcher's own baseline or clobber another workspace's
-change-detection state. The runtime threads the watcher's `workspacePath` into both the read and the
-write.
-
-#### Teardown and post-stop rejection
-
-Once a watcher is torn down — its `AbortSignal` aborted by `stop()`, or it is no longer the current
-active watcher for its monitor id (it exited and was superseded) — the runtime **MUST reject** any
-further `checkpoint` call from that watcher: it writes nothing and logs a single warning, then
-resolves. This prevents a straggling `checkpoint(staleState)` (e.g. from a timer that fires after
-shutdown) from clobbering a newer baseline written by `observe()` or a re-established watcher. Because
-a rejected checkpoint is never enqueued, watcher shutdown — which flushes the per-watcher
-serialization chain until its reference stabilizes so an in-flight checkpoint enqueued as shutdown
-begins is still awaited — is guaranteed to terminate.
-
-> **Test implication.** A test that stops the watcher and then invokes the checkpoint callback
-> captured before `stop()` MUST observe no state write and exactly one warning
-> (`libs/core/src/runtime/service.test.ts`).
+A crash before admission leaves the old replay baseline. After admission, every accepted observation
+is an event, durable retry, held notify work or intentional policy suppression. Sources that omit or
+lag checkpoints may replay duplicates; this is not exactly-once source acquisition or agent delivery.
+Verified by `watch-batch-admission.test.ts` (whole batch/suffix before suspended Interpret, independent
+read visibility, rollback/reopen, state-only failure, missing/undefined/null state semantics, legacy
+refusal, workspace isolation, abort, replacement ownership and lifecycle cleanup), with existing
+end-to-end watch/poll exclusivity scenarios retained in `service.test.ts`.
 
 ### 2.5 Tick result
 
@@ -1948,7 +1914,7 @@ error controls and length at its wire boundary as well as at text display. Omitt
 fields remain supported; doctor JSON uses empty summaries/groups while explain preserves omission.
 Real owned-socket tests verify dates rather than inferring correctness from core Date objects.
 
-Poll ingestion atomically admits the complete emitted span and source/notify state before Interpret. Runtime retry draining and watch checkpoint recovery remain separate work.
+Poll ingestion atomically admits the complete emitted span and source/notify state before Interpret. Runtime retry draining and final crash acceptance remain separate work.
 
 ### `session_event_state`
 

@@ -19,6 +19,7 @@ import type { ObservationSource } from '../observation/types.js';
 import { SourceRegistry } from '../observation/registry.js';
 import { AgentMonitorRuntime } from './service.js';
 import { RuntimeStore } from './store.js';
+import { registerRuntimeTransaction } from './runtime-transaction.js';
 
 /** Fixed observation time makes source cadence and notify deadlines exact. */
 const NOW = new Date('2026-11-01T12:00:00.000Z');
@@ -198,6 +199,8 @@ Inspect the changes.
   return {
     root,
     monitorsDir,
+    writer,
+    source,
     connect,
     store,
     reader,
@@ -413,6 +416,92 @@ describe('whole poll span before Interpret', () => {
       }
     });
   }
+
+  it('dispatches against notify state committed by another connection immediately before admission begins', async () => {
+    const f = fixture(true);
+    await f.runtime.tick(f.monitorsDir, f.root);
+    const before = f.reader.getMonitorState('span', f.root);
+    const first = before.notifyState.pendingDebounce?.observations[0];
+    if (!first) throw new Error('Fixture requires a held observation');
+    clockTime = NOW.getTime() + 2000;
+    let interposed = false;
+    // Test-only internal bridge intercepts the exact pre-BEGIN boundary. Both
+    // writes use real independent SQLite connections; no store reads are mocked.
+    registerRuntimeTransaction(f.store, (operation) => {
+      if (!interposed) {
+        interposed = true;
+        f.reader.setMonitorState('span', f.root, {
+          ...before,
+          notifyState: {
+            pendingDebounce: {
+              dueAt: new Date(NOW.getTime() + 1000).toISOString(),
+              observations: [
+                ...(before.notifyState.pendingDebounce?.observations ?? []),
+                {
+                  ...first,
+                  observation: {
+                    title: 'concurrent',
+                    summary: 'concurrent',
+                    objectKey: 'other',
+                    snapshotText: 'external',
+                  },
+                },
+              ],
+            },
+          },
+        });
+      }
+      return f.writer.client.transaction(operation).immediate();
+    });
+    const tick = f.runtime.tick(f.monitorsDir, f.root);
+    try {
+      await atFirstInterpret(f, tick);
+      expect(interposed).toBe(true);
+      expect(
+        f.reader
+          .listEvents()
+          .map(({ summary }) => summary)
+          .sort(),
+      ).toEqual(['concurrent', 'step-1', 'step-2', 'step-3']);
+      expect(f.reader.getMonitorState('span', f.root).notifyState).toEqual({});
+    } finally {
+      f.barrier.release();
+      await tick;
+    }
+  });
+
+  it('rejects a poll derived from an older source baseline even when the source mutates its context', async () => {
+    const f = fixture();
+    f.store.setMonitorState('span', f.root, {
+      sourceState: { cursor: 0 },
+      notifyState: {},
+    });
+    f.source.observe = (_config, context) => {
+      if (
+        context.previousState &&
+        typeof context.previousState === 'object' &&
+        'cursor' in context.previousState
+      )
+        context.previousState.cursor = 1;
+      f.reader.setMonitorState('span', f.root, {
+        sourceState: { cursor: 1 },
+        notifyState: { suppressedUntil: '2030-01-01T00:00:00.000Z' },
+      });
+      return Promise.resolve({ observations: [] });
+    };
+    const result = await f.runtime.tick(f.monitorsDir, f.root);
+    expect(result.erroredObservations).toHaveLength(1);
+    expect(result.erroredObservations[0]?.message).toContain(
+      'source baseline changed',
+    );
+    expect(f.reader.getMonitorState('span', f.root)).toEqual({
+      sourceState: { cursor: 1 },
+      notifyState: { suppressedUntil: '2030-01-01T00:00:00.000Z' },
+    });
+    expect(f.reader.listEvents()).toEqual([]);
+    expect(f.reader.listMaterializationRetries()).toEqual([]);
+    expect(f.barrier.calls).toEqual([]);
+  });
 
   it('restores the prior committed recipient cache rather than clearing it', async () => {
     const f = fixture();

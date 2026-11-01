@@ -591,7 +591,7 @@ export function isValidIanaTimeZone(timeZone: string): boolean;
 // @public
 export function isVerifyScratchObjectKey(objectKey: string): boolean;
 
-// @public (undocumented)
+// @public
 export type JsonSchema = Record<string, unknown>;
 
 // @public
@@ -1229,9 +1229,8 @@ export interface Observation {
     title: string;
 }
 
-// @public (undocumented)
+// @public
 export interface ObservationContext {
-    checkpoint?: (nextState: unknown) => Promise<void>;
     now: Date;
     previousState?: unknown;
     signal?: AbortSignal;
@@ -1267,10 +1266,9 @@ export interface ObservationHistoryRecord {
 // @public
 export type ObservationOutcome = 'triggered' | 'suppressed' | 'no-change' | 'no-files-matched' | 'errored' | 'rebaselined';
 
-// @public (undocumented)
+// @public
 export interface ObservationResult {
     nextState?: unknown;
-    // (undocumented)
     observations: Observation[];
     outcome?: 'rebaselined' | 'no-files-matched';
     warnings?: string[];
@@ -1282,7 +1280,7 @@ export interface ObservationSource {
     observe(config: Record<string, unknown>, context: ObservationContext): Promise<ObservationResult>;
     readonly scopeSchema: JsonSchema;
     readonly stateful?: boolean;
-    watch?(config: Record<string, unknown>, context: ObservationContext): AsyncIterable<Observation>;
+    watch?(config: Record<string, unknown>, context: ObservationContext): AsyncIterable<ObservationResult>;
 }
 
 // @public (undocumented)

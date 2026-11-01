@@ -905,8 +905,7 @@ export interface RuntimeStatus {
  *   (2) A dispatched observation failed deterministic materialization inside
  *       `ingest()` (tick or watch path). Earlier committed siblings remain
  *       events; the failed envelope and every later sibling are durably queued
- *       before notify state (and the poll source checkpoint) advances. The
- *       independent watch checkpoint is outside that transaction.
+ *       before the batch source checkpoint and notify state advance.
  *       `emittedEventIds` therefore names only committed events.
  *   In both cases the audit write itself is best-effort: a `recordObservationHistory`
  *   failure is swallowed so a failing audit row can never re-abort the tick.

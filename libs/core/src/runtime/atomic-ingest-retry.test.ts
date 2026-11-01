@@ -1,3 +1,7 @@
+/**
+ * Admission fault matrix: each emitted observation is an event or an ordered
+ * retained obligation, and failed outer admission preserves replayable state.
+ */
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -55,6 +59,7 @@ afterEach(() => {
   }
 });
 
+/** Inject real persistence failures at each nested or outer admission boundary. */
 class FaultStore extends RuntimeStore {
   failedSummary: string | undefined;
   eventFailures = 0;
@@ -109,6 +114,7 @@ interface RecordingInterpretAdapter extends InterpretAdapter {
   calls: InterpretInput[];
 }
 
+/** Record post-commit interpretation without changing its success behavior. */
 function recordingInterpretAdapter(): RecordingInterpretAdapter {
   const calls: InterpretInput[] = [];
   return {
@@ -121,6 +127,7 @@ function recordingInterpretAdapter(): RecordingInterpretAdapter {
   };
 }
 
+/** Isolate monitor definitions and durable database state for one scenario. */
 function createFixture() {
   const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-atomic-ingest-'));
   tempDirs.push(rootDir);
@@ -149,6 +156,7 @@ Handle it.
   };
 }
 
+/** Emit once from the old cursor so reopen proves replay rather than a fabricated retry. */
 function createSource(observedStates: unknown[]): ObservationSource {
   return {
     name: 'retry-source',
@@ -190,6 +198,7 @@ function createRuntime(
   );
 }
 
+/** Build the real runtime/store path with deterministic fault controls. */
 function setup() {
   const fixture = createFixture();
   const observedStates: unknown[] = [];
