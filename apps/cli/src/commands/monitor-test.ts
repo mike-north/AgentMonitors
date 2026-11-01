@@ -594,16 +594,16 @@ monitorTestCommand
         //
         // (A) Definition stage is not 'ok' (parse error, monitor not found,
         //     duplicate ID, unknown source, …), OR any stage reports a genuine
-        //     'failure' with nothing persisted to explain it (issue #297: an
+        //     'failure' computed from the current definition (issue #297: an
         //     invalid schedule timezone renders an 'observation'-stage failure
         //     computed purely in-memory — explainMonitor MUST NOT mutate state,
         //     so no observation_history row backs it, yet it is real actionable
         //     content, not "nothing has ever ticked"). The report carries the
-        //     exact failure the author needs. Show it WITHOUT the no-daemon
-        //     banner — the banner would be misleading (for a definition
-        //     failure, no persisted state is involved at all; for the #297
-        //     case, the failure is a fresh in-memory computation, not a stale
-        //     persisted diagnosis). Exit 0 (mirrors the live-daemon path).
+        //     exact failure the author needs and may also contain retained
+        //     retry metadata. Show it WITHOUT the no-daemon banner: its primary
+        //     diagnosis comes from the current definition, even when persisted
+        //     retry work accompanies that failure. Exit 0 (mirrors the
+        //     live-daemon path).
         //
         //     IMPORTANT: this is NOT "any stage is 'failure'" — a never-ticked
         //     monitor's 'observation' stage is ALSO reported 'failure' ("No
@@ -615,15 +615,15 @@ monitorTestCommand
         //     before scheduling could be evaluated at all).
         //
         // (B) Definition stage is 'ok', a 'scheduling' stage IS present, AND
-        //     there IS persisted state (observation history or materialized
-        //     events). The report is a real diagnosis from the last tick. Show
-        //     it WITH the no-daemon banner so the author knows it came from the
+        //     there IS persisted state (observation history, materialized
+        //     events, or retained retries). Show this persisted diagnosis
+        //     WITH the no-daemon banner so the author knows it came from the
         //     store, not a live daemon. Exit 0.
         //
         // (C) Definition stage is 'ok', a 'scheduling' stage IS present, AND
-        //     nothing has been persisted (no observations, no events). The
-        //     daemon is down and nothing has ever ticked. Show the actionable
-        //     remediation line (issue #150, PM decision (b)(i)) — not a raw
+        //     nothing is retained (no observations, events, or retries). The
+        //     daemon is down and has no persisted work to explain. Show the
+        //     actionable remediation line (issue #150, PM decision (b)(i)) — not a raw
         //     ENOENT. Exit 1.
         //     NOTE: a definition-failure (or #297-style unschedulable) report
         //     must never be replaced by the remediation message; those reach
