@@ -9,23 +9,29 @@ local daemon turns external changes into durable, queryable work signals and del
 tracked agent sessions at appropriate lifecycle points. Claude Code is the first host adapter, but
 the core is host-agnostic.
 
-**The canonical contract lives in [`docs/specs/`](docs/specs/)** (index:
-[`docs/specs/README.md`](docs/specs/README.md)) — the source of truth for _intended_ behavior, with
-each rule marked _current_ vs _target_. **Consult the doc that matches your task; you don't need to
-read the set for unrelated changes.** Relevance map:
-[`001`](docs/specs/001-monitor-definition.md) `MONITOR.md` files & frontmatter schema ·
-[`002`](docs/specs/002-runtime-delivery.md) runtime tick, scheduling, notify, delivery, persistence,
-daemon/IPC, adapters · [`003`](docs/specs/003-source-plugins.md) source-plugin contract & bundled
-sources · [`004`](docs/specs/004-validation-testing.md) validation & required test scenarios ·
-[`005`](docs/specs/005-cli-reference.md) `agentmonitors` CLI ·
-[`006`](docs/specs/006-agent-integration.md) delivery transports (hooks, channels) & agent
-integration · [`007`](docs/specs/007-agent-facing-interaction.md) act-on-signal verbs, ephemeral
-monitors & observability · [`008`](docs/specs/008-reliability-process-hygiene.md) containment,
-process lifecycle/cleanup & power posture · [`000`](docs/specs/000-principles.md)
-the invariants the rest cite · [`roadmap`](docs/specs/roadmap.md) current→target gaps ·
-[`glossary`](docs/specs/glossary.md) terminology. When you change behavior, update the matching doc
-and add a [`spec-changelog.md`](docs/specs/spec-changelog.md) entry
-(process: [`004`](docs/specs/004-validation-testing.md) §5–6).
+**The canonical contract is the OpenSpec spec in [`openspec/`](openspec/)** — the source of truth
+for _intended_ behavior, written as requirements with testable scenarios.
+[`openspec/specs/<capability>/spec.md`](openspec/specs/) holds **current** (implemented) behavior;
+[`openspec/changes/<change>/`](openspec/changes/) holds every **target** (not-yet-implemented)
+behavior as a proposal + delta specs + tasks (`openspec list` is the roadmap). **Consult the
+capability that matches your task; you don't need to read the set for unrelated changes**
+(`openspec list --specs`, `openspec show <capability> --type spec`). Relevance map:
+[`principles`](openspec/specs/principles/spec.md) the invariants (PP/SP/AP/BP/NP) the rest cite ·
+`monitor/*` `MONITOR.md` definition & validation · `pipeline/post-processing` + `runtime/*` tick,
+scheduling, state, notify dispatch, event materialization · `delivery/*` session projection,
+lifecycles, host adapters, transport seam, hook/channel transports, transport health ·
+`daemon/ipc` · `persistence/schema` · `inbox/legacy-inbox` · `sources/*` source contract & bundled
+sources · `cli/*` the `agentmonitors` command surface · `agent/*` ephemeral monitors ·
+`reliability/process-hygiene` · `engineering/test-integrity` test-suite obligations ·
+[`glossary`](docs/specs/glossary.md) terminology.
+
+**Changing behavior goes through an OpenSpec change** (`/opsx:propose` → `/opsx:apply` →
+`/opsx:archive`; archiving promotes the delta specs into `openspec/specs/`). Rules for each
+artifact are in [`openspec/config.yaml`](openspec/config.yaml); `pnpm check:openspec`
+(`openspec validate --all --strict`, part of `pnpm check`) must pass. `docs/specs/` is
+non-normative: glossary, design history, the frozen pre-OpenSpec `spec-changelog.md`, and the
+`000`–`008` crosswalk stubs that map the legacy `NNN §X.Y` citations (changelogs, commits, issues, older code comments) to the
+capability or change that now owns each section.
 
 ## Commands
 
@@ -34,7 +40,8 @@ pnpm + Nx monorepo (version pinned via package.json#packageManager). All targets
 ```bash
 pnpm build          # build all publishable packages (excludes workspace root + website)
 pnpm test           # run all package test suites (vitest), build deps first
-pnpm check          # check:packages (tsc --noEmit per package) + check:workspace (eslint + prettier)
+pnpm check          # check:packages (tsc --noEmit per package) + check:workspace (eslint + prettier + openspec)
+pnpm check:openspec # openspec validate --all --strict (the canonical spec in openspec/)
 pnpm check:api-report   # validate every checked-in api-report/*.api.md against the compiled surface (CI; no --local)
 pnpm fix:api-report     # regenerate api-report/*.api.md + dist rollups locally (--local; commit the diff)
 pnpm audit:prod             # pnpm audit --prod --audit-level high (raw report)

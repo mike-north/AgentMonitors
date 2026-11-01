@@ -1,28 +1,30 @@
 ---
-description: Canonical Agent Monitors specification set in docs/specs/ — the source of truth for intended behavior. Fetch and read the single relevant numbered doc when a task touches monitor definitions / MONITOR.md frontmatter, the runtime tick / scheduling / notify dispatch / event delivery / persistence pipeline, the daemon or its IPC layer, host adapters, delivery transports / Claude Code channels, source plugins, the agentmonitors CLI, or validation/testing. Not needed for changes unrelated to those areas.
+description: Canonical Agent Monitors specification in openspec/ (OpenSpec) — the source of truth for intended behavior. Read the single relevant capability spec when a task touches monitor definitions / MONITOR.md frontmatter, the runtime tick / scheduling / notify dispatch / event delivery / persistence pipeline, the daemon or its IPC layer, host adapters, delivery transports / Claude Code channels, source plugins, the agentmonitors CLI, reliability/process hygiene, or validation/testing. Not needed for changes unrelated to those areas.
 globs:
 alwaysApply: false
 ---
 
 # Agent Monitors specifications
 
-This repository has a **canonical, code-verified specification set in `docs/specs/`**
-(index: `docs/specs/README.md`). It is the source of truth for *intended* behavior and marks each
-rule as *current* vs *target*.
+This repository's **canonical specification is OpenSpec, in `openspec/`**. Current (implemented)
+behavior is in `openspec/specs/<capability>/spec.md`; target (not-yet-implemented) behavior is in
+`openspec/changes/<change>/` (`openspec list` is the roadmap).
 
-**Read only the one doc that matches the task at hand — do not read the whole set.** Relevance map:
+**Read only the one capability that matches the task at hand — do not read the whole set**
+(`openspec list --specs`, `openspec show <capability> --type spec`). Relevance map:
 
-- `docs/specs/001-monitor-definition.md` — `MONITOR.md` files, frontmatter schema, monitor identity
-- `docs/specs/002-runtime-delivery.md` — runtime tick & scheduling, notify dispatch, event
-  persistence, session projection, hook delivery, daemon/IPC, host adapters
-- `docs/specs/003-source-plugins.md` — the source-plugin contract and the bundled sources
-- `docs/specs/004-validation-testing.md` — validation surfaces and required test scenarios
-- `docs/specs/005-cli-reference.md` — the `agentmonitors` command surface
-- `docs/specs/006-agent-integration.md` — delivery transports & agent integration: the adapter seam,
-  the hook-state transport, the Claude Code channel transport (target), availability/fallback
-- `docs/specs/000-principles.md` — the invariants (PP/SP/AP/BP/NP) the rest cite
-- `docs/specs/roadmap.md` — known current→target gaps; `docs/specs/glossary.md` — terminology
+- `principles` — the invariants (PP/SP/AP/BP/NP) the rest cite
+- `monitor/definition`, `monitor/validation` — `MONITOR.md` files, frontmatter schema, identity, validation
+- `pipeline/post-processing`, `runtime/*` — pipeline, tick & scheduling, state, notify dispatch, event materialization
+- `delivery/*` — session projection, lifecycles, host adapters, transport seam, hook/channel transports, transport health
+- `daemon/ipc`, `persistence/schema`, `inbox/legacy-inbox`
+- `sources/*` — the source-plugin contract and the bundled sources
+- `cli/*` — the `agentmonitors` command surface
+- `agent/ephemeral-monitors`, `reliability/process-hygiene`, `engineering/test-integrity`
+- `docs/specs/glossary.md` — terminology
 
-When code and a spec disagree, the spec states which behavior is current vs target. When you change
-behavior, update the matching numbered doc and add a `docs/specs/spec-changelog.md` entry (process in
-`docs/specs/004-validation-testing.md` §5–6).
+When you change behavior, do it through an OpenSpec change (`/opsx-propose`, `/opsx-apply`,
+`/opsx-archive`); rules per artifact are in `openspec/config.yaml` and
+`openspec validate --all --strict` must pass. The `docs/specs/000`–`008` files are non-normative
+crosswalk stubs mapping the legacy `NNN §X.Y` citations
+(changelogs, commits, issues, older code comments) to their new home.

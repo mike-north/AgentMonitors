@@ -15,26 +15,27 @@ Review behavior and architecture before style.
 
 ## Specifications
 
-This repository has a canonical, code-verified specification set in `docs/specs/` (index:
-`docs/specs/README.md`). It is the source of truth for _intended_ behavior and marks each rule as
-_current_ vs _target_.
+This repository's canonical specification is OpenSpec, in `openspec/`: current (implemented)
+behavior in `openspec/specs/<capability>/spec.md`, target (not-yet-implemented) behavior in
+`openspec/changes/<change>/`.
 
-Consult the single doc that matches the change under review — you do not need to read the set for
-unrelated work. Relevance map:
+Consult the single capability that matches the change under review — you do not need to read the
+set for unrelated work. Relevance map:
 
-- `docs/specs/001-monitor-definition.md` — `MONITOR.md` files, frontmatter schema, monitor identity
-- `docs/specs/002-runtime-delivery.md` — runtime tick & scheduling, notify dispatch, persistence,
-  session projection, hook delivery, daemon/IPC, host adapters
-- `docs/specs/003-source-plugins.md` — the source-plugin contract and the bundled sources
-- `docs/specs/004-validation-testing.md` — validation surfaces and required test scenarios
-- `docs/specs/005-cli-reference.md` — the `agentmonitors` CLI
-- `docs/specs/006-agent-integration.md` — delivery transports: adapter seam, hook-state transport,
-  the Claude Code channel transport (target)
-- `docs/specs/000-principles.md` — the invariants the rest cite; `docs/specs/roadmap.md` —
-  current→target gaps
+- `principles` — the invariants (PP/SP/AP/BP/NP) the rest cite
+- `monitor/definition`, `monitor/validation` — `MONITOR.md` files, frontmatter schema, identity, validation
+- `pipeline/post-processing`, `runtime/*` — pipeline, tick & scheduling, state, notify dispatch, event materialization
+- `delivery/*` — session projection, lifecycles, host adapters, transport seam, hook/channel transports, transport health
+- `daemon/ipc`, `persistence/schema`, `inbox/legacy-inbox`
+- `sources/*` — the source-plugin contract and the bundled sources
+- `cli/*` — the `agentmonitors` command surface
+- `agent/ephemeral-monitors`, `reliability/process-hygiene`, `engineering/test-integrity`
+- `docs/specs/glossary.md` — terminology
 
-When a change alters behavior, expect the matching numbered doc to be updated and a
-`docs/specs/spec-changelog.md` entry added.
+When a change alters behavior, expect an OpenSpec change in the same PR: a new or updated
+`openspec/changes/<name>/` (proposal, delta specs, tasks), or — once the behavior is implemented —
+its archive into `openspec/specs/`. Specs describe current behavior only; target behavior in a main
+spec is a defect. The `docs/specs/000`–`008` files are crosswalk stubs, not the contract.
 
 ## Architectural Rules
 

@@ -22,3 +22,13 @@ apps/website/
 # would fight that check (and the bundled LICENSE has no Prettier parser).
 agent-plugins/
 .claude-plugin/
+
+# OpenSpec agent integrations (Claude Code, Codex, Cursor, GitHub Copilot): generated and
+# refreshed by `openspec update`. Formatting them would fight the regeneration.
+.claude/skills/openspec-*/
+.claude/commands/opsx/
+.agents/skills/
+.cursor/skills/openspec-*/
+.cursor/commands/opsx-*.md
+.github/skills/openspec-*/
+.github/prompts/opsx-*.prompt.md

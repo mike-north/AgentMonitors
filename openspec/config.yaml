@@ -1,0 +1,53 @@
+schema: spec-driven
+githubCopilot:
+  cloudAgent: false
+
+# Project context: constraints an agent cannot infer by reading the code. Injected into every
+# OpenSpec artifact instruction for this repository.
+context: |
+  Agent Monitors is a local-first monitoring system for agentic coding tools: a local daemon turns
+  external changes into durable, queryable work signals and delivers them into tracked agent
+  sessions. openspec/specs/ is the canonical behavior contract; openspec/changes/ holds every
+  not-yet-implemented (target) behavior. docs/specs/ is non-normative (glossary, rationale, history).
+
+  Invariants every artifact must respect (full text: openspec/specs/principles/spec.md, cited by ID):
+  - Source vs runtime split: sources own how to observe and their own change-detection state;
+    the runtime owns when to run, notify timing, persistence, diffing, projection, and delivery.
+  - Host-agnostic core: host-specific behavior (Claude Code hook names, transcripts) lives only in
+    host adapters, never in the runtime core.
+  - Session isolation and durability: per-session baselines, cursors, and unread state survive
+    daemon restarts and reboots; events project into lead sessions only.
+  - Unread, claimed, and acknowledged are three distinct delivery states; claiming never acknowledges.
+  - low / normal / high urgency are all first-class; high defaults to a 15s debounce settle.
+  - The daemon is deterministic and ships no model (PP10); agents declare intent and never poll (PP9).
+
+# Per-artifact rules.
+rules:
+  proposal:
+    - Name the GitHub issue(s) the change implements, if any, as "Refs #N".
+    - State which principles (PP/SP/AP/BP/NP IDs) the change relies on or affects.
+    - Say whether the change resolves a contradiction between specs, code, or public docs, and how.
+  specs:
+    - Main specs (openspec/specs/) describe current, implemented behavior only. Target behavior lives
+      in a change's delta specs until that change is implemented and archived.
+    - Use SHALL/MUST for every normative statement; one behavior per requirement.
+    - Every tricky rule gets a concrete scenario that names the exact inputs and expected outputs.
+    - Public contracts may name their identifiers (CLI flags, MONITOR.md frontmatter keys, wire/JSON
+      fields, exported @agentmonitors/core types, persisted table/column names); internal function
+      and class names stay out of specs.
+    - Cite invariants by their principle ID (e.g. "per SP4") instead of restating them.
+  design:
+    - Record rejected alternatives and the reason each was rejected.
+  tasks:
+    - Include the tests that enforce each new or changed requirement, at the right layer (unit,
+      integration, Docker-backed CLI, or fresh-install E2E), asserting spec-derived values rather
+      than snapshots; use fake timers for settle/debounce timing.
+    - Include a changeset task when published package behavior or public types change, and an
+      api-report regeneration task (pnpm --filter <pkg> run fix:api-report) when a public API changes.
+    - Include updating apps/website docs when user-visible behavior changes.
+
+operations:
+  archive:
+    guidance:
+      - Before archiving, confirm the change's behavior is implemented and its tests pass; archiving
+        is what promotes target behavior into the canonical current-behavior specs.
