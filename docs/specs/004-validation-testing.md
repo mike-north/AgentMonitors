@@ -227,6 +227,16 @@ uncommitted observation recovery, power-loss durability, or the pending material
 | Activation plugin `hooks.json` command strings stay wired to the CLI stdin contract (config drift)                                                                                 | Covered (`apps/cli/src/commands/cli.integration.test.ts` — "drives the plugin's literal hooks.json command strings end to end (boot, deliver body, deregister)"; "SessionStart command falls back to the install-hint JSON when agentmonitors is not on PATH"). The suite parses the real `agent-plugins/agentmonitors/hooks/hooks.json` and runs each `SessionStart`/`UserPromptSubmit`/`SessionEnd` command verbatim via `/bin/sh -c` with an `agentmonitors` PATH shim, so a drifted command string (flag re-added, binary renamed, chain broken), a regressed stdin contract, or an invalid missing-CLI fallback breaks the test. |
 | A global install of the packed launcher (no workspace `node_modules`) can go from `agentmonitors init` to a delivered signal over the real hook stdin/stdout contract (issue #276) | Covered (`scripts/test-e2e-fresh-install-hooks.mjs`, `pnpm test:e2e-fresh-install-hooks`, CI per-PR) — see [§2.7](#27-fresh-environment-e2e-hooks-path).                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
+### 3.5.1 Verify observation boundary
+
+`apps/cli/src/verify-observe.test.ts` verifies distinct old/new observation identities with actual
+SQLite second-rounded timestamps, command-start versus completion evidence, repeated-row refusal,
+adjacent and truncated windows, retained settling evidence and manual-mode/explicit-timeout rules.
+`apps/cli/src/commands/verify.integration.test.ts` runs a real owned daemon and a trigger command
+that waits for its durable `triggered` history row before returning; verification must still succeed.
+Run the daemon suite serially with retries disabled when accepting this boundary repair. This proves
+the deterministic recording-order defect and repair, not that every historical CI failure had that cause.
+
 ### 3.6 PR-alerting presets (`init --type pr-review` / `--type my-prs`, issue #444)
 
 All rows below are covered by `apps/cli/src/commands/pr-alerting-presets.test.ts`, which drives the

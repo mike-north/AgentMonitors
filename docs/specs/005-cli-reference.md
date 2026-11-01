@@ -2147,28 +2147,36 @@ agentmonitors verify [monitor] [--dir <path>] [--workspace <path>]
    change itself (the **command** trigger mode above), and `--manual` blocks and watches for an
    out-of-band change instead. The scratch file / edit is reverted on exit **and** on SIGINT/SIGTERM;
    a `--trigger-cmd`'s effects are not (an arbitrary command has no known inverse).
-6. **Observe.** Poll observation history for a **post-trigger** outcome. A `triggered` row is
-   success. A `no-files-matched` row (glob matched zero files) is always a **fail-fast**. A
-   `no-change` row normally means the trigger did nothing (**fail fast**, point at `--manual`) —
-   **except** while a `debounce`/`throttle` notify window is settling: there the change was observed
-   but is being held, recorded as a `suppressed` row, and the emitting `triggered` row only appears at
-   flush. So a `suppressed` row is not a distinct `verify` verdict; it is treated as "settling" and
-   keeps the wait alive, suppressing the `no-change` fail-fast until the flush (or the budget) — the
-   post-trigger history is `[suppressed, no-change…, triggered]` (issue #399 criterion 4).
+6. **Observe.** Correlate observation recording with two history identity boundaries from the
+   same live daemon. The newest baseline record is captured **before** starting the trigger (or
+   prompting in manual mode). A newly recorded `triggered` row beyond that identity is success,
+   including a row persisted while a long trigger command is still running. Do not compare its
+   second-rounded `createdAt` against a millisecond trigger time: a real new row can share the
+   baseline's persisted timestamp. Previously recorded rows remain excluded even in that same second.
 
-   A `no-change` verdict requires **two distinct post-trigger observation-history rows** (different
-   ids), both reporting `no-change`, before it is treated as decisive (issue #442 round 19). A single
-   `no-change` row — however long it persists across polls — is not sufficient evidence: a daemon tick
-   already in flight (mid-scan) when the trigger fired can finish and record its necessarily-stale,
-   pre-trigger `no-change` row _after_ the trigger's timestamp under enough scheduling delay (a busy
-   CI runner), and every subsequent poll re-reads that SAME row — persistence alone is just the
-   caller's own clock passing, not new information. A second, genuinely later tick completing and also
-   reporting `no-change` is real evidence neither post-trigger tick observed the change. A `triggered`
-   row still wins immediately regardless. Confirming two distinct rows takes roughly two full monitor
-   poll intervals of wall time, so `verify` extends the observe stage's deadline (only when using the
-   **default** derived budget, never when an explicit `--timeout-ms` is given — an explicit override
-   is honored as the operator's real cap, and a timeout shorter than one interval still fails fast with
-   `budget-exceeded`) to at least `2 × interval + margin`.
+   The completion snapshot is a separate boundary for **negative** evidence. A command's idle
+   observations before it returns cannot establish that its final change did nothing. After this
+   boundary, `no-files-matched` is a fail-fast, and **two distinct** `no-change` records are required
+   for a no-change verdict. Rereading one retained row never counts twice. The two-row rule guards
+   against one stale scan already in flight at the trigger; manual mode never fails fast on either
+   negative outcome. Timeout budgets still begin when the trigger command returns (or manual mode
+   starts); changing evidence boundaries does not extend an explicit `--timeout-ms`.
+
+   A newly recorded `suppressed` row means the change is settling in a debounce/throttle window
+   (002 §9.2/§9.3). Remember this evidence even after that row leaves the bounded history window;
+   no-change rows cannot overrule it. The eventual visible `triggered` flush wins immediately.
+   Consecutive bounded history windows must overlap at the last seen identity before absence can
+   support a negative verdict. If a long command, retention, or missing history breaks that chain,
+   an unseen success or suppression may have been lost: refuse negative verdicts and wait for
+   visible positive evidence or `budget-exceeded`. Do not silently treat truncated history as no change.
+
+   Identity order is the existing monotonic observation-ID order within the same daemon writer,
+   not a persisted sequence across process restarts or arbitrary concurrent writers. Recording
+   after the boundary does not claim causal attribution of an arbitrary external source change to
+   the trigger. No new source protocol, timestamp precision or runtime scheduling rule is introduced.
+   Confirming two distinct rows takes roughly two full monitor poll intervals, so the default
+   observe deadline remains at least `2 × interval + margin`. An explicit timeout remains the
+   operator's cap and is never stretched to fit the discriminator.
 
    That observe-stage extension can let a **real** `triggered` row land after the single-interval
    `detect` deadline the rest of the phase was sized against — e.g. a 20s-interval monitor with a
