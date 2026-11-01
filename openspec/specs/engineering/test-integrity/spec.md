@@ -38,6 +38,16 @@ Recovery of already-persisted recipient work after a daemon crash SHALL be prove
 - **AND** reopening the same host-session identity keeps its session id and the exact unread event
 - **AND** delivery leaves that event unread until it is explicitly acknowledged
 
+### Requirement: verify observation boundaries are proven with persisted identities
+
+The `verify` observe boundary SHALL be proven by unit tests over actual SQLite second-rounded timestamps (distinct old/new identities, command-start vs completion evidence, repeated-row refusal, adjacent and truncated windows, retained settling evidence, manual-mode and explicit-timeout rules) and by a serial real-daemon test whose trigger command waits for its durable `triggered` row before returning (#532).
+
+#### Scenario: Trigger command outlives its own observation
+
+- **GIVEN** a real owned daemon and a trigger command that returns only after its `triggered` history row is durable
+- **WHEN** the daemon suite runs serially with retries disabled
+- **THEN** `verify` succeeds, proving the recording-order repair rather than every historical CI failure's cause
+
 ### Requirement: CLI integration tests prove command wiring
 
 CLI integration tests in `apps/cli` SHALL be the primary proof surface for command wiring, output shape, argument validation, and round-trip behavior through the daemon/runtime interface.

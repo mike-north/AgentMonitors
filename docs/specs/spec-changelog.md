@@ -24,7 +24,17 @@ their content was ported into OpenSpec (`runtime/event-materialization`; the
 `persistence/schema`; the fresh-batch reminder policy in `delivery/lifecycles`,
 `daemon/ipc`, `cli/session-commands`, `cli/doctor`, and `delivery/transport-health`; the
 real-daemon crash-recovery test obligation in `engineering/test-integrity`; the SQLite lock and
-canonical-path rules in `runtime/local-data-permissions`).
+canonical-path rules in `runtime/local-data-permissions`; the observation-identity boundaries in
+`cli/verify` and their test obligation in `engineering/test-integrity`).
+
+## 2026-11-01 — Verify uses observation identity boundaries (005 §16) — Refs #532
+
+Replace millisecond-versus-second history timestamp comparison with a pre-trigger recording frontier
+and a separate trigger-completion frontier for negative evidence. Preserve changes observed during
+long commands, exclude earlier same-second rows and intermediate command idle ticks, retain settling
+evidence across window rotation, and refuse negative verdicts when history gaps could hide success.
+Keep explicit timeout caps and two-distinct-row no-change confirmation. Unit tests use actual persisted
+equal-second rows; a real daemon regression waits for durable triggered history before command exit.
 
 ## 2026-10-31 — Preserve SQLite locks during permission migration (002 §3.1) — Refs #529
 

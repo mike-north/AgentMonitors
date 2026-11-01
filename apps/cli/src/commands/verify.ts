@@ -51,6 +51,7 @@ import {
   type VerifyBudget,
 } from '../verify-budget.js';
 import {
+  createObserveWindow,
   resolveObserveDeadline,
   resolveObserveVerdict,
 } from '../verify-observe.js';
@@ -812,14 +813,12 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
       detail: 'first observation recorded',
     });
 
-    // Trigger the change. `observeFrom` marks the start of the observe window
-    // and is captured AFTER `fire()` returns for non-manual modes: in
-    // `--trigger-cmd` mode, `fire()` is a blocking `execSync` that can run for
-    // seconds, and a timestamp taken before it returns would (a) wrongly
-    // exclude a same-window daemon observation whose `createdAt` falls between
-    // the two timestamps from the post-trigger filter below, and (b) shorten
-    // the detect deadline by however long the command itself took to run.
-    // Manual mode has no `fire()` to wait on, so its semantics are unchanged.
+    // The last baseline response is the pre-trigger recording frontier. Keep
+    // it distinct from the budget clock: a long command may cause an observation
+    // before returning, while its intermediate idle ticks cannot prove failure.
+    // IDs order records in this same live daemon; second-rounded createdAt does
+    // not distinguish old and newly recorded rows within the trigger's second.
+    const positiveAfterId = baseline.id;
     let observeFrom: number;
     if (mode === 'manual') {
       observeFrom = Date.now();
@@ -892,22 +891,23 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
     // fail-fast 'no-change'/'no-files-matched' (the trigger did nothing).
     inFlightStage = 'observe';
     const detectDeadline = observeFrom + detectCapMs;
-    // A tick that was already IN FLIGHT (mid-scan) when the trigger fired can
-    // still finish and record its (necessarily stale, pre-trigger) `no-change`
-    // row AFTER `observeFrom` once the daemon is under enough scheduling delay
-    // (heavy CPU contention — the exact condition a shared CI runner can hit,
-    // even inside this suite's own serial/single-daemon isolation). That row
-    // satisfies the `createdAt > observeFrom` filter even though it never
-    // actually observed the post-trigger state, wrongly fail-fasting `verify`
-    // if trusted on sight. `resolveObserveVerdict` (verify-observe.ts) guards
-    // against this: a `no-change` verdict requires a SECOND, DISTINCT
-    // post-trigger row also reporting `no-change` — not merely the first one
-    // persisting, which is just the same stale row being re-read every poll.
-    // That discriminator needs roughly two full ticks of wall time to
-    // legitimately resolve, so the observe deadline is extended to
-    // `budget.noChangeConfirmMs` — but only for the DEFAULT derived budget; an
-    // explicit `--timeout-ms` is honored as the operator's real cap (a
-    // shorter override still fails fast with `budget-exceeded`).
+    // Snapshot completion separately from the pre-trigger frontier. Feed this
+    // exact response into the first poll so a change already observed during a
+    // command is retained. Negative evidence begins after completion; two new
+    // no-change records are still required because one scan may be in flight.
+    let initialRows:
+      | Awaited<ReturnType<typeof listObservationHistoryClient>>
+      | undefined = await listObservationHistoryClient(
+      { monitorId: monitor.id, workspacePath: workspace, limit: 10 },
+      daemon.socketPath,
+    );
+    const negativeAfterId = initialRows.reduce(
+      (latest, { id }) => (id > latest ? id : latest),
+      positiveAfterId,
+    );
+    const observeWindow = createObserveWindow(positiveAfterId, negativeAfterId);
+    // Only derived budgets may extend to fit two full observation cycles. An
+    // explicit timeout remains the operator's cap, measured after trigger exit.
     const observeDeadline = resolveObserveDeadline(
       observeFrom,
       detectDeadline,
@@ -915,23 +915,20 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
       timeoutOverridden,
     );
     const observeBudgetMs = observeDeadline - observeFrom;
-    const seenNoChangeIds = new Set<string>();
     const observed = await pollUntil<
       'triggered' | 'no-change' | 'no-files-matched'
     >(
       observeDeadline,
       daemon,
       async () => {
-        const rows = await listObservationHistoryClient(
-          { monitorId: monitor.id, workspacePath: workspace, limit: 10 },
-          daemon.socketPath,
-        );
-        return resolveObserveVerdict(
-          rows,
-          observeFrom,
-          mode === 'manual',
-          seenNoChangeIds,
-        );
+        const rows =
+          initialRows ??
+          (await listObservationHistoryClient(
+            { monitorId: monitor.id, workspacePath: workspace, limit: 10 },
+            daemon.socketPath,
+          ));
+        initialRows = undefined;
+        return resolveObserveVerdict(rows, observeWindow, mode === 'manual');
       },
       () => {
         progress(
@@ -974,7 +971,9 @@ async function runVerification(opts: RunOptions): Promise<VerifyResult> {
         stages,
         failure: {
           kind: 'budget-exceeded',
-          message: `no change was observed within the budget (${String(Math.round(observeBudgetMs / 1000))}s). ${budgetExceededHint(mode)}`,
+          message: observeWindow.hasGap
+            ? `observation history became incomplete during verification; no reliable outcome was established within the budget (${String(Math.round(observeBudgetMs / 1000))}s). ${budgetExceededHint(mode)}`
+            : `no change was observed within the budget (${String(Math.round(observeBudgetMs / 1000))}s). ${budgetExceededHint(mode)}`,
         },
       });
     }

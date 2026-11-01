@@ -142,23 +142,96 @@ By default `verify` SHALL run an isolated daemon on a temporary socket and db as
 
 ### Requirement: verify observe-stage outcomes
 
-`verify` SHALL poll observation history for a post-trigger row: `triggered` is success; `no-files-matched` always fails fast; `no-change` fails fast pointing at `--manual`; `suppressed` (a debounce/throttle window settling) SHALL keep the wait alive and suppress the `no-change` fail-fast until the flush or the budget (#399 criterion 4).
+`verify` SHALL capture the newest observation-history identity from the live daemon before starting the trigger (or prompting in manual mode) and treat any newly recorded `triggered` row beyond it as success, including one persisted while a trigger command still runs. It SHALL NOT compare second-rounded `createdAt` values against a millisecond trigger time; rows recorded before the boundary stay excluded even in the same second (#532).
+
+#### Scenario: New same-second triggered row
+
+- **GIVEN** a baseline `no-change` row and a newly recorded `triggered` row with the same persisted second
+- **WHEN** `verify` resolves the observe verdict
+- **THEN** the `observe` stage passes on the new row
+
+#### Scenario: Historical same-second success is excluded
+
+- **GIVEN** a `triggered` row recorded before the pre-trigger boundary, in the same second as the trigger
+- **WHEN** `verify` resolves the observe verdict
+- **THEN** that row does not count as success
+
+#### Scenario: Change observed while the trigger command runs
+
+- **GIVEN** a `--trigger-cmd` that waits for its durable `triggered` history row before returning
+- **WHEN** `verify` runs against a real daemon
+- **THEN** the `observe` stage passes on that row
 
 #### Scenario: Debounced change
 
 - **GIVEN** a monitor with a debounce notify window
-- **WHEN** post-trigger history reads `[suppressed, no-change, triggered]`
-- **THEN** `verify` keeps waiting through the `no-change` row and the `observe` stage passes on `triggered`
+- **WHEN** newly recorded history reads `[suppressed, no-change, no-change, triggered]`
+- **THEN** `verify` keeps waiting through the `no-change` rows and the `observe` stage passes on `triggered`
+
+### Requirement: Negative evidence starts at trigger completion
+
+`verify` SHALL take a second identity boundary when the trigger command returns (or manual mode starts) and count only rows recorded after it as negative evidence: `no-files-matched` then fails fast, and `no-change` fails fast pointing at `--manual`. Idle observations recorded while a command runs SHALL NOT establish that its final change did nothing. Manual mode SHALL never fail fast on either negative outcome.
+
+#### Scenario: Idle ticks during a long command
+
+- **GIVEN** `no-change` rows recorded while the trigger command was still running
+- **WHEN** the command returns and no later rows exist yet
+- **THEN** `verify` does not fail with `no-change`
+
+#### Scenario: Manual mode waits for a change
+
+- **GIVEN** `--manual` and newly recorded `no-change` and `no-files-matched` rows
+- **WHEN** `verify` resolves the observe verdict
+- **THEN** it keeps waiting and passes once a newly recorded `triggered` row appears
 
 ### Requirement: No-change requires two distinct post-trigger rows
 
-A `no-change` verdict SHALL require two distinct post-trigger observation-history rows (different ids) both reporting `no-change`; one row re-read across polls is not sufficient. A `triggered` row SHALL still win immediately (#442 round 19).
+A `no-change` verdict SHALL require two distinct `no-change` rows (different ids) recorded after the completion boundary; one row re-read across polls never counts twice. A `triggered` row SHALL still win immediately (#442 round 19).
 
 #### Scenario: Stale in-flight tick
 
-- **GIVEN** a tick in flight at trigger time records one `no-change` row after the trigger timestamp
+- **GIVEN** a tick in flight at trigger time records one `no-change` row after the completion boundary
 - **WHEN** `verify` polls and re-reads only that row
 - **THEN** it does not fail with `no-change` until a second, different `no-change` row appears
+
+#### Scenario: Triggered beats two no-change rows
+
+- **WHEN** a newly recorded `triggered` row appears alongside two distinct `no-change` rows
+- **THEN** the `observe` stage passes
+
+### Requirement: Settling evidence outlives the history window
+
+A newly recorded `suppressed` row (a debounce/throttle window settling, per `runtime/notify-dispatch`) SHALL keep the wait alive and suppress the `no-change` fail-fast until the flush or the budget, and `verify` SHALL remember it after the row leaves the bounded history window; later `no-change` rows SHALL NOT overrule it (#399 criterion 4).
+
+#### Scenario: Window rotates past the suppressed row
+
+- **GIVEN** a newly recorded `suppressed` row followed by enough `no-change` rows to push it out of the bounded history window
+- **WHEN** `verify` resolves the observe verdict
+- **THEN** it keeps waiting rather than failing with `no-change`
+
+### Requirement: History gaps refuse negative verdicts
+
+Consecutive bounded history windows SHALL overlap at the last seen identity before absence of success supports a negative verdict. When a long command, retention, or missing history breaks that chain, `verify` SHALL refuse `no-change` and `no-files-matched` verdicts and wait for visible positive evidence or `budget-exceeded`; an empty or unavailable window is never evidence of no change.
+
+#### Scenario: Truncated window
+
+- **GIVEN** a history window that no longer contains the last seen identity
+- **WHEN** it shows only `no-change` rows
+- **THEN** `verify` does not fail with `no-change`
+
+#### Scenario: Empty history
+
+- **WHEN** the history window is empty or unavailable
+- **THEN** `verify` does not fail with `no-change`
+
+### Requirement: Observation identity order is scoped to one daemon writer
+
+`verify` SHALL order rows by the monotonic observation-ID order of the same daemon writer, not a sequence persisted across restarts or concurrent writers. A row recorded after the boundary SHALL NOT be claimed as causally attributable to the trigger, and the boundaries add no source protocol, timestamp precision, or scheduling rule.
+
+#### Scenario: Wire timestamps stay strings
+
+- **WHEN** history rows arrive over IPC with `createdAt` as strings rather than `Date` instances
+- **THEN** the verdict is unchanged, because it depends only on row identities
 
 ### Requirement: verify budget derivation
 
@@ -188,7 +261,7 @@ The budget SHALL derive from the monitor's own timing (#399 criterion 2): `inter
 
 ### Requirement: Observe deadline extension under the default budget
 
-With the default derived budget, `verify` SHALL extend the observe stage's deadline to at least `noChangeConfirmMs` so a genuine `no-change` verdict can gather its second row. An explicit `--timeout-ms` SHALL never be extended; a value shorter than one interval SHALL fail fast with `budget-exceeded`.
+With the default derived budget, `verify` SHALL extend the observe stage's deadline to at least `noChangeConfirmMs` so a genuine `no-change` verdict can gather its second row. Budgets begin when the trigger command returns (or manual mode starts). An explicit `--timeout-ms` SHALL never be extended, including by the evidence boundaries; a value shorter than one interval SHALL fail fast with `budget-exceeded`.
 
 #### Scenario: Explicit short timeout
 

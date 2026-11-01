@@ -20,10 +20,12 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
@@ -812,6 +814,145 @@ describe('agentmonitors verify --use-workspace-daemon (issues #407/#418)', () =>
       rmSync(socketDir, { recursive: true, force: true });
     }
   }, 90_000);
+
+  it('keeps a real daemon observation recorded before the trigger command finishes', async () => {
+    const ws = mkdtempSync(path.join(tempDir, 'boundary-'));
+    const socketDir = mkdtempSync(path.join(tmpdir(), 'amb-'));
+    const dbPath = path.join(socketDir, 'verify.db');
+    const env: Record<string, string> = {
+      ...(Object.fromEntries(
+        Object.entries(process.env).filter(([, value]) => value !== undefined),
+      ) as Record<string, string>),
+      AGENTMONITORS_SOCKET: path.join(socketDir, 'd.sock'),
+      AGENTMONITORS_DB: dbPath,
+    };
+    expect(runWs(['init', '--enable-only'], ws, env).exitCode).toBe(0);
+    const watched = path.join(ws, 'watched.txt');
+    writeFileSync(watched, 'baseline contents');
+    writeMonitor(
+      ws,
+      'boundary-watch',
+      `watch:\n  type: command-poll\n  command:\n    - cat\n    - ${JSON.stringify(watched)}\n  interval: '1s'\nurgency: normal`,
+    );
+    const evidencePath = path.join(ws, 'boundary-evidence.json');
+    const scriptPath = path.join(ws, 'trigger.cjs');
+    const sqliteModule = createRequire(import.meta.url).resolve(
+      'better-sqlite3',
+    );
+    // This owned trigger waits for the actual durable daemon history row before
+    // completing. The test therefore does not depend on a lucky wall-clock phase
+    // or infer persistence from a source-side marker/timeout.
+    writeFileSync(
+      scriptPath,
+      `
+      const fs = require('node:fs');
+      const Database = require(${JSON.stringify(sqliteModule)});
+      const db = new Database(${JSON.stringify(dbPath)}, { readonly: true });
+      const route = ['boundary-watch', ${JSON.stringify(ws)}];
+      const latest = db.prepare('SELECT id FROM observation_history WHERE monitor_id = ? AND workspace_path = ? ORDER BY id DESC LIMIT 1').get(...route);
+      const query = db.prepare("SELECT id, created_at FROM observation_history WHERE monitor_id = ? AND workspace_path = ? AND id > ? AND result = 'triggered' ORDER BY id DESC LIMIT 1");
+      const startedAt = Date.now();
+      fs.writeFileSync(${JSON.stringify(watched)}, 'changed by bounded trigger');
+      let recorded;
+      while (Date.now() - startedAt < 10000) {
+        recorded = query.get(...route, latest.id);
+        if (recorded) break;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+      }
+      if (!recorded) throw new Error('Daemon did not persist the triggered observation');
+      const evidence = { beforeId: latest.id, triggeredId: recorded.id, persistedAtMs: recorded.created_at * 1000, completedAt: Date.now() };
+      fs.writeFileSync(${JSON.stringify(evidencePath)}, JSON.stringify(evidence));
+      db.close();
+    `,
+    );
+    const daemon = spawn(
+      CLI[0],
+      [
+        CLI[1],
+        'daemon',
+        'run',
+        path.join(ws, '.claude', 'monitors'),
+        '--workspace',
+        ws,
+        '--poll-ms',
+        '100',
+        '--reap-after-ms',
+        '0',
+      ],
+      { cwd: ws, env, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    let output = '';
+    daemon.stdout?.setEncoding('utf8');
+    daemon.stderr?.setEncoding('utf8');
+    daemon.stdout?.on('data', (chunk: string) => {
+      output += chunk;
+    });
+    daemon.stderr?.on('data', (chunk: string) => {
+      output += chunk;
+    });
+    try {
+      const deadline = Date.now() + 15000;
+      while (
+        !output.includes('AgentMon daemon listening') &&
+        Date.now() < deadline &&
+        daemon.exitCode === null
+      )
+        await delay(50);
+      expect(output).toContain('AgentMon daemon listening');
+      const command = `node '${scriptPath.replaceAll("'", "'\\''")}'`;
+      const result = runWs(
+        [
+          'verify',
+          'boundary-watch',
+          '--use-workspace-daemon',
+          '--workspace',
+          ws,
+          '--trigger-cmd',
+          command,
+          '--timeout-ms',
+          '8000',
+          '--format',
+          'json',
+        ],
+        ws,
+        env,
+      );
+      const evidence = JSON.parse(readFileSync(evidencePath, 'utf8')) as {
+        beforeId: string;
+        triggeredId: string;
+        persistedAtMs: number;
+        completedAt: number;
+      };
+      expect(evidence.triggeredId > evidence.beforeId).toBe(true);
+      expect(evidence.persistedAtMs).toBeLessThanOrEqual(evidence.completedAt);
+      const report = JSON.parse(result.stdout) as {
+        ok: boolean;
+        stages: { name: string; status: string }[];
+        additionalContext: string | null;
+      };
+      expect(report.ok, JSON.stringify({ report, evidence })).toBe(true);
+      expect(result.exitCode).toBe(0);
+      expect(report.stages.find(({ name }) => name === 'observe')?.status).toBe(
+        'pass',
+      );
+      expect(report.additionalContext).toBeTruthy();
+    } finally {
+      runWs(['daemon', 'stop'], ws, env);
+      if (daemon.exitCode === null) {
+        daemon.kill('SIGTERM');
+        await new Promise<void>((resolve) => {
+          const timer = globalThis.setTimeout(() => {
+            daemon.kill('SIGKILL');
+          }, 3000);
+          daemon.once('exit', () => {
+            globalThis.clearTimeout(timer);
+            resolve();
+          });
+        });
+      }
+      rmSync(socketDir, { recursive: true, force: true });
+    }
+  }, 40000);
 
   // Issue #418 (HIGH): a LITERAL single-file glob whose watched file did not exist
   // is a case verify triggers by creating the REAL watched file — its objectKey is
