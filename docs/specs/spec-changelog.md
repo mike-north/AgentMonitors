@@ -9,7 +9,7 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
-## 2026-10-31 — Preserve SQLite locks during permission migration (002 §3.1)
+## 2026-10-31 — Preserve SQLite locks during permission migration (002 §3.1) — Refs #529
 
 Move existing SQLite artifact tightening before connection creation. The previous
 post-open descriptor closes released POSIX locks, allowing independent child writers
