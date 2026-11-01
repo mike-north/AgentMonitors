@@ -26,13 +26,30 @@ import type {
 const NOW = new Date('2026-08-13T18:00:00.000Z');
 const tempDirs: string[] = [];
 
+/** Preserve native Date instances: retry envelopes reject subclass/augmented timestamps. */
+let clockTime = NOW.getTime();
 beforeEach(() => {
-  vi.useFakeTimers();
-  vi.setSystemTime(NOW);
+  clockTime = NOW.getTime();
+  vi.stubGlobal(
+    'Date',
+    new Proxy(Date, {
+      construct(target, args) {
+        return Reflect.construct(
+          target,
+          args.length === 0 ? [clockTime] : args,
+        );
+      },
+      get(target, key, receiver) {
+        return key === 'now'
+          ? () => clockTime
+          : Reflect.get(target, key, receiver);
+      },
+    }),
+  );
 });
 
 afterEach(() => {
-  vi.useRealTimers();
+  vi.unstubAllGlobals();
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -379,7 +396,7 @@ describe('atomic poll ingest', () => {
         { result: 'errored', observationData: { error: message } },
       ]);
 
-      vi.setSystemTime(NOW.getTime() + 1_000);
+      clockTime = NOW.getTime() + 1_000;
       const reopenedStore = new RuntimeStore(createDb(f.dbPath));
       const restarted = createRuntime(reopenedStore, f.source, f.interpret);
       const replayed = await restarted.tick(f.monitorsDir, f.rootDir);

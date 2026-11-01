@@ -71,6 +71,7 @@ import {
   sessionObjectCursor,
 } from '../inbox/schema.js';
 import { EPHEMERAL_MONITOR_ID_PREFIX } from './types.js';
+import { registerRuntimeTransaction } from './runtime-transaction.js';
 import type {
   AgentSessionRecord,
   EnqueueMaterializationRetryInput,
@@ -438,17 +439,19 @@ function scopeMatches(
 }
 
 export class RuntimeStore {
-  constructor(private readonly db: InboxDb) {}
-
-  /**
-   * Run a synchronous runtime persistence unit in one immediate transaction.
-   * Nested store transactions use SQLite savepoints, so callers can compose
-   * existing atomic operations without exposing the database handle.
-   *
-   * @internal
-   */
-  runInImmediateTransaction<T>(operation: () => T): T {
-    return asInternalDb(this.db).$client.transaction(operation).immediate();
+  constructor(private readonly db: InboxDb) {
+    // Runtime-owned spans compose store operations without adding executable
+    // callbacks to the published store API. Cache visibility follows the outer
+    // commit, including when nested event savepoints succeeded before rollback.
+    registerRuntimeTransaction(this, (operation) => {
+      const previousProjectedSessionIds = this.lastProjectedSessionIds;
+      try {
+        return asInternalDb(this.db).$client.transaction(operation).immediate();
+      } catch (error) {
+        this.lastProjectedSessionIds = previousProjectedSessionIds;
+        throw error;
+      }
+    });
   }
 
   openSession(input: OpenSessionInput): AgentSessionRecord {

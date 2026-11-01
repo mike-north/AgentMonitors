@@ -2,4 +2,4 @@
 '@agentmonitors/core': patch
 ---
 
-Make poll and watch ingestion atomically preserve failed observations for ordered durable retry before source state advances.
+Commit each finite poll span, its ordered retry suffix, and source/notify checkpoints together before optional interpretation. Preserve committed recipient-cache state when admission rolls back.

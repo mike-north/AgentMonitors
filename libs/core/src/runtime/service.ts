@@ -1,3 +1,8 @@
+/**
+ * Coordinate host-neutral observation, pacing, durable admission and session delivery.
+ * Deterministic persistence completes before optional interpretation; source plugins
+ * own acquisition while adapters own host-specific interaction.
+ */
 import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { ulid } from 'ulid';
@@ -36,6 +41,7 @@ import {
   netCollapseGroupKey,
 } from './store.js';
 import { DeliveryReservationRegistry } from './delivery-reservations.js';
+import { runRuntimeTransaction } from './runtime-transaction.js';
 import type {
   AgentSessionRecord,
   DeclareEphemeralMonitorInput,
@@ -551,6 +557,7 @@ interface TickAccumulator {
   skippedMonitors: { monitorId: string; nextDueAt: Date }[];
 }
 
+/** Committed event plus its exact recipient set for post-commit interpretation. */
 interface MaterializedObservation {
   monitor: MonitorDefinition;
   event: MonitorEventRecord;
@@ -558,21 +565,25 @@ interface MaterializedObservation {
   projectedSessionIds: string[];
 }
 
+/** Retained suffix entry; only the first actual write failure warrants an error audit. */
 interface MaterializationFailure {
   envelope: StoredObservationEnvelope;
   message: string;
   auditError: boolean;
 }
 
+/** Admission outcome distinguishes committed event ids from durable retry obligations. */
 interface MaterializationSpanResult {
   emittedEventIds: string[];
   failures: MaterializationFailure[];
 }
 
+/** Preserve a useful failure description without assuming the thrown value is an Error. */
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** Report the failed suffix size while preserving the first materialization error. */
 function summarizeMaterializationFailures(
   failures: MaterializationFailure[],
 ): string {
@@ -3044,7 +3055,7 @@ export class AgentMonitorRuntime {
     },
   ): Promise<MaterializationSpanResult> {
     const observed = options.observed;
-    const durable = this.store.runInImmediateTransaction(() => {
+    const durable = runRuntimeTransaction(this.store, () => {
       const materialized: MaterializedObservation[] = [];
       const failures: MaterializationFailure[] = [];
       let deferRemaining = false;
@@ -3162,6 +3173,7 @@ export class AgentMonitorRuntime {
     };
   }
 
+  /** Interpret only committed work; optional adapter failures cannot undo admission. */
   private async interpretMaterializedObservation(
     materialized: MaterializedObservation,
   ): Promise<void> {
@@ -3183,6 +3195,7 @@ export class AgentMonitorRuntime {
     }
   }
 
+  /** Refresh projections only after the workspace's deterministic admission has settled. */
   private refreshWorkspaceSessions(workspacePath: string): void {
     for (const session of this.store.sessionsForWorkspace(workspacePath)) {
       this.refreshHookState(session.id);

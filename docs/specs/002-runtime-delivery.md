@@ -610,6 +610,18 @@ bounded outbox before source/notify state advances. If outbox admission or the s
 the outer transaction rolls back the batch and retains the prior source baseline. Interpret and
 audit writes run best-effort only after that durable boundary.
 
+The complete finite span **MUST** be committed before the first Interpret invocation: all successful
+events, every recipient projection/cursor seed, sequential object snapshots (including empty text),
+ordered retry suffix, and source/notify checkpoint are visible from an independent connection while
+that first invocation is suspended. Held notify observations also belong to admission, even when
+no event is emitted. An outer failure preserves prior source and notify state, all prior committed
+rows, and the store's last-committed recipient cache; restart can retry from that prior state.
+
+Transaction composition is package-private and accepts only implementation-owned synchronous work.
+The exported RuntimeStore API does not expose an executable transaction callback. This does not
+claim that SQLite cancels asynchronous JavaScript effects. The separate watch checkpoint path in
+§2.4 is not part of this finite poll guarantee.
+
 Verified: `libs/core/src/runtime/service.ts` — `AgentMonitorRuntime.tick()`, `ingest()`, and
 `materializeSpan()`.
 
