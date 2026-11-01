@@ -99,7 +99,7 @@ describe('resolveObserveVerdict', () => {
       ]);
       expect(rows[0]?.id).not.toBe(baseline.id);
       expect(resolveObserveVerdict(rows, state, false)).toBe('triggered');
-      // A second write at exactly1750ms must advance raw identity too; record
+      // A second write at exactly 1750ms must advance raw identity too; record
       // order is now the boundary even when neither clock precision advances.
       const firstId = rows[0]?.id;
       if (!firstId) throw new Error('Expected first new observation');

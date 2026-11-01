@@ -3,6 +3,12 @@
 This file records clarifications, contradiction resolutions, and structural changes to the
 Agent Monitors spec set in `docs/specs/`.
 
+## Usage
+
+- Add entries when ambiguity is resolved or the intended contract changes.
+- Prefer short entries tied to the numbered doc affected.
+- If implementation behavior and desired behavior differ, say so explicitly.
+
 ## 2026-11-01 — Verify uses observation identity boundaries (005 §16) — Refs #532
 
 Replace millisecond-versus-second history timestamp comparison with a pre-trigger recording frontier
@@ -11,12 +17,6 @@ long commands, exclude earlier same-second rows and intermediate command idle ti
 evidence across window rotation, and refuse negative verdicts when history gaps could hide success.
 Keep explicit timeout caps and two-distinct-row no-change confirmation. Unit tests use actual persisted
 equal-second rows; a real daemon regression waits for durable triggered history before command exit.
-
-## Usage
-
-- Add entries when ambiguity is resolved or the intended contract changes.
-- Prefer short entries tied to the numbered doc affected.
-- If implementation behavior and desired behavior differ, say so explicitly.
 
 ## 2026-10-31 — Preserve SQLite locks during permission migration (002 §3.1) — Refs #529
 
