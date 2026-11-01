@@ -10,7 +10,6 @@ import type {
   EphemeralMonitorRecord,
   EventQuery,
   HookDeliveryDiagnosis,
-  MaterializationRetrySummary,
   MonitorDoctorReport,
   MonitorExplainInput,
   MonitorExplainReport,
@@ -20,6 +19,7 @@ import type {
   OpenSessionInput,
   RuntimeTickResult,
 } from '@agentmonitors/core';
+import { normalizeRetrySummary } from './retry-diagnostics.js';
 import { createRuntime } from './runtime.js';
 import { callDaemon, type DaemonStatusResult } from './daemon-ipc.js';
 
@@ -296,7 +296,7 @@ export async function explainMonitorClient(
     ...report,
     ...(report.materializationRetries
       ? {
-          materializationRetries: reviveMaterializationRetryDates(
+          materializationRetries: normalizeRetrySummary(
             report.materializationRetries,
           ),
         }
@@ -452,22 +452,6 @@ const MONITOR_ROLLUP_DATE_FIELDS = [
   'lastEventAt',
 ] as const satisfies readonly (keyof DoctorMonitorRollup)[];
 
-function reviveMaterializationRetryDates(
-  summary: MaterializationRetrySummary,
-): MaterializationRetrySummary {
-  return {
-    ...summary,
-    records: summary.records.map((record) => ({
-      ...record,
-      nextAttemptAt: record.nextAttemptAt
-        ? new Date(record.nextAttemptAt)
-        : null,
-      createdAt: new Date(record.createdAt),
-      updatedAt: new Date(record.updatedAt),
-    })),
-  };
-}
-
 /**
  * Reconstruct the `Date` fields {@link MonitorDoctorReport} promises, lost to
  * plain ISO strings by the JSON round trip over the daemon socket (issue
@@ -475,6 +459,8 @@ function reviveMaterializationRetryDates(
  * the store; `doctor.ts` calls `.toISOString()` on report dates unconditionally
  * (unlike sibling commands, which only re-serialize their reports), so
  * `doctorReportClient` must uphold the same contract or that call throws.
+ * Attached and orphan retry summaries share the safe metadata projection, so
+ * version-skewed daemon errors and unexpected private fields cannot bypass it.
  */
 function reviveDoctorReportDates(
   report: MonitorDoctorReport,
@@ -482,6 +468,15 @@ function reviveDoctorReportDates(
   return {
     ...report,
     generatedAt: new Date(report.generatedAt),
+    ...(report.orphanedMaterializationRetries
+      ? {
+          orphanedMaterializationRetries:
+            report.orphanedMaterializationRetries.map((group) => ({
+              monitorId: group.monitorId,
+              summary: normalizeRetrySummary(group.summary),
+            })),
+        }
+      : {}),
     monitors: report.monitors.map((monitor) => {
       const revived = { ...monitor };
       for (const field of MONITOR_ROLLUP_DATE_FIELDS) {
@@ -489,7 +484,7 @@ function reviveDoctorReportDates(
         if (value !== undefined) revived[field] = new Date(value);
       }
       if (revived.materializationRetries) {
-        revived.materializationRetries = reviveMaterializationRetryDates(
+        revived.materializationRetries = normalizeRetrySummary(
           revived.materializationRetries,
         );
       }

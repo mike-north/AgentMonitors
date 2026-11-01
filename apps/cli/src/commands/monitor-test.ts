@@ -15,6 +15,7 @@ import {
   type Observation,
 } from '@agentmonitors/core';
 import { registerCoreSources } from '../sources.js';
+import { retryRecordLines } from '../retry-diagnostics.js';
 import { reportError } from '../output.js';
 import { requireFile } from '../validation.js';
 import { appendErrorHints } from '../command-hints.js';
@@ -98,11 +99,8 @@ function printExplainText(report: MonitorExplainReport): void {
   for (const stage of report.stages) {
     console.log(`${statusGlyph(stage.status)} ${stage.label}: ${stage.reason}`);
   }
-  for (const retry of report.materializationRetries?.records ?? []) {
-    console.log(
-      `  Retry ${retry.id}: status=${retry.status}  attempts=${String(retry.attemptCount)}  next-at=${retry.nextAttemptAt?.toISOString() ?? 'none'}  updated-at=${retry.updatedAt.toISOString()}`,
-    );
-    if (retry.lastError) console.log(`    Last error: ${retry.lastError}`);
+  for (const line of retryRecordLines(report.materializationRetries)) {
+    console.log(line);
   }
   console.log(
     `Verdict: ${report.verdict.status} at ${EXPLAIN_STAGE_LABELS[report.verdict.stage]} - ${report.verdict.reason}`,

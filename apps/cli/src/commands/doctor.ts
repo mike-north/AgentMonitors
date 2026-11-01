@@ -5,8 +5,10 @@ import type {
   AgentSessionRecord,
   DoctorMonitorRollup,
   HookDeliveryDiagnosis,
+  MaterializationRetrySummary,
   MonitorDoctorReport,
 } from '@agentmonitors/core';
+import { retryRecordLines } from '../retry-diagnostics.js';
 import { reportError } from '../output.js';
 import { readLocalState } from '../local-state.js';
 import {
@@ -111,7 +113,10 @@ function leadSessionRemediation(workspacePath: string): string {
 const NEVER_OBSERVED_REMEDIATION =
   'The daemon has not observed this monitor yet. Start it with `agentmonitors daemon run` (or wait for the next tick), then check `agentmonitors monitor history <id>`; `agentmonitors monitor test <path>` dry-runs it now.';
 
-function retryOutboxFor(monitor: DoctorMonitorRollup) {
+/** Older daemon reports omit retry metadata; preserve their empty-summary default. */
+function retryOutboxFor(
+  monitor: DoctorMonitorRollup,
+): MaterializationRetrySummary {
   return (
     monitor.materializationRetries ?? {
       pending: 0,
@@ -215,8 +220,13 @@ function buildChecks(
         },
   );
 
-  // 3. every monitor validates
-  if (!report.monitorsDirExists || report.monitors.length === 0) {
+  // 3. every monitor validates. Parse failures can leave zero parsed rows,
+  // but still require a failure check instead of "no monitors to validate".
+  if (
+    (!report.monitorsDirExists || report.monitors.length === 0) &&
+    report.parseErrors.length === 0 &&
+    report.duplicateIds.length === 0
+  ) {
     checks.push({
       name: 'monitors-valid',
       status: 'skip',
@@ -231,6 +241,18 @@ function buildChecks(
     // One monitor can fail several ways at once (invalid scope + duplicate id,
     // parse error + duplicate); count and list each failing id exactly once.
     const problemIds = [...new Set([...invalidIds, ...parseIds, ...dupeIds])];
+    const problemDetails = [
+      ...report.monitors
+        .filter((monitor) => !monitor.valid)
+        .map(
+          (monitor) =>
+            `${monitor.id}: ${monitor.validationError ?? 'invalid definition'}`,
+        ),
+      ...report.parseErrors.map((error) => `${error.id}: ${error.error}`),
+      ...report.duplicateIds.map(
+        (duplicate) => `${duplicate.id}: duplicate monitor id`,
+      ),
+    ];
     checks.push(
       problemIds.length === 0
         ? {
@@ -241,7 +263,7 @@ function buildChecks(
         : {
             name: 'monitors-valid',
             status: 'fail',
-            detail: `${String(problemIds.length)} monitor(s) failed validation: ${problemIds.join(', ')}.`,
+            detail: `${String(problemIds.length)} monitor(s) failed validation: ${problemIds.join(', ')}. ${problemDetails.join('; ')}`,
             remediation: `Run \`agentmonitors validate ${report.monitorsDir}\` and fix the reported errors.`,
           },
     );
@@ -323,14 +345,14 @@ function buildChecks(
         name,
         status: 'fail',
         detail: `terminal materialization retry  ${rollup}`,
-        remediation: `Inspect safe retry details with \`agentmonitors monitor explain ${monitor.id}\`, repair the reported failure, then explicitly re-arm the listed retry record.`,
+        remediation: `Inspect safe retry details with \`agentmonitors monitor explain ${monitor.id}\`, investigate the listed record IDs and repair the reported failure. This CLI does not yet provide a retry action.`,
       });
     } else if (retryOutbox.pending > 0) {
       checks.push({
         name,
         status: 'fail',
         detail: `materialization retry pending  ${rollup}`,
-        remediation: `Inspect this monitor with \`agentmonitors monitor explain ${monitor.id}\` and allow the daemon to retry before observing newer state.`,
+        remediation: `Inspect this monitor with \`agentmonitors monitor explain ${monitor.id}\` and investigate the retained work before advancing source state. This command diagnoses retained work; it does not retry it.`,
       });
     } else if (monitor.neverObserved) {
       checks.push({
@@ -344,7 +366,33 @@ function buildChecks(
     }
   }
 
+  for (const monitor of report.monitors) {
+    if (!monitor.valid && monitor.materializationRetries) {
+      addRetainedWorkCheck(checks, monitor.id, monitor.materializationRetries);
+    }
+  }
+  for (const group of report.orphanedMaterializationRetries ?? []) {
+    addRetainedWorkCheck(checks, group.monitorId, group.summary);
+  }
+
   return checks;
+}
+
+/** Recovery obligations remain failures even without one valid current definition. */
+function addRetainedWorkCheck(
+  checks: DoctorCheck[],
+  monitorId: string,
+  summary: MaterializationRetrySummary,
+): void {
+  if (summary.pending === 0 && summary.terminal === 0) {
+    return;
+  }
+  checks.push({
+    name: `retry-outbox:${monitorId}`,
+    status: 'fail',
+    detail: `retained materialization work  retry-outbox=${String(summary.pending)}/${String(summary.terminal)}  bytes=${String(summary.bytes)}`,
+    remediation: `Inspect retained record IDs with \`agentmonitors monitor explain ${monitorId}\` and repair the definition or reported failure. This CLI does not yet provide a retry action.`,
+  });
 }
 
 /**
@@ -565,6 +613,24 @@ function renderText(
     lines.push(`${STATUS_GLYPH[check.status]} ${check.name}: ${check.detail}`);
     if (check.remediation) lines.push(`    ↳ ${check.remediation}`);
   }
+  // Outboxes have one location in the core report. Render records separately
+  // from definition health so invalid/absent definitions cannot hide them.
+  for (const group of [
+    ...report.monitors.flatMap((monitor) =>
+      monitor.materializationRetries
+        ? [{ monitorId: monitor.id, summary: monitor.materializationRetries }]
+        : [],
+    ),
+    ...(report.orphanedMaterializationRetries ?? []),
+  ]) {
+    if (group.summary.records.length === 0) {
+      continue;
+    }
+    lines.push(
+      `Retry outbox ${group.monitorId}: pending=${String(group.summary.pending)}  terminal=${String(group.summary.terminal)}  bytes=${String(group.summary.bytes)}`,
+    );
+    lines.push(...retryRecordLines(group.summary));
+  }
   const passed = checks.filter((check) => check.status === 'pass').length;
   const failed = checks.filter((check) => check.status === 'fail').length;
   const skipped = checks.filter((check) => check.status === 'skip').length;
@@ -637,6 +703,9 @@ function toJson(
       detail: check.detail,
       remediation: check.remediation ?? null,
     })),
+    orphanedMaterializationRetries: report.orphanedMaterializationRetries ?? [],
+    parseErrors: report.parseErrors,
+    duplicateIds: report.duplicateIds,
     monitors: report.monitors.map((monitor) => ({
       id: monitor.id,
       sourceType: monitor.sourceName,

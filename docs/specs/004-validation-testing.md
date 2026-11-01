@@ -192,6 +192,12 @@ The `RuntimeStore.saveSnapshot()` and `RuntimeStore.latestSnapshot()` methods (i
 | Retained retry diagnostics survive unusable definitions and stay isolated | Covered (`libs/core/src/runtime/retry-diagnostics.test.ts` — all explain early returns, removed/parse-failed/duplicate doctor outboxes, same-id workspace and NULL-scope isolation, omitted-workspace fallback, 257 rows across two monitors, metadata privacy/order and read-only state preservation).                                                                                     |
 | Retry summaries never expose captured envelopes or payloads               | Covered (`libs/core/src/runtime/retry-outbox.test.ts` and `retry-diagnostics.test.ts` — explicit safe metadata shape and private captured-input sentinels absent across reports).                                                                                                                                                                                                           |
 
+Retry CLI/IPC diagnostics are covered by `apps/cli/src/retry-diagnostics.test.ts`: real socket
+roundtrips revive distinct created/updated/next-attempt Dates for explain, doctor attached summaries
+and orphan groups; older-daemon omissions work in both commands and formats. Built CLI text/JSON
+preserve missing/invalid/duplicate definition errors and retained IDs exactly once, normalize legacy
+unsafe errors, exclude private metadata fields and other workspaces, and leave durable state unchanged.
+
 ### 3.4.1 Real daemon crash recovery
 
 `apps/cli/src/commands/daemon-crash-recovery.integration.test.ts` exercises a built CLI daemon
