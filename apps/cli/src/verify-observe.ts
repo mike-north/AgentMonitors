@@ -1,79 +1,103 @@
+/**
+ * Correlate verify's observation stage with recording activity in the same live
+ * daemon. History timestamps lose milliseconds in persistence; monotonic record
+ * identities distinguish rows across a trigger without widening the time window.
+ * This is recording order, not proof that an arbitrary source change was caused
+ * by the trigger. It is not a cross-process-restart or multi-writer sequence.
+ */
 import type { ObservationHistoryRecord } from '@agentmonitors/core';
 
-/**
- * Coerce a record timestamp to epoch ms. Over the daemon socket, `Date` fields
- * are JSON-serialized to ISO strings (the `ObservationHistoryRecord.createdAt:
- * Date` type describes the in-process shape, not the deserialized wire shape),
- * so a bare `.getTime()` would throw. Accept `Date | string | number` — mirrors
- * `verify.ts`'s own `toMs` (duplicated here rather than shared, to keep this
- * module import-free of `verify.ts` and independently unit-testable).
- */
-function toMs(value: Date | string | number): number {
-  if (value instanceof Date) return value.getTime();
-  return new Date(value).getTime();
-}
-
-/**
- * `verify`'s post-trigger observe-stage verdict: the decisive outcome once a
- * post-trigger tick has run, or `null` to keep polling.
- *
- * @see docs/specs/005-cli-reference.md §16
- */
+/** Decisive observation result, or null from the resolver while evidence is incomplete. */
 export type ObserveVerdict = 'triggered' | 'no-change' | 'no-files-matched';
 
 /**
- * Decide the observe-stage verdict from the current observation-history
- * window, given the rows already confirmed as decisive `no-change` evidence
- * on a PRIOR call (`seenNoChangeIds`, mutated in place as an accumulator across
- * polls — see `verify.ts`'s `pollUntil` loop, which calls this once per tick).
- *
- * A `triggered` row always wins immediately — that is the real, non-stale
- * post-trigger tick. `no-files-matched` is likewise always definitive (the
- * glob scope resolved to zero files).
- *
- * `no-change` is more subtle (issue #442 round 19): a daemon tick that was
- * already IN FLIGHT (mid-scan) when the trigger fired can still finish and
- * record its (necessarily stale, pre-trigger) `no-change` row AFTER
- * `observeFrom` — under enough scheduling delay its `createdAt` alone can't be
- * told apart from a genuine post-trigger observation. Requiring that single
- * row to merely PERSIST for a while is not sufficient evidence either: every
- * poll re-reads the SAME retained row, so "persistence" is just the caller's
- * own clock passing, not new information. The only real evidence that a
- * genuinely-late post-trigger tick has run and seen no change is a SECOND,
- * DISTINCT observation-history row (a different `id` — rows are monotonically
- * ID'd and newest-first, so a new id can only come from a tick that started
- * and completed after the first sighting) also reporting `no-change`. Two
- * distinct rows both saying `no-change` means two separate observation cycles
- * ran after the trigger and neither one saw the change — decisive. A single
- * stale row, however long it lingers, never reaches that bar.
- *
- * `no-change` is suppressed entirely while a `suppressed` row is present in
- * the same window — that means the change WAS observed and is settling in a
- * debounce/throttle window (002 §9.2/§9.3); the eventual `triggered` row at
- * flush still wins via the check above.
+ * Recording boundaries and accumulated evidence for one verification attempt.
+ * Keep this object across bounded history polls: rereading a row is not a new
+ * observation, and losing an older row must not erase settling or gap evidence.
+ * @internal
+ */
+export interface ObserveWindow {
+  /** Latest known record before starting the trigger or prompting a manual change. */
+  readonly positiveAfterId: string;
+  /** Latest known record at trigger completion; earlier idle rows cannot prove failure. */
+  readonly negativeAfterId: string;
+  /** Last visible frontier used to verify that consecutive history windows overlap. */
+  latestSeenId: string;
+  /** Distinct eligible no-change records; two cycles are needed to exclude one stale in-flight result. */
+  readonly noChangeIds: Set<string>;
+  /** A missing frontier means a success/settling row might have fallen out of the bounded window. */
+  hasGap: boolean;
+  /** Settling evidence remains meaningful after its history row leaves the window. */
+  sawSuppressed: boolean;
+}
+
+/**
+ * Start evidence collection from two snapshots of the same daemon's history.
+ * A command may already have produced a positive observation before it returns;
+ * negative observations during that command cannot prove its final effect.
+ * @internal
+ */
+export function createObserveWindow(
+  positiveAfterId: string,
+  negativeAfterId: string,
+): ObserveWindow {
+  return {
+    positiveAfterId,
+    negativeAfterId,
+    latestSeenId: positiveAfterId,
+    noChangeIds: new Set(),
+    hasGap: negativeAfterId < positiveAfterId,
+    sawSuppressed: false,
+  };
+}
+
+/**
+ * Resolve an outcome using newly recorded identities, independent of timestamp
+ * precision and wire Date revival. Positive evidence wins immediately. Negative
+ * evidence requires a continuous history window after trigger completion and
+ * is disabled for manual runs. Two distinct no-change rows guard against a scan
+ * already in flight at the trigger; a retained suppression keeps waiting for
+ * its eventual flush. A history gap can only resolve positively or time out.
  */
 export function resolveObserveVerdict(
   rows: readonly ObservationHistoryRecord[],
-  observeFrom: number,
+  window: ObserveWindow,
   manual: boolean,
-  seenNoChangeIds: Set<string>,
 ): ObserveVerdict | null {
-  const post = rows.filter((r) => toMs(r.createdAt) > observeFrom);
-  if (post.some((r) => r.result === 'triggered')) return 'triggered';
-  if (manual) return null;
-  if (post.some((r) => r.result === 'no-files-matched')) {
+  const post = rows.filter(({ id }) => id > window.positiveAfterId);
+  if (post.some(({ result }) => result === 'triggered')) {
+    return 'triggered';
+  }
+
+  const latestId = rows.reduce(
+    (latest, { id }) => (id > latest ? id : latest),
+    window.latestSeenId,
+  );
+  if (
+    latestId > window.latestSeenId &&
+    !rows.some(({ id }) => id === window.latestSeenId)
+  ) {
+    window.hasGap = true;
+  }
+  window.latestSeenId = latestId;
+  window.sawSuppressed ||= post.some(({ result }) => result === 'suppressed');
+  if (manual || window.hasGap) {
+    return null;
+  }
+
+  const negative = post.filter(({ id }) => id > window.negativeAfterId);
+  if (negative.some(({ result }) => result === 'no-files-matched')) {
     return 'no-files-matched';
   }
-  if (
-    post.some((r) => r.result === 'no-change') &&
-    !post.some((r) => r.result === 'suppressed')
-  ) {
-    for (const row of post) {
-      if (row.result === 'no-change') seenNoChangeIds.add(row.id);
-    }
-    return seenNoChangeIds.size >= 2 ? 'no-change' : null;
+  if (window.sawSuppressed) {
+    return null;
   }
-  return null;
+  for (const row of negative) {
+    if (row.result === 'no-change') {
+      window.noChangeIds.add(row.id);
+    }
+  }
+  return window.noChangeIds.size >= 2 ? 'no-change' : null;
 }
 
 /**
