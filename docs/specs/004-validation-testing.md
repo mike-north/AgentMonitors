@@ -189,6 +189,22 @@ The `RuntimeStore.saveSnapshot()` and `RuntimeStore.latestSnapshot()` methods (i
 | Retry envelopes round-trip without silent data conversion        | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — BigInt, negative zero, nested/customized Date, non-Date observedAt, and accessor/proxy values fail with a domain error before any sibling is written; altered-prototype built-in brands are rejected; route getters and direct or inherited proxy traps never run). |
 | Retry errors are safe and bounded                                | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — C0/DEL controls are stripped and persisted errors are capped at 1,024 characters).                                                                                                                                                                                  |
 
+### Snapshot materialization order
+
+`runtime/snapshot-materialization-order.test.ts` verifies that the diff predecessor is
+selected by committed insertion order, not timestamp/ULID order. Two actual child
+processes prime genuine snapshot ULID factories in private databases under an identical
+clock; the parent commits the higher-ID writer first and the lower-ID writer second,
+awaiting process exit at each barrier. An already-open independent connection and a fresh
+reader process must both return the second snapshot, giving the adjacent B→C diff.
+No stored IDs are replaced. Children have bounded lifetimes and their exits are awaited.
+
+Additional cases cover wall-clock reversal, rolled-back and rejected writes, deletion of
+the newest/all rows followed by insertion, `VACUUM` and reopen, legacy rowid bootstrap
+with unchanged public data/indexes/triggers and no replayed trigger effects, migration
+idempotence, and simultaneous first-open migration. The existing transactional
+materialization suite retains event/projection/cursor/snapshot rollback coverage.
+
 ### 3.4.1 Real daemon crash recovery
 
 `apps/cli/src/commands/daemon-crash-recovery.integration.test.ts` exercises a built CLI daemon

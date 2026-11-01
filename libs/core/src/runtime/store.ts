@@ -30,16 +30,10 @@ import { monotonicFactory, ulid } from 'ulid';
 const eventUlid = monotonicFactory();
 
 /**
- * Monotonic ULID factory for `monitor_snapshots` ids (issue #293). `created_at`
- * is stored at epoch-SECOND precision, so several snapshots for one
- * `(workspace, monitor, object)` written in the same second (an ordinary
- * same-tick burst) all tie on `created_at`. `latestSnapshot()` picks the diff
- * predecessor, so a tie that resolved to an OLDER row corrupted the shared diff
- * chain (repeating or omitting intermediate changes). A monotonic factory makes
- * `id` strictly increasing in insertion order, giving snapshots a total
- * materialization order; ordering by `(created_at, id)` then reflects it exactly
- * — the same tie-break the `monitor_events` table already uses (see
- * {@link eventUlid}).
+ * Public snapshot identities retain their ULID representation. This factory is
+ * local to one process and cannot establish insertion order across writers.
+ * SQLite's private snapshot sequence, not this ID or the wall clock, determines
+ * the committed predecessor used by shared diffs.
  */
 const snapshotUlid = monotonicFactory();
 
@@ -1436,10 +1430,9 @@ export class RuntimeStore {
             : eq(monitorSnapshots.workspacePath, workspacePath),
         ),
       )
-      // `created_at` is second-precision, so same-second writes tie; the
-      // monotonic `id` (see `snapshotUlid`) breaks the tie in materialization
-      // order so the newest snapshot is the diff predecessor (issue #293).
-      .orderBy(desc(monitorSnapshots.createdAt), desc(monitorSnapshots.id))
+      // The predecessor is the last retained materialization, independent of
+      // observation timestamps, wall-clock reversals or process-local IDs.
+      .orderBy(desc(monitorSnapshots.sequence))
       .get();
     return row ? { content: row.content } : null;
   }

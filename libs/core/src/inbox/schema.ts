@@ -77,8 +77,14 @@ export const monitorEvents = sqliteTable('monitor_events', {
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
 });
 
+/**
+ * Retained object artifacts. Public ULIDs identify snapshots; SQLite's private
+ * sequence orders committed materializations across writers independently of
+ * wall clocks. Rolled-back allocations have no durable ordering significance.
+ */
 export const monitorSnapshots = sqliteTable('monitor_snapshots', {
-  id: text('id').primaryKey(),
+  sequence: integer('sequence').primaryKey({ autoIncrement: true }),
+  id: text('id').notNull().unique(),
   workspacePath: text('workspace_path'),
   monitorId: text('monitor_id').notNull(),
   objectKey: text('object_key').notNull(),

@@ -356,7 +356,8 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
 
   db.run(sql`
     CREATE TABLE IF NOT EXISTS monitor_snapshots (
-      id TEXT PRIMARY KEY,
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      id TEXT NOT NULL UNIQUE,
       workspace_path TEXT,
       monitor_id TEXT NOT NULL,
       object_key TEXT NOT NULL,
@@ -365,6 +366,8 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
       created_at INTEGER NOT NULL
     )
   `);
+
+  migrateSnapshotMaterializationOrder(sqlite);
 
   db.run(sql`
     CREATE TABLE IF NOT EXISTS materialization_retry_outbox (
@@ -474,6 +477,49 @@ interface LegacyMonitorStateRow {
   last_observation_at: number | null;
   notify_state: string;
   updated_at: number;
+}
+
+/**
+ * Give retained snapshots a SQLite-owned materialization order without changing
+ * their public identities or artifacts. The schema-build immediate transaction
+ * owns this rebuild, so concurrent openers cannot see a partially copied table.
+ *
+ * Legacy hidden rowid order is the available bootstrap policy, not a recovery
+ * of historical chronology lost before migration (for example by VACUUM).
+ * New explicit integer keys survive VACUUM and reopen; AUTOINCREMENT prevents
+ * reuse after committed deletion. Rolled-back allocations may be reused because
+ * no committed snapshot ever acquired them. Existing indexes/triggers are
+ * recreated after copying so bootstrap does not replay insertion side effects.
+ */
+function migrateSnapshotMaterializationOrder(sqlite: BetterSQLiteClient): void {
+  if (tableHasColumn(sqlite, 'monitor_snapshots', 'sequence')) return;
+
+  const schemaObjects = sqlite
+    .prepare<[], { sql: string }>(
+      `SELECT sql FROM sqlite_master
+       WHERE tbl_name = 'monitor_snapshots' AND type IN ('index', 'trigger')
+         AND sql IS NOT NULL ORDER BY type, name`,
+    )
+    .all();
+  sqlite.exec(`
+    CREATE TABLE monitor_snapshots_ordered (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      id TEXT NOT NULL UNIQUE,
+      workspace_path TEXT,
+      monitor_id TEXT NOT NULL,
+      object_key TEXT NOT NULL,
+      event_id TEXT NOT NULL,
+      content TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    INSERT INTO monitor_snapshots_ordered
+      (id, workspace_path, monitor_id, object_key, event_id, content, created_at)
+      SELECT id, workspace_path, monitor_id, object_key, event_id, content, created_at
+      FROM monitor_snapshots ORDER BY rowid;
+    DROP TABLE monitor_snapshots;
+    ALTER TABLE monitor_snapshots_ordered RENAME TO monitor_snapshots;
+  `);
+  for (const object of schemaObjects) sqlite.exec(object.sql);
 }
 
 /**
