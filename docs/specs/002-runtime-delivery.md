@@ -1861,12 +1861,43 @@ restored as a Date; a string timestamp is not an accepted substitute. A batch
 enqueue uses one immediate transaction: if every failed sibling cannot fit, none is stored. Another
 workspace or monitor has independent capacity.
 
-New records first become due after 1 second. `last_error` has terminal controls removed and is capped
-at 1,024 characters.
+New records first become due after at least 1 second. Because retry timestamps are persisted at
+whole-second precision, deadlines round upward to the next representable second, never downward:
+admission at `12:00:00.850` becomes due at `12:00:02.000`. This can add less than one second to a
+backoff, but must not shorten it. `last_error` is a single-line diagnostic: C0/C1 controls, DEL and
+Unicode line/paragraph separators are replaced with spaces, then the result is capped at 1,024
+characters. The same rule applies at admission and every failed-attempt update.
 
-_Current in this change:_ schema, lossless serialization, route checks, bounded atomic admission,
-and oldest-first reads. Retry state transitions and transaction-coupled completion are added in the
-next stack layer. Runtime drain-before-observe adoption follows after that for #295.
+Failed automatic attempts wait at least 5 seconds, 30 seconds, 2 minutes, and 5 minutes; the fifth
+failed automatic attempt marks the row `terminal` and clears `next_attempt_at`. Due queries never
+return a terminal row. Terminal rows remain durable and consume capacity until an operator
+explicitly re-arms them. Re-arm preserves the identity and envelope, resets attempts and last error,
+and schedules the initial delay again. Re-arming a pending row is an invalid transition.
+
+Completion accepts a deterministically rendered event from the retained envelope, not a caller
+callback. The store **MUST** reject terminal work before any event write, and **MUST** require the
+event's workspace, monitor, source and object identity to match the retained work. An omitted
+observation object key defaults to the monitor ID, matching the normal runtime materialization path;
+explicit keys, including the empty string, retain their own identity. Rendering and
+selection of due work remain runtime responsibilities. The store owns the synchronous event,
+projection, cursor-seed and snapshot writes plus retry-row deletion in one immediate transaction.
+Any write or deletion failure **MUST** preserve the retry row and roll back all materialization
+writes; the last-projected-session cache must likewise describe committed state. For example, a
+failure deleting the retry after writing its snapshot leaves neither a new event nor a snapshot,
+and the original retry is still available. Interpret and external asynchronous effects happen only
+after successful completion; the API makes no claim that arbitrary asynchronous work is cancellable.
+
+Missing identities raise `MaterializationRetryNotFoundError` with code
+`materialization_retry_not_found`. Invalid lifecycle/completion transitions raise
+`MaterializationRetryTransitionError` with code `materialization_retry_invalid_transition`.
+Both expose `retryId`; neither includes the stored envelope. Storage failures remain distinguishable
+from these domain failures.
+
+_Current:_ storage, retry transitions and atomic completion primitives. Runtime drain-before-observe
+adoption remains target work for #295; these primitives alone do not make source checkpoints safe.
+Verified by `retry-outbox.test.ts` and `retry-lifecycle.test.ts`: due boundaries, invalid transitions,
+callback non-execution, actual snapshot/deletion fault rollback, failure-text sanitization and
+failed/terminal/rearmed/completed states across on-disk reopen.
 
 ### `session_event_state`
 

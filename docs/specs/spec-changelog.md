@@ -18,6 +18,17 @@ evidence across window rotation, and refuse negative verdicts when history gaps 
 Keep explicit timeout caps and two-distinct-row no-change confirmation. Unit tests use actual persisted
 equal-second rows; a real daemon regression waits for durable triggered history before command exit.
 
+## 2026-10-31 — Retry completion owns synchronous materialization (002 persistence, 004 §3.4) — Refs #494
+
+Replace the generic completion callback with concrete event data so asynchronous caller work cannot
+escape the transaction. Require pending state and matching observation route before writes; atomically
+commit event/projections/cursors/snapshot plus retry removal and preserve the projection cache on rollback.
+Document typed missing-identity/invalid-transition errors, single-line failure updates, and upward-rounded
+second-resolution deadlines. Tests reproduce terminal bypass, callback escape, early due admission and
+unsafe Unicode separators, then verify real database faults and on-disk lifecycle recovery. A runtime-backed
+regression also requires completion to honor the normal monitor-ID fallback for omitted object keys
+while preserving explicit keys, including the empty string.
+
 ## 2026-10-31 — Preserve SQLite locks during permission migration (002 §3.1) — Refs #529
 
 Move existing SQLite artifact tightening before connection creation. The previous
@@ -147,8 +158,10 @@ Two contradiction resolutions recorded per 004 §5, both surfaced by PR #512 rev
 Core now persists failed stored-observation envelopes in a workspace-scoped, per-monitor outbox
 before a later runtime change adopts it for source ticks. Batch enqueue is capacity-atomic at 256
 records or 8 MiB. Envelopes must round-trip through JSON without conversion, trusted routes are
-checked before mutation, and safe errors are control-stripped and bounded. Retry lifecycle and
-operator diagnostics are delivered in the next two stack layers.
+checked before mutation, and safe errors are control-stripped and bounded. The lifecycle layer adds
+fixed retry delays, terminal state after five failures, explicit re-arm, and transaction-coupled
+completion so a thrown materialization cannot delete its durable retry. Operator diagnostics follow
+in the next stack layer.
 
 ## 2026-08-13 — Event materialization is one atomic durable unit (002 §5, 004 §3.4) — Refs #295, #481
 
