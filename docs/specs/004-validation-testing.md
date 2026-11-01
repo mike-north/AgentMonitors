@@ -223,6 +223,9 @@ uncommitted observation recovery, power-loss durability, or the pending material
 
 | Concurrent admission decisions preserve newer durable work | Covered (`poll-admission.test.ts` — independent notify writer commits immediately before BEGIN and its held envelope is materialized; mutation of observation context cannot alter the captured source token; `watch-batch-admission.test.ts` refuses a stale later batch without changing the winning source/notify state). |
 
+| Not-due rollup decisions use current state under the writer lock | Covered (`rollup-admission.test.ts` — controlled owned child runtimes commit competing not-due, due and watch admissions before BEGIN; no duplicate events/Interpret or checkpoint/time rewinds; same-minute newly held work survives). |
+| Rollup suffix, rollback and non-emitting admission are coherent | Covered (`rollup-admission.test.ts` — suspended first Interpret exposes exact prefix/suffix/marker; state/outbox failure restores all durable artifacts and cache, reopens for one flush; empty/closed-window failures preserve state and healthy sibling progress without routine audit spam). |
+
 ### 3.5 CLI behavior
 
 | Scenario                                                                                                                                                                           | Coverage                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
